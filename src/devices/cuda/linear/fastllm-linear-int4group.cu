@@ -5,6 +5,8 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#include <cmath>
+
 #if !defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
 #include <cpuid.h>
 #endif
@@ -219,11 +221,75 @@ void LaunchFastllmGemmFp32Int4Group(float *input, uint8_t *weight, float *output
     }
 }
 
-static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
-        cudaError_t state = cudaSuccess;
-        int group = weight.group;
+static constexpr int INT4GROUP_CUDA_SCALES_IDX = 0;
+static constexpr int INT4GROUP_CUDA_MINS_IDX = 1;
+static constexpr int INT4GROUP_CUDA_BIAS_IDX = 2;
+static constexpr int INT4GROUP_MARLIN_WEIGHT_IDX = 3;
+static constexpr int INT4GROUP_MARLIN_ZEROS_IDX = 4;
+static constexpr int INT4GROUP_MARLIN_WORKSPACE_IDX = 5;
 
+static constexpr int INT4GROUP_HALF_SCALES_IDX = 0;
+static constexpr int INT4GROUP_HALF_MINS_IDX = 1;
+static constexpr int INT4GROUP_HALF_BIAS_IDX = 2;
+static constexpr int INT4GROUP_MARLIN_SCALES_HALF_IDX = 3;
+
+static bool FastllmCudaInt4GroupHasMarlinOnDevice(const fastllm::Data &weight) {
+    return (int)weight.extraCudaData.size() > INT4GROUP_MARLIN_WORKSPACE_IDX &&
+           (int)weight.extraCudaHalfData.size() > INT4GROUP_MARLIN_SCALES_HALF_IDX &&
+           weight.extraCudaData[INT4GROUP_MARLIN_WEIGHT_IDX] != nullptr &&
+           weight.extraCudaData[INT4GROUP_MARLIN_ZEROS_IDX] != nullptr &&
+           weight.extraCudaData[INT4GROUP_MARLIN_WORKSPACE_IDX] != nullptr &&
+           weight.extraCudaHalfData[INT4GROUP_MARLIN_SCALES_HALF_IDX] != nullptr;
+}
+
+static void FastllmCudaInt4GroupFallbackUnavailable() {
+    printf("Error: INT4_GROUP original CUDA weight was released after Marlin repack; fallback path is unavailable.\n");
+    throw("int4group marlin-only fallback error");
+    exit(0);
+}
+
+static void FastllmCudaInt4GroupReleaseExtraCudaData(fastllm::Data &weight, int index) {
+    if ((int)weight.extraCudaData.size() <= index || weight.extraCudaData[index] == nullptr) {
+        return;
+    }
+
+    void *ptr = weight.extraCudaData[index];
+    for (int i = 0; i < (int)weight.extraCudaHalfData.size(); i++) {
+        if (weight.extraCudaHalfData[i] == ptr) {
+            weight.extraCudaHalfData[i] = nullptr;
+        }
+    }
+    FastllmCudaFree(ptr);
+    weight.extraCudaData[index] = nullptr;
+}
+
+static void FastllmCudaInt4GroupReleaseFallbackCaches(fastllm::Data &weight) {
+    FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_CUDA_SCALES_IDX);
+    FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_CUDA_MINS_IDX);
+    FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_CUDA_BIAS_IDX);
+}
+
+static void FastllmCudaInt4GroupReleaseOriginalWeight(fastllm::Data &weight) {
+    if (weight.cudaData != nullptr) {
+        FastllmCudaFree(weight.cudaData);
+        weight.cudaData = nullptr;
+    }
+    FastllmCudaInt4GroupReleaseFallbackCaches(weight);
+}
+
+static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    if (weight.cudaData == nullptr) {
+        FastllmCudaInt4GroupFallbackUnavailable();
+    }
+
+    if ((int)weight.extraCudaData.size() <= INT4GROUP_CUDA_BIAS_IDX) {
+        weight.extraCudaData.resize(INT4GROUP_CUDA_BIAS_IDX + 1, nullptr);
+    }
+
+    cudaError_t state = cudaSuccess;
+    int group = weight.group;
+
+    if (weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX] == nullptr) {
         half *cudaScales;
         state = cudaMalloc(&cudaScales, k * group * sizeof(half));
         half *scales = new half[k * group];
@@ -231,9 +297,11 @@ static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &w
             scales[i] = (half)weight.scales[i];
         }
         state = cudaMemcpy(cudaScales, scales, k * group * sizeof(half), cudaMemcpyHostToDevice);
-        weight.extraCudaData.push_back((void*)cudaScales);
+        weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX] = (void*)cudaScales;
         delete[] scales;
+    }
 
+    if (weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX] == nullptr) {
         half *cudaMins;
         state = cudaMalloc(&cudaMins, k * group * sizeof(half));
         half *mins = new half[k * group];
@@ -242,8 +310,10 @@ static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &w
         }
         state = cudaMemcpy(cudaMins, mins, k * group * sizeof(half), cudaMemcpyHostToDevice);
         delete[] mins;
-        weight.extraCudaData.push_back((void*)cudaMins);
+        weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX] = (void*)cudaMins;
+    }
 
+    if (weight.extraCudaData[INT4GROUP_CUDA_BIAS_IDX] == nullptr) {
         float *cudaBiasData;
         state = cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
@@ -252,7 +322,7 @@ static void FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(fastllm::Data &w
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaData.push_back((void*)cudaBiasData);
+        weight.extraCudaData[INT4GROUP_CUDA_BIAS_IDX] = (void*)cudaBiasData;
     }
 }
 
@@ -261,9 +331,9 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
     int group = weight.group, groupCnt = weight.groupCnt;
     FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(weight, bias, k);
 
-    half *cudaScales = (half*)weight.extraCudaData[0];
-    half *cudaMins = (half*)weight.extraCudaData[1];
-    float *cudaBiasData = (float*)weight.extraCudaData[2];
+    half *cudaScales = (half*)weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX];
+    half *cudaMins = (half*)weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX];
+    float *cudaBiasData = (float*)weight.extraCudaData[INT4GROUP_CUDA_BIAS_IDX];
 
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
@@ -399,12 +469,166 @@ void LaunchFastllmGemmFp16Int4Group(half *input, uint8_t *weight, half *output, 
     
 }
 
-static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(weight, bias, k);
-    if (weight.cudaData == nullptr || weight.extraCudaHalfData.size() == 0) {
-        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[0]);
-        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[1]);
+__global__ void FastllmCudaInt4GroupToMarlinQWeightKernel(const uint8_t *weight, uint32_t *qweight, int m, int k) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int packsPerRow = m / 8;
+    int total = packsPerRow * k;
+    if (idx >= total) {
+        return;
+    }
 
+    int pack = idx / k;
+    int out = idx - pack * k;
+    int xBase = pack * 8;
+    const uint8_t *row = weight + (size_t)out * m / 2;
+
+    uint32_t v = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        uint8_t packed = row[(xBase + i) >> 1];
+        uint32_t q = ((xBase + i) & 1) ? (packed & 15) : (packed >> 4);
+        v |= q << (i * 4);
+    }
+    qweight[idx] = v;
+}
+
+static bool FastllmCudaInt4GroupMarlinEnabled(int n, int m, int k, int groupCnt) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    int dev = 0;
+    int major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        major * 10 + minor < 75) {
+        return false;
+    }
+    return n >= 1 && groupCnt == 128 && m % groupCnt == 0 &&
+           groupCnt % 16 == 0 && m % 64 == 0 && k % 64 == 0;
+#endif
+}
+
+static void FastllmBuildMarlinPermutedScalesAndZeros(const fastllm::Data &weight,
+                                                      std::vector<half> &scales,
+                                                      std::vector<uint32_t> &zeros,
+                                                      int m, int k) {
+    int group = weight.group;
+    scales.resize((size_t)group * k);
+    std::vector<uint8_t> zeroValues((size_t)group * k);
+
+    const int scalePerm[64] = {
+        0, 8, 16, 24, 32, 40, 48, 56,
+        1, 9, 17, 25, 33, 41, 49, 57,
+        2, 10, 18, 26, 34, 42, 50, 58,
+        3, 11, 19, 27, 35, 43, 51, 59,
+        4, 12, 20, 28, 36, 44, 52, 60,
+        5, 13, 21, 29, 37, 45, 53, 61,
+        6, 14, 22, 30, 38, 46, 54, 62,
+        7, 15, 23, 31, 39, 47, 55, 63
+    };
+    const int zpInterleave[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+
+    std::vector<float> scaleGN((size_t)group * k);
+    std::vector<uint8_t> zeroGN((size_t)group * k);
+    for (int g = 0; g < group; g++) {
+        for (int out = 0; out < k; out++) {
+            size_t dst = (size_t)g * k + out;
+            size_t src = (size_t)out * group + g;
+            float s = weight.scales[src];
+            float minv = weight.mins[src];
+            int z = s == 0.0f ? 0 : (int)std::lroundf(-minv / s);
+            z = std::max(0, std::min(15, z));
+            scaleGN[dst] = s;
+            zeroGN[dst] = (uint8_t)z;
+        }
+    }
+
+    for (size_t base = 0; base < scaleGN.size(); base += 64) {
+#pragma unroll
+        for (int i = 0; i < 64; i++) {
+            scales[base + i] = (half)scaleGN[base + scalePerm[i]];
+            zeroValues[base + i] = zeroGN[base + scalePerm[i]];
+        }
+    }
+
+    for (size_t base = 0; base < zeroValues.size(); base += 8) {
+        uint8_t tmp[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            tmp[i] = zeroValues[base + zpInterleave[i]];
+        }
+        uint32_t packed = 0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            packed |= ((uint32_t)tmp[i]) << (i * 4);
+        }
+        zeros.push_back(packed);
+    }
+}
+
+static bool FastllmCudaInt4GroupEnsureMarlinOnDevice(fastllm::Data &weight, int m, int k) {
+    if (FastllmCudaInt4GroupHasMarlinOnDevice(weight)) {
+        return true;
+    }
+
+    if (weight.group <= 0 || weight.groupCnt <= 0 ||
+        weight.scales.size() != (size_t)k * weight.group ||
+        weight.mins.size() != (size_t)k * weight.group ||
+        weight.cudaData == nullptr) {
+        return false;
+    }
+
+    size_t qweightCount = (size_t)(m / 8) * k;
+    uint32_t *stdQWeight = (uint32_t*)FastllmCudaMalloc(qweightCount * sizeof(uint32_t));
+    uint32_t *marlinQWeight = (uint32_t*)FastllmCudaMalloc(qweightCount * sizeof(uint32_t));
+
+    int threads = 256;
+    int blocks = (int)((qweightCount + threads - 1) / threads);
+    FastllmCudaInt4GroupToMarlinQWeightKernel <<< blocks, threads >>>(
+        (const uint8_t*)weight.cudaData, stdQWeight, m, k);
+
+    bool repacked = FastllmCudaGptqMarlinRepack(stdQWeight, marlinQWeight, m, k);
+    FastllmCudaFree(stdQWeight);
+    if (!repacked) {
+        FastllmCudaFree(marlinQWeight);
+        return false;
+    }
+    FastllmCudaInt4GroupReleaseOriginalWeight(weight);
+
+    std::vector<half> hostScales;
+    std::vector<uint32_t> hostZeros;
+    hostZeros.reserve((size_t)weight.group * k / 8);
+    FastllmBuildMarlinPermutedScalesAndZeros(weight, hostScales, hostZeros, m, k);
+
+    half *marlinScales = (half*)FastllmCudaMalloc(hostScales.size() * sizeof(half));
+    uint32_t *marlinZeros = (uint32_t*)FastllmCudaMalloc(hostZeros.size() * sizeof(uint32_t));
+    FastllmCudaCopyFromHostToDevice(marlinScales, hostScales.data(), hostScales.size() * sizeof(half));
+    FastllmCudaCopyFromHostToDevice(marlinZeros, hostZeros.data(), hostZeros.size() * sizeof(uint32_t));
+
+    int workspaceInts = std::max(1, (k / 64) * 16);
+    int *workspace = (int*)FastllmCudaMalloc((size_t)workspaceInts * sizeof(int));
+    FastllmCudaMemset0(workspace, (size_t)workspaceInts * sizeof(int));
+
+    if ((int)weight.extraCudaData.size() <= INT4GROUP_MARLIN_WORKSPACE_IDX) {
+        weight.extraCudaData.resize(INT4GROUP_MARLIN_WORKSPACE_IDX + 1, nullptr);
+    }
+    weight.extraCudaData[INT4GROUP_MARLIN_WEIGHT_IDX] = (void*)marlinQWeight;
+    weight.extraCudaData[INT4GROUP_MARLIN_ZEROS_IDX] = (void*)marlinZeros;
+    weight.extraCudaData[INT4GROUP_MARLIN_WORKSPACE_IDX] = (void*)workspace;
+
+    if ((int)weight.extraCudaHalfData.size() <= INT4GROUP_MARLIN_SCALES_HALF_IDX) {
+        weight.extraCudaHalfData.resize(INT4GROUP_MARLIN_SCALES_HALF_IDX + 1, nullptr);
+    }
+    weight.extraCudaHalfData[INT4GROUP_MARLIN_SCALES_HALF_IDX] = (void*)marlinScales;
+    return true;
+}
+
+static half *FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    if ((int)weight.extraCudaHalfData.size() <= INT4GROUP_HALF_BIAS_IDX) {
+        weight.extraCudaHalfData.resize(INT4GROUP_HALF_BIAS_IDX + 1, nullptr);
+    }
+    if (weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX] == nullptr) {
         half *cudaBiasData;
         cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(half));
         if (bias.dims.size() > 0) {
@@ -418,22 +642,61 @@ static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, co
             state = cudaMemset(cudaBiasData, 0, k * sizeof(half));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaHalfData.push_back((void*)cudaBiasData);
+        weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX] = (void*)cudaBiasData;
     }
+    return (half*)weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX];
+}
+
+static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(weight, bias, k);
+    if ((int)weight.extraCudaHalfData.size() <= INT4GROUP_HALF_BIAS_IDX) {
+        weight.extraCudaHalfData.resize(INT4GROUP_HALF_BIAS_IDX + 1, nullptr);
+    }
+    if (weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX] == nullptr) {
+        weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX] =
+            weight.extraCudaData[INT4GROUP_CUDA_SCALES_IDX];
+    }
+    if (weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX] == nullptr) {
+        weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX] =
+            weight.extraCudaData[INT4GROUP_CUDA_MINS_IDX];
+    }
+    FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(weight, bias, k);
 }
 
 bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     int group = weight.group, groupCnt = weight.groupCnt;
-    FastllmCudaInt4GroupEnsureScalesMinsAndBiasOnDevice(weight, bias, k);
-    FastllmCudaInt4GroupEnsureHalfBiasOnDevice(weight, bias, k);
-
-    half *cudaScales = (half*)weight.extraCudaHalfData[0];
-    half *cudaMins = (half*)weight.extraCudaHalfData[1];
+    bool useMarlin = FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
+                     FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
+    if (!useMarlin) {
+        if (weight.cudaData == nullptr) {
+            FastllmCudaInt4GroupFallbackUnavailable();
+        }
+        FastllmCudaInt4GroupEnsureHalfBiasOnDevice(weight, bias, k);
+    }
 
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
-    if (n > 16) {
+    if (useMarlin) {
+        uint32_t *marlinQWeight = (uint32_t*)weight.extraCudaData[INT4GROUP_MARLIN_WEIGHT_IDX];
+        uint32_t *marlinZeros = (uint32_t*)weight.extraCudaData[INT4GROUP_MARLIN_ZEROS_IDX];
+        int *marlinWorkspace = (int*)weight.extraCudaData[INT4GROUP_MARLIN_WORKSPACE_IDX];
+        half *marlinScales = (half*)weight.extraCudaHalfData[INT4GROUP_MARLIN_SCALES_HALF_IDX];
+
+        bool marlinOk = FastllmCudaMarlinHalfInt4Gemm(cudaInput, marlinQWeight, marlinScales, marlinZeros,
+                                                      cudaOutput, n, k, m, groupCnt, marlinWorkspace);
+        if (!marlinOk) {
+            printf("Error: INT4_GROUP Marlin GEMM failed after original CUDA weight was released.\n");
+            throw("int4group marlin gemm error");
+            exit(0);
+        }
+        if (bias.dims.size() > 0) {
+            half *cudaBiasData = FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(weight, bias, k);
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        }
+    } else if (n > 16) {
+        half *cudaScales = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX];
+        half *cudaMins = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX];
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         // 借用 FlashInfer 的 d_float_workspace 作为 INT4 -> FP16 的反量化临时缓冲；
@@ -498,13 +761,15 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
         FastllmCudaFree(cudaFp32Output);
 #endif
         if (bias.dims.size() > 0) {
-            half *cudaBiasData = (half*)weight.extraCudaHalfData[2];
+            half *cudaBiasData = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX];
             FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
         }
 
         FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else {
-        half *cudaBiasData = (half*)weight.extraCudaHalfData[2];
+        half *cudaScales = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_SCALES_IDX];
+        half *cudaMins = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_MINS_IDX];
+        half *cudaBiasData = (half*)weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX];
         LaunchFastllmGemmFp16Int4Group(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaMins, n, m, k, group, groupCnt);
     }
     FastllmCudaFinishInput(input, cudaInput);

@@ -144,6 +144,13 @@ void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outO
 // 与 Borrow 配对。仅当 outOwn==true 时才真正调用 FastllmCudaFree。
 void FastllmReleaseDequantScratch(void *ptr, bool own);
 
+bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t *out,
+                                 int size_k, int size_n);
+bool FastllmCudaMarlinHalfInt4Gemm(const void *a, const uint32_t *b_q_weight,
+                                   const void *b_scales, const uint32_t *b_zeros,
+                                   void *c, int size_m, int size_n, int size_k,
+                                   int group_size, int *workspace);
+
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromHostToDeviceAsync(void *dst, void *src, size_t size, void *stream);
