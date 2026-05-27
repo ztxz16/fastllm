@@ -582,6 +582,64 @@ namespace fastllm {
             return !devices.empty();
         }
 
+        static bool Qwen3MoeDeviceSpecStartsWith(const std::string &device, const std::string &prefix) {
+            std::string lower = device;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            return lower == prefix || lower.rfind(prefix + ":", 0) == 0;
+        }
+
+        static bool Qwen3MoeDeviceSpecIsCuda(const std::string &device) {
+            return Qwen3MoeDeviceSpecStartsWith(device, "cuda") ||
+                   Qwen3MoeDeviceSpecStartsWith(device, "multicuda");
+        }
+
+        static bool Qwen3MoeDeviceMapAllCuda(const std::map<std::string, int> &deviceMap) {
+            bool hasCuda = false;
+            for (auto &it : deviceMap) {
+                if (it.second <= 0) {
+                    continue;
+                }
+                if (!Qwen3MoeDeviceSpecIsCuda(it.first)) {
+                    return false;
+                }
+                hasCuda = true;
+            }
+            return hasCuda;
+        }
+
+        static bool Qwen3MoeCanUseGPUForward(const std::map<std::string, int> &deviceMap,
+                                             const std::map<std::string, int> &moeDeviceMap) {
+            std::vector<int> devices;
+            std::map<int, int> ratios;
+            if (!GetQwen3MoeGPUForwardDevices(deviceMap, devices, ratios)) {
+                return false;
+            }
+            return moeDeviceMap.empty() || Qwen3MoeDeviceMapAllCuda(moeDeviceMap);
+        }
+
+        static bool Qwen3MoeCanPlanFusedMoe(const std::map<std::string, int> &deviceMap,
+                                            const std::map<std::string, int> &moeDeviceMap) {
+#ifdef USE_CUDA
+            return Qwen3MoeCanUseGPUForward(deviceMap, moeDeviceMap);
+#else
+            (void)deviceMap;
+            (void)moeDeviceMap;
+            return false;
+#endif
+        }
+
+        static bool Qwen3MoeGenericForwardMayUseFusedMoe(const std::map<std::string, int> &deviceMap,
+                                                         const std::map<std::string, int> &moeDeviceMap) {
+#ifdef USE_CUDA
+            return Qwen3MoeCanUseGPUForward(deviceMap, moeDeviceMap);
+#else
+            (void)deviceMap;
+            (void)moeDeviceMap;
+            return false;
+#endif
+        }
+
         static bool GetQwen3MoeThreadTpDevices(const std::map<std::string, int> &deviceMap,
                                                std::vector<int> &devices,
                                                std::map<int, int> &ratios) {
@@ -1848,7 +1906,8 @@ namespace fastllm {
         }
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
+        if (!Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) ||
+            !GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
             return;
         }
 
@@ -2101,6 +2160,7 @@ namespace fastllm {
         std::vector<int> devices;
         std::map<int, int> ratios;
         bool prepareCuda = !Qwen3MoeDisableFusedMoe() &&
+            Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) &&
             GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) &&
             !devices.empty();
         if (prepareCuda && Qwen3MoeAllExpertsReady(moeGate3DExpertReady, layer, this->num_experts) &&
@@ -2275,6 +2335,7 @@ namespace fastllm {
         std::vector<int> devices;
         std::map<int, int> ratios;
         bool prepareCuda = !Qwen3MoeDisableFusedMoe() &&
+            Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) &&
             GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) &&
             !devices.empty();
         DivisionScheme interScheme;
@@ -2382,11 +2443,9 @@ namespace fastllm {
         loadFusedMoeSourceWeights.clear();
         consumedFusedMoeSourceWeights.clear();
 #ifdef USE_CUDA
-        std::vector<int> devices;
-        std::map<int, int> ratios;
         if (Qwen3MoeDisableFusedMoe() ||
-            !GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) ||
-            devices.empty() || block_cnt <= 0 || this->num_experts <= 0) {
+            !Qwen3MoeCanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) ||
+            block_cnt <= 0 || this->num_experts <= 0) {
             return;
         }
 
@@ -2676,7 +2735,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios)) {
+        if (Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) &&
+            GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios)) {
             return ForwardGPU(1, inputIds, attentionMasks, positionIdsVec, seqLens,
                               pagedPastKeyValues, generationConfigs, lastTokens,
                               &batchLogits)[0];
@@ -3600,7 +3660,8 @@ namespace fastllm {
 #else
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios)) {
+        if (!Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) ||
+            !GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios)) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
@@ -4163,7 +4224,16 @@ namespace fastllm {
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
 
-        PrepareMoeWeights(false);
+        bool useFusedMoeWeights = false;
+#ifdef USE_CUDA
+        if (!Qwen3MoeDisableFusedMoe() &&
+            Qwen3MoeGenericForwardMayUseFusedMoe(this->deviceMap, this->moeDeviceMap)) {
+            useFusedMoeWeights = TryBuildFusedMoeWeightsFromLoaded();
+        }
+#endif
+        if (!useFusedMoeWeights) {
+            PrepareMoeWeights(false);
+        }
 
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
@@ -4258,19 +4328,57 @@ namespace fastllm {
                 bool needNorm = true;
                 Softmax(routerLogitsTemp, routerLogitsTemp, -1);
 
-                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                bool layerHasFusedMoe = useFusedMoeWeights && HasFusedMoeWeights(i);
+                bool layerHasMergeMoe = !useFusedMoeWeights &&
+                    i < (int)weights.size() && i < (int)biass.size() &&
+                    weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() &&
+                    CanRunMergeMOE(attenInput, biass[i]);
+
+                if (layerHasFusedMoe || layerHasMergeMoe) {
                     SelectExpert(routerLogitsTemp, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
                                 this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
                 }
-                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
-                MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
-                    &weights[i], &biass[i],
-                    &w1, &w2, &w3,
-                    &tempInput, &tempOutput,
-                    1.0f, &moeFinal, i,
-                    this->dataType, this->moeAtype,
-                    &moeInputTemp, &moeOutputTemp);
+
+                const auto &effectiveMoeMap = this->moeDeviceMap.empty() ? this->deviceMap : this->moeDeviceMap;
+                std::string selectedMoeDevice = SelectDeviceFromMap(effectiveMoeMap, i + 1, block_cnt);
+                std::string selectedMoeDeviceLower = selectedMoeDevice;
+                std::transform(selectedMoeDeviceLower.begin(), selectedMoeDeviceLower.end(),
+                               selectedMoeDeviceLower.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                bool selectedCudaMoe = selectedMoeDeviceLower == "cuda" ||
+                    selectedMoeDeviceLower.rfind("cuda:", 0) == 0;
+                bool selectedNumaMoe = selectedMoeDeviceLower == "numa" ||
+                    selectedMoeDeviceLower.rfind("numa:", 0) == 0;
+
+                if (layerHasFusedMoe && (selectedCudaMoe || selectedNumaMoe)) {
+                    Data expertInput;
+                    expertInput.CopyFrom(attenInput);
+                    ApplyDeviceMap(effectiveMoeMap, i + 1, block_cnt);
+#ifdef USE_CUDA
+                    if (selectedCudaMoe) {
+                        std::map<int, int> selectedCudaRatios;
+                        std::vector<int> selectedCudaDevices = ParseDeviceIds(selectedMoeDevice, "cuda", selectedCudaRatios);
+                        int selectedCudaDevice = selectedCudaDevices.empty() ? 0 : selectedCudaDevices[0];
+                        Qwen3MoePrepareFusedMoeWeightForCuda(*moeGate3DWeights[i], selectedCudaDevice);
+                        Qwen3MoePrepareFusedMoeWeightForCuda(*moeUp3DWeights[i], selectedCudaDevice);
+                        Qwen3MoePrepareFusedMoeWeightForCuda(*moeDown3DWeights[i], selectedCudaDevice);
+                    }
+#endif
+                    FusedMOE(expertInput, expertIndex, expertScore,
+                             *moeGate3DWeights[i], *moeUp3DWeights[i], *moeDown3DWeights[i],
+                             w1, moeFinal, i, MoeGateSwiglu, 0.0f);
+                } else {
+                    AssertInFastLLM(layerHasMergeMoe,
+                                    "Qwen3-MOE has no runnable MoE weights for the selected device.\n");
+                    ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                    MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
+                        &weights[i], &biass[i],
+                        &w1, &w2, &w3,
+                        &tempInput, &tempOutput,
+                        1.0f, &moeFinal, i,
+                        this->dataType, this->moeAtype,
+                        &moeInputTemp, &moeOutputTemp);
+                }
                 moeFinal.Reshape(hiddenStates.dims);
                 ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 AddTo(hiddenStates, moeFinal);
