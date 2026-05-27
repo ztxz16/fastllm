@@ -15,6 +15,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 
 namespace fastllm {
@@ -67,6 +68,29 @@ namespace fastllm {
         virtual void WarmUp(); // 预热
 
         virtual void OnAutoWarmupFinished() override;
+
+        virtual void OnWeightsCreated(const std::set<std::string> &allWeightNames) override;
+
+        virtual int GetWeightLoadPriority(
+                const std::string &tensorName,
+                const std::vector <std::pair <std::string, DataType> > &mappedWeights) const override;
+
+        virtual bool ShouldLoadWeightSeriallyBeforeOthers(
+                const std::string &tensorName,
+                const std::vector <std::pair <std::string, DataType> > &mappedWeights) const override;
+
+        virtual void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+
+        virtual void OnWeightLoaded(const std::string &weightName,
+                                    const std::set<std::string> &finishedWeightNames) override;
+
+        virtual bool IsWeightConsumedAfterLoad(const std::string &weightName) const override;
+
+        virtual void OnWeightLoadGroupFinished() override;
+
+        virtual void OnModelWeightsLoaded() override;
+
+        virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const override;
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
@@ -134,8 +158,19 @@ namespace fastllm {
         bool mergeQKV = false;
         bool mergeSwiglu = false;
 
+        bool loadFusedMoePlanned = false;
+        bool moeWeightsPrepared = false;
+        bool moeFusedWeightsPrepared = false;
+        std::set <std::string> loadFusedMoeSourceWeights;
+        std::set <std::string> consumedFusedMoeSourceWeights;
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
+        std::vector <Data*> moeGate3DWeights;
+        std::vector <Data*> moeUp3DWeights;
+        std::vector <Data*> moeDown3DWeights;
+        std::vector <std::vector <char> > moeGate3DExpertReady;
+        std::vector <std::vector <char> > moeUp3DExpertReady;
+        std::vector <std::vector <char> > moeDown3DExpertReady;
         std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeWeights;
         std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeBiass;
         std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeWeights;
@@ -153,6 +188,18 @@ namespace fastllm {
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
         PersistentWorkerGroup threadTpWorkerGroup;
+
+        void PrepareMoeWeights(bool enableFusedMoe);
+        bool TryConsumeFusedMoeSourceWeight(const std::string &weightName);
+        void TryFinalizeFusedMoeLayerParts(int layer);
+        bool TryBuildFusedMoeWeightsFromLoaded();
+        bool TryBuildFusedMoeLayerFromLoaded(int layer);
+        bool HasFusedMoeWeights(int layer) const;
+        Data *GetFusedMoeWeightForDevice(Data *weight, int device) const;
+        void PrepareFusedMoeLayerForDevices(int layer, const std::vector <int> &devices,
+                                             std::map <int, int> ratios);
+        void PrepareFusedMoeWeightsForDevices(const std::vector <int> &devices,
+                                              std::map <int, int> ratios);
     };
 }
 

@@ -34,6 +34,418 @@ namespace fastllm {
     extern std::vector <float> GetInterLeavePowerOf2(int n);
     extern std::vector <float> GetInterleave(int n);
 
+    static bool Qwen3MoeIsTrueString(const std::string &value) {
+        std::string lowered = value;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered == "1" || lowered == "true" || lowered == "on";
+    }
+
+    static bool Qwen3MoeDisableFusedMoe() {
+        const char *env = std::getenv("FASTLLM_QWEN3_MOE_DISABLE_FUSED_MOE");
+        return env != nullptr && Qwen3MoeIsTrueString(env);
+    }
+
+    static std::string Qwen3MoeExpertPrefix(int layer, int expert) {
+        return "model.layers." + std::to_string(layer) + ".mlp.experts." +
+               std::to_string(expert) + ".";
+    }
+
+    static std::string Qwen3MoeFusedWeightName(int layer, const std::string &kind) {
+        return "model.layers." + std::to_string(layer) + ".mlp.fused_experts." +
+               kind + "_proj.weight";
+    }
+
+    static std::string Qwen3MoeExpertWeightName(int layer, int expert, const std::string &kind) {
+        return Qwen3MoeExpertPrefix(layer, expert) + kind + "_proj.weight";
+    }
+
+    static bool Qwen3MoeParseExpertWeightName(const std::string &name,
+                                              int &layer, int &expert, std::string &kind) {
+        const std::string prefix = "model.layers.";
+        if (!StartWith(name, prefix)) {
+            return false;
+        }
+        size_t pos = prefix.size();
+        if (pos >= name.size() || !std::isdigit((unsigned char)name[pos])) {
+            return false;
+        }
+        layer = 0;
+        while (pos < name.size() && std::isdigit((unsigned char)name[pos])) {
+            layer = layer * 10 + (name[pos] - '0');
+            pos++;
+        }
+        const std::string mid = ".mlp.experts.";
+        if (name.compare(pos, mid.size(), mid) != 0) {
+            return false;
+        }
+        pos += mid.size();
+        if (pos >= name.size() || !std::isdigit((unsigned char)name[pos])) {
+            return false;
+        }
+        expert = 0;
+        while (pos < name.size() && std::isdigit((unsigned char)name[pos])) {
+            expert = expert * 10 + (name[pos] - '0');
+            pos++;
+        }
+        const std::string suffix = "_proj.weight";
+        if (name.compare(pos, 1, ".") != 0 || name.size() <= pos + 1 + suffix.size() ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            return false;
+        }
+        kind = name.substr(pos + 1, name.size() - pos - 1 - suffix.size());
+        return kind == "gate" || kind == "up" || kind == "gateup" || kind == "down";
+    }
+
+    static int Qwen3MoeSourceLoadPriority(const std::string &name, int numExperts) {
+        int layer = -1, expert = -1;
+        std::string kind;
+        if (!Qwen3MoeParseExpertWeightName(name, layer, expert, kind)) {
+            return 0;
+        }
+        (void)expert;
+        (void)numExperts;
+        int layerStride = 3;
+        int order = (kind == "down") ? 2 : (kind == "up" ? 1 : 0);
+        return -100000000 + layer * layerStride + order;
+    }
+
+    static bool Qwen3MoeIsFusedFp8Type(DataType dataType) {
+        return dataType == DataType::FP8_E4M3 ||
+               dataType == DataType::FP8_E4M3_BLOCK_128;
+    }
+
+    static void Qwen3MoeCopyLinearWeightMeta(Data &dst, const Data &src, const std::string &name) {
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+        dst.blockK = src.blockK;
+        dst.blockM = src.blockM;
+        dst.group = src.group;
+        dst.groupCnt = src.groupCnt;
+        dst.perChannelAxis = src.perChannelAxis;
+        dst.tpLinearType = src.tpLinearType;
+        dst.tpPackType = src.tpPackType;
+    }
+
+    static size_t Qwen3MoeBytesPerRow(const Data &weight, int columns) {
+        return GetDataBytes(weight.dataType, 1, columns);
+    }
+
+    static bool Qwen3MoeCheckFp8ScaleRows(const Data &weight, int rowStart, int rows) {
+        if (weight.dataType != DataType::FP8_E4M3) {
+            return true;
+        }
+        if (weight.blockK <= 0 || weight.blockM <= 0 || weight.scales.empty() ||
+            weight.dims.size() != 2) {
+            return false;
+        }
+        int cols = weight.dims[1];
+        int totalRows = weight.dims[0];
+        int ms = (cols - 1) / weight.blockM + 1;
+        int scaleRows = (totalRows - 1) / weight.blockK + 1;
+        int scaleOffset = (rowStart / weight.blockK) * ms;
+        int scaleCount = ((rows - 1) / weight.blockK + 1) * ms;
+        return rowStart >= 0 && rows > 0 && rowStart + rows <= totalRows &&
+               rowStart % weight.blockK == 0 &&
+               scaleOffset + scaleCount <= (int)weight.scales.size() &&
+               scaleRows * ms <= (int)weight.scales.size();
+    }
+
+    static void Qwen3MoeAppendFp8ScaleRows(Data &dst, const Data &src, int rowStart, int rows) {
+        if (src.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(Qwen3MoeCheckFp8ScaleRows(src, rowStart, rows),
+                        "Qwen3-MOE FusedMOE FP8 scale slice is out of bounds.");
+        int cols = src.dims[1];
+        int ms = (cols - 1) / src.blockM + 1;
+        int scaleOffset = (rowStart / src.blockK) * ms;
+        int scaleCount = ((rows - 1) / src.blockK + 1) * ms;
+        dst.scales.insert(dst.scales.end(),
+                          src.scales.begin() + scaleOffset,
+                          src.scales.begin() + scaleOffset + scaleCount);
+    }
+
+    static void Qwen3MoeCopyRows(Data &dst, int dstRowStart,
+                                 Data &src, int srcRowStart, int rows) {
+        AssertInFastLLM(dst.dims.size() == 3 && src.dims.size() == 2,
+                        "Qwen3-MOE FusedMOE row copy expects 3D destination and 2D source.");
+        int cols = src.dims[1];
+        AssertInFastLLM(dst.dims[2] == cols &&
+                        srcRowStart >= 0 && rows > 0 && srcRowStart + rows <= src.dims[0],
+                        "Qwen3-MOE FusedMOE row copy shape mismatch.");
+        int dstRows = dst.dims[0] * dst.dims[1];
+        AssertInFastLLM(dstRowStart >= 0 && dstRowStart + rows <= dstRows,
+                        "Qwen3-MOE FusedMOE destination row range is out of bounds.");
+        src.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(src.cpuData != nullptr && dst.cpuData != nullptr,
+                        "Qwen3-MOE FusedMOE row copy requires CPU buffers.");
+        size_t bytesPerRow = Qwen3MoeBytesPerRow(src, cols);
+        memcpy(dst.cpuData + (size_t)dstRowStart * bytesPerRow,
+               src.cpuData + (size_t)srcRowStart * bytesPerRow,
+               (size_t)rows * bytesPerRow);
+    }
+
+    static bool Qwen3MoeCanBuildFusedLayer(const std::unordered_map<std::string, Data> &allWeights,
+                                           int layer, int numExperts) {
+        if (numExperts <= 0) {
+            return false;
+        }
+        const Data *gateup0 = nullptr;
+        const Data *down0 = nullptr;
+        int inter = 0, hidden = 0;
+        for (int expert = 0; expert < numExperts; expert++) {
+            std::string prefix = Qwen3MoeExpertPrefix(layer, expert);
+            auto gateupIt = allWeights.find(prefix + "gateup_proj.weight");
+            auto downIt = allWeights.find(prefix + "down_proj.weight");
+            if (gateupIt == allWeights.end() || downIt == allWeights.end()) {
+                return false;
+            }
+            const Data &gateup = gateupIt->second;
+            const Data &down = downIt->second;
+            if (gateup.isDiskWeight || down.isDiskWeight ||
+                gateup.cpuData == nullptr || down.cpuData == nullptr ||
+                gateup.dims.size() != 2 || down.dims.size() != 2 ||
+                gateup.dims[0] <= 0 || gateup.dims[1] <= 0 ||
+                (gateup.dims[0] & 1) != 0 ||
+                !Qwen3MoeIsFusedFp8Type(gateup.dataType) ||
+                gateup.dataType != down.dataType) {
+                return false;
+            }
+            int curInter = gateup.dims[0] / 2;
+            int curHidden = gateup.dims[1];
+            if (down.dims[0] != curHidden || down.dims[1] != curInter) {
+                return false;
+            }
+            if (gateup.dataType == DataType::FP8_E4M3 &&
+                (!Qwen3MoeCheckFp8ScaleRows(gateup, 0, curInter) ||
+                 !Qwen3MoeCheckFp8ScaleRows(gateup, curInter, curInter) ||
+                 !Qwen3MoeCheckFp8ScaleRows(down, 0, curHidden))) {
+                return false;
+            }
+            if (expert == 0) {
+                gateup0 = &gateup;
+                down0 = &down;
+                inter = curInter;
+                hidden = curHidden;
+            } else if (gateup.dataType != gateup0->dataType ||
+                       gateup.dims != gateup0->dims ||
+                       gateup.blockK != gateup0->blockK ||
+                       gateup.blockM != gateup0->blockM ||
+                       down.dataType != down0->dataType ||
+                       down.dims != down0->dims ||
+                       down.blockK != down0->blockK ||
+                       down.blockM != down0->blockM ||
+                       curInter != inter || curHidden != hidden) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool Qwen3MoeCanBuildAllFusedWeights(const std::unordered_map<std::string, Data> &allWeights,
+                                                int blockCnt, int numExperts) {
+        for (int layer = 0; layer < blockCnt; layer++) {
+            if (!Qwen3MoeCanBuildFusedLayer(allWeights, layer, numExperts)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void Qwen3MoeBuildFusedLayer(std::unordered_map<std::string, Data> &allWeights,
+                                        int layer, int numExperts,
+                                        Data *&gatePtr, Data *&upPtr, Data *&downPtr) {
+        std::string prefix0 = Qwen3MoeExpertPrefix(layer, 0);
+        Data &gateup0 = allWeights[prefix0 + "gateup_proj.weight"];
+        Data &down0 = allWeights[prefix0 + "down_proj.weight"];
+        int inter = gateup0.dims[0] / 2;
+        int hidden = gateup0.dims[1];
+        DataType gateupType = gateup0.dataType;
+        DataType downType = down0.dataType;
+
+        std::string gate3DName = Qwen3MoeFusedWeightName(layer, "gate");
+        std::string up3DName = Qwen3MoeFusedWeightName(layer, "up");
+        std::string down3DName = Qwen3MoeFusedWeightName(layer, "down");
+        allWeights[gate3DName] = Data(gateupType, {numExperts, inter, hidden});
+        allWeights[up3DName] = Data(gateupType, {numExperts, inter, hidden});
+        allWeights[down3DName] = Data(downType, {numExperts, hidden, inter});
+
+        Data &gate3D = allWeights[gate3DName];
+        Data &up3D = allWeights[up3DName];
+        Data &down3D = allWeights[down3DName];
+        Data &gateupMeta = allWeights[prefix0 + "gateup_proj.weight"];
+        Data &downMeta = allWeights[prefix0 + "down_proj.weight"];
+        Qwen3MoeCopyLinearWeightMeta(gate3D, gateupMeta, gate3DName);
+        Qwen3MoeCopyLinearWeightMeta(up3D, gateupMeta, up3DName);
+        Qwen3MoeCopyLinearWeightMeta(down3D, downMeta, down3DName);
+        gate3D.Allocate(false);
+        up3D.Allocate(false);
+        down3D.Allocate(false);
+        gate3D.scales.clear();
+        up3D.scales.clear();
+        down3D.scales.clear();
+
+        for (int expert = 0; expert < numExperts; expert++) {
+            std::string expertPrefix = Qwen3MoeExpertPrefix(layer, expert);
+            Data &gateup = allWeights[expertPrefix + "gateup_proj.weight"];
+            Data &down = allWeights[expertPrefix + "down_proj.weight"];
+            Qwen3MoeCopyRows(gate3D, expert * inter, gateup, 0, inter);
+            Qwen3MoeCopyRows(up3D, expert * inter, gateup, inter, inter);
+            Qwen3MoeCopyRows(down3D, expert * hidden, down, 0, hidden);
+            Qwen3MoeAppendFp8ScaleRows(gate3D, gateup, 0, inter);
+            Qwen3MoeAppendFp8ScaleRows(up3D, gateup, inter, inter);
+            Qwen3MoeAppendFp8ScaleRows(down3D, down, 0, hidden);
+        }
+
+        gatePtr = &gate3D;
+        upPtr = &up3D;
+        downPtr = &down3D;
+    }
+
+    static void Qwen3MoeBuildFusedLayerWeight(std::unordered_map<std::string, Data> &allWeights,
+                                              int layer, int numExperts, const std::string &kind,
+                                              Data *&weightPtr) {
+        std::string prefix0 = Qwen3MoeExpertPrefix(layer, 0);
+        Data &gateup0 = allWeights[prefix0 + "gateup_proj.weight"];
+        Data &down0 = allWeights[prefix0 + "down_proj.weight"];
+        int inter = gateup0.dims[0] / 2;
+        int hidden = gateup0.dims[1];
+        bool isDown = kind == "down";
+        AssertInFastLLM(kind == "gate" || kind == "up" || kind == "down",
+                        "Qwen3-MOE fused layer weight kind is invalid.\n");
+
+        std::string fusedName = Qwen3MoeFusedWeightName(layer, kind);
+        if (isDown) {
+            allWeights[fusedName] = Data(down0.dataType, {numExperts, hidden, inter});
+        } else {
+            allWeights[fusedName] = Data(gateup0.dataType, {numExperts, inter, hidden});
+        }
+
+        Data &fused = allWeights[fusedName];
+        Qwen3MoeCopyLinearWeightMeta(fused, isDown ? down0 : gateup0, fusedName);
+        fused.Allocate(false);
+        fused.scales.clear();
+
+        for (int expert = 0; expert < numExperts; expert++) {
+            std::string expertPrefix = Qwen3MoeExpertPrefix(layer, expert);
+            Data &gateup = allWeights[expertPrefix + "gateup_proj.weight"];
+            Data &down = allWeights[expertPrefix + "down_proj.weight"];
+            if (kind == "gate") {
+                Qwen3MoeCopyRows(fused, expert * inter, gateup, 0, inter);
+                Qwen3MoeAppendFp8ScaleRows(fused, gateup, 0, inter);
+            } else if (kind == "up") {
+                Qwen3MoeCopyRows(fused, expert * inter, gateup, inter, inter);
+                Qwen3MoeAppendFp8ScaleRows(fused, gateup, inter, inter);
+            } else {
+                Qwen3MoeCopyRows(fused, expert * hidden, down, 0, hidden);
+                Qwen3MoeAppendFp8ScaleRows(fused, down, 0, hidden);
+            }
+        }
+        weightPtr = &fused;
+    }
+
+    static void Qwen3MoeResizeFusedFp8Scales(Data &weight) {
+        if (weight.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(weight.dims.size() == 3 && weight.blockK > 0 && weight.blockM > 0,
+                        "Qwen3-MOE fused FP8 scale allocation got invalid metadata.\n");
+        int experts = weight.dims[0];
+        int rowsPerExpert = weight.dims[1];
+        int cols = weight.dims[2];
+        int scaleRowsPerExpert = (rowsPerExpert - 1) / weight.blockK + 1;
+        int scaleCols = (cols - 1) / weight.blockM + 1;
+        size_t scaleCount = (size_t)experts * scaleRowsPerExpert * scaleCols;
+        if (weight.scales.size() != scaleCount) {
+            weight.scales.assign(scaleCount, 0.0f);
+        }
+    }
+
+    static void Qwen3MoeCopyFp8ScaleRowsToExpert(Data &dst, const Data &src,
+                                                 int expert, int srcRowStart, int rows) {
+        if (src.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(dst.dataType == DataType::FP8_E4M3 &&
+                        dst.dims.size() == 3 && src.dims.size() == 2 &&
+                        dst.blockK == src.blockK && dst.blockM == src.blockM &&
+                        expert >= 0 && expert < dst.dims[0],
+                        "Qwen3-MOE fused FP8 scale copy got incompatible metadata.\n");
+        AssertInFastLLM(Qwen3MoeCheckFp8ScaleRows(src, srcRowStart, rows),
+                        "Qwen3-MOE fused FP8 scale source is not ready.\n");
+        int cols = src.dims[1];
+        int dstRowsPerExpert = dst.dims[1];
+        int scaleCols = (cols - 1) / src.blockM + 1;
+        int srcScaleOffset = (srcRowStart / src.blockK) * scaleCols;
+        int scaleRowCount = (rows - 1) / src.blockK + 1;
+        int dstScaleRowsPerExpert = (dstRowsPerExpert - 1) / dst.blockK + 1;
+        size_t dstOffset = ((size_t)expert * dstScaleRowsPerExpert) * scaleCols;
+        size_t count = (size_t)scaleRowCount * scaleCols;
+        AssertInFastLLM(dstOffset + count <= dst.scales.size() &&
+                        srcScaleOffset + count <= src.scales.size(),
+                        "Qwen3-MOE fused FP8 scale copy is out of bounds.\n");
+        memcpy(dst.scales.data() + dstOffset,
+               src.scales.data() + srcScaleOffset,
+               count * sizeof(float));
+    }
+
+    static void Qwen3MoeInitFusedLayerWeightMeta(std::unordered_map<std::string, Data> &allWeights,
+                                                 int layer, int numExperts, const std::string &kind,
+                                                 const Data &source, int rowsPerExpert, int columns,
+                                                 Data *&weightPtr) {
+        std::string fusedName = Qwen3MoeFusedWeightName(layer, kind);
+        allWeights[fusedName] = Data(source.dataType, {numExperts, rowsPerExpert, columns});
+        Data &fused = allWeights[fusedName];
+        Qwen3MoeCopyLinearWeightMeta(fused, source, fusedName);
+        weightPtr = &fused;
+    }
+
+    static void Qwen3MoeAllocateFusedWeightForLoad(Data *weight) {
+        if (weight == nullptr || weight->cpuData != nullptr ||
+            weight->multiDeviceData || weight->dataDevice != DataDevice::CPU) {
+            return;
+        }
+        weight->Allocate(false);
+    }
+
+    static void Qwen3MoeEnsureFusedLayerWeight(std::unordered_map<std::string, Data> &allWeights,
+                                               int layer, int numExperts, const std::string &kind,
+                                               const Data &source, int rowsPerExpert, int columns,
+                                               Data *&weightPtr) {
+        if (weightPtr == nullptr) {
+            Qwen3MoeInitFusedLayerWeightMeta(allWeights, layer, numExperts, kind,
+                                             source, rowsPerExpert, columns, weightPtr);
+        } else {
+            Qwen3MoeCopyLinearWeightMeta(*weightPtr, source, weightPtr->name);
+            AssertInFastLLM(weightPtr->dims.size() == 3 &&
+                            weightPtr->dims[0] == numExperts &&
+                            weightPtr->dims[1] == rowsPerExpert &&
+                            weightPtr->dims[2] == columns &&
+                            weightPtr->dataType == source.dataType,
+                            "Qwen3-MOE fused weight metadata does not match source weight.\n");
+        }
+        Qwen3MoeAllocateFusedWeightForLoad(weightPtr);
+        Qwen3MoeResizeFusedFp8Scales(*weightPtr);
+    }
+
+    static void Qwen3MoeReleaseConsumedSourceWeight(Data &weight) {
+        weight.FreeSpace();
+        weight.scales.clear();
+        weight.scales.shrink_to_fit();
+        weight.mins.clear();
+        weight.mins.shrink_to_fit();
+        weight.zeros.clear();
+        weight.zeros.shrink_to_fit();
+        weight.halfScales.clear();
+        weight.halfScales.shrink_to_fit();
+        weight.perChannelsConfigs.clear();
+        weight.perChannelsConfigs.shrink_to_fit();
+        weight.weightSum.clear();
+        weight.weightSum.shrink_to_fit();
+    }
+
 #ifdef USE_CUDA
     namespace {
         using namespace qwen3cuda;
@@ -505,6 +917,319 @@ namespace fastllm {
             if (dst.cudaData != nullptr) {
                 FastllmCudaMemset0(dst.cudaData, dst.GetBytes());
             }
+        }
+
+        static void Qwen3MoePrepareFusedMoeWeightForCuda(Data &weight, int device) {
+            FastllmCudaSetDevice(device);
+            weight.ToDevice(DataDevice::CUDA, {device}, true);
+            if (weight.dataType == DataType::FP8_E4M3 && weight.extraCudaData.empty()) {
+                AssertInFastLLM(!weight.scales.empty(),
+                                "Qwen3-MOE FusedMOE FP8 weight has no scales.\n");
+                float *cudaScales = (float*)FastllmCudaMalloc(weight.scales.size() * sizeof(float));
+                FastllmCudaCopyFromHostToDevice(cudaScales, (void*)weight.scales.data(),
+                                                weight.scales.size() * sizeof(float));
+                weight.extraCudaData.push_back((void*)cudaScales);
+                weight.scales.clear();
+                weight.scales.shrink_to_fit();
+            }
+        }
+
+        static int Qwen3MoeGcdInt(int a, int b) {
+            a = a < 0 ? -a : a;
+            b = b < 0 ? -b : b;
+            while (b != 0) {
+                int t = a % b;
+                a = b;
+                b = t;
+            }
+            return a == 0 ? 1 : a;
+        }
+
+        static int Qwen3MoeLcmInt(int a, int b) {
+            a = std::max(1, a);
+            b = std::max(1, b);
+            return a / Qwen3MoeGcdInt(a, b) * b;
+        }
+
+        static int Qwen3MoeFusedInterSplitUnit(const Data &weight) {
+            int unit = weight.groupCnt <= 0 ? 128 : weight.groupCnt;
+            if (weight.dataType == DataType::FP8_E4M3) {
+                if (weight.blockK > 0) {
+                    unit = Qwen3MoeLcmInt(unit, weight.blockK);
+                }
+                if (weight.blockM > 0) {
+                    unit = Qwen3MoeLcmInt(unit, weight.blockM);
+                }
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                unit = 128;
+            }
+            return std::max(1, unit);
+        }
+
+        static DivisionScheme Qwen3MoeBuildFusedInterScheme(const Data &gate,
+                                                            const std::vector<int> &devices,
+                                                            std::map<int, int> ratios) {
+            AssertInFastLLM(gate.dims.size() == 3 && gate.dims[1] > 0,
+                            "Qwen3-MOE fused TP split requires 3D gate weight.\n");
+            std::vector<int> devCopy = devices;
+            std::vector<int> points = FastllmMultiCudaGetSplitPoints(
+                devCopy, ratios, gate.dims[1], Qwen3MoeFusedInterSplitUnit(gate));
+            AssertInFastLLM((int)points.size() == (int)devices.size() + 1,
+                            "Qwen3-MOE fused TP split got invalid split points.\n");
+            DivisionScheme scheme;
+            for (int i = 0; i < (int)devices.size(); i++) {
+                scheme[devices[i]];
+                if (points[i] < points[i + 1]) {
+                    scheme[devices[i]].push_back({points[i], points[i + 1]});
+                }
+            }
+            return scheme;
+        }
+
+        static int Qwen3MoeFp8ScaleCols(int cols, int blockM) {
+            return (cols - 1) / blockM + 1;
+        }
+
+        static void Qwen3MoeAppendFp8ExpertRowScales(Data &dst, const Data &src,
+                                                     int expert, int expertRows, int cols,
+                                                     int rowStart, int rows) {
+            if (src.dataType != DataType::FP8_E4M3 || rows <= 0) {
+                return;
+            }
+            AssertInFastLLM(src.blockK > 0 && src.blockM > 0 && !src.scales.empty(),
+                            "Qwen3-MOE fused TP FP8 weight has invalid scale metadata.\n");
+            AssertInFastLLM(expert >= 0 && expert < src.dims[0] &&
+                            rowStart >= 0 && rowStart + rows <= expertRows &&
+                            rowStart % src.blockK == 0,
+                            "Qwen3-MOE fused TP FP8 row scale slice is unaligned.\n");
+            int scaleCols = Qwen3MoeFp8ScaleCols(cols, src.blockM);
+            int scaleRowsPerExpert = (expertRows - 1) / src.blockK + 1;
+            int scaleRowStart = expert * scaleRowsPerExpert + rowStart / src.blockK;
+            int scaleRowCount = (rows - 1) / src.blockK + 1;
+            size_t offset = (size_t)scaleRowStart * scaleCols;
+            size_t count = (size_t)scaleRowCount * scaleCols;
+            AssertInFastLLM(offset + count <= src.scales.size(),
+                            "Qwen3-MOE fused TP FP8 row scale slice is out of bounds.\n");
+            dst.scales.insert(dst.scales.end(),
+                              src.scales.begin() + offset,
+                              src.scales.begin() + offset + count);
+        }
+
+        static void Qwen3MoeCopyFusedInterRows(Data &dst, Data &src,
+                                               int interStart, int localInter) {
+            AssertInFastLLM(dst.dims.size() == 3 && src.dims.size() == 3,
+                            "Qwen3-MOE fused TP row shard expects 3D weights.\n");
+            int experts = src.dims[0], inter = src.dims[1], hidden = src.dims[2];
+            AssertInFastLLM(dst.dims[0] == experts && dst.dims[1] == localInter &&
+                            dst.dims[2] == hidden && interStart >= 0 &&
+                            localInter >= 0 && interStart + localInter <= inter,
+                            "Qwen3-MOE fused TP row shard shape mismatch.\n");
+            if (localInter == 0) {
+                return;
+            }
+            src.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(src.cpuData != nullptr && dst.cpuData != nullptr,
+                            "Qwen3-MOE fused TP row shard requires CPU buffers.\n");
+            size_t rowBytes = Qwen3MoeBytesPerRow(src, hidden);
+            for (int expert = 0; expert < experts; expert++) {
+                memcpy(dst.cpuData + (size_t)expert * localInter * rowBytes,
+                       src.cpuData + ((size_t)expert * inter + interStart) * rowBytes,
+                       (size_t)localInter * rowBytes);
+                Qwen3MoeAppendFp8ExpertRowScales(dst, src, expert, inter, hidden,
+                                                 interStart, localInter);
+            }
+        }
+
+        static void Qwen3MoeAppendFp8DownColumnScales(Data &dst, const Data &src,
+                                                      int interStart, int localInter) {
+            if (src.dataType != DataType::FP8_E4M3 || localInter <= 0) {
+                return;
+            }
+            int experts = src.dims[0], hidden = src.dims[1], inter = src.dims[2];
+            AssertInFastLLM(src.blockK > 0 && src.blockM > 0 && !src.scales.empty() &&
+                            interStart >= 0 && interStart + localInter <= inter &&
+                            interStart % src.blockM == 0,
+                            "Qwen3-MOE fused TP FP8 column scale slice is unaligned.\n");
+            int srcScaleCols = Qwen3MoeFp8ScaleCols(inter, src.blockM);
+            int dstScaleCols = Qwen3MoeFp8ScaleCols(localInter, src.blockM);
+            int scaleColStart = interStart / src.blockM;
+            int scaleRowsPerExpert = (hidden - 1) / src.blockK + 1;
+            for (int expert = 0; expert < experts; expert++) {
+                for (int scaleRow = 0; scaleRow < scaleRowsPerExpert; scaleRow++) {
+                    size_t offset = ((size_t)expert * scaleRowsPerExpert + scaleRow) *
+                                    srcScaleCols + scaleColStart;
+                    AssertInFastLLM(offset + dstScaleCols <= src.scales.size(),
+                                    "Qwen3-MOE fused TP FP8 column scale slice is out of bounds.\n");
+                    dst.scales.insert(dst.scales.end(),
+                                      src.scales.begin() + offset,
+                                      src.scales.begin() + offset + dstScaleCols);
+                }
+            }
+        }
+
+        static void Qwen3MoeCopyFusedDownInterColumns(Data &dst, Data &src,
+                                                      int interStart, int localInter) {
+            AssertInFastLLM(dst.dims.size() == 3 && src.dims.size() == 3,
+                            "Qwen3-MOE fused TP down shard expects 3D weights.\n");
+            int experts = src.dims[0], hidden = src.dims[1], inter = src.dims[2];
+            AssertInFastLLM(dst.dims[0] == experts && dst.dims[1] == hidden &&
+                            dst.dims[2] == localInter && interStart >= 0 &&
+                            localInter >= 0 && interStart + localInter <= inter,
+                            "Qwen3-MOE fused TP down shard shape mismatch.\n");
+            if (localInter == 0) {
+                return;
+            }
+            src.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(src.cpuData != nullptr && dst.cpuData != nullptr,
+                            "Qwen3-MOE fused TP down shard requires CPU buffers.\n");
+            int rows = experts * hidden;
+            size_t srcRowBytes = Qwen3MoeBytesPerRow(src, inter);
+            size_t dstRowBytes = Qwen3MoeBytesPerRow(dst, localInter);
+            if (src.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                const int block = 128;
+                const int blockBytes = block + (int)sizeof(float);
+                AssertInFastLLM(interStart % block == 0,
+                                "Qwen3-MOE fused TP FP8 block shard is unaligned.\n");
+                int blockStart = interStart / block;
+                int blockCount = (localInter + block - 1) / block;
+                for (int row = 0; row < rows; row++) {
+                    memcpy(dst.cpuData + (size_t)row * dstRowBytes,
+                           src.cpuData + (size_t)row * srcRowBytes + (size_t)blockStart * blockBytes,
+                           (size_t)blockCount * blockBytes);
+                }
+            } else {
+                AssertInFastLLM(src.dataType == DataType::FP8_E4M3,
+                                "Qwen3-MOE fused TP only supports FP8 fused weights.\n");
+                for (int row = 0; row < rows; row++) {
+                    memcpy(dst.cpuData + (size_t)row * dstRowBytes,
+                           src.cpuData + (size_t)row * srcRowBytes + interStart,
+                           (size_t)localInter);
+                }
+                Qwen3MoeAppendFp8DownColumnScales(dst, src, interStart, localInter);
+            }
+        }
+
+        static Data *Qwen3MoeCreateFusedInterShard(Data &src, int axis,
+                                                   int device, std::pair<int, int> range) {
+            AssertInFastLLM(axis == 1 || axis == 2,
+                            "Qwen3-MOE fused TP only splits inter dimension.\n");
+            int localInter = range.second - range.first;
+            AssertInFastLLM(localInter >= 0,
+                            "Qwen3-MOE fused TP got invalid shard range.\n");
+            std::vector<int> localDims = src.dims;
+            localDims[axis] = localInter;
+            Data *local = new Data(src.dataType, localDims);
+            Qwen3MoeCopyLinearWeightMeta(*local, src,
+                                         src.name + ".tp" + std::to_string(device));
+            local->scales.clear();
+            local->dataDeviceIds = {device};
+            if (local->Count(0) > 0) {
+                local->Allocate(false);
+                if (axis == 1) {
+                    Qwen3MoeCopyFusedInterRows(*local, src, range.first, localInter);
+                } else {
+                    Qwen3MoeCopyFusedDownInterColumns(*local, src, range.first, localInter);
+                }
+                Qwen3MoePrepareFusedMoeWeightForCuda(*local, device);
+            } else {
+                local->dataDevice = DataDevice::CUDA;
+            }
+            return local;
+        }
+
+        static bool Qwen3MoeFusedShardLayoutReady(const Data &weight,
+                                                  const std::vector<int> &devices,
+                                                  const DivisionScheme &scheme,
+                                                  int axis) {
+            if (!weight.multiDeviceData || weight.tpLayout != TP_LAYOUT_SHARDED ||
+                weight.tpAxis != axis || weight.tpRanges != scheme) {
+                return false;
+            }
+            for (int device : devices) {
+                auto localIt = weight.multiDeviceDatas.find(device);
+                auto rangeIt = scheme.find(device);
+                if (localIt == weight.multiDeviceDatas.end() || localIt->second == nullptr ||
+                    rangeIt == scheme.end()) {
+                    return false;
+                }
+                int localInter = 0;
+                for (auto &range : rangeIt->second) {
+                    localInter += range.second - range.first;
+                }
+                Data *local = localIt->second;
+                if (local->dims.size() != weight.dims.size() ||
+                    local->dims[axis] != localInter ||
+                    local->dataDevice != DataDevice::CUDA ||
+                    local->dataDeviceIds.empty() || local->dataDeviceIds[0] != device) {
+                    return false;
+                }
+                if (local->Count(0) > 0 &&
+                    (local->cudaData == nullptr ||
+                     (local->dataType == DataType::FP8_E4M3 && local->extraCudaData.empty()))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static void Qwen3MoePrepareFusedShardedWeight(Data &weight,
+                                                      const std::vector<int> &devices,
+                                                      const DivisionScheme &scheme,
+                                                      int axis) {
+            if (Qwen3MoeFusedShardLayoutReady(weight, devices, scheme, axis)) {
+                return;
+            }
+            weight.ToDevice(DataDevice::CPU);
+            Qwen3MoeCudaClearMultiDeviceState(weight);
+            std::map<int, Data*> localDatas;
+            for (int device : devices) {
+                auto rangeIt = scheme.find(device);
+                AssertInFastLLM(rangeIt != scheme.end(),
+                                "Qwen3-MOE fused TP missing device range.\n");
+                std::pair<int, int> range = {0, 0};
+                if (!rangeIt->second.empty()) {
+                    AssertInFastLLM(rangeIt->second.size() == 1,
+                                    "Qwen3-MOE fused TP expects contiguous per-device shards.\n");
+                    range = rangeIt->second[0];
+                }
+                localDatas[device] = Qwen3MoeCreateFusedInterShard(weight, axis, device, range);
+            }
+            weight.multiDeviceDatas.swap(localDatas);
+            weight.multiDeviceData = true;
+            weight.dataDevice = DataDevice::CUDA;
+            weight.dataDeviceIds = devices;
+            weight.tpLayout = TP_LAYOUT_SHARDED;
+            weight.tpAxis = axis;
+            weight.tpGlobalDims = weight.dims;
+            weight.tpRanges = scheme;
+            weight.cudaData = nullptr;
+            weight.deviceData = nullptr;
+            if (weight.cpuData != nullptr) {
+                delete[] weight.cpuData;
+                weight.cpuData = nullptr;
+            }
+            weight.scales.clear();
+            weight.scales.shrink_to_fit();
+        }
+
+        static bool Qwen3MoeHasLocalFusedMoeShard(Data *gate, Data *up, Data *down) {
+            return gate != nullptr && up != nullptr && down != nullptr &&
+                   gate->dims.size() == 3 && up->dims.size() == 3 && down->dims.size() == 3 &&
+                   gate->dims[1] > 0 && up->dims[1] > 0 && down->dims[2] > 0 &&
+                   gate->cudaData != nullptr && up->cudaData != nullptr && down->cudaData != nullptr;
+        }
+
+        static void Qwen3MoeCudaFusedMOE(Qwen3CudaDirectRunner &runner,
+                                         Data &input, Data &expertIndex, Data &expertScore,
+                                         Data &gate, Data &up, Data &down, Data &w1,
+                                         Data &output, int layer) {
+            runner.Run("FusedMOE",
+                       DataDict{{"input", &input}, {"index", &expertIndex}, {"score", &expertScore},
+                                {"gate", &gate}, {"up", &up}, {"down", &down},
+                                {"w1", &w1}, {"output", &output}},
+                       FloatDict{{"swigluLimit", 0.0f}},
+                       IntDict{{"layer", layer}, {"gateType", (int)MoeGateSwiglu}},
+                       {"w1", "output"});
         }
 
         static bool Qwen3MoeHasLocalMoeShard(const std::vector<Data*> &localWeights) {
@@ -1267,6 +1992,672 @@ namespace fastllm {
         }
     }
 
+    bool Qwen3MOEModel::HasFusedMoeWeights(int layer) const {
+        return layer >= 0 &&
+               layer < (int)moeGate3DWeights.size() &&
+               layer < (int)moeUp3DWeights.size() &&
+               layer < (int)moeDown3DWeights.size() &&
+               moeGate3DWeights[layer] != nullptr &&
+               moeUp3DWeights[layer] != nullptr &&
+               moeDown3DWeights[layer] != nullptr;
+    }
+
+    Data *Qwen3MOEModel::GetFusedMoeWeightForDevice(Data *weight, int device) const {
+        AssertInFastLLM(weight != nullptr,
+                        "Qwen3-MOE fused MoE weight is missing.\n");
+        if (!weight->multiDeviceData) {
+            return weight;
+        }
+        auto it = weight->multiDeviceDatas.find(device);
+        AssertInFastLLM(it != weight->multiDeviceDatas.end() && it->second != nullptr,
+                        "Qwen3-MOE fused MoE local shard is missing.\n");
+        return it->second;
+    }
+
+    void Qwen3MOEModel::PrepareFusedMoeLayerForDevices(int layer,
+                                                       const std::vector<int> &devices,
+                                                       std::map<int, int> ratios) {
+#ifdef USE_CUDA
+        if (!HasFusedMoeWeights(layer) || devices.empty()) {
+            return;
+        }
+        Data &gate = *moeGate3DWeights[layer];
+        Data &up = *moeUp3DWeights[layer];
+        Data &down = *moeDown3DWeights[layer];
+        AssertInFastLLM(gate.dims.size() == 3 && up.dims.size() == 3 &&
+                        down.dims.size() == 3 &&
+                        gate.dims[1] == up.dims[1] &&
+                        gate.dims[1] == down.dims[2],
+                        "Qwen3-MOE fused MoE TP weights have incompatible shapes.\n");
+        if (devices.size() == 1) {
+            int device = devices[0];
+            Qwen3MoePrepareFusedMoeWeightForCuda(gate, device);
+            Qwen3MoePrepareFusedMoeWeightForCuda(up, device);
+            Qwen3MoePrepareFusedMoeWeightForCuda(down, device);
+        } else {
+            DivisionScheme interScheme = Qwen3MoeBuildFusedInterScheme(gate, devices, ratios);
+            Qwen3MoePrepareFusedShardedWeight(gate, devices, interScheme, 1);
+            Qwen3MoePrepareFusedShardedWeight(up, devices, interScheme, 1);
+            Qwen3MoePrepareFusedShardedWeight(down, devices, interScheme, 2);
+        }
+#else
+        (void)layer;
+        (void)devices;
+        (void)ratios;
+#endif
+    }
+
+    void Qwen3MOEModel::PrepareFusedMoeWeightsForDevices(const std::vector<int> &devices,
+                                                         std::map<int, int> ratios) {
+        if (!moeFusedWeightsPrepared || devices.empty()) {
+            return;
+        }
+        for (int i = 0; i < block_cnt; i++) {
+            AssertInFastLLM(HasFusedMoeWeights(i),
+                            "Qwen3-MOE fused MoE weights are incomplete.\n");
+            PrepareFusedMoeLayerForDevices(i, devices, ratios);
+        }
+    }
+
+    static bool Qwen3MoeAllExpertsReady(const std::vector<std::vector<char>> &ready,
+                                        int layer, int numExperts) {
+        if (layer < 0 || layer >= (int)ready.size() ||
+            (int)ready[layer].size() != numExperts) {
+            return false;
+        }
+        for (int expert = 0; expert < numExperts; expert++) {
+            if (!ready[layer][expert]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool Qwen3MoeLayerStreamReady(const std::vector<Data*> &gateWeights,
+                                         const std::vector<Data*> &upWeights,
+                                         const std::vector<Data*> &downWeights,
+                                         int layer,
+                                         const std::vector<std::vector<char>> &gateReady,
+                                         const std::vector<std::vector<char>> &upReady,
+                                         const std::vector<std::vector<char>> &downReady,
+                                         int numExperts) {
+        return layer >= 0 &&
+               layer < (int)gateWeights.size() &&
+               layer < (int)upWeights.size() &&
+               layer < (int)downWeights.size() &&
+               gateWeights[layer] != nullptr &&
+               upWeights[layer] != nullptr &&
+               downWeights[layer] != nullptr &&
+               Qwen3MoeAllExpertsReady(gateReady, layer, numExperts) &&
+               Qwen3MoeAllExpertsReady(upReady, layer, numExperts) &&
+               Qwen3MoeAllExpertsReady(downReady, layer, numExperts);
+    }
+
+    void Qwen3MOEModel::TryFinalizeFusedMoeLayerParts(int layer) {
+        if (layer < 0 || layer >= block_cnt) {
+            return;
+        }
+#ifdef USE_CUDA
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        bool prepareCuda = !Qwen3MoeDisableFusedMoe() &&
+            GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) &&
+            !devices.empty();
+        if (prepareCuda && Qwen3MoeAllExpertsReady(moeGate3DExpertReady, layer, this->num_experts) &&
+            moeGate3DWeights[layer] != nullptr) {
+            if (devices.size() == 1) {
+                Qwen3MoePrepareFusedMoeWeightForCuda(*moeGate3DWeights[layer], devices[0]);
+            } else {
+                DivisionScheme interScheme = Qwen3MoeBuildFusedInterScheme(*moeGate3DWeights[layer], devices, ratios);
+                Qwen3MoePrepareFusedShardedWeight(*moeGate3DWeights[layer], devices, interScheme, 1);
+            }
+        }
+        if (prepareCuda && Qwen3MoeAllExpertsReady(moeUp3DExpertReady, layer, this->num_experts) &&
+            moeUp3DWeights[layer] != nullptr) {
+            if (devices.size() == 1) {
+                Qwen3MoePrepareFusedMoeWeightForCuda(*moeUp3DWeights[layer], devices[0]);
+            } else if (moeGate3DWeights[layer] != nullptr &&
+                       moeGate3DWeights[layer]->multiDeviceData &&
+                       !moeGate3DWeights[layer]->tpRanges.empty()) {
+                Qwen3MoePrepareFusedShardedWeight(*moeUp3DWeights[layer], devices,
+                                                  moeGate3DWeights[layer]->tpRanges, 1);
+            }
+        }
+        if (prepareCuda && Qwen3MoeAllExpertsReady(moeDown3DExpertReady, layer, this->num_experts) &&
+            moeDown3DWeights[layer] != nullptr) {
+            if (devices.size() == 1) {
+                Qwen3MoePrepareFusedMoeWeightForCuda(*moeDown3DWeights[layer], devices[0]);
+            } else if (moeGate3DWeights[layer] != nullptr &&
+                       moeGate3DWeights[layer]->multiDeviceData &&
+                       !moeGate3DWeights[layer]->tpRanges.empty()) {
+                Qwen3MoePrepareFusedShardedWeight(*moeDown3DWeights[layer], devices,
+                                                  moeGate3DWeights[layer]->tpRanges, 2);
+            }
+        }
+#endif
+        bool layerReady = Qwen3MoeLayerStreamReady(moeGate3DWeights, moeUp3DWeights, moeDown3DWeights,
+                                                   layer, moeGate3DExpertReady,
+                                                   moeUp3DExpertReady,
+                                                   moeDown3DExpertReady, this->num_experts);
+        if (!layerReady) {
+            return;
+        }
+        bool allReady = (int)moeGate3DWeights.size() == block_cnt;
+        for (int i = 0; allReady && i < block_cnt; i++) {
+            allReady = Qwen3MoeLayerStreamReady(moeGate3DWeights, moeUp3DWeights, moeDown3DWeights,
+                                                i, moeGate3DExpertReady,
+                                                moeUp3DExpertReady,
+                                                moeDown3DExpertReady, this->num_experts);
+        }
+        moeFusedWeightsPrepared = allReady;
+        if (allReady) {
+            loadFusedMoePlanned = false;
+            loadFusedMoeSourceWeights.clear();
+        }
+    }
+
+    bool Qwen3MOEModel::TryConsumeFusedMoeSourceWeight(const std::string &weightName) {
+        if (!loadFusedMoePlanned ||
+            loadFusedMoeSourceWeights.find(weightName) == loadFusedMoeSourceWeights.end()) {
+            return false;
+        }
+        int layer = -1, expert = -1;
+        std::string kind;
+        if (!Qwen3MoeParseExpertWeightName(weightName, layer, expert, kind) ||
+            layer < 0 || layer >= block_cnt || expert < 0 || expert >= this->num_experts) {
+            return false;
+        }
+        if (kind != "gate" && kind != "up" && kind != "gateup" && kind != "down") {
+            return false;
+        }
+        auto weightIt = this->weight.weight.find(weightName);
+        if (weightIt == this->weight.weight.end() || weightIt->second.cpuData == nullptr) {
+            return false;
+        }
+        Data &src = weightIt->second;
+        if ((int)moeGate3DWeights.size() != block_cnt) {
+            moeGate3DWeights.assign(block_cnt, nullptr);
+            moeUp3DWeights.assign(block_cnt, nullptr);
+            moeDown3DWeights.assign(block_cnt, nullptr);
+        }
+        if ((int)moeGate3DExpertReady.size() != block_cnt) {
+            moeGate3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+            moeUp3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+            moeDown3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+        }
+
+        if (kind == "gate" || kind == "up") {
+            if (src.dims.size() != 2 || !Qwen3MoeIsFusedFp8Type(src.dataType)) {
+                return false;
+            }
+            int inter = src.dims[0];
+            int hidden = src.dims[1];
+            Data *&target = kind == "gate" ? moeGate3DWeights[layer] : moeUp3DWeights[layer];
+            Qwen3MoeEnsureFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                           kind, src, inter, hidden, target);
+            Qwen3MoeCopyRows(*target, expert * inter, src, 0, inter);
+            Qwen3MoeCopyFp8ScaleRowsToExpert(*target, src, expert, 0, inter);
+            if (kind == "gate") {
+                moeGate3DExpertReady[layer][expert] = 1;
+            } else {
+                moeUp3DExpertReady[layer][expert] = 1;
+            }
+            Qwen3MoeReleaseConsumedSourceWeight(src);
+            consumedFusedMoeSourceWeights.insert(weightName);
+            TryFinalizeFusedMoeLayerParts(layer);
+            return true;
+        }
+
+        if (kind == "gateup") {
+            if (src.dims.size() != 2 || (src.dims[0] & 1) != 0 ||
+                !Qwen3MoeIsFusedFp8Type(src.dataType)) {
+                return false;
+            }
+            int inter = src.dims[0] / 2;
+            int hidden = src.dims[1];
+            Qwen3MoeEnsureFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                           "gate", src, inter, hidden, moeGate3DWeights[layer]);
+            Qwen3MoeEnsureFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                           "up", src, inter, hidden, moeUp3DWeights[layer]);
+            Qwen3MoeCopyRows(*moeGate3DWeights[layer], expert * inter, src, 0, inter);
+            Qwen3MoeCopyRows(*moeUp3DWeights[layer], expert * inter, src, inter, inter);
+            Qwen3MoeCopyFp8ScaleRowsToExpert(*moeGate3DWeights[layer], src, expert, 0, inter);
+            Qwen3MoeCopyFp8ScaleRowsToExpert(*moeUp3DWeights[layer], src, expert, inter, inter);
+            moeGate3DExpertReady[layer][expert] = 1;
+            moeUp3DExpertReady[layer][expert] = 1;
+            Qwen3MoeReleaseConsumedSourceWeight(src);
+            consumedFusedMoeSourceWeights.insert(weightName);
+            TryFinalizeFusedMoeLayerParts(layer);
+            return true;
+        }
+
+        if (src.dims.size() != 2 || !Qwen3MoeIsFusedFp8Type(src.dataType)) {
+            return false;
+        }
+        int hidden = src.dims[0];
+        int inter = src.dims[1];
+        Qwen3MoeEnsureFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                       "down", src, hidden, inter, moeDown3DWeights[layer]);
+        Qwen3MoeCopyRows(*moeDown3DWeights[layer], expert * hidden, src, 0, hidden);
+        Qwen3MoeCopyFp8ScaleRowsToExpert(*moeDown3DWeights[layer], src, expert, 0, hidden);
+        moeDown3DExpertReady[layer][expert] = 1;
+        Qwen3MoeReleaseConsumedSourceWeight(src);
+        consumedFusedMoeSourceWeights.insert(weightName);
+        TryFinalizeFusedMoeLayerParts(layer);
+        return true;
+    }
+
+    bool Qwen3MOEModel::TryBuildFusedMoeLayerFromLoaded(int layer) {
+        if (layer < 0 || layer >= block_cnt) {
+            return false;
+        }
+        if (HasFusedMoeWeights(layer)) {
+            return Qwen3MoeLayerStreamReady(moeGate3DWeights, moeUp3DWeights, moeDown3DWeights,
+                                            layer, moeGate3DExpertReady,
+                                            moeUp3DExpertReady,
+                                            moeDown3DExpertReady, this->num_experts);
+        }
+        if ((int)moeGate3DWeights.size() != block_cnt) {
+            moeGate3DWeights.assign(block_cnt, nullptr);
+            moeUp3DWeights.assign(block_cnt, nullptr);
+            moeDown3DWeights.assign(block_cnt, nullptr);
+        }
+        if ((int)moeGate3DExpertReady.size() != block_cnt) {
+            moeGate3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+            moeUp3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+            moeDown3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+        }
+        if (!Qwen3MoeCanBuildFusedLayer(this->weight.weight, layer, this->num_experts)) {
+            return false;
+        }
+
+#ifdef USE_CUDA
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        bool prepareCuda = !Qwen3MoeDisableFusedMoe() &&
+            GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) &&
+            !devices.empty();
+        DivisionScheme interScheme;
+#endif
+
+        Qwen3MoeBuildFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                      "gate", moeGate3DWeights[layer]);
+#ifdef USE_CUDA
+        if (prepareCuda) {
+            if (devices.size() == 1) {
+                Qwen3MoePrepareFusedMoeWeightForCuda(*moeGate3DWeights[layer], devices[0]);
+            } else {
+                interScheme = Qwen3MoeBuildFusedInterScheme(*moeGate3DWeights[layer], devices, ratios);
+                Qwen3MoePrepareFusedShardedWeight(*moeGate3DWeights[layer], devices, interScheme, 1);
+            }
+        }
+#endif
+
+        Qwen3MoeBuildFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                      "up", moeUp3DWeights[layer]);
+#ifdef USE_CUDA
+        if (prepareCuda) {
+            if (devices.size() == 1) {
+                Qwen3MoePrepareFusedMoeWeightForCuda(*moeUp3DWeights[layer], devices[0]);
+            } else {
+                Qwen3MoePrepareFusedShardedWeight(*moeUp3DWeights[layer], devices, interScheme, 1);
+            }
+        }
+#endif
+
+        Qwen3MoeBuildFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                      "down", moeDown3DWeights[layer]);
+#ifdef USE_CUDA
+        if (prepareCuda) {
+            if (devices.size() == 1) {
+                Qwen3MoePrepareFusedMoeWeightForCuda(*moeDown3DWeights[layer], devices[0]);
+            } else {
+                Qwen3MoePrepareFusedShardedWeight(*moeDown3DWeights[layer], devices, interScheme, 2);
+            }
+        }
+#endif
+
+        for (int expert = 0; expert < this->num_experts; expert++) {
+            std::string expertPrefix = Qwen3MoeExpertPrefix(layer, expert);
+            this->weight.weight.erase(expertPrefix + "gate_proj.weight");
+            this->weight.weight.erase(expertPrefix + "up_proj.weight");
+            this->weight.weight.erase(expertPrefix + "gateup_proj.weight");
+            this->weight.weight.erase(expertPrefix + "down_proj.weight");
+        }
+        if ((int)moeGate3DExpertReady.size() == block_cnt &&
+            (int)moeUp3DExpertReady.size() == block_cnt &&
+            (int)moeDown3DExpertReady.size() == block_cnt) {
+            std::fill(moeGate3DExpertReady[layer].begin(), moeGate3DExpertReady[layer].end(), 1);
+            std::fill(moeUp3DExpertReady[layer].begin(), moeUp3DExpertReady[layer].end(), 1);
+            std::fill(moeDown3DExpertReady[layer].begin(), moeDown3DExpertReady[layer].end(), 1);
+        }
+        weights.clear();
+        biass.clear();
+        threadTpMoeWeights.clear();
+        threadTpMoeBiass.clear();
+        singleGpuMoeWeights.clear();
+        singleGpuMoeBiass.clear();
+        threadTpWeightsPrepared.store(false, std::memory_order_release);
+        singleGpuWeightsPrepared.store(false, std::memory_order_release);
+        moeWeightsPrepared = false;
+
+        bool allReady = (int)moeGate3DWeights.size() == block_cnt;
+        for (int i = 0; allReady && i < block_cnt; i++) {
+            allReady = Qwen3MoeLayerStreamReady(moeGate3DWeights, moeUp3DWeights, moeDown3DWeights,
+                                                i, moeGate3DExpertReady,
+                                                moeUp3DExpertReady,
+                                                moeDown3DExpertReady, this->num_experts);
+        }
+        moeFusedWeightsPrepared = allReady;
+        if (allReady) {
+            loadFusedMoePlanned = false;
+            loadFusedMoeSourceWeights.clear();
+        }
+        return true;
+    }
+
+    bool Qwen3MOEModel::TryBuildFusedMoeWeightsFromLoaded() {
+        if (moeFusedWeightsPrepared) {
+            return true;
+        }
+        for (int i = 0; i < block_cnt; i++) {
+            if (Qwen3MoeLayerStreamReady(moeGate3DWeights, moeUp3DWeights, moeDown3DWeights,
+                                         i, moeGate3DExpertReady,
+                                         moeUp3DExpertReady,
+                                         moeDown3DExpertReady, this->num_experts)) {
+                continue;
+            }
+            if (!TryBuildFusedMoeLayerFromLoaded(i)) {
+                return false;
+            }
+        }
+        moeFusedWeightsPrepared = true;
+        loadFusedMoePlanned = false;
+        loadFusedMoeSourceWeights.clear();
+        return true;
+    }
+
+    void Qwen3MOEModel::OnWeightsCreated(const std::set<std::string> &allWeightNames) {
+        loadFusedMoePlanned = false;
+        loadFusedMoeSourceWeights.clear();
+        consumedFusedMoeSourceWeights.clear();
+#ifdef USE_CUDA
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (Qwen3MoeDisableFusedMoe() ||
+            !GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) ||
+            devices.empty() || block_cnt <= 0 || this->num_experts <= 0) {
+            return;
+        }
+
+        std::vector<bool> layerUsesGateup(block_cnt, false);
+        for (int i = 0; i < block_cnt; i++) {
+            int layerInter = -1, layerHidden = -1;
+            DataType layerType = DataType::FLOAT32;
+            for (int j = 0; j < this->num_experts; j++) {
+                std::string gateName = Qwen3MoeExpertWeightName(i, j, "gate");
+                std::string upName = Qwen3MoeExpertWeightName(i, j, "up");
+                std::string gateupName = Qwen3MoeExpertWeightName(i, j, "gateup");
+                std::string downName = Qwen3MoeExpertWeightName(i, j, "down");
+                bool hasMergedGateup = allWeightNames.find(gateupName) != allWeightNames.end();
+                bool hasGateAndUp = allWeightNames.find(gateName) != allWeightNames.end() &&
+                                    allWeightNames.find(upName) != allWeightNames.end();
+                if ((!hasMergedGateup && !hasGateAndUp) ||
+                    allWeightNames.find(downName) == allWeightNames.end()) {
+                    loadFusedMoeSourceWeights.clear();
+                    return;
+                }
+
+                auto downIt = this->weight.weight.find(downName);
+                auto gateupIt = this->weight.weight.find(gateupName);
+                auto gateIt = this->weight.weight.find(gateName);
+                auto upIt = this->weight.weight.find(upName);
+                if (downIt == this->weight.weight.end() ||
+                    (hasMergedGateup && gateupIt == this->weight.weight.end()) ||
+                    (!hasMergedGateup && (gateIt == this->weight.weight.end() ||
+                                          upIt == this->weight.weight.end()))) {
+                    loadFusedMoeSourceWeights.clear();
+                    return;
+                }
+
+                const Data &gateSource = hasMergedGateup ? gateupIt->second : gateIt->second;
+                const Data &upSource = hasMergedGateup ? gateupIt->second : upIt->second;
+                const Data &downSource = downIt->second;
+                if (gateSource.dims.size() != 2 || upSource.dims.size() != 2 ||
+                    downSource.dims.size() != 2 ||
+                    !Qwen3MoeIsFusedFp8Type(gateSource.dataType) ||
+                    gateSource.dataType != upSource.dataType ||
+                    gateSource.dataType != downSource.dataType) {
+                    loadFusedMoeSourceWeights.clear();
+                    return;
+                }
+                int inter = hasMergedGateup ? gateSource.dims[0] / 2 : gateSource.dims[0];
+                int hidden = gateSource.dims[1];
+                if (inter <= 0 || hidden <= 0 ||
+                    (hasMergedGateup && ((gateSource.dims[0] & 1) != 0 ||
+                                         upSource.dims[0] != gateSource.dims[0])) ||
+                    (!hasMergedGateup && (upSource.dims[0] != inter ||
+                                          upSource.dims[1] != hidden)) ||
+                    downSource.dims[0] != hidden || downSource.dims[1] != inter) {
+                    loadFusedMoeSourceWeights.clear();
+                    return;
+                }
+                if (j == 0) {
+                    layerInter = inter;
+                    layerHidden = hidden;
+                    layerType = gateSource.dataType;
+                    layerUsesGateup[i] = hasMergedGateup;
+                } else if (inter != layerInter || hidden != layerHidden ||
+                           gateSource.dataType != layerType ||
+                           hasMergedGateup != layerUsesGateup[i]) {
+                    loadFusedMoeSourceWeights.clear();
+                    return;
+                }
+
+                if (hasMergedGateup) {
+                    loadFusedMoeSourceWeights.insert(gateupName);
+                } else {
+                    loadFusedMoeSourceWeights.insert(gateName);
+                    loadFusedMoeSourceWeights.insert(upName);
+                }
+                loadFusedMoeSourceWeights.insert(downName);
+            }
+        }
+        moeGate3DWeights.assign(block_cnt, nullptr);
+        moeUp3DWeights.assign(block_cnt, nullptr);
+        moeDown3DWeights.assign(block_cnt, nullptr);
+        moeGate3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+        moeUp3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+        moeDown3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+
+        for (int i = 0; i < block_cnt; i++) {
+            std::string gateSourceName = layerUsesGateup[i] ?
+                Qwen3MoeExpertWeightName(i, 0, "gateup") :
+                Qwen3MoeExpertWeightName(i, 0, "gate");
+            std::string upSourceName = layerUsesGateup[i] ?
+                Qwen3MoeExpertWeightName(i, 0, "gateup") :
+                Qwen3MoeExpertWeightName(i, 0, "up");
+            std::string downSourceName = Qwen3MoeExpertWeightName(i, 0, "down");
+            Data &gateSource = this->weight.weight[gateSourceName];
+            Data &upSource = this->weight.weight[upSourceName];
+            Data &downSource = this->weight.weight[downSourceName];
+            int inter = layerUsesGateup[i] ? gateSource.dims[0] / 2 : gateSource.dims[0];
+            int hidden = gateSource.dims[1];
+            Qwen3MoeInitFusedLayerWeightMeta(this->weight.weight, i, this->num_experts,
+                                             "gate", gateSource, inter, hidden,
+                                             moeGate3DWeights[i]);
+            Qwen3MoeInitFusedLayerWeightMeta(this->weight.weight, i, this->num_experts,
+                                             "up", upSource, inter, hidden,
+                                             moeUp3DWeights[i]);
+            Qwen3MoeInitFusedLayerWeightMeta(this->weight.weight, i, this->num_experts,
+                                             "down", downSource, hidden, inter,
+                                             moeDown3DWeights[i]);
+        }
+
+        moeFusedWeightsPrepared = false;
+        loadFusedMoePlanned = true;
+#endif
+    }
+
+    int Qwen3MOEModel::GetWeightLoadPriority(
+            const std::string &tensorName,
+            const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+        if (!loadFusedMoePlanned) {
+            return 0;
+        }
+        if (loadFusedMoeSourceWeights.find(tensorName) != loadFusedMoeSourceWeights.end()) {
+            return Qwen3MoeSourceLoadPriority(tensorName, this->num_experts);
+        }
+        int priority = 0;
+        for (auto &mapped : mappedWeights) {
+            if (loadFusedMoeSourceWeights.find(mapped.first) != loadFusedMoeSourceWeights.end()) {
+                int mappedPriority = Qwen3MoeSourceLoadPriority(mapped.first, this->num_experts);
+                priority = priority == 0 ? mappedPriority : std::min(priority, mappedPriority);
+            }
+        }
+        return priority;
+    }
+
+    bool Qwen3MOEModel::ShouldLoadWeightSeriallyBeforeOthers(
+            const std::string &tensorName,
+            const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+        if (!loadFusedMoePlanned) {
+            return false;
+        }
+        if (loadFusedMoeSourceWeights.find(tensorName) != loadFusedMoeSourceWeights.end()) {
+            return true;
+        }
+        for (auto &mapped : mappedWeights) {
+            if (loadFusedMoeSourceWeights.find(mapped.first) != loadFusedMoeSourceWeights.end()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void Qwen3MOEModel::OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) {
+        if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
+            return;
+        }
+        for (auto &weightName : weightNames) {
+            if (loadFusedMoeSourceWeights.find(weightName) == loadFusedMoeSourceWeights.end()) {
+                continue;
+            }
+            int layer = -1, expert = -1;
+            std::string kind;
+            if (!Qwen3MoeParseExpertWeightName(weightName, layer, expert, kind) ||
+                layer < 0 || layer >= block_cnt) {
+                continue;
+            }
+            if (kind == "gate" || kind == "gateup") {
+                Qwen3MoeAllocateFusedWeightForLoad(moeGate3DWeights[layer]);
+            }
+            if (kind == "up" || kind == "gateup") {
+                Qwen3MoeAllocateFusedWeightForLoad(moeUp3DWeights[layer]);
+            }
+            if (kind == "down") {
+                Qwen3MoeAllocateFusedWeightForLoad(moeDown3DWeights[layer]);
+            }
+        }
+    }
+
+    void Qwen3MOEModel::OnWeightLoaded(const std::string &weightName,
+                                       const std::set<std::string> &finishedWeightNames) {
+        (void)finishedWeightNames;
+        if (!loadFusedMoePlanned || moeFusedWeightsPrepared ||
+            loadFusedMoeSourceWeights.find(weightName) == loadFusedMoeSourceWeights.end()) {
+            return;
+        }
+        int layer = -1, expert = -1;
+        std::string kind;
+        if (!Qwen3MoeParseExpertWeightName(weightName, layer, expert, kind)) {
+            return;
+        }
+        if (TryConsumeFusedMoeSourceWeight(weightName)) {
+            return;
+        }
+        TryBuildFusedMoeLayerFromLoaded(layer);
+    }
+
+    bool Qwen3MOEModel::IsWeightConsumedAfterLoad(const std::string &weightName) const {
+        return consumedFusedMoeSourceWeights.find(weightName) != consumedFusedMoeSourceWeights.end();
+    }
+
+    void Qwen3MOEModel::OnWeightLoadGroupFinished() {
+        if (consumedFusedMoeSourceWeights.empty()) {
+            return;
+        }
+        for (auto &weightName : consumedFusedMoeSourceWeights) {
+            this->weight.weight.erase(weightName);
+        }
+        consumedFusedMoeSourceWeights.clear();
+    }
+
+    bool Qwen3MOEModel::ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const {
+        return loadFusedMoePlanned &&
+               loadFusedMoeSourceWeights.find(weightName) != loadFusedMoeSourceWeights.end();
+    }
+
+    void Qwen3MOEModel::OnModelWeightsLoaded() {
+        if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
+        if (TryBuildFusedMoeWeightsFromLoaded()) {
+            loadFusedMoePlanned = false;
+            loadFusedMoeSourceWeights.clear();
+            return;
+        }
+        loadFusedMoePlanned = false;
+        loadFusedMoeSourceWeights.clear();
+    }
+
+    void Qwen3MOEModel::PrepareMoeWeights(bool enableFusedMoe) {
+        if (enableFusedMoe && moeFusedWeightsPrepared) {
+            return;
+        }
+        if (enableFusedMoe && !moeFusedWeightsPrepared &&
+            !Qwen3MoeDisableFusedMoe() &&
+            TryBuildFusedMoeWeightsFromLoaded()) {
+            return;
+        }
+
+        if (moeWeightsPrepared) {
+            return;
+        }
+        AssertInFastLLM(!moeFusedWeightsPrepared,
+                        "Qwen3-MOE non-fused MoE weights are unavailable after fused MoE preparation.\n");
+        weights.clear();
+        biass.clear();
+        weights.resize(block_cnt);
+        biass.resize(block_cnt);
+        for (int i = 0; i < block_cnt; i++) {
+            weights[i].push_back(nullptr);
+            weights[i].push_back(nullptr);
+            biass[i].push_back(nullptr);
+            biass[i].push_back(nullptr);
+            for (int j = 0; j < this->num_experts; j++) {
+                std::string expertPrefix = Qwen3MoeExpertPrefix(i, j);
+                std::string gateupWeightName = expertPrefix + "gateup_proj.weight";
+                std::string downWeightName = expertPrefix + "down_proj.weight";
+                AssertInFastLLM(weight.weight.find(gateupWeightName) != weight.weight.end(),
+                                "Qwen3-MOE requires merged expert gateup weight.\n");
+                AssertInFastLLM(weight.weight.find(downWeightName) != weight.weight.end(),
+                                "Qwen3-MOE requires expert down weight.\n");
+                Data &gateup = weight[gateupWeightName];
+                Data &down = weight[downWeightName];
+                gateup.tpLinearType = TP_LINEAR_ROW;
+                gateup.tpPackType = TP_PACK_GATEUP;
+                down.tpLinearType = TP_LINEAR_COLUMN;
+                weights[i].push_back(&gateup);
+                weights[i].push_back(&down);
+                biass[i].push_back(nullptr);
+                biass[i].push_back(nullptr);
+            }
+        }
+        moeWeightsPrepared = true;
+    }
+
     int Qwen3MOEModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
@@ -1356,8 +2747,9 @@ namespace fastllm {
         }
         bool indexedMoeOk = Qwen3MoeCanGraphIndexedMoe(moeWeightsByDevice, gpuId, block_cnt,
                                                        graphHidden, threadTpMoeAtype);
-        if (!syncGraphPeers(indexedMoeOk)) {
-            return rejectGraph("unsupported indexed moe layout");
+        bool fusedMoeOk = moeFusedWeightsPrepared;
+        if (!syncGraphPeers(indexedMoeOk || fusedMoeOk)) {
+            return rejectGraph("unsupported moe layout");
         }
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
@@ -1564,6 +2956,7 @@ namespace fastllm {
                   << ";inputType=" << (int)state.inputIds.dataType
                   << ";posType=" << (int)state.positionIds.dataType
                   << ";moeAtype=" << (int)threadTpMoeAtype
+                  << ";fusedMoe=" << (fusedMoeOk ? 1 : 0)
                   << ";kCache=" << pastKeyValues[0].first->pagedKVCacheData->cudaData
                   << ";vCache=" << pastKeyValues[0].second->pagedKVCacheData->cudaData
                   << ";lmLocal=" << requireLocal(weight["lm_head.weight"], "lm_head.weight")->dims[0];
@@ -1763,18 +3156,31 @@ namespace fastllm {
                                           this->num_experts_per_tok, true,
                                           this->routed_scaling_factor, localGateBias);
 
-                    auto &localWeights = moeWeightsByDevice.at(gpuId)[i];
-                    auto &localBiass = moeBiassByDevice.at(gpuId)[i];
-                    if (Qwen3MoeHasLocalMoeShard(localWeights)) {
-                        Qwen3CudaMergeMOEBlock(cudaRunner, &buf.attenInput, &buf.expertIndex, &buf.expertScore,
-                            &localWeights, &localBiass,
-                            &buf.w1, &buf.w2, &buf.w3,
-                            &buf.tempInput, &buf.tempOutput,
-                            1.0f, &buf.moeFinal, i,
-                            computeType, threadTpMoeAtype,
-                            &buf.moeInputTemp, &buf.moeOutputTemp);
+                    if (HasFusedMoeWeights(i)) {
+                        Data *localGate = GetFusedMoeWeightForDevice(moeGate3DWeights[i], gpuId);
+                        Data *localUp = GetFusedMoeWeightForDevice(moeUp3DWeights[i], gpuId);
+                        Data *localDown = GetFusedMoeWeightForDevice(moeDown3DWeights[i], gpuId);
+                        if (Qwen3MoeHasLocalFusedMoeShard(localGate, localUp, localDown)) {
+                            Qwen3MoeCudaFusedMOE(cudaRunner, buf.attenInput, buf.expertIndex, buf.expertScore,
+                                                 *localGate, *localUp, *localDown,
+                                                 buf.w1, buf.moeFinal, i);
+                        } else {
+                            Qwen3MoeZeroCudaLike(buf.moeFinal, buf.hiddenStates, gpuId);
+                        }
                     } else {
-                        Qwen3MoeZeroCudaLike(buf.moeFinal, buf.hiddenStates, gpuId);
+                        auto &localWeights = moeWeightsByDevice.at(gpuId)[i];
+                        auto &localBiass = moeBiassByDevice.at(gpuId)[i];
+                        if (Qwen3MoeHasLocalMoeShard(localWeights)) {
+                            Qwen3CudaMergeMOEBlock(cudaRunner, &buf.attenInput, &buf.expertIndex, &buf.expertScore,
+                                &localWeights, &localBiass,
+                                &buf.w1, &buf.w2, &buf.w3,
+                                &buf.tempInput, &buf.tempOutput,
+                                1.0f, &buf.moeFinal, i,
+                                computeType, threadTpMoeAtype,
+                                &buf.moeInputTemp, &buf.moeOutputTemp);
+                        } else {
+                            Qwen3MoeZeroCudaLike(buf.moeFinal, buf.hiddenStates, gpuId);
+                        }
                     }
                     buf.moeFinal.Reshape(buf.hiddenStates.dims);
                     if (buf.moeFinal.dataType != buf.hiddenStates.dataType) {
@@ -2107,18 +3513,31 @@ namespace fastllm {
                 Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
                                       this->num_experts_per_tok, true,
                                       this->routed_scaling_factor, localGateBias);
-                auto &localWeights = moeWeightsByDevice.at(gpuId)[i];
-                auto &localBiass = moeBiassByDevice.at(gpuId)[i];
-                if (Qwen3MoeHasLocalMoeShard(localWeights)) {
-                    Qwen3CudaMergeMOEBlock(cudaRunner, &attenInput, &expertIndex, &expertScore,
-                        &localWeights, &localBiass,
-                        &w1, &w2, &w3,
-                        &tempInput, &tempOutput,
-                        1.0f, &moeFinal, i,
-                        computeType, threadTpMoeAtype,
-                        &moeInputTemp, &moeOutputTemp);
+                if (HasFusedMoeWeights(i)) {
+                    Data *localGate = GetFusedMoeWeightForDevice(moeGate3DWeights[i], gpuId);
+                    Data *localUp = GetFusedMoeWeightForDevice(moeUp3DWeights[i], gpuId);
+                    Data *localDown = GetFusedMoeWeightForDevice(moeDown3DWeights[i], gpuId);
+                    if (Qwen3MoeHasLocalFusedMoeShard(localGate, localUp, localDown)) {
+                        Qwen3MoeCudaFusedMOE(cudaRunner, attenInput, expertIndex, expertScore,
+                                             *localGate, *localUp, *localDown,
+                                             w1, moeFinal, i);
+                    } else {
+                        Qwen3MoeZeroCudaLike(moeFinal, hiddenStates, gpuId);
+                    }
                 } else {
-                    Qwen3MoeZeroCudaLike(moeFinal, hiddenStates, gpuId);
+                    auto &localWeights = moeWeightsByDevice.at(gpuId)[i];
+                    auto &localBiass = moeBiassByDevice.at(gpuId)[i];
+                    if (Qwen3MoeHasLocalMoeShard(localWeights)) {
+                        Qwen3CudaMergeMOEBlock(cudaRunner, &attenInput, &expertIndex, &expertScore,
+                            &localWeights, &localBiass,
+                            &w1, &w2, &w3,
+                            &tempInput, &tempOutput,
+                            1.0f, &moeFinal, i,
+                            computeType, threadTpMoeAtype,
+                            &moeInputTemp, &moeOutputTemp);
+                    } else {
+                        Qwen3MoeZeroCudaLike(moeFinal, hiddenStates, gpuId);
+                    }
                 }
                 moeFinal.Reshape(hiddenStates.dims);
                 if (moeFinal.dataType != hiddenStates.dataType) {
@@ -2189,6 +3608,8 @@ namespace fastllm {
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
         bool tensorParallel = devices.size() > 1;
+        PrepareMoeWeights(true);
+        bool useFusedMoeWeights = moeFusedWeightsPrepared;
         bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
         const DataType computeType = ResolveQwen3MoeThreadTpComputeType(this->dataType);
         if (!useCpuEmbedding) {
@@ -2326,7 +3747,8 @@ namespace fastllm {
                                 "Qwen3-MOE ForwardGPU thread TP device config changed after weights were prepared.\n");
                 AssertInFastLLM((int)threadTpKVHeadSchemes.size() == block_cnt &&
                                 !threadTpLmHeadScheme.empty() &&
-                                hasMoeCache(threadTpMoeWeights, threadTpMoeBiass),
+                                (useFusedMoeWeights ||
+                                 hasMoeCache(threadTpMoeWeights, threadTpMoeBiass)),
                                 "Qwen3-MOE ForwardGPU thread TP cached weight schemes are incomplete.\n");
                 kvHeadSchemes = &threadTpKVHeadSchemes;
                 lmHeadScheme = &threadTpLmHeadScheme;
@@ -2391,6 +3813,12 @@ namespace fastllm {
                         AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1),
                                         "Qwen3-MOE ForwardGPU failed to split " + oWeightName + ".\n");
 
+                        if (useFusedMoeWeights) {
+                            AssertInFastLLM(HasFusedMoeWeights(i),
+                                            "Qwen3-MOE fused MoE weights are incomplete.\n");
+                            continue;
+                        }
+
                         DivisionScheme gateScheme;
                         for (int j = 0; j < this->num_experts; j++) {
                             std::string gateupWeightName = "model.layers." + std::to_string(i) + ".mlp.experts." +
@@ -2421,7 +3849,13 @@ namespace fastllm {
                         }
                     }
 
-                    fillMoeCache(threadTpMoeWeights, threadTpMoeBiass, true);
+                    if (useFusedMoeWeights) {
+                        PrepareFusedMoeWeightsForDevices(devices, ratios);
+                        threadTpMoeWeights.clear();
+                        threadTpMoeBiass.clear();
+                    } else {
+                        fillMoeCache(threadTpMoeWeights, threadTpMoeBiass, true);
+                    }
 
                     Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
                     std::vector<int> devCopy = devices;
@@ -2438,7 +3872,7 @@ namespace fastllm {
         } else {
             std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
             if (!singleGpuWeightsPrepared.load(std::memory_order_relaxed) ||
-                !hasMoeCache(singleGpuMoeWeights, singleGpuMoeBiass)) {
+                (!useFusedMoeWeights && !hasMoeCache(singleGpuMoeWeights, singleGpuMoeBiass))) {
                 int device = devices[0];
                 for (int i = 0; i < block_cnt; i++) {
                     std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
@@ -2454,6 +3888,14 @@ namespace fastllm {
                     mergeW.tpKVHeads = num_key_value_heads;
                     mergeW.tpHeadDim = head_dim;
 
+                    if (useFusedMoeWeights) {
+                        AssertInFastLLM(HasFusedMoeWeights(i),
+                                        "Qwen3-MOE fused MoE weights are incomplete.\n");
+                        Qwen3MoePrepareFusedMoeWeightForCuda(*moeGate3DWeights[i], device);
+                        Qwen3MoePrepareFusedMoeWeightForCuda(*moeUp3DWeights[i], device);
+                        Qwen3MoePrepareFusedMoeWeightForCuda(*moeDown3DWeights[i], device);
+                        continue;
+                    }
                     for (int j = 0; j < this->num_experts; j++) {
                         std::string gateupWeightName = "model.layers." + std::to_string(i) +
                             ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight";
@@ -2472,7 +3914,12 @@ namespace fastllm {
                         down.ToDevice(DataDevice::CUDA, {device}, true);
                     }
                 }
-                fillMoeCache(singleGpuMoeWeights, singleGpuMoeBiass, false);
+                if (!useFusedMoeWeights) {
+                    fillMoeCache(singleGpuMoeWeights, singleGpuMoeBiass, false);
+                } else {
+                    singleGpuMoeWeights.clear();
+                    singleGpuMoeBiass.clear();
+                }
                 singleGpuWeightsPrepared.store(true, std::memory_order_release);
             }
             localKvHeadSchemes.assign(block_cnt, DivisionScheme());
@@ -2716,27 +4163,7 @@ namespace fastllm {
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
 
-        if (weights.size() == 0) {
-            weights.resize(block_cnt);
-            biass.resize(block_cnt);
-            for (int i = 0; i < block_cnt; i++) {
-                weights[i].push_back(nullptr);
-                weights[i].push_back(nullptr);
-                biass[i].push_back(nullptr);
-                biass[i].push_back(nullptr);
-                for (int j = 0; j < this->num_experts; j++) {
-                    Data &gateup = weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight"];
-                    Data &down   = weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".down_proj.weight"];
-                    gateup.tpLinearType = TP_LINEAR_ROW;
-                    gateup.tpPackType   = TP_PACK_GATEUP;
-                    down.tpLinearType   = TP_LINEAR_COLUMN;
-                    weights[i].push_back(&gateup);
-                    weights[i].push_back(&down);
-                    biass[i].push_back(nullptr);
-                    biass[i].push_back(nullptr);
-                }
-            }
-        }
+        PrepareMoeWeights(false);
 
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
