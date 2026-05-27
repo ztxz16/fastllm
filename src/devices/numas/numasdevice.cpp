@@ -164,6 +164,7 @@ namespace fastllm {
         this->deviceType = "numa";
         // this->ops["Linear"] = (BaseOperator *) (new NumasLinearOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new NumasMergeMOE());
+        this->ops["FusedMOE"] = (BaseOperator*)(new NumasFusedMOE());
 
         /*this->ops["CatDirect"] = (BaseOperator *) (new NumaCatDirectOp());
         this->ops["Attention"] = (BaseOperator *) (new NumaAttention());
@@ -620,7 +621,11 @@ namespace fastllm {
             } else {
                 data->Repack();
 
-                if (data->dataType == DataType::FLOAT32 || data->dataType == DataType::BFLOAT16 || data->dataType == DataType::FLOAT16) {
+                if (data->dataType == DataType::FLOAT32 ||
+                    data->dataType == DataType::BFLOAT16 ||
+                    data->dataType == DataType::FLOAT16 ||
+                    data->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                    data->dataType == DataType::FP8_E4M3_PERCHANNEL) {
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
                     uint8_t *srcData = data->cpuData;
                     std::vector<uint8_t> reordered;
@@ -1693,6 +1698,260 @@ namespace fastllm {
                     reduceOutput.data(), bs, dim, GetAlivePool());
             }
         }
+    }
+
+    struct NumasFusedMoeLayerWeights {
+        Data *gateSource = nullptr;
+        Data *upSource = nullptr;
+        Data *downSource = nullptr;
+        int experts = 0;
+        int inter = 0;
+        int hidden = 0;
+        DataType gateType = DataType::FLOAT32;
+        DataType downType = DataType::FLOAT32;
+        std::vector<std::unique_ptr<Data> > ownedWeights;
+        std::vector<Data*> weights;
+        std::vector<Data*> biass;
+
+        bool IsReadyFor(Data &gate, Data &up, Data &down) const {
+            return gateSource == &gate && upSource == &up && downSource == &down &&
+                   experts > 0 && inter > 0 && hidden > 0 &&
+                   gate.dims.size() == 3 && up.dims.size() == 3 && down.dims.size() == 3 &&
+                   gate.dims[0] == experts && gate.dims[1] == inter && gate.dims[2] == hidden &&
+                   up.dims[0] == experts && up.dims[1] == inter && up.dims[2] == hidden &&
+                   down.dims[0] == experts && down.dims[1] == hidden && down.dims[2] == inter &&
+                   gate.dataType == gateType && up.dataType == gateType && down.dataType == downType &&
+                   weights.size() == (size_t)(experts + 1) * 2;
+        }
+    };
+
+    static std::unordered_map<int, NumasFusedMoeLayerWeights> fastllmNumasFusedMoeWeightsPerLayer;
+
+    static void CopyNumasFusedLinearMeta(Data &dst, const Data &src, const std::string &name) {
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+        dst.blockK = src.blockK;
+        dst.blockM = src.blockM;
+        dst.group = src.group;
+        dst.groupCnt = src.groupCnt;
+        dst.perChannelAxis = src.perChannelAxis;
+        dst.tpLinearType = src.tpLinearType;
+        dst.tpPackType = src.tpPackType;
+    }
+
+    static void EnsureNumasFusedWeightCpuData(Data &weight, const char *name) {
+        if (weight.cpuData != nullptr) {
+            return;
+        }
+#ifdef USE_CUDA
+        if (weight.cudaData != nullptr) {
+            weight.ToDevice(DataDevice::CPU);
+            if (weight.cpuData != nullptr) {
+                return;
+            }
+        }
+#endif
+        ErrorInFastLLM(std::string("NumasFusedMOE: fused weight ") + name + " has no CPU data.\n");
+    }
+
+    static void AppendNumasFusedFp8Scales(Data &dst, const Data &src,
+                                          int expert, int srcRowStart, int rows) {
+        if (src.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(src.dims.size() == 3 && src.blockK > 0 && src.blockM > 0 &&
+                        !src.scales.empty(),
+                        "NumasFusedMOE FP8 source scales are missing.\n");
+        int rowsPerExpert = src.dims[1];
+        int cols = src.dims[2];
+        int scaleCols = (cols - 1) / src.blockM + 1;
+        int scaleRowsPerExpert = (rowsPerExpert - 1) / src.blockK + 1;
+        int scaleRowStart = srcRowStart / src.blockK;
+        int scaleRows = (rows - 1) / src.blockK + 1;
+        size_t srcOffset = ((size_t)expert * scaleRowsPerExpert + scaleRowStart) * scaleCols;
+        size_t count = (size_t)scaleRows * scaleCols;
+        AssertInFastLLM(expert >= 0 && expert < src.dims[0] &&
+                        srcRowStart >= 0 && rows > 0 && srcRowStart + rows <= rowsPerExpert &&
+                        srcRowStart % src.blockK == 0 &&
+                        srcOffset + count <= src.scales.size(),
+                        "NumasFusedMOE FP8 scale slice is out of bounds.\n");
+        dst.scales.insert(dst.scales.end(),
+                          src.scales.begin() + srcOffset,
+                          src.scales.begin() + srcOffset + count);
+    }
+
+    static void CopyNumasFusedRows(Data &dst, int dstRowStart,
+                                   Data &src, int expert, int srcRowStart, int rows) {
+        AssertInFastLLM(src.dims.size() == 3 && dst.dims.size() == 2,
+                        "NumasFusedMOE row copy expects 3D source and 2D destination.\n");
+        int rowsPerExpert = src.dims[1];
+        int cols = src.dims[2];
+        AssertInFastLLM(dst.dims[1] == cols &&
+                        expert >= 0 && expert < src.dims[0] &&
+                        srcRowStart >= 0 && rows > 0 && srcRowStart + rows <= rowsPerExpert &&
+                        dstRowStart >= 0 && dstRowStart + rows <= dst.dims[0],
+                        "NumasFusedMOE row copy shape mismatch.\n");
+        EnsureNumasFusedWeightCpuData(src, src.name.c_str());
+        size_t bytesPerRow = GetDataBytes(src.dataType, 1, cols);
+        memcpy(dst.cpuData + (size_t)dstRowStart * bytesPerRow,
+               src.cpuData + ((size_t)expert * rowsPerExpert + srcRowStart) * bytesPerRow,
+               (size_t)rows * bytesPerRow);
+    }
+
+    static NumasFusedMoeLayerWeights &GetNumasFusedMoeLayerWeights(
+        int layer, Data &gate, Data &up, Data &down
+    ) {
+        AssertInFastLLM(gate.dims.size() == 3 && up.dims.size() == 3 && down.dims.size() == 3,
+                        "NumasFusedMOE expects 3D fused weights.\n");
+        int experts = gate.dims[0];
+        int inter = gate.dims[1];
+        int hidden = gate.dims[2];
+        AssertInFastLLM(experts > 0 && inter > 0 && hidden > 0 &&
+                        up.dims[0] == experts && up.dims[1] == inter && up.dims[2] == hidden &&
+                        down.dims[0] == experts && down.dims[1] == hidden && down.dims[2] == inter &&
+                        gate.dataType == up.dataType,
+                        "NumasFusedMOE fused weight shapes mismatch.\n");
+
+        auto &cache = fastllmNumasFusedMoeWeightsPerLayer[layer];
+        if (cache.IsReadyFor(gate, up, down)) {
+            return cache;
+        }
+
+        cache = NumasFusedMoeLayerWeights();
+        cache.gateSource = &gate;
+        cache.upSource = &up;
+        cache.downSource = &down;
+        cache.experts = experts;
+        cache.inter = inter;
+        cache.hidden = hidden;
+        cache.gateType = gate.dataType;
+        cache.downType = down.dataType;
+        cache.weights.assign((size_t)(experts + 1) * 2, nullptr);
+        cache.biass.assign((size_t)(experts + 1) * 2, nullptr);
+        cache.ownedWeights.reserve((size_t)experts * 2);
+
+        for (int expert = 0; expert < experts; expert++) {
+            std::unique_ptr<Data> gateup(new Data(gate.dataType, {inter * 2, hidden}));
+            CopyNumasFusedLinearMeta(*gateup, gate, gate.name + ".numas.gateup." + std::to_string(expert));
+            gateup->tpLinearType = TP_LINEAR_ROW;
+            gateup->tpPackType = TP_PACK_GATEUP;
+            gateup->Allocate(false);
+            gateup->scales.clear();
+            CopyNumasFusedRows(*gateup, 0, gate, expert, 0, inter);
+            CopyNumasFusedRows(*gateup, inter, up, expert, 0, inter);
+            AppendNumasFusedFp8Scales(*gateup, gate, expert, 0, inter);
+            AppendNumasFusedFp8Scales(*gateup, up, expert, 0, inter);
+            RegisterNumas(gateup.get(), "linearSwiglu");
+
+            std::unique_ptr<Data> downWeight(new Data(down.dataType, {hidden, inter}));
+            CopyNumasFusedLinearMeta(*downWeight, down, down.name + ".numas.down." + std::to_string(expert));
+            downWeight->tpLinearType = TP_LINEAR_COLUMN;
+            downWeight->Allocate(false);
+            downWeight->scales.clear();
+            CopyNumasFusedRows(*downWeight, 0, down, expert, 0, hidden);
+            AppendNumasFusedFp8Scales(*downWeight, down, expert, 0, hidden);
+            RegisterNumas(downWeight.get(), "linearColumn");
+
+            cache.weights[(expert + 1) * 2] = gateup.get();
+            cache.weights[(expert + 1) * 2 + 1] = downWeight.get();
+            cache.ownedWeights.push_back(std::move(gateup));
+            cache.ownedWeights.push_back(std::move(downWeight));
+        }
+
+        return cache;
+    }
+
+    bool NumasFusedMOE::CanRun(const std::string &opType, const DataDict &datas,
+                               const FloatDict &floatParams, const IntDict &intParams) {
+        auto gateIt = datas.find("gate");
+        auto upIt = datas.find("up");
+        auto downIt = datas.find("down");
+        if (gateIt == datas.end() || upIt == datas.end() || downIt == datas.end()) {
+            return false;
+        }
+        Data *gate = gateIt->second;
+        Data *up = upIt->second;
+        Data *down = downIt->second;
+        return gate != nullptr && up != nullptr && down != nullptr &&
+               gate->dims.size() == 3 && up->dims.size() == 3 && down->dims.size() == 3 &&
+               gate->dataType == up->dataType &&
+               (gate->dataType == DataType::FP8_E4M3 ||
+                gate->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                gate->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                gate->dataType == DataType::FLOAT32 ||
+                gate->dataType == DataType::FLOAT16 ||
+                gate->dataType == DataType::BFLOAT16) &&
+               (down->dataType == gate->dataType ||
+                down->dataType == DataType::FP8_E4M3 ||
+                down->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                down->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                down->dataType == DataType::FLOAT32 ||
+                down->dataType == DataType::FLOAT16 ||
+                down->dataType == DataType::BFLOAT16);
+    }
+
+    void NumasFusedMOE::Reshape(const std::string &opType, const DataDict &datas,
+                                const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &gate = *(datas.find("gate")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &output = *(datas.find("output")->second);
+        output.dataType = input.dataType;
+        output.Resize(input.dims);
+        if (index.dims.size() >= 2 && gate.dims.size() == 3) {
+            w1.dataType = input.dataType;
+            w1.Resize({(int)index.Count(0), gate.dims[1]});
+        }
+    }
+
+    void NumasFusedMOE::Run(const std::string &opType, const DataDict &datas,
+                            const FloatDict &floatParams, const IntDict &intParams) {
+        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
+            (MoeGateType)intParams.find("gateType")->second : MoeGateSwiglu;
+        if (gateType != MoeGateSwiglu) {
+            ErrorInFastLLM("NumasFusedMOE only supports swiglu gate type.\n");
+        }
+        float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
+            floatParams.find("swigluLimit")->second : 0.0f;
+        if (swigluLimit != 0.0f) {
+            ErrorInFastLLM("NumasFusedMOE does not support non-zero swigluLimit.\n");
+        }
+
+        Data &rawInput = *(datas.find("input")->second);
+        Data cpuInput;
+        Data &input = *GetCpuTensor(rawInput, cpuInput, "input");
+        Data &rawIndex = *(datas.find("index")->second);
+        Data &rawScore = *(datas.find("score")->second);
+        Data cpuIndex, cpuScore;
+        Data &index = *GetCpuTensor(rawIndex, cpuIndex, "index");
+        Data &score = *GetCpuTensor(rawScore, cpuScore, "score");
+        Data &gate = *(datas.find("gate")->second);
+        Data &up = *(datas.find("up")->second);
+        Data &down = *(datas.find("down")->second);
+        Data &output = *(datas.find("output")->second);
+
+        int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
+        auto &layerWeights = GetNumasFusedMoeLayerWeights(layer, gate, up, down);
+        FastllmMoeDataManagerNumas &manager = fastllmMoeDataManagerNumasPerLayer[layer % 2];
+
+        output.dataType = input.dataType;
+        output.expansionDims.clear();
+        output.Resize(input.dims);
+        output.Allocate();
+
+        int topk = index.dims.size() >= 2 ? index.dims[1] : 1;
+        std::unordered_set<int> cpuExperts;
+        for (int expert = 1; expert <= layerWeights.experts; expert++) {
+            cpuExperts.insert(expert);
+        }
+        DoNumasMergeMOEOnCPU(
+            input, output, index, score,
+            layerWeights.weights.data(), layerWeights.biass.data(),
+            1.0f, (int)layerWeights.weights.size(), topk,
+            cpuExperts, manager, nullptr
+        );
     }
 
     void NumasMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
