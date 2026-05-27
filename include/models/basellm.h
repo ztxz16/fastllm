@@ -180,8 +180,39 @@ namespace fastllm {
         virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
                 GetTensorMap(const std::vector <std::string> &tensorNames);
 
+        // 所有权重占位创建完成、实际读入前，允许模型提前规划加载策略。
+        virtual void OnWeightsCreated(const std::set<std::string> &allWeightNames) {}
+
+        // 返回值越小越先读，供模型把需要二次合成的权重提前读入。
+        virtual int GetWeightLoadPriority(const std::string &tensorName,
+                                          const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+            return 0;
+        }
+
+        // 返回 true 时，loader 会在普通并行加载前先读取该 tensor，便于流式合成后立即释放源权重。
+        virtual bool ShouldLoadWeightSeriallyBeforeOthers(
+                const std::string &tensorName,
+                const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+            return false;
+        }
+
+        // 一组提前读取的权重即将开始读取，模型可预分配目标权重空间。
+        virtual void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) {}
+
         // 某个权重完成加载后，允许模型做额外处理（如拆分 fused MoE 权重）
         virtual void OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) {}
+
+        // 权重加载回调是否已经消费该源权重；若已消费，loader 会跳过后续 merge / cuda 移动。
+        virtual bool IsWeightConsumedAfterLoad(const std::string &weightName) const { return false; }
+
+        // 一组提前读取的权重读取结束，模型可统一删除已消费的源权重占位。
+        virtual void OnWeightLoadGroupFinished() {}
+
+        // 所有权重完成加载后，允许模型做收尾合成。
+        virtual void OnModelWeightsLoaded() {}
+
+        // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
+        virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
 
         // 推理
         virtual int Forward(

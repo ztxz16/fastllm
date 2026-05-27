@@ -343,6 +343,9 @@ namespace fastllm {
     }
 
     bool basellm::MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const {
+        if (this->ShouldDelaySpecialWeightCudaMove(weightName)) {
+            return false;
+        }
         std::string selectedDevice = GetSpecialWeightSelectedDevice(this, weightName);
         if (!DeviceNameMatchesType(selectedDevice, "cuda")) {
             return false;
@@ -2068,6 +2071,12 @@ if (false) {
             readGGUFTasks[i].weight = &model->weight.weight[weightName];
             readGGUFTaskDict[readGGUFTasks[i].name] = &readGGUFTasks[i];
         }
+        model->OnWeightsCreated(allWeightNames);
+        std::stable_sort(tensors.begin(), tensors.end(),
+                         [&](const std::string &a, const std::string &b) {
+                             return model->GetWeightLoadPriority(a, {}) <
+                                    model->GetWeightLoadPriority(b, {});
+                         });
 
         std::vector <std::thread*> threads;
         int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
@@ -2170,6 +2179,7 @@ if (false) {
                                     if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
                                         continue;
                                     }
+                                    std::string mergedWeightName = it.output;
                                     int dim0Len = 0;
                                     for (auto input : it.inputs) {
                                         dim0Len += model->weight[input].dims[0];
@@ -2262,6 +2272,10 @@ if (false) {
                                         model->MoveSpecialWeightToCudaIfNeeded(mergeName, mergeData);
                                     }
 
+                                    locker.lock();
+                                    allFinishNames.insert(mergedWeightName);
+                                    model->OnWeightLoaded(mergedWeightName, allFinishNames);
+                                    locker.unlock();
                                     for (auto input : it.inputs) {
                                         model->weight.weight.erase(input);
                                     }
@@ -2272,10 +2286,13 @@ if (false) {
 #if defined(USE_TFACC) || defined(USE_NUMA)
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceTypes(weightName, {"numa", "tfacc"})) {
-                                    locker.lock();
-                                    model->weight.weight[weightName].weightSum.resize(1);
-                                    RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
-                                    locker.unlock();
+                                    auto weightIt = model->weight.weight.find(weightName);
+                                    if (weightIt != model->weight.weight.end()) {
+                                        locker.lock();
+                                        weightIt->second.weightSum.resize(1);
+                                        RegisterFastllmData(&weightIt->second, model->specialWeights[weightName]);
+                                        locker.unlock();
+                                    }
                                 }
                             } catch (...) {
                             }
@@ -2283,14 +2300,20 @@ if (false) {
 #if defined(USE_NUMAS)
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "numa")) {
-                                    model->weight.weight[weightName].weightSum.resize(1);
-                                    RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);
+                                    auto weightIt = model->weight.weight.find(weightName);
+                                    if (weightIt != model->weight.weight.end()) {
+                                        weightIt->second.weightSum.resize(1);
+                                        RegisterNumas(&weightIt->second, model->specialWeights[weightName]);
+                                    }
                                 }
                             } catch (...) {
                             }
 #endif
                             if (!needMerge) {
-                                model->MoveSpecialWeightToCudaIfNeeded(weightName, model->weight.weight[weightName]);
+                                auto weightIt = model->weight.weight.find(weightName);
+                                if (weightIt != model->weight.weight.end()) {
+                                    model->MoveSpecialWeightToCudaIfNeeded(weightName, weightIt->second);
+                                }
                             }
                         }
 
@@ -2308,6 +2331,7 @@ if (false) {
             threads[i]->join();
             delete threads[i];
         }
+        model->OnModelWeightsLoaded();
 
         printf("\n");
         fflush(stdout);
@@ -2570,13 +2594,43 @@ if (false) {
             printf("Load %d \r", (++cur) * 100 / (int)safeTensors.itmeDict.size());
             fflush(stdout);
         }
+        model->OnWeightsCreated(allWeightNames);
+        std::stable_sort(tensors.begin(), tensors.end(),
+                         [&](const std::string &a, const std::string &b) {
+                             return model->GetWeightLoadPriority(a, tensorMap[a]) <
+                                    model->GetWeightLoadPriority(b, tensorMap[b]);
+                         });
 
         // 4.2 读取
         std::vector <std::thread*> threads;
         int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
-        int per = tensors.size() / threadNum;
         std::mutex locker;
         int cnt = 0;
+        int loadProgressTotal = std::max(1, (int)tensorMap.size());
+        auto printLoadingProgress = [&]() {
+            locker.lock();
+            int progress = std::min(100, (++cnt) * 100 / loadProgressTotal);
+            printf("Loading %d \r", progress);
+            fflush(stdout);
+            locker.unlock();
+        };
+
+        std::vector <std::string> serialTensors, parallelTensors;
+        serialTensors.reserve(tensors.size());
+        parallelTensors.reserve(tensors.size());
+        for (auto &tensorName : tensors) {
+            if (model->ShouldLoadWeightSeriallyBeforeOthers(tensorName, tensorMap[tensorName])) {
+                serialTensors.push_back(tensorName);
+            } else {
+                parallelTensors.push_back(tensorName);
+            }
+        }
+        tensors.swap(parallelTensors);
+        loadProgressTotal = std::max(1, (int)serialTensors.size() + (int)tensors.size());
+        totalBytes = 0;
+        for (auto &tensorName : tensors) {
+            totalBytes += safeTensors.itmeDict[tensorName].bytes;
+        }
 
         std::vector <std::pair <int, int> > parts;
         int start = 0;
@@ -2597,18 +2651,37 @@ if (false) {
             parts.push_back(std::make_pair(-1, -1));
         }
 
-        for (int i = 0; i < threadNum; i++) {
-            int st = per * i, end = (i == threadNum - 1) ? tensors.size() : per * (i + 1);
-            threads.push_back(
-                new std::thread([&](int st, int end) {
+        std::vector <std::string> *activeTensors = &tensors;
+        auto buildSafeTensorParts = [&](const std::vector<std::string> &names,
+                                        int rangeStart, int rangeEnd, int partNum) {
+            std::vector <std::pair <int, int> > ret;
+            partNum = std::max(1, partNum);
+            long long rangeBytes = 0;
+            for (int i = rangeStart; i < rangeEnd; i++) {
+                rangeBytes += safeTensors.itmeDict[names[i]].bytes;
+            }
+            int curStart = rangeStart;
+            for (int i = 0; i < partNum; i++) {
+                int cur = curStart;
+                long long now = 0;
+                while (true) {
+                    if (now * partNum >= rangeBytes || curStart >= rangeEnd) {
+                        break;
+                    }
+                    now += safeTensors.itmeDict[names[curStart]].bytes;
+                    curStart++;
+                }
+                ret.push_back(std::make_pair(cur, curStart));
+            }
+            ret.back().second = rangeEnd;
+            return ret;
+        };
+        auto loadSafeTensorRange = [&](int st, int end) {
                     for (int i = st; i < end; i++) {
-                        auto &tensorName = tensors[i];
+                        auto &tensorName = (*activeTensors)[i];
                         if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
-                            locker.lock();
-                            printf("Loading %d \r", (++cnt) * 100 / (int)tensorMap.size());
-                            fflush(stdout);
-                            locker.unlock();
+                            printLoadingProgress();
                             continue;
                         }
                         auto &tensor = safeTensors.itmeDict[tensorName];
@@ -2823,6 +2896,10 @@ if (false) {
                             locker.lock();
                             allFinishNames.insert(weightName);
                             model->OnWeightLoaded(weightName, allFinishNames);
+                            if (model->IsWeightConsumedAfterLoad(weightName)) {
+                                locker.unlock();
+                                continue;
+                            }
                             // 检查是否需要合并权重
                             bool needMerge = false;
                             for (auto &rule : model->weightMergeRules) {
@@ -2875,6 +2952,7 @@ if (false) {
                                     if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
                                         continue;
                                     }
+                                    std::string mergedWeightName = it.output;
                                     int dim0Len = 0;
                                     for (auto input : it.inputs) {
                                         dim0Len += model->weight[input].dims[0];
@@ -2963,6 +3041,10 @@ if (false) {
                                         }
                                     }
 
+                                    locker.lock();
+                                    allFinishNames.insert(mergedWeightName);
+                                    model->OnWeightLoaded(mergedWeightName, allFinishNames);
+                                    locker.unlock();
                                     for (auto input : it.inputs) {
                                         model->weight.weight.erase(input);
                                     }
@@ -2973,10 +3055,13 @@ if (false) {
 #if defined(USE_TFACC) || defined(USE_NUMA)
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceTypes(weightName, {"numa", "tfacc"})) {
-                                    locker.lock();
-                                    model->weight.weight[weightName].weightSum.resize(1);
-                                    RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
-                                    locker.unlock();
+                                    auto weightIt = model->weight.weight.find(weightName);
+                                    if (weightIt != model->weight.weight.end()) {
+                                        locker.lock();
+                                        weightIt->second.weightSum.resize(1);
+                                        RegisterFastllmData(&weightIt->second, model->specialWeights[weightName]);
+                                        locker.unlock();
+                                    }
                                 }
                             } catch (...) {
                             }
@@ -2984,29 +3069,75 @@ if (false) {
 #if defined(USE_NUMAS)
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "numa")) {
-                                    model->weight.weight[weightName].weightSum.resize(1);
-                                    RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);
+                                    auto weightIt = model->weight.weight.find(weightName);
+                                    if (weightIt != model->weight.weight.end()) {
+                                        weightIt->second.weightSum.resize(1);
+                                        RegisterNumas(&weightIt->second, model->specialWeights[weightName]);
+                                    }
                                 }
                             } catch (...) {
                             }
 #endif
                             if (!needMerge) {
-                                model->MoveSpecialWeightToCudaIfNeeded(weightName, model->weight.weight[weightName]);
+                                auto weightIt = model->weight.weight.find(weightName);
+                                if (weightIt != model->weight.weight.end()) {
+                                    model->MoveSpecialWeightToCudaIfNeeded(weightName, weightIt->second);
+                                }
                             }
                         }
 
-                        locker.lock();
-                        printf("Loading %d \r", (++cnt) * 100 / (int)tensorMap.size());
-                        fflush(stdout);
-                        locker.unlock();
+                        printLoadingProgress();
                     }
-                }, parts[i].first, parts[i].second)
-            );
+        };
+
+        activeTensors = &serialTensors;
+        int serialStart = 0;
+        while (serialStart < (int)serialTensors.size()) {
+            int priority = model->GetWeightLoadPriority(serialTensors[serialStart],
+                                                        tensorMap[serialTensors[serialStart]]);
+            int serialEnd = serialStart + 1;
+            while (serialEnd < (int)serialTensors.size() &&
+                   model->GetWeightLoadPriority(serialTensors[serialEnd],
+                                                tensorMap[serialTensors[serialEnd]]) == priority) {
+                serialEnd++;
+            }
+            std::set<std::string> groupWeightNames;
+            for (int i = serialStart; i < serialEnd; i++) {
+                for (auto &mapped : tensorMap[serialTensors[i]]) {
+                    groupWeightNames.insert(mapped.first);
+                }
+            }
+            model->OnWeightLoadGroupStarted(groupWeightNames);
+            int groupThreadNum = std::min(threadNum, std::max(1, serialEnd - serialStart));
+            if (groupThreadNum <= 1) {
+                loadSafeTensorRange(serialStart, serialEnd);
+            } else {
+                std::vector <std::thread*> groupThreads;
+                auto groupParts = buildSafeTensorParts(serialTensors, serialStart, serialEnd, groupThreadNum);
+                for (auto &part : groupParts) {
+                    if (part.first < part.second) {
+                        groupThreads.push_back(new std::thread(loadSafeTensorRange, part.first, part.second));
+                    }
+                }
+                for (int i = 0; i < groupThreads.size(); i++) {
+                    groupThreads[i]->join();
+                    delete groupThreads[i];
+                }
+            }
+            model->OnWeightLoadGroupFinished();
+            serialStart = serialEnd;
+        }
+        activeTensors = &tensors;
+
+        for (int i = 0; i < threadNum; i++) {
+            threads.push_back(new std::thread(loadSafeTensorRange, parts[i].first, parts[i].second));
         }
         for (int i = 0; i < threads.size(); i++) {
             threads[i]->join();
             delete threads[i];
         }
+        model->OnWeightLoadGroupFinished();
+        model->OnModelWeightsLoaded();
 
         printf("\n");
         fflush(stdout);
