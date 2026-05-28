@@ -377,6 +377,18 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     float llama3OriginalMaxPosition = 131072.0f,
     float llama3LowFreqFactor = 1.0f,
     float llama3HighFreqFactor = 32.0f);
+bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
+    fastllm::Data &qgatekv, fastllm::Data &qNormWeight, fastllm::Data &kNormWeight,
+    const fastllm::Data &positionIds,
+    fastllm::Data &qOutput, fastllm::Data &gateOutput,
+    uint8_t *pagedKData, uint8_t *pagedVData,
+    int32_t *insertIndexs, int32_t *insertPositions,
+    int32_t *lastPageLens,
+    int qHeads, int kHeads, int headDim,
+    int rotaryDim, int sectionT, int sectionH, int sectionW,
+    float eps, float ropeTheta, float ropeScale,
+    int pageLen, fastllm::DataType pagedDataType, int batch,
+    int doQKNorm);
 bool FastllmCudaAdvanceDecodeMeta(
     int32_t *insertPositions, int32_t *lastPageLens, int batch);
 bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale);

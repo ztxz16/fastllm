@@ -146,6 +146,8 @@ namespace fastllm {
         this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CudaQKVRMSNormRopeOp());
         this->ops["QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CudaQKVRMSNormRopeSplitAppendPagedCacheOp());
         this->ops["Step3p5QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CudaQKVRMSNormRopeSplitAppendPagedCacheOp());
+        this->ops["Qwen35QGateKVRMSNormRopeSplitAppendPagedCache"] =
+                (BaseOperator*)(new CudaQwen35QGateKVRMSNormRopeSplitAppendPagedCacheOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CudaRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
@@ -2170,6 +2172,75 @@ namespace fastllm {
             pageLen, pagedKCacheData.dataType, batch, doQKNorm,
             useLlama3, llama3Factor, llama3OriginalMaxPosition,
             llama3LowFreqFactor, llama3HighFreqFactor);
+    }
+
+    void CudaQwen35QGateKVRMSNormRopeSplitAppendPagedCacheOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qgatekv = *(datas.find("qgatekv")->second);
+        Data &qNormWeight = *(datas.find("qNormWeight")->second);
+        Data &kNormWeight = *(datas.find("kNormWeight")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &qOutput = *(datas.find("qOutput")->second);
+        Data &gateOutput = *(datas.find("gateOutput")->second);
+        Data &pagedKCacheData = *(datas.find("pagedKCacheData")->second);
+        Data &pagedVCacheData = *(datas.find("pagedVCacheData")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        Data *lastPageLens = nullptr;
+        auto lastPageLensIt = datas.find("lastPageLens");
+        if (lastPageLensIt != datas.end()) {
+            lastPageLens = lastPageLensIt->second;
+        }
+
+        int qHeads = intParams.find("q_heads")->second;
+        int kHeads = intParams.find("k_heads")->second;
+        int headDim = intParams.find("head_dim")->second;
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int sectionT = intParams.find("sectionT") != intParams.end() ? intParams.find("sectionT")->second : 0;
+        int sectionH = intParams.find("sectionH") != intParams.end() ? intParams.find("sectionH")->second : 0;
+        int sectionW = intParams.find("sectionW") != intParams.end() ? intParams.find("sectionW")->second : 0;
+        int pageLen = intParams.find("pageLen")->second;
+        int batch = intParams.find("batch")->second;
+        int doQKNorm = intParams.find("doQKNorm") != intParams.end() ? intParams.find("doQKNorm")->second : 1;
+        float eps = floatParams.find("eps")->second;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        qOutput.Allocate();
+        gateOutput.Allocate();
+
+        if (lastPageLens != nullptr) {
+            if (lastPageLens->isFake) {
+                lastPageLens->isFake = false;
+                lastPageLens->cudaData = nullptr;
+                lastPageLens->cpuData = nullptr;
+                lastPageLens->expansionSize = 0;
+                lastPageLens->expansionBytes = 0;
+            }
+            for (auto &it : lastPageLens->multiDeviceDatas) {
+                delete it.second;
+            }
+            lastPageLens->multiDeviceDatas.clear();
+            lastPageLens->multiDeviceData = false;
+            lastPageLens->ClearTensorParallelLayout();
+            lastPageLens->dataType = DataType::INT32;
+            lastPageLens->dataDevice = DataDevice::CUDA;
+            lastPageLens->dataDeviceIds = {FastllmCudaGetDevice()};
+            lastPageLens->Resize({batch});
+            lastPageLens->Allocate(false);
+        }
+
+        FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
+            qgatekv, qNormWeight, kNormWeight, positionIds,
+            qOutput, gateOutput,
+            (uint8_t*)pagedKCacheData.cudaData, (uint8_t*)pagedVCacheData.cudaData,
+            (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
+            lastPageLens != nullptr ? (int32_t*)lastPageLens->cudaData : nullptr,
+            qHeads, kHeads, headDim, rotaryDim,
+            sectionT, sectionH, sectionW,
+            eps, ropeTheta, ropeScale, pageLen,
+            pagedKCacheData.dataType, batch, doQKNorm);
     }
 
     void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,

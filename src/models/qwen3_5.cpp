@@ -1224,6 +1224,320 @@ namespace fastllm {
             }
         }
 
+        static void Qwen35CudaQGateKVRMSNormRopeSplitAppendPagedCache(
+                Qwen3CudaDirectRunner &runner,
+                Data &qgatekv,
+                Data &qNormWeight,
+                Data &kNormWeight,
+                const Data &positionIds,
+                Data &qOutput,
+                Data &gateOutput,
+                Data &pagedKCacheData,
+                Data &pagedVCacheData,
+                Data &insertIndexs,
+                Data &insertPositions,
+                int qHeads,
+                int kHeads,
+                int headDim,
+                int rotaryDim,
+                const std::vector<int> &sections,
+                float eps,
+                float ropeTheta,
+                float ropeScale,
+                int pageLen,
+                int batch,
+                bool doQKNorm,
+                Data *lastPageLens) {
+            AssertInFastLLM(qgatekv.dims.size() == 3,
+                            "Qwen3.5 fused gated attention decode expects [bs, seq, dim].\n");
+            int bsz = qgatekv.dims[0];
+            int seqlen = qgatekv.dims[1];
+            qOutput.dataType = qgatekv.dataType;
+            qOutput.UpdateUnitSize();
+            qOutput.Resize({bsz * qHeads, seqlen, headDim});
+            gateOutput.dataType = qgatekv.dataType;
+            gateOutput.UpdateUnitSize();
+            gateOutput.Resize({bsz, seqlen, qHeads * headDim});
+
+            DataDict datas = {
+                    {"qgatekv", &qgatekv},
+                    {"qNormWeight", &qNormWeight},
+                    {"kNormWeight", &kNormWeight},
+                    {"positionIds", (Data*)&positionIds},
+                    {"qOutput", &qOutput},
+                    {"gateOutput", &gateOutput},
+                    {"pagedKCacheData", &pagedKCacheData},
+                    {"pagedVCacheData", &pagedVCacheData},
+                    {"insertIndexs", &insertIndexs},
+                    {"insertPositions", &insertPositions}
+            };
+            std::vector<std::string> outputs = {"qOutput", "gateOutput"};
+            if (lastPageLens != nullptr) {
+                datas["lastPageLens"] = lastPageLens;
+                outputs.push_back("lastPageLens");
+            }
+            runner.Run("Qwen35QGateKVRMSNormRopeSplitAppendPagedCache",
+                       datas,
+                       FloatDict{{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
+                       IntDict{{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
+                               {"rotaryDim", rotaryDim},
+                               {"sectionT", sections.size() > 0 ? sections[0] : 0},
+                               {"sectionH", sections.size() > 1 ? sections[1] : 0},
+                               {"sectionW", sections.size() > 2 ? sections[2] : 0},
+                               {"pageLen", pageLen}, {"batch", batch},
+                               {"doQKNorm", (int)doQKNorm}},
+                       outputs);
+        }
+
+        static void Qwen35CudaAttentionPagedBlock(
+                Qwen3CudaDirectRunner &runner,
+                Data *attenInput,
+                Data *mergeQkvWeight, Data *mergeQkvBias,
+                Data *qNormWeight, Data *kNormWeight,
+                Data *oWeight, Data *oBias,
+                Data *allPositionIds,
+                std::vector<std::pair<Data*, Data*> > *pastKeyValues,
+                std::vector<Data*> *batchPastKeys,
+                std::vector<Data*> *batchPastValues,
+                Data *merged, Data *qgate, Data *gate,
+                Data *q, Data *k, Data *v,
+                Data *attenOutput, Data *attenLastOutput,
+                Data *qForAttentionHolder,
+                Data *insertIndexs, Data *insertPositions,
+                Data *qSizes, Data *pageSizes,
+                Data *pageIndexs, Data *lastPageLens,
+                bool *generatedAppendParams,
+                bool *generatedDecodeParams,
+                int batch, int blockCnt, int layerIdx,
+                const std::vector<int> &seqLens,
+                int numAttentionHeads, int numKeyValueHeads, int headDim,
+                int rotaryDim, const std::vector<int> &mropeSections,
+                float rmsNormEps, float ropeBase, float ropeFactor,
+                int ropeType,
+                bool isPrefill,
+                Data *hiddenStates,
+                int pagedCacheLayerOffset,
+                bool skipOutputProjection,
+                bool externalDecodeMeta,
+                bool enableFlashInferCudaGraph = false,
+                int flashInferCudaGraph = -1) {
+            using namespace qwen3cuda;
+            AssertInFastLLM(attenInput != nullptr && mergeQkvWeight != nullptr &&
+                            mergeQkvBias != nullptr && qNormWeight != nullptr &&
+                            kNormWeight != nullptr && allPositionIds != nullptr &&
+                            pastKeyValues != nullptr && batchPastKeys != nullptr &&
+                            batchPastValues != nullptr && merged != nullptr &&
+                            qgate != nullptr && gate != nullptr && q != nullptr &&
+                            k != nullptr && v != nullptr && attenOutput != nullptr &&
+                            qForAttentionHolder != nullptr && insertIndexs != nullptr &&
+                            insertPositions != nullptr && qSizes != nullptr &&
+                            pageSizes != nullptr && pageIndexs != nullptr &&
+                            lastPageLens != nullptr && generatedAppendParams != nullptr &&
+                            generatedDecodeParams != nullptr,
+                            "Qwen3.5 gated paged attention block got null input.\n");
+            AssertInFastLLM(numAttentionHeads > 0 && numKeyValueHeads > 0 &&
+                            headDim > 0 && numAttentionHeads % numKeyValueHeads == 0,
+                            "Qwen3.5 gated paged attention block got invalid head metadata.\n");
+
+            Qwen3CudaLinear(runner, *attenInput, *mergeQkvWeight, *mergeQkvBias, *merged);
+
+            int bsz = attenInput->dims[0];
+            int seqlen = attenInput->dims[1];
+            int group = numAttentionHeads / numKeyValueHeads;
+            float ropeScale = (ropeType == RoPEType::LINEAR_SCALE) ? ropeFactor : 1.0f;
+
+            for (int b = 0; b < batch; b++) {
+                (*batchPastKeys)[b] = (*pastKeyValues)[b * blockCnt + layerIdx].first;
+                (*batchPastValues)[b] = (*pastKeyValues)[b * blockCnt + layerIdx].second;
+            }
+
+            auto makeCacheDesc = [](const Data &src, DataType targetType) {
+                Data desc(targetType);
+                desc.dims = src.dims;
+                desc.strides = src.strides;
+                desc.dataDevice = src.dataDevice;
+                desc.dataDeviceIds = src.dataDeviceIds;
+                desc.multiDeviceData = src.multiDeviceData;
+                desc.tpLayout = src.tpLayout;
+                desc.tpAxis = src.tpAxis;
+                desc.tpGlobalDims = src.tpGlobalDims;
+                desc.tpRanges = src.tpRanges;
+                desc.UpdateUnitSize();
+                return desc;
+            };
+            auto preparePagedAttentionQ = [&](Data &src, DataType cacheType) -> Data& {
+                DataType targetType;
+                if (cacheType == DataType::FLOAT16 || cacheType == DataType::BFLOAT16) {
+                    targetType = cacheType;
+                } else if (src.dataType == DataType::FLOAT16 || src.dataType == DataType::BFLOAT16) {
+                    targetType = src.dataType;
+                } else {
+                    targetType = attenInput->dataType == DataType::BFLOAT16 ?
+                        DataType::BFLOAT16 : DataType::FLOAT16;
+                }
+                if (src.dataType == targetType) {
+                    return src;
+                }
+                Qwen3CudaConvertToDataType(runner, src, *qForAttentionHolder, targetType);
+                return *qForAttentionHolder;
+            };
+
+            if (!isPrefill && (*batchPastKeys)[0]->pagedKVCacheData == nullptr) {
+                isPrefill = true;
+            }
+
+            if (isPrefill) {
+                int qgateDim = numAttentionHeads * headDim * 2;
+                int kvDim = numKeyValueHeads * headDim;
+                Qwen3CudaSplit(runner, *merged, -1, 0, qgateDim, *qgate);
+                Qwen3CudaSplit(runner, *merged, -1, qgateDim, qgateDim + kvDim, *k);
+                Qwen3CudaSplit(runner, *merged, -1, qgateDim + kvDim, qgateDim + kvDim * 2, *v);
+
+                qgate->Reshape({bsz, seqlen, numAttentionHeads, headDim * 2});
+                Qwen3CudaSplit(runner, *qgate, -1, 0, headDim, *q);
+                Qwen3CudaSplit(runner, *qgate, -1, headDim, headDim * 2, *gate);
+                gate->Reshape({bsz, seqlen, numAttentionHeads * headDim});
+                k->Reshape({bsz, seqlen, numKeyValueHeads, headDim});
+                v->Reshape({bsz, seqlen, numKeyValueHeads, headDim});
+
+                Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
+                Qwen3CudaRMSNorm(runner, *k, *kNormWeight, rmsNormEps, *k);
+                Qwen35CudaApplyRotary(runner, *q, *allPositionIds,
+                                      rotaryDim, mropeSections, ropeBase, ropeScale);
+                Qwen35CudaApplyRotary(runner, *k, *allPositionIds,
+                                      rotaryDim, mropeSections, ropeBase, ropeScale);
+
+                Qwen3CudaPermuteSelf(runner, *q, {0, 2, 1, 3});
+                Qwen3CudaPermuteSelf(runner, *k, {0, 2, 1, 3});
+                Qwen3CudaPermuteSelf(runner, *v, {0, 2, 1, 3});
+                q->Reshape({-1, seqlen, headDim});
+                k->Reshape({-1, seqlen, headDim});
+                v->Reshape({-1, seqlen, headDim});
+
+                if (batch == 1) {
+                    Data &pastKey = *(*batchPastKeys)[0];
+                    Data &pastValue = *(*batchPastValues)[0];
+                    Data kCacheDesc = makeCacheDesc(*k, pastKey.dataType);
+                    Data vCacheDesc = makeCacheDesc(*v, pastValue.dataType);
+                    int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
+                    PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
+                        cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                    PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
+                        cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                    Qwen3CudaAppendPagedCache(runner, *pagedCacheKManager, pastKey, *k);
+                    Qwen3CudaAppendPagedCache(runner, *pagedCacheVManager, pastValue, *v);
+                } else {
+                    int total = 0;
+                    Data curK, curV;
+                    for (int b = 0; b < batch; b++) {
+                        Data &pastKey = *(*batchPastKeys)[b];
+                        Data &pastValue = *(*batchPastValues)[b];
+                        Qwen3CudaSplit(runner, *k, 1, total, total + seqLens[b], curK);
+                        Qwen3CudaSplit(runner, *v, 1, total, total + seqLens[b], curV);
+                        Data kCacheDesc = makeCacheDesc(curK, pastKey.dataType);
+                        Data vCacheDesc = makeCacheDesc(curV, pastValue.dataType);
+                        int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
+                        PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
+                            cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                        PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
+                            cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                        Qwen3CudaAppendPagedCache(runner, *pagedCacheKManager, pastKey, curK);
+                        Qwen3CudaAppendPagedCache(runner, *pagedCacheVManager, pastValue, curV);
+                        total += seqLens[b];
+                    }
+                }
+
+                Data &kCaches = *(*batchPastKeys)[0];
+                Data &vCaches = *(*batchPastValues)[0];
+                Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType);
+                Qwen3CudaGeneratePagedBatchParams(runner, qForAttention, *batchPastKeys, batch,
+                                                  *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                                                  seqLens);
+                Qwen3CudaAttentionPagedBatch(runner, qForAttention,
+                                             kCaches, vCaches,
+                                             *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                                             *attenOutput, group,
+                                             1.0f / std::sqrt((float)headDim),
+                                             1, layerIdx > 0,
+                                             enableFlashInferCudaGraph,
+                                             flashInferCudaGraph);
+                attenOutput->Reshape({1, seqlen, numAttentionHeads * headDim});
+            } else {
+                Data &kCaches = *(*batchPastKeys)[0];
+                Data &vCaches = *(*batchPastValues)[0];
+                PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
+                PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
+                AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
+                                "Qwen3.5 gated paged attention decode requires paged KV cache.\n");
+
+                if (!externalDecodeMeta && !(*generatedAppendParams)) {
+                    Qwen3CudaGenerateAppendPagedCacheBatchParams(runner, *pagedCacheKManager,
+                                                                 *batchPastKeys, batch,
+                                                                 *insertIndexs, *insertPositions);
+                    *generatedAppendParams = true;
+                }
+
+                bool fillLastPageLensOnDevice = merged->dataDevice == DataDevice::CUDA &&
+                                                 !merged->multiDeviceData &&
+                                                 !externalDecodeMeta &&
+                                                 !(*generatedDecodeParams);
+                Qwen35CudaQGateKVRMSNormRopeSplitAppendPagedCache(
+                    runner, *merged, *qNormWeight, *kNormWeight, *allPositionIds,
+                    *q, *gate,
+                    *(Data*)pagedCacheKManager, *(Data*)pagedCacheVManager,
+                    *insertIndexs, *insertPositions,
+                    numAttentionHeads, numKeyValueHeads, headDim,
+                    rotaryDim, mropeSections, rmsNormEps, ropeBase, ropeScale,
+                    kCaches.pageLen, batch, true,
+                    fillLastPageLensOnDevice ? lastPageLens : nullptr);
+
+                if (!externalDecodeMeta) {
+                    for (int b = 0; b < batch; b++) {
+                        auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
+                            if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
+                                cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                                cache->lastPageLen = 1;
+                            } else {
+                                cache->lastPageLen++;
+                            }
+                        };
+                        updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
+                        updatePageMeta((*batchPastValues)[b], pagedCacheVManager);
+                    }
+                }
+                if (!externalDecodeMeta && !(*generatedDecodeParams)) {
+                    Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType);
+                    Qwen3CudaGeneratePagedBatchParams(runner, qForAttention, *batchPastKeys, batch,
+                                                      *qSizes, *pageSizes, *pageIndexs,
+                                                      *lastPageLens, std::vector<int>(),
+                                                      fillLastPageLensOnDevice);
+                    *generatedDecodeParams = true;
+                }
+                Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType);
+                Qwen3CudaAttentionPagedBatch(runner, qForAttention,
+                                             kCaches, vCaches,
+                                             *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                                             *attenOutput, group,
+                                             1.0f / std::sqrt((float)headDim),
+                                             1, layerIdx > 0,
+                                             enableFlashInferCudaGraph,
+                                             flashInferCudaGraph);
+                attenOutput->Reshape({seqlen, bsz, -1});
+                Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
+            }
+
+            Qwen35CudaSigmoid(runner, *gate, *gate);
+            if (gate->dataType != attenOutput->dataType) {
+                Qwen3CudaToDataType(runner, *gate, attenOutput->dataType);
+            }
+            Qwen35CudaMulTo(runner, *attenOutput, *gate);
+
+            if (!skipOutputProjection) {
+                Qwen3CudaLinearAddBlock(runner, attenOutput, oWeight, oBias,
+                                        attenLastOutput, hiddenStates);
+            }
+        }
+
         static bool Qwen35CanUseCudaFullLogitsSampling(
                 const std::vector<GenerationConfig> &generationConfigs,
                 std::vector<std::vector<float>*> *retLogits,
@@ -2363,22 +2677,6 @@ namespace fastllm {
             AssertInFastLLM(heads > 0, "Qwen3.5 ForwardSingleGPU graph got empty local head shard.\n");
             return heads;
         };
-        auto preparePagedAttentionQ = [&](Qwen3CudaDirectRunner &cudaRunner,
-                                          Data &src, DataType cacheType, Data &casted) -> Data& {
-            DataType targetType;
-            if (cacheType == DataType::FLOAT16 || cacheType == DataType::BFLOAT16) {
-                targetType = cacheType;
-            } else if (src.dataType == DataType::FLOAT16 || src.dataType == DataType::BFLOAT16) {
-                targetType = src.dataType;
-            } else {
-                targetType = computeType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
-            }
-            if (src.dataType == targetType) {
-                return src;
-            }
-            qwen3cuda::Qwen3CudaConvertToDataType(cudaRunner, src, casted, targetType);
-            return casted;
-        };
 
         auto runGraphBody = [&]() {
             using namespace qwen3cuda;
@@ -2411,6 +2709,8 @@ namespace fastllm {
                 }
             };
 
+            bool generatedAppendParams = false;
+            bool generatedDecodeParams = false;
             for (int i = 0; i < block_cnt; i++) {
                 std::string prefix = language_prefix + "layers." + std::to_string(i) + ".";
                 std::string inputRmsName = prefix + "input_layernorm.weight";
@@ -2443,62 +2743,34 @@ namespace fastllm {
                                                             num_key_value_heads);
                     }
                     int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
-                    int qgateDim = localQHeads * head_dim * 2;
-                    int kvDim = localKVHeads * head_dim;
-
-                    Qwen3CudaLinear(cudaRunner, buf.attenInput,
-                                    *requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                                    *requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
-                                    buf.merged);
-                    Qwen3CudaSplit(cudaRunner, buf.merged, -1, 0, qgateDim, buf.qgate);
-                    Qwen3CudaSplit(cudaRunner, buf.merged, -1, qgateDim, qgateDim + kvDim, buf.k);
-                    Qwen3CudaSplit(cudaRunner, buf.merged, -1, qgateDim + kvDim,
-                                   qgateDim + kvDim * 2, buf.v);
-
-                    buf.qgate.Reshape({bsz, seqlen, localQHeads, head_dim * 2});
-                    Qwen3CudaSplit(cudaRunner, buf.qgate, -1, 0, head_dim, buf.q);
-                    Qwen3CudaSplit(cudaRunner, buf.qgate, -1, head_dim, head_dim * 2, buf.gate);
-                    buf.gate.Reshape({bsz, seqlen, localQHeads * head_dim});
-                    buf.k.Reshape({bsz, seqlen, localKVHeads, head_dim});
-                    buf.v.Reshape({bsz, seqlen, localKVHeads, head_dim});
-
-                    Qwen3CudaRMSNorm(cudaRunner, buf.q, *requireLocal(weight[qNormName], qNormName),
-                                     rms_norm_eps, buf.q);
-                    Qwen3CudaRMSNorm(cudaRunner, buf.k, *requireLocal(weight[kNormName], kNormName),
-                                     rms_norm_eps, buf.k);
-                    float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
-                    Qwen35CudaApplyRotary(cudaRunner, buf.q, state.positionIds,
-                                          rotary_dim, mrope_sections, rope_base, ropeScale);
-                    Qwen35CudaApplyRotary(cudaRunner, buf.k, state.positionIds,
-                                          rotary_dim, mrope_sections, rope_base, ropeScale);
-
-                    Qwen3CudaPermuteSelf(cudaRunner, buf.q, {0, 2, 1, 3});
-                    Qwen3CudaPermuteSelf(cudaRunner, buf.k, {0, 2, 1, 3});
-                    Qwen3CudaPermuteSelf(cudaRunner, buf.v, {0, 2, 1, 3});
-                    buf.k.Reshape({batch, localKVHeads, head_dim});
-                    buf.v.Reshape({batch, localKVHeads, head_dim});
-                    Qwen35CudaPagedCacheCopyBatch(*pastKeyValues[i].first->pagedKVCacheData,
-                                                  buf.k, buf.insertIndexs, buf.insertPositions);
-                    Qwen35CudaPagedCacheCopyBatch(*pastKeyValues[i].second->pagedKVCacheData,
-                                                  buf.v, buf.insertIndexs, buf.insertPositions);
-                    buf.q.Reshape({batch * localQHeads, seqlen, head_dim});
-
-                    Data &qForAttention = preparePagedAttentionQ(
-                        cudaRunner, buf.q, pastKeyValues[i].first->dataType, buf.qForAttentionHolder);
-                    Qwen3CudaAttentionPagedBatch(cudaRunner, qForAttention,
-                                                 *pastKeyValues[i].first, *pastKeyValues[i].second,
-                                                 buf.qSizes, buf.pageSizes, buf.pageIndexs, buf.lastPageLens,
-                                                 buf.attenOutput,
-                                                 localQHeads / localKVHeads,
-                                                 1.0f / std::sqrt((float)head_dim),
-                                                 1, i > 0, true, 1);
-                    buf.attenOutput.Reshape({1, seqlen, localQHeads * head_dim});
-                    Qwen35CudaSigmoid(cudaRunner, buf.gate, buf.gate);
-                    if (buf.gate.dataType != buf.attenOutput.dataType) {
-                        Qwen3CudaToDataType(cudaRunner, buf.gate, buf.attenOutput.dataType);
-                    }
-                    Qwen35CudaMulTo(cudaRunner, buf.attenOutput, buf.gate);
-
+                    Qwen35CudaAttentionPagedBlock(
+                        cudaRunner,
+                        &buf.attenInput,
+                        requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
+                        requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                        requireLocal(weight[qNormName], qNormName),
+                        requireLocal(weight[kNormName], kNormName),
+                        requireLocal(weight[oWeightName], oWeightName),
+                        requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                        &state.positionIds,
+                        &pastKeyValues,
+                        &buf.batchPastKeys, &buf.batchPastValues,
+                        &buf.merged, &buf.qgate, &buf.gate,
+                        &buf.q, &buf.k, &buf.v,
+                        &buf.attenOutput, &buf.attenLastOutput,
+                        &buf.qForAttentionHolder,
+                        &buf.insertIndexs, &buf.insertPositions,
+                        &buf.qSizes, &buf.pageSizes,
+                        &buf.pageIndexs, &buf.lastPageLens,
+                        &generatedAppendParams, &generatedDecodeParams,
+                        batch, block_cnt, i, seqLens,
+                        localQHeads, localKVHeads, head_dim,
+                        rotary_dim, mrope_sections,
+                        rms_norm_eps, rope_base, rope_factor,
+                        rope_type, isPrefill,
+                        &buf.hiddenStates,
+                        pagedCacheLayerOffset,
+                        true, true, true, 1);
                     Qwen3CudaLinearResidualReduce(
                         cudaRunner, buf.attenOutput,
                         *requireLocal(weight[oWeightName], oWeightName),
@@ -2799,11 +3071,13 @@ namespace fastllm {
         Data attenInput, merged, qgate, gate, q, k, v, attenOutput, attenLastOutput;
         Data qForAttentionHolder;
         Data gateupResult, swigluResult, mlpPart;
-        Data qSizes, pageSizes, pageIndexs, lastPageLens;
+        Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
         Data gdnMerged, qkvConvInput, z, b, a, g, conv, convOutput, coreAttnOut, coreTemp;
         Data qRepeat, kRepeat, qq, qTemp, kkPad, vvPad, bbPad, ggPad, decayMask;
         Data kBeta, vBeta, attn, at, kCumdecay, gExp;
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
+        bool generatedAppendParams = false;
+        bool generatedDecodeParams = false;
 
         auto addPartialToResidualReduce = [&](Data &partial) {
             if (partial.dataType != hiddenStates.dataType) {
@@ -2820,37 +3094,6 @@ namespace fastllm {
             } else {
                 Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
             }
-        };
-
-        auto makeCacheDesc = [](const Data &src, DataType targetType) {
-            Data desc(targetType);
-            desc.dims = src.dims;
-            desc.strides = src.strides;
-            desc.dataDevice = src.dataDevice;
-            desc.dataDeviceIds = src.dataDeviceIds;
-            desc.multiDeviceData = src.multiDeviceData;
-            desc.tpLayout = src.tpLayout;
-            desc.tpAxis = src.tpAxis;
-            desc.tpGlobalDims = src.tpGlobalDims;
-            desc.tpRanges = src.tpRanges;
-            desc.UpdateUnitSize();
-            return desc;
-        };
-
-        auto preparePagedAttentionQ = [&](Data &src, DataType cacheType, Data &casted) -> Data& {
-            DataType targetType;
-            if (cacheType == DataType::FLOAT16 || cacheType == DataType::BFLOAT16) {
-                targetType = cacheType;
-            } else if (src.dataType == DataType::FLOAT16 || src.dataType == DataType::BFLOAT16) {
-                targetType = src.dataType;
-            } else {
-                targetType = computeType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
-            }
-            if (src.dataType == targetType) {
-                return src;
-            }
-            Qwen3CudaConvertToDataType(cudaRunner, src, casted, targetType);
-            return casted;
         };
 
         for (int i = 0; i < block_cnt; i++) {
@@ -2885,98 +3128,34 @@ namespace fastllm {
                                                         num_key_value_heads);
                 }
                 int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
-                int qgateDim = localQHeads * head_dim * 2;
-                int kvDim = localKVHeads * head_dim;
-
-                Qwen3CudaLinear(cudaRunner, attenInput,
-                                *requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                                *requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
-                                merged);
-                Qwen3CudaSplit(cudaRunner, merged, -1, 0, qgateDim, qgate);
-                Qwen3CudaSplit(cudaRunner, merged, -1, qgateDim, qgateDim + kvDim, k);
-                Qwen3CudaSplit(cudaRunner, merged, -1, qgateDim + kvDim, qgateDim + kvDim * 2, v);
-
-                qgate.Reshape({bsz, seqlen, localQHeads, head_dim * 2});
-                Qwen3CudaSplit(cudaRunner, qgate, -1, 0, head_dim, q);
-                Qwen3CudaSplit(cudaRunner, qgate, -1, head_dim, head_dim * 2, gate);
-                gate.Reshape({bsz, seqlen, localQHeads * head_dim});
-                k.Reshape({bsz, seqlen, localKVHeads, head_dim});
-                v.Reshape({bsz, seqlen, localKVHeads, head_dim});
-
-                Qwen3CudaRMSNorm(cudaRunner, q, *requireLocal(weight[qNormName], qNormName),
-                                 rms_norm_eps, q);
-                Qwen3CudaRMSNorm(cudaRunner, k, *requireLocal(weight[kNormName], kNormName),
-                                 rms_norm_eps, k);
-                float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
-                Qwen35CudaApplyRotary(cudaRunner, q, *requireLocal((Data&)positionIds, "positionIds"),
-                                      rotary_dim, mrope_sections, rope_base, ropeScale);
-                Qwen35CudaApplyRotary(cudaRunner, k, *requireLocal((Data&)positionIds, "positionIds"),
-                                      rotary_dim, mrope_sections, rope_base, ropeScale);
-
-                Qwen3CudaPermuteSelf(cudaRunner, q, {0, 2, 1, 3});
-                Qwen3CudaPermuteSelf(cudaRunner, k, {0, 2, 1, 3});
-                Qwen3CudaPermuteSelf(cudaRunner, v, {0, 2, 1, 3});
-                q.Reshape({-1, seqlen, head_dim});
-                k.Reshape({-1, seqlen, head_dim});
-                v.Reshape({-1, seqlen, head_dim});
-
-                for (int bidx = 0; bidx < batch; bidx++) {
-                    batchPastKeys[bidx] = pastKeyValues[bidx * block_cnt + i].first;
-                    batchPastValues[bidx] = pastKeyValues[bidx * block_cnt + i].second;
-                }
-
-                if (batch == 1) {
-                    Data &pastKey = *batchPastKeys[0];
-                    Data &pastValue = *batchPastValues[0];
-                    Data kCacheDesc = makeCacheDesc(k, pastKey.dataType);
-                    Data vCacheDesc = makeCacheDesc(v, pastValue.dataType);
-                    int cacheLayerIdx = pagedCacheLayerOffset + i;
-                    PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                        cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
-                    PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                        cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
-                    Qwen3CudaAppendPagedCache(cudaRunner, *pagedCacheKManager, pastKey, k);
-                    Qwen3CudaAppendPagedCache(cudaRunner, *pagedCacheVManager, pastValue, v);
-                } else {
-                    int total = 0;
-                    Data curK, curV;
-                    for (int bidx = 0; bidx < batch; bidx++) {
-                        Data &pastKey = *batchPastKeys[bidx];
-                        Data &pastValue = *batchPastValues[bidx];
-                        Qwen3CudaSplit(cudaRunner, k, 1, total, total + seqLens[bidx], curK);
-                        Qwen3CudaSplit(cudaRunner, v, 1, total, total + seqLens[bidx], curV);
-                        Data kCacheDesc = makeCacheDesc(curK, pastKey.dataType);
-                        Data vCacheDesc = makeCacheDesc(curV, pastValue.dataType);
-                        int cacheLayerIdx = pagedCacheLayerOffset + i;
-                        PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                            cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
-                        PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                            cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
-                        Qwen3CudaAppendPagedCache(cudaRunner, *pagedCacheKManager, pastKey, curK);
-                        Qwen3CudaAppendPagedCache(cudaRunner, *pagedCacheVManager, pastValue, curV);
-                        total += seqLens[bidx];
-                    }
-                }
-
-                Data &kCaches = *batchPastKeys[0];
-                Data &vCaches = *batchPastValues[0];
-                Data &qForAttention = preparePagedAttentionQ(q, kCaches.dataType, qForAttentionHolder);
-                Qwen3CudaGeneratePagedBatchParams(cudaRunner, qForAttention, batchPastKeys, batch,
-                                                  qSizes, pageSizes, pageIndexs, lastPageLens, seqLens);
-                Qwen3CudaAttentionPagedBatch(cudaRunner, qForAttention,
-                                             kCaches, vCaches,
-                                             qSizes, pageSizes, pageIndexs, lastPageLens,
-                                             attenOutput,
-                                             localQHeads / localKVHeads,
-                                             1.0f / std::sqrt((float)head_dim),
-                                             1, i > 0);
-                attenOutput.Reshape({1, seqlen, localQHeads * head_dim});
-                Qwen35CudaSigmoid(cudaRunner, gate, gate);
-                if (gate.dataType != attenOutput.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, gate, attenOutput.dataType);
-                }
-                Qwen35CudaMulTo(cudaRunner, attenOutput, gate);
-
+                Qwen35CudaAttentionPagedBlock(
+                    cudaRunner,
+                    &attenInput,
+                    requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
+                    requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                    requireLocal(weight[qNormName], qNormName),
+                    requireLocal(weight[kNormName], kNormName),
+                    requireLocal(weight[oWeightName], oWeightName),
+                    requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                    requireLocal((Data&)positionIds, "positionIds"),
+                    &pastKeyValues,
+                    &batchPastKeys, &batchPastValues,
+                    &merged, &qgate, &gate,
+                    &q, &k, &v,
+                    &attenOutput, &attenLastOutput,
+                    &qForAttentionHolder,
+                    &insertIndexs, &insertPositions,
+                    &qSizes, &pageSizes,
+                    &pageIndexs, &lastPageLens,
+                    &generatedAppendParams, &generatedDecodeParams,
+                    batch, block_cnt, i, seqLens,
+                    localQHeads, localKVHeads, head_dim,
+                    rotary_dim, mrope_sections,
+                    rms_norm_eps, rope_base, rope_factor,
+                    rope_type, isPrefill,
+                    &hiddenStates,
+                    pagedCacheLayerOffset,
+                    true, false);
                 Qwen3CudaLinearResidualReduce(
                     cudaRunner, attenOutput,
                     *requireLocal(weight[oWeightName], oWeightName),

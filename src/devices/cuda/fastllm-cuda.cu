@@ -5259,6 +5259,299 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     return true;
 }
 
+// ============================================================
+// Qwen3.5 gated attention decode fusion:
+//   input layout: [Q/Gate interleaved per Q head, K, V]
+//   Q -> RMSNorm + RoPE -> qOutput
+//   Gate -> gateOutput
+//   K -> RMSNorm + RoPE -> paged K cache
+//   V -> paged V cache
+// ============================================================
+template <int THREAD_PER_BLOCK, typename T, typename TKV>
+__global__ void FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel(
+    T *qgatekvData,
+    float *qNormWeight,
+    float *kNormWeight,
+    float *positionIds,
+    T *qOutputData,
+    T *gateOutputData,
+    TKV *pagedKData,
+    TKV *pagedVData,
+    int32_t *insertIndexs,
+    int32_t *insertPositions,
+    int32_t *lastPageLens,
+    int outer,
+    int totalDim,
+    int qHeads,
+    int kHeads,
+    int headDim,
+    int bs,
+    int seqlen,
+    int positionStride,
+    int rotaryDim,
+    int sectionH,
+    int sectionW,
+    int useInterleavedRope,
+    float eps,
+    float ropeTheta,
+    float ropeScale,
+    int pageLen,
+    int batch,
+    int doQKNorm) {
+    int totalHeads = qHeads + kHeads + kHeads;
+    int blockId = blockIdx.x;
+    int tokenId = blockId / totalHeads;
+    int headId = blockId % totalHeads;
+    int physB = tokenId / seqlen;
+    int physL = tokenId % seqlen;
+    int batchIdx = tokenId;
+    unsigned int tid = threadIdx.x;
+
+    if (lastPageLens != nullptr && headId == 0 && tid == 0 && batchIdx < batch) {
+        lastPageLens[batchIdx] = insertPositions[batchIdx] + 1;
+    }
+
+    int qGateDim = qHeads * headDim * 2;
+    T *base = nullptr;
+    float *normWeight = nullptr;
+    bool isQ = headId < qHeads;
+    bool isK = headId >= qHeads && headId < qHeads + kHeads;
+    if (isQ) {
+        base = qgatekvData + (size_t)tokenId * totalDim + headId * headDim * 2;
+        normWeight = qNormWeight;
+    } else if (isK) {
+        int kh = headId - qHeads;
+        base = qgatekvData + (size_t)tokenId * totalDim + qGateDim + kh * headDim;
+        normWeight = kNormWeight;
+    }
+
+    if (isQ || isK) {
+        if (doQKNorm) {
+            __shared__ float sdata[THREAD_PER_BLOCK];
+            __shared__ float scale;
+
+            float localSum2 = 0.0f;
+            for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
+                float x = FastllmCudaValueToFloat(base[i]);
+                localSum2 += x * x;
+            }
+            sdata[tid] = localSum2;
+            __syncthreads();
+
+            for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+                if (tid < s) {
+                    sdata[tid] += sdata[tid + s];
+                }
+                __syncthreads();
+            }
+            if (tid < 32) {
+                volatile float *now = sdata;
+                now[tid] += now[tid + 32];
+                now[tid] += now[tid + 16];
+                now[tid] += now[tid + 8];
+                now[tid] += now[tid + 4];
+                now[tid] += now[tid + 2];
+                now[tid] += now[tid + 1];
+            }
+            __syncthreads();
+
+            if (tid == 0) {
+                scale = 1.0f / sqrtf(sdata[0] / headDim + eps);
+            }
+            __syncthreads();
+
+            for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
+                base[i] = FastllmCudaFloatToValue<T>(
+                    FastllmCudaValueToFloat(base[i]) * scale * normWeight[i]);
+            }
+            __syncthreads();
+        }
+
+        int halfRotate = rotaryDim / 2;
+        if ((int)tid < halfRotate) {
+            int j = tid;
+            float rawPosition;
+            if (useInterleavedRope) {
+                int row = 0;
+                if (j % 3 == 1 && j < sectionH * 3) {
+                    row = 1;
+                } else if (j % 3 == 2 && j < sectionW * 3) {
+                    row = 2;
+                }
+                int logicalL = (outer == batch && batch > 1) ? batchIdx : physL;
+                rawPosition = positionIds[row * positionStride + logicalL];
+            } else {
+                int positionOffset = physB * positionStride + physL;
+                if (outer == batch && batch > 1) {
+                    positionOffset = (positionStride == 1) ? physB : batchIdx;
+                }
+                rawPosition = positionIds[positionOffset];
+            }
+            float position = rawPosition / ropeScale;
+            float freq = position / powf(ropeTheta, (float)(2 * j) / rotaryDim);
+            float curSin = sinf(freq);
+            float curCos = cosf(freq);
+            float va = FastllmCudaValueToFloat(base[j]);
+            float vb = FastllmCudaValueToFloat(base[j + halfRotate]);
+            base[j] = FastllmCudaFloatToValue<T>(va * curCos - vb * curSin);
+            base[j + halfRotate] = FastllmCudaFloatToValue<T>(va * curSin + vb * curCos);
+        }
+        __syncthreads();
+
+        if (isQ) {
+            T *qDst = qOutputData + ((physB * qHeads + headId) * seqlen + physL) * headDim;
+            T *gateBase = qgatekvData + (size_t)tokenId * totalDim + headId * headDim * 2 + headDim;
+            T *gateDst = gateOutputData + (size_t)tokenId * qHeads * headDim + headId * headDim;
+            for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
+                qDst[i] = base[i];
+                gateDst[i] = gateBase[i];
+            }
+        } else {
+            int kh = headId - qHeads;
+            int pageIdx = insertIndexs[batchIdx];
+            int pageOffset = insertPositions[batchIdx];
+            int pageStride = pageLen * kHeads * headDim;
+            int tokenStride = kHeads * headDim;
+            TKV *kDst = pagedKData + (size_t)pageIdx * pageStride +
+                pageOffset * tokenStride + kh * headDim;
+            for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
+                kDst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
+            }
+        }
+    } else {
+        int vh = headId - qHeads - kHeads;
+        T *vBase = qgatekvData + (size_t)tokenId * totalDim + qGateDim + kHeads * headDim + vh * headDim;
+        int pageIdx = insertIndexs[batchIdx];
+        int pageOffset = insertPositions[batchIdx];
+        int pageStride = pageLen * kHeads * headDim;
+        int tokenStride = kHeads * headDim;
+        TKV *vDst = pagedVData + (size_t)pageIdx * pageStride +
+            pageOffset * tokenStride + vh * headDim;
+        for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
+            vDst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(vBase[i]));
+        }
+    }
+}
+
+bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
+    fastllm::Data &qgatekv,
+    fastllm::Data &qNormWeight,
+    fastllm::Data &kNormWeight,
+    const fastllm::Data &positionIds,
+    fastllm::Data &qOutput,
+    fastllm::Data &gateOutput,
+    uint8_t *pagedKData,
+    uint8_t *pagedVData,
+    int32_t *insertIndexs,
+    int32_t *insertPositions,
+    int32_t *lastPageLens,
+    int qHeads, int kHeads, int headDim,
+    int rotaryDim, int sectionT, int sectionH, int sectionW,
+    float eps, float ropeTheta, float ropeScale,
+    int pageLen, fastllm::DataType pagedDataType, int batch,
+    int doQKNorm) {
+    fastllm::AssertInFastLLM(qgatekv.dims.size() == 3,
+                             "FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache expects [bs, seq, dim].\n");
+    int bs = qgatekv.dims[0];
+    int seqlen = qgatekv.dims[1];
+    int totalDim = qgatekv.dims[2];
+    int outer = bs * seqlen;
+    int expectedDim = qHeads * headDim * 2 + kHeads * headDim * 2;
+    fastllm::AssertInFastLLM(totalDim == expectedDim,
+                             "FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache got invalid qgatekv dim.\n");
+    fastllm::AssertInFastLLM(outer == batch,
+                             "FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache is decode-only.\n");
+    int useInterleavedRope = positionIds.dims.size() == 2 && positionIds.dims[0] == 3;
+    if (useInterleavedRope) {
+        fastllm::AssertInFastLLM(sectionT + sectionH + sectionW == rotaryDim / 2,
+                                 "Qwen3.5 fused decode RoPE section sizes must sum to rotary_dim / 2.\n");
+    }
+
+    float *cudaQGateKV = (float*)FastllmCudaPrepareInput(qgatekv);
+    float *cudaPositionIds = (float*)FastllmCudaPrepareInput(positionIds);
+    float *cudaQOutput = (float*)qOutput.cudaData;
+    float *cudaGateOutput = (float*)gateOutput.cudaData;
+
+    int totalHeads = qHeads + kHeads + kHeads;
+    int gridSize = outer * totalHeads;
+    int positionStride = (int)positionIds.dims.back();
+
+    auto launch = [&](auto TPB, auto *qgatekvPtr, auto *qOutputPtr, auto *gateOutputPtr, auto *pagedTag) {
+        using QT = std::remove_pointer_t<decltype(qgatekvPtr)>;
+        using KVT = std::remove_pointer_t<decltype(pagedTag)>;
+        FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel<decltype(TPB)::value, QT, KVT>
+            <<<gridSize, decltype(TPB)::value>>>(
+                qgatekvPtr, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
+                cudaPositionIds, qOutputPtr, gateOutputPtr,
+                (KVT*)pagedKData, (KVT*)pagedVData,
+                insertIndexs, insertPositions, lastPageLens,
+                outer, totalDim, qHeads, kHeads, headDim,
+                bs, seqlen, positionStride, rotaryDim,
+                sectionH, sectionW, useInterleavedRope,
+                eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
+    };
+
+    auto launchByPagedType = [&](auto TPB, auto *qgatekvPtr, auto *qOutputPtr, auto *gateOutputPtr) {
+        if (pagedDataType == fastllm::DataType::FLOAT32) {
+            launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (float*)nullptr);
+        } else if (pagedDataType == fastllm::DataType::FLOAT16) {
+            launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (half*)nullptr);
+        } else if (pagedDataType == fastllm::DataType::BFLOAT16) {
+            launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (__nv_bfloat16*)nullptr);
+        } else if (pagedDataType == fastllm::DataType::FP8_E4M3) {
+            launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (__nv_fp8_e4m3*)nullptr);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache: unsupported pagedDataType.\n");
+        }
+    };
+
+    if (qgatekv.dataType == fastllm::DataType::FLOAT32) {
+        if (headDim <= 64) {
+            launchByPagedType(std::integral_constant<int, 64>{}, (float*)cudaQGateKV,
+                              (float*)cudaQOutput, (float*)cudaGateOutput);
+        } else if (headDim <= 128) {
+            launchByPagedType(std::integral_constant<int, 128>{}, (float*)cudaQGateKV,
+                              (float*)cudaQOutput, (float*)cudaGateOutput);
+        } else {
+            launchByPagedType(std::integral_constant<int, 512>{}, (float*)cudaQGateKV,
+                              (float*)cudaQOutput, (float*)cudaGateOutput);
+        }
+    } else if (qgatekv.dataType == fastllm::DataType::FLOAT16) {
+        if (headDim <= 64) {
+            launchByPagedType(std::integral_constant<int, 64>{}, (half*)cudaQGateKV,
+                              (half*)cudaQOutput, (half*)cudaGateOutput);
+        } else if (headDim <= 128) {
+            launchByPagedType(std::integral_constant<int, 128>{}, (half*)cudaQGateKV,
+                              (half*)cudaQOutput, (half*)cudaGateOutput);
+        } else {
+            launchByPagedType(std::integral_constant<int, 512>{}, (half*)cudaQGateKV,
+                              (half*)cudaQOutput, (half*)cudaGateOutput);
+        }
+    } else if (qgatekv.dataType == fastllm::DataType::BFLOAT16) {
+        if (headDim <= 64) {
+            launchByPagedType(std::integral_constant<int, 64>{}, (__nv_bfloat16*)cudaQGateKV,
+                              (__nv_bfloat16*)cudaQOutput, (__nv_bfloat16*)cudaGateOutput);
+        } else if (headDim <= 128) {
+            launchByPagedType(std::integral_constant<int, 128>{}, (__nv_bfloat16*)cudaQGateKV,
+                              (__nv_bfloat16*)cudaQOutput, (__nv_bfloat16*)cudaGateOutput);
+        } else {
+            launchByPagedType(std::integral_constant<int, 512>{}, (__nv_bfloat16*)cudaQGateKV,
+                              (__nv_bfloat16*)cudaQOutput, (__nv_bfloat16*)cudaGateOutput);
+        }
+    } else {
+        fastllm::ErrorInFastLLM("FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache: unsupported qgatekv dataType.\n");
+    }
+
+    FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    cudaError_t launchError = cudaGetLastError();
+    if (launchError != cudaSuccess) {
+        printf("FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache: kernel launch failed: %s\n",
+               cudaGetErrorString(launchError));
+        return false;
+    }
+    return true;
+}
+
 __global__ void FastllmAdvanceDecodeMetaKernel(
     int32_t *insertPositions,
     int32_t *lastPageLens,

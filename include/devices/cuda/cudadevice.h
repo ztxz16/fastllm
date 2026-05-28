@@ -364,6 +364,11 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    // 融合 Qwen3.5 QGate/K/V RMSNorm/Rope/Split + AppendPagedCacheBatch
+    class CudaQwen35QGateKVRMSNormRopeSplitAppendPagedCacheOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CudaNearlyRotatePosition2DOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
