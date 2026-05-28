@@ -2305,7 +2305,20 @@ void FastllmCudaHostUnregister(void *ptr) {
 }
 
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
-    cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
+    if (size == 0 || dst == src) {
+        return;
+    }
+
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaError_t state = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
+    checkCudaErrors("Error: CUDA error when checking CUDA graph capture status!", state);
+    if (captureStatus != cudaStreamCaptureStatusNone) {
+        state = cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        checkCudaErrors("Error: CUDA error when async copy on GPU!", state);
+        return;
+    }
+
+    state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
     checkCudaErrors("Error: CUDA error when copy on GPU!", state);
     //cudaDeviceSynchronize();
 }
