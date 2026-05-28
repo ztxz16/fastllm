@@ -2411,9 +2411,12 @@ namespace fastllm {
             uint8_t *cpuOutputPinned = nullptr;
 #ifdef USE_CUDA
             if (gpuPrefill && cpuExperts.empty()) {
+                int gpuId = FastllmCudaGetDevice();
                 DoCudaMergeMOEFromCPU (
                     input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, gpuExperts, true
                 );
+                output.dataDevice = DataDevice::CUDA;
+                output.dataDeviceIds = {gpuId};
                 return;
             }
 
@@ -2465,6 +2468,8 @@ namespace fastllm {
                     Data cpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, cpuOutputStaging);
                     FastllmCudaAddTo(gpuOutputAlias, cpuOutputAlias, 1.0f);
                 }
+                output.dataDevice = DataDevice::CUDA;
+                output.dataDeviceIds = {gpuId};
             }
 #endif
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
