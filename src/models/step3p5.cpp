@@ -1170,7 +1170,6 @@ namespace fastllm {
             Data attenOutput;
             Data attenLastOutput;
             Data gate;
-            Data gateRep;
             Data ffMiddle;
             Data ffAct;
             Data ffUp;
@@ -1240,7 +1239,6 @@ namespace fastllm {
             Step3p5FreeReusableTensor(buf.attenOutput);
             Step3p5FreeReusableTensor(buf.attenLastOutput);
             Step3p5FreeReusableTensor(buf.gate);
-            Step3p5FreeReusableTensor(buf.gateRep);
             Step3p5FreeReusableTensor(buf.ffMiddle);
             Step3p5FreeReusableTensor(buf.ffAct);
             Step3p5FreeReusableTensor(buf.ffUp);
@@ -1676,15 +1674,6 @@ namespace fastllm {
             runner.Run("MulTo",
                        DataDict{{"input0", &input0}, {"input1", (Data*)&input1}},
                        FloatDict{{"alpha", alpha}}, IntDict());
-        }
-
-        static void Step3p5CudaRepeat(Qwen3CudaDirectRunner &runner,
-                                      const Data &input, int axis, int repeatTimes,
-                                      Data &output) {
-            runner.Run("Repeat",
-                       DataDict{{"input", (Data*)&input}, {"output", &output}},
-                       FloatDict(), IntDict{{"axis", axis}, {"repeatTimes", repeatTimes}},
-                       {"output"});
         }
 
         static void Step3p5CudaApplyRotary(Qwen3CudaDirectRunner &runner,
@@ -2661,12 +2650,11 @@ namespace fastllm {
                 Step3p5CudaSigmoid(cudaRunner, buf.gate, buf.gate);
                 int bsz = buf.attenInput.dims[0], seqlen = buf.attenInput.dims[1];
                 buf.gate.Reshape({bsz, seqlen, localQHeads, 1});
-                Step3p5CudaRepeat(cudaRunner, buf.gate, 3, head_dim, buf.gateRep);
-                if (buf.gateRep.dataType != buf.attenOutput.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, buf.gateRep, buf.attenOutput.dataType);
+                if (buf.gate.dataType != buf.attenOutput.dataType) {
+                    Qwen3CudaToDataType(cudaRunner, buf.gate, buf.attenOutput.dataType);
                 }
                 buf.attenOutput.Reshape({bsz, seqlen, localQHeads, head_dim});
-                Step3p5CudaMulTo(cudaRunner, buf.attenOutput, buf.gateRep);
+                Step3p5CudaMulTo(cudaRunner, buf.attenOutput, buf.gate);
                 buf.attenOutput.Reshape({bsz, seqlen, localQHeads * head_dim});
 
                 Qwen3CudaLinearResidualReduce(
@@ -2921,7 +2909,7 @@ namespace fastllm {
         }
 
         Data attenInput, qkv, q, qForAttentionHolder, attenOutput, attenLastOutput;
-        Data gate, gateRep;
+        Data gate;
         Data ffMiddle, ffAct, ffUp, ffOut;
         Data routerLogits, routerProb, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp, moeFinal, shareOutput;
@@ -3060,12 +3048,11 @@ namespace fastllm {
             Step3p5CudaSigmoid(cudaRunner, gate, gate);
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             gate.Reshape({bsz, seqlen, localQHeads, 1});
-            Step3p5CudaRepeat(cudaRunner, gate, 3, head_dim, gateRep);
-            if (gateRep.dataType != attenOutput.dataType) {
-                Qwen3CudaToDataType(cudaRunner, gateRep, attenOutput.dataType);
+            if (gate.dataType != attenOutput.dataType) {
+                Qwen3CudaToDataType(cudaRunner, gate, attenOutput.dataType);
             }
             attenOutput.Reshape({bsz, seqlen, localQHeads, head_dim});
-            Step3p5CudaMulTo(cudaRunner, attenOutput, gateRep);
+            Step3p5CudaMulTo(cudaRunner, attenOutput, gate);
             attenOutput.Reshape({bsz, seqlen, localQHeads * head_dim});
 
             Qwen3CudaLinearResidualReduce(
@@ -4335,7 +4322,7 @@ namespace fastllm {
         Data hiddenStates;
         EmbeddingBlock((Data*)&inputIds, &this->weight["model.embed_tokens.weight"], &hiddenStates, this->dataType);
 
-        Data attenInput, q, k, v, qkv, attenOutput, gate, gateRep, mergedQkv;
+        Data attenInput, q, k, v, qkv, attenOutput, gate, mergedQkv;
         Data w1, w2, w3, routerLogits, routerProb, expertIndex, expertScore;
         Data attenPart, moePart, moeFinal, shareOutput;
         Data tempInput, tempOutput;
@@ -4444,12 +4431,11 @@ namespace fastllm {
 
             Sigmoid(gate, gate);
             gate.Reshape({bsz, seqlen, qHeads, 1});
-            Repeat(gate, 3, head_dim, gateRep);
             qkv.Reshape({bsz, seqlen, qHeads, head_dim});
-            if (gateRep.dataType != qkv.dataType) {
-                ToDataType(gateRep, qkv.dataType);
+            if (gate.dataType != qkv.dataType) {
+                ToDataType(gate, qkv.dataType);
             }
-            MulTo(qkv, gateRep);
+            MulTo(qkv, gate);
             qkv.Reshape({bsz, seqlen, qDim});
 
             Linear(qkv, weight[prefix + "self_attn.o_proj.weight"], Data(), attenInput);
