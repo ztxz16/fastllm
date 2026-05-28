@@ -608,20 +608,23 @@ namespace fastllm {
             return hasCuda;
         }
 
+        static bool Qwen3MoeMoeDeviceMapAllowsCudaOnly(const std::map<std::string, int> &moeDeviceMap) {
+            return moeDeviceMap.empty() || Qwen3MoeDeviceMapAllCuda(moeDeviceMap);
+        }
+
         static bool Qwen3MoeCanUseGPUForward(const std::map<std::string, int> &deviceMap,
                                              const std::map<std::string, int> &moeDeviceMap) {
+            (void)moeDeviceMap;
             std::vector<int> devices;
             std::map<int, int> ratios;
-            if (!GetQwen3MoeGPUForwardDevices(deviceMap, devices, ratios)) {
-                return false;
-            }
-            return moeDeviceMap.empty() || Qwen3MoeDeviceMapAllCuda(moeDeviceMap);
+            return GetQwen3MoeGPUForwardDevices(deviceMap, devices, ratios);
         }
 
         static bool Qwen3MoeCanPlanFusedMoe(const std::map<std::string, int> &deviceMap,
                                             const std::map<std::string, int> &moeDeviceMap) {
 #ifdef USE_CUDA
-            return Qwen3MoeCanUseGPUForward(deviceMap, moeDeviceMap);
+            return Qwen3MoeCanUseGPUForward(deviceMap, moeDeviceMap) &&
+                   Qwen3MoeMoeDeviceMapAllowsCudaOnly(moeDeviceMap);
 #else
             (void)deviceMap;
             (void)moeDeviceMap;
@@ -632,7 +635,8 @@ namespace fastllm {
         static bool Qwen3MoeGenericForwardMayUseFusedMoe(const std::map<std::string, int> &deviceMap,
                                                          const std::map<std::string, int> &moeDeviceMap) {
 #ifdef USE_CUDA
-            return Qwen3MoeCanUseGPUForward(deviceMap, moeDeviceMap);
+            return Qwen3MoeCanUseGPUForward(deviceMap, moeDeviceMap) &&
+                   Qwen3MoeMoeDeviceMapAllowsCudaOnly(moeDeviceMap);
 #else
             (void)deviceMap;
             (void)moeDeviceMap;
@@ -907,6 +911,36 @@ namespace fastllm {
             return diff > 1e-6f || diff < -1e-6f;
         }
 
+        static Executor &Qwen3MoeThreadLocalGenericExecutor() {
+            static thread_local std::unique_ptr<Executor> executor;
+            if (executor == nullptr) {
+                executor.reset(new Executor());
+            }
+            return *executor;
+        }
+
+        class Qwen3MoeScopedGenericExecutor {
+        public:
+            explicit Qwen3MoeScopedGenericExecutor(const std::string &firstDevice)
+                    : oldExecutor(GetExecutor()) {
+                Executor &executor = Qwen3MoeThreadLocalGenericExecutor();
+                if (!firstDevice.empty()) {
+                    executor.SetFirstDevice(firstDevice);
+                }
+                SetCurrentThreadExecutor(&executor);
+            }
+
+            ~Qwen3MoeScopedGenericExecutor() {
+                SetCurrentThreadExecutor(oldExecutor);
+            }
+
+            Qwen3MoeScopedGenericExecutor(const Qwen3MoeScopedGenericExecutor&) = delete;
+            Qwen3MoeScopedGenericExecutor &operator=(const Qwen3MoeScopedGenericExecutor&) = delete;
+
+        private:
+            void *oldExecutor;
+        };
+
         static void Qwen3MoeCudaClearMultiDeviceState(Data &data) {
             for (auto &it : data.multiDeviceDatas) {
                 delete it.second;
@@ -914,6 +948,24 @@ namespace fastllm {
             data.multiDeviceDatas.clear();
             data.multiDeviceData = false;
             data.ClearTensorParallelLayout();
+        }
+
+        static void Qwen3MoeResetCpuScratch(Data &data) {
+            if (data.isFake) {
+                data.isFake = false;
+                data.cpuData = nullptr;
+                data.cudaData = nullptr;
+                data.deviceData = nullptr;
+                data.expansionSize = 0;
+                data.expansionBytes = 0;
+            } else {
+                data.FreeSpace();
+            }
+            Qwen3MoeCudaClearMultiDeviceState(data);
+            data.dataDevice = DataDevice::CPU;
+            data.dataDeviceIds.clear();
+            data.lockInCPU = false;
+            data.expansionDims.clear();
         }
 
         static void Qwen3MoeCudaPrepareLocalOutput(Data &data, int device) {
@@ -1906,7 +1958,8 @@ namespace fastllm {
         }
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) ||
+        if (!Qwen3MoeMoeDeviceMapAllowsCudaOnly(this->moeDeviceMap) ||
+            !Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) ||
             !GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
             return;
         }
@@ -2160,7 +2213,7 @@ namespace fastllm {
         std::vector<int> devices;
         std::map<int, int> ratios;
         bool prepareCuda = !Qwen3MoeDisableFusedMoe() &&
-            Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) &&
+            Qwen3MoeCanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) &&
             GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) &&
             !devices.empty();
         if (prepareCuda && Qwen3MoeAllExpertsReady(moeGate3DExpertReady, layer, this->num_experts) &&
@@ -2335,7 +2388,7 @@ namespace fastllm {
         std::vector<int> devices;
         std::map<int, int> ratios;
         bool prepareCuda = !Qwen3MoeDisableFusedMoe() &&
-            Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) &&
+            Qwen3MoeCanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) &&
             GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios) &&
             !devices.empty();
         DivisionScheme interScheme;
@@ -2784,6 +2837,9 @@ namespace fastllm {
         }
         if (inputIds.Count(0) != (uint64_t)batch || positionIds.Count(0) != (uint64_t)batch) {
             return rejectGraph("input/position count mismatch");
+        }
+        if (!Qwen3MoeMoeDeviceMapAllowsCudaOnly(this->moeDeviceMap)) {
+            return rejectGraph("mapped non-cuda moe");
         }
 
         int graphParticipants = tensorParallel ? std::max(2, (int)ratios.size()) : 1;
@@ -3454,6 +3510,7 @@ namespace fastllm {
             bool generatedDecodeParams = false;
             auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
             auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
+            bool useMappedNonCudaMoe = !Qwen3MoeMoeDeviceMapAllowsCudaOnly(this->moeDeviceMap);
 
             for (int i = 0; i < block_cnt; i++) {
                 std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
@@ -3573,7 +3630,29 @@ namespace fastllm {
                 Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
                                       this->num_experts_per_tok, true,
                                       this->routed_scaling_factor, localGateBias);
-                if (HasFusedMoeWeights(i)) {
+                if (useMappedNonCudaMoe) {
+                    if (!tensorParallel || firstTensorParallelRank) {
+                        const auto &effectiveMoeMap = this->moeDeviceMap.empty() ? this->deviceMap : this->moeDeviceMap;
+                        std::string selectedMoeDevice = SelectDeviceFromMap(effectiveMoeMap, i + 1, block_cnt);
+                        Qwen3MoeResetCpuScratch(moeFinal);
+                        FastllmCudaSetDevice(gpuId);
+                        Qwen3MoeScopedGenericExecutor scopedExecutor(selectedMoeDevice);
+                        MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
+                            &weights[i], &biass[i],
+                            &w1, &w2, &w3,
+                            &tempInput, &tempOutput,
+                            1.0f, &moeFinal, i,
+                            computeType, threadTpMoeAtype,
+                            &moeInputTemp, &moeOutputTemp);
+                        FastllmCudaSetDevice(gpuId);
+                        if (moeFinal.dataDevice != DataDevice::CUDA || moeFinal.cudaData == nullptr ||
+                            (!moeFinal.dataDeviceIds.empty() && moeFinal.dataDeviceIds[0] != gpuId)) {
+                            moeFinal.ToDevice(DataDevice::CUDA, {gpuId}, true);
+                        }
+                    } else {
+                        Qwen3MoeZeroCudaLike(moeFinal, hiddenStates, gpuId);
+                    }
+                } else if (HasFusedMoeWeights(i)) {
                     Data *localGate = GetFusedMoeWeightForDevice(moeGate3DWeights[i], gpuId);
                     Data *localUp = GetFusedMoeWeightForDevice(moeUp3DWeights[i], gpuId);
                     Data *localDown = GetFusedMoeWeightForDevice(moeDown3DWeights[i], gpuId);
@@ -3669,8 +3748,9 @@ namespace fastllm {
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
         bool tensorParallel = devices.size() > 1;
-        PrepareMoeWeights(true);
-        bool useFusedMoeWeights = moeFusedWeightsPrepared;
+        bool useMappedNonCudaMoe = !Qwen3MoeMoeDeviceMapAllowsCudaOnly(this->moeDeviceMap);
+        PrepareMoeWeights(!useMappedNonCudaMoe);
+        bool useFusedMoeWeights = !useMappedNonCudaMoe && moeFusedWeightsPrepared;
         bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
         const DataType computeType = ResolveQwen3MoeThreadTpComputeType(this->dataType);
         if (!useCpuEmbedding) {
@@ -3808,7 +3888,8 @@ namespace fastllm {
                                 "Qwen3-MOE ForwardGPU thread TP device config changed after weights were prepared.\n");
                 AssertInFastLLM((int)threadTpKVHeadSchemes.size() == block_cnt &&
                                 !threadTpLmHeadScheme.empty() &&
-                                (useFusedMoeWeights ||
+                                (useMappedNonCudaMoe ||
+                                 useFusedMoeWeights ||
                                  hasMoeCache(threadTpMoeWeights, threadTpMoeBiass)),
                                 "Qwen3-MOE ForwardGPU thread TP cached weight schemes are incomplete.\n");
                 kvHeadSchemes = &threadTpKVHeadSchemes;
@@ -3874,6 +3955,10 @@ namespace fastllm {
                         AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1),
                                         "Qwen3-MOE ForwardGPU failed to split " + oWeightName + ".\n");
 
+                        if (useMappedNonCudaMoe) {
+                            continue;
+                        }
+
                         if (useFusedMoeWeights) {
                             AssertInFastLLM(HasFusedMoeWeights(i),
                                             "Qwen3-MOE fused MoE weights are incomplete.\n");
@@ -3910,7 +3995,10 @@ namespace fastllm {
                         }
                     }
 
-                    if (useFusedMoeWeights) {
+                    if (useMappedNonCudaMoe) {
+                        threadTpMoeWeights.clear();
+                        threadTpMoeBiass.clear();
+                    } else if (useFusedMoeWeights) {
                         PrepareFusedMoeWeightsForDevices(devices, ratios);
                         threadTpMoeWeights.clear();
                         threadTpMoeBiass.clear();
@@ -3933,7 +4021,8 @@ namespace fastllm {
         } else {
             std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
             if (!singleGpuWeightsPrepared.load(std::memory_order_relaxed) ||
-                (!useFusedMoeWeights && !hasMoeCache(singleGpuMoeWeights, singleGpuMoeBiass))) {
+                (!useMappedNonCudaMoe && !useFusedMoeWeights &&
+                 !hasMoeCache(singleGpuMoeWeights, singleGpuMoeBiass))) {
                 int device = devices[0];
                 for (int i = 0; i < block_cnt; i++) {
                     std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
@@ -3948,6 +4037,10 @@ namespace fastllm {
                     mergeW.tpQHeads = num_attention_heads;
                     mergeW.tpKVHeads = num_key_value_heads;
                     mergeW.tpHeadDim = head_dim;
+
+                    if (useMappedNonCudaMoe) {
+                        continue;
+                    }
 
                     if (useFusedMoeWeights) {
                         AssertInFastLLM(HasFusedMoeWeights(i),
@@ -3975,7 +4068,10 @@ namespace fastllm {
                         down.ToDevice(DataDevice::CUDA, {device}, true);
                     }
                 }
-                if (!useFusedMoeWeights) {
+                if (useMappedNonCudaMoe) {
+                    singleGpuMoeWeights.clear();
+                    singleGpuMoeBiass.clear();
+                } else if (!useFusedMoeWeights) {
                     fillMoeCache(singleGpuMoeWeights, singleGpuMoeBiass, false);
                 } else {
                     singleGpuMoeWeights.clear();
