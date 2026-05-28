@@ -4118,6 +4118,40 @@ namespace fastllm {
            {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch}, {"doQKNorm", (int)doQKNorm}});
     }
 
+    void Step3p5QKVRMSNormRopeSplitAppendPagedCache(
+        Data &qkv, Data &qNormWeight, Data &kNormWeight,
+        const Data &positionIds,
+        Data &qOutput,
+        Data &pagedKCacheData, Data &pagedVCacheData,
+        Data &insertIndexs, Data &insertPositions,
+        int q_heads, int k_heads, int head_dim,
+        int rotaryDim, float eps, float ropeTheta,
+        bool useLlama3, float llama3Factor,
+        float llama3OriginalMaxPosition,
+        float llama3LowFreqFactor,
+        float llama3HighFreqFactor,
+        int pageLen, int batch, Data *lastPageLens) {
+        DataDict datas = {
+                {"qkv", &qkv}, {"qNormWeight", &qNormWeight}, {"kNormWeight", &kNormWeight},
+                {"positionIds", (Data*)&positionIds},
+                {"qOutput", &qOutput},
+                {"pagedKCacheData", &pagedKCacheData}, {"pagedVCacheData", &pagedVCacheData},
+                {"insertIndexs", &insertIndexs}, {"insertPositions", &insertPositions}
+        };
+        if (lastPageLens != nullptr) {
+            datas["lastPageLens"] = lastPageLens;
+        }
+        curExecutor->Run("Step3p5QKVRMSNormRopeSplitAppendPagedCache", datas,
+            {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", 1.0f},
+             {"llama3Factor", llama3Factor},
+             {"llama3OriginalMaxPosition", llama3OriginalMaxPosition},
+             {"llama3LowFreqFactor", llama3LowFreqFactor},
+             {"llama3HighFreqFactor", llama3HighFreqFactor}},
+            {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim},
+             {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch},
+             {"doQKNorm", 1}, {"useLlama3", useLlama3 ? 1 : 0}});
+    }
+
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale) {
         curExecutor->Run("RepeatPenalty", {
                 {"input", &input}, {"penalty", (Data*)&penalty}, {"penaltyScale", (Data*)&penaltyScale}

@@ -145,6 +145,7 @@ namespace fastllm {
         this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new CudaQwen35InterleavedRopeOp());
         this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CudaQKVRMSNormRopeOp());
         this->ops["QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CudaQKVRMSNormRopeSplitAppendPagedCacheOp());
+        this->ops["Step3p5QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CudaQKVRMSNormRopeSplitAppendPagedCacheOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CudaRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
@@ -2126,6 +2127,14 @@ namespace fastllm {
         float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
 
         int doQKNorm = intParams.find("doQKNorm") != intParams.end() ? intParams.find("doQKNorm")->second : 1;
+        int useLlama3 = intParams.find("useLlama3") != intParams.end() ? intParams.find("useLlama3")->second : 0;
+        float llama3Factor = floatParams.find("llama3Factor") != floatParams.end() ? floatParams.find("llama3Factor")->second : 1.0f;
+        float llama3OriginalMaxPosition = floatParams.find("llama3OriginalMaxPosition") != floatParams.end() ?
+            floatParams.find("llama3OriginalMaxPosition")->second : 131072.0f;
+        float llama3LowFreqFactor = floatParams.find("llama3LowFreqFactor") != floatParams.end() ?
+            floatParams.find("llama3LowFreqFactor")->second : 1.0f;
+        float llama3HighFreqFactor = floatParams.find("llama3HighFreqFactor") != floatParams.end() ?
+            floatParams.find("llama3HighFreqFactor")->second : 32.0f;
 
         // 分配 qOutput 内存
         qOutput.Allocate();
@@ -2158,7 +2167,9 @@ namespace fastllm {
             (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
             lastPageLens != nullptr ? (int32_t*)lastPageLens->cudaData : nullptr,
             q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
-            pageLen, pagedKCacheData.dataType, batch, doQKNorm);
+            pageLen, pagedKCacheData.dataType, batch, doQKNorm,
+            useLlama3, llama3Factor, llama3OriginalMaxPosition,
+            llama3LowFreqFactor, llama3HighFreqFactor);
     }
 
     void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,

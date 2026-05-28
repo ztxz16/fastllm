@@ -1700,6 +1700,62 @@ namespace fastllm {
             }
         }
 
+        static void Step3p5CudaQKVRMSNormRopeSplitAppendPagedCache(
+                Qwen3CudaDirectRunner &runner,
+                Data &qkv,
+                Data &qNormWeight,
+                Data &kNormWeight,
+                const Data &positionIds,
+                Data &qOutput,
+                Data &pagedKCacheData,
+                Data &pagedVCacheData,
+                Data &insertIndexs,
+                Data &insertPositions,
+                int qHeads,
+                int kHeads,
+                int headDim,
+                int rotaryDim,
+                float eps,
+                float ropeTheta,
+                bool useLlama3,
+                float llama3Factor,
+                float llama3OriginalMaxPosition,
+                float llama3LowFreqFactor,
+                float llama3HighFreqFactor,
+                int pageLen,
+                int batch,
+                Data *lastPageLens) {
+            DataDict datas = {
+                {"qkv", &qkv},
+                {"qNormWeight", &qNormWeight},
+                {"kNormWeight", &kNormWeight},
+                {"positionIds", (Data*)&positionIds},
+                {"qOutput", &qOutput},
+                {"pagedKCacheData", &pagedKCacheData},
+                {"pagedVCacheData", &pagedVCacheData},
+                {"insertIndexs", &insertIndexs},
+                {"insertPositions", &insertPositions}
+            };
+            std::vector<std::string> outputs = {"qOutput"};
+            if (lastPageLens != nullptr) {
+                datas["lastPageLens"] = lastPageLens;
+                outputs.push_back("lastPageLens");
+            }
+            runner.Run("Step3p5QKVRMSNormRopeSplitAppendPagedCache",
+                       datas,
+                       FloatDict{{"eps", eps},
+                                 {"ropeTheta", ropeTheta},
+                                 {"ropeScale", 1.0f},
+                                 {"llama3Factor", llama3Factor},
+                                 {"llama3OriginalMaxPosition", llama3OriginalMaxPosition},
+                                 {"llama3LowFreqFactor", llama3LowFreqFactor},
+                                 {"llama3HighFreqFactor", llama3HighFreqFactor}},
+                       IntDict{{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
+                               {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch},
+                               {"doQKNorm", 1}, {"useLlama3", useLlama3 ? 1 : 0}},
+                       outputs);
+        }
+
         static void Step3p5CudaClamp(Data &input,
                                      bool hasMin, float minValue,
                                      bool hasMax, float maxValue,
@@ -1758,8 +1814,6 @@ namespace fastllm {
                 bool externalDecodeMeta,
                 bool enableFlashInferCudaGraph = false,
                 int flashInferCudaGraph = -1) {
-            (void)generatedAppendParams;
-            (void)generatedDecodeParams;
             mergeQkvWeight->tpPackType = TP_PACK_QKV;
             mergeQkvWeight->tpQHeads = numAttentionHeads;
             mergeQkvWeight->tpKVHeads = numKeyValueHeads;
@@ -1865,6 +1919,123 @@ namespace fastllm {
                     *attenOutput, numAttentionHeads / numKeyValueHeads,
                     1.0f / std::sqrt((float)headDim), 1, layerIdx > 0,
                     enableFlashInferCudaGraph, flashInferCudaGraph);
+                attenOutput->Reshape({seqlen, bsz, -1});
+                Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
+                return;
+            }
+
+            if (!isPrefill && (*batchPastKeys)[0]->pagedKVCacheData == nullptr) {
+                isPrefill = true;
+            }
+
+            bool singleTokenDecode = (bsz * seqlen == batch);
+            for (int len : seqLens) {
+                singleTokenDecode = singleTokenDecode && (len == 1);
+            }
+
+            if (!isPrefill && !kvCacheInCPU && singleTokenDecode) {
+                AssertInFastLLM(qSizes != nullptr && pageSizes != nullptr &&
+                                pageIndexs != nullptr && lastPageLens != nullptr,
+                                "Step3p5 fused decode attention requires paged batch metadata buffers.\n");
+
+                Data &kCaches = *(*batchPastKeys)[0];
+                Data &vCaches = *(*batchPastValues)[0];
+                PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
+                PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
+                AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
+                                "Step3p5 fused decode attention requires paged KV cache managers.\n");
+
+                Data &pagedKData = *(Data*)pagedCacheKManager;
+                Data &pagedVData = *(Data*)pagedCacheVManager;
+                AssertInFastLLM(pagedKData.dims.size() == 4 && pagedVData.dims.size() == 4 &&
+                                pagedKData.cudaData != nullptr && pagedVData.cudaData != nullptr,
+                                "Step3p5 fused decode attention requires allocated paged KV cache data.\n");
+
+                Data localInsertIndexs, localInsertPositions;
+                Data &decodeInsertIndexs = insertIndexs == nullptr ? localInsertIndexs : *insertIndexs;
+                Data &decodeInsertPositions = insertPositions == nullptr ? localInsertPositions : *insertPositions;
+                bool appendParamsReady =
+                    generatedAppendParams != nullptr && *generatedAppendParams &&
+                    decodeInsertIndexs.cudaData != nullptr && decodeInsertPositions.cudaData != nullptr;
+                if (!appendParamsReady) {
+                    Qwen3CudaGenerateAppendPagedCacheBatchParams(runner, *pagedCacheKManager,
+                        *batchPastKeys, batch, decodeInsertIndexs, decodeInsertPositions);
+                    if (generatedAppendParams != nullptr &&
+                        insertIndexs != nullptr && insertPositions != nullptr) {
+                        *generatedAppendParams = true;
+                    }
+                }
+
+                q->dataType = qkv->dataType;
+                q->UpdateUnitSize();
+                q->Resize({bsz * numAttentionHeads, seqlen, headDim});
+
+                bool decodeParamsReady =
+                    generatedDecodeParams != nullptr && *generatedDecodeParams &&
+                    qSizes->cudaData != nullptr && pageSizes->cudaData != nullptr &&
+                    pageIndexs->cudaData != nullptr && lastPageLens->cudaData != nullptr;
+                bool fillLastPageLensOnDevice =
+                    qkv->dataDevice == DataDevice::CUDA && !qkv->multiDeviceData &&
+                    !decodeParamsReady;
+
+                Step3p5CudaQKVRMSNormRopeSplitAppendPagedCache(runner, *qkv,
+                    *qNormWeight, *kNormWeight,
+                    *allPositionIds,
+                    *q,
+                    pagedKData, pagedVData,
+                    decodeInsertIndexs, decodeInsertPositions,
+                    numAttentionHeads, numKeyValueHeads, headDim,
+                    rotaryDim, rmsNormEps, ropeTheta,
+                    useLlama3, ropeFactor,
+                    llama3OriginalMaxPosition,
+                    llama3LowFreqFactor,
+                    llama3HighFreqFactor,
+                    pagedKData.dims[1], batch,
+                    fillLastPageLensOnDevice ? lastPageLens : nullptr);
+
+                for (int b = 0; b < batch; b++) {
+                    auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
+                        if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
+                            cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                            cache->lastPageLen = 1;
+                        } else {
+                            cache->lastPageLen++;
+                        }
+                    };
+                    updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
+                    updatePageMeta((*batchPastValues)[b], pagedCacheVManager);
+                }
+
+                auto resolvePagedAttentionQType = [&](DataType cacheType, DataType queryType) -> DataType {
+                    if (cacheType == DataType::FP8_E4M3) {
+                        return queryType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
+                    }
+                    if (queryType == DataType::FLOAT16 || queryType == DataType::BFLOAT16) {
+                        return queryType;
+                    }
+                    return DataType::FLOAT16;
+                };
+                DataType targetType = resolvePagedAttentionQType(kCaches.dataType, q->dataType);
+                Data *qForAttention = q;
+                if (q->dataType != targetType) {
+                    Qwen3CudaConvertToDataType(runner, *q, *qForAttentionHolder, targetType);
+                    qForAttention = qForAttentionHolder;
+                }
+
+                if (!decodeParamsReady) {
+                    Qwen3CudaGeneratePagedBatchParams(runner, *qForAttention, *batchPastKeys, batch,
+                                                      *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                                                      std::vector<int>(), fillLastPageLensOnDevice);
+                    if (generatedDecodeParams != nullptr) {
+                        *generatedDecodeParams = true;
+                    }
+                }
+
+                Qwen3CudaAttentionPagedBatch(runner, *qForAttention,
+                                             kCaches, vCaches,
+                                             *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                                             *attenOutput, numAttentionHeads / numKeyValueHeads,
+                                             1.0f / std::sqrt((float)headDim), 1, layerIdx > 0);
                 attenOutput->Reshape({seqlen, bsz, -1});
                 Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
                 return;
@@ -2913,7 +3084,9 @@ namespace fastllm {
         Data ffMiddle, ffAct, ffUp, ffOut;
         Data routerLogits, routerProb, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp, moeFinal, shareOutput;
-        Data qSizes, pageSizes, pageIndexs, lastPageLens;
+        Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
+        bool generatedAppendParams = false;
+        bool generatedDecodeParams = false;
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
         auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
         auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
@@ -3022,9 +3195,9 @@ namespace fastllm {
                 &batchPastKeys, &batchPastValues,
                 &qkv, &q, nullptr, nullptr, &attenOutput,
                 &qForAttentionHolder,
-                nullptr, nullptr,
+                &insertIndexs, &insertPositions,
                 &qSizes, &pageSizes, &pageIndexs, &lastPageLens,
-                nullptr, nullptr,
+                &generatedAppendParams, &generatedDecodeParams,
                 batch, block_cnt, i,
                 seqLens,
                 localQHeads, localKVHeads, head_dim,
@@ -4250,8 +4423,8 @@ namespace fastllm {
             return ret;
         };
 
-        auto canRunFusedBatchDecode = [&]() -> bool {
-            if (batch <= 1 || !all1 || (int)pastKeyValues.size() < batch * block_cnt) {
+        auto canRunFusedDecode = [&]() -> bool {
+            if (!all1 || (int)pastKeyValues.size() < batch * block_cnt) {
                 return false;
             }
             for (int b = 0; b < batch; b++) {
@@ -4273,7 +4446,7 @@ namespace fastllm {
             return true;
         };
 
-        if (batch > 1 && !canRunFusedBatchDecode()) {
+        if (batch > 1 && !canRunFusedDecode()) {
             return runSplitBatchForward();
         }
 
@@ -4345,11 +4518,9 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
 
             std::string mergeQkvWeightName = prefix + "self_attn.mergeqkv.weight";
-            if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
+            bool hasMergedQkv = weight.weight.find(mergeQkvWeightName) != weight.weight.end();
+            if (hasMergedQkv) {
                 Linear(attenInput, weight[mergeQkvWeightName], Data(), mergedQkv);
-                Split(mergedQkv, -1, 0, qDim, q);
-                Split(mergedQkv, -1, qDim, qDim + kvDim, k);
-                Split(mergedQkv, -1, qDim + kvDim, qDim + kvDim * 2, v);
             } else {
                 Linear(attenInput, weight[prefix + "self_attn.q_proj.weight"], Data(), q);
                 Linear(attenInput, weight[prefix + "self_attn.k_proj.weight"], Data(), k);
@@ -4357,22 +4528,9 @@ namespace fastllm {
             }
             Linear(attenInput, weight[prefix + "self_attn.g_proj.weight"], Data(), gate);
 
-            q.Reshape({bsz, seqlen, qHeads, head_dim});
-            k.Reshape({bsz, seqlen, kvHeads, head_dim});
-            v.Reshape({bsz, seqlen, kvHeads, head_dim});
-            RMSNorm(q, this->weight[prefix + "self_attn.q_norm.weight"], rms_norm_eps, q);
-            RMSNorm(k, this->weight[prefix + "self_attn.k_norm.weight"], rms_norm_eps, k);
-            ApplyStepRotary(q, allPositionIds, i);
-            ApplyStepRotary(k, allPositionIds, i);
-
-            PermuteSelf(q, {0, 2, 1, 3});
-            PermuteSelf(k, {0, 2, 1, 3});
-            PermuteSelf(v, {0, 2, 1, 3});
-            q.Reshape({-1, seqlen, head_dim});
-            k.Reshape({-1, seqlen, head_dim});
-            v.Reshape({-1, seqlen, head_dim});
-
-            if (batch > 1 && all1) {
+            bool usedFusedDecodeAttention = false;
+            if (hasMergedQkv && canRunFusedDecode() &&
+                mergedQkv.dataDevice == DataDevice::CUDA && !mergedQkv.multiDeviceData) {
                 for (int b = 0; b < batch; b++) {
                     batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
                     batchPastValues[b] = pastKeyValues[b * block_cnt + i].second;
@@ -4385,42 +4543,140 @@ namespace fastllm {
                 AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
                                 "Step3p5 fused batch decode requires paged KV cache.");
 
+                Data &pagedKData = *(Data*)pagedCacheKManager;
+                Data &pagedVData = *(Data*)pagedCacheVManager;
                 if (!generatedAppendPagedCacheBatchParams) {
                     GenerateAppendPagedCacheBatchParams(*pagedCacheKManager, batchPastKeys, batch,
                                                         insertIndexs, insertPositions);
                     generatedAppendPagedCacheBatchParams = true;
                 }
 
-                Data kAppend, vAppend;
-                Permute(k, {1, 0, 2}, kAppend);
-                Permute(v, {1, 0, 2}, vAppend);
-                AppendPagedCacheBatch(*pagedCacheKManager, batchPastKeys, kAppend, insertIndexs, insertPositions);
-                AppendPagedCacheBatch(*pagedCacheVManager, batchPastValues, vAppend, insertIndexs, insertPositions);
+                q.dataType = mergedQkv.dataType;
+                q.UpdateUnitSize();
+                q.Resize({bsz * qHeads, seqlen, head_dim});
+                bool fillLastPageLensOnDevice =
+                    !generatedBatchDecodeParams &&
+                    mergedQkv.dataDevice == DataDevice::CUDA && !mergedQkv.multiDeviceData;
+
+                Step3p5QKVRMSNormRopeSplitAppendPagedCache(
+                    mergedQkv,
+                    this->weight[prefix + "self_attn.q_norm.weight"],
+                    this->weight[prefix + "self_attn.k_norm.weight"],
+                    allPositionIds,
+                    q,
+                    pagedKData, pagedVData,
+                    insertIndexs, insertPositions,
+                    qHeads, kvHeads, head_dim,
+                    i < (int)layer_rotary_dims.size() ? layer_rotary_dims[i] : head_dim,
+                    rms_norm_eps,
+                    i < (int)layer_rope_thetas.size() ? layer_rope_thetas[i] : rope_base,
+                    UseLlama3Rope(i), rope_factor,
+                    llama3_original_max_position_embeddings,
+                    llama3_low_freq_factor,
+                    llama3_high_freq_factor,
+                    pagedKData.dims[1], batch,
+                    fillLastPageLensOnDevice ? &lastPageLens : nullptr);
+
+                for (int b = 0; b < batch; b++) {
+                    auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
+                        if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
+                            cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                            cache->lastPageLen = 1;
+                        } else {
+                            cache->lastPageLen++;
+                        }
+                    };
+                    updatePageMeta(batchPastKeys[b], pagedCacheKManager);
+                    updatePageMeta(batchPastValues[b], pagedCacheVManager);
+                }
 
                 Data qForAttentionHolder;
                 Data &qForAttention = Step3p5PreparePagedAttentionQ(q, kCaches.dataType, this->dataType, qForAttentionHolder);
                 if (!generatedBatchDecodeParams) {
                     GeneratePagedBatchParams(qForAttention, batchPastKeys, batch,
-                                             qSizes, pageSizes, pageIndexs, lastPageLens);
+                                             qSizes, pageSizes, pageIndexs, lastPageLens,
+                                             std::vector<int>(), fillLastPageLensOnDevice);
                     generatedBatchDecodeParams = true;
                 }
                 AttentionPagedBatch(qForAttention, kCaches, vCaches,
                                     qSizes, pageSizes, pageIndexs, lastPageLens,
                                     qkv, qForAttention.dims[0] / kCaches.dims[0],
                                     1.0f / sqrt((float)head_dim), 1, false);
-            } else {
-                Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
-                PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
-                PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
-                AppendPagedCache(*pagedCacheKManager, pastKey, k);
-                AppendPagedCache(*pagedCacheVManager, pastValue, v);
-                AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0],
-                               1.0f / sqrt((float)head_dim), 1, false);
+                usedFusedDecodeAttention = true;
             }
 
-            if (batch > 1 && all1) {
+            if (!usedFusedDecodeAttention) {
+                if (hasMergedQkv) {
+                    Split(mergedQkv, -1, 0, qDim, q);
+                    Split(mergedQkv, -1, qDim, qDim + kvDim, k);
+                    Split(mergedQkv, -1, qDim + kvDim, qDim + kvDim * 2, v);
+                }
+
+                q.Reshape({bsz, seqlen, qHeads, head_dim});
+                k.Reshape({bsz, seqlen, kvHeads, head_dim});
+                v.Reshape({bsz, seqlen, kvHeads, head_dim});
+                RMSNorm(q, this->weight[prefix + "self_attn.q_norm.weight"], rms_norm_eps, q);
+                RMSNorm(k, this->weight[prefix + "self_attn.k_norm.weight"], rms_norm_eps, k);
+                ApplyStepRotary(q, allPositionIds, i);
+                ApplyStepRotary(k, allPositionIds, i);
+
+                PermuteSelf(q, {0, 2, 1, 3});
+                PermuteSelf(k, {0, 2, 1, 3});
+                PermuteSelf(v, {0, 2, 1, 3});
+                q.Reshape({-1, seqlen, head_dim});
+                k.Reshape({-1, seqlen, head_dim});
+                v.Reshape({-1, seqlen, head_dim});
+
+                if (batch > 1 && all1) {
+                    for (int b = 0; b < batch; b++) {
+                        batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
+                        batchPastValues[b] = pastKeyValues[b * block_cnt + i].second;
+                    }
+
+                    Data &kCaches = *batchPastKeys[0];
+                    Data &vCaches = *batchPastValues[0];
+                    PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
+                    PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
+                    AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
+                                    "Step3p5 fused batch decode requires paged KV cache.");
+
+                    if (!generatedAppendPagedCacheBatchParams) {
+                        GenerateAppendPagedCacheBatchParams(*pagedCacheKManager, batchPastKeys, batch,
+                                                            insertIndexs, insertPositions);
+                        generatedAppendPagedCacheBatchParams = true;
+                    }
+
+                    Data kAppend, vAppend;
+                    Permute(k, {1, 0, 2}, kAppend);
+                    Permute(v, {1, 0, 2}, vAppend);
+                    AppendPagedCacheBatch(*pagedCacheKManager, batchPastKeys, kAppend, insertIndexs, insertPositions);
+                    AppendPagedCacheBatch(*pagedCacheVManager, batchPastValues, vAppend, insertIndexs, insertPositions);
+
+                    Data qForAttentionHolder;
+                    Data &qForAttention = Step3p5PreparePagedAttentionQ(q, kCaches.dataType, this->dataType, qForAttentionHolder);
+                    if (!generatedBatchDecodeParams) {
+                        GeneratePagedBatchParams(qForAttention, batchPastKeys, batch,
+                                                 qSizes, pageSizes, pageIndexs, lastPageLens);
+                        generatedBatchDecodeParams = true;
+                    }
+                    AttentionPagedBatch(qForAttention, kCaches, vCaches,
+                                        qSizes, pageSizes, pageIndexs, lastPageLens,
+                                        qkv, qForAttention.dims[0] / kCaches.dims[0],
+                                        1.0f / sqrt((float)head_dim), 1, false);
+                } else {
+                    Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
+                    PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
+                        i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                    PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
+                        i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                    AppendPagedCache(*pagedCacheKManager, pastKey, k);
+                    AppendPagedCache(*pagedCacheVManager, pastValue, v);
+                    AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0],
+                                   1.0f / sqrt((float)head_dim), 1, false);
+                }
+            }
+
+            if (usedFusedDecodeAttention || (batch > 1 && all1)) {
                 qkv.Reshape({seqlen, bsz, -1});
                 PermuteSelf(qkv, {1, 0, 2});
             } else {

@@ -1028,6 +1028,20 @@ namespace fastllm {
         int rotaryDim, float eps, float ropeTheta, float ropeScale,
         int pageLen, int batch, bool doQKNorm = true, Data *lastPageLens = nullptr);
 
+    void Step3p5QKVRMSNormRopeSplitAppendPagedCache(
+        Data &qkv, Data &qNormWeight, Data &kNormWeight,
+        const Data &positionIds,
+        Data &qOutput,
+        Data &pagedKCacheData, Data &pagedVCacheData,
+        Data &insertIndexs, Data &insertPositions,
+        int q_heads, int k_heads, int head_dim,
+        int rotaryDim, float eps, float ropeTheta,
+        bool useLlama3, float llama3Factor,
+        float llama3OriginalMaxPosition,
+        float llama3LowFreqFactor,
+        float llama3HighFreqFactor,
+        int pageLen, int batch, Data *lastPageLens = nullptr);
+
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale); // 重复惩罚
 
     void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds);
