@@ -118,6 +118,133 @@ namespace fastllm {
                    FloatDict{{"eps", eps}}, IntDict{{"start", start}, {"end", end}}, {"output"});
     }
 
+    inline void Qwen3CudaRMSNormPartGlobal(Qwen3CudaDirectRunner &runner,
+                                           Data &input, Data &weight,
+                                           float eps, int start, int end,
+                                           int partChannelsGlobal, Data &output) {
+        int partChannelsLocal = end - start;
+        if (partChannelsGlobal <= 0 || partChannelsGlobal == partChannelsLocal) {
+            Qwen3CudaRMSNormPart(runner, input, weight, eps, start, end, output);
+            return;
+        }
+
+        AssertInFastLLM(&input == &output,
+                        "Qwen3CudaRMSNormPartGlobal currently requires in-place output.\n");
+        AssertInFastLLM(input.dataDevice == DataDevice::CUDA && input.cudaData != nullptr,
+                        "Qwen3CudaRMSNormPartGlobal requires CUDA input.\n");
+        AssertInFastLLM(weight.dataDevice == DataDevice::CUDA && weight.cudaData != nullptr,
+                        "Qwen3CudaRMSNormPartGlobal requires CUDA weight.\n");
+        AssertInFastLLM(input.dims.size() > 0,
+                        "Qwen3CudaRMSNormPartGlobal requires non-empty input dims.\n");
+
+        int axis = (int)input.dims.size() - 1;
+        int outer = input.Count(0) / input.Count(axis);
+        if (outer <= 0 || partChannelsLocal <= 0) {
+            return;
+        }
+
+        FastllmCudaSetDevice(runner.DeviceId());
+        float *sumBuffer = (float*)FastllmCudaMalloc(sizeof(float) * (size_t)outer);
+        AssertInFastLLM(sumBuffer != nullptr,
+                        "Qwen3CudaRMSNormPartGlobal failed to allocate sum buffer.\n");
+
+        bool ok = FastllmCudaRMSNormPartSum2(input, sumBuffer, start, end);
+        ForceDeviceSync();
+        if (ok) {
+            FastllmNcclAllReduce(sumBuffer, sumBuffer, outer,
+                                 (int)DataType::FLOAT32, runner.DeviceId());
+            ForceDeviceSync();
+            ok = FastllmCudaRMSNormPartApply(input, weight, output, sumBuffer,
+                                             eps, start, end, partChannelsGlobal);
+            ForceDeviceSync();
+        }
+
+        FastllmCudaFree(sumBuffer);
+        AssertInFastLLM(ok, "Qwen3CudaRMSNormPartGlobal failed.\n");
+    }
+
+    inline void Qwen3CudaRMSNormTwoPartsGlobal(Qwen3CudaDirectRunner &runner,
+                                               Data &input,
+                                               Data &firstWeight,
+                                               Data &secondWeight,
+                                               float eps,
+                                               int firstStart,
+                                               int firstEnd,
+                                               int firstChannelsGlobal,
+                                               int secondStart,
+                                               int secondEnd,
+                                               int secondChannelsGlobal,
+                                               Data &output) {
+        AssertInFastLLM(&input == &output,
+                        "Qwen3CudaRMSNormTwoPartsGlobal currently requires in-place output.\n");
+        int firstChannelsLocal = firstEnd - firstStart;
+        int secondChannelsLocal = secondEnd - secondStart;
+        bool firstNeedsReduce = firstChannelsGlobal > 0 &&
+                                firstChannelsGlobal != firstChannelsLocal;
+        bool secondNeedsReduce = secondChannelsGlobal > 0 &&
+                                 secondChannelsGlobal != secondChannelsLocal;
+        if (!firstNeedsReduce && !secondNeedsReduce) {
+            Qwen3CudaRMSNormPart(runner, input, firstWeight, eps,
+                                 firstStart, firstEnd, output);
+            Qwen3CudaRMSNormPart(runner, input, secondWeight, eps,
+                                 secondStart, secondEnd, output);
+            return;
+        }
+        if (!firstNeedsReduce || !secondNeedsReduce) {
+            Qwen3CudaRMSNormPartGlobal(runner, input, firstWeight, eps,
+                                       firstStart, firstEnd,
+                                       firstChannelsGlobal, output);
+            Qwen3CudaRMSNormPartGlobal(runner, input, secondWeight, eps,
+                                       secondStart, secondEnd,
+                                       secondChannelsGlobal, output);
+            return;
+        }
+
+        AssertInFastLLM(input.dataDevice == DataDevice::CUDA && input.cudaData != nullptr,
+                        "Qwen3CudaRMSNormTwoPartsGlobal requires CUDA input.\n");
+        AssertInFastLLM(firstWeight.dataDevice == DataDevice::CUDA &&
+                        firstWeight.cudaData != nullptr &&
+                        secondWeight.dataDevice == DataDevice::CUDA &&
+                        secondWeight.cudaData != nullptr,
+                        "Qwen3CudaRMSNormTwoPartsGlobal requires CUDA weights.\n");
+        AssertInFastLLM(input.dims.size() > 0,
+                        "Qwen3CudaRMSNormTwoPartsGlobal requires non-empty input dims.\n");
+
+        int axis = (int)input.dims.size() - 1;
+        int outer = input.Count(0) / input.Count(axis);
+        if (outer <= 0 || firstChannelsLocal <= 0 || secondChannelsLocal <= 0) {
+            return;
+        }
+
+        FastllmCudaSetDevice(runner.DeviceId());
+        float *sumBuffer = (float*)FastllmCudaMalloc(sizeof(float) * (size_t)outer * 2);
+        AssertInFastLLM(sumBuffer != nullptr,
+                        "Qwen3CudaRMSNormTwoPartsGlobal failed to allocate sum buffer.\n");
+
+        bool ok = FastllmCudaRMSNormPartSum2(input, sumBuffer,
+                                             firstStart, firstEnd) &&
+                  FastllmCudaRMSNormPartSum2(input, sumBuffer + outer,
+                                             secondStart, secondEnd);
+        ForceDeviceSync();
+        if (ok) {
+            FastllmNcclAllReduce(sumBuffer, sumBuffer, outer * 2,
+                                 (int)DataType::FLOAT32, runner.DeviceId());
+            ForceDeviceSync();
+            ok = FastllmCudaRMSNormPartApply(input, firstWeight, output,
+                                             sumBuffer, eps,
+                                             firstStart, firstEnd,
+                                             firstChannelsGlobal) &&
+                 FastllmCudaRMSNormPartApply(input, secondWeight, output,
+                                             sumBuffer + outer, eps,
+                                             secondStart, secondEnd,
+                                             secondChannelsGlobal);
+            ForceDeviceSync();
+        }
+
+        FastllmCudaFree(sumBuffer);
+        AssertInFastLLM(ok, "Qwen3CudaRMSNormTwoPartsGlobal failed.\n");
+    }
+
     inline void Qwen3CudaLinear(Qwen3CudaDirectRunner &runner,
                                 Data &input, Data &weight,
                                 const Data &bias, Data &output,
@@ -534,7 +661,9 @@ namespace fastllm {
             bool skipOutputProjection,
             bool externalDecodeMeta,
             bool enableFlashInferCudaGraph = false,
-            int flashInferCudaGraph = -1) {
+            int flashInferCudaGraph = -1,
+            int postQNormGlobalDim = -1,
+            int postKNormGlobalDim = -1) {
         bool mergedQkv = (mergeQkvWeight->dims.size() > 0);
         if (mergedQkv) {
             mergeQkvWeight->tpPackType = TP_PACK_QKV;
@@ -554,8 +683,14 @@ namespace fastllm {
         if (doPostQKNorm) {
             int per = qkv->dims.back() / (numAttentionHeads / numKeyValueHeads + 2);
             int qdim = per * (numAttentionHeads / numKeyValueHeads);
-            Qwen3CudaRMSNormPart(runner, *qkv, *preQNormWeight, rmsNormEps, 0, qdim, *qkv);
-            Qwen3CudaRMSNormPart(runner, *qkv, *preKNormWeight, rmsNormEps, qdim, qdim + per, *qkv);
+            int qNormGlobalDim = postQNormGlobalDim > 0 ? postQNormGlobalDim : qdim;
+            int kNormGlobalDim = postKNormGlobalDim > 0 ? postKNormGlobalDim : per;
+            Qwen3CudaRMSNormTwoPartsGlobal(runner, *qkv,
+                                           *preQNormWeight, *preKNormWeight,
+                                           rmsNormEps,
+                                           0, qdim, qNormGlobalDim,
+                                           qdim, qdim + per, kNormGlobalDim,
+                                           *qkv);
         }
 
         int targetSeqLength = 0;

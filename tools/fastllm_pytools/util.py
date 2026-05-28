@@ -62,6 +62,8 @@ def _first_thread_tp_cuda_device(tp) -> str:
     lower = spec.lower()
     if lower in ["", "auto", "true", "on", "1"]:
         return "cuda:0"
+    if lower.isdigit() and int(lower) > 1:
+        return "cuda:0"
 
     first_part = spec.split(",")[0].strip()
     first_lower = first_part.lower()
@@ -88,6 +90,12 @@ def _thread_tp_cuda_device_spec(tp) -> str:
         if count <= 1:
             return "cuda:0"
         return "cuda:" + ",".join(str(i) for i in range(count))
+    if lower.isdigit() and int(lower) > 1:
+        requested = int(lower)
+        count = _cuda_device_count()
+        if count > 0:
+            requested = min(requested, count)
+        return "cuda:" + ",".join(str(i) for i in range(requested))
 
     if lower.startswith("multicuda:") or lower.startswith("cuda:"):
         spec = spec.split(":", 1)[1].strip()
@@ -276,6 +284,8 @@ def make_normal_llm_model(args):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
             if (architecture == 'Qwen3MoeForCausalLM' or model_type == 'qwen3_moe'):
+                is_thread_tp_moe_model = True
+            if (architecture == 'MiniMaxM2ForCausalLM' or model_type == 'minimax_m2'):
                 is_thread_tp_moe_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):

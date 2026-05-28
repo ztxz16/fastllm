@@ -7,10 +7,15 @@
 
 #include "basellm.h"
 #include "llama.h"
+#include "utils/persistent_worker_group.h"
 
 #include "cmath"
 
+#include <atomic>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <unordered_map>
 
 namespace fastllm {
     class MinimaxM2Model : public basellm {
@@ -39,6 +44,17 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens,
                 std::vector <std::vector <float>*> *retLogits);
+
+        virtual std::vector <int> ForwardGPU(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *retLogits);
                 
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,
@@ -57,6 +73,26 @@ namespace fastllm {
         std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
 
     protected:
+        bool IsThreadTensorParallelEnabled() const;
+
+        void ForwardSingleGPU(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                bool firstTensorParallelRank,
+                int pagedCacheLayerOffset,
+                Data &logits,
+                Data *precomputedHiddenStates = nullptr);
+
+        Data &GetThreadTensorParallelBias(const std::string &name);
+
         RoPEType rope_type = RoPEType::BASE;
 
         float rope_base = 10000.f;
@@ -72,8 +108,23 @@ namespace fastllm {
 
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeBiass;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeBiass;
 
         float routed_scaling_factor = 1.0f;
+
+        std::unordered_map <std::string, Data> threadTpEmptyBiases;
+        int threadTpPagedCacheBase = -1;
+        std::mutex threadTpWeightPrepareLock;
+        std::atomic<bool> singleGpuWeightsPrepared{false};
+        std::atomic<bool> threadTpWeightsPrepared{false};
+        std::vector <int> threadTpPreparedDevices;
+        std::map <int, int> threadTpPreparedRatios;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
+        std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        PersistentWorkerGroup threadTpWorkerGroup;
     };
 }
 

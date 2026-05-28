@@ -257,7 +257,9 @@ namespace fastllm {
                                                   Data &data,
                                                   const std::vector<int> &deviceIds,
                                                   std::map<int, int> &ratios) {
-        if ((model->model_type != "qwen3_moe" && model->model_type != "step3p5") ||
+        if ((model->model_type != "qwen3_moe" &&
+             model->model_type != "step3p5" &&
+             model->model_type != "minimax_m2") ||
             !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
             data.isDiskWeight || data.dims.size() != 2 ||
             (data.cpuData == nullptr && data.cudaData == nullptr && data.numasData.empty())) {

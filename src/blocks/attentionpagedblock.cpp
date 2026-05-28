@@ -2,6 +2,10 @@
 #include "basellm.h"
 #include "fastllm.h"
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 namespace fastllm {
     /*
     Paged Attention Block:
