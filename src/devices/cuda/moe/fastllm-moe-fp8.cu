@@ -2761,12 +2761,13 @@ __global__ void FastllmGemvTypedFP8E4M3FusedTopKSwigluKernel(
     __shared__ float sdataUp[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
     int p = blockIdx.x;
-    int task = blockIdx.y;
-    int token = task / topk;
-    if (token >= batch) {
+    int topkSlot = blockIdx.y;
+    int token = blockIdx.z;
+    if (token >= batch || topkSlot >= topk) {
         return;
     }
 
+    int task = token * topk + topkSlot;
     int expertIdx = indices[task];
     if (expertIdx < 0 || expertIdx >= experts) {
         if (tid == 0) {
@@ -2829,12 +2830,13 @@ __global__ void FastllmGemvHalfFP8E4M3FusedTopKSwigluKernel(
     __shared__ float sdataUp[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
     int p = blockIdx.x;
-    int task = blockIdx.y;
-    int token = task / topk;
-    if (token >= batch) {
+    int topkSlot = blockIdx.y;
+    int token = blockIdx.z;
+    if (token >= batch || topkSlot >= topk) {
         return;
     }
 
+    int task = token * topk + topkSlot;
     int expertIdx = indices[task];
     if (expertIdx < 0 || expertIdx >= experts) {
         if (tid == 0) {
@@ -3356,7 +3358,7 @@ static void LaunchFastllmGemmTypedFP8E4M3FusedTopKSwiglu(
         T *input, const int32_t *indices, uint8_t *gateWeight, uint8_t *upWeight,
         float *gateScales, float *upScales, T *output,
         int batch, int topk, int hidden, int inter, int experts, int blockM, int blockK, float swigluLimit) {
-    dim3 grid(inter, batch * topk);
+    dim3 grid(inter, topk, batch);
     if constexpr (std::is_same_v<T, half>) {
         FastllmGemvHalfFP8E4M3FusedTopKSwigluKernel<64> <<< grid, 64 >>>(
             input, indices, gateWeight, upWeight, gateScales, upScales, output,
