@@ -328,7 +328,7 @@ namespace fastllm {
     }
 
     bool GetCudaEmbedding() {
-        return cudaEmbedding;
+        return cudaEmbedding || GetFastllmEnv().cudaGraph;
     }
 
     void SetCudaSlabMB(int mb) {
