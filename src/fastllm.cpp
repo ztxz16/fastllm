@@ -271,6 +271,7 @@ namespace fastllm {
         this->cudaSync = cudaSyncEnv != nullptr && std::strcmp(cudaSyncEnv, "1") == 0;
 
         this->printLogits = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_LOGITS"));
+        this->printProfile = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_PROFILE"));
         this->skipWarmup = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_SKIP_WARMUP"));
         this->cudaGraph = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_CUDA_GRAPH"));
 

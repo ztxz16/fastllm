@@ -41,6 +41,7 @@ namespace fastllm {
         int numas = -1;
         bool cudaSync = false;
         bool printLogits = false;
+        bool printProfile = false;
         bool skipWarmup = false;
         bool cudaGraph = false;
         bool useFusedTransferAttn = true;

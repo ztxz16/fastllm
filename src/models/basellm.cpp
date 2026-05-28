@@ -131,6 +131,21 @@ namespace fastllm {
             }
             return model->moeDeviceMap.empty() || IsPureGpuDeviceMap(model->moeDeviceMap);
         }
+
+        static void PrintLoopProfile(const char *loopName,
+                                     const std::vector<int> &seqLens,
+                                     int outputTokens,
+                                     const std::chrono::system_clock::time_point &startTime) {
+            PrintProfiler();
+            int total = 0;
+            for (int len : seqLens) {
+                total += len;
+            }
+            float spend = GetSpan(startTime, std::chrono::system_clock::now());
+            float tokenPerSecond = spend > 0.0f ? (float)total / spend : 0.0f;
+            printf("[fastllm-profile] loop = %s, batch = %d, input tokens = %d, output tokens = %d, spend = %f s, tokens / s = %f\n",
+                   loopName, (int)seqLens.size(), total, outputTokens, spend, tokenPerSecond);
+        }
     }
 
     static int NormalizeMaxBatchByModelCapability(basellm *model, int maxBatch) {
@@ -946,6 +961,7 @@ namespace fastllm {
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
         const bool canUseFastDecodeInput = (model->model_type == "qwen3");
+        const bool printProfile = GetFastllmEnv().printProfile;
         while (true) {
             if (model->isFree) {
                 break;
@@ -1383,7 +1399,11 @@ namespace fastllm {
 #endif
                 Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                 std::vector<int> ret;
-// auto st = std::chrono::system_clock::now();
+                std::chrono::system_clock::time_point profileStartTime;
+                if (printProfile) {
+                    profileStartTime = std::chrono::system_clock::now();
+                    ClearProfiler();
+                }
                 if (isSingleMultimodal) {
                     ret = model->ForwardMultimodal(
                         inputIds,
@@ -1471,10 +1491,9 @@ namespace fastllm {
                         }
                     }
                 }
-/*int total = 0;
-for (int i : seqLens) total += i;
-float spend = GetSpan(st, std::chrono::system_clock::now());
-printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);*/
+                if (printProfile) {
+                    PrintLoopProfile("new", seqLens, (int)ret.size(), profileStartTime);
+                }
 
                 forwardLocker.unlock();
                 dictLocker.lock();
@@ -1659,6 +1678,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
                     auto lastRecordTime = std::chrono::system_clock::now();
                     long long genTokens = 0;
+                    const bool printProfile = GetFastllmEnv().printProfile;
                     while (true) {
                         if (model->isFree) {
                             break;
@@ -1873,8 +1893,11 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret;
-auto st = std::chrono::system_clock::now();
-//ClearProfiler();
+                            std::chrono::system_clock::time_point profileStartTime;
+                            if (printProfile) {
+                                profileStartTime = std::chrono::system_clock::now();
+                                ClearProfiler();
+                            }
                             if (seqLens.size() > 1) {
                                 if (!model->canDoBatchForward) {
                                     dictLocker.lock();
@@ -1933,12 +1956,9 @@ auto st = std::chrono::system_clock::now();
                                     }
                                 }
                             }
-//PrintProfiler();
-/*int total = 0;
-for (int i : seqLens) total += i;
-float spend = GetSpan(st, std::chrono::system_clock::now());
-printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);
-*/
+                            if (printProfile) {
+                                PrintLoopProfile("old", seqLens, (int)ret.size(), profileStartTime);
+                            }
                             forwardLocker.unlock();
                             dictLocker.lock();
 
