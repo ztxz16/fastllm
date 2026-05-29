@@ -436,8 +436,13 @@ namespace fastllm {
 
         std::map <std::string, int> deviceMap;
         std::map <std::string, int> moeDeviceMap;
+        std::map <std::string, int> layeredMoeDeviceMap;
+        int moeDeviceLayers = -1;
 
         void AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId = -1);
+        bool UseLayeredMoeDevice(int layerId) const;
+        std::string SelectMoeDeviceForLayer(int layerId) const;
+        void ApplyMoeDeviceMapForLayer(int layerId) const;
         bool ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const;
         bool ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const;
         bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;

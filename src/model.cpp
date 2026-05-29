@@ -3,6 +3,7 @@
 
 #include "model.h"
 #include "fastllm.h"
+#include "executor.h"
 #include <sstream>
 #include <fstream>
 #include <regex>
@@ -198,11 +199,57 @@ namespace fastllm {
 #endif
         this->deviceMap = GetDeviceMap();
         this->moeDeviceMap = GetMoeDeviceMap();
+        this->layeredMoeDeviceMap = GetLayeredMoeDeviceMap();
+        this->moeDeviceLayers = GetMoeDeviceLayers();
     }
 
     void basellm::AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId) {
         this->specialWeights[weightName] = weightType;
         this->specialWeightLayerIds[weightName] = layerId;
+    }
+
+    bool basellm::UseLayeredMoeDevice(int layerId) const {
+        if (this->moeDeviceLayers < 0 || this->layeredMoeDeviceMap.empty() ||
+            this->block_cnt <= 0 || layerId < 0) {
+            return false;
+        }
+        if (this->moeDeviceLayers <= 0) {
+            return false;
+        }
+        int layeredLayers = std::min(this->moeDeviceLayers, this->block_cnt);
+        int firstLayer = this->block_cnt - layeredLayers;
+        return layerId >= firstLayer && layerId < this->block_cnt;
+    }
+
+    std::string basellm::SelectMoeDeviceForLayer(int layerId) const {
+        if (this->block_cnt <= 0) {
+            if (!this->moeDeviceMap.empty()) {
+                return SelectDeviceFromMap(this->moeDeviceMap, 1, 1);
+            }
+            return SelectDeviceFromMap(this->deviceMap, 1, 1);
+        }
+
+        if (this->UseLayeredMoeDevice(layerId)) {
+            int layeredLayers = std::min(this->moeDeviceLayers, this->block_cnt);
+            int firstLayer = this->block_cnt - layeredLayers;
+            return SelectDeviceFromMap(this->layeredMoeDeviceMap, layerId - firstLayer + 1, layeredLayers);
+        }
+
+        const auto &frontMap = this->moeDeviceMap.empty() ? this->deviceMap : this->moeDeviceMap;
+        int frontLayers = this->block_cnt;
+        if (this->moeDeviceLayers >= 0) {
+            int layeredLayers = std::min(std::max(this->moeDeviceLayers, 0), this->block_cnt);
+            frontLayers = std::max(1, this->block_cnt - layeredLayers);
+        }
+        return SelectDeviceFromMap(frontMap, std::min(layerId + 1, frontLayers), frontLayers);
+    }
+
+    void basellm::ApplyMoeDeviceMapForLayer(int layerId) const {
+        std::string selectedDevice = this->SelectMoeDeviceForLayer(layerId);
+        if (selectedDevice.empty()) {
+            return;
+        }
+        ((Executor*)GetExecutor())->SetFirstDevice(selectedDevice);
     }
 
     static bool DeviceNameMatchesType(const std::string &deviceName, const std::string &deviceType) {
@@ -289,18 +336,22 @@ namespace fastllm {
 #endif
 
     static std::string GetSpecialWeightSelectedDevice(const basellm *model, const std::string &weightName) {
-        if (model->specialWeights.find(weightName) == model->specialWeights.end() || model->moeDeviceMap.empty()) {
+        if (model->specialWeights.find(weightName) == model->specialWeights.end()) {
+            return "";
+        }
+        if (model->moeDeviceMap.empty() &&
+            (model->moeDeviceLayers < 0 || model->layeredMoeDeviceMap.empty())) {
             return "";
         }
         auto layerIt = model->specialWeightLayerIds.find(weightName);
         if (layerIt == model->specialWeightLayerIds.end() || layerIt->second < 0) {
             return "";
         }
-        return SelectDeviceFromMap(model->moeDeviceMap, layerIt->second + 1, model->block_cnt);
+        return model->SelectMoeDeviceForLayer(layerIt->second);
     }
 
     static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName) {
-        if (model == nullptr || model->moeDeviceMap.empty()) {
+        if (model == nullptr) {
             return "";
         }
         std::string selectedDevice = GetSpecialWeightSelectedDevice(model, weightName);

@@ -53,9 +53,13 @@ namespace fastllm {
 
     void SetDeviceMap(const std::map <std::string, int> &deviceMap);
     void SetMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
+    void SetLayeredMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
+    void SetMoeDeviceLayers(int layers);
 
     std::map <std::string, int> GetDeviceMap();
     std::map <std::string, int> GetMoeDeviceMap();
+    std::map <std::string, int> GetLayeredMoeDeviceMap();
+    int GetMoeDeviceLayers();
     std::string SelectDeviceFromMap(const std::map <std::string, int> &deviceMap, int current, int total);
 
     Data *GetEmptyData();

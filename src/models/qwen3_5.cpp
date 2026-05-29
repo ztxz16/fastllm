@@ -5696,7 +5696,7 @@ namespace fastllm {
                 Data expertIndex, expertScore;
                 SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, this->norm_topk_prob,
                              this->routed_scaling_factor, gateBiasData);
-                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                this->ApplyMoeDeviceMapForLayer(i);
                 MergeMOE(
                     attenInput, expertIndex, expertScore,
                     weights[i], biass[i],
@@ -6987,7 +6987,7 @@ namespace fastllm {
                 Data expertIndex, expertScore;
                 SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, this->norm_topk_prob,
                              this->routed_scaling_factor, gateBiasData);
-                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                this->ApplyMoeDeviceMapForLayer(i);
                 MergeMOE(
                     attenInput, expertIndex, expertScore,
                     weights[i], biass[i],

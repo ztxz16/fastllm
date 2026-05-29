@@ -1252,7 +1252,7 @@ namespace fastllm {
 
             Data w1, w2, w3, tempInput, tempOutput;
             Data moeInputTemp, moeOutputTemp;
-            ApplyDeviceMap(this->moeDeviceMap, layerId + 1, block_cnt);
+            this->ApplyMoeDeviceMapForLayer(layerId);
             MergeMOEBlock(
                 &expertInputFlat, &expertIndexData, &expertScoreData,
                 &weights[layerId], &biass[layerId],

@@ -3536,7 +3536,7 @@ namespace fastllm {
             Data &upSource = weight[upSourceName];
             Data &downSource = weight[downSourceName];
             bool useDiskMergedMoe = gateSource.isDiskWeight || upSource.isDiskWeight || downSource.isDiskWeight;
-            std::string selectedMoeDevice = SelectDeviceFromMap(this->moeDeviceMap, i + 1, block_cnt);
+            std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
             bool selectedCudaMoe = selectedMoeDevice.rfind("cuda", 0) == 0 ||
                                    selectedMoeDevice.rfind("multicuda", 0) == 0 ||
                                    (selectedMoeDevice.empty() &&
@@ -4751,7 +4751,7 @@ namespace fastllm {
 
                 bool useCudaMoe = Step3p5DeviceMapUsesCuda(this->moeDeviceMap);
                 bool useDiskMoe = Step3p5DeviceMapUsesDisk(this->moeDeviceMap);
-                std::string selectedMoeDevice = SelectDeviceFromMap(this->moeDeviceMap, i + 1, block_cnt);
+                std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
                 bool selectedCudaMoe = selectedMoeDevice.rfind("cuda", 0) == 0;
                 bool useFusedCudaMoe = selectedCudaMoe && !useDiskMoe &&
                     i < (int)moeGate3DWeights.size() &&
@@ -4759,7 +4759,7 @@ namespace fastllm {
                 if (useFusedCudaMoe) {
                     Data expertInput;
                     expertInput.CopyFrom(attenInput);
-                    ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                    this->ApplyMoeDeviceMapForLayer(i);
                     Step3p5PrepareFusedMoeWeightForCuda(*moeGate3DWeights[i], moeGate3DWeights[i]->dims[1]);
                     Step3p5PrepareFusedMoeWeightForCuda(*moeUp3DWeights[i], moeUp3DWeights[i]->dims[1]);
                     Step3p5PrepareFusedMoeWeightForCuda(*moeDown3DWeights[i], moeDown3DWeights[i]->dims[1]);
@@ -4775,7 +4775,7 @@ namespace fastllm {
                     if (i < (int)weights.size() && !weights[i].empty() && (useCudaMoe || useDiskMoe)) {
                         Data expertInput;
                         expertInput.CopyFrom(attenInput);
-                        ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                        this->ApplyMoeDeviceMapForLayer(i);
                         MergeMOE(expertInput, expertIndex, expertScore,
                                  weights[i], biass[i],
                                  w1, w2, w3, tempInput, tempOutput,

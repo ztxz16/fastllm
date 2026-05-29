@@ -129,7 +129,9 @@ namespace fastllm {
             if (model == nullptr || !IsPureGpuDeviceMap(model->deviceMap)) {
                 return false;
             }
-            return model->moeDeviceMap.empty() || IsPureGpuDeviceMap(model->moeDeviceMap);
+            return (model->moeDeviceMap.empty() || IsPureGpuDeviceMap(model->moeDeviceMap)) &&
+                   (model->moeDeviceLayers < 0 || model->layeredMoeDeviceMap.empty() ||
+                    IsPureGpuDeviceMap(model->layeredMoeDeviceMap));
         }
 
         static void PrintLoopProfile(const char *loopName,

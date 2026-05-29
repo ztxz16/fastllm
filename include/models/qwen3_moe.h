@@ -161,6 +161,7 @@ namespace fastllm {
         bool loadFusedMoePlanned = false;
         bool moeWeightsPrepared = false;
         bool moeFusedWeightsPrepared = false;
+        std::vector <char> moeFusedLayerPlanned;
         std::set <std::string> loadFusedMoeSourceWeights;
         std::set <std::string> consumedFusedMoeSourceWeights;
         std::vector <std::vector <Data*> > weights;
@@ -194,6 +195,9 @@ namespace fastllm {
         void TryFinalizeFusedMoeLayerParts(int layer);
         bool TryBuildFusedMoeWeightsFromLoaded();
         bool TryBuildFusedMoeLayerFromLoaded(int layer);
+        bool IsFusedMoeLayerPlanned(int layer) const;
+        bool HasPlannedFusedMoeLayers() const;
+        bool ArePlannedFusedMoeLayersReady() const;
         bool HasFusedMoeWeights(int layer) const;
         Data *GetFusedMoeWeightForDevice(Data *weight, int device) const;
         void PrepareFusedMoeLayerForDevices(int layer, const std::vector <int> &devices,

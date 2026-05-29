@@ -150,6 +150,10 @@ The following are common parameters when running the `ftllm` module:
   - **Common Values**: `cpu`, `cuda`, or `numa`.  
   - **Example**: `--moe_device cpu`  
 
+- `--moe_device_layers`:
+  - **Description**: Uses `--moe_device` only for the last N MoE layers; earlier MoE layers keep using the main device or CUDA TP devices from `--tp`.
+  - **Example**: `--tp 0,1 --moe_device numa --moe_device_layers 8`
+
 - `--moe_experts`:  
   - **Description**: Specifies the number of experts to use in the MOE layer. If not set, it follows the model's configuration. Reducing the number of experts may speed up inference but could lower accuracy.  
   - **Example**: `--moe_experts 6`  

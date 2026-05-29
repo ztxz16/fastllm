@@ -318,8 +318,10 @@ fastllm_lib.add_tokenizer_word_llm_model.argtype = [ctypes.c_int, ctypes.c_char_
 
 fastllm_lib.set_special_tokens_llm_model.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 
-fastllm_lib.set_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-fastllm_lib.set_moe_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -510,6 +512,31 @@ def set_device_map(device_map, is_moe = False):
                                (ctypes.c_int * len(device_len))(*device_len),
                                device_str.encode(),
                                (ctypes.c_int * len(values))(*values));
+
+def set_layered_moe_device_map(device_map):
+    devices = [];
+    values = [];
+    if (isinstance(device_map, str)):
+        devices.append(device_map);
+        values.append(1);
+    elif (isinstance(device_map, list)):
+        devices = [str(x) for x in device_map];
+        values = [1 for x in device_map];
+    elif (isinstance(device_map, dict)):
+        devices = [str(x) for x in device_map.keys()];
+        values = [int(device_map[x]) for x in device_map.keys()];
+    else:
+        print("set_layered_moe_device_map error.");
+        return;
+    device_str = ''.join(devices);
+    device_len = [len(x) for x in devices];
+    fastllm_lib.set_layered_moe_device_map(len(device_len),
+                           (ctypes.c_int * len(device_len))(*device_len),
+                           device_str.encode(),
+                           (ctypes.c_int * len(values))(*values));
+
+def set_moe_device_layers(layers: int):
+    fastllm_lib.set_moe_device_layers(ctypes.c_int(layers));
 
 def t2s_decode(safetensors_path, xy_pos, k_cache, v_cache, y, pe):
     bsz = xy_pos.shape[0]

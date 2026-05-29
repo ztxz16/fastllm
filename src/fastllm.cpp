@@ -218,7 +218,8 @@ namespace fastllm {
         }
     }
 
-    std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap;
+    std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap, defaultLayeredMoeDeviceMap;
+    int defaultMoeDeviceLayers = -1;
     Executor defaultExecutor;
     thread_local Executor *curExecutor = &defaultExecutor;
 
@@ -4608,6 +4609,22 @@ namespace fastllm {
 
     std::map <std::string, int> GetMoeDeviceMap() {
         return defaultMoeDeviceMap;
+    }
+
+    void SetLayeredMoeDeviceMap(const std::map <std::string, int> &deviceMap) {
+        defaultLayeredMoeDeviceMap = deviceMap;
+    }
+
+    std::map <std::string, int> GetLayeredMoeDeviceMap() {
+        return defaultLayeredMoeDeviceMap;
+    }
+
+    void SetMoeDeviceLayers(int layers) {
+        defaultMoeDeviceLayers = layers;
+    }
+
+    int GetMoeDeviceLayers() {
+        return defaultMoeDeviceLayers;
     }
 
     void PagedCacheManager::SetMaxPages(int maxPages) {

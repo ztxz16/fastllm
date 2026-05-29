@@ -3394,7 +3394,7 @@ namespace fastllm {
                     weights[layer][0] = weights[layer][1] = nullptr;
                     hasSharedExpertOut = true;
                 }
-                ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
+                this->ApplyMoeDeviceMapForLayer(layer);
                 {
                     DataType effectiveMoeAtype = ffnInput.dataType;
                     MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
@@ -3795,7 +3795,7 @@ namespace fastllm {
                     weights[layer][0] = weights[layer][1] = nullptr;
                     hasSharedExpertOut = true;
                 }
-                ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
+                this->ApplyMoeDeviceMapForLayer(layer);
                 {
                     DataType effectiveMoeAtype = ffnInput.dataType;
                     MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,

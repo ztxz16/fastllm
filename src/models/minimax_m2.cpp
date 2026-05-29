@@ -1736,7 +1736,7 @@ namespace fastllm {
                     SelectExpert(routerLogitsTemp, expertIndex, expertScore, this->num_experts_per_tok, needNorm,
                                 this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
                 }
-                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                this->ApplyMoeDeviceMapForLayer(i);
                 MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
                                   &weights[i], &biass[i],
                                   &w1, &w2, &w3, &tempInput, &tempOutput,

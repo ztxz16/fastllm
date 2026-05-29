@@ -148,6 +148,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备，如 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
+    parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
     parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
@@ -379,6 +380,7 @@ def make_normal_llm_model(args):
     if (args.moe_device and args.moe_device != ""):
         args.moe_device = expand_cudapp_device(args.moe_device)
     from ftllm import llm
+    llm.set_moe_device_layers(-1)
     if (args.device and args.device != ""):
         try:
             import ast
@@ -393,12 +395,30 @@ def make_normal_llm_model(args):
         try:
             import ast
             moe_device_map = ast.literal_eval(args.moe_device)
-            if (isinstance(moe_device_map, list) or isinstance(moe_device_map, dict)):
+            if (args.moe_device_layers >= 0):
+                front_moe_device = args.device
+                if (_uses_thread_tp(tp_arg) and is_thread_tp_moe_model):
+                    front_moe_device = _thread_tp_cuda_device_spec(tp_arg) or args.device
+                llm.set_device_map(front_moe_device, True)
+                if (isinstance(moe_device_map, list) or isinstance(moe_device_map, dict)):
+                    llm.set_layered_moe_device_map(moe_device_map)
+                else:
+                    llm.set_layered_moe_device_map(args.moe_device)
+                llm.set_moe_device_layers(args.moe_device_layers)
+            elif (isinstance(moe_device_map, list) or isinstance(moe_device_map, dict)):
                 llm.set_device_map(moe_device_map, True)
             else:
                 llm.set_device_map(args.moe_device, True)
         except:
-            llm.set_device_map(args.moe_device, True)
+            if (args.moe_device_layers >= 0):
+                front_moe_device = args.device
+                if (_uses_thread_tp(tp_arg) and is_thread_tp_moe_model):
+                    front_moe_device = _thread_tp_cuda_device_spec(tp_arg) or args.device
+                llm.set_device_map(front_moe_device, True)
+                llm.set_layered_moe_device_map(args.moe_device)
+                llm.set_moe_device_layers(args.moe_device_layers)
+            else:
+                llm.set_device_map(args.moe_device, True)
     llm.set_cpu_threads(args.threads)
     llm.set_cpu_low_mem(args.low)
     if (args.cuda_embedding):

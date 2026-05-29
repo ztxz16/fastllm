@@ -236,6 +236,11 @@ ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
    `--device cuda --moe_device numa` 来实现MOE模型的单卡+多NUMA节点加速推理
    如果指定的模型不是`moe`结构的模型，这个参数不会生效
 
+- `--moe_device_layers`:
+  - **描述**: 指定最后多少层 MOE 使用 `--moe_device`，前面的 MOE 层继续使用主设备或 `--tp` 指定的 CUDA 张量并行设备。
+  - **示例**: `--tp 0,1 --moe_device numa --moe_device_layers 8`
+  - **说明**: 默认 `-1` 表示所有 MOE 层都使用 `--moe_device`，设置为 `0` 表示不单独把后段 MOE 放到 `--moe_device`。
+
 若不设定这些参数，会使用默认配置来推理，默认配置如下：
 
 | 模型类型 | device | moe_device |
