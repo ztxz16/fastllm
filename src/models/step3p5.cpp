@@ -147,6 +147,30 @@ namespace fastllm {
         return ret;
     }
 
+    static void Step3p5FlattenTextConfig(std::map<std::string, std::string> &dicts) {
+        std::map<std::string, std::string> extra;
+        for (auto &it : dicts) {
+            const std::string &key = it.first;
+            const std::string prefix = "text_config.";
+            if (key.rfind(prefix, 0) != 0) {
+                continue;
+            }
+            std::string stripped = key.substr(prefix.size());
+            if (stripped.empty() || dicts.find(stripped) != dicts.end()) {
+                continue;
+            }
+            extra[stripped] = it.second;
+        }
+        for (auto &it : extra) {
+            dicts[it.first] = it.second;
+        }
+    }
+
+    static bool Step3p5IsVisionTensorName(const std::string &name) {
+        return name.rfind("vision_model.", 0) == 0 ||
+               name.rfind("vit_large_projector", 0) == 0;
+    }
+
     static void Step3p5Add1(Data &input) {
         if (input.dims.empty()) {
             return;
@@ -2185,6 +2209,18 @@ namespace fastllm {
         };
     }
 
+    std::map <std::string, std::vector <std::pair <std::string, DataType> > >
+            Step3p5Model::GetTensorMap(const std::vector <std::string> &tensorNames) {
+        std::vector<std::string> textTensorNames;
+        textTensorNames.reserve(tensorNames.size());
+        for (auto &name : tensorNames) {
+            if (!Step3p5IsVisionTensorName(name)) {
+                textTensorNames.push_back(name);
+            }
+        }
+        return basellm::GetTensorMap(textTensorNames);
+    }
+
     bool Step3p5Model::IsThreadTensorParallelEnabled() const {
 #ifdef USE_CUDA
         std::vector<int> devices;
@@ -3374,6 +3410,7 @@ namespace fastllm {
     }
 
     void Step3p5Model::InitParams() {
+        Step3p5FlattenTextConfig(weight.dicts);
         basellm::InitParams();
 
         base_attention_heads = Step3p5GetInt(weight.dicts, "num_attention_heads", num_attention_heads);

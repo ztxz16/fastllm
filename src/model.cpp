@@ -487,9 +487,9 @@ namespace fastllm {
         } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
             model = new Qwen3_5Model();
             model->model_type = modelType;
-        } else if (modelType == "step3p5") {
+        } else if (modelType == "step3p5" || modelType == "step3p7") {
             model = new Step3p5Model();
-            model->model_type = modelType;
+            model->model_type = "step3p5";
         } else if (modelType == "phi3") {
             model = new Phi3Model();
             model->model_type = "phi3";

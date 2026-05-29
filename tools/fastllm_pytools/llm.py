@@ -937,6 +937,10 @@ def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True
     return ret
 
 def try_load_hf_tokenizer(path):
+    if _is_step3p5_model_dir(path):
+        ret = _load_fast_tokenizer_from_tokenizer_json(path)
+        if ret is not None:
+            return ret
     try:
         import logging
         import os

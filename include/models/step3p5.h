@@ -23,6 +23,9 @@ namespace fastllm {
 
         virtual void InitParams();
 
+        virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
+                GetTensorMap(const std::vector <std::string> &tensorNames);
+
         virtual int Forward(
                 const Data &inputIds,
                 const Data &attentionMask,
