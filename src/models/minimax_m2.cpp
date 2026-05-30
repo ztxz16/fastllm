@@ -202,22 +202,13 @@ namespace fastllm {
                    MinimaxM2DeviceSpecStartsWith(device, "multicuda");
         }
 
-        static bool MinimaxM2DeviceMapAllCuda(const std::map<std::string, int> &deviceMap) {
-            bool hasCuda = false;
-            for (auto &it : deviceMap) {
-                if (it.second <= 0) {
-                    continue;
-                }
-                if (!MinimaxM2DeviceSpecIsCuda(it.first)) {
-                    return false;
-                }
-                hasCuda = true;
-            }
-            return hasCuda;
+        static bool MinimaxM2SelectedDeviceIsCudaOrEmpty(const std::string &device) {
+            return device.empty() || MinimaxM2DeviceSpecIsCuda(device);
         }
 
-        static bool MinimaxM2MoeDeviceMapAllowsCudaOnly(const std::map<std::string, int> &moeDeviceMap) {
-            return moeDeviceMap.empty() || MinimaxM2DeviceMapAllCuda(moeDeviceMap);
+        static bool MinimaxM2LayerUsesMappedNonCudaMoe(const MinimaxM2Model *model, int layer) {
+            return model != nullptr &&
+                   !MinimaxM2SelectedDeviceIsCudaOrEmpty(model->SelectMoeDeviceForLayer(layer));
         }
 
         static bool MinimaxM2CanUseGPUForward(const std::map<std::string, int> &deviceMap,
@@ -837,7 +828,6 @@ namespace fastllm {
         bool generatedDecodeParams = false;
         auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
         auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
-        bool useMappedNonCudaMoe = !MinimaxM2MoeDeviceMapAllowsCudaOnly(this->moeDeviceMap);
 
         for (int i = 0; i < block_cnt; i++) {
             std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
@@ -959,10 +949,9 @@ namespace fastllm {
             Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
                                   this->num_experts_per_tok, true,
                                   this->routed_scaling_factor, localGateBias);
-            if (useMappedNonCudaMoe) {
+            if (MinimaxM2LayerUsesMappedNonCudaMoe(this, i)) {
                 if (!tensorParallel || firstTensorParallelRank) {
-                    const auto &effectiveMoeMap = this->moeDeviceMap.empty() ? this->deviceMap : this->moeDeviceMap;
-                    std::string selectedMoeDevice = SelectDeviceFromMap(effectiveMoeMap, i + 1, block_cnt);
+                    std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
                     MinimaxM2ResetCpuScratch(moeFinal);
                     FastllmCudaSetDevice(gpuId);
                     MinimaxM2ScopedGenericExecutor scopedExecutor(selectedMoeDevice);
@@ -1066,7 +1055,6 @@ namespace fastllm {
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
         bool tensorParallel = devices.size() > 1;
-        bool useMappedNonCudaMoe = !MinimaxM2MoeDeviceMapAllowsCudaOnly(this->moeDeviceMap);
         bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
         const DataType computeType = ResolveMinimaxM2ThreadTpComputeType(this->dataType);
         if (!useCpuEmbedding) {
@@ -1161,8 +1149,23 @@ namespace fastllm {
         const DivisionScheme *lmHeadScheme = &localLmHeadScheme;
         Data &lmHead = weight["lm_head.weight"];
 
+        auto layerNeedsCudaMoeCache = [&](int layer) {
+            return !MinimaxM2LayerUsesMappedNonCudaMoe(this, layer);
+        };
+        auto anyLayerNeedsCudaMoeCache = [&]() {
+            for (int i = 0; i < block_cnt; i++) {
+                if (layerNeedsCudaMoeCache(i)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         auto hasMoeCache = [&](const std::unordered_map<int, std::vector<std::vector<Data*> > > &weightCache,
                                const std::unordered_map<int, std::vector<std::vector<Data*> > > &biasCache) {
+            if (!anyLayerNeedsCudaMoeCache()) {
+                return true;
+            }
             int expectedSize = this->num_experts * 2 + 2;
             for (int device : devices) {
                 auto weightIt = weightCache.find(device);
@@ -1175,6 +1178,9 @@ namespace fastllm {
                     if ((int)weightIt->second[i].size() != expectedSize ||
                         (int)biasIt->second[i].size() != expectedSize) {
                         return false;
+                    }
+                    if (!layerNeedsCudaMoeCache(i)) {
+                        continue;
                     }
                     for (int j = 2; j < expectedSize; j++) {
                         if (weightIt->second[i][j] == nullptr) {
@@ -1197,14 +1203,20 @@ namespace fastllm {
                 deviceWeights.resize(block_cnt);
                 deviceBiass.resize(block_cnt);
                 for (int i = 0; i < block_cnt; i++) {
+                    int expectedSize = this->num_experts * 2 + 2;
                     auto &layerWeights = deviceWeights[i];
                     auto &layerBiass = deviceBiass[i];
-                    layerWeights.reserve(this->num_experts * 2 + 2);
-                    layerBiass.reserve(this->num_experts * 2 + 2);
+                    layerWeights.reserve(expectedSize);
+                    layerBiass.reserve(expectedSize);
                     layerWeights.push_back(nullptr);
                     layerWeights.push_back(nullptr);
                     layerBiass.push_back(nullptr);
                     layerBiass.push_back(nullptr);
+                    if (!layerNeedsCudaMoeCache(i)) {
+                        layerWeights.resize(expectedSize, nullptr);
+                        layerBiass.resize(expectedSize, nullptr);
+                        continue;
+                    }
                     for (int j = 0; j < this->num_experts; j++) {
                         std::string gateupWeightName = "model.layers." + std::to_string(i) +
                             ".block_sparse_moe.experts." + std::to_string(j) + ".w1w3.weight";
@@ -1234,8 +1246,7 @@ namespace fastllm {
                                 "MiniMax-M2 ForwardGPU thread TP device config changed after weights were prepared.\n");
                 AssertInFastLLM((int)threadTpKVHeadSchemes.size() == block_cnt &&
                                 !threadTpLmHeadScheme.empty() &&
-                                (useMappedNonCudaMoe ||
-                                 hasMoeCache(threadTpMoeWeights, threadTpMoeBiass)),
+                                hasMoeCache(threadTpMoeWeights, threadTpMoeBiass),
                                 "MiniMax-M2 ForwardGPU thread TP cached weight schemes are incomplete.\n");
                 kvHeadSchemes = &threadTpKVHeadSchemes;
                 lmHeadScheme = &threadTpLmHeadScheme;
@@ -1312,7 +1323,7 @@ namespace fastllm {
                         AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1),
                                         "MiniMax-M2 ForwardGPU failed to split " + oWeightName + ".\n");
 
-                        if (useMappedNonCudaMoe) {
+                        if (MinimaxM2LayerUsesMappedNonCudaMoe(this, i)) {
                             continue;
                         }
 
@@ -1346,11 +1357,11 @@ namespace fastllm {
                         }
                     }
 
-                    if (useMappedNonCudaMoe) {
+                    if (anyLayerNeedsCudaMoeCache()) {
+                        fillMoeCache(threadTpMoeWeights, threadTpMoeBiass, true);
+                    } else {
                         threadTpMoeWeights.clear();
                         threadTpMoeBiass.clear();
-                    } else {
-                        fillMoeCache(threadTpMoeWeights, threadTpMoeBiass, true);
                     }
 
                     Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
@@ -1368,7 +1379,7 @@ namespace fastllm {
         } else {
             std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
             if (!singleGpuWeightsPrepared.load(std::memory_order_relaxed) ||
-                (!useMappedNonCudaMoe && !hasMoeCache(singleGpuMoeWeights, singleGpuMoeBiass))) {
+                !hasMoeCache(singleGpuMoeWeights, singleGpuMoeBiass)) {
                 int device = devices[0];
                 for (int i = 0; i < block_cnt; i++) {
                     std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
@@ -1384,7 +1395,7 @@ namespace fastllm {
                     mergeW.tpKVHeads = num_key_value_heads;
                     mergeW.tpHeadDim = head_dim;
 
-                    if (useMappedNonCudaMoe) {
+                    if (MinimaxM2LayerUsesMappedNonCudaMoe(this, i)) {
                         continue;
                     }
                     for (int j = 0; j < this->num_experts; j++) {
@@ -1405,7 +1416,7 @@ namespace fastllm {
                         down.ToDevice(DataDevice::CUDA, {device}, true);
                     }
                 }
-                if (!useMappedNonCudaMoe) {
+                if (anyLayerNeedsCudaMoeCache()) {
                     fillMoeCache(singleGpuMoeWeights, singleGpuMoeBiass, false);
                 } else {
                     singleGpuMoeWeights.clear();

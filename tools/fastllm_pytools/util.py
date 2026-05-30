@@ -317,6 +317,9 @@ def make_normal_llm_model(args):
                     args.enable_thinking = "true"
             if (architecture == 'Qwen3MoeForCausalLM' or model_type == 'qwen3_moe'):
                 is_thread_tp_moe_model = True
+            if (architecture == 'Qwen3_5MoeForConditionalGeneration' or
+                model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text'):
+                is_thread_tp_moe_model = True
             if (architecture == 'MiniMaxM2ForCausalLM' or model_type == 'minimax_m2'):
                 is_thread_tp_moe_model = True
             if (is_moe_model):
