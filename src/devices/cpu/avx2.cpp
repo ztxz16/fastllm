@@ -235,8 +235,8 @@ namespace fastllm {
         size_t stride_c
     ) {
 #ifdef __AVX2__
-        constexpr int UNROLL = 4;  // 展开因子
-        constexpr int SIMD_WIDTH = 8;
+        const int UNROLL = 4;  // 展开因子
+        const int SIMD_WIDTH = 8;
         
         int nb = n / (SIMD_WIDTH * UNROLL);
         int remainder = n % (SIMD_WIDTH * UNROLL);

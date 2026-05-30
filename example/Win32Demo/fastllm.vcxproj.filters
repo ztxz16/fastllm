@@ -25,17 +25,29 @@
     <Filter Include="头文件\utils">
       <UniqueIdentifier>{1da1956b-b0ea-4a15-9b4a-11a431319b7d}</UniqueIdentifier>
     </Filter>
-    <Filter Include="源文件\devices">
-      <UniqueIdentifier>{fa575702-cfa0-433c-8959-c953599bd9ed}</UniqueIdentifier>
+    <Filter Include="头文件\blocks">
+      <UniqueIdentifier>{490339bc-ef09-4c3f-a919-d3ab77527812}</UniqueIdentifier>
     </Filter>
-    <Filter Include="源文件\devices\cpu">
-      <UniqueIdentifier>{2fd7965b-96c9-47a3-8bff-8bd955ba0f3a}</UniqueIdentifier>
+    <Filter Include="源文件\blocks">
+      <UniqueIdentifier>{cd929ed5-5e66-4f20-9850-5906546a29a0}</UniqueIdentifier>
     </Filter>
     <Filter Include="头文件\devices">
       <UniqueIdentifier>{c6d29e93-8c08-452d-ace1-5ed804174f77}</UniqueIdentifier>
     </Filter>
     <Filter Include="头文件\devices\cpu">
       <UniqueIdentifier>{c17acf48-126f-4578-aaf9-aef7cfcb9fd9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\devices\disk">
+      <UniqueIdentifier>{c932daee-2bfb-439c-b5bd-27d1d7d758ff}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\devices">
+      <UniqueIdentifier>{fa575702-cfa0-433c-8959-c953599bd9ed}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\devices\cpu">
+      <UniqueIdentifier>{2fd7965b-96c9-47a3-8bff-8bd955ba0f3a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\devices\disk">
+      <UniqueIdentifier>{47e46b4d-abb2-46f3-9328-9febe62c9a6b}</UniqueIdentifier>
     </Filter>
     <Filter Include="头文件\third_party">
       <UniqueIdentifier>{1aa28959-8e28-496c-9bb2-e81e86c2b998}</UniqueIdentifier>
@@ -78,10 +90,16 @@
     <ClInclude Include="..\..\include\models\deepseekv2.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\deepseekv4.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\ernie4_5.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\factoryllm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\gemma4.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\glm.h">
@@ -114,6 +132,9 @@
     <ClInclude Include="..\..\include\models\minimax.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\minimax_m2.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\moe.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -129,7 +150,13 @@
     <ClInclude Include="..\..\include\models\qwen.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\qwen2.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\qwen3.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\qwen3_5.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\qwen3_moe.h">
@@ -138,8 +165,14 @@
     <ClInclude Include="..\..\include\models\qwen3_next.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\step3p5.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\xlmroberta.h">
       <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\blocks\baseblock.h">
+      <Filter>头文件\blocks</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cpu\alivethreadpool.h">
       <Filter>头文件\devices\cpu</Filter>
@@ -152,6 +185,9 @@
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cpu\cputhreadpool.h">
       <Filter>头文件\devices\cpu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\disk\diskdevice.h">
+      <Filter>头文件\devices\disk</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\utils\armMath.h">
       <Filter>头文件\utils</Filter>
@@ -203,7 +239,13 @@
     <ClCompile Include="..\..\src\models\deepseekv2.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\deepseekv4.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\ernie4_5.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\gemma4.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\glm.cpp">
@@ -236,6 +278,9 @@
     <ClCompile Include="..\..\src\models\minimax.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\minimax_m2.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\moe.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
@@ -251,13 +296,22 @@
     <ClCompile Include="..\..\src\models\qwen.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\qwen2.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\qwen3.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\qwen3_5.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\qwen3_moe.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\qwen3_next.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\step3p5.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\xlmroberta.cpp">
@@ -275,10 +329,34 @@
     <ClCompile Include="..\..\src\models\graph\telechat.cpp">
       <Filter>源文件\models\graph</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\blocks\attentionpagedblock.cpp">
+      <Filter>源文件\blocks</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\blocks\embeddingblock.cpp">
+      <Filter>源文件\blocks</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\blocks\linearaddblock.cpp">
+      <Filter>源文件\blocks</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\blocks\linearswiglublock.cpp">
+      <Filter>源文件\blocks</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\blocks\llmsamplingblock.cpp">
+      <Filter>源文件\blocks</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\blocks\mergemoeblock.cpp">
+      <Filter>源文件\blocks</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\blocks\mlpblock.cpp">
+      <Filter>源文件\blocks</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\amx.cpp">
       <Filter>源文件\devices\cpu</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\avx2.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\deepseekv4ops.cpp">
       <Filter>源文件\devices\cpu</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\avx512bf16.cpp">
@@ -298,6 +376,9 @@
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\linear.cpp">
       <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\disk\diskdevice.cpp">
+      <Filter>源文件\devices\disk</Filter>
     </ClCompile>
     <ClCompile Include="..\..\third_party\gguf\ggml-dequantize.cpp">
       <Filter>源文件\third_party</Filter>
