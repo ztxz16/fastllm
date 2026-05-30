@@ -566,10 +566,7 @@ namespace fastllm {
     }
 
     bool CudaEmbeddingDirect::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        bool forceGpuEmbedding = CudaTpSpecPresent("FASTLLM_TP") ||
-                                 CudaTpSpecPresent("FASTLLM_QWEN3_MOE_TP") ||
-                                 CudaTpSpecPresent("FASTLLM_QWEN3_THREAD_TP");
-        if (GetLowMemMode() || (!GetCudaEmbedding() && !forceGpuEmbedding)) {
+        if (GetLowMemMode() || (!GetCudaEmbedding())) {
             return false;
         }
         Data &input = *(datas.find("input")->second);

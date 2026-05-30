@@ -369,9 +369,11 @@ def make_normal_llm_model(args):
                 args.atype = "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
-    if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3" and
-        (_uses_cuda_device(args.moe_device) or _uses_thread_tp(tp_arg))):
-        args.moe_atype = "float16"
+    if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
+        if (_uses_cuda_device(args.moe_device)):
+            args.moe_atype = "float16"
+        elif (_uses_thread_tp(tp_arg)):
+            args.moe_atype = "bfloat16"
     if (args.device and args.device != ""):
         expanded = expand_cudapp_device(args.device)
         if expanded != args.device:
