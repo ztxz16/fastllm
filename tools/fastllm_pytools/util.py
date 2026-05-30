@@ -60,9 +60,9 @@ def _cuda_device_count() -> int:
 def _first_thread_tp_cuda_device(tp) -> str:
     spec = str(tp or "").strip()
     lower = spec.lower()
-    if lower in ["", "auto", "true", "on", "1"]:
+    if lower in ["", "auto", "true", "on"]:
         return "cuda:0"
-    if lower.isdigit() and int(lower) > 1:
+    if lower.isdigit():
         return "cuda:0"
 
     first_part = spec.split(",")[0].strip()
@@ -85,13 +85,15 @@ def _thread_tp_cuda_device_spec(tp) -> str:
     lower = spec.lower()
     if lower in ["", "false", "off", "none", "disable"]:
         return ""
-    if lower in ["auto", "true", "on", "1"]:
+    if lower in ["auto", "true", "on"]:
         count = _cuda_device_count()
         if count <= 1:
             return "cuda:0"
         return "cuda:" + ",".join(str(i) for i in range(count))
-    if lower.isdigit() and int(lower) > 1:
+    if lower.isdigit():
         requested = int(lower)
+        if requested == 0:
+            return "cuda:0"
         count = _cuda_device_count()
         if count > 0:
             requested = min(requested, count)
@@ -102,6 +104,33 @@ def _thread_tp_cuda_device_spec(tp) -> str:
     elif lower in ["multicuda", "cuda"]:
         return "cuda:0"
     return "cuda:" + spec
+
+def _normalize_thread_tp_arg(tp) -> str:
+    spec = str(tp or "").strip()
+    lower = spec.lower()
+    if lower in ["", "false", "off", "none", "disable"]:
+        return spec
+    return _thread_tp_cuda_device_spec(spec)
+
+def _explain_thread_tp_arg(original, normalized):
+    spec = str(original or "").strip()
+    if spec == "":
+        return
+    lower = spec.lower()
+    if lower in ["false", "off", "none", "disable"]:
+        print(f"[tp] --tp {spec}: thread-level tensor parallel is disabled")
+        return
+    normalized = str(normalized or "").strip()
+    if lower == "0":
+        print(f"[tp] --tp 0: interpreted as CUDA device id 0 => {normalized}")
+    elif lower.isdigit():
+        print(f"[tp] --tp {spec}: interpreted as using {int(lower)} CUDA device(s) => {normalized}")
+    elif lower in ["auto", "true", "on"]:
+        print(f"[tp] --tp {spec}: automatically using detected CUDA devices => {normalized}")
+    elif lower.startswith("cuda:") or lower.startswith("multicuda:"):
+        print(f"[tp] --tp {spec}: normalized explicit device list => {normalized}")
+    else:
+        print(f"[tp] --tp {spec}: completed as CUDA device list => {normalized}")
 
 def apply_page_size_default(args):
     if (getattr(args, "page_size", -1) <= 0 and
@@ -146,7 +175,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
     parser.add_argument('--device', type = str, help = '使用的设备')
-    parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备，如 0,1 或 auto')
+    parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
@@ -319,6 +348,12 @@ def make_normal_llm_model(args):
                     pass
         except:
             pass
+    raw_tp_arg = getattr(args, "tp", "")
+    normalized_tp_arg = _normalize_thread_tp_arg(raw_tp_arg)
+    if raw_tp_arg != "" and normalized_tp_arg != raw_tp_arg:
+        args.tp = normalized_tp_arg
+    _explain_thread_tp_arg(raw_tp_arg, normalized_tp_arg)
+
     if (_uses_thread_tp(getattr(args, "tp", ""))):
         tp_device = _first_thread_tp_cuda_device(args.tp)
         if (not user_set_device):
