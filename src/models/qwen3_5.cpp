@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "qwen3_5.h"
+#include "blocks/baseblock.h"
 #include "executor.h"
 
 #include <algorithm>
@@ -39,6 +40,361 @@ namespace fastllm {
 #ifdef USE_NUMAS
     extern void RegisterNumas(fastllm::Data *data, std::string weightType);
 #endif
+
+    static std::string Qwen35MoeExpertPrefix(int layer, int expert) {
+        return Qwen3_5Model::language_prefix + "layers." + std::to_string(layer) +
+               ".mlp.experts." + std::to_string(expert) + ".";
+    }
+
+    static std::string Qwen35MoeFusedWeightName(int layer, const std::string &kind) {
+        return Qwen3_5Model::language_prefix + "layers." + std::to_string(layer) +
+               ".mlp.fused_experts." + kind + "_proj.weight";
+    }
+
+    static std::string Qwen35MoeExpertWeightName(int layer, int expert, const std::string &kind) {
+        return Qwen35MoeExpertPrefix(layer, expert) + kind + "_proj.weight";
+    }
+
+    static bool Qwen35MoeParseExpertWeightName(const std::string &name,
+                                               int &layer, int &expert, std::string &kind) {
+        const std::string prefix = Qwen3_5Model::language_prefix + "layers.";
+        if (!StartWith(name, prefix)) {
+            return false;
+        }
+        size_t pos = prefix.size();
+        if (pos >= name.size() || !std::isdigit((unsigned char)name[pos])) {
+            return false;
+        }
+        layer = 0;
+        while (pos < name.size() && std::isdigit((unsigned char)name[pos])) {
+            layer = layer * 10 + (name[pos] - '0');
+            pos++;
+        }
+        const std::string mid = ".mlp.experts.";
+        if (name.compare(pos, mid.size(), mid) != 0) {
+            return false;
+        }
+        pos += mid.size();
+        if (pos >= name.size() || !std::isdigit((unsigned char)name[pos])) {
+            return false;
+        }
+        expert = 0;
+        while (pos < name.size() && std::isdigit((unsigned char)name[pos])) {
+            expert = expert * 10 + (name[pos] - '0');
+            pos++;
+        }
+        const std::string suffix = "_proj.weight";
+        if (name.compare(pos, 1, ".") != 0 || name.size() <= pos + 1 + suffix.size() ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            return false;
+        }
+        kind = name.substr(pos + 1, name.size() - pos - 1 - suffix.size());
+        return kind == "gate" || kind == "up" || kind == "gateup" || kind == "down";
+    }
+
+    static int Qwen35MoeSourceLoadPriority(const std::string &name, int numExperts) {
+        int layer = -1, expert = -1;
+        std::string kind;
+        if (!Qwen35MoeParseExpertWeightName(name, layer, expert, kind)) {
+            return 0;
+        }
+        (void)expert;
+        (void)numExperts;
+        int layerStride = 3;
+        int order = (kind == "down") ? 2 : (kind == "up" ? 1 : 0);
+        return -100000000 + layer * layerStride + order;
+    }
+
+    static bool Qwen35MoeIsFusedFp8Type(DataType dataType) {
+        return dataType == DataType::FP8_E4M3 ||
+               dataType == DataType::FP8_E4M3_BLOCK_128;
+    }
+
+    static bool Qwen35MoeIsTrueString(const std::string &value) {
+        std::string lowered = value;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered == "true" || lowered == "1" || lowered == "yes" || lowered == "on";
+    }
+
+    static bool Qwen35MoeDisableFusedMoe() {
+        const char *env = std::getenv("FASTLLM_QWEN35_MOE_DISABLE_FUSED_MOE");
+        if (env == nullptr) {
+            env = std::getenv("FASTLLM_QWEN3_MOE_DISABLE_FUSED_MOE");
+        }
+        return env != nullptr && Qwen35MoeIsTrueString(env);
+    }
+
+    static void Qwen35MoeCopyLinearWeightMeta(Data &dst, const Data &src, const std::string &name) {
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+        dst.blockK = src.blockK;
+        dst.blockM = src.blockM;
+        dst.group = src.group;
+        dst.groupCnt = src.groupCnt;
+        dst.perChannelAxis = src.perChannelAxis;
+        dst.tpLinearType = src.tpLinearType;
+        dst.tpPackType = src.tpPackType;
+    }
+
+    static size_t Qwen35MoeBytesPerRow(const Data &weight, int columns) {
+        return GetDataBytes(weight.dataType, 1, columns);
+    }
+
+    static bool Qwen35MoeCheckFp8ScaleRows(const Data &weight, int rowStart, int rows) {
+        if (weight.dataType != DataType::FP8_E4M3) {
+            return true;
+        }
+        if (weight.blockK <= 0 || weight.blockM <= 0 || weight.scales.empty() ||
+            weight.dims.size() != 2) {
+            return false;
+        }
+        int cols = weight.dims[1];
+        int totalRows = weight.dims[0];
+        int ms = (cols - 1) / weight.blockM + 1;
+        int scaleRows = (totalRows - 1) / weight.blockK + 1;
+        int scaleOffset = (rowStart / weight.blockK) * ms;
+        int scaleCount = ((rows - 1) / weight.blockK + 1) * ms;
+        return rowStart >= 0 && rows > 0 && rowStart + rows <= totalRows &&
+               rowStart % weight.blockK == 0 &&
+               scaleOffset + scaleCount <= (int)weight.scales.size() &&
+               scaleRows * ms <= (int)weight.scales.size();
+    }
+
+    static void Qwen35MoeAppendFp8ScaleRows(Data &dst, const Data &src, int rowStart, int rows) {
+        if (src.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(Qwen35MoeCheckFp8ScaleRows(src, rowStart, rows),
+                        "Qwen3.5 MoE fused FP8 scale slice is out of bounds.");
+        int cols = src.dims[1];
+        int ms = (cols - 1) / src.blockM + 1;
+        int scaleOffset = (rowStart / src.blockK) * ms;
+        int scaleCount = ((rows - 1) / src.blockK + 1) * ms;
+        dst.scales.insert(dst.scales.end(),
+                          src.scales.begin() + scaleOffset,
+                          src.scales.begin() + scaleOffset + scaleCount);
+    }
+
+    static void Qwen35MoeCopyRows(Data &dst, int dstRowStart,
+                                  Data &src, int srcRowStart, int rows) {
+        AssertInFastLLM(dst.dims.size() == 3 && src.dims.size() == 2,
+                        "Qwen3.5 MoE fused row copy expects 3D destination and 2D source.");
+        int cols = src.dims[1];
+        AssertInFastLLM(dst.dims[2] == cols &&
+                        srcRowStart >= 0 && rows > 0 && srcRowStart + rows <= src.dims[0],
+                        "Qwen3.5 MoE fused row copy shape mismatch.");
+        int dstRows = dst.dims[0] * dst.dims[1];
+        AssertInFastLLM(dstRowStart >= 0 && dstRowStart + rows <= dstRows,
+                        "Qwen3.5 MoE fused destination row range is out of bounds.");
+        src.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(src.cpuData != nullptr && dst.cpuData != nullptr,
+                        "Qwen3.5 MoE fused row copy requires CPU buffers.");
+        size_t bytesPerRow = Qwen35MoeBytesPerRow(src, cols);
+        memcpy(dst.cpuData + (size_t)dstRowStart * bytesPerRow,
+               src.cpuData + (size_t)srcRowStart * bytesPerRow,
+               (size_t)rows * bytesPerRow);
+    }
+
+    static bool Qwen35MoeCanBuildFusedLayer(const std::unordered_map<std::string, Data> &allWeights,
+                                            int layer, int numExperts) {
+        if (numExperts <= 0) {
+            return false;
+        }
+        const Data *gateup0 = nullptr;
+        const Data *down0 = nullptr;
+        int inter = 0, hidden = 0;
+        for (int expert = 0; expert < numExperts; expert++) {
+            std::string prefix = Qwen35MoeExpertPrefix(layer, expert);
+            auto gateupIt = allWeights.find(prefix + "gateup_proj.weight");
+            auto downIt = allWeights.find(prefix + "down_proj.weight");
+            if (gateupIt == allWeights.end() || downIt == allWeights.end()) {
+                return false;
+            }
+            const Data &gateup = gateupIt->second;
+            const Data &down = downIt->second;
+            if (gateup.isDiskWeight || down.isDiskWeight ||
+                gateup.cpuData == nullptr || down.cpuData == nullptr ||
+                gateup.dims.size() != 2 || down.dims.size() != 2 ||
+                gateup.dims[0] <= 0 || gateup.dims[1] <= 0 ||
+                (gateup.dims[0] & 1) != 0 ||
+                !Qwen35MoeIsFusedFp8Type(gateup.dataType) ||
+                gateup.dataType != down.dataType) {
+                return false;
+            }
+            int curInter = gateup.dims[0] / 2;
+            int curHidden = gateup.dims[1];
+            if (down.dims[0] != curHidden || down.dims[1] != curInter) {
+                return false;
+            }
+            if (gateup.dataType == DataType::FP8_E4M3 &&
+                (!Qwen35MoeCheckFp8ScaleRows(gateup, 0, curInter) ||
+                 !Qwen35MoeCheckFp8ScaleRows(gateup, curInter, curInter) ||
+                 !Qwen35MoeCheckFp8ScaleRows(down, 0, curHidden))) {
+                return false;
+            }
+            if (expert == 0) {
+                gateup0 = &gateup;
+                down0 = &down;
+                inter = curInter;
+                hidden = curHidden;
+            } else if (gateup.dataType != gateup0->dataType ||
+                       gateup.dims != gateup0->dims ||
+                       gateup.blockK != gateup0->blockK ||
+                       gateup.blockM != gateup0->blockM ||
+                       down.dataType != down0->dataType ||
+                       down.dims != down0->dims ||
+                       down.blockK != down0->blockK ||
+                       down.blockM != down0->blockM ||
+                       curInter != inter || curHidden != hidden) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void Qwen35MoeBuildFusedLayerWeight(std::unordered_map<std::string, Data> &allWeights,
+                                               int layer, int numExperts, const std::string &kind,
+                                               Data *&weightPtr) {
+        std::string prefix0 = Qwen35MoeExpertPrefix(layer, 0);
+        Data &gateup0 = allWeights[prefix0 + "gateup_proj.weight"];
+        Data &down0 = allWeights[prefix0 + "down_proj.weight"];
+        int inter = gateup0.dims[0] / 2;
+        int hidden = gateup0.dims[1];
+        bool isDown = kind == "down";
+        AssertInFastLLM(kind == "gate" || kind == "up" || kind == "down",
+                        "Qwen3.5 MoE fused layer weight kind is invalid.\n");
+
+        std::string fusedName = Qwen35MoeFusedWeightName(layer, kind);
+        if (isDown) {
+            allWeights[fusedName] = Data(down0.dataType, {numExperts, hidden, inter});
+        } else {
+            allWeights[fusedName] = Data(gateup0.dataType, {numExperts, inter, hidden});
+        }
+
+        Data &fused = allWeights[fusedName];
+        Qwen35MoeCopyLinearWeightMeta(fused, isDown ? down0 : gateup0, fusedName);
+        fused.Allocate(false);
+        fused.scales.clear();
+
+        for (int expert = 0; expert < numExperts; expert++) {
+            std::string expertPrefix = Qwen35MoeExpertPrefix(layer, expert);
+            Data &gateup = allWeights[expertPrefix + "gateup_proj.weight"];
+            Data &down = allWeights[expertPrefix + "down_proj.weight"];
+            if (kind == "gate") {
+                Qwen35MoeCopyRows(fused, expert * inter, gateup, 0, inter);
+                Qwen35MoeAppendFp8ScaleRows(fused, gateup, 0, inter);
+            } else if (kind == "up") {
+                Qwen35MoeCopyRows(fused, expert * inter, gateup, inter, inter);
+                Qwen35MoeAppendFp8ScaleRows(fused, gateup, inter, inter);
+            } else {
+                Qwen35MoeCopyRows(fused, expert * hidden, down, 0, hidden);
+                Qwen35MoeAppendFp8ScaleRows(fused, down, 0, hidden);
+            }
+        }
+        weightPtr = &fused;
+    }
+
+    static void Qwen35MoeResizeFusedFp8Scales(Data &weight) {
+        if (weight.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(weight.dims.size() == 3 && weight.blockK > 0 && weight.blockM > 0,
+                        "Qwen3.5 MoE fused FP8 scale allocation got invalid metadata.\n");
+        int experts = weight.dims[0];
+        int rowsPerExpert = weight.dims[1];
+        int cols = weight.dims[2];
+        int scaleRowsPerExpert = (rowsPerExpert - 1) / weight.blockK + 1;
+        int scaleCols = (cols - 1) / weight.blockM + 1;
+        size_t scaleCount = (size_t)experts * scaleRowsPerExpert * scaleCols;
+        if (weight.scales.size() != scaleCount) {
+            weight.scales.assign(scaleCount, 0.0f);
+        }
+    }
+
+    static void Qwen35MoeCopyFp8ScaleRowsToExpert(Data &dst, const Data &src,
+                                                  int expert, int srcRowStart, int rows) {
+        if (src.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(dst.dataType == DataType::FP8_E4M3 &&
+                        dst.dims.size() == 3 && src.dims.size() == 2 &&
+                        dst.blockK == src.blockK && dst.blockM == src.blockM &&
+                        expert >= 0 && expert < dst.dims[0],
+                        "Qwen3.5 MoE fused FP8 scale copy got incompatible metadata.\n");
+        AssertInFastLLM(Qwen35MoeCheckFp8ScaleRows(src, srcRowStart, rows),
+                        "Qwen3.5 MoE fused FP8 scale source is not ready.\n");
+        int cols = src.dims[1];
+        int dstRowsPerExpert = dst.dims[1];
+        int scaleCols = (cols - 1) / src.blockM + 1;
+        int srcScaleOffset = (srcRowStart / src.blockK) * scaleCols;
+        int scaleRowCount = (rows - 1) / src.blockK + 1;
+        int dstScaleRowsPerExpert = (dstRowsPerExpert - 1) / dst.blockK + 1;
+        size_t dstOffset = ((size_t)expert * dstScaleRowsPerExpert) * scaleCols;
+        size_t count = (size_t)scaleRowCount * scaleCols;
+        AssertInFastLLM(dstOffset + count <= dst.scales.size() &&
+                        srcScaleOffset + count <= src.scales.size(),
+                        "Qwen3.5 MoE fused FP8 scale copy is out of bounds.\n");
+        memcpy(dst.scales.data() + dstOffset,
+               src.scales.data() + srcScaleOffset,
+               count * sizeof(float));
+    }
+
+    static void Qwen35MoeInitFusedLayerWeightMeta(std::unordered_map<std::string, Data> &allWeights,
+                                                  int layer, int numExperts, const std::string &kind,
+                                                  const Data &source, int rowsPerExpert, int columns,
+                                                  Data *&weightPtr) {
+        std::string fusedName = Qwen35MoeFusedWeightName(layer, kind);
+        allWeights[fusedName] = Data(source.dataType, {numExperts, rowsPerExpert, columns});
+        Data &fused = allWeights[fusedName];
+        Qwen35MoeCopyLinearWeightMeta(fused, source, fusedName);
+        weightPtr = &fused;
+    }
+
+    static void Qwen35MoeAllocateFusedWeightForLoad(Data *weight) {
+        if (weight == nullptr || weight->cpuData != nullptr ||
+            weight->multiDeviceData || weight->dataDevice != DataDevice::CPU) {
+            return;
+        }
+        weight->Allocate(false);
+    }
+
+    static void Qwen35MoeEnsureFusedLayerWeight(std::unordered_map<std::string, Data> &allWeights,
+                                                int layer, int numExperts, const std::string &kind,
+                                                const Data &source, int rowsPerExpert, int columns,
+                                                Data *&weightPtr) {
+        if (weightPtr == nullptr) {
+            Qwen35MoeInitFusedLayerWeightMeta(allWeights, layer, numExperts, kind,
+                                              source, rowsPerExpert, columns, weightPtr);
+        } else {
+            Qwen35MoeCopyLinearWeightMeta(*weightPtr, source, weightPtr->name);
+            AssertInFastLLM(weightPtr->dims.size() == 3 &&
+                            weightPtr->dims[0] == numExperts &&
+                            weightPtr->dims[1] == rowsPerExpert &&
+                            weightPtr->dims[2] == columns &&
+                            weightPtr->dataType == source.dataType,
+                            "Qwen3.5 MoE fused weight metadata does not match source weight.\n");
+        }
+        Qwen35MoeAllocateFusedWeightForLoad(weightPtr);
+        Qwen35MoeResizeFusedFp8Scales(*weightPtr);
+    }
+
+    static void Qwen35MoeReleaseConsumedSourceWeight(Data &weight) {
+        weight.FreeSpace();
+        weight.scales.clear();
+        weight.scales.shrink_to_fit();
+        weight.mins.clear();
+        weight.mins.shrink_to_fit();
+        weight.zeros.clear();
+        weight.zeros.shrink_to_fit();
+        weight.halfScales.clear();
+        weight.halfScales.shrink_to_fit();
+        weight.perChannelsConfigs.clear();
+        weight.perChannelsConfigs.shrink_to_fit();
+        weight.weightSum.clear();
+        weight.weightSum.shrink_to_fit();
+    }
 
 #ifdef USE_CUDA
     namespace {
@@ -177,13 +533,74 @@ namespace fastllm {
             return !devices.empty();
         }
 
+        static bool Qwen35DeviceSpecStartsWith(const std::string &device, const std::string &prefix) {
+            std::string lower = device;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            return lower == prefix || lower.rfind(prefix + ":", 0) == 0;
+        }
+
+        static bool Qwen35DeviceSpecIsCuda(const std::string &device) {
+            return Qwen35DeviceSpecStartsWith(device, "cuda") ||
+                   Qwen35DeviceSpecStartsWith(device, "multicuda");
+        }
+
+        static bool Qwen35DeviceMapAllCuda(const std::map<std::string, int> &deviceMap) {
+            bool hasCuda = false;
+            for (auto &it : deviceMap) {
+                if (it.second <= 0) {
+                    continue;
+                }
+                if (!Qwen35DeviceSpecIsCuda(it.first)) {
+                    return false;
+                }
+                hasCuda = true;
+            }
+            return hasCuda;
+        }
+
+        static bool Qwen35MoeDeviceMapAllowsCudaOnly(const std::map<std::string, int> &moeDeviceMap) {
+            return moeDeviceMap.empty() || Qwen35DeviceMapAllCuda(moeDeviceMap);
+        }
+
+        static bool Qwen35SelectedDeviceIsCudaOrEmpty(const std::string &device) {
+            return device.empty() || Qwen35DeviceSpecIsCuda(device);
+        }
+
+        static bool Qwen35LayerUsesMappedNonCudaMoe(const Qwen3_5Model *model, int layer) {
+            return model != nullptr &&
+                   !Qwen35SelectedDeviceIsCudaOrEmpty(model->SelectMoeDeviceForLayer(layer));
+        }
+
+        static bool Qwen35ModelMoeLayersAllowCudaOnly(const Qwen3_5Model *model) {
+            if (model == nullptr) {
+                return true;
+            }
+            for (int i = 0; i < model->block_cnt; i++) {
+                if (Qwen35LayerUsesMappedNonCudaMoe(model, i)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static bool Qwen35CanUseGPUForward(const std::map<std::string, int> &deviceMap,
+                                           const std::map<std::string, int> &moeDeviceMap) {
+            (void)moeDeviceMap;
+            std::vector<int> devices;
+            std::map<int, int> ratios;
+            return GetQwen35GPUForwardDevices(deviceMap, devices, ratios);
+        }
+
+        static bool Qwen35CanPlanFusedMoe(const std::map<std::string, int> &deviceMap,
+                                          const std::map<std::string, int> &moeDeviceMap) {
+            return Qwen35CanUseGPUForward(deviceMap, moeDeviceMap) &&
+                   Qwen35MoeDeviceMapAllowsCudaOnly(moeDeviceMap);
+        }
+
         static bool GetQwen35ThreadTpDevices(const std::map<std::string, int> &deviceMap,
-                                             int numExperts,
                                              std::vector<int> &devices,
                                              std::map<int, int> &ratios) {
-            if (numExperts > 0) {
-                return false;
-            }
             if (!GetQwen35GPUForwardDevices(deviceMap, devices, ratios)) {
                 return false;
             }
@@ -333,6 +750,412 @@ namespace fastllm {
                 cache.UpdateUnitSize();
             }
             cache.ToDevice(DataDevice::CUDA, {device}, false);
+        }
+
+        static Executor &Qwen35ThreadLocalGenericExecutor() {
+            static thread_local std::unique_ptr<Executor> executor;
+            if (executor == nullptr) {
+                executor.reset(new Executor());
+            }
+            return *executor;
+        }
+
+        class Qwen35ScopedGenericExecutor {
+        public:
+            explicit Qwen35ScopedGenericExecutor(const std::string &firstDevice)
+                    : oldExecutor(GetExecutor()) {
+                Executor &executor = Qwen35ThreadLocalGenericExecutor();
+                if (!firstDevice.empty()) {
+                    executor.SetFirstDevice(firstDevice);
+                }
+                SetCurrentThreadExecutor(&executor);
+            }
+
+            ~Qwen35ScopedGenericExecutor() {
+                SetCurrentThreadExecutor(oldExecutor);
+            }
+
+            Qwen35ScopedGenericExecutor(const Qwen35ScopedGenericExecutor&) = delete;
+            Qwen35ScopedGenericExecutor &operator=(const Qwen35ScopedGenericExecutor&) = delete;
+
+        private:
+            void *oldExecutor;
+        };
+
+        static void Qwen35ResetCpuScratch(Data &data) {
+            if (data.isFake) {
+                data.isFake = false;
+                data.cpuData = nullptr;
+                data.cudaData = nullptr;
+                data.deviceData = nullptr;
+                data.expansionSize = 0;
+                data.expansionBytes = 0;
+            } else {
+                data.FreeSpace();
+            }
+            Qwen3CudaClearMultiDeviceState(data);
+            data.dataDevice = DataDevice::CPU;
+            data.dataDeviceIds.clear();
+            data.lockInCPU = false;
+            data.expansionDims.clear();
+        }
+
+        static void Qwen35ZeroCudaLike(Data &dst, const Data &like, int device) {
+            bool needReset = dst.isFake || dst.dataType != like.dataType ||
+                             dst.dataDevice != DataDevice::CUDA || dst.dims != like.dims ||
+                             (!dst.dataDeviceIds.empty() && dst.dataDeviceIds[0] != device);
+            if (!needReset && dst.cudaData != nullptr) {
+                int ptrDevice = GetPointerDeviceId(dst.cudaData);
+                needReset = ptrDevice >= 0 && ptrDevice != device;
+            }
+            if (needReset) {
+                if (!dst.isFake) {
+                    dst.FreeSpace();
+                } else {
+                    dst.isFake = false;
+                    dst.cpuData = nullptr;
+                    dst.cudaData = nullptr;
+                    dst.deviceData = nullptr;
+                    dst.expansionSize = 0;
+                    dst.expansionBytes = 0;
+                }
+                Qwen3CudaClearMultiDeviceState(dst);
+                dst.dataType = like.dataType;
+                dst.UpdateUnitSize();
+                dst.dataDevice = DataDevice::CUDA;
+                dst.dataDeviceIds = {device};
+                dst.Resize(like.dims);
+            }
+            dst.Allocate();
+            if (dst.cudaData != nullptr) {
+                FastllmCudaMemset0(dst.cudaData, dst.GetBytes());
+            }
+        }
+
+        static void Qwen35PrepareFusedMoeWeightForCuda(Data &weight, int device) {
+            FastllmCudaSetDevice(device);
+            weight.ToDevice(DataDevice::CUDA, {device}, true);
+            if (weight.dataType == DataType::FP8_E4M3 && weight.extraCudaData.empty()) {
+                AssertInFastLLM(!weight.scales.empty(),
+                                "Qwen3.5 MoE FusedMOE FP8 weight has no scales.\n");
+                float *cudaScales = (float*)FastllmCudaMalloc(weight.scales.size() * sizeof(float));
+                FastllmCudaCopyFromHostToDevice(cudaScales, (void*)weight.scales.data(),
+                                                weight.scales.size() * sizeof(float));
+                weight.extraCudaData.push_back((void*)cudaScales);
+                weight.scales.clear();
+                weight.scales.shrink_to_fit();
+            }
+        }
+
+        static int Qwen35GcdInt(int a, int b) {
+            a = a < 0 ? -a : a;
+            b = b < 0 ? -b : b;
+            while (b != 0) {
+                int t = a % b;
+                a = b;
+                b = t;
+            }
+            return a == 0 ? 1 : a;
+        }
+
+        static int Qwen35LcmInt(int a, int b) {
+            a = std::max(1, a);
+            b = std::max(1, b);
+            return a / Qwen35GcdInt(a, b) * b;
+        }
+
+        static int Qwen35FusedInterSplitUnit(const Data &weight) {
+            int unit = weight.groupCnt <= 0 ? 128 : weight.groupCnt;
+            if (weight.dataType == DataType::FP8_E4M3) {
+                if (weight.blockK > 0) {
+                    unit = Qwen35LcmInt(unit, weight.blockK);
+                }
+                if (weight.blockM > 0) {
+                    unit = Qwen35LcmInt(unit, weight.blockM);
+                }
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                unit = 128;
+            }
+            return std::max(1, unit);
+        }
+
+        static DivisionScheme Qwen35BuildFusedInterScheme(const Data &gate,
+                                                          const std::vector<int> &devices,
+                                                          std::map<int, int> ratios) {
+            AssertInFastLLM(gate.dims.size() == 3 && gate.dims[1] > 0,
+                            "Qwen3.5 MoE fused TP split requires 3D gate weight.\n");
+            std::vector<int> devCopy = devices;
+            std::vector<int> points = FastllmMultiCudaGetSplitPoints(
+                devCopy, ratios, gate.dims[1], Qwen35FusedInterSplitUnit(gate));
+            AssertInFastLLM((int)points.size() == (int)devices.size() + 1,
+                            "Qwen3.5 MoE fused TP split got invalid split points.\n");
+            DivisionScheme scheme;
+            for (int i = 0; i < (int)devices.size(); i++) {
+                scheme[devices[i]];
+                if (points[i] < points[i + 1]) {
+                    scheme[devices[i]].push_back({points[i], points[i + 1]});
+                }
+            }
+            return scheme;
+        }
+
+        static int Qwen35Fp8ScaleCols(int cols, int blockM) {
+            return (cols - 1) / blockM + 1;
+        }
+
+        static void Qwen35AppendFp8ExpertRowScales(Data &dst, const Data &src,
+                                                   int expert, int expertRows, int cols,
+                                                   int rowStart, int rows) {
+            if (src.dataType != DataType::FP8_E4M3 || rows <= 0) {
+                return;
+            }
+            AssertInFastLLM(src.blockK > 0 && src.blockM > 0 && !src.scales.empty(),
+                            "Qwen3.5 MoE fused TP FP8 weight has invalid scale metadata.\n");
+            AssertInFastLLM(expert >= 0 && expert < src.dims[0] &&
+                            rowStart >= 0 && rowStart + rows <= expertRows &&
+                            rowStart % src.blockK == 0,
+                            "Qwen3.5 MoE fused TP FP8 row scale slice is unaligned.\n");
+            int scaleCols = Qwen35Fp8ScaleCols(cols, src.blockM);
+            int scaleRowsPerExpert = (expertRows - 1) / src.blockK + 1;
+            int scaleRowStart = expert * scaleRowsPerExpert + rowStart / src.blockK;
+            int scaleRowCount = (rows - 1) / src.blockK + 1;
+            size_t offset = (size_t)scaleRowStart * scaleCols;
+            size_t count = (size_t)scaleRowCount * scaleCols;
+            AssertInFastLLM(offset + count <= src.scales.size(),
+                            "Qwen3.5 MoE fused TP FP8 row scale slice is out of bounds.\n");
+            dst.scales.insert(dst.scales.end(),
+                              src.scales.begin() + offset,
+                              src.scales.begin() + offset + count);
+        }
+
+        static void Qwen35CopyFusedInterRows(Data &dst, Data &src,
+                                             int interStart, int localInter) {
+            AssertInFastLLM(dst.dims.size() == 3 && src.dims.size() == 3,
+                            "Qwen3.5 MoE fused TP row shard expects 3D weights.\n");
+            int experts = src.dims[0], inter = src.dims[1], hidden = src.dims[2];
+            AssertInFastLLM(dst.dims[0] == experts && dst.dims[1] == localInter &&
+                            dst.dims[2] == hidden && interStart >= 0 &&
+                            localInter >= 0 && interStart + localInter <= inter,
+                            "Qwen3.5 MoE fused TP row shard shape mismatch.\n");
+            if (localInter == 0) {
+                return;
+            }
+            src.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(src.cpuData != nullptr && dst.cpuData != nullptr,
+                            "Qwen3.5 MoE fused TP row shard requires CPU buffers.\n");
+            size_t rowBytes = Qwen35MoeBytesPerRow(src, hidden);
+            for (int expert = 0; expert < experts; expert++) {
+                memcpy(dst.cpuData + (size_t)expert * localInter * rowBytes,
+                       src.cpuData + ((size_t)expert * inter + interStart) * rowBytes,
+                       (size_t)localInter * rowBytes);
+                Qwen35AppendFp8ExpertRowScales(dst, src, expert, inter, hidden,
+                                               interStart, localInter);
+            }
+        }
+
+        static void Qwen35AppendFp8DownColumnScales(Data &dst, const Data &src,
+                                                    int interStart, int localInter) {
+            if (src.dataType != DataType::FP8_E4M3 || localInter <= 0) {
+                return;
+            }
+            int experts = src.dims[0], hidden = src.dims[1], inter = src.dims[2];
+            AssertInFastLLM(src.blockK > 0 && src.blockM > 0 && !src.scales.empty() &&
+                            interStart >= 0 && interStart + localInter <= inter &&
+                            interStart % src.blockM == 0,
+                            "Qwen3.5 MoE fused TP FP8 column scale slice is unaligned.\n");
+            int srcScaleCols = Qwen35Fp8ScaleCols(inter, src.blockM);
+            int dstScaleCols = Qwen35Fp8ScaleCols(localInter, src.blockM);
+            int scaleColStart = interStart / src.blockM;
+            int scaleRowsPerExpert = (hidden - 1) / src.blockK + 1;
+            for (int expert = 0; expert < experts; expert++) {
+                for (int scaleRow = 0; scaleRow < scaleRowsPerExpert; scaleRow++) {
+                    size_t offset = ((size_t)expert * scaleRowsPerExpert + scaleRow) *
+                                    srcScaleCols + scaleColStart;
+                    AssertInFastLLM(offset + dstScaleCols <= src.scales.size(),
+                                    "Qwen3.5 MoE fused TP FP8 column scale slice is out of bounds.\n");
+                    dst.scales.insert(dst.scales.end(),
+                                      src.scales.begin() + offset,
+                                      src.scales.begin() + offset + dstScaleCols);
+                }
+            }
+        }
+
+        static void Qwen35CopyFusedDownInterColumns(Data &dst, Data &src,
+                                                    int interStart, int localInter) {
+            AssertInFastLLM(dst.dims.size() == 3 && src.dims.size() == 3,
+                            "Qwen3.5 MoE fused TP down shard expects 3D weights.\n");
+            int experts = src.dims[0], hidden = src.dims[1], inter = src.dims[2];
+            AssertInFastLLM(dst.dims[0] == experts && dst.dims[1] == hidden &&
+                            dst.dims[2] == localInter && interStart >= 0 &&
+                            localInter >= 0 && interStart + localInter <= inter,
+                            "Qwen3.5 MoE fused TP down shard shape mismatch.\n");
+            if (localInter == 0) {
+                return;
+            }
+            src.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(src.cpuData != nullptr && dst.cpuData != nullptr,
+                            "Qwen3.5 MoE fused TP down shard requires CPU buffers.\n");
+            int rows = experts * hidden;
+            size_t srcRowBytes = Qwen35MoeBytesPerRow(src, inter);
+            size_t dstRowBytes = Qwen35MoeBytesPerRow(dst, localInter);
+            if (src.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                const int block = 128;
+                const int blockBytes = block + (int)sizeof(float);
+                AssertInFastLLM(interStart % block == 0,
+                                "Qwen3.5 MoE fused TP FP8 block shard is unaligned.\n");
+                int blockStart = interStart / block;
+                int blockCount = (localInter + block - 1) / block;
+                for (int row = 0; row < rows; row++) {
+                    memcpy(dst.cpuData + (size_t)row * dstRowBytes,
+                           src.cpuData + (size_t)row * srcRowBytes + (size_t)blockStart * blockBytes,
+                           (size_t)blockCount * blockBytes);
+                }
+            } else {
+                AssertInFastLLM(src.dataType == DataType::FP8_E4M3,
+                                "Qwen3.5 MoE fused TP only supports FP8 fused weights.\n");
+                for (int row = 0; row < rows; row++) {
+                    memcpy(dst.cpuData + (size_t)row * dstRowBytes,
+                           src.cpuData + (size_t)row * srcRowBytes + interStart,
+                           (size_t)localInter);
+                }
+                Qwen35AppendFp8DownColumnScales(dst, src, interStart, localInter);
+            }
+        }
+
+        static Data *Qwen35CreateFusedInterShard(Data &src, int axis,
+                                                 int device, std::pair<int, int> range) {
+            AssertInFastLLM(axis == 1 || axis == 2,
+                            "Qwen3.5 MoE fused TP only splits inter dimension.\n");
+            int localInter = range.second - range.first;
+            AssertInFastLLM(localInter >= 0,
+                            "Qwen3.5 MoE fused TP got invalid shard range.\n");
+            std::vector<int> localDims = src.dims;
+            localDims[axis] = localInter;
+            Data *local = new Data(src.dataType, localDims);
+            Qwen35MoeCopyLinearWeightMeta(*local, src,
+                                          src.name + ".tp" + std::to_string(device));
+            local->scales.clear();
+            local->dataDeviceIds = {device};
+            if (local->Count(0) > 0) {
+                local->Allocate(false);
+                if (axis == 1) {
+                    Qwen35CopyFusedInterRows(*local, src, range.first, localInter);
+                } else {
+                    Qwen35CopyFusedDownInterColumns(*local, src, range.first, localInter);
+                }
+                Qwen35PrepareFusedMoeWeightForCuda(*local, device);
+            } else {
+                local->dataDevice = DataDevice::CUDA;
+            }
+            return local;
+        }
+
+        static bool Qwen35FusedShardLayoutReady(const Data &weight,
+                                                const std::vector<int> &devices,
+                                                const DivisionScheme &scheme,
+                                                int axis) {
+            if (!weight.multiDeviceData || weight.tpLayout != TP_LAYOUT_SHARDED ||
+                weight.tpAxis != axis || weight.tpRanges != scheme) {
+                return false;
+            }
+            for (int device : devices) {
+                auto localIt = weight.multiDeviceDatas.find(device);
+                auto rangeIt = scheme.find(device);
+                if (localIt == weight.multiDeviceDatas.end() || localIt->second == nullptr ||
+                    rangeIt == scheme.end()) {
+                    return false;
+                }
+                int localInter = 0;
+                for (auto &range : rangeIt->second) {
+                    localInter += range.second - range.first;
+                }
+                Data *local = localIt->second;
+                if (local->dims.size() != weight.dims.size() ||
+                    local->dims[axis] != localInter ||
+                    local->dataDevice != DataDevice::CUDA ||
+                    local->dataDeviceIds.empty() || local->dataDeviceIds[0] != device) {
+                    return false;
+                }
+                if (local->Count(0) > 0 &&
+                    (local->cudaData == nullptr ||
+                     (local->dataType == DataType::FP8_E4M3 && local->extraCudaData.empty()))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static void Qwen35PrepareFusedShardedWeight(Data &weight,
+                                                    const std::vector<int> &devices,
+                                                    const DivisionScheme &scheme,
+                                                    int axis) {
+            if (Qwen35FusedShardLayoutReady(weight, devices, scheme, axis)) {
+                return;
+            }
+            weight.ToDevice(DataDevice::CPU);
+            Qwen3CudaClearMultiDeviceState(weight);
+            std::map<int, Data*> localDatas;
+            for (int device : devices) {
+                auto rangeIt = scheme.find(device);
+                AssertInFastLLM(rangeIt != scheme.end(),
+                                "Qwen3.5 MoE fused TP missing device range.\n");
+                std::pair<int, int> range = {0, 0};
+                if (!rangeIt->second.empty()) {
+                    AssertInFastLLM(rangeIt->second.size() == 1,
+                                    "Qwen3.5 MoE fused TP expects contiguous per-device shards.\n");
+                    range = rangeIt->second[0];
+                }
+                localDatas[device] = Qwen35CreateFusedInterShard(weight, axis, device, range);
+            }
+            weight.multiDeviceDatas.swap(localDatas);
+            weight.multiDeviceData = true;
+            weight.dataDevice = DataDevice::CUDA;
+            weight.dataDeviceIds = devices;
+            weight.tpLayout = TP_LAYOUT_SHARDED;
+            weight.tpAxis = axis;
+            weight.tpGlobalDims = weight.dims;
+            weight.tpRanges = scheme;
+            weight.cudaData = nullptr;
+            weight.deviceData = nullptr;
+            if (weight.cpuData != nullptr) {
+                delete[] weight.cpuData;
+                weight.cpuData = nullptr;
+            }
+            weight.scales.clear();
+            weight.scales.shrink_to_fit();
+        }
+
+        static bool Qwen35HasLocalFusedMoeShard(Data *gate, Data *up, Data *down) {
+            return gate != nullptr && up != nullptr && down != nullptr &&
+                   gate->dims.size() == 3 && up->dims.size() == 3 && down->dims.size() == 3 &&
+                   gate->dims[1] > 0 && up->dims[1] > 0 && down->dims[2] > 0 &&
+                   gate->cudaData != nullptr && up->cudaData != nullptr && down->cudaData != nullptr;
+        }
+
+        static void Qwen35CudaFusedMOE(Qwen3CudaDirectRunner &runner,
+                                       Data &input, Data &expertIndex, Data &expertScore,
+                                       Data &gate, Data &up, Data &down, Data &w1,
+                                       Data &output, int layer) {
+            runner.Run("FusedMOE",
+                       DataDict{{"input", &input}, {"index", &expertIndex}, {"score", &expertScore},
+                                {"gate", &gate}, {"up", &up}, {"down", &down},
+                                {"w1", &w1}, {"output", &output}},
+                       FloatDict{{"swigluLimit", 0.0f}},
+                       IntDict{{"layer", layer}, {"gateType", (int)MoeGateSwiglu}},
+                       {"w1", "output"});
+        }
+
+        static bool Qwen35HasLocalMoeShard(const std::vector<Data*> &localWeights) {
+            for (int i = 2; i + 1 < (int)localWeights.size(); i += 2) {
+                Data *gateup = localWeights[i];
+                Data *down = localWeights[i + 1];
+                if (gateup != nullptr && down != nullptr &&
+                    gateup->dims.size() == 2 && down->dims.size() == 2 &&
+                    gateup->dims[0] > 0 && down->dims[1] > 0) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         static void SyncQwen35ThreadTpRootCacheMetaFromLocal(
@@ -521,6 +1344,50 @@ namespace fastllm {
                     ret[it.first].push_back({zBase + vs * headVDim, zBase + ve * headVDim});
                     ret[it.first].push_back({bBase + vs, bBase + ve});
                     ret[it.first].push_back({aBase + vs, aBase + ve});
+                }
+            }
+            return ret;
+        }
+
+        static DivisionScheme BuildQwen35LinearQkvzScheme(
+                const DivisionScheme &keyHeadScheme,
+                int numKHeads,
+                int numVHeads,
+                int headKDim,
+                int headVDim) {
+            DivisionScheme ret;
+            int valueHeadsPerKey = numVHeads / numKHeads;
+            int kd = numKHeads * headKDim;
+            int vd = numVHeads * headVDim;
+            int qBase = 0;
+            int kBase = kd;
+            int vBase = kd * 2;
+            int zBase = kd * 2 + vd;
+            for (auto &it : keyHeadScheme) {
+                ret[it.first];
+                for (auto &kr : it.second) {
+                    int vs = kr.first * valueHeadsPerKey;
+                    int ve = kr.second * valueHeadsPerKey;
+                    ret[it.first].push_back({qBase + kr.first * headKDim, qBase + kr.second * headKDim});
+                    ret[it.first].push_back({kBase + kr.first * headKDim, kBase + kr.second * headKDim});
+                    ret[it.first].push_back({vBase + vs * headVDim, vBase + ve * headVDim});
+                    ret[it.first].push_back({zBase + vs * headVDim, zBase + ve * headVDim});
+                }
+            }
+            return ret;
+        }
+
+        static DivisionScheme BuildQwen35LinearBaScheme(
+                const DivisionScheme &valueHeadScheme,
+                int numVHeads) {
+            DivisionScheme ret;
+            int bBase = 0;
+            int aBase = numVHeads;
+            for (auto &it : valueHeadScheme) {
+                ret[it.first];
+                for (auto &range : it.second) {
+                    ret[it.first].push_back({bBase + range.first, bBase + range.second});
+                    ret[it.first].push_back({aBase + range.first, aBase + range.second});
                 }
             }
             return ret;
@@ -741,6 +1608,9 @@ namespace fastllm {
             Data merged, qgate, gate, q, k, v, attenOutput, attenLastOutput, qForAttentionHolder;
             Data kAppend, vAppend;
             Data gateupResult, swigluResult, mlpPart;
+            Data routerLogits, routerLogitsTemp, expertIndex, expertScore;
+            Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+            Data moeFinal, sharedGate, sharedOutput;
             Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
             Data gdnMerged, qkvConvInput, z, ba, b, a, g, convOutput, coreAttnOut;
             Data linearQ, linearK, linearV;
@@ -809,6 +1679,13 @@ namespace fastllm {
             state.lastPastKeyHosts.clear();
         }
 
+        static void Qwen35AbortCudaGraphCapture() {
+            void *capturedGraph = nullptr;
+            if (FastllmCudaGraphEndCapture(&capturedGraph) && capturedGraph != nullptr) {
+                FastllmCudaGraphDestroy(capturedGraph);
+            }
+        }
+
         static void Qwen35DetachGraphDataStorage(Data &data) {
             data.pageIndex.clear();
             data.pagedKVCacheData = nullptr;
@@ -846,6 +1723,20 @@ namespace fastllm {
             Qwen35DetachGraphDataStorage(buf.gateupResult);
             Qwen35DetachGraphDataStorage(buf.swigluResult);
             Qwen35DetachGraphDataStorage(buf.mlpPart);
+            Qwen35DetachGraphDataStorage(buf.routerLogits);
+            Qwen35DetachGraphDataStorage(buf.routerLogitsTemp);
+            Qwen35DetachGraphDataStorage(buf.expertIndex);
+            Qwen35DetachGraphDataStorage(buf.expertScore);
+            Qwen35DetachGraphDataStorage(buf.w1);
+            Qwen35DetachGraphDataStorage(buf.w2);
+            Qwen35DetachGraphDataStorage(buf.w3);
+            Qwen35DetachGraphDataStorage(buf.tempInput);
+            Qwen35DetachGraphDataStorage(buf.tempOutput);
+            Qwen35DetachGraphDataStorage(buf.moeInputTemp);
+            Qwen35DetachGraphDataStorage(buf.moeOutputTemp);
+            Qwen35DetachGraphDataStorage(buf.moeFinal);
+            Qwen35DetachGraphDataStorage(buf.sharedGate);
+            Qwen35DetachGraphDataStorage(buf.sharedOutput);
             Qwen35DetachGraphDataStorage(buf.qSizes);
             Qwen35DetachGraphDataStorage(buf.pageSizes);
             Qwen35DetachGraphDataStorage(buf.pageIndexs);
@@ -2785,7 +3676,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> devices;
         std::map<int, int> ratios;
-        return GetQwen35ThreadTpDevices(this->deviceMap, this->num_experts, devices, ratios);
+        return GetQwen35ThreadTpDevices(this->deviceMap, devices, ratios);
 #else
         return false;
 #endif
@@ -2862,12 +3753,13 @@ namespace fastllm {
     void Qwen3_5Model::PreCaptureCudaGraphAfterWarmup() {
 #ifdef USE_CUDA
         if (!GetFastllmEnv().cudaGraph || autoWarmupRunning.load() ||
-            GetKVCacheInCPU() || num_experts > 0) {
+            GetKVCacheInCPU()) {
             return;
         }
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
+        if ((num_experts > 0 && !Qwen35ModelMoeLayersAllowCudaOnly(this)) ||
+            !GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
             return;
         }
 
@@ -3006,6 +3898,9 @@ namespace fastllm {
             }
         }
         if (precomputedHiddenStates == nullptr && inputIds.Count(0) != (uint64_t)batch) {
+            return false;
+        }
+        if (num_experts > 0 && !Qwen35ModelMoeLayersAllowCudaOnly(this)) {
             return false;
         }
 
@@ -3362,6 +4257,9 @@ namespace fastllm {
         }
 
         const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
+        const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
+        auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
+        auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
         auto localHeadsFromScheme = [&](const DivisionScheme &scheme, int defaultHeads) {
             if (!tensorParallel) {
                 return defaultHeads;
@@ -3471,6 +4369,8 @@ namespace fastllm {
                         buf.attenLastOutput, buf.hiddenStates,
                         tensorParallel, firstTensorParallelRank, gpuId);
                 } else {
+                    std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
+                    std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                     std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
                     std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
                     std::string conv1dBiasName = prefix + "linear_attn.conv1d.bias";
@@ -3494,16 +4394,37 @@ namespace fastllm {
                     int localVd = localValueHeads * head_v_dim;
                     int localQkvDim = localKd * 2 + localVd;
 
-                    Qwen3CudaLinear(cudaRunner, buf.attenInput,
-                                    *requireLocal(weight[qkvzbaWeightName], qkvzbaWeightName),
-                                    *requireLocal(GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias"),
-                                                  qkvzbaWeightName + ".tp_bias"),
-                                    buf.gdnMerged);
+                    bool hasMergedGdnInLinear =
+                        weight.weight.find(qkvzbaWeightName) != weight.weight.end();
+                    if (hasMergedGdnInLinear) {
+                        Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                        *requireLocal(weight[qkvzbaWeightName], qkvzbaWeightName),
+                                        *requireLocal(GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias"),
+                                                      qkvzbaWeightName + ".tp_bias"),
+                                        buf.gdnMerged);
+                    } else {
+                        AssertInFastLLM(weight.weight.find(qkvzWeightName) != weight.weight.end() &&
+                                        weight.weight.find(baWeightName) != weight.weight.end(),
+                                        "Qwen3.5 CUDA graph requires linear attention qkvz/ba weights.\n");
+                        Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                        *requireLocal(weight[qkvzWeightName], qkvzWeightName),
+                                        *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"),
+                                                      qkvzWeightName + ".tp_bias"),
+                                        buf.gdnMerged);
+                    }
                     Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0, localQkvDim, buf.qkvConvInput);
                     Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim,
                                    localQkvDim + localVd, buf.z);
-                    Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim + localVd,
-                                   localQkvDim + localVd + localValueHeads * 2, buf.ba);
+                    if (hasMergedGdnInLinear) {
+                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim + localVd,
+                                       localQkvDim + localVd + localValueHeads * 2, buf.ba);
+                    } else {
+                        Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                        *requireLocal(weight[baWeightName], baWeightName),
+                                        *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
+                                                      baWeightName + ".tp_bias"),
+                                        buf.ba);
+                    }
 
                     Data &pastKey = *pastKeyValues[i].first;
                     if (batch == 1) {
@@ -3674,17 +4595,107 @@ namespace fastllm {
                 Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
                                  *requireLocal(weight[postRmsName], postRmsName),
                                  rms_norm_eps, buf.attenInput);
-                Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
-                                      *requireLocal(weight[swigluWeightName], swigluWeightName),
-                                      *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
-                                                    swigluWeightName + ".tp_bias"),
-                                      buf.gateupResult, buf.swigluResult);
-                Qwen3CudaLinearResidualReduce(
-                    cudaRunner, buf.swigluResult,
-                    *requireLocal(weight[downWeightName], downWeightName),
-                    *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
-                    buf.mlpPart, buf.hiddenStates,
-                    tensorParallel, firstTensorParallelRank, gpuId);
+                bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                                   weight.weight.find(downWeightName) != weight.weight.end();
+                if (hasDenseMlp) {
+                    Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
+                                          *requireLocal(weight[swigluWeightName], swigluWeightName),
+                                          *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
+                                                        swigluWeightName + ".tp_bias"),
+                                          buf.gateupResult, buf.swigluResult);
+                    Qwen3CudaLinearResidualReduce(
+                        cudaRunner, buf.swigluResult,
+                        *requireLocal(weight[downWeightName], downWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
+                        buf.mlpPart, buf.hiddenStates,
+                        tensorParallel, firstTensorParallelRank, gpuId);
+                    continue;
+                }
+
+                std::string gateWeightName = prefix + "mlp.gate.weight";
+                std::string gateBiasName = prefix + "mlp.gate.e_score_correction_bias";
+                std::string sharedGateupWeightName = prefix + "mlp.shared_expert.gateup_proj.weight";
+                std::string sharedDownWeightName = prefix + "mlp.shared_expert.down_proj.weight";
+                std::string sharedExpertGateWeightName = prefix + "mlp.shared_expert_gate.weight";
+                AssertInFastLLM(weight.weight.find(gateWeightName) != weight.weight.end(),
+                                "Qwen3.5 CUDA graph layer has neither dense MLP nor router gate weight.\n");
+                AssertInFastLLM(!Qwen35LayerUsesMappedNonCudaMoe(this, i),
+                                "Qwen3.5 CUDA graph doesn't support non-CUDA moe_device layers.\n");
+
+                if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
+                    AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
+                                    "Qwen3.5 CUDA graph requires merged shared expert gateup weight.\n");
+                    Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
+                                          *requireLocal(weight[sharedGateupWeightName], sharedGateupWeightName),
+                                          *requireLocal(GetThreadTensorParallelBias(sharedGateupWeightName + ".tp_bias"),
+                                                        sharedGateupWeightName + ".tp_bias"),
+                                          buf.gateupResult, buf.swigluResult);
+                    Qwen3CudaLinear(cudaRunner, buf.swigluResult,
+                                    *requireLocal(weight[sharedDownWeightName], sharedDownWeightName),
+                                    *requireLocal(GetThreadTensorParallelBias(sharedDownWeightName + ".tp_bias"),
+                                                  sharedDownWeightName + ".tp_bias"),
+                                    buf.sharedOutput);
+                    if (weight.weight.find(sharedExpertGateWeightName) != weight.weight.end()) {
+                        Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                        *requireLocal(weight[sharedExpertGateWeightName], sharedExpertGateWeightName),
+                                        *GetEmptyData(), buf.sharedGate);
+                        Qwen35CudaSigmoid(cudaRunner, buf.sharedGate, buf.sharedGate);
+                        if (buf.sharedGate.dataType != buf.sharedOutput.dataType) {
+                            Qwen3CudaToDataType(cudaRunner, buf.sharedGate, buf.sharedOutput.dataType);
+                        }
+                        Qwen35CudaMulTo(cudaRunner, buf.sharedOutput, buf.sharedGate);
+                    }
+                    addPartialToResidualReduce(buf.sharedOutput);
+                }
+
+                int localBatch = buf.attenInput.dims[0];
+                int localLen = buf.attenInput.dims[1];
+                buf.attenInput.Reshape({localBatch * localLen, buf.attenInput.dims[2]});
+                Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                *requireLocal(weight[gateWeightName], gateWeightName),
+                                *GetEmptyData(), buf.routerLogits, true);
+                Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits,
+                                           buf.routerLogitsTemp, DataType::FLOAT32);
+                Qwen3CudaSoftmax(cudaRunner, buf.routerLogitsTemp, buf.routerLogitsTemp, -1);
+                Data *localGateBias = nullptr;
+                if (weight.weight.find(gateBiasName) != weight.weight.end()) {
+                    localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
+                }
+                Qwen3CudaSelectExpert(cudaRunner, buf.routerLogitsTemp,
+                                      buf.expertIndex, buf.expertScore,
+                                      this->num_experts_per_tok, this->norm_topk_prob,
+                                      this->routed_scaling_factor, localGateBias);
+
+                if (HasFusedMoeWeights(i)) {
+                    Data *localGate = GetFusedMoeWeightForDevice(moeGate3DWeights[i], gpuId);
+                    Data *localUp = GetFusedMoeWeightForDevice(moeUp3DWeights[i], gpuId);
+                    Data *localDown = GetFusedMoeWeightForDevice(moeDown3DWeights[i], gpuId);
+                    if (Qwen35HasLocalFusedMoeShard(localGate, localUp, localDown)) {
+                        Qwen35CudaFusedMOE(cudaRunner, buf.attenInput,
+                                           buf.expertIndex, buf.expertScore,
+                                           *localGate, *localUp, *localDown,
+                                           buf.w1, buf.moeFinal, i);
+                    } else {
+                        Qwen35ZeroCudaLike(buf.moeFinal, buf.hiddenStates, gpuId);
+                    }
+                } else {
+                    auto &localWeights = moeWeightsByDevice.at(gpuId)[i];
+                    auto &localBiass = moeBiassByDevice.at(gpuId)[i];
+                    if (Qwen35HasLocalMoeShard(localWeights)) {
+                        Qwen3CudaMergeMOEBlock(cudaRunner, &buf.attenInput,
+                            &buf.expertIndex, &buf.expertScore,
+                            &localWeights, &localBiass,
+                            &buf.w1, &buf.w2, &buf.w3,
+                            &buf.tempInput, &buf.tempOutput,
+                            1.0f, &buf.moeFinal, i,
+                            computeType, threadTpMoeAtype,
+                            &buf.moeInputTemp, &buf.moeOutputTemp);
+                    } else {
+                        Qwen35ZeroCudaLike(buf.moeFinal, buf.hiddenStates, gpuId);
+                    }
+                }
+                buf.moeFinal.Reshape(buf.hiddenStates.dims);
+                addPartialToResidualReduce(buf.moeFinal);
             }
 
             Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
@@ -3703,9 +4714,12 @@ namespace fastllm {
             Qwen35PrepareGraphCudaTensor(logits, state.logits, gpuId);
         };
 
-        auto runWithoutGraph = [&]() {
+        auto runWithoutGraph = [&]() -> bool {
+            FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
             runGraphBody();
+            bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
             finishWithLogits();
+            return usedUnsafeMoeFallback;
         };
 
         if (state.captured) {
@@ -3728,8 +4742,15 @@ namespace fastllm {
         }
 
         if (!state.warmed) {
-            runGraphBody();
-            finishWithLogits();
+            bool usedUnsafeMoeFallback = runWithoutGraph();
+            if (usedUnsafeMoeFallback) {
+                printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during warmup.\n",
+                       gpuId);
+                fflush(stdout);
+                Qwen35DestroyCudaGraph(state);
+                state.disabled = true;
+                return true;
+            }
             state.warmed = true;
             return true;
         }
@@ -3742,7 +4763,19 @@ namespace fastllm {
             runWithoutGraph();
             return true;
         }
+        FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
         runGraphBody();
+        bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
+        if (usedUnsafeMoeFallback) {
+            printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during capture.\n",
+                   gpuId);
+            fflush(stdout);
+            Qwen35AbortCudaGraphCapture();
+            Qwen35DestroyCudaGraph(state);
+            state.disabled = true;
+            runWithoutGraph();
+            return true;
+        }
         if (!FastllmCudaGraphEndCapture(&capturedGraph) || capturedGraph == nullptr) {
             printf("Warning: Qwen3.5 CUDA graph end capture failed on gpu %d: %s. Disable graph for this GPU.\n",
                    gpuId, FastllmCudaGraphLastError());
@@ -3837,6 +4870,7 @@ namespace fastllm {
         };
 
         const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
+        const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
         Data localHiddenStates;
         Data *hiddenStatesPtr = nullptr;
         if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
@@ -3864,13 +4898,18 @@ namespace fastllm {
         Data attenInput, merged, qgate, gate, q, k, v, attenOutput, attenLastOutput;
         Data qForAttentionHolder;
         Data gateupResult, swigluResult, mlpPart;
+        Data routerLogits, routerLogitsTemp, expertIndex, expertScore;
+        Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+        Data moeFinal, sharedGate, sharedOutput;
         Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
-        Data gdnMerged, qkvConvInput, z, b, a, g, conv, convOutput, coreAttnOut, coreTemp;
+        Data gdnMerged, baMerged, qkvConvInput, z, b, a, g, conv, convOutput, coreAttnOut, coreTemp;
         Data qRepeat, kRepeat, qq, qTemp, kkPad, vvPad, bbPad, ggPad, decayMask;
         Data kBeta, vBeta, attn, at, kCumdecay, gExp;
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
         bool generatedAppendParams = false;
         bool generatedDecodeParams = false;
+        auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
+        auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
 
         auto addPartialToResidualReduce = [&](Data &partial) {
             if (partial.dataType != hiddenStates.dataType) {
@@ -3956,6 +4995,8 @@ namespace fastllm {
                     attenLastOutput, hiddenStates,
                     tensorParallel, firstTensorParallelRank, gpuId);
             } else {
+                std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
+                std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                 std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
                 std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
                 std::string conv1dBiasName = prefix + "linear_attn.conv1d.bias";
@@ -3979,18 +5020,42 @@ namespace fastllm {
                 int localVd = localValueHeads * head_v_dim;
                 int localQkvDim = localKd * 2 + localVd;
 
-                Qwen3CudaLinear(cudaRunner, attenInput,
-                                *requireLocal(weight[qkvzbaWeightName], qkvzbaWeightName),
-                                *requireLocal(GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias"),
-                                              qkvzbaWeightName + ".tp_bias"),
-                                gdnMerged);
+                bool hasMergedGdnInLinear =
+                    weight.weight.find(qkvzbaWeightName) != weight.weight.end();
+                if (hasMergedGdnInLinear) {
+                    Qwen3CudaLinear(cudaRunner, attenInput,
+                                    *requireLocal(weight[qkvzbaWeightName], qkvzbaWeightName),
+                                    *requireLocal(GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias"),
+                                                  qkvzbaWeightName + ".tp_bias"),
+                                    gdnMerged);
+                } else {
+                    AssertInFastLLM(weight.weight.find(qkvzWeightName) != weight.weight.end() &&
+                                    weight.weight.find(baWeightName) != weight.weight.end(),
+                                    "Qwen3.5 ForwardSingleGPU requires linear attention qkvz/ba weights.\n");
+                    Qwen3CudaLinear(cudaRunner, attenInput,
+                                    *requireLocal(weight[qkvzWeightName], qkvzWeightName),
+                                    *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"),
+                                                  qkvzWeightName + ".tp_bias"),
+                                    gdnMerged);
+                }
                 Qwen3CudaSplit(cudaRunner, gdnMerged, -1, 0, localQkvDim, qkvConvInput);
                 Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim, localQkvDim + localVd, z);
-                Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim + localVd,
-                               localQkvDim + localVd + localValueHeads, b);
-                Qwen3CudaSplit(cudaRunner, gdnMerged, -1,
-                               localQkvDim + localVd + localValueHeads,
-                               localQkvDim + localVd + localValueHeads * 2, a);
+                if (hasMergedGdnInLinear) {
+                    Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim + localVd,
+                                   localQkvDim + localVd + localValueHeads, b);
+                    Qwen3CudaSplit(cudaRunner, gdnMerged, -1,
+                                   localQkvDim + localVd + localValueHeads,
+                                   localQkvDim + localVd + localValueHeads * 2, a);
+                } else {
+                    Qwen3CudaLinear(cudaRunner, attenInput,
+                                    *requireLocal(weight[baWeightName], baWeightName),
+                                    *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
+                                                  baWeightName + ".tp_bias"),
+                                    baMerged);
+                    Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
+                    Qwen3CudaSplit(cudaRunner, baMerged, -1, localValueHeads,
+                                   localValueHeads * 2, a);
+                }
 
                 Data &pastKey = *pastKeyValues[i].first;
                 Data &pastValue = *pastKeyValues[i].second;
@@ -4298,20 +5363,123 @@ namespace fastllm {
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
                              rms_norm_eps, attenInput);
-            AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end() &&
-                            weight.weight.find(downWeightName) != weight.weight.end(),
-                            "Qwen3.5 ForwardGPU currently supports dense MLP TP only.\n");
-            Qwen3CudaLinearSwiglu(cudaRunner, attenInput,
-                                  *requireLocal(weight[swigluWeightName], swigluWeightName),
-                                  *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
-                                                swigluWeightName + ".tp_bias"),
-                                  gateupResult, swigluResult);
-            Qwen3CudaLinearResidualReduce(
-                cudaRunner, swigluResult,
-                *requireLocal(weight[downWeightName], downWeightName),
-                *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
-                mlpPart, hiddenStates,
-                tensorParallel, firstTensorParallelRank, gpuId);
+            bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                               weight.weight.find(downWeightName) != weight.weight.end();
+            if (hasDenseMlp) {
+                Qwen3CudaLinearSwiglu(cudaRunner, attenInput,
+                                      *requireLocal(weight[swigluWeightName], swigluWeightName),
+                                      *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
+                                                    swigluWeightName + ".tp_bias"),
+                                      gateupResult, swigluResult);
+                Qwen3CudaLinearResidualReduce(
+                    cudaRunner, swigluResult,
+                    *requireLocal(weight[downWeightName], downWeightName),
+                    *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
+                    mlpPart, hiddenStates,
+                    tensorParallel, firstTensorParallelRank, gpuId);
+                continue;
+            }
+
+            std::string gateWeightName = prefix + "mlp.gate.weight";
+            std::string gateBiasName = prefix + "mlp.gate.e_score_correction_bias";
+            std::string sharedGateupWeightName = prefix + "mlp.shared_expert.gateup_proj.weight";
+            std::string sharedDownWeightName = prefix + "mlp.shared_expert.down_proj.weight";
+            std::string sharedExpertGateWeightName = prefix + "mlp.shared_expert_gate.weight";
+            AssertInFastLLM(weight.weight.find(gateWeightName) != weight.weight.end(),
+                            "Qwen3.5 ForwardGPU layer has neither dense MLP nor router gate weight.\n");
+
+            if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
+                AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
+                                "Qwen3.5 ForwardGPU requires merged shared expert gateup weight.\n");
+                Qwen3CudaLinearSwiglu(cudaRunner, attenInput,
+                                      *requireLocal(weight[sharedGateupWeightName], sharedGateupWeightName),
+                                      *requireLocal(GetThreadTensorParallelBias(sharedGateupWeightName + ".tp_bias"),
+                                                    sharedGateupWeightName + ".tp_bias"),
+                                      gateupResult, swigluResult);
+                Qwen3CudaLinear(cudaRunner, swigluResult,
+                                *requireLocal(weight[sharedDownWeightName], sharedDownWeightName),
+                                *requireLocal(GetThreadTensorParallelBias(sharedDownWeightName + ".tp_bias"),
+                                              sharedDownWeightName + ".tp_bias"),
+                                sharedOutput);
+                if (weight.weight.find(sharedExpertGateWeightName) != weight.weight.end()) {
+                    Qwen3CudaLinear(cudaRunner, attenInput,
+                                    *requireLocal(weight[sharedExpertGateWeightName], sharedExpertGateWeightName),
+                                    *GetEmptyData(), sharedGate);
+                    Qwen35CudaSigmoid(cudaRunner, sharedGate, sharedGate);
+                    if (sharedGate.dataType != sharedOutput.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, sharedGate, sharedOutput.dataType);
+                    }
+                    Qwen35CudaMulTo(cudaRunner, sharedOutput, sharedGate);
+                }
+                addPartialToResidualReduce(sharedOutput);
+            }
+
+            int localBatch = attenInput.dims[0];
+            int localLen = attenInput.dims[1];
+            attenInput.Reshape({localBatch * localLen, attenInput.dims[2]});
+            Qwen3CudaLinear(cudaRunner, attenInput,
+                            *requireLocal(weight[gateWeightName], gateWeightName),
+                            *GetEmptyData(), routerLogits, true);
+            Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerLogitsTemp, DataType::FLOAT32);
+            Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp, routerLogitsTemp, -1);
+            Data *localGateBias = nullptr;
+            if (weight.weight.find(gateBiasName) != weight.weight.end()) {
+                localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
+            }
+            Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
+                                  this->num_experts_per_tok, this->norm_topk_prob,
+                                  this->routed_scaling_factor, localGateBias);
+
+            bool layerMappedNonCudaMoe = Qwen35LayerUsesMappedNonCudaMoe(this, i);
+            if (layerMappedNonCudaMoe) {
+                if (!tensorParallel || firstTensorParallelRank) {
+                    std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
+                    Qwen35ResetCpuScratch(moeFinal);
+                    FastllmCudaSetDevice(gpuId);
+                    Qwen35ScopedGenericExecutor scopedExecutor(selectedMoeDevice);
+                    MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
+                        &weights[i], &biass[i],
+                        &w1, &w2, &w3,
+                        &tempInput, &tempOutput,
+                        1.0f, &moeFinal, i,
+                        computeType, threadTpMoeAtype,
+                        &moeInputTemp, &moeOutputTemp);
+                    FastllmCudaSetDevice(gpuId);
+                    if (moeFinal.dataDevice != DataDevice::CUDA || moeFinal.cudaData == nullptr ||
+                        (!moeFinal.dataDeviceIds.empty() && moeFinal.dataDeviceIds[0] != gpuId)) {
+                        moeFinal.ToDevice(DataDevice::CUDA, {gpuId}, true);
+                    }
+                } else {
+                    Qwen35ZeroCudaLike(moeFinal, hiddenStates, gpuId);
+                }
+            } else if (HasFusedMoeWeights(i)) {
+                Data *localGate = GetFusedMoeWeightForDevice(moeGate3DWeights[i], gpuId);
+                Data *localUp = GetFusedMoeWeightForDevice(moeUp3DWeights[i], gpuId);
+                Data *localDown = GetFusedMoeWeightForDevice(moeDown3DWeights[i], gpuId);
+                if (Qwen35HasLocalFusedMoeShard(localGate, localUp, localDown)) {
+                    Qwen35CudaFusedMOE(cudaRunner, attenInput, expertIndex, expertScore,
+                                       *localGate, *localUp, *localDown,
+                                       w1, moeFinal, i);
+                } else {
+                    Qwen35ZeroCudaLike(moeFinal, hiddenStates, gpuId);
+                }
+            } else {
+                auto &localWeights = moeWeightsByDevice.at(gpuId)[i];
+                auto &localBiass = moeBiassByDevice.at(gpuId)[i];
+                if (Qwen35HasLocalMoeShard(localWeights)) {
+                    Qwen3CudaMergeMOEBlock(cudaRunner, &attenInput, &expertIndex, &expertScore,
+                        &localWeights, &localBiass,
+                        &w1, &w2, &w3,
+                        &tempInput, &tempOutput,
+                        1.0f, &moeFinal, i,
+                        computeType, threadTpMoeAtype,
+                        &moeInputTemp, &moeOutputTemp);
+                } else {
+                    Qwen35ZeroCudaLike(moeFinal, hiddenStates, gpuId);
+                }
+            }
+            moeFinal.Reshape(hiddenStates.dims);
+            addPartialToResidualReduce(moeFinal);
         }
 
         Data lastHiddenStates;
@@ -4360,8 +5528,6 @@ namespace fastllm {
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
 #else
         (void)attentionMask;
-        AssertInFastLLM(num_experts <= 0,
-                        "Qwen3.5 ForwardGPU TP path doesn't support MoE layers yet.\n");
         std::vector<int> devices;
         std::map<int, int> ratios;
         if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios)) {
@@ -4477,6 +5643,13 @@ namespace fastllm {
             return runSplitBatchForward();
         }
 
+        if (num_experts > 0) {
+            if (!Qwen35MoeDisableFusedMoe() &&
+                Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap)) {
+                TryBuildFusedMoeWeightsFromLoaded();
+            }
+            PrepareMoeWeights();
+        }
         PrepareGdnWeights();
         if (this->weight.weight.find("lm_head.weight") == this->weight.weight.end()) {
             this->weight["lm_head.weight"] = Data();
@@ -4503,6 +5676,102 @@ namespace fastllm {
         const DivisionScheme *lmHeadScheme = &localLmHeadScheme;
         Data &lmHead = weight["lm_head.weight"];
 
+        auto layerHasMoe = [&](int layer) {
+            return num_experts > 0 &&
+                   weight.weight.find(language_prefix + "layers." + std::to_string(layer) +
+                                      ".mlp.gate.weight") != weight.weight.end();
+        };
+        auto layerNeedsCudaMoeCache = [&](int layer) {
+            return layerHasMoe(layer) &&
+                   !Qwen35LayerUsesMappedNonCudaMoe(this, layer) &&
+                   !HasFusedMoeWeights(layer);
+        };
+        auto anyLayerNeedsCudaMoeCache = [&]() {
+            for (int i = 0; i < block_cnt; i++) {
+                if (layerNeedsCudaMoeCache(i)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto hasMoeCache = [&](const std::unordered_map<int, std::vector<std::vector<Data*> > > &weightCache,
+                               const std::unordered_map<int, std::vector<std::vector<Data*> > > &biasCache) {
+            if (!anyLayerNeedsCudaMoeCache()) {
+                return true;
+            }
+            int expectedSize = this->num_experts * 2 + 2;
+            for (int device : devices) {
+                auto weightIt = weightCache.find(device);
+                auto biasIt = biasCache.find(device);
+                if (weightIt == weightCache.end() || biasIt == biasCache.end() ||
+                    (int)weightIt->second.size() != block_cnt || (int)biasIt->second.size() != block_cnt) {
+                    return false;
+                }
+                for (int i = 0; i < block_cnt; i++) {
+                    if ((int)weightIt->second[i].size() != expectedSize ||
+                        (int)biasIt->second[i].size() != expectedSize) {
+                        return false;
+                    }
+                    if (!layerNeedsCudaMoeCache(i)) {
+                        continue;
+                    }
+                    for (int j = 2; j < expectedSize; j++) {
+                        if (weightIt->second[i][j] == nullptr) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        };
+        auto fillMoeCache = [&](std::unordered_map<int, std::vector<std::vector<Data*> > > &weightCache,
+                                std::unordered_map<int, std::vector<std::vector<Data*> > > &biasCache,
+                                bool useLocalShards) {
+            weightCache.clear();
+            biasCache.clear();
+            int expectedSize = this->num_experts * 2 + 2;
+            for (int device : devices) {
+                auto &deviceWeights = weightCache[device];
+                auto &deviceBiass = biasCache[device];
+                deviceWeights.resize(block_cnt);
+                deviceBiass.resize(block_cnt);
+                for (int i = 0; i < block_cnt; i++) {
+                    auto &layerWeights = deviceWeights[i];
+                    auto &layerBiass = deviceBiass[i];
+                    layerWeights.reserve(expectedSize);
+                    layerBiass.reserve(expectedSize);
+                    layerWeights.push_back(nullptr);
+                    layerWeights.push_back(nullptr);
+                    layerBiass.push_back(nullptr);
+                    layerBiass.push_back(nullptr);
+                    if (!layerNeedsCudaMoeCache(i)) {
+                        layerWeights.resize(expectedSize, nullptr);
+                        layerBiass.resize(expectedSize, nullptr);
+                        continue;
+                    }
+                    for (int j = 0; j < this->num_experts; j++) {
+                        std::string gateupWeightName = language_prefix + "layers." + std::to_string(i) +
+                            ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight";
+                        std::string downWeightName = language_prefix + "layers." + std::to_string(i) +
+                            ".mlp.experts." + std::to_string(j) + ".down_proj.weight";
+                        auto getLocalOrRoot = [&](Data &data) -> Data* {
+                            if (useLocalShards) {
+                                auto it = data.multiDeviceDatas.find(device);
+                                if (it != data.multiDeviceDatas.end() && it->second != nullptr) {
+                                    return it->second;
+                                }
+                            }
+                            return &data;
+                        };
+                        layerWeights.push_back(getLocalOrRoot(weight[gateupWeightName]));
+                        layerWeights.push_back(getLocalOrRoot(weight[downWeightName]));
+                        layerBiass.push_back(nullptr);
+                        layerBiass.push_back(nullptr);
+                    }
+                }
+            }
+        };
+
         auto ensureInitializedAdd1 = [&]() {
             if (initialized_add1) {
                 return;
@@ -4523,7 +5792,8 @@ namespace fastllm {
                                 "Qwen3.5 ForwardGPU thread TP device config changed after weights were prepared.\n");
                 AssertInFastLLM((int)threadTpAttentionKVHeadSchemes.size() == block_cnt &&
                                 (int)threadTpLinearValueHeadSchemes.size() == block_cnt &&
-                                !threadTpLmHeadScheme.empty(),
+                                !threadTpLmHeadScheme.empty() &&
+                                hasMoeCache(threadTpMoeWeights, threadTpMoeBiass),
                                 "Qwen3.5 ForwardGPU thread TP cached weight schemes are incomplete.\n");
                 attentionKvSchemes = &threadTpAttentionKVHeadSchemes;
                 linearValueSchemes = &threadTpLinearValueHeadSchemes;
@@ -4592,6 +5862,8 @@ namespace fastllm {
                             AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, oScheme, 1),
                                             "Qwen3.5 ForwardGPU failed to split " + oWeightName + ".\n");
                         } else {
+                            std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
+                            std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                             std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
                             std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
                             std::string conv1dBiasName = prefix + "linear_attn.conv1d.bias";
@@ -4599,8 +5871,12 @@ namespace fastllm {
                             std::string dtBiasName = prefix + "linear_attn.dt_bias";
                             std::string outNormWeightName = prefix + "linear_attn.norm.weight";
                             std::string outProjWeightName = prefix + "linear_attn.out_proj.weight";
-                            AssertInFastLLM(weight.weight.find(qkvzbaWeightName) != weight.weight.end(),
-                                            "Qwen3.5 ForwardGPU requires merged linear attention qkvzba weight.\n");
+                            bool hasMergedGdnInLinear =
+                                weight.weight.find(qkvzbaWeightName) != weight.weight.end();
+                            AssertInFastLLM(hasMergedGdnInLinear ||
+                                            (weight.weight.find(qkvzWeightName) != weight.weight.end() &&
+                                             weight.weight.find(baWeightName) != weight.weight.end()),
+                                            "Qwen3.5 ForwardGPU requires linear attention qkvzba or qkvz/ba weights.\n");
                             prepareReplicated(outNormWeightName);
 
                             DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
@@ -4609,13 +5885,29 @@ namespace fastllm {
                                 keyScheme, num_v_heads / num_k_heads);
                             threadTpLinearValueHeadSchemes[i] = valueScheme;
 
-                            DivisionScheme qkvzbaScheme = BuildQwen35LinearQkvzbaScheme(
-                                keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
-                            Data &qkvzbaBias = GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias");
                             std::vector<int> devCopy = devices;
-                            AssertInFastLLM(SplitMultiCudaWeight(weight[qkvzbaWeightName], qkvzbaBias,
-                                                                 devCopy, qkvzbaScheme, 0),
-                                            "Qwen3.5 ForwardGPU failed to split " + qkvzbaWeightName + ".\n");
+                            if (hasMergedGdnInLinear) {
+                                DivisionScheme qkvzbaScheme = BuildQwen35LinearQkvzbaScheme(
+                                    keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
+                                Data &qkvzbaBias = GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias");
+                                AssertInFastLLM(SplitMultiCudaWeight(weight[qkvzbaWeightName], qkvzbaBias,
+                                                                     devCopy, qkvzbaScheme, 0),
+                                                "Qwen3.5 ForwardGPU failed to split " + qkvzbaWeightName + ".\n");
+                            } else {
+                                DivisionScheme qkvzScheme = BuildQwen35LinearQkvzScheme(
+                                    keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
+                                Data &qkvzBias = GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias");
+                                AssertInFastLLM(SplitMultiCudaWeight(weight[qkvzWeightName], qkvzBias,
+                                                                     devCopy, qkvzScheme, 0),
+                                                "Qwen3.5 ForwardGPU failed to split " + qkvzWeightName + ".\n");
+                                DivisionScheme baScheme = BuildQwen35LinearBaScheme(
+                                    valueScheme, num_v_heads);
+                                Data &baBias = GetThreadTensorParallelBias(baWeightName + ".tp_bias");
+                                devCopy = devices;
+                                AssertInFastLLM(SplitMultiCudaWeight(weight[baWeightName], baBias,
+                                                                     devCopy, baScheme, 0),
+                                                "Qwen3.5 ForwardGPU failed to split " + baWeightName + ".\n");
+                            }
 
                             DivisionScheme convScheme = BuildQwen35LinearConvScheme(
                                 keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
@@ -4637,23 +5929,103 @@ namespace fastllm {
                                             "Qwen3.5 ForwardGPU failed to split " + outProjWeightName + ".\n");
                         }
 
-                        AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end() &&
-                                        weight.weight.find(downWeightName) != weight.weight.end(),
-                                        "Qwen3.5 ForwardGPU requires dense merged gateup MLP weights.\n");
-                        Data &gateup = weight[swigluWeightName];
-                        Data &gateupBias = GetThreadTensorParallelBias(swigluWeightName + ".tp_bias");
-                        gateup.tpPackType = TP_PACK_GATEUP;
-                        std::vector<int> devCopy = devices;
-                        DivisionScheme gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
-                        AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
-                                        "Qwen3.5 ForwardGPU failed to split " + swigluWeightName + ".\n");
+                        bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                                           weight.weight.find(downWeightName) != weight.weight.end();
+                        if (hasDenseMlp) {
+                            Data &gateup = weight[swigluWeightName];
+                            Data &gateupBias = GetThreadTensorParallelBias(swigluWeightName + ".tp_bias");
+                            gateup.tpPackType = TP_PACK_GATEUP;
+                            std::vector<int> devCopy = devices;
+                            DivisionScheme gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
+                            AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
+                                            "Qwen3.5 ForwardGPU failed to split " + swigluWeightName + ".\n");
 
-                        Data &downBias = GetThreadTensorParallelBias(downBiasName);
-                        DivisionScheme downScheme = ExtractQwen35FirstRangeScheme(gateScheme);
-                        devCopy = devices;
-                        AssertInFastLLM(SplitMultiCudaWeight(weight[downWeightName], downBias,
-                                                             devCopy, downScheme, 1),
-                                        "Qwen3.5 ForwardGPU failed to split " + downWeightName + ".\n");
+                            Data &downBias = GetThreadTensorParallelBias(downBiasName);
+                            DivisionScheme downScheme = ExtractQwen35FirstRangeScheme(gateScheme);
+                            devCopy = devices;
+                            AssertInFastLLM(SplitMultiCudaWeight(weight[downWeightName], downBias,
+                                                                 devCopy, downScheme, 1),
+                                            "Qwen3.5 ForwardGPU failed to split " + downWeightName + ".\n");
+                            continue;
+                        }
+
+                        std::string gateWeightName = prefix + "mlp.gate.weight";
+                        std::string gateBiasName = prefix + "mlp.gate.e_score_correction_bias";
+                        AssertInFastLLM(weight.weight.find(gateWeightName) != weight.weight.end(),
+                                        "Qwen3.5 ForwardGPU layer has neither dense MLP nor router gate weight.\n");
+                        prepareReplicated(gateWeightName);
+                        if (weight.weight.find(gateBiasName) != weight.weight.end()) {
+                            prepareReplicated(gateBiasName);
+                        }
+
+                        std::string sharedGateupWeightName = prefix + "mlp.shared_expert.gateup_proj.weight";
+                        std::string sharedDownWeightName = prefix + "mlp.shared_expert.down_proj.weight";
+                        std::string sharedExpertGateWeightName = prefix + "mlp.shared_expert_gate.weight";
+                        if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
+                            AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
+                                            "Qwen3.5 ForwardGPU requires merged shared expert gateup weight.\n");
+                            Data &sharedGateup = weight[sharedGateupWeightName];
+                            Data &sharedGateupBias = GetThreadTensorParallelBias(sharedGateupWeightName + ".tp_bias");
+                            sharedGateup.tpPackType = TP_PACK_GATEUP;
+                            std::vector<int> devCopy = devices;
+                            DivisionScheme sharedGateScheme = BuildMultiCudaRowSplitScheme(sharedGateup, devCopy, ratios);
+                            AssertInFastLLM(SplitMultiCudaWeight(sharedGateup, sharedGateupBias,
+                                                                 devCopy, sharedGateScheme, 0),
+                                            "Qwen3.5 ForwardGPU failed to split " + sharedGateupWeightName + ".\n");
+
+                            Data &sharedDownBias = GetThreadTensorParallelBias(sharedDownWeightName + ".tp_bias");
+                            DivisionScheme sharedDownScheme = ExtractQwen35FirstRangeScheme(sharedGateScheme);
+                            devCopy = devices;
+                            AssertInFastLLM(SplitMultiCudaWeight(weight[sharedDownWeightName], sharedDownBias,
+                                                                 devCopy, sharedDownScheme, 1),
+                                            "Qwen3.5 ForwardGPU failed to split " + sharedDownWeightName + ".\n");
+                            if (weight.weight.find(sharedExpertGateWeightName) != weight.weight.end()) {
+                                prepareReplicated(sharedExpertGateWeightName);
+                            }
+                        }
+
+                        if (Qwen35LayerUsesMappedNonCudaMoe(this, i) || HasFusedMoeWeights(i)) {
+                            continue;
+                        }
+
+                        DivisionScheme gateScheme;
+                        for (int j = 0; j < this->num_experts; j++) {
+                            std::string gateupWeightName = prefix + "mlp.experts." +
+                                                           std::to_string(j) + ".gateup_proj.weight";
+                            std::string expertDownWeightName = prefix + "mlp.experts." +
+                                                               std::to_string(j) + ".down_proj.weight";
+                            AssertInFastLLM(weight.weight.find(gateupWeightName) != weight.weight.end(),
+                                            "Qwen3.5 ForwardGPU requires merged expert gateup weight.\n");
+                            AssertInFastLLM(weight.weight.find(expertDownWeightName) != weight.weight.end(),
+                                            "Qwen3.5 ForwardGPU requires expert down weight.\n");
+
+                            Data &gateup = weight[gateupWeightName];
+                            Data &gateupBias = GetThreadTensorParallelBias(gateupWeightName + ".tp_bias");
+                            gateup.tpLinearType = TP_LINEAR_ROW;
+                            gateup.tpPackType = TP_PACK_GATEUP;
+                            std::vector<int> devCopy = devices;
+                            gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
+                            AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
+                                            "Qwen3.5 ForwardGPU failed to split " + gateupWeightName + ".\n");
+
+                            Data &down = weight[expertDownWeightName];
+                            Data &downBias = GetThreadTensorParallelBias(expertDownWeightName + ".tp_bias");
+                            down.tpLinearType = TP_LINEAR_COLUMN;
+                            DivisionScheme downScheme = ExtractQwen35FirstRangeScheme(gateScheme);
+                            devCopy = devices;
+                            AssertInFastLLM(SplitMultiCudaWeight(down, downBias, devCopy, downScheme, 1),
+                                            "Qwen3.5 ForwardGPU failed to split " + expertDownWeightName + ".\n");
+                        }
+                    }
+
+                    if (HasPlannedFusedMoeLayers()) {
+                        PrepareFusedMoeWeightsForDevices(devices, ratios);
+                    }
+                    if (anyLayerNeedsCudaMoeCache()) {
+                        fillMoeCache(threadTpMoeWeights, threadTpMoeBiass, true);
+                    } else {
+                        threadTpMoeWeights.clear();
+                        threadTpMoeBiass.clear();
                     }
 
                     Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
@@ -4671,13 +6043,78 @@ namespace fastllm {
         } else {
             std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
             ensureInitializedAdd1();
-            if (!singleGpuWeightsPrepared.load(std::memory_order_relaxed)) {
+            if (!singleGpuWeightsPrepared.load(std::memory_order_relaxed) ||
+                !hasMoeCache(singleGpuMoeWeights, singleGpuMoeBiass)) {
+                int device = devices[0];
                 for (int i = 0; i < block_cnt; i++) {
                     std::string prefix = language_prefix + "layers." + std::to_string(i) + ".";
                     std::string swigluWeightName = prefix + "mlp.gateup_proj.weight";
-                    if (weight.weight.find(swigluWeightName) != weight.weight.end()) {
+                    std::string downWeightName = prefix + "mlp.down_proj.weight";
+                    bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                                       weight.weight.find(downWeightName) != weight.weight.end();
+                    if (hasDenseMlp) {
                         weight[swigluWeightName].tpPackType = TP_PACK_GATEUP;
+                        continue;
                     }
+                    if (!layerHasMoe(i)) {
+                        continue;
+                    }
+
+                    std::string gateWeightName = prefix + "mlp.gate.weight";
+                    std::string gateBiasName = prefix + "mlp.gate.e_score_correction_bias";
+                    AssertInFastLLM(weight.weight.find(gateWeightName) != weight.weight.end(),
+                                    "Qwen3.5 ForwardGPU requires router gate weight.\n");
+                    weight[gateWeightName].ToDevice(DataDevice::CUDA, {device}, true);
+                    if (weight.weight.find(gateBiasName) != weight.weight.end()) {
+                        weight[gateBiasName].ToDevice(DataDevice::CUDA, {device}, true);
+                    }
+
+                    std::string sharedGateupWeightName = prefix + "mlp.shared_expert.gateup_proj.weight";
+                    std::string sharedDownWeightName = prefix + "mlp.shared_expert.down_proj.weight";
+                    std::string sharedExpertGateWeightName = prefix + "mlp.shared_expert_gate.weight";
+                    if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
+                        AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
+                                        "Qwen3.5 ForwardGPU requires merged shared expert gateup weight.\n");
+                        weight[sharedGateupWeightName].tpPackType = TP_PACK_GATEUP;
+                        weight[sharedGateupWeightName].ToDevice(DataDevice::CUDA, {device}, true);
+                        weight[sharedDownWeightName].ToDevice(DataDevice::CUDA, {device}, true);
+                        if (weight.weight.find(sharedExpertGateWeightName) != weight.weight.end()) {
+                            weight[sharedExpertGateWeightName].ToDevice(DataDevice::CUDA, {device}, true);
+                        }
+                    }
+
+                    if (Qwen35LayerUsesMappedNonCudaMoe(this, i)) {
+                        continue;
+                    }
+                    if (HasFusedMoeWeights(i)) {
+                        Qwen35PrepareFusedMoeWeightForCuda(*moeGate3DWeights[i], device);
+                        Qwen35PrepareFusedMoeWeightForCuda(*moeUp3DWeights[i], device);
+                        Qwen35PrepareFusedMoeWeightForCuda(*moeDown3DWeights[i], device);
+                        continue;
+                    }
+                    for (int j = 0; j < this->num_experts; j++) {
+                        std::string gateupWeightName = prefix + "mlp.experts." +
+                                                       std::to_string(j) + ".gateup_proj.weight";
+                        std::string expertDownWeightName = prefix + "mlp.experts." +
+                                                           std::to_string(j) + ".down_proj.weight";
+                        AssertInFastLLM(weight.weight.find(gateupWeightName) != weight.weight.end(),
+                                        "Qwen3.5 ForwardGPU requires merged expert gateup weight.\n");
+                        AssertInFastLLM(weight.weight.find(expertDownWeightName) != weight.weight.end(),
+                                        "Qwen3.5 ForwardGPU requires expert down weight.\n");
+                        Data &gateup = weight[gateupWeightName];
+                        Data &down = weight[expertDownWeightName];
+                        gateup.tpLinearType = TP_LINEAR_ROW;
+                        gateup.tpPackType = TP_PACK_GATEUP;
+                        down.tpLinearType = TP_LINEAR_COLUMN;
+                        gateup.ToDevice(DataDevice::CUDA, {device}, true);
+                        down.ToDevice(DataDevice::CUDA, {device}, true);
+                    }
+                }
+                if (anyLayerNeedsCudaMoeCache()) {
+                    fillMoeCache(singleGpuMoeWeights, singleGpuMoeBiass, false);
+                } else {
+                    singleGpuMoeWeights.clear();
+                    singleGpuMoeBiass.clear();
                 }
                 singleGpuWeightsPrepared.store(true, std::memory_order_release);
             }
@@ -5144,6 +6581,656 @@ namespace fastllm {
         inv_scale_data.CopyFrom(temp);
     }
 
+    bool Qwen3_5Model::IsFusedMoeLayerPlanned(int layer) const {
+        return layer >= 0 &&
+               layer < (int)this->moeFusedLayerPlanned.size() &&
+               this->moeFusedLayerPlanned[layer];
+    }
+
+    bool Qwen3_5Model::HasPlannedFusedMoeLayers() const {
+        for (char planned : this->moeFusedLayerPlanned) {
+            if (planned) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool Qwen3_5Model::HasFusedMoeWeights(int layer) const {
+        return layer >= 0 &&
+               layer < (int)moeGate3DWeights.size() &&
+               layer < (int)moeUp3DWeights.size() &&
+               layer < (int)moeDown3DWeights.size() &&
+               moeGate3DWeights[layer] != nullptr &&
+               moeUp3DWeights[layer] != nullptr &&
+               moeDown3DWeights[layer] != nullptr;
+    }
+
+    static bool Qwen35MoeAllExpertsReady(const std::vector<std::vector<char>> &ready,
+                                         int layer, int numExperts) {
+        if (layer < 0 || layer >= (int)ready.size() ||
+            (int)ready[layer].size() != numExperts) {
+            return false;
+        }
+        for (int expert = 0; expert < numExperts; expert++) {
+            if (!ready[layer][expert]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool Qwen35MoeLayerStreamReady(const std::vector<Data*> &gateWeights,
+                                          const std::vector<Data*> &upWeights,
+                                          const std::vector<Data*> &downWeights,
+                                          int layer,
+                                          const std::vector<std::vector<char>> &gateReady,
+                                          const std::vector<std::vector<char>> &upReady,
+                                          const std::vector<std::vector<char>> &downReady,
+                                          int numExperts) {
+        return layer >= 0 &&
+               layer < (int)gateWeights.size() &&
+               layer < (int)upWeights.size() &&
+               layer < (int)downWeights.size() &&
+               gateWeights[layer] != nullptr &&
+               upWeights[layer] != nullptr &&
+               downWeights[layer] != nullptr &&
+               Qwen35MoeAllExpertsReady(gateReady, layer, numExperts) &&
+               Qwen35MoeAllExpertsReady(upReady, layer, numExperts) &&
+               Qwen35MoeAllExpertsReady(downReady, layer, numExperts);
+    }
+
+    bool Qwen3_5Model::ArePlannedFusedMoeLayersReady() const {
+        if (!HasPlannedFusedMoeLayers()) {
+            return false;
+        }
+        for (int i = 0; i < block_cnt; i++) {
+            if (!IsFusedMoeLayerPlanned(i)) {
+                continue;
+            }
+            if (!HasFusedMoeWeights(i) ||
+                i >= (int)moeGate3DExpertReady.size() ||
+                i >= (int)moeUp3DExpertReady.size() ||
+                i >= (int)moeDown3DExpertReady.size() ||
+                (int)moeGate3DExpertReady[i].size() != this->num_experts ||
+                (int)moeUp3DExpertReady[i].size() != this->num_experts ||
+                (int)moeDown3DExpertReady[i].size() != this->num_experts) {
+                return false;
+            }
+            for (int expert = 0; expert < this->num_experts; expert++) {
+                if (!moeGate3DExpertReady[i][expert] ||
+                    !moeUp3DExpertReady[i][expert] ||
+                    !moeDown3DExpertReady[i][expert]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    Data *Qwen3_5Model::GetFusedMoeWeightForDevice(Data *weight, int device) const {
+        AssertInFastLLM(weight != nullptr,
+                        "Qwen3.5 MoE fused weight is missing.\n");
+        if (!weight->multiDeviceData) {
+            return weight;
+        }
+        auto it = weight->multiDeviceDatas.find(device);
+        AssertInFastLLM(it != weight->multiDeviceDatas.end() && it->second != nullptr,
+                        "Qwen3.5 MoE fused local shard is missing.\n");
+        return it->second;
+    }
+
+    void Qwen3_5Model::PrepareFusedMoeLayerForDevices(int layer,
+                                                      const std::vector<int> &devices,
+                                                      std::map<int, int> ratios) {
+#ifdef USE_CUDA
+        if (!HasFusedMoeWeights(layer) || devices.empty()) {
+            return;
+        }
+        Data &gate = *moeGate3DWeights[layer];
+        Data &up = *moeUp3DWeights[layer];
+        Data &down = *moeDown3DWeights[layer];
+        AssertInFastLLM(gate.dims.size() == 3 && up.dims.size() == 3 &&
+                        down.dims.size() == 3 &&
+                        gate.dims[1] == up.dims[1] &&
+                        gate.dims[1] == down.dims[2],
+                        "Qwen3.5 MoE fused TP weights have incompatible shapes.\n");
+        if (devices.size() == 1) {
+            int device = devices[0];
+            Qwen35PrepareFusedMoeWeightForCuda(gate, device);
+            Qwen35PrepareFusedMoeWeightForCuda(up, device);
+            Qwen35PrepareFusedMoeWeightForCuda(down, device);
+        } else {
+            DivisionScheme interScheme = Qwen35BuildFusedInterScheme(gate, devices, ratios);
+            Qwen35PrepareFusedShardedWeight(gate, devices, interScheme, 1);
+            Qwen35PrepareFusedShardedWeight(up, devices, interScheme, 1);
+            Qwen35PrepareFusedShardedWeight(down, devices, interScheme, 2);
+        }
+#else
+        (void)layer;
+        (void)devices;
+        (void)ratios;
+#endif
+    }
+
+    void Qwen3_5Model::PrepareFusedMoeWeightsForDevices(const std::vector<int> &devices,
+                                                        std::map<int, int> ratios) {
+        if (!moeFusedWeightsPrepared || !HasPlannedFusedMoeLayers() || devices.empty()) {
+            return;
+        }
+        for (int i = 0; i < block_cnt; i++) {
+            if (!IsFusedMoeLayerPlanned(i)) {
+                continue;
+            }
+            AssertInFastLLM(HasFusedMoeWeights(i),
+                            "Qwen3.5 MoE fused weights are incomplete.\n");
+            PrepareFusedMoeLayerForDevices(i, devices, ratios);
+        }
+    }
+
+    void Qwen3_5Model::TryFinalizeFusedMoeLayerParts(int layer) {
+        if (layer < 0 || layer >= block_cnt || !IsFusedMoeLayerPlanned(layer)) {
+            return;
+        }
+#ifdef USE_CUDA
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        bool prepareCuda = !Qwen35MoeDisableFusedMoe() &&
+            !Qwen35LayerUsesMappedNonCudaMoe(this, layer) &&
+            Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) &&
+            GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
+            !devices.empty();
+        if (prepareCuda && Qwen35MoeAllExpertsReady(moeGate3DExpertReady, layer, this->num_experts) &&
+            moeGate3DWeights[layer] != nullptr) {
+            if (devices.size() == 1) {
+                Qwen35PrepareFusedMoeWeightForCuda(*moeGate3DWeights[layer], devices[0]);
+            } else {
+                DivisionScheme interScheme = Qwen35BuildFusedInterScheme(*moeGate3DWeights[layer], devices, ratios);
+                Qwen35PrepareFusedShardedWeight(*moeGate3DWeights[layer], devices, interScheme, 1);
+            }
+        }
+        if (prepareCuda && Qwen35MoeAllExpertsReady(moeUp3DExpertReady, layer, this->num_experts) &&
+            moeUp3DWeights[layer] != nullptr) {
+            if (devices.size() == 1) {
+                Qwen35PrepareFusedMoeWeightForCuda(*moeUp3DWeights[layer], devices[0]);
+            } else if (moeGate3DWeights[layer] != nullptr &&
+                       moeGate3DWeights[layer]->multiDeviceData &&
+                       !moeGate3DWeights[layer]->tpRanges.empty()) {
+                Qwen35PrepareFusedShardedWeight(*moeUp3DWeights[layer], devices,
+                                                moeGate3DWeights[layer]->tpRanges, 1);
+            }
+        }
+        if (prepareCuda && Qwen35MoeAllExpertsReady(moeDown3DExpertReady, layer, this->num_experts) &&
+            moeDown3DWeights[layer] != nullptr) {
+            if (devices.size() == 1) {
+                Qwen35PrepareFusedMoeWeightForCuda(*moeDown3DWeights[layer], devices[0]);
+            } else if (moeGate3DWeights[layer] != nullptr &&
+                       moeGate3DWeights[layer]->multiDeviceData &&
+                       !moeGate3DWeights[layer]->tpRanges.empty()) {
+                Qwen35PrepareFusedShardedWeight(*moeDown3DWeights[layer], devices,
+                                                moeGate3DWeights[layer]->tpRanges, 2);
+            }
+        }
+#endif
+        bool layerReady = Qwen35MoeLayerStreamReady(moeGate3DWeights, moeUp3DWeights, moeDown3DWeights,
+                                                    layer, moeGate3DExpertReady,
+                                                    moeUp3DExpertReady,
+                                                    moeDown3DExpertReady, this->num_experts);
+        if (!layerReady) {
+            return;
+        }
+        moeFusedWeightsPrepared = ArePlannedFusedMoeLayersReady();
+        if (moeFusedWeightsPrepared) {
+            loadFusedMoePlanned = false;
+            loadFusedMoeSourceWeights.clear();
+        }
+    }
+
+    bool Qwen3_5Model::TryConsumeFusedMoeSourceWeight(const std::string &weightName) {
+        if (!loadFusedMoePlanned ||
+            loadFusedMoeSourceWeights.find(weightName) == loadFusedMoeSourceWeights.end()) {
+            return false;
+        }
+        int layer = -1, expert = -1;
+        std::string kind;
+        if (!Qwen35MoeParseExpertWeightName(weightName, layer, expert, kind) ||
+            layer < 0 || layer >= block_cnt || expert < 0 || expert >= this->num_experts) {
+            return false;
+        }
+        if (!IsFusedMoeLayerPlanned(layer)) {
+            return false;
+        }
+        auto weightIt = this->weight.weight.find(weightName);
+        if (weightIt == this->weight.weight.end() || weightIt->second.cpuData == nullptr) {
+            return false;
+        }
+        Data &src = weightIt->second;
+        if ((int)moeGate3DWeights.size() != block_cnt) {
+            moeGate3DWeights.assign(block_cnt, nullptr);
+            moeUp3DWeights.assign(block_cnt, nullptr);
+            moeDown3DWeights.assign(block_cnt, nullptr);
+        }
+        if ((int)moeGate3DExpertReady.size() != block_cnt) {
+            moeGate3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+            moeUp3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+            moeDown3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+        }
+
+        if (kind == "gate" || kind == "up") {
+            if (src.dims.size() != 2 || !Qwen35MoeIsFusedFp8Type(src.dataType)) {
+                return false;
+            }
+            int inter = src.dims[0];
+            int hidden = src.dims[1];
+            Data *&target = kind == "gate" ? moeGate3DWeights[layer] : moeUp3DWeights[layer];
+            Qwen35MoeEnsureFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                            kind, src, inter, hidden, target);
+            Qwen35MoeCopyRows(*target, expert * inter, src, 0, inter);
+            Qwen35MoeCopyFp8ScaleRowsToExpert(*target, src, expert, 0, inter);
+            if (kind == "gate") {
+                moeGate3DExpertReady[layer][expert] = 1;
+            } else {
+                moeUp3DExpertReady[layer][expert] = 1;
+            }
+            Qwen35MoeReleaseConsumedSourceWeight(src);
+            consumedFusedMoeSourceWeights.insert(weightName);
+            TryFinalizeFusedMoeLayerParts(layer);
+            return true;
+        }
+
+        if (kind == "gateup") {
+            if (src.dims.size() != 2 || (src.dims[0] & 1) != 0 ||
+                !Qwen35MoeIsFusedFp8Type(src.dataType)) {
+                return false;
+            }
+            int inter = src.dims[0] / 2;
+            int hidden = src.dims[1];
+            Qwen35MoeEnsureFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                            "gate", src, inter, hidden, moeGate3DWeights[layer]);
+            Qwen35MoeEnsureFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                            "up", src, inter, hidden, moeUp3DWeights[layer]);
+            Qwen35MoeCopyRows(*moeGate3DWeights[layer], expert * inter, src, 0, inter);
+            Qwen35MoeCopyRows(*moeUp3DWeights[layer], expert * inter, src, inter, inter);
+            Qwen35MoeCopyFp8ScaleRowsToExpert(*moeGate3DWeights[layer], src, expert, 0, inter);
+            Qwen35MoeCopyFp8ScaleRowsToExpert(*moeUp3DWeights[layer], src, expert, inter, inter);
+            moeGate3DExpertReady[layer][expert] = 1;
+            moeUp3DExpertReady[layer][expert] = 1;
+            Qwen35MoeReleaseConsumedSourceWeight(src);
+            consumedFusedMoeSourceWeights.insert(weightName);
+            TryFinalizeFusedMoeLayerParts(layer);
+            return true;
+        }
+
+        if (src.dims.size() != 2 || !Qwen35MoeIsFusedFp8Type(src.dataType)) {
+            return false;
+        }
+        int hidden = src.dims[0];
+        int inter = src.dims[1];
+        Qwen35MoeEnsureFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                        "down", src, hidden, inter, moeDown3DWeights[layer]);
+        Qwen35MoeCopyRows(*moeDown3DWeights[layer], expert * hidden, src, 0, hidden);
+        Qwen35MoeCopyFp8ScaleRowsToExpert(*moeDown3DWeights[layer], src, expert, 0, hidden);
+        moeDown3DExpertReady[layer][expert] = 1;
+        Qwen35MoeReleaseConsumedSourceWeight(src);
+        consumedFusedMoeSourceWeights.insert(weightName);
+        TryFinalizeFusedMoeLayerParts(layer);
+        return true;
+    }
+
+    bool Qwen3_5Model::TryBuildFusedMoeLayerFromLoaded(int layer) {
+        if (layer < 0 || layer >= block_cnt) {
+            return false;
+        }
+        if (!IsFusedMoeLayerPlanned(layer)) {
+            return true;
+        }
+        if (HasFusedMoeWeights(layer)) {
+            return Qwen35MoeLayerStreamReady(moeGate3DWeights, moeUp3DWeights, moeDown3DWeights,
+                                             layer, moeGate3DExpertReady,
+                                             moeUp3DExpertReady,
+                                             moeDown3DExpertReady, this->num_experts);
+        }
+        if ((int)moeGate3DWeights.size() != block_cnt) {
+            moeGate3DWeights.assign(block_cnt, nullptr);
+            moeUp3DWeights.assign(block_cnt, nullptr);
+            moeDown3DWeights.assign(block_cnt, nullptr);
+        }
+        if ((int)moeGate3DExpertReady.size() != block_cnt) {
+            moeGate3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+            moeUp3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+            moeDown3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+        }
+        if (!Qwen35MoeCanBuildFusedLayer(this->weight.weight, layer, this->num_experts)) {
+            return false;
+        }
+
+#ifdef USE_CUDA
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        bool prepareCuda = !Qwen35MoeDisableFusedMoe() &&
+            !Qwen35LayerUsesMappedNonCudaMoe(this, layer) &&
+            Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) &&
+            GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
+            !devices.empty();
+        DivisionScheme interScheme;
+#endif
+
+        Qwen35MoeBuildFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                       "gate", moeGate3DWeights[layer]);
+#ifdef USE_CUDA
+        if (prepareCuda) {
+            if (devices.size() == 1) {
+                Qwen35PrepareFusedMoeWeightForCuda(*moeGate3DWeights[layer], devices[0]);
+            } else {
+                interScheme = Qwen35BuildFusedInterScheme(*moeGate3DWeights[layer], devices, ratios);
+                Qwen35PrepareFusedShardedWeight(*moeGate3DWeights[layer], devices, interScheme, 1);
+            }
+        }
+#endif
+
+        Qwen35MoeBuildFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                       "up", moeUp3DWeights[layer]);
+#ifdef USE_CUDA
+        if (prepareCuda) {
+            if (devices.size() == 1) {
+                Qwen35PrepareFusedMoeWeightForCuda(*moeUp3DWeights[layer], devices[0]);
+            } else {
+                Qwen35PrepareFusedShardedWeight(*moeUp3DWeights[layer], devices, interScheme, 1);
+            }
+        }
+#endif
+
+        Qwen35MoeBuildFusedLayerWeight(this->weight.weight, layer, this->num_experts,
+                                       "down", moeDown3DWeights[layer]);
+#ifdef USE_CUDA
+        if (prepareCuda) {
+            if (devices.size() == 1) {
+                Qwen35PrepareFusedMoeWeightForCuda(*moeDown3DWeights[layer], devices[0]);
+            } else {
+                Qwen35PrepareFusedShardedWeight(*moeDown3DWeights[layer], devices, interScheme, 2);
+            }
+        }
+#endif
+
+        for (int expert = 0; expert < this->num_experts; expert++) {
+            std::string expertPrefix = Qwen35MoeExpertPrefix(layer, expert);
+            this->weight.weight.erase(expertPrefix + "gate_proj.weight");
+            this->weight.weight.erase(expertPrefix + "up_proj.weight");
+            this->weight.weight.erase(expertPrefix + "gateup_proj.weight");
+            this->weight.weight.erase(expertPrefix + "down_proj.weight");
+        }
+        if ((int)moeGate3DExpertReady.size() == block_cnt &&
+            (int)moeUp3DExpertReady.size() == block_cnt &&
+            (int)moeDown3DExpertReady.size() == block_cnt) {
+            std::fill(moeGate3DExpertReady[layer].begin(), moeGate3DExpertReady[layer].end(), 1);
+            std::fill(moeUp3DExpertReady[layer].begin(), moeUp3DExpertReady[layer].end(), 1);
+            std::fill(moeDown3DExpertReady[layer].begin(), moeDown3DExpertReady[layer].end(), 1);
+        }
+        weights.clear();
+        biass.clear();
+        threadTpMoeWeights.clear();
+        threadTpMoeBiass.clear();
+        singleGpuMoeWeights.clear();
+        singleGpuMoeBiass.clear();
+        threadTpWeightsPrepared.store(false, std::memory_order_release);
+        singleGpuWeightsPrepared.store(false, std::memory_order_release);
+        moeWeightsPrepared = false;
+
+        moeFusedWeightsPrepared = ArePlannedFusedMoeLayersReady();
+        if (moeFusedWeightsPrepared) {
+            loadFusedMoePlanned = false;
+            loadFusedMoeSourceWeights.clear();
+        }
+        return true;
+    }
+
+    bool Qwen3_5Model::TryBuildFusedMoeWeightsFromLoaded() {
+        if (moeFusedWeightsPrepared && HasPlannedFusedMoeLayers()) {
+            return true;
+        }
+        if (!HasPlannedFusedMoeLayers()) {
+            return false;
+        }
+        for (int i = 0; i < block_cnt; i++) {
+            if (!IsFusedMoeLayerPlanned(i)) {
+                continue;
+            }
+            if (Qwen35MoeLayerStreamReady(moeGate3DWeights, moeUp3DWeights, moeDown3DWeights,
+                                          i, moeGate3DExpertReady,
+                                          moeUp3DExpertReady,
+                                          moeDown3DExpertReady, this->num_experts)) {
+                continue;
+            }
+            if (!TryBuildFusedMoeLayerFromLoaded(i)) {
+                return false;
+            }
+        }
+        moeFusedWeightsPrepared = ArePlannedFusedMoeLayersReady();
+        if (moeFusedWeightsPrepared) {
+            loadFusedMoePlanned = false;
+            loadFusedMoeSourceWeights.clear();
+        }
+        return moeFusedWeightsPrepared;
+    }
+
+    void Qwen3_5Model::OnWeightsCreated(const std::set<std::string> &allWeightNames) {
+        loadFusedMoePlanned = false;
+        loadFusedMoeSourceWeights.clear();
+        consumedFusedMoeSourceWeights.clear();
+        moeFusedLayerPlanned.clear();
+        moeFusedWeightsPrepared = false;
+#ifdef USE_CUDA
+        if (Qwen35MoeDisableFusedMoe() ||
+            !Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) ||
+            block_cnt <= 0 || this->num_experts <= 0) {
+            return;
+        }
+
+        std::vector<bool> layerUsesGateup(block_cnt, false);
+        std::vector<char> plannedLayers(block_cnt, 0);
+        std::set<std::string> plannedSourceWeights;
+        for (int i = 0; i < block_cnt; i++) {
+            if (Qwen35LayerUsesMappedNonCudaMoe(this, i)) {
+                continue;
+            }
+            bool hasCompleteLayer = true;
+            bool layerHasAnyExpert = false;
+            int layerInter = -1, layerHidden = -1;
+            DataType layerType = DataType::FLOAT32;
+            for (int j = 0; j < this->num_experts; j++) {
+                std::string gateName = Qwen35MoeExpertWeightName(i, j, "gate");
+                std::string upName = Qwen35MoeExpertWeightName(i, j, "up");
+                std::string gateupName = Qwen35MoeExpertWeightName(i, j, "gateup");
+                std::string downName = Qwen35MoeExpertWeightName(i, j, "down");
+                bool hasMergedGateup = allWeightNames.find(gateupName) != allWeightNames.end();
+                bool hasGateAndUp = allWeightNames.find(gateName) != allWeightNames.end() &&
+                                    allWeightNames.find(upName) != allWeightNames.end();
+                bool hasDown = allWeightNames.find(downName) != allWeightNames.end();
+                if (hasMergedGateup || hasGateAndUp || hasDown) {
+                    layerHasAnyExpert = true;
+                }
+                if ((!hasMergedGateup && !hasGateAndUp) || !hasDown) {
+                    hasCompleteLayer = false;
+                    break;
+                }
+
+                auto downIt = this->weight.weight.find(downName);
+                auto gateupIt = this->weight.weight.find(gateupName);
+                auto gateIt = this->weight.weight.find(gateName);
+                auto upIt = this->weight.weight.find(upName);
+                if (downIt == this->weight.weight.end() ||
+                    (hasMergedGateup && gateupIt == this->weight.weight.end()) ||
+                    (!hasMergedGateup && (gateIt == this->weight.weight.end() ||
+                                          upIt == this->weight.weight.end()))) {
+                    hasCompleteLayer = false;
+                    break;
+                }
+
+                const Data &gateSource = hasMergedGateup ? gateupIt->second : gateIt->second;
+                const Data &upSource = hasMergedGateup ? gateupIt->second : upIt->second;
+                const Data &downSource = downIt->second;
+                if (gateSource.dims.size() != 2 || upSource.dims.size() != 2 ||
+                    downSource.dims.size() != 2 ||
+                    !Qwen35MoeIsFusedFp8Type(gateSource.dataType) ||
+                    gateSource.dataType != upSource.dataType ||
+                    gateSource.dataType != downSource.dataType) {
+                    hasCompleteLayer = false;
+                    break;
+                }
+                int inter = hasMergedGateup ? gateSource.dims[0] / 2 : gateSource.dims[0];
+                int hidden = gateSource.dims[1];
+                if (inter <= 0 || hidden <= 0 ||
+                    (hasMergedGateup && ((gateSource.dims[0] & 1) != 0 ||
+                                         upSource.dims[0] != gateSource.dims[0])) ||
+                    (!hasMergedGateup && (upSource.dims[0] != inter ||
+                                          upSource.dims[1] != hidden)) ||
+                    downSource.dims[0] != hidden || downSource.dims[1] != inter) {
+                    hasCompleteLayer = false;
+                    break;
+                }
+                if (j == 0) {
+                    layerInter = inter;
+                    layerHidden = hidden;
+                    layerType = gateSource.dataType;
+                    layerUsesGateup[i] = hasMergedGateup;
+                } else if (inter != layerInter || hidden != layerHidden ||
+                           gateSource.dataType != layerType ||
+                           hasMergedGateup != layerUsesGateup[i]) {
+                    hasCompleteLayer = false;
+                    break;
+                }
+            }
+            if (!hasCompleteLayer) {
+                if (layerHasAnyExpert) {
+                    plannedSourceWeights.clear();
+                    return;
+                }
+                continue;
+            }
+            plannedLayers[i] = 1;
+            for (int j = 0; j < this->num_experts; j++) {
+                if (layerUsesGateup[i]) {
+                    plannedSourceWeights.insert(Qwen35MoeExpertWeightName(i, j, "gateup"));
+                } else {
+                    plannedSourceWeights.insert(Qwen35MoeExpertWeightName(i, j, "gate"));
+                    plannedSourceWeights.insert(Qwen35MoeExpertWeightName(i, j, "up"));
+                }
+                plannedSourceWeights.insert(Qwen35MoeExpertWeightName(i, j, "down"));
+            }
+        }
+        bool hasPlannedLayer = false;
+        for (char planned : plannedLayers) {
+            if (planned) {
+                hasPlannedLayer = true;
+                break;
+            }
+        }
+        if (!hasPlannedLayer) {
+            return;
+        }
+        loadFusedMoeSourceWeights.swap(plannedSourceWeights);
+        moeFusedLayerPlanned = plannedLayers;
+        moeGate3DWeights.assign(block_cnt, nullptr);
+        moeUp3DWeights.assign(block_cnt, nullptr);
+        moeDown3DWeights.assign(block_cnt, nullptr);
+        moeGate3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+        moeUp3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+        moeDown3DExpertReady.assign(block_cnt, std::vector<char>(this->num_experts, 0));
+
+        for (int i = 0; i < block_cnt; i++) {
+            if (!IsFusedMoeLayerPlanned(i)) {
+                continue;
+            }
+            std::string gateSourceName = layerUsesGateup[i] ?
+                Qwen35MoeExpertWeightName(i, 0, "gateup") :
+                Qwen35MoeExpertWeightName(i, 0, "gate");
+            std::string upSourceName = layerUsesGateup[i] ?
+                Qwen35MoeExpertWeightName(i, 0, "gateup") :
+                Qwen35MoeExpertWeightName(i, 0, "up");
+            std::string downSourceName = Qwen35MoeExpertWeightName(i, 0, "down");
+            Data &gateSource = this->weight.weight[gateSourceName];
+            Data &upSource = this->weight.weight[upSourceName];
+            Data &downSource = this->weight.weight[downSourceName];
+            int inter = layerUsesGateup[i] ? gateSource.dims[0] / 2 : gateSource.dims[0];
+            int hidden = gateSource.dims[1];
+            Qwen35MoeInitFusedLayerWeightMeta(this->weight.weight, i, this->num_experts,
+                                              "gate", gateSource, inter, hidden,
+                                              moeGate3DWeights[i]);
+            Qwen35MoeInitFusedLayerWeightMeta(this->weight.weight, i, this->num_experts,
+                                              "up", upSource, inter, hidden,
+                                              moeUp3DWeights[i]);
+            Qwen35MoeInitFusedLayerWeightMeta(this->weight.weight, i, this->num_experts,
+                                              "down", downSource, hidden, inter,
+                                              moeDown3DWeights[i]);
+        }
+
+        moeFusedWeightsPrepared = false;
+        loadFusedMoePlanned = true;
+#endif
+    }
+
+    int Qwen3_5Model::GetWeightLoadPriority(
+            const std::string &tensorName,
+            const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+        if (!loadFusedMoePlanned) {
+            return 0;
+        }
+        if (loadFusedMoeSourceWeights.find(tensorName) != loadFusedMoeSourceWeights.end()) {
+            return Qwen35MoeSourceLoadPriority(tensorName, this->num_experts);
+        }
+        int priority = 0;
+        for (auto &mapped : mappedWeights) {
+            if (loadFusedMoeSourceWeights.find(mapped.first) != loadFusedMoeSourceWeights.end()) {
+                int mappedPriority = Qwen35MoeSourceLoadPriority(mapped.first, this->num_experts);
+                priority = priority == 0 ? mappedPriority : std::min(priority, mappedPriority);
+            }
+        }
+        return priority;
+    }
+
+    bool Qwen3_5Model::ShouldLoadWeightSeriallyBeforeOthers(
+            const std::string &tensorName,
+            const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+        if (!loadFusedMoePlanned) {
+            return false;
+        }
+        if (loadFusedMoeSourceWeights.find(tensorName) != loadFusedMoeSourceWeights.end()) {
+            return true;
+        }
+        for (auto &mapped : mappedWeights) {
+            if (loadFusedMoeSourceWeights.find(mapped.first) != loadFusedMoeSourceWeights.end()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void Qwen3_5Model::OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) {
+        if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
+            return;
+        }
+        for (auto &weightName : weightNames) {
+            if (loadFusedMoeSourceWeights.find(weightName) == loadFusedMoeSourceWeights.end()) {
+                continue;
+            }
+            int layer = -1, expert = -1;
+            std::string kind;
+            if (!Qwen35MoeParseExpertWeightName(weightName, layer, expert, kind) ||
+                layer < 0 || layer >= block_cnt) {
+                continue;
+            }
+            if (kind == "gate" || kind == "gateup") {
+                Qwen35MoeAllocateFusedWeightForLoad(moeGate3DWeights[layer]);
+            }
+            if (kind == "up" || kind == "gateup") {
+                Qwen35MoeAllocateFusedWeightForLoad(moeUp3DWeights[layer]);
+            }
+            if (kind == "down") {
+                Qwen35MoeAllocateFusedWeightForLoad(moeDown3DWeights[layer]);
+            }
+        }
+    }
+
     void Qwen3_5Model::SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix) {
         const std::string fusedGateupName = layerPrefix + "experts.gate_up_proj";
         const std::string fusedDownName = layerPrefix + "experts.down_proj";
@@ -5190,6 +7277,18 @@ namespace fastllm {
             return;
         }
 
+        if (loadFusedMoePlanned && !moeFusedWeightsPrepared &&
+            loadFusedMoeSourceWeights.find(weightName) != loadFusedMoeSourceWeights.end()) {
+            int layer = -1, expert = -1;
+            std::string kind;
+            if (Qwen35MoeParseExpertWeightName(weightName, layer, expert, kind)) {
+                if (TryConsumeFusedMoeSourceWeight(weightName)) {
+                    return;
+                }
+                TryBuildFusedMoeLayerFromLoaded(layer);
+            }
+        }
+
         std::string layerPrefix;
         if (!TryGetFusedMoeLayerPrefix(weightName, layerPrefix) ||
             !StartWith(layerPrefix, language_prefix + "layers.")) {
@@ -5204,6 +7303,39 @@ namespace fastllm {
         }
 
         SplitFusedMoeWeightsIfNeeded(layerPrefix);
+    }
+
+    bool Qwen3_5Model::IsWeightConsumedAfterLoad(const std::string &weightName) const {
+        return consumedFusedMoeSourceWeights.find(weightName) != consumedFusedMoeSourceWeights.end();
+    }
+
+    void Qwen3_5Model::OnWeightLoadGroupFinished() {
+        if (consumedFusedMoeSourceWeights.empty()) {
+            return;
+        }
+        for (auto &weightName : consumedFusedMoeSourceWeights) {
+            this->weight.weight.erase(weightName);
+        }
+        consumedFusedMoeSourceWeights.clear();
+    }
+
+    void Qwen3_5Model::OnModelWeightsLoaded() {
+        if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
+        if (TryBuildFusedMoeWeightsFromLoaded()) {
+            loadFusedMoePlanned = false;
+            loadFusedMoeSourceWeights.clear();
+            return;
+        }
+        loadFusedMoePlanned = false;
+        loadFusedMoeSourceWeights.clear();
+    }
+
+    bool Qwen3_5Model::ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const {
+        return loadFusedMoePlanned &&
+               loadFusedMoeSourceWeights.find(weightName) != loadFusedMoeSourceWeights.end();
     }
 
     void Qwen3_5Model::PrepareMoeWeights() {
@@ -5229,6 +7361,11 @@ namespace fastllm {
                 this->weight.weight.find(fusedGateupName) != this->weight.weight.end() ||
                 this->weight.weight.find(firstExpertGateupName) != this->weight.weight.end();
             if (!hasMoeLayer) {
+                continue;
+            }
+
+            if (HasFusedMoeWeights(i) &&
+                this->weight.weight.find(firstExpertGateupName) == this->weight.weight.end()) {
                 continue;
             }
 
