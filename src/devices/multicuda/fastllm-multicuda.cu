@@ -12,6 +12,13 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdint>
+#include <condition_variable>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
@@ -25,6 +32,10 @@
 
 #include <cuda_runtime.h>
 #include <nccl.h>
+
+#ifndef USE_ROCM
+#include "comm/vllm_custom_all_reduce.cuh"
+#endif
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
 #include "mma.h"
@@ -1358,6 +1369,431 @@ static size_t FastllmNcclDataTypeBytes(int dataType) {
     return 0;
 }
 
+#ifndef USE_ROCM
+namespace {
+
+static bool FastllmCustomAllReduceEnvFlagOn(const char *name) {
+    const char *v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 && std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 && std::strcmp(v, "OFF") != 0;
+}
+
+static bool FastllmCustomAllReduceEnvFlagOff(const char *name) {
+    const char *v = std::getenv(name);
+    return v != nullptr && (std::strcmp(v, "0") == 0 ||
+                            std::strcmp(v, "false") == 0 ||
+                            std::strcmp(v, "FALSE") == 0 ||
+                            std::strcmp(v, "off") == 0 ||
+                            std::strcmp(v, "OFF") == 0);
+}
+
+static int FastllmCustomAllReduceEnvInt(const char *name, int defaultValue) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return defaultValue;
+    }
+    return std::max(1, std::atoi(v));
+}
+
+static bool FastllmCustomAllReduceDisabledByEnv() {
+    return FastllmCustomAllReduceEnvFlagOn("FASTLLM_DISABLE_CUSTOM_ALLREDUCE") ||
+           FastllmCustomAllReduceEnvFlagOff("FASTLLM_CUSTOM_ALLREDUCE");
+}
+
+struct FastllmPendingCustomAllReduce {
+    int arrived = 0;
+    int completed = 0;
+    int count = 0;
+    int dataType = -1;
+    bool ready = false;
+    bool useCustom = false;
+    std::vector<void*> inputs;
+    std::vector<void*> outputs;
+    std::vector<bool> streamCapturing;
+};
+
+struct FastllmCustomAllReduceState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool initialized = false;
+    bool enabled = false;
+    int worldSize = 0;
+    std::vector<int> devices;
+    std::map<int, int> ranks;
+    std::vector<void*> signalBuffers;
+    std::vector<void*> rankDataBuffers;
+    std::vector<std::unique_ptr<vllm::CustomAllreduce> > reducers;
+    std::vector<uint64_t> rankSeqs;
+    std::map<uint64_t, std::shared_ptr<FastllmPendingCustomAllReduce> > pending;
+    std::vector<std::unordered_map<void*, std::vector<void*> > > registeredPeerPtrs;
+};
+
+static FastllmCustomAllReduceState &FastllmGetCustomAllReduceState() {
+    static FastllmCustomAllReduceState *state = new FastllmCustomAllReduceState();
+    return *state;
+}
+
+static bool FastllmCustomAllReduceSupportedType(int dataType) {
+    return dataType == fastllm::DataType::FLOAT32 ||
+           dataType == fastllm::DataType::FLOAT16 ||
+           dataType == fastllm::DataType::BFLOAT16;
+}
+
+static bool FastllmCustomAllReduceSupportedWorldSize(int worldSize) {
+    // Keep this in sync with REDUCE_CASE entries in vllm_custom_all_reduce.cuh.
+    return worldSize == 2 || worldSize == 4 || worldSize == 6 || worldSize == 8;
+}
+
+static int FastllmCustomAllReducePackCount(int dataType) {
+    if (dataType == fastllm::DataType::FLOAT32) {
+        return 4;
+    }
+    if (dataType == fastllm::DataType::FLOAT16 || dataType == fastllm::DataType::BFLOAT16) {
+        return 8;
+    }
+    return 0;
+}
+
+static bool FastllmCustomAllReduceAligned16(void *ptr) {
+    return (reinterpret_cast<uintptr_t>(ptr) & 15) == 0;
+}
+
+static void FastllmDestroyCustomAllReduceLocked(FastllmCustomAllReduceState &state) {
+    state.reducers.clear();
+    for (int i = 0; i < (int)state.signalBuffers.size(); i++) {
+        if (state.signalBuffers[i] != nullptr) {
+            cudaSetDevice(state.devices[i]);
+            cudaFree(state.signalBuffers[i]);
+        }
+    }
+    for (int i = 0; i < (int)state.rankDataBuffers.size(); i++) {
+        if (state.rankDataBuffers[i] != nullptr) {
+            cudaSetDevice(state.devices[i]);
+            cudaFree(state.rankDataBuffers[i]);
+        }
+    }
+    state.initialized = false;
+    state.enabled = false;
+    state.worldSize = 0;
+    state.devices.clear();
+    state.ranks.clear();
+    state.signalBuffers.clear();
+    state.rankDataBuffers.clear();
+    state.rankSeqs.clear();
+    state.pending.clear();
+    state.registeredPeerPtrs.clear();
+}
+
+static bool FastllmCustomAllReduceDevicesMatch(const FastllmCustomAllReduceState &state,
+                                               const std::vector<int> &devices) {
+    return state.initialized && state.devices == devices;
+}
+
+static bool FastllmCustomAllReduceEnablePeerAccess(const std::vector<int> &devices) {
+    for (int src : devices) {
+        cudaSetDevice(src);
+        for (int dst : devices) {
+            if (src == dst) {
+                continue;
+            }
+            int canPeerAccess = 0;
+            cudaError_t state = cudaDeviceCanAccessPeer(&canPeerAccess, src, dst);
+            if (state != cudaSuccess || !canPeerAccess) {
+                cudaGetLastError();
+                return false;
+            }
+            state = cudaDeviceEnablePeerAccess(dst, 0);
+            if (state == cudaErrorPeerAccessAlreadyEnabled) {
+                cudaGetLastError();
+            } else if (state != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool FastllmCustomAllReduceHasFullNvlink(const std::vector<int> &devices) {
+    if (devices.size() <= 2) {
+        return true;
+    }
+
+    for (int src : devices) {
+        for (int dst : devices) {
+            if (src == dst) {
+                continue;
+            }
+
+            int performanceRank = -1;
+            cudaError_t state = cudaDeviceGetP2PAttribute(
+                &performanceRank, cudaDevP2PAttrPerformanceRank, src, dst);
+            if (state != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+
+            int nativeAtomicSupported = 0;
+            state = cudaDeviceGetP2PAttribute(
+                &nativeAtomicSupported, cudaDevP2PAttrNativeAtomicSupported, src, dst);
+            if (state != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+
+            if (performanceRank != 0 || !nativeAtomicSupported) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool FastllmInitCustomAllReduce(const std::vector<int> &devices) {
+    FastllmCustomAllReduceState &state = FastllmGetCustomAllReduceState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (FastllmCustomAllReduceDevicesMatch(state, devices)) {
+        return state.enabled;
+    }
+
+    FastllmDestroyCustomAllReduceLocked(state);
+    state.initialized = true;
+    state.enabled = false;
+    state.devices = devices;
+    state.worldSize = (int)devices.size();
+
+    if (FastllmCustomAllReduceDisabledByEnv() ||
+        !FastllmCustomAllReduceSupportedWorldSize(state.worldSize)) {
+        return false;
+    }
+    if (!FastllmCustomAllReduceEnablePeerAccess(devices)) {
+        printf("FastLLM custom all-reduce disabled: CUDA peer access is unavailable for selected devices.\n");
+        return false;
+    }
+    bool fullNvlink = FastllmCustomAllReduceHasFullNvlink(devices);
+    if (state.worldSize > 2 && !fullNvlink) {
+        printf("FastLLM custom all-reduce disabled: selected devices do not look like a full NVLink/NVSwitch topology.\n");
+        return false;
+    }
+
+    const size_t signalBytes =
+        sizeof(vllm::Signal) + (size_t)FastllmCustomAllReduceEnvInt("FASTLLM_CUSTOM_ALLREDUCE_SIGNAL_MB", 16) * 1024 * 1024;
+    const size_t rankDataBytes =
+        (size_t)FastllmCustomAllReduceEnvInt("FASTLLM_CUSTOM_ALLREDUCE_RANK_DATA_MB", 16) * 1024 * 1024;
+
+    state.signalBuffers.assign(state.worldSize, nullptr);
+    state.rankDataBuffers.assign(state.worldSize, nullptr);
+    state.rankSeqs.assign(state.worldSize, 0);
+    state.registeredPeerPtrs.resize(state.worldSize);
+
+    for (int rank = 0; rank < state.worldSize; rank++) {
+        state.ranks[devices[rank]] = rank;
+        cudaSetDevice(devices[rank]);
+        cudaError_t cudaState = cudaMalloc(&state.signalBuffers[rank], signalBytes);
+        if (cudaState != cudaSuccess) {
+            printf("FastLLM custom all-reduce disabled: cudaMalloc signal buffer failed on device %d: %s\n",
+                   devices[rank], cudaGetErrorString(cudaState));
+            FastllmDestroyCustomAllReduceLocked(state);
+            state.initialized = true;
+            return false;
+        }
+        cudaState = cudaMemset(state.signalBuffers[rank], 0, signalBytes);
+        if (cudaState == cudaSuccess) {
+            cudaState = cudaMalloc(&state.rankDataBuffers[rank], rankDataBytes);
+        }
+        if (cudaState == cudaSuccess) {
+            cudaState = cudaDeviceSynchronize();
+        }
+        if (cudaState != cudaSuccess) {
+            printf("FastLLM custom all-reduce disabled: initialization failed on device %d: %s\n",
+                   devices[rank], cudaGetErrorString(cudaState));
+            FastllmDestroyCustomAllReduceLocked(state);
+            state.initialized = true;
+            return false;
+        }
+    }
+
+    vllm::Signal *signals[8] = {nullptr};
+    for (int rank = 0; rank < state.worldSize; rank++) {
+        signals[rank] = reinterpret_cast<vllm::Signal*>(state.signalBuffers[rank]);
+    }
+
+    try {
+        state.reducers.reserve(state.worldSize);
+        for (int rank = 0; rank < state.worldSize; rank++) {
+            cudaSetDevice(devices[rank]);
+            state.reducers.emplace_back(new vllm::CustomAllreduce(
+                signals, state.rankDataBuffers[rank], rankDataBytes, rank, state.worldSize, fullNvlink));
+        }
+    } catch (const std::exception &e) {
+        printf("FastLLM custom all-reduce disabled: %s\n", e.what());
+        FastllmDestroyCustomAllReduceLocked(state);
+        state.initialized = true;
+        return false;
+    }
+
+    state.enabled = true;
+    printf("FastLLM custom all-reduce initialized for %d CUDA devices.\n", state.worldSize);
+    return true;
+}
+
+static bool FastllmCustomAllReduceValidateReady(FastllmCustomAllReduceState &state,
+                                                FastllmPendingCustomAllReduce &slot) {
+    if (slot.count <= 0 || !FastllmCustomAllReduceSupportedType(slot.dataType)) {
+        return false;
+    }
+    int pack = FastllmCustomAllReducePackCount(slot.dataType);
+    if (pack <= 0 || slot.count % pack != 0) {
+        return false;
+    }
+    for (int rank = 0; rank < state.worldSize; rank++) {
+        if (slot.inputs[rank] == nullptr || slot.outputs[rank] == nullptr ||
+            slot.streamCapturing[rank] ||
+            !FastllmCustomAllReduceAligned16(slot.inputs[rank]) ||
+            !FastllmCustomAllReduceAligned16(slot.outputs[rank])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool FastllmCustomAllReduceRegisterReadyBuffers(FastllmCustomAllReduceState &state,
+                                                       FastllmPendingCustomAllReduce &slot) {
+    try {
+        for (int rank = 0; rank < state.worldSize; rank++) {
+            auto &registered = state.registeredPeerPtrs[rank][slot.inputs[rank]];
+            if (registered == slot.inputs) {
+                continue;
+            }
+            cudaSetDevice(state.devices[rank]);
+            state.reducers[rank]->register_buffer(slot.inputs.data());
+            registered = slot.inputs;
+        }
+    } catch (const std::exception &e) {
+        printf("FastLLM custom all-reduce registration failed, falling back to NCCL: %s\n", e.what());
+        state.enabled = false;
+        return false;
+    }
+    return true;
+}
+
+static bool FastllmTryCustomAllReduce(void *data, void *dest, int count, int dataType, int deviceId) {
+    if (data == nullptr || dest == nullptr || count <= 0 ||
+        !FastllmCustomAllReduceSupportedType(dataType) ||
+        FastllmCustomAllReduceDisabledByEnv()) {
+        return false;
+    }
+
+    int pack = FastllmCustomAllReducePackCount(dataType);
+    if (pack <= 0 || count % pack != 0) {
+        return false;
+    }
+
+    cudaSetDevice(deviceId);
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaError_t captureState = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
+    bool streamCapturing = (captureState == cudaSuccess && captureStatus == cudaStreamCaptureStatusActive);
+    if (captureState != cudaSuccess) {
+        cudaGetLastError();
+        streamCapturing = true;
+    }
+
+    FastllmCustomAllReduceState &state = FastllmGetCustomAllReduceState();
+    int rank = -1;
+    uint64_t seq = 0;
+    std::shared_ptr<FastllmPendingCustomAllReduce> slot;
+    {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        if (!state.enabled || !FastllmCustomAllReduceSupportedWorldSize(state.worldSize)) {
+            return false;
+        }
+        auto rankIt = state.ranks.find(deviceId);
+        if (rankIt == state.ranks.end()) {
+            return false;
+        }
+        rank = rankIt->second;
+        seq = state.rankSeqs[rank]++;
+        auto &slotRef = state.pending[seq];
+        if (!slotRef) {
+            slotRef.reset(new FastllmPendingCustomAllReduce());
+            slotRef->inputs.assign(state.worldSize, nullptr);
+            slotRef->outputs.assign(state.worldSize, nullptr);
+            slotRef->streamCapturing.assign(state.worldSize, false);
+            slotRef->count = count;
+            slotRef->dataType = dataType;
+        }
+        slot = slotRef;
+        if (slot->count != count || slot->dataType != dataType ||
+            slot->inputs[rank] != nullptr || slot->outputs[rank] != nullptr) {
+            slot->useCustom = false;
+            slot->ready = true;
+            state.cv.notify_all();
+            return false;
+        }
+
+        slot->inputs[rank] = data;
+        slot->outputs[rank] = dest;
+        slot->streamCapturing[rank] = streamCapturing;
+        slot->arrived++;
+
+        if (slot->arrived == state.worldSize) {
+            slot->useCustom = FastllmCustomAllReduceValidateReady(state, *slot) &&
+                              FastllmCustomAllReduceRegisterReadyBuffers(state, *slot);
+            slot->ready = true;
+            state.cv.notify_all();
+        } else {
+            state.cv.wait(lock, [&slot]() { return slot->ready; });
+        }
+    }
+
+    bool useCustom = slot->useCustom;
+    if (useCustom) {
+        cudaSetDevice(deviceId);
+        cudaStream_t stream = cudaStreamPerThread;
+        try {
+            if (dataType == fastllm::DataType::FLOAT32) {
+                state.reducers[rank]->allreduce<float>(stream, (float*)data, (float*)dest, count, vllm::kMaxBlocks);
+            } else if (dataType == fastllm::DataType::FLOAT16) {
+                state.reducers[rank]->allreduce<half>(stream, (half*)data, (half*)dest, count, vllm::kMaxBlocks);
+            } else if (dataType == fastllm::DataType::BFLOAT16) {
+                state.reducers[rank]->allreduce<nv_bfloat16>(
+                    stream, (nv_bfloat16*)data, (nv_bfloat16*)dest, count, vllm::kMaxBlocks);
+            } else {
+                useCustom = false;
+            }
+        } catch (const std::exception &e) {
+            fastllm::ErrorInFastLLM(std::string("FastLLM custom all-reduce failed: ") + e.what() + "\n");
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        slot->completed++;
+        if (slot->completed == state.worldSize) {
+            state.pending.erase(seq);
+        }
+    }
+    return useCustom;
+}
+
+} // namespace
+#else
+static bool FastllmInitCustomAllReduce(const std::vector<int> &devices) {
+    (void)devices;
+    return false;
+}
+
+static bool FastllmTryCustomAllReduce(void *data, void *dest, int count, int dataType, int deviceId) {
+    (void)data;
+    (void)dest;
+    (void)count;
+    (void)dataType;
+    (void)deviceId;
+    return false;
+}
+#endif
+
 static ncclComm_t FindNcclCommNoLog(int deviceId) {
     auto it = g_ncclComms.find(deviceId);
     return it == g_ncclComms.end() ? nullptr : it->second;
@@ -1419,6 +1855,7 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     g_ncclInitialized = true;
     g_ncclWorldSize = numGPUs;
     printf("NCCL Initialized for %d devices.\n", numGPUs);
+    FastllmInitCustomAllReduce(uniqueDevices);
     return true;
 }
 
@@ -1518,6 +1955,10 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
     }
     if (comm == nullptr) {
         printf("Error: FastllmNcclAllReduce failed, comm is null for device %d\n", deviceId);
+        return;
+    }
+
+    if (FastllmTryCustomAllReduce(data, dest, count, dataType, deviceId)) {
         return;
     }
 
