@@ -2610,7 +2610,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         
         uint32_t total_num_rows = qSizes.cpuIntDatas[batch_size];
 
-        cudaStream_t stream = nullptr;
+        cudaStream_t stream = cudaStreamPerThread;
         static std::mutex plan_cache_mutex;
         static std::map<int, PrefillPlanInfo> plan_info_map;
         static std::map<int, std::vector<uint32_t>> plan_key_map;
