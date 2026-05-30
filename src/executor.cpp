@@ -28,10 +28,6 @@
 #include "devices/tops/topsdevice.h"
 #endif
 
-#ifdef USE_NUMA
-#include "devices/numa/numadevice.h"
-#endif
-
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #endif
@@ -51,16 +47,6 @@ namespace fastllm {
 #ifdef USE_TFACC
         this->devices.push_back((BaseDevice*) new TfaccDevice());
 #endif
-#ifdef USE_NUMA
-        try {
-            if (GetFastllmEnv().activateNuma) {
-                printf("ACTIVATE NUMA = ON\n");
-                this->devices.push_back((BaseDevice*) new NumaDevice());
-            }
-        } catch (...) {
-        }
-#endif
-
 #ifdef USE_NUMAS
         this->devices.push_back((BaseDevice*) new NumasDevice());
 #endif

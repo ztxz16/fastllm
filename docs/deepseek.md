@@ -39,7 +39,7 @@ ftllm server fastllm/DeepSeek-V3-0324-INT4
 可以设定环境变量来激活多NUMA节点加速（PIP版本可直接激活，源码安装时需要在编译时加入-DUSE_NUMAS=ON选项）
 
 ```
-export FASTLLM_USE_NUMA=ON
+export FASTLLM_ACTIVATE_NUMA=ON
 # export FASTLLM_NUMA_THREADS=27 # 选用，这个变量用于设定每个numa节点开启的线程数
 ```
 

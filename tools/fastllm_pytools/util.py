@@ -232,7 +232,7 @@ def make_normal_llm_model(args):
             with open(args.model, "r", encoding = "utf-8") as file:
                 args_config = json.load(file)
                 for it in args_config.keys():
-                    if (it == "FASTLLM_USE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
+                    if (it == "FASTLLM_ACTIVATE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
                         os.environ[it] = str(args_config[it])
                     setattr(args, it, args_config[it])
 

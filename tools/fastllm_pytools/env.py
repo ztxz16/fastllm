@@ -33,10 +33,6 @@ class FastllmEnv:
         return self.has_build_flag("USE_ROCM")
 
     @property
-    def use_numa(self) -> bool:
-        return self.has_build_flag("USE_NUMA")
-
-    @property
     def use_numas(self) -> bool:
         return self.has_build_flag("USE_NUMAS")
 

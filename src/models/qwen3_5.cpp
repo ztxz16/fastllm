@@ -32,10 +32,6 @@
 #include "fastllm-tfacc.h"
 #endif
 
-#ifdef USE_NUMA
-#include "fastllm-numa.h"
-#endif
-
 namespace fastllm {
 #ifdef USE_NUMAS
     extern void RegisterNumas(fastllm::Data *data, std::string weightType);
@@ -3383,7 +3379,7 @@ namespace fastllm {
 
         data.CalcWeightSum();
 
-#if defined(USE_TFACC) || defined(USE_NUMA)
+#ifdef USE_TFACC
         if (registerFastllmData) {
             data.weightSum.resize(1);
             RegisterFastllmData(&data, weightType);
@@ -7259,11 +7255,11 @@ namespace fastllm {
             SplitExpertLinearWeight(this->weight.weight[expertGateupName], fusedGateup, expertGateupName, j);
             SplitExpertLinearWeight(this->weight.weight[expertDownName], fusedDown, expertDownName, j);
             RegisterExpertLinearWeight(this->weight.weight[expertGateupName], "linearSwiglu",
-                                       this->ShouldRegisterSpecialWeightForDeviceTypes(expertGateupName, {"numa", "tfacc"}),
+                                       this->ShouldRegisterSpecialWeightForDeviceType(expertGateupName, "tfacc"),
                                        this->ShouldRegisterSpecialWeightForDeviceType(expertGateupName, "numa"));
             this->MoveSpecialWeightToCudaIfNeeded(expertGateupName, this->weight.weight[expertGateupName]);
             RegisterExpertLinearWeight(this->weight.weight[expertDownName], "linearColumn",
-                                       this->ShouldRegisterSpecialWeightForDeviceTypes(expertDownName, {"numa", "tfacc"}),
+                                       this->ShouldRegisterSpecialWeightForDeviceType(expertDownName, "tfacc"),
                                        this->ShouldRegisterSpecialWeightForDeviceType(expertDownName, "numa"));
             this->MoveSpecialWeightToCudaIfNeeded(expertDownName, this->weight.weight[expertDownName]);
         }

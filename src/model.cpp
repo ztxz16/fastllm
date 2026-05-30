@@ -52,10 +52,6 @@
 #include "fastllm-tfacc.h"
 #endif
 
-#ifdef USE_NUMA
-#include "fastllm-numa.h"
-#endif
-
 #ifdef USE_CUDA
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -2302,9 +2298,9 @@ if (false) {
                                             }
                                             mergeData.CalcWeightSum();
                                         }
-#if defined(USE_TFACC) || defined(USE_NUMA)
+#ifdef USE_TFACC
                                         try {
-                                            if (model->ShouldRegisterSpecialWeightForDeviceTypes(mergeName, {"numa", "tfacc"})) {
+                                            if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "tfacc")) {
                                                 locker.lock();
                                                 mergeData.weightSum.resize(1);
                                                 RegisterFastllmData(&mergeData, it.type);
@@ -2336,9 +2332,9 @@ if (false) {
                                 locker.lock();
                             }
                             locker.unlock();
-#if defined(USE_TFACC) || defined(USE_NUMA)
+#ifdef USE_TFACC
                             try {
-                                if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceTypes(weightName, {"numa", "tfacc"})) {
+                                if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "tfacc")) {
                                     auto weightIt = model->weight.weight.find(weightName);
                                     if (weightIt != model->weight.weight.end()) {
                                         locker.lock();
@@ -3070,9 +3066,9 @@ if (false) {
                                             }
 
                                             mergeData.CalcWeightSum();
-#if defined(USE_TFACC) || defined(USE_NUMA)
+#ifdef USE_TFACC
                                             try {
-                                                if (model->ShouldRegisterSpecialWeightForDeviceTypes(mergeName, {"numa", "tfacc"})) {
+                                                if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "tfacc")) {
                                                     locker.lock();
                                                     mergeData.weightSum.resize(1);
                                                     RegisterFastllmData(&mergeData, it.type);
@@ -3105,9 +3101,9 @@ if (false) {
                                 locker.lock();
                             }
                             locker.unlock();
-#if defined(USE_TFACC) || defined(USE_NUMA)
+#ifdef USE_TFACC
                             try {
-                                if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceTypes(weightName, {"numa", "tfacc"})) {
+                                if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "tfacc")) {
                                     auto weightIt = model->weight.weight.find(weightName);
                                     if (weightIt != model->weight.weight.end()) {
                                         locker.lock();
