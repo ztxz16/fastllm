@@ -130,6 +130,10 @@ namespace fastllm {
                 Data *precomputedHiddenStates = nullptr);
 
         void PreCaptureCudaGraphAfterWarmup();
+        void PreAllocateLinearSlotPoolsForCudaGraph(
+                const std::vector<int> &devices,
+                const std::map<int, int> &ratios,
+                int slotCapacity);
 
         Data &GetThreadTensorParallelBias(const std::string &name);
 

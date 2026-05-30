@@ -747,6 +747,7 @@ namespace fastllm {
             Data qRepeat, kRepeat, qq, kkPad, vvPad, bbPad, ggPad, decayMask;
             Data kBeta, vBeta, attn, at, kCumdecay, gExp, coreTemp;
             Data logitsHalf;
+            Data batchConvCache, batchRecurrentState;
             std::vector<Data*> batchPastKeys;
             std::vector<Data*> batchPastValues;
             std::vector<Data*> linearConvCaches;
@@ -769,10 +770,12 @@ namespace fastllm {
             Data positionIds;
             Qwen35ForwardSingleBuffers buffers;
             Data logits;
+            Data linearSlotIds;
             std::vector<int> lastInsertIndexHost;
             std::vector<int> lastPageSizesHost;
             std::vector<int> lastPageIndexHost;
             std::vector<int> lastDecodePageLensHost;
+            std::vector<int> lastLinearSlotIdsHost;
             std::vector<const Data*> lastPastKeyHosts;
 
             ~Qwen35CudaGraphDecodeState() {
@@ -802,6 +805,7 @@ namespace fastllm {
             state.lastPageSizesHost.clear();
             state.lastPageIndexHost.clear();
             state.lastDecodePageLensHost.clear();
+            state.lastLinearSlotIdsHost.clear();
             state.lastPastKeyHosts.clear();
         }
 
@@ -814,6 +818,7 @@ namespace fastllm {
             data.ClearTensorParallelLayout();
             data.cpuData = nullptr;
             data.cudaData = nullptr;
+            data.cudaDataBorrowed = false;
             data.deviceData = nullptr;
             data.extraCudaData.clear();
             data.extraCudaHalfData.clear();
@@ -882,6 +887,7 @@ namespace fastllm {
             Qwen35DetachGraphDataStorage(state.inputIds);
             Qwen35DetachGraphDataStorage(state.positionIds);
             Qwen35DetachGraphDataStorage(state.logits);
+            Qwen35DetachGraphDataStorage(state.linearSlotIds);
             Qwen35DetachGraphBuffers(state.buffers);
         }
 
@@ -994,6 +1000,324 @@ namespace fastllm {
             dst.Allocate(false);
             FastllmCudaCopyFromHostToDevice(dst.cudaData, (void*)host.data(), host.size() * sizeof(int32_t));
             dst.cpuIntDatas = host;
+        }
+
+        enum Qwen35LinearSlotPoolKind {
+            QWEN35_LINEAR_SLOT_CONV = 0,
+            QWEN35_LINEAR_SLOT_RECURRENT = 1
+        };
+
+        using Qwen35LinearSlotPoolKey = std::tuple<const Qwen3_5Model*, int, int, int, int>;
+
+        static std::mutex &Qwen35LinearSlotPoolsMutex() {
+            static std::mutex *mutex = new std::mutex();
+            return *mutex;
+        }
+
+        static std::map<Qwen35LinearSlotPoolKey, std::unique_ptr<PagedCacheManager> > &Qwen35LinearSlotPools() {
+            static auto *pools = new std::map<Qwen35LinearSlotPoolKey, std::unique_ptr<PagedCacheManager> >();
+            return *pools;
+        }
+
+        static int Qwen35MaxCudaGraphDecodeBatch() {
+            return 32;
+        }
+
+        static int Qwen35PreCaptureMaxBatch(const Qwen3_5Model *model) {
+            int maxGraphBatch = Qwen35MaxCudaGraphDecodeBatch();
+            (void)model;
+            return std::max(1, maxGraphBatch);
+        }
+
+        static int Qwen35LinearSlotCapacity(const Qwen3_5Model *model, int batch) {
+            int capacity = std::max(1, batch);
+            capacity = std::max(capacity, Qwen35PreCaptureMaxBatch(model));
+            return capacity;
+        }
+
+        static uint64_t Qwen35Float16BytesForDims(const std::vector<int> &dims) {
+            uint64_t count = 1;
+            for (int dim : dims) {
+                AssertInFastLLM(dim > 0, "Qwen3.5 linear slot cache got invalid dims.\n");
+                count *= (uint64_t)dim;
+            }
+            return count * sizeof(uint16_t);
+        }
+
+        static PagedCacheManager *Qwen35GetLinearSlotPoolLocked(
+                const Qwen3_5Model *model,
+                int gpuId,
+                int layer,
+                Qwen35LinearSlotPoolKind kind,
+                const std::vector<int> &managerDims) {
+            AssertInFastLLM(!managerDims.empty() && managerDims[0] > 0,
+                            "Qwen3.5 linear slot pool got invalid manager dims.\n");
+            auto key = std::make_tuple(model, gpuId, layer, (int)kind, managerDims[0]);
+            auto &pools = Qwen35LinearSlotPools();
+            auto it = pools.find(key);
+            if (it != pools.end()) {
+                PagedCacheManager *manager = it->second.get();
+                if (manager == nullptr || manager->dims != managerDims ||
+                    manager->dataDevice != DataDevice::CUDA ||
+                    manager->cudaData == nullptr) {
+                    return nullptr;
+                }
+                return manager;
+            }
+
+            FastllmCudaSetDevice(gpuId);
+            std::unique_ptr<PagedCacheManager> manager(new PagedCacheManager());
+            manager->type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE;
+            manager->pageLen = 1;
+            ((Data*)manager.get())->dataType = DataType::FLOAT16;
+            ((Data*)manager.get())->UpdateUnitSize();
+            ((Data*)manager.get())->directMemory = true;
+            ((Data*)manager.get())->dataDevice = DataDevice::CUDA;
+            ((Data*)manager.get())->dataDeviceIds = {gpuId};
+            ((Data*)manager.get())->Resize(managerDims);
+            ((Data*)manager.get())->Allocate();
+            FastllmCudaMemset0(manager->cudaData, manager->GetBytes());
+            manager->SetMaxPages(managerDims[0]);
+
+            PagedCacheManager *ret = manager.get();
+            pools[key] = std::move(manager);
+            return ret;
+        }
+
+        static PagedCacheManager *Qwen35FindLinearSlotPoolLocked(
+                const Qwen3_5Model *model,
+                int gpuId,
+                int layer,
+                Qwen35LinearSlotPoolKind kind,
+                const std::vector<int> &managerDims) {
+            auto &pools = Qwen35LinearSlotPools();
+            auto it = pools.find(std::make_tuple(model, gpuId, layer, (int)kind, managerDims[0]));
+            if (it == pools.end() || it->second == nullptr) {
+                return nullptr;
+            }
+            PagedCacheManager *manager = it->second.get();
+            if (manager->dims != managerDims ||
+                manager->dataDevice != DataDevice::CUDA ||
+                manager->cudaData == nullptr) {
+                return nullptr;
+            }
+            return manager;
+        }
+
+        static bool Qwen35LinearSlotIsFree(PagedCacheManager *manager, int slot) {
+            if (manager == nullptr || slot < 0 || slot >= manager->maxPages) {
+                return false;
+            }
+            std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+            return slot < (int)manager->pageRefCount.size() &&
+                   manager->pageRefCount[slot] == 0;
+        }
+
+        static bool Qwen35DataUsesLinearSlot(const Data &data, PagedCacheManager *manager, int &slot) {
+            if (data.cudaDataBorrowed && data.isPagedKVCache &&
+                data.pagedKVCacheData == manager && data.pageIndex.size() == 1) {
+                slot = data.pageIndex[0];
+                return slot >= 0 && manager != nullptr && slot < manager->maxPages;
+            }
+            return false;
+        }
+
+        static void Qwen35ReleasePagedReference(Data &data) {
+            if (data.isPagedKVCache && data.pagedKVCacheData != nullptr && !data.pageIndex.empty()) {
+                data.pagedKVCacheData->ReleasePageIndices(data.pageIndex);
+            }
+            data.pageIndex.clear();
+            data.pagedKVCacheData = nullptr;
+            data.isPagedKVCache = false;
+        }
+
+        static void Qwen35FreeOwnedCudaPointer(void *ptr, bool borrowed, bool directMemory) {
+            if (ptr == nullptr || borrowed) {
+                return;
+            }
+            if (directMemory) {
+                FastllmCudaDirectFree(ptr);
+            } else {
+                FastllmCudaFree(ptr);
+            }
+        }
+
+        static bool Qwen35AttachLinearSlot(
+                Data &cache,
+                PagedCacheManager *manager,
+                int slot,
+                const std::vector<int> &viewDims,
+                bool transposed,
+                bool alreadyPicked) {
+            if (manager == nullptr || manager->cudaData == nullptr ||
+                slot < 0 || slot >= manager->maxPages) {
+                return false;
+            }
+            uint64_t slotBytes = Qwen35Float16BytesForDims(viewDims);
+            void *slotPtr = (void*)((uint8_t*)manager->cudaData + (uint64_t)slot * slotBytes);
+            int existingSlot = -1;
+            if (Qwen35DataUsesLinearSlot(cache, manager, existingSlot) &&
+                existingSlot == slot && cache.cudaData == slotPtr) {
+                cache.isKVCache = true;
+                cache.isLinearAttention = true;
+                cache.isLinearAttentionTransposed = transposed;
+                return true;
+            }
+
+            void *oldPtr = cache.cudaData;
+            bool oldBorrowed = cache.cudaDataBorrowed;
+            bool oldDirectMemory = cache.directMemory;
+            uint64_t oldBytes = (!cache.dims.empty() && oldPtr != nullptr) ? cache.GetBytes() : 0;
+
+            if (!alreadyPicked) {
+                if (!Qwen35LinearSlotIsFree(manager, slot)) {
+                    return false;
+                }
+                std::vector<int> pickedPages = {slot};
+                manager->Pick(pickedPages);
+            }
+
+            if (oldPtr != nullptr && oldPtr != slotPtr && oldBytes == slotBytes &&
+                cache.dataDevice == DataDevice::CUDA) {
+                FastllmCudaCopyFromDeviceToDevice(slotPtr, oldPtr, slotBytes);
+            } else {
+                FastllmCudaMemset0(slotPtr, slotBytes);
+            }
+
+            if (!(cache.isPagedKVCache && cache.pagedKVCacheData == manager &&
+                  cache.pageIndex.size() == 1 && cache.pageIndex[0] == slot)) {
+                Qwen35ReleasePagedReference(cache);
+            }
+            if (oldPtr != slotPtr) {
+                Qwen35FreeOwnedCudaPointer(oldPtr, oldBorrowed, oldDirectMemory);
+            }
+
+            Qwen3CudaClearMultiDeviceState(cache);
+            cache.isFake = false;
+            cache.isKVCache = true;
+            cache.isLinearAttention = true;
+            cache.isLinearAttentionTransposed = transposed;
+            cache.lockInCPU = false;
+            cache.dataType = DataType::FLOAT16;
+            cache.UpdateUnitSize();
+            cache.dataDevice = DataDevice::CUDA;
+            cache.dataDeviceIds = manager->dataDeviceIds;
+            cache.directMemory = false;
+            cache.Resize(viewDims);
+            cache.expansionDims.clear();
+            cache.expansionSize = cache.Count(0);
+            cache.expansionBytes = slotBytes;
+            cache.cpuData = nullptr;
+            cache.cudaData = slotPtr;
+            cache.cudaDataBorrowed = true;
+            cache.isPagedKVCache = true;
+            cache.pagedKVCacheData = manager;
+            cache.pageIndex = {slot};
+            cache.pageLen = 1;
+            cache.lastPageLen = 1;
+            return true;
+        }
+
+        static PagedCacheManager *Qwen35FindLinearSlotPool(
+                const Qwen3_5Model *model,
+                int gpuId,
+                int layer,
+                Qwen35LinearSlotPoolKind kind,
+                int slotCapacity) {
+            std::lock_guard<std::mutex> guard(Qwen35LinearSlotPoolsMutex());
+            auto &pools = Qwen35LinearSlotPools();
+            auto it = pools.find(std::make_tuple(model, gpuId, layer, (int)kind, slotCapacity));
+            return it == pools.end() || it->second == nullptr ? nullptr : it->second.get();
+        }
+
+        static bool Qwen35PrepareLinearSlotCaches(
+                const Qwen3_5Model *model,
+                int gpuId,
+                int batch,
+                int blockCnt,
+                const std::vector<int> &linearLayers,
+                std::vector<std::pair<Data*, Data*> > &pastKeyValues,
+                std::vector<int> &slotIdsHost) {
+            if (linearLayers.empty()) {
+                slotIdsHost.clear();
+                return true;
+            }
+            int firstLinearLayer = linearLayers.front();
+            int slotCapacity = Qwen35LinearSlotCapacity(model, batch);
+            slotIdsHost.assign(batch, 0);
+            std::lock_guard<std::mutex> guard(Qwen35LinearSlotPoolsMutex());
+
+            for (int b = 0; b < batch; b++) {
+                Data *ownerCache = pastKeyValues[b * blockCnt + firstLinearLayer].first;
+                if (ownerCache == nullptr || ownerCache->dims.size() != 3 ||
+                    ownerCache->dims[0] != 1 || ownerCache->dims[2] != 4 ||
+                    ownerCache->dataDevice != DataDevice::CUDA ||
+                    ownerCache->dataType != DataType::FLOAT16 ||
+                    ownerCache->cudaData == nullptr) {
+                    return false;
+                }
+                PagedCacheManager *ownerPool = Qwen35FindLinearSlotPoolLocked(
+                    model, gpuId, firstLinearLayer, QWEN35_LINEAR_SLOT_CONV,
+                    {slotCapacity, 1, ownerCache->dims[1], 4});
+                if (ownerPool == nullptr) {
+                    return false;
+                }
+
+                int slot = -1;
+                bool ownerPicked = false;
+                if (!Qwen35DataUsesLinearSlot(*ownerCache, ownerPool, slot)) {
+                    if (ownerPool->FreePageCount() <= 0) {
+                        return false;
+                    }
+                    slot = ownerPool->GetUnusedPageIndex(true);
+                    ownerPicked = true;
+                }
+                slotIdsHost[b] = slot;
+
+                for (int layer : linearLayers) {
+                    Data *convCache = pastKeyValues[b * blockCnt + layer].first;
+                    Data *recurrentState = pastKeyValues[b * blockCnt + layer].second;
+                    if (convCache == nullptr || recurrentState == nullptr ||
+                        convCache->dims.size() != 3 || convCache->dims[0] != 1 ||
+                        convCache->dims[2] != 4 ||
+                        recurrentState->dims.size() != 4 || recurrentState->dims[0] != 1 ||
+                        convCache->dataDevice != DataDevice::CUDA ||
+                        recurrentState->dataDevice != DataDevice::CUDA ||
+                        convCache->dataType != DataType::FLOAT16 ||
+                        recurrentState->dataType != DataType::FLOAT16 ||
+                        convCache->cudaData == nullptr ||
+                        recurrentState->cudaData == nullptr ||
+                        !recurrentState->isLinearAttentionTransposed) {
+                        return false;
+                    }
+
+                    PagedCacheManager *convPool = Qwen35FindLinearSlotPoolLocked(
+                        model, gpuId, layer, QWEN35_LINEAR_SLOT_CONV,
+                        {slotCapacity, 1, convCache->dims[1], 4});
+                    PagedCacheManager *statePool = Qwen35FindLinearSlotPoolLocked(
+                        model, gpuId, layer, QWEN35_LINEAR_SLOT_RECURRENT,
+                        {slotCapacity, recurrentState->dims[1], recurrentState->dims[3],
+                         recurrentState->dims[2]});
+                    if (convPool == nullptr || statePool == nullptr) {
+                        return false;
+                    }
+
+                    bool convAlreadyPicked = layer == firstLinearLayer && ownerPicked;
+                    if (!Qwen35AttachLinearSlot(*convCache, convPool, slot,
+                                                {1, convCache->dims[1], 4},
+                                                false, convAlreadyPicked)) {
+                        return false;
+                    }
+                    if (!Qwen35AttachLinearSlot(*recurrentState, statePool, slot,
+                                                {1, recurrentState->dims[1],
+                                                 recurrentState->dims[2],
+                                                 recurrentState->dims[3]},
+                                                true, false)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
 
         static void Qwen35CudaPagedCacheCopyBatch(
@@ -1139,6 +1463,32 @@ namespace fastllm {
                                 {"aLog", &aLog}, {"dtBias", &dtBias},
                                 {"softplusOutput", &softplusOutput}},
                        FloatDict(), IntDict(), {"softplusOutput"});
+        }
+
+        static bool Qwen35TryCudaRMSNormSiluMul(
+                Data &input, Data &weight, Data &gateInput, Data &output, float eps) {
+            if (input.dataDevice != DataDevice::CUDA ||
+                gateInput.dataDevice != DataDevice::CUDA ||
+                output.dataDevice != DataDevice::CUDA ||
+                input.dataType != DataType::FLOAT16 ||
+                gateInput.dataType != DataType::FLOAT16 ||
+                output.dataType != DataType::FLOAT16) {
+                return false;
+            }
+            if (weight.dataDevice != DataDevice::CUDA) {
+                if (!input.dataDeviceIds.empty()) {
+                    weight.ToDevice(DataDevice::CUDA, input.dataDeviceIds);
+                } else {
+                    weight.ToDevice(DataDevice::CUDA);
+                }
+            }
+            if (weight.dataDevice != DataDevice::CUDA ||
+                weight.dataType != DataType::FLOAT32 ||
+                input.dims != gateInput.dims ||
+                input.dims != output.dims) {
+                return false;
+            }
+            return FastllmCudaRMSNormSiluMulFloat16(input, weight, gateInput, output, eps);
         }
 
         static void Qwen35CudaCausalMask(Qwen3CudaDirectRunner &runner,
@@ -1522,8 +1872,12 @@ namespace fastllm {
                                              1, layerIdx > 0,
                                              enableFlashInferCudaGraph,
                                              flashInferCudaGraph);
-                attenOutput->Reshape({seqlen, bsz, -1});
-                Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
+                if (bsz == 1 && seqlen == 1) {
+                    attenOutput->Reshape({bsz, seqlen, -1});
+                } else {
+                    attenOutput->Reshape({seqlen, bsz, -1});
+                    Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
+                }
             }
 
             Qwen35CudaSigmoid(runner, *gate, *gate);
@@ -1863,6 +2217,195 @@ namespace fastllm {
         std::swap(dims[1], dims[2]);
         input.Reshape(dims);
     }
+
+#ifdef USE_CUDA
+    static bool Qwen35EnsureCudaLinearAttnStateTransposed(Data &state) {
+        if (state.isLinearAttentionTransposed) {
+            return true;
+        }
+        if (FastllmLinearAttentionStateTransposeKVToVKFloat16(state)) {
+            state.isLinearAttentionTransposed = true;
+            return true;
+        }
+        return false;
+    }
+
+    static bool Qwen35EnsureCudaLinearAttnStateKVLayout(Data &state) {
+        if (!state.isLinearAttentionTransposed) {
+            return true;
+        }
+        if (FastllmLinearAttentionStateTransposeVKToKVFloat16(state)) {
+            state.isLinearAttentionTransposed = false;
+            return true;
+        }
+        return false;
+    }
+
+    static bool Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
+            Data &q, Data &k, Data &v, Data &g, Data &b,
+            Data &normWeight, float eps, Data &lastRecurrentState, Data &coreAttnOut) {
+        if (q.dataDevice != DataDevice::CUDA ||
+            k.dataDevice != DataDevice::CUDA ||
+            v.dataDevice != DataDevice::CUDA ||
+            g.dataDevice != DataDevice::CUDA ||
+            b.dataDevice != DataDevice::CUDA ||
+            q.dataType != DataType::FLOAT16 ||
+            k.dataType != DataType::FLOAT16 ||
+            v.dataType != DataType::FLOAT16 ||
+            g.dataType != DataType::FLOAT16 ||
+            b.dataType != DataType::FLOAT16 ||
+            q.dims.size() != 4 || k.dims.size() != 4 || v.dims.size() != 4 ||
+            b.dims.size() != 3 || g.dims.size() != 3 ||
+            q.dims[0] != 1 || k.dims[0] != 1 || v.dims[0] != 1 ||
+            q.dims[1] != 1 || k.dims[1] != 1 || v.dims[1] != 1 ||
+            b.dims[0] != 1 || g.dims[0] != 1 ||
+            b.dims[1] != 1 || g.dims[1] != 1 ||
+            q.dims[3] != 128 || k.dims[3] != 128 ||
+            q.dims[2] <= 0 || q.dims[2] != k.dims[2] ||
+            v.dims[2] <= 0 || b.dims[2] != v.dims[2] || g.dims[2] != v.dims[2] ||
+            lastRecurrentState.dataDevice != DataDevice::CUDA ||
+            lastRecurrentState.dataType != DataType::FLOAT16 ||
+            lastRecurrentState.dims.size() != 4 ||
+            lastRecurrentState.dims[0] != 1 ||
+            lastRecurrentState.dims[1] != v.dims[2] ||
+            lastRecurrentState.dims[2] != q.dims[3] ||
+            lastRecurrentState.dims[3] != v.dims[3] ||
+            lastRecurrentState.dims[1] % q.dims[2] != 0) {
+            return false;
+        }
+
+        if (normWeight.dataDevice != DataDevice::CUDA) {
+            if (!q.dataDeviceIds.empty()) {
+                normWeight.ToDevice(DataDevice::CUDA, q.dataDeviceIds);
+            } else {
+                normWeight.ToDevice(DataDevice::CUDA);
+            }
+        }
+        if (normWeight.dataDevice != DataDevice::CUDA ||
+            normWeight.dataType != DataType::FLOAT32 ||
+            normWeight.dims.size() != 1 ||
+            normWeight.dims[0] != q.dims[3]) {
+            return false;
+        }
+
+        SwapSingleTokenSeqHeadByReshape(q);
+        SwapSingleTokenSeqHeadByReshape(k);
+        SwapSingleTokenSeqHeadByReshape(v);
+        SwapSingleTokenSeqHeadByReshape(b);
+        SwapSingleTokenSeqHeadByReshape(g);
+
+        float recurrentQScale = 1.0f / std::sqrt((float)q.dims.back());
+        bool stateLayoutReady = Qwen35EnsureCudaLinearAttnStateTransposed(lastRecurrentState);
+        bool fused = stateLayoutReady &&
+            FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(
+                q, k, v, g, b, normWeight, lastRecurrentState, coreAttnOut, eps, recurrentQScale
+            );
+        if (fused) {
+            SwapSingleTokenSeqHeadByReshape(coreAttnOut);
+            return true;
+        }
+        if (stateLayoutReady) {
+            Qwen35EnsureCudaLinearAttnStateKVLayout(lastRecurrentState);
+        }
+
+        SwapSingleTokenSeqHeadByReshape(q);
+        SwapSingleTokenSeqHeadByReshape(k);
+        SwapSingleTokenSeqHeadByReshape(v);
+        SwapSingleTokenSeqHeadByReshape(b);
+        SwapSingleTokenSeqHeadByReshape(g);
+        return false;
+    }
+
+    static bool Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
+            Data &q, Data &k, Data &v, Data &a, Data &b,
+            Data &normWeight, Data &aLog, Data &dtBias,
+            float eps, Data &lastRecurrentState, Data &coreAttnOut) {
+        if (q.dataDevice != DataDevice::CUDA ||
+            k.dataDevice != DataDevice::CUDA ||
+            v.dataDevice != DataDevice::CUDA ||
+            a.dataDevice != DataDevice::CUDA ||
+            b.dataDevice != DataDevice::CUDA ||
+            q.dataType != DataType::FLOAT16 ||
+            k.dataType != DataType::FLOAT16 ||
+            v.dataType != DataType::FLOAT16 ||
+            a.dataType != DataType::FLOAT16 ||
+            b.dataType != DataType::FLOAT16 ||
+            q.dims.size() != 4 || k.dims.size() != 4 || v.dims.size() != 4 ||
+            a.dims.size() != 3 || b.dims.size() != 3 ||
+            q.dims[0] != 1 || k.dims[0] != 1 || v.dims[0] != 1 ||
+            q.dims[1] != 1 || k.dims[1] != 1 || v.dims[1] != 1 ||
+            a.dims[0] != 1 || b.dims[0] != 1 ||
+            a.dims[1] != 1 || b.dims[1] != 1 ||
+            q.dims[3] != 128 || k.dims[3] != 128 ||
+            q.dims[2] <= 0 || q.dims[2] != k.dims[2] ||
+            v.dims[2] <= 0 || a.dims[2] != v.dims[2] || b.dims[2] != v.dims[2] ||
+            lastRecurrentState.dataDevice != DataDevice::CUDA ||
+            lastRecurrentState.dataType != DataType::FLOAT16 ||
+            lastRecurrentState.dims.size() != 4 ||
+            lastRecurrentState.dims[0] != 1 ||
+            lastRecurrentState.dims[1] != v.dims[2] ||
+            lastRecurrentState.dims[2] != q.dims[3] ||
+            lastRecurrentState.dims[3] != v.dims[3] ||
+            lastRecurrentState.dims[1] % q.dims[2] != 0) {
+            return false;
+        }
+
+        auto moveToQDevice = [&](Data &data) {
+            if (data.dataDevice != DataDevice::CUDA) {
+                if (!q.dataDeviceIds.empty()) {
+                    data.ToDevice(DataDevice::CUDA, q.dataDeviceIds);
+                } else {
+                    data.ToDevice(DataDevice::CUDA);
+                }
+            }
+        };
+        moveToQDevice(normWeight);
+        moveToQDevice(aLog);
+        moveToQDevice(dtBias);
+        if (normWeight.dataDevice != DataDevice::CUDA ||
+            aLog.dataDevice != DataDevice::CUDA ||
+            dtBias.dataDevice != DataDevice::CUDA ||
+            normWeight.dataType != DataType::FLOAT32 ||
+            aLog.dataType != DataType::FLOAT32 ||
+            dtBias.dataType != DataType::FLOAT32 ||
+            normWeight.dims.size() != 1 ||
+            aLog.dims.size() != 1 ||
+            dtBias.dims.size() != 1 ||
+            normWeight.dims[0] != q.dims[3] ||
+            aLog.dims[0] != v.dims[2] ||
+            dtBias.dims[0] != v.dims[2]) {
+            return false;
+        }
+
+        SwapSingleTokenSeqHeadByReshape(q);
+        SwapSingleTokenSeqHeadByReshape(k);
+        SwapSingleTokenSeqHeadByReshape(v);
+        SwapSingleTokenSeqHeadByReshape(a);
+        SwapSingleTokenSeqHeadByReshape(b);
+
+        float recurrentQScale = 1.0f / std::sqrt((float)q.dims.back());
+        bool stateLayoutReady = Qwen35EnsureCudaLinearAttnStateTransposed(lastRecurrentState);
+        bool fused = stateLayoutReady &&
+            FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(
+                q, k, v, a, b, normWeight, aLog, dtBias, lastRecurrentState,
+                coreAttnOut, eps, recurrentQScale
+            );
+        if (fused) {
+            SwapSingleTokenSeqHeadByReshape(coreAttnOut);
+            return true;
+        }
+        if (stateLayoutReady) {
+            Qwen35EnsureCudaLinearAttnStateKVLayout(lastRecurrentState);
+        }
+
+        SwapSingleTokenSeqHeadByReshape(q);
+        SwapSingleTokenSeqHeadByReshape(k);
+        SwapSingleTokenSeqHeadByReshape(v);
+        SwapSingleTokenSeqHeadByReshape(a);
+        SwapSingleTokenSeqHeadByReshape(b);
+        return false;
+    }
+#endif
 
     static bool TryGetFusedMoeLayerPrefix(const std::string &weightName, std::string &layerPrefix) {
         static const std::string gateupSuffix = "experts.gate_up_proj";
@@ -2254,8 +2797,65 @@ namespace fastllm {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
+            ClearAllPagedCacheManagers();
+            FastllmCudaClearBigBuffer();
             PreCaptureCudaGraphAfterWarmup();
         }
+#endif
+    }
+
+    void Qwen3_5Model::PreAllocateLinearSlotPoolsForCudaGraph(
+            const std::vector<int> &devices,
+            const std::map<int, int> &ratios,
+            int slotCapacity) {
+#ifdef USE_CUDA
+        if (devices.empty() || slotCapacity <= 0 ||
+            num_k_heads <= 0 || num_v_heads <= 0 ||
+            head_k_dim <= 0 || head_v_dim <= 0 ||
+            num_v_heads % num_k_heads != 0) {
+            return;
+        }
+
+        bool tensorParallel = devices.size() > 1;
+        DivisionScheme keyScheme;
+        DivisionScheme valueScheme;
+        if (tensorParallel) {
+            keyScheme = BuildQwen35LinearKeyHeadScheme(devices, ratios, num_k_heads);
+            valueScheme = BuildQwen35LinearValueHeadScheme(keyScheme, num_v_heads / num_k_heads);
+        }
+
+        std::lock_guard<std::mutex> guard(Qwen35LinearSlotPoolsMutex());
+        for (int gpuId : devices) {
+            int localKeyHeads = num_k_heads;
+            int localValueHeads = num_v_heads;
+            if (tensorParallel) {
+                localKeyHeads = Qwen35LocalHeads(keyScheme, gpuId);
+                localValueHeads = Qwen35LocalHeads(valueScheme, gpuId);
+            }
+            if (localKeyHeads <= 0 || localValueHeads <= 0) {
+                continue;
+            }
+
+            int convDim = localKeyHeads * head_k_dim * 2 + localValueHeads * head_v_dim;
+            for (int layer = 0; layer < block_cnt; layer++) {
+                std::string prefix = language_prefix + "layers." + std::to_string(layer) + ".";
+                bool isAttentionLayer =
+                    weight.weight.find(prefix + "self_attn.o_proj.weight") != weight.weight.end();
+                if (isAttentionLayer) {
+                    continue;
+                }
+                Qwen35GetLinearSlotPoolLocked(
+                    this, gpuId, layer, QWEN35_LINEAR_SLOT_CONV,
+                    {slotCapacity, 1, convDim, 4});
+                Qwen35GetLinearSlotPoolLocked(
+                    this, gpuId, layer, QWEN35_LINEAR_SLOT_RECURRENT,
+                    {slotCapacity, localValueHeads, head_v_dim, head_k_dim});
+            }
+        }
+#else
+        (void)devices;
+        (void)ratios;
+        (void)slotCapacity;
 #endif
     }
 
@@ -2271,11 +2871,9 @@ namespace fastllm {
             return;
         }
 
-        const int maxCudaGraphDecodeBatch = 1;
-        int maxWarmupBatch = maxCudaGraphDecodeBatch;
-        if (this->maxBatch > 0) {
-            maxWarmupBatch = std::min(maxWarmupBatch, this->maxBatch);
-        }
+        int maxWarmupBatch = Qwen35PreCaptureMaxBatch(this);
+        int linearSlotCapacity = Qwen35LinearSlotCapacity(this, maxWarmupBatch);
+        PreAllocateLinearSlotPoolsForCudaGraph(devices, ratios, linearSlotCapacity);
 
         struct CudaGraphPreCaptureScope {
             std::atomic<bool> &flag;
@@ -2304,10 +2902,7 @@ namespace fastllm {
         printProgress(0, maxWarmupBatch, 0);
 
         for (int batch = 1; batch <= maxWarmupBatch; batch++) {
-            std::vector<float> inputIdsHost(batch, 1.0f);
-            Data inputIds(DataType::FLOAT32, {1, batch}, inputIdsHost);
             std::vector<Data*> attentionMasks(batch, nullptr);
-            std::vector<int> seqLens(batch, 1);
             std::vector<GenerationConfig> generationConfigs(batch);
             LastTokensManager lastTokens;
 
@@ -2326,13 +2921,41 @@ namespace fastllm {
                 }
             }
 
-            for (int step = 0; step < 3; step++) {
+            const int cudaGraphPreCapturePrefillTokens = 8;
+            std::vector<float> prefillInputIdsHost(batch * cudaGraphPreCapturePrefillTokens, 1.0f);
+            Data prefillInputIds(DataType::FLOAT32,
+                                 {1, batch * cudaGraphPreCapturePrefillTokens},
+                                 prefillInputIdsHost);
+            std::vector<int> prefillSeqLens(batch, cudaGraphPreCapturePrefillTokens);
+            std::vector<Data> prefillPositionIdsStorage;
+            std::vector<Data*> prefillPositionIds;
+            prefillPositionIdsStorage.reserve(batch);
+            prefillPositionIds.reserve(batch);
+            std::vector<float> prefillPositions(cudaGraphPreCapturePrefillTokens);
+            for (int i = 0; i < cudaGraphPreCapturePrefillTokens; i++) {
+                prefillPositions[i] = (float)i;
+            }
+            for (int b = 0; b < batch; b++) {
+                prefillPositionIdsStorage.push_back(
+                    Data(DataType::FLOAT32, {1, cudaGraphPreCapturePrefillTokens}, prefillPositions));
+                prefillPositionIds.push_back(&prefillPositionIdsStorage.back());
+            }
+            ForwardGPU(batch, prefillInputIds, attentionMasks, prefillPositionIds,
+                       prefillSeqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
+
+            std::vector<float> inputIdsHost(batch, 1.0f);
+            Data inputIds(DataType::FLOAT32, {1, batch}, inputIdsHost);
+            std::vector<int> seqLens(batch, 1);
+            const int cudaGraphPreCaptureDecodeSteps = 2;
+            for (int step = 0; step < cudaGraphPreCaptureDecodeSteps; step++) {
                 std::vector<Data> positionIdsStorage;
                 std::vector<Data*> positionIds;
                 positionIdsStorage.reserve(batch);
                 positionIds.reserve(batch);
                 for (int b = 0; b < batch; b++) {
-                    positionIdsStorage.push_back(Data(DataType::FLOAT32, {1, 1}, {(float)step}));
+                    positionIdsStorage.push_back(
+                        Data(DataType::FLOAT32, {1, 1},
+                             {(float)(cudaGraphPreCapturePrefillTokens + step)}));
                     positionIds.push_back(&positionIdsStorage.back());
                 }
                 ForwardGPU(batch, inputIds, attentionMasks, positionIds, seqLens,
@@ -2370,12 +2993,17 @@ namespace fastllm {
         return false;
 #else
         (void)ratios;
-        const int maxCudaGraphDecodeBatch = 32;
-        if (!Qwen35CudaGraphEnabled() || batch != 1 || batch > maxCudaGraphDecodeBatch ||
+        const int maxCudaGraphDecodeBatch = Qwen35MaxCudaGraphDecodeBatch();
+        if (!Qwen35CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
             !all1 || isPrefill || (int)seqLens.size() < batch ||
             (int)pastKeyValues.size() < batch * block_cnt || seqLens[0] != 1 ||
             positionIds.Count(0) != (uint64_t)batch) {
             return false;
+        }
+        for (int b = 0; b < batch; b++) {
+            if (seqLens[b] != 1) {
+                return false;
+            }
         }
         if (precomputedHiddenStates == nullptr && inputIds.Count(0) != (uint64_t)batch) {
             return false;
@@ -2438,7 +3066,7 @@ namespace fastllm {
                 localPrecomputedHiddenStates->cudaData == nullptr ||
                 localPrecomputedHiddenStates->dims.size() != 3 ||
                 localPrecomputedHiddenStates->dims[0] != 1 ||
-                localPrecomputedHiddenStates->dims[1] != 1) {
+                localPrecomputedHiddenStates->dims[1] != batch) {
                 return false;
             }
         }
@@ -2446,29 +3074,33 @@ namespace fastllm {
         int firstAttentionLayer = attentionLayers[0];
         int currentTokens = 0;
         for (int layer : attentionLayers) {
-            Data *pastKey = pastKeyValues[layer].first;
-            Data *pastValue = pastKeyValues[layer].second;
-            if (pastKey == nullptr || pastValue == nullptr ||
-                pastKey->pagedKVCacheData == nullptr ||
-                pastValue->pagedKVCacheData == nullptr ||
-                pastKey->pageIndex.empty() || pastValue->pageIndex.empty() ||
-                pastKey->dataDevice != DataDevice::CUDA ||
-                pastValue->dataDevice != DataDevice::CUDA ||
-                pastKey->dataType == DataType::FP8_E4M3 ||
-                pastValue->dataType == DataType::FP8_E4M3 ||
-                pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
-                pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
-                pastKey->lastPageLen != pastValue->lastPageLen) {
-                return false;
+            for (int b = 0; b < batch; b++) {
+                Data *pastKey = pastKeyValues[b * block_cnt + layer].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + layer].second;
+                if (pastKey == nullptr || pastValue == nullptr ||
+                    pastKey->pagedKVCacheData == nullptr ||
+                    pastValue->pagedKVCacheData == nullptr ||
+                    pastKey->pageIndex.empty() || pastValue->pageIndex.empty() ||
+                    pastKey->dataDevice != DataDevice::CUDA ||
+                    pastValue->dataDevice != DataDevice::CUDA ||
+                    pastKey->dataType == DataType::FP8_E4M3 ||
+                    pastValue->dataType == DataType::FP8_E4M3 ||
+                    pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
+                    pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
+                    pastKey->lastPageLen != pastValue->lastPageLen) {
+                    return false;
+                }
+                int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
+                currentTokens = std::max(currentTokens, layerTokens);
             }
-            int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
-            currentTokens = std::max(currentTokens, layerTokens);
         }
         if (rope_type == RoPEType::DYMAMIC_NTK && currentTokens + 1 >= max_positions) {
             return false;
         }
+        if (currentTokens < 8) {
+            return false;
+        }
 
-        Data *firstKeyBeforeUpdate = pastKeyValues[firstAttentionLayer].first;
         std::vector<int> insertIndexHost(batch, -1);
         std::vector<int> insertPositionHost(batch, 0);
         std::vector<int> lastPageLensHost(batch, 0);
@@ -2476,83 +3108,101 @@ namespace fastllm {
         std::vector<int> pageSizesHost(batch + 1, 0);
         std::vector<int> graphPlanPageSizesHost(batch + 1, 0);
         std::vector<int> pageIndexHost;
-        std::vector<const Data*> currentPastKeyHosts(batch, firstKeyBeforeUpdate);
-        bool needNewPage = firstKeyBeforeUpdate->pageIndex.empty() ||
-                           firstKeyBeforeUpdate->lastPageLen >= firstKeyBeforeUpdate->pageLen;
-        if (!needNewPage) {
-            insertIndexHost[0] = firstKeyBeforeUpdate->pageIndex.back();
-            insertPositionHost[0] = firstKeyBeforeUpdate->lastPageLen;
-        }
-
-        for (int layer : attentionLayers) {
-            Data *pastKey = pastKeyValues[layer].first;
-            Data *pastValue = pastKeyValues[layer].second;
-            bool layerNeedNewPage = pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
-            AssertInFastLLM(layerNeedNewPage == needNewPage,
-                            "Qwen3.5 CUDA graph requires aligned paged cache layout across attention layers.\n");
-            if (needNewPage) {
-                int keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
-                int valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
-                if (insertIndexHost[0] < 0) {
-                    insertIndexHost[0] = keyPage;
-                }
-                AssertInFastLLM(keyPage == insertIndexHost[0] && valuePage == insertIndexHost[0],
-                                "Qwen3.5 CUDA graph requires aligned K/V page indices across attention layers.\n");
-                pastKey->pageIndex.push_back(keyPage);
-                pastValue->pageIndex.push_back(valuePage);
-                pastKey->lastPageLen = 1;
-                pastValue->lastPageLen = 1;
-            } else {
-                AssertInFastLLM(pastKey->pageIndex.back() == insertIndexHost[0] &&
-                                pastValue->pageIndex.back() == insertIndexHost[0] &&
-                                pastKey->lastPageLen == insertPositionHost[0] &&
-                                pastValue->lastPageLen == insertPositionHost[0],
-                                "Qwen3.5 CUDA graph requires aligned paged cache positions across attention layers.\n");
-                pastKey->lastPageLen++;
-                pastValue->lastPageLen++;
+        std::vector<const Data*> currentPastKeyHosts(batch, nullptr);
+        std::vector<bool> needNewPageHost(batch, false);
+        bool anyNeedNewPage = false;
+        for (int b = 0; b < batch; b++) {
+            Data *firstKeyBeforeUpdate = pastKeyValues[b * block_cnt + firstAttentionLayer].first;
+            currentPastKeyHosts[b] = firstKeyBeforeUpdate;
+            needNewPageHost[b] = firstKeyBeforeUpdate->pageIndex.empty() ||
+                                 firstKeyBeforeUpdate->lastPageLen >= firstKeyBeforeUpdate->pageLen;
+            anyNeedNewPage = anyNeedNewPage || needNewPageHost[b];
+            if (!needNewPageHost[b]) {
+                insertIndexHost[b] = firstKeyBeforeUpdate->pageIndex.back();
+                insertPositionHost[b] = firstKeyBeforeUpdate->lastPageLen;
             }
         }
 
-        Data *firstKey = pastKeyValues[firstAttentionLayer].first;
-        Data *firstValue = pastKeyValues[firstAttentionLayer].second;
-        qSizesHost[1] = 1;
-        lastPageLensHost[0] = firstKey->lastPageLen;
-        int requestPages = (int)firstKey->pageIndex.size();
-        PagedCacheManager *graphPagedManager = firstKey->pagedKVCacheData;
+        for (int layer : attentionLayers) {
+            for (int b = 0; b < batch; b++) {
+                Data *pastKey = pastKeyValues[b * block_cnt + layer].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + layer].second;
+                bool layerNeedNewPage = pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
+                AssertInFastLLM(layerNeedNewPage == needNewPageHost[b],
+                                "Qwen3.5 CUDA graph requires aligned paged cache layout across attention layers.\n");
+                if (needNewPageHost[b]) {
+                    int keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
+                    int valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
+                    if (insertIndexHost[b] < 0) {
+                        insertIndexHost[b] = keyPage;
+                    }
+                    AssertInFastLLM(keyPage == insertIndexHost[b] && valuePage == insertIndexHost[b],
+                                    "Qwen3.5 CUDA graph requires aligned K/V page indices across attention layers.\n");
+                    pastKey->pageIndex.push_back(keyPage);
+                    pastValue->pageIndex.push_back(valuePage);
+                    pastKey->lastPageLen = 1;
+                    pastValue->lastPageLen = 1;
+                } else {
+                    AssertInFastLLM(pastKey->pageIndex.back() == insertIndexHost[b] &&
+                                    pastValue->pageIndex.back() == insertIndexHost[b] &&
+                                    pastKey->lastPageLen == insertPositionHost[b] &&
+                                    pastValue->lastPageLen == insertPositionHost[b],
+                                    "Qwen3.5 CUDA graph requires aligned paged cache positions across attention layers.\n");
+                    pastKey->lastPageLen++;
+                    pastValue->lastPageLen++;
+                }
+            }
+        }
+
+        PagedCacheManager *graphPagedManager = pastKeyValues[firstAttentionLayer].first->pagedKVCacheData;
         int graphMaxPagesPerRequest = graphPagedManager != nullptr ? graphPagedManager->maxPages : 0;
         if (graphMaxPagesPerRequest <= 0 && graphPagedManager != nullptr && !graphPagedManager->dims.empty()) {
             graphMaxPagesPerRequest = graphPagedManager->dims[0];
         }
-        if (graphMaxPagesPerRequest <= 0 || requestPages > graphMaxPagesPerRequest) {
+        if (graphMaxPagesPerRequest <= 0) {
             return false;
         }
-        pageSizesHost[1] = requestPages;
-        pageIndexHost.insert(pageIndexHost.end(), firstKey->pageIndex.begin(), firstKey->pageIndex.end());
-        AssertInFastLLM(firstKey->pageIndex.size() == firstValue->pageIndex.size() &&
-                        firstKey->lastPageLen == firstValue->lastPageLen,
-                        "Qwen3.5 CUDA graph requires aligned K/V page metadata.\n");
-        for (int layer : attentionLayers) {
-            Data *pastKey = pastKeyValues[layer].first;
-            Data *pastValue = pastKeyValues[layer].second;
-            AssertInFastLLM(pastKey->pageIndex == firstKey->pageIndex &&
-                            pastValue->pageIndex == firstKey->pageIndex &&
-                            pastKey->lastPageLen == firstKey->lastPageLen &&
-                            pastValue->lastPageLen == firstKey->lastPageLen,
-                            "Qwen3.5 CUDA graph requires identical page metadata across attention layers.\n");
+        for (int b = 0; b < batch; b++) {
+            Data *firstKey = pastKeyValues[b * block_cnt + firstAttentionLayer].first;
+            Data *firstValue = pastKeyValues[b * block_cnt + firstAttentionLayer].second;
+            qSizesHost[b + 1] = qSizesHost[b] + 1;
+            lastPageLensHost[b] = firstKey->lastPageLen;
+            int requestPages = (int)firstKey->pageIndex.size();
+            if (requestPages > graphMaxPagesPerRequest) {
+                return false;
+            }
+            pageSizesHost[b + 1] = pageSizesHost[b] + requestPages;
+            pageIndexHost.insert(pageIndexHost.end(), firstKey->pageIndex.begin(), firstKey->pageIndex.end());
+            AssertInFastLLM(firstKey->pageIndex.size() == firstValue->pageIndex.size() &&
+                            firstKey->lastPageLen == firstValue->lastPageLen,
+                            "Qwen3.5 CUDA graph requires aligned K/V page metadata.\n");
+            for (int layer : attentionLayers) {
+                Data *pastKey = pastKeyValues[b * block_cnt + layer].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + layer].second;
+                AssertInFastLLM(pastKey->pageIndex == firstKey->pageIndex &&
+                                pastValue->pageIndex == firstKey->pageIndex &&
+                                pastKey->lastPageLen == firstKey->lastPageLen &&
+                                pastValue->lastPageLen == firstKey->lastPageLen,
+                                "Qwen3.5 CUDA graph requires identical page metadata across attention layers.\n");
+            }
         }
         int graphPlanPagesPerRequest = graphMaxPagesPerRequest;
-        graphPlanPageSizesHost[1] = graphPlanPagesPerRequest;
+        for (int b = 0; b < batch; b++) {
+            graphPlanPageSizesHost[b + 1] = graphPlanPageSizesHost[b] + graphPlanPagesPerRequest;
+        }
         int pageIndexCapacity = batch * graphPlanPagesPerRequest;
 
         for (int layer : linearLayers) {
-            Data *convCache = pastKeyValues[layer].first;
-            Data *recurrentState = pastKeyValues[layer].second;
-            if (convCache == nullptr || recurrentState == nullptr ||
-                convCache->dims.empty() || recurrentState->dims.empty() ||
-                convCache->dataDevice != DataDevice::CUDA ||
-                recurrentState->dataDevice != DataDevice::CUDA ||
-                convCache->cudaData == nullptr || recurrentState->cudaData == nullptr) {
-                return false;
+            for (int b = 0; b < batch; b++) {
+                Data *convCache = pastKeyValues[b * block_cnt + layer].first;
+                Data *recurrentState = pastKeyValues[b * block_cnt + layer].second;
+                if (convCache == nullptr || recurrentState == nullptr ||
+                    convCache->dims.empty() || recurrentState->dims.empty() ||
+                    convCache->dataDevice != DataDevice::CUDA ||
+                    recurrentState->dataDevice != DataDevice::CUDA ||
+                    convCache->cudaData == nullptr || recurrentState->cudaData == nullptr) {
+                    return false;
+                }
             }
         }
 
@@ -2568,6 +3218,35 @@ namespace fastllm {
         }
 
         FastllmCudaSetDevice(gpuId);
+        state.buffers.batchPastKeys.resize(batch);
+        state.buffers.batchPastValues.resize(batch);
+        state.buffers.linearConvCaches.resize(batch);
+        state.buffers.recurrentStates.resize(batch);
+        bool useTransposedLinearState = true;
+        if (useTransposedLinearState) {
+            for (int layer : linearLayers) {
+                for (int b = 0; b < batch; b++) {
+                    if (!Qwen35EnsureCudaLinearAttnStateTransposed(*pastKeyValues[b * block_cnt + layer].second)) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            for (int layer : linearLayers) {
+                for (int b = 0; b < batch; b++) {
+                    if (!Qwen35EnsureCudaLinearAttnStateKVLayout(*pastKeyValues[b * block_cnt + layer].second)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        std::vector<int> linearSlotIdsHost;
+        int linearSlotCapacity = Qwen35LinearSlotCapacity(this, batch);
+        if (!Qwen35PrepareLinearSlotCaches(this, gpuId, batch, block_cnt,
+                                           linearLayers, pastKeyValues,
+                                           linearSlotIdsHost)) {
+            return false;
+        }
         Qwen35PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
         if (precomputedHiddenStates == nullptr) {
             Qwen35PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
@@ -2611,14 +3290,28 @@ namespace fastllm {
                       << ";vCache" << layer << "=" << pastKeyValues[layer].second->pagedKVCacheData->cudaData;
         }
         for (int layer : linearLayers) {
-            signature << ";linK" << layer << "=" << pastKeyValues[layer].first->cudaData
-                      << ";linV" << layer << "=" << pastKeyValues[layer].second->cudaData;
+            PagedCacheManager *convPool = Qwen35FindLinearSlotPool(
+                this, gpuId, layer, QWEN35_LINEAR_SLOT_CONV,
+                linearSlotCapacity);
+            PagedCacheManager *statePool = Qwen35FindLinearSlotPool(
+                this, gpuId, layer, QWEN35_LINEAR_SLOT_RECURRENT,
+                linearSlotCapacity);
+            signature << ";linConvPool" << layer << "=" << (convPool == nullptr ? nullptr : convPool->cudaData)
+                      << ";linStatePool" << layer << "=" << (statePool == nullptr ? nullptr : statePool->cudaData);
         }
         std::string newSignature = signature.str();
         bool signatureChanged = state.signature != newSignature;
         if (signatureChanged) {
             Qwen35DestroyCudaGraph(state);
             state.signature = newSignature;
+        }
+
+        if (!linearLayers.empty() &&
+            (state.linearSlotIds.cudaData == nullptr ||
+             state.lastLinearSlotIdsHost != linearSlotIdsHost ||
+             signatureChanged)) {
+            Qwen35PrepareGraphIntTensor(state.linearSlotIds, gpuId, linearSlotIdsHost);
+            state.lastLinearSlotIdsHost = linearSlotIdsHost;
         }
 
         bool graphMetaMissing =
@@ -2634,7 +3327,7 @@ namespace fastllm {
             state.lastPageIndexHost != pageIndexHost ||
             state.lastDecodePageLensHost != insertPositionHost ||
             state.lastPastKeyHosts != currentPastKeyHosts;
-        bool needFullMetaCopy = graphMetaMissing || signatureChanged || needNewPage || metadataChanged;
+        bool needFullMetaCopy = graphMetaMissing || signatureChanged || anyNeedNewPage || metadataChanged;
         if (needFullMetaCopy) {
             AssertInFastLLM((int)pageIndexHost.size() <= pageIndexCapacity,
                             "Qwen3.5 CUDA graph page metadata exceeds fixed graph capacity.\n");
@@ -2807,72 +3500,167 @@ namespace fastllm {
                                                   qkvzbaWeightName + ".tp_bias"),
                                     buf.gdnMerged);
                     Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0, localQkvDim, buf.qkvConvInput);
-                    Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim, localQkvDim + localVd, buf.z);
+                    Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim,
+                                   localQkvDim + localVd, buf.z);
                     Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim + localVd,
-                                   localQkvDim + localVd + localValueHeads, buf.b);
-                    Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1,
-                                   localQkvDim + localVd + localValueHeads,
-                                   localQkvDim + localVd + localValueHeads * 2, buf.a);
+                                   localQkvDim + localVd + localValueHeads * 2, buf.ba);
 
                     Data &pastKey = *pastKeyValues[i].first;
-                    Data &pastValue = *pastKeyValues[i].second;
-                    SwapSingleTokenSeqHeadByReshape(buf.qkvConvInput);
+                    if (batch == 1) {
+                        SwapSingleTokenSeqHeadByReshape(buf.qkvConvInput);
+                    } else {
+                        buf.qkvConvInput.Reshape({batch, buf.qkvConvInput.dims.back(), 1});
+                    }
                     buf.z.Reshape({bsz, seqlen, localValueHeads, head_v_dim});
 
-                    ShiftAppendSingleTokenLinearAttentionCache(pastKey, buf.qkvConvInput);
-                    Qwen35CudaConv1DPerChannel(cudaRunner, pastKey,
-                                               *requireLocal(weight[conv1dWeightName], conv1dWeightName),
-                                               *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
-                                               pastKey.dims[1],
-                                               requireLocal(weight[conv1dWeightName], conv1dWeightName)->dims[0],
-                                               4, 1, 0, buf.convOutput);
-                    Qwen35CudaSilu(cudaRunner, buf.convOutput, buf.convOutput);
-                    SwapSingleTokenSeqHeadByReshape(buf.convOutput);
+                    for (int bidx = 0; bidx < batch; bidx++) {
+                        buf.linearConvCaches[bidx] = pastKeyValues[bidx * block_cnt + i].first;
+                    }
+                    bool directBatchDecodeConvSilu = false;
+                    PagedCacheManager *linearConvPool = Qwen35FindLinearSlotPool(
+                        this, gpuId, i, QWEN35_LINEAR_SLOT_CONV,
+                        linearSlotCapacity);
+                    if (linearConvPool != nullptr && state.linearSlotIds.cudaData != nullptr) {
+                        directBatchDecodeConvSilu =
+                            FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchSlots(
+                                linearConvPool->cudaData, state.linearSlotIds.cudaData,
+                                batch, *buf.linearConvCaches[0], buf.qkvConvInput,
+                                *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                                *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                                buf.convOutput);
+                    }
+                    if (directBatchDecodeConvSilu) {
+                        buf.convOutput.Reshape({1, batch, buf.convOutput.dims[1]});
+                    } else if (batch == 1) {
+                        bool fusedDecodeConvSilu = FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
+                            pastKey, buf.qkvConvInput,
+                            *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                            buf.convOutput);
+                        if (!fusedDecodeConvSilu) {
+                            ShiftAppendSingleTokenLinearAttentionCache(pastKey, buf.qkvConvInput);
+                            Qwen35CudaConv1DPerChannel(cudaRunner, pastKey,
+                                                       *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                                                       *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                                                       pastKey.dims[1],
+                                                       requireLocal(weight[conv1dWeightName], conv1dWeightName)->dims[0],
+                                                       4, 1, 0, buf.convOutput);
+                            Qwen35CudaSilu(cudaRunner, buf.convOutput, buf.convOutput);
+                        }
+                        SwapSingleTokenSeqHeadByReshape(buf.convOutput);
+                    } else {
+                        CatBatchFirstDim(buf.linearConvCaches, buf.batchConvCache);
+                        bool fusedBatchDecodeConvSilu = FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
+                            buf.batchConvCache, buf.qkvConvInput,
+                            *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                            buf.convOutput);
+                        if (!fusedBatchDecodeConvSilu) {
+                            ShiftAppendSingleTokenLinearAttentionCache(buf.batchConvCache, buf.qkvConvInput);
+                            Qwen35CudaConv1DPerChannel(cudaRunner, buf.batchConvCache,
+                                                       *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                                                       *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                                                       buf.batchConvCache.dims[1],
+                                                       requireLocal(weight[conv1dWeightName], conv1dWeightName)->dims[0],
+                                                       4, 1, 0, buf.convOutput);
+                            Qwen35CudaSilu(cudaRunner, buf.convOutput, buf.convOutput);
+                        }
+                        SplitBatchFirstDim(buf.batchConvCache, buf.linearConvCaches);
+                        buf.convOutput.Reshape({1, batch, buf.convOutput.dims[1]});
+                    }
+                    for (int bidx = 0; bidx < batch; bidx++) {
+                        buf.linearConvCaches[bidx]->isLinearAttention = true;
+                    }
 
-                    Qwen3CudaSplit(cudaRunner, buf.convOutput, -1, 0, localKd, buf.linearQ);
-                    Qwen3CudaSplit(cudaRunner, buf.convOutput, -1, localKd, localKd * 2, buf.linearK);
-                    Qwen3CudaSplit(cudaRunner, buf.convOutput, -1, localKd * 2,
-                                   localKd * 2 + localVd, buf.linearV);
-                    buf.linearQ.Reshape({buf.linearQ.dims[0], buf.linearQ.dims[1],
-                                         localKeyHeads, head_k_dim});
-                    buf.linearK.Reshape({buf.linearK.dims[0], buf.linearK.dims[1],
-                                         localKeyHeads, head_k_dim});
-                    buf.linearV.Reshape({buf.linearV.dims[0], buf.linearV.dims[1],
-                                         localValueHeads, head_v_dim});
+                    for (int rb = 0; rb < batch; rb++) {
+                        buf.recurrentStates[rb] = pastKeyValues[rb * block_cnt + i].second;
+                    }
+                    PagedCacheManager *linearStatePool = Qwen35FindLinearSlotPool(
+                        this, gpuId, i, QWEN35_LINEAR_SLOT_RECURRENT,
+                        linearSlotCapacity);
+                    bool fusedBatchRecurrentFromConvBa = false;
+                    if (linearStatePool != nullptr && state.linearSlotIds.cudaData != nullptr) {
+                        float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
+                        fusedBatchRecurrentFromConvBa =
+                            FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
+                                buf.convOutput, buf.ba,
+                                *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                *requireLocal(weight[aLogName], aLogName),
+                                *requireLocal(weight[dtBiasName], dtBiasName),
+                                linearStatePool->cudaData, state.linearSlotIds.cudaData, batch,
+                                buf.coreAttnOut,
+                                localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
+                                rms_norm_eps, recurrentQScale);
+                    }
+                    if (fusedBatchRecurrentFromConvBa) {
+                        for (int rb = 0; rb < batch; rb++) {
+                            buf.recurrentStates[rb]->isLinearAttention = true;
+                        }
+                        buf.coreAttnOut.Reshape({1, batch, buf.coreAttnOut.dims[1],
+                                                 buf.coreAttnOut.dims[3]});
+                    }
 
-                    Qwen35CudaSigmoidMambaSoftplus(cudaRunner, buf.b, buf.a,
-                                                   *requireLocal(weight[aLogName], aLogName),
-                                                   *requireLocal(weight[dtBiasName], dtBiasName),
-                                                   buf.g);
-                    Qwen3CudaRMSNorm(cudaRunner, buf.linearQ,
-                                     *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                                     rms_norm_eps, buf.linearQ);
-                    Qwen3CudaRMSNorm(cudaRunner, buf.linearK,
-                                     *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                                     rms_norm_eps, buf.linearK);
-                    SwapSingleTokenSeqHeadByReshape(buf.linearQ);
-                    SwapSingleTokenSeqHeadByReshape(buf.linearK);
-                    SwapSingleTokenSeqHeadByReshape(buf.linearV);
-                    SwapSingleTokenSeqHeadByReshape(buf.b);
-                    SwapSingleTokenSeqHeadByReshape(buf.g);
-                    float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
-                    Qwen35CudaRecurrentGatedDeltaRule(cudaRunner, buf.linearQ, buf.linearK,
-                                                      buf.linearV, buf.g, buf.b,
-                                                      pastValue, buf.coreAttnOut,
-                                                      recurrentQScale);
-                    SwapSingleTokenSeqHeadByReshape(buf.coreAttnOut);
+                    if (!fusedBatchRecurrentFromConvBa) {
+                        Qwen3CudaSplit(cudaRunner, buf.convOutput, -1, 0, localKd, buf.linearQ);
+                        Qwen3CudaSplit(cudaRunner, buf.convOutput, -1, localKd, localKd * 2, buf.linearK);
+                        Qwen3CudaSplit(cudaRunner, buf.convOutput, -1, localKd * 2,
+                                       localKd * 2 + localVd, buf.linearV);
+                        buf.linearQ.Reshape({buf.linearQ.dims[0], buf.linearQ.dims[1],
+                                             localKeyHeads, head_k_dim});
+                        buf.linearK.Reshape({buf.linearK.dims[0], buf.linearK.dims[1],
+                                             localKeyHeads, head_k_dim});
+                        buf.linearV.Reshape({buf.linearV.dims[0], buf.linearV.dims[1],
+                                             localValueHeads, head_v_dim});
+                        Qwen3CudaSplit(cudaRunner, buf.ba, -1, 0, localValueHeads, buf.b);
+                        Qwen3CudaSplit(cudaRunner, buf.ba, -1,
+                                       localValueHeads, localValueHeads * 2, buf.a);
+                        Qwen35CudaSigmoidMambaSoftplus(cudaRunner, buf.b, buf.a,
+                                                       *requireLocal(weight[aLogName], aLogName),
+                                                       *requireLocal(weight[dtBiasName], dtBiasName),
+                                                       buf.g);
+                        Qwen3CudaRMSNorm(cudaRunner, buf.linearQ,
+                                         *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                         rms_norm_eps, buf.linearQ);
+                        Qwen3CudaRMSNorm(cudaRunner, buf.linearK,
+                                         *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                         rms_norm_eps, buf.linearK);
+                        buf.linearQ.Reshape({batch, localKeyHeads, 1, head_k_dim});
+                        buf.linearK.Reshape({batch, localKeyHeads, 1, head_k_dim});
+                        buf.linearV.Reshape({batch, localValueHeads, 1, head_v_dim});
+                        buf.b.Reshape({batch, localValueHeads, 1});
+                        buf.g.Reshape({batch, localValueHeads, 1});
+                        CatBatchFirstDim(buf.recurrentStates, buf.batchRecurrentState);
+                        float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
+                        Qwen35CudaRecurrentGatedDeltaRule(cudaRunner, buf.linearQ, buf.linearK,
+                                                          buf.linearV, buf.g, buf.b,
+                                                          buf.batchRecurrentState, buf.coreAttnOut,
+                                                          recurrentQScale);
+                        SplitBatchFirstDim(buf.batchRecurrentState, buf.recurrentStates);
+                        for (int rb = 0; rb < batch; rb++) {
+                            buf.recurrentStates[rb]->isLinearAttention = true;
+                        }
+                        buf.coreAttnOut.Reshape({1, batch, buf.coreAttnOut.dims[1],
+                                                 buf.coreAttnOut.dims[3]});
+                    }
 
                     std::vector<int> zShape = buf.z.dims;
                     buf.coreAttnOut.Reshape({-1, buf.coreAttnOut.dims.back()});
                     buf.z.Reshape({-1, buf.z.dims.back()});
-                    Qwen3CudaRMSNorm(cudaRunner, buf.coreAttnOut,
-                                     *requireLocal(weight[outNormWeightName], outNormWeightName),
-                                     rms_norm_eps, buf.coreAttnOut);
-                    Qwen35CudaSilu(cudaRunner, buf.z, buf.z);
-                    if (buf.z.dataType != buf.coreAttnOut.dataType) {
-                        Qwen3CudaToDataType(cudaRunner, buf.z, buf.coreAttnOut.dataType);
+                    bool fusedPostLinearAttn =
+                        Qwen35TryCudaRMSNormSiluMul(
+                            buf.coreAttnOut,
+                            *requireLocal(weight[outNormWeightName], outNormWeightName),
+                            buf.z, buf.coreAttnOut, rms_norm_eps);
+                    if (!fusedPostLinearAttn) {
+                        Qwen3CudaRMSNorm(cudaRunner, buf.coreAttnOut,
+                                         *requireLocal(weight[outNormWeightName], outNormWeightName),
+                                         rms_norm_eps, buf.coreAttnOut);
+                        Qwen35CudaSilu(cudaRunner, buf.z, buf.z);
+                        if (buf.z.dataType != buf.coreAttnOut.dataType) {
+                            Qwen3CudaToDataType(cudaRunner, buf.z, buf.coreAttnOut.dataType);
+                        }
+                        Qwen35CudaMulTo(cudaRunner, buf.coreAttnOut, buf.z);
                     }
-                    Qwen35CudaMulTo(cudaRunner, buf.coreAttnOut, buf.z);
                     buf.coreAttnOut.Reshape({zShape[0], zShape[1], localVd});
                     Qwen3CudaLinearResidualReduce(
                         cudaRunner, buf.coreAttnOut,
@@ -2930,6 +3718,11 @@ namespace fastllm {
                    gpuId, FastllmCudaGraphLastError());
             Qwen35DestroyCudaGraph(state);
             state.disabled = true;
+            runWithoutGraph();
+            return true;
+        }
+
+        if (!allowCapture) {
             runWithoutGraph();
             return true;
         }
@@ -3314,26 +4107,45 @@ namespace fastllm {
                 k.Reshape({k.dims[0], k.dims[1], localKeyHeads, head_k_dim});
                 v.Reshape({v.dims[0], v.dims[1], localValueHeads, head_v_dim});
 
-                Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
-                                               *requireLocal(weight[aLogName], aLogName),
-                                               *requireLocal(weight[dtBiasName], dtBiasName),
-                                               g);
-
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
-                    Qwen3CudaRMSNorm(cudaRunner, q, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                                     rms_norm_eps, q);
-                    Qwen3CudaRMSNorm(cudaRunner, k, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                                     rms_norm_eps, k);
-                    SwapSingleTokenSeqHeadByReshape(q);
-                    SwapSingleTokenSeqHeadByReshape(k);
-                    SwapSingleTokenSeqHeadByReshape(v);
-                    SwapSingleTokenSeqHeadByReshape(b);
-                    SwapSingleTokenSeqHeadByReshape(g);
-                    float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
-                    Qwen35CudaRecurrentGatedDeltaRule(cudaRunner, q, k, v, g, b,
-                                                      pastValue, coreAttnOut, recurrentQScale);
-                    SwapSingleTokenSeqHeadByReshape(coreAttnOut);
+                    bool fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
+                        q, k, v, a, b,
+                        *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                        *requireLocal(weight[aLogName], aLogName),
+                        *requireLocal(weight[dtBiasName], dtBiasName),
+                        rms_norm_eps, pastValue, coreAttnOut
+                    );
+                    if (!fusedSingleDecode) {
+                        Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
+                                                       *requireLocal(weight[aLogName], aLogName),
+                                                       *requireLocal(weight[dtBiasName], dtBiasName),
+                                                       g);
+                        fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
+                            q, k, v, g, b,
+                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                            rms_norm_eps, pastValue, coreAttnOut
+                        );
+                    }
+                    if (!fusedSingleDecode) {
+                        Qwen3CudaRMSNorm(cudaRunner, q, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                         rms_norm_eps, q);
+                        Qwen3CudaRMSNorm(cudaRunner, k, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                         rms_norm_eps, k);
+                        SwapSingleTokenSeqHeadByReshape(q);
+                        SwapSingleTokenSeqHeadByReshape(k);
+                        SwapSingleTokenSeqHeadByReshape(v);
+                        SwapSingleTokenSeqHeadByReshape(b);
+                        SwapSingleTokenSeqHeadByReshape(g);
+                        float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
+                        Qwen35CudaRecurrentGatedDeltaRule(cudaRunner, q, k, v, g, b,
+                                                          pastValue, coreAttnOut, recurrentQScale);
+                        SwapSingleTokenSeqHeadByReshape(coreAttnOut);
+                    }
                 } else if (batch > 1 && all1) {
+                    Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
+                                                   *requireLocal(weight[aLogName], aLogName),
+                                                   *requireLocal(weight[dtBiasName], dtBiasName),
+                                                   g);
                     Qwen3CudaRMSNorm(cudaRunner, q, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                                      rms_norm_eps, q);
                     Qwen3CudaRMSNorm(cudaRunner, k, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
@@ -3360,6 +4172,10 @@ namespace fastllm {
                     }
                     coreAttnOut.Reshape({1, batch, coreAttnOut.dims[1], coreAttnOut.dims[3]});
                 } else {
+                    Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
+                                                   *requireLocal(weight[aLogName], aLogName),
+                                                   *requireLocal(weight[dtBiasName], dtBiasName),
+                                                   g);
                     if (num_v_heads / num_k_heads > 1) {
                         Qwen35CudaMul(cudaRunner, q, 1.0f, qRepeat);
                         Qwen35CudaMul(cudaRunner, k, 1.0f, kRepeat);
@@ -3455,14 +4271,20 @@ namespace fastllm {
                 std::vector<int> zShape = z.dims;
                 coreAttnOut.Reshape({-1, coreAttnOut.dims.back()});
                 z.Reshape({-1, z.dims.back()});
-                Qwen3CudaRMSNorm(cudaRunner, coreAttnOut,
-                                 *requireLocal(weight[outNormWeightName], outNormWeightName),
-                                 rms_norm_eps, coreAttnOut);
-                Qwen35CudaSilu(cudaRunner, z, z);
-                if (z.dataType != coreAttnOut.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, z, coreAttnOut.dataType);
+                bool fusedPostLinearAttn = Qwen35TryCudaRMSNormSiluMul(
+                    coreAttnOut,
+                    *requireLocal(weight[outNormWeightName], outNormWeightName),
+                    z, coreAttnOut, rms_norm_eps);
+                if (!fusedPostLinearAttn) {
+                    Qwen3CudaRMSNorm(cudaRunner, coreAttnOut,
+                                     *requireLocal(weight[outNormWeightName], outNormWeightName),
+                                     rms_norm_eps, coreAttnOut);
+                    Qwen35CudaSilu(cudaRunner, z, z);
+                    if (z.dataType != coreAttnOut.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, z, coreAttnOut.dataType);
+                    }
+                    Qwen35CudaMulTo(cudaRunner, coreAttnOut, z);
                 }
-                Qwen35CudaMulTo(cudaRunner, coreAttnOut, z);
                 coreAttnOut.Reshape({zShape[0], zShape[1], localVd});
                 Qwen3CudaLinearResidualReduce(
                     cudaRunner, coreAttnOut,
@@ -3580,7 +4402,8 @@ namespace fastllm {
             all1 &= (seqLens[i] == 1);
         }
         bool isPrefill = !all1;
-        if (batch > 1 && !all1) {
+
+        auto runSplitBatchForward = [&]() -> std::vector<int> {
             std::vector<int> ret;
             ret.reserve(batch);
             int inputOffset = 0;
@@ -3618,6 +4441,40 @@ namespace fastllm {
                 ret.push_back(curRet[0]);
             }
             return ret;
+        };
+
+        auto canRunFusedBatchDecode = [&]() -> bool {
+            if (batch <= 1 || !all1 || (int)pastKeyValues.size() < batch * block_cnt) {
+                return false;
+            }
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < block_cnt; i++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey == nullptr || pastValue == nullptr) {
+                        return false;
+                    }
+                    bool isAttentionLayer =
+                        weight.weight.find(language_prefix + "layers." + std::to_string(i) +
+                                           ".self_attn.o_proj.weight") != weight.weight.end();
+                    if (isAttentionLayer) {
+                        if (!pastKey->isPagedKVCache || !pastValue->isPagedKVCache ||
+                            pastKey->pagedKVCacheData == nullptr ||
+                            pastValue->pagedKVCacheData == nullptr ||
+                            pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
+                            return false;
+                        }
+                    } else if (pastKey->dims.empty() || pastValue->dims.empty() ||
+                               pastKey->dims[0] != 1 || pastValue->dims[0] != 1) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (batch > 1 && (!all1 || !canRunFusedBatchDecode())) {
+            return runSplitBatchForward();
         }
 
         PrepareGdnWeights();
@@ -5348,26 +6205,39 @@ namespace fastllm {
 
                 Data &last_recurrent_state = pastValue;
                 Data core_attn_out, core_attn_out_temp;
+                #ifdef USE_CUDA
+                if (!isSingleTokenDecode) {
+                    Qwen35EnsureCudaLinearAttnStateKVLayout(last_recurrent_state);
+                }
+                #endif
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
-                    RMSNorm(q, inv_scale_data, rms_norm_eps, q);
-                    RMSNorm(k, inv_scale_data, rms_norm_eps, k);
+                    bool fusedSingleDecode = false;
+#ifdef USE_CUDA
+                    fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
+                        q, k, v, g, b, inv_scale_data, rms_norm_eps, last_recurrent_state, core_attn_out
+                    );
+#endif
+                    if (!fusedSingleDecode) {
+                        RMSNorm(q, inv_scale_data, rms_norm_eps, q);
+                        RMSNorm(k, inv_scale_data, rms_norm_eps, k);
 
-                    SwapSingleTokenSeqHeadByReshape(q);
-                    SwapSingleTokenSeqHeadByReshape(k);
-                    SwapSingleTokenSeqHeadByReshape(v);
-                    SwapSingleTokenSeqHeadByReshape(b);
-                    SwapSingleTokenSeqHeadByReshape(g);
+                        SwapSingleTokenSeqHeadByReshape(q);
+                        SwapSingleTokenSeqHeadByReshape(k);
+                        SwapSingleTokenSeqHeadByReshape(v);
+                        SwapSingleTokenSeqHeadByReshape(b);
+                        SwapSingleTokenSeqHeadByReshape(g);
 
-                    float scale = 1.0f / pow(q.dims.back(), 0.5);
-                    float recurrentQScale = 1.0f;
-                    if (q.dataDevice == DataDevice::CUDA) {
-                        recurrentQScale = scale;
-                    } else {
-                        Mul(q, scale, q);
+                        float scale = 1.0f / pow(q.dims.back(), 0.5);
+                        float recurrentQScale = 1.0f;
+                        if (q.dataDevice == DataDevice::CUDA) {
+                            recurrentQScale = scale;
+                        } else {
+                            Mul(q, scale, q);
+                        }
+
+                        RecurrentGatedDeltaRule(q, k, v, g, b, last_recurrent_state, core_attn_out, recurrentQScale);
+                        SwapSingleTokenSeqHeadByReshape(core_attn_out);
                     }
-
-                    RecurrentGatedDeltaRule(q, k, v, g, b, last_recurrent_state, core_attn_out, recurrentQScale);
-                    SwapSingleTokenSeqHeadByReshape(core_attn_out);
                 } else {
                     if (num_v_heads / num_k_heads > 1) {
                         Data qrepeat, krepeat;
@@ -5466,6 +6336,7 @@ namespace fastllm {
                         }
                         #endif
                         last_recurrent_state.Resize({key_batch_size, key_sequence_length, key_k_head_dim, v_head_dim_local});
+                        last_recurrent_state.isLinearAttentionTransposed = false;
                         last_recurrent_state.Allocate(0.0f);
                     }
 
@@ -6557,7 +7428,7 @@ namespace fastllm {
                 Split(convOutput, -1, 0, kd, q);
                 Split(convOutput, -1, kd, kd + kd, k);
                 Split(convOutput, -1, kd + kd, kd + kd + vd, v);
-                
+
                 q.Reshape({q.dims[0], q.dims[1], -1, head_k_dim});
                 k.Reshape({k.dims[0], k.dims[1], -1, head_k_dim});
                 v.Reshape({v.dims[0], v.dims[1], -1, head_v_dim});
@@ -6579,31 +7450,44 @@ namespace fastllm {
 
 
                 Data &last_recurrent_state = pastValue;
+                #ifdef USE_CUDA
+                if (!isSingleTokenDecode) {
+                    Qwen35EnsureCudaLinearAttnStateKVLayout(last_recurrent_state);
+                }
+                #endif
 
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
-                    RMSNorm(q, inv_scale_data, rms_norm_eps, q);
-                    RMSNorm(k, inv_scale_data, rms_norm_eps, k);
-
-                    SwapSingleTokenSeqHeadByReshape(q);
-                    SwapSingleTokenSeqHeadByReshape(k);
-                    SwapSingleTokenSeqHeadByReshape(v);
-                    SwapSingleTokenSeqHeadByReshape(b);
-                    SwapSingleTokenSeqHeadByReshape(g);
-
-                    float scale = 1.0f / pow(q.dims.back(), 0.5);
-                    float recurrentQScale = 1.0f;
-                    if (q.dataDevice == DataDevice::CUDA) {
-                        recurrentQScale = scale;
-                    } else {
-                        Mul(q, scale, q);
-                    }
-
-                    RecurrentGatedDeltaRule (
-                        q, k, v, g, b,
-                        last_recurrent_state, 
-                        core_attn_out, recurrentQScale
+                    bool fusedSingleDecode = false;
+#ifdef USE_CUDA
+                    fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
+                        q, k, v, g, b, inv_scale_data, rms_norm_eps, last_recurrent_state, core_attn_out
                     );
-                    SwapSingleTokenSeqHeadByReshape(core_attn_out);
+#endif
+                    if (!fusedSingleDecode) {
+                        RMSNorm(q, inv_scale_data, rms_norm_eps, q);
+                        RMSNorm(k, inv_scale_data, rms_norm_eps, k);
+
+                        SwapSingleTokenSeqHeadByReshape(q);
+                        SwapSingleTokenSeqHeadByReshape(k);
+                        SwapSingleTokenSeqHeadByReshape(v);
+                        SwapSingleTokenSeqHeadByReshape(b);
+                        SwapSingleTokenSeqHeadByReshape(g);
+
+                        float scale = 1.0f / pow(q.dims.back(), 0.5);
+                        float recurrentQScale = 1.0f;
+                        if (q.dataDevice == DataDevice::CUDA) {
+                            recurrentQScale = scale;
+                        } else {
+                            Mul(q, scale, q);
+                        }
+
+                        RecurrentGatedDeltaRule (
+                            q, k, v, g, b,
+                            last_recurrent_state,
+                            core_attn_out, recurrentQScale
+                        );
+                        SwapSingleTokenSeqHeadByReshape(core_attn_out);
+                    }
                 } else if (isFusedBatchDecode) {
                     RMSNorm(q, inv_scale_data, rms_norm_eps, q);
                     RMSNorm(k, inv_scale_data, rms_norm_eps, k);
@@ -6682,7 +7566,7 @@ namespace fastllm {
                     PermuteSelf(v, {0, 2, 1, 3});
                     PermuteSelf(b, {0, 2, 1});
                     PermuteSelf(g, {0, 2, 1});
-                    
+
                     int key_batch_size = k.dims[0], key_sequence_length = k.dims[1], key_num_heads = k.dims[2], key_k_head_dim = k.dims[3];
 
                     int chunk_size = 64;
@@ -6736,7 +7620,7 @@ namespace fastllm {
                     CausalMask(attn, 0, 0.0f);
                     TransferAttn(attn);
                     MatMul(attn, v_beta, vv);
-                    Data k_cumdecay, g_exp;                    
+                    Data k_cumdecay, g_exp;
                     Exp(*pgg, g_exp);
 
                     MulTo(k_beta, g_exp);
@@ -6754,6 +7638,7 @@ namespace fastllm {
                         }
 #endif
                         last_recurrent_state.Resize({key_batch_size, key_sequence_length, key_k_head_dim, v_head_dim_local});
+                        last_recurrent_state.isLinearAttentionTransposed = false;
                         last_recurrent_state.Allocate(0.0f);
                     }
 
@@ -6911,8 +7796,8 @@ namespace fastllm {
                                    Data(), attenInput);
                         }
                     } else {
-                        Linear(core_attn_out, 
-                            this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"], 
+                        Linear(core_attn_out,
+                            this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
                             Data(), attenInput);
                     }
                 }

@@ -244,7 +244,8 @@ namespace fastllm {
             if (cache.multiDeviceData) {
                 return;
             }
-            if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty()) {
+            if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
+                cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
                 cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
             }
         };
@@ -893,6 +894,9 @@ namespace fastllm {
                     }
                 }
                 if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+                    return;
+                }
+                if (cache.pagedKVCacheData->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
                     return;
                 }
                 if (cache.pageIndex.empty() || cache.lastPageLen >= cache.pageLen) {
