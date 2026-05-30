@@ -329,6 +329,8 @@ bool FastllmCudaConv1DPerChannelFloat32(const fastllm::Data &input, fastllm::Dat
 bool FastllmCudaConv1DPerChannelSiluSingleTokenFloat16(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(fastllm::Data &cache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(const std::vector<fastllm::Data*> &caches, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
+bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchDevicePointers(void *cudaCachePointers, int batch, const fastllm::Data &firstCache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
+bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchSlots(void *cudaCachePool, void *cudaSlotIds, int batch, const fastllm::Data &firstCache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output);
 
@@ -545,11 +547,46 @@ void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector
 void FastllmResetLogitsOfEOSAll(int batch, fastllm::Data *logits, const std::vector<int> &eos_ids);
 
 void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float qScale = 1.0f);
+bool FastllmLinearAttentionStateTransposeKVToVKFloat16(fastllm::Data &last_recurrent_state);
+bool FastllmLinearAttentionStateTransposeVKToKVFloat16(fastllm::Data &last_recurrent_state);
+bool FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale = 1.0f);
+bool FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &a, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &aLog, fastllm::Data &dtBias, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale = 1.0f);
+bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale = 1.0f);
 void FastllmRecurrentGatedDeltaRuleBatch(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out, float qScale = 1.0f);
+bool FastllmRecurrentGatedDeltaRuleBatchDevicePointers(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b,
+    fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
+    fastllm::Data &core_attn_out, float qScale = 1.0f);
 void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale = 1.0f);
+bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
+    fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale = 1.0f);
+bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
+    fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale = 1.0f);
+bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    void *cudaStatePool, void *cudaSlotIds, int batch,
+    fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale = 1.0f);
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
