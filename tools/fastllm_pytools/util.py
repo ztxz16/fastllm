@@ -259,6 +259,8 @@ def make_normal_llm_model(args):
             is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
                           model_type == 'step3p5' or
                           text_model_type == 'step3p5')
+            is_step3p7 = (architecture == 'Step3p7ForConditionalGeneration' or
+                          model_type == 'step3p7')
             if is_step3p5:
                 is_thread_tp_moe_model = True
                 if (args.cache_history == ""):
@@ -274,7 +276,7 @@ def make_normal_llm_model(args):
                         args.moe_device = "disk"
                 if (args.chunked_prefill_size <= 0):
                     args.chunked_prefill_size = 128
-                if (args.tokens <= 0 and not _uses_thread_tp(getattr(args, "tp", ""))):
+                if (args.tokens <= 0 and not is_step3p7 and not _uses_thread_tp(getattr(args, "tp", ""))):
                     args.tokens = 32768
 
             if (architecture == 'Qwen3ForCausalLM' or architecture == 'Qwen3MoeForCausalLM' or

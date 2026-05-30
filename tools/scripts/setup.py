@@ -6,7 +6,8 @@ server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn']
 webui_require = ['streamlit-chat']
 download_require = ['aria2']
 tokenizer_require = ['tiktoken', 'blobfile', 'partial_json_parser']
-all_require = server_require + webui_require + download_require + tokenizer_require
+video_require = ['imageio', 'imageio-ffmpeg']
+all_require = server_require + webui_require + download_require + tokenizer_require + video_require
 
 PACKAGE_INFO = {
     "release": {"name": "ftllm", "version": "0.1.6.4"},
@@ -75,6 +76,7 @@ setup (
     extras_require={
         'all': all_require,
         'server': server_require,
-        'webui': webui_require
+        'webui': webui_require,
+        'video': video_require,
     },
 )

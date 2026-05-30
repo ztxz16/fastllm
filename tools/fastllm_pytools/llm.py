@@ -42,6 +42,21 @@ except ImportError:
     )
 
 try:
+    from .step3p7_multimodal_native import (
+        build_step3p7_multimodal_payload,
+        build_step3p7_prompt,
+        normalize_step3p7_conversation,
+        prepare_step3p7_multimodal_inputs,
+    )
+except ImportError:
+    from step3p7_multimodal_native import (
+        build_step3p7_multimodal_payload,
+        build_step3p7_prompt,
+        normalize_step3p7_conversation,
+        prepare_step3p7_multimodal_inputs,
+    )
+
+try:
     import sentencepiece # 先加载sentencepiece，防止libc冲突
 except:
     pass
@@ -1453,6 +1468,27 @@ class model:
                     encode_fn = self.encode,
                 )
                 return len(native_inputs["input_ids"])
+            if architecture == "Step3p7ForConditionalGeneration":
+                step_conversation = normalize_step3p7_conversation(
+                    copy.deepcopy(conversation),
+                    len(multimodal_images),
+                    len(multimodal_videos),
+                )
+                model_dir = self.model_path if self.model_path else (
+                    self.hf_tokenizer.name_or_path if self.hf_tokenizer is not None else ""
+                )
+                native_inputs = prepare_step3p7_multimodal_inputs(
+                    tokenizer = self.hf_tokenizer,
+                    model_dir = model_dir,
+                    model_config = self.config,
+                    conversation = step_conversation,
+                    images = multimodal_images,
+                    videos = multimodal_videos,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                    encode_fn = self.encode,
+                )
+                return len(native_inputs["input_ids"])
         architecture = ""
         try:
             architecture = self.config["architectures"][0]
@@ -1480,6 +1516,11 @@ class model:
                     merge_size = 1,
                     add_generation_prompt = add_generation_prompt,
                     enable_thinking = enable_thinking,
+                )
+            elif architecture == "Step3p7ForConditionalGeneration":
+                prompt = build_step3p7_prompt(
+                    conversation = copy.deepcopy(conversation),
+                    add_generation_prompt = add_generation_prompt,
                 )
             else:
                 prompt = self.apply_chat_template(conversation)
@@ -1869,6 +1910,46 @@ class model:
                 payload_config, payload = build_qwen35_multimodal_payload(
                     native_inputs, tokenizer, model_config = self.config
                 )
+                payload_json = json.dumps(payload_config)
+                payload_buffer = ctypes.create_string_buffer(payload) if payload else None
+                input = native_inputs["input_ids"]
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(input), (ctypes.c_int * len(input))(*input),
+                    payload_json.encode(), payload_buffer,
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stop_token_len, stop_token_list
+                )
+                return handle
+            elif (architecture == "Step3p7ForConditionalGeneration"):
+                tokenizer = self.hf_tokenizer
+                if (conversation != None and len(conversation) != 0):
+                    step_conversation = normalize_step3p7_conversation(
+                        copy.deepcopy(conversation),
+                        len(multimodal_images),
+                        len(multimodal_videos),
+                    )
+                else:
+                    prompt_text = query if self.direct_query else self.get_prompt(query, history)
+                    step_conversation = normalize_step3p7_conversation(
+                        [{"role": "user", "content": prompt_text}],
+                        len(multimodal_images),
+                        len(multimodal_videos),
+                    )
+
+                model_dir = self.model_path if self.model_path else (tokenizer.name_or_path if tokenizer is not None else "")
+                native_inputs = prepare_step3p7_multimodal_inputs(
+                    tokenizer = tokenizer,
+                    model_dir = model_dir,
+                    model_config = self.config,
+                    conversation = step_conversation,
+                    images = multimodal_images,
+                    videos = multimodal_videos,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                    encode_fn = self.encode,
+                )
+                payload_config, payload = build_step3p7_multimodal_payload(native_inputs)
                 payload_json = json.dumps(payload_config)
                 payload_buffer = ctypes.create_string_buffer(payload) if payload else None
                 input = native_inputs["input_ids"]

@@ -49,6 +49,17 @@ except ImportError:
         prepare_qwen35_multimodal_inputs,
     )
 
+try:
+    from ..step3p7_multimodal_native import (
+        normalize_step3p7_conversation,
+        prepare_step3p7_multimodal_inputs,
+    )
+except ImportError:
+    from step3p7_multimodal_native import (
+        normalize_step3p7_conversation,
+        prepare_step3p7_multimodal_inputs,
+    )
+
 ConversationContent = Union[str, List[Dict[str, Any]]]
 
 
@@ -532,6 +543,23 @@ class FastLLmCompletion:
               add_generation_prompt = True,
               enable_thinking = enable_thinking,
               encode_vision = False,
+              encode_fn = self.model.encode,
+          )
+          return len(native_inputs["input_ids"])
+      if architecture == "Step3p7ForConditionalGeneration":
+          tokenizer = getattr(self.model, "hf_tokenizer", None)
+          step_conversation = normalize_step3p7_conversation(
+              copy.deepcopy(token_len_messages), len(images or []), len(videos or []))
+          model_dir = getattr(self.model, "model_path", "") or (tokenizer.name_or_path if tokenizer is not None else "")
+          native_inputs = prepare_step3p7_multimodal_inputs(
+              tokenizer = tokenizer,
+              model_dir = model_dir,
+              model_config = getattr(self.model, "config", {}),
+              conversation = step_conversation,
+              images = images,
+              videos = videos,
+              add_generation_prompt = True,
+              enable_thinking = enable_thinking,
               encode_fn = self.model.encode,
           )
           return len(native_inputs["input_ids"])
