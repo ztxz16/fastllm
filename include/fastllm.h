@@ -376,6 +376,7 @@ namespace fastllm {
         long long cacheUid = 0; // 用来标注Cache id
         bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
         bool isLinearAttention = false; // 是否是线性attention的缓存（永远保持同样的形状）
+        bool isLinearAttentionTransposed = false; // 线性attention recurrent state是否物理存成[V,K]
 
         // Paged KV Cache的相关信息
         // 当isKVCache = true且isPagedKVCache = true时，下面这些信息才有意义
@@ -400,6 +401,7 @@ namespace fastllm {
         uint8_t *cpuData = nullptr; // 数据指针
 
 	    void *cudaData = nullptr;
+        bool cudaDataBorrowed = false; // cudaData points into another owner and should not be freed directly
         std::vector <void*> extraCudaData;
         std::vector <void*> extraCudaHalfData;
 

@@ -96,6 +96,9 @@ namespace fastllm {
         }
 
         static void CudaFreeForData(const Data &data, void *ptr) {
+            if (data.cudaDataBorrowed && ptr == data.cudaData) {
+                return;
+            }
             if (data.directMemory) {
                 FastllmCudaDirectFree(ptr);
             } else {
@@ -841,6 +844,7 @@ namespace fastllm {
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
         this->isLinearAttention = ori.isLinearAttention;
+        this->isLinearAttentionTransposed = ori.isLinearAttentionTransposed;
         this->cacheUid = ori.cacheUid;
         this->dataDevice = ori.dataDevice;
         this->tpLayout = ori.tpLayout;
@@ -872,8 +876,11 @@ namespace fastllm {
                     this->cpuData = nullptr;
                 } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-                    FastllmCudaFree(this->cudaData);
+                    if (!this->cudaDataBorrowed) {
+                        FastllmCudaFree(this->cudaData);
+                    }
                     this->cudaData = nullptr;
+                    this->cudaDataBorrowed = false;
 #endif
                 }
                 return;
@@ -1717,6 +1724,7 @@ namespace fastllm {
             } else {
                 this->cudaData = FastllmCudaMalloc(this->expansionBytes);
             }
+            this->cudaDataBorrowed = false;
             if (this->cudaData == nullptr) {
                 std::string msg = "Error: cuda malloc failed in Data::MallocSpace. requestBytes = " +
                                   std::to_string(this->expansionBytes) +
@@ -1758,12 +1766,15 @@ namespace fastllm {
         }
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
-            if (this->directMemory) {
-                FastllmCudaDirectFree(this->cudaData);
-            } else {
-                FastllmCudaFree(this->cudaData);
+            if (!this->cudaDataBorrowed) {
+                if (this->directMemory) {
+                    FastllmCudaDirectFree(this->cudaData);
+                } else {
+                    FastllmCudaFree(this->cudaData);
+                }
             }
             this->cudaData = nullptr;
+            this->cudaDataBorrowed = false;
         }
 #endif
     }
@@ -1870,6 +1881,7 @@ namespace fastllm {
             } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
                 uint8_t *old = (uint8_t*)this->cudaData;
+                bool oldBorrowed = this->cudaDataBorrowed;
                 MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
                 int outer = this->Count(0) / this->Count(axis);
                 int input0Stride = this->Count(axis);
@@ -1877,7 +1889,9 @@ namespace fastllm {
                 int unitSize = this->unitSize;
                 FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
                                             (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
-                CudaFreeForData(*this, old);
+                if (!oldBorrowed) {
+                    CudaFreeForData(*this, old);
+                }
                 FastllmCudaClearBigBuffer();
 #else
                 ErrorInFastLLM("Error: cuda is not supported.\n");
@@ -1909,10 +1923,12 @@ namespace fastllm {
 #endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
-            if (this->directMemory) {
-                FastllmCudaDirectFree(this->cudaData);
-            } else {
-                FastllmCudaFree(this->cudaData);
+            if (!this->cudaDataBorrowed) {
+                if (this->directMemory) {
+                    FastllmCudaDirectFree(this->cudaData);
+                } else {
+                    FastllmCudaFree(this->cudaData);
+                }
             }
         }
 #endif
@@ -2254,6 +2270,7 @@ namespace fastllm {
                         if (needRealloc) {
                             CudaFreeForData(*this, this->cudaData);
                             this->cudaData = nullptr;
+                            this->cudaDataBorrowed = false;
                         }
                     }
                     if (copyData) {
@@ -2268,6 +2285,7 @@ namespace fastllm {
 #endif
                         if (this->cudaData == nullptr) {
                             this->cudaData = CudaMallocForData(*this, expansionBytes);
+                            this->cudaDataBorrowed = false;
                         }
 
                         if (cpuData != nullptr) {
@@ -2305,6 +2323,7 @@ namespace fastllm {
                     } else {
                         if (this->cudaData == nullptr) {
                             this->cudaData = CudaMallocForData(*this, expansionBytes);
+                            this->cudaDataBorrowed = false;
                         }
                     }
                 }
@@ -2320,6 +2339,7 @@ namespace fastllm {
                     if (this->isModelWeight || this->isKVCache) {
                         CudaFreeForData(*this, this->cudaData);
                         this->cudaData = nullptr;
+                        this->cudaDataBorrowed = false;
                     }
                 } else if (device == DataDevice::CUDA) {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
@@ -2339,6 +2359,7 @@ namespace fastllm {
                                         FastllmCudaSetDevice(sourceDevice);
                                         CudaFreeForData(*this, this->cudaData);
                                         this->cudaData = newCudaData;
+                                        this->cudaDataBorrowed = false;
                                         FastllmCudaSetDevice(destDevice);
                     }
                 }
@@ -2366,6 +2387,7 @@ namespace fastllm {
 
         if (this->cudaData == nullptr) {
             this->cudaData = (uint8_t*)FastllmCudaMalloc(bytes);
+            this->cudaDataBorrowed = false;
         }
 
         if (copyData) {
@@ -2435,8 +2457,11 @@ namespace fastllm {
         }
 
         if (this->isModelWeight) {
-            FastllmCudaFree(this->cudaData);
+            if (!this->cudaDataBorrowed) {
+                FastllmCudaFree(this->cudaData);
+            }
             this->cudaData = nullptr;
+            this->cudaDataBorrowed = false;
         }
 #else
         ErrorInFastLLM("FreeCudaTemporary Error: don't support.");
