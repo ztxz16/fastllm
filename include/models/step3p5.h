@@ -57,7 +57,19 @@ namespace fastllm {
                 const LastTokensManager &lastTokens,
                 std::vector <std::vector <float>*> *retLogits);
 
+        virtual std::vector <int> ForwardMultimodal(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *retLogits = nullptr);
+
         virtual bool NeedAttentionMask(int qlen, int klen);
+
+        virtual void Prepare();
 
         virtual void WarmUp();
 
@@ -91,6 +103,30 @@ namespace fastllm {
         bool need_fp32_gate = true;
         bool initialized_add1 = false;
         bool moeWeightsPrepared = false;
+
+        bool step3p7VisionAvailable = false;
+        bool step3p7VisionPrepared = false;
+        int step3p7ImageTokenId = 128001;
+        int step3p7VisionWidth = 1536;
+        int step3p7VisionLayers = 47;
+        int step3p7VisionHeads = 16;
+        int step3p7VisionHeadDim = 96;
+        int step3p7VisionImageSize = 728;
+        int step3p7VisionPatchSize = 14;
+        int step3p7VisionBaseGrid = 52;
+        int step3p7VisionMlpHidden = 8960;
+        int step3p7ImageTokenLen = 169;
+        int step3p7PatchTokenLen = 81;
+        float step3p7VisionLayerNormEps = 1e-5f;
+        float step3p7VisionRopeTheta = 10000.0f;
+        bool step3p7UseLnPre = true;
+        bool step3p7UseLnPost = false;
+        bool step3p7UseAbsPosEmb = true;
+        bool step3p7UseRope2d = true;
+        Data step3p7VisionSinData;
+        Data step3p7VisionCosData;
+        Data step3p7VisionConv1Bias;
+        Data *step3p7PrecomputedHiddenStates = nullptr;
 
         std::vector <std::string> layer_types;
         std::set <int> moe_layers;
@@ -179,6 +215,20 @@ namespace fastllm {
         bool UseLlama3Rope(int layer) const;
         void PrepareMoeWeights();
         void ApplyStepRotary(Data &input, const Data &positionIds, int layer);
+        void PrepareStep3p7Vision();
+        void ReleaseStep3p7VisionCuda();
+        void BuildStep3p7VisionPositionData(int gridH, int gridW,
+                                            Data &posEmb, Data &posH, Data &posW);
+        void ApplyStep3p7VisionRotary(Data &input, const Data &posH, const Data &posW);
+        void ApplyStep3p7LayerScale(Data &input, Data &gamma);
+        void Step3p7QuickGelu(Data &input);
+        void EncodeStep3p7PixelValues(const Data &pixelValues, Data &features);
+        void ProcessStep3p7ImageFeatures(const Data &hiddenStates, int grid, Data &features);
+        void EncodeStep3p7Images(const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                                 Data &features);
+        void MergeStep3p7ImageFeaturesIntoText(const Data &inputIds,
+                                               const Data &imageFeatures,
+                                               Data &hiddenStates);
     };
 }
 

@@ -45,6 +45,57 @@ namespace fastllm {
         return env != nullptr && Step3p5IsTrueString(env);
     }
 
+    static bool Step3p7CudaGraphDecodeEnabled() {
+        const char *env = getenv("FASTLLM_STEP3P7_CUDA_GRAPH_DECODE");
+        return env == nullptr || Step3p5IsTrueString(env);
+    }
+
+#ifdef USE_CUDA
+    static void Step3p7DebugCudaMemory(const char *tag) {
+        const char *env = getenv("FASTLLM_STEP3P7_DEBUG");
+        if (env == nullptr || !Step3p5IsTrueString(env)) {
+            return;
+        }
+        auto freeSizes = FastllmCudaGetFreeSizes();
+        printf("[Step3.7 debug] %s freeMB:", tag);
+        for (int i = 0; i < (int)freeSizes.size(); i++) {
+            printf(" %d=%lld", i, (long long)(freeSizes[i] / 1024 / 1024));
+        }
+        printf("\n");
+        fflush(stdout);
+    }
+
+    static Executor &Step3p7ThreadLocalVisionExecutor() {
+        static thread_local std::unique_ptr<Executor> executor;
+        if (executor == nullptr) {
+            executor.reset(new Executor());
+        }
+        return *executor;
+    }
+
+    class Step3p7ScopedVisionExecutor {
+    public:
+        explicit Step3p7ScopedVisionExecutor(int device) : oldExecutor(GetExecutor()) {
+            Executor &executor = Step3p7ThreadLocalVisionExecutor();
+            if (device >= 0) {
+                executor.SetFirstDevice("cuda:" + std::to_string(device));
+                FastllmCudaSetDevice(device);
+            }
+            SetCurrentThreadExecutor(&executor);
+        }
+
+        ~Step3p7ScopedVisionExecutor() {
+            SetCurrentThreadExecutor(oldExecutor);
+        }
+
+        Step3p7ScopedVisionExecutor(const Step3p7ScopedVisionExecutor&) = delete;
+        Step3p7ScopedVisionExecutor &operator=(const Step3p7ScopedVisionExecutor&) = delete;
+
+    private:
+        void *oldExecutor;
+    };
+#endif
+
     static bool Step3p5DeviceMapUsesCuda(const std::map<std::string, int> &deviceMap) {
         for (auto &it : deviceMap) {
             if (it.first.rfind("cuda", 0) == 0 || it.first.rfind("multicuda", 0) == 0) {
@@ -166,9 +217,24 @@ namespace fastllm {
         }
     }
 
-    static bool Step3p5IsVisionTensorName(const std::string &name) {
-        return name.rfind("vision_model.", 0) == 0 ||
-               name.rfind("vit_large_projector", 0) == 0;
+    static bool Step3p7VisionTensorType(const std::string &name, DataType &type) {
+        if (name.rfind("vision_model.", 0) != 0 &&
+            name.rfind("vit_large_projector", 0) != 0) {
+            return false;
+        }
+        if (name == "vision_model.conv1.weight" ||
+            name == "vision_model.vit_downsampler1.weight" ||
+            name == "vision_model.vit_downsampler2.weight" ||
+            name == "vit_large_projector.weight" ||
+            StringEndWith(name, ".attn.in_proj_weight") ||
+            StringEndWith(name, ".attn.out_proj.weight") ||
+            StringEndWith(name, ".mlp.c_fc.weight") ||
+            StringEndWith(name, ".mlp.c_proj.weight")) {
+            type = DataType::FLOAT16;
+        } else {
+            type = DataType::FLOAT32;
+        }
+        return true;
     }
 
     static void Step3p5Add1(Data &input) {
@@ -697,6 +763,42 @@ namespace fastllm {
             }
             devices.swap(uniqueDevices);
             return !devices.empty();
+        }
+
+        static int Step3p7ResolveVisionDevice(const std::map<std::string, int> &deviceMap) {
+            std::vector<int> devices;
+            std::map<int, int> ratios;
+            if (GetStep3p5GPUForwardDevices(deviceMap, devices, ratios) && !devices.empty()) {
+                return devices[0];
+            }
+
+            int bestDevice = -1;
+            for (auto &it : deviceMap) {
+                if (it.second <= 0) {
+                    continue;
+                }
+                std::string lower = it.first;
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                std::string type;
+                if (StartWith(lower, "multicuda")) {
+                    type = "multicuda";
+                } else if (StartWith(lower, "cuda")) {
+                    type = "cuda";
+                } else {
+                    continue;
+                }
+
+                std::vector<int> parsed;
+                std::map<int, int> parsedRatios;
+                Step3p5AppendCudaDevicesFromSpec(it.first, type, it.second, parsed, parsedRatios);
+                for (int device : parsed) {
+                    if (device >= 0 && (bestDevice < 0 || device < bestDevice)) {
+                        bestDevice = device;
+                    }
+                }
+            }
+            return bestDevice;
         }
 
         static bool GetStep3p5ThreadTpDevices(const std::map<std::string, int> &deviceMap,
@@ -2211,14 +2313,20 @@ namespace fastllm {
 
     std::map <std::string, std::vector <std::pair <std::string, DataType> > >
             Step3p5Model::GetTensorMap(const std::vector <std::string> &tensorNames) {
+        std::map <std::string, std::vector <std::pair <std::string, DataType> > > ret;
         std::vector<std::string> textTensorNames;
         textTensorNames.reserve(tensorNames.size());
         for (auto &name : tensorNames) {
-            if (!Step3p5IsVisionTensorName(name)) {
+            DataType visionType = DataType::FLOAT32;
+            if (Step3p7VisionTensorType(name, visionType)) {
+                ret[name].push_back(std::make_pair(name, visionType));
+            } else {
                 textTensorNames.push_back(name);
             }
         }
-        return basellm::GetTensorMap(textTensorNames);
+        auto textMap = basellm::GetTensorMap(textTensorNames);
+        ret.insert(textMap.begin(), textMap.end());
+        return ret;
     }
 
     bool Step3p5Model::IsThreadTensorParallelEnabled() const {
@@ -2234,6 +2342,20 @@ namespace fastllm {
     void Step3p5Model::OnAutoWarmupFinished() {
 #ifdef USE_CUDA
         if (GetFastllmEnv().cudaGraph) {
+            if (step3p7VisionAvailable) {
+                const char *forcePreCapture = std::getenv("FASTLLM_STEP3P7_CUDA_GRAPH_PRECAPTURE");
+                bool force = forcePreCapture != nullptr &&
+                             !(forcePreCapture[0] == '\0' ||
+                               (forcePreCapture[0] == '0' && forcePreCapture[1] == '\0'));
+                if (!force) {
+                    if (Step3p7CudaGraphDecodeEnabled()) {
+                        printf("[Fastllm] Step3.7 CUDA graph: skip startup pre-capture to keep vision prefill headroom; decode graph will warm up lazily per request.\n");
+                    } else {
+                        printf("[Fastllm] Step3.7 CUDA graph: skip startup pre-capture to keep vision prefill headroom; decode graph is disabled by FASTLLM_STEP3P7_CUDA_GRAPH_DECODE=0.\n");
+                    }
+                    return;
+                }
+            }
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
@@ -2389,6 +2511,9 @@ namespace fastllm {
         auto rejectGraph = [](const std::string &) -> bool {
             return false;
         };
+        if (step3p7VisionAvailable && !Step3p7CudaGraphDecodeEnabled()) {
+            return rejectGraph("Step3.7 decode graph disabled");
+        }
         if (!Step3p5CudaGraphEnabled(this)) {
             return rejectGraph("disabled");
         }
@@ -2659,6 +2784,7 @@ namespace fastllm {
             state.signature = newSignature;
         }
 
+        bool requestStateChanged = state.lastPastKeyHosts != currentPastKeyHosts;
         bool graphMetaMissing =
             state.metaBuffers.insertIndexs.cudaData == nullptr ||
             state.metaBuffers.insertPositions.cudaData == nullptr ||
@@ -2671,7 +2797,7 @@ namespace fastllm {
             state.lastPageSizesHost != pageSizesHost ||
             state.lastPageIndexHost != pageIndexHost ||
             state.lastDecodePageLensHost != insertPositionHost ||
-            state.lastPastKeyHosts != currentPastKeyHosts;
+            requestStateChanged;
         bool needFullMetaCopy = graphMetaMissing || signatureChanged || anyNewPage || metadataChanged;
         if (needFullMetaCopy) {
             AssertInFastLLM((int)pageIndexHost.size() <= pageIndexCapacity,
@@ -2969,6 +3095,10 @@ namespace fastllm {
         };
 
         if (state.captured) {
+            if (requestStateChanged) {
+                runWithoutGraph();
+                return true;
+            }
             if (!syncGraphPeers()) {
                 return false;
             }
@@ -3437,6 +3567,30 @@ namespace fastllm {
         llama3_original_max_position_embeddings = Step3p5GetFloat(weight.dicts, "rope_scaling.original_max_position_embeddings", 131072.0f);
         llama3_low_freq_factor = Step3p5GetFloat(weight.dicts, "rope_scaling.low_freq_factor", 1.0f);
         llama3_high_freq_factor = Step3p5GetFloat(weight.dicts, "rope_scaling.high_freq_factor", 32.0f);
+        step3p7VisionAvailable =
+            Step3p5GetDict(weight.dicts, "model_type", "") == "step3p7" ||
+            Step3p5GetDict(weight.dicts, "vision_config.model_type", "") != "";
+        if (step3p7VisionAvailable) {
+            step3p7ImageTokenId = Step3p5GetInt(weight.dicts, "image_token_id", step3p7ImageTokenId);
+            step3p7ImageTokenLen = Step3p5GetInt(weight.dicts, "image_token_len", step3p7ImageTokenLen);
+            step3p7PatchTokenLen = Step3p5GetInt(weight.dicts, "patch_token_len", step3p7PatchTokenLen);
+            step3p7VisionWidth = Step3p5GetInt(weight.dicts, "vision_config.width", step3p7VisionWidth);
+            step3p7VisionLayers = Step3p5GetInt(weight.dicts, "vision_config.layers", step3p7VisionLayers);
+            step3p7VisionHeads = Step3p5GetInt(weight.dicts, "vision_config.heads", step3p7VisionHeads);
+            step3p7VisionImageSize = Step3p5GetInt(weight.dicts, "vision_config.image_size", step3p7VisionImageSize);
+            step3p7VisionPatchSize = Step3p5GetInt(weight.dicts, "vision_config.patch_size", step3p7VisionPatchSize);
+            step3p7VisionLayerNormEps = Step3p5GetFloat(weight.dicts, "vision_config.layer_norm_eps", step3p7VisionLayerNormEps);
+            step3p7VisionRopeTheta = Step3p5GetFloat(weight.dicts, "vision_config.rope_theta", step3p7VisionRopeTheta);
+            step3p7UseLnPre = Step3p5IsTrueString(Step3p5GetDict(weight.dicts, "vision_config.use_ln_pre", "true"));
+            step3p7UseLnPost = Step3p5IsTrueString(Step3p5GetDict(weight.dicts, "vision_config.use_ln_post", "false"));
+            step3p7UseAbsPosEmb = Step3p5IsTrueString(Step3p5GetDict(weight.dicts, "vision_config.use_abs_posemb", "true"));
+            step3p7UseRope2d = Step3p5IsTrueString(Step3p5GetDict(weight.dicts, "vision_config.use_rope2d", "true"));
+            float mlpRatio = Step3p5GetFloat(weight.dicts, "vision_config.mlp_ratio", 8960.0f / 1536.0f);
+            step3p7VisionMlpHidden = (int)(step3p7VisionWidth * mlpRatio + 1e-4f);
+            step3p7VisionHeadDim = step3p7VisionWidth / std::max(1, step3p7VisionHeads);
+            step3p7VisionBaseGrid = step3p7VisionImageSize / std::max(1, step3p7VisionPatchSize);
+            this->is_multi_modal = true;
+        }
 
         layer_types = Step3p5ParseStringList(Step3p5GetDict(weight.dicts, "layer_types", ""));
         if ((int)layer_types.size() < block_cnt) {
@@ -3518,6 +3672,7 @@ namespace fastllm {
         biass.clear();
         moeWeightsPrepared = false;
         initialized_add1 = false;
+        step3p7VisionPrepared = false;
     }
 
     int Step3p5Model::LayerAttentionHeads(int layer) const {
@@ -3697,6 +3852,545 @@ namespace fastllm {
         fastllm::RopeEncoding(input, positionIds, curRotaryDim, theta, ropeScale);
     }
 
+    void Step3p5Model::PrepareStep3p7Vision() {
+        if (step3p7VisionPrepared) {
+            return;
+        }
+        AssertInFastLLM(step3p7VisionAvailable, "Step3.7 vision is not enabled for this model.\n");
+        AssertInFastLLM(weight.weight.find("vision_model.conv1.weight") != weight.weight.end() &&
+                        weight.weight.find("vision_model.positional_embedding") != weight.weight.end() &&
+                        weight.weight.find("vit_large_projector.weight") != weight.weight.end(),
+                        "Step3.7 vision weights are incomplete.\n");
+
+        int visionDevice = -1;
+#ifdef USE_CUDA
+        visionDevice = Step3p7ResolveVisionDevice(this->deviceMap);
+        if (getenv("FASTLLM_STEP3P7_DEBUG") != nullptr) {
+            printf("[Step3.7 debug] prepare vision device=%d\n", visionDevice);
+            fflush(stdout);
+        }
+#endif
+
+        auto prepareWeight = [&](const std::string &name, DataType type) {
+            auto it = weight.weight.find(name);
+            if (it == weight.weight.end()) {
+                return;
+            }
+            Data &data = it->second;
+            if (data.dataType != type) {
+                if (data.dataDevice != DataDevice::CPU) {
+                    data.ToDevice(DataDevice::CPU);
+                }
+                ToDataType(data, type);
+            }
+#ifdef USE_CUDA
+            if (visionDevice >= 0) {
+                data.ToDevice(DataDevice::CUDA, {visionDevice}, true);
+            }
+#endif
+        };
+
+        prepareWeight("vision_model.conv1.weight", DataType::FLOAT16);
+        prepareWeight("vision_model.positional_embedding", DataType::FLOAT32);
+        prepareWeight("vision_model.ln_pre.weight", DataType::FLOAT32);
+        prepareWeight("vision_model.ln_pre.bias", DataType::FLOAT32);
+        prepareWeight("vision_model.ln_post.weight", DataType::FLOAT32);
+        prepareWeight("vision_model.ln_post.bias", DataType::FLOAT32);
+        prepareWeight("vision_model.vit_downsampler1.weight", DataType::FLOAT16);
+        prepareWeight("vision_model.vit_downsampler1.bias", DataType::FLOAT32);
+        prepareWeight("vision_model.vit_downsampler2.weight", DataType::FLOAT16);
+        prepareWeight("vision_model.vit_downsampler2.bias", DataType::FLOAT32);
+        prepareWeight("vit_large_projector.weight", DataType::FLOAT16);
+        prepareWeight("vit_large_projector.bias", DataType::FLOAT32);
+
+        for (int i = 0; i < step3p7VisionLayers; i++) {
+            std::string pre = "vision_model.transformer.resblocks." + std::to_string(i);
+            prepareWeight(pre + ".ln_1.weight", DataType::FLOAT32);
+            prepareWeight(pre + ".ln_1.bias", DataType::FLOAT32);
+            prepareWeight(pre + ".ln_2.weight", DataType::FLOAT32);
+            prepareWeight(pre + ".ln_2.bias", DataType::FLOAT32);
+            prepareWeight(pre + ".attn.in_proj_weight", DataType::FLOAT16);
+            prepareWeight(pre + ".attn.in_proj_bias", DataType::FLOAT32);
+            prepareWeight(pre + ".attn.out_proj.weight", DataType::FLOAT16);
+            prepareWeight(pre + ".attn.out_proj.bias", DataType::FLOAT32);
+            prepareWeight(pre + ".mlp.c_fc.weight", DataType::FLOAT16);
+            prepareWeight(pre + ".mlp.c_fc.bias", DataType::FLOAT32);
+            prepareWeight(pre + ".mlp.c_proj.weight", DataType::FLOAT16);
+            prepareWeight(pre + ".mlp.c_proj.bias", DataType::FLOAT32);
+            prepareWeight(pre + ".ls_1.gamma", DataType::FLOAT32);
+            prepareWeight(pre + ".ls_2.gamma", DataType::FLOAT32);
+        }
+
+        int ropeDim = step3p7VisionHeadDim / 4;
+        std::vector<float> sinValues(step3p7VisionBaseGrid * ropeDim);
+        std::vector<float> cosValues(step3p7VisionBaseGrid * ropeDim);
+        int invBaseDim = step3p7VisionHeadDim / 2;
+        for (int p = 0; p < step3p7VisionBaseGrid; p++) {
+            for (int j = 0; j < ropeDim; j++) {
+                float invFreq = 1.0f / powf(step3p7VisionRopeTheta, (float)(2 * j) / (float)invBaseDim);
+                float v = (float)p * invFreq;
+                sinValues[p * ropeDim + j] = sinf(v);
+                cosValues[p * ropeDim + j] = cosf(v);
+            }
+        }
+        step3p7VisionSinData.CopyFrom(Data(DataType::FLOAT32, {step3p7VisionBaseGrid, ropeDim}, sinValues));
+        step3p7VisionCosData.CopyFrom(Data(DataType::FLOAT32, {step3p7VisionBaseGrid, ropeDim}, cosValues));
+        step3p7VisionConv1Bias.CopyFrom(Data(DataType::FLOAT32, {step3p7VisionWidth},
+                                             std::vector<float>(step3p7VisionWidth, 0.0f)));
+#ifdef USE_CUDA
+        if (visionDevice >= 0) {
+            step3p7VisionSinData.ToDevice(DataDevice::CUDA, {visionDevice}, true);
+            step3p7VisionCosData.ToDevice(DataDevice::CUDA, {visionDevice}, true);
+            step3p7VisionConv1Bias.ToDevice(DataDevice::CUDA, {visionDevice}, true);
+        }
+#endif
+        step3p7VisionPrepared = true;
+#ifdef USE_CUDA
+        Step3p7DebugCudaMemory("vision prepared weights");
+#endif
+    }
+
+    void Step3p5Model::ReleaseStep3p7VisionCuda() {
+#ifdef USE_CUDA
+        if (!step3p7VisionPrepared) {
+            return;
+        }
+        auto releaseTensor = [](Data &data) {
+            if (data.dataDevice == DataDevice::CUDA) {
+                std::vector<int> ids = data.dataDeviceIds.empty() ?
+                                       std::vector<int>{FastllmCudaGetDevice()} : data.dataDeviceIds;
+                data.ToDevice(DataDevice::CPU, ids, true);
+            }
+        };
+
+        for (auto &it : weight.weight) {
+            DataType type = DataType::FLOAT32;
+            if (Step3p7VisionTensorType(it.first, type)) {
+                releaseTensor(it.second);
+            }
+        }
+        releaseTensor(step3p7VisionSinData);
+        releaseTensor(step3p7VisionCosData);
+        releaseTensor(step3p7VisionConv1Bias);
+        step3p7VisionPrepared = false;
+        FastllmCudaClearBigBuffer();
+        Step3p7DebugCudaMemory("vision released weights");
+#endif
+    }
+
+    void Step3p5Model::BuildStep3p7VisionPositionData(int gridH, int gridW,
+                                                       Data &posEmb, Data &posH, Data &posW) {
+        PrepareStep3p7Vision();
+        Data posWeight(weight["vision_model.positional_embedding"]);
+        posWeight.ToDevice(DataDevice::CPU);
+        if (posWeight.dataType != DataType::FLOAT32) {
+            ToDataType(posWeight, DataType::FLOAT32);
+            posWeight.ToDevice(DataDevice::CPU);
+        }
+        AssertInFastLLM(posWeight.dims.size() == 2 && posWeight.dims[1] == step3p7VisionWidth,
+                        "Step3.7 vision positional embedding shape is invalid.\n");
+
+        int base = step3p7VisionBaseGrid;
+        int hidden = step3p7VisionWidth;
+        float *src = (float*)posWeight.cpuData;
+        std::vector<float> emb((size_t)gridH * gridW * hidden);
+        if (gridH == base && gridW == base) {
+            memcpy(emb.data(), src, emb.size() * sizeof(float));
+        } else {
+            auto sourceIndex = [&](int y, int x, int c) {
+                return ((y * base + x) * hidden + c);
+            };
+            for (int y = 0; y < gridH; y++) {
+                float inY = ((float)y + 0.5f) * (float)base / (float)gridH - 0.5f;
+                int y0 = (int)floorf(inY);
+                int y1 = y0 + 1;
+                float wy = inY - (float)y0;
+                if (y0 < 0) {
+                    y0 = 0;
+                    wy = 0.0f;
+                }
+                if (y1 >= base) {
+                    y1 = base - 1;
+                }
+                for (int x = 0; x < gridW; x++) {
+                    float inX = ((float)x + 0.5f) * (float)base / (float)gridW - 0.5f;
+                    int x0 = (int)floorf(inX);
+                    int x1 = x0 + 1;
+                    float wx = inX - (float)x0;
+                    if (x0 < 0) {
+                        x0 = 0;
+                        wx = 0.0f;
+                    }
+                    if (x1 >= base) {
+                        x1 = base - 1;
+                    }
+                    float w00 = (1.0f - wy) * (1.0f - wx);
+                    float w01 = (1.0f - wy) * wx;
+                    float w10 = wy * (1.0f - wx);
+                    float w11 = wy * wx;
+                    float *dst = emb.data() + ((y * gridW + x) * hidden);
+                    for (int c = 0; c < hidden; c++) {
+                        dst[c] = src[sourceIndex(y0, x0, c)] * w00 +
+                                 src[sourceIndex(y0, x1, c)] * w01 +
+                                 src[sourceIndex(y1, x0, c)] * w10 +
+                                 src[sourceIndex(y1, x1, c)] * w11;
+                    }
+                }
+            }
+        }
+
+        std::vector<float> hPos(gridH * gridW), wPos(gridH * gridW);
+        for (int y = 0; y < gridH; y++) {
+            for (int x = 0; x < gridW; x++) {
+                hPos[y * gridW + x] = (float)y;
+                wPos[y * gridW + x] = (float)x;
+            }
+        }
+        posEmb.CopyFrom(Data(DataType::FLOAT32, {1, gridH * gridW, hidden}, emb));
+        posH.CopyFrom(Data(DataType::FLOAT32, {1, gridH * gridW}, hPos));
+        posW.CopyFrom(Data(DataType::FLOAT32, {1, gridH * gridW}, wPos));
+        if (step3p7VisionSinData.dataDevice != DataDevice::CPU) {
+            posEmb.ToDevice(step3p7VisionSinData.dataDevice, step3p7VisionSinData.dataDeviceIds);
+            posH.ToDevice(step3p7VisionSinData.dataDevice, step3p7VisionSinData.dataDeviceIds);
+            posW.ToDevice(step3p7VisionSinData.dataDevice, step3p7VisionSinData.dataDeviceIds);
+        }
+    }
+
+    void Step3p5Model::ApplyStep3p7VisionRotary(Data &input, const Data &posH, const Data &posW) {
+        if (!step3p7UseRope2d) {
+            return;
+        }
+        AssertInFastLLM(input.dims.size() == 4 && input.dims.back() == step3p7VisionHeadDim,
+                        "Step3.7 vision rotary expects [batch, seq, heads, head_dim].\n");
+        int half = step3p7VisionHeadDim / 2;
+        int ropeDim = half / 2;
+        Data wPart, hPart, rotated;
+        Split(input, -1, 0, half, wPart);
+        Split(input, -1, half, step3p7VisionHeadDim, hPart);
+
+        auto rotatePart = [&](Data &part, const Data &pos) {
+            std::vector<int> dims = part.dims;
+            part.Reshape({dims[0], dims[1], dims[2], ropeDim, 2});
+            PermuteSelf(part, {0, 1, 2, 4, 3});
+            part.Reshape({dims[0], dims[1], dims[2], half});
+            LlamaRotatePosition2DPart(part, pos, step3p7VisionSinData, step3p7VisionCosData, ropeDim, half);
+            part.Reshape({dims[0], dims[1], dims[2], 2, ropeDim});
+            PermuteSelf(part, {0, 1, 2, 4, 3});
+            part.Reshape(dims);
+        };
+        rotatePart(wPart, posW);
+        rotatePart(hPart, posH);
+        Cat(wPart, hPart, -1, rotated);
+        input.CopyFrom(rotated);
+    }
+
+    void Step3p5Model::ApplyStep3p7LayerScale(Data &input, Data &gamma) {
+        if (gamma.dims.empty()) {
+            return;
+        }
+        std::vector<int> originalDims = input.dims;
+        int channels = originalDims.back();
+        int outer = input.Count(0) / channels;
+        Data scale(gamma);
+        if (scale.dataType != input.dataType) {
+            ToDataType(scale, input.dataType);
+        }
+        if (input.dataDevice != DataDevice::CPU) {
+            scale.ToDevice(input.dataDevice, input.dataDeviceIds);
+        }
+        input.Reshape({outer, channels});
+        PermuteSelf(input, {1, 0});
+        MulTo(input, scale);
+        input.Reshape({channels, outer});
+        PermuteSelf(input, {1, 0});
+        input.Reshape(originalDims);
+    }
+
+    void Step3p5Model::Step3p7QuickGelu(Data &input) {
+        Data gate;
+        Mul(input, 1.702f, gate);
+        Sigmoid(gate, gate);
+        MulTo(input, gate);
+    }
+
+    void Step3p5Model::ProcessStep3p7ImageFeatures(const Data &hiddenStates, int grid, Data &features) {
+        Data imageFeatures(hiddenStates);
+        if (imageFeatures.dataType != DataType::FLOAT32) {
+            ToDataType(imageFeatures, DataType::FLOAT32);
+        }
+        imageFeatures.Reshape({1, grid * grid, step3p7VisionWidth});
+        PermuteSelf(imageFeatures, {0, 2, 1});
+        imageFeatures.Reshape({1, step3p7VisionWidth, grid, grid});
+        if (weight["vision_model.vit_downsampler1.weight"].dataDevice != DataDevice::CPU) {
+            imageFeatures.ToDevice(weight["vision_model.vit_downsampler1.weight"].dataDevice,
+                                   weight["vision_model.vit_downsampler1.weight"].dataDeviceIds);
+        }
+        Data down1, down2;
+        Conv2D(imageFeatures,
+               weight["vision_model.vit_downsampler1.weight"],
+               weight["vision_model.vit_downsampler1.bias"],
+               step3p7VisionWidth, step3p7VisionWidth * 2,
+               3, 3, 2, 2, 1, 1, down1);
+        Conv2D(down1,
+               weight["vision_model.vit_downsampler2.weight"],
+               weight["vision_model.vit_downsampler2.bias"],
+               step3p7VisionWidth * 2, step3p7VisionWidth * 4,
+               3, 3, 2, 2, 1, 1, down2);
+        int outGrid = down2.dims[2];
+        down2.Reshape({1, step3p7VisionWidth * 4, outGrid * outGrid});
+        PermuteSelf(down2, {0, 2, 1});
+        Linear(down2, weight["vit_large_projector.weight"], *GetEmptyData(), features);
+    }
+
+    void Step3p5Model::EncodeStep3p7PixelValues(const Data &pixelValues, Data &features) {
+        PrepareStep3p7Vision();
+        features = Data();
+        if (pixelValues.dims.empty() || pixelValues.dims[0] == 0) {
+            return;
+        }
+        AssertInFastLLM(pixelValues.dims.size() == 4 && pixelValues.dims[1] == 3,
+                        "Step3.7 pixel_values should have shape [count, 3, H, W].\n");
+
+        int count = pixelValues.dims[0];
+        int imageH = pixelValues.dims[2];
+        int imageW = pixelValues.dims[3];
+        AssertInFastLLM(imageH == imageW && imageH % step3p7VisionPatchSize == 0,
+                        "Step3.7 vision input size is invalid.\n");
+        int grid = imageH / step3p7VisionPatchSize;
+        int outputTokens = (grid / 4) * (grid / 4);
+        std::vector<float> merged;
+        merged.reserve((size_t)count * outputTokens * embed_dim);
+
+        Data posEmb, posH, posW;
+        BuildStep3p7VisionPositionData(grid, grid, posEmb, posH, posW);
+        float attnScale = powf((float)step3p7VisionHeadDim, -0.5f);
+
+        for (int item = 0; item < count; item++) {
+            Data pixelInput;
+            Split(pixelValues, 0, item, item + 1, pixelInput);
+            if (pixelInput.dataType != DataType::FLOAT32) {
+                ToDataType(pixelInput, DataType::FLOAT32);
+            }
+            if (weight["vision_model.conv1.weight"].dataDevice != DataDevice::CPU) {
+                pixelInput.ToDevice(weight["vision_model.conv1.weight"].dataDevice,
+                                    weight["vision_model.conv1.weight"].dataDeviceIds);
+            }
+
+            Data hiddenStates;
+            Conv2D(pixelInput, weight["vision_model.conv1.weight"], step3p7VisionConv1Bias,
+                   3, step3p7VisionWidth,
+                   step3p7VisionPatchSize, step3p7VisionPatchSize,
+                   step3p7VisionPatchSize, step3p7VisionPatchSize,
+                   0, 0, hiddenStates);
+            hiddenStates.Reshape({1, step3p7VisionWidth, grid * grid});
+            PermuteSelf(hiddenStates, {0, 2, 1});
+
+            Data localPosEmb(posEmb);
+            if (hiddenStates.dataDevice != DataDevice::CPU) {
+                localPosEmb.ToDevice(hiddenStates.dataDevice, hiddenStates.dataDeviceIds);
+            }
+            AddTo(hiddenStates, localPosEmb);
+            if (step3p7UseLnPre) {
+                LayerNorm(hiddenStates, weight["vision_model.ln_pre.weight"], weight["vision_model.ln_pre.bias"],
+                          -1, hiddenStates);
+            }
+
+            Data blockInput, qkv, q, k, v, attnOutput, residual, mlpHidden, mlpOutput;
+            for (int layer = 0; layer < step3p7VisionLayers; layer++) {
+                std::string pre = "vision_model.transformer.resblocks." + std::to_string(layer);
+                Mul(hiddenStates, 1.0f, residual);
+                LayerNorm(hiddenStates, weight[pre + ".ln_1.weight"], weight[pre + ".ln_1.bias"],
+                          -1, blockInput);
+                Linear(blockInput, weight[pre + ".attn.in_proj_weight"], weight[pre + ".attn.in_proj_bias"], qkv);
+                Split(qkv, -1, 0, step3p7VisionWidth, q);
+                Split(qkv, -1, step3p7VisionWidth, step3p7VisionWidth * 2, k);
+                Split(qkv, -1, step3p7VisionWidth * 2, step3p7VisionWidth * 3, v);
+                q.Reshape({1, grid * grid, step3p7VisionHeads, step3p7VisionHeadDim});
+                k.Reshape({1, grid * grid, step3p7VisionHeads, step3p7VisionHeadDim});
+                v.Reshape({1, grid * grid, step3p7VisionHeads, step3p7VisionHeadDim});
+                ApplyStep3p7VisionRotary(q, posH, posW);
+                ApplyStep3p7VisionRotary(k, posH, posW);
+                PermuteSelf(q, {0, 2, 1, 3});
+                PermuteSelf(k, {0, 2, 1, 3});
+                PermuteSelf(v, {0, 2, 1, 3});
+                q.Reshape({step3p7VisionHeads, grid * grid, step3p7VisionHeadDim});
+                k.Reshape({step3p7VisionHeads, grid * grid, step3p7VisionHeadDim});
+                v.Reshape({step3p7VisionHeads, grid * grid, step3p7VisionHeadDim});
+                Attention(q, k, v, *GetEmptyData(), attnOutput, 1, attnScale, 2);
+                attnOutput.Reshape({1, step3p7VisionHeads, grid * grid, step3p7VisionHeadDim});
+                PermuteSelf(attnOutput, {0, 2, 1, 3});
+                attnOutput.Reshape({1, grid * grid, step3p7VisionWidth});
+                Linear(attnOutput, weight[pre + ".attn.out_proj.weight"], weight[pre + ".attn.out_proj.bias"], attnOutput);
+                ApplyStep3p7LayerScale(attnOutput, weight[pre + ".ls_1.gamma"]);
+                AddTo(residual, attnOutput);
+                hiddenStates.CopyFrom(residual);
+
+                Mul(hiddenStates, 1.0f, residual);
+                LayerNorm(hiddenStates, weight[pre + ".ln_2.weight"], weight[pre + ".ln_2.bias"],
+                          -1, blockInput);
+                Linear(blockInput, weight[pre + ".mlp.c_fc.weight"], weight[pre + ".mlp.c_fc.bias"], mlpHidden);
+                Step3p7QuickGelu(mlpHidden);
+                Linear(mlpHidden, weight[pre + ".mlp.c_proj.weight"], weight[pre + ".mlp.c_proj.bias"], mlpOutput);
+                ApplyStep3p7LayerScale(mlpOutput, weight[pre + ".ls_2.gamma"]);
+                AddTo(residual, mlpOutput);
+                hiddenStates.CopyFrom(residual);
+            }
+
+            if (step3p7UseLnPost) {
+                LayerNorm(hiddenStates, weight["vision_model.ln_post.weight"], weight["vision_model.ln_post.bias"],
+                          -1, hiddenStates);
+            }
+
+            Data projected;
+            ProcessStep3p7ImageFeatures(hiddenStates, grid, projected);
+            projected.ToDevice(DataDevice::CPU);
+            if (projected.dataType != DataType::FLOAT32) {
+                ToDataType(projected, DataType::FLOAT32);
+                projected.ToDevice(DataDevice::CPU);
+            }
+            AssertInFastLLM(projected.dims.size() == 3 && projected.dims[1] == outputTokens &&
+                            projected.dims[2] == embed_dim,
+                            "Step3.7 projected image feature shape mismatch.\n");
+            float *ptr = (float*)projected.cpuData;
+            merged.insert(merged.end(), ptr, ptr + projected.Count(0));
+        }
+        features.CopyFrom(Data(DataType::FLOAT32, {count, outputTokens, embed_dim}, merged));
+    }
+
+    void Step3p5Model::EncodeStep3p7Images(
+            const std::map <std::string, std::vector <Data*> > &multimodalInput,
+            Data &features) {
+        auto embedIt = multimodalInput.find("image_embeds");
+        if (embedIt != multimodalInput.end() && !embedIt->second.empty() && embedIt->second[0] != nullptr) {
+            features.CopyFrom(*embedIt->second[0]);
+            return;
+        }
+
+        auto pixelIt = multimodalInput.find("pixel_values");
+        auto numIt = multimodalInput.find("num_patches");
+        AssertInFastLLM(pixelIt != multimodalInput.end() && !pixelIt->second.empty() && pixelIt->second[0] != nullptr,
+                        "Step3.7 multimodal requires pixel_values.\n");
+        AssertInFastLLM(numIt != multimodalInput.end() && !numIt->second.empty() && numIt->second[0] != nullptr,
+                        "Step3.7 multimodal requires num_patches.\n");
+
+        Data numPatches(*numIt->second[0]);
+        numPatches.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(numPatches.dims.size() == 1,
+                        "Step3.7 num_patches should have shape [image_count].\n");
+        int imageCount = numPatches.dims[0];
+        std::vector<int> patchCounts(imageCount);
+        int totalPatchCount = 0;
+        if (numPatches.dataType == DataType::INT32) {
+            int *ptr = (int*)numPatches.cpuData;
+            for (int i = 0; i < imageCount; i++) {
+                patchCounts[i] = ptr[i];
+                totalPatchCount += ptr[i];
+            }
+        } else {
+            if (numPatches.dataType != DataType::FLOAT32) {
+                ToDataType(numPatches, DataType::FLOAT32);
+                numPatches.ToDevice(DataDevice::CPU);
+            }
+            float *ptr = (float*)numPatches.cpuData;
+            for (int i = 0; i < imageCount; i++) {
+                patchCounts[i] = (int)ptr[i];
+                totalPatchCount += patchCounts[i];
+            }
+        }
+
+        Data imageFeatures, patchFeatures;
+        EncodeStep3p7PixelValues(*pixelIt->second[0], imageFeatures);
+        AssertInFastLLM(imageFeatures.dims.size() == 3 && imageFeatures.dims[0] == imageCount,
+                        "Step3.7 image feature count mismatch.\n");
+
+        auto patchIt = multimodalInput.find("patch_pixel_values");
+        if (totalPatchCount > 0) {
+            AssertInFastLLM(patchIt != multimodalInput.end() && !patchIt->second.empty() && patchIt->second[0] != nullptr,
+                            "Step3.7 multimodal requires patch_pixel_values when num_patches is non-zero.\n");
+            EncodeStep3p7PixelValues(*patchIt->second[0], patchFeatures);
+            AssertInFastLLM(patchFeatures.dims.size() == 3 && patchFeatures.dims[0] == totalPatchCount,
+                            "Step3.7 patch feature count mismatch.\n");
+        }
+
+        imageFeatures.ToDevice(DataDevice::CPU);
+        if (imageFeatures.dataType != DataType::FLOAT32) {
+            ToDataType(imageFeatures, DataType::FLOAT32);
+            imageFeatures.ToDevice(DataDevice::CPU);
+        }
+        if (!patchFeatures.dims.empty()) {
+            patchFeatures.ToDevice(DataDevice::CPU);
+            if (patchFeatures.dataType != DataType::FLOAT32) {
+                ToDataType(patchFeatures, DataType::FLOAT32);
+                patchFeatures.ToDevice(DataDevice::CPU);
+            }
+        }
+
+        int totalTokens = imageCount * step3p7ImageTokenLen + totalPatchCount * step3p7PatchTokenLen;
+        std::vector<float> merged;
+        merged.reserve((size_t)totalTokens * embed_dim);
+        float *imagePtr = (float*)imageFeatures.cpuData;
+        float *patchPtr = patchFeatures.dims.empty() ? nullptr : (float*)patchFeatures.cpuData;
+        int patchOffset = 0;
+        for (int i = 0; i < imageCount; i++) {
+            for (int p = 0; p < patchCounts[i]; p++) {
+                float *src = patchPtr + (long long)(patchOffset + p) * step3p7PatchTokenLen * embed_dim;
+                merged.insert(merged.end(), src, src + (long long)step3p7PatchTokenLen * embed_dim);
+            }
+            patchOffset += patchCounts[i];
+            float *src = imagePtr + (long long)i * step3p7ImageTokenLen * embed_dim;
+            merged.insert(merged.end(), src, src + (long long)step3p7ImageTokenLen * embed_dim);
+        }
+        features.CopyFrom(Data(DataType::FLOAT32, {1, totalTokens, embed_dim}, merged));
+    }
+
+    void Step3p5Model::MergeStep3p7ImageFeaturesIntoText(const Data &inputIds,
+                                                          const Data &imageFeatures,
+                                                          Data &hiddenStates) {
+        Data ids(inputIds);
+        ids.ToDevice(DataDevice::CPU);
+        if (ids.dataType != DataType::FLOAT32) {
+            ToDataType(ids, DataType::FLOAT32);
+            ids.ToDevice(DataDevice::CPU);
+        }
+        Data feats(imageFeatures);
+        feats.ToDevice(DataDevice::CPU);
+        if (feats.dataType != DataType::FLOAT32) {
+            ToDataType(feats, DataType::FLOAT32);
+            feats.ToDevice(DataDevice::CPU);
+        }
+        hiddenStates.ToDevice(DataDevice::CPU);
+        if (hiddenStates.dataType != DataType::FLOAT32) {
+            ToDataType(hiddenStates, DataType::FLOAT32);
+            hiddenStates.ToDevice(DataDevice::CPU);
+        }
+        AssertInFastLLM(ids.dims.size() == 2 && ids.dims[0] == 1,
+                        "Step3.7 multimodal input ids should have shape [1, seq].\n");
+        AssertInFastLLM(feats.dims.size() == 3 && feats.dims[0] == 1 && feats.dims[2] == embed_dim,
+                        "Step3.7 image features should have shape [1, tokens, hidden].\n");
+        AssertInFastLLM(hiddenStates.dims.size() == 3 && hiddenStates.dims[0] == 1 &&
+                        hiddenStates.dims[1] == ids.dims[1] && hiddenStates.dims[2] == embed_dim,
+                        "Step3.7 text embedding shape mismatch.\n");
+
+        float *idPtr = (float*)ids.cpuData;
+        float *hiddenPtr = (float*)hiddenStates.cpuData;
+        float *featPtr = (float*)feats.cpuData;
+        int seq = ids.dims[1];
+        int featureIndex = 0;
+        for (int i = 0; i < seq; i++) {
+            if ((int)idPtr[i] != step3p7ImageTokenId) {
+                continue;
+            }
+            AssertInFastLLM(featureIndex < feats.dims[1],
+                            "Step3.7 has more image placeholders than image features.\n");
+            memcpy(hiddenPtr + (long long)i * embed_dim,
+                   featPtr + (long long)featureIndex * embed_dim,
+                   (size_t)embed_dim * sizeof(float));
+            featureIndex++;
+        }
+        AssertInFastLLM(featureIndex == feats.dims[1],
+                        "Step3.7 image feature count does not match image placeholders.\n");
+    }
+
     int Step3p5Model::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
@@ -3724,6 +4418,138 @@ namespace fastllm {
                          pagedPastKeyValues, generationConfigs, lastTokens, &batchLogits)[0];
     }
 
+    std::vector <int> Step3p5Model::ForwardMultimodal(
+            const fastllm::Data &inputIds,
+            const fastllm::Data &attentionMask,
+            const fastllm::Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const std::map <std::string, std::vector <Data*> > &multimodalInput,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector <std::vector <float>*> *retLogits) {
+        std::vector<int> ret;
+        std::vector<float> *logits = nullptr;
+        if (retLogits != nullptr && !retLogits->empty()) {
+            logits = (*retLogits)[0];
+        }
+        if (!step3p7VisionAvailable || multimodalInput.empty()) {
+            ret.push_back(Forward(inputIds, attentionMask, positionIds, pastKeyValues,
+                                  generationConfig, lastTokens, logits));
+            return ret;
+        }
+        if (pastKeyValues.size() > 0 && pastKeyValues[0].second.dims.size() > 0) {
+            ret.push_back(Forward(inputIds, attentionMask, positionIds, pastKeyValues,
+                                  generationConfig, lastTokens, logits));
+            return ret;
+        }
+
+        AssertInFastLLM(inputIds.dims.size() == 2 && inputIds.dims[0] == 1,
+                        "Step3.7 multimodal currently supports a single prompt batch only.\n");
+
+#ifdef USE_CUDA
+        Step3p7DebugCudaMemory("multimodal before vision");
+#endif
+        Data imageFeatures;
+        {
+#ifdef USE_CUDA
+            int visionDevice = -1;
+            visionDevice = Step3p7ResolveVisionDevice(this->deviceMap);
+            if (getenv("FASTLLM_STEP3P7_DEBUG") != nullptr) {
+                printf("[Step3.7 debug] vision device=%d\n", visionDevice);
+                fflush(stdout);
+            }
+            Step3p7ScopedVisionExecutor visionExecutor(visionDevice);
+#endif
+            EncodeStep3p7Images(multimodalInput, imageFeatures);
+        }
+#ifdef USE_CUDA
+        ReleaseStep3p7VisionCuda();
+        Step3p7DebugCudaMemory("multimodal after vision");
+#endif
+
+        Data embeddingResult, hiddenStates;
+        Embedding(inputIds, weight["model.embed_tokens.weight"], embeddingResult);
+        ToDataType(embeddingResult, hiddenStates, DataType::FLOAT32);
+        MergeStep3p7ImageFeaturesIntoText(inputIds, imageFeatures, hiddenStates);
+#ifdef USE_CUDA
+        Step3p7DebugCudaMemory("multimodal after merge");
+#endif
+
+#ifndef USE_CUDA
+        ErrorInFastLLM("Step3.7 multimodal currently requires CUDA text forward.\n");
+        return ret;
+#else
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        bool useThreadTpForward = GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios);
+
+        std::vector <std::pair <Data*, Data*> > pagedPastKeyValues;
+        for (int i = 0; i < (int)pastKeyValues.size(); i++) {
+            pagedPastKeyValues.push_back(std::make_pair(&pastKeyValues[i].first, &pastKeyValues[i].second));
+        }
+
+        struct PrecomputedGuard {
+            Step3p5Model *model;
+            explicit PrecomputedGuard(Step3p5Model *model) : model(model) {}
+            ~PrecomputedGuard() { model->step3p7PrecomputedHiddenStates = nullptr; }
+        } guard(this);
+        std::vector <GenerationConfig> generationConfigs = {generationConfig};
+        int seqLen = (int)inputIds.dims[1];
+        int chunkSize = GetChunkedPrefillSize();
+        if (chunkSize <= 0 || seqLen <= chunkSize) {
+            Data attentionMaskCopy(attentionMask), positionIdsCopy(positionIds);
+            std::vector <Data*> attentionMasks = {&attentionMaskCopy};
+            std::vector <Data*> positionIdsVec = {&positionIdsCopy};
+            std::vector <int> seqLens = {seqLen};
+            step3p7PrecomputedHiddenStates = &hiddenStates;
+            if (useThreadTpForward) {
+                return ForwardGPU(1, inputIds, attentionMasks, positionIdsVec, seqLens,
+                                  pagedPastKeyValues, generationConfigs, lastTokens, retLogits);
+            }
+            return ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens,
+                             pagedPastKeyValues, generationConfigs, lastTokens, retLogits);
+        }
+
+        LastTokensManager emptyLastTokens;
+        for (int st = 0; st < seqLen; ) {
+            int curLen = std::min(chunkSize, seqLen - st);
+            Data curInputIds, curPositionIds, curHiddenStates;
+            Split(inputIds, 1, st, st + curLen, curInputIds);
+            Split(positionIds, 1, st, st + curLen, curPositionIds);
+            Split(hiddenStates, 1, st, st + curLen, curHiddenStates);
+
+            std::vector <Data*> curAttentionMasks = {nullptr};
+            std::vector <Data*> curPositionIdsVec = {&curPositionIds};
+            std::vector <int> curSeqLens = {curLen};
+            bool isLastChunk = (st + curLen >= seqLen);
+#ifdef USE_CUDA
+            if (getenv("FASTLLM_STEP3P7_DEBUG") != nullptr) {
+                printf("[Step3.7 debug] text chunk %d-%d / %d\n", st, st + curLen, seqLen);
+                fflush(stdout);
+            }
+            Step3p7DebugCudaMemory("before text chunk");
+#endif
+            step3p7PrecomputedHiddenStates = &curHiddenStates;
+            if (useThreadTpForward) {
+                ret = ForwardGPU(1, curInputIds, curAttentionMasks, curPositionIdsVec, curSeqLens,
+                                 pagedPastKeyValues, generationConfigs,
+                                 isLastChunk ? lastTokens : emptyLastTokens,
+                                 isLastChunk ? retLogits : nullptr);
+            } else {
+                ret = ForwardV2(1, curInputIds, curAttentionMasks, curPositionIdsVec, curSeqLens,
+                                pagedPastKeyValues, generationConfigs,
+                                isLastChunk ? lastTokens : emptyLastTokens,
+                                isLastChunk ? retLogits : nullptr);
+            }
+#ifdef USE_CUDA
+            Step3p7DebugCudaMemory("after text chunk");
+#endif
+            st += curLen;
+        }
+        return ret;
+#endif
+    }
+
     std::vector <int> Step3p5Model::ForwardGPU(
         int batch,
         const Data &inputIds,
@@ -3749,7 +4575,12 @@ namespace fastllm {
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
         bool tensorParallel = devices.size() > 1;
-        bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
+        bool hasPrecomputedHiddenStates = step3p7PrecomputedHiddenStates != nullptr;
+        bool skipCudaEmbeddingForVisionWarmup =
+            step3p7VisionAvailable && autoWarmupRunning.load(std::memory_order_acquire);
+        bool useCpuEmbedding = hasPrecomputedHiddenStates ||
+                               skipCudaEmbeddingForVisionWarmup ||
+                               !GetCudaEmbedding() || GetLowMemMode();
         const DataType computeType = ResolveStep3p5ThreadTpComputeType(this->dataType);
         if (!useCpuEmbedding) {
             PrepareStep3p5CudaEmbeddingWeightType(weight["model.embed_tokens.weight"], computeType);
@@ -4184,8 +5015,13 @@ namespace fastllm {
             PrepareMultiCudaReplicatedData(weight["model.embed_tokens.weight"], devices, true);
         }
         Data cpuEmbeddingHiddenStates;
-        Data *precomputedHiddenStates = nullptr;
-        if (useCpuEmbedding) {
+        Data *precomputedHiddenStates = step3p7PrecomputedHiddenStates;
+        if (precomputedHiddenStates != nullptr) {
+            if (precomputedHiddenStates->dataType != computeType) {
+                ToDataType(*precomputedHiddenStates, computeType);
+            }
+            PrepareStep3p5CpuEmbeddingHiddenStates(*precomputedHiddenStates, devices, threadTpWorkerGroup);
+        } else if (useCpuEmbedding) {
             Data cpuInputIds;
             cpuInputIds.CopyFrom(inputIds);
             Step3p5CpuEmbeddingDirect(cpuInputIds, weight["model.embed_tokens.weight"],
@@ -4530,7 +5366,18 @@ namespace fastllm {
         }
 
         Data hiddenStates;
-        EmbeddingBlock((Data*)&inputIds, &this->weight["model.embed_tokens.weight"], &hiddenStates, this->dataType);
+        if (step3p7PrecomputedHiddenStates != nullptr) {
+            hiddenStates.CopyFrom(*step3p7PrecomputedHiddenStates);
+            DataType hiddenType = (this->dataType == DataType::FLOAT32 ||
+                                   this->dataType == DataType::FLOAT16 ||
+                                   this->dataType == DataType::BFLOAT16) ?
+                                  this->dataType : DataType::FLOAT16;
+            if (hiddenStates.dataType != hiddenType) {
+                ToDataType(hiddenStates, hiddenType);
+            }
+        } else {
+            EmbeddingBlock((Data*)&inputIds, &this->weight["model.embed_tokens.weight"], &hiddenStates, this->dataType);
+        }
 
         Data attenInput, q, k, v, qkv, attenOutput, gate, mergedQkv;
         Data w1, w2, w3, routerLogits, routerProb, expertIndex, expertScore;
@@ -4901,8 +5748,20 @@ namespace fastllm {
         return false;
     }
 
+    void Step3p5Model::Prepare() {
+        if (!step3p7VisionAvailable || GetMaxTokens() > 0) {
+            return;
+        }
+        printf("[Fastllm] Step3.7 vision: auto-calculate KV cache pages with %.0f%% GPU memory budget; remaining memory is reserved for image prefill headroom.\n",
+               GetGpuMemRatio() * 100.0f);
+    }
+
     void Step3p5Model::WarmUp() {
         printf("Warmup...\n");
+        float oldGpuMemRatio = GetGpuMemRatio();
+        if (step3p7VisionAvailable && oldGpuMemRatio > 0.85f) {
+            SetGpuMemRatio(0.85f);
+        }
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(this->dataType, {1, 1}, {0});
         Data positionIds = Data(DataType::FLOAT32, {1, 1}, {0});
@@ -4913,6 +5772,9 @@ namespace fastllm {
             pastKeyValues.back().second.SetKVCache();
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        if (GetGpuMemRatio() != oldGpuMemRatio) {
+            SetGpuMemRatio(oldGpuMemRatio);
+        }
         printf("finish.\n");
     }
 
