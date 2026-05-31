@@ -15,6 +15,8 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 #include "utils/utils.h"
+#include "attention/fastllm-attention-dtype.cuh"
+#include "attention/fastllm-paged-attention-native.cuh"
 
 #include <cstdlib>
 #include <cuda_fp8.h>
@@ -978,7 +980,8 @@ mask_mode = MaskMode::kCausal;
     // 对于 HND 布局：
     // - stride_n (token 之间的 stride) = head_dim
     // - stride_h (head 之间的 stride) = seq_len * head_dim
-    bool use_flashinfer = (head_dim_qk == 128 && head_dim_vo == 128 && !use_custom_mask);
+    bool use_flashinfer = (head_dim_qk == 128 && head_dim_vo == 128 && !use_custom_mask) &&
+                          FastllmCudaFlashInferSupported();
 // use_flashinfer = false;
     // 调试信息：打印参数值
     if (use_flashinfer) {
@@ -1250,6 +1253,13 @@ printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
         if (maskd) {
             int spatial = q1 * k1, n = batch, m = q0 / batch;
             FastllmAttentionMaskKernel <256> <<< n * m, 256>>>(qk, maskd, __float2half_rn(-10000), n, m, spatial);
+        } else if (batch == 1 && maskType == 0 && q1 > 1) {
+            // 没有显式 mask 且为 prefill（q1>1）时按因果方式屏蔽未来 token。
+            // qk 物理布局为 [q0, q1, k1]，对每个 head 单独应用因果 mask。
+            // base=k1-q1 使 query 行 r 可见 key [0, k1-q1+r]（兼容带历史上下文的分块 prefill）。
+            for (int h = 0; h < q0; h++) {
+                CausalMask<256, half> <<< q1, 256 >>>(qk + (size_t)h * q1 * k1, __float2half_rn(-10000.0f), q1, k1, k1 - q1);
+            }
         }
 
         int outer = q0 * q1;
@@ -1752,47 +1762,6 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
     return true;
 }
 
-template <typename T>
-__device__ __forceinline__ float FastllmAttentionValueToFloat(T value);
-
-template <>
-__device__ __forceinline__ float FastllmAttentionValueToFloat<float>(float value) {
-    return value;
-}
-
-template <>
-__device__ __forceinline__ float FastllmAttentionValueToFloat<half>(half value) {
-    return __half2float(value);
-}
-
-template <>
-__device__ __forceinline__ float FastllmAttentionValueToFloat<__nv_bfloat16>(__nv_bfloat16 value) {
-    return __bfloat162float(value);
-}
-
-template <typename T>
-__device__ __forceinline__ T FastllmAttentionFloatToValue(float value);
-
-template <>
-__device__ __forceinline__ float FastllmAttentionFloatToValue<float>(float value) {
-    return value;
-}
-
-template <>
-__device__ __forceinline__ half FastllmAttentionFloatToValue<half>(float value) {
-    return __float2half(value);
-}
-
-template <>
-__device__ __forceinline__ __nv_bfloat16 FastllmAttentionFloatToValue<__nv_bfloat16>(float value) {
-    return __float2bfloat16_rn(value);
-}
-
-template <>
-__device__ __forceinline__ __nv_fp8_e4m3 FastllmAttentionFloatToValue<__nv_fp8_e4m3>(float value) {
-    return __nv_fp8_e4m3(value);
-}
-
 // CUDA kernel for copying data from input to paged KV cache
 // input: [numHeads, seqLen, headDim], pagedData: [maxPages, pageLen, numHeads, headDim]
 template <typename SrcT, typename DstT, int THREAD_PER_BLOCK>
@@ -2239,6 +2208,9 @@ static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long 
 }
 
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited) {
+    if (!FastllmCudaFlashInferSupported()) {
+        return FastllmCudaHalfPagedAttentionFastllmFallback(q, k, v, output, group, scale);
+    }
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
 // ForceDeviceSync(); auto st = std::chrono::system_clock::now();
@@ -2500,6 +2472,14 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
 }
 
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph) {
+    if (!FastllmCudaFlashInferSupported()) {
+        bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
+        if (sync) {
+            DeviceSync();
+        }
+        return ok;
+    }
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     

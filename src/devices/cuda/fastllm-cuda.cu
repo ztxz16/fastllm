@@ -177,6 +177,33 @@ CudaInfos *getCudaInfos() {
     return cudaInfos;
 }
 
+bool FastllmCudaFlashInferSupported() {
+    static thread_local std::map<int, bool> supportedByDevice;
+    static thread_local std::map<int, bool> loggedByDevice;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        return false;
+    }
+    auto it = supportedByDevice.find(dev);
+    if (it != supportedByDevice.end()) {
+        return it->second;
+    }
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        supportedByDevice[dev] = false;
+        return false;
+    }
+    bool supported = major * 10 + minor >= 75;
+    supportedByDevice[dev] = supported;
+    if (!supported && loggedByDevice.find(dev) == loggedByDevice.end()) {
+        printf("[Fastllm] FlashInfer attention disabled on GPU %d (CC %d.%d), using native attention.\n",
+               dev, major, minor);
+        loggedByDevice[dev] = true;
+    }
+    return supported;
+}
+
 void DeviceSync() {
     if (fastllm::GetFastllmEnv().cudaSync) {
         cudaDeviceSynchronize();

@@ -82,6 +82,9 @@ const size_t ST128_FP16_COUNT = 8;
 
 CudaInfos *getCudaInfos();
 
+// FlashInfer attention requires compute capability >= 7.5 (Turing+).
+bool FastllmCudaFlashInferSupported();
+
 void *FastllmCudaPrepareInput(const fastllm::Data &input);
 void *FastllmCudaPrepareOutput(fastllm::Data &output);
 void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
