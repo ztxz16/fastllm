@@ -279,6 +279,9 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/deepseekv4-kernels.cu)
 
+    # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
+    # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
+
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
 

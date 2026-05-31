@@ -232,6 +232,14 @@ __device__ inline void mma(const typename ScalarType<scalar_t>::FragA& a_frag,
   const uint32_t* a = reinterpret_cast<const uint32_t*>(&a_frag);
   const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
   float* c = reinterpret_cast<float*>(&frag_c);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  // Tensor-core MMA 指令需要 sm_75+。低算力（如 sm_70）下 Marlin 在运行期不会被调度到，
+  // 这里提供可编译的占位实现，保证多 CUDA_ARCH 打包时整体编译可以继续。
+  (void)a;
+  (void)b;
+  (void)c;
+  __trap();
+#else
   if constexpr (std::is_same<scalar_t, half>::value) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
     asm volatile(
@@ -264,6 +272,7 @@ __device__ inline void mma(const typename ScalarType<scalar_t>::FragA& a_frag,
   } else {
     STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t);
   }
+#endif
 }
 
 // Instruction for loading a full 16x16 matrix fragment of operand A from shared
@@ -273,9 +282,16 @@ __device__ inline void ldsm4(typename ScalarType<scalar_t>::FragA& frag_a,
                              const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  // ldmatrix 需要 sm_75+，低算力下提供占位实现以保证编译通过（运行期不会走到 Marlin）。
+  (void)a;
+  (void)smem;
+  __trap();
+#else
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
                : "r"(smem));
+#endif
 }
 
 // Lookup-table based 3-input logical operation; explicitly used for
