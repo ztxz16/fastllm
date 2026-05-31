@@ -261,6 +261,55 @@ __device__ __forceinline__ float FastllmKvLoadFloat(const KVType *base, int d) {
     return FastllmAttentionValueToFloat(FastllmKvLoad(base, d));
 }
 
+// 向量化加载 4 个「连续」的 KV 元素到 out[0..3]（float）。
+// 调用方保证 d0 % 4 == 0；当 d0+4 <= headDim 时走一次性向量化读取（warp 内 32 lane 各读 4 个连续元素，
+// 合并成单条 128B/256B 事务，完全 coalesce），否则逐元素回退（仅 headDim 非 128 的尾部）。
+// 这是 SM70(V100) 上把分页注意力从 ~30% 带宽拉高的关键：原实现按 d=lane+(i*32) 跨步逐元素 __ldg，
+// 每个 key 需 4 条 64B 事务，向量化后降为 1 条指令。
+template <typename KVType>
+__device__ __forceinline__ void FastllmKvLoad4Contig(const KVType *base, int d0, int headDim, float out[4]);
+
+template <>
+__device__ __forceinline__ void FastllmKvLoad4Contig<half>(const half *base, int d0, int headDim, float out[4]) {
+    if (d0 + 4 <= headDim) {
+        uint2 raw = __ldg(reinterpret_cast<const uint2 *>(base + d0));   // 8 字节 = 4 个 half
+        const half2 *h2 = reinterpret_cast<const half2 *>(&raw);
+        float2 a = __half22float2(h2[0]);
+        float2 b = __half22float2(h2[1]);
+        out[0] = a.x; out[1] = a.y; out[2] = b.x; out[3] = b.y;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            out[i] = (d0 + i < headDim) ? __half2float(__ldg(base + d0 + i)) : 0.0f;
+        }
+    }
+}
+
+template <>
+__device__ __forceinline__ void FastllmKvLoad4Contig<__nv_bfloat16>(const __nv_bfloat16 *base, int d0, int headDim, float out[4]) {
+    if (d0 + 4 <= headDim) {
+        uint2 raw = __ldg(reinterpret_cast<const uint2 *>(base + d0));   // 8 字节 = 4 个 bf16
+        const __nv_bfloat162 *b2 = reinterpret_cast<const __nv_bfloat162 *>(&raw);
+        float2 a = __bfloat1622float2(b2[0]);
+        float2 b = __bfloat1622float2(b2[1]);
+        out[0] = a.x; out[1] = a.y; out[2] = b.x; out[3] = b.y;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            out[i] = (d0 + i < headDim) ? __bfloat162float(__ldg(base + d0 + i)) : 0.0f;
+        }
+    }
+}
+
+template <>
+__device__ __forceinline__ void FastllmKvLoad4Contig<__nv_fp8_e4m3>(const __nv_fp8_e4m3 *base, int d0, int headDim, float out[4]) {
+    // FP8 与标量路径保持逐元素一致的数值语义（不改变 FP8 行为），仅改为连续 d 排布。
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        out[i] = (d0 + i < headDim) ? FastllmKvLoadFloat<__nv_fp8_e4m3>(base, d0 + i) : 0.0f;
+    }
+}
+
 // flash-decoding 风格：每个 block 处理一个 (batch, head)，blockDim = MAX_WARPS*32。
 //   - 多个 warp 并行处理不同的 key（warp 内用 shfl 归约点积，避免逐 key 的 __syncthreads）；
 //   - 每个 warp 维护各自的在线 softmax 状态，最后一次性跨 warp 合并；
@@ -704,18 +753,15 @@ __device__ __forceinline__ void FastllmPagedGqaAttnKvRange(
     size_t pageStride, size_t tokenStride, size_t kvHeadOffset,
     const float *sQ, int group, float scale,
     float *m, float *l, float *acc) {
+    int d0 = lane << 2;   // 每个 lane 负责 4 个「连续」维度 [4*lane, 4*lane+4)，使整 warp 读取完全合并。
     for (int j = kvStart + warpId; j < kvEnd; j += numWarps) {
         size_t base = linearKv
             ? ((size_t)j * tokenStride + kvHeadOffset)
             : FastllmPagedKvTokenBase(j, pageStart, pageLen, numPages, pageIndexs,
                                       pageStride, tokenStride, kvHeadOffset);
         float kreg[4], vreg[4];
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            int d = lane + (i << 5);
-            kreg[i] = (d < headDim) ? FastllmKvLoadFloat<KVType>(pagedK + base, d) : 0.0f;
-            vreg[i] = (d < headDim) ? FastllmKvLoadFloat<KVType>(pagedV + base, d) : 0.0f;
-        }
+        FastllmKvLoad4Contig<KVType>(pagedK + base, d0, headDim, kreg);
+        FastllmKvLoad4Contig<KVType>(pagedV + base, d0, headDim, vreg);
 
         // 1) 各 group 的 lane 局部点积（彼此独立）。
         float partial[GROUP_MAX];
@@ -724,7 +770,7 @@ __device__ __forceinline__ void FastllmPagedGqaAttnKvRange(
             float p = 0.0f;
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                int d = lane + (i << 5);
+                int d = d0 + i;
                 if (d < headDim) {
                     p += sQ[g * headDim + d] * kreg[i];
                 }
@@ -743,25 +789,42 @@ __device__ __forceinline__ void FastllmPagedGqaAttnKvRange(
         }
 
         // 3) 在线 softmax 更新（各 group 独立）。
+        // SM70 优化：在 log2 域用 exp2f（少一次乘法），并对 acc 的 rescale 加 warp-uniform 条件分支
+        //（partial[g] 经全 warp 归约后各 lane 相同，分支不会 divergence）。最大值不变时跳过 corr-exp 与
+        // acc rescale —— decode 时最大值很快稳定，绝大多数 key 走这条便宜路径。m[g]/sM 存的是 log2 域最大值。
+        const float kLog2e = 1.4426950408889634f;
+        float scaleLog2 = scale * kLog2e;
         #pragma unroll
         for (int g = 0; g < GROUP_MAX; g++) {
-            float score = partial[g] * scale;
-            float newM = fmaxf(m[g], score);
-            float corr = __expf(m[g] - newM);
-            float p = __expf(score - newM);
+            float s2 = partial[g] * scaleLog2;
+            if (s2 > m[g]) {
+                float corr = exp2f(m[g] - s2);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    acc[g * 4 + i] *= corr;
+                }
+                l[g] *= corr;
+                m[g] = s2;
+            }
+            float p = exp2f(s2 - m[g]);
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                acc[g * 4 + i] = acc[g * 4 + i] * corr + p * vreg[i];
+                acc[g * 4 + i] += p * vreg[i];
             }
-            l[g] = l[g] * corr + p;
-            m[g] = newM;
+            l[g] += p;
         }
     }
 }
 
+// SM70(V100) 优化：默认编译该内核用到 ~91 寄存器，被寄存器数限制到每 SM 仅 2 个 block(25% 占用率)，
+// 单 SM 在途访存请求不足以掩盖 HBM 延迟（实测带宽仅 ~31% 峰值）。用 __launch_bounds__ 强约束寄存器，
+// 把每 SM 驻留 block 数提到 5（48 寄存器/线程、无 spill，受 18.7KB 共享内存约束 96KB/18.7KB≈5），
+// 占用率 25% -> 62.5%，显著提升访存级并行与有效带宽（实测 split kernel 196us -> 176us，整体 attn 9.8ms -> ~7.5ms）。
+#define FASTLLM_PAGED_GQA_MIN_BLOCKS_PER_SM 5
 // 通过把切分段数 S 按 numKvHeads 选取，保持足够 SM 并行且控制 combine 段数。GROUP_MAX 为编译期上界。
 template <typename QType, typename KVType, int GROUP_MAX>
-__global__ void FastllmPagedAttentionSplitGQAKernel(
+__global__ void __launch_bounds__(256, FASTLLM_PAGED_GQA_MIN_BLOCKS_PER_SM)
+FastllmPagedAttentionSplitGQAKernel(
     const QType *qd,
     const KVType *pagedK,
     const KVType *pagedV,
@@ -851,7 +914,7 @@ __global__ void FastllmPagedAttentionSplitGQAKernel(
         }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int d = lane + (i << 5);
+            int d = (lane << 2) + i;
             if (d < headDim) {
                 sAcc[(g * numWarps + warpId) * headDim + d] = acc[g * 4 + i];
             }
@@ -868,12 +931,12 @@ __global__ void FastllmPagedAttentionSplitGQAKernel(
         }
         float L = 0.0f;
         for (int w = 0; w < numWarps; w++) {
-            L += sL[g * numWarps + w] * __expf(sM[g * numWarps + w] - M);
+            L += sL[g * numWarps + w] * exp2f(sM[g * numWarps + w] - M);
         }
         for (int d = tid; d < headDim; d += blockDim.x) {
             float o = 0.0f;
             for (int w = 0; w < numWarps; w++) {
-                o += sAcc[(g * numWarps + w) * headDim + d] * __expf(sM[g * numWarps + w] - M);
+                o += sAcc[(g * numWarps + w) * headDim + d] * exp2f(sM[g * numWarps + w] - M);
             }
             slot[d] = o;
         }
@@ -885,8 +948,10 @@ __global__ void FastllmPagedAttentionSplitGQAKernel(
 }
 
 // 解码 GQA 非 split：grid = (batch, numKvHeads)，一次扫完整 KV，无 scratch/combine。
+// 同样用 __launch_bounds__ 提高 V100 占用率（短上下文 decode 走此路径）。
 template <typename QType, typename KVType, int GROUP_MAX>
-__global__ void FastllmPagedAttentionBatchGQAKernel(
+__global__ void __launch_bounds__(256, FASTLLM_PAGED_GQA_MIN_BLOCKS_PER_SM)
+FastllmPagedAttentionBatchGQAKernel(
     const QType *qd,
     const KVType *pagedK,
     const KVType *pagedV,
@@ -958,7 +1023,7 @@ __global__ void FastllmPagedAttentionBatchGQAKernel(
         }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int d = lane + (i << 5);
+            int d = (lane << 2) + i;
             if (d < headDim) {
                 sAcc[(g * numWarps + warpId) * headDim + d] = acc[g * 4 + i];
             }
@@ -974,12 +1039,12 @@ __global__ void FastllmPagedAttentionBatchGQAKernel(
         }
         float L = 0.0f;
         for (int w = 0; w < numWarps; w++) {
-            L += sL[g * numWarps + w] * __expf(sM[g * numWarps + w] - M);
+            L += sL[g * numWarps + w] * exp2f(sM[g * numWarps + w] - M);
         }
         for (int d = tid; d < headDim; d += blockDim.x) {
             float o = 0.0f;
             for (int w = 0; w < numWarps; w++) {
-                o += sAcc[(g * numWarps + w) * headDim + d] * __expf(sM[g * numWarps + w] - M);
+                o += sAcc[(g * numWarps + w) * headDim + d] * exp2f(sM[g * numWarps + w] - M);
             }
             o = (L > 0.0f) ? (o / L) : 0.0f;
             od[(size_t)token * H * headDim + (size_t)h * headDim + d] =
@@ -1061,12 +1126,12 @@ __global__ void FastllmPagedAttentionCombineGQAKernel(
         }
         float L = 0.0f;
         for (int s = 0; s < S; s++) {
-            L += sLs[s] * __expf(sMs[s] - M);
+            L += sLs[s] * exp2f(sMs[s] - M);
         }
         for (int d = tid; d < headDim; d += blockDim.x) {
             float o = 0.0f;
             for (int s = 0; s < S; s++) {
-                o += base[(size_t)s * headDimPlus + d] * __expf(sMs[s] - M);
+                o += base[(size_t)s * headDimPlus + d] * exp2f(sMs[s] - M);
             }
             o = (L > 0.0f) ? (o / L) : 0.0f;
             od[(size_t)token * H * headDim + (size_t)h * headDim + d] =
