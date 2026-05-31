@@ -182,6 +182,83 @@ __global__ void FastllmGemvHalfFP8E4M3Kernel1MultiRow(half *A, uint8_t *B, half 
     __syncthreads();
 }
 
+// 优化版本: 每个 warp 负责一行输出, 每个 lane 一次加载 16 个 FP8 权重 (uint4),
+// 使用 warp shuffle 归约, 不再依赖 shared memory 与 __syncthreads, 显著提升访存带宽利用率。
+// 要求 m % 16 == 0 (FP8 block 量化 blockM=128 时恒成立)。
+template <int WARPS_PER_BLOCK, int PART>
+__global__ void FastllmGemvHalfFP8E4M3KernelWarpMultiRow(const half * __restrict__ A, const uint8_t * __restrict__ B,
+                                                    half * __restrict__ C, const half * __restrict__ bias,
+                                                    const float * __restrict__ scales,
+                                                    int m, int k, int blockM, int blockK) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    if (st >= k) return;
+
+    const int ms = (m - 1) / blockM + 1;
+    const float magicScaleConstant = exp2f(8.0f);
+    const float *rowScales = scales + (st / blockK) * ms;
+    const uint8_t *baseB = B + (size_t)st * m;
+
+    float acc[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) acc[x] = 0.0f;
+
+    const int numGroups = m >> 4; // 每组 16 个元素
+    for (int g = laneId; g < numGroups; g += 32) {
+        const int i = g << 4;
+        const float curScale = rowScales[i / blockM];
+
+        uint4 bw = *reinterpret_cast<const uint4*>(baseB + i); // 16 个 FP8 权重
+        const uint32_t words[4] = {bw.x, bw.y, bw.z, bw.w};
+        half2 Bv[8];
+#pragma unroll
+        for (int wi = 0; wi < 4; wi++) {
+            const uint32_t bb = words[wi];
+            Bv[wi * 2]     = make_half2(__short_as_half((short)((((bb >> 0)  & 0x80) << 8) | (((bb >> 0)  & 0x7F) << 7))),
+                                        __short_as_half((short)((((bb >> 8)  & 0x80) << 8) | (((bb >> 8)  & 0x7F) << 7))));
+            Bv[wi * 2 + 1] = make_half2(__short_as_half((short)((((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 7))),
+                                        __short_as_half((short)((((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 7))));
+        }
+
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            const half *Ax = A + (size_t)x * m + i;
+            union_half8 a0, a1;
+            a0.in = *reinterpret_cast<const uint4*>(Ax);
+            a1.in = *reinterpret_cast<const uint4*>(Ax + 8);
+            const half2 ah[8] = {a0.out2[0], a0.out2[1], a0.out2[2], a0.out2[3],
+                                 a1.out2[0], a1.out2[1], a1.out2[2], a1.out2[3]};
+            float gsum = 0.0f;
+#pragma unroll
+            for (int wi = 0; wi < 4; wi++) {
+                half2 p = __hadd2(__hmul2(ah[wi * 2], Bv[wi * 2]), __hmul2(ah[wi * 2 + 1], Bv[wi * 2 + 1]));
+                gsum += __half2float(p.x) + __half2float(p.y);
+            }
+            acc[x] += gsum * curScale;
+        }
+    }
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float v = acc[x];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        acc[x] = v;
+    }
+
+    if (laneId == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            float r = acc[x] * magicScaleConstant;
+            if (bias != nullptr) r += (float)bias[st];
+            C[st + (size_t)k * x] = (half)r;
+        }
+    }
+}
+
 void LaunchFastllmGemmFp32FP8E4M3(float *input, uint8_t *weight, float *output, float *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
     if (n == 1) {
         FastllmGemvFP8E4M3Kernel1MultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
@@ -210,38 +287,9 @@ void LaunchFastllmGemmFp32FP8E4M3(float *input, uint8_t *weight, float *output, 
 }
 
 void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, half *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
-    if (n == 1) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 2) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 2> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 3) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 3> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 4) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 4> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 5) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 5> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 6) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 6> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 7) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 7> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 8) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 8> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 9) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 9> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 10) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 10> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 11) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 11> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 12) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 12> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 13) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 13> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 14) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 14> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else if (n == 15) {
-        FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 15> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
-    } else {
-        int i = 0; 
+    // m 不是 16 的倍数时, 无法安全使用 uint4 向量化加载, 回退到旧 kernel。
+    if ((m & 15) != 0) {
+        int i = 0;
         for (; i + 15 < n; i += 16) {
             FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 16> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, m, k, blockM, blockK);
         }
@@ -256,6 +304,39 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
         }
         return;
     }
+
+    constexpr int W = 8; // 每个 block 8 个 warp (256 线程)
+    const int grid = (k + W - 1) / W;
+#define FASTLLM_FP8_WARP_LAUNCH(PARTVAL, AOFF, COFF) \
+    FastllmGemvHalfFP8E4M3KernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
+        input + (AOFF) * m, weight, output + (COFF) * k, bias, scales, m, k, blockM, blockK)
+
+    switch (n) {
+        case 1:  FASTLLM_FP8_WARP_LAUNCH(1, 0, 0);  return;
+        case 2:  FASTLLM_FP8_WARP_LAUNCH(2, 0, 0);  return;
+        case 3:  FASTLLM_FP8_WARP_LAUNCH(3, 0, 0);  return;
+        case 4:  FASTLLM_FP8_WARP_LAUNCH(4, 0, 0);  return;
+        case 5:  FASTLLM_FP8_WARP_LAUNCH(5, 0, 0);  return;
+        case 6:  FASTLLM_FP8_WARP_LAUNCH(6, 0, 0);  return;
+        case 7:  FASTLLM_FP8_WARP_LAUNCH(7, 0, 0);  return;
+        case 8:  FASTLLM_FP8_WARP_LAUNCH(8, 0, 0);  return;
+        default: break;
+    }
+
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        FASTLLM_FP8_WARP_LAUNCH(8, i, i);
+    }
+    for (; i + 3 < n; i += 4) {
+        FASTLLM_FP8_WARP_LAUNCH(4, i, i);
+    }
+    for (; i + 1 < n; i += 2) {
+        FASTLLM_FP8_WARP_LAUNCH(2, i, i);
+    }
+    for (; i < n; i++) {
+        FASTLLM_FP8_WARP_LAUNCH(1, i, i);
+    }
+#undef FASTLLM_FP8_WARP_LAUNCH
 }
 
 template <int THREAD_PER_BLOCK, int PART>
@@ -348,53 +429,117 @@ __global__ void FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow(half *A, uint8_t *
     __syncthreads();
 }
 
-void LaunchFastllmGemmFp16FP8E4M3Block128(half *input, uint8_t *weight, half *output, half *bias, int n, int m, int k, int perRow) {
-    if (n == 1) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 2) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 2> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 3) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 3> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 4) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 4> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 5) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 5> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 6) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 6> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 7) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 7> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 8) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 8> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 9) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 9> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 10) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 10> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 11) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 11> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 12) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 12> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 13) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 13> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 14) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 14> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 15) {
-        FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 15> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else {
-        int i = 0; 
-        for (; i + 15 < n; i += 16) {
-            FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 16> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+// 优化版本: 每个 warp 负责一行输出。一个 128 大小的量化 block 恰好由 32 个 lane 各处理 4 个
+// FP8 权重 (uint32), 完全利用整个 warp (旧版本 64 线程里有一半空闲)。使用 warp shuffle 归约,
+// 去除 shared memory 与 __syncthreads, 显著提升访存带宽利用率。
+template <int WARPS_PER_BLOCK, int PART>
+__global__ void FastllmGemvHalfFP8E4M3Block128KernelWarpMultiRow(
+        const half * __restrict__ A, const uint8_t * __restrict__ B, half * __restrict__ C,
+        const half * __restrict__ bias, int m, int k, int perRow) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    if (st >= k) return;
+
+    const float magicScaleConstant = exp2f(8.0f);
+    const int block_size = 128;
+    const int numBlocks = (m - 1) / block_size + 1;
+    const uint8_t *baseB = B + (size_t)st * perRow;
+
+    float acc[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) acc[x] = 0.0f;
+
+    for (int blk = 0; blk < numBlocks; blk++) {
+        const int blkStart = blk * block_size;
+        const uint8_t *blkData = baseB + (size_t)blk * (block_size + sizeof(float));
+        const float blkScale = *(const float*)(blkData + block_size);
+        const int localOff = laneId * 4;
+        const int i = blkStart + localOff;
+
+        if (i + 3 < m) {
+            uint32_t bb = *(const uint32_t*)(blkData + localOff);
+            half2 B01 = make_half2(__short_as_half((short)((((bb >> 0)  & 0x80) << 8) | (((bb >> 0)  & 0x7F) << 7))),
+                                   __short_as_half((short)((((bb >> 8)  & 0x80) << 8) | (((bb >> 8)  & 0x7F) << 7))));
+            half2 B23 = make_half2(__short_as_half((short)((((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 7))),
+                                   __short_as_half((short)((((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 7))));
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                union_half4 regA;
+                regA.in = *reinterpret_cast<const uint2*>(A + (size_t)x * m + i);
+                half2 p = __hadd2(__hmul2(regA.out2[0], B01), __hmul2(regA.out2[1], B23));
+                acc[x] += (__half2float(p.x) + __half2float(p.y)) * blkScale;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (i + j >= m) break;
+                uint8_t bv = blkData[localOff + j];
+                float bf = __half2float(__short_as_half((short)(((bv & 0x80) << 8) | ((bv & 0x7F) << 7)))) * blkScale;
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    acc[x] += __half2float(A[(size_t)x * m + i + j]) * bf;
+                }
+            }
         }
+    }
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float v = acc[x];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        acc[x] = v;
+    }
+
+    if (laneId == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            float r = acc[x] * magicScaleConstant;
+            if (bias != nullptr) r += (float)bias[st];
+            C[st + (size_t)k * x] = (half)r;
+        }
+    }
+}
+
+void LaunchFastllmGemmFp16FP8E4M3Block128(half *input, uint8_t *weight, half *output, half *bias, int n, int m, int k, int perRow) {
+    constexpr int W = 8; // 每个 block 8 个 warp (256 线程)
+    const int grid = (k + W - 1) / W;
+#define FASTLLM_FP8_B128_WARP_LAUNCH(PARTVAL, AOFF, COFF) \
+    FastllmGemvHalfFP8E4M3Block128KernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
+        input + (AOFF) * m, weight, output + (COFF) * k, bias, m, k, perRow)
+
+    switch (n) {
+        case 1:  FASTLLM_FP8_B128_WARP_LAUNCH(1, 0, 0);  return;
+        case 2:  FASTLLM_FP8_B128_WARP_LAUNCH(2, 0, 0);  return;
+        case 3:  FASTLLM_FP8_B128_WARP_LAUNCH(3, 0, 0);  return;
+        case 4:  FASTLLM_FP8_B128_WARP_LAUNCH(4, 0, 0);  return;
+        case 5:  FASTLLM_FP8_B128_WARP_LAUNCH(5, 0, 0);  return;
+        case 6:  FASTLLM_FP8_B128_WARP_LAUNCH(6, 0, 0);  return;
+        case 7:  FASTLLM_FP8_B128_WARP_LAUNCH(7, 0, 0);  return;
+        case 8:  FASTLLM_FP8_B128_WARP_LAUNCH(8, 0, 0);  return;
+        default: break;
+    }
+
+    {
+        int i = 0;
         for (; i + 7 < n; i += 8) {
-            FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 8> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+            FASTLLM_FP8_B128_WARP_LAUNCH(8, i, i);
         }
         for (; i + 3 < n; i += 4) {
-            FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 4> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+            FASTLLM_FP8_B128_WARP_LAUNCH(4, i, i);
+        }
+        for (; i + 1 < n; i += 2) {
+            FASTLLM_FP8_B128_WARP_LAUNCH(2, i, i);
         }
         for (; i < n; i++) {
-            FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow<64, 1> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+            FASTLLM_FP8_B128_WARP_LAUNCH(1, i, i);
         }
         return;
     }
+#undef FASTLLM_FP8_B128_WARP_LAUNCH
 }
 
 static void FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
@@ -1112,53 +1257,120 @@ __global__ void FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow(__nv_bfloat16 *A, 
     __syncthreads();
 }
 
-void LaunchFastllmGemmBF16FP8E4M3Block128(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k, int perRow) {
-    if (n == 1) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 2) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 2> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 3) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 3> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 4) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 4> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 5) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 5> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 6) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 6> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 7) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 7> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 8) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 8> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 9) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 9> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 10) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 10> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 11) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 11> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 12) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 12> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 13) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 13> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 14) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 14> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else if (n == 15) {
-        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 15> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
-    } else {
-        int i = 0;
-        for (; i + 15 < n; i += 16) {
-            FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 16> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+// 优化版本: 每个 warp 负责一行输出。一个 128 大小的量化 block 恰好由 32 个 lane 各处理 4 个
+// FP8 权重 (uint32), 完全利用整个 warp。使用 warp shuffle 归约, 去除 shared memory 与
+// __syncthreads。V100(sm_70) 无原生 bf16 运算, 解码后转 float 累加。
+template <int WARPS_PER_BLOCK, int PART>
+__global__ void FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow(
+        const __nv_bfloat16 * __restrict__ A, const uint8_t * __restrict__ B, __nv_bfloat16 * __restrict__ C,
+        const __nv_bfloat16 * __restrict__ bias, int m, int k, int perRow) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    if (st >= k) return;
+
+    const float magicScaleConstant = exp2f(120.0f);
+    const int block_size = 128;
+    const int numBlocks = (m - 1) / block_size + 1;
+    const uint8_t *baseB = B + (size_t)st * perRow;
+
+    float acc[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) acc[x] = 0.0f;
+
+    for (int blk = 0; blk < numBlocks; blk++) {
+        const int blkStart = blk * block_size;
+        const uint8_t *blkData = baseB + (size_t)blk * (block_size + sizeof(float));
+        const float blkScale = *(const float*)(blkData + block_size);
+        const int localOff = laneId * 4;
+        const int i = blkStart + localOff;
+
+        if (i + 3 < m) {
+            uint32_t bb = *(const uint32_t*)(blkData + localOff);
+            uint16_t b0_bits = (((bb >> 0)  & 0x80) << 8) | (((bb >> 0)  & 0x7F) << 4);
+            uint16_t b1_bits = (((bb >> 8)  & 0x80) << 8) | (((bb >> 8)  & 0x7F) << 4);
+            uint16_t b2_bits = (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
+            uint16_t b3_bits = (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
+            float bf0 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b0_bits));
+            float bf1 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b1_bits));
+            float bf2 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b2_bits));
+            float bf3 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b3_bits));
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                union_bf16_4_fp8 regA;
+                regA.in = *reinterpret_cast<const uint2*>(A + (size_t)x * m + i);
+                acc[x] += (__bfloat162float(regA.out[0]) * bf0 +
+                           __bfloat162float(regA.out[1]) * bf1 +
+                           __bfloat162float(regA.out[2]) * bf2 +
+                           __bfloat162float(regA.out[3]) * bf3) * blkScale;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if (i + j >= m) break;
+                uint16_t bj_bits = ((blkData[localOff + j] & 0x80) << 8) | ((blkData[localOff + j] & 0x7F) << 4);
+                float bVal = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&bj_bits)) * blkScale;
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    acc[x] += __bfloat162float(A[(size_t)x * m + i + j]) * bVal;
+                }
+            }
         }
-        for (; i + 7 < n; i += 8) {
-            FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 8> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
-        }
-        for (; i + 3 < n; i += 4) {
-            FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 4> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
-        }
-        for (; i < n; i++) {
-            FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 1> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
-        }
-        return;
     }
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float v = acc[x];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        acc[x] = v;
+    }
+
+    if (laneId == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            float r = acc[x] * magicScaleConstant;
+            if (bias != nullptr) r += __bfloat162float(bias[st]);
+            C[st + (size_t)k * x] = __float2bfloat16_rn(r);
+        }
+    }
+}
+
+void LaunchFastllmGemmBF16FP8E4M3Block128(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k, int perRow) {
+    constexpr int W = 8; // 每个 block 8 个 warp (256 线程)
+    const int grid = (k + W - 1) / W;
+#define FASTLLM_BF16_FP8_B128_WARP_LAUNCH(PARTVAL, AOFF, COFF) \
+    FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
+        input + (AOFF) * m, weight, output + (COFF) * k, bias, m, k, perRow)
+
+    switch (n) {
+        case 1:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(1, 0, 0);  return;
+        case 2:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(2, 0, 0);  return;
+        case 3:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(3, 0, 0);  return;
+        case 4:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(4, 0, 0);  return;
+        case 5:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(5, 0, 0);  return;
+        case 6:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(6, 0, 0);  return;
+        case 7:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(7, 0, 0);  return;
+        case 8:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(8, 0, 0);  return;
+        default: break;
+    }
+
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        FASTLLM_BF16_FP8_B128_WARP_LAUNCH(8, i, i);
+    }
+    for (; i + 3 < n; i += 4) {
+        FASTLLM_BF16_FP8_B128_WARP_LAUNCH(4, i, i);
+    }
+    for (; i + 1 < n; i += 2) {
+        FASTLLM_BF16_FP8_B128_WARP_LAUNCH(2, i, i);
+    }
+    for (; i < n; i++) {
+        FASTLLM_BF16_FP8_B128_WARP_LAUNCH(1, i, i);
+    }
+#undef FASTLLM_BF16_FP8_B128_WARP_LAUNCH
 }
 
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
