@@ -1,7 +1,17 @@
 //
 // Created by huangyuyang on 1/21/26.
 //
+
+// FlashInfer 依赖 cuda/std/barrier 等同步原语（要求 sm_70+），其头文件在 sm_70 以下的
+// device 编译 pass（如 sm_60）中会直接 #error。为兼容多 CUDA_ARCH 一起编译，这里仅在
+// host pass 与 sm_70+ 的 device pass 中启用 FlashInfer；sm_70 以下的 device pass 完全
+// 排除 FlashInfer 代码，运行期由原生分页注意力兜底。
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700)
+#define FASTLLM_ENABLE_FLASHINFER
+#endif
+
 // FlashInfer includes
+#ifdef FASTLLM_ENABLE_FLASHINFER
 #include "attention_impl.cuh"
 #include "attention/default_prefill_params.cuh"
 #include "attention/variants.cuh"
@@ -11,6 +21,7 @@
 #include "fastdiv.cuh"
 #include "pos_enc.cuh"
 #include "utils.cuh"
+#endif
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
@@ -914,7 +925,9 @@ extern bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axi
 
 bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                               const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType) {
+#ifdef FASTLLM_ENABLE_FLASHINFER
     using namespace flashinfer;
+#endif
     
     int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
     half *qd = (half*)q.cudaData;
@@ -962,13 +975,15 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     uint32_t head_dim_vo = v2;           // VO head dimension
     
     // 确定 mask mode - FlashInfer 的 custom mask 需要 bit-packed 格式，暂时不支持
-    MaskMode mask_mode = MaskMode::kNone;
     bool use_custom_mask = (maskd != nullptr);
 // printf("maskType = %d, use_custom_mask = %d, batch = %d\n", maskType, use_custom_mask, batch);
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    MaskMode mask_mode = MaskMode::kNone;
     if (maskType == 0 && !use_custom_mask && batch == 1) {
         mask_mode = MaskMode::kCausal;
     }
 mask_mode = MaskMode::kCausal;
+#endif
     // 注意：FlashInfer 的 custom mask 格式与 fastllm 不同，暂时禁用
     if (use_custom_mask) {
         // Fallback 到原始实现，因为 mask 格式不兼容
@@ -980,8 +995,12 @@ mask_mode = MaskMode::kCausal;
     // 对于 HND 布局：
     // - stride_n (token 之间的 stride) = head_dim
     // - stride_h (head 之间的 stride) = seq_len * head_dim
+#ifdef FASTLLM_ENABLE_FLASHINFER
     bool use_flashinfer = (head_dim_qk == 128 && head_dim_vo == 128 && !use_custom_mask) &&
                           FastllmCudaFlashInferSupported();
+#else
+    bool use_flashinfer = false;
+#endif
 // use_flashinfer = false;
     // 调试信息：打印参数值
     if (use_flashinfer) {
@@ -989,6 +1008,7 @@ mask_mode = MaskMode::kCausal;
         // printf("  num_kv_heads=%u, num_qo_heads=%u, actual_batch=%u, qo_len=%u, kv_len=%u\n", num_kv_heads, num_qo_heads, actual_batch, qo_len, kv_len);
     }
     
+#ifdef FASTLLM_ENABLE_FLASHINFER
     if (use_flashinfer) {
         // 为每个 batch item 调用 FlashInfer
         // q0 = batch * num_qo_heads，所以需要按 batch 循环
@@ -1092,6 +1112,7 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
             return true;
         }
     }
+#endif
     
     // Fallback 到原始实现
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
@@ -2151,6 +2172,7 @@ void FastllmReleaseDequantScratch(void *ptr, bool own) {
     }
 }
 
+#ifdef FASTLLM_ENABLE_FLASHINFER
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, typename DType, typename Params>
 static cudaError_t FastllmDispatchPagedPrefillKernel(Params &prefill_params, DType *tmp_v, float *tmp_s,
                                                      bool enable_pdl, cudaStream_t stream) {
@@ -2206,8 +2228,12 @@ static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long 
             return cudaErrorNotSupported;
     }
 }
+#endif
 
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited) {
+#ifndef FASTLLM_ENABLE_FLASHINFER
+    return FastllmCudaHalfPagedAttentionFastllmFallback(q, k, v, output, group, scale);
+#else
     if (!FastllmCudaFlashInferSupported()) {
         return FastllmCudaHalfPagedAttentionFastllmFallback(q, k, v, output, group, scale);
     }
@@ -2469,9 +2495,18 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     
     DeviceSync();
     return true;
+#endif
 }
 
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph) {
+#ifndef FASTLLM_ENABLE_FLASHINFER
+    bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+        q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
+    if (sync) {
+        DeviceSync();
+    }
+    return ok;
+#else
     if (!FastllmCudaFlashInferSupported()) {
         bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
             q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
@@ -2790,10 +2825,15 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         DeviceSync();
     }
     return true;
+#endif
 }
 
 bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
                          fastllm::Data &output, float softmaxScale) {
+#ifndef FASTLLM_ENABLE_FLASHINFER
+    // FlashInfer 不可用（sm_70 以下），分页 MLA 暂无原生实现。
+    return false;
+#else
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     if (!kvCachePaged.isPagedKVCache || !peCachePaged.isPagedKVCache) return false;
@@ -2892,4 +2932,5 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     if (status != cudaSuccess) return false;
     DeviceSync();
     return true;
+#endif
 }
