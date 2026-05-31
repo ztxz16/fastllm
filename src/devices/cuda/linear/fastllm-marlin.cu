@@ -597,11 +597,17 @@ __device__ inline void barrier_acquire(int* lock, int count) {
   if (threadIdx.x == 0) {
     int state = -1;
     do
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+      // sm_70 以下不支持 .acquire 作用域限定指令，退化为 volatile 读。
+      // Marlin 在低算力设备上运行期不会被调度到，这里仅保证可编译。
+      state = *reinterpret_cast<volatile int*>(lock);
+#else
       // Guarantee that subsequent writes by this threadblock will be visible
       // globally.
       asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
                    : "=r"(state)
                    : "l"(lock));
+#endif
     while (state != count);
   }
   __syncthreads();
@@ -616,12 +622,19 @@ __device__ inline void barrier_release(int* lock, bool reset = false) {
       return;
     }
     int val = 1;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // sm_70 以下不支持 .acq_rel/.relaxed 作用域限定指令，退化为 threadfence + atomicAdd。
+    // Marlin 在低算力设备上运行期不会被调度到，这里仅保证可编译。
+    __threadfence();
+    atomicAdd(lock, val);
+#else
     // Make sure that all writes since acquiring this barrier are visible
     // globally, while releasing the barrier.
     asm volatile("fence.acq_rel.gpu;\n");
     asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
                  :
                  : "l"(lock), "r"(val));
+#endif
   }
 }
 
