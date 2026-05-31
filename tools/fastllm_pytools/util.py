@@ -15,6 +15,13 @@ def _has_cuda_device() -> bool:
     except Exception:
         return False
 
+def _normalize_mtp_arg(value) -> int:
+    try:
+        value = int(value)
+    except Exception:
+        value = 0
+    return max(0, value)
+
 def _total_memory_gib() -> float:
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
@@ -219,6 +226,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
+    parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
@@ -275,6 +283,8 @@ def make_normal_llm_model(args):
 
     user_set_device = bool(args.device and args.device != "")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
+    mtp = _normalize_mtp_arg(getattr(args, "mtp", 0))
+    args.mtp = mtp
 
     usenuma = False
     try:
@@ -352,6 +362,10 @@ def make_normal_llm_model(args):
                 architecture == 'Glm4MoeForCausalLM'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
+            if ((architecture == 'Qwen3_5ForConditionalGeneration' or
+                 model_type == 'qwen3_5' or text_model_type == 'qwen3_5_text') and
+                (not user_set_device) and _has_cuda_device()):
+                args.device = "cuda"
             if (architecture == 'Qwen3MoeForCausalLM' or model_type == 'qwen3_moe'):
                 is_thread_tp_moe_model = True
             if (architecture == 'Qwen3_5MoeForConditionalGeneration' or
@@ -516,6 +530,7 @@ def make_normal_llm_model(args):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
         llm.set_cuda_slab(args.cuda_slab)
+    os.environ["FASTLLM_QWEN35_ENABLE_MTP"] = str(mtp)
     graph = None
     if (args.custom != ""):
         import importlib.util

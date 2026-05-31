@@ -8,6 +8,7 @@
 #include "cmath"
 #include "utils/persistent_worker_group.h"
 
+#include <array>
 #include <atomic>
 #include <iostream>
 #include <map>
@@ -106,6 +107,14 @@ namespace fastllm {
 
         virtual void WarmupCudaRuntimeBuffers(int batch) override;
 
+        virtual void OnResponseContextCreated(ResponseContext *context) override;
+
+        virtual void OnResponseContextRemoved(ResponseContext *context) override;
+
+        virtual bool UseModelSpecificScheduler() const override;
+
+        virtual void RunModelSpecificScheduler() override;
+
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
@@ -185,6 +194,26 @@ namespace fastllm {
         bool initialized_add1 = false;
 
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
+        int mtp_num_hidden_layers = 0;
+        struct MtpKvCache {
+            Data key;
+            Data value;
+            int tokens = 0;
+        };
+        bool mtpWeightsPrepared = false;
+        int mtpWeightsPreparedDevice = -1;
+        bool speculativeCollectAllLogits = false;
+        Data speculativeHiddenStates;
+        bool speculativeCaptureFirstTokenLinearState = false;
+        std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
+        std::vector<int> speculativeFirstTokenLinearCaptureMask;
+        std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
+        std::mutex mtpCacheMutex;
+        std::atomic<bool> mtpLogPrinted{false};
+        std::atomic<bool> mtpSkipLogPrinted{false};
+        std::atomic<long long> mtpValidationCount{0};
+        std::array<std::atomic<long long>, 8> mtpDraftPositionAttempts{};
+        std::array<std::atomic<long long>, 8> mtpDraftPositionAccepts{};
 
         Data inv_scale_data;
 
@@ -284,6 +313,29 @@ namespace fastllm {
         void AdjustPositionIdsWithDelta(const Data &positionIds,
                                         const Data &mropePositionDelta,
                                         Data &adjustedPositionIds);
+        bool HasMtpWeights() const;
+        void AddMtpRmsNormOffset();
+        void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
+        Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
+        Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
+        int RunMtpGreedyDraft(int device, MtpKvCache &cache,
+                              const Data &targetHiddenStates,
+                              const std::vector<int> &inputTokens,
+                              const Data &positionIds, int sampleRow,
+                              Data *sampledHiddenStates = nullptr);
+        void Qwen35MTPLoop();
+        bool Qwen35MTPForward(
+                bool useGPUForward,
+                ResponseContext *context,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                std::vector <std::vector <int> > &acceptedTokens,
+                std::vector <std::vector <int> > &nextInputTokens,
+                std::vector <int> &keptInputLens);
         std::vector <int> ForwardFromHiddenStates(
                 int batch,
                 const Data &inputIds,

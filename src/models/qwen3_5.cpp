@@ -121,6 +121,30 @@ namespace fastllm {
         return env != nullptr && Qwen35MoeIsTrueString(env);
     }
 
+    static constexpr int QWEN35_MTP_LOG_INTERVAL = 64;
+    static constexpr int QWEN35_MTP_MAX_DRAFTS = 8;
+
+    static int Qwen35MtpDraftsPerStep() {
+        const char *env = std::getenv("FASTLLM_QWEN35_ENABLE_MTP");
+        if (env == nullptr || env[0] == '\0') {
+            return 0;
+        }
+        if (Qwen35MoeIsTrueString(env)) {
+            return 1;
+        }
+        int value = atoi(env);
+        return std::max(0, std::min(value, QWEN35_MTP_MAX_DRAFTS));
+    }
+
+    static bool Qwen35MtpDisabledByEnv() {
+        return Qwen35MtpDraftsPerStep() <= 0;
+    }
+
+    static bool Qwen35MtpWarmupEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_MTP_WARMUP");
+        return env == nullptr || env[0] == '\0' || Qwen35MoeIsTrueString(env);
+    }
+
     static void Qwen35MoeCopyLinearWeightMeta(Data &dst, const Data &src, const std::string &name) {
         dst.name = name;
         dst.weightType = WeightType::LINEAR;
@@ -4213,6 +4237,16 @@ namespace fastllm {
             language_prefix + "layers.*.linear_attn.in_proj_qkvz.weight",
             language_prefix + "layers.*.linear_attn.in_proj_ba.weight",
             language_prefix + "layers.*.linear_attn.out_proj.weight",
+            "mtp.fc.weight",
+            "mtp.layers.*.mlp.down_proj.weight",
+            "mtp.layers.*.mlp.up_proj.weight",
+            "mtp.layers.*.mlp.gate_proj.weight",
+            "mtp.layers.*.mlp.gateup_proj.weight",
+            "mtp.layers.*.self_attn.o_proj.weight",
+            "mtp.layers.*.self_attn.q_proj.weight",
+            "mtp.layers.*.self_attn.k_proj.weight",
+            "mtp.layers.*.self_attn.v_proj.weight",
+            "mtp.layers.*.self_attn.mergeqkv.weight",
             visual_prefix + "patch_embed.proj.weight",
             visual_prefix + "blocks.*.attn.qkv.weight",
             visual_prefix + "blocks.*.attn.proj.weight",
@@ -4321,6 +4355,17 @@ namespace fastllm {
 
     void Qwen3_5Model::OnAutoWarmupFinished() {
 #ifdef USE_CUDA
+        if (!Qwen35MtpDisabledByEnv() && Qwen35MtpWarmupEnabled() && HasMtpWeights()) {
+            std::vector<int> devices;
+            std::map<int, int> ratios;
+            if (GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
+                devices.size() == 1) {
+                int device = devices[0];
+                PrepareMtpWeightsForDevice(device, false);
+                printf("[Qwen3.5 MTP] warmup: device=cuda:%d.\n", device);
+                fflush(stdout);
+            }
+        }
         if (GetFastllmEnv().cudaGraph) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
@@ -4539,6 +4584,43 @@ namespace fastllm {
         int pageLen = fastllm::GetPageLen();
         interval = std::max(pageLen, interval / pageLen * pageLen);
         return std::max(pageLen, std::min(base, interval));
+    }
+
+    void Qwen3_5Model::OnResponseContextCreated(ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(mtpCacheMutex);
+        mtpCaches.erase(context);
+    }
+
+    void Qwen3_5Model::OnResponseContextRemoved(ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(mtpCacheMutex);
+        mtpCaches.erase(context);
+    }
+
+    bool Qwen3_5Model::UseModelSpecificScheduler() const {
+#ifndef USE_CUDA
+        return false;
+#else
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        return !Qwen35MtpDisabledByEnv() &&
+               HasMtpWeights() &&
+               GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
+               devices.size() == 1;
+#endif
+    }
+
+    void Qwen3_5Model::RunModelSpecificScheduler() {
+        if (UseModelSpecificScheduler()) {
+            Qwen35MTPLoop();
+        } else {
+            NewMainLoop();
+        }
     }
 
     void Qwen3_5Model::PreAllocateLinearSlotPoolsForCudaGraph(
@@ -5730,7 +5812,8 @@ namespace fastllm {
         const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
         Data localHiddenStates;
         Data *hiddenStatesPtr = nullptr;
-        if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
+        if (!speculativeCollectAllLogits &&
+            ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                         seqLens, pastKeyValues, all1, isPrefill,
                                         tensorParallel, firstTensorParallelRank,
                                         pagedCacheLayerOffset, logits,
@@ -5760,6 +5843,11 @@ namespace fastllm {
         Data moeFinal, sharedGate, sharedOutput;
         Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
         Data gdnMerged, baMerged, qkvConvInput, z, b, a, g, conv, convOutput, coreAttnOut, coreTemp;
+        Data convInputWithCache;
+        Data convToken0, convToken1, convOutput0, convOutput1;
+        Data convRow0, convRow1, baRow0, baRow1;
+        Data q0, k0, v0, a0, b0, coreAttnOut0;
+        Data q1, k1, v1, a1, b1, coreAttnOut1;
         Data qRepeat, kRepeat, qq, qTemp, kkPad, vvPad, bbPad, ggPad, decayMask;
         Data kBeta, vBeta, attn, at, kCumdecay, gExp;
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
@@ -5794,7 +5882,6 @@ namespace fastllm {
             std::string downBiasName = prefix + "mlp.down_proj.bias";
             bool isAttentionLayer =
                 weight.weight.find(prefix + "self_attn.o_proj.weight") != weight.weight.end();
-
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[inputRmsName], inputRmsName),
                              rms_norm_eps, attenInput);
@@ -5882,7 +5969,6 @@ namespace fastllm {
                 int localKd = localKeyHeads * head_k_dim;
                 int localVd = localValueHeads * head_v_dim;
                 int localQkvDim = localKd * 2 + localVd;
-
                 bool hasMergedGdnInLinear =
                     weight.weight.find(qkvzbaWeightName) != weight.weight.end();
                 if (hasMergedGdnInLinear) {
@@ -5903,26 +5989,54 @@ namespace fastllm {
                 }
                 Qwen3CudaSplit(cudaRunner, gdnMerged, -1, 0, localQkvDim, qkvConvInput);
                 Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim, localQkvDim + localVd, z);
+                bool keepCombinedBaForTwoToken =
+                    speculativeCaptureFirstTokenLinearState && batch == 1 && bsz == 1 && seqlen == 2;
+                bool keepCombinedBaForBatchRecurrent = batch > 1 && all1;
+                bool keepCombinedBa = keepCombinedBaForTwoToken || keepCombinedBaForBatchRecurrent;
+                bool baSplitReady = false;
                 if (hasMergedGdnInLinear) {
-                    Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim + localVd,
-                                   localQkvDim + localVd + localValueHeads * 2,
-                                   baMerged);
+                    if (keepCombinedBa) {
+                        Qwen3CudaSplit(cudaRunner, gdnMerged, -1,
+                                       localQkvDim + localVd,
+                                       localQkvDim + localVd + localValueHeads * 2,
+                                       baMerged);
+                    } else {
+                        Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim + localVd,
+                                       localQkvDim + localVd + localValueHeads, b);
+                        Qwen3CudaSplit(cudaRunner, gdnMerged, -1,
+                                       localQkvDim + localVd + localValueHeads,
+                                       localQkvDim + localVd + localValueHeads * 2, a);
+                        baSplitReady = true;
+                    }
                 } else {
                     Qwen3CudaLinear(cudaRunner, attenInput,
                                     *requireLocal(weight[baWeightName], baWeightName),
                                     *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
                                                   baWeightName + ".tp_bias"),
                                     baMerged);
+                    if (!keepCombinedBa) {
+                        Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
+                        Qwen3CudaSplit(cudaRunner, baMerged, -1, localValueHeads,
+                                       localValueHeads * 2, a);
+                        baSplitReady = true;
+                    }
                 }
-                Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
-                Qwen3CudaSplit(cudaRunner, baMerged, -1, localValueHeads,
-                               localValueHeads * 2, a);
+                auto ensureBaSplit = [&]() {
+                    if (baSplitReady) {
+                        return;
+                    }
+                    AssertInFastLLM(!baMerged.dims.empty(),
+                                    "Qwen3.5 linear attention missing combined ba tensor.\n");
+                    Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
+                    Qwen3CudaSplit(cudaRunner, baMerged, -1, localValueHeads,
+                                   localValueHeads * 2, a);
+                    baSplitReady = true;
+                };
 
                 Data &pastKey = *pastKeyValues[i].first;
                 Data &pastValue = *pastKeyValues[i].second;
                 Qwen35PrepareLinearAttentionCache(pastKey, computeType);
                 Qwen35PrepareLinearAttentionCache(pastValue, computeType);
-
                 if (batch == 1 && all1 && pastKey.dims.size() > 0) {
                     SwapSingleTokenSeqHeadByReshape(qkvConvInput);
                 } else if (batch > 1 && all1) {
@@ -5997,6 +6111,52 @@ namespace fastllm {
                     for (int bidx = 0; bidx < batch; bidx++) {
                         Qwen35PrepareLinearAttentionCache(*linearConvCaches[bidx], computeType);
                     }
+                } else if (speculativeCaptureFirstTokenLinearState &&
+                           batch == 1 && pastKey.dims.size() == 3 &&
+                           pastKey.dims[0] == 1 && pastKey.dims[1] == qkvConvInput.dims[1] &&
+                           pastKey.dims[2] == 4 && qkvConvInput.dims[2] > 0) {
+                    bool fusedTwoTokenConvSilu = false;
+                    bool canTryFusedTwoTokenConvSilu =
+                        qkvConvInput.dims[2] == 2 &&
+                        pastKey.dataDevice == DataDevice::CUDA &&
+                        pastKey.dataType == DataType::FLOAT16 &&
+                        qkvConvInput.dataDevice == DataDevice::CUDA &&
+                        qkvConvInput.dataType == DataType::FLOAT16 &&
+                        requireLocal(weight[conv1dWeightName], conv1dWeightName)->dataType == DataType::FLOAT32;
+                    if (canTryFusedTwoTokenConvSilu) {
+                        Data *firstTokenConvCache = nullptr;
+                        if (speculativeCaptureFirstTokenLinearState &&
+                            i < (int)speculativeFirstTokenLinearStates.size()) {
+                            firstTokenConvCache = &speculativeFirstTokenLinearStates[i].first;
+                        }
+                        fusedTwoTokenConvSilu =
+                            FastllmCudaShiftAppendConv1DPerChannelSiluTwoTokenFloat16(
+                                pastKey, qkvConvInput,
+                                *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                                *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                                convOutput, firstTokenConvCache);
+                        if (fusedTwoTokenConvSilu) {
+                            if (firstTokenConvCache) {
+                                Qwen35PrepareLinearAttentionCache(*firstTokenConvCache, computeType);
+                                speculativeFirstTokenLinearCaptureMask[i] |= 1;
+                            }
+                        }
+                    }
+                    if (!fusedTwoTokenConvSilu) {
+                        Qwen3CudaCat(cudaRunner, pastKey, qkvConvInput, -1, convInputWithCache);
+                        Qwen35CudaConv1DPerChannel(cudaRunner, convInputWithCache,
+                                                   *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                                                   *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                                                   convInputWithCache.dims[1],
+                                                   requireLocal(weight[conv1dWeightName], conv1dWeightName)->dims[0],
+                                                   4, 1, 0, conv);
+                        Qwen3CudaSplit(cudaRunner, conv, -1, 1, 1 + seqlen, convOutput);
+                        Qwen3CudaSplit(cudaRunner, convInputWithCache, -1,
+                                       convInputWithCache.dims.back() - 4,
+                                       convInputWithCache.dims.back(), pastKey);
+                        pastKey.expansionDims = pastKey.dims;
+                        Qwen35CudaSilu(cudaRunner, convOutput, convOutput);
+                    }
                 } else {
                     if (qkvConvInput.dims.back() >= 4) {
                         Qwen3CudaSplit(cudaRunner, qkvConvInput, -1,
@@ -6025,6 +6185,19 @@ namespace fastllm {
                 } else {
                     Qwen3CudaPermuteSelf(cudaRunner, convOutput, {0, 2, 1});
                 }
+                bool convQkvSplitReady = false;
+                auto ensureConvQkvSplit = [&]() {
+                    if (convQkvSplitReady) {
+                        return;
+                    }
+                    Qwen3CudaSplit(cudaRunner, convOutput, -1, 0, localKd, q);
+                    Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd, localKd * 2, k);
+                    Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd * 2, localKd * 2 + localVd, v);
+                    q.Reshape({q.dims[0], q.dims[1], localKeyHeads, head_k_dim});
+                    k.Reshape({k.dims[0], k.dims[1], localKeyHeads, head_k_dim});
+                    v.Reshape({v.dims[0], v.dims[1], localValueHeads, head_v_dim});
+                    convQkvSplitReady = true;
+                };
 
                 bool fusedBatchRecurrentFromConvBa = false;
 #ifdef USE_CUDA
@@ -6098,79 +6271,18 @@ namespace fastllm {
                 }
 #endif
 
-                if (!fusedBatchRecurrentFromConvBa) {
-                    Qwen3CudaSplit(cudaRunner, convOutput, -1, 0, localKd, q);
-                    Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd, localKd * 2, k);
-                    Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd * 2, localKd * 2 + localVd, v);
-                    q.Reshape({q.dims[0], q.dims[1], localKeyHeads, head_k_dim});
-                    k.Reshape({k.dims[0], k.dims[1], localKeyHeads, head_k_dim});
-                    v.Reshape({v.dims[0], v.dims[1], localValueHeads, head_v_dim});
-
-                if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
-                    bool fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
-                        q, k, v, a, b,
-                        *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                        *requireLocal(weight[aLogName], aLogName),
-                        *requireLocal(weight[dtBiasName], dtBiasName),
-                        rms_norm_eps, pastValue, coreAttnOut
-                    );
-                    if (!fusedSingleDecode) {
-                        Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
-                                                       *requireLocal(weight[aLogName], aLogName),
-                                                       *requireLocal(weight[dtBiasName], dtBiasName),
-                                                       g);
-                        fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
-                            q, k, v, g, b,
-                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                            rms_norm_eps, pastValue, coreAttnOut
-                        );
+                bool isSingleTokenLinearDecode = bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0;
+                bool canTryTwoTokenLinearDecode =
+                    speculativeCaptureFirstTokenLinearState &&
+                    bsz == 1 && seqlen == 2 && batch == 1 &&
+                    pastKey.dims.size() == 3 && pastKey.dims[0] == 1 &&
+                    pastKey.dims[2] == 4 && pastValue.dims.size() > 0;
+                auto runChunkLinearAttention = [&]() {
+                    ensureConvQkvSplit();
+                    ensureBaSplit();
+                    if (batch == 1 && pastValue.dims.size() > 0) {
+                        Qwen35EnsureCudaLinearAttnStateKVLayout(pastValue);
                     }
-                    if (!fusedSingleDecode) {
-                        Qwen3CudaRMSNorm(cudaRunner, q, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                                         rms_norm_eps, q);
-                        Qwen3CudaRMSNorm(cudaRunner, k, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                                         rms_norm_eps, k);
-                        SwapSingleTokenSeqHeadByReshape(q);
-                        SwapSingleTokenSeqHeadByReshape(k);
-                        SwapSingleTokenSeqHeadByReshape(v);
-                        SwapSingleTokenSeqHeadByReshape(b);
-                        SwapSingleTokenSeqHeadByReshape(g);
-                        float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
-                        Qwen35CudaRecurrentGatedDeltaRule(cudaRunner, q, k, v, g, b,
-                                                          pastValue, coreAttnOut, recurrentQScale);
-                        SwapSingleTokenSeqHeadByReshape(coreAttnOut);
-                    }
-                } else if (batch > 1 && all1) {
-                    Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
-                                                   *requireLocal(weight[aLogName], aLogName),
-                                                   *requireLocal(weight[dtBiasName], dtBiasName),
-                                                   g);
-                    Qwen3CudaRMSNorm(cudaRunner, q, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                                     rms_norm_eps, q);
-                    Qwen3CudaRMSNorm(cudaRunner, k, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                                     rms_norm_eps, k);
-                    q.Reshape({batch, localKeyHeads, 1, head_k_dim});
-                    k.Reshape({batch, localKeyHeads, 1, head_k_dim});
-                    v.Reshape({batch, localValueHeads, 1, head_v_dim});
-                    b.Reshape({batch, localValueHeads, 1});
-                    g.Reshape({batch, localValueHeads, 1});
-
-                    std::vector<Data*> recurrentStates(batch);
-                    for (int rb = 0; rb < batch; rb++) {
-                        recurrentStates[rb] = pastKeyValues[rb * block_cnt + i].second;
-                    }
-                    Data batchRecurrentState;
-                    CatBatchFirstDim(recurrentStates, batchRecurrentState);
-                    float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
-                    Qwen35CudaRecurrentGatedDeltaRule(cudaRunner, q, k, v, g, b,
-                                                      batchRecurrentState, coreAttnOut,
-                                                      recurrentQScale);
-                    SplitBatchFirstDim(batchRecurrentState, recurrentStates);
-                    for (int rb = 0; rb < batch; rb++) {
-                        Qwen35PrepareLinearAttentionCache(*recurrentStates[rb], computeType);
-                    }
-                    coreAttnOut.Reshape({1, batch, coreAttnOut.dims[1], coreAttnOut.dims[3]});
-                } else {
                     Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
                                                    *requireLocal(weight[aLogName], aLogName),
                                                    *requireLocal(weight[dtBiasName], dtBiasName),
@@ -6265,9 +6377,166 @@ namespace fastllm {
                     } else {
                         Qwen3CudaPermuteSelf(cudaRunner, coreAttnOut, {0, 2, 1, 3});
                     }
-                }
-                }
+                };
+                if (fusedBatchRecurrentFromConvBa) {
+                    // coreAttnOut is already produced by the fused batch recurrent path.
+                } else if (isSingleTokenLinearDecode) {
+                    ensureConvQkvSplit();
+                    ensureBaSplit();
+                    bool fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
+                        q, k, v, a, b,
+                        *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                        *requireLocal(weight[aLogName], aLogName),
+                        *requireLocal(weight[dtBiasName], dtBiasName),
+                        rms_norm_eps, pastValue, coreAttnOut
+                    );
+                    if (!fusedSingleDecode) {
+                        Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
+                                                       *requireLocal(weight[aLogName], aLogName),
+                                                       *requireLocal(weight[dtBiasName], dtBiasName),
+                                                       g);
+                        fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
+                            q, k, v, g, b,
+                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                            rms_norm_eps, pastValue, coreAttnOut
+                        );
+                    }
+                    if (!fusedSingleDecode) {
+                        Qwen3CudaRMSNorm(cudaRunner, q, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                         rms_norm_eps, q);
+                        Qwen3CudaRMSNorm(cudaRunner, k, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                         rms_norm_eps, k);
+                        SwapSingleTokenSeqHeadByReshape(q);
+                        SwapSingleTokenSeqHeadByReshape(k);
+                        SwapSingleTokenSeqHeadByReshape(v);
+                        SwapSingleTokenSeqHeadByReshape(b);
+                        SwapSingleTokenSeqHeadByReshape(g);
+                        float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
+                        Qwen35CudaRecurrentGatedDeltaRule(cudaRunner, q, k, v, g, b,
+                                                          pastValue, coreAttnOut, recurrentQScale);
+                        SwapSingleTokenSeqHeadByReshape(coreAttnOut);
+                    }
+                } else if (canTryTwoTokenLinearDecode) {
+                    bool fusedTwoTokenDecode = false;
+                    bool fusedConvBaTwoTokenDecode = false;
+                    if (keepCombinedBaForTwoToken && !baMerged.dims.empty() &&
+                        convOutput.dims.size() >= 3 && convOutput.dims[0] == 1 &&
+                        convOutput.dims[1] == 2 && convOutput.dims.back() == localQkvDim &&
+                        baMerged.dims.size() >= 3 && baMerged.dims[0] == 1 &&
+                        baMerged.dims[1] == 2 && baMerged.dims.back() == localValueHeads * 2 &&
+                        Qwen35EnsureCudaLinearAttnStateTransposed(pastValue)) {
+                        Qwen3CudaSplit(cudaRunner, convOutput, 1, 0, 1, convRow0);
+                        Qwen3CudaSplit(cudaRunner, baMerged, 1, 0, 1, baRow0);
+                        bool fusedFirstToken =
+                            FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
+                                convRow0, baRow0,
+                                *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                *requireLocal(weight[aLogName], aLogName),
+                                *requireLocal(weight[dtBiasName], dtBiasName),
+                                pastValue, coreAttnOut0,
+                                localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
+                                rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
+                        if (fusedFirstToken) {
+                            if (speculativeCaptureFirstTokenLinearState &&
+                                i < (int)speculativeFirstTokenLinearStates.size()) {
+                                speculativeFirstTokenLinearStates[i].second.CopyFrom(pastValue);
+                                speculativeFirstTokenLinearCaptureMask[i] |= 2;
+                            }
+                            SwapSingleTokenSeqHeadByReshape(coreAttnOut0);
+                            Qwen3CudaSplit(cudaRunner, convOutput, 1, 1, 2, convRow1);
+                            Qwen3CudaSplit(cudaRunner, baMerged, 1, 1, 2, baRow1);
+                            bool fusedSecondToken =
+                                FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
+                                    convRow1, baRow1,
+                                    *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                    *requireLocal(weight[aLogName], aLogName),
+                                    *requireLocal(weight[dtBiasName], dtBiasName),
+                                    pastValue, coreAttnOut1,
+                                    localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
+                                    rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
+                            AssertInFastLLM(fusedSecondToken,
+                                            "Qwen3.5 two-token conv+ba linear decode fused first token but failed second token.\n");
+                            SwapSingleTokenSeqHeadByReshape(coreAttnOut1);
+                            Qwen3CudaCat(cudaRunner, coreAttnOut0, coreAttnOut1, 1, coreAttnOut);
+                            fusedTwoTokenDecode = true;
+                            fusedConvBaTwoTokenDecode = true;
+                        }
+                    }
+                    if (!fusedTwoTokenDecode) {
+                        ensureConvQkvSplit();
+                        ensureBaSplit();
+                        Qwen3CudaSplit(cudaRunner, q, 1, 0, 1, q0);
+                        Qwen3CudaSplit(cudaRunner, k, 1, 0, 1, k0);
+                        Qwen3CudaSplit(cudaRunner, v, 1, 0, 1, v0);
+                        Qwen3CudaSplit(cudaRunner, a, 1, 0, 1, a0);
+                        Qwen3CudaSplit(cudaRunner, b, 1, 0, 1, b0);
+                        fusedTwoTokenDecode = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
+                            q0, k0, v0, a0, b0,
+                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                            *requireLocal(weight[aLogName], aLogName),
+                            *requireLocal(weight[dtBiasName], dtBiasName),
+                            rms_norm_eps, pastValue, coreAttnOut0
+                        );
+                    }
+                    if (fusedTwoTokenDecode && !fusedConvBaTwoTokenDecode) {
+                        if (speculativeCaptureFirstTokenLinearState &&
+                            i < (int)speculativeFirstTokenLinearStates.size()) {
+                            speculativeFirstTokenLinearStates[i].second.CopyFrom(pastValue);
+                            speculativeFirstTokenLinearCaptureMask[i] |= 2;
+                        }
+                        Qwen3CudaSplit(cudaRunner, q, 1, 1, 2, q1);
+                        Qwen3CudaSplit(cudaRunner, k, 1, 1, 2, k1);
+                        Qwen3CudaSplit(cudaRunner, v, 1, 1, 2, v1);
+                        Qwen3CudaSplit(cudaRunner, a, 1, 1, 2, a1);
+                        Qwen3CudaSplit(cudaRunner, b, 1, 1, 2, b1);
+                        bool fusedSecondToken = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
+                            q1, k1, v1, a1, b1,
+                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                            *requireLocal(weight[aLogName], aLogName),
+                            *requireLocal(weight[dtBiasName], dtBiasName),
+                            rms_norm_eps, pastValue, coreAttnOut1
+                        );
+                        AssertInFastLLM(fusedSecondToken,
+                                        "Qwen3.5 two-token linear decode fused first token but failed second token.\n");
+                        Qwen3CudaCat(cudaRunner, coreAttnOut0, coreAttnOut1, 1, coreAttnOut);
+                    } else if (!fusedTwoTokenDecode) {
+                        runChunkLinearAttention();
+                    }
+                } else if (batch > 1 && all1) {
+                    ensureConvQkvSplit();
+                    ensureBaSplit();
+                    Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
+                                                   *requireLocal(weight[aLogName], aLogName),
+                                                   *requireLocal(weight[dtBiasName], dtBiasName),
+                                                   g);
+                    Qwen3CudaRMSNorm(cudaRunner, q, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                     rms_norm_eps, q);
+                    Qwen3CudaRMSNorm(cudaRunner, k, *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                     rms_norm_eps, k);
+                    q.Reshape({batch, localKeyHeads, 1, head_k_dim});
+                    k.Reshape({batch, localKeyHeads, 1, head_k_dim});
+                    v.Reshape({batch, localValueHeads, 1, head_v_dim});
+                    b.Reshape({batch, localValueHeads, 1});
+                    g.Reshape({batch, localValueHeads, 1});
 
+                    std::vector<Data*> recurrentStates(batch);
+                    for (int rb = 0; rb < batch; rb++) {
+                        recurrentStates[rb] = pastKeyValues[rb * block_cnt + i].second;
+                    }
+                    Data batchRecurrentState;
+                    CatBatchFirstDim(recurrentStates, batchRecurrentState);
+                    float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
+                    Qwen35CudaRecurrentGatedDeltaRule(cudaRunner, q, k, v, g, b,
+                                                      batchRecurrentState, coreAttnOut,
+                                                      recurrentQScale);
+                    SplitBatchFirstDim(batchRecurrentState, recurrentStates);
+                    for (int rb = 0; rb < batch; rb++) {
+                        Qwen35PrepareLinearAttentionCache(*recurrentStates[rb], computeType);
+                    }
+                    coreAttnOut.Reshape({1, batch, coreAttnOut.dims[1], coreAttnOut.dims[3]});
+                } else {
+                    runChunkLinearAttention();
+                }
                 std::vector<int> zShape = z.dims;
                 coreAttnOut.Reshape({-1, coreAttnOut.dims.back()});
                 z.Reshape({-1, z.dims.back()});
@@ -6294,7 +6563,6 @@ namespace fastllm {
                     attenLastOutput, hiddenStates,
                     tensorParallel, firstTensorParallelRank, gpuId);
             }
-
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
                              rms_norm_eps, attenInput);
@@ -6416,10 +6684,10 @@ namespace fastllm {
             moeFinal.Reshape(hiddenStates.dims);
             addPartialToResidualReduce(moeFinal);
         }
-
         Data lastHiddenStates;
         Data *headInput = &hiddenStates;
-        if (!all1) {
+        bool keepAllRowsForSpeculative = speculativeCollectAllLogits && batch == 1;
+        if (!all1 && !keepAllRowsForSpeculative) {
             int total = 0;
             std::vector<Data> lastToks(seqLens.size());
             std::vector<Data*> lastTokPointers;
@@ -6434,11 +6702,13 @@ namespace fastllm {
             Qwen3CudaCatBatch(cudaRunner, lastTokPointers, 1, lastHiddenStates);
             headInput = &lastHiddenStates;
         }
-
         Qwen3CudaRMSNorm(cudaRunner, *headInput,
                          *requireLocal(weight[language_prefix + "norm.weight"],
                                        language_prefix + "norm.weight"),
                          rms_norm_eps, *headInput);
+        if (keepAllRowsForSpeculative) {
+            speculativeHiddenStates.CopyFrom(*headInput);
+        }
         Qwen3CudaLinear(cudaRunner, *headInput,
                         *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
                         *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
@@ -6718,6 +6988,7 @@ namespace fastllm {
                 Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
             }
             Add1(this->weight[language_prefix + "norm.weight"]);
+            AddMtpRmsNormOffset();
             initialized_add1 = true;
         };
 
@@ -7252,6 +7523,50 @@ namespace fastllm {
         }
 
         int vocabSize = lmHead.dims[0];
+        int logitRows = batch;
+        auto singleDeviceHasFullVocabLogits = [&]() {
+            if (devices.size() != 1) {
+                return false;
+            }
+            auto schemeIt = lmHeadScheme->find(devices[0]);
+            return schemeIt != lmHeadScheme->end() &&
+                   schemeIt->second.size() == 1 &&
+                   schemeIt->second[0].first == 0 &&
+                   schemeIt->second[0].second == vocabSize &&
+                   !localLogits.empty() &&
+                   localLogits[0].dataDevice == DataDevice::CUDA &&
+                   localLogits[0].cudaData != nullptr &&
+                   localLogits[0].dims.size() >= 2 &&
+                   localLogits[0].dims.back() == vocabSize;
+        };
+        if (speculativeCollectAllLogits) {
+            AssertInFastLLM(!localLogits.empty() && !localLogits[0].dims.empty(),
+                            "Qwen3.5 speculative forward did not produce logits.\n");
+            int localVocab = localLogits[0].dims.back();
+            logitRows = localVocab > 0 ? (int)(localLogits[0].Count(0) / localVocab) : 0;
+            AssertInFastLLM(logitRows > 0,
+                            "Qwen3.5 speculative forward produced empty logits.\n");
+            std::vector<GenerationConfig> rowConfigs(logitRows, generationConfigs[0]);
+            void *oldExecutor = GetExecutor();
+            Executor samplingExecutor;
+            samplingExecutor.SetFirstDevice("cuda:" + std::to_string(devices[0]));
+            SetCurrentThreadExecutor(&samplingExecutor);
+            Data *sampleLogits = nullptr;
+            Data &fullCudaLogits = Qwen35ThreadLocalCudaSamplingFullLogits();
+            if (singleDeviceHasFullVocabLogits()) {
+                sampleLogits = &localLogits[0];
+            } else {
+                Qwen35GatherShardLogitsToRootCuda(devices[0], devices, *lmHeadScheme,
+                                                  localLogits, logitRows, vocabSize,
+                                                  fullCudaLogits);
+                sampleLogits = &fullCudaLogits;
+            }
+            ResetLogitsOfEOS(logitRows, sampleLogits, pastKeyValues, rowConfigs);
+            SetCurrentThreadExecutor(oldExecutor);
+            std::vector<int> sampled = Qwen35SampleFromRootCudaLogits(devices[0], *sampleLogits, logitRows,
+                                                                       1, true, rowConfigs);
+            return sampled;
+        }
         bool allSimpleCudaSampling = true;
         int cudaSamplingTopK = 1;
         if (Qwen35CanUseCudaFullLogitsSampling(generationConfigs, retLogits, batch,
@@ -7335,6 +7650,1394 @@ namespace fastllm {
             lastRet.push_back(LLMSampling(fullLogits, b, generationConfigs[b], unit));
         }
         return lastRet;
+#endif
+    }
+
+    bool Qwen3_5Model::Qwen35MTPForward(
+        bool useGPUForward,
+        ResponseContext *context,
+        const Data &inputIds,
+        const std::vector <Data*> &attentionMask,
+        const std::vector <Data*> &positionIds,
+        const std::vector <int> &seqLens,
+        std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+        const std::vector <GenerationConfig> &generationConfigs,
+        std::vector <std::vector <int> > &acceptedTokens,
+        std::vector <std::vector <int> > &nextInputTokens,
+        std::vector <int> &keptInputLens) {
+#ifndef USE_CUDA
+        (void)useGPUForward;
+        (void)context;
+        (void)inputIds;
+        (void)attentionMask;
+        (void)positionIds;
+        (void)seqLens;
+        (void)pastKeyValues;
+        (void)generationConfigs;
+        (void)acceptedTokens;
+        (void)nextInputTokens;
+        (void)keptInputLens;
+        return false;
+#else
+        if (Qwen35MtpDisabledByEnv()) {
+            return false;
+        }
+
+        auto logMtpSkip = [&](const std::string &reason) {
+            if (mtpSkipLogPrinted.exchange(true)) {
+                return;
+            }
+            bool simpleGreedy = !generationConfigs.empty() && generationConfigs[0].IsSimpleGreedy();
+            bool outputLogits = !generationConfigs.empty() && generationConfigs[0].output_logits;
+            int outputLeast = generationConfigs.empty() ? -1 : generationConfigs[0].output_token_least;
+            int topK = generationConfigs.empty() ? -1 : generationConfigs[0].top_k;
+            float repeatPenalty = generationConfigs.empty() ? -1.0f : generationConfigs[0].repeat_penalty;
+            bool hasPositionIds = !positionIds.empty() && positionIds[0] != nullptr;
+            printf("[Qwen3.5 MTP] not enabled: %s (use_gpu=%d seq_lens=%zu mtp_layers=%d has_mtp_weights=%d simple_greedy=%d top_k=%d repeat_penalty=%.4f output_logits=%d output_least=%d has_position_ids=%d past_kv=%zu block_cnt=%d).\n",
+                   reason.c_str(), useGPUForward ? 1 : 0, seqLens.size(),
+                   mtp_num_hidden_layers, HasMtpWeights() ? 1 : 0,
+                   simpleGreedy ? 1 : 0, topK, repeatPenalty,
+                   outputLogits ? 1 : 0, outputLeast, hasPositionIds ? 1 : 0,
+                   pastKeyValues.size(), block_cnt);
+            fflush(stdout);
+        };
+
+        if (!useGPUForward) {
+            logMtpSkip("GPU forward is disabled");
+            return false;
+        }
+        if (seqLens.size() != 1 || context == nullptr) {
+            return false;
+        }
+        if (generationConfigs.empty() || !generationConfigs[0].IsSimpleGreedy()) {
+            logMtpSkip("generation config is not simple greedy");
+            return false;
+        }
+        if (generationConfigs[0].output_logits) {
+            logMtpSkip("generation config needs logits");
+            return false;
+        }
+        if (!HasMtpWeights()) {
+            logMtpSkip("MTP weights were not found");
+            return false;
+        }
+        if (positionIds.empty() || positionIds[0] == nullptr ||
+            (int)pastKeyValues.size() < block_cnt) {
+            logMtpSkip("position ids or KV cache are incomplete");
+            return false;
+        }
+        if (seqLens[0] <= 0) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
+        MtpKvCache &mtpCache = mtpCaches[context];
+        if (context->cacheLen > 0 && mtpCache.tokens == 0) {
+            logMtpSkip("prefix cache hit without MTP cache");
+            return false;
+        }
+        if (mtpCache.tokens == 0 && context->preTokens > seqLens[0]) {
+            logMtpSkip("MTP cache was not seeded during prefill");
+            return false;
+        }
+
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
+            devices.size() != 1) {
+            logMtpSkip("single-GPU CUDA forward device is unavailable");
+            return false;
+        }
+        int device = devices[0];
+        const int logInterval = QWEN35_MTP_LOG_INTERVAL;
+        int mtpDraftsPerStep = Qwen35MtpDraftsPerStep();
+        if (mtpDraftsPerStep <= 0) {
+            return false;
+        }
+        if (!mtpLogPrinted.exchange(true)) {
+            printf("[Qwen3.5 MTP] enabled: layers=%d, drafts_per_step=%d, device=cuda:%d, log_interval=%d validations.\n",
+                   mtp_num_hidden_layers, mtpDraftsPerStep, device, logInterval);
+            fflush(stdout);
+        }
+
+        auto logMtpStats = [&]() {
+            long long validations = mtpValidationCount.load(std::memory_order_relaxed);
+            if (validations <= 0) {
+                return;
+            }
+            if (validations % logInterval != 0) {
+                return;
+            }
+            printf("[Qwen3.5 MTP] pos_accept_rate=[");
+            for (int i = 0; i < mtpDraftsPerStep; i++) {
+                long long attempts =
+                    mtpDraftPositionAttempts[i].load(std::memory_order_relaxed);
+                long long accepts =
+                    mtpDraftPositionAccepts[i].load(std::memory_order_relaxed);
+                double rate = attempts > 0 ?
+                    (double)accepts * 100.0 / (double)attempts : 0.0;
+                printf("%s%.2f%%", i == 0 ? "" : ", ", rate);
+            }
+            printf("].\n");
+            fflush(stdout);
+        };
+
+        struct CacheMeta {
+            bool isPagedKVCache = false;
+            int pageLen = 128;
+            PagedCacheManager *pagedKVCacheData = nullptr;
+            std::vector<int> pageIndex;
+            int lastPageLen = 0;
+            std::vector<int> dims;
+            std::vector<uint64_t> strides;
+            std::vector<int> expansionDims;
+            uint64_t expansionSize = 0;
+            uint64_t expansionBytes = 0;
+        };
+
+        auto makeMeta = [](Data &cache) {
+            CacheMeta meta;
+            meta.isPagedKVCache = cache.isPagedKVCache;
+            meta.pageLen = cache.pageLen;
+            meta.pagedKVCacheData = cache.pagedKVCacheData;
+            meta.pageIndex = cache.pageIndex;
+            meta.lastPageLen = cache.lastPageLen;
+            meta.dims = cache.dims;
+            meta.strides = cache.strides;
+            meta.expansionDims = cache.expansionDims;
+            meta.expansionSize = cache.expansionSize;
+            meta.expansionBytes = cache.expansionBytes;
+            return meta;
+        };
+
+        auto restoreMeta = [](Data &cache, const CacheMeta &meta) {
+            if (cache.isPagedKVCache && cache.pagedKVCacheData != nullptr) {
+                std::set<int> keepPages(meta.pageIndex.begin(), meta.pageIndex.end());
+                std::vector<int> releasePages;
+                for (int page : cache.pageIndex) {
+                    if (keepPages.find(page) == keepPages.end()) {
+                        releasePages.push_back(page);
+                    }
+                }
+                if (!releasePages.empty()) {
+                    cache.pagedKVCacheData->ReleasePageIndices(releasePages);
+                }
+            }
+            cache.isPagedKVCache = meta.isPagedKVCache;
+            cache.pageLen = meta.pageLen;
+            cache.pagedKVCacheData = meta.pagedKVCacheData;
+            cache.pageIndex = meta.pageIndex;
+            cache.lastPageLen = meta.lastPageLen;
+            cache.dims = meta.dims;
+            cache.strides = meta.strides;
+            cache.expansionDims = meta.expansionDims;
+            cache.expansionSize = meta.expansionSize;
+            cache.expansionBytes = meta.expansionBytes;
+        };
+
+        auto isAttentionLayerAt = [&](int layer) {
+            return weight.weight.find(language_prefix + "layers." + std::to_string(layer) +
+                                      ".self_attn.o_proj.weight") != weight.weight.end();
+        };
+
+        auto copyPagedCacheView = [&](Data &dst, const Data &src) {
+            dst.isFake = false;
+            dst.cacheUid = src.cacheUid;
+            dst.isKVCache = src.isKVCache;
+            dst.isLinearAttention = src.isLinearAttention;
+            dst.isLinearAttentionTransposed = src.isLinearAttentionTransposed;
+            dst.isPagedKVCache = src.isPagedKVCache;
+            dst.pageLen = src.pageLen;
+            dst.pagedKVCacheData = src.pagedKVCacheData;
+            dst.pageIndex = src.pageIndex;
+            dst.lastPageLen = src.lastPageLen;
+            dst.dataType = src.dataType;
+            dst.unitSize = src.unitSize;
+            dst.unitSizeDiv = src.unitSizeDiv;
+            dst.dims = src.dims;
+            dst.strides = src.strides;
+            dst.expansionSize = src.expansionSize;
+            dst.expansionBytes = src.expansionBytes;
+            dst.expansionDims = src.expansionDims;
+            dst.cudaData = src.cudaData;
+            dst.cudaDataBorrowed = true;
+            dst.dataDevice = src.dataDevice;
+            dst.dataDeviceIds = src.dataDeviceIds;
+            dst.tpLayout = src.tpLayout;
+            dst.tpAxis = src.tpAxis;
+            dst.tpGlobalDims = src.tpGlobalDims;
+            dst.tpRanges = src.tpRanges;
+            dst.tpLinearType = src.tpLinearType;
+            dst.tpPackType = src.tpPackType;
+            dst.tpQHeads = src.tpQHeads;
+            dst.tpKVHeads = src.tpKVHeads;
+            dst.tpHeadDim = src.tpHeadDim;
+        };
+
+        auto recomputeContiguousStrides = [](std::vector<int> &dims,
+                                             std::vector<uint64_t> &strides) {
+            strides.assign(dims.size(), 1);
+            if (dims.empty()) {
+                return;
+            }
+            for (int i = (int)dims.size() - 2; i >= 0; i--) {
+                strides[i] = (uint64_t)dims[i + 1] * strides[i + 1];
+            }
+        };
+
+        auto advancePagedMetaTokens = [&](CacheMeta &meta, int tokens) {
+            if (tokens <= 0) {
+                return;
+            }
+            if (meta.dims.size() >= 2) {
+                meta.dims[1] += tokens;
+                if (meta.expansionDims.empty()) {
+                    recomputeContiguousStrides(meta.dims, meta.strides);
+                }
+            }
+            if (meta.expansionDims.size() >= 2) {
+                meta.expansionDims[1] = std::max(meta.expansionDims[1],
+                                                 meta.dims.size() >= 2 ? meta.dims[1] : meta.expansionDims[1]);
+            }
+        };
+
+        auto copyPagedCachePage = [&](Data &cache, int srcPage, int dstPage) {
+            PagedCacheManager *manager = cache.pagedKVCacheData;
+            AssertInFastLLM(manager != nullptr && manager->dims.size() == 4,
+                            "Qwen3.5 MTP validation paged cache manager is invalid.\n");
+            size_t pageBytes = (size_t)manager->pageLen * manager->dims[2] *
+                               manager->dims[3] * manager->unitSize / manager->unitSizeDiv;
+            size_t srcOffset = (size_t)srcPage * pageBytes;
+            size_t dstOffset = (size_t)dstPage * pageBytes;
+            if (manager->dataDevice == DataDevice::CUDA) {
+                FastllmCudaCopyFromDeviceToDevice((uint8_t*)manager->cudaData + dstOffset,
+                                                  (uint8_t*)manager->cudaData + srcOffset,
+                                                  pageBytes);
+            } else {
+                memcpy(manager->cpuData + dstOffset, manager->cpuData + srcOffset, pageBytes);
+            }
+        };
+
+        auto copyPagedCacheForValidation = [&](Data &dst, const Data &src) {
+            copyPagedCacheView(dst, src);
+            if (!dst.isPagedKVCache || dst.pagedKVCacheData == nullptr ||
+                dst.pageIndex.empty() || dst.lastPageLen <= 0 ||
+                dst.lastPageLen >= dst.pageLen) {
+                return;
+            }
+            int oldPage = dst.pageIndex.back();
+            int newPage = dst.pagedKVCacheData->GetUnusedPageIndex(true);
+            copyPagedCachePage(dst, oldPage, newPage);
+            dst.pageIndex.back() = newPage;
+        };
+
+        auto detachPagedCacheView = [&](Data &cache) {
+            cache.pageIndex.clear();
+            cache.pagedKVCacheData = nullptr;
+            cache.isPagedKVCache = false;
+            cache.cudaData = nullptr;
+            cache.cudaDataBorrowed = true;
+        };
+
+        auto copyTensorIntoExistingStorage = [&](Data &dst, const Data &src) {
+            if (dst.dataDevice == DataDevice::CUDA && src.dataDevice == DataDevice::CUDA &&
+                dst.cudaData != nullptr && src.cudaData != nullptr &&
+                dst.dataType == src.dataType && dst.dims == src.dims &&
+                dst.GetBytes() == src.GetBytes()) {
+                FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
+                dst.isKVCache = src.isKVCache;
+                dst.isLinearAttention = src.isLinearAttention;
+                dst.isLinearAttentionTransposed = src.isLinearAttentionTransposed;
+                dst.cacheUid = src.cacheUid;
+                dst.strides = src.strides;
+                dst.expansionDims = src.expansionDims;
+                dst.expansionSize = src.expansionSize;
+                dst.expansionBytes = src.expansionBytes;
+            } else {
+                dst.CopyFrom(src);
+            }
+        };
+
+        auto firstTokenMetaFromTemp = [&](const CacheMeta &base, const Data &temp) {
+            CacheMeta first = base;
+            first.isPagedKVCache = temp.isPagedKVCache;
+            first.pageLen = temp.pageLen;
+            first.pagedKVCacheData = temp.pagedKVCacheData;
+            if (first.pageIndex.empty() || first.lastPageLen >= first.pageLen) {
+                int nextPageOffset = (int)first.pageIndex.size();
+                AssertInFastLLM(nextPageOffset < (int)temp.pageIndex.size(),
+                                "Qwen3.5 MTP validation temp cache missing first-token page.\n");
+                first.pageIndex.push_back(temp.pageIndex[nextPageOffset]);
+                first.lastPageLen = 1;
+            } else {
+                int tailPageOffset = (int)first.pageIndex.size() - 1;
+                AssertInFastLLM(tailPageOffset >= 0 && tailPageOffset < (int)temp.pageIndex.size(),
+                                "Qwen3.5 MTP validation temp cache missing writable tail page.\n");
+                first.pageIndex[tailPageOffset] = temp.pageIndex[tailPageOffset];
+                first.lastPageLen++;
+            }
+            advancePagedMetaTokens(first, 1);
+            return first;
+        };
+
+        auto releaseUncommittedPagedPages = [&](Data &temp, const CacheMeta &committed) {
+            if (!temp.isPagedKVCache || temp.pagedKVCacheData == nullptr) {
+                detachPagedCacheView(temp);
+                return;
+            }
+            std::set<int> keepPages(committed.pageIndex.begin(), committed.pageIndex.end());
+            std::vector<int> releasePages;
+            for (int page : temp.pageIndex) {
+                if (keepPages.find(page) == keepPages.end()) {
+                    releasePages.push_back(page);
+                }
+            }
+            if (!releasePages.empty()) {
+                temp.pagedKVCacheData->ReleasePageIndices(releasePages);
+            }
+            detachPagedCacheView(temp);
+        };
+
+        auto runTargetWithPast = [&](const Data &curInputIds,
+                                     const std::vector<Data*> &curAttentionMask,
+                                     const std::vector<Data*> &curPositionIds,
+                                     const std::vector<int> &curSeqLens,
+                                     std::vector<std::pair<Data*, Data*> > &curPastKeyValues) {
+            bool oldSpeculativeCollectAllLogits = speculativeCollectAllLogits;
+            speculativeCollectAllLogits = true;
+            speculativeHiddenStates.FreeSpace();
+            speculativeHiddenStates.dims.clear();
+            speculativeHiddenStates.strides.clear();
+            speculativeHiddenStates.expansionDims.clear();
+            std::vector<int> ret = ForwardGPU(1, curInputIds, curAttentionMask,
+                                              curPositionIds, curSeqLens,
+                                              curPastKeyValues, generationConfigs,
+                                              LastTokensManager(), nullptr);
+            speculativeCollectAllLogits = oldSpeculativeCollectAllLogits;
+            return ret;
+        };
+
+        auto runTarget = [&](const Data &curInputIds,
+                             const std::vector<Data*> &curAttentionMask,
+                             const std::vector<Data*> &curPositionIds,
+                             const std::vector<int> &curSeqLens) {
+            return runTargetWithPast(curInputIds, curAttentionMask, curPositionIds,
+                                     curSeqLens, pastKeyValues);
+        };
+
+        Data inputCpu;
+        inputCpu.CopyFrom(inputIds);
+        inputCpu.ToDevice(DataDevice::CPU);
+        if (inputCpu.dataType != DataType::FLOAT32) {
+            ToDataType(inputCpu, DataType::FLOAT32);
+            inputCpu.ToDevice(DataDevice::CPU);
+        }
+        float *inputPtr = (float*)inputCpu.cpuData;
+        Data allPositionIds = BuildFlattenedPositionIds(positionIds, seqLens, seqLens[0] == 1);
+
+        acceptedTokens.assign(1, std::vector<int>());
+        nextInputTokens.assign(1, std::vector<int>());
+        keptInputLens.assign(1, seqLens[0]);
+
+        int seqLen = seqLens[0];
+        auto tokenAt = [&](int index) {
+            return (int)(inputPtr[index] + 1e-3f);
+        };
+        auto buildInputIdsSlice = [&](int begin, int end) {
+            std::vector<float> values;
+            values.reserve(std::max(0, end - begin));
+            for (int i = begin; i < end; i++) {
+                values.push_back((float)tokenAt(i));
+            }
+            return Data(DataType::FLOAT32, {1, end - begin}, values);
+        };
+        struct MtpRuntimeDataMeta {
+            std::vector<int> dims;
+            std::vector<uint64_t> strides;
+            std::vector<int> expansionDims;
+            uint64_t expansionSize = 0;
+            uint64_t expansionBytes = 0;
+        };
+        struct MtpRuntimeCacheMeta {
+            MtpRuntimeDataMeta key;
+            MtpRuntimeDataMeta value;
+            int tokens = 0;
+        };
+        auto makeMtpRuntimeDataMeta = [](const Data &data) {
+            MtpRuntimeDataMeta meta;
+            meta.dims = data.dims;
+            meta.strides = data.strides;
+            meta.expansionDims = data.expansionDims;
+            meta.expansionSize = data.expansionSize;
+            meta.expansionBytes = data.expansionBytes;
+            return meta;
+        };
+        auto restoreMtpRuntimeDataMeta = [](Data &data, const MtpRuntimeDataMeta &meta) {
+            data.dims = meta.dims;
+            data.strides = meta.strides;
+            data.expansionDims = meta.expansionDims;
+            data.expansionSize = meta.expansionSize;
+            data.expansionBytes = meta.expansionBytes;
+        };
+        auto makeMtpRuntimeCacheMeta = [&]() {
+            MtpRuntimeCacheMeta meta;
+            meta.key = makeMtpRuntimeDataMeta(mtpCache.key);
+            meta.value = makeMtpRuntimeDataMeta(mtpCache.value);
+            meta.tokens = mtpCache.tokens;
+            return meta;
+        };
+        auto restoreMtpRuntimeCacheMeta = [&](const MtpRuntimeCacheMeta &meta) {
+            restoreMtpRuntimeDataMeta(mtpCache.key, meta.key);
+            restoreMtpRuntimeDataMeta(mtpCache.value, meta.value);
+            mtpCache.tokens = meta.tokens;
+        };
+        auto setNextInputWithDrafts = [&](int firstToken, const std::vector<int> &drafts) {
+            nextInputTokens[0].clear();
+            nextInputTokens[0].reserve(1 + drafts.size());
+            nextInputTokens[0].push_back(firstToken);
+            nextInputTokens[0].insert(nextInputTokens[0].end(), drafts.begin(), drafts.end());
+        };
+        auto runMtpDraftChain = [&](const Data &targetHiddenStates,
+                                    const std::vector<int> &mtpInputTokens,
+                                    const Data &mtpPositionIds,
+                                    int sampleRow,
+                                    int lastPositionRow) {
+            std::vector<int> drafts;
+            drafts.reserve(mtpDraftsPerStep);
+            Data draftHidden;
+            int draft = RunMtpGreedyDraft(device, mtpCache, targetHiddenStates,
+                                          mtpInputTokens, mtpPositionIds,
+                                          sampleRow,
+                                          mtpDraftsPerStep > 1 ? &draftHidden : nullptr);
+            drafts.push_back(draft);
+            if (mtpDraftsPerStep > 1) {
+                MtpRuntimeCacheMeta runtimeMeta = makeMtpRuntimeCacheMeta();
+                Data prevHiddenStorage;
+                Data *prevHidden = &draftHidden;
+                int prevDraft = draft;
+                for (int extra = 1; extra < mtpDraftsPerStep; extra++) {
+                    Data extraHidden;
+                    Data extraPositionIds = BuildMtpPositionIdsSlice(
+                        allPositionIds, lastPositionRow, lastPositionRow + 1, extra);
+                    std::vector<int> extraInputTokens(1, prevDraft);
+                    bool needNextHidden = extra + 1 < mtpDraftsPerStep;
+                    int nextDraft = RunMtpGreedyDraft(device, mtpCache, *prevHidden,
+                                                      extraInputTokens, extraPositionIds,
+                                                      0, needNextHidden ? &extraHidden : nullptr);
+                    drafts.push_back(nextDraft);
+                    if (needNextHidden) {
+                        prevHiddenStorage.CopyFrom(extraHidden);
+                        prevHidden = &prevHiddenStorage;
+                    }
+                    prevDraft = nextDraft;
+                }
+                restoreMtpRuntimeCacheMeta(runtimeMeta);
+            }
+            return drafts;
+        };
+
+        std::vector<int> targetRet;
+        bool isSpeculativeValidation =
+            seqLen >= 2 && seqLen <= mtpDraftsPerStep + 1 &&
+            mtpCache.tokens > 0 && context->preTokens > seqLen;
+        if (!isSpeculativeValidation) {
+            targetRet = runTarget(inputIds, attentionMask, positionIds, seqLens);
+            AssertInFastLLM((int)targetRet.size() >= seqLen,
+                            "Qwen3.5 MTP target forward returned no token.\n");
+            int nextToken = targetRet[seqLen - 1];
+            std::vector<int> mtpInputTokens;
+            mtpInputTokens.reserve(seqLen);
+            for (int i = 1; i < seqLen; i++) {
+                mtpInputTokens.push_back(tokenAt(i));
+            }
+            mtpInputTokens.push_back(nextToken);
+            Data mtpPositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, seqLen, 0);
+            std::vector<int> drafts = runMtpDraftChain(
+                speculativeHiddenStates, mtpInputTokens, mtpPositionIds,
+                seqLen - 1, seqLen - 1);
+            acceptedTokens[0].push_back(nextToken);
+            setNextInputWithDrafts(nextToken, drafts);
+            return true;
+        }
+
+        std::vector<std::pair<Data, Data> > validationPastStorage(block_cnt);
+        std::vector<std::pair<Data*, Data*> > validationPastKeyValues(block_cnt);
+        std::vector<CacheMeta> baseKeyMetas(block_cnt), baseValueMetas(block_cnt);
+        std::vector<CacheMeta> finalKeyMetas(block_cnt), finalValueMetas(block_cnt);
+        std::vector<CacheMeta> firstKeyMetas(block_cnt), firstValueMetas(block_cnt);
+        for (int i = 0; i < block_cnt; i++) {
+            Data *realKey = pastKeyValues[i].first;
+            Data *realValue = pastKeyValues[i].second;
+            AssertInFastLLM(realKey != nullptr && realValue != nullptr,
+                            "Qwen3.5 MTP validation got null cache.\n");
+            if (isAttentionLayerAt(i)) {
+                baseKeyMetas[i] = makeMeta(*realKey);
+                baseValueMetas[i] = makeMeta(*realValue);
+                copyPagedCacheForValidation(validationPastStorage[i].first, *realKey);
+                copyPagedCacheForValidation(validationPastStorage[i].second, *realValue);
+            } else {
+                validationPastStorage[i].first.CopyFrom(*realKey);
+                validationPastStorage[i].second.CopyFrom(*realValue);
+            }
+            validationPastKeyValues[i] = {
+                &validationPastStorage[i].first,
+                &validationPastStorage[i].second
+            };
+        }
+        speculativeCaptureFirstTokenLinearState = true;
+        speculativeFirstTokenLinearStates.resize(block_cnt);
+        speculativeFirstTokenLinearCaptureMask.assign(block_cnt, 0);
+        targetRet = runTargetWithPast(inputIds, attentionMask, positionIds, seqLens,
+                                      validationPastKeyValues);
+        speculativeCaptureFirstTokenLinearState = false;
+        AssertInFastLLM((int)targetRet.size() >= 2,
+                        "Qwen3.5 MTP validation target forward returned too few tokens.\n");
+        for (int i = 0; i < block_cnt; i++) {
+            if (!isAttentionLayerAt(i)) {
+                continue;
+            }
+            finalKeyMetas[i] = makeMeta(validationPastStorage[i].first);
+            finalValueMetas[i] = makeMeta(validationPastStorage[i].second);
+            firstKeyMetas[i] = firstTokenMetaFromTemp(baseKeyMetas[i], validationPastStorage[i].first);
+            firstValueMetas[i] = firstTokenMetaFromTemp(baseValueMetas[i], validationPastStorage[i].second);
+        }
+        auto releaseValidationPagedViews = [&](const std::vector<CacheMeta> &keepKeyMetas,
+                                               const std::vector<CacheMeta> &keepValueMetas) {
+            for (int i = 0; i < block_cnt; i++) {
+                if (!isAttentionLayerAt(i)) {
+                    continue;
+                }
+                releaseUncommittedPagedPages(validationPastStorage[i].first, keepKeyMetas[i]);
+                releaseUncommittedPagedPages(validationPastStorage[i].second, keepValueMetas[i]);
+            }
+        };
+        auto commitAcceptedValidationCache = [&]() {
+            for (int i = 0; i < block_cnt; i++) {
+                if (isAttentionLayerAt(i)) {
+                    restoreMeta(*pastKeyValues[i].first, finalKeyMetas[i]);
+                    restoreMeta(*pastKeyValues[i].second, finalValueMetas[i]);
+                } else {
+                    copyTensorIntoExistingStorage(*pastKeyValues[i].first,
+                                                  validationPastStorage[i].first);
+                    copyTensorIntoExistingStorage(*pastKeyValues[i].second,
+                                                  validationPastStorage[i].second);
+                }
+            }
+            releaseValidationPagedViews(finalKeyMetas, finalValueMetas);
+        };
+        auto canCommitRejectedFirstTokenCache = [&]() {
+            for (int i = 0; i < block_cnt; i++) {
+                if (isAttentionLayerAt(i)) {
+                    continue;
+                }
+                if (i >= (int)speculativeFirstTokenLinearCaptureMask.size() ||
+                    (speculativeFirstTokenLinearCaptureMask[i] & 3) != 3) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto commitRejectedFirstTokenCache = [&]() {
+            for (int i = 0; i < block_cnt; i++) {
+                if (isAttentionLayerAt(i)) {
+                    restoreMeta(*pastKeyValues[i].first, firstKeyMetas[i]);
+                    restoreMeta(*pastKeyValues[i].second, firstValueMetas[i]);
+                } else {
+                    copyTensorIntoExistingStorage(*pastKeyValues[i].first,
+                                                  speculativeFirstTokenLinearStates[i].first);
+                    copyTensorIntoExistingStorage(*pastKeyValues[i].second,
+                                                  speculativeFirstTokenLinearStates[i].second);
+                }
+            }
+            releaseValidationPagedViews(firstKeyMetas, firstValueMetas);
+        };
+        int draftTokenCount = seqLen - 1;
+        int matchedDrafts = 0;
+        while (matchedDrafts < draftTokenCount &&
+               targetRet[matchedDrafts] == tokenAt(matchedDrafts + 1)) {
+            matchedDrafts++;
+        }
+        for (int i = 0; i < draftTokenCount && i < QWEN35_MTP_MAX_DRAFTS; i++) {
+            mtpDraftPositionAttempts[i].fetch_add(1, std::memory_order_relaxed);
+            if (matchedDrafts > i) {
+                mtpDraftPositionAccepts[i].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (matchedDrafts == draftTokenCount) {
+            commitAcceptedValidationCache();
+            std::vector<int> mtpInputTokens;
+            mtpInputTokens.reserve(seqLen);
+            for (int i = 1; i < seqLen; i++) {
+                mtpInputTokens.push_back(tokenAt(i));
+            }
+            mtpInputTokens.push_back(targetRet[seqLen - 1]);
+            Data mtpPositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, seqLen, 0);
+            std::vector<int> drafts = runMtpDraftChain(
+                speculativeHiddenStates, mtpInputTokens, mtpPositionIds,
+                seqLen - 1, seqLen - 1);
+            mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
+            acceptedTokens[0].assign(targetRet.begin(), targetRet.begin() + seqLen);
+            setNextInputWithDrafts(targetRet[seqLen - 1], drafts);
+            keptInputLens[0] = seqLen;
+            logMtpStats();
+            return true;
+        }
+
+        mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
+        int commitLen = matchedDrafts + 1;
+        std::vector<int> retryRet(targetRet.begin(), targetRet.begin() + commitLen);
+        bool committedRejectedFast = commitLen == 1 && canCommitRejectedFirstTokenCache();
+        if (committedRejectedFast) {
+            commitRejectedFirstTokenCache();
+        } else {
+            releaseValidationPagedViews(baseKeyMetas, baseValueMetas);
+            Data singleInputIds = buildInputIdsSlice(0, commitLen);
+            Data singlePositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
+            std::vector<Data*> singleAttentionMask = {nullptr};
+            std::vector<Data*> singlePositionIdVec = {&singlePositionIds};
+            std::vector<int> singleSeqLens = {commitLen};
+            retryRet = runTarget(singleInputIds, singleAttentionMask,
+                                 singlePositionIdVec, singleSeqLens);
+            AssertInFastLLM((int)retryRet.size() >= commitLen,
+                            "Qwen3.5 MTP retry target forward returned no token.\n");
+        }
+        Data hiddenForMtp;
+        Split(speculativeHiddenStates, 1, 0, commitLen, hiddenForMtp);
+        Data mtpPositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
+        std::vector<int> mtpInputTokens;
+        mtpInputTokens.reserve(commitLen);
+        for (int i = 1; i < commitLen; i++) {
+            mtpInputTokens.push_back(tokenAt(i));
+        }
+        mtpInputTokens.push_back(retryRet[commitLen - 1]);
+        std::vector<int> drafts = runMtpDraftChain(
+            hiddenForMtp, mtpInputTokens, mtpPositionIds,
+            commitLen - 1, commitLen - 1);
+        acceptedTokens[0].assign(retryRet.begin(), retryRet.begin() + commitLen);
+        setNextInputWithDrafts(retryRet[commitLen - 1], drafts);
+        keptInputLens[0] = commitLen;
+        logMtpStats();
+        return true;
+#endif
+    }
+
+    void Qwen3_5Model::Qwen35MTPLoop() {
+#ifndef USE_CUDA
+        NewMainLoop();
+#else
+        Qwen3_5Model *model = this;
+        int maxTotalLens = 0;
+        int totalPages = 0;
+        int pagesLimit = 0;
+        int pageLen = fastllm::GetPageLen();
+
+        const int mtpSchedulerLanes = 1;
+        int prefillChunkSize = model->GetChunkedPrefillSize();
+
+        auto releasePagedCachePages = [](Data &cache, bool clearDims = false) {
+            std::set<std::pair<PagedCacheManager*, int> > releasedPages;
+            auto releaseUnique = [&](Data &pagedCache) {
+                if (!pagedCache.isPagedKVCache || pagedCache.pagedKVCacheData == nullptr ||
+                    pagedCache.pageIndex.empty()) {
+                    return;
+                }
+                std::vector<int> uniquePages;
+                for (int page : pagedCache.pageIndex) {
+                    std::pair<PagedCacheManager*, int> key = {pagedCache.pagedKVCacheData, page};
+                    if (releasedPages.insert(key).second) {
+                        uniquePages.push_back(page);
+                    }
+                }
+                if (!uniquePages.empty()) {
+                    pagedCache.pagedKVCacheData->ReleasePageIndices(uniquePages);
+                }
+                pagedCache.pageIndex.clear();
+                pagedCache.lastPageLen = 0;
+            };
+            releaseUnique(cache);
+            if (cache.multiDeviceData) {
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr) {
+                        releaseUnique(*it.second);
+                        if (clearDims) {
+                            it.second->dims.clear();
+                        }
+                    }
+                }
+            }
+            if (clearDims) {
+                cache.dims.clear();
+            }
+        };
+
+        auto eraseMtpCache = [&](ResponseContext *ctx) {
+            if (ctx == nullptr) {
+                return;
+            }
+            std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+            model->mtpCaches.erase(ctx);
+        };
+
+        auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
+            if (ctx == nullptr) {
+                return;
+            }
+            for (int i = 0; i < model->block_cnt && i < (int)ctx->pastKeyValues.size(); i++) {
+                releasePagedCachePages(ctx->pastKeyValues[i].first, true);
+                releasePagedCachePages(ctx->pastKeyValues[i].second, true);
+            }
+            eraseMtpCache(ctx);
+            ctx->currentTokens = ctx->allTokens;
+            ctx->preTokens = 0;
+            ctx->cacheLen = 0;
+            ctx->intParams.clear();
+        };
+
+        auto getPagedManagerFromCache = [](Data &cache) -> PagedCacheManager* {
+            if (cache.multiDeviceData) {
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr && it.second->pagedKVCacheData != nullptr) {
+                        return it.second->pagedKVCacheData;
+                    }
+                }
+            }
+            return cache.pagedKVCacheData;
+        };
+
+        auto findRuntimePagedManager = [&]() -> PagedCacheManager* {
+            if (model->kvCacheId >= 0) {
+                for (auto &it : model->responseContextDict.dicts) {
+                    ResponseContext *ctx = it.second;
+                    if (ctx == nullptr || model->kvCacheId >= (int)ctx->pastKeyValues.size()) {
+                        continue;
+                    }
+                    PagedCacheManager *manager =
+                        getPagedManagerFromCache(ctx->pastKeyValues[model->kvCacheId].first);
+                    if (manager != nullptr) {
+                        return manager;
+                    }
+                }
+            }
+            return GetPagedCacheManager(model->kvCacheId * 2);
+        };
+
+        auto collectDecodePageNeeds = [&](ResponseContext *ctx) -> std::map<PagedCacheManager*, int> {
+            std::map<PagedCacheManager*, int> needs;
+            std::function<void(Data&)> addCacheNeed = [&](Data &cache) {
+                if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                    bool usedLocal = false;
+                    for (auto &it : cache.multiDeviceDatas) {
+                        if (it.second != nullptr) {
+                            addCacheNeed(*it.second);
+                            usedLocal = true;
+                        }
+                    }
+                    if (usedLocal) {
+                        return;
+                    }
+                }
+                if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+                    return;
+                }
+                if (cache.pagedKVCacheData->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                    return;
+                }
+                if (cache.pageIndex.empty() || cache.lastPageLen >= cache.pageLen) {
+                    needs[cache.pagedKVCacheData]++;
+                }
+            };
+            if (ctx != nullptr) {
+                for (int i = 0; i < model->block_cnt && i < (int)ctx->pastKeyValues.size(); i++) {
+                    addCacheNeed(ctx->pastKeyValues[i].first);
+                    addCacheNeed(ctx->pastKeyValues[i].second);
+                }
+            }
+            return needs;
+        };
+
+        auto hasPagedManagerShortage = [](const std::map<PagedCacheManager*, int> &needs) -> bool {
+            for (auto &it : needs) {
+                PagedCacheManager *manager = it.first;
+                if (manager == nullptr || it.second <= 0) {
+                    continue;
+                }
+                int freePages = 0;
+                {
+                    std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                    freePages = manager->FreePageCount();
+                }
+                if (freePages < it.second) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto createPendingResultLogits = [](const GenerationConfig &config) {
+            return config.output_logits ? new std::vector<float>() : nullptr;
+        };
+
+        auto queueGeneratedResultLogits = [](ResponseContext *ctx,
+                                             std::vector<std::vector<float>*> &logits,
+                                             int index) {
+            if (ctx == nullptr || index < 0 || index >= (int)logits.size() || logits[index] == nullptr) {
+                return;
+            }
+            ctx->resultLogits.push(logits[index]);
+            logits[index] = nullptr;
+        };
+
+        auto releasePendingResultLogits = [](std::vector<std::vector<float>*> &logits) {
+            for (auto *&item : logits) {
+                delete item;
+                item = nullptr;
+            }
+        };
+
+        auto *pcm = GetPagedCacheManager(model->kvCacheId * 2);
+        if (pcm != nullptr) {
+            totalPages = pcm->maxPages;
+            pageLen = pcm->pageLen;
+            maxTotalLens = totalPages * pageLen;
+            pagesLimit = totalPages * 4 / 5;
+            model->tokensLimit = maxTotalLens;
+            model->promptLimit = pagesLimit * pageLen;
+            if (model->verbose) {
+                printf("Fastllm KV Cache Token limit: %d tokens (totalPages=%d, pageLen=%d).\n",
+                       maxTotalLens, totalPages, pageLen);
+                printf("Fastllm AddPrefill Pages limit: %d pages (80%% of %d).\n",
+                       pagesLimit, totalPages);
+                printf("Fastllm Scheduler: Qwen3.5 MTP (lane=%d).\n", mtpSchedulerLanes);
+            }
+        } else if (model->tokensLimit > 0) {
+            maxTotalLens = model->tokensLimit;
+            totalPages = std::max(1, maxTotalLens / pageLen);
+            pagesLimit = model->promptLimit > 0 ?
+                std::max(1, (model->promptLimit + pageLen - 1) / pageLen) :
+                totalPages * 4 / 5;
+            if (model->promptLimit <= 0) {
+                model->promptLimit = pagesLimit * pageLen;
+            }
+            if (model->verbose) {
+                printf("Fastllm KV Cache Token limit: %d tokens (pageLen=%d).\n",
+                       maxTotalLens, pageLen);
+                printf("Fastllm AddPrefill Pages limit: %d pages.\n", pagesLimit);
+                printf("Fastllm Scheduler: Qwen3.5 MTP (lane=%d).\n", mtpSchedulerLanes);
+            }
+        } else if (model->verbose) {
+            printf("Fastllm Scheduler: Qwen3.5 MTP (lane=%d).\n", mtpSchedulerLanes);
+        }
+
+        auto lastRecordTime = std::chrono::system_clock::now();
+        long long genTokens = 0;
+        while (true) {
+            if (model->isFree) {
+                break;
+            }
+
+            std::vector<Data*> attentionMasks;
+            std::vector<Data*> positionIds;
+            std::vector<Data*> ownedAttentionMasks;
+            std::vector<Data*> ownedPositionIds;
+            std::vector<std::pair<Data*, Data*> > pastKeyValues;
+            std::vector<float> ids;
+            std::vector<int> seqLens;
+            std::vector<int> handles;
+            std::vector<GenerationConfig> generationConfigs;
+            LastTokensManager tokensManager;
+            std::vector<ResponseContext*> tokenContexts;
+            std::vector<std::vector<float>*> logits;
+            std::vector<float> decodePositionValues;
+            std::vector<Data> decodePositionIds;
+            static const std::vector<int> decodeScalarDims = {1, 1};
+            bool selectedNeedLastTokens = false;
+            bool selectedIsPrompt = false;
+            bool selectedMultimodal = false;
+
+            attentionMasks.reserve(1);
+            positionIds.reserve(1);
+            ownedAttentionMasks.reserve(1);
+            ownedPositionIds.reserve(1);
+            pastKeyValues.reserve(model->block_cnt);
+            ids.reserve(4);
+            seqLens.reserve(1);
+            handles.reserve(1);
+            generationConfigs.reserve(1);
+            tokenContexts.reserve(1);
+            logits.reserve(1);
+            decodePositionValues.reserve(1);
+            decodePositionIds.reserve(1);
+
+            std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            auto &forwardLocker = model->forwardLocker;
+
+            std::vector<int> abortHandles;
+            int busyPages = 0;
+            int currentActivate = 0;
+            bool hasPrefill = false;
+            struct DecodeOrder {
+                int sortKey;
+                int handle;
+                ResponseContext *context;
+            };
+            std::vector<DecodeOrder> orders;
+            orders.reserve(model->responseContextDict.dicts.size());
+
+            for (auto &it : model->responseContextDict.dicts) {
+                ResponseContext *ctx = it.second;
+                if (ctx == nullptr) {
+                    continue;
+                }
+                if (ctx->isAbort) {
+                    ctx->TryRecordPagedCache();
+                    abortHandles.push_back(it.first);
+                    continue;
+                }
+                if (ctx->isEnding) {
+                    for (int i = 0; i < model->block_cnt && i < (int)ctx->pastKeyValues.size(); i++) {
+                        releasePagedCachePages(ctx->pastKeyValues[i].first);
+                        releasePagedCachePages(ctx->pastKeyValues[i].second);
+                    }
+                    eraseMtpCache(ctx);
+                    continue;
+                }
+                if (ctx->preTokens > 0) {
+                    currentActivate++;
+                }
+                if (ctx->preTokens == 0) {
+                    hasPrefill = true;
+                }
+                orders.push_back({-(int)ctx->currentTokens.size(), it.first, ctx});
+            }
+            for (int handle : abortHandles) {
+                model->RemoveResponseContext(handle);
+            }
+            sort(orders.begin(), orders.end(), [](const DecodeOrder &a, const DecodeOrder &b) {
+                if (a.sortKey != b.sortKey) {
+                    return a.sortKey < b.sortKey;
+                }
+                return a.handle < b.handle;
+            });
+
+            if (totalPages > 0) {
+                PagedCacheManager *probeManager = findRuntimePagedManager();
+                if (probeManager != nullptr) {
+                    std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
+                    busyPages = probeManager->maxPages - probeManager->FreePageCount();
+                    totalPages = probeManager->maxPages;
+                    pageLen = probeManager->pageLen;
+                    maxTotalLens = totalPages * pageLen;
+                    pagesLimit = totalPages * 4 / 5;
+                }
+            }
+            bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
+
+            for (int isPrompt = 1; isPrompt >= 0 && seqLens.empty(); isPrompt--) {
+                if (isPrompt == 1 && !canAddPrefill) {
+                    continue;
+                }
+                if (isPrompt == 0 && hasPrefill && canAddPrefill) {
+                    continue;
+                }
+
+                for (auto &ii : orders) {
+                    ResponseContext *ctx = ii.context;
+                    if (ctx == nullptr || ctx->isEnding) {
+                        continue;
+                    }
+                    if (isPrompt && ctx->preTokens != 0) {
+                        continue;
+                    }
+                    if (!isPrompt && ctx->preTokens == 0) {
+                        continue;
+                    }
+
+                    if ((maxTotalLens > 0 &&
+                         ctx->cacheLen + (int)ctx->currentTokens.size() > maxTotalLens) ||
+                        ctx->cacheLen + (int)ctx->currentTokens.size() > model->max_positions) {
+                        ctx->isEnding = true;
+                        ctx->error = ResponseContextErrorPromptTooLong;
+                        continue;
+                    }
+
+                    if (!isPrompt) {
+                        auto pageNeeds = collectDecodePageNeeds(ctx);
+                        if (!pageNeeds.empty() && hasPagedManagerShortage(pageNeeds)) {
+                            releaseAndReinitRequest(ctx);
+                            continue;
+                        }
+                    }
+
+                    tokenContexts.push_back(ctx);
+                    handles.push_back(ii.handle);
+                    generationConfigs.push_back(ctx->generationConfig);
+                    logits.push_back(createPendingResultLogits(ctx->generationConfig));
+                    selectedNeedLastTokens |= Qwen35NeedRepeatPenalty(ctx->generationConfig) ||
+                                              ctx->generationConfig.output_logits;
+                    selectedIsPrompt = isPrompt != 0;
+                    selectedMultimodal = !ctx->multimodalInput.empty();
+
+                    if (!isPrompt && !selectedMultimodal && !ctx->currentTokens.empty()) {
+                        int seqLen = (int)ctx->currentTokens.size();
+                        if (seqLen == 1) {
+                            ids.push_back((float)ctx->currentTokens[0]);
+                            seqLens.push_back(1);
+                            attentionMasks.push_back(nullptr);
+                            float position = ctx->allTokens.empty() ?
+                                0.0f : (float)((int)ctx->allTokens.size() - 1);
+                            decodePositionValues.push_back(position);
+                            decodePositionIds.emplace_back(DataType::FLOAT32, decodeScalarDims,
+                                                           DataDevice::CPU,
+                                                           (void*)&decodePositionValues.back());
+                            positionIds.push_back(&decodePositionIds.back());
+                            ctx->preTokens += 1;
+                        } else {
+                            int keyLen = (int)ctx->allTokens.size() + seqLen - 1;
+                            int startPosition = keyLen - seqLen;
+                            for (int token : ctx->currentTokens) {
+                                ids.push_back((float)token);
+                            }
+                            seqLens.push_back(seqLen);
+
+                            std::vector<float> vPositionIds(seqLen, 0.0f);
+                            for (int i = 0; i < seqLen; i++) {
+                                vPositionIds[i] = (float)(startPosition + i);
+                            }
+                            positionIds.push_back(new Data());
+                            ownedPositionIds.push_back(positionIds.back());
+                            positionIds.back()->CopyFrom(
+                                Data(DataType::FLOAT32, {1, seqLen}, vPositionIds));
+
+                            if (model->NeedAttentionMask(seqLen, keyLen)) {
+                                std::vector<float> vmask(seqLen * keyLen, 0.0f);
+                                for (int i = 0; i < seqLen; i++) {
+                                    for (int j = i + 1; j < seqLen; j++) {
+                                        vmask[i * keyLen + startPosition + j] = 1.0f;
+                                    }
+                                }
+                                attentionMasks.push_back(new Data());
+                                ownedAttentionMasks.push_back(attentionMasks.back());
+                                attentionMasks.back()->CopyFrom(
+                                    Data(DataType::FLOAT32, {seqLen, keyLen}, vmask));
+                                ToDataType(*attentionMasks.back(), model->dataType);
+                            } else {
+                                attentionMasks.push_back(nullptr);
+                            }
+                            ctx->preTokens += seqLen;
+                        }
+                    } else {
+                        if (ctx->preTokens == 0) {
+                            ctx->intParams["add_special_tokens"] =
+                                ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
+                            ctx->intParams["promptLen"] =
+                                ctx->cacheLen + (int)ctx->currentTokens.size();
+                            ctx->intParams["index"] = 0;
+                        } else {
+                            ctx->intParams["index"]++;
+                        }
+                        Data inputIds, attentionMask, curPositionIds;
+                        std::vector<std::vector<float> > tokens(1);
+                        tokens[0].reserve(ctx->currentTokens.size());
+                        for (int token : ctx->currentTokens) {
+                            tokens[0].push_back((float)token);
+                        }
+                        model->FillLLMInputs(tokens, ctx->intParams,
+                                             inputIds, attentionMask, curPositionIds);
+                        ToDataType(attentionMask, model->dataType);
+
+                        seqLens.push_back(inputIds.Count(0));
+                        for (int i = 0; i < inputIds.Count(0); i++) {
+                            ids.push_back(((float*)inputIds.cpuData)[i]);
+                        }
+                        if (attentionMask.dims.empty()) {
+                            attentionMasks.push_back(nullptr);
+                        } else {
+                            attentionMasks.push_back(new Data());
+                            ownedAttentionMasks.push_back(attentionMasks.back());
+                            attentionMask.ToDevice(DataDevice::CPU);
+                            attentionMasks.back()->CopyFrom(attentionMask);
+                        }
+                        if (curPositionIds.dims.empty()) {
+                            positionIds.push_back(nullptr);
+                        } else {
+                            positionIds.push_back(new Data());
+                            ownedPositionIds.push_back(positionIds.back());
+                            positionIds.back()->CopyFrom(curPositionIds);
+                        }
+                        ctx->preTokens += seqLens.back();
+                    }
+
+                    for (int i = 0; i < model->block_cnt; i++) {
+                        pastKeyValues.push_back(std::make_pair(&ctx->pastKeyValues[i].first,
+                                                               &ctx->pastKeyValues[i].second));
+                    }
+                    break;
+                }
+            }
+
+            if (selectedNeedLastTokens) {
+                tokensManager.units.reserve(tokenContexts.size());
+                for (auto *ctx : tokenContexts) {
+                    tokensManager.units.push_back(ctx->tokens);
+                }
+            }
+
+            if (!seqLens.empty()) {
+                ResponseContext *singleContext = tokenContexts.empty() ? nullptr : tokenContexts[0];
+                dictLocker.unlock();
+                forwardLocker.lock();
+
+                Data inputIds(DataType::FLOAT32, {1, (int)ids.size()}, ids);
+                std::vector<int> ret;
+                std::vector<std::vector<int> > acceptedTokenLists;
+                std::vector<std::vector<int> > nextInputTokenLists;
+                std::vector<int> keptInputLens;
+                bool usedMtpForward = false;
+
+                if (selectedMultimodal && singleContext != nullptr) {
+                    ret = model->ForwardMultimodal(
+                        inputIds,
+                        attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                        positionIds[0] == nullptr ? Data() : *positionIds[0],
+                        singleContext->pastKeyValues,
+                        singleContext->multimodalInput,
+                        singleContext->generationConfig,
+                        tokensManager,
+                        &logits);
+                } else if (seqLens.size() == 1 && selectedIsPrompt &&
+                           seqLens[0] > prefillChunkSize && singleContext != nullptr) {
+                    int len = seqLens[0];
+                    std::vector<std::pair<Data, Data> > *pastKeyValue1 = nullptr;
+                    dictLocker.lock();
+                    auto contextIt = model->responseContextDict.dicts.find(handles[0]);
+                    if (contextIt != model->responseContextDict.dicts.end()) {
+                        pastKeyValue1 = &contextIt->second->pastKeyValues;
+                    }
+                    dictLocker.unlock();
+                    if (pastKeyValue1 == nullptr) {
+                        ret.push_back(model->eos_token_id);
+                    } else {
+                        auto prefillStartTime = std::chrono::system_clock::now();
+                        for (int st = 0; st < len; ) {
+                            int curLen = std::min(prefillChunkSize, len - st);
+                            auto chunkStartTime = std::chrono::system_clock::now();
+                            Data curInput, curPositionIds;
+                            Split(inputIds, 1, st, st + curLen, curInput);
+                            if (positionIds[0] != nullptr) {
+                                curPositionIds.dataType = positionIds[0]->dataType;
+                                curPositionIds.Resize({1, curLen});
+                                curPositionIds.Allocate();
+                                int unitSize = curPositionIds.unitSize;
+                                memcpy(curPositionIds.cpuData,
+                                       positionIds[0]->cpuData + st * unitSize,
+                                       curLen * unitSize);
+                            }
+
+                            std::vector<int> curSeqLens = {curLen};
+                            std::vector<Data*> curAttentionMasks = {nullptr};
+                            std::vector<Data*> curPositionIdsVec =
+                                {positionIds[0] == nullptr ? nullptr : &curPositionIds};
+                            std::vector<std::pair<Data*, Data*> > curPastKeyValues;
+                            curPastKeyValues.reserve(model->block_cnt);
+                            for (int i = 0; i < model->block_cnt; i++) {
+                                curPastKeyValues.push_back(
+                                    std::make_pair(&(*pastKeyValue1)[i].first,
+                                                   &(*pastKeyValue1)[i].second));
+                            }
+                            ret = model->ForwardGPU(1, curInput, curAttentionMasks,
+                                                    curPositionIdsVec, curSeqLens,
+                                                    curPastKeyValues, generationConfigs,
+                                                    tokensManager, &logits);
+                            st += curLen;
+                            if (model->verbose) {
+                                auto chunkEndTime = std::chrono::system_clock::now();
+                                float chunkSpend = GetSpan(chunkStartTime, chunkEndTime);
+                                float totalSpend = GetSpan(prefillStartTime, chunkEndTime);
+                                float chunkSpeed = chunkSpend > 0 ? curLen / chunkSpend : 0;
+                                (void)totalSpend;
+                                printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
+                                       st, len, st * 100 / len, chunkSpeed);
+                            }
+                        }
+                    }
+                } else {
+                    auto batchStartTime = std::chrono::system_clock::now();
+                    usedMtpForward = model->Qwen35MTPForward(
+                        true, singleContext, inputIds, attentionMasks, positionIds,
+                        seqLens, pastKeyValues, generationConfigs,
+                        acceptedTokenLists, nextInputTokenLists, keptInputLens);
+
+                    if (!usedMtpForward && !selectedIsPrompt && seqLens[0] > 1 &&
+                        singleContext != nullptr && !singleContext->currentTokens.empty()) {
+                        singleContext->preTokens -= seqLens[0];
+                        std::vector<float> fallbackIds = {
+                            (float)singleContext->currentTokens[0]
+                        };
+                        Data fallbackInputIds(DataType::FLOAT32, {1, 1}, fallbackIds);
+                        float position = singleContext->allTokens.empty() ?
+                            0.0f : (float)((int)singleContext->allTokens.size() - 1);
+                        Data fallbackPositionIds(DataType::FLOAT32, {1, 1},
+                                                 DataDevice::CPU, (void*)&position);
+                        std::vector<Data*> fallbackAttentionMasks = {nullptr};
+                        std::vector<Data*> fallbackPositionIdVec = {&fallbackPositionIds};
+                        std::vector<int> fallbackSeqLens = {1};
+                        singleContext->preTokens += 1;
+                        ret = model->ForwardGPU(1, fallbackInputIds,
+                                                fallbackAttentionMasks,
+                                                fallbackPositionIdVec,
+                                                fallbackSeqLens, pastKeyValues,
+                                                generationConfigs, tokensManager, &logits);
+                        seqLens = fallbackSeqLens;
+                    } else if (!usedMtpForward) {
+                        ret = model->ForwardGPU((int)seqLens.size(), inputIds,
+                                                attentionMasks, positionIds, seqLens,
+                                                pastKeyValues, generationConfigs,
+                                                tokensManager, &logits);
+                    }
+
+                    if (model->verbose && selectedIsPrompt) {
+                        int prefillTokens = 0;
+                        for (int len : seqLens) {
+                            if (len > 1) {
+                                prefillTokens += len;
+                            }
+                        }
+                        if (prefillTokens > 0) {
+                            auto batchEndTime = std::chrono::system_clock::now();
+                            float batchSpend = GetSpan(batchStartTime, batchEndTime);
+                            float prefillSpeed = batchSpend > 0 ? prefillTokens / batchSpend : 0;
+                            printf("[Prompt] %d Tokens. Speed: %f tokens / s.\n",
+                                   prefillTokens, prefillSpeed);
+                        }
+                    }
+                }
+
+                if (!usedMtpForward) {
+                    acceptedTokenLists.clear();
+                    nextInputTokenLists.clear();
+                    keptInputLens.assign(seqLens.begin(), seqLens.end());
+                    acceptedTokenLists.reserve(ret.size());
+                    nextInputTokenLists.reserve(ret.size());
+                    for (int token : ret) {
+                        acceptedTokenLists.push_back(std::vector<int>{token});
+                        nextInputTokenLists.push_back(std::vector<int>{token});
+                    }
+                }
+
+                forwardLocker.unlock();
+                dictLocker.lock();
+
+                if (selectedIsPrompt) {
+                    for (int i = 0; i < (int)handles.size(); i++) {
+                        auto contextIt = model->responseContextDict.dicts.find(handles[i]);
+                        if (contextIt == model->responseContextDict.dicts.end()) {
+                            continue;
+                        }
+                        if (i < (int)seqLens.size() && seqLens[i] > 1 &&
+                            (int)contextIt->second->allTokens.size() >= pageLen) {
+                            contextIt->second->TryRecordPagedCache();
+                        }
+                    }
+                }
+
+                if (model->verbose) {
+                    for (auto &tokens : acceptedTokenLists) {
+                        genTokens += (int)tokens.size();
+                    }
+                    auto nowTime = std::chrono::system_clock::now();
+                    float spend = GetSpan(lastRecordTime, nowTime);
+                    if (spend > 1) {
+                        int logPending = (int)orders.size() - currentActivate;
+                        float kvUsage = totalPages > 0 ? busyPages * 100.0f / totalPages : 0;
+                        printf("[Decode] alive = %d, pending = %d, context usages: %.1f%%, Speed: %f tokens / s.\n",
+                               currentActivate, logPending, kvUsage,
+                               spend > 0 ? (float)genTokens / spend : 0.0f);
+                        lastRecordTime = nowTime;
+                        genTokens = 0;
+                    }
+                }
+
+                for (int i = 0; i < (int)handles.size(); i++) {
+                    auto contextIt = model->responseContextDict.dicts.find(handles[i]);
+                    if (contextIt == model->responseContextDict.dicts.end()) {
+                        continue;
+                    }
+                    ResponseContext *ctx = contextIt->second;
+                    if (i < (int)keptInputLens.size() && i < (int)seqLens.size() &&
+                        keptInputLens[i] >= 0 && keptInputLens[i] < seqLens[i]) {
+                        ctx->preTokens -= seqLens[i] - keptInputLens[i];
+                    }
+
+                    static const std::vector<int> emptyAcceptedTokens;
+                    const std::vector<int> &curAcceptedTokens =
+                        i < (int)acceptedTokenLists.size() ?
+                            acceptedTokenLists[i] : emptyAcceptedTokens;
+                    for (int tokenIndex = 0; tokenIndex < (int)curAcceptedTokens.size(); tokenIndex++) {
+                        int curRet = curAcceptedTokens[tokenIndex];
+                        if (curRet == model->eos_token_id ||
+                            model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache();
+                            eraseMtpCache(ctx);
+                            break;
+                        }
+                        auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
+                        if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache();
+                            eraseMtpCache(ctx);
+                            break;
+                        }
+
+                        ctx->resultTokenQueue.push(curRet);
+                        if (tokenIndex == 0) {
+                            queueGeneratedResultLogits(ctx, logits, i);
+                        }
+                        ctx->allTokens.push_back(curRet);
+                        if (Qwen35NeedRepeatPenalty(ctx->generationConfig)) {
+                            ctx->tokens.Push(curRet);
+                        }
+                        ctx->curTokens++;
+                        if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache();
+                            eraseMtpCache(ctx);
+                        } else if (ctx->allTokens.size() >= model->max_positions) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache();
+                            eraseMtpCache(ctx);
+                        }
+                        if (ctx->isEnding) {
+                            break;
+                        }
+                    }
+                    if (!ctx->isEnding && !curAcceptedTokens.empty()) {
+                        if (i < (int)nextInputTokenLists.size() &&
+                            !nextInputTokenLists[i].empty()) {
+                            ctx->currentTokens = nextInputTokenLists[i];
+                        } else {
+                            ctx->currentTokens.assign(1, curAcceptedTokens.back());
+                        }
+                    }
+                }
+                releasePendingResultLogits(logits);
+            }
+
+            for (auto *ptr : ownedAttentionMasks) {
+                delete ptr;
+            }
+            for (auto *ptr : ownedPositionIds) {
+                delete ptr;
+            }
+
+            if (seqLens.empty()) {
+                if (!orders.empty()) {
+                    model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                } else {
+                    model->dictCV.wait(dictLocker);
+                }
+            }
+        }
 #endif
     }
 
@@ -7504,9 +9207,29 @@ namespace fastllm {
             atoi(this->weight.dicts["shared_expert_intermediate_size"].c_str()) > 0) {
             n_shared_experts = 1;
         }
+        mtp_num_hidden_layers = atoi(getDictValue("mtp_num_hidden_layers", "0").c_str());
         weights.clear();
         biass.clear();
         moeWeightsPrepared = false;
+
+        for (int i = 0; i < mtp_num_hidden_layers; i++) {
+            std::string mtpGateWeightName = "mtp.layers." + std::to_string(i) + ".mlp.gate_proj.weight";
+            std::string mtpUpWeightName = "mtp.layers." + std::to_string(i) + ".mlp.up_proj.weight";
+            std::string mtpGateupWeightName = "mtp.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            this->weightMergeRules.push_back(
+                WeightMergeRule({WeightMergeRuleSingle({mtpGateWeightName, mtpUpWeightName},
+                                                        mtpGateupWeightName, std::string("linearSwiglu"))})
+            );
+
+            std::string mtpQWeightName = "mtp.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string mtpKWeightName = "mtp.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string mtpVWeightName = "mtp.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string mtpMergeQkvWeightName = "mtp.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+            this->weightMergeRules.push_back(
+                WeightMergeRule({WeightMergeRuleSingle({mtpQWeightName, mtpKWeightName, mtpVWeightName},
+                                                        mtpMergeQkvWeightName, std::string("linear"))})
+            );
+        }
 
         for (int i = 0; i < block_cnt; i++) {
             std::string w1WeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate_proj.weight";
@@ -8980,6 +10703,300 @@ namespace fastllm {
         }
     }
 
+    bool Qwen3_5Model::HasMtpWeights() const {
+        if (mtp_num_hidden_layers <= 0) {
+            return false;
+        }
+        bool hasMtpQkv =
+            weight.weight.find("mtp.layers.0.self_attn.mergeqkv.weight") != weight.weight.end() ||
+            (weight.weight.find("mtp.layers.0.self_attn.q_proj.weight") != weight.weight.end() &&
+             weight.weight.find("mtp.layers.0.self_attn.k_proj.weight") != weight.weight.end() &&
+             weight.weight.find("mtp.layers.0.self_attn.v_proj.weight") != weight.weight.end());
+        return weight.weight.find("mtp.fc.weight") != weight.weight.end() &&
+               weight.weight.find("mtp.norm.weight") != weight.weight.end() &&
+               weight.weight.find("mtp.pre_fc_norm_embedding.weight") != weight.weight.end() &&
+               weight.weight.find("mtp.pre_fc_norm_hidden.weight") != weight.weight.end() &&
+               hasMtpQkv &&
+               weight.weight.find("mtp.layers.0.self_attn.o_proj.weight") != weight.weight.end() &&
+               weight.weight.find("mtp.layers.0.mlp.gateup_proj.weight") != weight.weight.end() &&
+               weight.weight.find("mtp.layers.0.mlp.down_proj.weight") != weight.weight.end();
+    }
+
+    void Qwen3_5Model::AddMtpRmsNormOffset() {
+        if (mtp_num_hidden_layers <= 0) {
+            return;
+        }
+        Add1(this->weight["mtp.pre_fc_norm_embedding.weight"]);
+        Add1(this->weight["mtp.pre_fc_norm_hidden.weight"]);
+        Add1(this->weight["mtp.norm.weight"]);
+        for (int i = 0; i < mtp_num_hidden_layers; i++) {
+            std::string prefix = "mtp.layers." + std::to_string(i) + ".";
+            Add1(this->weight[prefix + "input_layernorm.weight"]);
+            Add1(this->weight[prefix + "self_attn.q_norm.weight"]);
+            Add1(this->weight[prefix + "self_attn.k_norm.weight"]);
+            Add1(this->weight[prefix + "post_attention_layernorm.weight"]);
+        }
+    }
+
+    void Qwen3_5Model::PrepareMtpWeightsForDevice(int device, bool includeSharedWeights) {
+#ifdef USE_CUDA
+        if (!HasMtpWeights()) {
+            return;
+        }
+        if (mtpWeightsPrepared && mtpWeightsPreparedDevice == device) {
+            return;
+        }
+        auto moveWeight = [&](const std::string &name) {
+            auto it = weight.weight.find(name);
+            if (it != weight.weight.end() && !it->second.dims.empty()) {
+                it->second.ToDevice(DataDevice::CUDA, {device}, true);
+            }
+        };
+        if (includeSharedWeights && GetCudaEmbedding() && !GetLowMemMode()) {
+            moveWeight(language_prefix + "embed_tokens.weight");
+        }
+        if (includeSharedWeights) {
+            moveWeight("lm_head.weight");
+        }
+        moveWeight("mtp.fc.weight");
+        moveWeight("mtp.pre_fc_norm_embedding.weight");
+        moveWeight("mtp.pre_fc_norm_hidden.weight");
+        moveWeight("mtp.norm.weight");
+        for (int i = 0; i < mtp_num_hidden_layers; i++) {
+            std::string prefix = "mtp.layers." + std::to_string(i) + ".";
+            bool hasMergedQkv = weight.weight.find(prefix + "self_attn.mergeqkv.weight") != weight.weight.end();
+            moveWeight(prefix + "input_layernorm.weight");
+            if (hasMergedQkv) {
+                moveWeight(prefix + "self_attn.mergeqkv.weight");
+            } else {
+                moveWeight(prefix + "self_attn.q_proj.weight");
+                moveWeight(prefix + "self_attn.k_proj.weight");
+                moveWeight(prefix + "self_attn.v_proj.weight");
+            }
+            moveWeight(prefix + "self_attn.o_proj.weight");
+            moveWeight(prefix + "self_attn.q_norm.weight");
+            moveWeight(prefix + "self_attn.k_norm.weight");
+            moveWeight(prefix + "post_attention_layernorm.weight");
+            weight[prefix + "mlp.gateup_proj.weight"].tpPackType = TP_PACK_GATEUP;
+            moveWeight(prefix + "mlp.gateup_proj.weight");
+            moveWeight(prefix + "mlp.down_proj.weight");
+        }
+        if (includeSharedWeights) {
+            mtpWeightsPrepared = true;
+            mtpWeightsPreparedDevice = device;
+        }
+#else
+        (void)device;
+        (void)includeSharedWeights;
+#endif
+    }
+
+    Data Qwen3_5Model::BuildMtpPositionIds(const Data &positionIds, int row, int delta) {
+        return BuildMtpPositionIdsSlice(positionIds, row, row + 1, delta);
+    }
+
+    Data Qwen3_5Model::BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta) {
+        Data cpuPositionIds;
+        cpuPositionIds.CopyFrom(positionIds);
+        cpuPositionIds.ToDevice(DataDevice::CPU);
+        if (cpuPositionIds.dataType != DataType::FLOAT32) {
+            ToDataType(cpuPositionIds, DataType::FLOAT32);
+            cpuPositionIds.ToDevice(DataDevice::CPU);
+        }
+        if (cpuPositionIds.dims.size() != 2 || cpuPositionIds.dims[1] <= 0) {
+            int len = std::max(1, end - begin);
+            std::vector<float> values(len);
+            for (int i = 0; i < len; i++) {
+                values[i] = (float)(begin + i + delta);
+            }
+            return Data(DataType::FLOAT32, {1, len}, values);
+        }
+        int rows = cpuPositionIds.dims[0];
+        int cols = cpuPositionIds.dims[1];
+        begin = std::max(0, std::min(begin, cols - 1));
+        end = std::max(begin + 1, std::min(end, cols));
+        int len = end - begin;
+        float *ptr = (float*)cpuPositionIds.cpuData;
+        std::vector<float> values(rows * len);
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < len; c++) {
+                values[r * len + c] = ptr[r * cols + begin + c] + (float)delta;
+            }
+        }
+        return Data(DataType::FLOAT32, {rows, len}, values);
+    }
+
+    int Qwen3_5Model::RunMtpGreedyDraft(int device, MtpKvCache &cache,
+                                        const Data &targetHiddenStates,
+                                        const std::vector<int> &inputTokens,
+                                        const Data &positionIds, int sampleRow,
+                                        Data *sampledHiddenStates) {
+#ifndef USE_CUDA
+        (void)device;
+        (void)cache;
+        (void)targetHiddenStates;
+        (void)inputTokens;
+        (void)positionIds;
+        (void)sampleRow;
+        (void)sampledHiddenStates;
+        return -1;
+#else
+        PrepareMtpWeightsForDevice(device);
+        AssertInFastLLM(HasMtpWeights(), "Qwen3.5 MTP weights are missing.\n");
+        int seqLen = (int)inputTokens.size();
+        AssertInFastLLM(seqLen > 0, "Qwen3.5 MTP needs at least one input token.\n");
+
+        Qwen35ScopedGenericExecutor mtpExecutor("cuda:" + std::to_string(device));
+        FastllmCudaSetDevice(device);
+
+        std::vector<float> tokenValues(seqLen);
+        for (int i = 0; i < seqLen; i++) {
+            tokenValues[i] = (float)inputTokens[i];
+        }
+        Data tokenIds(DataType::FLOAT32, {1, seqLen}, tokenValues);
+        Data hiddenStates;
+        hiddenStates.CopyFrom(targetHiddenStates);
+        if (hiddenStates.dataType != this->dataType) {
+            ToDataType(hiddenStates, this->dataType);
+        }
+        AssertInFastLLM(hiddenStates.dims.size() == 3 && hiddenStates.dims[1] == seqLen,
+                        "Qwen3.5 MTP hidden states length mismatch.\n");
+        Data mtpPositionIds;
+        mtpPositionIds.CopyFrom(positionIds);
+        mtpPositionIds.ToDevice(DataDevice::CUDA, {device}, true);
+
+        Data inputEmbeds, normEmbeds, normHidden, fusedInput;
+        Data &embedWeight = weight[language_prefix + "embed_tokens.weight"];
+        bool useCpuEmbeddingForMtp =
+            !GetCudaEmbedding() || GetLowMemMode() ||
+            embedWeight.dataDevice != DataDevice::CUDA ||
+            embedWeight.cudaData == nullptr ||
+            embedWeight.dataDeviceIds.empty() ||
+            embedWeight.dataDeviceIds[0] != device;
+        if (useCpuEmbeddingForMtp) {
+            Qwen35CpuEmbeddingDirect(tokenIds, embedWeight, inputEmbeds, hiddenStates.dataType);
+            inputEmbeds.ToDevice(DataDevice::CUDA, {device}, true);
+        } else {
+            tokenIds.ToDevice(DataDevice::CUDA, {device}, true);
+            Embedding(tokenIds, embedWeight, inputEmbeds);
+        }
+        if (inputEmbeds.dataType != hiddenStates.dataType) {
+            ToDataType(inputEmbeds, hiddenStates.dataType);
+        }
+        RMSNorm(inputEmbeds, weight["mtp.pre_fc_norm_embedding.weight"], rms_norm_eps, normEmbeds);
+        RMSNorm(hiddenStates, weight["mtp.pre_fc_norm_hidden.weight"], rms_norm_eps, normHidden);
+        Cat(normEmbeds, normHidden, -1, fusedInput);
+        Linear(fusedInput, weight["mtp.fc.weight"], *GetEmptyData(), hiddenStates);
+
+        std::string prefix = "mtp.layers.0.";
+        Data attenInput, qgate, q, gate, k, v, attenOutput, projected, mergedQkv;
+        RMSNorm(hiddenStates, weight[prefix + "input_layernorm.weight"], rms_norm_eps, attenInput);
+        std::string mergeQkvWeightName = prefix + "self_attn.mergeqkv.weight";
+        if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
+            Linear(attenInput, weight[mergeQkvWeightName], *GetEmptyData(), mergedQkv);
+            int qgateDim = num_attention_heads * this->head_dim * 2;
+            int kvDim = num_key_value_heads * this->head_dim;
+            Split(mergedQkv, -1, 0, qgateDim, qgate);
+            Split(mergedQkv, -1, qgateDim, qgateDim + kvDim, k);
+            Split(mergedQkv, -1, qgateDim + kvDim, qgateDim + kvDim * 2, v);
+        } else {
+            Linear(attenInput, weight[prefix + "self_attn.q_proj.weight"], *GetEmptyData(), qgate);
+            Linear(attenInput, weight[prefix + "self_attn.k_proj.weight"], *GetEmptyData(), k);
+            Linear(attenInput, weight[prefix + "self_attn.v_proj.weight"], *GetEmptyData(), v);
+        }
+
+        qgate.Reshape({1, seqLen, -1, this->head_dim * 2});
+        Split(qgate, -1, 0, this->head_dim, q);
+        Split(qgate, -1, this->head_dim, qgate.dims.back(), gate);
+        gate.Reshape({1, seqLen, -1});
+        k.Reshape({1, seqLen, -1, this->head_dim});
+        v.Reshape({1, seqLen, -1, this->head_dim});
+        RMSNorm(q, weight[prefix + "self_attn.q_norm.weight"], rms_norm_eps, q);
+        RMSNorm(k, weight[prefix + "self_attn.k_norm.weight"], rms_norm_eps, k);
+        float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
+        ApplyMultimodalRotary(q, mtpPositionIds, ropeScale);
+        ApplyMultimodalRotary(k, mtpPositionIds, ropeScale);
+        PermuteSelf(q, {0, 2, 1, 3});
+        PermuteSelf(k, {0, 2, 1, 3});
+        PermuteSelf(v, {0, 2, 1, 3});
+        q.Reshape({-1, seqLen, this->head_dim});
+        k.Reshape({-1, seqLen, this->head_dim});
+        v.Reshape({-1, seqLen, this->head_dim});
+
+        auto appendMtpCache = [&](Data &past, Data &cur) {
+            if (past.dims.empty() && past.expansionDims.empty()) {
+                Data typed(cur.dataType);
+                past.CopyFrom(typed);
+                past.dataDevice = DataDevice::CUDA;
+                past.dataDeviceIds = {device};
+            }
+            int unitLen = 128;
+            while ((past.dims.size() == 0 && (past.expansionDims.size() == 0 || cur.dims[1] > past.expansionDims[1]))
+                || (past.dims.size() > 0 && past.dims[1] + cur.dims[1] > past.expansionDims[1])) {
+                std::vector<int> newDims;
+                if (past.Count(0) == 0 || past.dims.size() == 0) {
+                    newDims = {cur.dims[0], ((cur.dims[1] - 1) / unitLen + 1) * unitLen, cur.dims[2]};
+                } else {
+                    newDims = past.dims;
+                    newDims[1] += ((cur.dims[1] - 1) / unitLen + 1) * unitLen;
+                }
+                past.Expansion(newDims);
+            }
+            CatDirect(past, cur, 1);
+        };
+        appendMtpCache(cache.key, k);
+        appendMtpCache(cache.value, v);
+        cache.tokens += seqLen;
+
+        Attention(q, cache.key, cache.value, *GetEmptyData(), attenOutput,
+                  q.dims[0] / cache.key.dims[0], 1.0f / std::sqrt((float)this->head_dim), 1);
+        PermuteSelf(attenOutput, {1, 0, 2});
+        attenOutput.Reshape({1, seqLen, -1});
+        Sigmoid(gate, gate);
+        if (gate.dataType != attenOutput.dataType) {
+            ToDataType(gate, attenOutput.dataType);
+        }
+        MulTo(attenOutput, gate);
+        Linear(attenOutput, weight[prefix + "self_attn.o_proj.weight"], *GetEmptyData(), projected);
+        AddTo(hiddenStates, projected);
+
+        Data mlpInput, gateupResult, swigluResult;
+        RMSNorm(hiddenStates, weight[prefix + "post_attention_layernorm.weight"], rms_norm_eps, mlpInput);
+        MLPBlock(&mlpInput, &weight[prefix + "mlp.gateup_proj.weight"],
+                 &weight[prefix + "mlp.down_proj.weight"],
+                 &gateupResult, &swigluResult, &hiddenStates);
+
+        sampleRow = std::max(0, std::min(sampleRow, seqLen - 1));
+        Data logits, sampleHidden;
+        Data *sampleHiddenPtr = &hiddenStates;
+        if (seqLen > 1) {
+            Split(hiddenStates, 1, sampleRow, sampleRow + 1, sampleHidden);
+            sampleHiddenPtr = &sampleHidden;
+        }
+        RMSNorm(*sampleHiddenPtr, weight["mtp.norm.weight"], rms_norm_eps, *sampleHiddenPtr);
+        Linear(*sampleHiddenPtr, weight["lm_head.weight"], *GetEmptyData(), logits);
+        if (sampledHiddenStates != nullptr) {
+            sampledHiddenStates->CopyFrom(*sampleHiddenPtr);
+        }
+        ToDataType(logits, DataType::FLOAT32);
+        AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.cudaData != nullptr,
+                        "Qwen3.5 MTP greedy draft logits must stay on CUDA.\n");
+        Data &cudaOutput = Qwen35ThreadLocalCudaSamplingOutput();
+        Qwen3CudaPrepareLocalOutput(cudaOutput, device);
+        cudaOutput.dataType = DataType::INT32;
+        cudaOutput.UpdateUnitSize();
+        cudaOutput.Resize({1});
+        cudaOutput.Allocate();
+        FastllmCudaGreedySampling((float*)logits.cudaData,
+                                  (int*)cudaOutput.cudaData,
+                                  1, logits.dims.back());
+        int draft = 0;
+        FastllmCudaCopyFromDeviceToHost(&draft, cudaOutput.cudaData, sizeof(int));
+
+        return draft;
+#endif
+    }
+
     void Qwen3_5Model::AdjustPositionIdsWithDelta(const Data &positionIds,
                                                   const Data &mropePositionDelta,
                                                   Data &adjustedPositionIds) {
@@ -9052,6 +11069,7 @@ namespace fastllm {
                 Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
             }
             Add1(this->weight[language_prefix + "norm.weight"]);
+            AddMtpRmsNormOffset();
             initialized_add1 = true;
         }
 
@@ -10159,6 +12177,7 @@ namespace fastllm {
                 Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
             }
             Add1(this->weight[language_prefix + "norm.weight"]);
+            AddMtpRmsNormOffset();
             initialized_add1 = true;
         }
 

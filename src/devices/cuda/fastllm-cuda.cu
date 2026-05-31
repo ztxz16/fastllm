@@ -6576,6 +6576,64 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluSingleTokenHalfKernel(
 #endif
 }
 
+__global__ void FastllmShiftAppendConv1DPerChannelSiluTwoTokenHalfKernel(
+    half *cache, const half *newTokens, const float *weight, const float *bias,
+    half *output, half *firstTokenCache, int batch, int channels) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (row >= total) {
+        return;
+    }
+
+    int c = row % channels;
+    half *cacheRow = cache + row * 4;
+    const half *tokenRow = newTokens + row * 2;
+    half t0 = tokenRow[0];
+    half t1 = tokenRow[1];
+    half x1 = cacheRow[1];
+    half x2 = cacheRow[2];
+    half x3 = cacheRow[3];
+
+    if (firstTokenCache) {
+        half *firstRow = firstTokenCache + row * 4;
+        firstRow[0] = x1;
+        firstRow[1] = x2;
+        firstRow[2] = x3;
+        firstRow[3] = t0;
+    }
+
+    cacheRow[0] = x2;
+    cacheRow[1] = x3;
+    cacheRow[2] = t0;
+    cacheRow[3] = t1;
+
+    const float *curWeight = weight + c * 4;
+    float value0 = bias ? bias[c] : 0.0f;
+    value0 += __half2float(x1) * curWeight[0];
+    value0 += __half2float(x2) * curWeight[1];
+    value0 += __half2float(x3) * curWeight[2];
+    value0 += __half2float(t0) * curWeight[3];
+
+    float value1 = bias ? bias[c] : 0.0f;
+    value1 += __half2float(x2) * curWeight[0];
+    value1 += __half2float(x3) * curWeight[1];
+    value1 += __half2float(t0) * curWeight[2];
+    value1 += __half2float(t1) * curWeight[3];
+
+    half conv0 = __float2half_rn(value0);
+    half conv1 = __float2half_rn(value1);
+    half *outputRow = output + row * 2;
+#ifdef CUDA_NO_TENSOR_CORE
+    float y0 = __half2float(conv0);
+    float y1 = __half2float(conv1);
+    outputRow[0] = __float2half(y0 / (1.0f + expf(-y0)));
+    outputRow[1] = __float2half(y1 / (1.0f + expf(-y1)));
+#else
+    outputRow[0] = __hdiv(conv0, __hadd(__float2half(1.0f), hexp(-conv0)));
+    outputRow[1] = __hdiv(conv1, __hadd(__float2half(1.0f), hexp(-conv1)));
+#endif
+}
+
 __global__ void FastllmShiftAppendConv1DPerChannelSiluSingleTokenHalfPointerKernel(
     half **caches, const half *newToken, const float *weight, const float *bias,
     half *output, int batch, int channels) {
@@ -6731,6 +6789,61 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(fastllm::Data 
         cudaCache, cudaNewToken, cudaWeight, cudaBias, cudaOutput, batch, channels
     );
     checkCudaErrors("Error: CUDA error in FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaShiftAppendConv1DPerChannelSiluTwoTokenFloat16(fastllm::Data &cache, const fastllm::Data &newTokens,
+                                                               fastllm::Data &weight, fastllm::Data &bias,
+                                                               fastllm::Data &output, fastllm::Data *firstTokenCache) {
+    if (cache.dataDevice != fastllm::DataDevice::CUDA || newTokens.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA) {
+        return false;
+    }
+    if (cache.dataType != fastllm::DataType::FLOAT16 || newTokens.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        (bias.dims.size() > 0 && (bias.dataDevice != fastllm::DataDevice::CUDA || bias.dataType != fastllm::DataType::FLOAT32))) {
+        return false;
+    }
+    bool validWeightShape =
+        (weight.dims.size() == 2 && weight.dims[0] == cache.dims[1] && weight.dims[1] == 4) ||
+        (weight.dims.size() == 3 && weight.dims[0] == cache.dims[1] && weight.dims[1] == 1 && weight.dims[2] == 4);
+    if (cache.dims.size() != 3 || cache.dims[0] <= 0 || cache.dims[2] != 4 ||
+        newTokens.dims.size() != 3 || newTokens.dims[0] != cache.dims[0] ||
+        newTokens.dims[1] != cache.dims[1] || newTokens.dims[2] != 2 ||
+        cache.strides.empty() || newTokens.strides.empty() ||
+        cache.strides.back() != 1 || newTokens.strides.back() != 1 ||
+        !validWeightShape ||
+        (bias.dims.size() > 0 && (bias.dims.size() != 1 || bias.dims[0] != cache.dims[1]))) {
+        return false;
+    }
+
+    output.dataType = cache.dataType;
+    output.Resize({cache.dims[0], cache.dims[1], 2});
+    output.ToDevice(cache.dataDevice, cache.dataDeviceIds);
+    output.Allocate();
+
+    if (firstTokenCache) {
+        firstTokenCache->dataType = cache.dataType;
+        firstTokenCache->Resize(cache.dims);
+        firstTokenCache->ToDevice(cache.dataDevice, cache.dataDeviceIds);
+        firstTokenCache->Allocate();
+    }
+
+    int batch = cache.dims[0];
+    int channels = cache.dims[1];
+    int total = batch * channels;
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (total + threadsPerBlock - 1) / threadsPerBlock;
+    half *cudaCache = (half *) cache.cudaData;
+    const half *cudaNewTokens = (const half *) newTokens.cudaData;
+    const float *cudaWeight = (const float *) weight.cudaData;
+    const float *cudaBias = bias.dims.size() > 0 ? (const float *) bias.cudaData : nullptr;
+    half *cudaOutput = (half *) output.cudaData;
+    half *cudaFirstTokenCache = firstTokenCache ? (half *) firstTokenCache->cudaData : nullptr;
+    FastllmShiftAppendConv1DPerChannelSiluTwoTokenHalfKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        cudaCache, cudaNewTokens, cudaWeight, cudaBias, cudaOutput, cudaFirstTokenCache, batch, channels
+    );
+    checkCudaErrors("Error: CUDA error in FastllmCudaShiftAppendConv1DPerChannelSiluTwoTokenFloat16.", cudaGetLastError());
     return true;
 }
 
