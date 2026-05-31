@@ -703,22 +703,24 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     if (weight.multiDeviceData) {
         return true;
     }
+    bool hasBias = bias.dims.size() > 0;
     weight.multiDeviceData = true;
     bias.multiDeviceData = true;
     int k = weight.dims[0], m = weight.dims[1];
     cudaError_t state = cudaSuccess;
-    float *cudaBiasData = (float*)FastllmCudaMalloc(k * sizeof(float));
-    if (cudaBiasData == nullptr) {
-        fastllm::ErrorInFastLLM("SplitMultiCudaWeight failed to allocate temporary bias for \"" +
-                                weight.name + "\".\n");
-    }
-    if (bias.dims.size() > 0) {
+    float *cudaBiasData = nullptr;
+    if (hasBias) {
+        cudaBiasData = (float*)FastllmCudaMalloc(k * sizeof(float));
+        if (cudaBiasData == nullptr) {
+            fastllm::ErrorInFastLLM("SplitMultiCudaWeight failed to allocate temporary bias for \"" +
+                                    weight.name + "\".\n");
+        }
         state = cudaMemcpy(cudaBiasData, (uint8_t *) bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
-    } else {
-        state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
     }
     if (state != cudaSuccess) {
-        FastllmCudaFree(cudaBiasData);
+        if (cudaBiasData != nullptr) {
+            FastllmCudaFree(cudaBiasData);
+        }
         ResetMultiDeviceData(weight);
         ResetMultiDeviceData(bias);
         checkCudaErrors("Error: CUDA error when split weight!", state);
@@ -744,17 +746,19 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             weight.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(weight, {len, m});
             weight.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             weight.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
-            bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, {len});
+            bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, hasBias ? std::vector<int>{len} : std::vector<int>{});
             bias.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             bias.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
             SetLocalQKVPackMeta(weight.multiDeviceDatas[deviceId], weight, div);
             weight.multiDeviceDatas[deviceId]->Allocate();
-            bias.multiDeviceDatas[deviceId]->Allocate();
+            if (hasBias) {
+                bias.multiDeviceDatas[deviceId]->Allocate();
+            }
 
             deviceWeightData = mallocType == 0 ? weight.multiDeviceDatas[deviceId]->cpuData : weight.multiDeviceDatas[deviceId]->cudaData;
-            deviceBiasData = (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData);
+            deviceBiasData = hasBias ? (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData) : nullptr;
             bool emptyShard = len == 0;
-            if (!emptyShard && (deviceWeightData == nullptr || deviceBiasData == nullptr)) {
+            if (!emptyShard && (deviceWeightData == nullptr || (hasBias && deviceBiasData == nullptr))) {
                 state = cudaErrorMemoryAllocation;
             }
             int curLen = 0;
@@ -784,10 +788,12 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (state != cudaSuccess) {
                         break;
                     }
-                    state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
-                                       (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
-                    if (state != cudaSuccess) {
-                        break;
+                    if (hasBias) {
+                        state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                           (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                        if (state != cudaSuccess) {
+                            break;
+                        }
                     }
                     curLen += copyLen;
                 }
@@ -805,10 +811,12 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (state != cudaSuccess) {
                         break;
                     }
-                    state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
-                                       (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
-                    if (state != cudaSuccess) {
-                        break;
+                    if (hasBias) {
+                        state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                           (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                        if (state != cudaSuccess) {
+                            break;
+                        }
                     }
                     curLen += copyLen;
                 }
@@ -826,10 +834,12 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (state != cudaSuccess) {
                         break;
                     }
-                    state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
-                                       (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
-                    if (state != cudaSuccess) {
-                        break;
+                    if (hasBias) {
+                        state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                           (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                        if (state != cudaSuccess) {
+                            break;
+                        }
                     }
                     curLen += copyLen;
                 }
@@ -862,10 +872,12 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (state != cudaSuccess) {
                         break;
                     }
-                    state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
-                                       (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
-                    if (state != cudaSuccess) {
-                        break;
+                    if (hasBias) {
+                        state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                           (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                        if (state != cudaSuccess) {
+                            break;
+                        }
                     }
                     curLen += copyLen;
                 }
@@ -877,9 +889,11 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (state != cudaSuccess) {
                         break;
                     }
-                    state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(float), GetCudaMemcpyType(mallocType, 1));
-                    if (state != cudaSuccess) {
-                        break;
+                    if (hasBias) {
+                        state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                        if (state != cudaSuccess) {
+                            break;
+                        }
                     }
                     curLen += (it.second - it.first);
                 }
@@ -888,16 +902,18 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             weight.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(weight, {k, len});
             weight.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             weight.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
-            bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, {k});
+            bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, hasBias ? std::vector<int>{k} : std::vector<int>{});
             bias.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             bias.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
             weight.multiDeviceDatas[deviceId]->Allocate();
-            bias.multiDeviceDatas[deviceId]->Allocate();
+            if (hasBias) {
+                bias.multiDeviceDatas[deviceId]->Allocate();
+            }
 
             deviceWeightData = mallocType == 0 ? weight.multiDeviceDatas[deviceId]->cpuData : weight.multiDeviceDatas[deviceId]->cudaData;
-            deviceBiasData = (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData);
+            deviceBiasData = hasBias ? (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData) : nullptr;
             bool emptyShard = len == 0;
-            if (!emptyShard && (deviceWeightData == nullptr || deviceBiasData == nullptr)) {
+            if (!emptyShard && (deviceWeightData == nullptr || (hasBias && deviceBiasData == nullptr))) {
                 state = cudaErrorMemoryAllocation;
             }
 
@@ -1009,7 +1025,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += (it.second - it.first);
                 }
             }
-            if (state == cudaSuccess && !emptyShard) {
+            if (state == cudaSuccess && !emptyShard && hasBias) {
                 if (i == 0) {
                     state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(float), GetCudaMemcpyType(mallocType, 1));
                 } else {
@@ -1019,14 +1035,19 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
         }
 
         if (cudaSuccess != state) {
-            FastllmCudaFree(cudaBiasData);
+            if (cudaBiasData != nullptr) {
+                FastllmCudaFree(cudaBiasData);
+            }
             ResetMultiDeviceData(weight);
             ResetMultiDeviceData(bias);
             checkCudaErrors("Error: CUDA error when split weight!", state);
             return false;
         }
     }
-    FastllmCudaFree(cudaBiasData);
+    if (cudaBiasData != nullptr) {
+        FastllmCudaFree(cudaBiasData);
+        cudaBiasData = nullptr;
+    }
 
     if (weight.dataType == fastllm::DataType::FP8_E4M3) {
         for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
@@ -1157,7 +1178,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
 
     cudaSetDevice(rootDevice);
     FastllmCudaFree(weight.cudaData);
-    FastllmCudaFree(cudaBiasData);
+    if (cudaBiasData != nullptr) {
+        FastllmCudaFree(cudaBiasData);
+    }
     ClearGGUFExtraCudaCaches(weight);
     weight.cudaData = nullptr;
     weight.weightSum.clear();
