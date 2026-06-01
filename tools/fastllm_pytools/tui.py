@@ -100,14 +100,26 @@ class DeployConfig:
     dtype_custom: str = ""
     moe_dtype: str = "auto"
     moe_dtype_custom: str = ""
+    gpu_mem_ratio: str = "0.9"
+    cuda_graph: bool = False
+    chunked_prefill_size: str = "auto"
+    kv_cache_dtype: str = "auto"
+    moe_atype: str = "auto"
+    enable_thinking: str = "auto"
+    tokens: str = "auto"
     threads: str = "auto"
     kv_cache_limit: str = "auto"
     max_batch: str = "auto"
+    temperature: str = ""
+    top_p: str = ""
+    top_k: str = ""
+    repeat_penalty: str = ""
     api_key: str = ""
     hide_input: bool = False
     cache_dir: str = ""
     ori: str = ""
     extra_args: str = ""
+    env_vars: str = ""
 
 
 @dataclass
@@ -170,6 +182,26 @@ MOE_DTYPE_CHOICES: Sequence[Choice] = (
     ("int4g256", "int4g256"),
     ("fp8_e4m3", "fp8_e4m3"),
     ("custom", "自定义"),
+)
+
+KV_CACHE_DTYPE_CHOICES: Sequence[Choice] = (
+    ("auto", "auto"),
+    ("float16", "float16"),
+    ("bfloat16", "bfloat16"),
+    ("fp8_e4m3", "fp8"),
+)
+
+MOE_ATYPE_CHOICES: Sequence[Choice] = (
+    ("auto", "自动/不指定"),
+    ("float32", "float32"),
+    ("float16", "float16"),
+    ("bfloat16", "bfloat16"),
+)
+
+ENABLE_THINKING_CHOICES: Sequence[Choice] = (
+    ("auto", "自动"),
+    ("true", "开启"),
+    ("false", "关闭"),
 )
 
 
@@ -254,25 +286,37 @@ FIELDS: Sequence[FormField] = (
         "输入 8 表示最后 8 层 MOE 放到所选设备；输入 -1 表示全部 MOE 层都放到所选设备。",
         visible=lambda c: c.enable_moe_hybrid,
     ),
-    FormField("dtype", "权重类型", "choice", "HF 模型在线加载时使用的权重类型。", DTYPE_CHOICES),
     FormField(
-        "dtype_custom",
-        "自定义权重类型",
+        "gpu_mem_ratio",
+        "显存利用率",
         "text",
-        "例如 int4g64 或 fastllm 支持的其它 dtype。",
-        visible=lambda c: c.dtype == "custom",
+        "GPU显存使用比例，如 0.9 表示最多使用 90% 的显存。",
     ),
-    FormField("moe_dtype", "MOE权重类型", "choice", "MOE 层单独权重类型；自动表示不传该参数。", MOE_DTYPE_CHOICES),
     FormField(
-        "moe_dtype_custom",
-        "自定义MOE类型",
-        "text",
-        "例如 int4g64 或 fastllm 支持的其它 moe_dtype。",
-        visible=lambda c: c.moe_dtype == "custom",
+        "cuda_graph",
+        "打开CUDA Graph",
+        "bool",
+        "打开后启动时设置 FASTLLM_CUDA_GRAPH=ON，启用 CUDA Graph。",
     ),
-    FormField("threads", "CPU线程", "text", "auto 表示由 fastllm 自动估算；CPU/NUMA 部署时可填写整数。"),
-    FormField("kv_cache_limit", "KV缓存上限", "text", "auto 表示自动；也可填写 5G、100M 等。"),
-    FormField("max_batch", "最大Batch", "text", "auto 表示自动；服务并发较高时可填写整数。"),
+    FormField(
+        "chunked_prefill_size",
+        "预处理分片大小",
+        "text",
+        "分块 prefill 的切片大小；调小可以减少显存占用，auto 表示不指定。",
+    ),
+    FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16 或 fp8。", KV_CACHE_DTYPE_CHOICES),
+    FormField("max_batch", "最大Batch", "text", "每次最多同时推理的询问数量；auto 表示不指定。"),
+    FormField("moe_atype", "MOE激活类型", "choice", "MOE层激活类型，可使用 float32、float16 或 bfloat16。", MOE_ATYPE_CHOICES),
+    FormField("enable_thinking", "思考开关", "choice", "是否开启硬思考开关，需要模型支持。", ENABLE_THINKING_CHOICES),
+    FormField("tokens", "tokens数量", "text", "设置总 token 数量；auto 表示不指定。"),
+    FormField("threads", "线程数", "text", "线程数量；auto 表示由 fastllm 自动估算。"),
+    FormField(
+        "sampling_params",
+        "采样参数",
+        "submenu",
+        "进入二级菜单，配置 temperature、top_p、top_k 和 repeat_penalty。",
+        visible=lambda c: c.command == "server",
+    ),
     FormField(
         "api_key",
         "API Key",
@@ -280,15 +324,15 @@ FIELDS: Sequence[FormField] = (
         "设置后 server 会校验 Bearer token；留空表示不校验。",
         visible=lambda c: c.command == "server",
     ),
-    FormField(
-        "hide_input",
-        "隐藏请求",
-        "bool",
-        "server 日志中隐藏请求内容。",
-        visible=lambda c: c.command == "server",
-    ),
-    FormField("cache_dir", "缓存目录", "text", "在线下载模型时使用的缓存目录；留空使用默认缓存，本地路径可按 Tab 补全。"),
-    FormField("extra_args", "额外参数", "text", "直接追加到 ftllm 命令末尾，例如 --cuda_slab 1024。"),
+    FormField("extra_args", "其它参数", "text", "直接追加到 ftllm 命令末尾，例如 --cuda_slab 1024。"),
+    FormField("env_vars", "环境变量", "text", "启动前设置环境变量，格式 KEY=VALUE KEY2=VALUE2，例如 FASTLLM_ACTIVATE_NUMA=ON。"),
+)
+
+SAMPLING_FIELDS: Sequence[FormField] = (
+    FormField("temperature", "temperature", "text", "覆盖服务端默认 temperature；留空表示使用模型默认值。"),
+    FormField("top_p", "top_p", "text", "覆盖服务端默认 top_p；留空表示使用模型默认值。"),
+    FormField("top_k", "top_k", "text", "覆盖服务端默认 top_k；留空表示使用模型默认值。"),
+    FormField("repeat_penalty", "repeat_penalty", "text", "覆盖服务端默认 repeat_penalty；留空表示使用模型默认值。"),
 )
 
 BASIC_FIELD_KEYS = {
@@ -378,6 +422,42 @@ def is_gguf_model(model_path: str) -> bool:
     return str(model_path).strip().lower().endswith(".gguf")
 
 
+def _is_valid_env_name(name: str) -> bool:
+    if not name:
+        return False
+    first = name[0]
+    if not (first == "_" or "A" <= first <= "Z" or "a" <= first <= "z"):
+        return False
+    return all(ch == "_" or "A" <= ch <= "Z" or "a" <= ch <= "z" or "0" <= ch <= "9" for ch in name)
+
+
+def parse_env_vars(value: str) -> dict:
+    raw = str(value).strip()
+    if not raw:
+        return {}
+    parts = shlex.split(raw.replace(";", " "))
+    env = {}
+    for part in parts:
+        if "=" not in part:
+            raise ValueError(f"环境变量缺少 '=': {part}")
+        key, env_value = part.split("=", 1)
+        if not _is_valid_env_name(key):
+            raise ValueError(f"环境变量名无效: {key}")
+        env[key] = env_value
+    return env
+
+
+def build_fastllm_env(config: DeployConfig) -> dict:
+    env = parse_env_vars(config.env_vars)
+    if config.cuda_graph:
+        env["FASTLLM_CUDA_GRAPH"] = "ON"
+    return env
+
+
+def _env_prefix(config: DeployConfig) -> List[str]:
+    return [f"{key}={shlex.quote(value)}" for key, value in build_fastllm_env(config).items()]
+
+
 def _cuda_device_id(value: str) -> str:
     value = str(value).strip()
     if value.lower().startswith("cuda:"):
@@ -418,6 +498,61 @@ def _is_valid_moe_device_layers(value: str) -> bool:
     except ValueError:
         return False
     return layers == -1 or layers > 0
+
+
+def _is_auto_or_empty(value: str) -> bool:
+    return str(value).strip() in ("", "auto")
+
+
+def _is_positive_int_or_auto(value: str) -> bool:
+    if _is_auto_or_empty(value):
+        return True
+    try:
+        return int(str(value).strip()) > 0
+    except ValueError:
+        return False
+
+
+def _is_positive_float_or_auto(value: str) -> bool:
+    if _is_auto_or_empty(value):
+        return True
+    try:
+        return float(str(value).strip()) > 0
+    except ValueError:
+        return False
+
+
+def _is_ratio(value: str) -> bool:
+    try:
+        ratio = float(str(value).strip())
+    except ValueError:
+        return False
+    return 0 < ratio <= 1
+
+
+def _is_optional_float(value: str, min_value: Optional[float] = None, max_value: Optional[float] = None) -> bool:
+    value = str(value).strip()
+    if value == "":
+        return True
+    try:
+        number = float(value)
+    except ValueError:
+        return False
+    if min_value is not None and number < min_value:
+        return False
+    if max_value is not None and number > max_value:
+        return False
+    return True
+
+
+def _is_optional_positive_int(value: str) -> bool:
+    value = str(value).strip()
+    if value == "":
+        return True
+    try:
+        return int(value) > 0
+    except ValueError:
+        return False
 
 
 def _optional_text(value: str, auto_values: Sequence[str] = ("", "auto")) -> str:
@@ -825,6 +960,12 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     if config.enable_moe_hybrid:
         _add_option(argv, "--moe_device", config.moe_device.strip())
         _add_option(argv, "--moe_device_layers", config.moe_device_layers.strip())
+    _add_option(argv, "--gpu_mem_ratio", _optional_text(config.gpu_mem_ratio))
+    _add_option(argv, "--chunked_prefill_size", _optional_text(config.chunked_prefill_size))
+    _add_option(argv, "--kv_cache_dtype", _optional_text(config.kv_cache_dtype))
+    _add_option(argv, "--moe_atype", _optional_text(config.moe_atype))
+    _add_option(argv, "--enable_thinking", _optional_text(config.enable_thinking))
+    _add_option(argv, "--tokens", _optional_text(config.tokens))
     _add_option(argv, "--dtype", dtype)
     _add_option(argv, "--moe_dtype", moe_dtype)
     _add_option(argv, "-t", _optional_text(config.threads))
@@ -839,6 +980,10 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
         _add_option(argv, "--host", config.host.strip())
         _add_option(argv, "--port", config.port.strip())
         _add_option(argv, "--api_key", config.api_key.strip())
+        _add_option(argv, "--temperature", config.temperature.strip())
+        _add_option(argv, "--top_p", config.top_p.strip())
+        _add_option(argv, "--top_k", config.top_k.strip())
+        _add_option(argv, "--repeat_penalty", config.repeat_penalty.strip())
         if config.hide_input:
             argv.append("--hide_input")
     elif config.command == "webui":
@@ -851,7 +996,11 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
 
 
 def build_fastllm_command(config: DeployConfig) -> str:
-    return " ".join(shlex.quote(part) for part in build_fastllm_argv(config))
+    try:
+        env_prefix = _env_prefix(config)
+    except ValueError as exc:
+        env_prefix = [f"<环境变量错误:{exc}>"]
+    return " ".join(env_prefix + [shlex.quote(part) for part in build_fastllm_argv(config)])
 
 
 def validate_config(config: DeployConfig) -> List[str]:
@@ -877,15 +1026,17 @@ def validate_config(config: DeployConfig) -> List[str]:
         except ValueError:
             errors.append("端口必须是整数。")
 
-    for label, value in (("CPU线程", config.threads), ("最大Batch", config.max_batch)):
-        value = value.strip()
-        if value in ("", "auto"):
-            continue
-        try:
-            if int(value) <= 0:
-                errors.append(f"{label}必须是正整数或 auto。")
-        except ValueError:
+    for label, value in (
+        ("预处理分片大小", config.chunked_prefill_size),
+        ("最大Batch", config.max_batch),
+        ("tokens数量", config.tokens),
+        ("线程数", config.threads),
+    ):
+        if not _is_positive_int_or_auto(value):
             errors.append(f"{label}必须是正整数或 auto。")
+
+    if not _is_ratio(config.gpu_mem_ratio):
+        errors.append("显存利用率必须是 0 到 1 之间的数字，例如 0.9。")
 
     if config.command == "server" and not config.host.strip():
         errors.append("监听地址不能为空。")
@@ -905,11 +1056,25 @@ def validate_config(config: DeployConfig) -> List[str]:
     if config.moe_dtype == "custom" and not config.moe_dtype_custom.strip():
         errors.append("选择自定义MOE类型时必须填写自定义MOE类型。")
 
+    if not _is_optional_float(config.temperature, min_value=0):
+        errors.append("temperature 必须是大于等于 0 的数字，或留空使用模型默认值。")
+    if not _is_optional_float(config.top_p, min_value=0, max_value=1):
+        errors.append("top_p 必须是 0 到 1 之间的数字，或留空使用模型默认值。")
+    if not _is_optional_positive_int(config.top_k):
+        errors.append("top_k 必须是正整数，或留空使用模型默认值。")
+    if not _is_optional_float(config.repeat_penalty, min_value=0):
+        errors.append("repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。")
+
     if config.extra_args.strip():
         try:
             shlex.split(config.extra_args)
         except ValueError as exc:
             errors.append(f"额外参数无法解析: {exc}")
+    if config.env_vars.strip():
+        try:
+            parse_env_vars(config.env_vars)
+        except ValueError as exc:
+            errors.append(str(exc))
     return errors
 
 
@@ -1166,7 +1331,7 @@ class FastllmCursesTUI:
     def _advanced_toggle_help(self) -> str:
         if self.form_show_advanced:
             return "返回基础配置。"
-        return "进入高级选项，配置 MOE、dtype、线程、缓存和额外参数。"
+        return "进入高级选项，配置显存、缓存、batch、思考、采样、API Key、其它参数和环境变量。"
 
     def _advanced_toggle_selected(self, visible_fields: Sequence[FormField]) -> bool:
         return self.selected >= len(visible_fields)
@@ -1175,7 +1340,7 @@ class FastllmCursesTUI:
         self.form_show_advanced = not self.form_show_advanced
         self.selected = 0
         if self.form_show_advanced:
-            self.status = "高级选项已打开；这里包含 MOE、dtype、线程、缓存和额外参数。"
+            self.status = "高级选项已打开；采样参数在二级菜单中配置。"
         else:
             self.status = "已返回基础配置。"
 
@@ -1597,6 +1762,17 @@ class FastllmCursesTUI:
         self._refresh(stdscr)
 
     def _display_value(self, field: FormField) -> str:
+        if field.kind == "submenu":
+            if field.key == "sampling_params":
+                items = [
+                    ("temperature", self.config.temperature),
+                    ("top_p", self.config.top_p),
+                    ("top_k", self.config.top_k),
+                    ("repeat_penalty", self.config.repeat_penalty),
+                ]
+                active = [f"{name}={value}" for name, value in items if str(value).strip()]
+                return ", ".join(active) if active else "(使用模型默认值)"
+            return "进入"
         value = getattr(self.config, field.key)
         if field.kind == "bool":
             return "是" if value else "否"
@@ -1610,7 +1786,12 @@ class FastllmCursesTUI:
         return str(value)
 
     def _edit_field(self, stdscr, field: FormField):
-        if field.kind == "bool":
+        if field.kind == "submenu":
+            if field.key == "sampling_params":
+                self._sampling_loop(stdscr)
+            else:
+                self.status = "未知二级菜单。"
+        elif field.kind == "bool":
             setattr(self.config, field.key, not getattr(self.config, field.key))
             if field.key == "enable_moe_hybrid" and getattr(self.config, field.key):
                 apply_moe_hybrid_defaults(self.config)
@@ -1637,6 +1818,79 @@ class FastllmCursesTUI:
 
     def _apply_command_defaults(self, old_command: str, new_command: str):
         apply_command_defaults(self.config, old_command, new_command)
+
+    def _sampling_loop(self, stdscr):
+        selected = 0
+        button_selected = 0
+        buttons: Sequence[Choice] = (("edit", "编辑"), ("back", "返回"))
+        self.status = "采样参数未填写时使用模型默认值。"
+        while True:
+            selected = min(selected, max(0, len(SAMPLING_FIELDS) - 1))
+            button_selected = min(button_selected, max(0, len(buttons) - 1))
+            self._draw_sampling(stdscr, selected, buttons, button_selected)
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                selected = _previous_index(selected, len(SAMPLING_FIELDS))
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = _next_index(selected, len(SAMPLING_FIELDS))
+            elif key in (curses.KEY_LEFT, curses.KEY_BTAB):
+                button_selected = (button_selected - 1) % len(buttons)
+            elif key in (curses.KEY_RIGHT, 9):
+                button_selected = (button_selected + 1) % len(buttons)
+            elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                action = buttons[button_selected][0]
+                if action == "edit":
+                    value = self._input_text(stdscr, SAMPLING_FIELDS[selected])
+                    if value is not None:
+                        setattr(self.config, SAMPLING_FIELDS[selected].key, value)
+                        self.status = f"{SAMPLING_FIELDS[selected].label}已更新。"
+                elif action == "back":
+                    self.status = "已返回高级选项。"
+                    return
+            elif key in (ord("f"), ord("F")):
+                value = self._input_text(stdscr, SAMPLING_FIELDS[selected])
+                if value is not None:
+                    setattr(self.config, SAMPLING_FIELDS[selected].key, value)
+                    self.status = f"{SAMPLING_FIELDS[selected].label}已更新。"
+            elif key in (ord("b"), ord("B"), 27):
+                self.status = "已返回高级选项。"
+                return
+            elif key in (ord("q"), ord("Q")):
+                self.status = "已返回高级选项。"
+                return
+
+    def _draw_sampling(self, stdscr, selected: int, buttons: Sequence[Choice], button_selected: int):
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        if height < 18 or width < 72:
+            self._safe_addstr(stdscr, 0, 0, "终端窗口太小，至少需要 72x18。请调整窗口大小。", curses.A_BOLD)
+            self._refresh(stdscr)
+            return
+
+        panel = self._draw_panel(stdscr, "fastllm TUI 部署向导 - 采样参数", 18)
+        label_x = panel["left"]
+        value_x = panel["left"] + 18
+        self._safe_addstr(stdscr, panel["content_top"], panel["left"], "上下选择采样字段，左右/Tab选择底部按钮，Enter执行。")
+
+        form_top = panel["content_top"] + 2
+        for row, index in enumerate(range(len(SAMPLING_FIELDS)), start=form_top):
+            field = SAMPLING_FIELDS[index]
+            attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+            value = self._display_value(field)
+            self._safe_addstr(stdscr, row, label_x, f"{field.label}:".ljust(16), attr)
+            self._safe_addstr(stdscr, row, value_x, _clip_display(value, max(1, panel["right"] - value_x)), attr)
+
+        help_y = panel["content_bottom"] - 5
+        selected_field = SAMPLING_FIELDS[selected]
+        self._safe_addstr(stdscr, help_y, panel["left"], _clip_display(selected_field.help, panel["width"]), curses.A_DIM)
+        command = build_fastllm_command(self.config)
+        self._safe_addstr(stdscr, panel["content_bottom"] - 4, panel["left"], "命令预览:", curses.A_BOLD)
+        self._safe_addstr(stdscr, panel["content_bottom"] - 3, panel["left"], _clip_display(command, panel["width"]))
+        if _display_width(command) > panel["width"]:
+            self._safe_addstr(stdscr, panel["content_bottom"] - 2, panel["left"], _clip_display(command[panel["width"] :], panel["width"]))
+        self._draw_buttons(stdscr, panel["content_bottom"] - 1, panel["left"], buttons, button_selected, panel["width"])
+        self._safe_addstr(stdscr, panel["content_bottom"], panel["left"], _clip_display(self.status, panel["width"]), curses.A_BOLD)
+        self._refresh(stdscr)
 
     def _choose(self, stdscr, field: FormField) -> Optional[str]:
         choices = list(field.choices)
@@ -2034,6 +2288,14 @@ def _save_plain_config(saved_configs: List[DeployConfig], config: DeployConfig, 
 
 def _prompt_deploy_field(config: DeployConfig, field: FormField):
     print(f"\n{field.help}")
+    if field.kind == "submenu":
+        if field.key == "sampling_params":
+            raw = _read_line("是否编辑采样参数? (y/N): ").strip().lower()
+            if raw in ("y", "yes"):
+                print("\n采样参数")
+                for sampling_field in SAMPLING_FIELDS:
+                    _prompt_deploy_field(config, sampling_field)
+        return
     if field.kind == "choice":
         old_command = config.command
         old_device = config.device
@@ -2218,9 +2480,13 @@ def _should_use_plain(plain: bool) -> bool:
     return False
 
 
-def _execute(argv: Sequence[str]) -> int:
+def _execute(argv: Sequence[str], env_overrides: Optional[dict] = None) -> int:
+    env = None
+    if env_overrides:
+        env = os.environ.copy()
+        env.update(env_overrides)
     try:
-        return subprocess.call(list(argv))
+        return subprocess.call(list(argv), env=env)
     except KeyboardInterrupt:
         return 130
 
@@ -2247,8 +2513,8 @@ def FastllmTUI(plain: bool = False) -> int:
     if action == "start":
         assert isinstance(config, DeployConfig)
         argv = build_fastllm_argv(config)
-        print("Running: " + " ".join(shlex.quote(part) for part in argv))
-        return _execute(argv)
+        print("Running: " + build_fastllm_command(config))
+        return _execute(argv, build_fastllm_env(config))
     return 0
 
 
