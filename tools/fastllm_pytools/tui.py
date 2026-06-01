@@ -16,7 +16,7 @@ except ImportError:
 Choice = Tuple[str, str]
 ModelGroup = Tuple[str, str, Sequence[Choice]]
 PATH_COMPLETION_FIELDS = {"model", "cache_dir", "ori"}
-DIRECTORY_COMPLETION_FIELDS = {"model", "cache_dir", "ori"}
+DIRECTORY_COMPLETION_FIELDS = {"cache_dir", "ori"}
 CONTENT_MAX_WIDTH = 96
 PANEL_MAX_HEIGHT = 28
 PANEL_PADDING_X = 2
@@ -174,7 +174,14 @@ MOE_DTYPE_CHOICES: Sequence[Choice] = (
 
 
 FIELDS: Sequence[FormField] = (
-    FormField("model", "模型路径", "text", "必填，必须是已存在的本地模型目录；可选择已下载模型，或按 Tab 补全目录。"),
+    FormField("model", "模型路径", "text", "必填，必须是已存在的本地模型目录或 GGUF 文件；可选择已下载模型，或按 Tab 补全路径。"),
+    FormField(
+        "ori",
+        "模型配置文件夹",
+        "text",
+        "GGUF 文件对应的原始模型目录；会传给 --ori，用于读取 config.json 等模型配置。",
+        visible=lambda c: is_gguf_model(c.model),
+    ),
     FormField("name", "配置名称", "text", "保存在首页命令列表中的名称；新建时自动生成，可按需修改。"),
     FormField(
         "command",
@@ -281,7 +288,6 @@ FIELDS: Sequence[FormField] = (
         visible=lambda c: c.command == "server",
     ),
     FormField("cache_dir", "缓存目录", "text", "在线下载模型时使用的缓存目录；留空使用默认缓存，本地路径可按 Tab 补全。"),
-    FormField("ori", "原始模型", "text", "读取 GGUF 时可指定原始模型目录，本地路径可按 Tab 补全。"),
     FormField("extra_args", "额外参数", "text", "直接追加到 ftllm 命令末尾，例如 --cuda_slab 1024。"),
 )
 
@@ -289,6 +295,7 @@ BASIC_FIELD_KEYS = {
     "name",
     "command",
     "model",
+    "ori",
     "model_name",
     "host",
     "port",
@@ -365,6 +372,10 @@ def _resolve_custom(value: str, custom_value: str) -> str:
     if value == "auto":
         return ""
     return value.strip()
+
+
+def is_gguf_model(model_path: str) -> bool:
+    return str(model_path).strip().lower().endswith(".gguf")
 
 
 def _cuda_device_id(value: str) -> str:
@@ -820,7 +831,8 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "--kv_cache_limit", _optional_text(config.kv_cache_limit))
     _add_option(argv, "--max_batch", _optional_text(config.max_batch))
     _add_option(argv, "--cache_dir", _expand_user_path(config.cache_dir.strip()))
-    _add_option(argv, "--ori", _expand_user_path(config.ori.strip()))
+    if is_gguf_model(config.model):
+        _add_option(argv, "--ori", _expand_user_path(config.ori.strip()))
 
     if config.command == "server":
         _add_option(argv, "--model_name", effective_model_name(config))
@@ -847,8 +859,15 @@ def validate_config(config: DeployConfig) -> List[str]:
     model_path = _expand_user_path(config.model.strip())
     if not model_path:
         errors.append("模型路径不能为空。")
+    elif is_gguf_model(model_path):
+        if not os.path.isfile(model_path):
+            errors.append("GGUF模型路径必须是已存在的本地 .gguf 文件。")
     elif not os.path.isdir(model_path):
-        errors.append("模型路径必须是已存在的本地目录。")
+        errors.append("模型路径必须是已存在的本地模型目录，或 .gguf 文件。")
+
+    ori_path = _expand_user_path(config.ori.strip())
+    if is_gguf_model(config.model) and ori_path and not os.path.isdir(ori_path):
+        errors.append("模型配置文件夹必须是已存在的本地目录。")
 
     if config.command in ("server", "webui"):
         try:
@@ -1673,7 +1692,7 @@ class FastllmCursesTUI:
                 stdscr,
                 field,
                 str(getattr(self.config, field.key)),
-                directories_only=True,
+                directories_only=False,
             )
 
         choices = downloaded_models + [("__manual__", "手动输入路径")]
@@ -1699,7 +1718,7 @@ class FastllmCursesTUI:
                         stdscr,
                         field,
                         str(getattr(self.config, field.key)),
-                        directories_only=True,
+                        directories_only=False,
                     )
                 return value
             elif key in (27, ord("q"), ord("Q")):
