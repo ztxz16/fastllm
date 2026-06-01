@@ -213,7 +213,105 @@ __global__ void FastllmGemvHalfInt4GroupKernelMultiRow(half *A, uint8_t *B, half
     __syncthreads();
 }
 
+// 优化版本: 每个 warp 负责一行输出, 每个 lane 一次加载 8 个 INT4 权重字节 (uint2 = 16 个 nibble),
+// 使用 warp shuffle 归约, 去除 shared memory 与 __syncthreads。float 输入版本。
+// 参照 FP8 的 warp kernel。要求 m % 16 == 0 且 groupCnt % 16 == 0。
+template <int WARPS_PER_BLOCK, int PART>
+__global__ void FastllmGemvFloatInt4GroupKernelWarpMultiRow(
+        const float * __restrict__ A, const uint8_t * __restrict__ B,
+        float * __restrict__ C, const float * __restrict__ bias,
+        const half * __restrict__ scales, const half * __restrict__ mins,
+        int m, int k, int group, int groupCnt) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    if (st >= k) return;
+
+    const uint8_t *baseB = B + (size_t)st * (m / 2);
+    const half *rowScales = scales + (size_t)st * group;
+    const half *rowMins = mins + (size_t)st * group;
+
+    float acc[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) acc[x] = 0.0f;
+
+    const int numUnits = m >> 4;  // 每单元 16 个元素 (8 字节权重)
+    for (int u = laneId; u < numUnits; u += 32) {
+        const int i = u << 4;
+        const int g = i / groupCnt;
+        const float curScale = __half2float(__ldg(rowScales + g));
+        const float curMin = __half2float(__ldg(rowMins + g));
+
+        union_char8 bw;
+        bw.in = *reinterpret_cast<const uint2 *>(baseB + (size_t)u * 8);
+        float wval[16];
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const uint8_t byteVal = bw.out[b];
+            wval[b * 2]     = curMin + curScale * (float)(byteVal >> 4);
+            wval[b * 2 + 1] = curMin + curScale * (float)(byteVal & 15);
+        }
+
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            const float *Ax = A + (size_t)x * m + i;
+            float4 a0 = *reinterpret_cast<const float4 *>(Ax);
+            float4 a1 = *reinterpret_cast<const float4 *>(Ax + 4);
+            float4 a2 = *reinterpret_cast<const float4 *>(Ax + 8);
+            float4 a3 = *reinterpret_cast<const float4 *>(Ax + 12);
+            acc[x] += a0.x * wval[0]  + a0.y * wval[1]  + a0.z * wval[2]  + a0.w * wval[3]
+                    + a1.x * wval[4]  + a1.y * wval[5]  + a1.z * wval[6]  + a1.w * wval[7]
+                    + a2.x * wval[8]  + a2.y * wval[9]  + a2.z * wval[10] + a2.w * wval[11]
+                    + a3.x * wval[12] + a3.y * wval[13] + a3.z * wval[14] + a3.w * wval[15];
+        }
+    }
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float v = acc[x];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        acc[x] = v;
+    }
+
+    if (laneId == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            C[st + (size_t)k * x] = acc[x] + bias[st];
+        }
+    }
+}
+
 void LaunchFastllmGemmFp32Int4Group(float *input, uint8_t *weight, float *output, float *bias, half *scales, half *mins, int n, int m, int k, int group, int groupCnt) {
+    // 满足 16 对齐时走 warp 优化版 GEMV (参照 FP8 warp kernel)。
+    if ((m & 15) == 0 && groupCnt > 0 && (groupCnt & 15) == 0) {
+        constexpr int W = 8;  // 每个 block 8 个 warp (256 线程)
+        const int grid = (k + W - 1) / W;
+#define FASTLLM_INT4G_WARP_LAUNCH_F32(PARTVAL, OFF) \
+        FastllmGemvFloatInt4GroupKernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
+            input + (OFF) * m, weight, output + (OFF) * k, bias, scales, mins, m, k, group, groupCnt)
+        switch (n) {
+            case 1:  FASTLLM_INT4G_WARP_LAUNCH_F32(1, 0);  return;
+            case 2:  FASTLLM_INT4G_WARP_LAUNCH_F32(2, 0);  return;
+            case 3:  FASTLLM_INT4G_WARP_LAUNCH_F32(3, 0);  return;
+            case 4:  FASTLLM_INT4G_WARP_LAUNCH_F32(4, 0);  return;
+            case 5:  FASTLLM_INT4G_WARP_LAUNCH_F32(5, 0);  return;
+            case 6:  FASTLLM_INT4G_WARP_LAUNCH_F32(6, 0);  return;
+            case 7:  FASTLLM_INT4G_WARP_LAUNCH_F32(7, 0);  return;
+            case 8:  FASTLLM_INT4G_WARP_LAUNCH_F32(8, 0);  return;
+            default: break;
+        }
+        int i = 0;
+        for (; i + 7 < n; i += 8) FASTLLM_INT4G_WARP_LAUNCH_F32(8, i);
+        for (; i + 3 < n; i += 4) FASTLLM_INT4G_WARP_LAUNCH_F32(4, i);
+        for (; i + 1 < n; i += 2) FASTLLM_INT4G_WARP_LAUNCH_F32(2, i);
+        for (; i < n; i++)        FASTLLM_INT4G_WARP_LAUNCH_F32(1, i);
+#undef FASTLLM_INT4G_WARP_LAUNCH_F32
+        return;
+    }
+
     for (int i = 0; i < n; i++) {
 #ifdef CUDA_NO_TENSOR_CORE
         FastllmGemvInt4GroupKernel3<64, 4> <<< k / 4, 64 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k, group, groupCnt);
@@ -542,7 +640,111 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
     return true;
 }
 
+// 优化版本: 每个 warp 负责一行输出, 每个 lane 一次加载 8 个 INT4 权重字节 (uint2 = 16 个 nibble),
+// 使用 warp shuffle 归约, 去除 shared memory 与 __syncthreads, 显著提升访存带宽利用率。
+// 参照 FP8 的 FastllmGemvHalfFP8E4M3KernelWarpMultiRow。
+// 要求 m % 16 == 0 且 groupCnt % 16 == 0 (AWQ groupCnt 32/64/128 均满足),
+// 这样每 16 个元素的对齐单元必定落在同一量化组内, scale/min 取一次即可。
+template <int WARPS_PER_BLOCK, int PART>
+__global__ void FastllmGemvHalfInt4GroupKernelWarpMultiRow(
+        const half * __restrict__ A, const uint8_t * __restrict__ B,
+        half * __restrict__ C, const half * __restrict__ bias,
+        const half * __restrict__ scales, const half * __restrict__ mins,
+        int m, int k, int group, int groupCnt) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    if (st >= k) return;
+
+    const uint8_t *baseB = B + (size_t)st * (m / 2);
+    const half *rowScales = scales + (size_t)st * group;
+    const half *rowMins = mins + (size_t)st * group;
+
+    float acc[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) acc[x] = 0.0f;
+
+    const int numUnits = m >> 4;  // 每单元 16 个元素 (8 字节权重)
+    for (int u = laneId; u < numUnits; u += 32) {
+        const int i = u << 4;
+        const int g = i / groupCnt;
+        const float curScale = __half2float(__ldg(rowScales + g));
+        const float curMin = __half2float(__ldg(rowMins + g));
+
+        union_char8 bw;
+        bw.in = *reinterpret_cast<const uint2 *>(baseB + (size_t)u * 8);
+        // 解出 16 个权重值: 字节 b 的高 nibble = 元素 2b, 低 nibble = 元素 2b+1
+        float wval[16];
+#pragma unroll
+        for (int b = 0; b < 8; b++) {
+            const uint8_t byteVal = bw.out[b];
+            wval[b * 2]     = curMin + curScale * (float)(byteVal >> 4);
+            wval[b * 2 + 1] = curMin + curScale * (float)(byteVal & 15);
+        }
+
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            const half *Ax = A + (size_t)x * m + i;
+            union_half8 a0, a1;
+            a0.in = *reinterpret_cast<const uint4 *>(Ax);
+            a1.in = *reinterpret_cast<const uint4 *>(Ax + 8);
+            float gsum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; j++) gsum += (float)a0.out[j] * wval[j];
+#pragma unroll
+            for (int j = 0; j < 8; j++) gsum += (float)a1.out[j] * wval[8 + j];
+            acc[x] += gsum;
+        }
+    }
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float v = acc[x];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        acc[x] = v;
+    }
+
+    if (laneId == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            float r = acc[x];
+            if (bias != nullptr) r += (float)bias[st];
+            C[st + (size_t)k * x] = (half)r;
+        }
+    }
+}
+
 void LaunchFastllmGemmFp16Int4Group(half *input, uint8_t *weight, half *output, half *bias, half *scales, half *mins, int n, int m, int k, int group, int groupCnt) {
+    // 满足 16 对齐时走 warp 优化版 GEMV (参照 FP8 warp kernel)。
+    if ((m & 15) == 0 && groupCnt > 0 && (groupCnt & 15) == 0) {
+        constexpr int W = 8;  // 每个 block 8 个 warp (256 线程)
+        const int grid = (k + W - 1) / W;
+#define FASTLLM_INT4G_WARP_LAUNCH(PARTVAL, OFF) \
+        FastllmGemvHalfInt4GroupKernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
+            input + (OFF) * m, weight, output + (OFF) * k, bias, scales, mins, m, k, group, groupCnt)
+        switch (n) {
+            case 1:  FASTLLM_INT4G_WARP_LAUNCH(1, 0);  return;
+            case 2:  FASTLLM_INT4G_WARP_LAUNCH(2, 0);  return;
+            case 3:  FASTLLM_INT4G_WARP_LAUNCH(3, 0);  return;
+            case 4:  FASTLLM_INT4G_WARP_LAUNCH(4, 0);  return;
+            case 5:  FASTLLM_INT4G_WARP_LAUNCH(5, 0);  return;
+            case 6:  FASTLLM_INT4G_WARP_LAUNCH(6, 0);  return;
+            case 7:  FASTLLM_INT4G_WARP_LAUNCH(7, 0);  return;
+            case 8:  FASTLLM_INT4G_WARP_LAUNCH(8, 0);  return;
+            default: break;
+        }
+        int i = 0;
+        for (; i + 7 < n; i += 8) FASTLLM_INT4G_WARP_LAUNCH(8, i);
+        for (; i + 3 < n; i += 4) FASTLLM_INT4G_WARP_LAUNCH(4, i);
+        for (; i + 1 < n; i += 2) FASTLLM_INT4G_WARP_LAUNCH(2, i);
+        for (; i < n; i++)        FASTLLM_INT4G_WARP_LAUNCH(1, i);
+#undef FASTLLM_INT4G_WARP_LAUNCH
+        return;
+    }
+
     if (n == 1) {
         FastllmGemvHalfInt4GroupKernelMultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
     } else if (n == 2) {
