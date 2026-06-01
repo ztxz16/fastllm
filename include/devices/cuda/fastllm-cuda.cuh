@@ -430,6 +430,9 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int batch, int vocabSize);
 bool FastllmCudaGreedySampling(float *logits, int *output,
                                int batch, int vocabSize);
+bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
+                                         float *scores, int batch,
+                                         int vocabSize);
 bool FastllmCudaSampleTopK(float *topk, float *temperatures,
                            int *topKArr, float *topPArr, float *randoms,
                            int *output,

@@ -6221,6 +6221,69 @@ bool FastllmCudaGreedySampling(float *logits, int *output,
     return true;
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGreedySamplingWithScoresKernel(float *logits, int *output,
+                                                      float *scores, int vocabSize) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    float *row = logits + (long long)b * vocabSize;
+
+    __shared__ float maxData[THREAD_PER_BLOCK];
+    __shared__ int idData[THREAD_PER_BLOCK];
+    float localMax = -1.0e30f;
+    int localId = 0;
+    for (int i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
+        float v = row[i];
+        if (v > localMax) {
+            localMax = v;
+            localId = i;
+        }
+    }
+    maxData[tid] = localMax;
+    idData[tid] = localId;
+    __syncthreads();
+
+    for (int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float other = maxData[tid + s];
+            int otherId = idData[tid + s];
+            if (maxData[tid] < other ||
+                (maxData[tid] == other && idData[tid] > otherId)) {
+                maxData[tid] = other;
+                idData[tid] = otherId;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[b] = idData[0];
+        scores[b] = maxData[0];
+    }
+}
+
+bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
+                                         float *scores, int batch,
+                                         int vocabSize) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (logits == nullptr || output == nullptr || scores == nullptr ||
+        vocabSize <= 0) {
+        fastllm::ErrorInFastLLM("FastllmCudaGreedySamplingWithScores: invalid input.\n");
+        return false;
+    }
+    FastllmGreedySamplingWithScoresKernel<256><<<batch, 256>>>(
+        logits, output, scores, vocabSize);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaGreedySamplingWithScores: kernel launch failed: %s\n",
+               cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
 __global__ void FastllmSampleTopKKernel(float *topk, float *temperatures,
                                         int *topKArr, float *topPArr,
                                         float *randoms, int *output,

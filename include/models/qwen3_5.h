@@ -318,7 +318,8 @@ namespace fastllm {
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
         Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
-        int RunMtpGreedyDraft(int device, MtpKvCache &cache,
+        int RunMtpGreedyDraft(int device, const std::vector<int> &devices,
+                              MtpKvCache &cache,
                               const Data &targetHiddenStates,
                               const std::vector<int> &inputTokens,
                               const Data &positionIds, int sampleRow,
