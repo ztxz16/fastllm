@@ -253,6 +253,9 @@ if (USE_CUDA)
     endif()
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
+    # TurboMind s884 内核（third_party/turbomind）依赖这些 nvcc 特性。
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
     add_compile_definitions(USE_CUDA)
     if (CUDA_NO_TENSOR_CORE)
         add_compile_definitions(CUDA_NO_TENSOR_CORE)
@@ -281,6 +284,51 @@ if (USE_CUDA)
 
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
     # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
+
+    # SM70 (V100) AWQ W4A16: 移植的 TurboMind s884 内核子集 + fastllm 对接层。
+    # 仅在编译目标包含 sm_70 时编译；其它算力下这些 .cu 编译为占位实现（运行期不调度）。
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/turbomind)
+    set(TURBOMIND_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/turbomind/src/turbomind)
+    set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES}
+        src/devices/cuda/awq_sm70/fastllm-awq-sm70.cu
+        src/devices/cuda/awq_sm70/tm_registry_sm70.cu
+        ${TURBOMIND_ROOT}/core/check.cc
+        ${TURBOMIND_ROOT}/core/layout.cc
+        ${TURBOMIND_ROOT}/core/context.cc
+        ${TURBOMIND_ROOT}/core/allocator.cc
+        ${TURBOMIND_ROOT}/core/buffer.cc
+        ${TURBOMIND_ROOT}/core/stream.cc
+        ${TURBOMIND_ROOT}/utils/logger.cc
+        ${TURBOMIND_ROOT}/utils/parser.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/gemm.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/kernel.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/dispatch_cache.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/context.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/convert_v3.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/cast.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/unpack.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/cache_utils.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/measurer.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/sampler.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/stopping_criterion.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/params.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/kernel/sm70_884_4.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/kernel/sm70_884_8.cu
+        ${TURBOMIND_ROOT}/kernels/gemm/kernel/sm70_884_16.cu)
+
+    # TurboMind 的 .cc 为主机代码但依赖 CUDA 头文件，强制用 nvcc 编译以获得 CUDA include/链接。
+    set_source_files_properties(
+        ${TURBOMIND_ROOT}/core/check.cc
+        ${TURBOMIND_ROOT}/core/layout.cc
+        ${TURBOMIND_ROOT}/core/context.cc
+        ${TURBOMIND_ROOT}/core/allocator.cc
+        ${TURBOMIND_ROOT}/core/buffer.cc
+        ${TURBOMIND_ROOT}/core/stream.cc
+        ${TURBOMIND_ROOT}/utils/logger.cc
+        ${TURBOMIND_ROOT}/utils/parser.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/stopping_criterion.cc
+        ${TURBOMIND_ROOT}/kernels/gemm/tuner/params.cc
+        PROPERTIES LANGUAGE CUDA)
 
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
