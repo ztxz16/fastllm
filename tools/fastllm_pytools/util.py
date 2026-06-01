@@ -218,6 +218,12 @@ def expand_cudapp_device(device_str):
     if not device_str or not device_str.startswith("cudapp="):
         return device_str
     spec = device_str[len("cudapp="):]
+    if ',' in spec:
+        raw_device_ids = [device_id.strip() for device_id in spec.split(',')]
+        if any(device_id == '' for device_id in raw_device_ids):
+            raise ValueError(f"invalid cudapp device list: {spec}")
+        device_ids = [int(device_id) for device_id in raw_device_ids]
+        return str({f'cuda:{device_id}': 1 for device_id in device_ids})
     if ':' in spec:
         weights = [int(w) for w in spec.split(':')]
     else:

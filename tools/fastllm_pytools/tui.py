@@ -91,6 +91,7 @@ class DeployConfig:
     device: str = "cuda"
     cuda_device_id: str = "0"
     tp: str = "2"
+    cudapp: str = "2"
     device_custom: str = ""
     enable_moe_hybrid: bool = False
     moe_device: str = "numa"
@@ -153,6 +154,7 @@ COMMAND_CHOICES: Sequence[Choice] = (
 DEVICE_CHOICES: Sequence[Choice] = (
     ("cuda", "CUDA 单卡"),
     ("tp", "多卡张量并行"),
+    ("cudapp", "多卡串行"),
     ("cpu", "CPU"),
 )
 
@@ -255,8 +257,15 @@ FIELDS: Sequence[FormField] = (
         "tp",
         "TP卡数/ID",
         "text",
-        "多卡张量并行：输入 4 表示使用 0、1、2、3 号卡；输入 0,2,3 表示只使用 0、2、3 号卡。",
+        "多卡张量并行：输入 1 表示单卡；输入 4 表示使用 0、1、2、3 号卡；输入 0,2,3 表示指定卡号。",
         visible=lambda c: c.device == "tp",
+    ),
+    FormField(
+        "cudapp",
+        "串行参数",
+        "text",
+        "多卡串行：生成 --device cudapp=...；只填写 ... 的内容。输入 4 表示 4 卡串行；输入 0,1,2 表示指定卡号。",
+        visible=lambda c: c.device == "cudapp",
     ),
     FormField(
         "device_custom",
@@ -346,6 +355,7 @@ BASIC_FIELD_KEYS = {
     "device",
     "cuda_device_id",
     "tp",
+    "cudapp",
     "device_custom",
     "enable_moe_hybrid",
     "moe_device",
@@ -468,6 +478,8 @@ def _cuda_device_id(value: str) -> str:
 def _resolve_main_device_args(config: DeployConfig) -> Tuple[str, str]:
     if config.device == "cuda":
         return "cuda:" + _cuda_device_id(config.cuda_device_id), ""
+    if config.device == "cudapp":
+        return "cudapp=" + config.cudapp.strip(), ""
     if config.device == "tp":
         return "", config.tp.strip()
     if config.device == "cpu":
@@ -483,10 +495,25 @@ def _is_valid_tp_spec(value: str) -> bool:
     value = str(value).strip()
     if not value:
         return False
+    lower = value.lower()
+    if lower.startswith("cuda:") or lower.startswith("multicuda:"):
+        value = value.split(":", 1)[1].strip()
+        if not value:
+            return False
     if value.isdigit():
-        return int(value) >= 2
+        return int(value) >= 0
     parts = [part.strip() for part in value.split(",")]
-    return len(parts) >= 2 and all(part.isdigit() for part in parts)
+    return len(parts) >= 1 and all(part.isdigit() for part in parts)
+
+
+def _is_valid_cudapp_spec(value: str) -> bool:
+    value = str(value).strip()
+    if not value:
+        return False
+    if value.isdigit():
+        return int(value) > 0
+    parts = [part.strip() for part in value.split(",")]
+    return len(parts) >= 2 and len(set(parts)) == len(parts) and all(part.isdigit() for part in parts)
 
 
 def _is_valid_moe_device_layers(value: str) -> bool:
@@ -764,6 +791,14 @@ def normalize_main_device_config(config: DeployConfig):
     if lower in ("", "auto"):
         config.device = "cuda"
         config.cuda_device_id = config.cuda_device_id.strip() or "0"
+    elif lower.startswith("cudapp="):
+        spec = device.split("=", 1)[1].strip()
+        if _is_valid_cudapp_spec(spec):
+            config.device = "cudapp"
+            config.cudapp = spec
+    elif lower == "cudapp":
+        config.device = "cudapp"
+        config.cudapp = config.cudapp.strip() or "2"
     elif lower.startswith("cuda:"):
         spec = device.split(":", 1)[1].strip()
         if spec.isdigit() or spec == "":
@@ -868,6 +903,8 @@ def apply_main_device_defaults(config: DeployConfig, old_device: str, new_device
         return
     if new_device == "cuda" and not config.cuda_device_id.strip():
         config.cuda_device_id = "0"
+    elif new_device == "cudapp" and not config.cudapp.strip():
+        config.cudapp = "2"
     elif new_device == "tp" and not config.tp.strip():
         config.tp = "2"
 
@@ -1042,8 +1079,10 @@ def validate_config(config: DeployConfig) -> List[str]:
         errors.append("监听地址不能为空。")
     if config.device == "cuda" and not _is_valid_cuda_device_id(config.cuda_device_id):
         errors.append("CUDA卡号必须是非负整数；留空表示 0。")
+    if config.device == "cudapp" and not _is_valid_cudapp_spec(config.cudapp):
+        errors.append("串行参数格式不对。请输入正整数卡数，例如 4；或输入至少两个卡号，例如 0,1,2。")
     if config.device == "tp" and not _is_valid_tp_spec(config.tp):
-        errors.append("TP卡数/ID格式不对。请输入大于等于 2 的卡数，例如 4；或输入至少两个卡号，例如 0,2,3。")
+        errors.append("TP卡数/ID格式不对。请输入卡数，例如 1 或 4；或输入卡号，例如 0、cuda:1、0,2,3。")
     if config.device == "custom" and not config.device_custom.strip():
         errors.append("选择自定义主设备时必须填写自定义主设备。")
     if config.enable_moe_hybrid:
@@ -1912,16 +1951,18 @@ class FastllmCursesTUI:
     def _draw_choice_popup(self, stdscr, field: FormField, choices: Sequence[Choice], selected: int):
         self._draw(stdscr, self._visible_fields())
         height, width = stdscr.getmaxyx()
-        box_width = min(max(42, max(len(label) for _, label in choices) + 8), width - 4)
+        content_width = max([_display_width(field.label)] + [_display_width(label) for _, label in choices])
+        box_width = min(max(42, content_width + 4), width - 4)
         box_height = min(len(choices) + 4, height - 4)
         top = max(1, (height - box_height) // 2)
         left = max(2, (width - box_width) // 2)
+        inner_width = max(1, box_width - 4)
         self._safe_addstr(stdscr, top, left, "+" + "-" * (box_width - 2) + "+", curses.A_BOLD)
-        self._safe_addstr(stdscr, top + 1, left, f"| {field.label}".ljust(box_width - 1) + "|", curses.A_BOLD)
+        self._safe_addstr(stdscr, top + 1, left, "| " + _pad_display(field.label, inner_width) + " |", curses.A_BOLD)
         for row, (_, label) in enumerate(choices[: box_height - 4], start=top + 2):
             choice_index = row - top - 2
             attr = curses.A_REVERSE if choice_index == selected else curses.A_NORMAL
-            self._safe_addstr(stdscr, row, left, "| " + label.ljust(box_width - 4) + " |", attr)
+            self._safe_addstr(stdscr, row, left, "| " + _pad_display(label, inner_width) + " |", attr)
         self._safe_addstr(stdscr, top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", curses.A_BOLD)
         self._refresh(stdscr)
 
