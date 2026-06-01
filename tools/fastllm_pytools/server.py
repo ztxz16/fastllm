@@ -73,6 +73,13 @@ fastllm_embed:FastLLmEmbed
 fastllm_model:FastLLmModel
 dev_mode_enabled:bool = False
 
+class FastLLMUvicornServer(uvicorn.Server):
+    async def startup(self, sockets = None):
+        await super().startup(sockets)
+        if self.started and not self.should_exit:
+            from .llm import disable_cuda_malloc
+            disable_cuda_malloc()
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
                                  raw_request: Request):
@@ -241,7 +248,8 @@ def fastllm_server(args):
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     fastllm_model = FastLLmModel(model_name = args.model_name)
     set_ulimit()
-    uvicorn.run(app, host = args.host, port = args.port)
+    config = uvicorn.Config(app, host = args.host, port = args.port)
+    FastLLMUvicornServer(config).run()
 
 if __name__ == "__main__":
     args = parse_args()

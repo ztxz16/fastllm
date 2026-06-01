@@ -1,6 +1,10 @@
 #include "model.h"
 #include "factoryllm.h"
 
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
+
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -429,6 +433,9 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("get_kv_cache", &fastllm::GetKVCacheInCPU)
     .def("set_device_map", &fastllm::SetDeviceMap)
     .def("create_llm", &fastllm::CreateLLMModelFromFile);
+#ifdef USE_CUDA
+  m.def("disable_cuda_malloc", &DisableCudaMalloc);
+#endif
   m.def("std_hash", [](std::string input) -> size_t {
 		return std::hash<std::string>{}(input);
   }); 

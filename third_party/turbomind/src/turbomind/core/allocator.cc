@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
+#include "fastllm-cuda.cuh"
 #include "src/turbomind/core/allocator.h"
 #include "src/turbomind/core/check.h"
 

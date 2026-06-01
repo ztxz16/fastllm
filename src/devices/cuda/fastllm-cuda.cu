@@ -5,11 +5,13 @@
 #include <thrust/copy.h>
 #include <thrust/functional.h> */
 
+#define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 #include "utils/utils.h"
 
 #include <cstdlib>
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <map>
@@ -21,6 +23,10 @@
 #include <cuda_fp8.h>
 #include "sampling.cuh"
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <execinfo.h>
+#endif
+
 void showError(cudaError_t result, char const* const message, const char* const file,
            int const line) {
     if (cudaSuccess != result) {
@@ -28,6 +34,59 @@ void showError(cudaError_t result, char const* const message, const char* const 
             message, result, cudaGetErrorName(result), file, line, cudaGetErrorString(result));
         fflush(stdout);
     }  
+}
+
+static std::atomic<bool> fastllmCudaMallocDisabled(false);
+static std::mutex fastllmCudaMallocCheckMutex;
+
+static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line, bool rejected) {
+    std::lock_guard<std::mutex> lock(fastllmCudaMallocCheckMutex);
+    fprintf(stderr,
+            "[FASTLLM_CUDA_MEM_CHECK] cudaMalloc %s size=%zu bytes (%.2f MB) at %s:%d\n",
+            rejected ? "rejected" : "called",
+            size,
+            (double)size / (1024.0 * 1024.0),
+            file == nullptr ? "<unknown>" : file,
+            line);
+#if defined(__linux__) || defined(__APPLE__)
+    const int maxFrames = 64;
+    void *frames[maxFrames];
+    int numFrames = backtrace(frames, maxFrames);
+    char **symbols = backtrace_symbols(frames, numFrames);
+    if (symbols != nullptr) {
+        int skip = 2;
+        int end = std::min(numFrames, skip + 32);
+        for (int i = skip; i < end; i++) {
+            fprintf(stderr, "  #%d %s\n", i - skip, symbols[i]);
+        }
+        free(symbols);
+    }
+#else
+    fprintf(stderr, "  call stack is not available on this platform.\n");
+#endif
+    fflush(stderr);
+}
+
+cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
+    if (fastllm::GetFastllmEnv().cudaMemCheck) {
+        bool rejected = fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
+        FastllmCudaPrintMallocStack(size, file, line, rejected);
+        if (rejected) {
+            if (ret != nullptr) {
+                *ret = nullptr;
+            }
+            return cudaErrorMemoryAllocation;
+        }
+    }
+    return cudaMalloc(ret, size);
+}
+
+void DisableCudaMalloc() {
+    fastllmCudaMallocDisabled.store(true, std::memory_order_relaxed);
+    if (fastllm::GetFastllmEnv().cudaMemCheck) {
+        fprintf(stderr, "[FASTLLM_CUDA_MEM_CHECK] cudaMalloc disabled.\n");
+        fflush(stderr);
+    }
 }
 
 /*
@@ -153,7 +212,13 @@ __global__ void GetCudaInfoKernel(int *infos) {
 CudaInfos::CudaInfos() {
     int infoLen = 10;
     int *infos;
-    cudaMalloc(&infos, infoLen * sizeof(int));
+    cudaError_t state = FastllmCudaCheckedMalloc((void **)&infos, infoLen * sizeof(int), __FILE__, __LINE__);
+    if (cudaSuccess != state) {
+        cudaArch = 0;
+        hasTensorCore = false;
+        checkCudaErrors("Error: CUDA error when allocating cuda info buffer!", state);
+        return;
+    }
     GetCudaInfoKernel <<<1, 1>>> (infos);
     int *infosInCpu = new int[infoLen];
     cudaMemcpy(infosInCpu, infos, infoLen * sizeof(int), cudaMemcpyDeviceToHost);
@@ -1769,7 +1834,7 @@ void *FastllmCudaMallocModelWeight(size_t size) {
 
     if (slabId < 0) {
         void *base = nullptr;
-        state = cudaMalloc(&base, slabBytes);
+        state = FastllmCudaCheckedMalloc(&base, slabBytes, __FILE__, __LINE__);
         if (cudaSuccess != state) {
             printf("Error: CUDA error when allocating model weight slab %lu MB memory! maybe there's no enough memory left on device.",
                    slabBytes >> 20);
@@ -2038,7 +2103,7 @@ static void CudaMemDebugRemove(void *ptr) {
 
 void * FastllmCudaDirectMalloc(size_t size) {
     void * ret;
-    cudaError_t state = cudaMalloc(&ret, size);
+    cudaError_t state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state) {
         printf("Error: CUDA error when allocating %lu kB memory! maybe there's no enough memory left on device.", size >> 10);
         checkCudaErrors("", state);
@@ -2113,7 +2178,7 @@ void * FastllmCudaMalloc(size_t size) {
         }
 
         void * ret;
-        state = cudaMalloc(&ret, size);
+        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
         if (cudaSuccess != state) {
             size_t freeMem = 0, totalMem = 0;
             cudaMemGetInfo(&freeMem, &totalMem);
@@ -2145,7 +2210,7 @@ void * FastllmCudaMalloc(size_t size) {
         }
     }
     void * ret;
-    state = cudaMalloc(&ret, size);
+    state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state) {
         size_t freeMem = 0, totalMem = 0;
         cudaMemGetInfo(&freeMem, &totalMem);
@@ -2234,10 +2299,12 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     int id = -1;
     cudaGetDevice(&id);
     auto &bigBuffers = bigBuffersMap[id];
-    auto state = cudaMalloc(&ret, size);
-    if (cudaSuccess != state)
+    auto state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+    if (cudaSuccess != state) {
         printf("Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory left on device.", size >> 20);
-    checkCudaErrors("", state);
+        checkCudaErrors("", state);
+        return;
+    }
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 

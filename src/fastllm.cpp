@@ -64,6 +64,21 @@ namespace fastllm {
             return value == "1" || value == "on" || value == "true";
         }
 
+        bool IsEnvValueEnabledUnlessFalseIgnoreCase(const char *env) {
+            if (env == nullptr || env[0] == '\0') {
+                return false;
+            }
+
+            std::string value(env);
+            for (char &c : value) {
+                if (c >= 'A' && c <= 'Z') {
+                    c = c - 'A' + 'a';
+                }
+            }
+            return value != "0" && value != "false" && value != "off" &&
+                   value != "no" && value != "disable" && value != "disabled";
+        }
+
         static void PrintDimsInline(const std::vector <int> &dims) {
             for (int dim : dims) {
                 printf("%d ", dim);
@@ -278,6 +293,7 @@ namespace fastllm {
         this->printProfile = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_PROFILE"));
         this->skipWarmup = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_SKIP_WARMUP"));
         this->cudaGraph = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_CUDA_GRAPH"));
+        this->cudaMemCheck = IsEnvValueEnabledUnlessFalseIgnoreCase(std::getenv("FASTLLM_CUDA_MEM_CHECK"));
 
         const char *useFusedTransferAttnEnv = std::getenv("FASTLLM_USE_FUSED_TRANSFER_ATTN");
         if (useFusedTransferAttnEnv != nullptr && std::strcmp(useFusedTransferAttnEnv, "0") == 0) {

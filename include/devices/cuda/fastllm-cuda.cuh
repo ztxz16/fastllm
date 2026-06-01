@@ -1,3 +1,6 @@
+#ifndef FASTLLM_CUDA_CUH
+#define FASTLLM_CUDA_CUH
+
 #include "fastllm.h"
 
 #ifdef __CUDACC__
@@ -118,8 +121,12 @@ const char *FastllmCudaGraphLastError();
 
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
+#ifdef __CUDACC__
+cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);
+#endif
 void *FastllmCudaMalloc(size_t size);
 void FastllmCudaFree(void *ret);
+void DisableCudaMalloc();
 void FastllmCudaSetWeightSlabBytes(size_t bytes);
 size_t FastllmCudaGetWeightSlabBytes();
 void *FastllmCudaMallocModelWeight(size_t size);
@@ -615,4 +622,10 @@ extern __global__ void FastllmCudaFloat2Bf16Kernel(float* a, __nv_bfloat16* b, i
 extern __global__ void FastllmCudaBF162HalfKernel(uint16_t* a, half *b, int len);
 extern __global__ void FastllmCudaHalf2BF16Kernel(half* a, __nv_bfloat16 *b, int len);
 extern __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bias, int k);
+
+#ifndef FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
+#define cudaMalloc(ptr, size) FastllmCudaCheckedMalloc((void **)(ptr), (size), __FILE__, __LINE__)
 #endif
+#endif
+
+#endif // FASTLLM_CUDA_CUH

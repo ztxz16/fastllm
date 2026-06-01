@@ -24,6 +24,7 @@
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
+#include "fastllm-cuda.cuh"
 
 namespace fastllm {
 namespace awq_sm70 {

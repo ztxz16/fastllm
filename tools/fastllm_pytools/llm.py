@@ -257,6 +257,8 @@ else:
 fastllm_lib.has_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.has_device.restype = ctypes.c_bool
 
+fastllm_lib.disable_cuda_malloc.argtypes = []
+
 fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
@@ -478,6 +480,9 @@ def set_cuda_embedding(cuda_embedding):
 
 def set_cuda_slab(mb: int):
     fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
+
+def disable_cuda_malloc():
+    fastllm_lib.disable_cuda_malloc();
 
 def set_enable_amx(enable_amx):
     fastllm_lib.set_enable_amx(ctypes.c_bool(enable_amx));

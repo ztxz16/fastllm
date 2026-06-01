@@ -1,5 +1,6 @@
 // Copyright (c) OpenMMLab. All rights reserved.
 
+#include "fastllm-cuda.cuh"
 #include "src/turbomind/kernels/gemm/tuner/cache_utils.h"
 
 namespace turbomind::gemm {

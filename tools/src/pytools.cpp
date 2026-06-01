@@ -8,6 +8,10 @@
 #include <csignal>
 #include <cstdint>
 
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
+
 #ifdef WIN32
 #define DLL_EXPORT _declspec(dllexport)
 #else
@@ -56,6 +60,12 @@ extern "C" {
 
     DLL_EXPORT void set_cuda_slab(int mb) {
         fastllm::SetCudaSlabMB(mb);
+    }
+
+    DLL_EXPORT void disable_cuda_malloc() {
+#ifdef USE_CUDA
+        DisableCudaMalloc();
+#endif
     }
 
     DLL_EXPORT void set_cuda_shared_expert(bool cuda_shared_expert) {
