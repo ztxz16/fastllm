@@ -88,9 +88,13 @@ class DeployConfig:
     model_name: str = ""
     host: str = "0.0.0.0"
     port: str = "8080"
-    device: str = "auto"
+    device: str = "cuda"
+    cuda_device_id: str = "0"
+    tp: str = "2"
     device_custom: str = ""
-    moe_device: str = "auto"
+    enable_moe_hybrid: bool = False
+    moe_device: str = "numa"
+    moe_device_layers: str = "10000"
     moe_device_custom: str = ""
     dtype: str = "auto"
     dtype_custom: str = ""
@@ -135,23 +139,14 @@ COMMAND_CHOICES: Sequence[Choice] = (
 )
 
 DEVICE_CHOICES: Sequence[Choice] = (
-    ("auto", "自动"),
-    ("cpu", "CPU"),
     ("cuda", "CUDA 单卡"),
-    ("numa", "NUMA CPU"),
-    ("multicuda:0,1", "多卡张量并行 multicuda:0,1"),
-    ("multicuda:0,cpu", "GPU + CPU 张量并行"),
-    ("cudapp=2", "两卡流水并行 cudapp=2"),
-    ("custom", "自定义"),
+    ("tp", "多卡张量并行"),
+    ("cpu", "CPU"),
 )
 
 MOE_DEVICE_CHOICES: Sequence[Choice] = (
-    ("auto", "自动"),
-    ("cpu", "CPU"),
-    ("cuda", "CUDA"),
     ("numa", "NUMA CPU"),
     ("disk", "Disk"),
-    ("custom", "自定义"),
 )
 
 DTYPE_CHOICES: Sequence[Choice] = (
@@ -211,19 +206,46 @@ FIELDS: Sequence[FormField] = (
     ),
     FormField("device", "主设备", "choice", "主干网络使用的计算设备。", DEVICE_CHOICES),
     FormField(
+        "cuda_device_id",
+        "CUDA卡号",
+        "text",
+        "单卡 CUDA 使用的卡号；留空默认 0。",
+        visible=lambda c: c.device == "cuda",
+    ),
+    FormField(
+        "tp",
+        "TP卡数/ID",
+        "text",
+        "多卡张量并行：输入 4 表示使用 0、1、2、3 号卡；输入 0,2,3 表示只使用 0、2、3 号卡。",
+        visible=lambda c: c.device == "tp",
+    ),
+    FormField(
         "device_custom",
         "自定义主设备",
         "text",
         "例如 multicuda:0:4,1:5,cpu:1 或 {'cuda:0':3,'cuda:1':2}。",
         visible=lambda c: c.device == "custom",
     ),
-    FormField("moe_device", "MOE设备", "choice", "MOE 专家层使用的设备；非 MOE 模型可保持自动。", MOE_DEVICE_CHOICES),
     FormField(
-        "moe_device_custom",
-        "自定义MOE设备",
+        "enable_moe_hybrid",
+        "打开MOE混合推理",
+        "bool",
+        "打开后可把最后若干层 MOE 专家放到 NUMA CPU 或磁盘上。",
+    ),
+    FormField(
+        "moe_device",
+        "MOE推理设备",
+        "choice",
+        "选择放置指定 MOE 层的设备。",
+        MOE_DEVICE_CHOICES,
+        visible=lambda c: c.enable_moe_hybrid,
+    ),
+    FormField(
+        "moe_device_layers",
+        "MOE设备层数",
         "text",
-        "例如 cpu、numa、multicuda:0,1 或 cudapp=2。",
-        visible=lambda c: c.moe_device == "custom",
+        "输入 8 表示最后 8 层 MOE 放到所选设备；输入 -1 表示全部 MOE 层都放到所选设备。",
+        visible=lambda c: c.enable_moe_hybrid,
     ),
     FormField("dtype", "权重类型", "choice", "HF 模型在线加载时使用的权重类型。", DTYPE_CHOICES),
     FormField(
@@ -271,7 +293,12 @@ BASIC_FIELD_KEYS = {
     "host",
     "port",
     "device",
+    "cuda_device_id",
+    "tp",
     "device_custom",
+    "enable_moe_hybrid",
+    "moe_device",
+    "moe_device_layers",
 }
 
 
@@ -317,6 +344,14 @@ def _choice_label(choices: Sequence[Choice], value: str) -> str:
     return value
 
 
+def _previous_index(index: int, count: int) -> int:
+    return (index - 1) % count if count > 0 else 0
+
+
+def _next_index(index: int, count: int) -> int:
+    return (index + 1) % count if count > 0 else 0
+
+
 def _modelscope_group_index_for_model(model_id: str) -> int:
     for group_index, (_, _, choices) in enumerate(MODELSCOPE_MODEL_GROUPS):
         if any(value == model_id for value, _ in choices):
@@ -330,6 +365,48 @@ def _resolve_custom(value: str, custom_value: str) -> str:
     if value == "auto":
         return ""
     return value.strip()
+
+
+def _cuda_device_id(value: str) -> str:
+    value = str(value).strip()
+    if value.lower().startswith("cuda:"):
+        value = value.split(":", 1)[1].strip()
+    return value or "0"
+
+
+def _resolve_main_device_args(config: DeployConfig) -> Tuple[str, str]:
+    if config.device == "cuda":
+        return "cuda:" + _cuda_device_id(config.cuda_device_id), ""
+    if config.device == "tp":
+        return "", config.tp.strip()
+    if config.device == "cpu":
+        return "cpu", ""
+    return _resolve_custom(config.device, config.device_custom), ""
+
+
+def _is_valid_cuda_device_id(value: str) -> bool:
+    return _cuda_device_id(value).isdigit()
+
+
+def _is_valid_tp_spec(value: str) -> bool:
+    value = str(value).strip()
+    if not value:
+        return False
+    if value.isdigit():
+        return int(value) >= 2
+    parts = [part.strip() for part in value.split(",")]
+    return len(parts) >= 2 and all(part.isdigit() for part in parts)
+
+
+def _is_valid_moe_device_layers(value: str) -> bool:
+    value = str(value).strip()
+    if not value:
+        return False
+    try:
+        layers = int(value)
+    except ValueError:
+        return False
+    return layers == -1 or layers > 0
 
 
 def _optional_text(value: str, auto_values: Sequence[str] = ("", "auto")) -> str:
@@ -535,12 +612,61 @@ def clone_config(config: DeployConfig) -> DeployConfig:
     return config_from_dict(asdict(config))
 
 
+def normalize_main_device_config(config: DeployConfig):
+    device = str(config.device).strip()
+    lower = device.lower()
+    if lower in ("", "auto"):
+        config.device = "cuda"
+        config.cuda_device_id = config.cuda_device_id.strip() or "0"
+    elif lower.startswith("cuda:"):
+        spec = device.split(":", 1)[1].strip()
+        if spec.isdigit() or spec == "":
+            config.device = "cuda"
+            config.cuda_device_id = spec or "0"
+        elif _is_valid_tp_spec(spec):
+            config.device = "tp"
+            config.tp = spec
+    elif lower.startswith("multicuda:"):
+        spec = device.split(":", 1)[1].strip()
+        if _is_valid_tp_spec(spec):
+            config.device = "tp"
+            config.tp = spec
+        elif spec.isdigit():
+            config.device = "cuda"
+            config.cuda_device_id = spec
+        else:
+            return
+    elif lower == "multicuda":
+        config.device = "tp"
+        config.tp = config.tp.strip() or "2"
+
+
+def normalize_moe_hybrid_config(config: DeployConfig, has_enable_field: bool, has_layers_field: bool):
+    moe_device = str(config.moe_device).strip().lower()
+    if not has_enable_field and moe_device in ("numa", "disk"):
+        config.enable_moe_hybrid = True
+        if not has_layers_field:
+            config.moe_device_layers = "-1"
+
+    if config.enable_moe_hybrid:
+        if moe_device not in ("numa", "disk"):
+            config.moe_device = "numa"
+        else:
+            config.moe_device = moe_device
+        if not str(config.moe_device_layers).strip():
+            config.moe_device_layers = "10000"
+
+
 def config_from_dict(data: dict) -> DeployConfig:
     config = DeployConfig()
     valid_keys = {field.name for field in fields(DeployConfig)}
+    has_enable_moe_hybrid = "enable_moe_hybrid" in data
+    has_moe_device_layers = "moe_device_layers" in data
     for key, value in data.items():
         if key in valid_keys:
             setattr(config, key, value)
+    normalize_main_device_config(config)
+    normalize_moe_hybrid_config(config, has_enable_moe_hybrid, has_moe_device_layers)
     return config
 
 
@@ -589,6 +715,22 @@ def apply_model_name_default(config: DeployConfig, old_model: str, new_model: st
     default_name = default_model_name_from_path(new_model)
     if default_name:
         config.name = default_name
+
+
+def apply_main_device_defaults(config: DeployConfig, old_device: str, new_device: str):
+    if old_device == new_device:
+        return
+    if new_device == "cuda" and not config.cuda_device_id.strip():
+        config.cuda_device_id = "0"
+    elif new_device == "tp" and not config.tp.strip():
+        config.tp = "2"
+
+
+def apply_moe_hybrid_defaults(config: DeployConfig):
+    if config.moe_device not in ("numa", "disk"):
+        config.moe_device = "numa"
+    if not str(config.moe_device_layers).strip():
+        config.moe_device_layers = "10000"
 
 
 def load_saved_configs(path: Optional[str] = None) -> List[DeployConfig]:
@@ -663,13 +805,15 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     if model:
         argv.append(model)
 
-    device = _resolve_custom(config.device, config.device_custom)
-    moe_device = _resolve_custom(config.moe_device, config.moe_device_custom)
+    device, tp = _resolve_main_device_args(config)
     dtype = _resolve_custom(config.dtype, config.dtype_custom)
     moe_dtype = _resolve_custom(config.moe_dtype, config.moe_dtype_custom)
 
     _add_option(argv, "--device", device)
-    _add_option(argv, "--moe_device", moe_device)
+    _add_option(argv, "--tp", tp)
+    if config.enable_moe_hybrid:
+        _add_option(argv, "--moe_device", config.moe_device.strip())
+        _add_option(argv, "--moe_device_layers", config.moe_device_layers.strip())
     _add_option(argv, "--dtype", dtype)
     _add_option(argv, "--moe_dtype", moe_dtype)
     _add_option(argv, "-t", _optional_text(config.threads))
@@ -726,10 +870,17 @@ def validate_config(config: DeployConfig) -> List[str]:
 
     if config.command == "server" and not config.host.strip():
         errors.append("监听地址不能为空。")
+    if config.device == "cuda" and not _is_valid_cuda_device_id(config.cuda_device_id):
+        errors.append("CUDA卡号必须是非负整数；留空表示 0。")
+    if config.device == "tp" and not _is_valid_tp_spec(config.tp):
+        errors.append("TP卡数/ID格式不对。请输入大于等于 2 的卡数，例如 4；或输入至少两个卡号，例如 0,2,3。")
     if config.device == "custom" and not config.device_custom.strip():
         errors.append("选择自定义主设备时必须填写自定义主设备。")
-    if config.moe_device == "custom" and not config.moe_device_custom.strip():
-        errors.append("选择自定义MOE设备时必须填写自定义MOE设备。")
+    if config.enable_moe_hybrid:
+        if config.moe_device not in ("numa", "disk"):
+            errors.append("MOE推理设备只能选择 NUMA CPU 或 Disk。")
+        if not _is_valid_moe_device_layers(config.moe_device_layers):
+            errors.append("MOE设备层数格式不对。请输入正整数，例如 8；或输入 -1 表示全部 MOE 层。")
     if config.dtype == "custom" and not config.dtype_custom.strip():
         errors.append("选择自定义权重类型时必须填写自定义权重类型。")
     if config.moe_dtype == "custom" and not config.moe_dtype_custom.strip():
@@ -794,10 +945,10 @@ class FastllmCursesTUI:
             self._draw_home(stdscr, pending_delete)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
-                self.home_selected = max(0, self.home_selected - 1)
+                self.home_selected = _previous_index(self.home_selected, len(self.saved_configs))
                 pending_delete = None
             elif key in (curses.KEY_DOWN, ord("j")):
-                self.home_selected = min(len(self.saved_configs) - 1, self.home_selected + 1)
+                self.home_selected = _next_index(self.home_selected, len(self.saved_configs))
                 pending_delete = None
             elif key in (curses.KEY_LEFT, curses.KEY_BTAB):
                 self.home_button_selected = (self.home_button_selected - 1) % len(buttons)
@@ -917,9 +1068,9 @@ class FastllmCursesTUI:
             self._draw(stdscr, visible_fields)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
-                self.selected = max(0, self.selected - 1)
+                self.selected = _previous_index(self.selected, selectable_count)
             elif key in (curses.KEY_DOWN, ord("j")):
-                self.selected = min(selectable_count - 1, self.selected + 1)
+                self.selected = _next_index(self.selected, selectable_count)
             elif key in (curses.KEY_LEFT, curses.KEY_BTAB):
                 self.form_button_selected = (self.form_button_selected - 1) % len(buttons)
             elif key in (curses.KEY_RIGHT, 9):
@@ -1023,9 +1174,9 @@ class FastllmCursesTUI:
             self._draw_download(stdscr, config, visible_fields, field_selected)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
-                field_selected = max(0, field_selected - 1)
+                field_selected = _previous_index(field_selected, len(visible_fields))
             elif key in (curses.KEY_DOWN, ord("j")):
-                field_selected = min(len(visible_fields) - 1, field_selected + 1)
+                field_selected = _next_index(field_selected, len(visible_fields))
             elif key in (curses.KEY_LEFT, curses.KEY_BTAB):
                 self.download_button_selected = (self.download_button_selected - 1) % len(buttons)
             elif key in (curses.KEY_RIGHT, 9):
@@ -1155,9 +1306,9 @@ class FastllmCursesTUI:
             self._draw_download_choice_popup(stdscr, field, choices, index, config)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
-                index = max(0, index - 1)
+                index = _previous_index(index, len(choices))
             elif key in (curses.KEY_DOWN, ord("j")):
-                index = min(len(choices) - 1, index + 1)
+                index = _next_index(index, len(choices))
             elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
                 return choices[index][0]
             elif key in (27, ord("q"), ord("Q")):
@@ -1197,9 +1348,9 @@ class FastllmCursesTUI:
             self._draw_download_choice_popup(stdscr, field, choices, selected, config, "选择模型分类")
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
-                selected = max(0, selected - 1)
+                selected = _previous_index(selected, len(choices))
             elif key in (curses.KEY_DOWN, ord("j")):
-                selected = min(len(choices) - 1, selected + 1)
+                selected = _next_index(selected, len(choices))
             elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
                 return selected
             elif key in (27, ord("q"), ord("Q")):
@@ -1220,9 +1371,9 @@ class FastllmCursesTUI:
             self._draw_download_choice_popup(stdscr, field, choices, selected, config, group_label)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
-                selected = max(0, selected - 1)
+                selected = _previous_index(selected, len(choices))
             elif key in (curses.KEY_DOWN, ord("j")):
-                selected = min(len(choices) - 1, selected + 1)
+                selected = _next_index(selected, len(choices))
             elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
                 return choices[selected][0]
             elif key in (curses.KEY_LEFT, curses.KEY_BACKSPACE, 127, ord("b"), ord("B")):
@@ -1442,14 +1593,19 @@ class FastllmCursesTUI:
     def _edit_field(self, stdscr, field: FormField):
         if field.kind == "bool":
             setattr(self.config, field.key, not getattr(self.config, field.key))
+            if field.key == "enable_moe_hybrid" and getattr(self.config, field.key):
+                apply_moe_hybrid_defaults(self.config)
             self.status = f"{field.label}已切换。"
         elif field.kind == "choice":
             value = self._choose(stdscr, field)
             if value is not None:
                 old_command = self.config.command
+                old_device = self.config.device
                 setattr(self.config, field.key, value)
                 if field.key == "command" and old_command != value:
                     self._apply_command_defaults(old_command, value)
+                if field.key == "device" and old_device != value:
+                    apply_main_device_defaults(self.config, old_device, value)
                 self.status = f"{field.label}已更新。"
         else:
             old_model = self.config.model
@@ -1471,9 +1627,9 @@ class FastllmCursesTUI:
             self._draw_choice_popup(stdscr, field, choices, index)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
-                index = max(0, index - 1)
+                index = _previous_index(index, len(choices))
             elif key in (curses.KEY_DOWN, ord("j")):
-                index = min(len(choices) - 1, index + 1)
+                index = _next_index(index, len(choices))
             elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
                 return choices[index][0]
             elif key in (27, ord("q"), ord("Q")):
@@ -1533,9 +1689,9 @@ class FastllmCursesTUI:
             self._draw_model_path_popup(stdscr, field, choices, selected)
             key = stdscr.getch()
             if key in (curses.KEY_UP, ord("k")):
-                selected = max(0, selected - 1)
+                selected = _previous_index(selected, len(choices))
             elif key in (curses.KEY_DOWN, ord("j")):
-                selected = min(len(choices) - 1, selected + 1)
+                selected = _next_index(selected, len(choices))
             elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
                 value = choices[selected][0]
                 if value == "__manual__":
@@ -1861,15 +2017,20 @@ def _prompt_deploy_field(config: DeployConfig, field: FormField):
     print(f"\n{field.help}")
     if field.kind == "choice":
         old_command = config.command
+        old_device = config.device
         value = _prompt_choice(field, config)
         setattr(config, field.key, value)
         if field.key == "command" and old_command != value:
             apply_command_defaults(config, old_command, value)
+        if field.key == "device" and old_device != value:
+            apply_main_device_defaults(config, old_device, value)
     elif field.kind == "bool":
         current = getattr(config, field.key)
         raw = _read_line(f"{field.label} [{'Y' if current else 'N'}] (y/n): ").strip().lower()
         if raw in ("y", "yes", "1", "true", "on"):
             setattr(config, field.key, True)
+            if field.key == "enable_moe_hybrid":
+                apply_moe_hybrid_defaults(config)
         elif raw in ("n", "no", "0", "false", "off"):
             setattr(config, field.key, False)
     else:
