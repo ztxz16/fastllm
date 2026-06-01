@@ -4,8 +4,10 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "devices/cuda/fastllm-awq-sm70.cuh"
 
 #include <cmath>
+#include <unordered_map>
 
 #if !defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
 #include <cpuid.h>
@@ -232,6 +234,119 @@ static constexpr int INT4GROUP_HALF_SCALES_IDX = 0;
 static constexpr int INT4GROUP_HALF_MINS_IDX = 1;
 static constexpr int INT4GROUP_HALF_BIAS_IDX = 2;
 static constexpr int INT4GROUP_MARLIN_SCALES_HALF_IDX = 3;
+
+// ==================== SM70 (V100) AWQ via TurboMind s884 ====================
+// Marlin 需要 sm_75+，在 V100 上不可用，INT4_GROUP 会退化为 dequant + cublas，
+// 速度与 FP8 无异。这里为 SM70 提供一条真正的 W4A16 GEMM 路径：把 INT4_GROUP
+// 权重重排为 TurboMind 所需的解包权重 / scale / zero，交由移植的 s884 内核计算。
+// Handle 为主机侧指针，不能放入 extraCudaData（会被 FastllmCudaFree），单独缓存。
+static std::unordered_map<const fastllm::Data*, void*> g_sm70AwqHandles;
+
+// 重排成功后释放原始 INT4_GROUP 权重，定义在后面，这里前置声明。
+static void FastllmCudaInt4GroupReleaseOriginalWeight(fastllm::Data &weight);
+
+// weight: [k, m] 每字节两个 nibble（输出在外、输入在内），偶数输入在高位。
+// 输出 out: [K=m, N=k] 行主序，out[in * k + outIdx] = 该 (输入 in, 输出 outIdx) 的 4bit 值。
+__global__ void FastllmInt4GroupToAwqU16Kernel(const uint8_t *weight, uint16_t *out, int m, int k) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)m * k;
+    if (idx >= total) {
+        return;
+    }
+    int in = (int)(idx / k);
+    int outIdx = (int)(idx - (size_t)in * k);
+    uint8_t byte = weight[(size_t)outIdx * (m / 2) + in / 2];
+    uint16_t q = (in & 1) ? (byte & 0xF) : (byte >> 4);
+    out[idx] = q;
+}
+
+static bool FastllmCudaInt4GroupSm70AwqEnabled(int n, int m, int k, int groupCnt) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    static const bool disabled = (getenv("FASTLLM_DISABLE_SM70_AWQ") != nullptr);
+    if (disabled) {
+        return false;
+    }
+    if (!fastllm::awq_sm70::Supported()) {
+        return false;
+    }
+    // K = m (输入维), N = k (输出维)，TurboMind 要求 K/N 为 8 的倍数，按 K 分组。
+    return groupCnt > 0 && (groupCnt == 32 || groupCnt == 64 || groupCnt == 128) &&
+           m % groupCnt == 0 && m % 8 == 0 && k % 8 == 0;
+#endif
+}
+
+static bool FastllmCudaInt4GroupEnsureSm70AwqOnDevice(fastllm::Data &weight, int m, int k) {
+    auto it = g_sm70AwqHandles.find(&weight);
+    if (it != g_sm70AwqHandles.end()) {
+        return it->second != nullptr;
+    }
+    int group = weight.group, groupCnt = weight.groupCnt;
+    if (weight.cudaData == nullptr || group <= 0 || groupCnt <= 0 ||
+        weight.scales.size() != (size_t)k * group ||
+        weight.mins.size() != (size_t)k * group) {
+        g_sm70AwqHandles[&weight] = nullptr;
+        return false;
+    }
+
+    const int K = m, N = k, numGroups = group;
+
+    uint16_t *dU16 = (uint16_t*)FastllmCudaMalloc((size_t)K * N * sizeof(uint16_t));
+    if (dU16 == nullptr) {
+        printf("FastllmAwqSm70 prepare error: FastllmCudaMalloc(dU16, %zu bytes) failed (likely OOM). m=%d k=%d\n",
+               (size_t)K * N * sizeof(uint16_t), m, k);
+        g_sm70AwqHandles[&weight] = nullptr;
+        return false;
+    }
+    size_t total = (size_t)K * N;
+    int threads = 256;
+    FastllmInt4GroupToAwqU16Kernel <<< (total + threads - 1) / threads, threads >>>(
+        (const uint8_t*)weight.cudaData, dU16, m, k);
+
+    std::vector<half> hScales((size_t)numGroups * N);
+    std::vector<half> hZeros((size_t)numGroups * N);
+    for (int g = 0; g < numGroups; g++) {
+        for (int nn = 0; nn < N; nn++) {
+            float s = weight.scales[(size_t)nn * group + g];
+            float mn = weight.mins[(size_t)nn * group + g];
+            int z = (s == 0.0f) ? 0 : (int)std::lroundf(-mn / s);
+            z = std::max(0, std::min(15, z));
+            hScales[(size_t)g * N + nn] = __float2half(s);
+            hZeros[(size_t)g * N + nn] = __float2half((float)z);
+        }
+    }
+    half *dScales = (half*)FastllmCudaMalloc(hScales.size() * sizeof(half));
+    half *dZeros = (half*)FastllmCudaMalloc(hZeros.size() * sizeof(half));
+    if (dScales == nullptr || dZeros == nullptr) {
+        printf("FastllmAwqSm70 prepare error: FastllmCudaMalloc(scales=%p zeros=%p) failed (likely OOM). "
+               "numGroups=%d N=%d\n", (void*)dScales, (void*)dZeros, numGroups, N);
+        FastllmCudaFree(dU16);
+        if (dScales) FastllmCudaFree(dScales);
+        if (dZeros) FastllmCudaFree(dZeros);
+        g_sm70AwqHandles[&weight] = nullptr;
+        return false;
+    }
+    FastllmCudaCopyFromHostToDevice(dScales, hScales.data(), hScales.size() * sizeof(half));
+    FastllmCudaCopyFromHostToDevice(dZeros, hZeros.data(), hZeros.size() * sizeof(half));
+
+    // dU16 已经从原始权重重排出量化值，scale/zero 也已拷到 device，原始 INT4_GROUP
+    // 权重（weight.cudaData）此后不再需要：GEMM 走 handle->tmWeight/tmScales。
+    // 这里在 Prepare 之前就释放，并用 FastllmCudaClearBigBuffer 把池中空闲显存真正
+    // 归还给 OS——Prepare 内部用的是原生 cudaMalloc，只能向 OS 申请显存。否则
+    // 原始权重虽被标记空闲仍滞留在 fastllm 显存池里，Prepare 仍会 OOM。
+    FastllmCudaInt4GroupReleaseOriginalWeight(weight);
+    FastllmCudaClearBigBuffer();
+
+    void *handle = fastllm::awq_sm70::Prepare(dU16, dScales, dZeros, K, N, numGroups, groupCnt, 0);
+
+    FastllmCudaFree(dU16);
+    FastllmCudaFree(dScales);
+    FastllmCudaFree(dZeros);
+
+    g_sm70AwqHandles[&weight] = handle;
+    return handle != nullptr;
+}
 
 static bool FastllmCudaInt4GroupHasMarlinOnDevice(const fastllm::Data &weight) {
     return (int)weight.extraCudaData.size() > INT4GROUP_MARLIN_WORKSPACE_IDX &&
@@ -667,7 +782,10 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
     int group = weight.group, groupCnt = weight.groupCnt;
     bool useMarlin = FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
                      FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
-    if (!useMarlin) {
+    bool useSm70Awq = !useMarlin &&
+                      FastllmCudaInt4GroupSm70AwqEnabled(n, m, k, groupCnt) &&
+                      FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k);
+    if (!useMarlin && !useSm70Awq) {
         if (weight.cudaData == nullptr) {
             FastllmCudaInt4GroupFallbackUnavailable();
         }
@@ -677,7 +795,17 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
-    if (useMarlin) {
+    if (useSm70Awq) {
+        bool ok = fastllm::awq_sm70::Gemm(g_sm70AwqHandles[&weight], cudaInput, cudaOutput, n, 0);
+        if (!ok) {
+            printf("Error: INT4_GROUP SM70 AWQ GEMM failed.\n");
+            throw("int4group sm70 awq gemm error");
+        }
+        if (bias.dims.size() > 0) {
+            half *cudaBiasData = FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(weight, bias, k);
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        }
+    } else if (useMarlin) {
         uint32_t *marlinQWeight = (uint32_t*)weight.extraCudaData[INT4GROUP_MARLIN_WEIGHT_IDX];
         uint32_t *marlinZeros = (uint32_t*)weight.extraCudaData[INT4GROUP_MARLIN_ZEROS_IDX];
         int *marlinWorkspace = (int*)weight.extraCudaData[INT4GROUP_MARLIN_WORKSPACE_IDX];
