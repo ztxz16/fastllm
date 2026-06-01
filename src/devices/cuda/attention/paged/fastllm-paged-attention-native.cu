@@ -253,7 +253,12 @@ __device__ __forceinline__ KVType FastllmKvLoad(const KVType *base, int d) {
 
 template <>
 __device__ __forceinline__ __nv_fp8_e4m3 FastllmKvLoad<__nv_fp8_e4m3>(const __nv_fp8_e4m3 *base, int d) {
-    return __nv_fp8_e4m3(__ldg(reinterpret_cast<const unsigned char *>(base) + d));
+    // 注意：__nv_fp8_e4m3 的整型构造函数会对数值做转换（把整数值转成 FP8），
+    // 而这里需要的是把缓存里那一字节的 FP8「位模式」原样还原。因此必须直接写入存储位
+    // __x，而不能用 __nv_fp8_e4m3(rawByte) 构造（那会把字节当作整数值再转一次，得到错误结果）。
+    __nv_fp8_e4m3 result;
+    result.__x = __ldg(reinterpret_cast<const unsigned char *>(base) + d);
+    return result;
 }
 
 template <typename KVType>
