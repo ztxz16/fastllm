@@ -1,0 +1,24 @@
+{"case_id":"agent:001","category":"lookup","task":"查一下订单 ORD-1001 当前状态。最终只回答英文状态词。","expected":"delivered","answer_type":"text","aliases":["delivered"],"required_tools":["lookup_order"]}
+{"case_id":"agent:002","category":"lookup","task":"客户 C-003 是什么会员等级？最终只回答英文等级。","expected":"platinum","answer_type":"text","aliases":["platinum"],"required_tools":["lookup_customer"]}
+{"case_id":"agent:003","category":"lookup","task":"SKU USB-C-1M 当前库存是多少？最终只回答数字。","expected":"42","answer_type":"number","aliases":[],"required_tools":["inventory_check"]}
+{"case_id":"agent:004","category":"calculation","task":"3 个 USB-C-1M 的税前总价是多少？最终只回答数字，保留两位小数。","expected":"35.97","answer_type":"number","aliases":[],"required_tools":["inventory_check","calculator"]}
+{"case_id":"agent:005","category":"lookup","task":"订单 ORD-1003 购买了几个 HD-2TB？最终只回答数字。","expected":"2","answer_type":"number","aliases":[],"required_tools":["lookup_order"]}
+{"case_id":"agent:006","category":"multi_step","task":"订单 ORD-1002 对应客户所在城市是哪里？最终只回答英文城市名。","expected":"Austin","answer_type":"text","aliases":["austin"],"required_tools":["lookup_order","lookup_customer"]}
+{"case_id":"agent:007","category":"lookup","task":"订单 ORD-1001 的总价是多少？最终只回答数字，保留两位小数。","expected":"35.97","answer_type":"number","aliases":[],"required_tools":["lookup_order"]}
+{"case_id":"agent:008","category":"knowledge","task":"根据折扣政策，platinum 客户的折扣百分比是多少？最终只回答百分比。","expected":"15%","answer_type":"text","aliases":["15%","15 percent","15 pct"],"required_tools":["search_kb"]}
+{"case_id":"agent:009","category":"multi_step","task":"Gold 客户买 2 个 KB-MECH，折后税前价格是多少？最终只回答数字，保留两位小数。","expected":"152.10","answer_type":"number","aliases":["152.1"],"required_tools":["inventory_check","search_kb","calculator"]}
+{"case_id":"agent:010","category":"policy","task":"订单 ORD-1004 是否可以退货？最终只回答 yes 或 no。","expected":"no","answer_type":"boolean","aliases":["no","false","否","不可以"],"required_tools":["lookup_order","search_kb"]}
+{"case_id":"agent:011","category":"policy","task":"今天是 2026-06-02。订单 ORD-1001 还能退货吗？最终只回答 yes 或 no。","expected":"yes","answer_type":"boolean","aliases":["yes","true","是","可以"],"required_tools":["lookup_order","search_kb","date_diff"]}
+{"case_id":"agent:012","category":"knowledge","task":"SKU NB-14 这类 laptop 的保修期多久？最终只回答英文短语。","expected":"2 years","answer_type":"text","aliases":["2 years","two years","2 years warranty","two years warranty"],"required_tools":["search_kb"]}
+{"case_id":"agent:013","category":"knowledge","task":"BAT-AA 这种 battery 的保修期多久？最终只回答英文短语。","expected":"90 days","answer_type":"text","aliases":["90 days","ninety days","90 days warranty","ninety days warranty"],"required_tools":["search_kb"]}
+{"case_id":"agent:014","category":"knowledge","task":"根据配送政策，expedited shipping 需要几个 business days？最终只回答数字。","expected":"2","answer_type":"number","aliases":[],"required_tools":["search_kb"]}
+{"case_id":"agent:015","category":"inventory","task":"HD-2TB 当前有货吗？最终只回答 yes 或 no。","expected":"no","answer_type":"boolean","aliases":["no","false","否","没货"],"required_tools":["inventory_check"]}
+{"case_id":"agent:016","category":"inventory","task":"客户需要 4 台 MON-27，当前库存是否足够？最终只回答 yes 或 no。","expected":"no","answer_type":"boolean","aliases":["no","false","否","不足"],"required_tools":["inventory_check"]}
+{"case_id":"agent:017","category":"calculation","task":"2 台 MON-27 加 1 台 NB-14 的总重量是多少 kg？最终只回答数字，保留一位小数。","expected":"12.0","answer_type":"number","aliases":["12"],"required_tools":["inventory_check","calculator"]}
+{"case_id":"agent:018","category":"multi_step","task":"订单 ORD-1005 是哪位客户下的？最终只回答客户英文姓名。","expected":"Ada Chen","answer_type":"text","aliases":["ada chen"],"required_tools":["lookup_order","lookup_customer"]}
+{"case_id":"agent:019","category":"policy","task":"根据免运费政策，订单 ORD-1002 是否满足 free shipping 条件？最终只回答 yes 或 no。","expected":"yes","answer_type":"boolean","aliases":["yes","true","是","满足"],"required_tools":["lookup_order","search_kb"]}
+{"case_id":"agent:020","category":"policy","task":"如果订单 ORD-1002 发生退款，根据升级政策需要哪类审批？最终只回答英文短语。","expected":"finance approval","answer_type":"text","aliases":["finance approval","finance"],"required_tools":["lookup_order","search_kb"]}
+{"case_id":"agent:021","category":"knowledge","task":"根据折扣政策，silver 客户的折扣百分比是多少？最终只回答百分比。","expected":"5%","answer_type":"text","aliases":["5%","5 percent","5 pct"],"required_tools":["search_kb"]}
+{"case_id":"agent:022","category":"multi_step","task":"订单 ORD-1003 对应客户有多少 reward points？最终只回答数字。","expected":"15200","answer_type":"number","aliases":[],"required_tools":["lookup_order","lookup_customer"]}
+{"case_id":"agent:023","category":"calculation","task":"USB-C-1M 的库存比 KB-MECH 多多少？最终只回答数字。","expected":"35","answer_type":"number","aliases":[],"required_tools":["inventory_check","calculator"]}
+{"case_id":"agent:024","category":"inventory","task":"客户要买 10 个 BAG-LITE，当前库存是否足够？最终只回答 yes 或 no。","expected":"yes","answer_type":"boolean","aliases":["yes","true","是","足够"],"required_tools":["inventory_check"]}
