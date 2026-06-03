@@ -135,6 +135,18 @@ void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
 void FastllmCudaMemset0(void *ret, size_t size);
 
+// Borrow a per-device temporary CUDA buffer for short-lived intermediate data.
+// Small requests reuse the existing FlashInfer float workspace when it has
+// already been created and is large enough. Larger requests use one persistent
+// grow-only temp buffer per device, so warmup can reserve the max scratch size
+// and serving does not need to create another CUDA allocation.
+//
+// outOwn is kept for compatibility with older scratch users. Current borrowed
+// buffers are cache-owned, so callers should still pair Release with Borrow but
+// should not assume Release frees the CUDA memory.
+void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outOwn);
+void FastllmReleaseCudaTempBuffer(void *ptr, bool own);
+
 // 借用 FlashInfer 的 d_float_workspace 作为临时 scratch（例如 INT4 反量化为 FP16 的临时缓冲）。
 // 语义：
 //   - 当前 device 的 workspace 指针 + 字节大小通过出参返回；
@@ -148,10 +160,10 @@ void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize);
 // FastllmBorrowDequantScratch:
 //   - needBytes: 期望大小（字节）；如果为 0，按 workspace 大小返回。
 //   - outBytes:  实际可用字节数（>= 1，可能小于 needBytes，表示需要分块）。
-//   - outOwn:    true 表示 scratch 是用 FastllmCudaMalloc 分配的，使用完必须调用 Release 归还。
-// 行为：优先借用 FlashInfer workspace；workspace 为空或大小为 0 时回退为 FastllmCudaMalloc(needBytes)。
+//   - outOwn:    兼容旧调用方；当前返回的 scratch 由缓存持有，调用方只需要配对 Release。
+// 行为：优先借用已有 FlashInfer workspace；不足时使用每设备一个 grow-only temp buffer。
 void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outOwn);
-// 与 Borrow 配对。仅当 outOwn==true 时才真正调用 FastllmCudaFree。
+// 与 Borrow 配对。
 void FastllmReleaseDequantScratch(void *ptr, bool own);
 
 bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t *out,

@@ -2134,6 +2134,12 @@ FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
     return *ptr;
 }
 
+static FlashInferWorkSpaceManager *tryGetFastllmFlashInferWorkSpace(int id) {
+    std::lock_guard<std::mutex> guard(s_fastllmFlashInferWorkSpaceMapLock);
+    auto it = s_fastllmFlashInferWorkSpaceMap.find(id);
+    return it == s_fastllmFlashInferWorkSpaceMap.end() ? nullptr : it->second.get();
+}
+
 void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize) {
     FlashInferWorkSpaceManager &workspace = getFastllmFlashInferWorkSpace();
     if (outSize != nullptr) {
@@ -2142,34 +2148,98 @@ void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize) {
     return workspace.d_float_workspace;
 }
 
-void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outOwn) {
-    size_t wsBytes = 0;
-    void *ws = FastllmCudaGetFlashInferFloatWorkspace(&wsBytes);
-    if (ws != nullptr && wsBytes > 0) {
-        if (outBytes != nullptr) {
-            *outBytes = wsBytes;
+struct FastllmCudaTempDeviceBuffer {
+    int device = -1;
+    void *data = nullptr;
+    size_t size = 0;
+
+    explicit FastllmCudaTempDeviceBuffer(int device) : device(device) {}
+
+    ~FastllmCudaTempDeviceBuffer() {
+        if (data == nullptr) {
+            return;
         }
-        if (outOwn != nullptr) {
-            *outOwn = false;
+        int oldDevice = -1;
+        cudaGetDevice(&oldDevice);
+        cudaSetDevice(device);
+        FastllmCudaDirectFree(data);
+        if (oldDevice >= 0) {
+            cudaSetDevice(oldDevice);
         }
-        return ws;
     }
-    // 兜底：拿不到 workspace 就用 bigBuffer 池整块申请。
-    size_t allocBytes = needBytes > 0 ? needBytes : 1;
-    void *ret = FastllmCudaMalloc(allocBytes);
-    if (outBytes != nullptr) {
-        *outBytes = allocBytes;
-    }
-    if (outOwn != nullptr) {
-        *outOwn = true;
-    }
-    return ret;
+};
+
+static std::map<int, std::unique_ptr<FastllmCudaTempDeviceBuffer>> s_fastllmCudaTempBuffers;
+static std::mutex s_fastllmCudaTempBuffersLock;
+
+static size_t FastllmCudaTempAlignBytes(size_t size) {
+    const size_t align = 256;
+    return ((size + align - 1) / align) * align;
 }
 
-void FastllmReleaseDequantScratch(void *ptr, bool own) {
+void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outOwn) {
+    if (outOwn != nullptr) {
+        *outOwn = false;
+    }
+    if (needBytes == 0) {
+        needBytes = 1;
+    }
+
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    checkCudaErrors("Error: CUDA error when find device!", state);
+
+    FlashInferWorkSpaceManager *workspace = tryGetFastllmFlashInferWorkSpace(id);
+    if (workspace != nullptr && workspace->d_float_workspace != nullptr &&
+        workspace->cached_float_workspace_size >= needBytes) {
+        if (outBytes != nullptr) {
+            *outBytes = workspace->cached_float_workspace_size;
+        }
+        return workspace->d_float_workspace;
+    }
+
+    std::lock_guard<std::mutex> guard(s_fastllmCudaTempBuffersLock);
+    auto &holder = s_fastllmCudaTempBuffers[id];
+    if (holder == nullptr) {
+        holder = std::make_unique<FastllmCudaTempDeviceBuffer>(id);
+    }
+
+    size_t allocBytes = FastllmCudaTempAlignBytes(needBytes);
+    if (holder->size < allocBytes) {
+        if (holder->data != nullptr) {
+            FastllmCudaDirectFree(holder->data);
+            holder->data = nullptr;
+            holder->size = 0;
+        }
+        holder->data = FastllmCudaDirectMalloc(allocBytes);
+        if (holder->data == nullptr) {
+            holder->size = 0;
+            if (outBytes != nullptr) {
+                *outBytes = 0;
+            }
+            return nullptr;
+        }
+        holder->size = allocBytes;
+    }
+
+    if (outBytes != nullptr) {
+        *outBytes = holder->size;
+    }
+    return holder->data;
+}
+
+void FastllmReleaseCudaTempBuffer(void *ptr, bool own) {
     if (own && ptr != nullptr) {
         FastllmCudaFree(ptr);
     }
+}
+
+void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outOwn) {
+    return FastllmBorrowCudaTempBuffer(needBytes, outBytes, outOwn);
+}
+
+void FastllmReleaseDequantScratch(void *ptr, bool own) {
+    FastllmReleaseCudaTempBuffer(ptr, own);
 }
 
 #ifdef FASTLLM_ENABLE_FLASHINFER

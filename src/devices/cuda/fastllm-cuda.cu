@@ -2176,6 +2176,22 @@ void * FastllmCudaMalloc(size_t size) {
 #endif
             return bigBuffers[selId].data;
         }
+        if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+            for (int i = 0; i < bigBuffers.size(); i++) {
+                if (bigBuffers[i].size >= size && !bigBuffers[i].busy) {
+                    if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
+                        selId = i;
+                    }
+                }
+            }
+            if (selId != -1) {
+                bigBuffers[selId].busy = true;
+#ifdef CUDA_MEM_DEBUG
+                CudaMemDebugRecord(bigBuffers[selId].data, size);
+#endif
+                return bigBuffers[selId].data;
+            }
+        }
 
         void * ret;
         state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
@@ -2209,6 +2225,24 @@ void * FastllmCudaMalloc(size_t size) {
             return cudaBuffers[i].data;
         }
     }
+    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        auto &bigBuffers = bigBuffersMap[id];
+        int selId = -1;
+        for (int i = 0; i < bigBuffers.size(); i++) {
+            if (bigBuffers[i].size >= size && !bigBuffers[i].busy) {
+                if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
+                    selId = i;
+                }
+            }
+        }
+        if (selId != -1) {
+            bigBuffers[selId].busy = true;
+#ifdef CUDA_MEM_DEBUG
+            CudaMemDebugRecord(bigBuffers[selId].data, size);
+#endif
+            return bigBuffers[selId].data;
+        }
+    }
     void * ret;
     state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state) {
@@ -2239,8 +2273,9 @@ void FastllmCudaFree(void *ret) {
         return;
     int oriId = FastllmCudaGetDevice();
     cudaError_t state = cudaSuccess;
+    bool keepCudaBuffers = fastllm::GetFastllmEnv().cudaMemCheck;
     for (auto &it: cudaBuffersMap) {
-        if (noBusyCnt[it.first] > 1024 * 1024 * 1024) {
+        if (!keepCudaBuffers && noBusyCnt[it.first] > 1024 * 1024 * 1024) {
             auto &cudaBuffers = it.second;
             std::vector <CudaMemoryBuffer> temp;
             for (int i = 0; i < cudaBuffers.size(); i++) {
@@ -2309,6 +2344,10 @@ void FastllmCudaMallocBigBuffer(size_t size) {
 }
 
 void FastllmCudaClearBigBuffer() {
+    if (fastllm::GetFastllmEnv().cudaMemCheck &&
+        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        return;
+    }
     int id = -1;
     cudaGetDevice(&id);
     if (bigBuffersMap.empty())
@@ -4317,7 +4356,23 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         exit(0);
     }
     int len = input.Count(0);
-    uint8_t *tempData = (uint8_t *)FastllmCudaMalloc(len * input.unitSize);
+    size_t tempBytes = (size_t)len * input.unitSize;
+    bool permuteFastPath =
+        axis == std::vector <int> {1, 0, 2} ||
+        axis == std::vector <int> {2, 0, 1, 3} ||
+        axis == std::vector <int> {1, 2, 0, 3} ||
+        (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1);
+    size_t alignedTempBytes = FastllmCudaAlignBytes(tempBytes, 256);
+    size_t axisTempBytes = permuteFastPath ? 0 : FastllmCudaAlignBytes(axis.size() * 3 * sizeof(int), 256);
+    size_t tempBufferBytes = 0;
+    bool tempOwn = false;
+    uint8_t *tempData = (uint8_t *)FastllmBorrowCudaTempBuffer(
+        alignedTempBytes + axisTempBytes, &tempBufferBytes, &tempOwn);
+    if (tempData == nullptr || tempBufferBytes < alignedTempBytes + axisTempBytes) {
+        printf("FastllmCudaPermute: failed to borrow CUDA temp buffer.\n");
+        fflush(stdout);
+        return false;
+    }
     cudaMemcpy(tempData, input.cudaData, len * input.unitSize, cudaMemcpyDeviceToDevice);
 
     std::vector<int> new_dims;
@@ -4366,7 +4421,7 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
             temp.push_back(input.Count(i + 1));
         }
 
-        int *cudaTemp = (int *) FastllmCudaMalloc(temp.size() * sizeof(int));
+        int *cudaTemp = (int *)(tempData + alignedTempBytes);
         cudaMemcpy(cudaTemp, temp.data(), temp.size() * sizeof(int), cudaMemcpyHostToDevice);
         int threadPerBlock = std::min(256, len);
         if (input.unitSize == 4) {
@@ -4380,11 +4435,10 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
                     (uint8_t *) input.cudaData,(uint8_t *)tempData, cudaTemp,(int) axis.size(), len);
         }
 
-        FastllmCudaFree(cudaTemp);
     }
 
-    FastllmCudaFree(tempData);
     DeviceSync();
+    FastllmReleaseCudaTempBuffer(tempData, tempOwn);
     return true;
 }
 
@@ -5881,10 +5935,11 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
     bool scratchOwn = false;
     uint8_t *scratch = (uint8_t *)FastllmBorrowDequantScratch(
         alignedProbsBytes + alignedParamBytes, &scratchBytes, &scratchOwn);
-    if (scratchBytes < alignedProbsBytes + alignedParamBytes) {
+    if (scratch == nullptr || scratchBytes < alignedProbsBytes + alignedParamBytes) {
         FastllmReleaseDequantScratch(scratch, scratchOwn);
-        scratch = (uint8_t *)FastllmCudaMalloc(alignedProbsBytes + alignedParamBytes);
-        scratchOwn = true;
+        printf("FastllmCudaTopKTopPSampling: failed to borrow CUDA temp buffer.\n");
+        fflush(stdout);
+        return false;
     }
     float *cudaProbs = (float *)scratch;
     uint8_t *cudaParamBuf = scratch + alignedProbsBytes;

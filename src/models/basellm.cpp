@@ -2887,6 +2887,68 @@ namespace fastllm {
         }
         captureWarmupPagedCacheManager(pastKeyValuesStorage);
 
+#ifdef USE_CUDA
+        if (autoCalcPages && GetFastllmEnv().cudaMemCheck && len > 1) {
+            for (auto &kv : pastKeyValuesStorage) {
+                ReleasePagedCachePages(kv.first);
+                ReleasePagedCachePages(kv.second);
+            }
+            std::vector<int> extraPrefillLens;
+            for (int candidate : {512, 1024, 2048, 4096}) {
+                if (candidate > 1 && candidate < len) {
+                    extraPrefillLens.push_back(candidate);
+                }
+            }
+            if (!extraPrefillLens.empty()) {
+                printf("[Fastllm] AutoWarmup CUDA memcheck prefill buckets:");
+                for (int warmLen : extraPrefillLens) {
+                    printf(" %d", warmLen);
+                }
+                printf("\n");
+            }
+
+            auto runExtraPrefillWarmup = [&](int warmLen) {
+                std::vector <float> warmIds(warmLen, 1.0f);
+                Data warmInputIds = Data(DataType::FLOAT32, {1, warmLen}, warmIds);
+                std::vector <float> warmPosData(warmLen);
+                for (int i = 0; i < warmLen; i++) {
+                    warmPosData[i] = i;
+                }
+                Data warmPositionIds = Data(this->dataType, {1, warmLen}, warmPosData);
+                std::vector <Data*> warmAttentionMasks = {nullptr};
+                std::vector <Data*> warmPositionIdsVec = {&warmPositionIds};
+                std::vector <int> warmSeqLens = {warmLen};
+                std::vector <std::pair <Data, Data> > warmPastKeyValuesStorage;
+                std::vector <std::pair <Data*, Data*> > warmPastKeyValues;
+                warmPastKeyValuesStorage.reserve(block_cnt);
+                warmPastKeyValues.reserve(block_cnt);
+                for (int i = 0; i < block_cnt; i++) {
+                    warmPastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+                    warmPastKeyValuesStorage.back().first.SetKVCache();
+                    warmPastKeyValuesStorage.back().second.SetKVCache();
+                    warmPastKeyValues.push_back(std::make_pair(&warmPastKeyValuesStorage.back().first,
+                                                               &warmPastKeyValuesStorage.back().second));
+                }
+                GenerationConfig warmGenerationConfig;
+                std::vector <GenerationConfig> warmGenerationConfigs = {warmGenerationConfig};
+                LastTokensManager warmLastTokens;
+                runWarmupForward(1, warmInputIds, warmAttentionMasks, warmPositionIdsVec,
+                                 warmSeqLens, warmPastKeyValues, warmGenerationConfigs, warmLastTokens);
+                for (auto &kv : warmPastKeyValuesStorage) {
+                    ReleasePagedCachePages(kv.first);
+                    kv.first.pagedKVCacheData = nullptr;
+                    kv.first.isPagedKVCache = false;
+                    ReleasePagedCachePages(kv.second);
+                    kv.second.pagedKVCacheData = nullptr;
+                    kv.second.isPagedKVCache = false;
+                }
+            };
+            for (int warmLen : extraPrefillLens) {
+                runExtraPrefillWarmup(warmLen);
+            }
+        }
+#endif
+
         if (autoCalcPages) {
 #ifdef USE_CUDA
             std::set <int> deviceIds;
@@ -2966,6 +3028,62 @@ namespace fastllm {
 
             auto freeSizes = FastllmCudaGetFreeSizes();
             auto totalSizes = FastllmCudaGetTotalSizes();
+            auto getCudaMemCheckReserve = [&](int id, long long avail) -> long long {
+                if (!GetFastllmEnv().cudaMemCheck || avail <= 0 ||
+                    id < 0 || id >= (int)totalSizes.size()) {
+                    return 0LL;
+                }
+                long long extraReserve = std::max(512LL << 20, (long long)(totalSizes[id] * 0.08));
+                return std::min(extraReserve, avail / 2);
+            };
+            auto applyCudaMemCheckReserve = [&](int id, long long avail, bool printReserve) -> long long {
+                long long extraReserve = getCudaMemCheckReserve(id, avail);
+                if (extraReserve > 0) {
+                    if (printReserve) {
+                        printf("[Fastllm] AutoWarmup CUDA memcheck GPU %d: reserve extra %.2f GB for activation pools.\n",
+                               id, extraReserve / 1e9);
+                    }
+                    avail -= extraReserve;
+                }
+                return avail;
+            };
+            auto getCudaMemCheckBatchLimit = [&]() -> int {
+                int batchLimit = 512;
+                if (this->maxBatch > 0) {
+                    batchLimit = this->maxBatch;
+                }
+                batchLimit = NormalizeMaxBatchByModelCapability(this, batchLimit);
+                return std::max(1, batchLimit);
+            };
+            auto fitPagesWithLinearReserve = [&](int id, long long avail, long long kvBytesPerPage) -> int {
+                if (avail <= 0 || kvBytesPerPage <= 0) {
+                    return 0;
+                }
+                long long rawPages = avail / kvBytesPerPage;
+                if (!GetFastllmEnv().cudaMemCheck || linearFixedBytes <= 0 || rawPages <= 0) {
+                    return (int)std::min<long long>(rawPages, INT_MAX);
+                }
+
+                int batchLimit = getCudaMemCheckBatchLimit();
+                long long low = 0, high = rawPages;
+                while (low < high) {
+                    long long mid = (low + high + 1) / 2;
+                    long long activeBatch = std::min<long long>(batchLimit, mid);
+                    __int128 need = (__int128)mid * kvBytesPerPage +
+                                    (__int128)activeBatch * linearFixedBytes;
+                    if (need <= avail) {
+                        low = mid;
+                    } else {
+                        high = mid - 1;
+                    }
+                }
+                if (low < rawPages) {
+                    long long activeBatch = std::min<long long>(batchLimit, low);
+                    printf("[Fastllm] AutoWarmup CUDA memcheck GPU %d: limit pages %lld -> %lld, reserve %.2f MB/request linear cache up to batch %lld.\n",
+                           id, rawPages, low, linearFixedBytes / 1e6, activeBatch);
+                }
+                return (int)std::min<long long>(low, INT_MAX);
+            };
             if (deviceBytesPerPage.size() > 1) {
                 // 多卡模式：对每张实际承载 token-growing cache 的卡分别限流，取最小值
                 int maxPages = INT_MAX;
@@ -2974,13 +3092,14 @@ namespace fastllm {
                     if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
                         long long reserved = (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
                         long long avail = freeSizes[id] - reserved;
+                        avail = applyCudaMemCheckReserve(id, avail, true);
                         long long perPageOnDevice = it.second;
                         printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, localKVPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                id, freeSizes[id] / 1e9, totalSizes[id] / 1e9, reserved / 1e9,
                                avail / 1e9, perPageOnDevice / 1e6,
                                deviceLayerCount.count(id) ? deviceLayerCount[id] : 0);
                         if (perPageOnDevice > 0 && avail > 0) {
-                            int pages = (int)(avail / perPageOnDevice);
+                            int pages = fitPagesWithLinearReserve(id, avail, perPageOnDevice);
                             maxPages = std::min(maxPages, pages);
                         }
                     }
@@ -2994,6 +3113,7 @@ namespace fastllm {
                     for (int id : deviceIds) {
                         if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
                             long long avail = freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+                            avail = applyCudaMemCheckReserve(id, avail, false);
                             int layers = deviceLayerCount.count(id) ? deviceLayerCount[id] : 0;
                             printf("  GPU %d: layers=%d, avail=%.2f GB.\n", id, layers, avail / 1e9);
                         }
@@ -3011,6 +3131,7 @@ namespace fastllm {
                     if (cacheDeviceId < (int)freeSizes.size() && cacheDeviceId < (int)totalSizes.size()) {
                         long long reserved = (long long)(totalSizes[cacheDeviceId] * (1.0 - fastllm::GetGpuMemRatio()));
                         cacheAvail = freeSizes[cacheDeviceId] - reserved;
+                        cacheAvail = applyCudaMemCheckReserve(cacheDeviceId, cacheAvail, true);
                         printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                cacheDeviceId, freeSizes[cacheDeviceId] / 1e9, totalSizes[cacheDeviceId] / 1e9,
                                reserved / 1e9, cacheAvail / 1e9, cacheBytesPerPage / 1e6,
@@ -3018,7 +3139,7 @@ namespace fastllm {
                     }
                 }
                 if (cacheAvail > 0 && cacheBytesPerPage > 0) {
-                    int maxPages = (int)(cacheAvail / cacheBytesPerPage);
+                    int maxPages = fitPagesWithLinearReserve(cacheDeviceId, cacheAvail, cacheBytesPerPage);
                     if (maxPages > 0) {
                         fastllm::SetMaxTokens(maxPages * pageLen);
                         updatedPages = true;
@@ -3053,29 +3174,78 @@ namespace fastllm {
             if (skipShortWarmupForward) {
                 printf("[Fastllm] Step3.5 CUDA graph: skip AutoWarmup short decode forward.\n");
             } else {
-                for (int i = 0; i < block_cnt; i++) {
-                    pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
-                    pastKeyValuesStorage.back().first.SetKVCache();
-                    pastKeyValuesStorage.back().second.SetKVCache();
+                int warmupMaxBatch = 1;
+                if (GetFastllmEnv().cudaMemCheck) {
+                    warmupMaxBatch = 512;
+                    if (this->maxBatch > 0) {
+                        warmupMaxBatch = this->maxBatch;
+                    }
+                    warmupMaxBatch = NormalizeMaxBatchByModelCapability(this, warmupMaxBatch);
+                    warmupMaxBatch = std::max(1, std::min(warmupMaxBatch, fastllm::GetMaxTokens() / 128));
+                    printf("[Fastllm] AutoWarmup CUDA memcheck batch warmup up to %d.\n", warmupMaxBatch);
                 }
-                for (int i = 0; i < block_cnt; i++) {
-                    pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage[i].first, &pastKeyValuesStorage[i].second));
+
+                std::vector<int> shortWarmupBatches;
+                for (int batch = 1; batch < warmupMaxBatch; batch *= 2) {
+                    shortWarmupBatches.push_back(batch);
                 }
-                Data shortInputIds = Data(DataType::FLOAT32, {1, 1}, {1.0f});
-                Data shortPositionIds = Data(this->dataType, {1, 1}, {0.0f});
-                std::vector <Data*> shortAttentionMasks = {nullptr};
-                std::vector <Data*> shortPositionIdsVec = {&shortPositionIds};
-                std::vector <int> shortSeqLens = {1};
-                runWarmupForward(1, shortInputIds, shortAttentionMasks, shortPositionIdsVec,
-                                 shortSeqLens, pastKeyValues, generationConfigs, lastTokens);
-                captureWarmupPagedCacheManager(pastKeyValuesStorage);
-                for (auto &kv : pastKeyValuesStorage) {
-                    kv.first.pageIndex.clear();
-                    kv.first.pagedKVCacheData = nullptr;
-                    kv.first.isPagedKVCache = false;
-                    kv.second.pageIndex.clear();
-                    kv.second.pagedKVCacheData = nullptr;
-                    kv.second.isPagedKVCache = false;
+                if (shortWarmupBatches.empty() || shortWarmupBatches.back() != warmupMaxBatch) {
+                    shortWarmupBatches.push_back(warmupMaxBatch);
+                }
+
+                auto runShortBatchWarmup = [&](int batch, int tokensPerRequest) {
+                    pastKeyValuesStorage.clear();
+                    pastKeyValues.clear();
+                    pastKeyValuesStorage.reserve((size_t)batch * block_cnt);
+                    pastKeyValues.reserve((size_t)batch * block_cnt);
+                    for (int b = 0; b < batch; b++) {
+                        for (int i = 0; i < block_cnt; i++) {
+                            pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+                            pastKeyValuesStorage.back().first.SetKVCache();
+                            pastKeyValuesStorage.back().second.SetKVCache();
+                            pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
+                                                                   &pastKeyValuesStorage.back().second));
+                        }
+                    }
+
+                    int totalTokens = batch * tokensPerRequest;
+                    std::vector<float> shortInputIdsHost(totalTokens, 1.0f);
+                    Data shortInputIds = Data(DataType::FLOAT32, {1, totalTokens}, shortInputIdsHost);
+                    std::vector<Data> shortPositionIdsStorage;
+                    std::vector<Data*> shortPositionIdsVec;
+                    shortPositionIdsStorage.reserve(batch);
+                    shortPositionIdsVec.reserve(batch);
+                    for (int b = 0; b < batch; b++) {
+                        std::vector<float> shortPos(tokensPerRequest);
+                        for (int i = 0; i < tokensPerRequest; i++) {
+                            shortPos[i] = (float)i;
+                        }
+                        shortPositionIdsStorage.push_back(Data(this->dataType, {1, tokensPerRequest}, shortPos));
+                        shortPositionIdsVec.push_back(&shortPositionIdsStorage.back());
+                    }
+                    std::vector <Data*> shortAttentionMasks(batch, nullptr);
+                    std::vector <int> shortSeqLens(batch, tokensPerRequest);
+                    std::vector <GenerationConfig> shortGenerationConfigs(batch);
+                    LastTokensManager shortLastTokens(batch, shortGenerationConfigs[0].last_n);
+
+                    runWarmupForward(batch, shortInputIds, shortAttentionMasks, shortPositionIdsVec,
+                                     shortSeqLens, pastKeyValues, shortGenerationConfigs, shortLastTokens);
+                    captureWarmupPagedCacheManager(pastKeyValuesStorage);
+                    for (auto &kv : pastKeyValuesStorage) {
+                        ReleasePagedCachePages(kv.first);
+                        kv.first.pagedKVCacheData = nullptr;
+                        kv.first.isPagedKVCache = false;
+                        ReleasePagedCachePages(kv.second);
+                        kv.second.pagedKVCacheData = nullptr;
+                        kv.second.isPagedKVCache = false;
+                    }
+                };
+
+                for (int batch : shortWarmupBatches) {
+                    runShortBatchWarmup(batch, 1);
+                    if (GetFastllmEnv().cudaMemCheck && batch > 1) {
+                        runShortBatchWarmup(batch, 2);
+                    }
                 }
             }
 #endif
