@@ -831,6 +831,20 @@ namespace fastllm {
         this->Allocate();
         if (type == DataType::FLOAT32) {
             std::memcpy(this->cpuData, data.data(), this->GetBytes());
+        } else if (type == DataType::FLOAT16 || type == DataType::BFLOAT16) {
+            size_t n = std::min((size_t)this->Count(0), data.size());
+            uint16_t *dst = (uint16_t *) this->cpuData;
+            if (type == DataType::FLOAT16) {
+                for (size_t i = 0; i < n; i++) {
+                    dst[i] = float_to_half(data[i]);
+                }
+            } else {
+                for (size_t i = 0; i < n; i++) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &data[i], sizeof(bits));
+                    dst[i] = (uint16_t)(bits >> 16); // fp32 -> bf16 截断
+                }
+            }
         }
     }
 

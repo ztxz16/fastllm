@@ -116,6 +116,14 @@ namespace fastllm {
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
+        {
+            auto positionIt = datas.find("positionIds");
+            if (positionIt != datas.end() && positionIt->second != nullptr &&
+                positionIt->second->dataType != DataType::FLOAT32 &&
+                intParams.find("positionIds___batch") == intParams.end()) {
+                this->Run("ToFloat32", {{"input", positionIt->second}}, {}, {});
+            }
+        }
         bool lockInCPU = false;
         if (GetKVCacheInCPU() || GetHistoryCacheInCPU()) {
             // 暂时只有kvcache可能lock在CPU上
