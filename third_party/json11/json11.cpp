@@ -1,3 +1,4 @@
+#include <cstdint>
 /* Copyright (c) 2013 Dropbox, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
