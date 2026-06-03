@@ -1,0 +1,5 @@
+{"question_id":"baseline-mmlu-pro-001","category":"math","question":"What is 7 + 5?","options":["10","11","12","13"],"answer":"C"}
+{"question_id":"baseline-mmlu-pro-002","category":"science","question":"Which gas do plants primarily take in during photosynthesis?","options":["Oxygen","Carbon dioxide","Nitrogen","Hydrogen"],"answer":"B"}
+{"question_id":"baseline-mmlu-pro-003","category":"history","question":"The Magna Carta was first issued in which century?","options":["11th century","12th century","13th century","14th century"],"answer":"C"}
+{"question_id":"baseline-mmlu-pro-004","category":"computer_science","question":"Which data structure uses first-in, first-out ordering?","options":["Stack","Queue","Heap","Tree"],"answer":"B"}
+{"question_id":"baseline-mmlu-pro-005","category":"economics","question":"If demand increases while supply stays constant, what usually happens to market price?","options":["It rises","It falls","It must become zero","It is unrelated to demand"],"answer":"A"}
