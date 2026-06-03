@@ -1,0 +1,5 @@
+{"question_id":"baseline-gsm8k-001","question":"Lina has 3 boxes with 4 pencils in each box. How many pencils does she have in total?","answer":"Lina has 3 * 4 = 12 pencils. #### 12"}
+{"question_id":"baseline-gsm8k-002","question":"A shop sold 18 apples in the morning and 7 apples in the afternoon. It started with 40 apples. How many apples are left?","answer":"The shop sold 18 + 7 = 25 apples, so 40 - 25 = 15 are left. #### 15"}
+{"question_id":"baseline-gsm8k-003","question":"Noah saves $6 each week for 5 weeks, then spends $8. How much money does he have left?","answer":"Noah saves 6 * 5 = 30 dollars and spends 8, leaving 22. #### 22"}
+{"question_id":"baseline-gsm8k-004","question":"A class has 24 students. One quarter of them bring lunch from home. How many students bring lunch from home?","answer":"One quarter of 24 is 24 / 4 = 6. #### 6"}
+{"question_id":"baseline-gsm8k-005","question":"Mia read 9 pages on Monday and twice as many pages on Tuesday. How many pages did she read over both days?","answer":"On Tuesday Mia read 9 * 2 = 18 pages. In total she read 9 + 18 = 27 pages. #### 27"}
