@@ -121,9 +121,13 @@ printf("\n");
 */
 
 static std::map<int, cublasHandle_t> s_fastllmCublasHandleMap;
+static std::mutex s_fastllmCublasHandleMapMutex;
 cublasHandle_t getFastllmCublasHandle() {
     int id = -1;
     cudaGetDevice(&id);
+    // 线程级张量并行时，多个 worker 线程会并发访问该全局 map，
+    // 必须加锁，否则并发读写 std::map 会破坏其内部结构导致死循环/崩溃。
+    std::lock_guard<std::mutex> guard(s_fastllmCublasHandleMapMutex);
     auto it = s_fastllmCublasHandleMap.find(id);
     if (it != s_fastllmCublasHandleMap.end()) {
         cublasSetStream(it->second, cudaStreamPerThread);
