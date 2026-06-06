@@ -5135,20 +5135,18 @@ namespace fastllm {
                 Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim, localQkvDim + localVd, z);
                 if (hasMergedGdnInLinear) {
                     Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim + localVd,
-                                   localQkvDim + localVd + localValueHeads, b);
-                    Qwen3CudaSplit(cudaRunner, gdnMerged, -1,
-                                   localQkvDim + localVd + localValueHeads,
-                                   localQkvDim + localVd + localValueHeads * 2, a);
+                                   localQkvDim + localVd + localValueHeads * 2,
+                                   baMerged);
                 } else {
                     Qwen3CudaLinear(cudaRunner, attenInput,
                                     *requireLocal(weight[baWeightName], baWeightName),
                                     *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
                                                   baWeightName + ".tp_bias"),
                                     baMerged);
-                    Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
-                    Qwen3CudaSplit(cudaRunner, baMerged, -1, localValueHeads,
-                                   localValueHeads * 2, a);
                 }
+                Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
+                Qwen3CudaSplit(cudaRunner, baMerged, -1, localValueHeads,
+                               localValueHeads * 2, a);
 
                 Data &pastKey = *pastKeyValues[i].first;
                 Data &pastValue = *pastKeyValues[i].second;
@@ -5258,12 +5256,85 @@ namespace fastllm {
                     Qwen3CudaPermuteSelf(cudaRunner, convOutput, {0, 2, 1});
                 }
 
-                Qwen3CudaSplit(cudaRunner, convOutput, -1, 0, localKd, q);
-                Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd, localKd * 2, k);
-                Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd * 2, localKd * 2 + localVd, v);
-                q.Reshape({q.dims[0], q.dims[1], localKeyHeads, head_k_dim});
-                k.Reshape({k.dims[0], k.dims[1], localKeyHeads, head_k_dim});
-                v.Reshape({v.dims[0], v.dims[1], localValueHeads, head_v_dim});
+                bool fusedBatchRecurrentFromConvBa = false;
+#ifdef USE_CUDA
+                std::vector<Data*> fusedRecurrentStates;
+                if (batch > 1 && all1) {
+                    Data *linearNormWeight = requireLocal(inv_scale_data, "linear_attn.inv_scale");
+                    Data *aLog = requireLocal(weight[aLogName], aLogName);
+                    Data *dtBias = requireLocal(weight[dtBiasName], dtBiasName);
+                    fusedRecurrentStates.resize(batch);
+                    bool canUseFusedBatchRecurrent =
+                        convOutput.dataDevice == DataDevice::CUDA &&
+                        convOutput.dataType == DataType::FLOAT16 &&
+                        baMerged.dataDevice == DataDevice::CUDA &&
+                        baMerged.dataType == DataType::FLOAT16 &&
+                        baMerged.dims.size() > 0 &&
+                        baMerged.dims.back() == localValueHeads * 2 &&
+                        linearNormWeight->dataDevice == DataDevice::CUDA &&
+                        linearNormWeight->dataType == DataType::FLOAT32 &&
+                        linearNormWeight->dims.size() == 1 &&
+                        linearNormWeight->dims[0] == head_k_dim &&
+                        aLog->dataDevice == DataDevice::CUDA &&
+                        aLog->dataType == DataType::FLOAT32 &&
+                        aLog->dims.size() == 1 &&
+                        aLog->dims[0] == localValueHeads &&
+                        dtBias->dataDevice == DataDevice::CUDA &&
+                        dtBias->dataType == DataType::FLOAT32 &&
+                        dtBias->dims.size() == 1 &&
+                        dtBias->dims[0] == localValueHeads &&
+                        localKeyHeads > 0 &&
+                        localValueHeads % localKeyHeads == 0;
+                    bool recurrentStatesTransposed = false;
+                    for (int rb = 0; rb < batch; rb++) {
+                        fusedRecurrentStates[rb] = pastKeyValues[rb * block_cnt + i].second;
+                        Data *state = fusedRecurrentStates[rb];
+                        if (rb == 0 && state != nullptr) {
+                            recurrentStatesTransposed = state->isLinearAttentionTransposed;
+                        }
+                        canUseFusedBatchRecurrent &= state != nullptr &&
+                                                     state->dataDevice == DataDevice::CUDA &&
+                                                     state->dataType == DataType::FLOAT16 &&
+                                                     state->cudaData != nullptr &&
+                                                     state->dims.size() == 4 &&
+                                                     state->dims[0] == 1 &&
+                                                     state->dims[1] == localValueHeads &&
+                                                     state->dims[2] == head_k_dim &&
+                                                     state->dims[3] == head_v_dim &&
+                                                     state->isLinearAttentionTransposed == recurrentStatesTransposed;
+                    }
+                    canUseFusedBatchRecurrent &= !recurrentStatesTransposed || head_k_dim == 128;
+                    if (canUseFusedBatchRecurrent) {
+                        float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
+                        if (recurrentStatesTransposed) {
+                            FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
+                                convOutput, baMerged, *linearNormWeight, *aLog, *dtBias,
+                                fusedRecurrentStates, coreAttnOut,
+                                localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
+                                rms_norm_eps, recurrentQScale);
+                        } else {
+                            FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
+                                convOutput, baMerged, *linearNormWeight, *aLog, *dtBias,
+                                fusedRecurrentStates, coreAttnOut,
+                                localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
+                                rms_norm_eps, recurrentQScale);
+                        }
+                        fusedBatchRecurrentFromConvBa = true;
+                        for (int rb = 0; rb < batch; rb++) {
+                            fusedRecurrentStates[rb]->isLinearAttention = true;
+                        }
+                        coreAttnOut.Reshape({1, batch, coreAttnOut.dims[1], coreAttnOut.dims[3]});
+                    }
+                }
+#endif
+
+                if (!fusedBatchRecurrentFromConvBa) {
+                    Qwen3CudaSplit(cudaRunner, convOutput, -1, 0, localKd, q);
+                    Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd, localKd * 2, k);
+                    Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd * 2, localKd * 2 + localVd, v);
+                    q.Reshape({q.dims[0], q.dims[1], localKeyHeads, head_k_dim});
+                    k.Reshape({k.dims[0], k.dims[1], localKeyHeads, head_k_dim});
+                    v.Reshape({v.dims[0], v.dims[1], localValueHeads, head_v_dim});
 
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
                     bool fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
@@ -5424,6 +5495,7 @@ namespace fastllm {
                     } else {
                         Qwen3CudaPermuteSelf(cudaRunner, coreAttnOut, {0, 2, 1, 3});
                     }
+                }
                 }
 
                 std::vector<int> zShape = z.dims;

@@ -8469,6 +8469,28 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
     FastllmCudaFree(cudaPointers);
 }
 
+void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    int batch = (int)last_recurrent_states.size();
+    void **cpuPointers = new void*[batch];
+    for (int i = 0; i < batch; i++) {
+        cpuPointers[i] = last_recurrent_states[i]->cudaData;
+    }
+    void **cudaPointers = (void**)FastllmCudaMalloc(sizeof(void*) * batch);
+    cudaError_t state = cudaMemcpy(cudaPointers, cpuPointers, sizeof(void*) * batch, cudaMemcpyHostToDevice);
+    delete[] cpuPointers;
+    checkCudaErrors("Error: CUDA error when copy transposed recurrent state pointers to GPU!", state);
+
+    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
+        convOutput, ba, normWeight, aLog, dtBias, *last_recurrent_states[0], cudaPointers, batch,
+        core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
+    FastllmCudaFree(cudaPointers);
+}
+
 template <typename T>
 __global__ void FastllmChunkGatedDeltaRuleBuildQScaledChunkKernel(
     const T *q, const T *g, T *qScaled,

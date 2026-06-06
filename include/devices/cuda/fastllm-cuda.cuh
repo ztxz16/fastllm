@@ -590,6 +590,12 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
     std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale = 1.0f);
+void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale = 1.0f);
 bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
