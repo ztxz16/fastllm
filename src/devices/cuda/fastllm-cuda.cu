@@ -1775,6 +1775,7 @@ std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
 std::map<int, int> cudaBuffersMinId; // 最小的空闲id
 std::map<int, size_t> noBusyCnt;
 std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
+static std::mutex fastllmCudaMemPoolMutex;
 
 static size_t fastllmCudaMemPoolAllocated = 0;
 static size_t fastllmCudaMemPoolPeak = 0;
@@ -2130,6 +2131,7 @@ void FastllmCudaMemset0(void *ret, size_t size) {
 void FastllmCudaMemPoolStats() {
     int id = -1;
     cudaGetDevice(&id);
+    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
     size_t bigTotal = 0, bigBusy = 0;
     size_t smallTotal = 0, smallBusy = 0;
     auto &bigBuffers = bigBuffersMap[id];
@@ -2153,17 +2155,77 @@ void FastllmCudaMemPoolStats() {
            freeMem >> 20, totalMem >> 20);
 }
 
+static bool FastllmCudaCanReusePooledBigBuffer(size_t bufferSize, size_t requestSize) {
+    if (bufferSize < requestSize) {
+        return false;
+    }
+    size_t maxWaste = 16 * 1024 * 1024;
+    if (requestSize >= 64 * 1024 * 1024) {
+        return bufferSize <= requestSize * 3;
+    }
+    if (requestSize >= 32 * 1024 * 1024) {
+        return bufferSize <= requestSize * 4;
+    }
+    if (requestSize >= 8 * 1024 * 1024) {
+        return bufferSize <= requestSize * 5;
+    }
+    return bufferSize <= requestSize * 2 || bufferSize - requestSize < maxWaste;
+}
+
+static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize) {
+    if (!fastllm::GetFastllmEnv().cudaMemCheck) {
+        return;
+    }
+    fprintf(stderr, "[FASTLLM_CUDA_MEM_CHECK] pooled buffers on device %d before rejecting %.2f MB:\n",
+            id, requestSize / 1048576.0);
+    auto bigIt = bigBuffersMap.find(id);
+    if (bigIt == bigBuffersMap.end() || bigIt->second.empty()) {
+        fprintf(stderr, "  bigPool: empty\n");
+    } else {
+        int printed = 0;
+        for (int i = 0; i < (int)bigIt->second.size(); i++) {
+            auto &b = bigIt->second[i];
+            if (b.size < 1024 * 1024 && printed >= 16) {
+                continue;
+            }
+            fprintf(stderr, "  big[%d]: %.2f MB %s %s\n", i, b.size / 1048576.0,
+                    b.busy ? "busy" : "free",
+                    FastllmCudaCanReusePooledBigBuffer(b.size, requestSize) ? "fits" : "skip");
+            printed++;
+        }
+    }
+    auto smallIt = cudaBuffersMap.find(id);
+    if (smallIt == cudaBuffersMap.end() || smallIt->second.empty()) {
+        fprintf(stderr, "  smallPool: empty\n");
+    } else {
+        size_t smallFree = 0, smallBusy = 0;
+        int freeCount = 0, busyCount = 0;
+        for (auto &b : smallIt->second) {
+            if (b.busy) {
+                smallBusy += b.size;
+                busyCount++;
+            } else {
+                smallFree += b.size;
+                freeCount++;
+            }
+        }
+        fprintf(stderr, "  smallPool: free %.2f MB (%d), busy %.2f MB (%d)\n",
+                smallFree / 1048576.0, freeCount, smallBusy / 1048576.0, busyCount);
+    }
+    fflush(stderr);
+}
+
 void * FastllmCudaMalloc(size_t size) {
     int id = -1;
     cudaError_t state = cudaSuccess;
     state = cudaGetDevice(&id);
     checkCudaErrors("Error: CUDA error when find device!", state);
+    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
     if (size > 1024 * 1024) {
         auto &bigBuffers = bigBuffersMap[id];
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (bigBuffers[i].size >= size && !bigBuffers[i].busy
-                && (bigBuffers[i].size <= size * 2 || bigBuffers[i].size - size < 1 * 1024 * 1024)) {
+            if (!bigBuffers[i].busy && FastllmCudaCanReusePooledBigBuffer(bigBuffers[i].size, size)) {
                 if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
                     selId = i;
                 }
@@ -2178,7 +2240,7 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
             for (int i = 0; i < bigBuffers.size(); i++) {
-                if (bigBuffers[i].size >= size && !bigBuffers[i].busy) {
+                if (!bigBuffers[i].busy && bigBuffers[i].size >= size) {
                     if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
                         selId = i;
                     }
@@ -2194,6 +2256,9 @@ void * FastllmCudaMalloc(size_t size) {
         }
 
         void * ret;
+        if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+            FastllmCudaPrintPoolRejectStateLocked(id, size);
+        }
         state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
         if (cudaSuccess != state) {
             size_t freeMem = 0, totalMem = 0;
@@ -2229,7 +2294,7 @@ void * FastllmCudaMalloc(size_t size) {
         auto &bigBuffers = bigBuffersMap[id];
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (bigBuffers[i].size >= size && !bigBuffers[i].busy) {
+            if (!bigBuffers[i].busy && bigBuffers[i].size >= size) {
                 if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
                     selId = i;
                 }
@@ -2244,6 +2309,9 @@ void * FastllmCudaMalloc(size_t size) {
         }
     }
     void * ret;
+    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        FastllmCudaPrintPoolRejectStateLocked(id, size);
+    }
     state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state) {
         size_t freeMem = 0, totalMem = 0;
@@ -2269,11 +2337,12 @@ void FastllmCudaFree(void *ret) {
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
-    if (cudaBuffersMap.empty() && bigBuffersMap.empty())
-        return;
     int oriId = FastllmCudaGetDevice();
     cudaError_t state = cudaSuccess;
-    bool keepCudaBuffers = fastllm::GetFastllmEnv().cudaMemCheck;
+    bool keepCudaBuffers = true;
+    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
+    if (cudaBuffersMap.empty() && bigBuffersMap.empty())
+        return;
     for (auto &it: cudaBuffersMap) {
         if (!keepCudaBuffers && noBusyCnt[it.first] > 1024 * 1024 * 1024) {
             auto &cudaBuffers = it.second;
@@ -2305,6 +2374,7 @@ void FastllmCudaFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRemove(ret);
 #endif
+                FastllmCudaSetDevice(oriId);
                 return;
             }
         }
@@ -2317,6 +2387,7 @@ void FastllmCudaFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRemove(ret);
 #endif
+                FastllmCudaSetDevice(oriId);
                 return;
             }
         }
@@ -2333,6 +2404,7 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     void * ret;
     int id = -1;
     cudaGetDevice(&id);
+    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
     auto &bigBuffers = bigBuffersMap[id];
     auto state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state) {
@@ -2344,12 +2416,12 @@ void FastllmCudaMallocBigBuffer(size_t size) {
 }
 
 void FastllmCudaClearBigBuffer() {
-    if (fastllm::GetFastllmEnv().cudaMemCheck &&
-        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return;
     }
     int id = -1;
     cudaGetDevice(&id);
+    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
     if (bigBuffersMap.empty())
         return;
     cudaError_t state = cudaSuccess;

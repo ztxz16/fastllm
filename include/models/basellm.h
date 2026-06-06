@@ -321,6 +321,10 @@ namespace fastllm {
 
         virtual void OnAutoWarmupFinished() {};
 
+        virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
+
+        virtual void WarmupCudaRuntimeBuffers(int batch) {}
+
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
         virtual void AddPromptCache(const std::vector <int> &inputTokens);

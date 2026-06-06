@@ -91,6 +91,10 @@ namespace fastllm {
 
         virtual void OnAutoWarmupFinished() override;
 
+        virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
+
+        virtual void WarmupCudaRuntimeBuffers(int batch) override;
+
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history

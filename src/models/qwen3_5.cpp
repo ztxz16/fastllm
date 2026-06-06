@@ -2816,6 +2816,25 @@ namespace fastllm {
             return data;
         }
 
+        static void Qwen35ReleaseThreadLocalCudaSamplingBuffers() {
+            Qwen35ThreadLocalCudaSamplingFullLogits().FreeSpace();
+            Qwen35ThreadLocalCudaSamplingOutput().FreeSpace();
+        }
+
+        static long long Qwen35CudaRuntimeScratchReserveBytes() {
+            return (32LL + 16LL + 8LL + 8LL) * 1024LL * 1024LL;
+        }
+
+        static void Qwen35WarmupCudaRuntimeScratchBuffers() {
+            for (size_t bytes : {
+                    32ULL * 1024ULL * 1024ULL,
+                    16ULL * 1024ULL * 1024ULL,
+                    8ULL * 1024ULL * 1024ULL,
+                    8ULL * 1024ULL * 1024ULL}) {
+                FastllmCudaMallocBigBuffer(bytes);
+            }
+        }
+
         static void Qwen35GatherShardLogitsToRootCuda(
                 int rootDevice,
                 const std::vector<int> &devices,
@@ -3678,6 +3697,83 @@ namespace fastllm {
 #endif
     }
 
+    long long Qwen3_5Model::GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const {
+#ifdef USE_CUDA
+        if (batch <= 0) {
+            return 0;
+        }
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
+            devices.empty() || devices[0] != deviceId) {
+            return 0;
+        }
+
+        auto it = this->weight.weight.find("lm_head.weight");
+        if (it == this->weight.weight.end()) {
+            it = this->weight.weight.find(language_prefix + "embed_tokens.weight");
+        }
+        if (it == this->weight.weight.end() || it->second.dims.empty() || it->second.dims[0] <= 0) {
+            return 0;
+        }
+
+        long long vocabSize = it->second.dims[0];
+        DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
+        long long localLogitsBytes = computeType == DataType::FLOAT32 ? 0 :
+            (long long)GetDataBytes(computeType, (size_t)batch, (size_t)vocabSize);
+        return (long long)batch * vocabSize * (long long)sizeof(float) +
+               localLogitsBytes +
+               (long long)batch * (long long)sizeof(int) +
+               Qwen35CudaRuntimeScratchReserveBytes();
+#else
+        return 0;
+#endif
+    }
+
+    void Qwen3_5Model::WarmupCudaRuntimeBuffers(int batch) {
+#ifdef USE_CUDA
+        if (batch <= 0) {
+            return;
+        }
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
+            return;
+        }
+
+        auto it = this->weight.weight.find("lm_head.weight");
+        if (it == this->weight.weight.end()) {
+            it = this->weight.weight.find(language_prefix + "embed_tokens.weight");
+        }
+        if (it == this->weight.weight.end() || it->second.dims.empty() || it->second.dims[0] <= 0) {
+            return;
+        }
+
+        int rootDevice = devices[0];
+        int vocabSize = it->second.dims[0];
+        FastllmCudaSetDevice(rootDevice);
+
+        size_t logitsBytes = (size_t)batch * (size_t)vocabSize * sizeof(float);
+        FastllmCudaMallocBigBuffer(logitsBytes);
+        DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
+        if (computeType != DataType::FLOAT32) {
+            size_t localLogitsBytes = GetDataBytes(computeType, (size_t)batch, (size_t)vocabSize);
+            FastllmCudaMallocBigBuffer(localLogitsBytes);
+        }
+        Qwen35WarmupCudaRuntimeScratchBuffers();
+
+        Data cudaOutput(DataType::INT32);
+        Qwen3CudaPrepareLocalOutput(cudaOutput, rootDevice);
+        cudaOutput.Resize({batch});
+        cudaOutput.Allocate();
+        cudaOutput.FreeSpace();
+
+        long long reserveBytes = GetAutoWarmupCudaRuntimeReserveBytes(rootDevice, batch);
+        printf("[Fastllm] AutoWarmup Qwen3.5 CUDA sampling buffers: batch %d, vocab %d, reserve %.2f MB on GPU %d.\n",
+               batch, vocabSize, reserveBytes / 1e6, rootDevice);
+#endif
+    }
+
     void Qwen3_5Model::OnAutoWarmupFinished() {
 #ifdef USE_CUDA
         if (GetFastllmEnv().cudaGraph) {
@@ -3688,6 +3784,7 @@ namespace fastllm {
             FastllmCudaClearBigBuffer();
             PreCaptureCudaGraphAfterWarmup();
         }
+        Qwen35ReleaseThreadLocalCudaSamplingBuffers();
 #endif
     }
 
@@ -6273,17 +6370,30 @@ namespace fastllm {
         int cudaSamplingTopK = 1;
         if (Qwen35CanUseCudaFullLogitsSampling(generationConfigs, retLogits, batch,
                                                allSimpleCudaSampling, cudaSamplingTopK)) {
-            Data &fullCudaLogits = Qwen35ThreadLocalCudaSamplingFullLogits();
-            Qwen35GatherShardLogitsToRootCuda(devices[0], devices, *lmHeadScheme,
-                                              localLogits, batch, vocabSize,
-                                              fullCudaLogits);
+            Data *rootCudaLogits = nullptr;
+            if (devices.size() == 1) {
+                rootCudaLogits = &localLogits[0];
+                AssertInFastLLM(rootCudaLogits->dataDevice == DataDevice::CUDA &&
+                                rootCudaLogits->cudaData != nullptr,
+                                "Qwen3.5 CUDA sampling: single GPU logits must stay on CUDA.\n");
+                AssertInFastLLM(rootCudaLogits->dims.size() > 0 &&
+                                rootCudaLogits->dims.back() == vocabSize &&
+                                rootCudaLogits->Count(0) / vocabSize == batch,
+                                "Qwen3.5 CUDA sampling: single GPU logits shape mismatch.\n");
+            } else {
+                Data &fullCudaLogits = Qwen35ThreadLocalCudaSamplingFullLogits();
+                Qwen35GatherShardLogitsToRootCuda(devices[0], devices, *lmHeadScheme,
+                                                  localLogits, batch, vocabSize,
+                                                  fullCudaLogits);
+                rootCudaLogits = &fullCudaLogits;
+            }
             void *oldExecutor = GetExecutor();
             Executor samplingExecutor;
             samplingExecutor.SetFirstDevice("cuda:" + std::to_string(devices[0]));
             SetCurrentThreadExecutor(&samplingExecutor);
-            ResetLogitsOfEOS(batch, &fullCudaLogits, pastKeyValues, generationConfigs);
+            ResetLogitsOfEOS(batch, rootCudaLogits, pastKeyValues, generationConfigs);
             SetCurrentThreadExecutor(oldExecutor);
-            return Qwen35SampleFromRootCudaLogits(devices[0], fullCudaLogits, batch,
+            return Qwen35SampleFromRootCudaLogits(devices[0], *rootCudaLogits, batch,
                                                   cudaSamplingTopK, allSimpleCudaSampling,
                                                   generationConfigs);
         }
