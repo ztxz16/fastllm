@@ -62,7 +62,7 @@ cp tools/ftllm/libfastllm_tools.so tools/ftllm/libfastllm_tools-cpu.so
 
 # cuda-12
 rm -rf CMakeCache.txt CMakeFiles
-CUDA_ARCH_LIST="70;75;80;89;90;100;120"
+CUDA_ARCH_LIST="60-real;70-real;75-real;80-real;89-real;90-real;100-real;120"
 if [ -x /usr/local/cuda/bin/nvcc ]; then
     CUDA_COMPILER=/usr/local/cuda/bin/nvcc
 elif [ -x /usr/local/cuda-12.9/bin/nvcc ]; then
@@ -82,7 +82,8 @@ cmake .. \
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH_LIST}" \
     -DCMAKE_CXX_COMPILER="${CXX_COMPILER}" \
     -DCMAKE_CUDA_HOST_COMPILER="${CXX_COMPILER}" \
-    -DCMAKE_CUDA_COMPILER="${CUDA_COMPILER}"
+    -DCMAKE_CUDA_COMPILER="${CUDA_COMPILER}" \
+    -DCMAKE_CUDA_FLAGS="--split-compile=16"
 make fastllm_tools -j30
 if [ $? != 0 ]; then
     exit -1
