@@ -2170,7 +2170,31 @@ struct FastllmCudaTempDeviceBuffer {
 };
 
 static std::map<int, std::unique_ptr<FastllmCudaTempDeviceBuffer>> s_fastllmCudaTempBuffers;
-static std::mutex s_fastllmCudaTempBuffersLock;
+// s_fastllmCudaTempBuffersMapLock 仅保护 map 结构本身（查找/插入），
+// 持锁期间绝不调用任何 CUDA API，避免跨设备线程互相阻塞。
+static std::mutex s_fastllmCudaTempBuffersMapLock;
+// 每个设备一把锁：缓冲区的 malloc/free（会触发本设备同步）只在对应设备锁内进行，
+// 不会阻塞其它设备线程。这是张量并行下避免死锁的关键：
+// 否则一个 rank 在持有全局锁时执行 cudaFree（隐式同步本设备），
+// 而本设备 stream 上挂着需要其它 rank 共同完成的 NCCL 集合通信，
+// 其它 rank 又卡在等待这把全局锁，从而形成跨 rank 死锁。
+static std::map<int, std::unique_ptr<std::mutex>> s_fastllmCudaTempBufferDeviceLocks;
+
+static FastllmCudaTempDeviceBuffer *FastllmGetCudaTempBufferHolder(int id, std::mutex **outDeviceLock) {
+    std::lock_guard<std::mutex> guard(s_fastllmCudaTempBuffersMapLock);
+    auto &holder = s_fastllmCudaTempBuffers[id];
+    if (holder == nullptr) {
+        holder = std::make_unique<FastllmCudaTempDeviceBuffer>(id);
+    }
+    auto &deviceLock = s_fastllmCudaTempBufferDeviceLocks[id];
+    if (deviceLock == nullptr) {
+        deviceLock = std::make_unique<std::mutex>();
+    }
+    if (outDeviceLock != nullptr) {
+        *outDeviceLock = deviceLock.get();
+    }
+    return holder.get();
+}
 
 static size_t FastllmCudaTempAlignBytes(size_t size) {
     const size_t align = 256;
@@ -2198,34 +2222,33 @@ void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outO
         return workspace->d_float_workspace;
     }
 
-    std::lock_guard<std::mutex> guard(s_fastllmCudaTempBuffersLock);
-    auto &holder = s_fastllmCudaTempBuffers[id];
-    if (holder == nullptr) {
-        holder = std::make_unique<FastllmCudaTempDeviceBuffer>(id);
-    }
+    std::mutex *deviceLock = nullptr;
+    FastllmCudaTempDeviceBuffer *holderPtr = FastllmGetCudaTempBufferHolder(id, &deviceLock);
+    std::lock_guard<std::mutex> guard(*deviceLock);
+    FastllmCudaTempDeviceBuffer &holder = *holderPtr;
 
     size_t allocBytes = FastllmCudaTempAlignBytes(needBytes);
-    if (holder->size < allocBytes) {
-        if (holder->data != nullptr) {
-            FastllmCudaDirectFree(holder->data);
-            holder->data = nullptr;
-            holder->size = 0;
+    if (holder.size < allocBytes) {
+        if (holder.data != nullptr) {
+            FastllmCudaDirectFree(holder.data);
+            holder.data = nullptr;
+            holder.size = 0;
         }
-        holder->data = FastllmCudaDirectMalloc(allocBytes);
-        if (holder->data == nullptr) {
-            holder->size = 0;
+        holder.data = FastllmCudaDirectMalloc(allocBytes);
+        if (holder.data == nullptr) {
+            holder.size = 0;
             if (outBytes != nullptr) {
                 *outBytes = 0;
             }
             return nullptr;
         }
-        holder->size = allocBytes;
+        holder.size = allocBytes;
     }
 
     if (outBytes != nullptr) {
-        *outBytes = holder->size;
+        *outBytes = holder.size;
     }
-    return holder->data;
+    return holder.data;
 }
 
 void FastllmReleaseCudaTempBuffer(void *ptr, bool own) {
