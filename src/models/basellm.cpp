@@ -3271,7 +3271,7 @@ namespace fastllm {
                 printf("[Fastllm] Batch limit: %d.\n", mBatch);
             }
         } else if (fastllm::GetMaxTokens() > 0) {
-            int totalPages = fastllm::GetMaxTokens() / pageLen + 1;
+            int totalPages = (fastllm::GetMaxTokens() + pageLen - 1) / pageLen;
             int cachePageLen = pageLen;
             this->tokensLimit = totalPages * cachePageLen;
             this->promptLimit = (totalPages * 4 / 5) * cachePageLen;

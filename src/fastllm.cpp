@@ -4391,7 +4391,7 @@ namespace fastllm {
         if (maxPages <= 0) {
             int globalMaxTokens = GetMaxTokens();
             if (globalMaxTokens > 0 && pageLen > 0) {
-                maxPages = globalMaxTokens / pageLen + 1;
+                maxPages = (globalMaxTokens + pageLen - 1) / pageLen;
             } else {
                 maxPages = 300;
             }
