@@ -3350,6 +3350,83 @@ namespace fastllm {
                 }
                 this->WarmupCudaRuntimeBuffers(warmupMaxBatch);
                 printCudaWarmupPoolStats("batch and sampling warmup");
+
+                auto calibrateCachePagesToGpuBudget = [&]() {
+                    if (!updatedPages || pageLen <= 0 || deviceBytesPerPage.empty()) {
+                        return;
+                    }
+                    int currentPages = std::max(1, (fastllm::GetMaxTokens() + pageLen - 1) / pageLen);
+                    auto freeAfterWarmup = FastllmCudaGetFreeSizes();
+                    auto totalAfterWarmup = FastllmCudaGetTotalSizes();
+                    long long extraPages = LLONG_MAX;
+                    std::map<int, long long> deviceExtraPages;
+                    std::map<int, long long> deviceTargetFree;
+                    bool canGrow = false;
+
+                    for (auto &it : deviceBytesPerPage) {
+                        int id = it.first;
+                        long long bytesPerPageOnDevice = it.second;
+                        if (bytesPerPageOnDevice <= 0 ||
+                            id < 0 || id >= (int)freeAfterWarmup.size() ||
+                            id >= (int)totalAfterWarmup.size()) {
+                            continue;
+                        }
+
+                        long long finalSafety =
+                            std::max(128LL * 1024LL * 1024LL, totalAfterWarmup[id] / 200);
+                        finalSafety = std::min(finalSafety, 512LL * 1024LL * 1024LL);
+                        long long targetFree =
+                            (long long)(totalAfterWarmup[id] * (1.0 - fastllm::GetGpuMemRatio())) +
+                            finalSafety;
+                        long long growBytes = freeAfterWarmup[id] - targetFree;
+                        long long pages = growBytes > 0 ? growBytes / bytesPerPageOnDevice : 0;
+                        deviceExtraPages[id] = pages;
+                        deviceTargetFree[id] = targetFree;
+                        if (pages > 0) {
+                            extraPages = std::min(extraPages, pages);
+                            canGrow = true;
+                        } else {
+                            extraPages = 0;
+                        }
+                    }
+
+                    if (!canGrow || extraPages <= 0 || extraPages == LLONG_MAX) {
+                        return;
+                    }
+
+                    long long calibratedPagesLong = (long long)currentPages + extraPages;
+                    calibratedPagesLong = std::min<long long>(
+                        calibratedPagesLong, INT_MAX / std::max(1, pageLen));
+                    int calibratedPages = (int)calibratedPagesLong;
+                    if (calibratedPages <= currentPages) {
+                        return;
+                    }
+
+                    printf("[Fastllm] AutoWarmup calibrate cache pages by post-warmup GPU budget: %d -> %d (tokens: %lld -> %lld).\n",
+                           currentPages, calibratedPages,
+                           (long long)currentPages * pageLen,
+                           (long long)calibratedPages * pageLen);
+                    for (auto &it : deviceBytesPerPage) {
+                        int id = it.first;
+                        if (id < 0 || id >= (int)freeAfterWarmup.size() ||
+                            id >= (int)totalAfterWarmup.size()) {
+                            continue;
+                        }
+                        long long pages = deviceExtraPages.count(id) ? deviceExtraPages[id] : 0;
+                        long long targetFree = deviceTargetFree.count(id) ? deviceTargetFree[id] : 0;
+                        printf("  GPU %d: freeAfterWarmup=%.2f GB, targetFree=%.2f GB, localKVPerPage=%.2f MB, extraPagesLimit=%lld.\n",
+                               id, freeAfterWarmup[id] / 1e9, targetFree / 1e9,
+                               it.second / 1e6, pages);
+                    }
+
+                    autoWarmupPagedCacheManager = nullptr;
+                    ClearAllPagedCacheManagers();
+                    fastllm::SetMaxTokens(calibratedPages * pageLen);
+                    calculatedMaxPages = calibratedPages;
+                    runUniformBatchWarmup(1, 1, false);
+                    printCudaWarmupPoolStats("calibrated paged cache allocation");
+                };
+                calibrateCachePagesToGpuBudget();
             }
 #endif
         }
