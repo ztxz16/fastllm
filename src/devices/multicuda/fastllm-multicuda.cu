@@ -332,6 +332,65 @@ void BalanceMultiCudaDivisionSchemeByLayer(const std::string &weightName,
     scheme.swap(rotated);
 }
 
+void BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(const std::string &weightName,
+                                                          const std::vector<int> &devices,
+                                                          DivisionScheme &scheme,
+                                                          int mid,
+                                                          bool explicitDeviceRatios) {
+    if (!MultiCudaLayerBalanceCanRotate(devices, explicitDeviceRatios) || mid <= 0) {
+        return;
+    }
+    int layer = ParseLayerIdFromWeightName(weightName);
+    if (layer < 0) {
+        return;
+    }
+    int shift = layer % (int)devices.size();
+    if (shift == 0) {
+        return;
+    }
+
+    std::vector<int> sizes(devices.size(), 0);
+    int total = 0;
+    for (int i = 0; i < (int)devices.size(); i++) {
+        auto it = scheme.find(devices[i]);
+        if (it == scheme.end()) {
+            continue;
+        }
+        for (auto &range : it->second) {
+            int l = std::max(0, std::min(mid, range.first));
+            int r = std::max(0, std::min(mid, range.second));
+            if (l < r) {
+                sizes[i] += r - l;
+                total += r - l;
+            }
+        }
+    }
+    if (total != mid) {
+        return;
+    }
+
+    std::vector<int> rotatedSizes(devices.size(), 0);
+    for (int i = 0; i < (int)devices.size(); i++) {
+        rotatedSizes[(i + shift) % (int)devices.size()] = sizes[i];
+    }
+
+    DivisionScheme rotated;
+    int offset = 0;
+    for (int i = 0; i < (int)devices.size(); i++) {
+        int device = devices[i];
+        int len = rotatedSizes[i];
+        rotated[device];
+        if (len > 0) {
+            rotated[device].push_back({offset, offset + len});
+            rotated[device].push_back({mid + offset, mid + offset + len});
+        }
+        offset += len;
+    }
+    if (offset == mid) {
+        scheme.swap(rotated);
+    }
+}
+
 static void BalanceDivisionSchemeByLayer(const fastllm::Data &weight,
                                          const std::vector<int> &devices,
                                          DivisionScheme &scheme,
@@ -456,6 +515,25 @@ static size_t GetGGUFRowBytes(const fastllm::Data &data, int columns) {
                              "GGUF split requires aligned columns, got " + std::to_string(columns) +
                              " for block size " + std::to_string(blockSize) + ".\n");
     return ggml_row_size((ggml_type)data.ggmlType, columns);
+}
+
+static bool IsRowContiguousNumaGateUpSource(const fastllm::Data &data) {
+    if (data.tpPackType != fastllm::TP_PACK_GATEUP || data.numasData.empty()) {
+        return false;
+    }
+    if (IsGGUFTensor(data)) {
+        return true;
+    }
+    return data.dataType == fastllm::DataType::FLOAT32 ||
+           data.dataType == fastllm::DataType::BFLOAT16 ||
+           data.dataType == fastllm::DataType::FLOAT16 ||
+           data.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128 ||
+           data.dataType == fastllm::DataType::FP8_E4M3_PERCHANNEL;
+}
+
+static size_t GetRowContiguousNumaGateUpRowBytes(const fastllm::Data &data, int columns) {
+    return IsGGUFTensor(data) ? GetGGUFRowBytes(data, columns)
+                              : fastllm::GetDataBytes(data.dataType, 1, columns);
 }
 
 static int GetMultiCudaSplitUnit(const fastllm::Data &data) {
@@ -931,16 +1009,14 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 state = cudaErrorMemoryAllocation;
             }
             int curLen = 0;
-            bool sourceCrossGateUp = weight.tpPackType == fastllm::TP_PACK_GATEUP &&
-                                     weight.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128 &&
-                                     !weight.numasData.empty();
+            bool sourceCrossGateUp = IsRowContiguousNumaGateUpSource(weight);
             if (state != cudaSuccess) {
                 // handled by the common error path below
             } else if (emptyShard) {
                 // This can happen when the number of GPUs is larger than the number of aligned TP blocks.
             } else if (sourceCrossGateUp) {
                 int mid = k / 2;
-                size_t rowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
+                size_t rowBytes = GetRowContiguousNumaGateUpRowBytes(weight, m);
                 for (auto &it : div) {
                     int copyLen = it.second - it.first;
                     int srcRow = it.first < mid ? it.first * 2 : (it.first - mid) * 2 + 1;

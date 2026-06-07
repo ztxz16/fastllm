@@ -2625,16 +2625,20 @@ namespace fastllm {
 
                         Data &gateup = weight[swigluWeightName];
                         Data &gateupBias = GetThreadTensorParallelBias(swigluWeightName + ".tp_bias");
+                        gateup.tpLinearType = TP_LINEAR_ROW;
                         gateup.tpPackType = TP_PACK_GATEUP;
                         devCopy = devices;
                         DivisionScheme gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
-                        AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
+                        BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(
+                            swigluWeightName, devices, gateScheme, gateup.dims[0] / 2);
+                        AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0, true),
                                         "Qwen3 ForwardGPU failed to split " + swigluWeightName + ".\n");
 
                         Data &downBias = GetThreadTensorParallelBias(downBiasName);
+                        weight[downWeightName].tpLinearType = TP_LINEAR_COLUMN;
                         DivisionScheme downScheme = ExtractQwen3FirstRangeScheme(gateScheme);
                         devCopy = devices;
-                        AssertInFastLLM(SplitMultiCudaWeight(weight[downWeightName], downBias, devCopy, downScheme, 1),
+                        AssertInFastLLM(SplitMultiCudaWeight(weight[downWeightName], downBias, devCopy, downScheme, 1, true),
                                         "Qwen3 ForwardGPU failed to split " + downWeightName + ".\n");
                     }
 
@@ -2666,7 +2670,10 @@ namespace fastllm {
                         mergeW.tpQHeads = num_attention_heads;
                         mergeW.tpKVHeads = num_key_value_heads;
                         mergeW.tpHeadDim = head_dim;
+                        weight[swigluWeightName].tpLinearType = TP_LINEAR_ROW;
                         weight[swigluWeightName].tpPackType = TP_PACK_GATEUP;
+                        weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"].tpLinearType =
+                            TP_LINEAR_COLUMN;
                     }
                     singleGpuWeightsPrepared.store(true, std::memory_order_release);
                 }

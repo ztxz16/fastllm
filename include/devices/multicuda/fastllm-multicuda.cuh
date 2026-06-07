@@ -24,6 +24,9 @@ void FastllmGetMulticudaDeviceAndRatio(std::vector <int> &devices, std::map <int
 void BalanceMultiCudaDivisionSchemeByLayer(const std::string &weightName,
     const std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme,
     bool explicitDeviceRatios = false);
+void BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(const std::string &weightName,
+    const std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme,
+    int mid, bool explicitDeviceRatios = false);
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
     std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme, int splitAxis,
     bool explicitDeviceRatios = false);
