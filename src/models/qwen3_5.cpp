@@ -419,6 +419,75 @@ namespace fastllm {
             return diff > 1e-6f || diff < -1e-6f;
         }
 
+        static bool Qwen35IsLogitsEnvEnabled(const char *value) {
+            return value != nullptr && value[0] != '\0' &&
+                   !(value[0] == '0' && value[1] == '\0');
+        }
+
+        static bool Qwen35ShouldPrintLogits() {
+            return GetFastllmEnv().printLogits ||
+                   Qwen35IsLogitsEnvEnabled(std::getenv("FASTLLM_PRINT_LOGITS"));
+        }
+
+        static void Qwen35PrintTopKRows(const char *tag, const float *topkData, int batch, int topK) {
+            printf("%s top%d logits:\n", tag, topK);
+            for (int b = 0; b < batch; b++) {
+                printf("  batch %d:", b);
+                const float *row = topkData + (size_t)b * topK * 2;
+                for (int k = 0; k < topK; k++) {
+                    printf(" %d:%g", (int)(row[k * 2] + 1e-3f), row[k * 2 + 1]);
+                }
+                printf("\n");
+            }
+            fflush(stdout);
+        }
+
+        static void Qwen35PrintCudaLogitsTopK(Data &logits, int batch, const char *tag) {
+            if (!Qwen35ShouldPrintLogits() || logits.dims.empty()) {
+                return;
+            }
+            int vocabSize = logits.dims.back();
+            int topK = std::min(10, vocabSize);
+            Data topk;
+            TopK(logits, topk, topK);
+            topk.ToDevice(DataDevice::CPU);
+            Qwen35PrintTopKRows(tag, (const float*)topk.cpuData, batch, topK);
+        }
+
+        static void Qwen35PrintCpuLogitsTopK(Data &logits, int batch, const char *tag) {
+            if (!Qwen35ShouldPrintLogits() || logits.dims.empty() || logits.cpuData == nullptr) {
+                return;
+            }
+            int vocabSize = logits.dims.back();
+            int topK = std::min(10, vocabSize);
+            std::vector<float> topkData((size_t)batch * topK * 2);
+            const float *logitsData = (const float*)logits.cpuData;
+            for (int b = 0; b < batch; b++) {
+                std::vector<std::pair<float, int>> best;
+                best.reserve(topK);
+                const float *row = logitsData + (size_t)b * vocabSize;
+                for (int i = 0; i < vocabSize; i++) {
+                    float value = row[i];
+                    int insertPos = 0;
+                    while (insertPos < (int)best.size() && best[insertPos].first >= value) {
+                        insertPos++;
+                    }
+                    if (insertPos < topK) {
+                        best.insert(best.begin() + insertPos, {value, i});
+                        if ((int)best.size() > topK) {
+                            best.pop_back();
+                        }
+                    }
+                }
+                float *out = topkData.data() + (size_t)b * topK * 2;
+                for (int k = 0; k < topK; k++) {
+                    out[k * 2] = best[k].second;
+                    out[k * 2 + 1] = best[k].first;
+                }
+            }
+            Qwen35PrintTopKRows(tag, topkData.data(), batch, topK);
+        }
+
         static bool AppendQwen35CudaDevicesFromSpec(const std::string &spec,
                                                     const std::string &type,
                                                     int defaultRatio,
@@ -6477,6 +6546,7 @@ namespace fastllm {
             samplingExecutor.SetFirstDevice("cuda:" + std::to_string(devices[0]));
             SetCurrentThreadExecutor(&samplingExecutor);
             ResetLogitsOfEOS(batch, rootCudaLogits, pastKeyValues, generationConfigs);
+            Qwen35PrintCudaLogitsTopK(*rootCudaLogits, batch, "Qwen3.5 CUDA");
             SetCurrentThreadExecutor(oldExecutor);
             return Qwen35SampleFromRootCudaLogits(devices[0], *rootCudaLogits, batch,
                                                   cudaSamplingTopK, allSimpleCudaSampling,
@@ -6517,6 +6587,7 @@ namespace fastllm {
         }
 
         ResetLogitsOfEOS(batch, &fullLogits, pastKeyValues, generationConfigs);
+        Qwen35PrintCpuLogitsTopK(fullLogits, batch, "Qwen3.5 CPU");
         std::vector<int> lastRet;
         LastTokensUnit emptyLastTokens;
         for (int b = 0; b < batch; b++) {
