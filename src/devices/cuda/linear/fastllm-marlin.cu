@@ -2147,97 +2147,18 @@ exec_config_t determine_thread_config(int prob_m, int prob_n, int prob_k,
   return exec_config_t{0, {-1, -1, -1}};
 }
 
-  #define GPTQ_CALL_IF(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)             \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, false, 0, NUM_THREADS,   \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, true, false, 0, NUM_THREADS,   \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, true, false, 0, NUM_THREADS,   \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, true, false, 0, NUM_THREADS,   \
-              false)                                                        \
-                                                                            \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, false, -1, NUM_THREADS, \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, false, 2, NUM_THREADS,  \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, false, 4, NUM_THREADS,  \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, false, 8, NUM_THREADS,  \
-              false)                                                        \
-                                                                            \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, false, -1, NUM_THREADS, \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, false, 2, NUM_THREADS,  \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, false, 4, NUM_THREADS,  \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, false, 8, NUM_THREADS,  \
-              false)                                                        \
-                                                                            \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, false, -1, NUM_THREADS, \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, false, 2, NUM_THREADS,  \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, false, 4, NUM_THREADS,  \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, false, 8, NUM_THREADS,  \
-              false)                                                        \
-                                                                            \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, false, -1, NUM_THREADS, \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, false, 2, NUM_THREADS,  \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, false, 4, NUM_THREADS,  \
-              false)                                                        \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, false, 8, NUM_THREADS,  \
-              false)
-
-  #define AWQ_CALL_IF(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)             \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, true, -1, NUM_THREADS, \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, true, 2, NUM_THREADS,  \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, true, 4, NUM_THREADS,  \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, true, 8, NUM_THREADS,  \
-              false)                                                       \
-                                                                           \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, true, -1, NUM_THREADS, \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, true, 2, NUM_THREADS,  \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, true, 4, NUM_THREADS,  \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, true, 8, NUM_THREADS,  \
-              false)                                                       \
-                                                                           \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, true, -1, NUM_THREADS, \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, true, 2, NUM_THREADS,  \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, true, 4, NUM_THREADS,  \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, true, 8, NUM_THREADS,  \
-              false)                                                       \
-                                                                           \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, true, -1, NUM_THREADS, \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, true, 2, NUM_THREADS,  \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, true, 4, NUM_THREADS,  \
-              false)                                                       \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, true, 8, NUM_THREADS, false)
-
-  // We currently have 4-bit models only with group_blocks == 4
-  #define HQQ_CALL_IF(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)            \
-    __CALL_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, true, 4, NUM_THREADS, \
-              true)                                                       \
-    __CALL_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, true, 4, NUM_THREADS, \
-              true)                                                       \
-    __CALL_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, true, 4, NUM_THREADS, \
-              true)                                                       \
-    __CALL_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, true, 4, NUM_THREADS, true)
+  // FastLLM only calls this file through FastllmCudaMarlinHalfInt4Gemm:
+  // half activations, uint4 weights, AWQ-style zero points, no act-order,
+  // group_size == 128 (group_blocks == 8), and fp16 reduction.
+  #define FASTLLM_INT4GROUP_CALL_IF(N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
+    __CALL_IF(vllm::kU4, 1, N_BLOCKS, K_BLOCKS, false, true, 8,           \
+              NUM_THREADS, false)                                        \
+    __CALL_IF(vllm::kU4, 2, N_BLOCKS, K_BLOCKS, false, true, 8,           \
+              NUM_THREADS, false)                                        \
+    __CALL_IF(vllm::kU4, 3, N_BLOCKS, K_BLOCKS, false, true, 8,           \
+              NUM_THREADS, false)                                        \
+    __CALL_IF(vllm::kU4, 4, N_BLOCKS, K_BLOCKS, false, true, 8,           \
+              NUM_THREADS, false)
 
 template <typename scalar_t>
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
@@ -2382,28 +2303,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
 
     if (false) {
     }
-    GPTQ_CALL_IF(vllm::kU4B8, 16, 4, 256)
-    GPTQ_CALL_IF(vllm::kU4B8, 8, 8, 256)
-    GPTQ_CALL_IF(vllm::kU4B8, 8, 4, 128)
-    GPTQ_CALL_IF(vllm::kU4B8, 4, 8, 128)
-    GPTQ_CALL_IF(vllm::kU8B128, 16, 4, 256)
-    GPTQ_CALL_IF(vllm::kU8B128, 8, 8, 256)
-    GPTQ_CALL_IF(vllm::kU8B128, 8, 4, 128)
-    GPTQ_CALL_IF(vllm::kU8B128, 4, 8, 128)
-
-    AWQ_CALL_IF(vllm::kU4, 16, 4, 256)
-    AWQ_CALL_IF(vllm::kU4, 8, 8, 256)
-    AWQ_CALL_IF(vllm::kU4, 8, 4, 128)
-    AWQ_CALL_IF(vllm::kU4, 4, 8, 128)
-    AWQ_CALL_IF(vllm::kU8, 16, 4, 256)
-    AWQ_CALL_IF(vllm::kU8, 8, 8, 256)
-    AWQ_CALL_IF(vllm::kU8, 8, 4, 128)
-    AWQ_CALL_IF(vllm::kU8, 4, 8, 128)
-
-    HQQ_CALL_IF(vllm::kU4, 16, 4, 256)
-    HQQ_CALL_IF(vllm::kU4, 8, 8, 256)
-    HQQ_CALL_IF(vllm::kU4, 8, 4, 128)
-    HQQ_CALL_IF(vllm::kU4, 4, 8, 128)
+    FASTLLM_INT4GROUP_CALL_IF(16, 4, 256)
+    FASTLLM_INT4GROUP_CALL_IF(8, 8, 256)
+    FASTLLM_INT4GROUP_CALL_IF(8, 4, 128)
+    FASTLLM_INT4GROUP_CALL_IF(4, 8, 128)
     else {
       TORCH_CHECK(false, "Unsupported shapes: MNK = [", prob_m, ", ", prob_n,
                   ", ", prob_k, "]", ", has_act_order = ", has_act_order,
@@ -2418,6 +2321,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
     C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par;
   }
 }
+
+#undef FASTLLM_INT4GROUP_CALL_IF
+#undef __CALL_IF
 
 }  // namespace marlin
 
@@ -2720,7 +2626,8 @@ extern "C" bool FastllmCudaMarlinHalfInt4Gemm(const void *a, const uint32_t *b_q
     if (!FastllmCudaMarlinCurrentDeviceSupported()) {
         return false;
     }
-    if (size_m <= 0 || size_n <= 0 || size_k <= 0 || group_size <= 0) {
+    if (size_m <= 0 || size_n <= 0 || size_k <= 0 || group_size != 128 ||
+        size_k % group_size != 0) {
         return false;
     }
     if (size_n % marlin::min_thread_n != 0 || size_k % marlin::min_thread_k != 0) {
