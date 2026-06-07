@@ -239,13 +239,19 @@ namespace fastllm {
         responseContextDict.RemoveHandle(handleId);
     }
 
-    void ResponseContext::TryRecordPagedCache() {
+    void ResponseContext::TryRecordPagedCache(basellm *model) {
+        bool hasLinearAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
             auto &kvFirst = this->pastKeyValues[i].first;
             auto &kvSecond = this->pastKeyValues[i].second;
             if (kvFirst.isLinearAttention || kvSecond.isLinearAttention) {
-                return;
+                hasLinearAttentionCache = true;
+                break;
             }
+        }
+        if (hasLinearAttentionCache &&
+            (model == nullptr || !model->TryRecordPagedPrefixCacheExtra(this))) {
+            return;
         }
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
@@ -292,6 +298,22 @@ namespace fastllm {
             ret.push_back(std::make_pair(device, manager));
         }
         return ret;
+    }
+
+    bool basellm::TryRecordPagedPrefixCacheExtra(ResponseContext *context) {
+        (void)context;
+        return false;
+    }
+
+    int basellm::QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const {
+        (void)context;
+        return maxCachedLen;
+    }
+
+    bool basellm::RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const {
+        (void)context;
+        (void)cachedLen;
+        return true;
     }
 
     PastKVCacheMemory::PastKVCacheMemory(const std::vector <int> &inputToken, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
@@ -1058,7 +1080,7 @@ namespace fastllm {
 
             for (auto &it: model->responseContextDict.dicts) {
                 if (it.second->isAbort) {
-                    it.second->TryRecordPagedCache();
+                    it.second->TryRecordPagedCache(model);
                     abortHandles.push_back(it.first);
                     continue;
                 }
@@ -1202,6 +1224,15 @@ namespace fastllm {
                                 }
                                 if (minCachedPages > 0) {
                                     int cachedLen = minCachedPages * probeManager->pageLen;
+                                    int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
+                                    extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
+                                    minCachedPages = extraCachedLen / probeManager->pageLen;
+                                }
+                                if (minCachedPages > 0) {
+                                    int cachedLen = minCachedPages * probeManager->pageLen;
+                                    if (!model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
+                                        continue;
+                                    }
                                     auto managerDevice = [](PagedCacheManager *manager) {
                                         if (manager == nullptr) {
                                             return -1;
@@ -1593,6 +1624,15 @@ namespace fastllm {
                                                    tokensManager, &logits);
                         }
                         st += curLen;
+                        if (st < len) {
+                            dictLocker.lock();
+                            auto contextIt = model->responseContextDict.dicts.find(handles[0]);
+                            if (contextIt != model->responseContextDict.dicts.end() &&
+                                (int)contextIt->second->allTokens.size() >= pageLen) {
+                                contextIt->second->TryRecordPagedCache(model);
+                            }
+                            dictLocker.unlock();
+                        }
                         if (model->verbose) {
                             auto chunkEndTime = std::chrono::system_clock::now();
                             float chunkSpend = GetSpan(chunkStartTime, chunkEndTime);
@@ -1641,7 +1681,7 @@ namespace fastllm {
                     if (seqLens[i] > 1) {
                         auto &ctx = *model->responseContextDict.dicts[handles[i]];
                         if ((int)ctx.allTokens.size() >= pageLen) {
-                            ctx.TryRecordPagedCache();
+                            ctx.TryRecordPagedCache(model);
                         }
                     }
                 }
@@ -1664,13 +1704,13 @@ namespace fastllm {
                     int curRet = ret[i];
                     if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                         ctx->isEnding = true;
-                        ctx->TryRecordPagedCache();
+                        ctx->TryRecordPagedCache(model);
                         // printf("[Handle %d] Finished. Reason: eos token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                     } else {
                         auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
                         if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
                             ctx->isEnding = true;
-                            ctx->TryRecordPagedCache();
+                            ctx->TryRecordPagedCache(model);
                             // printf("[Handle %d] Finished. Reason: stop token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                         }
                     }
@@ -1689,12 +1729,12 @@ namespace fastllm {
                         ctx->curTokens++;
                         if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
                             ctx->isEnding = true;
-                            ctx->TryRecordPagedCache();
+                            ctx->TryRecordPagedCache(model);
                             // printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
                                    // handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
                         } else if (ctx->allTokens.size() >= model->max_positions) {
                             ctx->isEnding = true;
-                            ctx->TryRecordPagedCache();
+                            ctx->TryRecordPagedCache(model);
                             // printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
                                    //handles[i], (int)it.second->allTokens.size(), model->max_positions);
                         }

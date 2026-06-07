@@ -97,6 +97,10 @@ namespace fastllm {
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
+        virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
+        virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const override;
+        virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
+        virtual int GetChunkedPrefillSize() override;
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
 
