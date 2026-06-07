@@ -336,6 +336,8 @@ namespace fastllm {
 
         virtual void TryRecordResponseContext(ResponseContext *context);
 
+        virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const;
+
         virtual void OnResponseContextCreated(ResponseContext *context) {}
 
         virtual void OnResponseContextRemoved(ResponseContext *context) {}

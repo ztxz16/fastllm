@@ -75,6 +75,8 @@ namespace fastllm {
 
         virtual void OnAutoWarmupFinished();
 
+        virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+
         void PreCaptureCudaGraphAfterWarmup();
 
         virtual std::string ApplyChatTemplate(const ChatMessages &messages);

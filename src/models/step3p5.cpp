@@ -2366,6 +2366,17 @@ namespace fastllm {
 #endif
     }
 
+    PagedCacheManager* Step3p5Model::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
+        if (layerIndex >= 0 && this->threadTpPagedCacheBase >= 0) {
+            PagedCacheManager *manager = GetPagedCacheManager(
+                (this->threadTpPagedCacheBase + layerIndex) * 2 + (isKey ? 0 : 1));
+            if (manager != nullptr) {
+                return manager;
+            }
+        }
+        return basellm::GetPagedKVCacheManager(layerIndex, isKey);
+    }
+
     static std::vector<int> GetStep3p5CudaGraphWarmupBatches() {
         const int maxCudaGraphDecodeBatch = 32;
         std::vector<int> ret;

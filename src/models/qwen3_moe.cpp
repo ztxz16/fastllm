@@ -1972,6 +1972,17 @@ namespace fastllm {
 #endif
     }
 
+    PagedCacheManager* Qwen3MOEModel::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
+        if (layerIndex >= 0 && this->threadTpPagedCacheBase >= 0) {
+            PagedCacheManager *manager = GetPagedCacheManager(
+                (this->threadTpPagedCacheBase + layerIndex) * 2 + (isKey ? 0 : 1));
+            if (manager != nullptr) {
+                return manager;
+            }
+        }
+        return basellm::GetPagedKVCacheManager(layerIndex, isKey);
+    }
+
     void Qwen3MOEModel::PreCaptureCudaGraphAfterWarmup() {
 #ifdef USE_CUDA
         if (!GetFastllmEnv().cudaGraph || autoWarmupRunning.load() || GetKVCacheInCPU()) {

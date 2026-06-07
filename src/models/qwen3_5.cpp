@@ -3855,6 +3855,17 @@ namespace fastllm {
 #endif
     }
 
+    PagedCacheManager* Qwen3_5Model::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
+        if (layerIndex >= 0 && this->threadTpPagedCacheBase >= 0) {
+            PagedCacheManager *manager = GetPagedCacheManager(
+                (this->threadTpPagedCacheBase + layerIndex) * 2 + (isKey ? 0 : 1));
+            if (manager != nullptr) {
+                return manager;
+            }
+        }
+        return basellm::GetPagedKVCacheManager(layerIndex, isKey);
+    }
+
     void Qwen3_5Model::PreAllocateLinearSlotPoolsForCudaGraph(
             const std::vector<int> &devices,
             const std::map<int, int> &ratios,

@@ -257,6 +257,13 @@ namespace fastllm {
         }
     }
 
+    PagedCacheManager* basellm::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
+        if (layerIndex < 0) {
+            return nullptr;
+        }
+        return GetPagedCacheManager(layerIndex * 2 + (isKey ? 0 : 1));
+    }
+
     PastKVCacheMemory::PastKVCacheMemory(const std::vector <int> &inputToken, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
         this->inputToken = inputToken;
         this->tokens = tokens;
@@ -874,7 +881,7 @@ namespace fastllm {
                     }
                 }
             }
-            return GetPagedCacheManager(model->kvCacheId * 2);
+            return model->GetPagedKVCacheManager(model->kvCacheId, true);
         };
 
         auto collectDecodePageNeeds =
@@ -933,7 +940,7 @@ namespace fastllm {
             return false;
         };
 
-        auto *pcm = GetPagedCacheManager(model->kvCacheId * 2);
+        auto *pcm = model->GetPagedKVCacheManager(model->kvCacheId, true);
         if (pcm != nullptr) {
             totalPages = pcm->maxPages;
             pageLen = pcm->pageLen;
@@ -1118,7 +1125,7 @@ namespace fastllm {
 
                     if (isPrompt) {
                         if (ctx->cacheLen == 0) {
-                            PagedCacheManager *probeManager = GetPagedCacheManager(model->kvCacheId * 2);
+                            PagedCacheManager *probeManager = model->GetPagedKVCacheManager(model->kvCacheId, true);
                             if (probeManager != nullptr) {
                                 // 只在代表 layer 上做 Query 确定可命中页数
                                 std::vector<int> probePages;
@@ -1137,8 +1144,8 @@ namespace fastllm {
                                     for (int li = 0; li < model->block_cnt; li++) {
                                         auto &kvFirst = ctx->pastKeyValues[li].first;
                                         auto &kvSecond = ctx->pastKeyValues[li].second;
-                                        PagedCacheManager *kMgr = GetPagedCacheManager(li * 2);
-                                        PagedCacheManager *vMgr = GetPagedCacheManager(li * 2 + 1);
+                                        PagedCacheManager *kMgr = model->GetPagedKVCacheManager(li, true);
+                                        PagedCacheManager *vMgr = model->GetPagedKVCacheManager(li, false);
                                         if (kMgr != nullptr) {
                                             std::vector<int> kPages;
                                             kMgr->Query(ctx->currentTokens, kPages);
@@ -3438,7 +3445,7 @@ namespace fastllm {
         printf("finish.\n");
 
         auto *pcm = autoWarmupPagedCacheManager != nullptr ?
-            autoWarmupPagedCacheManager : GetPagedCacheManager(this->kvCacheId * 2);
+            autoWarmupPagedCacheManager : this->GetPagedKVCacheManager(this->kvCacheId, true);
         if (pcm != nullptr) {
             int totalPages = pcm->maxPages;
             int cachePageLen = pcm->pageLen;
