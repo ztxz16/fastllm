@@ -1299,8 +1299,6 @@ namespace fastllm {
                 int headDim) {
             AssertInFastLLM(kvHeads > 0 && qHeads > 0 && headDim > 0 && qHeads % kvHeads == 0,
                             "Qwen3.5 gated attention TP requires valid head metadata.\n");
-            AssertInFastLLM((int)devices.size() <= kvHeads,
-                            "Qwen3.5 gated attention TP currently requires devices <= KV heads.\n");
             DivisionScheme scheme;
             int group = qHeads / kvHeads;
             int qGateWidth = qHeads * headDim * 2;
@@ -4427,7 +4425,6 @@ namespace fastllm {
                 return defaultHeads;
             }
             int heads = Qwen35LocalHeads(scheme, gpuId);
-            AssertInFastLLM(heads > 0, "Qwen3.5 ForwardSingleGPU graph got empty local head shard.\n");
             return heads;
         };
 
@@ -4495,41 +4492,46 @@ namespace fastllm {
                         localKVHeads = localHeadsFromScheme(threadTpAttentionKVHeadSchemes[i],
                                                             num_key_value_heads);
                     }
-                    int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
-                    Qwen35CudaAttentionPagedBlock(
-                        cudaRunner,
-                        &buf.attenInput,
-                        requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                        requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
-                        requireLocal(weight[qNormName], qNormName),
-                        requireLocal(weight[kNormName], kNormName),
-                        requireLocal(weight[oWeightName], oWeightName),
-                        requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                        &state.positionIds,
-                        &pastKeyValues,
-                        &buf.batchPastKeys, &buf.batchPastValues,
-                        &buf.merged, &buf.qgate, &buf.gate,
-                        &buf.q, &buf.k, &buf.v,
-                        &buf.attenOutput, &buf.attenLastOutput,
-                        &buf.qForAttentionHolder,
-                        &buf.insertIndexs, &buf.insertPositions,
-                        &buf.qSizes, &buf.pageSizes,
-                        &buf.pageIndexs, &buf.lastPageLens,
-                        &generatedAppendParams, &generatedDecodeParams,
-                        batch, block_cnt, i, seqLens,
-                        localQHeads, localKVHeads, head_dim,
-                        rotary_dim, mrope_sections,
-                        rms_norm_eps, rope_base, rope_factor,
-                        rope_type, isPrefill,
-                        &buf.hiddenStates,
-                        pagedCacheLayerOffset,
-                        true, true, true, 1);
-                    Qwen3CudaLinearResidualReduce(
-                        cudaRunner, buf.attenOutput,
-                        *requireLocal(weight[oWeightName], oWeightName),
-                        *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                        buf.attenLastOutput, buf.hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId);
+                    if (localKVHeads > 0) {
+                        int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
+                        Qwen35CudaAttentionPagedBlock(
+                            cudaRunner,
+                            &buf.attenInput,
+                            requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
+                            requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                            requireLocal(weight[qNormName], qNormName),
+                            requireLocal(weight[kNormName], kNormName),
+                            requireLocal(weight[oWeightName], oWeightName),
+                            requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                            &state.positionIds,
+                            &pastKeyValues,
+                            &buf.batchPastKeys, &buf.batchPastValues,
+                            &buf.merged, &buf.qgate, &buf.gate,
+                            &buf.q, &buf.k, &buf.v,
+                            &buf.attenOutput, &buf.attenLastOutput,
+                            &buf.qForAttentionHolder,
+                            &buf.insertIndexs, &buf.insertPositions,
+                            &buf.qSizes, &buf.pageSizes,
+                            &buf.pageIndexs, &buf.lastPageLens,
+                            &generatedAppendParams, &generatedDecodeParams,
+                            batch, block_cnt, i, seqLens,
+                            localQHeads, localKVHeads, head_dim,
+                            rotary_dim, mrope_sections,
+                            rms_norm_eps, rope_base, rope_factor,
+                            rope_type, isPrefill,
+                            &buf.hiddenStates,
+                            pagedCacheLayerOffset,
+                            true, true, true, 1);
+                        Qwen3CudaLinearResidualReduce(
+                            cudaRunner, buf.attenOutput,
+                            *requireLocal(weight[oWeightName], oWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                            buf.attenLastOutput, buf.hiddenStates,
+                            tensorParallel, firstTensorParallelRank, gpuId);
+                    } else {
+                        Qwen35ZeroCudaLike(buf.attenLastOutput, buf.hiddenStates, gpuId);
+                        addPartialToResidualReduce(buf.attenLastOutput);
+                    }
                 } else {
                     std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
                     std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
@@ -5028,7 +5030,6 @@ namespace fastllm {
                 return defaultHeads;
             }
             int heads = Qwen35LocalHeads(scheme, gpuId);
-            AssertInFastLLM(heads > 0, "Qwen3.5 ForwardSingleGPU got empty local head shard.\n");
             return heads;
         };
 
@@ -5122,41 +5123,46 @@ namespace fastllm {
                     localKVHeads = localHeadsFromScheme(threadTpAttentionKVHeadSchemes[i],
                                                         num_key_value_heads);
                 }
-                int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
-                Qwen35CudaAttentionPagedBlock(
-                    cudaRunner,
-                    &attenInput,
-                    requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                    requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
-                    requireLocal(weight[qNormName], qNormName),
-                    requireLocal(weight[kNormName], kNormName),
-                    requireLocal(weight[oWeightName], oWeightName),
-                    requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                    requireLocal((Data&)positionIds, "positionIds"),
-                    &pastKeyValues,
-                    &batchPastKeys, &batchPastValues,
-                    &merged, &qgate, &gate,
-                    &q, &k, &v,
-                    &attenOutput, &attenLastOutput,
-                    &qForAttentionHolder,
-                    &insertIndexs, &insertPositions,
-                    &qSizes, &pageSizes,
-                    &pageIndexs, &lastPageLens,
-                    &generatedAppendParams, &generatedDecodeParams,
-                    batch, block_cnt, i, seqLens,
-                    localQHeads, localKVHeads, head_dim,
-                    rotary_dim, mrope_sections,
-                    rms_norm_eps, rope_base, rope_factor,
-                    rope_type, isPrefill,
-                    &hiddenStates,
-                    pagedCacheLayerOffset,
-                    true, false);
-                Qwen3CudaLinearResidualReduce(
-                    cudaRunner, attenOutput,
-                    *requireLocal(weight[oWeightName], oWeightName),
-                    *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                    attenLastOutput, hiddenStates,
-                    tensorParallel, firstTensorParallelRank, gpuId);
+                if (localKVHeads > 0) {
+                    int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
+                    Qwen35CudaAttentionPagedBlock(
+                        cudaRunner,
+                        &attenInput,
+                        requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
+                        requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                        requireLocal(weight[qNormName], qNormName),
+                        requireLocal(weight[kNormName], kNormName),
+                        requireLocal(weight[oWeightName], oWeightName),
+                        requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                        requireLocal((Data&)positionIds, "positionIds"),
+                        &pastKeyValues,
+                        &batchPastKeys, &batchPastValues,
+                        &merged, &qgate, &gate,
+                        &q, &k, &v,
+                        &attenOutput, &attenLastOutput,
+                        &qForAttentionHolder,
+                        &insertIndexs, &insertPositions,
+                        &qSizes, &pageSizes,
+                        &pageIndexs, &lastPageLens,
+                        &generatedAppendParams, &generatedDecodeParams,
+                        batch, block_cnt, i, seqLens,
+                        localQHeads, localKVHeads, head_dim,
+                        rotary_dim, mrope_sections,
+                        rms_norm_eps, rope_base, rope_factor,
+                        rope_type, isPrefill,
+                        &hiddenStates,
+                        pagedCacheLayerOffset,
+                        true, false);
+                    Qwen3CudaLinearResidualReduce(
+                        cudaRunner, attenOutput,
+                        *requireLocal(weight[oWeightName], oWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                        attenLastOutput, hiddenStates,
+                        tensorParallel, firstTensorParallelRank, gpuId);
+                } else {
+                    Qwen35ZeroCudaLike(attenLastOutput, hiddenStates, gpuId);
+                    addPartialToResidualReduce(attenLastOutput);
+                }
             } else {
                 std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
                 std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
