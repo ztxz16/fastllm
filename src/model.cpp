@@ -295,6 +295,19 @@ namespace fastllm {
         return false;
     }
 
+    static bool HasExplicitRatiosForAllDevices(const std::vector<int> &devices,
+                                               const std::map<int, int> &ratios) {
+        if (devices.empty() || ratios.empty()) {
+            return false;
+        }
+        for (int device : devices) {
+            if (ratios.find(device) == ratios.end()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     static bool SplitSpecialWeightToCudaTpDevices(const basellm *model,
                                                   const std::string &weightName,
                                                   Data &data,
@@ -315,17 +328,18 @@ namespace fastllm {
 
         std::vector<int> devices = deviceIds;
         Data emptyBias;
+        bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
         if (typeIt->second == "linearSwiglu") {
             data.tpLinearType = TP_LINEAR_ROW;
             data.tpPackType = TP_PACK_GATEUP;
             DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0);
+            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
         }
         if (typeIt->second == "linearColumn") {
             data.tpLinearType = TP_LINEAR_COLUMN;
             DivisionScheme scheme = BuildMultiCudaColumnSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 1);
+            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 1, explicitDeviceRatios);
         }
         return false;
     }

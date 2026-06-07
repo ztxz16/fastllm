@@ -11,7 +11,11 @@
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <set>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
@@ -175,6 +179,165 @@ cudaMemcpyKind GetCudaMemcpyType(int dstType, int srcType) {
 
 std::vector <int> multiCudaCurrentDevices;
 std::map <int, int> multiCudaCurrentRatios;
+static std::set<int> multiCudaExplicitRatioDevices;
+
+static bool FastllmMultiCudaLayerBalanceDisabled() {
+    const char *env = std::getenv("FASTLLM_DISABLE_MULTICUDA_LAYER_BALANCE");
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+    return value != "0" && value != "false" && value != "off";
+}
+
+static bool ParseIntAt(const std::string &s, size_t pos, int &value) {
+    if (pos >= s.size() || !std::isdigit((unsigned char)s[pos])) {
+        return false;
+    }
+    long long v = 0;
+    while (pos < s.size() && std::isdigit((unsigned char)s[pos])) {
+        v = v * 10 + (s[pos] - '0');
+        if (v > 1000000000LL) {
+            return false;
+        }
+        pos++;
+    }
+    value = (int)v;
+    return true;
+}
+
+static int ParseLayerIdFromWeightName(const std::string &name) {
+    static const char *tags[] = {
+        "layers.", "layer.", "blocks.", "block.", "h."
+    };
+    for (const char *tag : tags) {
+        size_t tagLen = strlen(tag);
+        size_t pos = 0;
+        while ((pos = name.find(tag, pos)) != std::string::npos) {
+            int layer = -1;
+            if (ParseIntAt(name, pos + tagLen, layer)) {
+                return layer;
+            }
+            pos += tagLen;
+        }
+    }
+    return -1;
+}
+
+static bool MultiCudaDevicesHaveExplicitRatios(const std::vector<int> &devices) {
+    if (devices.empty() || multiCudaExplicitRatioDevices.empty()) {
+        return false;
+    }
+    for (int device : devices) {
+        if (multiCudaExplicitRatioDevices.find(device) == multiCudaExplicitRatioDevices.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool MultiCudaLayerBalanceCanRotate(const std::vector<int> &devices,
+                                           bool explicitDeviceRatios) {
+    if (devices.size() <= 1 || FastllmMultiCudaLayerBalanceDisabled()) {
+        return false;
+    }
+    if (explicitDeviceRatios || MultiCudaDevicesHaveExplicitRatios(devices)) {
+        return false;
+    }
+    for (int device : devices) {
+        if (specialDeviceIds.find(device) != specialDeviceIds.end()) {
+            return false;
+        }
+    }
+    int firstRatio = -1;
+    for (int device : devices) {
+        auto it = multiCudaCurrentRatios.find(device);
+        int ratio = it == multiCudaCurrentRatios.end() ? 1 : std::max(0, it->second);
+        if (firstRatio < 0) {
+            firstRatio = ratio;
+        } else if (ratio != firstRatio) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int FindFirstRangeOwnerIndex(const DivisionScheme &scheme, const std::vector<int> &devices) {
+    bool found = false;
+    int bestStart = 0;
+    int bestIndex = -1;
+    for (int i = 0; i < (int)devices.size(); i++) {
+        auto it = scheme.find(devices[i]);
+        if (it == scheme.end()) {
+            continue;
+        }
+        for (auto &range : it->second) {
+            if (range.second <= range.first) {
+                continue;
+            }
+            if (!found || range.first < bestStart ||
+                (range.first == bestStart && i < bestIndex)) {
+                found = true;
+                bestStart = range.first;
+                bestIndex = i;
+            }
+        }
+    }
+    return bestIndex;
+}
+
+void BalanceMultiCudaDivisionSchemeByLayer(const std::string &weightName,
+                                           const std::vector<int> &devices,
+                                           DivisionScheme &scheme,
+                                           bool explicitDeviceRatios) {
+    if (!MultiCudaLayerBalanceCanRotate(devices, explicitDeviceRatios)) {
+        return;
+    }
+    int layer = ParseLayerIdFromWeightName(weightName);
+    if (layer < 0) {
+        return;
+    }
+    int shift = layer % (int)devices.size();
+    if (shift == 0) {
+        return;
+    }
+
+    int firstOwner = FindFirstRangeOwnerIndex(scheme, devices);
+    if (firstOwner != 0) {
+        return;
+    }
+
+    DivisionScheme original = scheme;
+    DivisionScheme rotated;
+    std::set<int> deviceSet(devices.begin(), devices.end());
+    for (int device : devices) {
+        rotated[device];
+    }
+    for (int i = 0; i < (int)devices.size(); i++) {
+        int srcDevice = devices[i];
+        int dstDevice = devices[(i + shift) % (int)devices.size()];
+        auto it = original.find(srcDevice);
+        if (it != original.end()) {
+            rotated[dstDevice] = it->second;
+        }
+    }
+    for (auto &it : original) {
+        if (deviceSet.find(it.first) == deviceSet.end()) {
+            rotated[it.first] = it.second;
+        }
+    }
+    scheme.swap(rotated);
+}
+
+static void BalanceDivisionSchemeByLayer(const fastllm::Data &weight,
+                                         const std::vector<int> &devices,
+                                         DivisionScheme &scheme,
+                                         bool explicitDeviceRatios) {
+    BalanceMultiCudaDivisionSchemeByLayer(weight.name, devices, scheme, explicitDeviceRatios);
+}
 
 void FastllmMultiCudaSetDevice(std::vector <int> ids) {
     multiCudaCurrentDevices = ids;
@@ -182,6 +345,10 @@ void FastllmMultiCudaSetDevice(std::vector <int> ids) {
 
 void FastllmMultiCudaSetDeviceRatio(std::map <int, int> &deviceRatio) {
     multiCudaCurrentRatios = deviceRatio;
+    multiCudaExplicitRatioDevices.clear();
+    for (auto &it : deviceRatio) {
+        multiCudaExplicitRatioDevices.insert(it.first);
+    }
 }
 
 void FastllmGetMulticudaDeviceAndRatio(std::vector <int> &devices, std::map <int, int> &ratios, bool noSpecial) {
@@ -633,9 +800,11 @@ DivisionScheme BuildMultiCudaColumnSplitScheme(fastllm::Data &weight, std::vecto
 }
 
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
-                    std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme, int splitAxis) {
+                    std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme, int splitAxis,
+                    bool explicitDeviceRatios) {
     int deviceNum = multiCudaCurrentDevices.size();
     int rootDevice = deviceNum > 0 ? multiCudaCurrentDevices[0] : 0;
+    BalanceDivisionSchemeByLayer(weight, multiCudaCurrentDevices, divisionScheme, explicitDeviceRatios);
     auto hasRequestedLocalTensors = [&]() {
         if (!weight.multiDeviceData) {
             return false;

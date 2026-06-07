@@ -151,9 +151,7 @@ namespace fastllm {
                 }
                 if (device->deviceType == "multicuda" && device->deviceIds.size() > 0) {
                     FastllmMultiCudaSetDevice(device->deviceIds);
-                    if (device->deviceIdsRatio.size() > 0) {
-                        FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
-                    }
+                    FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
                 }
 #endif
                 bool intParamsSize = intParams.size();
@@ -222,9 +220,7 @@ namespace fastllm {
             }
             if (device->deviceType == "multicuda" && device->deviceIds.size() > 0) {
                 FastllmMultiCudaSetDevice(device->deviceIds);
-                if (device->deviceIdsRatio.size() > 0) {
-                    FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
-                }
+                FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
             }
 #endif
             bool intParamsSize = intParams.size();

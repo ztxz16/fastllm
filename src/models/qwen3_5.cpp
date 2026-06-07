@@ -3801,26 +3801,9 @@ namespace fastllm {
         }
 
         bool tensorParallel = devices.size() > 1;
-        DivisionScheme keyScheme;
-        DivisionScheme valueScheme;
-        if (tensorParallel) {
-            keyScheme = BuildQwen35LinearKeyHeadScheme(devices, ratios, num_k_heads);
-            valueScheme = BuildQwen35LinearValueHeadScheme(keyScheme, num_v_heads / num_k_heads);
-        }
 
         std::lock_guard<std::mutex> guard(Qwen35LinearSlotPoolsMutex());
         for (int gpuId : devices) {
-            int localKeyHeads = num_k_heads;
-            int localValueHeads = num_v_heads;
-            if (tensorParallel) {
-                localKeyHeads = Qwen35LocalHeads(keyScheme, gpuId);
-                localValueHeads = Qwen35LocalHeads(valueScheme, gpuId);
-            }
-            if (localKeyHeads <= 0 || localValueHeads <= 0) {
-                continue;
-            }
-
-            int convDim = localKeyHeads * head_k_dim * 2 + localValueHeads * head_v_dim;
             for (int layer = 0; layer < block_cnt; layer++) {
                 std::string prefix = language_prefix + "layers." + std::to_string(layer) + ".";
                 bool isAttentionLayer =
@@ -3828,6 +3811,23 @@ namespace fastllm {
                 if (isAttentionLayer) {
                     continue;
                 }
+                int localKeyHeads = num_k_heads;
+                int localValueHeads = num_v_heads;
+                if (tensorParallel) {
+                    DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
+                        devices, ratios, num_k_heads);
+                    BalanceMultiCudaDivisionSchemeByLayer(
+                        prefix + "linear_attn.in_proj_qkvz.weight", devices, keyScheme);
+                    DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
+                        keyScheme, num_v_heads / num_k_heads);
+                    localKeyHeads = Qwen35LocalHeads(keyScheme, gpuId);
+                    localValueHeads = Qwen35LocalHeads(valueScheme, gpuId);
+                }
+                if (localKeyHeads <= 0 || localValueHeads <= 0) {
+                    continue;
+                }
+
+                int convDim = localKeyHeads * head_k_dim * 2 + localValueHeads * head_v_dim;
                 Qwen35GetLinearSlotPoolLocked(
                     this, gpuId, layer, QWEN35_LINEAR_SLOT_CONV,
                     {slotCapacity, 1, convDim, 4});
@@ -4475,9 +4475,10 @@ namespace fastllm {
                     int localKeyHeads = num_k_heads;
                     int localValueHeads = num_v_heads;
                     if (tensorParallel) {
-                        DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
-                            threadTpPreparedDevices, threadTpPreparedRatios, num_k_heads);
-                        localKeyHeads = localHeadsFromScheme(keyScheme, num_k_heads);
+                        AssertInFastLLM(i < (int)threadTpLinearKeyHeadSchemes.size(),
+                                        "Qwen3.5 ForwardSingleGPU graph missing linear key scheme.\n");
+                        localKeyHeads = localHeadsFromScheme(threadTpLinearKeyHeadSchemes[i],
+                                                             num_k_heads);
                         AssertInFastLLM(i < (int)threadTpLinearValueHeadSchemes.size(),
                                         "Qwen3.5 ForwardSingleGPU graph missing linear value scheme.\n");
                         localValueHeads = localHeadsFromScheme(threadTpLinearValueHeadSchemes[i],
@@ -5101,9 +5102,10 @@ namespace fastllm {
                 int localKeyHeads = num_k_heads;
                 int localValueHeads = num_v_heads;
                 if (tensorParallel) {
-                    DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
-                        threadTpPreparedDevices, threadTpPreparedRatios, num_k_heads);
-                    localKeyHeads = localHeadsFromScheme(keyScheme, num_k_heads);
+                    AssertInFastLLM(i < (int)threadTpLinearKeyHeadSchemes.size(),
+                                    "Qwen3.5 ForwardSingleGPU missing linear key scheme.\n");
+                    localKeyHeads = localHeadsFromScheme(threadTpLinearKeyHeadSchemes[i],
+                                                         num_k_heads);
                     AssertInFastLLM(i < (int)threadTpLinearValueHeadSchemes.size(),
                                     "Qwen3.5 ForwardSingleGPU missing linear value scheme.\n");
                     localValueHeads = localHeadsFromScheme(threadTpLinearValueHeadSchemes[i],
@@ -5956,6 +5958,7 @@ namespace fastllm {
                 AssertInFastLLM(threadTpPreparedDevices == devices && threadTpPreparedRatios == ratios,
                                 "Qwen3.5 ForwardGPU thread TP device config changed after weights were prepared.\n");
                 AssertInFastLLM((int)threadTpAttentionKVHeadSchemes.size() == block_cnt &&
+                                (int)threadTpLinearKeyHeadSchemes.size() == block_cnt &&
                                 (int)threadTpLinearValueHeadSchemes.size() == block_cnt &&
                                 !threadTpLmHeadScheme.empty() &&
                                 hasMoeCache(threadTpMoeWeights, threadTpMoeBiass),
@@ -5983,6 +5986,7 @@ namespace fastllm {
                     PrepareMultiCudaReplicatedData(inv_scale_data, devices, true);
 
                     threadTpAttentionKVHeadSchemes.assign(block_cnt, DivisionScheme());
+                    threadTpLinearKeyHeadSchemes.assign(block_cnt, DivisionScheme());
                     threadTpLinearValueHeadSchemes.assign(block_cnt, DivisionScheme());
 
                     for (int i = 0; i < block_cnt; i++) {
@@ -6046,8 +6050,12 @@ namespace fastllm {
 
                             DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
                                 devices, ratios, num_k_heads);
+                            BalanceMultiCudaDivisionSchemeByLayer(
+                                hasMergedGdnInLinear ? qkvzbaWeightName : qkvzWeightName,
+                                devices, keyScheme);
                             DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
                                 keyScheme, num_v_heads / num_k_heads);
+                            threadTpLinearKeyHeadSchemes[i] = keyScheme;
                             threadTpLinearValueHeadSchemes[i] = valueScheme;
 
                             std::vector<int> devCopy = devices;
@@ -6411,8 +6419,13 @@ namespace fastllm {
                         weight.weight.find(language_prefix + "layers." + std::to_string(i) +
                                            ".self_attn.o_proj.weight") == weight.weight.end();
                     if (isLinearLayer) {
+                        std::string prefix = language_prefix + "layers." + std::to_string(i) + ".";
+                        DivisionScheme linearKeyScheme = BuildQwen35LinearKeyHeadScheme(
+                            devices, ratios, num_k_heads);
+                        BalanceMultiCudaDivisionSchemeByLayer(
+                            prefix + "linear_attn.in_proj_qkvz.weight", devices, linearKeyScheme);
                         DivisionScheme convScheme = BuildQwen35LinearConvScheme(
-                            BuildQwen35LinearKeyHeadScheme(devices, ratios, num_k_heads),
+                            linearKeyScheme,
                             num_k_heads, num_v_heads, head_k_dim, head_v_dim);
                         SyncQwen35ThreadTpRootCacheMetaFromLocal(
                             *pastKeyValues[idx].first, localKeyMeta, devices, convScheme,

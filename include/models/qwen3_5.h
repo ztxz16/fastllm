@@ -232,6 +232,7 @@ namespace fastllm {
         std::vector <int> threadTpPreparedDevices;
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpAttentionKVHeadSchemes;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearKeyHeadSchemes;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearValueHeadSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
         PersistentWorkerGroup threadTpWorkerGroup;
