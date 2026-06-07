@@ -1933,6 +1933,9 @@ namespace fastllm {
     }
 
     Data::~Data() {
+        if (isFake) {
+            return;
+        }
         if (this->isPagedKVCache && !this->pageIndex.empty()) {
             this->pagedKVCacheData->ReleasePageIndices(this->pageIndex);
         }
@@ -1940,9 +1943,6 @@ namespace fastllm {
             for (auto it : this->multiDeviceDatas) {
                 delete it.second;
             }
-        }
-        if (isFake) {
-            return;
         }
         if (this->cpuData != nullptr)
 #ifdef USE_MMAP
