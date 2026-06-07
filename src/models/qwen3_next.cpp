@@ -189,6 +189,24 @@ namespace fastllm {
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
     }
 
+    static DataType Qwen3NextLinearAttentionCacheDataType(DataType modelType) {
+        if (modelType == DataType::FLOAT32 ||
+            modelType == DataType::FLOAT16 ||
+            modelType == DataType::BFLOAT16) {
+            return modelType;
+        }
+        return DataType::FLOAT16;
+    }
+
+    static void Qwen3NextPrepareLinearAttentionCache(Data &cache, DataType cacheType) {
+        cache.isKVCache = true;
+        cache.isLinearAttention = true;
+        if (cache.dims.empty() && cache.dataType != cacheType) {
+            cache.dataType = cacheType;
+            cache.UpdateUnitSize();
+        }
+    }
+
     void Add1(Data &input) {
         if (input.dims.size() == 0) {
             return;
@@ -365,7 +383,9 @@ namespace fastllm {
                 Linear(qkv, weight[oWeightName], oBias, attenInput);
             } else {
                 Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-                pastKey.isLinearAttention = pastValue.isLinearAttention = true;
+                DataType linearCacheType = Qwen3NextLinearAttentionCacheDataType(this->dataType);
+                Qwen3NextPrepareLinearAttentionCache(pastKey, linearCacheType);
+                Qwen3NextPrepareLinearAttentionCache(pastValue, linearCacheType);
                 std::string qkvzWeightName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
                 std::string qkvzBiasName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.bias";
                 std::string baWeightName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
@@ -1358,4 +1378,4 @@ namespace fastllm {
         printf("finish.\n");
     }
 }
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+

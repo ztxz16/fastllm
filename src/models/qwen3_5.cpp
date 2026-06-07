@@ -3460,6 +3460,24 @@ namespace fastllm {
     }
 #endif
 
+    static DataType Qwen35LinearAttentionCacheDataType(DataType modelType) {
+        if (modelType == DataType::FLOAT32 ||
+            modelType == DataType::FLOAT16 ||
+            modelType == DataType::BFLOAT16) {
+            return modelType;
+        }
+        return DataType::FLOAT16;
+    }
+
+    static void Qwen35PrepareLinearAttentionCache(Data &cache, DataType cacheType) {
+        cache.isKVCache = true;
+        cache.isLinearAttention = true;
+        if (cache.dims.empty() && cache.dataType != cacheType) {
+            cache.dataType = cacheType;
+            cache.UpdateUnitSize();
+        }
+    }
+
     static void Add1(Data &input) {
         if (input.dims.size() == 0) {
             return;
@@ -4632,10 +4650,17 @@ namespace fastllm {
             pastKeyValues.reserve(batch * block_cnt);
             for (int b = 0; b < batch; b++) {
                 for (int i = 0; i < block_cnt; i++) {
-                    pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType),
-                                                                  Data(this->kvCacheDataType)));
+                    bool isLinearLayer = Qwen35LayerIsLinearAttention(this, i);
+                    DataType cacheType = isLinearLayer ?
+                        Qwen35LinearAttentionCacheDataType(this->dataType) : this->kvCacheDataType;
+                    pastKeyValuesStorage.push_back(std::make_pair(Data(cacheType),
+                                                                  Data(cacheType)));
                     pastKeyValuesStorage.back().first.SetKVCache();
                     pastKeyValuesStorage.back().second.SetKVCache();
+                    if (isLinearLayer) {
+                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().first, cacheType);
+                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().second, cacheType);
+                    }
                     pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
                                                            &pastKeyValuesStorage.back().second));
                 }
@@ -5323,7 +5348,7 @@ namespace fastllm {
                         buf.convOutput.Reshape({1, batch, buf.convOutput.dims[1]});
                     }
                     for (int bidx = 0; bidx < batch; bidx++) {
-                        buf.linearConvCaches[bidx]->isLinearAttention = true;
+                        Qwen35PrepareLinearAttentionCache(*buf.linearConvCaches[bidx], computeType);
                     }
 
                     for (int rb = 0; rb < batch; rb++) {
@@ -5348,7 +5373,7 @@ namespace fastllm {
                     }
                     if (fusedBatchRecurrentFromConvBa) {
                         for (int rb = 0; rb < batch; rb++) {
-                            buf.recurrentStates[rb]->isLinearAttention = true;
+                            Qwen35PrepareLinearAttentionCache(*buf.recurrentStates[rb], computeType);
                         }
                         buf.coreAttnOut.Reshape({1, batch, buf.coreAttnOut.dims[1],
                                                  buf.coreAttnOut.dims[3]});
@@ -5391,7 +5416,7 @@ namespace fastllm {
                                                           recurrentQScale);
                         SplitBatchFirstDim(buf.batchRecurrentState, buf.recurrentStates);
                         for (int rb = 0; rb < batch; rb++) {
-                            buf.recurrentStates[rb]->isLinearAttention = true;
+                            Qwen35PrepareLinearAttentionCache(*buf.recurrentStates[rb], computeType);
                         }
                         buf.coreAttnOut.Reshape({1, batch, buf.coreAttnOut.dims[1],
                                                  buf.coreAttnOut.dims[3]});
@@ -5895,8 +5920,8 @@ namespace fastllm {
 
                 Data &pastKey = *pastKeyValues[i].first;
                 Data &pastValue = *pastKeyValues[i].second;
-                pastKey.isLinearAttention = true;
-                pastValue.isLinearAttention = true;
+                Qwen35PrepareLinearAttentionCache(pastKey, computeType);
+                Qwen35PrepareLinearAttentionCache(pastValue, computeType);
 
                 if (batch == 1 && all1 && pastKey.dims.size() > 0) {
                     SwapSingleTokenSeqHeadByReshape(qkvConvInput);
@@ -5970,7 +5995,7 @@ namespace fastllm {
                         SplitBatchFirstDim(batchConvCache, linearConvCaches);
                     }
                     for (int bidx = 0; bidx < batch; bidx++) {
-                        linearConvCaches[bidx]->isLinearAttention = true;
+                        Qwen35PrepareLinearAttentionCache(*linearConvCaches[bidx], computeType);
                     }
                 } else {
                     if (qkvConvInput.dims.back() >= 4) {
@@ -6066,7 +6091,7 @@ namespace fastllm {
                         }
                         fusedBatchRecurrentFromConvBa = true;
                         for (int rb = 0; rb < batch; rb++) {
-                            fusedRecurrentStates[rb]->isLinearAttention = true;
+                            Qwen35PrepareLinearAttentionCache(*fusedRecurrentStates[rb], computeType);
                         }
                         coreAttnOut.Reshape({1, batch, coreAttnOut.dims[1], coreAttnOut.dims[3]});
                     }
@@ -6142,7 +6167,7 @@ namespace fastllm {
                                                       recurrentQScale);
                     SplitBatchFirstDim(batchRecurrentState, recurrentStates);
                     for (int rb = 0; rb < batch; rb++) {
-                        recurrentStates[rb]->isLinearAttention = true;
+                        Qwen35PrepareLinearAttentionCache(*recurrentStates[rb], computeType);
                     }
                     coreAttnOut.Reshape({1, batch, coreAttnOut.dims[1], coreAttnOut.dims[3]});
                 } else {
@@ -7081,18 +7106,32 @@ namespace fastllm {
                     bool isLinearLayer =
                         weight.weight.find(language_prefix + "layers." + std::to_string(layer) +
                                            ".self_attn.o_proj.weight") == weight.weight.end();
-                    pastKeyValues[idx].first->isLinearAttention = isLinearLayer;
-                    pastKeyValues[idx].second->isLinearAttention = isLinearLayer;
-                    DataType keyCacheType = ResolveQwen35ThreadTpCacheType(
-                        pastKeyValues[idx].first->dataType, computeType);
-                    DataType valueCacheType = ResolveQwen35ThreadTpCacheType(
-                        pastKeyValues[idx].second->dataType, computeType);
+                    DataType keyCacheType;
+                    DataType valueCacheType;
+                    if (isLinearLayer) {
+                        keyCacheType = computeType;
+                        valueCacheType = computeType;
+                        Qwen35PrepareLinearAttentionCache(*pastKeyValues[idx].first, keyCacheType);
+                        Qwen35PrepareLinearAttentionCache(*pastKeyValues[idx].second, valueCacheType);
+                    } else {
+                        pastKeyValues[idx].first->isLinearAttention = false;
+                        pastKeyValues[idx].second->isLinearAttention = false;
+                        keyCacheType = ResolveQwen35ThreadTpCacheType(
+                            pastKeyValues[idx].first->dataType, computeType);
+                        valueCacheType = ResolveQwen35ThreadTpCacheType(
+                            pastKeyValues[idx].second->dataType, computeType);
+                    }
                     localPastKeyValues[r][idx].first = EnsureQwen35ThreadTpLocalCache(
                         *pastKeyValues[idx].first, device, keyCacheType);
                     localPastKeyValues[r][idx].second = EnsureQwen35ThreadTpLocalCache(
                         *pastKeyValues[idx].second, device, valueCacheType);
-                    localPastKeyValues[r][idx].first->isLinearAttention = isLinearLayer;
-                    localPastKeyValues[r][idx].second->isLinearAttention = isLinearLayer;
+                    if (isLinearLayer) {
+                        Qwen35PrepareLinearAttentionCache(*localPastKeyValues[r][idx].first, keyCacheType);
+                        Qwen35PrepareLinearAttentionCache(*localPastKeyValues[r][idx].second, valueCacheType);
+                    } else {
+                        localPastKeyValues[r][idx].first->isLinearAttention = false;
+                        localPastKeyValues[r][idx].second->isLinearAttention = false;
+                    }
                 }
             }
         } else {
@@ -7102,12 +7141,21 @@ namespace fastllm {
                 bool isLinearLayer =
                     weight.weight.find(language_prefix + "layers." + std::to_string(layer) +
                                        ".self_attn.o_proj.weight") == weight.weight.end();
-                pastKeyValues[idx].first->isLinearAttention = isLinearLayer;
-                pastKeyValues[idx].second->isLinearAttention = isLinearLayer;
-                DataType keyCacheType = ResolveQwen35ThreadTpCacheType(
-                    pastKeyValues[idx].first->dataType, computeType);
-                DataType valueCacheType = ResolveQwen35ThreadTpCacheType(
-                    pastKeyValues[idx].second->dataType, computeType);
+                DataType keyCacheType;
+                DataType valueCacheType;
+                if (isLinearLayer) {
+                    keyCacheType = computeType;
+                    valueCacheType = computeType;
+                    Qwen35PrepareLinearAttentionCache(*pastKeyValues[idx].first, keyCacheType);
+                    Qwen35PrepareLinearAttentionCache(*pastKeyValues[idx].second, valueCacheType);
+                } else {
+                    pastKeyValues[idx].first->isLinearAttention = false;
+                    pastKeyValues[idx].second->isLinearAttention = false;
+                    keyCacheType = ResolveQwen35ThreadTpCacheType(
+                        pastKeyValues[idx].first->dataType, computeType);
+                    valueCacheType = ResolveQwen35ThreadTpCacheType(
+                        pastKeyValues[idx].second->dataType, computeType);
+                }
                 PrepareQwen35SingleCudaCache(*pastKeyValues[idx].first, device, keyCacheType);
                 PrepareQwen35SingleCudaCache(*pastKeyValues[idx].second, device, valueCacheType);
             }
@@ -9105,7 +9153,9 @@ namespace fastllm {
                 std::string conv1dBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.bias";
                 std::string aLogName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.A_log";
                 std::string dtBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.dt_bias";
-                pastKey.isLinearAttention = pastValue.isLinearAttention = true;
+                DataType linearCacheType = Qwen35LinearAttentionCacheDataType(this->dataType);
+                Qwen35PrepareLinearAttentionCache(pastKey, linearCacheType);
+                Qwen35PrepareLinearAttentionCache(pastValue, linearCacheType);
 
                 int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
                 int mixedQkvzDim = this->weight[qkvzWeightName].dims[0];
@@ -9234,7 +9284,7 @@ namespace fastllm {
                         SplitBatchFirstDim(batchConvCache, linearConvCaches);
                     }
                     for (int b = 0; b < batch; b++) {
-                        linearConvCaches[b]->isLinearAttention = true;
+                        Qwen35PrepareLinearAttentionCache(*linearConvCaches[b], linearCacheType);
                     }
                 } else {
                     if (qkvConvInput.dims.back() >= 4) {
@@ -10264,7 +10314,9 @@ namespace fastllm {
             } else {
                 // Gated Delta Net Block
                 Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
-                pastKey.isLinearAttention = pastValue.isLinearAttention = true;
+                DataType linearCacheType = Qwen35LinearAttentionCacheDataType(this->dataType);
+                Qwen35PrepareLinearAttentionCache(pastKey, linearCacheType);
+                Qwen35PrepareLinearAttentionCache(pastValue, linearCacheType);
                 std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
                 std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
                 std::string qkvzbaWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvzba.weight";
@@ -10408,7 +10460,7 @@ namespace fastllm {
                         SplitBatchFirstDim(batchConvCache, linearConvCaches);
                     }
                     for (int b = 0; b < batch; b++) {
-                        linearConvCaches[b]->isLinearAttention = true;
+                        Qwen35PrepareLinearAttentionCache(*linearConvCaches[b], linearCacheType);
                     }
                 } else {
                     if (qkvConvInput.dims.back() >= 4) {
@@ -10491,7 +10543,7 @@ namespace fastllm {
                             rms_norm_eps, recurrentQScale
                         );
                         for (int rb = 0; rb < batch; rb++) {
-                            recurrentStates[rb]->isLinearAttention = true;
+                            Qwen35PrepareLinearAttentionCache(*recurrentStates[rb], linearCacheType);
                         }
                         core_attn_out.Reshape({1, batch, core_attn_out.dims[1], core_attn_out.dims[3]});
                         fusedBatchRecurrentFromConvBa = true;
@@ -10620,7 +10672,7 @@ namespace fastllm {
                         SplitBatchFirstDim(batchRecurrentState, recurrentStates);
                     }
                     for (int rb = 0; rb < batch; rb++) {
-                        recurrentStates[rb]->isLinearAttention = true;
+                        Qwen35PrepareLinearAttentionCache(*recurrentStates[rb], linearCacheType);
                     }
                     core_attn_out.Reshape({1, batch, core_attn_out.dims[1], core_attn_out.dims[3]});
                 } else {
