@@ -3344,6 +3344,120 @@ namespace fastllm {
             return lastRet;
         }
     }
+#else
+    namespace {
+        struct Qwen35LinearPrefixSnapshotCache {
+            bool valid = false;
+        };
+
+        struct Qwen35LinearPrefixSnapshotLayer {
+            bool linear = false;
+            Qwen35LinearPrefixSnapshotCache first;
+            Qwen35LinearPrefixSnapshotCache second;
+        };
+
+        struct Qwen35LinearPrefixSnapshot {
+            int cachedLen = 0;
+            int requestId = 0;
+            long long timestamp = 0;
+            std::vector<int> tokens;
+            std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
+        };
+
+        static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
+            static auto *mutex = new std::mutex();
+            return *mutex;
+        }
+
+        static std::map<const Qwen3_5Model*, std::vector<std::unique_ptr<Qwen35LinearPrefixSnapshot> > >
+                &Qwen35LinearPrefixSnapshots() {
+            static auto *snapshots =
+                new std::map<const Qwen3_5Model*, std::vector<std::unique_ptr<Qwen35LinearPrefixSnapshot> > >();
+            return *snapshots;
+        }
+
+        static long long &Qwen35LinearPrefixSnapshotTimestamp() {
+            static auto *timestamp = new long long(0);
+            return *timestamp;
+        }
+
+        static std::atomic<int> &Qwen35LinearPrefixSnapshotRequestCounter() {
+            static auto *counter = new std::atomic<int>(0);
+            return *counter;
+        }
+
+        static bool Qwen35LinearPrefixCacheEnabled() {
+            return false;
+        }
+
+        static int Qwen35LinearPrefixSnapshotIntervalTokens() {
+            return fastllm::GetPageLen();
+        }
+
+        static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
+            return 1;
+        }
+
+        static int Qwen35LinearPrefixSnapshotMaxRecords() {
+            return 1;
+        }
+
+        static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {
+            std::string prefix = Qwen3_5Model::language_prefix + "layers." + std::to_string(layer) + ".";
+            return model->weight.weight.find(prefix + "self_attn.o_proj.weight") == model->weight.weight.end();
+        }
+
+        static bool Qwen35HasLinearAttentionLayers(const Qwen3_5Model *model, int blockCnt) {
+            for (int i = 0; i < blockCnt; i++) {
+                if (Qwen35LayerIsLinearAttention(model, i)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        static int Qwen35CurrentTokenGrowingCacheLen(
+                const Qwen3_5Model *model,
+                int blockCnt,
+                const std::vector<std::pair<Data, Data> > &pastKeyValues) {
+            (void)model;
+            (void)blockCnt;
+            (void)pastKeyValues;
+            return 0;
+        }
+
+        static bool Qwen35SnapshotCopyCache(
+                const Data &src,
+                Qwen35LinearPrefixSnapshotCache &dst) {
+            (void)src;
+            (void)dst;
+            return false;
+        }
+
+        static bool Qwen35RestoreSnapshotCache(
+                const Qwen35LinearPrefixSnapshotCache &snapshot,
+                Data &dst) {
+            (void)snapshot;
+            (void)dst;
+            return false;
+        }
+
+        static const Qwen35LinearPrefixSnapshot *Qwen35FindLinearPrefixSnapshotLocked(
+                const Qwen3_5Model *model,
+                const std::vector<int> &tokens,
+                int maxCachedLen,
+                int exactLen = -1) {
+            (void)model;
+            (void)tokens;
+            (void)maxCachedLen;
+            (void)exactLen;
+            return nullptr;
+        }
+
+        static void Qwen35EraseLinearPrefixSnapshots(const Qwen3_5Model *model) {
+            (void)model;
+        }
+    }
 #endif
 
     static void Add1(Data &input) {
