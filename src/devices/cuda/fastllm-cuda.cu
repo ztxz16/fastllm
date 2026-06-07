@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <map>
 #include <random>
@@ -39,6 +40,27 @@ void showError(cudaError_t result, char const* const message, const char* const 
 
 static std::atomic<bool> fastllmCudaMallocDisabled(false);
 static std::mutex fastllmCudaMallocCheckMutex;
+
+// 张量并行下 NCCL 集合通信异步发射在 cudaStreamPerThread 上且不立即同步。此时执行真实 cudaMalloc
+// 会持有 CUDA 驱动分配锁并隐式同步设备，与 NCCL 主机 proxy 线程争用驱动锁，形成跨 rank 死锁。
+// 该标志由 multicuda 在 NCCL 初始化成功后置位；置位后真实 cudaMalloc 前会先排空在途集合通信，
+// 使分配发生在任何在途 NCCL 之外。仅在冷池真实分配时触发，热池命中无影响。
+std::atomic<bool> fastllmCudaNcclActive(false);
+void FastllmCudaSetNcclActive(bool value) {
+    fastllmCudaNcclActive.store(value, std::memory_order_relaxed);
+}
+
+// 是否要求 NCCL 集合通信「发射后立即同步」。默认 true（安全）：权重加载与 warmup 阶段几乎每次都会
+// 发生真实 cudaMalloc，与在途集合通信争用 CUDA 驱动锁会导致跨 rank 死锁，故全程同步发射。
+// warmup 成功结束后由 basellm 置为 false：此时内存池已热、稳态前向基本不再有真实 cudaMalloc，
+// 异步发射安全且能恢复通信/计算重叠带来的吞吐。malloc 护栏继续作为稳态兜底。
+std::atomic<bool> fastllmCudaNcclForceSync(true);
+void FastllmCudaSetNcclForceSync(bool value) {
+    fastllmCudaNcclForceSync.store(value, std::memory_order_relaxed);
+}
+bool FastllmCudaGetNcclForceSync() {
+    return fastllmCudaNcclForceSync.load(std::memory_order_relaxed);
+}
 
 static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line, bool rejected) {
     std::lock_guard<std::mutex> lock(fastllmCudaMallocCheckMutex);
@@ -78,6 +100,10 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
             }
             return cudaErrorMemoryAllocation;
         }
+    }
+    if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
+        // 真实 cudaMalloc 前排空在途 NCCL 集合通信，避免与 cudaMalloc 争用 CUDA 驱动锁导致跨 rank 死锁。
+        cudaDeviceSynchronize();
     }
     return cudaMalloc(ret, size);
 }
@@ -1800,7 +1826,88 @@ std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
 std::map<int, int> cudaBuffersMinId; // 最小的空闲id
 std::map<int, size_t> noBusyCnt;
 std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
-static std::mutex fastllmCudaMemPoolMutex;
+
+// fastllmCudaMemPoolMetaMutex 仅保护上面这些 map 结构本身（查找/插入新设备条目），
+// 持锁期间绝不调用任何 CUDA API，避免跨设备线程互相阻塞。
+static std::mutex fastllmCudaMemPoolMetaMutex;
+// 每个设备一把锁：内存池的 cudaMalloc/cudaFree（会隐式同步本设备）只在对应设备锁内进行，
+// 不会阻塞其它设备线程。这是张量并行下避免死锁的关键：
+// 否则一个 rank 持有跨设备全局锁时执行 cudaMalloc/cudaFree（隐式同步本设备），
+// 而本设备 stream 上挂着需要其它 rank 共同完成的 NCCL 集合通信，
+// 其它 rank 又卡在等待这把全局锁，从而形成跨 rank 死锁
+// （典型现象：单卡 100%、其余 0%，且卡住的卡不固定）。
+static std::map<int, std::unique_ptr<std::mutex>> fastllmCudaMemPoolDeviceLocks;
+
+// 某个设备的内存池视图：均为指向全局 map 内元素的稳定指针。
+// std::map 保证元素引用/指针在其它 key 插入或删除时仍然有效，
+// 因此在元锁下取得这些指针后，可在设备锁（而非元锁）下安全地修改其内容。
+struct FastllmCudaMemPoolView {
+    std::mutex *lock = nullptr;
+    std::vector<CudaMemoryBuffer> *bigBuffers = nullptr;
+    std::vector<CudaMemoryBuffer> *smallBuffers = nullptr;
+    int *minId = nullptr;
+    size_t *noBusy = nullptr;
+    int device = -1;
+};
+
+// 在元锁下创建/获取指定设备的池视图与设备锁。
+static FastllmCudaMemPoolView FastllmGetCudaMemPoolView(int id) {
+    std::lock_guard<std::mutex> meta(fastllmCudaMemPoolMetaMutex);
+    FastllmCudaMemPoolView view;
+    view.device = id;
+    view.bigBuffers = &bigBuffersMap[id];
+    view.smallBuffers = &cudaBuffersMap[id];
+    view.minId = &cudaBuffersMinId[id];
+    view.noBusy = &noBusyCnt[id];
+    auto &lk = fastllmCudaMemPoolDeviceLocks[id];
+    if (lk == nullptr) {
+        lk = std::unique_ptr<std::mutex>(new std::mutex());
+    }
+    view.lock = lk.get();
+    return view;
+}
+
+// 在元锁下对当前所有设备做一次快照（仅复制稳定指针），
+// 用于需要跨设备查找/清理的场景（FastllmCudaFree / FastllmCudaClearBigBuffer）。
+// 拿到快照后即释放元锁，再逐设备各自加锁处理，绝不同时持有两把设备锁去调用 CUDA。
+static std::vector<FastllmCudaMemPoolView> FastllmSnapshotCudaMemPoolViews() {
+    std::lock_guard<std::mutex> meta(fastllmCudaMemPoolMetaMutex);
+    std::vector<FastllmCudaMemPoolView> views;
+    for (auto &it : bigBuffersMap) {
+        int id = it.first;
+        FastllmCudaMemPoolView view;
+        view.device = id;
+        view.bigBuffers = &it.second;
+        view.smallBuffers = &cudaBuffersMap[id];
+        view.minId = &cudaBuffersMinId[id];
+        view.noBusy = &noBusyCnt[id];
+        auto &lk = fastllmCudaMemPoolDeviceLocks[id];
+        if (lk == nullptr) {
+            lk = std::unique_ptr<std::mutex>(new std::mutex());
+        }
+        view.lock = lk.get();
+        views.push_back(view);
+    }
+    for (auto &it : cudaBuffersMap) {
+        int id = it.first;
+        if (bigBuffersMap.find(id) != bigBuffersMap.end()) {
+            continue;
+        }
+        FastllmCudaMemPoolView view;
+        view.device = id;
+        view.bigBuffers = &bigBuffersMap[id];
+        view.smallBuffers = &it.second;
+        view.minId = &cudaBuffersMinId[id];
+        view.noBusy = &noBusyCnt[id];
+        auto &lk = fastllmCudaMemPoolDeviceLocks[id];
+        if (lk == nullptr) {
+            lk = std::unique_ptr<std::mutex>(new std::mutex());
+        }
+        view.lock = lk.get();
+        views.push_back(view);
+    }
+    return views;
+}
 
 static size_t fastllmCudaMemPoolAllocated = 0;
 static size_t fastllmCudaMemPoolPeak = 0;
@@ -2156,15 +2263,16 @@ void FastllmCudaMemset0(void *ret, size_t size) {
 void FastllmCudaMemPoolStats() {
     int id = -1;
     cudaGetDevice(&id);
-    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    std::lock_guard<std::mutex> lock(*view.lock);
     size_t bigTotal = 0, bigBusy = 0;
     size_t smallTotal = 0, smallBusy = 0;
-    auto &bigBuffers = bigBuffersMap[id];
+    auto &bigBuffers = *view.bigBuffers;
     for (auto &b : bigBuffers) {
         bigTotal += b.size;
         if (b.busy) bigBusy += b.size;
     }
-    auto &cudaBuffers = cudaBuffersMap[id];
+    auto &cudaBuffers = *view.smallBuffers;
     for (auto &b : cudaBuffers) {
         smallTotal += b.size;
         if (b.busy) smallBusy += b.size;
@@ -2197,19 +2305,20 @@ static bool FastllmCudaCanReusePooledBigBuffer(size_t bufferSize, size_t request
     return bufferSize <= requestSize * 2 || bufferSize - requestSize < maxWaste;
 }
 
-static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize) {
+static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
+                                                  std::vector<CudaMemoryBuffer> *bigBuffersPtr,
+                                                  std::vector<CudaMemoryBuffer> *smallBuffersPtr) {
     if (!fastllm::GetFastllmEnv().cudaMemCheck) {
         return;
     }
     fprintf(stderr, "[FASTLLM_CUDA_MEM_CHECK] pooled buffers on device %d before rejecting %.2f MB:\n",
             id, requestSize / 1048576.0);
-    auto bigIt = bigBuffersMap.find(id);
-    if (bigIt == bigBuffersMap.end() || bigIt->second.empty()) {
+    if (bigBuffersPtr == nullptr || bigBuffersPtr->empty()) {
         fprintf(stderr, "  bigPool: empty\n");
     } else {
         int printed = 0;
-        for (int i = 0; i < (int)bigIt->second.size(); i++) {
-            auto &b = bigIt->second[i];
+        for (int i = 0; i < (int)bigBuffersPtr->size(); i++) {
+            auto &b = (*bigBuffersPtr)[i];
             if (b.size < 1024 * 1024 && printed >= 16) {
                 continue;
             }
@@ -2219,13 +2328,12 @@ static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize) {
             printed++;
         }
     }
-    auto smallIt = cudaBuffersMap.find(id);
-    if (smallIt == cudaBuffersMap.end() || smallIt->second.empty()) {
+    if (smallBuffersPtr == nullptr || smallBuffersPtr->empty()) {
         fprintf(stderr, "  smallPool: empty\n");
     } else {
         size_t smallFree = 0, smallBusy = 0;
         int freeCount = 0, busyCount = 0;
-        for (auto &b : smallIt->second) {
+        for (auto &b : *smallBuffersPtr) {
             if (b.busy) {
                 smallBusy += b.size;
                 busyCount++;
@@ -2245,9 +2353,10 @@ void * FastllmCudaMalloc(size_t size) {
     cudaError_t state = cudaSuccess;
     state = cudaGetDevice(&id);
     checkCudaErrors("Error: CUDA error when find device!", state);
-    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    std::lock_guard<std::mutex> lock(*view.lock);
     if (size > 1024 * 1024) {
-        auto &bigBuffers = bigBuffersMap[id];
+        auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && FastllmCudaCanReusePooledBigBuffer(bigBuffers[i].size, size)) {
@@ -2282,7 +2391,7 @@ void * FastllmCudaMalloc(size_t size) {
 
         void * ret;
         if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
-            FastllmCudaPrintPoolRejectStateLocked(id, size);
+            FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
         }
         state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
         if (cudaSuccess != state) {
@@ -2301,13 +2410,13 @@ void * FastllmCudaMalloc(size_t size) {
 #endif
         return ret;
     }
-    auto &cudaBuffers = cudaBuffersMap[id];
-    for (int i = cudaBuffersMinId[id]; i < cudaBuffers.size(); i++) {
+    auto &cudaBuffers = *view.smallBuffers;
+    for (int i = *view.minId; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy) {
             cudaBuffers[i].busy = true;
-            noBusyCnt[id] -= cudaBuffers[i].size;
-            while (cudaBuffersMinId[id] < cudaBuffers.size() && cudaBuffers[cudaBuffersMinId[id]].busy) {
-                cudaBuffersMinId[id]++;
+            *view.noBusy -= cudaBuffers[i].size;
+            while (*view.minId < cudaBuffers.size() && cudaBuffers[*view.minId].busy) {
+                (*view.minId)++;
             }
 #ifdef CUDA_MEM_DEBUG
             CudaMemDebugRecord(cudaBuffers[i].data, size);
@@ -2316,7 +2425,7 @@ void * FastllmCudaMalloc(size_t size) {
         }
     }
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
-        auto &bigBuffers = bigBuffersMap[id];
+        auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].size >= size) {
@@ -2335,7 +2444,7 @@ void * FastllmCudaMalloc(size_t size) {
     }
     void * ret;
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
-        FastllmCudaPrintPoolRejectStateLocked(id, size);
+        FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
     }
     state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state) {
@@ -2363,64 +2472,49 @@ void FastllmCudaFree(void *ret) {
         return;
     }
     int oriId = FastllmCudaGetDevice();
-    cudaError_t state = cudaSuccess;
-    bool keepCudaBuffers = true;
-    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
-    if (cudaBuffersMap.empty() && bigBuffersMap.empty())
-        return;
-    for (auto &it: cudaBuffersMap) {
-        if (!keepCudaBuffers && noBusyCnt[it.first] > 1024 * 1024 * 1024) {
-            auto &cudaBuffers = it.second;
-            std::vector <CudaMemoryBuffer> temp;
-            for (int i = 0; i < cudaBuffers.size(); i++) {
-                if (!cudaBuffers[i].busy) {
-                    state = cudaSetDevice(it.first);
-                    state = cudaFree(cudaBuffers[i].data);
-                    if (cudaSuccess != state)
-                        printf("Error: CUDA error when release memory on device %d!", it.first);
-                    checkCudaErrors("", state);
-                } else {
-                    temp.push_back(cudaBuffers[i]);
-                }
-            }
-            cudaBuffers.clear();
-            it.second = temp;
-            noBusyCnt[it.first] = 0;
-        }
-    }
 
-    for (auto &it: cudaBuffersMap) {
-        auto &cudaBuffers = it.second;
+    // 逐设备各自加锁查找该指针所属的池并归还。归还只做标记（busy=false），
+    // 不调用任何 CUDA API；因此即使在张量并行下，也不会出现"持锁 + 隐式同步本设备"
+    // 而阻塞其它 rank 进入 NCCL 集合通信、形成跨 rank 死锁的情况。
+    std::vector<FastllmCudaMemPoolView> views = FastllmSnapshotCudaMemPoolViews();
+    if (views.empty()) {
+        return;
+    }
+    for (auto &view : views) {
+        std::lock_guard<std::mutex> lock(*view.lock);
+        auto &cudaBuffers = *view.smallBuffers;
         for (int i = 0; i < cudaBuffers.size(); i++) {
             if (cudaBuffers[i].data == ret) {
-                noBusyCnt[it.first] += cudaBuffers[i].size;
+                *view.noBusy += cudaBuffers[i].size;
                 cudaBuffers[i].busy = false;
-                cudaBuffersMinId[it.first] = std::min(cudaBuffersMinId[it.first], i);
+                *view.minId = std::min(*view.minId, i);
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRemove(ret);
 #endif
-                FastllmCudaSetDevice(oriId);
                 return;
             }
         }
-    }
-    for (auto &it: bigBuffersMap) {
-        auto &bigBuffers = it.second;
+        auto &bigBuffers = *view.bigBuffers;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (bigBuffers[i].data == ret) {
                 bigBuffers[i].busy = false;
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRemove(ret);
 #endif
-                FastllmCudaSetDevice(oriId);
                 return;
             }
         }
     }
+
+    // 未在任何池中找到：直接释放。此处不持有任何池锁，避免跨设备阻塞。
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
-    state = cudaFree(ret);
+    if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
+        // 同 cudaMalloc：真实 cudaFree 前排空在途 NCCL，避免争用 CUDA 驱动锁导致跨 rank 死锁。
+        cudaDeviceSynchronize();
+    }
+    cudaError_t state = cudaFree(ret);
     FastllmCudaSetDevice(oriId);
     checkCudaErrors("CUDA error when release memory!", state);
 }
@@ -2429,8 +2523,9 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     void * ret;
     int id = -1;
     cudaGetDevice(&id);
-    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
-    auto &bigBuffers = bigBuffersMap[id];
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    auto &bigBuffers = *view.bigBuffers;
     auto state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state) {
         printf("Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory left on device.", size >> 20);
@@ -2446,12 +2541,15 @@ void FastllmCudaClearBigBuffer() {
     }
     int id = -1;
     cudaGetDevice(&id);
-    std::lock_guard<std::mutex> lock(fastllmCudaMemPoolMutex);
-    if (bigBuffersMap.empty())
+    std::vector<FastllmCudaMemPoolView> views = FastllmSnapshotCudaMemPoolViews();
+    if (views.empty())
         return;
     cudaError_t state = cudaSuccess;
-    for (auto &it : bigBuffersMap) {
-        auto &bigBuffers = it.second;
+    // 逐设备各自加锁清理：cudaSetDevice/cudaFree 只在对应设备锁内进行，
+    // 不会同时持有多把设备锁，避免跨设备阻塞。
+    for (auto &view : views) {
+        std::lock_guard<std::mutex> lock(*view.lock);
+        auto &bigBuffers = *view.bigBuffers;
         std::vector <CudaMemoryBuffer> temp;
         long long littleMemSum = 0;        
         long long littleMemSumLimit = 300 * 1024 * 1024; // 留一小部分复用  
@@ -2472,10 +2570,10 @@ void FastllmCudaClearBigBuffer() {
         }
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && littleMemIds.find(i) == littleMemIds.end()) {
-                state = cudaSetDevice(it.first);
+                state = cudaSetDevice(view.device);
                 state = cudaFree(bigBuffers[i].data);
                 if (cudaSuccess != state)
-                    printf("Error: CUDA error when release memory on device %d!", it.first);
+                    printf("Error: CUDA error when release memory on device %d!", view.device);
                 checkCudaErrors("", state);
             } else {
                 temp.push_back(bigBuffers[i]);

@@ -127,6 +127,13 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
 void *FastllmCudaMalloc(size_t size);
 void FastllmCudaFree(void *ret);
 void DisableCudaMalloc();
+// 由 multicuda 在 NCCL 初始化成功后置位；置位后真实 cudaMalloc 前会先排空在途 NCCL 集合通信，
+// 规避 cudaMalloc 与 NCCL 主机 proxy 争用 CUDA 驱动锁导致的跨 rank 死锁。
+void FastllmCudaSetNcclActive(bool value);
+// 控制 NCCL 集合通信是否「发射后立即同步」。默认 true（权重加载/warmup 阶段防死锁），
+// warmup 成功结束后由 basellm 置 false 以恢复稳态解码吞吐。
+void FastllmCudaSetNcclForceSync(bool value);
+bool FastllmCudaGetNcclForceSync();
 void FastllmCudaSetWeightSlabBytes(size_t bytes);
 size_t FastllmCudaGetWeightSlabBytes();
 void *FastllmCudaMallocModelWeight(size_t size);

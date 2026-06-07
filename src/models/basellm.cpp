@@ -2717,6 +2717,11 @@ namespace fastllm {
             AutoWarmupFinishGuard(basellm *model) : model(model) {}
             ~AutoWarmupFinishGuard() {
                 model->OnAutoWarmupFinished();
+#ifdef USE_CUDA
+                // warmup 结束后切回异步集合通信：此时内存池已热，稳态前向基本不再触发真实 cudaMalloc，
+                // 异步发射安全且能恢复通信/计算重叠的吞吐。warmup 及之前(权重加载)保持同步以防死锁。
+                FastllmCudaSetNcclForceSync(false);
+#endif
             }
         } autoWarmupFinishGuard(this);
         struct AutoWarmupRunningGuard {

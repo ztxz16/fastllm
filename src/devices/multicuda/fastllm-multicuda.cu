@@ -1686,6 +1686,9 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         
     g_ncclInitialized = true;
     g_ncclWorldSize = numGPUs;
+    // 通知 CUDA 分配器：NCCL 已激活。此后真实 cudaMalloc 前会先排空在途集合通信，
+    // 避免 cudaMalloc 与 NCCL 主机 proxy 争用 CUDA 驱动锁导致的跨 rank 死锁。
+    FastllmCudaSetNcclActive(true);
     printf("NCCL Initialized for %d devices.\n", numGPUs);
     return true;
 }
@@ -1696,6 +1699,12 @@ ncclComm_t GetNcclComm(int deviceId) {
     }
     printf("Error: No NCCL comm found for device %d\n", deviceId);
     return nullptr;
+}
+
+// 集合通信发射后是否立即同步：warmup/权重加载阶段返回 true 以防跨 rank 死锁，
+// warmup 结束后返回 false，稳态前向异步发射以恢复通信/计算重叠(见 FastllmCudaSetNcclForceSync)。
+static bool FastllmNcclPostSyncEnabled() {
+    return FastllmCudaGetNcclForceSync();
 }
 
 // 功能：将 root 设备上的 data 数据广播到所有卡 (In-place 操作)
@@ -1758,6 +1767,13 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
     
     if (res != ncclSuccess) {
         printf("Error: ncclBroadcast failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
+        return;
+    }
+    // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
+    // 若集合通信在途时另一线程触发真实 cudaMalloc(持 CUDA 驱动锁并隐式同步)，会与 NCCL 主机 proxy
+    // 争用驱动锁形成跨 rank 死锁。同步发射可彻底消除该竞态。
+    if (FastllmNcclPostSyncEnabled()) {
+        cudaStreamSynchronize(stream);
     }
 }
 
@@ -1807,10 +1823,17 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
     // op: ncclSum (求和)
     cudaStream_t stream = cudaStreamPerThread;
     
-    // 注意：NCCL调用是异步的
+    // 注意：ncclAllReduce 发射是异步的
     ncclResult_t res = ncclAllReduce(data, dest, count, ncclType, ncclSum, comm, stream);
     
     if (res != ncclSuccess) {
         printf("Error: ncclAllReduce failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
+        return;
+    }
+    // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
+    // 若集合通信在途时另一线程触发真实 cudaMalloc(持 CUDA 驱动锁并隐式同步)，会与 NCCL 主机 proxy
+    // 争用驱动锁形成跨 rank 死锁。同步发射可彻底消除该竞态。
+    if (FastllmNcclPostSyncEnabled()) {
+        cudaStreamSynchronize(stream);
     }
 }
