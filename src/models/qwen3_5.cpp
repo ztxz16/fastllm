@@ -2207,6 +2207,7 @@ namespace fastllm {
 
         struct Qwen35LinearPrefixSnapshot {
             int cachedLen = 0;
+            int requestId = 0;
             long long timestamp = 0;
             std::vector<int> tokens;
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
@@ -2227,6 +2228,11 @@ namespace fastllm {
         static long long &Qwen35LinearPrefixSnapshotTimestamp() {
             static auto *timestamp = new long long(0);
             return *timestamp;
+        }
+
+        static std::atomic<int> &Qwen35LinearPrefixSnapshotRequestCounter() {
+            static auto *counter = new std::atomic<int>(0);
+            return *counter;
         }
 
         static int Qwen35EnvInt(const char *name, int fallback) {
@@ -4255,18 +4261,26 @@ namespace fastllm {
         }
         int lastSnapshotLen = context->intParams["qwen35_linear_prefix_last_len"];
         int snapshotCount = context->intParams["qwen35_linear_prefix_count"];
-        if (currentLen <= lastSnapshotLen ||
-            snapshotCount >= Qwen35LinearPrefixSnapshotMaxPerRequest()) {
+        if (currentLen <= lastSnapshotLen) {
             return false;
         }
         int interval = Qwen35LinearPrefixSnapshotIntervalTokens();
         if (snapshotCount > 0 && currentLen % interval != 0) {
             return false;
         }
+        int requestId = context->intParams["qwen35_linear_prefix_request_id"];
+        if (requestId <= 0) {
+            requestId = ++Qwen35LinearPrefixSnapshotRequestCounter();
+            if (requestId <= 0) {
+                requestId = 1;
+                Qwen35LinearPrefixSnapshotRequestCounter().store(1);
+            }
+            context->intParams["qwen35_linear_prefix_request_id"] = requestId;
+        }
 
         std::unique_ptr<Qwen35LinearPrefixSnapshot> snapshot(new Qwen35LinearPrefixSnapshot());
         snapshot->cachedLen = currentLen;
-        snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
+        snapshot->requestId = requestId;
         snapshot->tokens.assign(context->allTokens.begin(), context->allTokens.begin() + currentLen);
         snapshot->layers.resize(this->block_cnt);
         for (int i = 0; i < this->block_cnt; i++) {
@@ -4284,6 +4298,7 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
             auto &items = Qwen35LinearPrefixSnapshots()[this];
+            snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
             for (auto it = items.begin(); it != items.end(); ) {
                 Qwen35LinearPrefixSnapshot *old = it->get();
                 if (old != nullptr && old->cachedLen == snapshot->cachedLen &&
@@ -4294,6 +4309,31 @@ namespace fastllm {
                 }
             }
             items.push_back(std::move(snapshot));
+            int maxPerRequest = Qwen35LinearPrefixSnapshotMaxPerRequest();
+            int requestRecords = 0;
+            for (auto &item : items) {
+                if (item != nullptr && item->requestId == requestId) {
+                    requestRecords++;
+                }
+            }
+            while (requestRecords > maxPerRequest) {
+                auto oldest = items.end();
+                for (auto it = items.begin(); it != items.end(); ++it) {
+                    Qwen35LinearPrefixSnapshot *old = it->get();
+                    if (old == nullptr || old->requestId != requestId) {
+                        continue;
+                    }
+                    if (oldest == items.end() ||
+                        old->timestamp < (*oldest)->timestamp) {
+                        oldest = it;
+                    }
+                }
+                if (oldest == items.end()) {
+                    break;
+                }
+                items.erase(oldest);
+                requestRecords--;
+            }
             int maxRecords = Qwen35LinearPrefixSnapshotMaxRecords();
             while ((int)items.size() > maxRecords) {
                 items.erase(items.begin());
