@@ -3157,6 +3157,19 @@ namespace fastllm {
 
             auto freeSizes = FastllmCudaGetFreeSizes();
             auto totalSizes = FastllmCudaGetTotalSizes();
+            auto getCudaRuntimeHeadroom = [&](int id, long long avail) -> long long {
+                if (avail <= 0) {
+                    return 0;
+                }
+
+                long long headroom = 512LL * 1024LL * 1024LL;
+                if (id >= 0 && id < (int)totalSizes.size()) {
+                    headroom = std::max(headroom, totalSizes[id] / 100);
+                }
+                headroom = std::min(headroom, 2LL * 1024LL * 1024LL * 1024LL);
+                headroom = std::min(headroom, avail / 4);
+                return std::max(0LL, headroom);
+            };
             auto fitPagesWithLinearReserve = [&](int id, long long avail, long long kvBytesPerPage) -> int {
                 if (avail <= 0 || kvBytesPerPage <= 0) {
                     return 0;
@@ -3209,12 +3222,14 @@ namespace fastllm {
                     int id = it.first;
                     if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
                         long long reserved = (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
-                        long long avail = freeSizes[id] - reserved;
+                        long long rawAvail = freeSizes[id] - reserved;
+                        long long runtimeHeadroom = getCudaRuntimeHeadroom(id, rawAvail);
+                        long long avail = rawAvail - runtimeHeadroom;
                         long long perPageOnDevice = it.second;
                         updateLinearAttentionBatchLimit(avail);
-                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, localKVPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
+                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, availForKV=%.2f GB, localKVPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                id, freeSizes[id] / 1e9, totalSizes[id] / 1e9, reserved / 1e9,
-                               avail / 1e9, perPageOnDevice / 1e6,
+                               runtimeHeadroom / 1e6, avail / 1e9, perPageOnDevice / 1e6,
                                deviceLayerCount.count(id) ? deviceLayerCount[id] : 0);
                         if (perPageOnDevice > 0 && avail > 0) {
                             int pages = fitPagesWithLinearReserve(id, avail, perPageOnDevice);
@@ -3230,7 +3245,8 @@ namespace fastllm {
                            maxPages, maxPages * pageLen);
                     for (int id : deviceIds) {
                         if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
-                            long long avail = freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+                            long long rawAvail = freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+                            long long avail = rawAvail - getCudaRuntimeHeadroom(id, rawAvail);
                             int layers = deviceLayerCount.count(id) ? deviceLayerCount[id] : 0;
                             printf("  GPU %d: layers=%d, avail=%.2f GB.\n", id, layers, avail / 1e9);
                         }
@@ -3247,11 +3263,13 @@ namespace fastllm {
                     cacheDeviceId = deviceBytesPerPage.begin()->first;
                     if (cacheDeviceId < (int)freeSizes.size() && cacheDeviceId < (int)totalSizes.size()) {
                         long long reserved = (long long)(totalSizes[cacheDeviceId] * (1.0 - fastllm::GetGpuMemRatio()));
-                        cacheAvail = freeSizes[cacheDeviceId] - reserved;
+                        long long rawAvail = freeSizes[cacheDeviceId] - reserved;
+                        long long runtimeHeadroom = getCudaRuntimeHeadroom(cacheDeviceId, rawAvail);
+                        cacheAvail = rawAvail - runtimeHeadroom;
                         updateLinearAttentionBatchLimit(cacheAvail);
-                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
+                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                cacheDeviceId, freeSizes[cacheDeviceId] / 1e9, totalSizes[cacheDeviceId] / 1e9,
-                               reserved / 1e9, cacheAvail / 1e9, cacheBytesPerPage / 1e6,
+                               reserved / 1e9, runtimeHeadroom / 1e6, cacheAvail / 1e9, cacheBytesPerPage / 1e6,
                                deviceLayerCount.count(cacheDeviceId) ? deviceLayerCount[cacheDeviceId] : 0);
                     }
                 }
@@ -3270,7 +3288,7 @@ namespace fastllm {
                     } else if (cacheBytesPerPage <= 0) {
                         fallbackReason = "kvPerPage <= 0.";
                     } else {
-                        fallbackReason = "availForKV <= 0 after reserve.";
+                        fallbackReason = "availForKV <= 0 after reserve and runtime headroom.";
                     }
                 }
             }
