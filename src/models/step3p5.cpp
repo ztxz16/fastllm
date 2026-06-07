@@ -2377,6 +2377,36 @@ namespace fastllm {
         return basellm::GetPagedKVCacheManager(layerIndex, isKey);
     }
 
+    std::vector<std::pair<int, PagedCacheManager*> > Step3p5Model::GetPagedKVCacheManagers(int layerIndex, bool isKey) const {
+        if (layerIndex >= 0 && this->threadTpPagedCacheBase >= 0) {
+            std::vector<std::pair<int, PagedCacheManager*> > ret;
+            int ranks = this->threadTpPreparedDevices.empty() ? 1 : (int)this->threadTpPreparedDevices.size();
+            for (int r = 0; r < ranks; r++) {
+                PagedCacheManager *manager = GetPagedCacheManager(
+                    (this->threadTpPagedCacheBase + r * this->block_cnt + layerIndex) * 2 + (isKey ? 0 : 1));
+                if (manager == nullptr) {
+                    ret.clear();
+                    break;
+                }
+                int device = r < (int)this->threadTpPreparedDevices.size() ? this->threadTpPreparedDevices[r] : -1;
+                if (device < 0) {
+                    Data *managerData = (Data*)manager;
+                    if (!managerData->dataDeviceIds.empty()) {
+                        device = managerData->dataDeviceIds[0];
+                    }
+                }
+                ret.push_back(std::make_pair(device, manager));
+            }
+            if (!ret.empty()) {
+                return ret;
+            }
+            if (!this->threadTpPreparedDevices.empty()) {
+                return ret;
+            }
+        }
+        return basellm::GetPagedKVCacheManagers(layerIndex, isKey);
+    }
+
     static std::vector<int> GetStep3p5CudaGraphWarmupBatches() {
         const int maxCudaGraphDecodeBatch = 32;
         std::vector<int> ret;

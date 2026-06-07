@@ -70,6 +70,7 @@ namespace fastllm {
         virtual void OnAutoWarmupFinished() override;
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+        virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
 
         virtual void OnWeightsCreated(const std::set<std::string> &allWeightNames) override;
 

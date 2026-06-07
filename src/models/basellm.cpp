@@ -240,9 +240,25 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache() {
-        auto recordPagedCache = [&](Data &cache) {
-            if (cache.multiDeviceData) {
+        for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
+            auto &kvFirst = this->pastKeyValues[i].first;
+            auto &kvSecond = this->pastKeyValues[i].second;
+            if (kvFirst.isLinearAttention || kvSecond.isLinearAttention) {
                 return;
+            }
+        }
+        std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
+            if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                bool recordedLocal = false;
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr) {
+                        recordPagedCache(*it.second);
+                        recordedLocal = true;
+                    }
+                }
+                if (recordedLocal) {
+                    return;
+                }
             }
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
@@ -262,6 +278,20 @@ namespace fastllm {
             return nullptr;
         }
         return GetPagedCacheManager(layerIndex * 2 + (isKey ? 0 : 1));
+    }
+
+    std::vector<std::pair<int, PagedCacheManager*> > basellm::GetPagedKVCacheManagers(int layerIndex, bool isKey) const {
+        std::vector<std::pair<int, PagedCacheManager*> > ret;
+        PagedCacheManager *manager = this->GetPagedKVCacheManager(layerIndex, isKey);
+        if (manager != nullptr) {
+            int device = -1;
+            Data *managerData = (Data*)manager;
+            if (!managerData->dataDeviceIds.empty()) {
+                device = managerData->dataDeviceIds[0];
+            }
+            ret.push_back(std::make_pair(device, manager));
+        }
+        return ret;
     }
 
     PastKVCacheMemory::PastKVCacheMemory(const std::vector <int> &inputToken, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
@@ -1125,12 +1155,43 @@ namespace fastllm {
 
                     if (isPrompt) {
                         if (ctx->cacheLen == 0) {
-                            PagedCacheManager *probeManager = model->GetPagedKVCacheManager(model->kvCacheId, true);
+                            auto probeRefs = model->GetPagedKVCacheManagers(model->kvCacheId, true);
+                            PagedCacheManager *probeManager = nullptr;
+                            for (auto &ref : probeRefs) {
+                                if (ref.second != nullptr) {
+                                    probeManager = ref.second;
+                                    break;
+                                }
+                            }
                             if (probeManager != nullptr) {
-                                // 只在代表 layer 上做 Query 确定可命中页数
-                                std::vector<int> probePages;
-                                probeManager->Query(ctx->currentTokens, probePages);
-                                int minCachedPages = (int)probePages.size();
+                                std::map<PagedCacheManager*, std::vector<int> > queriedPages;
+                                auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
+                                    auto it = queriedPages.find(manager);
+                                    if (it == queriedPages.end()) {
+                                        std::vector<int> pages;
+                                        manager->Query(ctx->currentTokens, pages);
+                                        it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
+                                    }
+                                    return it->second;
+                                };
+
+                                int minCachedPages = (int)queryManager(probeManager).size();
+                                if (minCachedPages > 0) {
+                                    for (int li = 0; li < model->block_cnt; li++) {
+                                        for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                                            bool isKey = keyFlag == 0;
+                                            auto refs = model->GetPagedKVCacheManagers(li, isKey);
+                                            for (auto &ref : refs) {
+                                                PagedCacheManager *manager = ref.second;
+                                                if (manager == nullptr || manager->pageLen != probeManager->pageLen) {
+                                                    continue;
+                                                }
+                                                minCachedPages = std::min(minCachedPages,
+                                                        (int)queryManager(manager).size());
+                                            }
+                                        }
+                                    }
+                                }
 
                                 if (minCachedPages > 0) {
                                     int cachedLen = minCachedPages * probeManager->pageLen;
@@ -1141,48 +1202,112 @@ namespace fastllm {
                                 }
                                 if (minCachedPages > 0) {
                                     int cachedLen = minCachedPages * probeManager->pageLen;
+                                    auto managerDevice = [](PagedCacheManager *manager) {
+                                        if (manager == nullptr) {
+                                            return -1;
+                                        }
+                                        Data *managerData = (Data*)manager;
+                                        if (managerData->dataDeviceIds.empty()) {
+                                            return -1;
+                                        }
+                                        return managerData->dataDeviceIds[0];
+                                    };
+                                    auto restoreOne = [&](Data &cache,
+                                                          PagedCacheManager *manager,
+                                                          const std::vector<int> &pages) {
+                                        if (manager == nullptr || (int)pages.size() < minCachedPages) {
+                                            return;
+                                        }
+                                        Data *managerData = (Data*)manager;
+                                        if (managerData->dims.size() < 4) {
+                                            return;
+                                        }
+                                        cache.isKVCache = true;
+                                        cache.isPagedKVCache = true;
+                                        cache.pagedKVCacheData = manager;
+                                        cache.pageLen = manager->pageLen;
+                                        cache.pageIndex.assign(pages.begin(), pages.begin() + minCachedPages);
+                                        manager->Pick(cache.pageIndex);
+                                        cache.lastPageLen = manager->pageLen;
+                                        cache.dataType = managerData->dataType;
+                                        cache.UpdateUnitSize();
+                                        cache.dataDevice = managerData->dataDevice;
+                                        cache.dataDeviceIds = managerData->dataDeviceIds;
+                                        int numHeads = managerData->dims[2];
+                                        int headDim = managerData->dims[3];
+                                        cache.Resize({numHeads, minCachedPages * manager->pageLen, headDim});
+                                    };
+                                    auto restorePagedCache = [&](Data &cache,
+                                                                 const std::vector<std::pair<int, PagedCacheManager*> > &refs) {
+                                        std::vector<std::pair<int, PagedCacheManager*> > validRefs;
+                                        for (auto ref : refs) {
+                                            if (ref.second == nullptr || ref.second->pageLen != probeManager->pageLen) {
+                                                continue;
+                                            }
+                                            if ((int)queryManager(ref.second).size() < minCachedPages) {
+                                                continue;
+                                            }
+                                            validRefs.push_back(ref);
+                                        }
+                                        if (validRefs.empty()) {
+                                            return;
+                                        }
+                                        if (validRefs.size() == 1) {
+                                            restoreOne(cache, validRefs[0].second, queryManager(validRefs[0].second));
+                                            return;
+                                        }
+
+                                        cache.multiDeviceData = true;
+                                        cache.dataDevice = DataDevice::CUDA;
+                                        cache.dataDeviceIds.clear();
+                                        cache.isKVCache = true;
+                                        cache.isPagedKVCache = true;
+                                        Data *firstLocal = nullptr;
+                                        for (auto &ref : validRefs) {
+                                            int device = ref.first >= 0 ? ref.first : managerDevice(ref.second);
+                                            if (device < 0) {
+                                                continue;
+                                            }
+                                            cache.dataDeviceIds.push_back(device);
+                                            Data *managerData = (Data*)ref.second;
+                                            Data *&local = cache.multiDeviceDatas[device];
+                                            if (local == nullptr) {
+                                                local = new Data(managerData->dataType);
+                                                local->SetKVCache();
+                                                local->cacheUid = cache.cacheUid;
+                                            }
+                                            restoreOne(*local, ref.second, queryManager(ref.second));
+                                            if (firstLocal == nullptr) {
+                                                firstLocal = local;
+                                            }
+                                        }
+                                        if (firstLocal == nullptr) {
+                                            cache.multiDeviceData = false;
+                                            cache.isPagedKVCache = false;
+                                            cache.pagedKVCacheData = nullptr;
+                                            cache.pageIndex.clear();
+                                            return;
+                                        }
+                                        cache.dataType = firstLocal->dataType;
+                                        cache.UpdateUnitSize();
+                                        cache.cudaData = nullptr;
+                                        cache.pageLen = firstLocal->pageLen;
+                                        cache.pageIndex = firstLocal->pageIndex;
+                                        cache.lastPageLen = firstLocal->lastPageLen;
+                                        cache.pagedKVCacheData = firstLocal->pagedKVCacheData;
+                                        cache.dims = firstLocal->dims;
+                                    };
                                     for (int li = 0; li < model->block_cnt; li++) {
                                         auto &kvFirst = ctx->pastKeyValues[li].first;
                                         auto &kvSecond = ctx->pastKeyValues[li].second;
-                                        PagedCacheManager *kMgr = model->GetPagedKVCacheManager(li, true);
-                                        PagedCacheManager *vMgr = model->GetPagedKVCacheManager(li, false);
-                                        if (kMgr != nullptr) {
-                                            std::vector<int> kPages;
-                                            kMgr->Query(ctx->currentTokens, kPages);
-                                            int actualPages = std::min(minCachedPages, (int)kPages.size());
-                                            kvFirst.isPagedKVCache = true;
-                                            kvFirst.pagedKVCacheData = kMgr;
-                                            kvFirst.pageLen = kMgr->pageLen;
-                                            kvFirst.pageIndex.assign(kPages.begin(), kPages.begin() + actualPages);
-                                            kMgr->Pick(kvFirst.pageIndex);
-                                            kvFirst.lastPageLen = kMgr->pageLen;
-                                            int numHeads = ((Data*)kMgr)->dims[2];
-                                            int headDim = ((Data*)kMgr)->dims[3];
-                                            kvFirst.Resize({numHeads, actualPages * kMgr->pageLen, headDim});
-                                        }
-                                        if (vMgr != nullptr) {
-                                            std::vector<int> vPages;
-                                            vMgr->Query(ctx->currentTokens, vPages);
-                                            int actualPages = std::min(minCachedPages, (int)vPages.size());
-                                            kvSecond.isPagedKVCache = true;
-                                            kvSecond.pagedKVCacheData = vMgr;
-                                            kvSecond.pageLen = vMgr->pageLen;
-                                            kvSecond.pageIndex.assign(vPages.begin(), vPages.begin() + actualPages);
-                                            vMgr->Pick(kvSecond.pageIndex);
-                                            kvSecond.lastPageLen = vMgr->pageLen;
-                                            int numHeads = ((Data*)vMgr)->dims[2];
-                                            int headDim = ((Data*)vMgr)->dims[3];
-                                            kvSecond.Resize({numHeads, actualPages * vMgr->pageLen, headDim});
-                                        }
+                                        restorePagedCache(kvFirst, model->GetPagedKVCacheManagers(li, true));
+                                        restorePagedCache(kvSecond, model->GetPagedKVCacheManagers(li, false));
                                     }
                                     ctx->currentTokens.erase(ctx->currentTokens.begin(), ctx->currentTokens.begin() + cachedLen);
                                     ctx->cacheLen = cachedLen;
                                     {
                                         std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
                                         curBusyPages = probeManager->maxPages - probeManager->FreePageCount() + pendingNewPages;
-                                    }
-                                    if (model->verbose) {
-                                        // printf("[Handle %d] Prefix cache hit: %d pages (%d tokens).\n", it.first, minCachedPages, cachedLen);
                                     }
                                 }
                             }

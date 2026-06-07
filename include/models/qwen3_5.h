@@ -96,6 +96,7 @@ namespace fastllm {
         virtual void OnAutoWarmupFinished() override;
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+        virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
 

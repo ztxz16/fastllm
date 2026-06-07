@@ -76,6 +76,7 @@ namespace fastllm {
         virtual void OnAutoWarmupFinished();
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+        virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
 
         void PreCaptureCudaGraphAfterWarmup();
 
