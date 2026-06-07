@@ -142,6 +142,26 @@ def apply_page_size_default(args):
             args.page_size = 16
     return args
 
+def apply_prefix_cache_env(args):
+    prefix_cache = getattr(args, "prefix_cache", "")
+    if (prefix_cache != ""):
+        os.environ["FASTLLM_PREFIX_CACHE"] = str(prefix_cache)
+
+    env_args = [
+        ("prefix_cache_snapshot_interval_pages", "FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES"),
+        ("prefix_cache_snapshot_max_per_request", "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST"),
+        ("prefix_cache_snapshot_max_records", "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS"),
+    ]
+    for arg_name, env_name in env_args:
+        value = getattr(args, arg_name, -1)
+        try:
+            value = int(value)
+        except:
+            value = -1
+        if (value > 0):
+            os.environ[env_name] = str(value)
+    return args
+
 def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
     return (architecture in [
         "DeepseekV3ForCausalLM",
@@ -186,6 +206,17 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--enable_amx", "--amx", type = str, default = "false", help = "是否开启amx加速")
     parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
     parser.add_argument("--page_size", type = int, default = -1, help = "设置paged cache每页的大小（token数），默认multicuda为16，其它设备使用后端默认值")
+    parser.add_argument("--prefix_cache", "--prefix-cache", dest = "prefix_cache", type = str, default = "",
+                        help = "是否启用前缀缓存（true/false），对应 FASTLLM_PREFIX_CACHE")
+    parser.add_argument("--prefix_cache_snapshot_interval_pages", "--prefix-cache-snapshot-interval-pages",
+                        dest = "prefix_cache_snapshot_interval_pages", type = int, default = -1,
+                        help = "前缀缓存快照间隔页数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
+    parser.add_argument("--prefix_cache_snapshot_max_per_request", "--prefix-cache-snapshot-max-per-request",
+                        dest = "prefix_cache_snapshot_max_per_request", type = int, default = -1,
+                        help = "单请求最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST")
+    parser.add_argument("--prefix_cache_snapshot_max_records", "--prefix-cache-snapshot-max-records",
+                        dest = "prefix_cache_snapshot_max_records", type = int, default = -1,
+                        help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     
@@ -480,6 +511,7 @@ def make_normal_llm_model(args):
     apply_page_size_default(args)
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
+    apply_prefix_cache_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):

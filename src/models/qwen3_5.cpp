@@ -2249,22 +2249,22 @@ namespace fastllm {
         }
 
         static bool Qwen35LinearPrefixCacheEnabled() {
-            const char *disabled = std::getenv("FASTLLM_QWEN35_DISABLE_LINEAR_PREFIX_CACHE");
-            return disabled == nullptr || !Qwen35MoeIsTrueString(disabled);
+            const char *enabled = std::getenv("FASTLLM_PREFIX_CACHE");
+            return enabled == nullptr || enabled[0] == 0 || Qwen35MoeIsTrueString(enabled);
         }
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
-            int pages = Qwen35EnvInt("FASTLLM_QWEN35_LINEAR_PREFIX_SNAPSHOT_INTERVAL_PAGES", 16);
+            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
             pages = std::max(1, pages);
             return pages * fastllm::GetPageLen();
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_QWEN35_LINEAR_PREFIX_SNAPSHOT_MAX_PER_REQUEST", 4));
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 4));
         }
 
         static int Qwen35LinearPrefixSnapshotMaxRecords() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_QWEN35_LINEAR_PREFIX_SNAPSHOT_MAX_RECORDS", 8));
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 8));
         }
 
         static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {
