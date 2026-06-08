@@ -3555,6 +3555,9 @@ namespace fastllm {
                         long long targetFree =
                             (long long)(totalAfterWarmup[id] * (1.0 - fastllm::GetGpuMemRatio())) +
                             finalSafety;
+                        targetFree += std::max(
+                            0LL,
+                            this->GetAutoWarmupCudaRuntimeReserveBytes(id, warmupMaxBatch));
                         long long growBytes = freeAfterWarmup[id] - targetFree;
                         long long pages = growBytes > 0 ? growBytes / bytesPerPageOnDevice : 0;
                         deviceExtraPages[id] = pages;

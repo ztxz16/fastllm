@@ -4744,10 +4744,42 @@ namespace fastllm {
         DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
         long long localLogitsBytes = computeType == DataType::FLOAT32 ? 0 :
             (long long)GetDataBytes(computeType, (size_t)batch, (size_t)vocabSize);
-        return (long long)batch * vocabSize * (long long)sizeof(float) +
-               localLogitsBytes +
-               (long long)batch * (long long)sizeof(int) +
-               Qwen35CudaRuntimeScratchReserveBytes();
+        long long reserveBytes =
+            (long long)batch * vocabSize * (long long)sizeof(float) +
+            localLogitsBytes +
+            (long long)batch * (long long)sizeof(int) +
+            Qwen35CudaRuntimeScratchReserveBytes();
+
+        int mtpDrafts = Qwen35MtpDraftsPerStep();
+        if (!Qwen35MtpDisabledByEnv() && mtpDrafts > 0 && HasMtpWeights() &&
+            devices.size() == 1) {
+            long long linearStateBytes = 0;
+            for (int layer = 0; layer < block_cnt; layer++) {
+                std::string prefix = language_prefix + "layers." +
+                                     std::to_string(layer) + ".";
+                bool isLinearAttentionLayer =
+                    this->weight.weight.find(prefix + "linear_attn.out_proj.weight") !=
+                        this->weight.weight.end() ||
+                    this->weight.weight.find(prefix + "linear_attn.in_proj_qkvz.weight") !=
+                        this->weight.weight.end() ||
+                    this->weight.weight.find(prefix + "linear_attn.in_proj_qkvzba.weight") !=
+                        this->weight.weight.end();
+                if (!isLinearAttentionLayer) {
+                    continue;
+                }
+                long long localKd = (long long)num_k_heads * head_k_dim;
+                long long localVd = (long long)num_v_heads * head_v_dim;
+                long long keyElements = (localKd * 2 + localVd) * 4;
+                long long valueElements =
+                    (long long)num_v_heads * head_k_dim * head_v_dim;
+                linearStateBytes += (long long)GetDataBytes(
+                    computeType, 1, (size_t)(keyElements + valueElements));
+            }
+            // MTP validation keeps one temporary linear cache plus one
+            // snapshot for each partial draft position.
+            reserveBytes += (long long)batch * (mtpDrafts + 1) * linearStateBytes;
+        }
+        return reserveBytes;
 #else
         return 0;
 #endif
@@ -6468,10 +6500,24 @@ namespace fastllm {
                 }
                 Qwen3CudaSplit(cudaRunner, gdnMerged, -1, 0, localQkvDim, qkvConvInput);
                 Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim, localQkvDim + localVd, z);
-                bool captureFirstTokenLinearState =
+                bool captureLinearState =
                     speculativeCaptureFirstTokenLinearState;
-                auto getFirstTokenLinearCaptureSlot = [&](bool keyState) -> Data* {
-                    if (!captureFirstTokenLinearState ||
+                int linearStateCaptureSlots =
+                    (!tensorParallel && speculativeLinearStateCaptureSlots > 0) ?
+                    speculativeLinearStateCaptureSlots : 1;
+                auto getLinearCaptureSlot = [&](int tokenIndex, bool keyState) -> Data* {
+                    if (!captureLinearState || tokenIndex < 0) {
+                        return nullptr;
+                    }
+                    if (!tensorParallel && speculativeLinearStateCaptureSlots > 0 &&
+                        i < (int)speculativeLinearStates.size() &&
+                        tokenIndex < (int)speculativeLinearStates[i].size()) {
+                        Data &slotRoot = keyState ?
+                            speculativeLinearStates[i][tokenIndex].first :
+                            speculativeLinearStates[i][tokenIndex].second;
+                        return &slotRoot;
+                    }
+                    if (tokenIndex != 0 ||
                         i >= (int)speculativeFirstTokenLinearStates.size()) {
                         return nullptr;
                     }
@@ -6485,11 +6531,27 @@ namespace fastllm {
                     return slotIt == slotRoot.multiDeviceDatas.end() ?
                         nullptr : slotIt->second;
                 };
-                auto markFirstTokenLinearCaptured = [&](int mask) {
+                auto markLinearCaptured = [&](int tokenIndex, int mask) {
+                    if (!tensorParallel && speculativeLinearStateCaptureSlots > 0 &&
+                        i < (int)speculativeLinearCaptureMask.size() &&
+                        tokenIndex >= 0 &&
+                        tokenIndex < (int)speculativeLinearCaptureMask[i].size()) {
+                        speculativeLinearCaptureMask[i][tokenIndex] |= mask;
+                        return;
+                    }
+                    if (tokenIndex != 0) {
+                        return;
+                    }
                     if (!tensorParallel &&
                         i < (int)speculativeFirstTokenLinearCaptureMask.size()) {
                         speculativeFirstTokenLinearCaptureMask[i] |= mask;
                     }
+                };
+                auto getFirstTokenLinearCaptureSlot = [&](bool keyState) -> Data* {
+                    return getLinearCaptureSlot(0, keyState);
+                };
+                auto markFirstTokenLinearCaptured = [&](int mask) {
+                    markLinearCaptured(0, mask);
                 };
                 bool keepCombinedBaForTwoToken =
                     speculativeCaptureFirstTokenLinearState && batch == 1 && bsz == 1 && seqlen == 2;
@@ -6660,15 +6722,19 @@ namespace fastllm {
                         Qwen3CudaSplit(cudaRunner, convInputWithCache, -1,
                                        convInputWithCache.dims.back() - 4,
                                        convInputWithCache.dims.back(), pastKey);
-                        Data *firstTokenConvCache = getFirstTokenLinearCaptureSlot(true);
-                        if (firstTokenConvCache != nullptr &&
-                            convInputWithCache.dims.back() >= 5) {
-                            Qwen3CudaSplit(cudaRunner, convInputWithCache, -1,
-                                           convInputWithCache.dims.back() - 5,
-                                           convInputWithCache.dims.back() - 1,
-                                           *firstTokenConvCache);
-                            Qwen35PrepareLinearAttentionCache(*firstTokenConvCache, computeType);
-                            markFirstTokenLinearCaptured(1);
+                        int captureTokens = std::min(seqlen, linearStateCaptureSlots);
+                        for (int tokenIndex = 0; tokenIndex < captureTokens; tokenIndex++) {
+                            Data *tokenConvCache = getLinearCaptureSlot(tokenIndex, true);
+                            int cacheBegin = tokenIndex + 1;
+                            int cacheEnd = cacheBegin + 4;
+                            if (tokenConvCache != nullptr &&
+                                cacheEnd <= convInputWithCache.dims.back()) {
+                                Qwen3CudaSplit(cudaRunner, convInputWithCache, -1,
+                                               cacheBegin, cacheEnd,
+                                               *tokenConvCache);
+                                Qwen35PrepareLinearAttentionCache(*tokenConvCache, computeType);
+                                markLinearCaptured(tokenIndex, 1);
+                            }
                         }
                         pastKey.expansionDims = pastKey.dims;
                         Qwen35CudaSilu(cudaRunner, convOutput, convOutput);
@@ -6939,6 +7005,8 @@ namespace fastllm {
                     }
                 } else if (canTrySmallSpeculativeLinearDecode) {
                     bool fusedSmallDecode = false;
+                    bool needLinearStateSnapshots =
+                        !tensorParallel && speculativeLinearStateCaptureSlots > 1;
                     if (keepCombinedBaForSmallDecode && !baMerged.dims.empty() &&
                         convOutput.dims.size() >= 3 && convOutput.dims[0] == 1 &&
                         convOutput.dims[1] == seqlen && convOutput.dims.back() == localQkvDim &&
@@ -6946,7 +7014,8 @@ namespace fastllm {
                         baMerged.dims[1] == seqlen &&
                         baMerged.dims.back() == localValueHeads * 2 &&
                         Qwen35EnsureCudaLinearAttnStateTransposed(pastValue)) {
-                        if (Qwen35MtpFusedLinearSeqEnabled()) {
+                        if (Qwen35MtpFusedLinearSeqEnabled() &&
+                            !needLinearStateSnapshots) {
                             fusedSmallDecode =
                                 FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
                                     convOutput, baMerged,
@@ -6981,6 +7050,12 @@ namespace fastllm {
                                     }
                                     AssertInFastLLM(false,
                                                     "Qwen3.5 small speculative linear decode failed after updating state.\n");
+                                }
+                                Data *tokenValueState =
+                                    getLinearCaptureSlot(row, false);
+                                if (tokenValueState != nullptr) {
+                                    tokenValueState->CopyFrom(pastValue);
+                                    markLinearCaptured(row, 2);
                                 }
                                 SwapSingleTokenSeqHeadByReshape(rowOut);
                                 if (row == 0) {
@@ -8901,26 +8976,40 @@ namespace fastllm {
             swap(dst.cpuIntDatas, src.cpuIntDatas);
         };
 
-        auto firstTokenMetaFromTemp = [&](const CacheMeta &base, const Data &temp) {
-            CacheMeta first = base;
-            first.isPagedKVCache = temp.isPagedKVCache;
-            first.pageLen = temp.pageLen;
-            first.pagedKVCacheData = temp.pagedKVCacheData;
-            if (first.pageIndex.empty() || first.lastPageLen >= first.pageLen) {
-                int nextPageOffset = (int)first.pageIndex.size();
-                AssertInFastLLM(nextPageOffset < (int)temp.pageIndex.size(),
-                                "Qwen3.5 MTP validation temp cache missing first-token page.\n");
-                first.pageIndex.push_back(temp.pageIndex[nextPageOffset]);
-                first.lastPageLen = 1;
-            } else {
-                int tailPageOffset = (int)first.pageIndex.size() - 1;
-                AssertInFastLLM(tailPageOffset >= 0 && tailPageOffset < (int)temp.pageIndex.size(),
-                                "Qwen3.5 MTP validation temp cache missing writable tail page.\n");
-                first.pageIndex[tailPageOffset] = temp.pageIndex[tailPageOffset];
-                first.lastPageLen++;
+        auto prefixTokenMetaFromTemp = [&](const CacheMeta &base,
+                                           const Data &temp,
+                                           int tokens) {
+            CacheMeta prefix = base;
+            prefix.isPagedKVCache = temp.isPagedKVCache;
+            prefix.pageLen = temp.pageLen;
+            prefix.pagedKVCacheData = temp.pagedKVCacheData;
+            AssertInFastLLM(tokens >= 0,
+                            "Qwen3.5 MTP validation got negative prefix tokens.\n");
+            int pageLen = std::max(1, prefix.pageLen);
+            int baseTokens = 0;
+            if (base.dims.size() >= 2) {
+                baseTokens = base.dims[1];
+            } else if (!base.pageIndex.empty()) {
+                baseTokens = ((int)base.pageIndex.size() - 1) * pageLen +
+                             std::max(0, base.lastPageLen);
             }
-            advancePagedMetaTokens(first, 1);
-            return first;
+            int newTokens = baseTokens + tokens;
+            int newPageCount = newTokens <= 0 ? 0 :
+                (newTokens + pageLen - 1) / pageLen;
+            AssertInFastLLM(newPageCount <= (int)temp.pageIndex.size(),
+                            "Qwen3.5 MTP validation temp cache missing prefix pages.\n");
+            prefix.pageIndex.assign(temp.pageIndex.begin(),
+                                    temp.pageIndex.begin() + newPageCount);
+            prefix.lastPageLen = newTokens <= 0 ? 0 : newTokens % pageLen;
+            if (newTokens > 0 && prefix.lastPageLen == 0) {
+                prefix.lastPageLen = pageLen;
+            }
+            advancePagedMetaTokens(prefix, tokens);
+            return prefix;
+        };
+
+        auto firstTokenMetaFromTemp = [&](const CacheMeta &base, const Data &temp) {
+            return prefixTokenMetaFromTemp(base, temp, 1);
         };
 
         auto releaseUncommittedPagedPages = [&](Data &temp, const CacheMeta &committed) {
@@ -9544,8 +9633,10 @@ namespace fastllm {
         std::vector<std::pair<Data, Data> > validationPastStorage(block_cnt);
         std::vector<std::pair<Data*, Data*> > validationPastKeyValues(block_cnt);
         std::vector<CacheMeta> baseKeyMetas(block_cnt), baseValueMetas(block_cnt);
-        std::vector<CacheMeta> finalKeyMetas(block_cnt), finalValueMetas(block_cnt);
-        std::vector<CacheMeta> firstKeyMetas(block_cnt), firstValueMetas(block_cnt);
+        std::vector<std::vector<CacheMeta> > prefixKeyMetas(
+            seqLen + 1, std::vector<CacheMeta>(block_cnt));
+        std::vector<std::vector<CacheMeta> > prefixValueMetas(
+            seqLen + 1, std::vector<CacheMeta>(block_cnt));
         for (int i = 0; i < block_cnt; i++) {
             Data *realKey = pastKeyValues[i].first;
             Data *realValue = pastKeyValues[i].second;
@@ -9565,27 +9656,48 @@ namespace fastllm {
                 &validationPastStorage[i].second
             };
         }
+        prefixKeyMetas[0] = baseKeyMetas;
+        prefixValueMetas[0] = baseValueMetas;
         mtpProfileMark(mtpProfileCachePrepUs);
+        bool oldCaptureFirstTokenLinearState = speculativeCaptureFirstTokenLinearState;
+        int oldLinearStateCaptureSlots = speculativeLinearStateCaptureSlots;
         speculativeCaptureFirstTokenLinearState = true;
+        int linearCaptureSlots = std::max(1, seqLen - 1);
+        speculativeLinearStateCaptureSlots = linearCaptureSlots;
+        speculativeLinearStates.clear();
+        speculativeLinearStates.resize(block_cnt);
+        speculativeLinearCaptureMask.clear();
+        speculativeLinearCaptureMask.resize(block_cnt);
+        for (int i = 0; i < block_cnt; i++) {
+            if (isAttentionLayerAt(i)) {
+                continue;
+            }
+            speculativeLinearStates[i].resize(linearCaptureSlots);
+            speculativeLinearCaptureMask[i].assign(linearCaptureSlots, 0);
+        }
         speculativeFirstTokenLinearStates.clear();
         speculativeFirstTokenLinearStates.resize(block_cnt);
         speculativeFirstTokenLinearCaptureMask.assign(block_cnt, 0);
         targetRet = runTargetWithPast(inputIds, attentionMask, positionIds, seqLens,
                                       validationPastKeyValues);
-        speculativeCaptureFirstTokenLinearState = false;
+        speculativeCaptureFirstTokenLinearState = oldCaptureFirstTokenLinearState;
         mtpProfileMark(mtpProfileTargetUs);
-        AssertInFastLLM((int)targetRet.size() >= 2,
+        AssertInFastLLM((int)targetRet.size() >= seqLen,
                         "Qwen3.5 MTP validation target forward returned too few tokens.\n");
         for (int i = 0; i < block_cnt; i++) {
             if (!isAttentionLayerAt(i)) {
                 continue;
             }
-            finalKeyMetas[i] = makeMeta(validationPastStorage[i].first);
-            finalValueMetas[i] = makeMeta(validationPastStorage[i].second);
-            firstKeyMetas[i] = firstTokenMetaFromTemp(baseKeyMetas[i],
-                                                      validationPastStorage[i].first);
-            firstValueMetas[i] = firstTokenMetaFromTemp(baseValueMetas[i],
-                                                        validationPastStorage[i].second);
+            for (int tokens = 1; tokens <= seqLen; tokens++) {
+                prefixKeyMetas[tokens][i] =
+                    prefixTokenMetaFromTemp(baseKeyMetas[i],
+                                            validationPastStorage[i].first,
+                                            tokens);
+                prefixValueMetas[tokens][i] =
+                    prefixTokenMetaFromTemp(baseValueMetas[i],
+                                            validationPastStorage[i].second,
+                                            tokens);
+            }
         }
         auto releaseValidationPagedViews = [&](const std::vector<CacheMeta> &keepKeyMetas,
                                                const std::vector<CacheMeta> &keepValueMetas) {
@@ -9597,45 +9709,56 @@ namespace fastllm {
                 releaseUncommittedPagedPages(validationPastStorage[i].second, keepValueMetas[i]);
             }
         };
-        auto commitAcceptedValidationCache = [&]() {
-            for (int i = 0; i < block_cnt; i++) {
-                if (isAttentionLayerAt(i)) {
-                    restoreMeta(*pastKeyValues[i].first, finalKeyMetas[i]);
-                    restoreMeta(*pastKeyValues[i].second, finalValueMetas[i]);
-                } else {
-                    copyTensorIntoExistingStorage(*pastKeyValues[i].first,
-                                                  validationPastStorage[i].first);
-                    copyTensorIntoExistingStorage(*pastKeyValues[i].second,
-                                                  validationPastStorage[i].second);
-                }
-            }
-            releaseValidationPagedViews(finalKeyMetas, finalValueMetas);
+        auto clearSpeculativeLinearCapture = [&]() {
+            speculativeLinearStateCaptureSlots = oldLinearStateCaptureSlots;
+            speculativeLinearStates.clear();
+            speculativeLinearCaptureMask.clear();
         };
-        auto canCommitRejectedFirstTokenCache = [&]() {
+        auto canCommitValidationCachePrefix = [&](int tokens) {
+            if (tokens == seqLen) {
+                return true;
+            }
+            if (tokens <= 0 || tokens > seqLen) {
+                return false;
+            }
+            int slot = tokens - 1;
             for (int i = 0; i < block_cnt; i++) {
                 if (isAttentionLayerAt(i)) {
                     continue;
                 }
-                if (i >= (int)speculativeFirstTokenLinearCaptureMask.size() ||
-                    (speculativeFirstTokenLinearCaptureMask[i] & 3) != 3) {
+                if (i >= (int)speculativeLinearCaptureMask.size() ||
+                    slot >= (int)speculativeLinearCaptureMask[i].size() ||
+                    (speculativeLinearCaptureMask[i][slot] & 3) != 3) {
                     return false;
                 }
             }
             return true;
         };
-        auto commitRejectedFirstTokenCache = [&]() {
+        auto commitValidationCachePrefix = [&](int tokens) {
+            AssertInFastLLM(tokens > 0 && tokens <= seqLen,
+                            "Qwen3.5 MTP validation got invalid commit prefix.\n");
+            bool useValidationLinearFinal = tokens == seqLen;
+            int slot = tokens - 1;
             for (int i = 0; i < block_cnt; i++) {
                 if (isAttentionLayerAt(i)) {
-                    restoreMeta(*pastKeyValues[i].first, firstKeyMetas[i]);
-                    restoreMeta(*pastKeyValues[i].second, firstValueMetas[i]);
-                } else {
+                    restoreMeta(*pastKeyValues[i].first, prefixKeyMetas[tokens][i]);
+                    restoreMeta(*pastKeyValues[i].second, prefixValueMetas[tokens][i]);
+                } else if (useValidationLinearFinal) {
                     copyTensorIntoExistingStorage(*pastKeyValues[i].first,
-                                                  speculativeFirstTokenLinearStates[i].first);
+                                                  validationPastStorage[i].first);
                     copyTensorIntoExistingStorage(*pastKeyValues[i].second,
-                                                  speculativeFirstTokenLinearStates[i].second);
+                                                  validationPastStorage[i].second);
+                } else {
+                    AssertInFastLLM(i < (int)speculativeLinearStates.size() &&
+                                    slot < (int)speculativeLinearStates[i].size(),
+                                    "Qwen3.5 MTP validation missing linear state slot.\n");
+                    copyTensorIntoExistingStorage(*pastKeyValues[i].first,
+                                                  speculativeLinearStates[i][slot].first);
+                    copyTensorIntoExistingStorage(*pastKeyValues[i].second,
+                                                  speculativeLinearStates[i][slot].second);
                 }
             }
-            releaseValidationPagedViews(firstKeyMetas, firstValueMetas);
+            releaseValidationPagedViews(prefixKeyMetas[tokens], prefixValueMetas[tokens]);
         };
         int draftTokenCount = seqLen - 1;
         int matchedDrafts = 0;
@@ -9651,7 +9774,7 @@ namespace fastllm {
         }
         mtpProfileMark(mtpProfileMatchUs);
         if (matchedDrafts == draftTokenCount) {
-            commitAcceptedValidationCache();
+            commitValidationCachePrefix(seqLen);
             mtpProfileMark(mtpProfileCommitUs);
             std::vector<int> mtpInputTokens;
             mtpInputTokens.reserve(seqLen);
@@ -9671,30 +9794,17 @@ namespace fastllm {
             logMtpStats();
             mtpProfileRecord(QWEN35_MTP_PROFILE_SINGLE, true,
                              draftTokenCount, matchedDrafts, seqLen);
+            clearSpeculativeLinearCapture();
             return true;
         }
 
         mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
         int commitLen = matchedDrafts + 1;
-        std::vector<int> retryRet(targetRet.begin(), targetRet.begin() + commitLen);
-        bool committedRejectedFast = commitLen == 1 && canCommitRejectedFirstTokenCache();
-        if (committedRejectedFast) {
-            commitRejectedFirstTokenCache();
-            mtpProfileMark(mtpProfileRollbackUs);
-        } else {
-            releaseValidationPagedViews(baseKeyMetas, baseValueMetas);
-            mtpProfileMark(mtpProfileRollbackUs);
-            Data singleInputIds = buildInputIdsSlice(0, commitLen);
-            Data singlePositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
-            std::vector<Data*> singleAttentionMask = {nullptr};
-            std::vector<Data*> singlePositionIdVec = {&singlePositionIds};
-            std::vector<int> singleSeqLens = {commitLen};
-            retryRet = runTarget(singleInputIds, singleAttentionMask,
-                                 singlePositionIdVec, singleSeqLens);
-            mtpProfileMark(mtpProfileRetryUs);
-            AssertInFastLLM((int)retryRet.size() >= commitLen,
-                            "Qwen3.5 MTP retry target forward returned no token.\n");
-        }
+        std::vector<int> committedRet(targetRet.begin(), targetRet.begin() + commitLen);
+        AssertInFastLLM(canCommitValidationCachePrefix(commitLen),
+                        "Qwen3.5 MTP validation missing committed linear state snapshot.\n");
+        commitValidationCachePrefix(commitLen);
+        mtpProfileMark(mtpProfileRollbackUs);
         Data hiddenForMtp;
         Split(speculativeHiddenStates, 1, 0, commitLen, hiddenForMtp);
         Data mtpPositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
@@ -9703,17 +9813,18 @@ namespace fastllm {
         for (int i = 1; i < commitLen; i++) {
             mtpInputTokens.push_back(tokenAt(i));
         }
-        mtpInputTokens.push_back(retryRet[commitLen - 1]);
+        mtpInputTokens.push_back(committedRet[commitLen - 1]);
         std::vector<int> drafts = runMtpDraftChain(
             hiddenForMtp, mtpInputTokens, mtpPositionIds,
             commitLen - 1, commitLen - 1);
         mtpProfileMark(mtpProfileDraftUs);
-        acceptedTokens[0].assign(retryRet.begin(), retryRet.begin() + commitLen);
-        setNextInputWithDrafts(retryRet[commitLen - 1], drafts);
+        acceptedTokens[0].assign(committedRet.begin(), committedRet.begin() + commitLen);
+        setNextInputWithDrafts(committedRet[commitLen - 1], drafts);
         keptInputLens[0] = commitLen;
         logMtpStats();
         mtpProfileRecord(QWEN35_MTP_PROFILE_SINGLE, true,
                          draftTokenCount, matchedDrafts, commitLen);
+        clearSpeculativeLinearCapture();
         return true;
 #endif
     }
