@@ -23,6 +23,7 @@ PANEL_PADDING_X = 2
 PANEL_PADDING_Y = 1
 DEFAULT_ESCDELAY_MS = 25
 QWEN_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
+    ("Qwen/Qwen3.6-27B-FP8", "Qwen3.6-27B-FP8"),
     ("Qwen/Qwen3-0.6B", "Qwen3-0.6B"),
     ("Qwen/Qwen3-1.7B", "Qwen3-1.7B"),
     ("Qwen/Qwen3-4B", "Qwen3-4B"),
@@ -43,6 +44,7 @@ MINIMAX_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("MiniMax/MiniMax-M1-80k", "MiniMax-M1-80k"),
 )
 HOT_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
+    ("Qwen/Qwen3.6-27B-FP8", "Qwen3.6-27B-FP8"),
     ("Qwen/Qwen3-0.6B", "Qwen3-0.6B"),
     ("Qwen/Qwen3-8B", "Qwen3-8B"),
     ("Qwen/Qwen3-30B-A3B", "Qwen3-30B-A3B"),
@@ -102,7 +104,6 @@ class DeployConfig:
     moe_dtype: str = "auto"
     moe_dtype_custom: str = ""
     gpu_mem_ratio: str = "0.9"
-    cuda_graph: bool = False
     chunked_prefill_size: str = "auto"
     kv_cache_dtype: str = "auto"
     moe_atype: str = "auto"
@@ -110,6 +111,7 @@ class DeployConfig:
     tokens: str = "auto"
     threads: str = "auto"
     kv_cache_limit: str = "auto"
+    mtp: str = "auto"
     max_batch: str = "auto"
     temperature: str = ""
     top_p: str = ""
@@ -302,18 +304,13 @@ FIELDS: Sequence[FormField] = (
         "GPU显存使用比例，如 0.9 表示最多使用 90% 的显存。",
     ),
     FormField(
-        "cuda_graph",
-        "打开CUDA Graph",
-        "bool",
-        "打开后启动时设置 FASTLLM_CUDA_GRAPH=ON，启用 CUDA Graph。",
-    ),
-    FormField(
         "chunked_prefill_size",
         "预处理分片大小",
         "text",
         "分块 prefill 的切片大小；调小可以减少显存占用，auto 表示不指定。",
     ),
     FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16 或 fp8。", KV_CACHE_DTYPE_CHOICES),
+    FormField("mtp", "MTP", "text", "Qwen3.5 MTP 每步生成的 draft token 数；0 表示关闭，1-8 开启，auto 表示不指定。"),
     FormField("max_batch", "最大Batch", "text", "每次最多同时推理的询问数量；auto 表示不指定。"),
     FormField("moe_atype", "MOE激活类型", "choice", "MOE层激活类型，可使用 float32、float16 或 bfloat16。", MOE_ATYPE_CHOICES),
     FormField("enable_thinking", "思考开关", "choice", "是否开启硬思考开关，需要模型支持。", ENABLE_THINKING_CHOICES),
@@ -458,10 +455,7 @@ def parse_env_vars(value: str) -> dict:
 
 
 def build_fastllm_env(config: DeployConfig) -> dict:
-    env = parse_env_vars(config.env_vars)
-    if config.cuda_graph:
-        env["FASTLLM_CUDA_GRAPH"] = "ON"
-    return env
+    return parse_env_vars(config.env_vars)
 
 
 def _env_prefix(config: DeployConfig) -> List[str]:
@@ -538,6 +532,16 @@ def _is_positive_int_or_auto(value: str) -> bool:
         return int(str(value).strip()) > 0
     except ValueError:
         return False
+
+
+def _is_mtp_value(value: str) -> bool:
+    if _is_auto_or_empty(value):
+        return True
+    try:
+        mtp = int(str(value).strip())
+    except ValueError:
+        return False
+    return 0 <= mtp <= 8
 
 
 def _is_positive_float_or_auto(value: str) -> bool:
@@ -1007,6 +1011,7 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "--moe_dtype", moe_dtype)
     _add_option(argv, "-t", _optional_text(config.threads))
     _add_option(argv, "--kv_cache_limit", _optional_text(config.kv_cache_limit))
+    _add_option(argv, "--mtp", _optional_text(config.mtp))
     _add_option(argv, "--max_batch", _optional_text(config.max_batch))
     _add_option(argv, "--cache_dir", _expand_user_path(config.cache_dir.strip()))
     if is_gguf_model(config.model):
@@ -1071,6 +1076,9 @@ def validate_config(config: DeployConfig) -> List[str]:
     ):
         if not _is_positive_int_or_auto(value):
             errors.append(f"{label}必须是正整数或 auto。")
+
+    if not _is_mtp_value(config.mtp):
+        errors.append("MTP 必须是 0-8 的整数或 auto。")
 
     if not _is_ratio(config.gpu_mem_ratio):
         errors.append("显存利用率必须是 0 到 1 之间的数字，例如 0.9。")
