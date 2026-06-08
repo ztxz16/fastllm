@@ -8670,7 +8670,7 @@ namespace fastllm {
             return true;
         }
 
-        if (tensorParallel && seqLen == 2) {
+        if (tensorParallel) {
             std::vector<std::pair<Data, Data> > validationPastStorage(block_cnt);
             std::vector<std::pair<Data*, Data*> > validationPastKeyValues(block_cnt);
             std::vector<CacheMeta> finalRootKeyMetas(block_cnt), finalRootValueMetas(block_cnt);
@@ -8713,10 +8713,10 @@ namespace fastllm {
                 };
             }
             bool oldCaptureFirstTokenLinearState = speculativeCaptureFirstTokenLinearState;
+            // This flag also selects the cached multi-token linear-attention
+            // decode path. No capture slots are allocated here because TP
+            // rollback uses the temporary validation cache instead.
             speculativeCaptureFirstTokenLinearState = true;
-            speculativeFirstTokenLinearStates.clear();
-            speculativeFirstTokenLinearStates.resize(block_cnt);
-            speculativeFirstTokenLinearCaptureMask.assign(block_cnt, 0);
             targetRet = runTargetWithPast(inputIds, attentionMask, positionIds, seqLens,
                                           validationPastKeyValues);
             speculativeCaptureFirstTokenLinearState = oldCaptureFirstTokenLinearState;
@@ -8828,8 +8828,11 @@ namespace fastllm {
                 std::vector<Data*> singleAttentionMask = {nullptr};
                 std::vector<Data*> singlePositionIdVec = {&singlePositionIds};
                 std::vector<int> singleSeqLens = {commitLen};
+                bool oldCaptureFirstTokenLinearState = speculativeCaptureFirstTokenLinearState;
+                speculativeCaptureFirstTokenLinearState = true;
                 committedRet = runTarget(singleInputIds, singleAttentionMask,
                                          singlePositionIdVec, singleSeqLens);
+                speculativeCaptureFirstTokenLinearState = oldCaptureFirstTokenLinearState;
                 AssertInFastLLM((int)committedRet.size() >= commitLen,
                                 "Qwen3.5 MTP TP validation retry returned too few tokens.\n");
             }
@@ -8848,65 +8851,6 @@ namespace fastllm {
             acceptedTokens[0].assign(committedRet.begin(),
                                      committedRet.begin() + commitLen);
             setNextInputWithDrafts(committedRet[commitLen - 1], drafts);
-            keptInputLens[0] = commitLen;
-            logMtpStats();
-            return true;
-        }
-
-        if (tensorParallel) {
-            std::vector<int> sequentialRet;
-            std::vector<Data> hiddenRows;
-            sequentialRet.reserve(seqLen);
-            hiddenRows.reserve(seqLen);
-            int draftTokenCount = seqLen - 1;
-            int matchedDrafts = 0;
-            bool mismatch = false;
-            for (int row = 0; row < seqLen; row++) {
-                Data singleInputIds = buildInputIdsSlice(row, row + 1);
-                Data singlePositionIds = BuildMtpPositionIdsSlice(allPositionIds, row, row + 1, 0);
-                std::vector<Data*> singleAttentionMask = {nullptr};
-                std::vector<Data*> singlePositionIdVec = {&singlePositionIds};
-                std::vector<int> singleSeqLens = {1};
-                std::vector<int> rowRet = runTarget(singleInputIds, singleAttentionMask,
-                                                     singlePositionIdVec, singleSeqLens);
-                AssertInFastLLM(!rowRet.empty(),
-                                "Qwen3.5 MTP TP validation target forward returned no token.\n");
-                sequentialRet.push_back(rowRet[0]);
-                hiddenRows.emplace_back();
-                hiddenRows.back().CopyFrom(speculativeHiddenStates);
-                if (row < draftTokenCount) {
-                    mtpDraftPositionAttempts[row].fetch_add(1, std::memory_order_relaxed);
-                    if (rowRet[0] == tokenAt(row + 1)) {
-                        mtpDraftPositionAccepts[row].fetch_add(1, std::memory_order_relaxed);
-                        matchedDrafts++;
-                    } else {
-                        mismatch = true;
-                        break;
-                    }
-                }
-            }
-            int commitLen = mismatch ? matchedDrafts + 1 : seqLen;
-            Data hiddenForMtp;
-            hiddenForMtp.CopyFrom(hiddenRows[0]);
-            for (int row = 1; row < commitLen; row++) {
-                Data catHidden;
-                Cat(hiddenForMtp, hiddenRows[row], 1, catHidden);
-                hiddenForMtp.CopyFrom(catHidden);
-            }
-            Data mtpPositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
-            std::vector<int> mtpInputTokens;
-            mtpInputTokens.reserve(commitLen);
-            for (int i = 1; i < commitLen; i++) {
-                mtpInputTokens.push_back(tokenAt(i));
-            }
-            mtpInputTokens.push_back(sequentialRet[commitLen - 1]);
-            std::vector<int> drafts = runMtpDraftChain(
-                hiddenForMtp, mtpInputTokens, mtpPositionIds,
-                commitLen - 1, commitLen - 1);
-            mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
-            acceptedTokens[0].assign(sequentialRet.begin(),
-                                     sequentialRet.begin() + commitLen);
-            setNextInputWithDrafts(sequentialRet[commitLen - 1], drafts);
             keptInputLens[0] = commitLen;
             logMtpStats();
             return true;
