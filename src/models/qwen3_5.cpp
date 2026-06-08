@@ -145,6 +145,14 @@ namespace fastllm {
         return env == nullptr || env[0] == '\0' || Qwen35MoeIsTrueString(env);
     }
 
+    static bool Qwen35MtpFusedLinearSeqEnabled() {
+        static bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_QWEN35_MTP_FUSED_LINEAR_SEQ");
+            return env == nullptr || env[0] == '\0' || Qwen35MoeIsTrueString(env);
+        }();
+        return enabled;
+    }
+
     static void Qwen35MoeCopyLinearWeightMeta(Data &dst, const Data &src, const std::string &name) {
         dst.name = name;
         dst.weightType = WeightType::LINEAR;
@@ -6573,41 +6581,54 @@ namespace fastllm {
                         baMerged.dims[1] == seqlen &&
                         baMerged.dims.back() == localValueHeads * 2 &&
                         Qwen35EnsureCudaLinearAttnStateTransposed(pastValue)) {
-                        Data fusedRows;
-                        fusedSmallDecode = true;
-                        for (int row = 0; row < seqlen; row++) {
-                            Data convRow, baRow, rowOut;
-                            Qwen3CudaSplit(cudaRunner, convOutput, 1, row, row + 1, convRow);
-                            Qwen3CudaSplit(cudaRunner, baMerged, 1, row, row + 1, baRow);
-                            bool rowOk =
-                                FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
-                                    convRow, baRow,
+                        if (Qwen35MtpFusedLinearSeqEnabled()) {
+                            fusedSmallDecode =
+                                FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
+                                    convOutput, baMerged,
                                     *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                                     *requireLocal(weight[aLogName], aLogName),
                                     *requireLocal(weight[dtBiasName], dtBiasName),
-                                    pastValue, rowOut,
+                                    pastValue, coreAttnOut,
                                     localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
                                     rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
-                            if (!rowOk) {
-                                if (row == 0) {
-                                    fusedSmallDecode = false;
-                                    Qwen35EnsureCudaLinearAttnStateKVLayout(pastValue);
-                                    break;
-                                }
-                                AssertInFastLLM(false,
-                                                "Qwen3.5 small speculative linear decode failed after updating state.\n");
-                            }
-                            SwapSingleTokenSeqHeadByReshape(rowOut);
-                            if (row == 0) {
-                                fusedRows.CopyFrom(rowOut);
-                            } else {
-                                Data catRows;
-                                Qwen3CudaCat(cudaRunner, fusedRows, rowOut, 1, catRows);
-                                fusedRows.CopyFrom(catRows);
-                            }
                         }
-                        if (fusedSmallDecode) {
-                            coreAttnOut.CopyFrom(fusedRows);
+                        if (!fusedSmallDecode) {
+                            Data fusedRows;
+                            fusedSmallDecode = true;
+                            for (int row = 0; row < seqlen; row++) {
+                                Data convRow, baRow, rowOut;
+                                Qwen3CudaSplit(cudaRunner, convOutput, 1, row, row + 1, convRow);
+                                Qwen3CudaSplit(cudaRunner, baMerged, 1, row, row + 1, baRow);
+                                bool rowOk =
+                                    FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
+                                        convRow, baRow,
+                                        *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                                        *requireLocal(weight[aLogName], aLogName),
+                                        *requireLocal(weight[dtBiasName], dtBiasName),
+                                        pastValue, rowOut,
+                                        localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
+                                        rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
+                                if (!rowOk) {
+                                    if (row == 0) {
+                                        fusedSmallDecode = false;
+                                        Qwen35EnsureCudaLinearAttnStateKVLayout(pastValue);
+                                        break;
+                                    }
+                                    AssertInFastLLM(false,
+                                                    "Qwen3.5 small speculative linear decode failed after updating state.\n");
+                                }
+                                SwapSingleTokenSeqHeadByReshape(rowOut);
+                                if (row == 0) {
+                                    fusedRows.CopyFrom(rowOut);
+                                } else {
+                                    Data catRows;
+                                    Qwen3CudaCat(cudaRunner, fusedRows, rowOut, 1, catRows);
+                                    fusedRows.CopyFrom(catRows);
+                                }
+                            }
+                            if (fusedSmallDecode) {
+                                coreAttnOut.CopyFrom(fusedRows);
+                            }
                         }
                     }
                     if (!fusedSmallDecode) {
