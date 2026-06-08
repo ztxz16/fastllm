@@ -203,6 +203,7 @@ namespace fastllm {
         bool mtpWeightsPrepared = false;
         int mtpWeightsPreparedDevice = -1;
         bool speculativeCollectAllLogits = false;
+        bool speculativeCacheOnlyForward = false;
         Data speculativeHiddenStates;
         bool speculativeCaptureFirstTokenLinearState = false;
         std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
