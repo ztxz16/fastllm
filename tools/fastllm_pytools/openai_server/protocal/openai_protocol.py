@@ -79,11 +79,7 @@ class ChatCompletionNamedToolChoiceParam(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: Optional[Union[
-        str,
-        List[Dict[str, str]],
-        List[Dict[str, Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]]],
-    ]] = []
+    messages: Optional[Union[str, List[Dict[str, Any]]]] = []
     prompt: Optional[str] = ""
     temperature: Optional[float] = None
     top_p: Optional[float] = None
