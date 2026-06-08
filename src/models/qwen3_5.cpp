@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <exception>
 #include <memory>
@@ -124,6 +125,80 @@ namespace fastllm {
     static constexpr int QWEN35_MTP_LOG_INTERVAL = 64;
     static constexpr int QWEN35_MTP_MAX_DRAFTS = 8;
 
+    enum Qwen35MtpProfilePath {
+        QWEN35_MTP_PROFILE_SEED = 0,
+        QWEN35_MTP_PROFILE_TP_INPLACE = 1,
+        QWEN35_MTP_PROFILE_TP_COPY = 2,
+        QWEN35_MTP_PROFILE_SINGLE = 3
+    };
+
+    struct Qwen35MtpProfileAggregate {
+        std::atomic<long long> samples{0};
+        std::atomic<long long> seedPath{0};
+        std::atomic<long long> tpInplacePath{0};
+        std::atomic<long long> tpCopyPath{0};
+        std::atomic<long long> singlePath{0};
+        std::atomic<long long> speculative{0};
+        std::atomic<long long> fullAccept{0};
+        std::atomic<long long> partialAccept{0};
+        std::atomic<long long> rejectFirst{0};
+        std::atomic<long long> draftSlots{0};
+        std::atomic<long long> matchedDrafts{0};
+        std::atomic<long long> committedTokens{0};
+        std::atomic<long long> setupUs{0};
+        std::atomic<long long> cachePrepUs{0};
+        std::atomic<long long> targetUs{0};
+        std::atomic<long long> matchUs{0};
+        std::atomic<long long> commitUs{0};
+        std::atomic<long long> rollbackUs{0};
+        std::atomic<long long> retryUs{0};
+        std::atomic<long long> draftUs{0};
+        std::atomic<long long> draftFirstUs{0};
+        std::atomic<long long> draftExtraUs{0};
+        std::atomic<long long> totalUs{0};
+    };
+
+    struct Qwen35MtpTargetProfileAggregate {
+        std::atomic<long long> samples{0};
+        std::atomic<long long> tensorParallelCalls{0};
+        std::atomic<long long> seqTokens{0};
+        std::atomic<long long> logitRows{0};
+        std::atomic<long long> setupUs{0};
+        std::atomic<long long> weightPrepUs{0};
+        std::atomic<long long> inputPrepUs{0};
+        std::atomic<long long> embeddingUs{0};
+        std::atomic<long long> cacheLocalUs{0};
+        std::atomic<long long> workerUs{0};
+        std::atomic<long long> metaSyncUs{0};
+        std::atomic<long long> samplingUs{0};
+        std::atomic<long long> totalUs{0};
+    };
+
+    struct Qwen35MtpWorkerProfileAggregate {
+        std::atomic<long long> samples{0};
+        std::atomic<long long> firstRankCalls{0};
+        std::atomic<long long> seqTokens{0};
+        std::atomic<long long> setupUs{0};
+        std::atomic<long long> layersUs{0};
+        std::atomic<long long> headUs{0};
+        std::atomic<long long> totalUs{0};
+    };
+
+    static Qwen35MtpProfileAggregate &Qwen35MtpProfileStats() {
+        static Qwen35MtpProfileAggregate stats;
+        return stats;
+    }
+
+    static Qwen35MtpTargetProfileAggregate &Qwen35MtpTargetProfileStats() {
+        static Qwen35MtpTargetProfileAggregate stats;
+        return stats;
+    }
+
+    static Qwen35MtpWorkerProfileAggregate &Qwen35MtpWorkerProfileStats() {
+        static Qwen35MtpWorkerProfileAggregate stats;
+        return stats;
+    }
+
     static int Qwen35MtpDraftsPerStep() {
         const char *env = std::getenv("FASTLLM_QWEN35_ENABLE_MTP");
         if (env == nullptr || env[0] == '\0') {
@@ -151,6 +226,261 @@ namespace fastllm {
             return env == nullptr || env[0] == '\0' || Qwen35MoeIsTrueString(env);
         }();
         return enabled;
+    }
+
+    static int Qwen35MtpProfileInterval() {
+        static int interval = []() {
+            const char *env = std::getenv("FASTLLM_QWEN35_MTP_PROFILE");
+            if (env == nullptr || env[0] == '\0') {
+                return 0;
+            }
+            if (Qwen35MoeIsTrueString(env)) {
+                return QWEN35_MTP_LOG_INTERVAL;
+            }
+            int value = atoi(env);
+            return value > 0 ? value : 0;
+        }();
+        return interval;
+    }
+
+    static int Qwen35MtpWorkerProfileInterval() {
+        static int interval = []() {
+            const char *env = std::getenv("FASTLLM_QWEN35_MTP_WORKER_PROFILE");
+            if (env == nullptr || env[0] == '\0') {
+                return 0;
+            }
+            if (Qwen35MoeIsTrueString(env)) {
+                return QWEN35_MTP_LOG_INTERVAL;
+            }
+            int value = atoi(env);
+            return value > 0 ? value : 0;
+        }();
+        return interval;
+    }
+
+    static long long Qwen35MtpProfileElapsedUs(
+            std::chrono::steady_clock::time_point begin,
+            std::chrono::steady_clock::time_point end) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count();
+    }
+
+    static void Qwen35MtpProfilePrintIfNeeded(int interval,
+                                              Qwen35MtpProfileAggregate &stats,
+                                              long long samples) {
+        if (interval <= 0 || samples <= 0 || samples % interval != 0) {
+            return;
+        }
+        long long setupUs = stats.setupUs.load(std::memory_order_relaxed);
+        long long cachePrepUs = stats.cachePrepUs.load(std::memory_order_relaxed);
+        long long targetUs = stats.targetUs.load(std::memory_order_relaxed);
+        long long matchUs = stats.matchUs.load(std::memory_order_relaxed);
+        long long commitUs = stats.commitUs.load(std::memory_order_relaxed);
+        long long rollbackUs = stats.rollbackUs.load(std::memory_order_relaxed);
+        long long retryUs = stats.retryUs.load(std::memory_order_relaxed);
+        long long draftUs = stats.draftUs.load(std::memory_order_relaxed);
+        long long totalUs = stats.totalUs.load(std::memory_order_relaxed);
+        long long knownUs = setupUs + cachePrepUs + targetUs + matchUs +
+                            commitUs + rollbackUs + retryUs + draftUs;
+        long long otherUs = std::max(0LL, totalUs - knownUs);
+        auto avgMs = [&](long long us) {
+            return samples > 0 ? (double)us / 1000.0 / (double)samples : 0.0;
+        };
+        auto avgCount = [&](long long count) {
+            return samples > 0 ? (double)count / (double)samples : 0.0;
+        };
+        printf("[Qwen3.5 MTP profile] samples=%lld paths={seed=%lld,tp_inplace=%lld,tp_copy=%lld,single=%lld} "
+               "accept={spec=%lld,full=%lld,partial=%lld,reject0=%lld} "
+               "avg_tokens={commit=%.2f,matched_draft=%.2f,draft_slots=%.2f} "
+               "avg_ms={total=%.3f,setup=%.3f,cache_prep=%.3f,target=%.3f,match=%.3f,"
+               "commit=%.3f,rollback=%.3f,retry=%.3f,draft=%.3f,draft_first=%.3f,"
+               "draft_extra=%.3f,other=%.3f}.\n",
+               samples,
+               stats.seedPath.load(std::memory_order_relaxed),
+               stats.tpInplacePath.load(std::memory_order_relaxed),
+               stats.tpCopyPath.load(std::memory_order_relaxed),
+               stats.singlePath.load(std::memory_order_relaxed),
+               stats.speculative.load(std::memory_order_relaxed),
+               stats.fullAccept.load(std::memory_order_relaxed),
+               stats.partialAccept.load(std::memory_order_relaxed),
+               stats.rejectFirst.load(std::memory_order_relaxed),
+               avgCount(stats.committedTokens.load(std::memory_order_relaxed)),
+               avgCount(stats.matchedDrafts.load(std::memory_order_relaxed)),
+               avgCount(stats.draftSlots.load(std::memory_order_relaxed)),
+               avgMs(totalUs), avgMs(setupUs), avgMs(cachePrepUs), avgMs(targetUs),
+               avgMs(matchUs), avgMs(commitUs), avgMs(rollbackUs), avgMs(retryUs),
+               avgMs(draftUs),
+               avgMs(stats.draftFirstUs.load(std::memory_order_relaxed)),
+               avgMs(stats.draftExtraUs.load(std::memory_order_relaxed)),
+               avgMs(otherUs));
+        fflush(stdout);
+    }
+
+    static void Qwen35MtpProfileRecord(
+            int interval, Qwen35MtpProfilePath path, bool speculative,
+            int draftSlots, int matchedDrafts, int committedTokens,
+            long long setupUs, long long cachePrepUs, long long targetUs,
+            long long matchUs, long long commitUs, long long rollbackUs,
+            long long retryUs, long long draftUs, long long draftFirstUs,
+            long long draftExtraUs, long long totalUs) {
+        if (interval <= 0) {
+            return;
+        }
+        Qwen35MtpProfileAggregate &stats = Qwen35MtpProfileStats();
+        long long samples = stats.samples.fetch_add(1, std::memory_order_relaxed) + 1;
+        switch (path) {
+        case QWEN35_MTP_PROFILE_SEED:
+            stats.seedPath.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case QWEN35_MTP_PROFILE_TP_INPLACE:
+            stats.tpInplacePath.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case QWEN35_MTP_PROFILE_TP_COPY:
+            stats.tpCopyPath.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case QWEN35_MTP_PROFILE_SINGLE:
+            stats.singlePath.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        if (speculative) {
+            stats.speculative.fetch_add(1, std::memory_order_relaxed);
+            if (matchedDrafts >= draftSlots) {
+                stats.fullAccept.fetch_add(1, std::memory_order_relaxed);
+            } else if (matchedDrafts > 0) {
+                stats.partialAccept.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                stats.rejectFirst.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        stats.draftSlots.fetch_add(std::max(0, draftSlots), std::memory_order_relaxed);
+        stats.matchedDrafts.fetch_add(std::max(0, matchedDrafts), std::memory_order_relaxed);
+        stats.committedTokens.fetch_add(std::max(0, committedTokens), std::memory_order_relaxed);
+        stats.setupUs.fetch_add(setupUs, std::memory_order_relaxed);
+        stats.cachePrepUs.fetch_add(cachePrepUs, std::memory_order_relaxed);
+        stats.targetUs.fetch_add(targetUs, std::memory_order_relaxed);
+        stats.matchUs.fetch_add(matchUs, std::memory_order_relaxed);
+        stats.commitUs.fetch_add(commitUs, std::memory_order_relaxed);
+        stats.rollbackUs.fetch_add(rollbackUs, std::memory_order_relaxed);
+        stats.retryUs.fetch_add(retryUs, std::memory_order_relaxed);
+        stats.draftUs.fetch_add(draftUs, std::memory_order_relaxed);
+        stats.draftFirstUs.fetch_add(draftFirstUs, std::memory_order_relaxed);
+        stats.draftExtraUs.fetch_add(draftExtraUs, std::memory_order_relaxed);
+        stats.totalUs.fetch_add(totalUs, std::memory_order_relaxed);
+        Qwen35MtpProfilePrintIfNeeded(interval, stats, samples);
+    }
+
+    static void Qwen35MtpTargetProfilePrintIfNeeded(
+            int interval, Qwen35MtpTargetProfileAggregate &stats,
+            long long samples) {
+        if (interval <= 0 || samples <= 0 || samples % interval != 0) {
+            return;
+        }
+        long long setupUs = stats.setupUs.load(std::memory_order_relaxed);
+        long long weightPrepUs = stats.weightPrepUs.load(std::memory_order_relaxed);
+        long long inputPrepUs = stats.inputPrepUs.load(std::memory_order_relaxed);
+        long long embeddingUs = stats.embeddingUs.load(std::memory_order_relaxed);
+        long long cacheLocalUs = stats.cacheLocalUs.load(std::memory_order_relaxed);
+        long long workerUs = stats.workerUs.load(std::memory_order_relaxed);
+        long long metaSyncUs = stats.metaSyncUs.load(std::memory_order_relaxed);
+        long long samplingUs = stats.samplingUs.load(std::memory_order_relaxed);
+        long long totalUs = stats.totalUs.load(std::memory_order_relaxed);
+        long long knownUs = setupUs + weightPrepUs + inputPrepUs + embeddingUs +
+                            cacheLocalUs + workerUs + metaSyncUs + samplingUs;
+        long long otherUs = std::max(0LL, totalUs - knownUs);
+        auto avgMs = [&](long long us) {
+            return samples > 0 ? (double)us / 1000.0 / (double)samples : 0.0;
+        };
+        auto avgCount = [&](long long count) {
+            return samples > 0 ? (double)count / (double)samples : 0.0;
+        };
+        printf("[Qwen3.5 MTP target profile] samples=%lld tp_calls=%lld "
+               "avg={seq_tokens=%.2f,logit_rows=%.2f} "
+               "avg_ms={total=%.3f,setup=%.3f,weight_prep=%.3f,input_prep=%.3f,"
+               "embedding=%.3f,cache_local=%.3f,worker=%.3f,meta_sync=%.3f,"
+               "sampling=%.3f,other=%.3f}.\n",
+               samples,
+               stats.tensorParallelCalls.load(std::memory_order_relaxed),
+               avgCount(stats.seqTokens.load(std::memory_order_relaxed)),
+               avgCount(stats.logitRows.load(std::memory_order_relaxed)),
+               avgMs(totalUs), avgMs(setupUs), avgMs(weightPrepUs),
+               avgMs(inputPrepUs), avgMs(embeddingUs), avgMs(cacheLocalUs),
+               avgMs(workerUs), avgMs(metaSyncUs), avgMs(samplingUs),
+               avgMs(otherUs));
+        fflush(stdout);
+    }
+
+    static void Qwen35MtpTargetProfileRecord(
+            int interval, bool tensorParallel, int seqTokens, int logitRows,
+            long long setupUs, long long weightPrepUs, long long inputPrepUs,
+            long long embeddingUs, long long cacheLocalUs, long long workerUs,
+            long long metaSyncUs, long long samplingUs, long long totalUs) {
+        if (interval <= 0) {
+            return;
+        }
+        Qwen35MtpTargetProfileAggregate &stats = Qwen35MtpTargetProfileStats();
+        long long samples = stats.samples.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (tensorParallel) {
+            stats.tensorParallelCalls.fetch_add(1, std::memory_order_relaxed);
+        }
+        stats.seqTokens.fetch_add(std::max(0, seqTokens), std::memory_order_relaxed);
+        stats.logitRows.fetch_add(std::max(0, logitRows), std::memory_order_relaxed);
+        stats.setupUs.fetch_add(setupUs, std::memory_order_relaxed);
+        stats.weightPrepUs.fetch_add(weightPrepUs, std::memory_order_relaxed);
+        stats.inputPrepUs.fetch_add(inputPrepUs, std::memory_order_relaxed);
+        stats.embeddingUs.fetch_add(embeddingUs, std::memory_order_relaxed);
+        stats.cacheLocalUs.fetch_add(cacheLocalUs, std::memory_order_relaxed);
+        stats.workerUs.fetch_add(workerUs, std::memory_order_relaxed);
+        stats.metaSyncUs.fetch_add(metaSyncUs, std::memory_order_relaxed);
+        stats.samplingUs.fetch_add(samplingUs, std::memory_order_relaxed);
+        stats.totalUs.fetch_add(totalUs, std::memory_order_relaxed);
+        Qwen35MtpTargetProfilePrintIfNeeded(interval, stats, samples);
+    }
+
+    static void Qwen35MtpWorkerProfilePrintIfNeeded(
+            int interval, Qwen35MtpWorkerProfileAggregate &stats,
+            long long samples) {
+        if (interval <= 0 || samples <= 0 || samples % interval != 0) {
+            return;
+        }
+        long long setupUs = stats.setupUs.load(std::memory_order_relaxed);
+        long long layersUs = stats.layersUs.load(std::memory_order_relaxed);
+        long long headUs = stats.headUs.load(std::memory_order_relaxed);
+        long long totalUs = stats.totalUs.load(std::memory_order_relaxed);
+        long long otherUs = std::max(0LL, totalUs - setupUs - layersUs - headUs);
+        auto avgMs = [&](long long us) {
+            return samples > 0 ? (double)us / 1000.0 / (double)samples : 0.0;
+        };
+        auto avgCount = [&](long long count) {
+            return samples > 0 ? (double)count / (double)samples : 0.0;
+        };
+        printf("[Qwen3.5 MTP worker profile] samples=%lld first_rank=%lld "
+               "avg={seq_tokens=%.2f} "
+               "avg_ms={total=%.3f,setup=%.3f,layers=%.3f,head=%.3f,other=%.3f}.\n",
+               samples,
+               stats.firstRankCalls.load(std::memory_order_relaxed),
+               avgCount(stats.seqTokens.load(std::memory_order_relaxed)),
+               avgMs(totalUs), avgMs(setupUs), avgMs(layersUs), avgMs(headUs),
+               avgMs(otherUs));
+        fflush(stdout);
+    }
+
+    static void Qwen35MtpWorkerProfileRecord(
+            int interval, bool firstRank, int seqTokens,
+            long long setupUs, long long layersUs, long long headUs,
+            long long totalUs) {
+        if (interval <= 0) {
+            return;
+        }
+        Qwen35MtpWorkerProfileAggregate &stats = Qwen35MtpWorkerProfileStats();
+        long long samples = stats.samples.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (firstRank) {
+            stats.firstRankCalls.fetch_add(1, std::memory_order_relaxed);
+        }
+        stats.seqTokens.fetch_add(std::max(0, seqTokens), std::memory_order_relaxed);
+        stats.setupUs.fetch_add(setupUs, std::memory_order_relaxed);
+        stats.layersUs.fetch_add(layersUs, std::memory_order_relaxed);
+        stats.headUs.fetch_add(headUs, std::memory_order_relaxed);
+        stats.totalUs.fetch_add(totalUs, std::memory_order_relaxed);
+        Qwen35MtpWorkerProfilePrintIfNeeded(interval, stats, samples);
     }
 
     static void Qwen35MoeCopyLinearWeightMeta(Data &dst, const Data &src, const std::string &name) {
@@ -5893,6 +6223,40 @@ namespace fastllm {
                         "Qwen3.5 ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
         Qwen3CudaDirectRunner cudaRunner(gpuId);
+        int mtpWorkerProfileInterval = speculativeCollectAllLogits ?
+            Qwen35MtpWorkerProfileInterval() : 0;
+        bool mtpWorkerProfileEnabled = mtpWorkerProfileInterval > 0;
+        int mtpWorkerProfileSeqTokens = 0;
+        for (int len : seqLens) {
+            mtpWorkerProfileSeqTokens += len;
+        }
+        auto mtpWorkerProfileStart = mtpWorkerProfileEnabled ?
+            std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point();
+        auto mtpWorkerProfileLast = mtpWorkerProfileStart;
+        long long mtpWorkerProfileSetupUs = 0;
+        long long mtpWorkerProfileLayersUs = 0;
+        long long mtpWorkerProfileHeadUs = 0;
+        auto mtpWorkerProfileSyncMark = [&](long long &slot) {
+            if (!mtpWorkerProfileEnabled) {
+                return;
+            }
+            ForceDeviceSync();
+            auto now = std::chrono::steady_clock::now();
+            slot += Qwen35MtpProfileElapsedUs(mtpWorkerProfileLast, now);
+            mtpWorkerProfileLast = now;
+        };
+        auto mtpWorkerProfileRecord = [&]() {
+            if (!mtpWorkerProfileEnabled) {
+                return;
+            }
+            long long totalUs = Qwen35MtpProfileElapsedUs(
+                mtpWorkerProfileStart, std::chrono::steady_clock::now());
+            Qwen35MtpWorkerProfileRecord(
+                mtpWorkerProfileInterval, firstTensorParallelRank,
+                mtpWorkerProfileSeqTokens, mtpWorkerProfileSetupUs,
+                mtpWorkerProfileLayersUs, mtpWorkerProfileHeadUs, totalUs);
+        };
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
             auto it = data.multiDeviceDatas.find(gpuId);
@@ -5948,6 +6312,7 @@ namespace fastllm {
         if (hiddenStates.dataType != computeType) {
             Qwen3CudaToDataType(cudaRunner, hiddenStates, computeType);
         }
+        mtpWorkerProfileSyncMark(mtpWorkerProfileSetupUs);
 
         Data attenInput, merged, qgate, gate, q, k, v, attenOutput, attenLastOutput;
         Data qForAttentionHolder;
@@ -6904,6 +7269,7 @@ namespace fastllm {
             moeFinal.Reshape(hiddenStates.dims);
             addPartialToResidualReduce(moeFinal);
         }
+        mtpWorkerProfileSyncMark(mtpWorkerProfileLayersUs);
         if (speculativeCacheOnlyForward) {
             logits.FreeSpace();
             logits.dims.clear();
@@ -6942,6 +7308,8 @@ namespace fastllm {
                                       "lm_head.weight.tp_bias"),
                         logits);
         Qwen3CudaToDataType(cudaRunner, logits, DataType::FLOAT32);
+        mtpWorkerProfileSyncMark(mtpWorkerProfileHeadUs);
+        mtpWorkerProfileRecord();
 #endif
     }
 
@@ -6960,6 +7328,33 @@ namespace fastllm {
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
 #else
         (void)attentionMask;
+        int mtpTargetProfileInterval = speculativeCollectAllLogits ?
+            Qwen35MtpProfileInterval() : 0;
+        bool mtpTargetProfileEnabled = mtpTargetProfileInterval > 0;
+        int mtpTargetProfileSeqTokens = 0;
+        for (int len : seqLens) {
+            mtpTargetProfileSeqTokens += len;
+        }
+        auto mtpTargetProfileStart = mtpTargetProfileEnabled ?
+            std::chrono::steady_clock::now() :
+            std::chrono::steady_clock::time_point();
+        auto mtpTargetProfileLast = mtpTargetProfileStart;
+        long long mtpTargetProfileSetupUs = 0;
+        long long mtpTargetProfileWeightPrepUs = 0;
+        long long mtpTargetProfileInputPrepUs = 0;
+        long long mtpTargetProfileEmbeddingUs = 0;
+        long long mtpTargetProfileCacheLocalUs = 0;
+        long long mtpTargetProfileWorkerUs = 0;
+        long long mtpTargetProfileMetaSyncUs = 0;
+        long long mtpTargetProfileSamplingUs = 0;
+        auto mtpTargetProfileMark = [&](long long &slot) {
+            if (!mtpTargetProfileEnabled) {
+                return;
+            }
+            auto now = std::chrono::steady_clock::now();
+            slot += Qwen35MtpProfileElapsedUs(mtpTargetProfileLast, now);
+            mtpTargetProfileLast = now;
+        };
         std::vector<int> devices;
         std::map<int, int> ratios;
         if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios)) {
@@ -6970,6 +7365,21 @@ namespace fastllm {
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
         bool tensorParallel = devices.size() > 1;
+        auto mtpTargetProfileRecord = [&](int logitRows) {
+            if (!mtpTargetProfileEnabled) {
+                return;
+            }
+            long long totalUs = Qwen35MtpProfileElapsedUs(
+                mtpTargetProfileStart, std::chrono::steady_clock::now());
+            Qwen35MtpTargetProfileRecord(
+                mtpTargetProfileInterval, tensorParallel,
+                mtpTargetProfileSeqTokens, logitRows,
+                mtpTargetProfileSetupUs, mtpTargetProfileWeightPrepUs,
+                mtpTargetProfileInputPrepUs, mtpTargetProfileEmbeddingUs,
+                mtpTargetProfileCacheLocalUs, mtpTargetProfileWorkerUs,
+                mtpTargetProfileMetaSyncUs, mtpTargetProfileSamplingUs,
+                totalUs);
+        };
         bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
         const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
 
@@ -7075,6 +7485,7 @@ namespace fastllm {
             return runSplitBatchForward();
         }
 
+        mtpTargetProfileMark(mtpTargetProfileSetupUs);
         if (num_experts > 0) {
             if (!Qwen35MoeDisableFusedMoe() &&
                 Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap)) {
@@ -7091,6 +7502,7 @@ namespace fastllm {
         if (!useCpuEmbedding) {
             PrepareQwen35CudaEmbeddingWeightType(weight[language_prefix + "embed_tokens.weight"], computeType);
         }
+        mtpTargetProfileMark(mtpTargetProfileWeightPrepUs);
 
         Data allPositionIds = BuildFlattenedPositionIds(positionIds, seqLens, all1);
         Data gpuInputIds;
@@ -7099,6 +7511,7 @@ namespace fastllm {
             PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
             PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
         }
+        mtpTargetProfileMark(mtpTargetProfileInputPrepUs);
 
         std::vector<DivisionScheme> localAttentionKvSchemes(block_cnt);
         std::vector<DivisionScheme> localLinearValueSchemes(block_cnt);
@@ -7581,6 +7994,7 @@ namespace fastllm {
         if (tensorParallel && !useCpuEmbedding) {
             PrepareMultiCudaReplicatedData(weight[language_prefix + "embed_tokens.weight"], devices, true);
         }
+        mtpTargetProfileMark(mtpTargetProfileWeightPrepUs);
 
         Data cpuEmbeddingHiddenStates;
         Data *precomputedHiddenStates = nullptr;
@@ -7592,6 +8006,7 @@ namespace fastllm {
             PrepareQwen35CpuEmbeddingHiddenStates(cpuEmbeddingHiddenStates, devices, threadTpWorkerGroup);
             precomputedHiddenStates = &cpuEmbeddingHiddenStates;
         }
+        mtpTargetProfileMark(mtpTargetProfileEmbeddingUs);
 
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
         if (tensorParallel) {
@@ -7658,6 +8073,7 @@ namespace fastllm {
                 PrepareQwen35SingleCudaCache(*pastKeyValues[idx].second, device, valueCacheType);
             }
         }
+        mtpTargetProfileMark(mtpTargetProfileCacheLocalUs);
 
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
@@ -7685,6 +8101,7 @@ namespace fastllm {
                 }
             }
         }
+        mtpTargetProfileMark(mtpTargetProfileWorkerUs);
 
         if (tensorParallel) {
             auto validLocalMeta = [](Data *data) {
@@ -7748,6 +8165,7 @@ namespace fastllm {
                 }
             }
         }
+        mtpTargetProfileMark(mtpTargetProfileMetaSyncUs);
 
         if (speculativeCacheOnlyForward) {
             return {};
@@ -7840,9 +8258,12 @@ namespace fastllm {
                 }
             }
             if (devices.size() > 1 && generationConfigs[0].IsSimpleGreedy()) {
-                return Qwen35SampleGreedyFromShardedCudaLogits(
+                std::vector<int> sampled = Qwen35SampleGreedyFromShardedCudaLogits(
                     devices, *lmHeadScheme, localLogits, logitRows, vocabSize,
                     resetEosForMtp, eosIdsForMtp);
+                mtpTargetProfileMark(mtpTargetProfileSamplingUs);
+                mtpTargetProfileRecord(logitRows);
+                return sampled;
             }
             void *oldExecutor = GetExecutor();
             Executor samplingExecutor;
@@ -7862,6 +8283,8 @@ namespace fastllm {
             SetCurrentThreadExecutor(oldExecutor);
             std::vector<int> sampled = Qwen35SampleFromRootCudaLogits(devices[0], *sampleLogits, logitRows,
                                                                        1, true, rowConfigs);
+            mtpTargetProfileMark(mtpTargetProfileSamplingUs);
+            mtpTargetProfileRecord(logitRows);
             return sampled;
         }
         bool allSimpleCudaSampling = true;
@@ -8079,6 +8502,55 @@ namespace fastllm {
             }
             printf("].\n");
             fflush(stdout);
+        };
+
+        int mtpProfileInterval = Qwen35MtpProfileInterval();
+        bool mtpProfileEnabled = mtpProfileInterval > 0;
+        auto mtpProfileStart = mtpProfileEnabled ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point();
+        auto mtpProfileLast = mtpProfileStart;
+        long long mtpProfileSetupUs = 0;
+        long long mtpProfileCachePrepUs = 0;
+        long long mtpProfileTargetUs = 0;
+        long long mtpProfileMatchUs = 0;
+        long long mtpProfileCommitUs = 0;
+        long long mtpProfileRollbackUs = 0;
+        long long mtpProfileRetryUs = 0;
+        long long mtpProfileDraftUs = 0;
+        long long mtpProfileDraftFirstUs = 0;
+        long long mtpProfileDraftExtraUs = 0;
+        auto mtpProfileMark = [&](long long &slot) {
+            if (!mtpProfileEnabled) {
+                return;
+            }
+            auto now = std::chrono::steady_clock::now();
+            slot += Qwen35MtpProfileElapsedUs(mtpProfileLast, now);
+            mtpProfileLast = now;
+        };
+        auto mtpProfileAddSpan = [&](long long &slot,
+                                     std::chrono::steady_clock::time_point begin) {
+            if (!mtpProfileEnabled) {
+                return;
+            }
+            slot += Qwen35MtpProfileElapsedUs(begin, std::chrono::steady_clock::now());
+        };
+        auto mtpProfileRecord = [&](Qwen35MtpProfilePath path, bool speculative,
+                                    int draftSlots, int matchedDrafts,
+                                    int committedTokens) {
+            if (!mtpProfileEnabled) {
+                return;
+            }
+            long long totalUs = Qwen35MtpProfileElapsedUs(
+                mtpProfileStart, std::chrono::steady_clock::now());
+            Qwen35MtpProfileRecord(
+                mtpProfileInterval, path, speculative, draftSlots,
+                matchedDrafts, committedTokens,
+                mtpProfileSetupUs, mtpProfileCachePrepUs,
+                mtpProfileTargetUs, mtpProfileMatchUs,
+                mtpProfileCommitUs, mtpProfileRollbackUs,
+                mtpProfileRetryUs, mtpProfileDraftUs,
+                mtpProfileDraftFirstUs, mtpProfileDraftExtraUs,
+                totalUs);
         };
 
         struct CacheMeta {
@@ -8608,10 +9080,13 @@ namespace fastllm {
             std::vector<int> drafts;
             drafts.reserve(mtpDraftsPerStep);
             Data draftHidden;
+            auto firstDraftStart = mtpProfileEnabled ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point();
             int draft = RunMtpGreedyDraft(device, devices, mtpCache, targetHiddenStates,
                                           mtpInputTokens, mtpPositionIds,
                                           sampleRow,
                                           mtpDraftsPerStep > 1 ? &draftHidden : nullptr);
+            mtpProfileAddSpan(mtpProfileDraftFirstUs, firstDraftStart);
             drafts.push_back(draft);
             if (mtpDraftsPerStep > 1) {
                 MtpRuntimeCacheMeta runtimeMeta = makeMtpRuntimeCacheMeta();
@@ -8624,9 +9099,12 @@ namespace fastllm {
                         allPositionIds, lastPositionRow, lastPositionRow + 1, extra);
                     std::vector<int> extraInputTokens(1, prevDraft);
                     bool needNextHidden = extra + 1 < mtpDraftsPerStep;
+                    auto extraDraftStart = mtpProfileEnabled ? std::chrono::steady_clock::now()
+                                                             : std::chrono::steady_clock::time_point();
                     int nextDraft = RunMtpGreedyDraft(device, devices, mtpCache, *prevHidden,
                                                       extraInputTokens, extraPositionIds,
                                                       0, needNextHidden ? &extraHidden : nullptr);
+                    mtpProfileAddSpan(mtpProfileDraftExtraUs, extraDraftStart);
                     drafts.push_back(nextDraft);
                     if (needNextHidden) {
                         prevHiddenStorage.CopyFrom(extraHidden);
@@ -8639,12 +9117,14 @@ namespace fastllm {
             return drafts;
         };
 
+        mtpProfileMark(mtpProfileSetupUs);
         std::vector<int> targetRet;
         bool isSpeculativeValidation =
             seqLen >= 2 && seqLen <= mtpDraftsPerStep + 1 &&
             mtpCache.tokens > 0 && context->preTokens > seqLen;
         if (!isSpeculativeValidation) {
             targetRet = runTarget(inputIds, attentionMask, positionIds, seqLens);
+            mtpProfileMark(mtpProfileTargetUs);
             AssertInFastLLM((int)targetRet.size() >= seqLen,
                             "Qwen3.5 MTP target forward returned no token.\n");
             int nextToken = targetRet[seqLen - 1];
@@ -8658,8 +9138,10 @@ namespace fastllm {
             std::vector<int> drafts = runMtpDraftChain(
                 speculativeHiddenStates, mtpInputTokens, mtpPositionIds,
                 seqLen - 1, seqLen - 1);
+            mtpProfileMark(mtpProfileDraftUs);
             acceptedTokens[0].push_back(nextToken);
             setNextInputWithDrafts(nextToken, drafts);
+            mtpProfileRecord(QWEN35_MTP_PROFILE_SEED, false, 0, 0, 1);
             return true;
         }
 
@@ -8748,12 +9230,14 @@ namespace fastllm {
                     valueSlots.multiDeviceDatas[localDevice] = new Data();
                 }
             }
+            mtpProfileMark(mtpProfileCachePrepUs);
 
             bool oldCaptureFirstTokenLinearState = speculativeCaptureFirstTokenLinearState;
             speculativeCaptureFirstTokenLinearState = true;
             targetRet = runTargetWithPast(inputIds, attentionMask, positionIds, seqLens,
                                           pastKeyValues);
             speculativeCaptureFirstTokenLinearState = oldCaptureFirstTokenLinearState;
+            mtpProfileMark(mtpProfileTargetUs);
             AssertInFastLLM((int)targetRet.size() >= seqLen,
                             "Qwen3.5 MTP TP inplace validation target forward returned too few tokens.\n");
 
@@ -8794,6 +9278,7 @@ namespace fastllm {
                 }
             }
             mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
+            mtpProfileMark(mtpProfileMatchUs);
 
             int commitLen = matchedDrafts == draftTokenCount ? seqLen : matchedDrafts + 1;
             std::vector<int> committedRet(targetRet.begin(), targetRet.begin() + commitLen);
@@ -8834,6 +9319,9 @@ namespace fastllm {
                         }
                     }
                 }
+                mtpProfileMark(mtpProfileRollbackUs);
+            } else {
+                mtpProfileMark(mtpProfileCommitUs);
             }
 
             Data hiddenForMtp;
@@ -8848,11 +9336,14 @@ namespace fastllm {
             std::vector<int> drafts = runMtpDraftChain(
                 hiddenForMtp, mtpInputTokens, mtpPositionIds,
                 commitLen - 1, commitLen - 1);
+            mtpProfileMark(mtpProfileDraftUs);
             acceptedTokens[0].assign(committedRet.begin(),
                                      committedRet.begin() + commitLen);
             setNextInputWithDrafts(committedRet[commitLen - 1], drafts);
             keptInputLens[0] = commitLen;
             logMtpStats();
+            mtpProfileRecord(QWEN35_MTP_PROFILE_TP_INPLACE, true,
+                             draftTokenCount, matchedDrafts, commitLen);
             return true;
         }
 
@@ -8896,6 +9387,7 @@ namespace fastllm {
                     &validationPastStorage[i].second
                 };
             }
+            mtpProfileMark(mtpProfileCachePrepUs);
             bool oldCaptureFirstTokenLinearState = speculativeCaptureFirstTokenLinearState;
             // This flag also selects the cached multi-token linear-attention
             // decode path. No capture slots are allocated here because TP
@@ -8904,6 +9396,7 @@ namespace fastllm {
             targetRet = runTargetWithPast(inputIds, attentionMask, positionIds, seqLens,
                                           validationPastKeyValues);
             speculativeCaptureFirstTokenLinearState = oldCaptureFirstTokenLinearState;
+            mtpProfileMark(mtpProfileTargetUs);
             AssertInFastLLM((int)targetRet.size() >= seqLen,
                             "Qwen3.5 MTP TP validation target forward returned too few tokens.\n");
 
@@ -8919,6 +9412,7 @@ namespace fastllm {
                     mtpDraftPositionAccepts[i].fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            mtpProfileMark(mtpProfileMatchUs);
 
             auto cleanupTpValidationPaged = [&](const std::vector<std::map<int, CacheMeta> > &keepKeyMetas,
                                                 const std::vector<std::map<int, CacheMeta> > &keepValueMetas) {
@@ -9007,8 +9501,10 @@ namespace fastllm {
                 }
                 cleanupTpValidationPaged(finalLocalKeyMetas, finalLocalValueMetas);
                 committedRet.assign(targetRet.begin(), targetRet.begin() + commitLen);
+                mtpProfileMark(mtpProfileCommitUs);
             } else {
                 cleanupTpValidationPaged(baseLocalKeyMetas, baseLocalValueMetas);
+                mtpProfileMark(mtpProfileRollbackUs);
                 committedRet.assign(targetRet.begin(), targetRet.begin() + commitLen);
                 Data singleInputIds = buildInputIdsSlice(0, commitLen);
                 Data singlePositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
@@ -9020,6 +9516,7 @@ namespace fastllm {
                 runTargetCacheOnly(singleInputIds, singleAttentionMask,
                                    singlePositionIdVec, singleSeqLens);
                 speculativeCaptureFirstTokenLinearState = oldCaptureFirstTokenLinearState;
+                mtpProfileMark(mtpProfileRetryUs);
             }
             Data hiddenForMtp;
             Split(speculativeHiddenStates, 1, 0, commitLen, hiddenForMtp);
@@ -9033,11 +9530,14 @@ namespace fastllm {
             std::vector<int> drafts = runMtpDraftChain(
                 hiddenForMtp, mtpInputTokens, mtpPositionIds,
                 commitLen - 1, commitLen - 1);
+            mtpProfileMark(mtpProfileDraftUs);
             acceptedTokens[0].assign(committedRet.begin(),
                                      committedRet.begin() + commitLen);
             setNextInputWithDrafts(committedRet[commitLen - 1], drafts);
             keptInputLens[0] = commitLen;
             logMtpStats();
+            mtpProfileRecord(QWEN35_MTP_PROFILE_TP_COPY, true,
+                             draftTokenCount, matchedDrafts, commitLen);
             return true;
         }
 
@@ -9065,6 +9565,7 @@ namespace fastllm {
                 &validationPastStorage[i].second
             };
         }
+        mtpProfileMark(mtpProfileCachePrepUs);
         speculativeCaptureFirstTokenLinearState = true;
         speculativeFirstTokenLinearStates.clear();
         speculativeFirstTokenLinearStates.resize(block_cnt);
@@ -9072,6 +9573,7 @@ namespace fastllm {
         targetRet = runTargetWithPast(inputIds, attentionMask, positionIds, seqLens,
                                       validationPastKeyValues);
         speculativeCaptureFirstTokenLinearState = false;
+        mtpProfileMark(mtpProfileTargetUs);
         AssertInFastLLM((int)targetRet.size() >= 2,
                         "Qwen3.5 MTP validation target forward returned too few tokens.\n");
         for (int i = 0; i < block_cnt; i++) {
@@ -9147,8 +9649,10 @@ namespace fastllm {
                 mtpDraftPositionAccepts[i].fetch_add(1, std::memory_order_relaxed);
             }
         }
+        mtpProfileMark(mtpProfileMatchUs);
         if (matchedDrafts == draftTokenCount) {
             commitAcceptedValidationCache();
+            mtpProfileMark(mtpProfileCommitUs);
             std::vector<int> mtpInputTokens;
             mtpInputTokens.reserve(seqLen);
             for (int i = 1; i < seqLen; i++) {
@@ -9159,11 +9663,14 @@ namespace fastllm {
             std::vector<int> drafts = runMtpDraftChain(
                 speculativeHiddenStates, mtpInputTokens, mtpPositionIds,
                 seqLen - 1, seqLen - 1);
+            mtpProfileMark(mtpProfileDraftUs);
             mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
             acceptedTokens[0].assign(targetRet.begin(), targetRet.begin() + seqLen);
             setNextInputWithDrafts(targetRet[seqLen - 1], drafts);
             keptInputLens[0] = seqLen;
             logMtpStats();
+            mtpProfileRecord(QWEN35_MTP_PROFILE_SINGLE, true,
+                             draftTokenCount, matchedDrafts, seqLen);
             return true;
         }
 
@@ -9173,8 +9680,10 @@ namespace fastllm {
         bool committedRejectedFast = commitLen == 1 && canCommitRejectedFirstTokenCache();
         if (committedRejectedFast) {
             commitRejectedFirstTokenCache();
+            mtpProfileMark(mtpProfileRollbackUs);
         } else {
             releaseValidationPagedViews(baseKeyMetas, baseValueMetas);
+            mtpProfileMark(mtpProfileRollbackUs);
             Data singleInputIds = buildInputIdsSlice(0, commitLen);
             Data singlePositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
             std::vector<Data*> singleAttentionMask = {nullptr};
@@ -9182,6 +9691,7 @@ namespace fastllm {
             std::vector<int> singleSeqLens = {commitLen};
             retryRet = runTarget(singleInputIds, singleAttentionMask,
                                  singlePositionIdVec, singleSeqLens);
+            mtpProfileMark(mtpProfileRetryUs);
             AssertInFastLLM((int)retryRet.size() >= commitLen,
                             "Qwen3.5 MTP retry target forward returned no token.\n");
         }
@@ -9197,10 +9707,13 @@ namespace fastllm {
         std::vector<int> drafts = runMtpDraftChain(
             hiddenForMtp, mtpInputTokens, mtpPositionIds,
             commitLen - 1, commitLen - 1);
+        mtpProfileMark(mtpProfileDraftUs);
         acceptedTokens[0].assign(retryRet.begin(), retryRet.begin() + commitLen);
         setNextInputWithDrafts(retryRet[commitLen - 1], drafts);
         keptInputLens[0] = commitLen;
         logMtpStats();
+        mtpProfileRecord(QWEN35_MTP_PROFILE_SINGLE, true,
+                         draftTokenCount, matchedDrafts, commitLen);
         return true;
 #endif
     }
