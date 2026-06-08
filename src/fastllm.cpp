@@ -294,6 +294,7 @@ namespace fastllm {
         this->skipWarmup = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_SKIP_WARMUP"));
         this->cudaGraph = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_CUDA_GRAPH"));
         this->cudaMemCheck = IsEnvValueEnabledUnlessFalseIgnoreCase(std::getenv("FASTLLM_CUDA_MEM_CHECK"));
+        this->cudaTriton = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_CUDA_TRITON"));
 
         const char *useFusedTransferAttnEnv = std::getenv("FASTLLM_USE_FUSED_TRANSFER_ATTN");
         if (useFusedTransferAttnEnv != nullptr && std::strcmp(useFusedTransferAttnEnv, "0") == 0) {

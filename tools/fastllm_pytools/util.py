@@ -48,6 +48,13 @@ def _uses_thread_tp(tp) -> bool:
     spec = str(tp).strip().lower()
     return spec not in ["", "false", "off", "none", "disable"]
 
+def _arg_enabled(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() not in ["", "false", "0", "off", "none", "disable"]
+
 def _cuda_device_count() -> int:
     try:
         result = subprocess.run(["nvidia-smi", "-L"],
@@ -227,6 +234,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
@@ -297,6 +305,8 @@ def make_normal_llm_model(args):
     if (args.path == '' or args.path is None):
         print("model can't be empty. (Example: ftllm run MODELNAME)")
         exit(0)
+    if (_arg_enabled(getattr(args, "triton", False))):
+        os.environ["FASTLLM_CUDA_TRITON"] = "1"
     if not(os.path.exists(args.path)):
         if (hasattr(args, "model_name") and args.model_name == ''):
             args.model_name = args.path
