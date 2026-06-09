@@ -13,7 +13,7 @@ namespace fastllm {
         if (CanRunLinearAdd(*input, *weight, *bias, *output)) {
             LinearAdd(*input, *weight, *bias, *middle, *output);
         } else {
-            Linear(*input, *weight, *bias, *middle)
+            Linear(*input, *weight, *bias, *middle);
             if (middle->dataType != output->dataType) {
                 Data tempMiddle;
                 ToDataType(*middle, tempMiddle, output->dataType);
