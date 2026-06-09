@@ -1,0 +1,4 @@
+interface:
+  display_name: "FastLLM Triton Ops"
+  short_description: "Add Triton-backed operators to FastLLM"
+  default_prompt: "Use $fastllm-triton-ops to add or update a Triton-backed operator in FastLLM."
