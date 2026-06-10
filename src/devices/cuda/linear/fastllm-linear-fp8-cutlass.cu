@@ -1,12 +1,14 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -208,6 +210,46 @@ __device__ inline float FastllmCutlassToFloat(__nv_bfloat16 x) {
 }
 
 template <typename T>
+struct FastllmCutlassInputFp8QuantTraits;
+
+template <>
+struct FastllmCutlassInputFp8QuantTraits<half> {
+    __device__ static inline float ToFloat(uint16_t bits) {
+        return __half2float(__ushort_as_half(bits));
+    }
+};
+
+template <>
+struct FastllmCutlassInputFp8QuantTraits<__nv_bfloat16> {
+    __device__ static inline float ToFloat(uint16_t bits) {
+        return __bfloat162float(__ushort_as_bfloat16(bits));
+    }
+};
+
+template <typename T>
+__device__ inline void FastllmCutlassLoad4AsFloat(const T *__restrict__ ptr, float (&values)[4]) {
+    static_assert(sizeof(T) == 2, "FP8 input quantization expects 16-bit source elements");
+    uint2 packed = *reinterpret_cast<const uint2 *>(ptr);
+    values[0] = FastllmCutlassInputFp8QuantTraits<T>::ToFloat((uint16_t)(packed.x & 0xffffu));
+    values[1] = FastllmCutlassInputFp8QuantTraits<T>::ToFloat((uint16_t)(packed.x >> 16));
+    values[2] = FastllmCutlassInputFp8QuantTraits<T>::ToFloat((uint16_t)(packed.y & 0xffffu));
+    values[3] = FastllmCutlassInputFp8QuantTraits<T>::ToFloat((uint16_t)(packed.y >> 16));
+}
+
+__device__ inline uint8_t FastllmCutlassFloatToFp8Byte(float v) {
+    v = fminf(448.0f, fmaxf(-448.0f, v));
+    return cutlass::float_e4m3_t(v).storage;
+}
+
+__device__ inline uint32_t FastllmCutlassPackFp8x4(float v0, float v1, float v2, float v3) {
+    uint32_t b0 = FastllmCutlassFloatToFp8Byte(v0);
+    uint32_t b1 = FastllmCutlassFloatToFp8Byte(v1);
+    uint32_t b2 = FastllmCutlassFloatToFp8Byte(v2);
+    uint32_t b3 = FastllmCutlassFloatToFp8Byte(v3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+template <typename T>
 __global__ void FastllmCutlassQuantInputFp8Kernel(
     const T *input, cutlass::float_e4m3_t *quant, float *scales,
     int rows, int cols, int scaleCols) {
@@ -246,6 +288,59 @@ __global__ void FastllmCutlassQuantInputFp8Kernel(
         // offset = k_block * rows + row.
         scales[(size_t)group * rows + row] = scale;
     }
+}
+
+template <typename T, int WARPS_PER_BLOCK>
+__global__ void __launch_bounds__(256) FastllmCutlassQuantInputFp8PackedWarpKernel(
+    const T *__restrict__ input, cutlass::float_e4m3_t *__restrict__ quant,
+    float *__restrict__ scales, int rows, int cols, int scaleCols) {
+    int warpId = threadIdx.x >> 5;
+    int laneId = threadIdx.x & 31;
+    int task = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    int totalTasks = rows * scaleCols;
+    if (task >= totalTasks) {
+        return;
+    }
+
+    int row = task / scaleCols;
+    int group = task - row * scaleCols;
+    int base = group * 128;
+    size_t blockOffset = (size_t)row * cols + base;
+
+    float values[4];
+    FastllmCutlassLoad4AsFloat(input + blockOffset + laneId * 4, values);
+
+    float maxAbs = fmaxf(fmaxf(fabsf(values[0]), fabsf(values[1])),
+                         fmaxf(fabsf(values[2]), fabsf(values[3])));
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        maxAbs = fmaxf(maxAbs, __shfl_down_sync(0xffffffff, maxAbs, offset));
+    }
+    maxAbs = __shfl_sync(0xffffffff, maxAbs, 0);
+
+    float scale = fmaxf(maxAbs, 1.0e-10f) * (1.0f / 448.0f);
+    if (laneId == 0) {
+        // CUTLASS blockwise SFA layout is physically K-block-major:
+        // offset = k_block * rows + row.
+        scales[(size_t)group * rows + row] = scale;
+    }
+    float invScale = 1.0f / scale;
+
+    uint32_t packed = FastllmCutlassPackFp8x4(values[0] * invScale, values[1] * invScale,
+                                             values[2] * invScale, values[3] * invScale);
+    reinterpret_cast<uint32_t *>(quant + blockOffset)[laneId] = packed;
+}
+
+static bool FastllmCutlassUseWarpQuant() {
+    static const bool enabled = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_WARP_QUANT");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        return !(env[0] == '0' || env[0] == 'f' || env[0] == 'F' ||
+                 env[0] == 'n' || env[0] == 'N');
+    }();
+    return enabled;
 }
 
 template <typename T>
@@ -514,13 +609,26 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128(
     }
 
     int scaleCols = (m + 127) / 128;
-    dim3 grid(n, scaleCols);
-    if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmCutlassQuantInputFp8Kernel<<<grid, 256, 0, stream>>>(
-            (const half*)inputData, scratch->input, scratch->inputScales, n, m, scaleCols);
+    if (FastllmCutlassUseWarpQuant() && (m % 128) == 0) {
+        constexpr int warpQuantWarps = 8;
+        int tasks = n * scaleCols;
+        dim3 grid((tasks + warpQuantWarps - 1) / warpQuantWarps);
+        if (input.dataType == fastllm::DataType::FLOAT16) {
+            FastllmCutlassQuantInputFp8PackedWarpKernel<half, warpQuantWarps><<<grid, warpQuantWarps * 32, 0, stream>>>(
+                (const half*)inputData, scratch->input, scratch->inputScales, n, m, scaleCols);
+        } else {
+            FastllmCutlassQuantInputFp8PackedWarpKernel<__nv_bfloat16, warpQuantWarps><<<grid, warpQuantWarps * 32, 0, stream>>>(
+                (const __nv_bfloat16*)inputData, scratch->input, scratch->inputScales, n, m, scaleCols);
+        }
     } else {
-        FastllmCutlassQuantInputFp8Kernel<<<grid, 256, 0, stream>>>(
-            (const __nv_bfloat16*)inputData, scratch->input, scratch->inputScales, n, m, scaleCols);
+        dim3 grid(n, scaleCols);
+        if (input.dataType == fastllm::DataType::FLOAT16) {
+            FastllmCutlassQuantInputFp8Kernel<<<grid, 256, 0, stream>>>(
+                (const half*)inputData, scratch->input, scratch->inputScales, n, m, scaleCols);
+        } else {
+            FastllmCutlassQuantInputFp8Kernel<<<grid, 256, 0, stream>>>(
+                (const __nv_bfloat16*)inputData, scratch->input, scratch->inputScales, n, m, scaleCols);
+        }
     }
     if (cudaGetLastError() != cudaSuccess) {
         FastllmCudaFinishInput(input, inputData);
