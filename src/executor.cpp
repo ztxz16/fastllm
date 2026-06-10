@@ -33,6 +33,27 @@
 #endif
 
 namespace fastllm {
+#ifdef USE_CUDA
+    static void SyncCudaDeviceForProfiler(BaseDevice *device) {
+        if (!GetFastllmEnv().cudaSync || device == nullptr) {
+            return;
+        }
+        if (device->deviceType == "cuda") {
+            ForceDeviceSync();
+        } else if (device->deviceType == "multicuda") {
+            if (device->deviceIds.empty()) {
+                ForceDeviceSync();
+                return;
+            }
+            for (int deviceId : device->deviceIds) {
+                if (deviceId >= 0) {
+                    FastllmCudaSyncDevice(deviceId);
+                }
+            }
+        }
+    }
+#endif
+
     Executor::Executor() {
         this->devices.clear();
 #ifdef USE_CUDA
@@ -189,6 +210,9 @@ namespace fastllm {
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
                 device->Run(opType, datas, floatParams, intParams);
+#ifdef USE_CUDA
+                SyncCudaDeviceForProfiler(device);
+#endif
                 run = true;
                 break;
             }
@@ -258,6 +282,9 @@ namespace fastllm {
             }
             device->Reshape(opType, datas, floatParams, intParams);
             device->Run(opType, datas, floatParams, intParams);
+#ifdef USE_CUDA
+            SyncCudaDeviceForProfiler(device);
+#endif
             run = true;
             break;
         }
