@@ -2348,6 +2348,58 @@ static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
     fflush(stderr);
 }
 
+static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
+    cudaError_t state = cudaSetDevice(id);
+    checkCudaErrors("Error: CUDA error when switching device to release cached memory!", state);
+
+    auto bigIt = bigBuffersMap.find(id);
+    if (bigIt != bigBuffersMap.end()) {
+        auto &bigBuffers = bigIt->second;
+        std::vector<CudaMemoryBuffer> busyBuffers;
+        busyBuffers.reserve(bigBuffers.size());
+        for (auto &buffer : bigBuffers) {
+            if (buffer.busy) {
+                busyBuffers.push_back(buffer);
+            } else {
+                state = cudaFree(buffer.data);
+                if (cudaSuccess != state) {
+                    printf("Error: CUDA error when releasing idle big buffer on device %d!", id);
+                    checkCudaErrors("", state);
+                }
+            }
+        }
+        bigBuffers.swap(busyBuffers);
+    }
+
+    auto smallIt = cudaBuffersMap.find(id);
+    if (smallIt != cudaBuffersMap.end()) {
+        auto &cudaBuffers = smallIt->second;
+        std::vector<CudaMemoryBuffer> busyBuffers;
+        busyBuffers.reserve(cudaBuffers.size());
+        for (auto &buffer : cudaBuffers) {
+            if (buffer.busy) {
+                busyBuffers.push_back(buffer);
+            } else {
+                state = cudaFree(buffer.data);
+                if (cudaSuccess != state) {
+                    printf("Error: CUDA error when releasing idle buffer on device %d!", id);
+                    checkCudaErrors("", state);
+                }
+            }
+        }
+        cudaBuffers.swap(busyBuffers);
+        noBusyCnt[id] = 0;
+        cudaBuffersMinId[id] = (int)cudaBuffers.size();
+    }
+}
+
+static bool FastllmCudaRetryMallocAfterReleasingIdle(size_t size, void **ret, int id, const char *file, int line) {
+    cudaGetLastError();
+    FastllmCudaReleaseIdleCachedBuffersForDevice(id);
+    cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
+    return state == cudaSuccess;
+}
+
 void * FastllmCudaMalloc(size_t size) {
     int id = -1;
     cudaError_t state = cudaSuccess;
@@ -2394,6 +2446,9 @@ void * FastllmCudaMalloc(size_t size) {
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
         }
         state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+        if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
+            state = cudaSuccess;
+        }
         if (cudaSuccess != state) {
             size_t freeMem = 0, totalMem = 0;
             cudaMemGetInfo(&freeMem, &totalMem);
@@ -2447,6 +2502,9 @@ void * FastllmCudaMalloc(size_t size) {
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
     }
     state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+    if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
+        state = cudaSuccess;
+    }
     if (cudaSuccess != state) {
         size_t freeMem = 0, totalMem = 0;
         cudaMemGetInfo(&freeMem, &totalMem);
@@ -2462,6 +2520,70 @@ void * FastllmCudaMalloc(size_t size) {
     CudaMemDebugRecord(ret, size);
 #endif
     return ret;
+}
+
+void FastllmCudaForceFree(void *ret) {
+    if (ret == nullptr) {
+        return;
+    }
+    if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
+        return;
+    }
+    int oriId = FastllmCudaGetDevice();
+    cudaError_t state = cudaSuccess;
+
+    std::vector<FastllmCudaMemPoolView> views = FastllmSnapshotCudaMemPoolViews();
+    for (auto &view : views) {
+        std::lock_guard<std::mutex> lock(*view.lock);
+        auto &cudaBuffers = *view.smallBuffers;
+        for (int i = 0; i < (int)cudaBuffers.size(); i++) {
+            if (cudaBuffers[i].data == ret) {
+                state = cudaSetDevice(view.device);
+                state = cudaFree(cudaBuffers[i].data);
+                if (cudaSuccess != state) {
+                    printf("Error: CUDA error when force releasing memory on device %d!", view.device);
+                }
+                cudaBuffers.erase(cudaBuffers.begin() + i);
+                *view.noBusy = 0;
+                *view.minId = (int)cudaBuffers.size();
+                for (int j = 0; j < (int)cudaBuffers.size(); j++) {
+                    if (!cudaBuffers[j].busy) {
+                        *view.noBusy += cudaBuffers[j].size;
+                        *view.minId = std::min(*view.minId, j);
+                    }
+                }
+#ifdef CUDA_MEM_DEBUG
+                CudaMemDebugRemove(ret);
+#endif
+                FastllmCudaSetDevice(oriId);
+                checkCudaErrors("CUDA error when force releasing memory!", state);
+                return;
+            }
+        }
+        auto &bigBuffers = *view.bigBuffers;
+        for (int i = 0; i < (int)bigBuffers.size(); i++) {
+            if (bigBuffers[i].data == ret) {
+                state = cudaSetDevice(view.device);
+                state = cudaFree(bigBuffers[i].data);
+                if (cudaSuccess != state) {
+                    printf("Error: CUDA error when force releasing big memory on device %d!", view.device);
+                }
+                bigBuffers.erase(bigBuffers.begin() + i);
+#ifdef CUDA_MEM_DEBUG
+                CudaMemDebugRemove(ret);
+#endif
+                FastllmCudaSetDevice(oriId);
+                checkCudaErrors("CUDA error when force releasing big memory!", state);
+                return;
+            }
+        }
+    }
+#ifdef CUDA_MEM_DEBUG
+    CudaMemDebugRemove(ret);
+#endif
+    state = cudaFree(ret);
+    FastllmCudaSetDevice(oriId);
+    checkCudaErrors("CUDA error when force releasing uncached memory!", state);
 }
 
 void FastllmCudaFree(void *ret) {

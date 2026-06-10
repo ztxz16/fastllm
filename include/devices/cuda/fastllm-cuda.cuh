@@ -125,6 +125,7 @@ void FastllmCudaClearBigBuffer();
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);
 #endif
 void *FastllmCudaMalloc(size_t size);
+void FastllmCudaForceFree(void *ret);
 void FastllmCudaFree(void *ret);
 void DisableCudaMalloc();
 // 由 multicuda 在 NCCL 初始化成功后置位；置位后真实 cudaMalloc 前会先排空在途 NCCL 集合通信，
@@ -467,6 +468,10 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data
 void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k);
 bool FastllmCudaHalfMatMulFloatFP8E4M3Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatFP8E4M3AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);
+bool FastllmCudaRegisterMoeFp8ExpertTableFromPacked(fastllm::Data **weights, int weightsBatch, int hidden, int inter,
+                                                    void *packedGateWeights, void *packedGateScales,
+                                                    void *packedDownWeights, void *packedDownScales,
+                                                    int gateBlockM, int gateBlockK, int downBlockM, int downBlockK);
 bool FastllmCudaHalfMergeMOEFP8E4M3Batch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                           fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
                                           bool scoresOnCuda, int topk, int hidden, int inter);
@@ -566,6 +571,7 @@ bool FastllmCudaBFloat16MergeMOENVFP4GroupedIndexed(const fastllm::Data &input, 
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -573,13 +579,31 @@ bool FastllmCudaBFloat16MergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::
                                            fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
                                            bool scoresOnCuda, int topk, int hidden, int inter);
 
-
 bool FastllmCudaTritonLinearFP8E4M3Block128(
     const char *quantCubitPath, const char *quantKernelName, int quantNumWarps, int quantShared,
     const char *matmulCubitPath, const char *matmulKernelName, int matmulNumWarps, int matmulShared,
     int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight,
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
     int n, int m, int k);
+
+bool FastllmCudaTritonMergeMOEFP8E4M3Indexed(
+    const char *const *cubinPaths, const char *const *kernelNames,
+    const int *numWarps, const int *shared,
+    int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN, int groupBlockK, int groupSizeM,
+    const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
+    fastllm::Data **weights, int weightsBatch, const int32_t *indices, const float *scores,
+    int batch, int topk, int hidden, int inter);
+bool FastllmCudaTritonMergeMOEFP8E4M3IndexedIsPacked(
+    fastllm::Data **weights, int weightsBatch, int hidden, int inter);
+
+bool FastllmCudaTritonFusedMOEFP8E4M3(
+    const char *const *cubinPaths, const char *const *kernelNames,
+    const int *numWarps, const int *shared,
+    int routeBlockT, int maxExperts, int groupBlockM, int groupBlockN, int groupBlockK, int groupSizeM,
+    const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up, fastllm::Data &down,
+    const fastllm::Data &index, const fastllm::Data &score,
+    fastllm::Data &w1, fastllm::Data &output,
+    int batch, int topk, int hidden, int inter, int experts);
 
 bool FastllmCudaHalfMatMulFloat16Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 

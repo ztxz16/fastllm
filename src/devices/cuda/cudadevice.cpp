@@ -66,6 +66,14 @@ namespace fastllm {
                strcmp(v, "disable") != 0 && strcmp(v, "DISABLE") != 0;
     }
 
+    static bool CudaEnvFlagDefaultEnabled(const char *name, bool fallback) {
+        const char *v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') {
+            return fallback;
+        }
+        return CudaEnvFlagEnabled(name);
+    }
+
     static int CudaEnvInt(const char *name, int fallback) {
         const char *v = std::getenv(name);
         if (v == nullptr || v[0] == '\0') {
@@ -77,14 +85,6 @@ namespace fastllm {
             return fallback;
         }
         return (int)value;
-    }
-
-    static bool CudaEnvFlagDefaultEnabled(const char *name, bool fallback) {
-        const char *v = std::getenv(name);
-        if (v == nullptr || v[0] == '\0') {
-            return fallback;
-        }
-        return CudaEnvFlagEnabled(name);
     }
 
     static int CudaEnvIntRange(const char *name, int fallback, int minValue, int maxValue) {
@@ -107,6 +107,22 @@ namespace fastllm {
         "matmul",
     };
 
+    static const int kCudaTritonMergeMoeFp8KernelCount = 12;
+    static const char *kCudaTritonMergeMoeFp8KernelKeys[kCudaTritonMergeMoeFp8KernelCount] = {
+        "init_count",
+        "zero_route",
+        "count",
+        "prefix",
+        "fill_sorted",
+        "scatter_blocks",
+        "quant_input",
+        "gateup",
+        "gateup_fused",
+        "swiglu_quant",
+        "down",
+        "sum_output",
+    };
+
     struct CudaTritonKernelMeta {
         std::string cubinPath;
         std::string kernelName;
@@ -125,6 +141,16 @@ namespace fastllm {
         int numStages = 3;
         bool hasBias = false;
         bool packedWeight = true;
+    };
+
+    struct CudaTritonMergeMoeFp8Meta {
+        CudaTritonKernelMeta kernels[kCudaTritonMergeMoeFp8KernelCount];
+        int routeBlockT = 1024;
+        int maxExperts = 256;
+        int groupBlockM = 16;
+        int groupBlockN = 128;
+        int groupBlockK = 128;
+        int groupSizeM = 32;
     };
 
     static std::string CudaTritonHomePath() {
@@ -228,6 +254,24 @@ namespace fastllm {
         return os.str();
     }
 
+    static std::string CudaTritonMergeMoeFp8BaseName(
+        const std::string &inputDtype, int arch,
+        int routeBlockT, int maxExperts, int topk, int hidden, int inter,
+        int groupBlockM, int groupBlockN, int groupBlockK,
+        int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages) {
+        std::ostringstream os;
+        os << "merge_moe_fp8_v34_" << inputDtype
+           << "_sm" << arch
+           << "_rt" << routeBlockT << "_me" << maxExperts
+           << "_tk" << topk
+           << "_h" << hidden << "_i" << inter
+           << "_gm" << groupBlockM << "_gn" << groupBlockN << "_gk" << groupBlockK
+           << "_gsm" << groupSizeM
+           << "_rnw" << routeNumWarps << "_gnw" << groupNumWarps
+           << "_ns" << numStages;
+        return os.str();
+    }
+
     static bool CudaTritonReadTextFile(const std::string &path, std::string &text) {
         std::ifstream file(path);
         if (!file.good()) {
@@ -266,6 +310,42 @@ namespace fastllm {
         json11::Json kernels = json["kernels"];
         for (int i = 0; i < kCudaTritonLinearFp8Block128KernelCount; i++) {
             json11::Json item = kernels[kCudaTritonLinearFp8Block128KernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() || meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 || !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonReadMergeMoeFp8Meta(const std::string &path, CudaTritonMergeMoeFp8Meta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value()) {
+            return false;
+        }
+        meta.routeBlockT = json["route_block_t"].int_value();
+        meta.maxExperts = json["max_experts"].int_value();
+        meta.groupBlockM = json["group_block_m"].int_value();
+        meta.groupBlockN = json["group_block_n"].int_value();
+        meta.groupBlockK = json["group_block_k"].int_value();
+        meta.groupSizeM = json["group_size_m"].int_value();
+        if (meta.routeBlockT <= 0 || meta.maxExperts <= 0 ||
+            meta.groupBlockM <= 0 || meta.groupBlockN <= 0 || meta.groupBlockK <= 0 ||
+            meta.groupSizeM < 0) {
+            return false;
+        }
+        json11::Json kernels = json["kernels"];
+        for (int i = 0; i < kCudaTritonMergeMoeFp8KernelCount; i++) {
+            json11::Json item = kernels[kCudaTritonMergeMoeFp8KernelKeys[i]];
             meta.kernels[i].cubinPath = item["cubin"].string_value();
             meta.kernels[i].kernelName = item["kernel"].string_value();
             meta.kernels[i].shared = item["shared"].int_value();
@@ -553,6 +633,148 @@ namespace fastllm {
         return true;
     }
 
+    static bool CudaTritonRequestMergeMoeFp8Kernel(
+        const std::string &cacheDir, const std::string &inputDtype, int arch,
+        int routeBlockT, int maxExperts, int topk, int hidden, int inter,
+        int groupBlockM, int groupBlockN, int groupBlockK,
+        int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages,
+        CudaTritonMergeMoeFp8Meta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "merge_moe_fp8"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"input_dtype", inputDtype},
+            {"route_block_t", routeBlockT},
+            {"max_experts", maxExperts},
+            {"topk", topk},
+            {"hidden", hidden},
+            {"inter", inter},
+            {"group_block_m", groupBlockM},
+            {"group_block_n", groupBlockN},
+            {"group_block_k", groupBlockK},
+            {"group_size_m", groupSizeM},
+            {"route_num_warps", routeNumWarps},
+            {"group_num_warps", groupNumWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() || !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                std::string message = response["error"].string_value();
+                printf("Fastllm Triton: compile failed, fallback to built-in CUDA mergeMoe. %s\n", message.c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.routeBlockT = response["route_block_t"].int_value();
+        meta.maxExperts = response["max_experts"].int_value();
+        meta.groupBlockM = response["group_block_m"].int_value();
+        meta.groupBlockN = response["group_block_n"].int_value();
+        meta.groupBlockK = response["group_block_k"].int_value();
+        meta.groupSizeM = response["group_size_m"].int_value();
+        if (meta.routeBlockT <= 0 || meta.maxExperts <= 0 ||
+            meta.groupBlockM <= 0 || meta.groupBlockN <= 0 || meta.groupBlockK <= 0 ||
+            meta.groupSizeM < 0) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0; i < kCudaTritonMergeMoeFp8KernelCount; i++) {
+            json11::Json item = kernels[kCudaTritonMergeMoeFp8KernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() || meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 || !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonGetMergeMoeFp8Meta(
+        const std::string &cacheDir, const std::string &base, const std::string &inputDtype, int arch,
+        int routeBlockT, int maxExperts, int topk, int hidden, int inter,
+        int groupBlockM, int groupBlockN, int groupBlockK,
+        int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages,
+        const CudaTritonMergeMoeFp8Meta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonMergeMoeFp8Meta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonMergeMoeFp8Meta loaded;
+        if (!CudaTritonReadMergeMoeFp8Meta(metaPath, loaded)) {
+            if (!CudaTritonRequestMergeMoeFp8Kernel(
+                    cacheDir, inputDtype, arch,
+                    routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+                    groupSizeM, routeNumWarps, groupNumWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool TryCudaCutlassLinearFp8Block128(
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
+        if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8", true)) {
+            return false;
+        }
+        if (n <= 0 || m <= 0 || k <= 0 || (m % 128) != 0 || (k % 128) != 0 ||
+            input.dataDevice != DataDevice::CUDA || input.cudaData == nullptr ||
+            weight.dataDevice != DataDevice::CUDA || weight.cudaData == nullptr ||
+            weight.dataType != DataType::FP8_E4M3 ||
+            weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m ||
+            weight.blockK != 128 || weight.blockM != 128 || weight.scales.empty() ||
+            (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) ||
+            output.dataType != input.dataType) {
+            return false;
+        }
+        bool hasBias = bias.dims.size() > 0;
+        if (hasBias && (bias.dataType != DataType::FLOAT32 || bias.cudaData == nullptr)) {
+            return false;
+        }
+
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 2);
+        if (n < minBatch) {
+            return false;
+        }
+        int maxBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MAX_BATCH", 0);
+        if (maxBatch > 0 && n > maxBatch) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch != 120 && arch != 121) {
+            return false;
+        }
+        return FastllmCudaCutlassLinearFP8E4M3Block128(input, weight, bias, output, n, m, k);
+    }
+
     static bool TryCudaTritonLinearFp8Block128(
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
         if (!GetFastllmEnv().cudaTriton ||
@@ -633,12 +855,222 @@ namespace fastllm {
             input, weight, bias, output, n, m, k);
     }
 
+    static bool TryCudaTritonMergeMOEFp8Indexed(
+        Data &input, Data &output, Data &index, Data &score, int batch, int topk,
+        Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        if (!GetFastllmEnv().cudaTriton) {
+            return false;
+        }
+        const char *moeEnv = std::getenv("FASTLLM_CUDA_TRITON_MERGE_MOE");
+        if (moeEnv != nullptr && moeEnv[0] != '\0' && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MERGE_MOE")) {
+            return false;
+        }
+        if (batch <= 0 || topk <= 0 || gateType != MoeGateSwiglu ||
+            input.dataDevice != DataDevice::CUDA ||
+            (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) ||
+            input.cudaData == nullptr || input.dims.size() == 0 || input.dims[0] != batch ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 || index.cudaData == nullptr ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 || score.cudaData == nullptr ||
+            weights == nullptr || weightsBatch < 4 || (weightsBatch & 1)) {
+            return false;
+        }
+        if (weights[0] != nullptr && sharedScale != 0.0f) {
+            return false;
+        }
+
+        int hidden = input.dims.back();
+        Data *gateup = weights[2];
+        Data *down = weights[3];
+        if (gateup == nullptr || down == nullptr ||
+            gateup->dataType != DataType::FP8_E4M3 || down->dataType != DataType::FP8_E4M3 ||
+            gateup->dims.size() != 2 || down->dims.size() != 2 ||
+            gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
+            down->dims[0] != hidden) {
+            return false;
+        }
+        int inter = down->dims[1];
+        if (hidden <= 0 || inter <= 0) {
+            return false;
+        }
+
+        std::string inputDtype;
+        if (!CudaTritonDataTypeName(input.dataType, inputDtype)) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch <= 0) {
+            return false;
+        }
+
+        int routeBlockT = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_BLOCK_T", 1024);
+        int maxExperts = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MAX_EXPERTS", 256);
+        int experts = weightsBatch / 2 - 1;
+        int groupBlockM = batch <= 64 ? 16 : 64;
+        int groupBlockN = 128;
+        int groupBlockK = 128;
+        int groupSizeM = batch <= 16 ? 1 : 32;
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MIN_BATCH", 16);
+        bool packedTableReady = FastllmCudaTritonMergeMOEFP8E4M3IndexedIsPacked(
+            weights, weightsBatch, hidden, inter);
+        if (batch < minBatch && !packedTableReady) {
+            return false;
+        }
+        int routeNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_NUM_WARPS", 4);
+        int groupNumWarps = 4;
+        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_NUM_STAGES", 3);
+        if (experts <= 0 || experts > maxExperts || groupBlockN != groupBlockK) {
+            return false;
+        }
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonMergeMoeFp8BaseName(
+            inputDtype, arch,
+            routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+            groupSizeM, routeNumWarps, groupNumWarps, numStages);
+
+        const CudaTritonMergeMoeFp8Meta *meta = nullptr;
+        if (!CudaTritonGetMergeMoeFp8Meta(
+                cacheDir, base, inputDtype, arch,
+                routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+                groupSizeM, routeNumWarps, groupNumWarps, numStages, meta)) {
+            if (packedTableReady) {
+                ErrorInFastLLM("Fastllm Triton MergeMOE source weights have been released, but Triton metadata is unavailable.\n");
+            }
+            return false;
+        }
+        if (meta == nullptr || experts > meta->maxExperts) {
+            if (packedTableReady) {
+                ErrorInFastLLM("Fastllm Triton MergeMOE source weights have been released, but Triton metadata is incompatible.\n");
+            }
+            return false;
+        }
+        const char *cubinPaths[kCudaTritonMergeMoeFp8KernelCount];
+        const char *kernelNames[kCudaTritonMergeMoeFp8KernelCount];
+        int kernelWarps[kCudaTritonMergeMoeFp8KernelCount];
+        int kernelShared[kCudaTritonMergeMoeFp8KernelCount];
+        for (int i = 0; i < kCudaTritonMergeMoeFp8KernelCount; i++) {
+            cubinPaths[i] = meta->kernels[i].cubinPath.c_str();
+            kernelNames[i] = meta->kernels[i].kernelName.c_str();
+            kernelWarps[i] = meta->kernels[i].numWarps;
+            kernelShared[i] = meta->kernels[i].shared;
+        }
+        bool ok = FastllmCudaTritonMergeMOEFP8E4M3Indexed(
+            cubinPaths, kernelNames, kernelWarps, kernelShared,
+            meta->routeBlockT, meta->maxExperts, meta->groupBlockM, meta->groupBlockN, meta->groupBlockK,
+            meta->groupSizeM,
+            input, w1, output, weights, weightsBatch,
+            (const int32_t*)index.cudaData, (const float*)score.cudaData,
+            batch, topk, hidden, inter);
+        if (!ok && packedTableReady) {
+            ErrorInFastLLM("Fastllm Triton MergeMOE source weights have been released, but Triton launch failed.\n");
+        }
+        return ok;
+    }
+
+    static bool TryCudaTritonFusedMOEFp8(
+        Data &input, Data &output, Data &index, Data &score,
+        Data &gate, Data &up, Data &down, Data &w1,
+        int batch, int topk, int hidden, int inter, int experts,
+        MoeGateType gateType, float swigluLimit) {
+        if (!GetFastllmEnv().cudaTriton) {
+            return false;
+        }
+        const char *moeEnv = std::getenv("FASTLLM_CUDA_TRITON_MERGE_MOE");
+        if (moeEnv != nullptr && moeEnv[0] != '\0' && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MERGE_MOE")) {
+            return false;
+        }
+        if (batch <= 0 || topk <= 0 || hidden <= 0 || inter <= 0 || experts <= 0 ||
+            gateType != MoeGateSwiglu || swigluLimit != 0.0f ||
+            input.dataDevice != DataDevice::CUDA ||
+            (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) ||
+            input.cudaData == nullptr || input.Count(0) != (uint64_t)batch * hidden ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 || index.cudaData == nullptr ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 || score.cudaData == nullptr ||
+            index.Count(0) != (uint64_t)batch * topk || score.Count(0) != (uint64_t)batch * topk ||
+            gate.dataDevice != DataDevice::CUDA || up.dataDevice != DataDevice::CUDA || down.dataDevice != DataDevice::CUDA ||
+            gate.dataType != DataType::FP8_E4M3 || up.dataType != DataType::FP8_E4M3 || down.dataType != DataType::FP8_E4M3 ||
+            gate.cudaData == nullptr || up.cudaData == nullptr || down.cudaData == nullptr ||
+            gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty() ||
+            gate.dims.size() != 3 || up.dims.size() != 3 || down.dims.size() != 3 ||
+            gate.dims[0] != experts || gate.dims[1] != inter || gate.dims[2] != hidden ||
+            up.dims[0] != experts || up.dims[1] != inter || up.dims[2] != hidden ||
+            down.dims[0] != experts || down.dims[1] != hidden || down.dims[2] != inter) {
+            return false;
+        }
+
+        std::string inputDtype;
+        if (!CudaTritonDataTypeName(input.dataType, inputDtype)) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch <= 0) {
+            return false;
+        }
+
+        int routeBlockT = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_BLOCK_T", 1024);
+        int maxExperts = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MAX_EXPERTS", 256);
+        int groupBlockM = batch <= 64 ? 16 : 64;
+        int groupBlockN = 128;
+        int groupBlockK = 128;
+        int groupSizeM = batch <= 16 ? 1 : 32;
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MIN_BATCH", 16);
+        if (batch < minBatch) {
+            return false;
+        }
+        int routeNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_NUM_WARPS", 4);
+        int groupNumWarps = 4;
+        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_NUM_STAGES", 3);
+        if (experts > maxExperts || groupBlockN != groupBlockK) {
+            return false;
+        }
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonMergeMoeFp8BaseName(
+            inputDtype, arch,
+            routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+            groupSizeM, routeNumWarps, groupNumWarps, numStages);
+
+        const CudaTritonMergeMoeFp8Meta *meta = nullptr;
+        if (!CudaTritonGetMergeMoeFp8Meta(
+                cacheDir, base, inputDtype, arch,
+                routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+                groupSizeM, routeNumWarps, groupNumWarps, numStages, meta)) {
+            return false;
+        }
+        if (meta == nullptr || experts > meta->maxExperts) {
+            return false;
+        }
+        const char *cubinPaths[kCudaTritonMergeMoeFp8KernelCount];
+        const char *kernelNames[kCudaTritonMergeMoeFp8KernelCount];
+        int kernelWarps[kCudaTritonMergeMoeFp8KernelCount];
+        int kernelShared[kCudaTritonMergeMoeFp8KernelCount];
+        for (int i = 0; i < kCudaTritonMergeMoeFp8KernelCount; i++) {
+            cubinPaths[i] = meta->kernels[i].cubinPath.c_str();
+            kernelNames[i] = meta->kernels[i].kernelName.c_str();
+            kernelWarps[i] = meta->kernels[i].numWarps;
+            kernelShared[i] = meta->kernels[i].shared;
+        }
+        return FastllmCudaTritonFusedMOEFP8E4M3(
+            cubinPaths, kernelNames, kernelWarps, kernelShared,
+            meta->routeBlockT, meta->maxExperts, meta->groupBlockM, meta->groupBlockN, meta->groupBlockK,
+            meta->groupSizeM,
+            input, gate, up, down, index, score, w1, output,
+            batch, topk, hidden, inter, experts);
+    }
 #else
     static bool TryCudaTritonLinearFp8Block128(
         Data &, Data &, const Data &, Data &, int, int, int) {
         return false;
     }
 
+    static bool TryCudaTritonMergeMOEFp8Indexed(
+        Data &, Data &, Data &, Data &, int, int, Data &, Data **, int, float, MoeGateType) {
+        return false;
+    }
+
+    static bool TryCudaTritonFusedMOEFp8(
+        Data &, Data &, Data &, Data &, Data &, Data &, Data &, Data &,
+        int, int, int, int, int, MoeGateType, float) {
+        return false;
+    }
 #endif
 
     static void InvalidateCpuMirror(Data &data) {
@@ -1264,7 +1696,8 @@ namespace fastllm {
             } else if (weight.dataType == DataType::INT4_NOZERO) {
                 FastllmCudaHalfMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
-                if (!TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                if (!TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
+                    !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
                     FastllmCudaHalfMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
                 }
             } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
@@ -1320,7 +1753,8 @@ namespace fastllm {
             } else if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaBFloat16MatMulFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
-                if (!TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                if (!TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
+                    !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
                     FastllmCudaBFloat16MatMulFP8E4M3(input, weight, bias, output, n, m, k);
                 }
             } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
@@ -3570,6 +4004,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 
         int inter = down->dims[1];
         if (isFp8) {
+            if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, 1, topk,
+                                                w1, weights, weightsBatch, sharedScale, gateType)) {
+                return true;
+            }
             return input.dataType == DataType::FLOAT16 ?
                 FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
                                                             (const int32_t*)index.cudaData, (const float*)score.cudaData,
@@ -3628,6 +4066,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 
         int inter = down->dims[1];
         if (isFp8) {
+            if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, batch, topk,
+                                                w1, weights, weightsBatch, sharedScale, gateType)) {
+                return true;
+            }
             return input.dataType == DataType::FLOAT16 ?
                 FastllmCudaHalfMergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
                                                                 (const int32_t*)index.cudaData, (const float*)score.cudaData,
@@ -3769,6 +4211,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 int topk = index.dims[1];
                 if (TryCudaMergeMOESmallBatchFp8Indexed(input, output, index, score, batch, topk,
                                                         w1, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
+            } else if (batch > 64 && index.dims.size() >= 2) {
+                int topk = index.dims[1];
+                if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, batch, topk,
+                                                    w1, weights, weightsBatch, sharedScale, gateType)) {
                     return;
                 }
             }
@@ -4074,6 +4522,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         };
         clearIfOnOtherDevice(w1);
         clearIfOnOtherDevice(output);
+
+        if (isFp8 &&
+            TryCudaTritonFusedMOEFp8(input, output, index, score, gate, up, down, w1,
+                                     batch, topk, hidden, inter, experts, gateType, swigluLimit)) {
+            return;
+        }
 
         bool ok = false;
         if (isFp8Block128) {

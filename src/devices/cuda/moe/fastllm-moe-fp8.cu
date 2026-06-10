@@ -3833,6 +3833,86 @@ struct FastllmMoeFp8ExpertTable {
 
 static std::map<std::pair<int, const void*>, FastllmMoeFp8ExpertTable> fastllmMoeFp8ExpertTables;
 
+bool FastllmCudaRegisterMoeFp8ExpertTableFromPacked(fastllm::Data **weights, int weightsBatch, int hidden, int inter,
+                                                    void *packedGateWeights, void *packedGateScales,
+                                                    void *packedDownWeights, void *packedDownScales,
+                                                    int gateBlockM, int gateBlockK, int downBlockM, int downBlockK) {
+    if (weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
+        hidden <= 0 || inter <= 0 || gateBlockM <= 0 || gateBlockK <= 0 || downBlockM <= 0 || downBlockK <= 0 ||
+        packedGateWeights == nullptr || packedGateScales == nullptr ||
+        packedDownWeights == nullptr || packedDownScales == nullptr) {
+        return false;
+    }
+    int experts = weightsBatch / 2 - 1;
+    if (experts <= 0 || weights[2] == nullptr) {
+        return false;
+    }
+
+    int gateScaleRows = (inter * 2 + gateBlockK - 1) / gateBlockK;
+    int gateScaleCols = (hidden + gateBlockM - 1) / gateBlockM;
+    int downScaleRows = (hidden + downBlockK - 1) / downBlockK;
+    int downScaleCols = (inter + downBlockM - 1) / downBlockM;
+    size_t gateWeightBytes = (size_t)inter * 2 * hidden;
+    size_t downWeightBytes = (size_t)hidden * inter;
+    size_t gateScaleElements = (size_t)gateScaleRows * gateScaleCols;
+    size_t downScaleElements = (size_t)downScaleRows * downScaleCols;
+
+    std::vector<uint8_t*> hGateWeights(experts), hDownWeights(experts);
+    std::vector<float*> hGateScales(experts), hDownScales(experts);
+    for (int e = 0; e < experts; e++) {
+        hGateWeights[e] = (uint8_t*)packedGateWeights + (size_t)e * gateWeightBytes;
+        hDownWeights[e] = (uint8_t*)packedDownWeights + (size_t)e * downWeightBytes;
+        hGateScales[e] = (float*)packedGateScales + (size_t)e * gateScaleElements;
+        hDownScales[e] = (float*)packedDownScales + (size_t)e * downScaleElements;
+    }
+
+    int deviceId = FastllmCudaGetDevice();
+    auto key = std::make_pair(deviceId, (const void*)weights[2]);
+    FastllmMoeFp8ExpertTable &cached = fastllmMoeFp8ExpertTables[key];
+    if (cached.inited &&
+        (cached.experts != experts || cached.hidden != hidden || cached.inter != inter)) {
+        return false;
+    }
+
+    size_t ptrBytes = (size_t)experts * sizeof(void*);
+    if (cached.gateWeights == nullptr) {
+        cached.gateWeights = (uint8_t**)FastllmCudaMalloc(ptrBytes);
+    }
+    if (cached.gateScales == nullptr) {
+        cached.gateScales = (float**)FastllmCudaMalloc(ptrBytes);
+    }
+    if (cached.downWeights == nullptr) {
+        cached.downWeights = (uint8_t**)FastllmCudaMalloc(ptrBytes);
+    }
+    if (cached.downScales == nullptr) {
+        cached.downScales = (float**)FastllmCudaMalloc(ptrBytes);
+    }
+    if (cached.gateWeights == nullptr || cached.gateScales == nullptr ||
+        cached.downWeights == nullptr || cached.downScales == nullptr) {
+        return false;
+    }
+
+    cudaError_t state = cudaSuccess;
+    state = cudaMemcpyAsync(cached.gateWeights, hGateWeights.data(), ptrBytes, cudaMemcpyHostToDevice);
+    checkCudaErrors("Error: CUDA error when registering packed MoE gate pointer table!", state);
+    state = cudaMemcpyAsync(cached.gateScales, hGateScales.data(), ptrBytes, cudaMemcpyHostToDevice);
+    checkCudaErrors("Error: CUDA error when registering packed MoE gate scale table!", state);
+    state = cudaMemcpyAsync(cached.downWeights, hDownWeights.data(), ptrBytes, cudaMemcpyHostToDevice);
+    checkCudaErrors("Error: CUDA error when registering packed MoE down pointer table!", state);
+    state = cudaMemcpyAsync(cached.downScales, hDownScales.data(), ptrBytes, cudaMemcpyHostToDevice);
+    checkCudaErrors("Error: CUDA error when registering packed MoE down scale table!", state);
+
+    cached.inited = true;
+    cached.experts = experts;
+    cached.hidden = hidden;
+    cached.inter = inter;
+    cached.gateBlockM = gateBlockM;
+    cached.gateBlockK = gateBlockK;
+    cached.downBlockM = downBlockM;
+    cached.downBlockK = downBlockK;
+    return true;
+}
+
 static bool FastllmGetMoeFp8ExpertTable(fastllm::Data **weights, int weightsBatch, int hidden, int inter,
                                         FastllmMoeFp8ExpertTable *&table) {
     if (weights == nullptr || weightsBatch < 4 || (weightsBatch & 1)) {
