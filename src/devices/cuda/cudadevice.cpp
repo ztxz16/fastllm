@@ -760,7 +760,7 @@ namespace fastllm {
             return false;
         }
 
-        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 2);
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
         if (n < minBatch) {
             return false;
         }
@@ -1106,6 +1106,7 @@ namespace fastllm {
         this->ops["RMSNormPart"] = (BaseOperator*)(new CudaRMSNormPartOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
+        this->ops["SwigluLinearAdd"] = (BaseOperator*)(new CudaSwigluLinearAddOp());
         this->ops["LinearSwiglu"] = (BaseOperator*)(new CudaLinearSwigluOp());
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
@@ -1850,6 +1851,94 @@ namespace fastllm {
             // output += middle
             FastllmCudaAddTo(output, middle, 1.0f);
         }
+    }
+
+    static bool CanUseCudaCutlassSwigluLinearAdd(
+        const Data &input, const Data &weight, const Data &bias, const Data &output) {
+        if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT", true)) {
+            return false;
+        }
+        if (input.dims.empty() || weight.dims.size() != 2 || output.dims.empty()) {
+            return false;
+        }
+        int gateup = input.dims.back();
+        if ((gateup % 2) != 0) {
+            return false;
+        }
+        int inter = gateup / 2;
+        int hidden = output.dims.back();
+        return (input.dataType == DataType::FLOAT16 || input.dataType == DataType::BFLOAT16) &&
+               output.dataType == input.dataType &&
+               weight.dataType == DataType::FP8_E4M3 &&
+               weight.blockM == 128 && weight.blockK == 128 && !weight.scales.empty() &&
+               weight.dims[0] == hidden && weight.dims[1] == inter &&
+               (inter % 128) == 0 && (hidden % 128) == 0 &&
+               (bias.dims.empty() || bias.dataType == DataType::FLOAT32);
+    }
+
+    void CudaSwigluLinearAddOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+
+        AssertInFastLLM(input.dims.size() > 0 && (input.dims.back() % 2) == 0,
+                        "SwigluLinearAdd's input last dimension should be even.\n");
+        AssertInFastLLM(weight.dims.size() == 2, "SwigluLinearAdd's weight's shape's size should be 2.\n");
+        AssertInFastLLM(input.dims.back() / 2 == weight.dims[1], "SwigluLinearAdd's weight's shape error.\n");
+        AssertInFastLLM(output.dims.size() > 0 && output.dims.back() == weight.dims[0],
+                        "SwigluLinearAdd's output's shape doesn't match weight.\n");
+
+        std::vector<int> dims = input.dims;
+        dims.back() = weight.dims[0];
+        middle.dataType = input.dataType;
+        middle.Resize(dims);
+        weight.weightType = WeightType::LINEAR;
+    }
+
+    bool CudaSwigluLinearAddOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        auto inputIt = datas.find("input");
+        auto weightIt = datas.find("weight");
+        auto biasIt = datas.find("bias");
+        auto outputIt = datas.find("output");
+        if (inputIt == datas.end() || weightIt == datas.end() ||
+            biasIt == datas.end() || outputIt == datas.end() ||
+            inputIt->second == nullptr || weightIt->second == nullptr ||
+            biasIt->second == nullptr || outputIt->second == nullptr) {
+            return false;
+        }
+        return CanUseCudaCutlassSwigluLinearAdd(
+            *inputIt->second, *weightIt->second, *biasIt->second, *outputIt->second);
+    }
+
+    void CudaSwigluLinearAddOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back() / 2;
+        int k = weight.dims[0];
+        middle.Allocate(false);
+        bool ok = FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(input, weight, bias, middle, n, m, k);
+        if (!ok) {
+            Data swiglu;
+            DoCudaSwigluReshape(input, swiglu);
+            DoCudaSwiglu(input, swiglu);
+            if (DoCudaLinearAdd(swiglu, weight, bias, output)) {
+                return;
+            }
+            DoCudaLinearReshape(swiglu, weight, middle);
+            DoCudaLinear(swiglu, weight, bias, middle);
+        }
+        AssertInFastLLM(middle.dataType == output.dataType,
+                        "SwigluLinearAdd fallback requires middle and output dtype to match.\n");
+        FastllmCudaAddTo(output, middle, 1.0f);
     }
 
     void CudaLinearSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,

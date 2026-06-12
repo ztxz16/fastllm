@@ -3728,6 +3728,16 @@ namespace fastllm {
         return curExecutor->CanRunOnFirstDevice("LinearAdd", {{"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"output", (Data*)&output}}, {}, {});
     }
 
+    void SwigluLinearAdd(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output) {
+        curExecutor->Run("SwigluLinearAdd",
+            {{"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"middle", &middle}, {"output", &output}},
+        {}, {});
+    }
+
+    bool CanRunSwigluLinearAdd(const Data &input, const Data &weight, const Data &bias, const Data &output) {
+        return curExecutor->CanRunOnFirstDevice("SwigluLinearAdd", {{"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"output", (Data*)&output}}, {}, {});
+    }
+
     void LinearSwiglu(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output) {
         curExecutor->Run("LinearSwiglu", {
             {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"middle", (Data*)&middle}, {"output", (Data*)&output}

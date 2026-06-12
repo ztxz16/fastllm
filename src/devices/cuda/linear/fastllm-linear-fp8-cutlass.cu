@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -217,12 +218,18 @@ struct FastllmCutlassInputFp8QuantTraits<half> {
     __device__ static inline float ToFloat(uint16_t bits) {
         return __half2float(__ushort_as_half(bits));
     }
+    __device__ static inline half FromBits(uint16_t bits) {
+        return __ushort_as_half(bits);
+    }
 };
 
 template <>
 struct FastllmCutlassInputFp8QuantTraits<__nv_bfloat16> {
     __device__ static inline float ToFloat(uint16_t bits) {
         return __bfloat162float(__ushort_as_bfloat16(bits));
+    }
+    __device__ static inline __nv_bfloat16 FromBits(uint16_t bits) {
+        return __ushort_as_bfloat16(bits);
     }
 };
 
@@ -331,16 +338,122 @@ __global__ void __launch_bounds__(256) FastllmCutlassQuantInputFp8PackedWarpKern
     reinterpret_cast<uint32_t *>(quant + blockOffset)[laneId] = packed;
 }
 
+__device__ inline float FastllmCutlassRoundedSwiglu(half gate, half up) {
+#ifdef CUDA_NO_TENSOR_CORE
+    float x = __half2float(gate);
+    float y = __half2float(up);
+    half rounded = __float2half((x / (1.0 + expf(-x))) * y);
+#else
+    half rounded = __hmul(__hdiv(gate, __hadd(__float2half(1.0), hexp(-gate))), up);
+#endif
+    return __half2float(rounded);
+}
+
+__device__ inline float FastllmCutlassRoundedSwiglu(__nv_bfloat16 gate, __nv_bfloat16 up) {
+    float x = __bfloat162float(gate);
+    float y = __bfloat162float(up);
+    __nv_bfloat16 rounded = __float2bfloat16((x / (1.0f + expf(-x))) * y);
+    return __bfloat162float(rounded);
+}
+
+template <typename T>
+__device__ inline void FastllmCutlassLoad4RoundedSwiglu(
+    const T *__restrict__ gatePtr, const T *__restrict__ upPtr, float (&values)[4]) {
+    uint2 gatePacked = *reinterpret_cast<const uint2 *>(gatePtr);
+    uint2 upPacked = *reinterpret_cast<const uint2 *>(upPtr);
+    values[0] = FastllmCutlassRoundedSwiglu(
+        FastllmCutlassInputFp8QuantTraits<T>::FromBits((uint16_t)(gatePacked.x & 0xffffu)),
+        FastllmCutlassInputFp8QuantTraits<T>::FromBits((uint16_t)(upPacked.x & 0xffffu)));
+    values[1] = FastllmCutlassRoundedSwiglu(
+        FastllmCutlassInputFp8QuantTraits<T>::FromBits((uint16_t)(gatePacked.x >> 16)),
+        FastllmCutlassInputFp8QuantTraits<T>::FromBits((uint16_t)(upPacked.x >> 16)));
+    values[2] = FastllmCutlassRoundedSwiglu(
+        FastllmCutlassInputFp8QuantTraits<T>::FromBits((uint16_t)(gatePacked.y & 0xffffu)),
+        FastllmCutlassInputFp8QuantTraits<T>::FromBits((uint16_t)(upPacked.y & 0xffffu)));
+    values[3] = FastllmCutlassRoundedSwiglu(
+        FastllmCutlassInputFp8QuantTraits<T>::FromBits((uint16_t)(gatePacked.y >> 16)),
+        FastllmCutlassInputFp8QuantTraits<T>::FromBits((uint16_t)(upPacked.y >> 16)));
+}
+
+template <typename T, int WARPS_PER_BLOCK>
+__global__ void __launch_bounds__(256) FastllmCutlassSwigluQuantInputFp8PackedWarpKernel(
+    const T *__restrict__ gateup, cutlass::float_e4m3_t *__restrict__ quant,
+    float *__restrict__ scales, int rows, int cols, int gateupStride, int scaleCols) {
+    int warpId = threadIdx.x >> 5;
+    int laneId = threadIdx.x & 31;
+    int task = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    int totalTasks = rows * scaleCols;
+    if (task >= totalTasks) {
+        return;
+    }
+
+    int row = task / scaleCols;
+    int group = task - row * scaleCols;
+    int base = group * 128;
+    size_t gateOffset = (size_t)row * gateupStride + base + laneId * 4;
+    size_t blockOffset = (size_t)row * cols + base;
+
+    float values[4];
+    FastllmCutlassLoad4RoundedSwiglu(gateup + gateOffset, gateup + gateOffset + cols, values);
+
+    float maxAbs = fmaxf(fmaxf(fabsf(values[0]), fabsf(values[1])),
+                         fmaxf(fabsf(values[2]), fabsf(values[3])));
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        maxAbs = fmaxf(maxAbs, __shfl_down_sync(0xffffffff, maxAbs, offset));
+    }
+    maxAbs = __shfl_sync(0xffffffff, maxAbs, 0);
+
+    float scale = fmaxf(maxAbs, 1.0e-10f) * (1.0f / 448.0f);
+    if (laneId == 0) {
+        scales[(size_t)group * rows + row] = scale;
+    }
+    float invScale = 1.0f / scale;
+
+    uint32_t packed = FastllmCutlassPackFp8x4(values[0] * invScale, values[1] * invScale,
+                                             values[2] * invScale, values[3] * invScale);
+    reinterpret_cast<uint32_t *>(quant + blockOffset)[laneId] = packed;
+}
+
 static bool FastllmCutlassUseWarpQuant() {
     static const bool enabled = []() {
         const char *env = std::getenv("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_WARP_QUANT");
         if (env == nullptr || env[0] == '\0') {
             return true;
         }
-        return !(env[0] == '0' || env[0] == 'f' || env[0] == 'F' ||
-                 env[0] == 'n' || env[0] == 'N');
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 && std::strcmp(env, "FALSE") != 0 &&
+               std::strcmp(env, "off") != 0 && std::strcmp(env, "OFF") != 0 &&
+               std::strcmp(env, "no") != 0 && std::strcmp(env, "NO") != 0;
     }();
     return enabled;
+}
+
+static bool FastllmCutlassUseFusedSwigluQuant() {
+    static const bool enabled = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 && std::strcmp(env, "FALSE") != 0 &&
+               std::strcmp(env, "off") != 0 && std::strcmp(env, "OFF") != 0 &&
+               std::strcmp(env, "no") != 0 && std::strcmp(env, "NO") != 0;
+    }();
+    return enabled;
+}
+
+static int FastllmCutlassEnvInt(const char *name, int fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return fallback;
+    }
+    char *end = nullptr;
+    long value = std::strtol(v, &end, 10);
+    if (end == v || value <= 0 || value > 4096) {
+        return fallback;
+    }
+    return (int)value;
 }
 
 template <typename T>
@@ -629,6 +742,114 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128(
             FastllmCutlassQuantInputFp8Kernel<<<grid, 256, 0, stream>>>(
                 (const __nv_bfloat16*)inputData, scratch->input, scratch->inputScales, n, m, scaleCols);
         }
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+        FastllmCudaFinishInput(input, inputData);
+        FastllmCudaFinishOutput(output, outputData);
+        return false;
+    }
+
+    bool ok = false;
+    if (input.dataType == fastllm::DataType::FLOAT16) {
+        ok = FastllmDispatchCutlassFp8Blockwise(
+            scratch->input, cache->weightTN, scratch->inputScales, cache->weightScales,
+            (cutlass::half_t*)outputData, n, k, m, stream);
+        if (ok && bias.dims.size() > 0) {
+            int threads = 256;
+            int blocks = (int)std::min<size_t>(4096, ((size_t)n * k + threads - 1) / threads);
+            FastllmCutlassAddFloatBiasKernel<<<blocks, threads, 0, stream>>>(
+                (half*)outputData, (const float*)bias.cudaData, n, k);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+    } else {
+        ok = FastllmDispatchCutlassFp8Blockwise(
+            scratch->input, cache->weightTN, scratch->inputScales, cache->weightScales,
+            (cutlass::bfloat16_t*)outputData, n, k, m, stream);
+        if (ok && bias.dims.size() > 0) {
+            int threads = 256;
+            int blocks = (int)std::min<size_t>(4096, ((size_t)n * k + threads - 1) / threads);
+            FastllmCutlassAddFloatBiasKernel<<<blocks, threads, 0, stream>>>(
+                (__nv_bfloat16*)outputData, (const float*)bias.cudaData, n, k);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+    }
+
+    FastllmCudaFinishInput(input, inputData);
+    FastllmCudaFinishOutput(output, outputData);
+    return ok;
+#else
+    (void)input;
+    (void)weight;
+    (void)bias;
+    (void)output;
+    (void)n;
+    (void)m;
+    (void)k;
+    return false;
+#endif
+}
+
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
+    const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
+    fastllm::Data &output, int n, int m, int k) {
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    using namespace fastllm_cuda_cutlass_fp8;
+
+    if (!FastllmCutlassUseFusedSwigluQuant() || !FastllmCutlassUseWarpQuant()) {
+        return false;
+    }
+    int minBatch = FastllmCutlassEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+    if (n < minBatch) {
+        return false;
+    }
+    int maxBatch = FastllmCutlassEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MAX_BATCH", 0);
+    if (maxBatch > 0 && n > maxBatch) {
+        return false;
+    }
+    if (n <= 0 || m <= 0 || k <= 0 || (m % 128) != 0 || (k % 128) != 0 ||
+        input.cudaData == nullptr || weight.cudaData == nullptr ||
+        input.dims.empty() || input.dims.back() != m * 2 ||
+        weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m ||
+        weight.dataType != fastllm::DataType::FP8_E4M3 ||
+        weight.blockM != 128 || weight.blockK != 128 || weight.scales.empty() ||
+        output.dataType != input.dataType ||
+        (input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16) ||
+        (bias.dims.size() > 0 && bias.dataType != fastllm::DataType::FLOAT32)) {
+        return false;
+    }
+    int arch = FastllmCudaRuntimeArch();
+    if (!FastllmCutlassFp8CompiledForRuntimeArch(arch)) {
+        return false;
+    }
+
+    FastllmCutlassFp8Scratch *scratch = nullptr;
+    FastllmCutlassFp8WeightCache *cache = nullptr;
+    cudaStream_t stream = 0;
+    if (!FastllmCutlassEnsureScratch(n, m, stream, scratch) ||
+        !FastllmCutlassEnsureWeightCache(weight, m, k, stream, cache)) {
+        return false;
+    }
+
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *outputData = FastllmCudaPrepareOutput(output);
+    if (inputData == nullptr || outputData == nullptr) {
+        FastllmCudaFinishInput(input, inputData);
+        FastllmCudaFinishOutput(output, outputData);
+        return false;
+    }
+
+    constexpr int warpQuantWarps = 8;
+    int scaleCols = (m + 127) / 128;
+    int tasks = n * scaleCols;
+    dim3 grid((tasks + warpQuantWarps - 1) / warpQuantWarps);
+    if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmCutlassSwigluQuantInputFp8PackedWarpKernel<half, warpQuantWarps><<<grid, warpQuantWarps * 32, 0, stream>>>(
+            (const half*)inputData, scratch->input, scratch->inputScales, n, m, m * 2, scaleCols);
+    } else {
+        FastllmCutlassSwigluQuantInputFp8PackedWarpKernel<__nv_bfloat16, warpQuantWarps><<<grid, warpQuantWarps * 32, 0, stream>>>(
+            (const __nv_bfloat16*)inputData, scratch->input, scratch->inputScales, n, m, m * 2, scaleCols);
     }
     if (cudaGetLastError() != cudaSuccess) {
         FastllmCudaFinishInput(input, inputData);

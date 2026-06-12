@@ -6014,17 +6014,24 @@ namespace fastllm {
                 bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
                                    weight.weight.find(downWeightName) != weight.weight.end();
                 if (hasDenseMlp) {
-                    Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
-                                          *requireLocal(weight[swigluWeightName], swigluWeightName),
-                                          *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
-                                                        swigluWeightName + ".tp_bias"),
-                                          buf.gateupResult, buf.swigluResult);
-                    Qwen3CudaLinearResidualReduce(
-                        cudaRunner, buf.swigluResult,
-                        *requireLocal(weight[downWeightName], downWeightName),
-                        *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
-                        buf.mlpPart, buf.hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId);
+                    Data &gateUpWeight = *requireLocal(weight[swigluWeightName], swigluWeightName);
+                    Data &gateUpBias = *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
+                                                     swigluWeightName + ".tp_bias");
+                    Data &downWeight = *requireLocal(weight[downWeightName], downWeightName);
+                    Data &downBias = *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName);
+                    if (!Qwen3CudaTrySwigluLinearResidualReduce(
+                            cudaRunner, buf.attenInput, gateUpWeight, gateUpBias,
+                            downWeight, downBias, buf.gateupResult, buf.swigluResult, buf.mlpPart,
+                            buf.hiddenStates, tensorParallel)) {
+                        Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
+                                              gateUpWeight, gateUpBias,
+                                              buf.gateupResult, buf.swigluResult);
+                        Qwen3CudaLinearResidualReduce(
+                            cudaRunner, buf.swigluResult,
+                            downWeight, downBias,
+                            buf.mlpPart, buf.hiddenStates,
+                            tensorParallel, firstTensorParallelRank, gpuId);
+                    }
                     continue;
                 }
 
@@ -7229,17 +7236,24 @@ namespace fastllm {
             bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
                                weight.weight.find(downWeightName) != weight.weight.end();
             if (hasDenseMlp) {
-                Qwen3CudaLinearSwiglu(cudaRunner, attenInput,
-                                      *requireLocal(weight[swigluWeightName], swigluWeightName),
-                                      *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
-                                                    swigluWeightName + ".tp_bias"),
-                                      gateupResult, swigluResult);
-                Qwen3CudaLinearResidualReduce(
-                    cudaRunner, swigluResult,
-                    *requireLocal(weight[downWeightName], downWeightName),
-                    *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
-                    mlpPart, hiddenStates,
-                    tensorParallel, firstTensorParallelRank, gpuId);
+                Data &gateUpWeight = *requireLocal(weight[swigluWeightName], swigluWeightName);
+                Data &gateUpBias = *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
+                                                 swigluWeightName + ".tp_bias");
+                Data &downWeight = *requireLocal(weight[downWeightName], downWeightName);
+                Data &downBias = *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName);
+                if (!Qwen3CudaTrySwigluLinearResidualReduce(
+                        cudaRunner, attenInput, gateUpWeight, gateUpBias,
+                        downWeight, downBias, gateupResult, swigluResult, mlpPart,
+                        hiddenStates, tensorParallel)) {
+                    Qwen3CudaLinearSwiglu(cudaRunner, attenInput,
+                                          gateUpWeight, gateUpBias,
+                                          gateupResult, swigluResult);
+                    Qwen3CudaLinearResidualReduce(
+                        cudaRunner, swigluResult,
+                        downWeight, downBias,
+                        mlpPart, hiddenStates,
+                        tensorParallel, firstTensorParallelRank, gpuId);
+                }
                 continue;
             }
 

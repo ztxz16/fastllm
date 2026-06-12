@@ -1251,13 +1251,83 @@ namespace {
         }
     }
 
+    static void CheckLinearFp8Block128SwigluCuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "separate") {
+            throw std::runtime_error("linear_fp8_block128 swiglu check targets separate FP8_E4M3 scale layout");
+        }
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+
+        fastllm::Data gateupFp32 = MakeTensor({state->batch, state->in * 2}, 0.17f, 0.03f);
+        if (params.GetString("input_pattern") == "blocky") {
+            LinearFp8Block128BenchState::MakeBlockyInput(gateupFp32, state->batch, state->in * 2, state->block);
+        }
+        fastllm::Data gateup;
+        gateup.CopyFrom(gateupFp32);
+        if (state->input.dataType == fastllm::DataType::FLOAT16) {
+            fastllm::ToDataType(gateup, fastllm::DataType::FLOAT16);
+        } else if (state->input.dataType == fastllm::DataType::BFLOAT16) {
+            fastllm::ToDataType(gateup, fastllm::DataType::BFLOAT16);
+        } else {
+            throw std::runtime_error("linear_fp8_block128 swiglu check requires fp16 or bf16 input");
+        }
+        gateup.ToDevice(fastllm::DataDevice::CUDA);
+
+        fastllm::Data swiglu = MakeCudaOutputLike(state->input.dataType, state->batch, state->in);
+        fastllm::Data ref = MakeCudaOutputLike(state->input.dataType, state->batch, state->out);
+        fastllm::Data fused = MakeCudaOutputLike(state->input.dataType, state->batch, state->out);
+
+        fastllm::Swiglu(gateup, swiglu);
+        ForceDeviceSync();
+
+        bool ok = FastllmCudaCutlassLinearFP8E4M3Block128(
+            swiglu, state->weight, state->bias, ref, state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("CUTLASS FP8 swiglu reference linear path failed");
+        }
+        ForceDeviceSync();
+
+        ok = FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
+            gateup, state->weight, state->bias, fused, state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("CUTLASS FP8 fused swiglu path failed");
+        }
+        ForceDeviceSync();
+
+        fastllm::Data ref32 = ConvertToFloat32Data(ref);
+        fastllm::Data fused32 = ConvertToFloat32Data(fused);
+        std::vector<float> refVec = ToFloatVector(ref32);
+        std::vector<float> fusedVec = ToFloatVector(fused32);
+        PrintLinearFp8Block128CheckStats(refVec, fusedVec, state->batch, state->out);
+
+        float maxAbsDiff = 0.0f;
+        for (size_t i = 0; i < refVec.size(); i++) {
+            maxAbsDiff = std::max(maxAbsDiff, std::fabs(refVec[i] - fusedVec[i]));
+        }
+        if (maxAbsDiff > 1.0e-3f) {
+            throw std::runtime_error("CUTLASS FP8 fused swiglu output mismatch");
+        }
+
+        if (params.GetInt("print") != 0) {
+            fastllm::Data gateup32 = ConvertToFloat32Data(gateup);
+            fastllm::Data swiglu32 = ConvertToFloat32Data(swiglu);
+            gateup32.Print("linear_fp8_swiglu_check.gateup.float32");
+            swiglu32.Print("linear_fp8_swiglu_check.swiglu.float32");
+            ref32.Print("linear_fp8_swiglu_check.ref.float32");
+            fused32.Print("linear_fp8_swiglu_check.fused.float32");
+        }
+    }
+
     static BenchmarkResult BenchmarkLinearFp8Block128Cuda(const OpTestParams &params,
                                                           const std::string &device,
                                                           int warmup, int iters) {
 #ifdef USE_CUDA
         ScopedFirstDevice guard(device);
-        if (params.GetInt("check") != 0) {
+        if (params.GetInt("check") == 1) {
             CheckLinearFp8Block128Cuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 2) {
+            CheckLinearFp8Block128SwigluCuda(params);
             return BenchmarkResult();
         }
 
@@ -1315,7 +1385,7 @@ namespace {
                 params.Add("input_type", "bf16", "fp16 or bf16");
                 params.Add("input_pattern", "blocky", "smooth or blocky");
                 params.Add("weight_layout", "packed", "packed or separate");
-                params.Add("check", "0", "1 to compare builtin CUDA FP8 linear with CUTLASS FP8 linear");
+                params.Add("check", "0", "1 linear check, 2 fused swiglu+quant check");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },

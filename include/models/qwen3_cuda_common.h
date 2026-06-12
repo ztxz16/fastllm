@@ -3,6 +3,8 @@
 #include "fastllm.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -274,6 +276,13 @@ namespace fastllm {
                    FloatDict(), IntDict(), {"middle", "output"});
     }
 
+    inline void Qwen3CudaSwiglu(Qwen3CudaDirectRunner &runner,
+                                Data &input, Data &output) {
+        runner.Run("Swiglu",
+                   DataDict{{"input", &input}, {"output", &output}},
+                   FloatDict(), IntDict(), {"output"});
+    }
+
     inline void Qwen3CudaLinearAddBlock(Qwen3CudaDirectRunner &runner,
                                         Data *input, Data *weight, Data *bias,
                                         Data *middle, Data *output) {
@@ -281,6 +290,68 @@ namespace fastllm {
                    DataDict{{"input", input}, {"weight", weight}, {"bias", bias},
                             {"middle", middle}, {"output", output}},
                    FloatDict(), IntDict(), {"middle"});
+    }
+
+    inline bool Qwen3CudaEnvDefaultEnabled(const char *name) {
+        const char *env = std::getenv(name);
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 && std::strcmp(env, "FALSE") != 0 &&
+               std::strcmp(env, "off") != 0 && std::strcmp(env, "OFF") != 0 &&
+               std::strcmp(env, "no") != 0 && std::strcmp(env, "NO") != 0;
+    }
+
+    inline bool Qwen3CudaCanUseSwigluLinearAdd(
+            const Data &input, const Data &gateUp, const Data &down,
+            const Data &downBias, const Data &hiddenStates, bool tensorParallel) {
+        if (tensorParallel ||
+            !Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT")) {
+            return false;
+        }
+        if (input.dims.empty() || gateUp.dims.size() != 2 || down.dims.size() != 2 ||
+            hiddenStates.dims.empty()) {
+            return false;
+        }
+        int inter = down.dims[1];
+        int hidden = hiddenStates.dims.back();
+        return (input.dataType == DataType::FLOAT16 || input.dataType == DataType::BFLOAT16) &&
+               hiddenStates.dataType == input.dataType &&
+               down.dataType == DataType::FP8_E4M3 &&
+               down.blockM == 128 && down.blockK == 128 && !down.scales.empty() &&
+               gateUp.dims[0] == inter * 2 && down.dims[0] == hidden &&
+               (inter % 128) == 0 && (hidden % 128) == 0 &&
+               (downBias.dims.empty() || downBias.dataType == DataType::FLOAT32);
+    }
+
+    inline bool Qwen3CudaTrySwigluLinearResidualReduce(
+            Qwen3CudaDirectRunner &runner,
+            Data &input, Data &gateUp, Data &gateUpBias,
+            Data &down, Data &downBias,
+            Data &gateUpResult, Data &swigluResult, Data &middle, Data &hiddenStates,
+            bool tensorParallel) {
+        if (!Qwen3CudaCanUseSwigluLinearAdd(input, gateUp, down, downBias, hiddenStates, tensorParallel)) {
+            return false;
+        }
+        Qwen3CudaLinear(runner, input, gateUp, gateUpBias, gateUpResult);
+        std::vector<int> dims = gateUpResult.dims;
+        dims.back() = down.dims[0];
+        middle.dataType = gateUpResult.dataType;
+        Qwen3CudaPrepareLocalOutput(middle, runner.DeviceId());
+        middle.Resize(dims);
+        middle.Allocate(false);
+        int n = gateUpResult.Count(0) / gateUpResult.dims.back();
+        int m = gateUpResult.dims.back() / 2;
+        int k = down.dims[0];
+        if (!FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
+                gateUpResult, down, downBias, middle, n, m, k)) {
+            Qwen3CudaSwiglu(runner, gateUpResult, swigluResult);
+            Qwen3CudaLinearAddBlock(runner, &swigluResult, &down, &downBias, &middle, &hiddenStates);
+            return true;
+        }
+        FastllmCudaAddTo(hiddenStates, middle, 1.0f);
+        return true;
     }
 
     inline void Qwen3CudaSplit(Qwen3CudaDirectRunner &runner,

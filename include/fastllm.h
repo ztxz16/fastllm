@@ -865,6 +865,10 @@ namespace fastllm {
 
     bool CanRunLinearAdd(const Data &input, const Data &weight, const Data &bias, const Data &output);
 
+    void SwigluLinearAdd(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output);
+
+    bool CanRunSwigluLinearAdd(const Data &input, const Data &weight, const Data &bias, const Data &output);
+
     void LinearSwiglu(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output);
 
     bool CanRunLinearSwiglu(const Data &input, const Data &weight);
