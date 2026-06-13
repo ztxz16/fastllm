@@ -764,10 +764,6 @@ namespace fastllm {
         if (n < minBatch) {
             return false;
         }
-        int maxBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MAX_BATCH", 0);
-        if (maxBatch > 0 && n > maxBatch) {
-            return false;
-        }
         int arch = CudaTritonRuntimeArch();
         if (arch != 120 && arch != 121) {
             return false;
@@ -1863,6 +1859,11 @@ namespace fastllm {
         }
         int gateup = input.dims.back();
         if ((gateup % 2) != 0) {
+            return false;
+        }
+        int n = input.Count(0) / gateup;
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+        if (n < minBatch) {
             return false;
         }
         int inter = gateup / 2;

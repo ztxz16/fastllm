@@ -803,10 +803,6 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
     if (n < minBatch) {
         return false;
     }
-    int maxBatch = FastllmCutlassEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MAX_BATCH", 0);
-    if (maxBatch > 0 && n > maxBatch) {
-        return false;
-    }
     if (n <= 0 || m <= 0 || k <= 0 || (m % 128) != 0 || (k % 128) != 0 ||
         input.cudaData == nullptr || weight.cudaData == nullptr ||
         input.dims.empty() || input.dims.back() != m * 2 ||

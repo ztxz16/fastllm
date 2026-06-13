@@ -680,6 +680,24 @@ namespace fastllm {
                    std::strcmp(env, "no") != 0 && std::strcmp(env, "NO") != 0;
         }
 
+        static int Qwen3CudaEnvInt(const char *name, int fallback) {
+            const char *env = std::getenv(name);
+            if (env == nullptr || env[0] == '\0') {
+                return fallback;
+            }
+            char *end = nullptr;
+            long value = std::strtol(env, &end, 10);
+            if (end == env || value <= 0 || value > 4096) {
+                return fallback;
+            }
+            return (int)value;
+        }
+
+        static bool Qwen3CudaShouldTryCutlassSwigluLinearAdd(int tokens) {
+            int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+            return tokens >= minBatch;
+        }
+
         static bool Qwen3CudaCanUseSwigluLinearAdd(
                 const Data &input, const Data &gateUp, const Data &down,
                 const Data &downBias, const Data &hiddenStates, bool tensorParallel) {
@@ -691,8 +709,16 @@ namespace fastllm {
                 hiddenStates.dims.empty()) {
                 return false;
             }
+            if (input.dims.back() <= 0) {
+                return false;
+            }
             int inter = down.dims[1];
             int hidden = hiddenStates.dims.back();
+            int n = input.Count(0) / input.dims.back();
+            int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+            if (n < minBatch) {
+                return false;
+            }
             return (input.dataType == DataType::FLOAT16 || input.dataType == DataType::BFLOAT16) &&
                    hiddenStates.dataType == input.dataType &&
                    down.dataType == DataType::FP8_E4M3 &&
@@ -2058,10 +2084,15 @@ namespace fastllm {
                                                  swigluWeightName + ".tp_bias");
                 Data &downWeight = *requireLocal(weight[downWeightName], downWeightName);
                 Data &downBias = *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName);
-                if (!Qwen3CudaTrySwigluLinearResidualReduce(
+                bool shouldTryMlp = Qwen3CudaShouldTryCutlassSwigluLinearAdd(batch);
+                bool usedTryMlp = false;
+                if (shouldTryMlp) {
+                    usedTryMlp = Qwen3CudaTrySwigluLinearResidualReduce(
                         cudaRunner, buf.attenInput, gateUpWeight, gateUpBias,
                         downWeight, downBias, buf.gateupResult, buf.swigluResult, buf.mlpPart,
-                        buf.hiddenStates, tensorParallel)) {
+                        buf.hiddenStates, tensorParallel);
+                }
+                if (!usedTryMlp) {
                     Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
                                           gateUpWeight, gateUpBias,
                                           buf.gateupResult, buf.swigluResult);
@@ -2309,10 +2340,17 @@ namespace fastllm {
                                              swigluWeightName + ".tp_bias");
             Data &downWeight = *requireLocal(weight[downWeightName], downWeightName);
             Data &downBias = *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName);
-            if (!Qwen3CudaTrySwigluLinearResidualReduce(
+            int mlpTokens = attenInput.dims.empty() || attenInput.dims.back() <= 0 ?
+                0 : (int)(attenInput.Count(0) / attenInput.dims.back());
+            bool shouldTryMlp = Qwen3CudaShouldTryCutlassSwigluLinearAdd(mlpTokens);
+            bool usedTryMlp = false;
+            if (shouldTryMlp) {
+                usedTryMlp = Qwen3CudaTrySwigluLinearResidualReduce(
                     cudaRunner, attenInput, gateUpWeight, gateUpBias,
                     downWeight, downBias, gateupResult, swigluResult, mlpPart,
-                    hiddenStates, tensorParallel)) {
+                    hiddenStates, tensorParallel);
+            }
+            if (!usedTryMlp) {
                 Qwen3CudaLinearSwiglu(cudaRunner, attenInput,
                                       gateUpWeight, gateUpBias,
                                       gateupResult, swigluResult);
