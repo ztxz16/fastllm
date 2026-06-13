@@ -73,8 +73,8 @@ namespace fastllm {
         int *pos;
         int bsz, k;
         int hidden_size;
-        int batch_st, batch_end;  // batch维度的范围
-        int hidden_st, hidden_end; // hidden维度的范围
+        int batch_st, batch_end;  // batch维度的范围  
+        int hidden_st, hidden_end; // hidden维度的范围  
         
         MultiThreadReduceBatchOp(uint8_t *downOutData, DataType downOutDataType,
             float *weights, float *lastOutput,
@@ -107,7 +107,7 @@ namespace fastllm {
 
     void ConvertFromFloat32(void *dstData, DataType dstDataType, const float *floatData, size_t rows, size_t columns);
 
-    // 新增一个专门的Op来处理数据类型转换
+    // 新增一个专门的Op来处理数据类型转换  
     struct MultiThreadConvertFromFloat32Op : MultiThreadBaseOp {
         void *dstData;
         DataType dstDataType;
