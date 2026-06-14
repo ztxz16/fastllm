@@ -169,6 +169,7 @@ struct FastllmCutlassFp8WeightCache {
     cutlass::float_e4m3_t *weightTN = nullptr;
     float *weightScales = nullptr;
     const float *hostScales = nullptr;
+    bool ownsWeightTN = false;
     size_t scaleCount = 0;
     int inFeatures = 0;
     int outFeatures = 0;
@@ -522,33 +523,29 @@ static bool FastllmCutlassEnsureWeightCache(
         return false;
     }
     auto &entry = g_cutlassWeightCache[cacheKey];
-    if (entry.weightTN != nullptr) {
+    if (entry.weightTN != nullptr && entry.ownsWeightTN) {
         FastllmCudaFree(entry.weightTN);
-        entry.weightTN = nullptr;
     }
+    entry.weightTN = nullptr;
+    entry.ownsWeightTN = false;
     if (entry.weightScales != nullptr) {
         FastllmCudaFree(entry.weightScales);
         entry.weightScales = nullptr;
     }
 
-    size_t weightBytes = (size_t)inFeatures * outFeatures;
     size_t scaleBytes = weight.scales.size() * sizeof(float);
-    entry.weightTN = (cutlass::float_e4m3_t*)FastllmCudaMalloc(weightBytes);
+    // CUTLASS consumes FastLLM's native packed [out][in] FP8 bytes directly.
+    // Keep an alias here; allocating another weightTN copy doubles FP8 weight VRAM.
+    entry.weightTN = (cutlass::float_e4m3_t*)weight.cudaData;
+    entry.ownsWeightTN = false;
     entry.weightScales = (float*)FastllmCudaMalloc(scaleBytes);
     if (entry.weightTN == nullptr || entry.weightScales == nullptr) {
         return false;
     }
-    // CUTLASS reads B as a logical transpose with column-major layout, just like
-    // vLLM passes B.T while keeping the original [out][in] physical storage.
-    cudaError_t state = cudaMemcpyAsync(entry.weightTN, weight.cudaData, weightBytes,
-                                        cudaMemcpyDeviceToDevice, stream);
-    if (state != cudaSuccess) {
-        return false;
-    }
     // CUTLASS SFB layout for B scales matches FastLLM's native
     // [out_block][in_block] row-major order.
-    state = cudaMemcpyAsync(entry.weightScales, weight.scales.data(), scaleBytes,
-                            cudaMemcpyHostToDevice, stream);
+    cudaError_t state = cudaMemcpyAsync(entry.weightScales, weight.scales.data(), scaleBytes,
+                                        cudaMemcpyHostToDevice, stream);
     if (state != cudaSuccess) {
         return false;
     }
