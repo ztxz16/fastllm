@@ -98,6 +98,8 @@ class Qwen3CoderToolParser(ToolParser):
         self.accumulated_text = ""
         self.json_started = False
         self.json_closed = False
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
 
     def _parse_xml_function_call(
             self, function_call_str: str,
