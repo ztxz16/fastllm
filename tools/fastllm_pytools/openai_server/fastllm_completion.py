@@ -115,7 +115,6 @@ class FastLLmCompletion:
     self.hide_input = hide_input
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
-    self.tool_parser = None
     
   def init_fast_llm_model(self):
     pass
@@ -682,28 +681,27 @@ class FastLLmCompletion:
           tool_choice = "auto",
       )
 
-  def _ensure_tool_parser(self):
-      if self.tool_parser is None:
-          tokenizer = getattr(self.model, "hf_tokenizer", None)
-          model_type = self.model.get_type()
-          chat_template = getattr(tokenizer, "chat_template", None)
-          force_type = getattr(self.model, "tool_call_parser", "auto")
-          allow_without_chat_template = (
-              model_type == "deepseek_v4" or
-              force_type in ("deepseek_v4",)
+  def _create_tool_parser(self):
+      tokenizer = getattr(self.model, "hf_tokenizer", None)
+      model_type = self.model.get_type()
+      chat_template = getattr(tokenizer, "chat_template", None)
+      force_type = getattr(self.model, "tool_call_parser", "auto")
+      allow_without_chat_template = (
+          model_type == "deepseek_v4" or
+          force_type in ("deepseek_v4",)
+      )
+      if tokenizer is None and allow_without_chat_template:
+          tokenizer = _EmptyToolTokenizer()
+      if tokenizer is None or (chat_template is None and not allow_without_chat_template):
+          raise ValueError(
+              "Tool calling requires a Hugging Face tokenizer with chat_template. "
+              "Please use an HF model directory or provide the original tokenizer files."
           )
-          if tokenizer is None and allow_without_chat_template:
-              tokenizer = _EmptyToolTokenizer()
-          if tokenizer is None or (chat_template is None and not allow_without_chat_template):
-              raise ValueError(
-                  "Tool calling requires a Hugging Face tokenizer with chat_template. "
-                  "Please use an HF model directory or provide the original tokenizer files."
-              )
-          from .tool_parsers import ToolParserManager
-          self.tool_parser = ToolParserManager.get_tool_parser_auto(
-              model_type, chat_template,
-              force_chat_template = self.model.force_chat_template,
-              force_type = force_type)(tokenizer)
+      from .tool_parsers import ToolParserManager
+      return ToolParserManager.get_tool_parser_auto(
+          model_type, chat_template,
+          force_chat_template = self.model.force_chat_template,
+          force_type = force_type)(tokenizer)
 
   def _parse_anthropic_message_content(
       self,
@@ -1115,10 +1113,8 @@ class FastLLmCompletion:
           result, emit_reasoning_content)
 
       if request.tools:
-          self._ensure_tool_parser()
-
-      if request.tools:
-          tool_call_info = self.tool_parser.extract_tool_calls(result, request)
+          tool_parser = self._create_tool_parser()
+          tool_call_info = tool_parser.extract_tool_calls(result, request)
       else:
           tool_call_info = ExtractedToolCallInformation(
               tools_called=False, tool_calls=[], content=result)
@@ -1233,8 +1229,7 @@ class FastLLmCompletion:
 
         # 2. content部分
 
-        if request.tools:
-            self._ensure_tool_parser()
+        tool_parser = self._create_tool_parser() if request.tools else None
         
         completion_tokens = 0
 
@@ -1275,14 +1270,14 @@ class FastLLmCompletion:
             # print("delta_text", delta_text)
 
             # Send token-by-token response for each request.n
-            if self.tool_parser and request.tools: 
-                now_ids = self.tool_parser.get_token_ids(delta_text)
+            if tool_parser and request.tools:
+                now_ids = tool_parser.get_token_ids(delta_text)
                 # print("delta_text", delta_text, "now_ids", now_ids)
 
                 current_text += delta_text
                 current_token_ids += now_ids
 
-                delta_message = self.tool_parser.extract_tool_calls_streaming(
+                delta_message = tool_parser.extract_tool_calls_streaming(
                                 previous_text = previous_text,
                                 current_text = current_text,
                                 delta_text = delta_text,
@@ -1347,7 +1342,7 @@ class FastLLmCompletion:
 
         # 3. 结束标志
         finish_reason = 'stop'
-        if request.tools and self.tool_parser and getattr(self.tool_parser, "prev_tool_call_arr", None):
+        if request.tools and tool_parser and getattr(tool_parser, "prev_tool_call_arr", None):
             finish_reason = 'tool_calls'
         if fast_text_stream:
             data = json_dump({
@@ -1421,8 +1416,8 @@ class FastLLmCompletion:
            return self.create_error_response("Client disconnected")
 
       if request.tools and parser_request is not None:
-          self._ensure_tool_parser()
-          tool_call_info = self.tool_parser.extract_tool_calls(result, parser_request)
+          tool_parser = self._create_tool_parser()
+          tool_call_info = tool_parser.extract_tool_calls(result, parser_request)
       else:
           tool_call_info = ExtractedToolCallInformation(
               tools_called = False, tool_calls = [], content = result)
@@ -1475,8 +1470,11 @@ class FastLLmCompletion:
           yield self._create_anthropic_sse_event(
               "message_start", MessageStartEvent(message = message))
 
-          if request.tools and parser_request is not None:
-              self._ensure_tool_parser()
+          tool_parser = (
+              self._create_tool_parser()
+              if request.tools and parser_request is not None
+              else None
+          )
 
           async for res in result_generator:
               if (res == "[unused16]"):
@@ -1486,12 +1484,12 @@ class FastLLmCompletion:
               completion_tokens += 1
               delta_text = res
 
-              if request.tools and parser_request is not None and self.tool_parser:
-                  now_ids = self.tool_parser.get_token_ids(delta_text)
+              if request.tools and parser_request is not None and tool_parser:
+                  now_ids = tool_parser.get_token_ids(delta_text)
                   current_text += delta_text
                   current_token_ids += now_ids
 
-                  delta_message = self.tool_parser.extract_tool_calls_streaming(
+                  delta_message = tool_parser.extract_tool_calls_streaming(
                                   previous_text = previous_text,
                                   current_text = current_text,
                                   delta_text = delta_text,
