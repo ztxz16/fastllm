@@ -9,6 +9,7 @@ import json
 import math
 import importlib.util
 import importlib.metadata as importlib_metadata
+import logging
 import site
 import sys
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
@@ -1787,9 +1788,14 @@ class model:
                         max_length: int = 8192, min_length: int = 0, do_sample = True, 
                         top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
-                        images: List = None, videos: List = None, tools: List = None, enable_thinking = None):
+                        images: List = None, videos: List = None, tools: List = None, enable_thinking = None,
+                        tool_call_constraint: Optional[Dict[str, Any]] = None):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        if tool_call_constraint is not None:
+            logging.debug(
+                "Received tool_call_constraint, but the native FastLLM "
+                "backend does not consume generation constraints yet.")
         conversation = None
         if (isinstance(query, List)):
             conversation = query

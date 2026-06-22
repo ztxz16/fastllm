@@ -805,6 +805,47 @@ class FastLLmCompletion:
           tool_parser_name = tool_parser_name,
       )
 
+  def _build_tool_call_generation_constraint(
+      self,
+      request: ChatCompletionRequest,
+  ) -> Optional[Dict[str, Any]]:
+      descriptor = self._build_tool_call_constraint_descriptor(request)
+      if descriptor is None:
+          return None
+      return descriptor.to_dict()
+
+  def _model_supports_tool_call_constraint(self) -> bool:
+      launch_fn = getattr(self.model, "launch_stream_response", None)
+      if launch_fn is None:
+          return False
+      try:
+          parameters = inspect.signature(launch_fn).parameters
+      except (TypeError, ValueError):
+          return False
+      if "tool_call_constraint" in parameters:
+          return True
+      return any(
+          parameter.kind == inspect.Parameter.VAR_KEYWORD
+          for parameter in parameters.values()
+      )
+
+  def _attach_tool_call_constraint_if_supported(
+      self,
+      launch_kwargs: Dict[str, Any],
+      request: ChatCompletionRequest,
+  ) -> Optional[Dict[str, Any]]:
+      constraint = self._build_tool_call_generation_constraint(request)
+      if constraint is None:
+          return None
+      if self._model_supports_tool_call_constraint():
+          launch_kwargs["tool_call_constraint"] = constraint
+      else:
+          logging.debug(
+              "Tool call generation constraint prepared but backend does not "
+              "support tool_call_constraint; continuing without backend "
+              "constraint.")
+      return constraint
+
   def _format_tool_call_diagnostics(self, diagnostics: Iterable[Any]) -> str:
       parts = []
       for diagnostic in diagnostics:
@@ -1070,12 +1111,25 @@ class FastLLmCompletion:
               images = model_images,
               videos = model_videos,
               tools = model_tools)
-          handle = self.model.launch_stream_response(messages,
-                            max_length = max_length, min_length = 0, do_sample = do_sample,
-                            top_p = top_p, top_k = top_k, temperature = temperature,
-                            repeat_penalty = frequency_penalty, tools = model_tools,
-                            one_by_one = True, enable_thinking = self.enable_thinking,
-                            images = model_images, videos = model_videos)
+          launch_kwargs = {
+              "max_length": max_length,
+              "min_length": 0,
+              "do_sample": do_sample,
+              "top_p": top_p,
+              "top_k": top_k,
+              "temperature": temperature,
+              "repeat_penalty": frequency_penalty,
+              "tools": model_tools,
+              "one_by_one": True,
+              "enable_thinking": self.enable_thinking,
+              "images": model_images,
+              "videos": model_videos,
+          }
+          if parser_request is not None:
+              self._attach_tool_call_constraint_if_supported(
+                  launch_kwargs, parser_request)
+          handle = self.model.launch_stream_response(
+              messages, **launch_kwargs)
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       self.conversation_handles[request_id] = handle
@@ -1200,12 +1254,25 @@ class FastLLmCompletion:
               videos = model_videos,
               tools = tools)
 
-          handle = self.model.launch_stream_response(messages,
-                            max_length = max_length, min_length = min_length, do_sample = do_sample,
-                            top_p = top_p, top_k = top_k, temperature = temperature,
-                            repeat_penalty = frequency_penalty, tools = tools, one_by_one = True,
-                            enable_thinking = enable_thinking, images = model_images,
-                            videos = model_videos, stop_token_ids = stop_token_ids)
+          launch_kwargs = {
+              "max_length": max_length,
+              "min_length": min_length,
+              "do_sample": do_sample,
+              "top_p": top_p,
+              "top_k": top_k,
+              "temperature": temperature,
+              "repeat_penalty": frequency_penalty,
+              "tools": tools,
+              "one_by_one": True,
+              "enable_thinking": enable_thinking,
+              "images": model_images,
+              "videos": model_videos,
+              "stop_token_ids": stop_token_ids,
+          }
+          self._attach_tool_call_constraint_if_supported(
+              launch_kwargs, request)
+          handle = self.model.launch_stream_response(
+              messages, **launch_kwargs)
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
