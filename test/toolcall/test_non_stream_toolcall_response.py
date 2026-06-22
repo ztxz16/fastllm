@@ -3,6 +3,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -151,6 +152,36 @@ class NonStreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("DSML", response.message)
         self.assertNotIn("tool_calls", response.message)
         self.assertIn("invalid_tool_name", "\n".join(logs.output))
+
+    async def test_compat_mode_error_includes_closest_match_diagnostic(self):
+        with patch.dict("os.environ", {"FT_TOOLCALL_COMPAT_MODE": "ON"}):
+            with self.assertLogs(level="WARNING"):
+                response = await self._run_full_generator(
+                    _dsml_call("get_wearher"),
+                    _request(tools=[_weather_tool()]),
+                )
+
+        self.assertIsInstance(response, ErrorResponse)
+        self.assertIn("invalid_tool_name", response.message)
+        self.assertIn("get_wearher", response.message)
+        self.assertIn("closest='get_weather'", response.message)
+        self.assertIn("ratio=", response.message)
+
+    async def test_forward_unknown_tools_returns_raw_unknown_tool_call(self):
+        with patch.dict("os.environ",
+                        {"FT_TOOLCALL_FORWARD_UNKNOWN_TOOLS": "ON"}):
+            response = await self._run_full_generator(
+                _dsml_call("get_wearher"),
+                _request(tools=[_weather_tool()]),
+            )
+
+        self.assertIsInstance(response, ChatCompletionResponse)
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(choice.message.tool_calls[0].function.name,
+                         "get_wearher")
+        self.assertEqual(json.loads(
+            choice.message.tool_calls[0].function.arguments), {"city": "北京"})
 
     async def test_malformed_tool_block_returns_error_without_leaking_dsml(self):
         with self.assertLogs(level="WARNING") as logs:

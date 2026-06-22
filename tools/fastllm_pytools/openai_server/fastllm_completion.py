@@ -799,9 +799,17 @@ class FastLLmCompletion:
           tool_name = getattr(diagnostic, "tool_name", None)
           index = getattr(diagnostic, "index", None)
           if tool_name is not None:
-              parts.append(f"{code} at index {index}: {tool_name!r}")
+              message = f"{code} at index {index}: {tool_name!r}"
           else:
-              parts.append(f"{code} at index {index}")
+              message = f"{code} at index {index}"
+          closest_tool_name = getattr(diagnostic, "closest_tool_name", None)
+          similarity_ratio = getattr(diagnostic, "similarity_ratio", None)
+          if closest_tool_name is not None and similarity_ratio is not None:
+              message += (
+                  f" closest={closest_tool_name!r} "
+                  f"ratio={similarity_ratio:.3f}"
+              )
+          parts.append(message)
       return "; ".join(parts) or "invalid_tool_call"
 
   def _parse_non_stream_tool_calls(

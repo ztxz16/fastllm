@@ -1,3 +1,5 @@
+import difflib
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -14,6 +16,9 @@ class ToolCallDiagnostic:
     message: str
     tool_name: Optional[str] = None
     index: Optional[int] = None
+    allowed_tool_names: tuple[str, ...] = ()
+    closest_tool_name: Optional[str] = None
+    similarity_ratio: Optional[float] = None
 
 
 @dataclass
@@ -65,6 +70,9 @@ class FunctionCallParser:
             parser_cls = ToolParserManager.get_tool_parser(tool_parser_name)
             parser = parser_cls(tokenizer or _EmptyToolTokenizer())
         self.parser = parser
+        self.compat_mode = _env_enabled("FT_TOOLCALL_COMPAT_MODE")
+        self.forward_unknown_tools = _env_enabled(
+            "FT_TOOLCALL_FORWARD_UNKNOWN_TOOLS")
         self.invalid_stream_tool_indices: set[int] = set()
         self.valid_stream_tool_indices: set[int] = set()
         self.stream_index_map: Dict[int, int] = {}
@@ -181,15 +189,20 @@ class FunctionCallParser:
             name = _tool_call_name(tool_call)
             if name:
                 if name not in self.tool_index:
+                    diagnostic = self._invalid_tool_name_diagnostic(
+                        name, raw_index)
+                    if self.forward_unknown_tools:
+                        self.valid_stream_tool_indices.add(raw_index)
+                        self.stream_index_map.setdefault(
+                            raw_index, len(self.stream_index_map))
+                        diagnostics.append(diagnostic)
+                        valid_tool_calls.append(
+                            _copy_tool_call_with_index(
+                                tool_call, self.stream_index_map[raw_index]))
+                        continue
                     self.invalid_stream_tool_indices.add(raw_index)
                     invalid_tool_calls.append(tool_call)
-                    diagnostics.append(
-                        ToolCallDiagnostic(
-                            code="invalid_tool_name",
-                            message=f"tool name {name!r} is not in request tools",
-                            tool_name=name,
-                            index=raw_index,
-                        ))
+                    diagnostics.append(diagnostic)
                     continue
                 self.valid_stream_tool_indices.add(raw_index)
                 self.stream_index_map.setdefault(raw_index,
@@ -239,17 +252,16 @@ class FunctionCallParser:
             if name in self.tool_index:
                 valid_tool_calls.append(tool_call)
                 continue
+            diagnostic = self._invalid_tool_name_diagnostic(name, index)
+            if self.forward_unknown_tools:
+                valid_tool_calls.append(tool_call)
+                diagnostics.append(diagnostic)
+                continue
             invalid_tool_calls.append(tool_call)
-            diagnostics.append(
-                ToolCallDiagnostic(
-                    code="invalid_tool_name",
-                    message=f"tool name {name!r} is not in request tools",
-                    tool_name=name,
-                    index=index,
-                ))
+            diagnostics.append(diagnostic)
 
         return ToolCallValidationResult(
-            valid=not diagnostics,
+            valid=not invalid_tool_calls,
             diagnostics=diagnostics,
             valid_tool_calls=valid_tool_calls,
             invalid_tool_calls=invalid_tool_calls,
@@ -279,6 +291,34 @@ class FunctionCallParser:
                 index[name] = position
         return index
 
+    def _invalid_tool_name_diagnostic(
+        self,
+        name: str,
+        index: int,
+    ) -> ToolCallDiagnostic:
+        allowed_names = tuple(self.tool_index)
+        closest_name, ratio = _closest_tool_name(name, allowed_names)
+        if self.compat_mode and closest_name is not None:
+            message = (
+                f"tool name {name!r} is not in request tools; "
+                f"closest allowed tool is {closest_name!r} "
+                f"(similarity={ratio:.3f})"
+            )
+        else:
+            message = f"tool name {name!r} is not in request tools"
+            closest_name = None
+            ratio = None
+            allowed_names = ()
+        return ToolCallDiagnostic(
+            code="invalid_tool_name",
+            message=message,
+            tool_name=name,
+            index=index,
+            allowed_tool_names=allowed_names,
+            closest_tool_name=closest_name,
+            similarity_ratio=ratio,
+        )
+
 
 def _tool_call_name(tool_call: Any) -> Optional[str]:
     function = _get_value(tool_call, "function")
@@ -301,6 +341,25 @@ def _copy_tool_call_with_index(tool_call: Any, index: int) -> Any:
         copied["index"] = index
         return copied
     return tool_call
+
+
+def _closest_tool_name(
+    actual_name: str,
+    allowed_names: tuple[str, ...],
+) -> tuple[Optional[str], Optional[float]]:
+    if not allowed_names:
+        return None, None
+    closest_name = max(
+        allowed_names,
+        key=lambda name: difflib.SequenceMatcher(
+            None, actual_name, name).ratio(),
+    )
+    ratio = difflib.SequenceMatcher(None, actual_name, closest_name).ratio()
+    return closest_name, ratio
+
+
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "on", "true", "yes"}
 
 
 def _get_value(obj: Any, key: str) -> Any:

@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import Dict, List, Tuple
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -196,6 +197,24 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._reconstruct_tool_calls(chunks), {})
         self.assertNotIn("DSML", serialized)
         self.assertNotIn("get_wearher", serialized)
+        self.assertIn("invalid_tool_name", "\n".join(logs.output))
+
+    async def test_forward_unknown_tools_streams_raw_unknown_name(self):
+        with patch.dict("os.environ",
+                        {"FT_TOOLCALL_FORWARD_UNKNOWN_TOOLS": "ON"}):
+            with self.assertLogs(level="WARNING") as logs:
+                chunks, saw_done = await self._collect_stream(
+                    _weather_call("get_wearher"),
+                    _request(tools=[_weather_tool()]),
+                )
+
+        tool_calls = self._reconstruct_tool_calls(chunks)
+        self.assertTrue(saw_done)
+        self.assertEqual(self._finish_reason(chunks), "tool_calls")
+        self.assertEqual(set(tool_calls), {0})
+        self.assertEqual(tool_calls[0]["name"], "get_wearher")
+        self.assertEqual(json.loads(tool_calls[0]["arguments"]),
+                         {"city": "北京"})
         self.assertIn("invalid_tool_name", "\n".join(logs.output))
 
     async def test_valid_second_tool_after_invalid_first_is_compacted(self):

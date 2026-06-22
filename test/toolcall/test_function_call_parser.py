@@ -5,6 +5,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import Dict, Iterable, List
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -157,6 +158,55 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(len(result.diagnostics), 1)
         self.assertEqual(result.diagnostics[0].code, "invalid_tool_name")
         self.assertEqual(result.diagnostics[0].tool_name, "get_wearher")
+        self.assertIsNone(result.diagnostics[0].closest_tool_name)
+
+    def test_compat_mode_records_closest_match_diagnostics(self):
+        with patch.dict("os.environ", {"FT_TOOLCALL_COMPAT_MODE": "ON"}):
+            parser = FunctionCallParser.from_request(
+                _request(tools=[_weather_tool()]))
+
+        result = parser.parse_non_stream(_dsml_call("get_wearher"))
+
+        self.assertFalse(result.tools_called)
+        self.assertTrue(result.has_invalid_tool_block)
+        self.assertEqual(len(result.diagnostics), 1)
+        diagnostic = result.diagnostics[0]
+        self.assertEqual(diagnostic.code, "invalid_tool_name")
+        self.assertEqual(diagnostic.tool_name, "get_wearher")
+        self.assertEqual(diagnostic.allowed_tool_names, ("get_weather",))
+        self.assertEqual(diagnostic.closest_tool_name, "get_weather")
+        self.assertGreater(diagnostic.similarity_ratio, 0.9)
+
+    def test_forward_unknown_tools_is_off_by_default(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool()]))
+
+        result = parser.parse_non_stream(_dsml_call("get_wearher"))
+
+        self.assertFalse(result.tools_called)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.invalid_tool_calls), 1)
+
+    def test_forward_unknown_tools_preserves_raw_unknown_name(self):
+        with patch.dict("os.environ",
+                        {"FT_TOOLCALL_FORWARD_UNKNOWN_TOOLS": "ON"}):
+            parser = FunctionCallParser.from_request(
+                _request(tools=[_weather_tool()]))
+
+        result = parser.parse_non_stream(_dsml_call("get_wearher"))
+        validation = parser.validate_tool_calls(result.valid_tool_calls)
+
+        self.assertTrue(result.tools_called)
+        self.assertFalse(result.has_invalid_tool_block)
+        self.assertEqual(result.invalid_tool_calls, [])
+        self.assertEqual(len(result.valid_tool_calls), 1)
+        self.assertEqual(result.valid_tool_calls[0].function.name,
+                         "get_wearher")
+        self.assertEqual(len(result.diagnostics), 1)
+        self.assertEqual(result.diagnostics[0].code, "invalid_tool_name")
+        self.assertTrue(validation.valid)
+        self.assertEqual(validation.invalid_tool_calls, [])
+        self.assertEqual(len(validation.diagnostics), 1)
 
     def test_non_stream_malformed_tool_block_is_invalid(self):
         parser = FunctionCallParser.from_request(
@@ -248,6 +298,29 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(diagnostics[0].code, "invalid_tool_name")
         self.assertEqual(diagnostics[0].tool_name, "get_wearher")
+
+    def test_stream_forward_unknown_tools_preserves_raw_unknown_name(self):
+        with patch.dict("os.environ",
+                        {"FT_TOOLCALL_FORWARD_UNKNOWN_TOOLS": "ON"}):
+            parser = FunctionCallParser.from_request(
+                _request(tools=[_weather_tool()]))
+
+        results = self._stream_results(parser, _dsml_call("get_wearher"))
+
+        valid_calls = [
+            call
+            for result in results
+            for call in result.valid_tool_calls
+        ]
+        diagnostics = [
+            diagnostic
+            for result in results
+            for diagnostic in result.diagnostics
+        ]
+        self.assertEqual(len(valid_calls), 1)
+        self.assertEqual(valid_calls[0].function.name, "get_wearher")
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0].code, "invalid_tool_name")
 
     def test_request_tools_are_not_mutated(self):
         request = _request(tools=[_weather_tool(), _time_tool()])
