@@ -65,6 +65,10 @@ class FunctionCallParser:
             parser_cls = ToolParserManager.get_tool_parser(tool_parser_name)
             parser = parser_cls(tokenizer or _EmptyToolTokenizer())
         self.parser = parser
+        self.invalid_stream_tool_indices: set[int] = set()
+        self.valid_stream_tool_indices: set[int] = set()
+        self.stream_index_map: Dict[int, int] = {}
+        self.stream_diagnostics: List[ToolCallDiagnostic] = []
 
     @classmethod
     def from_request(
@@ -98,6 +102,16 @@ class FunctionCallParser:
         if token:
             tokens.append(token)
         return any(token in text for token in tokens)
+
+    @property
+    def has_valid_streamed_tool_calls(self) -> bool:
+        return bool(self.valid_stream_tool_indices)
+
+    def get_token_ids(self, text: str) -> list[int]:
+        get_token_ids = getattr(self.parser, "get_token_ids", None)
+        if callable(get_token_ids):
+            return get_token_ids(text)
+        return [0]
 
     def parse_non_stream(self, text: str) -> ToolCallParseResult:
         if not self.has_tools:
@@ -146,14 +160,63 @@ class FunctionCallParser:
         if delta is None:
             return ToolCallParseResult()
 
-        validation = self.validate_tool_calls(delta.tool_calls)
+        valid_tool_calls: List[Any] = []
+        invalid_tool_calls: List[Any] = []
+        diagnostics: List[ToolCallDiagnostic] = []
+
+        for tool_call in delta.tool_calls:
+            raw_index = _tool_call_index(tool_call)
+            if raw_index is None:
+                diagnostics.append(
+                    ToolCallDiagnostic(
+                        code="missing_tool_index",
+                        message="stream tool call is missing index",
+                    ))
+                invalid_tool_calls.append(tool_call)
+                continue
+            if raw_index in self.invalid_stream_tool_indices:
+                invalid_tool_calls.append(tool_call)
+                continue
+
+            name = _tool_call_name(tool_call)
+            if name:
+                if name not in self.tool_index:
+                    self.invalid_stream_tool_indices.add(raw_index)
+                    invalid_tool_calls.append(tool_call)
+                    diagnostics.append(
+                        ToolCallDiagnostic(
+                            code="invalid_tool_name",
+                            message=f"tool name {name!r} is not in request tools",
+                            tool_name=name,
+                            index=raw_index,
+                        ))
+                    continue
+                self.valid_stream_tool_indices.add(raw_index)
+                self.stream_index_map.setdefault(raw_index,
+                                                 len(self.stream_index_map))
+            elif raw_index not in self.valid_stream_tool_indices:
+                self.invalid_stream_tool_indices.add(raw_index)
+                invalid_tool_calls.append(tool_call)
+                diagnostics.append(
+                    ToolCallDiagnostic(
+                        code="missing_tool_name",
+                        message="stream tool call is missing function.name",
+                        index=raw_index,
+                    ))
+                continue
+
+            valid_tool_calls.append(
+                _copy_tool_call_with_index(
+                    tool_call, self.stream_index_map[raw_index]))
+
+        self.stream_diagnostics.extend(diagnostics)
         return ToolCallParseResult(
             content=delta.content,
-            tools_called=bool(validation.valid_tool_calls),
-            valid_tool_calls=validation.valid_tool_calls,
-            invalid_tool_calls=validation.invalid_tool_calls,
-            diagnostics=validation.diagnostics,
-            has_invalid_tool_block=bool(validation.invalid_tool_calls),
+            tools_called=bool(valid_tool_calls),
+            valid_tool_calls=valid_tool_calls,
+            invalid_tool_calls=invalid_tool_calls,
+            diagnostics=diagnostics,
+            has_invalid_tool_block=bool(invalid_tool_calls or diagnostics),
         )
 
     def validate_tool_calls(
@@ -222,6 +285,22 @@ def _tool_call_name(tool_call: Any) -> Optional[str]:
     if function is None:
         return None
     return _get_value(function, "name")
+
+
+def _tool_call_index(tool_call: Any) -> Optional[int]:
+    return _get_value(tool_call, "index")
+
+
+def _copy_tool_call_with_index(tool_call: Any, index: int) -> Any:
+    if hasattr(tool_call, "model_copy"):
+        return tool_call.model_copy(update={"index": index})
+    if hasattr(tool_call, "copy"):
+        return tool_call.copy(update={"index": index})
+    if isinstance(tool_call, dict):
+        copied = dict(tool_call)
+        copied["index"] = index
+        return copied
+    return tool_call
 
 
 def _get_value(obj: Any, key: str) -> Any:

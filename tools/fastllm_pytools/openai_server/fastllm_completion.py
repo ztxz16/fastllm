@@ -1367,7 +1367,9 @@ class FastLLmCompletion:
 
         # 2. content部分
 
-        tool_parser = self._create_tool_parser() if request.tools else None
+        tool_call_parser = (
+            self._create_function_call_parser(request) if request.tools else None
+        )
         
         completion_tokens = 0
 
@@ -1417,24 +1419,35 @@ class FastLLmCompletion:
             # print("delta_text", delta_text)
 
             # Send token-by-token response for each request.n
-            if tool_parser and request.tools:
-                now_ids = tool_parser.get_token_ids(delta_text)
+            if tool_call_parser and request.tools:
+                now_ids = tool_call_parser.get_token_ids(delta_text)
                 # print("delta_text", delta_text, "now_ids", now_ids)
 
                 current_text += delta_text
                 current_token_ids += now_ids
 
-                delta_message = tool_parser.extract_tool_calls_streaming(
+                parse_result = tool_call_parser.parse_stream_chunk(
                                 previous_text = previous_text,
                                 current_text = current_text,
                                 delta_text = delta_text,
                                 previous_token_ids = previous_token_ids,
                                 current_token_ids = current_token_ids,
-                                delta_token_ids = [0],
-                                request = request)
+                                delta_token_ids = now_ids)
 
                 previous_text += delta_text
                 previous_token_ids += now_ids
+                if parse_result.has_invalid_tool_block:
+                    diagnostics = self._format_tool_call_diagnostics(
+                        parse_result.diagnostics)
+                    logging.warning("Invalid stream tool call suppressed: %s",
+                                    diagnostics)
+                if parse_result.content or parse_result.valid_tool_calls:
+                    delta_message = DeltaMessage(
+                        content = parse_result.content,
+                        tool_calls = parse_result.valid_tool_calls,
+                    )
+                else:
+                    delta_message = None
                 # print("delta", delta_message)
             else:
                 delta_message = DeltaMessage(content = delta_text)
@@ -1524,7 +1537,8 @@ class FastLLmCompletion:
         finish_reason = self._chat_finish_reason(
             completion_tokens, request.max_tokens or 32768,
             stopped_by_stop_string)
-        if request.tools and tool_parser and getattr(tool_parser, "prev_tool_call_arr", None):
+        if (request.tools and tool_call_parser
+                and tool_call_parser.has_valid_streamed_tool_calls):
             finish_reason = 'tool_calls'
         if fast_text_stream:
             data = json_dump({
