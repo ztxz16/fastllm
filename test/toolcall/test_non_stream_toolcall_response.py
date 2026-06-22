@@ -35,6 +35,22 @@ def _weather_tool(name="get_weather"):
     }
 
 
+def _strict_weather_tool(name="get_weather"):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Get weather.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+
+
 def _time_tool(name="get_time"):
     return {
         "type": "function",
@@ -80,6 +96,15 @@ def _malformed_dsml_call() -> str:
         "<｜DSML｜tool_calls>"
         "<｜DSML｜invoke name=\"get_weather\">"
         "<｜DSML｜parameter name=\"city\" string=\"true\">北京</｜DSML｜parameter>"
+        "</｜DSML｜tool_calls>"
+    )
+
+
+def _empty_args_dsml_call() -> str:
+    return (
+        "<｜DSML｜tool_calls>"
+        "<｜DSML｜invoke name=\"get_weather\">"
+        "</｜DSML｜invoke>"
         "</｜DSML｜tool_calls>"
     )
 
@@ -270,6 +295,33 @@ class NonStreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.code, 400)
         self.assertIn("parallel_tool_calls_violation", response.message)
         self.assertIn("parallel_tool_calls_violation", "\n".join(logs.output))
+
+    async def test_strict_schema_valid_call_passes(self):
+        response = await self._run_full_generator(
+            _dsml_call("get_weather"),
+            _request(tools=[_strict_weather_tool()]),
+        )
+
+        self.assertIsInstance(response, ChatCompletionResponse)
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(choice.message.tool_calls[0].function.name,
+                         "get_weather")
+        self.assertEqual(json.loads(
+            choice.message.tool_calls[0].function.arguments), {"city": "北京"})
+
+    async def test_strict_schema_missing_required_returns_error(self):
+        with self.assertLogs(level="WARNING") as logs:
+            response = await self._run_full_generator(
+                _empty_args_dsml_call(),
+                _request(tools=[_strict_weather_tool()]),
+            )
+
+        self.assertIsInstance(response, ErrorResponse)
+        self.assertEqual(response.code, 400)
+        self.assertIn("missing_required_argument", response.message)
+        self.assertIn("city", response.message)
+        self.assertIn("missing_required_argument", "\n".join(logs.output))
 
     async def test_plain_text_without_tools_is_unchanged(self):
         response = await self._run_full_generator(

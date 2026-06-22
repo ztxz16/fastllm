@@ -1,4 +1,5 @@
 import difflib
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
@@ -16,6 +17,7 @@ class ToolCallDiagnostic:
     message: str
     tool_name: Optional[str] = None
     index: Optional[int] = None
+    argument_name: Optional[str] = None
     allowed_tool_names: tuple[str, ...] = ()
     closest_tool_name: Optional[str] = None
     similarity_ratio: Optional[float] = None
@@ -80,6 +82,9 @@ class FunctionCallParser:
         self.valid_stream_tool_indices: set[int] = set()
         self.stream_index_map: Dict[int, int] = {}
         self.stream_diagnostics: List[ToolCallDiagnostic] = []
+        self.stream_tool_call_fragments: Dict[int, Dict[str, str]] = {}
+        self.buffered_stream_tool_calls: Dict[int, List[Any]] = {}
+        self._stream_finalized = False
 
     @classmethod
     def from_request(
@@ -214,6 +219,7 @@ class FunctionCallParser:
                         self.stream_index_map.setdefault(
                             raw_index, len(self.stream_index_map))
                         diagnostics.append(diagnostic)
+                        self._record_stream_tool_call(raw_index, tool_call)
                         valid_tool_calls.append(
                             _copy_tool_call_with_index(
                                 tool_call, self.stream_index_map[raw_index]))
@@ -232,6 +238,10 @@ class FunctionCallParser:
                 self.valid_stream_tool_indices.add(raw_index)
                 self.stream_index_map.setdefault(raw_index,
                                                  len(self.stream_index_map))
+                if self._is_strict_tool(name):
+                    self._record_stream_tool_call(raw_index, tool_call)
+                    self._buffer_stream_tool_call(raw_index, tool_call)
+                    continue
             elif raw_index not in self.valid_stream_tool_indices:
                 self.invalid_stream_tool_indices.add(raw_index)
                 invalid_tool_calls.append(tool_call)
@@ -242,7 +252,14 @@ class FunctionCallParser:
                         index=raw_index,
                     ))
                 continue
+            else:
+                state = self.stream_tool_call_fragments.get(raw_index, {})
+                if self._is_strict_tool(state.get("name")):
+                    self._record_stream_tool_call(raw_index, tool_call)
+                    self._buffer_stream_tool_call(raw_index, tool_call)
+                    continue
 
+            self._record_stream_tool_call(raw_index, tool_call)
             valid_tool_calls.append(
                 _copy_tool_call_with_index(
                     tool_call, self.stream_index_map[raw_index]))
@@ -280,6 +297,12 @@ class FunctionCallParser:
                 diagnostics.append(diagnostic)
                 continue
             if name in self.tool_index:
+                schema_diagnostics = self._strict_schema_diagnostics(
+                    tool_call, name, index)
+                if schema_diagnostics:
+                    invalid_tool_calls.append(tool_call)
+                    diagnostics.extend(schema_diagnostics)
+                    continue
                 valid_tool_calls.append(tool_call)
                 continue
             diagnostic = self._invalid_tool_name_diagnostic(name, index)
@@ -333,12 +356,50 @@ class FunctionCallParser:
         )
 
     def finalize_stream(self) -> List[ToolCallDiagnostic]:
+        return self._finalize_stream_diagnostics()
+
+    def flush_stream_tool_calls(self) -> ToolCallParseResult:
+        diagnostics = self._finalize_stream_diagnostics()
+        if diagnostics:
+            return ToolCallParseResult(
+                diagnostics=diagnostics,
+                has_invalid_tool_block=True,
+            )
+        tool_calls: List[Any] = []
+        for raw_index in sorted(self.buffered_stream_tool_calls):
+            tool_calls.extend(self.buffered_stream_tool_calls[raw_index])
+        self.buffered_stream_tool_calls.clear()
+        return ToolCallParseResult(
+            tools_called=bool(tool_calls),
+            valid_tool_calls=tool_calls,
+        )
+
+    def _finalize_stream_diagnostics(self) -> List[ToolCallDiagnostic]:
+        if self._stream_finalized:
+            return []
+        self._stream_finalized = True
         diagnostics: List[ToolCallDiagnostic] = []
         if self._requires_tool_call() and not self.has_valid_streamed_tool_calls:
             diagnostics.append(
                 ToolCallDiagnostic(
                     code="tool_choice_violation",
                     message="tool_choice='required' was set but no valid stream tool call was produced",
+                ))
+        for raw_index in sorted(self.valid_stream_tool_indices):
+            state = self.stream_tool_call_fragments.get(raw_index, {})
+            name = state.get("name")
+            if not name:
+                continue
+            diagnostics.extend(
+                self._strict_schema_diagnostics(
+                    {
+                        "function": {
+                            "name": name,
+                            "arguments": state.get("arguments", ""),
+                        }
+                    },
+                    name,
+                    self.stream_index_map.get(raw_index, raw_index),
                 ))
         self.stream_diagnostics.extend(diagnostics)
         return diagnostics
@@ -430,12 +491,126 @@ class FunctionCallParser:
             index=raw_index,
         )
 
+    def _record_stream_tool_call(self, raw_index: int, tool_call: Any) -> None:
+        state = self.stream_tool_call_fragments.setdefault(
+            raw_index, {"name": "", "arguments": ""})
+        function = _get_value(tool_call, "function")
+        name = _get_value(function, "name")
+        if name:
+            state["name"] = name
+        arguments = _get_value(function, "arguments")
+        if arguments:
+            state["arguments"] += str(arguments)
+
+    def _buffer_stream_tool_call(self, raw_index: int, tool_call: Any) -> None:
+        external_index = self.stream_index_map[raw_index]
+        self.buffered_stream_tool_calls.setdefault(raw_index, []).append(
+            _copy_tool_call_with_index(tool_call, external_index))
+
+    def _strict_schema_diagnostics(
+        self,
+        tool_call: Any,
+        name: str,
+        index: int,
+    ) -> List[ToolCallDiagnostic]:
+        function = self._tool_function(name)
+        if not _get_value(function, "strict"):
+            return []
+
+        arguments = _tool_call_arguments(tool_call)
+        if not isinstance(arguments, str):
+            return [
+                ToolCallDiagnostic(
+                    code="malformed_arguments_json",
+                    message="function.arguments must be a JSON string",
+                    tool_name=name,
+                    index=index,
+                )
+            ]
+
+        try:
+            parsed_arguments = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError) as exc:
+            return [
+                ToolCallDiagnostic(
+                    code="malformed_arguments_json",
+                    message=f"function.arguments is not valid JSON: {exc}",
+                    tool_name=name,
+                    index=index,
+                )
+            ]
+
+        if not isinstance(parsed_arguments, dict):
+            return [
+                ToolCallDiagnostic(
+                    code="malformed_arguments_json",
+                    message="function.arguments must decode to a JSON object",
+                    tool_name=name,
+                    index=index,
+                )
+            ]
+
+        parameters = _get_value(function, "parameters") or {}
+        diagnostics: List[ToolCallDiagnostic] = []
+        for argument_name in _required_arguments(parameters):
+            if argument_name not in parsed_arguments:
+                diagnostics.append(
+                    ToolCallDiagnostic(
+                        code="missing_required_argument",
+                        message=(
+                            f"required argument {argument_name!r} is missing"
+                        ),
+                        tool_name=name,
+                        index=index,
+                        argument_name=argument_name,
+                    ))
+
+        properties = _get_value(parameters, "properties") or {}
+        for argument_name, value in parsed_arguments.items():
+            property_schema = _get_value(properties, argument_name)
+            expected_type = _get_value(property_schema, "type")
+            if expected_type is None:
+                continue
+            if _matches_json_schema_type(value, expected_type):
+                continue
+            diagnostics.append(
+                ToolCallDiagnostic(
+                    code="invalid_argument_type",
+                    message=(
+                        f"argument {argument_name!r} expected type "
+                        f"{expected_type!r} but got {_json_type_name(value)!r}"
+                    ),
+                    tool_name=name,
+                    index=index,
+                    argument_name=argument_name,
+                ))
+        return diagnostics
+
+    def _tool_function(self, name: str) -> Any:
+        position = self.tool_index.get(name)
+        if position is None:
+            return None
+        tool = self.tools[position]
+        return _get_value(tool, "function")
+
+    def _is_strict_tool(self, name: Optional[str]) -> bool:
+        if name is None:
+            return False
+        return bool(_get_value(self._tool_function(name), "strict"))
+
 
 def _tool_call_name(tool_call: Any) -> Optional[str]:
     function = _get_value(tool_call, "function")
     if function is None:
         return None
     return _get_value(function, "name")
+
+
+def _tool_call_arguments(tool_call: Any) -> Any:
+    function = _get_value(tool_call, "function")
+    if function is None:
+        return None
+    return _get_value(function, "arguments")
 
 
 def _tool_call_index(tool_call: Any) -> Optional[int]:
@@ -479,6 +654,54 @@ def _get_value(obj: Any, key: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(key)
     return getattr(obj, key, None)
+
+
+def _required_arguments(parameters: Any) -> List[str]:
+    required = _get_value(parameters, "required") or []
+    if not isinstance(required, list):
+        return []
+    return [name for name in required if isinstance(name, str)]
+
+
+def _matches_json_schema_type(value: Any, expected_type: Any) -> bool:
+    if isinstance(expected_type, list):
+        return any(_matches_json_schema_type(value, item)
+                   for item in expected_type)
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return (
+            isinstance(value, int) or isinstance(value, float)
+        ) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "null":
+        return value is None
+    return True
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
 
 
 class _EmptyToolTokenizer:

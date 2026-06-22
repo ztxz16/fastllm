@@ -35,6 +35,28 @@ def _weather_tool(name: str = "get_weather") -> Dict:
     }
 
 
+def _strict_weather_tool(name: str = "get_weather") -> Dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Get weather.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "rain": {"type": "boolean"},
+                    "tags": {"type": "array"},
+                    "meta": {"type": "object"},
+                },
+                "required": ["city"],
+            },
+        },
+    }
+
+
 def _time_tool() -> Dict:
     return {
         "type": "function",
@@ -87,6 +109,17 @@ def _parallel_dsml_call() -> str:
         f"{_time_dsml_call()}"
         "</｜DSML｜tool_calls>"
     )
+
+
+def _tool_call_dict(name: str, arguments) -> Dict:
+    return {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        },
+    }
 
 
 def _chunks(text: str, chunk_size: int) -> Iterable[str]:
@@ -215,6 +248,94 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(len(result.invalid_tool_calls), 2)
         self.assertEqual(result.diagnostics[-1].code,
                          "parallel_tool_calls_violation")
+
+    def test_strict_schema_required_key_present_passes(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict(
+                "get_weather",
+                json.dumps({"city": "北京", "days": 3},
+                           ensure_ascii=False),
+            )
+        ])
+
+        self.assertTrue(result.valid)
+        self.assertEqual(len(result.valid_tool_calls), 1)
+        self.assertEqual(result.invalid_tool_calls, [])
+        self.assertEqual(result.diagnostics, [])
+
+    def test_strict_schema_required_key_missing_is_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("get_weather", json.dumps({"days": 3}))
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.invalid_tool_calls), 1)
+        self.assertEqual(len(result.diagnostics), 1)
+        self.assertEqual(result.diagnostics[0].code,
+                         "missing_required_argument")
+        self.assertEqual(result.diagnostics[0].argument_name, "city")
+
+    def test_strict_schema_wrong_primitive_type_is_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("get_weather", json.dumps({"city": 123}))
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.invalid_tool_calls), 1)
+        self.assertEqual(result.diagnostics[0].code, "invalid_argument_type")
+        self.assertEqual(result.diagnostics[0].argument_name, "city")
+
+    def test_strict_schema_arguments_must_be_json(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("get_weather", "{bad json")
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.invalid_tool_calls), 1)
+        self.assertEqual(result.diagnostics[0].code,
+                         "malformed_arguments_json")
+
+    def test_strict_schema_arguments_must_be_object(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("get_weather", json.dumps(["北京"]))
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.invalid_tool_calls), 1)
+        self.assertEqual(result.diagnostics[0].code,
+                         "malformed_arguments_json")
+
+    def test_non_strict_schema_missing_required_key_is_allowed(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("get_weather", json.dumps({}))
+        ])
+
+        self.assertTrue(result.valid)
+        self.assertEqual(len(result.valid_tool_calls), 1)
+        self.assertEqual(result.invalid_tool_calls, [])
+        self.assertEqual(result.diagnostics, [])
 
     def test_non_stream_valid_tool_name_passes(self):
         parser = FunctionCallParser.from_request(

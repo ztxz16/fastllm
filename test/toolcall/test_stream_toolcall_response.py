@@ -34,6 +34,22 @@ def _weather_tool(name="get_weather"):
     }
 
 
+def _strict_weather_tool(name="get_weather"):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Get weather.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+
+
 def _time_tool(name="get_time"):
     return {
         "type": "function",
@@ -82,6 +98,10 @@ def _tool_calls(*invokes: str) -> str:
 
 def _weather_call(name="get_weather") -> str:
     return _tool_calls(_invoke(name, _param("city", True, "北京")))
+
+
+def _empty_weather_call(name="get_weather") -> str:
+    return _tool_calls(_invoke(name, ""))
 
 
 def _weather_and_time_call(weather_name="get_weather") -> str:
@@ -301,6 +321,36 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tool_choice_violation", errors[0]["message"])
         self.assertEqual(self._reconstruct_tool_calls(chunks), {})
         self.assertIn("tool_choice_violation", "\n".join(logs.output))
+
+    async def test_strict_schema_missing_required_streams_error(self):
+        with self.assertLogs(level="WARNING") as logs:
+            chunks, saw_done = await self._collect_stream(
+                _empty_weather_call(),
+                _request(tools=[_strict_weather_tool()]),
+            )
+
+        self.assertTrue(saw_done)
+        errors = self._errors(chunks)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing_required_argument", errors[0]["message"])
+        self.assertIn("city", errors[0]["message"])
+        self.assertEqual(self._reconstruct_tool_calls(chunks), {})
+        self.assertIn("missing_required_argument", "\n".join(logs.output))
+
+    async def test_strict_schema_valid_call_streams_after_validation(self):
+        chunks, saw_done = await self._collect_stream(
+            _weather_call(),
+            _request(tools=[_strict_weather_tool()]),
+        )
+
+        self.assertTrue(saw_done)
+        self.assertEqual(self._errors(chunks), [])
+        self.assertEqual(self._finish_reason(chunks), "tool_calls")
+        tool_calls = self._reconstruct_tool_calls(chunks)
+        self.assertEqual(set(tool_calls), {0})
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(json.loads(tool_calls[0]["arguments"]),
+                         {"city": "北京"})
 
 
 if __name__ == "__main__":

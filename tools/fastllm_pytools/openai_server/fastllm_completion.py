@@ -802,6 +802,9 @@ class FastLLmCompletion:
               message = f"{code} at index {index}: {tool_name!r}"
           else:
               message = f"{code} at index {index}"
+          detail = getattr(diagnostic, "message", None)
+          if detail:
+              message += f" ({detail})"
           closest_tool_name = getattr(diagnostic, "closest_tool_name", None)
           similarity_ratio = getattr(diagnostic, "similarity_ratio", None)
           if closest_tool_name is not None and similarity_ratio is not None:
@@ -1595,6 +1598,27 @@ class FastLLmCompletion:
                                   completion_tokens = completion_tokens))
             data = chunk.model_dump_json(exclude_unset = True,
                                         exclude_none = True)
+        if (final_stream_error_data is None and request.tools
+                and tool_call_parser):
+            flush_result = tool_call_parser.flush_stream_tool_calls()
+            if flush_result.valid_tool_calls:
+                delta_message = DeltaMessage(
+                    tool_calls = flush_result.valid_tool_calls,
+                )
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index = 0,
+                    delta = delta_message,
+                    logprobs = None,
+                    finish_reason = None)
+                chunk = ChatCompletionStreamResponseWithUsage(
+                    id = request_id,
+                    object = chunk_object_type,
+                    created = created_time,
+                    choices = [choice_data],
+                    model = model_name)
+                flush_data = chunk.model_dump_json(exclude_unset = True,
+                                                   exclude_none = True)
+                yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
         data = self.create_streaming_error_response(str(e))
