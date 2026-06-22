@@ -158,6 +158,25 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(result.diagnostics[0].code, "invalid_tool_name")
         self.assertEqual(result.diagnostics[0].tool_name, "get_wearher")
 
+    def test_non_stream_malformed_tool_block_is_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool()]))
+        raw_output = (
+            "<｜DSML｜tool_calls>"
+            "<｜DSML｜invoke name=\"get_weather\">"
+            "<｜DSML｜parameter name=\"city\" string=\"true\">北京</｜DSML｜parameter>"
+            "</｜DSML｜tool_calls>"
+        )
+
+        result = parser.parse_non_stream(raw_output)
+
+        self.assertFalse(result.tools_called)
+        self.assertTrue(result.has_invalid_tool_block)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(result.invalid_tool_calls, [])
+        self.assertEqual(len(result.diagnostics), 1)
+        self.assertEqual(result.diagnostics[0].code, "malformed_tool_block")
+
     def test_missing_tool_name_is_invalid(self):
         parser = FunctionCallParser.from_request(
             _request(tools=[_weather_tool()]))

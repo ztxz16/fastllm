@@ -785,6 +785,54 @@ class FastLLmCompletion:
           force_chat_template = self.model.force_chat_template,
           force_type = force_type)(tokenizer)
 
+  def _create_function_call_parser(self, request: ChatCompletionRequest):
+      from .toolcall_parser import FunctionCallParser
+      return FunctionCallParser.from_request(
+          request,
+          parser = self._create_tool_parser(),
+      )
+
+  def _format_tool_call_diagnostics(self, diagnostics: Iterable[Any]) -> str:
+      parts = []
+      for diagnostic in diagnostics:
+          code = getattr(diagnostic, "code", "invalid_tool_call")
+          tool_name = getattr(diagnostic, "tool_name", None)
+          index = getattr(diagnostic, "index", None)
+          if tool_name is not None:
+              parts.append(f"{code} at index {index}: {tool_name!r}")
+          else:
+              parts.append(f"{code} at index {index}")
+      return "; ".join(parts) or "invalid_tool_call"
+
+  def _parse_non_stream_tool_calls(
+      self,
+      result: str,
+      request: ChatCompletionRequest,
+  ) -> Union[ErrorResponse, ExtractedToolCallInformation]:
+      if not request.tools:
+          return ExtractedToolCallInformation(
+              tools_called = False,
+              tool_calls = [],
+              content = result,
+          )
+
+      parser = self._create_function_call_parser(request)
+      parsed = parser.parse_non_stream(result)
+      if parsed.has_invalid_tool_block:
+          diagnostics = self._format_tool_call_diagnostics(parsed.diagnostics)
+          logging.warning("Invalid non-stream tool call rejected: %s",
+                          diagnostics)
+          return self.create_error_response(
+              f"Invalid tool call: {diagnostics}",
+              err_type = "invalid_tool_call",
+          )
+
+      return ExtractedToolCallInformation(
+          tools_called = parsed.tools_called,
+          tool_calls = parsed.valid_tool_calls,
+          content = parsed.content,
+      )
+
   def _parse_anthropic_message_content(
       self,
       role: str,
@@ -1198,12 +1246,11 @@ class FastLLmCompletion:
       result, stopped_by_stop_string = self._truncate_at_stop(
           result, self._normalize_stop_strings(request.stop))
 
-      if request.tools:
-          tool_parser = self._create_tool_parser()
-          tool_call_info = tool_parser.extract_tool_calls(result, request)
-      else:
-          tool_call_info = ExtractedToolCallInformation(
-              tools_called=False, tool_calls=[], content=result)
+      tool_call_info = self._parse_non_stream_tool_calls(result, request)
+      if isinstance(tool_call_info, ErrorResponse):
+          if request_id in self.conversation_handles:
+              del self.conversation_handles[request_id]
+          return tool_call_info
 
       if tool_call_info.tools_called:
           choice_data = ChatCompletionResponseChoice(

@@ -48,6 +48,7 @@ class FunctionCallParser:
         tool_choice: Any = "auto",
         tool_parser_name: str = "deepseek_v4",
         tokenizer: Optional[Any] = None,
+        parser: Optional[Any] = None,
         model: str = "toolcall-parser",
     ):
         self.tools = list(tools or [])
@@ -60,8 +61,10 @@ class FunctionCallParser:
             tools=self.tools or None,
             tool_choice=tool_choice,
         )
-        parser_cls = ToolParserManager.get_tool_parser(tool_parser_name)
-        self.parser = parser_cls(tokenizer or _EmptyToolTokenizer())
+        if parser is None:
+            parser_cls = ToolParserManager.get_tool_parser(tool_parser_name)
+            parser = parser_cls(tokenizer or _EmptyToolTokenizer())
+        self.parser = parser
 
     @classmethod
     def from_request(
@@ -69,12 +72,14 @@ class FunctionCallParser:
         request: ChatCompletionRequest,
         tool_parser_name: str = "deepseek_v4",
         tokenizer: Optional[Any] = None,
+        parser: Optional[Any] = None,
     ) -> "FunctionCallParser":
         return cls(
             tools=request.tools,
             tool_choice=request.tool_choice,
             tool_parser_name=tool_parser_name,
             tokenizer=tokenizer,
+            parser=parser,
             model=request.model,
         )
 
@@ -100,6 +105,20 @@ class FunctionCallParser:
 
         extracted = self.parser.extract_tool_calls(text, self._request)
         validation = self.validate_tool_calls(extracted.tool_calls)
+        if self.has_tool_call(text) and not validation.valid_tool_calls:
+            if not validation.invalid_tool_calls:
+                diagnostic = ToolCallDiagnostic(
+                    code="malformed_tool_block",
+                    message="tool call markup was detected but no valid tool call was parsed",
+                )
+                return ToolCallParseResult(
+                    content=extracted.content,
+                    tools_called=False,
+                    valid_tool_calls=[],
+                    invalid_tool_calls=[],
+                    diagnostics=[diagnostic],
+                    has_invalid_tool_block=True,
+                )
         return self._result_from_extracted(extracted, validation)
 
     def parse_stream_chunk(
