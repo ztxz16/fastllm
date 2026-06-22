@@ -1,3 +1,4 @@
+import copy
 import difflib
 import json
 import os
@@ -39,6 +40,34 @@ class ToolCallValidationResult:
     diagnostics: List[ToolCallDiagnostic] = field(default_factory=list)
     valid_tool_calls: List[Any] = field(default_factory=list)
     invalid_tool_calls: List[Any] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ToolCallConstraintDescriptor:
+    constraint_type: str
+    model_type: str
+    tool_names: tuple[str, ...]
+    allowed_tool_names: tuple[str, ...]
+    tool_choice: Any
+    requires_tool_call: bool
+    named_tool_choice: Optional[str]
+    parallel_tool_calls: Optional[bool]
+    schemas: Dict[str, Any] = field(default_factory=dict)
+    strict_tool_names: tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "constraint_type": self.constraint_type,
+            "model_type": self.model_type,
+            "tool_names": list(self.tool_names),
+            "allowed_tool_names": list(self.allowed_tool_names),
+            "tool_choice": self.tool_choice,
+            "requires_tool_call": self.requires_tool_call,
+            "named_tool_choice": self.named_tool_choice,
+            "parallel_tool_calls": self.parallel_tool_calls,
+            "schemas": copy.deepcopy(self.schemas),
+            "strict_tool_names": list(self.strict_tool_names),
+        }
 
 
 class FunctionCallParser:
@@ -104,6 +133,21 @@ class FunctionCallParser:
             parallel_tool_calls=getattr(request, "parallel_tool_calls", None),
         )
 
+    @classmethod
+    def build_constraint_descriptor_from_request(
+        cls,
+        request: ChatCompletionRequest,
+        tool_parser_name: str = "deepseek_v4",
+    ) -> Optional[ToolCallConstraintDescriptor]:
+        return cls(
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            tool_parser_name=tool_parser_name,
+            parser=_NoopToolParser(),
+            model=request.model,
+            parallel_tool_calls=getattr(request, "parallel_tool_calls", None),
+        ).build_constraint_descriptor()
+
     @property
     def has_tools(self) -> bool:
         return bool(self.tools)
@@ -129,6 +173,44 @@ class FunctionCallParser:
         if callable(get_token_ids):
             return get_token_ids(text)
         return [0]
+
+    def build_constraint_descriptor(
+        self,
+    ) -> Optional[ToolCallConstraintDescriptor]:
+        if not self.has_tools:
+            return None
+
+        named_tool_choice = self._named_tool_choice()
+        if named_tool_choice is not None:
+            allowed_tool_names = (named_tool_choice,)
+        else:
+            allowed_tool_names = tuple(self.tool_index)
+
+        strict_tool_names: List[str] = []
+        schemas: Dict[str, Any] = {}
+        for name in self.tool_index:
+            function = self._tool_function(name)
+            if not _get_value(function, "strict"):
+                continue
+            strict_tool_names.append(name)
+            parameters = _get_value(function, "parameters")
+            if parameters is not None:
+                schemas[name] = copy.deepcopy(parameters)
+
+        return ToolCallConstraintDescriptor(
+            constraint_type=self._constraint_type(),
+            model_type=self.tool_parser_name,
+            tool_names=tuple(self.tool_index),
+            allowed_tool_names=allowed_tool_names,
+            tool_choice=_normalize_tool_choice_for_descriptor(
+                self.tool_choice),
+            requires_tool_call=self._requires_tool_call()
+            or named_tool_choice is not None,
+            named_tool_choice=named_tool_choice,
+            parallel_tool_calls=self.parallel_tool_calls,
+            schemas=schemas,
+            strict_tool_names=tuple(strict_tool_names),
+        )
 
     def parse_non_stream(self, text: str) -> ToolCallParseResult:
         if not self.has_tools:
@@ -598,6 +680,11 @@ class FunctionCallParser:
             return False
         return bool(_get_value(self._tool_function(name), "strict"))
 
+    def _constraint_type(self) -> str:
+        if self.tool_parser_name == "deepseek_v4":
+            return "deepseek_v4_dsml"
+        return f"{self.tool_parser_name}_tool_call"
+
 
 def _tool_call_name(tool_call: Any) -> Optional[str]:
     function = _get_value(tool_call, "function")
@@ -704,6 +791,24 @@ def _json_type_name(value: Any) -> str:
     return type(value).__name__
 
 
+def _normalize_tool_choice_for_descriptor(tool_choice: Any) -> Any:
+    if isinstance(tool_choice, str) or tool_choice is None:
+        return tool_choice
+    tool_type = _get_value(tool_choice, "type")
+    function = _get_value(tool_choice, "function")
+    name = _get_value(function, "name")
+    if tool_type == "function" and name:
+        return {
+            "type": "function",
+            "function": {"name": name},
+        }
+    return str(tool_choice)
+
+
 class _EmptyToolTokenizer:
     def get_vocab(self):
         return {}
+
+
+class _NoopToolParser:
+    pass

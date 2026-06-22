@@ -337,6 +337,106 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(result.invalid_tool_calls, [])
         self.assertEqual(result.diagnostics, [])
 
+    def test_constraint_descriptor_auto_without_strict_is_dry_run(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool(), _time_tool()]))
+
+        descriptor = parser.build_constraint_descriptor()
+
+        self.assertIsNotNone(descriptor)
+        self.assertEqual(descriptor.constraint_type, "deepseek_v4_dsml")
+        self.assertEqual(descriptor.model_type, "deepseek_v4")
+        self.assertEqual(descriptor.tool_names, ("get_weather", "get_time"))
+        self.assertEqual(descriptor.allowed_tool_names,
+                         ("get_weather", "get_time"))
+        self.assertEqual(descriptor.tool_choice, "auto")
+        self.assertFalse(descriptor.requires_tool_call)
+        self.assertEqual(descriptor.schemas, {})
+        self.assertEqual(descriptor.strict_tool_names, ())
+
+    def test_constraint_descriptor_required_requires_tool_call(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool()], tool_choice="required"))
+
+        descriptor = parser.build_constraint_descriptor()
+
+        self.assertTrue(descriptor.requires_tool_call)
+        self.assertIsNone(descriptor.named_tool_choice)
+        self.assertEqual(descriptor.allowed_tool_names, ("get_weather",))
+
+    def test_constraint_descriptor_named_tool_choice_restricts_enum(self):
+        parser = FunctionCallParser.from_request(
+            _request(
+                tools=[_weather_tool(), _time_tool()],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "get_time"},
+                },
+            ))
+
+        descriptor = parser.build_constraint_descriptor()
+
+        self.assertTrue(descriptor.requires_tool_call)
+        self.assertEqual(descriptor.named_tool_choice, "get_time")
+        self.assertEqual(descriptor.allowed_tool_names, ("get_time",))
+        self.assertEqual(
+            descriptor.tool_choice,
+            {"type": "function", "function": {"name": "get_time"}},
+        )
+
+    def test_constraint_descriptor_strict_includes_schema(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool(), _time_tool()]))
+
+        descriptor = parser.build_constraint_descriptor()
+
+        self.assertEqual(descriptor.strict_tool_names, ("get_weather",))
+        self.assertEqual(
+            descriptor.schemas["get_weather"]["required"], ["city"])
+        self.assertEqual(
+            descriptor.schemas["get_weather"]["properties"]["city"]["type"],
+            "string",
+        )
+        self.assertNotIn("get_time", descriptor.schemas)
+
+    def test_constraint_descriptor_schema_is_snapshot(self):
+        tool = _strict_weather_tool()
+        parser = FunctionCallParser.from_request(_request(tools=[tool]))
+
+        descriptor = parser.build_constraint_descriptor()
+        tool["function"]["parameters"]["required"].append("unit")
+
+        self.assertEqual(descriptor.schemas["get_weather"]["required"],
+                         ["city"])
+        self.assertEqual(descriptor.to_dict()["schemas"]["get_weather"]
+                         ["required"], ["city"])
+
+    def test_constraint_descriptor_to_dict_is_json_serializable_copy(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+        descriptor = parser.build_constraint_descriptor()
+
+        dumped = descriptor.to_dict()
+        dumped["schemas"]["get_weather"]["required"].append("unit")
+
+        json.dumps(dumped, ensure_ascii=False)
+        self.assertEqual(descriptor.schemas["get_weather"]["required"],
+                         ["city"])
+
+    def test_constraint_descriptor_parallel_flag_is_included(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool()], parallel_tool_calls=False))
+
+        descriptor = parser.build_constraint_descriptor()
+
+        self.assertFalse(descriptor.parallel_tool_calls)
+        self.assertFalse(descriptor.to_dict()["parallel_tool_calls"])
+
+    def test_constraint_descriptor_absent_without_tools(self):
+        parser = FunctionCallParser.from_request(_request(tools=None))
+
+        self.assertIsNone(parser.build_constraint_descriptor())
+
     def test_non_stream_valid_tool_name_passes(self):
         parser = FunctionCallParser.from_request(
             _request(tools=[_weather_tool()]))

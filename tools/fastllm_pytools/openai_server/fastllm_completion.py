@@ -792,6 +792,19 @@ class FastLLmCompletion:
           parser = self._create_tool_parser(),
       )
 
+  def _build_tool_call_constraint_descriptor(self,
+                                             request: ChatCompletionRequest):
+      if not request.tools:
+          return None
+      from .toolcall_parser import FunctionCallParser
+      force_type = getattr(self.model, "tool_call_parser", "auto")
+      model_type = self.model.get_type()
+      tool_parser_name = force_type if force_type != "auto" else model_type
+      return FunctionCallParser.build_constraint_descriptor_from_request(
+          request,
+          tool_parser_name = tool_parser_name,
+      )
+
   def _format_tool_call_diagnostics(self, diagnostics: Iterable[Any]) -> str:
       parts = []
       for diagnostic in diagnostics:

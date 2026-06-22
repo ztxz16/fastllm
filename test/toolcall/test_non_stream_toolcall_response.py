@@ -323,6 +323,48 @@ class NonStreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("city", response.message)
         self.assertIn("missing_required_argument", "\n".join(logs.output))
 
+    async def test_constraint_descriptor_dry_run_does_not_change_response(self):
+        completion = _completion()
+        request = _request(
+            tools=[_strict_weather_tool()],
+            tool_choice="required",
+            parallel_tool_calls=False,
+        )
+
+        descriptor = completion._build_tool_call_constraint_descriptor(request)
+        response = await completion.chat_completion_full_generator(
+            request=request,
+            raw_request=_RawRequest(),
+            handle=0,
+            result_generator=_result_generator(_dsml_call("get_weather")),
+            request_id="chatcmpl-test",
+            input_token_len=3,
+        )
+
+        self.assertEqual(descriptor.constraint_type, "deepseek_v4_dsml")
+        self.assertTrue(descriptor.requires_tool_call)
+        self.assertEqual(descriptor.strict_tool_names, ("get_weather",))
+        self.assertFalse(descriptor.parallel_tool_calls)
+        self.assertIsInstance(response, ChatCompletionResponse)
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(choice.message.tool_calls[0].function.name,
+                         "get_weather")
+
+    async def test_constraint_descriptor_dry_run_does_not_create_parser(self):
+        completion = _completion()
+        completion.model.hf_tokenizer = object()
+        request = _request(tools=[_strict_weather_tool()])
+
+        def fail_create_tool_parser():
+            raise AssertionError("descriptor helper should not create parser")
+
+        completion._create_tool_parser = fail_create_tool_parser
+        descriptor = completion._build_tool_call_constraint_descriptor(request)
+
+        self.assertEqual(descriptor.constraint_type, "deepseek_v4_dsml")
+        self.assertEqual(descriptor.strict_tool_names, ("get_weather",))
+
     async def test_plain_text_without_tools_is_unchanged(self):
         response = await self._run_full_generator(
             "普通回复",
