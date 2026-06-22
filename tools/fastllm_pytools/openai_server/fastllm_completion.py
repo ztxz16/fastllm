@@ -812,7 +812,9 @@ class FastLLmCompletion:
       descriptor = self._build_tool_call_constraint_descriptor(request)
       if descriptor is None:
           return None
-      return descriptor.to_dict()
+      from .toolcall_constraints import compile_tool_call_constraint
+      spec = compile_tool_call_constraint(descriptor)
+      return spec.to_dict() if spec is not None else None
 
   def _model_supports_tool_call_constraint(self) -> bool:
       launch_fn = getattr(self.model, "launch_stream_response", None)

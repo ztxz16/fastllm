@@ -208,13 +208,18 @@ class ToolCallGenerationConstraintTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(model.launch_called)
         constraint = model.received_constraint
         self.assertIsNotNone(constraint)
-        self.assertEqual(constraint["constraint_type"], "deepseek_v4_dsml")
-        self.assertEqual(constraint["tool_names"], ["get_weather"])
-        self.assertEqual(constraint["allowed_tool_names"], ["get_weather"])
-        self.assertTrue(constraint["requires_tool_call"])
-        self.assertEqual(constraint["strict_tool_names"], ["get_weather"])
+        self.assertEqual(constraint["backend"],
+                         "fastllm_toolcall_prototype")
+        self.assertEqual(constraint["structural_tag"]["format"],
+                         "deepseek_v4_dsml")
+        descriptor = constraint["descriptor"]
+        self.assertEqual(descriptor["constraint_type"], "deepseek_v4_dsml")
+        self.assertEqual(descriptor["tool_names"], ["get_weather"])
+        self.assertEqual(descriptor["allowed_tool_names"], ["get_weather"])
+        self.assertTrue(descriptor["requires_tool_call"])
+        self.assertEqual(descriptor["strict_tool_names"], ["get_weather"])
         self.assertEqual(
-            constraint["schemas"]["get_weather"]["required"], ["city"])
+            constraint["json_schemas"]["get_weather"]["required"], ["city"])
         choice = response.choices[0]
         self.assertEqual(choice.finish_reason, "tool_calls")
         self.assertEqual(choice.message.tool_calls[0].function.name,
@@ -271,10 +276,15 @@ class ToolCallGenerationConstraintTest(unittest.IsolatedAsyncioTestCase):
                          "get_weather")
         constraint = model.received_constraint
         self.assertIsNotNone(constraint)
-        self.assertEqual(constraint["constraint_type"], "deepseek_v4_dsml")
-        self.assertEqual(constraint["tool_names"], ["get_weather"])
-        self.assertEqual(constraint["allowed_tool_names"], ["get_weather"])
-        self.assertFalse(constraint["requires_tool_call"])
+        self.assertEqual(constraint["backend"],
+                         "fastllm_toolcall_prototype")
+        self.assertEqual(constraint["structural_tag"]["format"],
+                         "deepseek_v4_dsml")
+        descriptor = constraint["descriptor"]
+        self.assertEqual(descriptor["constraint_type"], "deepseek_v4_dsml")
+        self.assertEqual(descriptor["tool_names"], ["get_weather"])
+        self.assertEqual(descriptor["allowed_tool_names"], ["get_weather"])
+        self.assertFalse(descriptor["requires_tool_call"])
 
     async def test_anthropic_constraint_absent_without_tools(self):
         model = _ConstraintAwareModel("普通回复")
