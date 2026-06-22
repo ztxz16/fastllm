@@ -1545,10 +1545,23 @@ class FastLLmCompletion:
         finish_reason = self._chat_finish_reason(
             completion_tokens, request.max_tokens or 32768,
             stopped_by_stop_string)
-        if (request.tools and tool_call_parser
-                and tool_call_parser.has_valid_streamed_tool_calls):
-            finish_reason = 'tool_calls'
-        if fast_text_stream:
+        final_stream_error_data = None
+        if request.tools and tool_call_parser:
+            final_diagnostics = tool_call_parser.finalize_stream()
+            if final_diagnostics:
+                diagnostics = self._format_tool_call_diagnostics(
+                    final_diagnostics)
+                logging.warning("Invalid stream tool call final state: %s",
+                                diagnostics)
+                final_stream_error_data = self.create_streaming_error_response(
+                    f"Invalid tool call: {diagnostics}",
+                    err_type = "invalid_tool_call",
+                )
+            elif tool_call_parser.has_valid_streamed_tool_calls:
+                finish_reason = 'tool_calls'
+        if final_stream_error_data is not None:
+            data = final_stream_error_data
+        elif fast_text_stream:
             data = json_dump({
                 "id": request_id,
                 "object": chunk_object_type,

@@ -99,6 +99,7 @@ class ChatCompletionRequest(BaseModel):
         Literal["required"],
         ChatCompletionNamedToolChoiceParam,
     ]] = "none"
+    parallel_tool_calls: Optional[bool] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 

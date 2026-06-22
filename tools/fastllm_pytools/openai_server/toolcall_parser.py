@@ -55,9 +55,11 @@ class FunctionCallParser:
         tokenizer: Optional[Any] = None,
         parser: Optional[Any] = None,
         model: str = "toolcall-parser",
+        parallel_tool_calls: Optional[bool] = None,
     ):
         self.tools = list(tools or [])
         self.tool_choice = tool_choice
+        self.parallel_tool_calls = parallel_tool_calls
         self.tool_parser_name = tool_parser_name
         self.tool_index = self._build_tool_index(self.tools)
         self._request = ChatCompletionRequest(
@@ -65,6 +67,7 @@ class FunctionCallParser:
             messages=[],
             tools=self.tools or None,
             tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
         if parser is None:
             parser_cls = ToolParserManager.get_tool_parser(tool_parser_name)
@@ -93,6 +96,7 @@ class FunctionCallParser:
             tokenizer=tokenizer,
             parser=parser,
             model=request.model,
+            parallel_tool_calls=getattr(request, "parallel_tool_calls", None),
         )
 
     @property
@@ -188,10 +192,24 @@ class FunctionCallParser:
 
             name = _tool_call_name(tool_call)
             if name:
+                choice_diagnostic = self._tool_choice_diagnostic(
+                    name, raw_index)
+                if choice_diagnostic is not None:
+                    self.invalid_stream_tool_indices.add(raw_index)
+                    invalid_tool_calls.append(tool_call)
+                    diagnostics.append(choice_diagnostic)
+                    continue
                 if name not in self.tool_index:
                     diagnostic = self._invalid_tool_name_diagnostic(
                         name, raw_index)
                     if self.forward_unknown_tools:
+                        parallel_diagnostic = self._parallel_stream_diagnostic(
+                            raw_index)
+                        if parallel_diagnostic is not None:
+                            self.invalid_stream_tool_indices.add(raw_index)
+                            invalid_tool_calls.append(tool_call)
+                            diagnostics.append(parallel_diagnostic)
+                            continue
                         self.valid_stream_tool_indices.add(raw_index)
                         self.stream_index_map.setdefault(
                             raw_index, len(self.stream_index_map))
@@ -203,6 +221,13 @@ class FunctionCallParser:
                     self.invalid_stream_tool_indices.add(raw_index)
                     invalid_tool_calls.append(tool_call)
                     diagnostics.append(diagnostic)
+                    continue
+                parallel_diagnostic = self._parallel_stream_diagnostic(
+                    raw_index)
+                if parallel_diagnostic is not None:
+                    self.invalid_stream_tool_indices.add(raw_index)
+                    invalid_tool_calls.append(tool_call)
+                    diagnostics.append(parallel_diagnostic)
                     continue
                 self.valid_stream_tool_indices.add(raw_index)
                 self.stream_index_map.setdefault(raw_index,
@@ -249,6 +274,11 @@ class FunctionCallParser:
                         index=index,
                     ))
                 continue
+            diagnostic = self._tool_choice_diagnostic(name, index)
+            if diagnostic is not None:
+                invalid_tool_calls.append(tool_call)
+                diagnostics.append(diagnostic)
+                continue
             if name in self.tool_index:
                 valid_tool_calls.append(tool_call)
                 continue
@@ -272,14 +302,46 @@ class FunctionCallParser:
         extracted: ExtractedToolCallInformation,
         validation: ToolCallValidationResult,
     ) -> ToolCallParseResult:
+        diagnostics = list(validation.diagnostics)
+        has_invalid_tool_block = bool(validation.invalid_tool_calls)
+        valid_tool_calls = list(validation.valid_tool_calls)
+        invalid_tool_calls = list(validation.invalid_tool_calls)
+        if self._requires_tool_call() and not validation.valid_tool_calls:
+            diagnostics.append(
+                ToolCallDiagnostic(
+                    code="tool_choice_violation",
+                    message="tool_choice='required' was set but no valid tool call was produced",
+                ))
+            has_invalid_tool_block = True
+        if (self.parallel_tool_calls is False
+                and len(validation.valid_tool_calls) > 1):
+            diagnostics.append(
+                ToolCallDiagnostic(
+                    code="parallel_tool_calls_violation",
+                    message="parallel_tool_calls=false was set but multiple valid tool calls were produced",
+                ))
+            invalid_tool_calls.extend(valid_tool_calls)
+            valid_tool_calls = []
+            has_invalid_tool_block = True
         return ToolCallParseResult(
             content=extracted.content,
-            tools_called=bool(validation.valid_tool_calls),
-            valid_tool_calls=validation.valid_tool_calls,
-            invalid_tool_calls=validation.invalid_tool_calls,
-            diagnostics=validation.diagnostics,
-            has_invalid_tool_block=bool(validation.invalid_tool_calls),
+            tools_called=bool(valid_tool_calls),
+            valid_tool_calls=valid_tool_calls,
+            invalid_tool_calls=invalid_tool_calls,
+            diagnostics=diagnostics,
+            has_invalid_tool_block=has_invalid_tool_block,
         )
+
+    def finalize_stream(self) -> List[ToolCallDiagnostic]:
+        diagnostics: List[ToolCallDiagnostic] = []
+        if self._requires_tool_call() and not self.has_valid_streamed_tool_calls:
+            diagnostics.append(
+                ToolCallDiagnostic(
+                    code="tool_choice_violation",
+                    message="tool_choice='required' was set but no valid stream tool call was produced",
+                ))
+        self.stream_diagnostics.extend(diagnostics)
+        return diagnostics
 
     @staticmethod
     def _build_tool_index(tools: Iterable[Any]) -> Dict[str, int]:
@@ -317,6 +379,55 @@ class FunctionCallParser:
             allowed_tool_names=allowed_names,
             closest_tool_name=closest_name,
             similarity_ratio=ratio,
+        )
+
+    def _requires_tool_call(self) -> bool:
+        return self.tool_choice == "required"
+
+    def _named_tool_choice(self) -> Optional[str]:
+        if isinstance(self.tool_choice, str) or self.tool_choice is None:
+            return None
+        function = _get_value(self.tool_choice, "function")
+        if function is None:
+            return None
+        return _get_value(function, "name")
+
+    def _tool_choice_diagnostic(
+        self,
+        name: str,
+        index: int,
+    ) -> Optional[ToolCallDiagnostic]:
+        required_name = self._named_tool_choice()
+        if required_name is None or name == required_name:
+            return None
+        return ToolCallDiagnostic(
+            code="tool_choice_violation",
+            message=(
+                f"tool_choice requires function {required_name!r} "
+                f"but model produced {name!r}"
+            ),
+            tool_name=name,
+            index=index,
+            allowed_tool_names=(required_name,),
+        )
+
+    def _parallel_stream_diagnostic(
+        self,
+        raw_index: int,
+    ) -> Optional[ToolCallDiagnostic]:
+        if self.parallel_tool_calls is not False:
+            return None
+        if raw_index in self.valid_stream_tool_indices:
+            return None
+        if not self.valid_stream_tool_indices:
+            return None
+        return ToolCallDiagnostic(
+            code="parallel_tool_calls_violation",
+            message=(
+                "parallel_tool_calls=false was set but stream produced "
+                "more than one tool call"
+            ),
+            index=raw_index,
         )
 
 

@@ -49,12 +49,14 @@ def _time_tool() -> Dict:
     }
 
 
-def _request(tools=None, tool_choice="auto") -> ChatCompletionRequest:
+def _request(tools=None, tool_choice="auto",
+             parallel_tool_calls=None) -> ChatCompletionRequest:
     return ChatCompletionRequest(
         model="dummy",
         messages=[{"role": "user", "content": "查天气"}],
         tools=tools,
         tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
     )
 
 
@@ -64,6 +66,25 @@ def _dsml_call(name: str) -> str:
         f"<｜DSML｜invoke name=\"{name}\">"
         "<｜DSML｜parameter name=\"city\" string=\"true\">北京</｜DSML｜parameter>"
         "</｜DSML｜invoke>"
+        "</｜DSML｜tool_calls>"
+    )
+
+
+def _time_dsml_call() -> str:
+    return (
+        "<｜DSML｜invoke name=\"get_time\">"
+        "<｜DSML｜parameter name=\"timezone\" string=\"true\">Asia/Shanghai</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+    )
+
+
+def _parallel_dsml_call() -> str:
+    return (
+        "<｜DSML｜tool_calls>"
+        "<｜DSML｜invoke name=\"get_weather\">"
+        "<｜DSML｜parameter name=\"city\" string=\"true\">北京</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        f"{_time_dsml_call()}"
         "</｜DSML｜tool_calls>"
     )
 
@@ -108,13 +129,13 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertTrue(parser.has_tool_call("detected"))
         self.assertFalse(parser.has_tool_call("plain text"))
 
-    def test_tool_choice_is_stored_but_not_enforced(self):
+    def test_named_tool_choice_match_passes(self):
         parser = FunctionCallParser.from_request(
             _request(
                 tools=[_weather_tool(), _time_tool()],
                 tool_choice={
                     "type": "function",
-                    "function": {"name": "get_time"},
+                    "function": {"name": "get_weather"},
                 },
             ))
 
@@ -124,6 +145,76 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertTrue(result.tools_called)
         self.assertEqual(result.diagnostics, [])
         self.assertEqual(result.valid_tool_calls[0].function.name, "get_weather")
+
+    def test_named_tool_choice_mismatch_is_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(
+                tools=[_weather_tool(), _time_tool()],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "get_time"},
+                },
+            ))
+
+        result = parser.parse_non_stream(_dsml_call("get_weather"))
+
+        self.assertFalse(result.tools_called)
+        self.assertTrue(result.has_invalid_tool_block)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.invalid_tool_calls), 1)
+        self.assertEqual(result.diagnostics[0].code, "tool_choice_violation")
+        self.assertEqual(result.diagnostics[0].tool_name, "get_weather")
+
+    def test_required_tool_choice_without_call_is_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool()], tool_choice="required"))
+
+        result = parser.parse_non_stream("普通回复")
+
+        self.assertFalse(result.tools_called)
+        self.assertTrue(result.has_invalid_tool_block)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.diagnostics), 1)
+        self.assertEqual(result.diagnostics[0].code, "tool_choice_violation")
+
+    def test_required_tool_choice_with_valid_call_passes(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool()], tool_choice="required"))
+
+        result = parser.parse_non_stream(_dsml_call("get_weather"))
+
+        self.assertTrue(result.tools_called)
+        self.assertFalse(result.has_invalid_tool_block)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_parallel_tool_calls_false_with_one_call_passes(self):
+        parser = FunctionCallParser.from_request(
+            _request(
+                tools=[_weather_tool(), _time_tool()],
+                parallel_tool_calls=False,
+            ))
+
+        result = parser.parse_non_stream(_dsml_call("get_weather"))
+
+        self.assertTrue(result.tools_called)
+        self.assertFalse(result.has_invalid_tool_block)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_parallel_tool_calls_false_with_two_calls_is_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(
+                tools=[_weather_tool(), _time_tool()],
+                parallel_tool_calls=False,
+            ))
+
+        result = parser.parse_non_stream(_parallel_dsml_call())
+
+        self.assertFalse(result.tools_called)
+        self.assertTrue(result.has_invalid_tool_block)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.invalid_tool_calls), 2)
+        self.assertEqual(result.diagnostics[-1].code,
+                         "parallel_tool_calls_violation")
 
     def test_non_stream_valid_tool_name_passes(self):
         parser = FunctionCallParser.from_request(
@@ -321,6 +412,57 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(valid_calls[0].function.name, "get_wearher")
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(diagnostics[0].code, "invalid_tool_name")
+
+    def test_stream_named_tool_choice_mismatch_is_suppressed(self):
+        parser = FunctionCallParser.from_request(
+            _request(
+                tools=[_weather_tool(), _time_tool()],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "get_time"},
+                },
+            ))
+
+        results = self._stream_results(parser, _dsml_call("get_weather"))
+
+        valid_calls = [
+            call
+            for result in results
+            for call in result.valid_tool_calls
+        ]
+        diagnostics = [
+            diagnostic
+            for result in results
+            for diagnostic in result.diagnostics
+        ]
+        self.assertEqual(valid_calls, [])
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0].code, "tool_choice_violation")
+
+    def test_stream_parallel_tool_calls_false_suppresses_second_call(self):
+        parser = FunctionCallParser.from_request(
+            _request(
+                tools=[_weather_tool(), _time_tool()],
+                parallel_tool_calls=False,
+            ))
+
+        results = self._stream_results(parser, _parallel_dsml_call())
+
+        valid_calls = [
+            call
+            for result in results
+            for call in result.valid_tool_calls
+        ]
+        diagnostics = [
+            diagnostic
+            for result in results
+            for diagnostic in result.diagnostics
+        ]
+        self.assertEqual(len(valid_calls), 1)
+        self.assertEqual(valid_calls[0].function.name, "get_weather")
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0].code,
+                         "parallel_tool_calls_violation")
 
     def test_request_tools_are_not_mutated(self):
         request = _request(tools=[_weather_tool(), _time_tool()])

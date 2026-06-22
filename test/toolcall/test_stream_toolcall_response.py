@@ -49,12 +49,13 @@ def _time_tool(name="get_time"):
     }
 
 
-def _request(tools=None):
+def _request(tools=None, tool_choice="auto", parallel_tool_calls=None):
     return ChatCompletionRequest(
         model="dummy",
         messages=[{"role": "user", "content": "查工具"}],
         tools=tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         max_tokens=128,
         stream=True,
     )
@@ -170,6 +171,13 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(reasons), 1)
         return reasons[0]
 
+    def _errors(self, chunks: List[Dict]) -> List[Dict]:
+        return [
+            chunk["error"]
+            for chunk in chunks
+            if "error" in chunk
+        ]
+
     async def test_valid_tool_call_streams_tool_delta_and_done(self):
         chunks, saw_done = await self._collect_stream(
             _weather_call(),
@@ -244,6 +252,55 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._finish_reason(chunks), "tool_calls")
         self.assertEqual([tool_calls[index]["name"] for index in sorted(tool_calls)],
                          ["get_weather", "get_time"])
+
+    async def test_named_tool_choice_mismatch_is_suppressed(self):
+        with self.assertLogs(level="WARNING") as logs:
+            chunks, saw_done = await self._collect_stream(
+                _weather_call("get_weather"),
+                _request(
+                    tools=[_weather_tool(), _time_tool()],
+                    tool_choice={
+                        "type": "function",
+                        "function": {"name": "get_time"},
+                    },
+                ),
+            )
+
+        self.assertTrue(saw_done)
+        self.assertEqual(self._finish_reason(chunks), "stop")
+        self.assertEqual(self._reconstruct_tool_calls(chunks), {})
+        self.assertIn("tool_choice_violation", "\n".join(logs.output))
+
+    async def test_parallel_tool_calls_false_suppresses_second_call(self):
+        with self.assertLogs(level="WARNING") as logs:
+            chunks, saw_done = await self._collect_stream(
+                _weather_and_time_call(),
+                _request(
+                    tools=[_weather_tool(), _time_tool()],
+                    parallel_tool_calls=False,
+                ),
+            )
+
+        tool_calls = self._reconstruct_tool_calls(chunks)
+        self.assertTrue(saw_done)
+        self.assertEqual(self._finish_reason(chunks), "tool_calls")
+        self.assertEqual(set(tool_calls), {0})
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertIn("parallel_tool_calls_violation", "\n".join(logs.output))
+
+    async def test_required_tool_choice_no_stream_call_logs_violation(self):
+        with self.assertLogs(level="WARNING") as logs:
+            chunks, saw_done = await self._collect_stream(
+                "普通回复",
+                _request(tools=[_weather_tool()], tool_choice="required"),
+            )
+
+        self.assertTrue(saw_done)
+        errors = self._errors(chunks)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("tool_choice_violation", errors[0]["message"])
+        self.assertEqual(self._reconstruct_tool_calls(chunks), {})
+        self.assertIn("tool_choice_violation", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

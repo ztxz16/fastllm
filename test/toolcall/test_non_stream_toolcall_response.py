@@ -35,12 +35,28 @@ def _weather_tool(name="get_weather"):
     }
 
 
-def _request(tools=None):
+def _time_tool(name="get_time"):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Get time.",
+            "parameters": {
+                "type": "object",
+                "properties": {"timezone": {"type": "string"}},
+                "required": ["timezone"],
+            },
+        },
+    }
+
+
+def _request(tools=None, tool_choice="auto", parallel_tool_calls=None):
     return ChatCompletionRequest(
         model="dummy",
         messages=[{"role": "user", "content": "查天气"}],
         tools=tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         max_tokens=128,
     )
 
@@ -64,6 +80,19 @@ def _malformed_dsml_call() -> str:
         "<｜DSML｜tool_calls>"
         "<｜DSML｜invoke name=\"get_weather\">"
         "<｜DSML｜parameter name=\"city\" string=\"true\">北京</｜DSML｜parameter>"
+        "</｜DSML｜tool_calls>"
+    )
+
+
+def _parallel_dsml_call() -> str:
+    return (
+        "<｜DSML｜tool_calls>"
+        "<｜DSML｜invoke name=\"get_weather\">"
+        "<｜DSML｜parameter name=\"city\" string=\"true\">北京</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        "<｜DSML｜invoke name=\"get_time\">"
+        "<｜DSML｜parameter name=\"timezone\" string=\"true\">Asia/Shanghai</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
         "</｜DSML｜tool_calls>"
     )
 
@@ -196,6 +225,51 @@ class NonStreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("DSML", response.message)
         self.assertNotIn("tool_calls", response.message)
         self.assertIn("malformed_tool_block", "\n".join(logs.output))
+
+    async def test_required_tool_choice_no_call_returns_error(self):
+        with self.assertLogs(level="WARNING") as logs:
+            response = await self._run_full_generator(
+                "普通回复",
+                _request(tools=[_weather_tool()], tool_choice="required"),
+            )
+
+        self.assertIsInstance(response, ErrorResponse)
+        self.assertEqual(response.code, 400)
+        self.assertIn("tool_choice_violation", response.message)
+        self.assertIn("tool_choice_violation", "\n".join(logs.output))
+
+    async def test_named_tool_choice_mismatch_returns_error(self):
+        with self.assertLogs(level="WARNING") as logs:
+            response = await self._run_full_generator(
+                _dsml_call("get_weather"),
+                _request(
+                    tools=[_weather_tool(), _time_tool()],
+                    tool_choice={
+                        "type": "function",
+                        "function": {"name": "get_time"},
+                    },
+                ),
+            )
+
+        self.assertIsInstance(response, ErrorResponse)
+        self.assertEqual(response.code, 400)
+        self.assertIn("tool_choice_violation", response.message)
+        self.assertIn("tool_choice_violation", "\n".join(logs.output))
+
+    async def test_parallel_tool_calls_false_returns_error_for_two_calls(self):
+        with self.assertLogs(level="WARNING") as logs:
+            response = await self._run_full_generator(
+                _parallel_dsml_call(),
+                _request(
+                    tools=[_weather_tool(), _time_tool()],
+                    parallel_tool_calls=False,
+                ),
+            )
+
+        self.assertIsInstance(response, ErrorResponse)
+        self.assertEqual(response.code, 400)
+        self.assertIn("parallel_tool_calls_violation", response.message)
+        self.assertIn("parallel_tool_calls_violation", "\n".join(logs.output))
 
     async def test_plain_text_without_tools_is_unchanged(self):
         response = await self._run_full_generator(
