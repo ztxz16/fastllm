@@ -81,6 +81,14 @@ class _ToolCallConstraintDecoder:
         self.payload = payload
 
 
+class _ToolNameConstraintDecoder:
+    def __init__(self):
+        self.payload = None
+
+    def set_tool_name_constraint(self, payload):
+        self.payload = payload
+
+
 class _StructuralTagDecoder:
     def __init__(self):
         self.payload = None
@@ -110,6 +118,12 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
         self.assertEqual(spec.structural_tag["format"], "deepseek_v4_dsml")
         self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
                          ["get_weather", "get_time"])
+        self.assertEqual(spec.name_constraint["format"], "deepseek_v4_dsml")
+        self.assertEqual(spec.name_constraint["allowed_names"],
+                         ["get_weather", "get_time"])
+        self.assertEqual(spec.name_constraint["type"], "tool_name_enum")
+        self.assertIn('<｜DSML｜invoke name="',
+                      spec.name_constraint["invoke_name_prefixes"])
         self.assertIn('"get_weather"', spec.name_grammar)
         self.assertIn('"get_time"', spec.name_grammar)
         self.assertIn("<｜DSML｜tool_calls>", spec.name_grammar)
@@ -127,6 +141,7 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
 
         self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
                          ["get_time"])
+        self.assertEqual(spec.name_constraint["allowed_names"], ["get_time"])
         self.assertIn('"get_time"', spec.name_grammar)
         self.assertNotIn('"get_weather"', spec.name_grammar)
 
@@ -162,8 +177,19 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
         self.assertIsNone(spec.structural_tag)
         self.assertIsNone(spec.name_grammar)
         self.assertIn("no structural_tag prototype", spec.notes[-1])
+        self.assertIsNone(spec.name_constraint)
 
-    def test_tool_call_constraint_decoder_accepts_spec(self):
+    def test_tool_name_constraint_decoder_accepts_name_payload_first(self):
+        decoder = _ToolNameConstraintDecoder()
+        result = apply_tool_call_constraint_to_decoder(
+            decoder, _descriptor(tools=[_weather_tool()]))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.mode, "tool_name_constraint")
+        self.assertEqual(decoder.payload["type"], "tool_name_enum")
+        self.assertEqual(decoder.payload["allowed_names"], ["get_weather"])
+
+    def test_tool_call_constraint_decoder_accepts_full_spec(self):
         decoder = _ToolCallConstraintDecoder()
         result = apply_tool_call_constraint_to_decoder(
             decoder, _descriptor(tools=[_weather_tool()]))
@@ -172,6 +198,8 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
         self.assertEqual(result.mode, "tool_call_constraint")
         self.assertEqual(decoder.payload["backend"],
                          "fastllm_toolcall_prototype")
+        self.assertEqual(decoder.payload["name_constraint"]["allowed_names"],
+                         ["get_weather"])
 
     def test_structural_tag_decoder_accepts_structural_tag(self):
         decoder = _StructuralTagDecoder()

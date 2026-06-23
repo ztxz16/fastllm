@@ -1358,6 +1358,40 @@ class model:
             cache_dict[token_id] = self.tokenizer_decode_token(token_id)
 
         self.tokenizer_decode_token_cache = cache_dict
+
+    def _apply_tool_call_constraint_to_native(
+            self, tool_call_constraint: Optional[Dict[str, Any]]) -> bool:
+        native_setter = getattr(
+            fastllm_lib, "set_tool_call_constraint_llm_model", None)
+        if native_setter is None:
+            logging.debug(
+                "Native FastLLM does not expose "
+                "set_tool_call_constraint_llm_model yet; continuing without "
+                "generation constraint.")
+            return False
+        # `null` is the clear signal for future model-level native backends.
+        # This prevents one tool request's constraint from leaking into the
+        # next no-tools request on the same loaded model.
+        payload = json.dumps(
+            tool_call_constraint,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        try:
+            native_setter.argtypes = [ctypes.c_int, ctypes.c_char_p]
+            native_setter.restype = ctypes.c_bool
+            applied = bool(native_setter(self.model, payload))
+        except Exception:
+            logging.exception(
+                "Native FastLLM failed to apply tool_call_constraint.")
+            return False
+        if not applied:
+            logging.debug(
+                "Native FastLLM declined tool_call_constraint; continuing "
+                "without generation constraint.")
+            return False
+        logging.debug("Native FastLLM accepted tool_call_constraint.")
+        return True
     
     def tokenizer_encode_string(self, content: str) -> List[int]:
         output_buffer_init_len = 1024
@@ -1792,10 +1826,7 @@ class model:
                         tool_call_constraint: Optional[Dict[str, Any]] = None):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
-        if tool_call_constraint is not None:
-            logging.debug(
-                "Received tool_call_constraint, but the native FastLLM "
-                "backend does not consume generation constraints yet.")
+        self._apply_tool_call_constraint_to_native(tool_call_constraint)
         conversation = None
         if (isinstance(query, List)):
             conversation = query

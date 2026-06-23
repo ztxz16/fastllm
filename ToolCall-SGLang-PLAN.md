@@ -445,6 +445,63 @@ Acceptance:
   - model adherence failure;
   - constraint effectiveness.
 
+## Milestone 11: DeepSeek V4 Name-Only Constraint Spike
+
+Goal: make the first generation-time constraint target explicit and testable:
+the model must only emit request-approved function names inside DeepSeek V4
+DSML `invoke name="..."` attributes.
+
+Scope:
+
+- Build a backend-neutral name enum constraint from the existing descriptor.
+- Keep parser-side strict validation as the correctness fallback.
+- Do not fuzzy-correct unknown model output.
+- Do not implement full DSML structural decoding or argument JSON schema
+  decoding yet.
+- Do not require GPU or live server in deterministic tests.
+
+Implementation:
+
+- Extend `ToolCallConstraintSpec` with a `name_constraint` payload:
+  - format: `deepseek_v4_dsml`;
+  - trigger prefixes for standard and alternate DSML invoke tags;
+  - allowed function names from `request.tools` or named `tool_choice`;
+  - tokenizer-agnostic matching mode.
+- Add a focused name-only adapter path:
+  - prefer `set_tool_name_constraint(payload)` if a backend exposes it;
+  - fallback to `set_tool_call_constraint(spec)` for backends that consume the
+    full spec;
+  - otherwise report that no native backend support exists.
+- In `llm.py`, attempt to apply `tool_call_constraint` before launch if the
+  underlying native object exposes a future constraint API. If no API exists,
+  log and continue.
+- Treat `tool_call_constraint=None` as an explicit clear signal for future
+  model-level native backends so constraints cannot leak across requests.
+- Keep all live tests manual.
+
+Unit tests:
+
+- DeepSeek V4 spec includes name-only constraint with allowed names.
+- Named `tool_choice` reduces allowed names to the named function.
+- Empty tools produce no constraint.
+- Decoder exposing `set_tool_name_constraint` receives only the name payload.
+- Decoder exposing only `set_tool_call_constraint` still receives the full spec.
+- Unsupported backend reports not applied and does not crash.
+
+Integration tests:
+
+- Mock model records that `tool_call_constraint` reaches `launch_stream_response`.
+- Mock decoder accepts the name-only payload.
+- Existing parser/server deterministic tests still pass.
+
+Manual live acceptance for a future native backend:
+
+- `live_openai_baseline_get_weather --repeat 20`: no invalid tool names.
+- `live_openai_named_weather_function --repeat 20`: no invalid tool names.
+- `live_openai_required_weather_stream --repeat 20`: no invalid tool names.
+- `live_openai_parallel_weather_time --repeat 20`: no `get_w eather` or
+  similar variants.
+
 ## Recommended PR Split
 
 1. Parser facade and validation layer, no server behavior change.

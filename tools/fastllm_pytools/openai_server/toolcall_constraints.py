@@ -13,6 +13,7 @@ class ToolCallConstraintSpec:
     backend: str
     descriptor: Dict[str, Any]
     structural_tag: Optional[Dict[str, Any]] = None
+    name_constraint: Optional[Dict[str, Any]] = None
     name_grammar: Optional[str] = None
     json_schemas: Dict[str, Any] = field(default_factory=dict)
     notes: tuple[str, ...] = ()
@@ -23,6 +24,7 @@ class ToolCallConstraintSpec:
             "backend": self.backend,
             "descriptor": copy.deepcopy(self.descriptor),
             "structural_tag": copy.deepcopy(self.structural_tag),
+            "name_constraint": copy.deepcopy(self.name_constraint),
             "name_grammar": self.name_grammar,
             "json_schemas": copy.deepcopy(self.json_schemas),
             "notes": list(self.notes),
@@ -46,6 +48,7 @@ def compile_tool_call_constraint(
 
     constraint_type = descriptor_dict.get("constraint_type")
     structural_tag = None
+    name_constraint = None
     name_grammar = None
     notes = [
         "prototype only: native FastLLM decoding does not consume this yet",
@@ -53,6 +56,7 @@ def compile_tool_call_constraint(
     ]
     if constraint_type == "deepseek_v4_dsml":
         structural_tag = _build_deepseek_v4_structural_tag(descriptor_dict)
+        name_constraint = _build_deepseek_v4_name_constraint(descriptor_dict)
         name_grammar = _build_deepseek_v4_name_grammar(descriptor_dict)
     else:
         notes.append(
@@ -63,6 +67,7 @@ def compile_tool_call_constraint(
         backend="fastllm_toolcall_prototype",
         descriptor=descriptor_dict,
         structural_tag=structural_tag,
+        name_constraint=name_constraint,
         name_grammar=name_grammar,
         json_schemas=copy.deepcopy(descriptor_dict.get("schemas") or {}),
         notes=tuple(notes),
@@ -84,6 +89,15 @@ def apply_tool_call_constraint_to_decoder(
             mode=None,
             spec=None,
             message="no toolcall constraint descriptor",
+        )
+
+    name_setter = getattr(decoder, "set_tool_name_constraint", None)
+    if spec.name_constraint is not None and callable(name_setter):
+        name_setter(copy.deepcopy(spec.name_constraint))
+        return ConstraintApplyResult(
+            applied=True,
+            mode="tool_name_constraint",
+            spec=spec,
         )
 
     setter = getattr(decoder, "set_tool_call_constraint", None)
@@ -165,6 +179,27 @@ def _build_deepseek_v4_structural_tag(
             1 if descriptor.get("parallel_tool_calls") is False else None
         ),
         "schemas": copy.deepcopy(descriptor.get("schemas") or {}),
+    }
+
+
+def _build_deepseek_v4_name_constraint(
+    descriptor: Dict[str, Any],
+) -> Dict[str, Any]:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    return {
+        "type": "tool_name_enum",
+        "format": "deepseek_v4_dsml",
+        "matching": "tokenizer_agnostic_string_prefix",
+        "allowed_names": allowed_tool_names,
+        "invoke_name_prefixes": [
+            '<｜DSML｜invoke name="',
+            '<\\DSML\\invoke name="',
+        ],
+        "name_terminator": '"',
+        "notes": [
+            "name-only spike: constrains invoke name values only",
+            "arguments and full DSML structure remain parser-validated",
+        ],
     }
 
 
