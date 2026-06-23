@@ -2389,6 +2389,7 @@ namespace fastllm {
                     }
 
                     generationConfigs.push_back(ctx->generationConfig);
+                    model->PrepareToolCallConstraint(ctx, generationConfigs.back());
                     if (ctx->generationConfig.output_logits) {
                         ctx->resultLogits.push(new std::vector<float>());
                         logits.push_back(ctx->resultLogits.back());
@@ -2584,6 +2585,7 @@ namespace fastllm {
                         }
                     }
                     if (!ctx->isEnding) {
+                        model->UpdateToolCallConstraintState(ctx, curRet);
                         ctx->currentTokens = std::vector<int>{curRet};
                         ctx->resultTokenQueue.push(curRet);
                         ctx->allTokens.push_back(curRet);

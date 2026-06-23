@@ -96,7 +96,7 @@ namespace fastllm {
         Linear(*hiddenStates, *lmHeadWeight, *GetEmptyData(), logits);
         ToDataType(logits, DataType::FLOAT32);
 
-        bool allSimple = true, needLogits = false, needRepeatPenalty = false;
+        bool allSimple = true, needLogits = false, needRepeatPenalty = false, needToolNameMask = false;
         int maxTopK = 1;
         for (int b = 0; b < batch; b++) {
             if (!generationConfigs[b].IsSimpleGreedy()) {
@@ -107,6 +107,7 @@ namespace fastllm {
         for (int b = 0; b < batch; b++) {
             needLogits |= generationConfigs[b].output_logits;
             needRepeatPenalty |= NeedRepeatPenalty(generationConfigs[b]);
+            needToolNameMask |= !generationConfigs[b].tool_call_allowed_token_ids.empty();
             maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
         }
 
@@ -126,7 +127,7 @@ namespace fastllm {
                 lastRet.push_back((int) (topkData[0] + 1e-3));
                 topkData += topk.Count(2);
             }
-        } else if (!needLogits) {
+        } else if (!needLogits && !needToolNameMask) {
             if (needRepeatPenalty) {
                 int maxTokenSetSize = 0;
                 for (int b = 0; b < batch; b++) {
@@ -196,7 +197,10 @@ namespace fastllm {
                     topk.ToDevice(DataDevice::CPU);
                     lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
                 } else {
-                    lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
+                    LastTokensUnit emptyUnit;
+                    const LastTokensUnit &unit =
+                            b < (int)lastTokens.units.size() ? lastTokens.units[b] : emptyUnit;
+                    lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], unit));
                 }
             }
         }

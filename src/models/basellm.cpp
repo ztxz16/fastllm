@@ -80,6 +80,73 @@ namespace fastllm {
             }
         }
 
+        static bool ToolCallConstraintStartsWith(const std::string &text, const std::string &prefix) {
+            return text.size() >= prefix.size() &&
+                   memcmp(text.data(), prefix.data(), prefix.size()) == 0;
+        }
+
+        static bool FindActiveToolCallNamePartial(const std::string &text,
+                                                  const GenerationConfig &config,
+                                                  std::string &partial) {
+            if (!config.tool_call_name_constraint_enabled ||
+                config.tool_call_allowed_names.empty() ||
+                config.tool_call_invoke_name_prefixes.empty()) {
+                return false;
+            }
+            const std::string terminator =
+                    config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+            std::string::size_type bestPos = std::string::npos;
+            const std::string *bestPrefix = nullptr;
+            for (const auto &prefix : config.tool_call_invoke_name_prefixes) {
+                if (prefix.empty()) {
+                    continue;
+                }
+                auto pos = text.rfind(prefix);
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                if (bestPos == std::string::npos || pos > bestPos) {
+                    bestPos = pos;
+                    bestPrefix = &prefix;
+                }
+            }
+            if (bestPrefix == nullptr) {
+                return false;
+            }
+            auto nameStart = bestPos + bestPrefix->size();
+            if (text.find(terminator, nameStart) != std::string::npos) {
+                return false;
+            }
+            partial = text.substr(nameStart);
+            return true;
+        }
+
+        static bool IsToolCallNameTokenAllowed(const std::string &partial,
+                                               const std::string &tokenText,
+                                               const GenerationConfig &config) {
+            if (tokenText.empty()) {
+                return false;
+            }
+            const std::string terminator =
+                    config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+            std::string combined = partial + tokenText;
+            auto terminatorPos = combined.find(terminator);
+            std::string namePart = terminatorPos == std::string::npos ?
+                                   combined : combined.substr(0, terminatorPos);
+            for (const auto &name : config.tool_call_allowed_names) {
+                if (terminatorPos != std::string::npos) {
+                    if (namePart == name) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (ToolCallConstraintStartsWith(name, namePart)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         static bool IsPureGpuDeviceSpec(const std::string &device) {
 #ifndef USE_CUDA
             return false;
@@ -208,6 +275,7 @@ namespace fastllm {
             pastKeyValues.back().second.SetKVCache();
         }
         intParams.clear();
+        toolCallConstraintGeneratedText.clear();
         currentTokens.clear();
         allTokens.clear();
         while (resultTokenQueue.size() > 0){
@@ -228,6 +296,43 @@ namespace fastllm {
         this->TryRecordHistoryCache(context->allTokens);
         if (this->saveHistoryChat && this->UseGenericHistoryCache()) {
             this->pastKVCacheManager.Record(context->allTokens, context->allTokens.size(), &context->pastKeyValues);
+        }
+    }
+
+    void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
+        generationConfig.tool_call_allowed_token_ids.clear();
+        if (context == nullptr || !generationConfig.tool_call_name_constraint_enabled) {
+            return;
+        }
+        std::string partial;
+        if (!FindActiveToolCallNamePartial(context->toolCallConstraintGeneratedText,
+                                           generationConfig, partial)) {
+            return;
+        }
+
+        std::vector<int> allowedIds;
+        allowedIds.reserve(generationConfig.tool_call_allowed_names.size() * 4);
+        for (const auto &item : this->weight.tokenizer.tokenToStringDict) {
+            int tokenId = item.first;
+            std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
+            if (IsToolCallNameTokenAllowed(partial, tokenText, generationConfig)) {
+                allowedIds.push_back(tokenId);
+            }
+        }
+        std::sort(allowedIds.begin(), allowedIds.end());
+        allowedIds.erase(std::unique(allowedIds.begin(), allowedIds.end()), allowedIds.end());
+        generationConfig.tool_call_allowed_token_ids = std::move(allowedIds);
+    }
+
+    void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {
+        if (context == nullptr || !context->generationConfig.tool_call_name_constraint_enabled || tokenId < 0) {
+            return;
+        }
+        context->toolCallConstraintGeneratedText += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
+        const size_t maxTrackedBytes = 8192;
+        if (context->toolCallConstraintGeneratedText.size() > maxTrackedBytes) {
+            context->toolCallConstraintGeneratedText.erase(
+                    0, context->toolCallConstraintGeneratedText.size() - maxTrackedBytes);
         }
     }
 
@@ -1487,10 +1592,12 @@ namespace fastllm {
                     }
 
                     generationConfigs.push_back(ctx->generationConfig);
-                    bool ctxNeedRepeatPenalty = NeedRepeatPenalty(ctx->generationConfig);
+                    model->PrepareToolCallConstraint(ctx, generationConfigs.back());
+                    bool ctxNeedRepeatPenalty = NeedRepeatPenalty(generationConfigs.back());
                     selectedNeedLastTokens |= ctxNeedRepeatPenalty ||
-                                              (ctx->generationConfig.output_logits &&
-                                               !ctx->generationConfig.IsSimpleGreedy());
+                                              (generationConfigs.back().output_logits &&
+                                               !generationConfigs.back().IsSimpleGreedy()) ||
+                                              !generationConfigs.back().tool_call_allowed_token_ids.empty();
                     logits.push_back(CreatePendingResultLogits(ctx->generationConfig));
 
                     tokenContexts.push_back(ctx);
@@ -1683,7 +1790,7 @@ namespace fastllm {
                         positionIds[0] == nullptr ? Data() : *positionIds[0],
                         singleContext->pastKeyValues,
                         singleContext->multimodalInput,
-                        singleContext->generationConfig,
+                        generationConfigs[0],
                         tokensManager,
                         &logits
                     );
@@ -1818,6 +1925,7 @@ namespace fastllm {
                         }
                     }
                     if (ctx->isEnding == false) {
+                        model->UpdateToolCallConstraintState(ctx, curRet);
                         if (ctx->currentTokens.size() == 1) {
                             ctx->currentTokens[0] = curRet;
                         } else {
@@ -2106,6 +2214,7 @@ namespace fastllm {
                                 }
 
                                 generationConfigs.push_back(it.second->generationConfig);
+                                model->PrepareToolCallConstraint(it.second, generationConfigs.back());
                                 logits.push_back(CreatePendingResultLogits(it.second->generationConfig));
 
                                 tokensManager.units.push_back(it.second->tokens);
@@ -2281,6 +2390,7 @@ namespace fastllm {
                                     }
                                 }
                                 if (it.second->isEnding == false) {
+                                    model->UpdateToolCallConstraintState(it.second, curRet);
                                     it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
                                     QueueGeneratedResultLogits(it.second, logits, i);

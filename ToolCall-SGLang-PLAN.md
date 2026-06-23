@@ -502,6 +502,72 @@ Manual live acceptance for a future native backend:
 - `live_openai_parallel_weather_time --repeat 20`: no `get_w eather` or
   similar variants.
 
+## Milestone 12: Native DeepSeek V4 Name Constraint Backend
+
+Goal: consume the M11 name-only constraint in native FastLLM generation and
+mask sampling at the DeepSeek V4 DSML `invoke name="..."` position.
+
+Scope:
+
+- Native backend only constrains function names.
+- Allowed names come from `request.tools` or named `tool_choice` through the
+  existing M11 `name_constraint` payload.
+- No parser fuzzy correction.
+- No unknown-name auto repair.
+- No full DSML grammar, JSON argument grammar, strict schema, or
+  `parallel_tool_calls=false` enforcement.
+- Live tests remain manual.
+
+Implementation:
+
+- Export `set_tool_call_constraint_llm_model(model, json_payload)` from
+  `tools/src/pytools.cpp`.
+- Store the payload in thread-local pending request state and consume it into
+  the next `GenerationConfig` at `launch_response*`.
+- Treat JSON `null` as an explicit clear signal.
+- Extend `GenerationConfig` with:
+  - enabled flag;
+  - allowed function names;
+  - DeepSeek V4 invoke-name trigger prefixes;
+  - name terminator;
+  - per-step allowed token ids.
+- Track generated output text per `ResponseContext`, excluding prompt text.
+- Before each decode/prefill sampling step, detect the latest unclosed
+  DeepSeek V4 invoke-name prefix in generated text and compute allowed next
+  token ids by tokenizer-decoded string prefix matching.
+- Apply the mask in common `LLMSampling` / `LLMSamplingOnly`; when the mask is
+  active, sample from allowed ids rather than filtering an already selected
+  global top-k.
+- Keep `LLMSamplingBlock` on the CPU sampling path when a name mask is active,
+  so CUDA top-k/top-p does not bypass the mask.
+- Wire the prepare/update hooks into both generic `basellm` schedulers and the
+  DeepSeek V4 model-specific scheduler.
+
+Unit tests:
+
+- Existing M11 Python hook tests verify the native setter receives JSON and
+  receives JSON `null` on clear.
+- Existing constraint compiler tests verify allowed names and named
+  `tool_choice` reduction.
+- C++ compile is required to catch native API and scheduler integration.
+
+Integration tests:
+
+- Deterministic OpenAI parser/server/toolcall suites remain green.
+- Native build/compile checks succeed.
+- Manual live acceptance after rebuilding/restarting the server:
+  - `live_openai_baseline_get_weather --repeat 20`;
+  - `live_openai_named_weather_function --repeat 20`;
+  - `live_openai_required_weather_stream --repeat 20`;
+  - `live_openai_parallel_weather_time --repeat 20`.
+
+Acceptance:
+
+- No generated DeepSeek V4 DSML invoke name outside request-approved names in
+  live strict-path cases.
+- Existing short-name/alias live diagnostics still work, but are mitigation
+  paths rather than required for correctness.
+
 ## Recommended PR Split
 
 1. Parser facade and validation layer, no server behavior change.
