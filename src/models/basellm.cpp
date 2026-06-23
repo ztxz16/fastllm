@@ -992,6 +992,88 @@ namespace fastllm {
             return false;
         };
 
+        struct PageNeedState {
+            std::map<PagedCacheManager*, int> needs;
+            bool impossible = false;
+        };
+
+        auto mergePageNeeds = [](std::map<PagedCacheManager*, int> &dst,
+                                 const std::map<PagedCacheManager*, int> &src) {
+            for (auto &it : src) {
+                if (it.first != nullptr && it.second > 0) {
+                    dst[it.first] += it.second;
+                }
+            }
+        };
+
+        auto addManagerPageNeed = [](PagedCacheManager *manager, int currentTokens,
+                                     int currentPages, int appendTokens,
+                                     PageNeedState &state) {
+            if (manager == nullptr || appendTokens <= 0 ||
+                manager->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE ||
+                manager->pageLen <= 0) {
+                return;
+            }
+            currentTokens = std::max(0, currentTokens);
+            currentPages = std::max(0, currentPages);
+            int totalTokens = currentTokens + appendTokens;
+            int totalPages = (totalTokens + manager->pageLen - 1) / manager->pageLen;
+            if (totalPages > manager->maxPages) {
+                state.impossible = true;
+                return;
+            }
+            int newPages = totalPages - currentPages;
+            if (newPages > 0) {
+                state.needs[manager] += newPages;
+            }
+        };
+
+        auto collectPrefillPageNeeds = [&](ResponseContext *ctx, int appendTokens) -> PageNeedState {
+            PageNeedState state;
+            if (ctx == nullptr || appendTokens <= 0) {
+                return state;
+            }
+
+            std::function<bool(Data&, int, PageNeedState&)> addExistingCacheNeed =
+                    [&](Data &cache, int tokens, PageNeedState &out) -> bool {
+                if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                    bool usedLocal = false;
+                    for (auto &it : cache.multiDeviceDatas) {
+                        if (it.second != nullptr) {
+                            usedLocal = addExistingCacheNeed(*it.second, tokens, out) || usedLocal;
+                        }
+                    }
+                    if (usedLocal) {
+                        return true;
+                    }
+                }
+                if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+                    return false;
+                }
+                int currentPages = (int)cache.pageIndex.size();
+                int cachePageLen = cache.pageLen > 0 ? cache.pageLen : cache.pagedKVCacheData->pageLen;
+                int currentTokens = currentPages > 0 ?
+                        (currentPages - 1) * cachePageLen + cache.lastPageLen : 0;
+                addManagerPageNeed(cache.pagedKVCacheData, currentTokens, currentPages, tokens, out);
+                return true;
+            };
+
+            for (int li = 0; li < model->block_cnt && li < (int)ctx->pastKeyValues.size(); li++) {
+                for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                    bool isKey = keyFlag == 0;
+                    Data &cache = isKey ? ctx->pastKeyValues[li].first : ctx->pastKeyValues[li].second;
+                    if (addExistingCacheNeed(cache, appendTokens, state)) {
+                        continue;
+                    }
+                    auto refs = model->GetPagedKVCacheManagers(li, isKey);
+                    for (auto &ref : refs) {
+                        addManagerPageNeed(ref.second, 0, 0, appendTokens, state);
+                    }
+                }
+            }
+            return state;
+        };
+
         auto *pcm = model->GetPagedKVCacheManager(model->kvCacheId, true);
         if (pcm != nullptr) {
             totalPages = pcm->maxPages;
@@ -1144,6 +1226,7 @@ namespace fastllm {
                 int curBusyPages = busyPages;
                 int pendingNewPages = 0;
                 bool selectedMultimodal = false;
+                std::map<PagedCacheManager*, int> selectedPrefillPageNeeds;
 
                 for (auto &ii : orders) {
                     ResponseContext *ctx = ii.context;
@@ -1166,12 +1249,19 @@ namespace fastllm {
                         continue;
                     }
 
-                    if ((maxTotalLens > 0 && ctx->cacheLen + ctx->currentTokens.size() > maxTotalLens) ||
-                        ctx->cacheLen + ctx->currentTokens.size() > model->max_positions) {
+                    int contextTokens = isPrompt ? ctx->cacheLen + (int)ctx->currentTokens.size() :
+                                                    (int)ctx->allTokens.size();
+                    if ((maxTotalLens > 0 && contextTokens > maxTotalLens) ||
+                        contextTokens > model->max_positions) {
                         ctx->isEnding = true;
                         ctx->error = ResponseContextErrorPromptTooLong;
                         // printf("[Handle %d] Finished. Reason: prompt too long (cacheLen=%d, currentTokens=%d, maxTotalLens=%d, max_positions=%d).\n",
                                // it.first, it.second->cacheLen, (int)it.second->currentTokens.size(), maxTotalLens, model->max_positions);
+                        continue;
+                    }
+                    if (!isPrompt && maxTotalLens > 0 && contextTokens >= maxTotalLens) {
+                        ctx->isEnding = true;
+                        ctx->TryRecordPagedCache(model);
                         continue;
                     }
 
@@ -1351,6 +1441,18 @@ namespace fastllm {
                         int thisLen = (int)ctx->currentTokens.size();
                         int thisPages = (thisLen + pageLen - 1) / pageLen;
 
+                        PageNeedState pageNeed = collectPrefillPageNeeds(ctx, thisLen);
+                        if (pageNeed.impossible) {
+                            ctx->isEnding = true;
+                            ctx->error = ResponseContextErrorPromptTooLong;
+                            continue;
+                        }
+                        std::map<PagedCacheManager*, int> combinedPrefillPageNeeds = selectedPrefillPageNeeds;
+                        mergePageNeeds(combinedPrefillPageNeeds, pageNeed.needs);
+                        if (hasPagedManagerShortage(combinedPrefillPageNeeds)) {
+                            continue;
+                        }
+
                         // Prefill后已用分页不能超过pagesLimit（除非单个请求就超过了）
                         if (pagesLimit > 0 && curBusyPages + thisPages > pagesLimit) {
                             bool noActiveRequests = currentActivate == 0 && seqLens.empty();
@@ -1378,6 +1480,7 @@ namespace fastllm {
                         prefillTokenCount += thisLen;
                         curBusyPages += thisPages;
                         pendingNewPages += thisPages;
+                        selectedPrefillPageNeeds.swap(combinedPrefillPageNeeds);
                         currentActivate++;
                     } else {
                         // Decode阶段：不在这里限制分页，由后续驱逐逻辑统一处理
@@ -1732,7 +1835,8 @@ namespace fastllm {
                             ctx->TryRecordPagedCache(model);
                             // printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
                                    // handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
-                        } else if (ctx->allTokens.size() >= model->max_positions) {
+                        } else if ((maxTotalLens > 0 && (int)ctx->allTokens.size() >= maxTotalLens) ||
+                                   ctx->allTokens.size() >= model->max_positions) {
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             // printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
@@ -2916,6 +3020,16 @@ namespace fastllm {
         int pageLen = fastllm::GetPageLen();
         int len = this->GetChunkedPrefillSize();
         bool autoCalcPages = (fastllm::GetMaxTokens() <= 0);
+        if (!autoCalcPages && fastllm::GetMaxTokens() > 0 && pageLen > 0) {
+            int maxWarmupLen = std::max(1, fastllm::GetMaxTokens() - pageLen);
+            if (len > maxWarmupLen) {
+                if (this->verbose) {
+                    printf("[Fastllm] AutoWarmup prefill length clamped from %d to %d by explicit KV cache token limit %d.\n",
+                           len, maxWarmupLen, fastllm::GetMaxTokens());
+                }
+                len = maxWarmupLen;
+            }
+        }
 #ifdef USE_CUDA
         const bool userSetMaxBatch = this->maxBatch > 0;
         const int userMaxBatch = this->maxBatch;
