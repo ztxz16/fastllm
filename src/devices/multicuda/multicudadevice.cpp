@@ -2810,7 +2810,7 @@ namespace fastllm {
                 (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
                 nullptr,
                 q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
-                pageLen, pagedKCacheData.dataType, batch, doQKNorm
+                pageLen, pagedKCacheData.dims[0], pagedKCacheData.dataType, batch, doQKNorm
             );
             return;
         }
@@ -2877,7 +2877,7 @@ namespace fastllm {
                 (int32_t*)insertPositions.multiDeviceDatas[device]->cudaData,
                 nullptr,
                 localQHeads, localKHeads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
-                pageLen, localKManager->dataType, batch, doQKNorm
+                pageLen, localKManager->dims[0], localKManager->dataType, batch, doQKNorm
             );
         }
         SyncCudaAndCheckAll(devices, "MultiCudaQKVRMSNormRopeSplitAppendPagedCacheOp");

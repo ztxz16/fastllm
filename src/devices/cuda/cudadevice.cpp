@@ -3248,6 +3248,30 @@ namespace fastllm {
         float llama3HighFreqFactor = floatParams.find("llama3HighFreqFactor") != floatParams.end() ?
             floatParams.find("llama3HighFreqFactor")->second : 32.0f;
 
+        AssertInFastLLM(batch > 0 && pageLen > 0,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: batch and pageLen must be positive.\n");
+        AssertInFastLLM(qkv.dims.size() == 3 && qkv.dims[0] * qkv.dims[1] == batch,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: qkv token count must match logical batch.\n");
+        AssertInFastLLM(pagedKCacheData.dims.size() == 4 && pagedVCacheData.dims.size() == 4,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: paged KV cache data should have 4 dimensions.\n");
+        AssertInFastLLM(pagedKCacheData.dims[0] == pagedVCacheData.dims[0] &&
+                        pagedKCacheData.dims[1] == pageLen &&
+                        pagedVCacheData.dims[1] == pageLen,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: paged KV cache shape mismatch.\n");
+        AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == batch &&
+                        insertPositions.dims.size() == 1 && insertPositions.dims[0] == batch,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: insert meta length should match batch.\n");
+        int maxPages = pagedKCacheData.dims[0];
+        if ((int)insertIndexs.cpuIntDatas.size() >= batch &&
+            (int)insertPositions.cpuIntDatas.size() >= batch) {
+            for (int i = 0; i < batch; i++) {
+                AssertInFastLLM(insertIndexs.cpuIntDatas[i] >= 0 && insertIndexs.cpuIntDatas[i] < maxPages,
+                                "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: insert page index out of range.\n");
+                AssertInFastLLM(insertPositions.cpuIntDatas[i] >= 0 && insertPositions.cpuIntDatas[i] < pageLen,
+                                "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: insert page offset out of range.\n");
+            }
+        }
+
         // 分配 qOutput 内存
         qOutput.Allocate();
 
@@ -3272,16 +3296,17 @@ namespace fastllm {
             lastPageLens->Allocate(false);
         }
 
-        FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
+        AssertInFastLLM(FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
             qkv, qNormWeight, kNormWeight, positionIds,
             qOutput,
             (uint8_t*)pagedKCacheData.cudaData, (uint8_t*)pagedVCacheData.cudaData,
             (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
             lastPageLens != nullptr ? (int32_t*)lastPageLens->cudaData : nullptr,
             q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
-            pageLen, pagedKCacheData.dataType, batch, doQKNorm,
+            pageLen, maxPages, pagedKCacheData.dataType, batch, doQKNorm,
             useLlama3, llama3Factor, llama3OriginalMaxPosition,
-            llama3LowFreqFactor, llama3HighFreqFactor);
+            llama3LowFreqFactor, llama3HighFreqFactor),
+            "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: CUDA fused append failed.\n");
     }
 
     void CudaQwen35QGateKVRMSNormRopeSplitAppendPagedCacheOp::Run(

@@ -404,7 +404,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int32_t *lastPageLens,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
-    int pageLen, fastllm::DataType pagedDataType, int batch,
+    int pageLen, int maxPages, fastllm::DataType pagedDataType, int batch,
     int doQKNorm,
     int useLlama3 = 0, float llama3Factor = 1.0f,
     float llama3OriginalMaxPosition = 131072.0f,

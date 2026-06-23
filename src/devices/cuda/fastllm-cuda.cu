@@ -5505,6 +5505,7 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     float ropeTheta,
     float ropeScale,
     int pageLen,             // page length for paged cache
+    int maxPages,            // max pages in paged cache
     int batch,               // 逻辑 batch 数（= insertIndexs 长度）
     int doQKNorm,            // 是否做 QK RMSNorm（0 = 跳过）
     int useLlama3,
@@ -5529,8 +5530,17 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
 
     unsigned int tid = threadIdx.x;
 
-    if (lastPageLens != nullptr && head_id == 0 && tid == 0 && batch_idx < batch) {
-        lastPageLens[batch_idx] = insertPositions[batch_idx] + 1;
+    if (batch_idx >= batch) {
+        return;
+    }
+
+    int insertPageIdx = insertIndexs[batch_idx];
+    int insertPageOffset = insertPositions[batch_idx];
+    bool validInsert = insertPageIdx >= 0 && insertPageIdx < maxPages &&
+                       insertPageOffset >= 0 && insertPageOffset < pageLen;
+
+    if (lastPageLens != nullptr && head_id == 0 && tid == 0) {
+        lastPageLens[batch_idx] = validInsert ? insertPageOffset + 1 : 0;
     }
 
     // 确定当前 head 在 qkv 中的偏移
@@ -5635,12 +5645,13 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
             // K head: 直接写入 paged K cache
             // pagedData layout: [maxPages, pageLen, numHeads, headDim]
             // 用逻辑 batch_idx 索引 insertIndexs / insertPositions
+            if (!validInsert) {
+                return;
+            }
             int kh = head_id - q_heads;
-            int pageIdx = insertIndexs[batch_idx];
-            int pageOffset = insertPositions[batch_idx];
             int pageStride = pageLen * k_heads * head_dim;
             int tokenStride = k_heads * head_dim;
-            TKV *dst = pagedKData + (size_t)pageIdx * pageStride + pageOffset * tokenStride + kh * head_dim;
+            TKV *dst = pagedKData + (size_t)insertPageIdx * pageStride + insertPageOffset * tokenStride + kh * head_dim;
             for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
                 dst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
             }
@@ -5648,12 +5659,13 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     } else {
         // ======== V head: 直接拷贝到 paged V cache（无需 RMSNorm/RoPE）========
         // 用逻辑 batch_idx 索引 insertIndexs / insertPositions
+        if (!validInsert) {
+            return;
+        }
         int vh = head_id - q_heads - k_heads;
-        int pageIdx = insertIndexs[batch_idx];
-        int pageOffset = insertPositions[batch_idx];
         int pageStride = pageLen * v_heads * head_dim;
         int tokenStride = v_heads * head_dim;
-        TKV *dst = pagedVData + (size_t)pageIdx * pageStride + pageOffset * tokenStride + vh * head_dim;
+        TKV *dst = pagedVData + (size_t)insertPageIdx * pageStride + insertPageOffset * tokenStride + vh * head_dim;
         for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
             dst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
         }
@@ -5673,7 +5685,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int32_t *lastPageLens,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
-    int pageLen, fastllm::DataType pagedDataType, int batch,
+    int pageLen, int maxPages, fastllm::DataType pagedDataType, int batch,
     int doQKNorm,
     int useLlama3, float llama3Factor,
     float llama3OriginalMaxPosition,
@@ -5703,7 +5715,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
             cudaPositionIds, qOutputPtr,
             (KVT*)pagedKData, (KVT*)pagedVData, insertIndexs, insertPositions, lastPageLens,
             outer, total_dim, q_heads, k_heads, v_heads, head_dim,
-            bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm,
+            bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, maxPages, batch, doQKNorm,
             useLlama3, llama3Factor, llama3OriginalMaxPosition,
             llama3LowFreqFactor, llama3HighFreqFactor);
     };

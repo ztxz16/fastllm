@@ -2015,7 +2015,7 @@ namespace fastllm {
                         nullptr,
                         numAttentionHeads, numKeyValueHeads, headDim,
                         rotaryDim, rmsNormEps, ropeTheta, 1.0f,
-                        pagedKData.dims[1], pagedKData.dataType, batch, 1,
+                        pagedKData.dims[1], pagedKData.dims[0], pagedKData.dataType, batch, 1,
                         useLlama3 ? 1 : 0, ropeFactor,
                         llama3OriginalMaxPosition,
                         llama3LowFreqFactor,
