@@ -34,6 +34,50 @@ install the existing server requirements:
 pip install -r requirements-server.txt
 ```
 
+## Manual Live Smoke Tests
+
+The live runner is a manual diagnostic tool for already-running
+OpenAI-compatible servers. It does not start a server, download a model, or use
+GPU commands. It is not part of unittest discovery and is not part of the
+deterministic parser golden tests.
+
+List manual cases without contacting a server:
+
+```bash
+python3 test/toolcall/run_live_toolcall_tests.py --list-cases
+```
+
+Run one live case against a server that you started separately:
+
+```bash
+python3 test/toolcall/run_live_toolcall_tests.py \
+  --base-url http://127.0.0.1:8080/v1 \
+  --model DeepSeek-V4-Flash \
+  --case-id live_openai_baseline_get_weather \
+  --verbose \
+  --dump-dir /tmp/fastllm-toolcall-live
+```
+
+Run the manual matrix in report-only mode to measure model/tool adherence
+without making failures fail the shell command:
+
+```bash
+python3 test/toolcall/run_live_toolcall_tests.py \
+  --base-url http://127.0.0.1:8080/v1 \
+  --model DeepSeek-V4-Flash \
+  --repeat 3 \
+  --report-only \
+  --dump-dir /tmp/fastllm-toolcall-live
+```
+
+The matrix is meant to distinguish parser/server bugs, protocol bugs,
+model-adherence failures, and generation-constraint effectiveness. It covers
+baseline `get_weather`, short-name `weather`, required and named tool choice,
+parallel calls, tool-result roundtrip, no-tool plain text, and strict-schema
+missing-required diagnostics. The runner reports stable `error_code` values such
+as `invalid_tool_name`, `no_tool_call`, `invalid_arguments_json`,
+`missing_required_argument`, `stream_missing_done`, and `http_error`.
+
 Known future coverage gaps:
 
 - `parameter name="arguments"` wrapper unwrapping is not covered because the
@@ -42,5 +86,5 @@ Known future coverage gaps:
   `invoke` closes; incremental argument streaming is not required by this suite.
 - Streaming behavior for a complete `invoke` under the wrong outer block name is
   not fixed as a golden case yet.
-- These tests do not cover server integration, chat template rendering, or
-  model-side tool selection.
+- Deterministic tests do not cover real model quality. Use the manual live
+  runner for model-side tool selection and constraint impact diagnostics.
