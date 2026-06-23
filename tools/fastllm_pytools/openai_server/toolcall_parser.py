@@ -53,6 +53,7 @@ class ToolCallConstraintDescriptor:
     named_tool_choice: Optional[str]
     parallel_tool_calls: Optional[bool]
     schemas: Dict[str, Any] = field(default_factory=dict)
+    parameter_names: Dict[str, tuple[str, ...]] = field(default_factory=dict)
     strict_tool_names: tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -66,6 +67,10 @@ class ToolCallConstraintDescriptor:
             "named_tool_choice": self.named_tool_choice,
             "parallel_tool_calls": self.parallel_tool_calls,
             "schemas": copy.deepcopy(self.schemas),
+            "parameter_names": {
+                name: list(names)
+                for name, names in self.parameter_names.items()
+            },
             "strict_tool_names": list(self.strict_tool_names),
         }
 
@@ -188,12 +193,16 @@ class FunctionCallParser:
 
         strict_tool_names: List[str] = []
         schemas: Dict[str, Any] = {}
+        parameter_names: Dict[str, tuple[str, ...]] = {}
         for name in self.tool_index:
             function = self._tool_function(name)
+            parameters = _get_value(function, "parameters")
+            names = _schema_property_names(parameters)
+            if names:
+                parameter_names[name] = tuple(names)
             if not _get_value(function, "strict"):
                 continue
             strict_tool_names.append(name)
-            parameters = _get_value(function, "parameters")
             if parameters is not None:
                 schemas[name] = copy.deepcopy(parameters)
 
@@ -209,6 +218,7 @@ class FunctionCallParser:
             named_tool_choice=named_tool_choice,
             parallel_tool_calls=self.parallel_tool_calls,
             schemas=schemas,
+            parameter_names=parameter_names,
             strict_tool_names=tuple(strict_tool_names),
         )
 
@@ -650,22 +660,13 @@ class FunctionCallParser:
         properties = _get_value(parameters, "properties") or {}
         for argument_name, value in parsed_arguments.items():
             property_schema = _get_value(properties, argument_name)
-            expected_type = _get_value(property_schema, "type")
-            if expected_type is None:
-                continue
-            if _matches_json_schema_type(value, expected_type):
-                continue
-            diagnostics.append(
-                ToolCallDiagnostic(
-                    code="invalid_argument_type",
-                    message=(
-                        f"argument {argument_name!r} expected type "
-                        f"{expected_type!r} but got {_json_type_name(value)!r}"
-                    ),
-                    tool_name=name,
-                    index=index,
-                    argument_name=argument_name,
-                ))
+            diagnostics.extend(_schema_value_diagnostics(
+                value,
+                property_schema,
+                argument_name,
+                name,
+                index,
+            ))
         return diagnostics
 
     def _tool_function(self, name: str) -> Any:
@@ -748,6 +749,90 @@ def _required_arguments(parameters: Any) -> List[str]:
     if not isinstance(required, list):
         return []
     return [name for name in required if isinstance(name, str)]
+
+
+def _schema_value_diagnostics(
+    value: Any,
+    schema: Any,
+    path: str,
+    tool_name: str,
+    index: int,
+) -> List[ToolCallDiagnostic]:
+    if not isinstance(schema, dict):
+        return []
+
+    expected_type = _get_value(schema, "type")
+    if expected_type is not None and not _matches_json_schema_type(
+            value, expected_type):
+        return [
+            ToolCallDiagnostic(
+                code="invalid_argument_type",
+                message=(
+                    f"argument {path!r} expected type "
+                    f"{expected_type!r} but got {_json_type_name(value)!r}"
+                ),
+                tool_name=tool_name,
+                index=index,
+                argument_name=path,
+            )
+        ]
+
+    diagnostics: List[ToolCallDiagnostic] = []
+    if isinstance(value, dict) and _schema_allows_type(expected_type, "object"):
+        for child_name in _required_arguments(schema):
+            if child_name in value:
+                continue
+            child_path = f"{path}.{child_name}"
+            diagnostics.append(
+                ToolCallDiagnostic(
+                    code="missing_required_argument",
+                    message=f"required argument {child_path!r} is missing",
+                    tool_name=tool_name,
+                    index=index,
+                    argument_name=child_path,
+                ))
+
+        properties = _get_value(schema, "properties") or {}
+        if isinstance(properties, dict):
+            for child_name, child_value in value.items():
+                child_schema = _get_value(properties, child_name)
+                diagnostics.extend(_schema_value_diagnostics(
+                    child_value,
+                    child_schema,
+                    f"{path}.{child_name}",
+                    tool_name,
+                    index,
+                ))
+
+    if isinstance(value, list) and _schema_allows_type(expected_type, "array"):
+        item_schema = _get_value(schema, "items")
+        for item_index, item_value in enumerate(value):
+            diagnostics.extend(_schema_value_diagnostics(
+                item_value,
+                item_schema,
+                f"{path}[{item_index}]",
+                tool_name,
+                index,
+            ))
+
+    return diagnostics
+
+
+def _schema_allows_type(expected_type: Any, schema_type: str) -> bool:
+    if expected_type is None:
+        return True
+    if isinstance(expected_type, list):
+        return schema_type in expected_type
+    return expected_type == schema_type
+
+
+def _schema_property_names(parameters: Any) -> List[str]:
+    if _get_value(parameters, "type") not in (None, "object"):
+        return []
+    properties = _get_value(parameters, "properties")
+    if not isinstance(properties, dict):
+        return []
+    return [name for name in properties if isinstance(name, str)]
 
 
 def _matches_json_schema_type(value: Any, expected_type: Any) -> bool:

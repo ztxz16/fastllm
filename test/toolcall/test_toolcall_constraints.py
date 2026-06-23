@@ -60,6 +60,35 @@ def _time_tool():
     }
 
 
+def _todowrite_tool():
+    return {
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "description": "Create and maintain a structured task list.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string"},
+                                "priority": {"type": "string"},
+                            },
+                            "required": ["content", "status", "priority"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    }
+
+
 def _request(tools=None, tool_choice="auto", parallel_tool_calls=None):
     return ChatCompletionRequest(
         model="dummy",
@@ -128,8 +157,18 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
         self.assertEqual(spec.name_constraint["allowed_names"],
                          ["get_weather", "get_time"])
         self.assertEqual(spec.name_constraint["type"], "tool_name_enum")
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"],
+            {
+                "get_weather": ["city", "days"],
+                "get_time": ["timezone"],
+            },
+        )
         self.assertIn('<｜DSML｜invoke name="',
                       spec.name_constraint["invoke_name_prefixes"])
+        self.assertIn('<｜DSML｜parameter name="',
+                      spec.parameter_name_constraint[
+                          "parameter_name_prefixes"])
         self.assertIn('"get_weather"', spec.name_grammar)
         self.assertIn('"get_time"', spec.name_grammar)
         self.assertIn("<｜DSML｜tool_calls>", spec.name_grammar)
@@ -148,6 +187,13 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
         self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
                          ["get_time"])
         self.assertEqual(spec.name_constraint["allowed_names"], ["get_time"])
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"],
+            {
+                "get_weather": ["city", "days"],
+                "get_time": ["timezone"],
+            },
+        )
         self.assertIn('"get_time"', spec.name_grammar)
         self.assertNotIn('"get_weather"', spec.name_grammar)
 
@@ -164,6 +210,16 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
         self.assertIn('"apply_patch"', spec.name_grammar)
         self.assertNotIn('"get_weather"', spec.name_grammar)
         self.assertNotIn('"get_time"', spec.name_grammar)
+        parameter_names = spec.parameter_name_constraint[
+            "parameter_names_by_tool"]
+        self.assertEqual(parameter_names["read_file"],
+                         ["path", "start_line", "end_line"])
+        self.assertEqual(parameter_names["search_code"],
+                         ["query", "path", "file_pattern"])
+        self.assertEqual(parameter_names["apply_patch"], ["path", "patch"])
+        self.assertEqual(parameter_names["run_tests"],
+                         ["command", "cwd", "timeout_seconds"])
+        self.assertNotIn("git_status", parameter_names)
 
     def test_named_software_dev_tool_choice_restricts_name_enum(self):
         spec = compile_tool_call_constraint(
@@ -179,8 +235,23 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
                          ["search_code"])
         self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
                          ["search_code"])
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"][
+                "search_code"],
+            ["query", "path", "file_pattern"])
         self.assertIn('"search_code"', spec.name_grammar)
         self.assertNotIn('"read_file"', spec.name_grammar)
+
+    def test_todowrite_parameter_name_constraint_allows_only_todos(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(tools=[_todowrite_tool()]))
+
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"],
+            {"todowrite": ["todos"]},
+        )
+        self.assertEqual(
+            spec.json_schemas["todowrite"]["required"], ["todos"])
 
     def test_software_dev_name_payload_adapter_has_no_alias_inference(self):
         decoder = _ToolNameConstraintDecoder()
@@ -247,6 +318,10 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
                          "fastllm_toolcall_prototype")
         self.assertEqual(decoder.payload["name_constraint"]["allowed_names"],
                          ["get_weather"])
+        self.assertEqual(
+            decoder.payload["parameter_name_constraint"][
+                "parameter_names_by_tool"]["get_weather"],
+            ["city", "days"])
 
     def test_structural_tag_decoder_accepts_structural_tag(self):
         decoder = _StructuralTagDecoder()

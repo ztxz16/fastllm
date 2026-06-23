@@ -677,6 +677,122 @@ Implementation status:
 - Manual live cases cover `search_code`, `read_file` roundtrip,
   `apply_patch` dry-run, and parallel `read_file` + `search_code`.
 
+## M14: DeepSeek V4 DSML Parameter-Name Constraint
+
+Goal: extend the native DeepSeek V4 generation-time strict path from
+`invoke name="..."` to DSML top-level `parameter name="..."`, using the
+request tool schemas to prevent common argument-key drift before parsing.
+
+Motivation:
+
+- Real opencode-style `todowrite` traces showed valid tool-call transport but
+  invalid top-level argument names:
+  - `todo`;
+  - `todoList`;
+  - `todolist`;
+  - `todoS`;
+  - `description`;
+  - `arguments: {}`.
+- The expected top-level argument shape is `{"todos": [...]}`.
+- Existing strict schema validation can reject missing `todos`, but it cannot
+  make the first tool call usable. The next SGLang-style step is to constrain
+  generation at the DSML parameter-name position.
+
+Scope:
+
+- Use `request.tools[].function.parameters.properties` as the source of allowed
+  top-level argument names for each function.
+- For DeepSeek V4 DSML, when decoding inside a legal invoke for a known tool and
+  at `<｜DSML｜parameter name="...">` or `<\DSML\parameter name="...">`, allow
+  only that tool's schema property names.
+- Keep the existing native function-name constraint unchanged.
+- Keep parser-side strict validation as the correctness fallback.
+- Do not hardcode tool names such as `get_weather`, `get_time`, or
+  `todowrite`.
+- Do not fuzzy-correct unknown argument names.
+
+Out of scope:
+
+- Full JSON-schema constrained decoding.
+- Nested object/array item schema decoding.
+- Enum/value constraints.
+- Automatic repair or retry after invalid arguments.
+- Parser-side aliasing of argument names.
+
+Expected behavior:
+
+- For `todowrite`, top-level DSML parameter names are constrained to `todos`.
+- For `get_weather`, top-level DSML parameter names are constrained to
+  `city`, `unit`, and any other request-provided properties.
+- For `read_file`, top-level DSML parameter names are constrained to
+  `path`, `start_line`, and `end_line`.
+- If a tool has no object schema properties, do not apply a parameter-name mask
+  for that tool.
+- If the active invoke tool name is unknown or invalid, do not apply a
+  parameter-name mask; parser strict validation should reject the call later.
+
+Implementation tasks:
+
+- Extend the Python constraint descriptor/spec with a parameter-name payload:
+  - `tool_name -> allowed_parameter_names`;
+  - DSML standard and alternate parameter-name prefixes;
+  - schema-derived only, no hardcoded names.
+- Pass the parameter-name payload through the existing native
+  `set_tool_call_constraint_llm_model` path.
+- Extend the native DeepSeek V4 constraint state machine to track:
+  - current invoke tool name;
+  - whether decoding is inside a parameter `name` attribute value;
+  - allowed parameter names for the current tool.
+- Apply token/name masking only while generating the parameter-name attribute
+  value.
+- Clear state at invoke close and between requests so constraints cannot leak.
+
+Deterministic unit tests:
+
+- Constraint compiler includes parameter-name constraints for object-schema
+  tools.
+- `todowrite` descriptor allows only `todos`.
+- Software-dev descriptors derive `read_file`, `search_code`, `apply_patch`,
+  and `run_tests` argument names from request schemas.
+- Empty or non-object schemas do not produce parameter-name masks.
+- Named `tool_choice` still restricts function names but preserves that tool's
+  parameter-name constraints.
+- No hardcoded weather/time/todowrite names appear in compiler behavior.
+
+Deterministic integration tests:
+
+- Parser/server validation still accepts valid `todowrite` arguments with
+  top-level `todos`.
+- Parser/server validation still rejects `todo`, `todoList`, `todolist`,
+  `todoS`, `description`, and `arguments: {}` as missing `todos`.
+- Native backend contract tests show parameter-name payload reaches the native
+  setter.
+- Native state-machine tests, where feasible, verify that the mask activates at
+  DSML parameter-name positions and not in content or argument values.
+
+Manual live smoke tests:
+
+- `live_openai_opencode_todowrite --repeat 20`:
+  - expected `todowrite` tool call;
+  - expected top-level `todos`;
+  - no `missing_required_argument`.
+- Existing name-constraint live tests remain green:
+  - `live_openai_baseline_get_weather`;
+  - `live_openai_required_weather_stream`;
+  - `live_openai_named_weather_function`;
+  - `live_openai_parallel_weather_time`.
+
+Acceptance:
+
+- The branch can distinguish transport/parser/server failures from model
+  argument-key adherence failures.
+- The opencode `todowrite` failure shape is covered deterministically.
+- The native strict path prevents top-level DSML parameter-name drift for
+  schema-backed tools without implementing full JSON-schema constrained
+  decoding.
+- No parser fuzzy correction or hardcoded tool-name/argument-name list is
+  introduced.
+
 ## Recommended PR Split
 
 1. Parser facade and validation layer, no server behavior change.
@@ -689,9 +805,11 @@ Implementation status:
 8. Generation-time constraint hook.
 9. Optional real constraint backend prototype.
 10. Realistic software-development tool matrix.
+11. DeepSeek V4 DSML parameter-name constraint.
 
 ## Immediate Next Step
 
-The next implementation step should be manual validation of the M13 live cases
-against an already-running local server when needed. Do not implement fuzzy
-correction. Do not hardcode weather/time names.
+The next implementation step should be M14: implement schema-derived DSML
+parameter-name constraints, starting with deterministic compiler/server tests
+and the `todowrite.todos` failure shape. Do not implement fuzzy correction. Do
+not hardcode weather/time/todowrite names.

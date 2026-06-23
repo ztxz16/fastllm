@@ -235,6 +235,10 @@ class ToolCallGenerationConstraintTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(descriptor["strict_tool_names"], ["get_weather"])
         self.assertEqual(
             constraint["json_schemas"]["get_weather"]["required"], ["city"])
+        self.assertEqual(
+            constraint["parameter_name_constraint"][
+                "parameter_names_by_tool"]["get_weather"],
+            ["city"])
         choice = response.choices[0]
         self.assertEqual(choice.finish_reason, "tool_calls")
         self.assertEqual(choice.message.tool_calls[0].function.name,
@@ -300,6 +304,10 @@ class ToolCallGenerationConstraintTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(descriptor["tool_names"], ["get_weather"])
         self.assertEqual(descriptor["allowed_tool_names"], ["get_weather"])
         self.assertFalse(descriptor["requires_tool_call"])
+        self.assertEqual(
+            constraint["parameter_name_constraint"][
+                "parameter_names_by_tool"]["get_weather"],
+            ["city"])
 
     async def test_anthropic_constraint_absent_without_tools(self):
         model = _ConstraintAwareModel("普通回复")
@@ -333,6 +341,10 @@ class ToolCallGenerationConstraintTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(descriptor["allowed_tool_names"], ["search_code"])
         self.assertEqual(constraint["name_constraint"]["allowed_names"],
                          ["search_code"])
+        self.assertEqual(
+            constraint["parameter_name_constraint"][
+                "parameter_names_by_tool"]["search_code"],
+            ["query", "path", "file_pattern"])
         self.assertNotIn("get_weather", constraint["name_grammar"])
         self.assertNotIn("get_time", constraint["name_grammar"])
         choice = response.choices[0]

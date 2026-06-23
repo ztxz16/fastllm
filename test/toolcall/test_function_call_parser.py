@@ -57,6 +57,35 @@ def _strict_weather_tool(name: str = "get_weather") -> Dict:
     }
 
 
+def _strict_todowrite_tool() -> Dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "description": "Create and maintain a structured task list.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string"},
+                                "priority": {"type": "string"},
+                            },
+                            "required": ["content", "status", "priority"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    }
+
+
 def _time_tool() -> Dict:
     return {
         "type": "function",
@@ -282,6 +311,91 @@ class FunctionCallParserTest(unittest.TestCase):
                          "missing_required_argument")
         self.assertEqual(result.diagnostics[0].argument_name, "city")
 
+    def test_opencode_todowrite_todos_array_passes(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_todowrite_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict(
+                "todowrite",
+                json.dumps({
+                    "todos": [
+                        {
+                            "content": "inspect OpenAI request",
+                            "status": "pending",
+                            "priority": "medium",
+                        },
+                        {
+                            "content": "inspect tool call arguments",
+                            "status": "pending",
+                            "priority": "medium",
+                        },
+                    ],
+                }),
+            )
+        ])
+
+        self.assertTrue(result.valid)
+        self.assertEqual(len(result.valid_tool_calls), 1)
+        self.assertEqual(result.invalid_tool_calls, [])
+        self.assertEqual(result.diagnostics, [])
+
+    def test_opencode_todowrite_wrong_top_level_keys_are_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_todowrite_tool()]))
+
+        wrong_arguments = [
+            {"todo": [{"content": "inspect OpenAI request"}]},
+            {"todoList": [{"content": "inspect OpenAI request"}]},
+            {"todolist": [{"content": "inspect OpenAI request"}]},
+            {"todoS": [{"content": "inspect OpenAI request"}]},
+            {"description": "inspect OpenAI request"},
+            {"arguments": {}},
+        ]
+        for arguments in wrong_arguments:
+            with self.subTest(arguments=arguments):
+                result = parser.validate_tool_calls([
+                    _tool_call_dict("todowrite", json.dumps(arguments))
+                ])
+
+                self.assertFalse(result.valid)
+                self.assertEqual(result.valid_tool_calls, [])
+                self.assertEqual(len(result.invalid_tool_calls), 1)
+                self.assertEqual(len(result.diagnostics), 1)
+                self.assertEqual(result.diagnostics[0].code,
+                                 "missing_required_argument")
+                self.assertEqual(result.diagnostics[0].argument_name, "todos")
+
+    def test_opencode_todowrite_missing_todo_item_fields_are_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_todowrite_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict(
+                "todowrite",
+                json.dumps({
+                    "todos": [
+                        {
+                            "content": "inspect OpenAI request",
+                        },
+                    ],
+                }),
+            )
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.valid_tool_calls, [])
+        self.assertEqual(len(result.invalid_tool_calls), 1)
+        diagnostic_names = {
+            diagnostic.argument_name for diagnostic in result.diagnostics
+        }
+        self.assertIn("todos[0].status", diagnostic_names)
+        self.assertIn("todos[0].priority", diagnostic_names)
+        self.assertTrue(all(
+            diagnostic.code == "missing_required_argument"
+            for diagnostic in result.diagnostics
+        ))
+
     def test_strict_schema_wrong_primitive_type_is_invalid(self):
         parser = FunctionCallParser.from_request(
             _request(tools=[_strict_weather_tool()]))
@@ -352,6 +466,10 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(descriptor.tool_choice, "auto")
         self.assertFalse(descriptor.requires_tool_call)
         self.assertEqual(descriptor.schemas, {})
+        self.assertEqual(descriptor.parameter_names, {
+            "get_weather": ("city",),
+            "get_time": ("timezone",),
+        })
         self.assertEqual(descriptor.strict_tool_names, ())
 
     def test_constraint_descriptor_required_requires_tool_call(self):
@@ -398,6 +516,10 @@ class FunctionCallParserTest(unittest.TestCase):
             "string",
         )
         self.assertNotIn("get_time", descriptor.schemas)
+        self.assertEqual(descriptor.parameter_names["get_weather"],
+                         ("city", "days", "rain", "tags", "meta"))
+        self.assertEqual(descriptor.parameter_names["get_time"],
+                         ("timezone",))
 
     def test_constraint_descriptor_schema_is_snapshot(self):
         tool = _strict_weather_tool()
@@ -418,10 +540,13 @@ class FunctionCallParserTest(unittest.TestCase):
 
         dumped = descriptor.to_dict()
         dumped["schemas"]["get_weather"]["required"].append("unit")
+        dumped["parameter_names"]["get_weather"].append("unit")
 
         json.dumps(dumped, ensure_ascii=False)
         self.assertEqual(descriptor.schemas["get_weather"]["required"],
                          ["city"])
+        self.assertEqual(descriptor.parameter_names["get_weather"],
+                         ("city", "days", "rain", "tags", "meta"))
 
     def test_constraint_descriptor_parallel_flag_is_included(self):
         parser = FunctionCallParser.from_request(

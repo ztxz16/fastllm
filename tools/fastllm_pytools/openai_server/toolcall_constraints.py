@@ -14,6 +14,7 @@ class ToolCallConstraintSpec:
     descriptor: Dict[str, Any]
     structural_tag: Optional[Dict[str, Any]] = None
     name_constraint: Optional[Dict[str, Any]] = None
+    parameter_name_constraint: Optional[Dict[str, Any]] = None
     name_grammar: Optional[str] = None
     json_schemas: Dict[str, Any] = field(default_factory=dict)
     notes: tuple[str, ...] = ()
@@ -25,6 +26,8 @@ class ToolCallConstraintSpec:
             "descriptor": copy.deepcopy(self.descriptor),
             "structural_tag": copy.deepcopy(self.structural_tag),
             "name_constraint": copy.deepcopy(self.name_constraint),
+            "parameter_name_constraint": copy.deepcopy(
+                self.parameter_name_constraint),
             "name_grammar": self.name_grammar,
             "json_schemas": copy.deepcopy(self.json_schemas),
             "notes": list(self.notes),
@@ -49,6 +52,7 @@ def compile_tool_call_constraint(
     constraint_type = descriptor_dict.get("constraint_type")
     structural_tag = None
     name_constraint = None
+    parameter_name_constraint = None
     name_grammar = None
     notes = [
         "prototype only: native FastLLM decoding does not consume this yet",
@@ -57,6 +61,8 @@ def compile_tool_call_constraint(
     if constraint_type == "deepseek_v4_dsml":
         structural_tag = _build_deepseek_v4_structural_tag(descriptor_dict)
         name_constraint = _build_deepseek_v4_name_constraint(descriptor_dict)
+        parameter_name_constraint = (
+            _build_deepseek_v4_parameter_name_constraint(descriptor_dict))
         name_grammar = _build_deepseek_v4_name_grammar(descriptor_dict)
     else:
         notes.append(
@@ -68,6 +74,7 @@ def compile_tool_call_constraint(
         descriptor=descriptor_dict,
         structural_tag=structural_tag,
         name_constraint=name_constraint,
+        parameter_name_constraint=parameter_name_constraint,
         name_grammar=name_grammar,
         json_schemas=copy.deepcopy(descriptor_dict.get("schemas") or {}),
         notes=tuple(notes),
@@ -201,6 +208,43 @@ def _build_deepseek_v4_name_constraint(
             "arguments and full DSML structure remain parser-validated",
         ],
     }
+
+
+def _build_deepseek_v4_parameter_name_constraint(
+    descriptor: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    parameter_names = _normalize_parameter_names(
+        descriptor.get("parameter_names") or {})
+    if not parameter_names:
+        return None
+    return {
+        "type": "tool_parameter_name_enum",
+        "format": "deepseek_v4_dsml",
+        "matching": "tokenizer_agnostic_string_prefix",
+        "parameter_names_by_tool": parameter_names,
+        "parameter_name_prefixes": [
+            '<｜DSML｜parameter name="',
+            '<\\DSML\\parameter name="',
+        ],
+        "name_terminator": '"',
+        "notes": [
+            "constrains top-level DSML parameter name values only",
+            "argument values and nested JSON schema remain parser-validated",
+        ],
+    }
+
+
+def _normalize_parameter_names(value: Any) -> Dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: Dict[str, list[str]] = {}
+    for tool_name, names in value.items():
+        if not isinstance(tool_name, str) or not isinstance(names, list):
+            continue
+        clean_names = [name for name in names if isinstance(name, str)]
+        if clean_names:
+            normalized[tool_name] = clean_names
+    return normalized
 
 
 def _build_deepseek_v4_name_grammar(descriptor: Dict[str, Any]) -> str:

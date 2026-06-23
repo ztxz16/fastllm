@@ -203,6 +203,21 @@ extern "C" {
         return ret;
     }
 
+    static std::map<std::string, std::vector<std::string> > read_string_array_map(
+            const json11::Json &node) {
+        std::map<std::string, std::vector<std::string> > ret;
+        if (!node.is_object()) {
+            return ret;
+        }
+        for (const auto &item : node.object_items()) {
+            auto values = read_string_array(item.second);
+            if (!values.empty()) {
+                ret[item.first] = std::move(values);
+            }
+        }
+        return ret;
+    }
+
     static bool apply_tool_call_constraint_json(
             fastllm::GenerationConfig &config,
             const std::string &payload) {
@@ -242,6 +257,28 @@ extern "C" {
         config.tool_call_allowed_names = std::move(allowedNames);
         config.tool_call_invoke_name_prefixes = std::move(prefixes);
         config.tool_call_name_terminator = terminator;
+        config.tool_call_parameter_name_constraint_enabled = false;
+        config.tool_call_allowed_parameter_names.clear();
+        config.tool_call_parameter_name_prefixes.clear();
+
+        json11::Json parameterNameConstraint = root["parameter_name_constraint"];
+        if (parameterNameConstraint.is_object() &&
+            parameterNameConstraint["type"].string_value() == "tool_parameter_name_enum" &&
+            parameterNameConstraint["format"].string_value() == "deepseek_v4_dsml") {
+            auto parameterNames = read_string_array_map(
+                    parameterNameConstraint["parameter_names_by_tool"]);
+            if (!parameterNames.empty()) {
+                auto parameterPrefixes = read_string_array(
+                        parameterNameConstraint["parameter_name_prefixes"]);
+                if (parameterPrefixes.empty()) {
+                    parameterPrefixes.push_back("<｜DSML｜parameter name=\"");
+                    parameterPrefixes.push_back("<\\DSML\\parameter name=\"");
+                }
+                config.tool_call_parameter_name_constraint_enabled = true;
+                config.tool_call_allowed_parameter_names = std::move(parameterNames);
+                config.tool_call_parameter_name_prefixes = std::move(parameterPrefixes);
+            }
+        }
         config.tool_call_allowed_token_ids.clear();
         return true;
     }

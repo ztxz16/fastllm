@@ -101,12 +101,34 @@ Manual software-development smoke cases are also available. They ask the model
 to call coding-agent style tools but still do not execute those tools:
 For roundtrip cases, mocked structured tool results are sent as JSON strings in
 the tool-role message content for OpenAI-compatible server compatibility.
+The `live_openai_opencode_todowrite` case mirrors an opencode `todowrite`
+failure mode: the expected top-level argument is `todos`, and variants such as
+`todo`, `todoList`, or `arguments: {}` should be diagnosed as missing the
+required `todos` key rather than treated as valid tool input.
 
 ```bash
 python3 test/toolcall/run_live_toolcall_tests.py \
   --base-url http://127.0.0.1:8080/v1 \
   --model DeepSeek-V4-Flash \
   --case-id live_openai_dev_search_code \
+  --verbose \
+  --dump-dir /tmp/fastllm-toolcall-live-dev
+```
+
+```bash
+python3 test/toolcall/run_live_toolcall_tests.py \
+  --base-url http://127.0.0.1:8080/v1 \
+  --model DeepSeek-V4-Flash \
+  --case-id live_openai_opencode_todowrite \
+  --verbose \
+  --dump-dir /tmp/fastllm-toolcall-live-dev
+```
+
+```bash
+python3 test/toolcall/run_live_toolcall_tests.py \
+  --base-url http://127.0.0.1:8080/v1 \
+  --model DeepSeek-V4-Flash \
+  --case-id live_openai_opencode_todowrite_stream \
   --verbose \
   --dump-dir /tmp/fastllm-toolcall-live-dev
 ```

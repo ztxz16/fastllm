@@ -85,6 +85,97 @@ namespace fastllm {
                    memcmp(text.data(), prefix.data(), prefix.size()) == 0;
         }
 
+        static bool FindLastPrefix(const std::string &text,
+                                   const std::vector<std::string> &prefixes,
+                                   std::string::size_type &bestPos,
+                                   const std::string **bestPrefix) {
+            bestPos = std::string::npos;
+            *bestPrefix = nullptr;
+            for (const auto &prefix : prefixes) {
+                if (prefix.empty()) {
+                    continue;
+                }
+                auto pos = text.rfind(prefix);
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                if (bestPos == std::string::npos || pos > bestPos) {
+                    bestPos = pos;
+                    *bestPrefix = &prefix;
+                }
+            }
+            return *bestPrefix != nullptr;
+        }
+
+        static bool FindLastPrefixBefore(const std::string &text,
+                                         const std::vector<std::string> &prefixes,
+                                         std::string::size_type exclusiveEnd,
+                                         std::string::size_type &bestPos) {
+            bestPos = std::string::npos;
+            if (exclusiveEnd == std::string::npos || exclusiveEnd > text.size()) {
+                exclusiveEnd = text.size();
+            }
+            for (const auto &prefix : prefixes) {
+                if (prefix.empty() || exclusiveEnd < prefix.size()) {
+                    continue;
+                }
+                auto pos = text.rfind(prefix, exclusiveEnd - prefix.size());
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                if (bestPos == std::string::npos || pos > bestPos) {
+                    bestPos = pos;
+                }
+            }
+            return bestPos != std::string::npos;
+        }
+
+        static std::string::size_type FindLastNeedleBefore(
+                const std::string &text,
+                const std::vector<std::string> &needles,
+                std::string::size_type exclusiveEnd) {
+            std::string::size_type bestPos = std::string::npos;
+            if (exclusiveEnd == std::string::npos || exclusiveEnd > text.size()) {
+                exclusiveEnd = text.size();
+            }
+            for (const auto &needle : needles) {
+                if (needle.empty() || exclusiveEnd < needle.size()) {
+                    continue;
+                }
+                auto pos = text.rfind(needle, exclusiveEnd - needle.size());
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                if (bestPos == std::string::npos || pos > bestPos) {
+                    bestPos = pos;
+                }
+            }
+            return bestPos;
+        }
+
+        static bool HasUnclosedToolCallParameterBefore(
+                const std::string &text,
+                const GenerationConfig &config,
+                std::string::size_type invokePos,
+                std::string::size_type parameterPos) {
+            std::string::size_type previousParameterPos = std::string::npos;
+            if (!FindLastPrefixBefore(text, config.tool_call_parameter_name_prefixes,
+                                      parameterPos, previousParameterPos) ||
+                previousParameterPos < invokePos) {
+                return false;
+            }
+
+            const std::vector<std::string> parameterCloseTags = {
+                    "</｜DSML｜parameter>",
+                    "</\\DSML\\parameter>",
+            };
+            auto closePos = FindLastNeedleBefore(text, parameterCloseTags, parameterPos);
+            if (closePos != std::string::npos && closePos > previousParameterPos) {
+                return false;
+            }
+            return true;
+        }
+
         static bool FindActiveToolCallNamePartial(const std::string &text,
                                                   const GenerationConfig &config,
                                                   std::string &partial) {
@@ -97,20 +188,8 @@ namespace fastllm {
                     config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
             std::string::size_type bestPos = std::string::npos;
             const std::string *bestPrefix = nullptr;
-            for (const auto &prefix : config.tool_call_invoke_name_prefixes) {
-                if (prefix.empty()) {
-                    continue;
-                }
-                auto pos = text.rfind(prefix);
-                if (pos == std::string::npos) {
-                    continue;
-                }
-                if (bestPos == std::string::npos || pos > bestPos) {
-                    bestPos = pos;
-                    bestPrefix = &prefix;
-                }
-            }
-            if (bestPrefix == nullptr) {
+            if (!FindLastPrefix(text, config.tool_call_invoke_name_prefixes,
+                                bestPos, &bestPrefix)) {
                 return false;
             }
             auto nameStart = bestPos + bestPrefix->size();
@@ -121,19 +200,100 @@ namespace fastllm {
             return true;
         }
 
-        static bool IsToolCallNameTokenAllowed(const std::string &partial,
-                                               const std::string &tokenText,
-                                               const GenerationConfig &config) {
-            if (tokenText.empty()) {
+        static bool FindActiveToolCallInvokeName(const std::string &text,
+                                                 const GenerationConfig &config,
+                                                 std::string &toolName,
+                                                 std::string::size_type &invokePos) {
+            if (config.tool_call_invoke_name_prefixes.empty()) {
                 return false;
             }
             const std::string terminator =
                     config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+            const std::string standardClose = "</｜DSML｜invoke>";
+            const std::string alternateClose = "</\\DSML\\invoke>";
+            std::string::size_type bestPos = std::string::npos;
+            const std::string *bestPrefix = nullptr;
+            if (!FindLastPrefix(text, config.tool_call_invoke_name_prefixes,
+                                bestPos, &bestPrefix)) {
+                return false;
+            }
+            auto nameStart = bestPos + bestPrefix->size();
+            auto terminatorPos = text.find(terminator, nameStart);
+            if (terminatorPos == std::string::npos) {
+                return false;
+            }
+            auto standardClosePos = text.rfind(standardClose);
+            auto alternateClosePos = text.rfind(alternateClose);
+            auto closePos = standardClosePos;
+            if (closePos == std::string::npos ||
+                (alternateClosePos != std::string::npos &&
+                 alternateClosePos > closePos)) {
+                closePos = alternateClosePos;
+            }
+            if (closePos != std::string::npos && closePos > bestPos) {
+                return false;
+            }
+            toolName = text.substr(nameStart, terminatorPos - nameStart);
+            invokePos = bestPos;
+            return !toolName.empty();
+        }
+
+        static bool FindActiveToolCallParameterNamePartial(
+                const std::string &text,
+                const GenerationConfig &config,
+                std::string &partial,
+                std::vector<std::string> &allowedNames) {
+            if (!config.tool_call_parameter_name_constraint_enabled ||
+                config.tool_call_allowed_parameter_names.empty() ||
+                config.tool_call_parameter_name_prefixes.empty()) {
+                return false;
+            }
+            std::string toolName;
+            std::string::size_type invokePos = std::string::npos;
+            if (!FindActiveToolCallInvokeName(text, config, toolName, invokePos)) {
+                return false;
+            }
+            auto allowedIt = config.tool_call_allowed_parameter_names.find(toolName);
+            if (allowedIt == config.tool_call_allowed_parameter_names.end() ||
+                allowedIt->second.empty()) {
+                return false;
+            }
+            std::string::size_type parameterPos = std::string::npos;
+            const std::string *parameterPrefix = nullptr;
+            if (!FindLastPrefix(text, config.tool_call_parameter_name_prefixes,
+                                parameterPos, &parameterPrefix)) {
+                return false;
+            }
+            if (parameterPos == std::string::npos || parameterPos < invokePos) {
+                return false;
+            }
+            if (HasUnclosedToolCallParameterBefore(text, config,
+                                                   invokePos, parameterPos)) {
+                return false;
+            }
+            const std::string terminator =
+                    config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+            auto nameStart = parameterPos + parameterPrefix->size();
+            if (text.find(terminator, nameStart) != std::string::npos) {
+                return false;
+            }
+            partial = text.substr(nameStart);
+            allowedNames = allowedIt->second;
+            return true;
+        }
+
+        static bool IsToolCallEnumTokenAllowed(const std::string &partial,
+                                               const std::string &tokenText,
+                                               const std::vector<std::string> &allowedValues,
+                                               const std::string &terminator) {
+            if (tokenText.empty()) {
+                return false;
+            }
             std::string combined = partial + tokenText;
             auto terminatorPos = combined.find(terminator);
             std::string namePart = terminatorPos == std::string::npos ?
                                    combined : combined.substr(0, terminatorPos);
-            for (const auto &name : config.tool_call_allowed_names) {
+            for (const auto &name : allowedValues) {
                 if (terminatorPos != std::string::npos) {
                     if (namePart == name) {
                         return true;
@@ -301,21 +461,40 @@ namespace fastllm {
 
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
         generationConfig.tool_call_allowed_token_ids.clear();
-        if (context == nullptr || !generationConfig.tool_call_name_constraint_enabled) {
+        if (context == nullptr ||
+            (!generationConfig.tool_call_name_constraint_enabled &&
+             !generationConfig.tool_call_parameter_name_constraint_enabled)) {
             return;
         }
         std::string partial;
-        if (!FindActiveToolCallNamePartial(context->toolCallConstraintGeneratedText,
-                                           generationConfig, partial)) {
+        std::vector<std::string> allowedValues;
+        if (!FindActiveToolCallParameterNamePartial(
+                    context->toolCallConstraintGeneratedText,
+                    generationConfig,
+                    partial,
+                    allowedValues)) {
+            if (!FindActiveToolCallNamePartial(
+                        context->toolCallConstraintGeneratedText,
+                        generationConfig,
+                        partial)) {
+                return;
+            }
+            allowedValues = generationConfig.tool_call_allowed_names;
+        }
+        if (allowedValues.empty()) {
             return;
         }
 
         std::vector<int> allowedIds;
-        allowedIds.reserve(generationConfig.tool_call_allowed_names.size() * 4);
+        allowedIds.reserve(allowedValues.size() * 4);
+        const std::string terminator =
+                generationConfig.tool_call_name_terminator.empty()
+                ? "\"" : generationConfig.tool_call_name_terminator;
         for (const auto &item : this->weight.tokenizer.tokenToStringDict) {
             int tokenId = item.first;
             std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
-            if (IsToolCallNameTokenAllowed(partial, tokenText, generationConfig)) {
+            if (IsToolCallEnumTokenAllowed(partial, tokenText,
+                                           allowedValues, terminator)) {
                 allowedIds.push_back(tokenId);
             }
         }
@@ -325,7 +504,10 @@ namespace fastllm {
     }
 
     void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {
-        if (context == nullptr || !context->generationConfig.tool_call_name_constraint_enabled || tokenId < 0) {
+        if (context == nullptr ||
+            (!context->generationConfig.tool_call_name_constraint_enabled &&
+             !context->generationConfig.tool_call_parameter_name_constraint_enabled) ||
+            tokenId < 0) {
             return;
         }
         context->toolCallConstraintGeneratedText += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});

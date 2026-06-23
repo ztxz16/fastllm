@@ -55,6 +55,35 @@ def _strict_weather_tool(name="get_weather"):
     }
 
 
+def _strict_todowrite_tool():
+    return {
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "description": "Create and maintain a structured task list.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string"},
+                                "priority": {"type": "string"},
+                            },
+                            "required": ["content", "status", "priority"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    }
+
+
 def _time_tool(name="get_time"):
     return {
         "type": "function",
@@ -125,6 +154,43 @@ def _run_tests_dsml_call() -> str:
         _param("command", False, '["python","-m","unittest","test.toolcall"]'),
         _param("cwd", True, "."),
         _param("timeout_seconds", False, "120"),
+    ))
+
+
+def _todowrite_dsml_call(param_name: str = "todos") -> str:
+    return _tool_calls(_invoke(
+        "todowrite",
+        _param(
+            param_name,
+            False,
+            json.dumps([
+                {
+                    "content": "inspect OpenAI request",
+                    "status": "pending",
+                    "priority": "medium",
+                },
+                {
+                    "content": "inspect tool call arguments",
+                    "status": "pending",
+                    "priority": "medium",
+                },
+            ]),
+        ),
+    ))
+
+
+def _todowrite_dsml_call_missing_item_fields() -> str:
+    return _tool_calls(_invoke(
+        "todowrite",
+        _param(
+            "todos",
+            False,
+            json.dumps([
+                {
+                    "content": "inspect OpenAI request",
+                },
+            ]),
+        ),
     ))
 
 
@@ -398,6 +464,50 @@ class NonStreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.code, 400)
         self.assertIn("missing_required_argument", response.message)
         self.assertIn("city", response.message)
+        self.assertIn("missing_required_argument", "\n".join(logs.output))
+
+    async def test_opencode_todowrite_response_shape_passes_with_todos(self):
+        response = await self._run_full_generator(
+            _todowrite_dsml_call(),
+            _request(tools=[_strict_todowrite_tool()]),
+        )
+
+        self.assertIsInstance(response, ChatCompletionResponse)
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.function.name, "todowrite")
+        arguments = json.loads(tool_call.function.arguments)
+        self.assertEqual([todo["content"] for todo in arguments["todos"]], [
+            "inspect OpenAI request",
+            "inspect tool call arguments",
+        ])
+
+    async def test_opencode_todowrite_wrong_key_returns_missing_todos_error(self):
+        with self.assertLogs(level="WARNING") as logs:
+            response = await self._run_full_generator(
+                _todowrite_dsml_call("todoList"),
+                _request(tools=[_strict_todowrite_tool()]),
+            )
+
+        self.assertIsInstance(response, ErrorResponse)
+        self.assertEqual(response.code, 400)
+        self.assertIn("missing_required_argument", response.message)
+        self.assertIn("todos", response.message)
+        self.assertIn("missing_required_argument", "\n".join(logs.output))
+
+    async def test_opencode_todowrite_missing_item_fields_returns_error(self):
+        with self.assertLogs(level="WARNING") as logs:
+            response = await self._run_full_generator(
+                _todowrite_dsml_call_missing_item_fields(),
+                _request(tools=[_strict_todowrite_tool()]),
+            )
+
+        self.assertIsInstance(response, ErrorResponse)
+        self.assertEqual(response.code, 400)
+        self.assertIn("missing_required_argument", response.message)
+        self.assertIn("todos[0].status", response.message)
+        self.assertIn("todos[0].priority", response.message)
         self.assertIn("missing_required_argument", "\n".join(logs.output))
 
     async def test_constraint_descriptor_dry_run_does_not_change_response(self):

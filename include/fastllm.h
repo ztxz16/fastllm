@@ -147,6 +147,9 @@ namespace fastllm {
         std::vector <std::string> tool_call_allowed_names;
         std::vector <std::string> tool_call_invoke_name_prefixes;
         std::string tool_call_name_terminator = "\"";
+        bool tool_call_parameter_name_constraint_enabled = false;
+        std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
+        std::vector <std::string> tool_call_parameter_name_prefixes;
         std::vector <int> tool_call_allowed_token_ids;
 
         bool IsSimpleGreedy() const {
