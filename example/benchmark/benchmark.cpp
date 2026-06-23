@@ -30,6 +30,8 @@ std::map <std::string, fastllm::DataType> dataTypeDict = {
     {"float32", fastllm::DataType::FLOAT32},
     {"half", fastllm::DataType::FLOAT16},
     {"float16", fastllm::DataType::FLOAT16},
+    {"fp8", fastllm::DataType::FP8_E4M3},
+    {"fp8_e4m3", fastllm::DataType::FP8_E4M3},
     {"int8", fastllm::DataType::INT8},
     {"int4", fastllm::DataType::INT4_NOZERO},
     {"int4z", fastllm::DataType::INT4},
@@ -57,7 +59,7 @@ void Usage() {
     std::cout << "<-l|--limit> <args>:          输出token数限制" << std::endl;
     std::cout << "<-b|--batch> <args>:          batch数"      << std::endl;
     std::cout << "<-f|--file> <args>:           输入文件，文件中每行一个prompt，如果行数不足batch则用之前的prompt补充"      << std::endl;
-    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
+    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效, 支持float32/float16/fp8等)" << std::endl;
     std::cout << "<--atype> <args>:             设置推理使用的数据类型（float32/float16）" << std::endl;
 }
 

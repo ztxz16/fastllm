@@ -281,6 +281,8 @@ if triton is not None:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        WEIGHT_BLOCK_N: tl.constexpr,
+        WEIGHT_BLOCK_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr,
     ):
         pid = tl.program_id(axis=0)
@@ -327,7 +329,9 @@ if triton is not None:
                     other=0.0,
                 )
                 b_scale = tl.load(
-                    b_scale_ptr + (offs_n // BLOCK_K) * SCALE_COLS + k,
+                    b_scale_ptr
+                    + (offs_n // WEIGHT_BLOCK_N) * SCALE_COLS
+                    + ((k * BLOCK_K) // WEIGHT_BLOCK_K),
                     mask=offs_n < N,
                     other=0.0,
                 )
@@ -347,6 +351,76 @@ if triton is not None:
             acc.to(COMPUTE_TYPE),
             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
         )
+
+
+    @triton.jit
+    def fastllm_linear_fp8_block128_strided_matmul_kernel(
+        A,
+        B,
+        C,
+        As,
+        Bs,
+        M,
+        N,
+        K,
+        group_n,
+        group_k,
+        stride_am,
+        stride_bn,
+        stride_cm,
+        stride_As_m,
+        stride_Bs_n,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :])
+        b_ptrs = B + (offs_k[:, None] + offs_bn[None, :] * stride_bn)
+
+        As_ptrs = As + offs_am * stride_As_m
+        offs_bsn = offs_bn // group_n
+        Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+
+            k_start = k * BLOCK_SIZE_K
+            offs_ks = k_start // group_k
+            a_s = tl.load(As_ptrs + offs_ks)
+            b_s = tl.load(Bs_ptrs + offs_ks)
+
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+            a_ptrs += BLOCK_SIZE_K
+            b_ptrs += BLOCK_SIZE_K
+
+        if C.dtype.element_ty == tl.bfloat16:
+            c = accumulator.to(tl.bfloat16)
+        elif C.dtype.element_ty == tl.float16:
+            c = accumulator.to(tl.float16)
+        else:
+            c = accumulator.to(tl.float32)
+
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = C + stride_cm * offs_cm[:, None] + offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
     @triton.jit
@@ -821,6 +895,13 @@ MERGE_MOE_FP8_KERNEL_ORDER = (
 LINEAR_FP8_BLOCK128_KERNEL_ORDER = ("quant_input", "matmul")
 
 
+def linear_fp8_block128_matmul_variant(payload):
+    variant = str(payload.get("matmul_variant") or "fastllm").strip().lower()
+    if variant not in {"fastllm", "strided"}:
+        raise ValueError("matmul_variant must be fastllm or strided")
+    return variant
+
+
 def linear_fp8_block128_cache_paths(payload):
     arch = require_int(payload, "arch")
     input_dtype = require_dtype(payload, "input_dtype")
@@ -839,12 +920,20 @@ def linear_fp8_block128_cache_paths(payload):
     num_stages = require_int(payload, "num_stages", 3)
     if block_k != 128:
         raise ValueError("FP8 block128 linear requires block_k=128")
+    matmul_variant = linear_fp8_block128_matmul_variant(payload)
     cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
-    name = (
-        f"linear_fp8_block128_v2_{weight_layout}_{input_dtype}_bias{has_bias}_sm{arch}"
-        f"_bm{block_m}_bn{block_n}_bk{block_k}_gsm{group_size_m}"
-        f"_qnw{quant_num_warps}_mnw{matmul_num_warps}_ns{num_stages}"
-    )
+    if matmul_variant == "fastllm":
+        name = (
+            f"linear_fp8_block128_v5_{weight_layout}_{input_dtype}_bias{has_bias}_sm{arch}"
+            f"_bm{block_m}_bn{block_n}_bk{block_k}_gsm{group_size_m}"
+            f"_qnw{quant_num_warps}_mnw{matmul_num_warps}_ns{num_stages}"
+        )
+    else:
+        name = (
+            f"linear_fp8_block128_strided_v4_{weight_layout}_{input_dtype}_bias{has_bias}_sm{arch}"
+            f"_bm{block_m}_bn{block_n}_bk{block_k}_gsm{group_size_m}"
+            f"_qnw{quant_num_warps}_mnw{matmul_num_warps}_ns{num_stages}"
+        )
     cubins = {
         key: cache_dir / f"{name}_{key}.cubin"
         for key in LINEAR_FP8_BLOCK128_KERNEL_ORDER
@@ -997,6 +1086,11 @@ def compile_linear_fp8_block128(payload):
     if weight_layout not in {"packed", "separate"}:
         raise ValueError("weight_layout must be packed or separate")
     packed_weight = weight_layout == "packed"
+    matmul_variant = linear_fp8_block128_matmul_variant(payload)
+    if matmul_variant == "strided" and packed_weight:
+        raise ValueError("strided FP8 block128 linear variant requires separate weight scales")
+    if matmul_variant == "strided" and has_bias:
+        raise ValueError("strided FP8 block128 linear variant does not support bias")
     if block_k != 128:
         raise ValueError("FP8 block128 linear requires block_k=128")
 
@@ -1025,43 +1119,87 @@ def compile_linear_fp8_block128(payload):
         cubin_paths["quant_input"],
     )
 
-    matmul_signature = {
-        "a_ptr": "*fp8e4nv",
-        "a_scale_ptr": "*fp32",
-        "b_ptr": "*fp8e4nv",
-        "b_scale_ptr": "*fp32",
-        "bias_ptr": "*fp32",
-        "c_ptr": f"*{input_dtype}",
-        "M": "i32",
-        "N": "i32",
-        "K": "i32",
-        "PER_ROW": "i32",
-        "SCALE_COLS": "i32",
-        "HAS_BIAS": "constexpr",
-        "PACKED_WEIGHT": "constexpr",
-        "COMPUTE_TYPE": "constexpr",
-        "BLOCK_M": "constexpr",
-        "BLOCK_N": "constexpr",
-        "BLOCK_K": "constexpr",
-        "GROUP_SIZE_M": "constexpr",
-    }
-    matmul_constexprs = {
-        "HAS_BIAS": has_bias,
-        "PACKED_WEIGHT": packed_weight,
-        "COMPUTE_TYPE": compute_type,
-        "BLOCK_M": block_m,
-        "BLOCK_N": block_n,
-        "BLOCK_K": block_k,
-        "GROUP_SIZE_M": group_size_m,
-    }
+    if matmul_variant == "strided":
+        matmul_fn = fastllm_linear_fp8_block128_strided_matmul_kernel
+        matmul_signature = {
+            "A": "*fp8e4nv",
+            "B": "*fp8e4nv",
+            "C": f"*{input_dtype}",
+            "As": "*fp32",
+            "Bs": "*fp32",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "group_n": "i32",
+            "group_k": "i32",
+            "stride_am": "i32",
+            "stride_bn": "i32",
+            "stride_cm": "i32",
+            "stride_As_m": "i32",
+            "stride_Bs_n": "i32",
+            "BLOCK_SIZE_M": "constexpr",
+            "BLOCK_SIZE_N": "constexpr",
+            "BLOCK_SIZE_K": "constexpr",
+            "GROUP_SIZE_M": "constexpr",
+        }
+        matmul_constexprs = {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": block_k,
+            "GROUP_SIZE_M": group_size_m,
+        }
+        matmul_extra_divisible_by_16 = {
+            "K",
+            "group_n",
+            "group_k",
+            "stride_am",
+            "stride_bn",
+        }
+    else:
+        matmul_fn = fastllm_linear_fp8_block128_matmul_kernel
+        matmul_signature = {
+            "a_ptr": "*fp8e4nv",
+            "a_scale_ptr": "*fp32",
+            "b_ptr": "*fp8e4nv",
+            "b_scale_ptr": "*fp32",
+            "bias_ptr": "*fp32",
+            "c_ptr": f"*{input_dtype}",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "PER_ROW": "i32",
+            "SCALE_COLS": "i32",
+            "HAS_BIAS": "constexpr",
+            "PACKED_WEIGHT": "constexpr",
+            "COMPUTE_TYPE": "constexpr",
+            "BLOCK_M": "constexpr",
+            "BLOCK_N": "constexpr",
+            "BLOCK_K": "constexpr",
+            "WEIGHT_BLOCK_N": "constexpr",
+            "WEIGHT_BLOCK_K": "constexpr",
+            "GROUP_SIZE_M": "constexpr",
+        }
+        matmul_constexprs = {
+            "HAS_BIAS": has_bias,
+            "PACKED_WEIGHT": packed_weight,
+            "COMPUTE_TYPE": compute_type,
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "BLOCK_K": block_k,
+            "WEIGHT_BLOCK_N": 128,
+            "WEIGHT_BLOCK_K": 128,
+            "GROUP_SIZE_M": group_size_m,
+        }
+        matmul_extra_divisible_by_16 = None
     matmul_ccinfo = _compile_cubin(
-        fastllm_linear_fp8_block128_matmul_kernel,
+        matmul_fn,
         matmul_signature,
         matmul_constexprs,
         arch,
         matmul_num_warps,
         num_stages,
         cubin_paths["matmul"],
+        extra_divisible_by_16=matmul_extra_divisible_by_16,
     )
 
     ccinfos = {
@@ -1085,6 +1223,8 @@ def compile_linear_fp8_block128(payload):
         "block_m": block_m,
         "block_n": block_n,
         "block_k": block_k,
+        "weight_block_n": 128,
+        "weight_block_k": 128,
         "group_size_m": group_size_m,
         "quant_num_warps": quant_num_warps,
         "matmul_num_warps": matmul_num_warps,
@@ -1094,6 +1234,7 @@ def compile_linear_fp8_block128(payload):
         "weight_layout": weight_layout,
         "packed_weight": packed_weight,
         "has_bias": has_bias,
+        "matmul_variant": matmul_variant,
     }
     meta_path.write_text(json.dumps(meta, sort_keys=True))
     return meta

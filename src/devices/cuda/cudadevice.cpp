@@ -74,6 +74,20 @@ namespace fastllm {
         return CudaEnvFlagEnabled(name);
     }
 
+    static void TraceCudaLinearFp8Path(const char *path, int n, int m, int k) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_LINEAR_FP8_TRACE")) {
+            return;
+        }
+        static std::mutex mutex;
+        static std::map<std::string, int> counts;
+        std::lock_guard<std::mutex> guard(mutex);
+        int &count = counts[path];
+        if (count < 16) {
+            printf("FastLLM CUDA linear fp8 path: %s n=%d m=%d k=%d\n", path, n, m, k);
+        }
+        count++;
+    }
+
     static int CudaEnvInt(const char *name, int fallback) {
         const char *v = std::getenv(name);
         if (v == nullptr || v[0] == '\0') {
@@ -141,6 +155,7 @@ namespace fastllm {
         int numStages = 3;
         bool hasBias = false;
         bool packedWeight = true;
+        std::string matmulVariant = "fastllm";
     };
 
     struct CudaTritonMergeMoeFp8Meta {
@@ -241,9 +256,15 @@ namespace fastllm {
     static std::string CudaTritonLinearFp8Block128BaseName(
         const std::string &inputDtype, bool hasBias, bool packedWeight, int arch,
         int blockM, int blockN, int blockK, int groupSizeM,
-        int quantNumWarps, int matmulNumWarps, int numStages) {
+        int quantNumWarps, int matmulNumWarps, int numStages,
+        const std::string &matmulVariant) {
         std::ostringstream os;
-        os << "linear_fp8_block128_v2_" << (packedWeight ? "packed" : "separate")
+        if (matmulVariant == "strided") {
+            os << "linear_fp8_block128_strided_v4_";
+        } else {
+            os << "linear_fp8_block128_v5_";
+        }
+        os << (packedWeight ? "packed" : "separate")
            << "_" << inputDtype
            << "_bias" << (hasBias ? 1 : 0)
            << "_sm" << arch
@@ -303,8 +324,13 @@ namespace fastllm {
         meta.numStages = json["num_stages"].int_value();
         meta.hasBias = json["has_bias"].bool_value();
         meta.packedWeight = json["packed_weight"].bool_value();
+        meta.matmulVariant = json["matmul_variant"].string_value();
+        if (meta.matmulVariant.empty()) {
+            meta.matmulVariant = "fastllm";
+        }
         if (meta.blockM <= 0 || meta.blockN <= 0 || meta.blockK != 128 ||
-            meta.groupSizeM <= 0 || meta.quantNumWarps <= 0 || meta.matmulNumWarps <= 0) {
+            meta.groupSizeM <= 0 || meta.quantNumWarps <= 0 || meta.matmulNumWarps <= 0 ||
+            (meta.matmulVariant != "fastllm" && meta.matmulVariant != "strided")) {
             return false;
         }
         json11::Json kernels = json["kernels"];
@@ -534,6 +560,7 @@ namespace fastllm {
         const std::string &cacheDir, const std::string &inputDtype, bool hasBias, bool packedWeight, int arch,
         int blockM, int blockN, int blockK, int groupSizeM,
         int quantNumWarps, int matmulNumWarps, int numStages,
+        const std::string &matmulVariant,
         CudaTritonLinearFp8Block128Meta &meta) {
         if (!CudaTritonEnsureServer()) {
             return false;
@@ -552,6 +579,7 @@ namespace fastllm {
             {"quant_num_warps", quantNumWarps},
             {"matmul_num_warps", matmulNumWarps},
             {"num_stages", numStages},
+            {"matmul_variant", matmulVariant},
         };
         int status = 0;
         std::string body;
@@ -578,8 +606,13 @@ namespace fastllm {
         meta.numStages = response["num_stages"].int_value();
         meta.hasBias = response["has_bias"].bool_value();
         meta.packedWeight = response["packed_weight"].bool_value();
+        meta.matmulVariant = response["matmul_variant"].string_value();
+        if (meta.matmulVariant.empty()) {
+            meta.matmulVariant = "fastllm";
+        }
         if (meta.blockM <= 0 || meta.blockN <= 0 || meta.blockK != 128 ||
-            meta.groupSizeM <= 0 || meta.quantNumWarps <= 0 || meta.matmulNumWarps <= 0) {
+            meta.groupSizeM <= 0 || meta.quantNumWarps <= 0 || meta.matmulNumWarps <= 0 ||
+            meta.matmulVariant != matmulVariant) {
             return false;
         }
         json11::Json kernels = response["kernels"];
@@ -601,6 +634,7 @@ namespace fastllm {
         const std::string &cacheDir, const std::string &base, const std::string &inputDtype,
         bool hasBias, bool packedWeight, int arch, int blockM, int blockN, int blockK, int groupSizeM,
         int quantNumWarps, int matmulNumWarps, int numStages,
+        const std::string &matmulVariant,
         const CudaTritonLinearFp8Block128Meta *&meta) {
         static std::mutex mutex;
         static std::map<std::string, CudaTritonLinearFp8Block128Meta> cachedMeta;
@@ -619,7 +653,7 @@ namespace fastllm {
         if (!CudaTritonReadLinearFp8Block128Meta(metaPath, loaded)) {
             if (!CudaTritonRequestLinearFp8Block128Kernel(
                     cacheDir, inputDtype, hasBias, packedWeight, arch, blockM, blockN, blockK, groupSizeM,
-                    quantNumWarps, matmulNumWarps, numStages, loaded)) {
+                    quantNumWarps, matmulNumWarps, numStages, matmulVariant, loaded)) {
                 return false;
             }
         }
@@ -768,7 +802,11 @@ namespace fastllm {
         if (arch != 120 && arch != 121) {
             return false;
         }
-        return FastllmCudaCutlassLinearFP8E4M3Block128(input, weight, bias, output, n, m, k);
+        bool ok = FastllmCudaCutlassLinearFP8E4M3Block128(input, weight, bias, output, n, m, k);
+        if (ok) {
+            TraceCudaLinearFp8Path("cutlass-fp8-e4m3-block128", n, m, k);
+        }
+        return ok;
     }
 
     static bool TryCudaTritonLinearFp8Block128(
@@ -797,11 +835,17 @@ namespace fastllm {
             return false;
         }
 
+        int arch = CudaTritonRuntimeArch();
+        if (arch <= 0 || arch < 89) {
+            return false;
+        }
+
         int minBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MIN_BATCH", 8);
         if (n < minBatch) {
             return false;
         }
-        int maxBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MAX_BATCH", 64);
+        int defaultMaxBatch = arch == 89 ? 256 : 64;
+        int maxBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MAX_BATCH", defaultMaxBatch);
         if (maxBatch > 0 && n > maxBatch) {
             return false;
         }
@@ -810,20 +854,29 @@ namespace fastllm {
         if (!CudaTritonDataTypeName(input.dataType, inputDtype)) {
             return false;
         }
-        int arch = CudaTritonRuntimeArch();
-        if (arch <= 0 || arch < 89) {
-            return false;
+        std::string matmulVariant = arch == 89 ? "strided" : "fastllm";
+        const char *kernelEnv = std::getenv("FASTLLM_CUDA_TRITON_LINEAR_FP8_KERNEL");
+        if (kernelEnv != nullptr && kernelEnv[0] != '\0') {
+            if (strcmp(kernelEnv, "strided") == 0 || strcmp(kernelEnv, "STRIDED") == 0) {
+                matmulVariant = "strided";
+            } else if (strcmp(kernelEnv, "fastllm") == 0 || strcmp(kernelEnv, "FASTLLM") == 0) {
+                matmulVariant = "fastllm";
+            }
+        }
+        if (matmulVariant == "strided" && (packedWeight || hasBias)) {
+            matmulVariant = "fastllm";
         }
 
-        int defaultBlockM = n <= 64 ? 16 : 64;
-        int defaultBlockN = n <= 64 ? 64 : 32;
+        int defaultBlockM = matmulVariant == "strided" ? 64 : (n <= 64 ? 16 : 64);
+        int defaultBlockN = matmulVariant == "strided" ? 128 : (n <= 64 ? 64 : 32);
         int blockM = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_BLOCK_M", defaultBlockM);
         int blockN = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_BLOCK_N", defaultBlockN);
         int blockK = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_BLOCK_K", 128);
         int groupSizeM = CudaEnvIntRange("FASTLLM_CUDA_TRITON_LINEAR_FP8_GROUP_SIZE_M", 32, 1, 4096);
         int quantNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_QUANT_NUM_WARPS", 4);
         int matmulNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MATMUL_NUM_WARPS", 4);
-        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_NUM_STAGES", 3);
+        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_NUM_STAGES",
+                                   matmulVariant == "strided" ? 2 : 3);
         if (blockK != 128 || blockN <= 0 || blockM <= 0) {
             return false;
         }
@@ -831,24 +884,36 @@ namespace fastllm {
         std::string cacheDir = CudaTritonCacheDir();
         std::string base = CudaTritonLinearFp8Block128BaseName(
             inputDtype, hasBias, packedWeight, arch, blockM, blockN, blockK, groupSizeM,
-            quantNumWarps, matmulNumWarps, numStages);
+            quantNumWarps, matmulNumWarps, numStages, matmulVariant);
 
         const CudaTritonLinearFp8Block128Meta *meta = nullptr;
         if (!CudaTritonGetLinearFp8Block128Meta(
                 cacheDir, base, inputDtype, hasBias, packedWeight, arch, blockM, blockN, blockK, groupSizeM,
-                quantNumWarps, matmulNumWarps, numStages, meta)) {
+                quantNumWarps, matmulNumWarps, numStages, matmulVariant, meta)) {
             return false;
         }
-        if (meta == nullptr || meta->hasBias != hasBias || meta->packedWeight != packedWeight) {
+        if (meta == nullptr || meta->hasBias != hasBias || meta->packedWeight != packedWeight ||
+            meta->matmulVariant != matmulVariant) {
             return false;
         }
-        return FastllmCudaTritonLinearFP8E4M3Block128(
+        bool ok = FastllmCudaTritonLinearFP8E4M3Block128(
             meta->kernels[0].cubinPath.c_str(), meta->kernels[0].kernelName.c_str(),
             meta->kernels[0].numWarps, meta->kernels[0].shared,
             meta->kernels[1].cubinPath.c_str(), meta->kernels[1].kernelName.c_str(),
             meta->kernels[1].numWarps, meta->kernels[1].shared,
-            meta->blockM, meta->blockN, meta->blockK, meta->groupSizeM, meta->packedWeight,
+            meta->blockM, meta->blockN, meta->blockK, meta->groupSizeM,
+            meta->packedWeight, meta->matmulVariant == "strided",
             input, weight, bias, output, n, m, k);
+        if (ok) {
+            if (meta->matmulVariant == "strided") {
+                TraceCudaLinearFp8Path("triton-fp8-e4m3-block128-strided", n, m, k);
+            } else {
+                TraceCudaLinearFp8Path(meta->packedWeight ? "triton-fp8-e4m3-packed-block128" :
+                                                            "triton-fp8-e4m3-block128",
+                                       n, m, k);
+            }
+        }
+        return ok;
     }
 
     static bool TryCudaTritonMergeMOEFp8Indexed(
@@ -1695,10 +1760,12 @@ namespace fastllm {
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 if (!TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                    TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
                     FastllmCudaHalfMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
                 }
             } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
                 if (!TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                    TraceCudaLinearFp8Path("native-fp8-e4m3-packed-block128", n, m, k);
                     FastllmCudaHalfMatMulFloatFP8E4M3Block128(input, weight, bias, output, n, m, k);
                 }
             } else if (weight.dataType == DataType::NVFP4) {
@@ -1752,10 +1819,12 @@ namespace fastllm {
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 if (!TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                    TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
                     FastllmCudaBFloat16MatMulFP8E4M3(input, weight, bias, output, n, m, k);
                 }
             } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
                 if (!TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                    TraceCudaLinearFp8Path("native-fp8-e4m3-packed-block128", n, m, k);
                     FastllmCudaBFloat16MatMulFP8E4M3Block128(input, weight, bias, output, n, m, k);
                 }
             } else if (weight.dataType == DataType::NVFP4) {

@@ -2,6 +2,9 @@
 #include "fastllm.h"
 
 #include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdlib>
@@ -181,6 +184,90 @@ static bool TritonEnvFlagEnabled(const char *name) {
     return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0 &&
            strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
            strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
+}
+
+static bool TritonEnvFlagDefaultEnabled(const char *name, bool fallback) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return fallback;
+    }
+    return TritonEnvFlagEnabled(name);
+}
+
+template <typename T>
+__global__ void FastllmLinearFp8GroupQuant128Kernel(
+    const T *__restrict__ input, uint8_t *__restrict__ output, float *__restrict__ scales,
+    int totalGroups, int groupsPerRow) {
+    constexpr int groupSize = 128;
+    constexpr int threadsPerGroup = 16;
+    constexpr int valuesPerThread = groupSize / threadsPerGroup;
+
+    int localGroup = threadIdx.x / threadsPerGroup;
+    int lane = threadIdx.x % threadsPerGroup;
+    int groupsPerBlock = blockDim.x / threadsPerGroup;
+    int globalGroup = blockIdx.x * groupsPerBlock + localGroup;
+    if (globalGroup >= totalGroups) {
+        return;
+    }
+
+    int row = globalGroup / groupsPerRow;
+    int group = globalGroup - row * groupsPerRow;
+    int base = (row * groupsPerRow + group) * groupSize;
+
+    float values[valuesPerThread];
+    float localAbsMax = 1.0e-10f;
+#pragma unroll
+    for (int i = 0; i < valuesPerThread; i++) {
+        int offset = lane + i * threadsPerGroup;
+        float value = static_cast<float>(input[base + offset]);
+        values[i] = value;
+        localAbsMax = fmaxf(localAbsMax, fabsf(value));
+    }
+
+    unsigned int mask = (threadIdx.x % 32 >= 16) ? 0xffff0000u : 0x0000ffffu;
+    localAbsMax = fmaxf(localAbsMax, __shfl_xor_sync(mask, localAbsMax, 8));
+    localAbsMax = fmaxf(localAbsMax, __shfl_xor_sync(mask, localAbsMax, 4));
+    localAbsMax = fmaxf(localAbsMax, __shfl_xor_sync(mask, localAbsMax, 2));
+    localAbsMax = fmaxf(localAbsMax, __shfl_xor_sync(mask, localAbsMax, 1));
+
+    float scale = localAbsMax * (1.0f / 448.0f);
+    if (lane == 0) {
+        scales[globalGroup] = scale;
+    }
+    float invScale = 1.0f / scale;
+#pragma unroll
+    for (int i = 0; i < valuesPerThread; i++) {
+        int offset = lane + i * threadsPerGroup;
+        float q = fminf(fmaxf(values[i] * invScale, -448.0f), 448.0f);
+        output[base + offset] = __nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+static bool LaunchFastllmLinearFp8NativeQuant128(
+    const void *input, fastllm::DataType inputType, uint8_t *output, float *scales,
+    int rows, int cols) {
+    if (input == nullptr || output == nullptr || scales == nullptr || rows <= 0 ||
+        cols <= 0 || (cols % 128) != 0) {
+        return false;
+    }
+    int groupsPerRow = cols / 128;
+    int totalGroups = rows * groupsPerRow;
+    int groupsPerBlock = 8;
+    dim3 block(groupsPerBlock * 16);
+    dim3 grid((totalGroups + groupsPerBlock - 1) / groupsPerBlock);
+    cudaStream_t stream = nullptr;
+    cudaError_t state = cudaGetLastError();
+    (void)state;
+    if (inputType == fastllm::DataType::FLOAT16) {
+        FastllmLinearFp8GroupQuant128Kernel<half><<<grid, block, 0, stream>>>(
+            (const half*)input, output, scales, totalGroups, groupsPerRow);
+    } else if (inputType == fastllm::DataType::BFLOAT16) {
+        FastllmLinearFp8GroupQuant128Kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+            (const __nv_bfloat16*)input, output, scales, totalGroups, groupsPerRow);
+    } else {
+        return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
 }
 
 struct TritonMoeFp8ExpertTable {
@@ -793,7 +880,7 @@ extern "C" int FastllmCudaRuntimeArch() {
 extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
     const char *quantCubitPath, const char *quantKernelName, int quantNumWarps, int quantShared,
     const char *matmulCubitPath, const char *matmulKernelName, int matmulNumWarps, int matmulShared,
-    int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight,
+    int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight, bool stridedMatmul,
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
     int n, int m, int k) {
     if (quantCubitPath == nullptr || quantKernelName == nullptr ||
@@ -816,6 +903,9 @@ extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
     if (hasBias && (bias.cudaData == nullptr || bias.dataType != fastllm::DataType::FLOAT32)) {
         return false;
     }
+    if (stridedMatmul && (packedWeight || hasBias)) {
+        return false;
+    }
 
     if (!packedWeight && weight.extraCudaData.empty()) {
         float *cudaScales = nullptr;
@@ -832,9 +922,11 @@ extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
         weight.extraCudaData.push_back((void*)cudaScales);
     }
 
-    LoadedTritonKernel *quantKernel = LoadTritonKernel(quantCubitPath, quantKernelName, quantShared);
+    bool useNativeQuant = TritonEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8_NATIVE_QUANT", true);
+    LoadedTritonKernel *quantKernel = useNativeQuant ? nullptr :
+        LoadTritonKernel(quantCubitPath, quantKernelName, quantShared);
     LoadedTritonKernel *matmulKernel = LoadTritonKernel(matmulCubitPath, matmulKernelName, matmulShared);
-    if (quantKernel == nullptr || matmulKernel == nullptr) {
+    if ((!useNativeQuant && quantKernel == nullptr) || matmulKernel == nullptr) {
         return false;
     }
 
@@ -869,29 +961,46 @@ extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
     CUdeviceptr globalScratch = 0;
     CUdeviceptr profileScratch = 0;
 
-    void *quantArgs[] = {
-        &inputPtr,
-        &inputQuantPtr,
-        &inputScalePtr,
-        &mArg,
-        &kArg,
-        &globalScratch,
-        &profileScratch,
-    };
-    CUresult result = LaunchTritonKernel(
-        quantKernel,
-        (unsigned int)n, (unsigned int)inputScaleCols, 1,
-        (unsigned int)(quantNumWarps * 32), (unsigned int)quantShared,
-        quantArgs);
-    if (!CheckCu(result, "cuLaunchKernel linear_fp8_block128_quant_input")) {
-        FastllmCudaFinishInput(input, inputData);
-        FastllmCudaFinishOutput(output, outputData);
-        return false;
+    CUresult result = CUDA_SUCCESS;
+    if (useNativeQuant) {
+        if (!LaunchFastllmLinearFp8NativeQuant128(
+                inputData, input.dataType, scratch->inputQuant, scratch->inputScale, n, m)) {
+            FastllmCudaFinishInput(input, inputData);
+            FastllmCudaFinishOutput(output, outputData);
+            return false;
+        }
+    } else {
+        void *quantArgs[] = {
+            &inputPtr,
+            &inputQuantPtr,
+            &inputScalePtr,
+            &mArg,
+            &kArg,
+            &globalScratch,
+            &profileScratch,
+        };
+        result = LaunchTritonKernel(
+            quantKernel,
+            (unsigned int)n, (unsigned int)inputScaleCols, 1,
+            (unsigned int)(quantNumWarps * 32), (unsigned int)quantShared,
+            quantArgs);
+        if (!CheckCu(result, "cuLaunchKernel linear_fp8_block128_quant_input")) {
+            FastllmCudaFinishInput(input, inputData);
+            FastllmCudaFinishOutput(output, outputData);
+            return false;
+        }
     }
 
     int gridM = (n + blockM - 1) / blockM;
     int gridN = (k + blockN - 1) / blockN;
-    void *matmulArgs[] = {
+    int32_t groupNArg = 128;
+    int32_t groupKArg = 128;
+    int32_t strideAmArg = m;
+    int32_t strideBnArg = m;
+    int32_t strideCmArg = k;
+    int32_t strideAsMArg = scaleCols;
+    int32_t strideBsNArg = scaleCols;
+    void *matmulArgsFastllm[] = {
         &inputQuantPtr,
         &inputScalePtr,
         &weightPtr,
@@ -906,11 +1015,30 @@ extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
         &globalScratch,
         &profileScratch,
     };
+    void *matmulArgsStrided[] = {
+        &inputQuantPtr,
+        &weightPtr,
+        &outputPtr,
+        &inputScalePtr,
+        &weightScalePtr,
+        &mArg,
+        &nArg,
+        &kArg,
+        &groupNArg,
+        &groupKArg,
+        &strideAmArg,
+        &strideBnArg,
+        &strideCmArg,
+        &strideAsMArg,
+        &strideBsNArg,
+        &globalScratch,
+        &profileScratch,
+    };
     result = LaunchTritonKernel(
         matmulKernel,
         (unsigned int)(gridM * gridN), 1, 1,
         (unsigned int)(matmulNumWarps * 32), (unsigned int)matmulShared,
-        matmulArgs);
+        stridedMatmul ? matmulArgsStrided : matmulArgsFastllm);
 
     FastllmCudaFinishInput(input, inputData);
     FastllmCudaFinishOutput(output, outputData);
