@@ -34,6 +34,25 @@ install the existing server requirements:
 pip install -r requirements-server.txt
 ```
 
+## Software-Development Tool Matrix
+
+The deterministic suite now includes coding-agent style tools in addition to
+weather/time examples:
+
+- `read_file(path, start_line, end_line)`
+- `search_code(query, path, file_pattern)`
+- `run_tests(command, cwd, timeout_seconds)`
+- `apply_patch(path, patch)`
+- `git_status()`
+- `git_diff(path)`
+- `list_files(path, recursive)`
+
+These tests verify parser output, OpenAI response shape, streaming
+`delta.tool_calls`, and native tool-name constraints with realistic argument
+types: arrays, booleans, numbers, zero-argument calls, optional arguments, and
+long patch strings containing quotes, braces, and newlines. The tests do not
+read files, apply patches, run shell commands, or mutate the repository.
+
 ## Manual Live Smoke Tests
 
 The live runner is a manual diagnostic tool for already-running
@@ -77,6 +96,29 @@ parallel calls, tool-result roundtrip, no-tool plain text, and strict-schema
 missing-required diagnostics. The runner reports stable `error_code` values such
 as `invalid_tool_name`, `no_tool_call`, `invalid_arguments_json`,
 `missing_required_argument`, `stream_missing_done`, and `http_error`.
+
+Manual software-development smoke cases are also available. They ask the model
+to call coding-agent style tools but still do not execute those tools:
+For roundtrip cases, mocked structured tool results are sent as JSON strings in
+the tool-role message content for OpenAI-compatible server compatibility.
+
+```bash
+python3 test/toolcall/run_live_toolcall_tests.py \
+  --base-url http://127.0.0.1:8080/v1 \
+  --model DeepSeek-V4-Flash \
+  --case-id live_openai_dev_search_code \
+  --verbose \
+  --dump-dir /tmp/fastllm-toolcall-live-dev
+```
+
+```bash
+python3 test/toolcall/run_live_toolcall_tests.py \
+  --base-url http://127.0.0.1:8080/v1 \
+  --model DeepSeek-V4-Flash \
+  --case-id live_openai_dev_apply_patch_dry_run \
+  --verbose \
+  --dump-dir /tmp/fastllm-toolcall-live-dev
+```
 
 Known future coverage gaps:
 

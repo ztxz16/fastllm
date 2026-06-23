@@ -17,6 +17,12 @@ from tools.fastllm_pytools.openai_server.fastllm_completion import (  # noqa: E4
 from tools.fastllm_pytools.openai_server.protocal.openai_protocol import (  # noqa: E402
     ChatCompletionRequest,
 )
+from lib.software_dev_tools import (  # noqa: E402
+    apply_patch_tool,
+    git_status_tool,
+    read_file_tool,
+    search_code_tool,
+)
 
 
 def _weather_tool(name="get_weather"):
@@ -109,6 +115,46 @@ def _weather_and_time_call(weather_name="get_weather") -> str:
         _invoke(weather_name, _param("city", True, "北京")),
         _invoke("get_time", _param("timezone", True, "Asia/Shanghai")),
     )
+
+
+def _apply_patch_call() -> Tuple[str, str]:
+    patch_text = (
+        "*** Begin Patch\n"
+        "*** Update File: src/example.py\n"
+        "@@\n"
+        "-config = {\"mode\": \"old\"}\n"
+        "+config = {\"mode\": \"new\"}\n"
+        "*** End Patch"
+    )
+    return (
+        _tool_calls(_invoke(
+            "apply_patch",
+            _param("path", True, "src/example.py") +
+            _param("patch", True, patch_text),
+        )),
+        patch_text,
+    )
+
+
+def _read_file_and_search_call() -> str:
+    return _tool_calls(
+        _invoke(
+            "read_file",
+            _param("path", True, "src/models/basellm.cpp") +
+            _param("start_line", False, "1") +
+            _param("end_line", False, "80"),
+        ),
+        _invoke(
+            "search_code",
+            _param("query", True, "ForwardBatch") +
+            _param("path", True, "src") +
+            _param("file_pattern", True, "*.cpp"),
+        ),
+    )
+
+
+def _git_status_call() -> str:
+    return _tool_calls(_invoke("git_status", ""))
 
 
 async def _result_generator(text: str, chunk_size: int = 7):
@@ -272,6 +318,59 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._finish_reason(chunks), "tool_calls")
         self.assertEqual([tool_calls[index]["name"] for index in sorted(tool_calls)],
                          ["get_weather", "get_time"])
+
+    async def test_software_dev_apply_patch_reconstructs_long_string_arguments(self):
+        raw_output, patch_text = _apply_patch_call()
+        chunks, saw_done = await self._collect_stream(
+            raw_output,
+            _request(tools=[apply_patch_tool()]),
+        )
+
+        tool_calls = self._reconstruct_tool_calls(chunks)
+        self.assertTrue(saw_done)
+        self.assertEqual(self._finish_reason(chunks), "tool_calls")
+        self.assertEqual(set(tool_calls), {0})
+        self.assertEqual(tool_calls[0]["name"], "apply_patch")
+        self.assertEqual(json.loads(tool_calls[0]["arguments"]), {
+            "path": "src/example.py",
+            "patch": patch_text,
+        })
+
+    async def test_software_dev_parallel_read_file_and_search_preserve_order(self):
+        chunks, saw_done = await self._collect_stream(
+            _read_file_and_search_call(),
+            _request(tools=[read_file_tool(), search_code_tool()]),
+        )
+
+        tool_calls = self._reconstruct_tool_calls(chunks)
+        self.assertTrue(saw_done)
+        self.assertEqual(self._finish_reason(chunks), "tool_calls")
+        self.assertEqual(
+            [tool_calls[index]["name"] for index in sorted(tool_calls)],
+            ["read_file", "search_code"],
+        )
+        self.assertEqual(json.loads(tool_calls[0]["arguments"]), {
+            "path": "src/models/basellm.cpp",
+            "start_line": 1,
+            "end_line": 80,
+        })
+        self.assertEqual(json.loads(tool_calls[1]["arguments"]), {
+            "query": "ForwardBatch",
+            "path": "src",
+            "file_pattern": "*.cpp",
+        })
+
+    async def test_software_dev_zero_arg_tool_streams_empty_object(self):
+        chunks, saw_done = await self._collect_stream(
+            _git_status_call(),
+            _request(tools=[git_status_tool()]),
+        )
+
+        tool_calls = self._reconstruct_tool_calls(chunks)
+        self.assertTrue(saw_done)
+        self.assertEqual(self._finish_reason(chunks), "tool_calls")
+        self.assertEqual(tool_calls[0]["name"], "git_status")
+        self.assertEqual(json.loads(tool_calls[0]["arguments"]), {})
 
     async def test_named_tool_choice_mismatch_is_suppressed(self):
         with self.assertLogs(level="WARNING") as logs:

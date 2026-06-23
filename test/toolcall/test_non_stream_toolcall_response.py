@@ -18,6 +18,10 @@ from tools.fastllm_pytools.openai_server.protocal.openai_protocol import (  # no
     ChatCompletionResponse,
     ErrorResponse,
 )
+from lib.software_dev_tools import (  # noqa: E402
+    run_tests_tool,
+    search_code_tool,
+)
 
 
 def _weather_tool(name="get_weather"):
@@ -85,6 +89,43 @@ def _dsml_call(name: str) -> str:
         "</｜DSML｜invoke>"
         "</｜DSML｜tool_calls>"
     )
+
+
+def _param(name: str, is_string: bool, value: str) -> str:
+    return (
+        f"<｜DSML｜parameter name=\"{name}\" "
+        f"string=\"{str(is_string).lower()}\">{value}</｜DSML｜parameter>"
+    )
+
+
+def _invoke(name: str, *params: str) -> str:
+    return (
+        f"<｜DSML｜invoke name=\"{name}\">"
+        f"{''.join(params)}"
+        "</｜DSML｜invoke>"
+    )
+
+
+def _tool_calls(*invokes: str) -> str:
+    return "<｜DSML｜tool_calls>" + "".join(invokes) + "</｜DSML｜tool_calls>"
+
+
+def _search_code_dsml_call() -> str:
+    return _tool_calls(_invoke(
+        "search_code",
+        _param("query", True, "FunctionCallParser"),
+        _param("path", True, "tools/fastllm_pytools/openai_server"),
+        _param("file_pattern", True, "*.py"),
+    ))
+
+
+def _run_tests_dsml_call() -> str:
+    return _tool_calls(_invoke(
+        "run_tests",
+        _param("command", False, '["python","-m","unittest","test.toolcall"]'),
+        _param("cwd", True, "."),
+        _param("timeout_seconds", False, "120"),
+    ))
 
 
 def _dsml_call_with_prefix(name: str) -> str:
@@ -191,6 +232,42 @@ class NonStreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(choice.message.content, "我来查一下。\n")
         self.assertEqual(choice.message.tool_calls[0].function.name,
                          "get_weather")
+
+    async def test_software_dev_search_code_response_shape(self):
+        response = await self._run_full_generator(
+            _search_code_dsml_call(),
+            _request(tools=[search_code_tool()]),
+        )
+
+        self.assertIsInstance(response, ChatCompletionResponse)
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertIsNone(choice.message.content)
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.function.name, "search_code")
+        self.assertEqual(json.loads(tool_call.function.arguments), {
+            "query": "FunctionCallParser",
+            "path": "tools/fastllm_pytools/openai_server",
+            "file_pattern": "*.py",
+        })
+
+    async def test_software_dev_run_tests_array_arguments(self):
+        response = await self._run_full_generator(
+            _run_tests_dsml_call(),
+            _request(tools=[run_tests_tool()]),
+        )
+
+        self.assertIsInstance(response, ChatCompletionResponse)
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.function.name, "run_tests")
+        self.assertEqual(json.loads(tool_call.function.arguments), {
+            "command": ["python", "-m", "unittest", "test.toolcall"],
+            "cwd": ".",
+            "timeout_seconds": 120,
+        })
 
     async def test_unknown_tool_name_returns_error_without_leaking_dsml(self):
         with self.assertLogs(level="WARNING") as logs:

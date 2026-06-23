@@ -345,6 +345,12 @@ def _openai_tool_call_shape(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _tool_result_content_for_request(content: Any) -> Any:
+    if content is None or isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+
 def run_non_stream_case(
     case: Dict[str, Any],
     base_url: str,
@@ -458,7 +464,8 @@ def run_roundtrip_case(
     messages.append({
         "role": "tool",
         "tool_call_id": first_tool_call.get("id"),
-        "content": tool_result.get("content", {}),
+        "content": _tool_result_content_for_request(
+            tool_result.get("content", {})),
     })
     messages.append({"role": "user", "content": follow_up})
 

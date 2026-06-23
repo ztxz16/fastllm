@@ -568,6 +568,115 @@ Acceptance:
 - Existing short-name/alias live diagnostics still work, but are mitigation
   paths rather than required for correctness.
 
+## Milestone 13: Realistic Software-Development Tool Matrix
+
+Goal: extend coverage beyond toy weather/time examples so the suite exercises
+tool call shapes commonly used by coding agents and software project workflows.
+
+Scope:
+
+- Deterministic tests first; live tests remain manual.
+- Do not execute destructive commands.
+- Do not connect tools to the real filesystem or shell in live smoke tests
+  unless explicitly isolated behind a safe mock adapter.
+- Continue validating OpenAI-compatible schema, DeepSeek V4 DSML parser output,
+  stream deltas, and native function-name constraints.
+- Do not add parser fuzzy correction.
+- Do not add model-specific hardcoded function-name lists.
+
+Tool matrix:
+
+- `read_file(path, start_line, end_line)`:
+  - string path;
+  - optional numeric line range;
+  - validates nested/optional argument handling.
+- `search_code(query, path, file_pattern)`:
+  - multiple string arguments;
+  - validates tool selection for code-search intent.
+- `run_tests(command, cwd, timeout_seconds)`:
+  - command represented as an array or string, depending on API shape;
+  - validates potentially sensitive tool names without executing them.
+- `apply_patch(path, patch)`:
+  - long string argument;
+  - validates arguments containing braces, quotes, newlines, and diff-like text.
+- `git_status()` and `git_diff(path)`:
+  - zero-argument and optional-argument tool cases;
+  - validates empty `{}` arguments and tool-name adherence.
+- `list_files(path, recursive)`:
+  - boolean argument;
+  - validates JSON booleans and path-like strings.
+
+Deterministic unit tests:
+
+- Constraint compiler emits allowed names for all software-dev tools.
+- Named `tool_choice` restricts to one software-dev tool.
+- Native hook receives software-dev names without weather/time assumptions.
+- Alias helper, if used, remains explicit and does not infer names.
+- Parser golden cases cover:
+  - zero-argument calls;
+  - long string arguments;
+  - arrays;
+  - nested objects;
+  - booleans and numbers.
+
+Deterministic integration tests:
+
+- Server-mock non-stream response for `search_code`.
+- Server-mock stream response for `apply_patch` with long string argument
+  reconstruction.
+- Parallel tool call response for `read_file` + `search_code`.
+- Tool result roundtrip:
+  - assistant calls `run_tests`;
+  - tool role returns structured JSON result;
+  - assistant produces final text.
+- Native name constraint contract:
+  - allowed names are taken from request tools;
+  - no hardcoded weather/time names are used.
+
+Manual live smoke tests:
+
+- `live_openai_dev_search_code`:
+  - ask the model to search for a symbol;
+  - require `search_code`;
+  - validate arguments JSON only.
+- `live_openai_dev_read_file_then_answer`:
+  - first turn calls `read_file`;
+  - second turn receives mocked file content as tool result;
+  - final answer must be non-empty.
+- `live_openai_dev_apply_patch_dry_run`:
+  - model proposes an `apply_patch` call;
+  - test records patch argument but does not apply it.
+- `live_openai_dev_parallel_read_and_search`:
+  - allow `read_file` and `search_code`;
+  - validate parallel or subset behavior without requiring real execution.
+
+Acceptance:
+
+- Deterministic suite proves that toolcall transport, parser, stream deltas,
+  and native name constraints are not weather/time-specific.
+- Live smoke can distinguish:
+  - schema/parser/server failure;
+  - model tool-choice failure;
+  - unsafe or malformed arguments;
+  - real-model quality limitations.
+- No real shell/file mutation happens in default or manual smoke tests without
+  an explicit safe adapter.
+
+Implementation status:
+
+- Software-development tool definitions are shared by deterministic tests.
+- Parser golden cases cover zero-argument, array, boolean, number, optional
+  path, long patch-string, and parallel read/search shapes.
+- Server-mock tests cover non-stream `search_code`, non-stream `run_tests`,
+  stream `apply_patch`, stream `git_status`, and stream `read_file` +
+  `search_code`.
+- Deterministic live-helper tests cover `run_tests` tool-result roundtrip with
+  structured JSON output.
+- Native constraint tests verify request-driven software-dev names and named
+  `tool_choice` reduction without weather/time assumptions.
+- Manual live cases cover `search_code`, `read_file` roundtrip,
+  `apply_patch` dry-run, and parallel `read_file` + `search_code`.
+
 ## Recommended PR Split
 
 1. Parser facade and validation layer, no server behavior change.
@@ -579,16 +688,10 @@ Acceptance:
 7. Constraint descriptor dry run.
 8. Generation-time constraint hook.
 9. Optional real constraint backend prototype.
+10. Realistic software-development tool matrix.
 
 ## Immediate Next Step
 
-The next implementation step should be:
-
-1. Revert or set aside alias-first M2 work if it conflicts with this plan.
-2. Implement Milestone 1:
-   - `FunctionCallParser` facade;
-   - request tool index;
-   - valid/invalid tool name diagnostics;
-   - non-stream and stream deterministic tests.
-
-Do not implement fuzzy correction. Do not implement generation-time constraints in Milestone 1.
+The next implementation step should be manual validation of the M13 live cases
+against an already-running local server when needed. Do not implement fuzzy
+correction. Do not hardcode weather/time names.

@@ -22,6 +22,10 @@ from tools.fastllm_pytools.openai_server.protocal.anthropic_protocol import (  #
     AnthropicMessageRequest,
     AnthropicMessageResponse,
 )
+from lib.software_dev_tools import (  # noqa: E402
+    software_dev_tool_names,
+    software_dev_tools,
+)
 
 
 def _weather_tool(strict=False):
@@ -54,6 +58,17 @@ def _dsml_call(name="get_weather"):
         "<｜DSML｜tool_calls>"
         f"<｜DSML｜invoke name=\"{name}\">"
         "<｜DSML｜parameter name=\"city\" string=\"true\">北京</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        "</｜DSML｜tool_calls>"
+    )
+
+
+def _search_code_dsml_call():
+    return (
+        "<｜DSML｜tool_calls>"
+        "<｜DSML｜invoke name=\"search_code\">"
+        "<｜DSML｜parameter name=\"query\" string=\"true\">FunctionCallParser</｜DSML｜parameter>"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">tools/fastllm_pytools/openai_server</｜DSML｜parameter>"
         "</｜DSML｜invoke>"
         "</｜DSML｜tool_calls>"
     )
@@ -296,6 +311,39 @@ class ToolCallGenerationConstraintTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(model.launch_called)
         self.assertIsNone(model.received_constraint)
         self.assertIsNone(model.launch_kwargs["tools"])
+
+    async def test_software_dev_tools_build_request_driven_constraint(self):
+        model = _ConstraintAwareModel(_search_code_dsml_call())
+        request = _request(
+            tools=software_dev_tools(),
+            tool_choice={
+                "type": "function",
+                "function": {"name": "search_code"},
+            },
+        )
+
+        response = await self._run_completion(model, request)
+
+        self.assertIsInstance(response, ChatCompletionResponse)
+        self.assertTrue(model.launch_called)
+        constraint = model.received_constraint
+        self.assertIsNotNone(constraint)
+        descriptor = constraint["descriptor"]
+        self.assertEqual(descriptor["tool_names"], software_dev_tool_names())
+        self.assertEqual(descriptor["allowed_tool_names"], ["search_code"])
+        self.assertEqual(constraint["name_constraint"]["allowed_names"],
+                         ["search_code"])
+        self.assertNotIn("get_weather", constraint["name_grammar"])
+        self.assertNotIn("get_time", constraint["name_grammar"])
+        choice = response.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(choice.message.tool_calls[0].function.name,
+                         "search_code")
+        self.assertEqual(json.loads(
+            choice.message.tool_calls[0].function.arguments), {
+                "query": "FunctionCallParser",
+                "path": "tools/fastllm_pytools/openai_server",
+            })
 
 
 if __name__ == "__main__":

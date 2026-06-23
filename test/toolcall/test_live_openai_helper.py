@@ -1,4 +1,5 @@
 import copy
+import json
 import unittest
 
 from lib import live_openai
@@ -10,6 +11,7 @@ from lib.live_openai import (
     run_roundtrip_case,
     validate_tool_calls,
 )
+from lib.software_dev_tools import run_tests_tool
 
 
 class LiveOpenAIHelperTest(unittest.TestCase):
@@ -191,7 +193,100 @@ class LiveOpenAIHelperTest(unittest.TestCase):
         )
         self.assertEqual(second_messages[2]["role"], "tool")
         self.assertEqual(second_messages[2]["tool_call_id"], "call_1")
-        self.assertEqual(second_messages[2]["content"]["temperature"], 22)
+        self.assertEqual(json.loads(second_messages[2]["content"]),
+                         {"city": "北京", "temperature": 22})
+
+    def test_software_dev_run_tests_roundtrip_preserves_tool_result(self):
+        case = {
+            "id": "live_run_tests_roundtrip_dummy",
+            "mode": "roundtrip",
+            "request": {
+                "messages": [{
+                    "role": "user",
+                    "content": "请运行单元测试并总结结果。",
+                }],
+                "tools": [run_tests_tool()],
+                "tool_choice": "required",
+            },
+            "tool_result": {
+                "content": {
+                    "exit_code": 0,
+                    "stdout": "Ran 91 tests in 0.156s\nOK",
+                    "stderr": "",
+                },
+                "follow_up_user_message": "请根据测试结果回答。",
+            },
+            "expected": {
+                "must_call_tool": True,
+                "allowed_tool_names": ["run_tests"],
+                "arguments_must_be_json": True,
+                "required_argument_keys": ["command"],
+                "final_content_non_empty": True,
+            },
+        }
+        responses = [
+            {
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_tests",
+                            "type": "function",
+                            "function": {
+                                "name": "run_tests",
+                                "arguments": (
+                                    "{\"command\":[\"python\",\"-m\","
+                                    "\"unittest\",\"discover\"],\"cwd\":\".\"}"
+                                ),
+                            },
+                        }],
+                    },
+                }]
+            },
+            {
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "测试已通过。",
+                    },
+                }]
+            },
+        ]
+        seen_payloads = []
+
+        def fake_post_json(_base_url, payload, _timeout):
+            seen_payloads.append(copy.deepcopy(payload))
+            return responses.pop(0)
+
+        original_post_json = live_openai.post_json
+        live_openai.post_json = fake_post_json
+        try:
+            result = run_roundtrip_case(
+                case,
+                base_url="http://127.0.0.1:8080/v1",
+                model="dummy",
+                timeout=1,
+            )
+        finally:
+            live_openai.post_json = original_post_json
+
+        self.assertEqual(result["second_content"], "测试已通过。")
+        self.assertEqual(len(seen_payloads), 2)
+        second_messages = seen_payloads[1]["messages"]
+        self.assertEqual(second_messages[1]["role"], "assistant")
+        self.assertIsNone(second_messages[1]["content"])
+        self.assertEqual(
+            second_messages[1]["tool_calls"][0]["function"]["name"],
+            "run_tests",
+        )
+        self.assertEqual(second_messages[2]["role"], "tool")
+        self.assertEqual(second_messages[2]["tool_call_id"], "call_tests")
+        tool_content = json.loads(second_messages[2]["content"])
+        self.assertEqual(tool_content["exit_code"], 0)
+        self.assertIn("91 tests", tool_content["stdout"])
 
 
 if __name__ == "__main__":

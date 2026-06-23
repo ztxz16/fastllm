@@ -20,6 +20,12 @@ from tools.fastllm_pytools.openai_server.toolcall_parser import (  # noqa: E402
     FunctionCallParser,
 )
 
+from lib.software_dev_tools import (  # noqa: E402
+    search_code_tool,
+    software_dev_tool_names,
+    software_dev_tools,
+)
+
 
 def _weather_tool(strict=False):
     function = {
@@ -144,6 +150,47 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
         self.assertEqual(spec.name_constraint["allowed_names"], ["get_time"])
         self.assertIn('"get_time"', spec.name_grammar)
         self.assertNotIn('"get_weather"', spec.name_grammar)
+
+    def test_software_dev_tools_emit_request_driven_name_enum(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(tools=software_dev_tools()))
+
+        expected_names = software_dev_tool_names()
+        self.assertEqual(spec.name_constraint["allowed_names"],
+                         expected_names)
+        self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
+                         expected_names)
+        self.assertIn('"read_file"', spec.name_grammar)
+        self.assertIn('"apply_patch"', spec.name_grammar)
+        self.assertNotIn('"get_weather"', spec.name_grammar)
+        self.assertNotIn('"get_time"', spec.name_grammar)
+
+    def test_named_software_dev_tool_choice_restricts_name_enum(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(
+                tools=software_dev_tools(),
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "search_code"},
+                },
+            ))
+
+        self.assertEqual(spec.name_constraint["allowed_names"],
+                         ["search_code"])
+        self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
+                         ["search_code"])
+        self.assertIn('"search_code"', spec.name_grammar)
+        self.assertNotIn('"read_file"', spec.name_grammar)
+
+    def test_software_dev_name_payload_adapter_has_no_alias_inference(self):
+        decoder = _ToolNameConstraintDecoder()
+        result = apply_tool_call_constraint_to_decoder(
+            decoder, _descriptor(tools=[search_code_tool()]))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.mode, "tool_name_constraint")
+        self.assertEqual(decoder.payload["allowed_names"], ["search_code"])
+        self.assertNotIn("aliases", decoder.payload)
 
     def test_strict_schema_is_copied_to_spec(self):
         tool = _weather_tool(strict=True)
