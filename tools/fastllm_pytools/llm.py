@@ -9,6 +9,7 @@ import json
 import math
 import importlib.util
 import importlib.metadata as importlib_metadata
+import logging
 import site
 import sys
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
@@ -1357,6 +1358,40 @@ class model:
             cache_dict[token_id] = self.tokenizer_decode_token(token_id)
 
         self.tokenizer_decode_token_cache = cache_dict
+
+    def _apply_tool_call_constraint_to_native(
+            self, tool_call_constraint: Optional[Dict[str, Any]]) -> bool:
+        native_setter = getattr(
+            fastllm_lib, "set_tool_call_constraint_llm_model", None)
+        if native_setter is None:
+            logging.debug(
+                "Native FastLLM does not expose "
+                "set_tool_call_constraint_llm_model yet; continuing without "
+                "generation constraint.")
+            return False
+        # `null` is the clear signal for future model-level native backends.
+        # This prevents one tool request's constraint from leaking into the
+        # next no-tools request on the same loaded model.
+        payload = json.dumps(
+            tool_call_constraint,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        try:
+            native_setter.argtypes = [ctypes.c_int, ctypes.c_char_p]
+            native_setter.restype = ctypes.c_bool
+            applied = bool(native_setter(self.model, payload))
+        except Exception:
+            logging.exception(
+                "Native FastLLM failed to apply tool_call_constraint.")
+            return False
+        if not applied:
+            logging.debug(
+                "Native FastLLM declined tool_call_constraint; continuing "
+                "without generation constraint.")
+            return False
+        logging.debug("Native FastLLM accepted tool_call_constraint.")
+        return True
     
     def tokenizer_encode_string(self, content: str) -> List[int]:
         output_buffer_init_len = 1024
@@ -1787,9 +1822,11 @@ class model:
                         max_length: int = 8192, min_length: int = 0, do_sample = True, 
                         top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
-                        images: List = None, videos: List = None, tools: List = None, enable_thinking = None):
+                        images: List = None, videos: List = None, tools: List = None, enable_thinking = None,
+                        tool_call_constraint: Optional[Dict[str, Any]] = None):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        self._apply_tool_call_constraint_to_native(tool_call_constraint)
         conversation = None
         if (isinstance(query, List)):
             conversation = query

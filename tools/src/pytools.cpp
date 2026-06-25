@@ -188,6 +188,127 @@ extern "C" {
         return config;
     }
 
+    static thread_local std::string pendingToolCallConstraintJson;
+
+    static std::vector<std::string> read_string_array(const json11::Json &node) {
+        std::vector<std::string> ret;
+        if (!node.is_array()) {
+            return ret;
+        }
+        for (const auto &item : node.array_items()) {
+            if (item.is_string()) {
+                ret.push_back(item.string_value());
+            }
+        }
+        return ret;
+    }
+
+    static std::map<std::string, std::vector<std::string> > read_string_array_map(
+            const json11::Json &node) {
+        std::map<std::string, std::vector<std::string> > ret;
+        if (!node.is_object()) {
+            return ret;
+        }
+        for (const auto &item : node.object_items()) {
+            auto values = read_string_array(item.second);
+            if (!values.empty()) {
+                ret[item.first] = std::move(values);
+            }
+        }
+        return ret;
+    }
+
+    static bool apply_tool_call_constraint_json(
+            fastllm::GenerationConfig &config,
+            const std::string &payload) {
+        if (payload.empty() || payload == "null") {
+            return true;
+        }
+        std::string error;
+        auto root = json11::Json::parse(payload, error);
+        if (!error.empty() || root.is_null()) {
+            return false;
+        }
+        json11::Json nameConstraint = root["name_constraint"];
+        if (!nameConstraint.is_object()) {
+            nameConstraint = root;
+        }
+        if (!nameConstraint.is_object() ||
+            nameConstraint["type"].string_value() != "tool_name_enum" ||
+            nameConstraint["format"].string_value() != "deepseek_v4_dsml") {
+            return false;
+        }
+
+        auto allowedNames = read_string_array(nameConstraint["allowed_names"]);
+        if (allowedNames.empty()) {
+            return false;
+        }
+        auto prefixes = read_string_array(nameConstraint["invoke_name_prefixes"]);
+        if (prefixes.empty()) {
+            prefixes.push_back("<｜DSML｜invoke name=\"");
+            prefixes.push_back("<\\DSML\\invoke name=\"");
+        }
+        std::string terminator = nameConstraint["name_terminator"].string_value();
+        if (terminator.empty()) {
+            terminator = "\"";
+        }
+
+        config.tool_call_name_constraint_enabled = true;
+        config.tool_call_allowed_names = std::move(allowedNames);
+        config.tool_call_invoke_name_prefixes = std::move(prefixes);
+        config.tool_call_name_terminator = terminator;
+        config.tool_call_parameter_name_constraint_enabled = false;
+        config.tool_call_allowed_parameter_names.clear();
+        config.tool_call_parameter_name_prefixes.clear();
+
+        json11::Json parameterNameConstraint = root["parameter_name_constraint"];
+        if (parameterNameConstraint.is_object() &&
+            parameterNameConstraint["type"].string_value() == "tool_parameter_name_enum" &&
+            parameterNameConstraint["format"].string_value() == "deepseek_v4_dsml") {
+            auto parameterNames = read_string_array_map(
+                    parameterNameConstraint["parameter_names_by_tool"]);
+            if (!parameterNames.empty()) {
+                auto parameterPrefixes = read_string_array(
+                        parameterNameConstraint["parameter_name_prefixes"]);
+                if (parameterPrefixes.empty()) {
+                    parameterPrefixes.push_back("<｜DSML｜parameter name=\"");
+                    parameterPrefixes.push_back("<\\DSML\\parameter name=\"");
+                }
+                config.tool_call_parameter_name_constraint_enabled = true;
+                config.tool_call_allowed_parameter_names = std::move(parameterNames);
+                config.tool_call_parameter_name_prefixes = std::move(parameterPrefixes);
+            }
+        }
+        config.tool_call_allowed_token_ids.clear();
+        return true;
+    }
+
+    static bool apply_pending_tool_call_constraint(fastllm::GenerationConfig &config) {
+        if (pendingToolCallConstraintJson.empty()) {
+            return true;
+        }
+        std::string payload = pendingToolCallConstraintJson;
+        pendingToolCallConstraintJson.clear();
+        return apply_tool_call_constraint_json(config, payload);
+    }
+
+    DLL_EXPORT bool set_tool_call_constraint_llm_model(int modelId, char *payload) {
+        bool modelExists = false;
+        models.locker.lock();
+        auto it = models.models.find(modelId);
+        modelExists = it != models.models.end() && it->second != nullptr;
+        models.locker.unlock();
+        if (!modelExists) {
+            return false;
+        }
+        if (payload == nullptr || std::string(payload) == "null") {
+            pendingToolCallConstraintJson.clear();
+            return true;
+        }
+        pendingToolCallConstraintJson = payload;
+        return true;
+    }
+
     DLL_EXPORT int create_llm_model(char *path) {
         models.locker.lock();
         int id = models.models.size();
@@ -504,6 +625,7 @@ extern "C" {
                                  float temperature, float repeat_penalty, bool output_logits) {
         auto model = models.GetModel(modelId);
         auto config = make_config(max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, true);
+        apply_pending_tool_call_constraint(config);
         std::string s = model->Response(content, nullptr, config);
         return string_to_chars(s);
     }
@@ -519,6 +641,7 @@ extern "C" {
             tokens.push_back((int)((float*)v.cpuData)[i]);
         }
         auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, true);
+        apply_pending_tool_call_constraint(config);
         config.input_token_length = tokens.size();
         for(int i = 0; i < stop_token_len; i++ )
         {
@@ -555,6 +678,7 @@ extern "C" {
             input.push_back(values[i]);
         }
         auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
+        apply_pending_tool_call_constraint(config);
         for(int i = 0; i < stop_token_len; i++ )
         {
             config.stop_token_ids.insert(stop_token_ids[i]);
@@ -574,6 +698,7 @@ extern "C" {
             input.push_back(values[i]);
         }
         auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
+        apply_pending_tool_call_constraint(config);
         for(int i = 0; i < stop_token_len; i++ ) {
             config.stop_token_ids.insert(stop_token_ids[i]);
         }

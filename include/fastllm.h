@@ -143,8 +143,19 @@ namespace fastllm {
         bool enable_hash_id = false; // 给会话添加hash id
         bool add_special_tokens = true; // prompt添加special tokens（chatglm模型生效）
         std::multiset <int> stop_token_ids;
+        bool tool_call_name_constraint_enabled = false;
+        std::vector <std::string> tool_call_allowed_names;
+        std::vector <std::string> tool_call_invoke_name_prefixes;
+        std::string tool_call_name_terminator = "\"";
+        bool tool_call_parameter_name_constraint_enabled = false;
+        std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
+        std::vector <std::string> tool_call_parameter_name_prefixes;
+        std::vector <int> tool_call_allowed_token_ids;
 
         bool IsSimpleGreedy() const {
+            if (!tool_call_allowed_token_ids.empty()) {
+                return false;
+            }
             if (fabs(repeat_penalty - 1) > 1e-8) {
                 return false;
             }

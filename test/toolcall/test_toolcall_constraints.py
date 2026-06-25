@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+import json
+import sys
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.fastllm_pytools.openai_server.protocal.openai_protocol import (  # noqa: E402
+    ChatCompletionRequest,
+)
+from tools.fastllm_pytools.openai_server.toolcall_constraints import (  # noqa: E402
+    apply_tool_call_constraint_to_decoder,
+    compile_tool_call_constraint,
+)
+from tools.fastllm_pytools.openai_server.toolcall_parser import (  # noqa: E402
+    FunctionCallParser,
+)
+
+from lib.software_dev_tools import (  # noqa: E402
+    search_code_tool,
+    software_dev_tool_names,
+    software_dev_tools,
+)
+
+
+def _weather_tool(strict=False):
+    function = {
+        "name": "get_weather",
+        "description": "Get weather.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "days": {"type": "integer"},
+            },
+            "required": ["city"],
+        },
+    }
+    if strict:
+        function["strict"] = True
+    return {"type": "function", "function": function}
+
+
+def _time_tool():
+    return {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Get time.",
+            "parameters": {
+                "type": "object",
+                "properties": {"timezone": {"type": "string"}},
+                "required": ["timezone"],
+            },
+        },
+    }
+
+
+def _todowrite_tool():
+    return {
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "description": "Create and maintain a structured task list.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string"},
+                                "priority": {"type": "string"},
+                            },
+                            "required": ["content", "status", "priority"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    }
+
+
+def _request(tools=None, tool_choice="auto", parallel_tool_calls=None):
+    return ChatCompletionRequest(
+        model="dummy",
+        messages=[{"role": "user", "content": "查工具"}],
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+    )
+
+
+def _descriptor(tools=None, tool_choice="auto", parallel_tool_calls=None):
+    return FunctionCallParser.build_constraint_descriptor_from_request(
+        _request(
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+        ))
+
+
+class _ToolCallConstraintDecoder:
+    def __init__(self):
+        self.payload = None
+
+    def set_tool_call_constraint(self, payload):
+        self.payload = payload
+
+
+class _ToolNameConstraintDecoder:
+    def __init__(self):
+        self.payload = None
+
+    def set_tool_name_constraint(self, payload):
+        self.payload = payload
+
+
+class _StructuralTagDecoder:
+    def __init__(self):
+        self.payload = None
+
+    def set_structural_tag(self, payload):
+        self.payload = payload
+
+
+class _StructuredOutputsDecoder:
+    def __init__(self):
+        self.payload = None
+
+    def set_structured_outputs(self, payload):
+        self.payload = payload
+
+
+class _UnsupportedDecoder:
+    pass
+
+
+class ToolCallConstraintCompilerTest(unittest.TestCase):
+    def test_compile_deepseek_v4_structural_tag_and_name_grammar(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(tools=[_weather_tool(), _time_tool()]))
+
+        self.assertEqual(spec.backend, "fastllm_toolcall_prototype")
+        self.assertEqual(spec.structural_tag["format"], "deepseek_v4_dsml")
+        self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
+                         ["get_weather", "get_time"])
+        self.assertEqual(spec.name_constraint["format"], "deepseek_v4_dsml")
+        self.assertEqual(spec.name_constraint["allowed_names"],
+                         ["get_weather", "get_time"])
+        self.assertEqual(spec.name_constraint["type"], "tool_name_enum")
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"],
+            {
+                "get_weather": ["city", "days"],
+                "get_time": ["timezone"],
+            },
+        )
+        self.assertIn('<｜DSML｜invoke name="',
+                      spec.name_constraint["invoke_name_prefixes"])
+        self.assertIn('<｜DSML｜parameter name="',
+                      spec.parameter_name_constraint[
+                          "parameter_name_prefixes"])
+        self.assertIn('"get_weather"', spec.name_grammar)
+        self.assertIn('"get_time"', spec.name_grammar)
+        self.assertIn("<｜DSML｜tool_calls>", spec.name_grammar)
+        json.dumps(spec.to_dict(), ensure_ascii=False)
+
+    def test_named_tool_choice_restricts_name_enum(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(
+                tools=[_weather_tool(), _time_tool()],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "get_time"},
+                },
+            ))
+
+        self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
+                         ["get_time"])
+        self.assertEqual(spec.name_constraint["allowed_names"], ["get_time"])
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"],
+            {
+                "get_weather": ["city", "days"],
+                "get_time": ["timezone"],
+            },
+        )
+        self.assertIn('"get_time"', spec.name_grammar)
+        self.assertNotIn('"get_weather"', spec.name_grammar)
+
+    def test_software_dev_tools_emit_request_driven_name_enum(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(tools=software_dev_tools()))
+
+        expected_names = software_dev_tool_names()
+        self.assertEqual(spec.name_constraint["allowed_names"],
+                         expected_names)
+        self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
+                         expected_names)
+        self.assertIn('"read_file"', spec.name_grammar)
+        self.assertIn('"apply_patch"', spec.name_grammar)
+        self.assertNotIn('"get_weather"', spec.name_grammar)
+        self.assertNotIn('"get_time"', spec.name_grammar)
+        parameter_names = spec.parameter_name_constraint[
+            "parameter_names_by_tool"]
+        self.assertEqual(parameter_names["read_file"],
+                         ["path", "start_line", "end_line"])
+        self.assertEqual(parameter_names["search_code"],
+                         ["query", "path", "file_pattern"])
+        self.assertEqual(parameter_names["apply_patch"], ["path", "patch"])
+        self.assertEqual(parameter_names["run_tests"],
+                         ["command", "cwd", "timeout_seconds"])
+        self.assertNotIn("git_status", parameter_names)
+
+    def test_named_software_dev_tool_choice_restricts_name_enum(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(
+                tools=software_dev_tools(),
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "search_code"},
+                },
+            ))
+
+        self.assertEqual(spec.name_constraint["allowed_names"],
+                         ["search_code"])
+        self.assertEqual(spec.structural_tag["invoke"]["allowed_names"],
+                         ["search_code"])
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"][
+                "search_code"],
+            ["query", "path", "file_pattern"])
+        self.assertIn('"search_code"', spec.name_grammar)
+        self.assertNotIn('"read_file"', spec.name_grammar)
+
+    def test_todowrite_parameter_name_constraint_allows_only_todos(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(tools=[_todowrite_tool()]))
+
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"],
+            {"todowrite": ["todos"]},
+        )
+        self.assertEqual(
+            spec.json_schemas["todowrite"]["required"], ["todos"])
+
+    def test_software_dev_name_payload_adapter_has_no_alias_inference(self):
+        decoder = _ToolNameConstraintDecoder()
+        result = apply_tool_call_constraint_to_decoder(
+            decoder, _descriptor(tools=[search_code_tool()]))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.mode, "tool_name_constraint")
+        self.assertEqual(decoder.payload["allowed_names"], ["search_code"])
+        self.assertNotIn("aliases", decoder.payload)
+
+    def test_strict_schema_is_copied_to_spec(self):
+        tool = _weather_tool(strict=True)
+        descriptor = _descriptor(tools=[tool])
+        spec = compile_tool_call_constraint(descriptor)
+        tool["function"]["parameters"]["required"].append("days")
+
+        self.assertEqual(
+            spec.json_schemas["get_weather"]["required"], ["city"])
+        spec_dict = spec.to_dict()
+        spec_dict["json_schemas"]["get_weather"]["required"].append("days")
+        self.assertEqual(
+            spec.json_schemas["get_weather"]["required"], ["city"])
+
+    def test_parallel_false_sets_max_tool_calls(self):
+        spec = compile_tool_call_constraint(
+            _descriptor(
+                tools=[_weather_tool(), _time_tool()],
+                parallel_tool_calls=False,
+            ))
+
+        self.assertEqual(spec.structural_tag["max_tool_calls"], 1)
+
+    def test_non_deepseek_descriptor_does_not_emit_dsml_grammar(self):
+        descriptor = _descriptor(tools=[_weather_tool()]).to_dict()
+        descriptor["constraint_type"] = "qwen_tool_call"
+        descriptor["model_type"] = "qwen"
+
+        spec = compile_tool_call_constraint(descriptor)
+
+        self.assertIsNone(spec.structural_tag)
+        self.assertIsNone(spec.name_grammar)
+        self.assertIn("no structural_tag prototype", spec.notes[-1])
+        self.assertIsNone(spec.name_constraint)
+
+    def test_tool_name_constraint_decoder_accepts_name_payload_first(self):
+        decoder = _ToolNameConstraintDecoder()
+        result = apply_tool_call_constraint_to_decoder(
+            decoder, _descriptor(tools=[_weather_tool()]))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.mode, "tool_name_constraint")
+        self.assertEqual(decoder.payload["type"], "tool_name_enum")
+        self.assertEqual(decoder.payload["allowed_names"], ["get_weather"])
+
+    def test_tool_call_constraint_decoder_accepts_full_spec(self):
+        decoder = _ToolCallConstraintDecoder()
+        result = apply_tool_call_constraint_to_decoder(
+            decoder, _descriptor(tools=[_weather_tool()]))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.mode, "tool_call_constraint")
+        self.assertEqual(decoder.payload["backend"],
+                         "fastllm_toolcall_prototype")
+        self.assertEqual(decoder.payload["name_constraint"]["allowed_names"],
+                         ["get_weather"])
+        self.assertEqual(
+            decoder.payload["parameter_name_constraint"][
+                "parameter_names_by_tool"]["get_weather"],
+            ["city", "days"])
+
+    def test_structural_tag_decoder_accepts_structural_tag(self):
+        decoder = _StructuralTagDecoder()
+        result = apply_tool_call_constraint_to_decoder(
+            decoder, _descriptor(tools=[_weather_tool()]))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.mode, "structural_tag")
+        self.assertEqual(decoder.payload["format"], "deepseek_v4_dsml")
+
+    def test_structured_outputs_decoder_accepts_structural_tag_json(self):
+        decoder = _StructuredOutputsDecoder()
+        result = apply_tool_call_constraint_to_decoder(
+            decoder, _descriptor(tools=[_weather_tool()]))
+
+        self.assertTrue(result.applied)
+        self.assertEqual(result.mode, "structured_outputs")
+        payload = json.loads(decoder.payload["structural_tag"])
+        self.assertEqual(payload["format"], "deepseek_v4_dsml")
+
+    def test_unsupported_decoder_does_not_crash(self):
+        decoder = _UnsupportedDecoder()
+        result = apply_tool_call_constraint_to_decoder(
+            decoder, _descriptor(tools=[_weather_tool()]))
+
+        self.assertFalse(result.applied)
+        self.assertIsNone(result.mode)
+        self.assertIsNotNone(result.spec)
+        self.assertIn("does not expose", result.message)
+
+    def test_no_descriptor_is_not_applied(self):
+        decoder = _ToolCallConstraintDecoder()
+        result = apply_tool_call_constraint_to_decoder(decoder, None)
+
+        self.assertFalse(result.applied)
+        self.assertIsNone(decoder.payload)
+        self.assertIsNone(result.spec)
+
+
+if __name__ == "__main__":
+    unittest.main()

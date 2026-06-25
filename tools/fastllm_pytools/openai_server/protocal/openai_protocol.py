@@ -62,6 +62,7 @@ class FunctionDefinition(BaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class ChatCompletionToolsParam(BaseModel):
@@ -99,6 +100,7 @@ class ChatCompletionRequest(BaseModel):
         Literal["required"],
         ChatCompletionNamedToolChoiceParam,
     ]] = "none"
+    parallel_tool_calls: Optional[bool] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 

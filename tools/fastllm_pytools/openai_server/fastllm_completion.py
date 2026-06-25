@@ -785,6 +785,121 @@ class FastLLmCompletion:
           force_chat_template = self.model.force_chat_template,
           force_type = force_type)(tokenizer)
 
+  def _create_function_call_parser(self, request: ChatCompletionRequest):
+      from .toolcall_parser import FunctionCallParser
+      return FunctionCallParser.from_request(
+          request,
+          parser = self._create_tool_parser(),
+      )
+
+  def _build_tool_call_constraint_descriptor(self,
+                                             request: ChatCompletionRequest):
+      if not request.tools:
+          return None
+      from .toolcall_parser import FunctionCallParser
+      force_type = getattr(self.model, "tool_call_parser", "auto")
+      model_type = self.model.get_type()
+      tool_parser_name = force_type if force_type != "auto" else model_type
+      return FunctionCallParser.build_constraint_descriptor_from_request(
+          request,
+          tool_parser_name = tool_parser_name,
+      )
+
+  def _build_tool_call_generation_constraint(
+      self,
+      request: ChatCompletionRequest,
+  ) -> Optional[Dict[str, Any]]:
+      descriptor = self._build_tool_call_constraint_descriptor(request)
+      if descriptor is None:
+          return None
+      from .toolcall_constraints import compile_tool_call_constraint
+      spec = compile_tool_call_constraint(descriptor)
+      return spec.to_dict() if spec is not None else None
+
+  def _model_supports_tool_call_constraint(self) -> bool:
+      launch_fn = getattr(self.model, "launch_stream_response", None)
+      if launch_fn is None:
+          return False
+      try:
+          parameters = inspect.signature(launch_fn).parameters
+      except (TypeError, ValueError):
+          return False
+      if "tool_call_constraint" in parameters:
+          return True
+      return any(
+          parameter.kind == inspect.Parameter.VAR_KEYWORD
+          for parameter in parameters.values()
+      )
+
+  def _attach_tool_call_constraint_if_supported(
+      self,
+      launch_kwargs: Dict[str, Any],
+      request: ChatCompletionRequest,
+  ) -> Optional[Dict[str, Any]]:
+      constraint = self._build_tool_call_generation_constraint(request)
+      if constraint is None:
+          return None
+      if self._model_supports_tool_call_constraint():
+          launch_kwargs["tool_call_constraint"] = constraint
+      else:
+          logging.debug(
+              "Tool call generation constraint prepared but backend does not "
+              "support tool_call_constraint; continuing without backend "
+              "constraint.")
+      return constraint
+
+  def _format_tool_call_diagnostics(self, diagnostics: Iterable[Any]) -> str:
+      parts = []
+      for diagnostic in diagnostics:
+          code = getattr(diagnostic, "code", "invalid_tool_call")
+          tool_name = getattr(diagnostic, "tool_name", None)
+          index = getattr(diagnostic, "index", None)
+          if tool_name is not None:
+              message = f"{code} at index {index}: {tool_name!r}"
+          else:
+              message = f"{code} at index {index}"
+          detail = getattr(diagnostic, "message", None)
+          if detail:
+              message += f" ({detail})"
+          closest_tool_name = getattr(diagnostic, "closest_tool_name", None)
+          similarity_ratio = getattr(diagnostic, "similarity_ratio", None)
+          if closest_tool_name is not None and similarity_ratio is not None:
+              message += (
+                  f" closest={closest_tool_name!r} "
+                  f"ratio={similarity_ratio:.3f}"
+              )
+          parts.append(message)
+      return "; ".join(parts) or "invalid_tool_call"
+
+  def _parse_non_stream_tool_calls(
+      self,
+      result: str,
+      request: ChatCompletionRequest,
+  ) -> Union[ErrorResponse, ExtractedToolCallInformation]:
+      if not request.tools:
+          return ExtractedToolCallInformation(
+              tools_called = False,
+              tool_calls = [],
+              content = result,
+          )
+
+      parser = self._create_function_call_parser(request)
+      parsed = parser.parse_non_stream(result)
+      if parsed.has_invalid_tool_block:
+          diagnostics = self._format_tool_call_diagnostics(parsed.diagnostics)
+          logging.warning("Invalid non-stream tool call rejected: %s",
+                          diagnostics)
+          return self.create_error_response(
+              f"Invalid tool call: {diagnostics}",
+              err_type = "invalid_tool_call",
+          )
+
+      return ExtractedToolCallInformation(
+          tools_called = parsed.tools_called,
+          tool_calls = parsed.valid_tool_calls,
+          content = parsed.content,
+      )
+
   def _parse_anthropic_message_content(
       self,
       role: str,
@@ -998,12 +1113,25 @@ class FastLLmCompletion:
               images = model_images,
               videos = model_videos,
               tools = model_tools)
-          handle = self.model.launch_stream_response(messages,
-                            max_length = max_length, min_length = 0, do_sample = do_sample,
-                            top_p = top_p, top_k = top_k, temperature = temperature,
-                            repeat_penalty = frequency_penalty, tools = model_tools,
-                            one_by_one = True, enable_thinking = self.enable_thinking,
-                            images = model_images, videos = model_videos)
+          launch_kwargs = {
+              "max_length": max_length,
+              "min_length": 0,
+              "do_sample": do_sample,
+              "top_p": top_p,
+              "top_k": top_k,
+              "temperature": temperature,
+              "repeat_penalty": frequency_penalty,
+              "tools": model_tools,
+              "one_by_one": True,
+              "enable_thinking": self.enable_thinking,
+              "images": model_images,
+              "videos": model_videos,
+          }
+          if parser_request is not None:
+              self._attach_tool_call_constraint_if_supported(
+                  launch_kwargs, parser_request)
+          handle = self.model.launch_stream_response(
+              messages, **launch_kwargs)
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       self.conversation_handles[request_id] = handle
@@ -1128,12 +1256,25 @@ class FastLLmCompletion:
               videos = model_videos,
               tools = tools)
 
-          handle = self.model.launch_stream_response(messages,
-                            max_length = max_length, min_length = min_length, do_sample = do_sample,
-                            top_p = top_p, top_k = top_k, temperature = temperature,
-                            repeat_penalty = frequency_penalty, tools = tools, one_by_one = True,
-                            enable_thinking = enable_thinking, images = model_images,
-                            videos = model_videos, stop_token_ids = stop_token_ids)
+          launch_kwargs = {
+              "max_length": max_length,
+              "min_length": min_length,
+              "do_sample": do_sample,
+              "top_p": top_p,
+              "top_k": top_k,
+              "temperature": temperature,
+              "repeat_penalty": frequency_penalty,
+              "tools": tools,
+              "one_by_one": True,
+              "enable_thinking": enable_thinking,
+              "images": model_images,
+              "videos": model_videos,
+              "stop_token_ids": stop_token_ids,
+          }
+          self._attach_tool_call_constraint_if_supported(
+              launch_kwargs, request)
+          handle = self.model.launch_stream_response(
+              messages, **launch_kwargs)
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
@@ -1198,12 +1339,11 @@ class FastLLmCompletion:
       result, stopped_by_stop_string = self._truncate_at_stop(
           result, self._normalize_stop_strings(request.stop))
 
-      if request.tools:
-          tool_parser = self._create_tool_parser()
-          tool_call_info = tool_parser.extract_tool_calls(result, request)
-      else:
-          tool_call_info = ExtractedToolCallInformation(
-              tools_called=False, tool_calls=[], content=result)
+      tool_call_info = self._parse_non_stream_tool_calls(result, request)
+      if isinstance(tool_call_info, ErrorResponse):
+          if request_id in self.conversation_handles:
+              del self.conversation_handles[request_id]
+          return tool_call_info
 
       if tool_call_info.tools_called:
           choice_data = ChatCompletionResponseChoice(
@@ -1320,7 +1460,9 @@ class FastLLmCompletion:
 
         # 2. content部分
 
-        tool_parser = self._create_tool_parser() if request.tools else None
+        tool_call_parser = (
+            self._create_function_call_parser(request) if request.tools else None
+        )
         
         completion_tokens = 0
 
@@ -1370,24 +1512,35 @@ class FastLLmCompletion:
             # print("delta_text", delta_text)
 
             # Send token-by-token response for each request.n
-            if tool_parser and request.tools:
-                now_ids = tool_parser.get_token_ids(delta_text)
+            if tool_call_parser and request.tools:
+                now_ids = tool_call_parser.get_token_ids(delta_text)
                 # print("delta_text", delta_text, "now_ids", now_ids)
 
                 current_text += delta_text
                 current_token_ids += now_ids
 
-                delta_message = tool_parser.extract_tool_calls_streaming(
+                parse_result = tool_call_parser.parse_stream_chunk(
                                 previous_text = previous_text,
                                 current_text = current_text,
                                 delta_text = delta_text,
                                 previous_token_ids = previous_token_ids,
                                 current_token_ids = current_token_ids,
-                                delta_token_ids = [0],
-                                request = request)
+                                delta_token_ids = now_ids)
 
                 previous_text += delta_text
                 previous_token_ids += now_ids
+                if parse_result.has_invalid_tool_block:
+                    diagnostics = self._format_tool_call_diagnostics(
+                        parse_result.diagnostics)
+                    logging.warning("Invalid stream tool call suppressed: %s",
+                                    diagnostics)
+                if parse_result.content or parse_result.valid_tool_calls:
+                    delta_message = DeltaMessage(
+                        content = parse_result.content,
+                        tool_calls = parse_result.valid_tool_calls,
+                    )
+                else:
+                    delta_message = None
                 # print("delta", delta_message)
             else:
                 delta_message = DeltaMessage(content = delta_text)
@@ -1477,9 +1630,23 @@ class FastLLmCompletion:
         finish_reason = self._chat_finish_reason(
             completion_tokens, request.max_tokens or 32768,
             stopped_by_stop_string)
-        if request.tools and tool_parser and getattr(tool_parser, "prev_tool_call_arr", None):
-            finish_reason = 'tool_calls'
-        if fast_text_stream:
+        final_stream_error_data = None
+        if request.tools and tool_call_parser:
+            final_diagnostics = tool_call_parser.finalize_stream()
+            if final_diagnostics:
+                diagnostics = self._format_tool_call_diagnostics(
+                    final_diagnostics)
+                logging.warning("Invalid stream tool call final state: %s",
+                                diagnostics)
+                final_stream_error_data = self.create_streaming_error_response(
+                    f"Invalid tool call: {diagnostics}",
+                    err_type = "invalid_tool_call",
+                )
+            elif tool_call_parser.has_valid_streamed_tool_calls:
+                finish_reason = 'tool_calls'
+        if final_stream_error_data is not None:
+            data = final_stream_error_data
+        elif fast_text_stream:
             data = json_dump({
                 "id": request_id,
                 "object": chunk_object_type,
@@ -1513,6 +1680,27 @@ class FastLLmCompletion:
                                   completion_tokens = completion_tokens))
             data = chunk.model_dump_json(exclude_unset = True,
                                         exclude_none = True)
+        if (final_stream_error_data is None and request.tools
+                and tool_call_parser):
+            flush_result = tool_call_parser.flush_stream_tool_calls()
+            if flush_result.valid_tool_calls:
+                delta_message = DeltaMessage(
+                    tool_calls = flush_result.valid_tool_calls,
+                )
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index = 0,
+                    delta = delta_message,
+                    logprobs = None,
+                    finish_reason = None)
+                chunk = ChatCompletionStreamResponseWithUsage(
+                    id = request_id,
+                    object = chunk_object_type,
+                    created = created_time,
+                    choices = [choice_data],
+                    model = model_name)
+                flush_data = chunk.model_dump_json(exclude_unset = True,
+                                                   exclude_none = True)
+                yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
         data = self.create_streaming_error_response(str(e))

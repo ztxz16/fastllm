@@ -2811,6 +2811,14 @@ namespace fastllm {
 
     Random fastllmRandom;
 
+    static bool ToolCallConstraintAllowsToken(const GenerationConfig &config, int tokenId) {
+        const auto &allowed = config.tool_call_allowed_token_ids;
+        if (allowed.empty()) {
+            return true;
+        }
+        return std::binary_search(allowed.begin(), allowed.end(), tokenId);
+    }
+
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens) {
         logits.ToDevice(DataDevice::CPU);
@@ -2836,6 +2844,7 @@ namespace fastllm {
             topk = 1;
         }
         std::vector <std::pair <float, int> > v;
+        bool hasToolNameMask = !config.tool_call_allowed_token_ids.empty();
         if (topk <= 64) {
             v.reserve(topk);
             auto betterThan = [](const std::pair<float, int> &a,
@@ -2847,6 +2856,9 @@ namespace fastllm {
                 std::vector<std::pair<float, int> >,
                 decltype(betterThan)> heap(betterThan);
             for (int i = 0; i < vocabSize; i++) {
+                if (hasToolNameMask && !ToolCallConstraintAllowsToken(config, i)) {
+                    continue;
+                }
                 std::pair<float, int> cur = std::make_pair(base[i] * invTemp, i);
                 if ((int)heap.size() < topk) {
                     heap.push(cur);
@@ -2865,13 +2877,25 @@ namespace fastllm {
         } else {
             v.reserve(vocabSize);
             for (int i = 0; i < vocabSize; i++) {
+                if (hasToolNameMask && !ToolCallConstraintAllowsToken(config, i)) {
+                    continue;
+                }
                 v.push_back(std::make_pair(-base[i] * invTemp, i));
             }
-            std::partial_sort(v.begin(), v.begin() + topk, v.end());
+            topk = std::min(topk, (int)v.size());
+            if (topk > 0) {
+                std::partial_sort(v.begin(), v.begin() + topk, v.end());
+            }
             for (int i = 0; i < topk; i++) {
                 v[i].first = -v[i].first;
             }
         }
+        if (v.empty() && hasToolNameMask) {
+            GenerationConfig fallbackConfig = config;
+            fallbackConfig.tool_call_allowed_token_ids.clear();
+            return LLMSampling(logits, outerOffset, fallbackConfig, tokens);
+        }
+        topk = std::min(topk, (int)v.size());
         float psum = 0.0, maxValue = v.begin()->first;
         std::vector <float> ps;
         for (int i = 0; i < topk; i++) {
@@ -2903,11 +2927,28 @@ namespace fastllm {
         int maxTopKSize = logits.dims.back() / 2;
         float *base = ((float*)logits.cpuData) + outerOffset * maxTopKSize * 2;
         float invTemp = 1.0f / config.temperature;
-        int topk = config.top_k;
-        float psum = 0.0, maxValue = base[1];
+        int topk = std::min(config.top_k, maxTopKSize);
+        std::vector<int> candidateOffsets;
+        candidateOffsets.reserve(topk);
+        for (int i = 0; i < topk; i++) {
+            int tokenId = (int)base[i * 2];
+            if (ToolCallConstraintAllowsToken(config, tokenId)) {
+                candidateOffsets.push_back(i);
+            }
+        }
+        if (candidateOffsets.empty() && !config.tool_call_allowed_token_ids.empty()) {
+            GenerationConfig fallbackConfig = config;
+            fallbackConfig.tool_call_allowed_token_ids.clear();
+            return LLMSamplingOnly(logits, outerOffset, fallbackConfig);
+        }
+        if (candidateOffsets.empty()) {
+            return base[0];
+        }
+        topk = candidateOffsets.size();
+        float psum = 0.0, maxValue = base[candidateOffsets[0] * 2 + 1];
         std::vector <float> ps;
         for (int i = 0; i < topk; i++) {
-            ps.push_back(expf(base[i * 2 + 1] - maxValue));
+            ps.push_back(expf(base[candidateOffsets[i] * 2 + 1] - maxValue));
             psum += ps.back();
         }
         float curSum = 0.0;
@@ -2924,7 +2965,7 @@ namespace fastllm {
         for (int i = 0; i < topk; i++) {
             curSum += ps[i];
             if (curSum > rnd || i == topk - 1) {
-                return base[i * 2];
+                return base[candidateOffsets[i] * 2];
             }
         }
         return -1;

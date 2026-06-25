@@ -43,6 +43,7 @@ namespace fastllm {
         GenerationConfig generationConfig;
         LastTokensUnit tokens;
         ResponseContextError error = ResponseContextErrorNone;
+        std::string toolCallConstraintGeneratedText;
 
         int preTokens = 0;
         int curTokens = 0;
@@ -341,6 +342,10 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+
+        virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
+
+        virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 
         virtual void OnResponseContextCreated(ResponseContext *context) {}
 
