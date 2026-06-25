@@ -2726,10 +2726,19 @@ namespace fastllm {
     JinjaVar ChatMessagesToJinjaVar(const ChatMessages &messages) {
         JinjaVar ret = {{"messages", fastllm::JinjaArray {}}};
         for (auto &message : messages) {
-            ret["messages"].arrayValue.push_back({
+            auto msg = JinjaVar({
                 {"role", message.first},
                 {"content", message.second}
             });
+            std::string content = message.second;
+            size_t thinkEnd = content.find("</think>");
+            if (thinkEnd != std::string::npos) {
+                size_t thinkStart = content.find("<think>");
+                if (thinkStart != std::string::npos && thinkStart < thinkEnd) {
+                    msg["reasoning_content"] = content.substr(thinkStart + 7, thinkEnd - thinkStart - 7);
+                }
+            }
+            ret["messages"].arrayValue.push_back(msg);
         }
         ret["add_generation_prompt"] = fastllm::JinjaVar{1};
         ret["tools"] = fastllm::JinjaVar{std::vector <JinjaVar>()};
