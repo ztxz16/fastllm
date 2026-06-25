@@ -104,6 +104,32 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
+class ResponsesRequest(BaseModel):
+    model: str
+    input: Optional[Union[str, List[Any]]] = None
+    instructions: Optional[Union[str, List[Dict[str, Any]], Dict[str, Any]]] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
+    stop: Optional[Union[str, List[str]]] = None
+    stream: Optional[bool] = False
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = "auto"
+    parallel_tool_calls: Optional[bool] = False
+    store: Optional[bool] = False
+    previous_response_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    user: Optional[str] = None
+    text: Optional[Dict[str, Any]] = None
+    reasoning: Optional[Dict[str, Any]] = None
+    truncation: Optional[str] = "disabled"
+    include: Optional[List[Any]] = Field(default_factory=list)
+    prompt_cache_key: Optional[str] = None
+    client_metadata: Optional[Dict[str, Any]] = None
+
+
 class FunctionCall(BaseModel):
     name: str
     arguments: str
@@ -177,6 +203,53 @@ class ChatCompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
+
+
+class ResponsesUsageInfo(BaseModel):
+    input_tokens: int = 0
+    input_tokens_details: Dict[str, Any] = Field(default_factory=lambda: {
+        "cached_tokens": 0,
+    })
+    output_tokens: int = 0
+    output_tokens_details: Dict[str, Any] = Field(default_factory=lambda: {
+        "reasoning_tokens": 0,
+    })
+    total_tokens: int = 0
+
+
+class ResponsesResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"resp_{shortuuid.random()}")
+    object: Literal["response"] = "response"
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    status: Literal["in_progress", "completed", "incomplete", "failed"] = "completed"
+    completed_at: Optional[int] = None
+    error: Optional[Dict[str, Any]] = None
+    incomplete_details: Optional[Dict[str, Any]] = None
+    instructions: Optional[Any] = None
+    max_output_tokens: Optional[int] = None
+    model: str
+    output: List[Dict[str, Any]] = Field(default_factory=list)
+    output_text: Optional[str] = None
+    parallel_tool_calls: bool = False
+    previous_response_id: Optional[str] = None
+    reasoning: Optional[Dict[str, Any]] = Field(default_factory=lambda: {
+        "effort": None,
+        "summary": None,
+    })
+    store: bool = False
+    temperature: Optional[float] = None
+    text: Dict[str, Any] = Field(default_factory=lambda: {
+        "format": {
+            "type": "text",
+        },
+    })
+    tool_choice: Any = "auto"
+    tools: List[Dict[str, Any]] = Field(default_factory=list)
+    top_p: Optional[float] = None
+    truncation: str = "disabled"
+    usage: Optional[ResponsesUsageInfo] = None
+    user: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TokenCheckRequestItem(BaseModel):

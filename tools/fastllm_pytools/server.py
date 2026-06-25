@@ -96,6 +96,23 @@ async def create_chat_completion(request: ChatCompletionRequest,
         assert isinstance(generator, ChatCompletionResponse)
         return JSONResponse(content = generator.model_dump())
 
+@app.post("/v1/responses")
+@app.post("/v1/response")
+async def create_response(request: ResponsesRequest,
+                          raw_request: Request):
+    generator = await fastllm_completion.create_response(
+        request, raw_request)
+    if isinstance(generator, ErrorResponse):
+        return JSONResponse(content = generator.model_dump(),
+                            status_code = generator.code)
+    if request.stream:
+        return StreamingResponse(content = generator[0],
+                                 background = generator[1],
+                                 media_type = "text/event-stream")
+    else:
+        assert isinstance(generator, ResponsesResponse)
+        return JSONResponse(content = generator.model_dump())
+
 @app.post("/v1/messages")
 async def create_anthropic_message(request: AnthropicMessageRequest,
                                    raw_request: Request):

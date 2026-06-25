@@ -1035,6 +1035,839 @@ class FastLLmCompletion:
           return "max_tokens"
       return "end_turn"
 
+  def _stringify_responses_tool_output(self, output: Any) -> str:
+      if output is None:
+          return ""
+      if isinstance(output, str):
+          return output
+      if isinstance(output, list):
+          parts = []
+          for item in output:
+              if isinstance(item, dict) and item.get("type") in (
+                      "input_text", "output_text", "text"):
+                  parts.append(item.get("text", ""))
+              else:
+                  parts.append(json.dumps(item, ensure_ascii = False))
+          return "\n".join([part for part in parts if part != ""])
+      if isinstance(output, dict):
+          return json.dumps(output, ensure_ascii = False)
+      return str(output)
+
+  def _convert_responses_content_to_chat_content(self, content: Any) -> ConversationContent:
+      if content is None:
+          return ""
+      if isinstance(content, str):
+          return content
+      if isinstance(content, dict):
+          if content.get("type") in ("input_text", "output_text", "text"):
+              return content.get("text", "")
+          return self._stringify_responses_tool_output(content)
+      if not isinstance(content, list):
+          return str(content)
+
+      parts: List[Dict[str, Any]] = []
+      has_media = False
+      for part in content:
+          if isinstance(part, str):
+              parts.append({"type": "text", "text": part})
+              continue
+          if not isinstance(part, dict):
+              parts.append({"type": "text", "text": str(part)})
+              continue
+
+          part_type = part.get("type")
+          if part_type in ("input_text", "output_text", "text"):
+              parts.append({"type": "text", "text": part.get("text", "")})
+          elif part_type in ("input_image", "image_url"):
+              image_url = part.get("image_url") or part.get("url")
+              if isinstance(image_url, dict):
+                  image_url = image_url.get("url")
+              if image_url:
+                  parts.append({
+                      "type": "image_url",
+                      "image_url": {"url": image_url},
+                  })
+                  has_media = True
+          elif part_type in ("input_file", "file"):
+              parts.append({
+                  "type": "text",
+                  "text": json.dumps(part, ensure_ascii = False),
+              })
+          else:
+              parts.append({
+                  "type": "text",
+                  "text": json.dumps(part, ensure_ascii = False),
+              })
+
+      if has_media:
+          return parts
+      return "\n".join([
+          part.get("text", "")
+          for part in parts
+          if part.get("type") == "text" and part.get("text", "") != ""
+      ])
+
+  def _append_responses_instruction_messages(
+      self,
+      messages: List[Dict[str, Any]],
+      instructions: Any,
+  ):
+      if instructions is None:
+          return
+      if isinstance(instructions, list):
+          for item in instructions:
+              if isinstance(item, dict):
+                  role = item.get("role", "system")
+                  if role == "developer":
+                      role = "system"
+                  messages.append({
+                      "role": role,
+                      "content": self._convert_responses_content_to_chat_content(
+                          item.get("content", "")),
+                  })
+              else:
+                  messages.append({"role": "system", "content": str(item)})
+          return
+      if isinstance(instructions, dict):
+          role = instructions.get("role", "system")
+          if role == "developer":
+              role = "system"
+          messages.append({
+              "role": role,
+              "content": self._convert_responses_content_to_chat_content(
+                  instructions.get("content", instructions)),
+          })
+          return
+      messages.append({"role": "system", "content": str(instructions)})
+
+  def _responses_system_content_to_text(self, content: Any) -> str:
+      converted = self._convert_responses_content_to_chat_content(content)
+      if converted is None:
+          return ""
+      if isinstance(converted, list):
+          parts = []
+          for part in converted:
+              if isinstance(part, dict) and part.get("type") == "text":
+                  parts.append(part.get("text", ""))
+              elif part is not None:
+                  parts.append(json.dumps(part, ensure_ascii = False)
+                               if isinstance(part, dict) else str(part))
+          return "\n".join([part for part in parts if part != ""])
+      return str(converted)
+
+  def _normalize_responses_chat_messages(
+      self, messages: List[Dict[str, Any]]
+  ) -> List[Dict[str, Any]]:
+      system_parts: List[str] = []
+      normalized: List[Dict[str, Any]] = []
+      for message in messages:
+          if not isinstance(message, dict):
+              normalized.append({"role": "user", "content": str(message)})
+              continue
+
+          role = message.get("role", "user")
+          if role == "developer":
+              role = "system"
+          if role == "system":
+              text = self._responses_system_content_to_text(
+                  message.get("content", ""))
+              if text:
+                  system_parts.append(text)
+              continue
+
+          message = dict(message)
+          message["role"] = role
+          normalized.append(message)
+
+      if system_parts:
+          normalized.insert(0, {
+              "role": "system",
+              "content": "\n\n".join(system_parts),
+          })
+      return normalized
+
+  def _responses_input_to_chat_messages(
+      self, request: ResponsesRequest
+  ) -> List[Dict[str, Any]]:
+      messages: List[Dict[str, Any]] = []
+      self._append_responses_instruction_messages(messages, request.instructions)
+
+      response_input = request.input
+      if response_input is None:
+          return self._normalize_responses_chat_messages(messages)
+      if isinstance(response_input, str):
+          messages.append({"role": "user", "content": response_input})
+          return self._normalize_responses_chat_messages(messages)
+      if not isinstance(response_input, list):
+          messages.append({"role": "user", "content": str(response_input)})
+          return self._normalize_responses_chat_messages(messages)
+
+      for item in response_input:
+          if isinstance(item, str):
+              messages.append({"role": "user", "content": item})
+              continue
+          if not isinstance(item, dict):
+              messages.append({"role": "user", "content": str(item)})
+              continue
+
+          item_type = item.get("type")
+          if item_type == "function_call":
+              call_id = item.get("call_id") or item.get("id") or f"call_{shortuuid.random()}"
+              messages.append({
+                  "role": "assistant",
+                  "content": None,
+                  "tool_calls": [{
+                      "id": call_id,
+                      "type": "function",
+                      "function": {
+                          "name": item.get("name", ""),
+                          "arguments": item.get("arguments", "{}"),
+                      },
+                  }],
+              })
+              continue
+
+          if item_type in (
+                  "function_call_output", "custom_tool_call_output",
+                  "local_shell_call_output", "shell_call_output",
+                  "apply_patch_call_output"):
+              messages.append({
+                  "role": "tool",
+                  "tool_call_id": item.get("call_id") or item.get("id"),
+                  "content": self._stringify_responses_tool_output(
+                      item.get("output", "")),
+              })
+              continue
+
+          if item_type in ("reasoning", "item_reference"):
+              continue
+
+          if item_type in ("input_text", "input_image", "input_file", "text"):
+              messages.append({
+                  "role": "user",
+                  "content": self._convert_responses_content_to_chat_content([item]),
+              })
+              continue
+
+          if "role" in item or item_type in ("message", "input_message", "output_message"):
+              role = item.get("role", "user")
+              if role == "developer":
+                  role = "system"
+              messages.append({
+                  "role": role,
+                  "content": self._convert_responses_content_to_chat_content(
+                      item.get("content", "")),
+              })
+              continue
+
+          messages.append({
+              "role": "user",
+              "content": json.dumps(item, ensure_ascii = False),
+          })
+      return self._normalize_responses_chat_messages(messages)
+
+  def _convert_responses_tools(
+      self, tools: Optional[List[Dict[str, Any]]]
+  ) -> Optional[List[ChatCompletionToolsParam]]:
+      if not tools:
+          return None
+      converted: List[ChatCompletionToolsParam] = []
+      for tool in tools:
+          if not isinstance(tool, dict):
+              continue
+          if tool.get("type") != "function":
+              continue
+
+          function = tool.get("function")
+          if not isinstance(function, dict):
+              function = {
+                  "name": tool.get("name"),
+                  "description": tool.get("description"),
+                  "parameters": tool.get("parameters"),
+              }
+          if not function.get("name"):
+              continue
+          converted.append(ChatCompletionToolsParam(
+              function = FunctionDefinition(
+                  name = function.get("name"),
+                  description = function.get("description"),
+                  parameters = function.get("parameters"),
+              )))
+      return converted or None
+
+  def _convert_responses_tool_choice(self, tool_choice: Any) -> Any:
+      if tool_choice is None:
+          return "auto"
+      if isinstance(tool_choice, str):
+          if tool_choice in ("auto", "none", "required"):
+              return tool_choice
+          return "auto"
+      if isinstance(tool_choice, dict):
+          function = tool_choice.get("function")
+          if isinstance(function, dict) and function.get("name"):
+              return ChatCompletionNamedToolChoiceParam(
+                  function = ChatCompletionNamedFunction(name = function.get("name")))
+          if tool_choice.get("type") == "function" and tool_choice.get("name"):
+              return ChatCompletionNamedToolChoiceParam(
+                  function = ChatCompletionNamedFunction(name = tool_choice.get("name")))
+      return "auto"
+
+  def _build_chat_request_from_responses(
+      self, request: ResponsesRequest
+  ) -> ChatCompletionRequest:
+      messages = self._responses_input_to_chat_messages(request)
+      max_tokens = request.max_output_tokens
+      if max_tokens is None:
+          max_tokens = request.max_tokens
+      return ChatCompletionRequest(
+          model = request.model,
+          messages = messages,
+          temperature = request.temperature,
+          top_p = request.top_p,
+          top_k = request.top_k,
+          max_tokens = max_tokens,
+          stop = request.stop,
+          stream = request.stream,
+          tools = self._convert_responses_tools(request.tools),
+          tool_choice = self._convert_responses_tool_choice(request.tool_choice),
+      )
+
+  def _responses_usage_from_chat_usage(self, usage: Optional[UsageInfo]) -> ResponsesUsageInfo:
+      if usage is None:
+          return ResponsesUsageInfo()
+      prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+      completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+      total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or 0
+      return ResponsesUsageInfo(
+          input_tokens = prompt_tokens,
+          output_tokens = completion_tokens,
+          total_tokens = total_tokens,
+      )
+
+  def _responses_usage_from_dict(self, usage: Optional[Dict[str, Any]]) -> ResponsesUsageInfo:
+      if not usage:
+          return ResponsesUsageInfo()
+      prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+      completion_tokens = usage.get(
+          "completion_tokens", usage.get("output_tokens", 0)) or 0
+      total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens) or 0
+      return ResponsesUsageInfo(
+          input_tokens = prompt_tokens,
+          output_tokens = completion_tokens,
+          total_tokens = total_tokens,
+      )
+
+  def _responses_tool_schemas_by_name(
+      self, tools: Optional[List[Dict[str, Any]]]
+  ) -> Dict[str, Dict[str, Any]]:
+      schemas: Dict[str, Dict[str, Any]] = {}
+      for tool in tools or []:
+          if not isinstance(tool, dict):
+              continue
+          function = tool.get("function")
+          if isinstance(function, dict):
+              name = function.get("name") or tool.get("name")
+              parameters = function.get("parameters") or tool.get("parameters")
+          else:
+              name = tool.get("name")
+              parameters = tool.get("parameters")
+          if isinstance(name, str) and isinstance(parameters, dict):
+              schemas[name] = parameters
+      return schemas
+
+  def _coerce_json_value_by_schema(self, value: Any, schema: Any) -> Any:
+      if not isinstance(schema, dict):
+          return value
+
+      schema_type = schema.get("type")
+      if isinstance(schema_type, list):
+          schema_type = next((item for item in schema_type if item != "null"), None)
+
+      if schema_type == "boolean" and isinstance(value, str):
+          lower = value.strip().lower()
+          if lower == "true":
+              return True
+          if lower == "false":
+              return False
+      if schema_type == "integer" and isinstance(value, str):
+          try:
+              return int(value.strip())
+          except ValueError:
+              return value
+      if schema_type == "number" and isinstance(value, str):
+          try:
+              return float(value.strip())
+          except ValueError:
+              return value
+      if schema_type == "array":
+          if isinstance(value, str):
+              try:
+                  parsed_value = json.loads(value)
+              except json.JSONDecodeError:
+                  parsed_value = value
+              value = parsed_value
+          if isinstance(value, list):
+              item_schema = schema.get("items")
+              return [
+                  self._coerce_json_value_by_schema(item, item_schema)
+                  for item in value
+              ]
+          return value
+      if schema_type == "object" and isinstance(value, dict):
+          properties = schema.get("properties")
+          if not isinstance(properties, dict):
+              return value
+          coerced = dict(value)
+          for key, prop_schema in properties.items():
+              if key in coerced:
+                  coerced[key] = self._coerce_json_value_by_schema(
+                      coerced[key], prop_schema)
+          return coerced
+      return value
+
+  def _coerce_responses_tool_argument_fallback(
+      self, value: Any, key: Optional[str] = None
+  ) -> Any:
+      if isinstance(value, dict):
+          return {
+              item_key: self._coerce_responses_tool_argument_fallback(
+                  item_value, item_key)
+              for item_key, item_value in value.items()
+          }
+      if isinstance(value, list):
+          return [
+              self._coerce_responses_tool_argument_fallback(item)
+              for item in value
+          ]
+      if isinstance(value, float) and value.is_integer():
+          return int(value)
+
+      int_keys = {
+          "autoResolutionMs",
+          "content_offset_chars",
+          "duration",
+          "expected_size_bytes",
+          "limit",
+          "max_output_tokens",
+          "pageno",
+          "recency",
+          "session_id",
+          "yield_time_ms",
+      }
+      bool_keys = {
+          "login",
+          "stream",
+          "tty",
+      }
+      if isinstance(value, str) and key in int_keys:
+          try:
+              parsed = float(value.strip())
+              if parsed.is_integer():
+                  return int(parsed)
+          except ValueError:
+              return value
+      if isinstance(value, str) and key in bool_keys:
+          lower = value.strip().lower()
+          if lower == "true":
+              return True
+          if lower == "false":
+              return False
+      return value
+
+  def _coerce_responses_tool_arguments(
+      self,
+      name: Optional[str],
+      arguments: Any,
+      tool_schemas: Dict[str, Dict[str, Any]],
+  ) -> str:
+      if isinstance(arguments, str):
+          try:
+              parsed_arguments = json.loads(arguments)
+          except json.JSONDecodeError:
+              return arguments
+      else:
+          parsed_arguments = arguments or {}
+
+      if isinstance(name, str) and name in tool_schemas:
+          parsed_arguments = self._coerce_json_value_by_schema(
+              parsed_arguments, tool_schemas[name])
+      parsed_arguments = self._coerce_responses_tool_argument_fallback(
+          parsed_arguments)
+      return json.dumps(parsed_arguments or {}, ensure_ascii = False)
+
+  def _responses_function_call_item(
+      self,
+      tool_call: Any,
+      tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
+  ) -> Dict[str, Any]:
+      tool_call_id = getattr(tool_call, "id", None)
+      function = getattr(tool_call, "function", None)
+      if isinstance(tool_call, dict):
+          tool_call_id = tool_call.get("id", tool_call_id)
+          function = tool_call.get("function", function)
+
+      name = getattr(function, "name", None)
+      arguments = getattr(function, "arguments", None)
+      if isinstance(function, dict):
+          name = function.get("name", name)
+          arguments = function.get("arguments", arguments)
+      arguments = self._coerce_responses_tool_arguments(
+          name, arguments, tool_schemas or {})
+
+      call_id = tool_call_id or f"call_{shortuuid.random()}"
+      return {
+          "type": "function_call",
+          "id": f"fc_{shortuuid.random()}",
+          "call_id": call_id,
+          "name": name or "",
+          "arguments": arguments,
+          "status": "completed",
+      }
+
+  def _responses_message_item(
+      self, item_id: str, text: str, status: str = "completed"
+  ) -> Dict[str, Any]:
+      return {
+          "type": "message",
+          "id": item_id,
+          "status": status,
+          "role": "assistant",
+          "content": [{
+              "type": "output_text",
+              "text": text,
+              "annotations": [],
+          }],
+      }
+
+  def _responses_response_object(
+      self,
+      request: ResponsesRequest,
+      response_id: str,
+      created_at: int,
+      status: str,
+      output: List[Dict[str, Any]],
+      usage: Optional[ResponsesUsageInfo],
+      output_text: Optional[str] = None,
+  ) -> ResponsesResponse:
+      completed_at = int(time.time()) if status in ("completed", "incomplete", "failed") else None
+      incomplete_details = None
+      if status == "incomplete":
+          incomplete_details = {"reason": "max_output_tokens"}
+      return ResponsesResponse(
+          id = response_id,
+          created_at = created_at,
+          status = status,
+          completed_at = completed_at,
+          incomplete_details = incomplete_details,
+          instructions = request.instructions,
+          max_output_tokens = request.max_output_tokens or request.max_tokens,
+          model = self.model_name,
+          output = output,
+          output_text = output_text,
+          parallel_tool_calls = bool(request.parallel_tool_calls),
+          previous_response_id = request.previous_response_id,
+          reasoning = request.reasoning or {"effort": None, "summary": None},
+          store = bool(request.store),
+          temperature = request.temperature,
+          text = request.text or {"format": {"type": "text"}},
+          tool_choice = request.tool_choice,
+          tools = request.tools or [],
+          top_p = request.top_p,
+          truncation = request.truncation or "disabled",
+          usage = usage,
+          user = request.user,
+          metadata = request.metadata or {},
+      )
+
+  def _chat_response_to_responses_response(
+      self, request: ResponsesRequest, chat_response: ChatCompletionResponse
+  ) -> ResponsesResponse:
+      response_id = chat_response.id
+      created_at = chat_response.created
+      output: List[Dict[str, Any]] = []
+      output_text = ""
+      finish_reason = None
+      tool_schemas = self._responses_tool_schemas_by_name(request.tools)
+
+      for choice in chat_response.choices:
+          finish_reason = choice.finish_reason
+          message = choice.message
+          content = message.content or ""
+          if content:
+              item_id = f"msg_{shortuuid.random()}"
+              output.append(self._responses_message_item(item_id, content))
+              output_text += content
+          if message.tool_calls:
+              for tool_call in message.tool_calls:
+                  output.append(self._responses_function_call_item(
+                      tool_call, tool_schemas))
+
+      status = "incomplete" if finish_reason == "length" else "completed"
+      return self._responses_response_object(
+          request = request,
+          response_id = response_id,
+          created_at = created_at,
+          status = status,
+          output = output,
+          usage = self._responses_usage_from_chat_usage(chat_response.usage),
+          output_text = output_text or None,
+      )
+
+  def _responses_sse_event(
+      self,
+      event_type: str,
+      payload: Dict[str, Any],
+      sequence_number: int,
+  ) -> str:
+      payload = dict(payload)
+      payload["type"] = event_type
+      payload["sequence_number"] = sequence_number
+      data = json.dumps(payload, ensure_ascii = False, separators = (",", ":"))
+      return f"event: {event_type}\ndata: {data}\n\n"
+
+  async def create_response(
+      self, request: ResponsesRequest, raw_request: Request
+  ) -> Union[ErrorResponse, ResponsesResponse,
+             Tuple[AsyncGenerator[str, None], AsyncGenerator]]:
+      try:
+          chat_request = self._build_chat_request_from_responses(request)
+          if len(chat_request.messages) == 0:
+              return self.create_error_response("Empty input")
+      except Exception as e:
+          logging.error("Error in applying responses request: %s", e)
+          traceback.print_exc()
+          return self.create_error_response(str(e))
+
+      generator = await self.create_chat_completion(chat_request, raw_request)
+      if isinstance(generator, ErrorResponse):
+          return generator
+
+      if request.stream:
+          return (self.responses_stream_generator(request, generator[0]),
+                  generator[1])
+
+      assert isinstance(generator, ChatCompletionResponse)
+      return self._chat_response_to_responses_response(request, generator)
+
+  async def responses_stream_generator(
+      self,
+      request: ResponsesRequest,
+      chat_stream: AsyncIterator[str],
+  ) -> AsyncGenerator[str, None]:
+      response_id = f"resp_{shortuuid.random()}"
+      created_at = int(time.time())
+      sequence_number = 0
+      response_started = False
+      message_started = False
+      content_started = False
+      message_item_id = f"msg_{shortuuid.random()}"
+      output_text = ""
+      output: List[Dict[str, Any]] = []
+      tool_calls: Dict[int, Dict[str, Any]] = {}
+      tool_schemas = self._responses_tool_schemas_by_name(request.tools)
+      usage = ResponsesUsageInfo()
+      finish_reason = None
+
+      def next_event(event_type: str, payload: Dict[str, Any]) -> str:
+          nonlocal sequence_number
+          sequence_number += 1
+          return self._responses_sse_event(event_type, payload, sequence_number)
+
+      def ensure_response_started() -> List[str]:
+          nonlocal response_started
+          if response_started:
+              return []
+          response_started = True
+          response = self._responses_response_object(
+              request = request,
+              response_id = response_id,
+              created_at = created_at,
+              status = "in_progress",
+              output = [],
+              usage = None,
+          )
+          return [next_event("response.created", {
+              "response": response.model_dump(),
+          })]
+
+      def ensure_text_item_started() -> List[str]:
+          nonlocal message_started
+          nonlocal content_started
+          events = ensure_response_started()
+          if not message_started:
+              message_started = True
+              item = self._responses_message_item(
+                  message_item_id, "", status = "in_progress")
+              item["content"] = []
+              events.append(next_event("response.output_item.added", {
+                  "output_index": 0,
+                  "item": item,
+              }))
+          if not content_started:
+              content_started = True
+              events.append(next_event("response.content_part.added", {
+                  "item_id": message_item_id,
+                  "output_index": 0,
+                  "content_index": 0,
+                  "part": {
+                      "type": "output_text",
+                      "text": "",
+                      "annotations": [],
+                  },
+              }))
+          return events
+
+      async for chunk in chat_stream:
+          for line in chunk.splitlines():
+              line = line.strip()
+              if not line.startswith("data:"):
+                  continue
+              data_str = line[len("data:"):].strip()
+              if data_str == "[DONE]":
+                  continue
+              try:
+                  data = json.loads(data_str)
+              except json.JSONDecodeError:
+                  continue
+
+              if "error" in data:
+                  for event_data in ensure_response_started():
+                      yield event_data
+                  yield next_event("error", {
+                      "error": data["error"],
+                  })
+                  return
+
+              response_id = data.get("id", response_id)
+              created_at = data.get("created", created_at)
+              for event_data in ensure_response_started():
+                  yield event_data
+
+              choices = data.get("choices", [])
+              if not choices:
+                  if "usage" in data:
+                      usage = self._responses_usage_from_dict(data.get("usage"))
+                  continue
+
+              choice = choices[0]
+              if choice.get("finish_reason") is not None:
+                  finish_reason = choice.get("finish_reason")
+              delta = choice.get("delta") or {}
+              if "usage" in data:
+                  usage = self._responses_usage_from_dict(data.get("usage"))
+
+              text_delta = delta.get("content")
+              if text_delta:
+                  for event_data in ensure_text_item_started():
+                      yield event_data
+                  output_text += text_delta
+                  yield next_event("response.output_text.delta", {
+                      "item_id": message_item_id,
+                      "output_index": 0,
+                      "content_index": 0,
+                      "delta": text_delta,
+                  })
+
+              for tool_delta in delta.get("tool_calls", []) or []:
+                  index = tool_delta.get("index", 0)
+                  current = tool_calls.setdefault(index, {
+                      "id": tool_delta.get("id") or f"call_{shortuuid.random()}",
+                      "name": "",
+                      "arguments": "",
+                  })
+                  if tool_delta.get("id"):
+                      current["id"] = tool_delta["id"]
+                  function = tool_delta.get("function") or {}
+                  if function.get("name"):
+                      current["name"] += function["name"]
+                  if function.get("arguments"):
+                      current["arguments"] += function["arguments"]
+
+      for event_data in ensure_response_started():
+          yield event_data
+
+      output_index = 0
+      if message_started:
+          message_item = self._responses_message_item(message_item_id, output_text)
+          output.append(message_item)
+          yield next_event("response.output_text.done", {
+              "item_id": message_item_id,
+              "output_index": output_index,
+              "content_index": 0,
+              "text": output_text,
+          })
+          yield next_event("response.content_part.done", {
+              "item_id": message_item_id,
+              "output_index": output_index,
+              "content_index": 0,
+              "part": {
+                  "type": "output_text",
+                  "text": output_text,
+                  "annotations": [],
+              },
+          })
+          yield next_event("response.output_item.done", {
+              "output_index": output_index,
+              "item": message_item,
+          })
+          output_index += 1
+
+      for index in sorted(tool_calls):
+          tool_call = tool_calls[index]
+          arguments = self._coerce_responses_tool_arguments(
+              tool_call["name"], tool_call["arguments"], tool_schemas)
+          item = {
+              "type": "function_call",
+              "id": f"fc_{shortuuid.random()}",
+              "call_id": tool_call["id"],
+              "name": tool_call["name"],
+              "arguments": arguments,
+              "status": "completed",
+          }
+          output.append(item)
+          added_item = dict(item)
+          added_item["arguments"] = ""
+          added_item["status"] = "in_progress"
+          yield next_event("response.output_item.added", {
+              "output_index": output_index,
+              "item": added_item,
+          })
+          if arguments:
+              yield next_event("response.function_call_arguments.delta", {
+                  "item_id": item["id"],
+                  "output_index": output_index,
+                  "delta": arguments,
+              })
+          yield next_event("response.function_call_arguments.done", {
+              "item_id": item["id"],
+              "output_index": output_index,
+              "arguments": arguments,
+          })
+          yield next_event("response.output_item.done", {
+              "output_index": output_index,
+              "item": item,
+          })
+          output_index += 1
+
+      if not output and output_text == "":
+          message_item = self._responses_message_item(message_item_id, "")
+          output.append(message_item)
+
+      status = "incomplete" if finish_reason == "length" else "completed"
+      response = self._responses_response_object(
+          request = request,
+          response_id = response_id,
+          created_at = created_at,
+          status = status,
+          output = output,
+          usage = usage,
+          output_text = output_text or None,
+      )
+      event_type = "response.incomplete" if status == "incomplete" else "response.completed"
+      yield next_event(event_type, {
+          "response": response.model_dump(),
+      })
+
   def _create_anthropic_sse_event(self, event_name: str, payload: BaseModel) -> str:
       data = payload.model_dump_json(exclude_none = True)
       return f"event: {event_name}\ndata: {data}\n\n"
