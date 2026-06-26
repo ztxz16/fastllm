@@ -1,0 +1,40 @@
+{
+  "model": "Qwen/Qwen3.6-27B",
+  "modelscope_url": "https://modelscope.cn/models/Qwen/Qwen3.6-27B",
+  "huggingface_url": "https://huggingface.co/Qwen/Qwen3.6-27B",
+  "benchmark": {
+    "name": "Terminal-Bench 2.0",
+    "reported_score": 59.3,
+    "dataset": "terminal-bench@2.0",
+    "sample_dataset": "terminal-bench-sample@2.0",
+    "harness": "Harbor",
+    "agent": "Terminus-2",
+    "task_count": 89,
+    "scoring": "binary 0/1 per task with aggregate accuracy"
+  },
+  "execution": {
+    "timeout": "3h",
+    "cpu": 32,
+    "memory_gb": 48,
+    "runs": 5,
+    "aggregation": "average of 5 runs"
+  },
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_tokens": "80K",
+    "context_window": "256K"
+  },
+  "notes": [
+    "The public Qwen model card reports the Terminal-Bench 2.0 methodology and score, but the benchmark tasks and execution are managed by Harbor.",
+    "Exact reproducibility depends on the Harbor version, Terminus-2 version, endpoint behavior, model quantization/serving stack, sandbox provider, and timeout/resource enforcement."
+  ],
+  "sources": [
+    "https://modelscope.cn/models/Qwen/Qwen3.6-27B",
+    "https://huggingface.co/Qwen/Qwen3.6-27B",
+    "https://www.harborframework.com/docs/tutorials/running-terminal-bench",
+    "https://github.com/harbor-framework/terminal-bench-2",
+    "https://evalscope.readthedocs.io/en/v1.5.2/benchmarks/terminal_bench_v2.html"
+  ]
+}
