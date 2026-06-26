@@ -87,6 +87,9 @@
     <ClInclude Include="..\..\include\models\glm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\glm5_moe_dsa.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\graphllm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -195,6 +198,9 @@
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\glm.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\glm5_moe_dsa.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\graphllm.cpp">

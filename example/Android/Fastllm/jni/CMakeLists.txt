@@ -42,6 +42,7 @@ set(FASTLLM_SOURCES
     ${FASTLLM_ROOT}/src/models/ernie4_5.cpp
     ${FASTLLM_ROOT}/src/models/pangu_moe.cpp
     ${FASTLLM_ROOT}/src/models/glm4_moe.cpp
+    ${FASTLLM_ROOT}/src/models/glm5_moe_dsa.cpp
     ${FASTLLM_ROOT}/src/models/gpt_oss.cpp
     ${FASTLLM_ROOT}/src/models/minimax_m2.cpp
     ${FASTLLM_ROOT}/src/models/qwen2.cpp

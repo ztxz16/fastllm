@@ -188,6 +188,7 @@
     <ClInclude Include="..\..\include\models\ernie4_5.h" />
     <ClInclude Include="..\..\include\models\factoryllm.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
+    <ClInclude Include="..\..\include\models\glm5_moe_dsa.h" />
     <ClInclude Include="..\..\include\models\graphllm.h" />
     <ClInclude Include="..\..\include\models\hunyuan.h" />
     <ClInclude Include="..\..\include\models\internlm2.h" />
@@ -226,6 +227,7 @@
     <ClCompile Include="..\..\src\models\deepseekv2.cpp" />
     <ClCompile Include="..\..\src\models\ernie4_5.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
+    <ClCompile Include="..\..\src\models\glm5_moe_dsa.cpp" />
     <ClCompile Include="..\..\src\models\graphllm.cpp" />
     <ClCompile Include="..\..\src\models\graph\fastllmjson.cpp" />
     <ClCompile Include="..\..\src\models\graph\gemma2.cpp" />
