@@ -48,7 +48,7 @@ class ServerManager:
         port = lc.port if lc.port > 0 else _find_free_port()
         model_name = lc.model_name if lc.model_name else item.name
 
-        cmd = [sys.executable, "-m", "ftllm", "serve", item.path, "--port", str(port)]
+        cmd = [sys.executable, "-m", "ftllm.cli", "serve", item.path, "--port", str(port)]
 
         if lc.device:
             cmd.extend(["--device", lc.device])
@@ -61,8 +61,8 @@ class ServerManager:
 
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         self._servers[item.model_id] = (proc, port, model_name)
         return port

@@ -12,7 +12,36 @@ Rectangle {
     property string selectedModelId: ""
 
     function refreshModels() {
-        if (chatViewModel) runningModels = chatViewModel.getRunningModels()
+        if (!chatViewModel) return
+        runningModels = chatViewModel.getRunningModels()
+
+        var exists = false
+        for (var i = 0; i < runningModels.length; i++) {
+            if (runningModels[i].model_id === selectedModelId) {
+                exists = true
+                break
+            }
+        }
+        if (!exists) {
+            selectedModelId = ""
+            modelSelector.currentIndex = 0
+            chatViewModel.selectModel("")
+        }
+    }
+
+    function modelOptions() {
+        var items = [qsTr("Select deployed model")]
+        for (var i = 0; i < runningModels.length; i++) {
+            items.push(runningModels[i].name + "  127.0.0.1:" + runningModels[i].port)
+        }
+        return items
+    }
+
+    function sendAction() {
+        var text = inputArea.text.trim()
+        if (!chatViewModel || !text || !selectedModelId || chatViewModel.streaming) return
+        chatViewModel.sendMessage(text)
+        inputArea.text = ""
     }
 
     Component.onCompleted: refreshModels()
@@ -24,14 +53,13 @@ Rectangle {
     }
     Connections {
         target: chatViewModel
-        function onMessagesChanged() { chatListView.positionViewAtEnd() }
+        function onMessagesChanged() { Qt.callLater(function() { chatListView.positionViewAtEnd() }) }
     }
 
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
 
-        // ── Top toolbar ──
         Rectangle {
             Layout.fillWidth: true
             Layout.preferredHeight: Styles.Theme.toolbarHeight
@@ -39,128 +67,165 @@ Rectangle {
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: Styles.Theme.paddingLarge
-                anchors.rightMargin: Styles.Theme.paddingLarge
-                spacing: Styles.Theme.spacing
+                anchors.leftMargin: 18
+                anchors.rightMargin: 18
+                spacing: 12
 
-                Text {
-                    text: qsTr("Local Chat")
-                    font.pixelSize: Styles.Theme.fontSizeLarge
-                    font.weight: Font.DemiBold
-                    color: Styles.Theme.textBright
+                ColumnLayout {
+                    spacing: 0
+                    Layout.fillWidth: true
+
+                    Text {
+                        text: qsTr("Conversation")
+                        color: Styles.Theme.textDisabled
+                        font.pixelSize: Styles.Theme.fontSizeTiny
+                        font.weight: Font.Bold
+                    }
+                    Text {
+                        text: qsTr("Chat")
+                        color: Styles.Theme.textBright
+                        font.pixelSize: Styles.Theme.fontSizeLarge
+                        font.weight: Font.DemiBold
+                    }
                 }
 
-                Item { Layout.preferredWidth: Styles.Theme.spacing }
+                ComboBox {
+                    id: modelSelector
+                    Layout.preferredWidth: 330
+                    model: chatPage.modelOptions()
+                    palette.window: Styles.Theme.bgInput
+                    palette.text: Styles.Theme.textPrimary
+                    palette.buttonText: Styles.Theme.textPrimary
+                    onActivated: function(idx) {
+                        if (idx > 0 && idx - 1 < runningModels.length) {
+                            selectedModelId = runningModels[idx - 1].model_id
+                            if (chatViewModel) chatViewModel.selectModel(selectedModelId)
+                        } else {
+                            selectedModelId = ""
+                            if (chatViewModel) chatViewModel.selectModel("")
+                        }
+                    }
+                }
 
-                // Model selector
                 Rectangle {
-                    Layout.preferredWidth: 280; height: 34; radius: Styles.Theme.borderRadius
-                    color: Styles.Theme.bgInput; border.color: Styles.Theme.border; border.width: 1
+                    Layout.preferredWidth: newChatLabel.implicitWidth + 24
+                    Layout.preferredHeight: 32
+                    radius: Styles.Theme.borderRadius
+                    color: newChatMouse.containsMouse ? Styles.Theme.bgCardHover : "transparent"
+                    border.color: Styles.Theme.border
 
-                    ComboBox {
-                        id: modelSelector
+                    Text {
+                        id: newChatLabel
+                        anchors.centerIn: parent
+                        text: qsTr("New Chat")
+                        color: Styles.Theme.textPrimary
+                        font.pixelSize: Styles.Theme.fontSizeMedium
+                    }
+
+                    MouseArea {
+                        id: newChatMouse
                         anchors.fill: parent
-                        palette.window: Styles.Theme.bgInput
-                        palette.text: Styles.Theme.textPrimary
-                        palette.buttonText: Styles.Theme.textPrimary
-
-                        model: {
-                            var items = [qsTr("Select a model")]
-                            for (var i = 0; i < runningModels.length; i++)
-                                items.push(runningModels[i].name + " (:" + runningModels[i].port + ")")
-                            return items
-                        }
-                        currentIndex: 0
-                        onActivated: function(idx) {
-                            if (idx > 0 && idx - 1 < runningModels.length) {
-                                selectedModelId = runningModels[idx - 1].model_id
-                                if (chatViewModel) chatViewModel.selectModel(selectedModelId)
-                            } else { selectedModelId = "" }
-                        }
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { if (chatViewModel) chatViewModel.clearChat() }
                     }
                 }
 
-                Item { Layout.fillWidth: true }
-
-                // New chat
                 Rectangle {
-                    width: newChatRow.implicitWidth + 24; height: 32; radius: Styles.Theme.borderRadius
-                    color: newChatMa.containsMouse ? Styles.Theme.bgInput : "transparent"
-                    Row {
-                        id: newChatRow; anchors.centerIn: parent; spacing: 6
-                        Text { text: "+"; font.pixelSize: 15; font.weight: Font.Bold; color: Styles.Theme.textPrimary }
-                        Text { text: qsTr("New Chat"); font.pixelSize: Styles.Theme.fontSizeMedium; color: Styles.Theme.textPrimary }
+                    Layout.preferredWidth: 32
+                    Layout.preferredHeight: 32
+                    radius: Styles.Theme.borderRadius
+                    color: settingsMouse.containsMouse ? Styles.Theme.bgCardHover : "transparent"
+                    border.color: Styles.Theme.border
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "S"
+                        color: Styles.Theme.textSecondary
+                        font.pixelSize: 12
+                        font.weight: Font.Bold
                     }
-                    MouseArea { id: newChatMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if (chatViewModel) chatViewModel.clearChat() } }
-                }
 
-                // Settings gear
-                Rectangle {
-                    width: 34; height: 34; radius: Styles.Theme.borderRadius
-                    color: gearMa.containsMouse ? Styles.Theme.bgInput : "transparent"
-                    Text { anchors.centerIn: parent; text: "⚙"; font.pixelSize: 18; color: Styles.Theme.textSecondary }
-                    MouseArea { id: gearMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: samplingSettings.open() }
+                    MouseArea {
+                        id: settingsMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: samplingSettings.open()
+                    }
                 }
             }
 
             Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Styles.Theme.border }
         }
 
-        // ── Empty state ──
         Item {
-            Layout.fillWidth: true; Layout.fillHeight: true
-            visible: selectedModelId === ""
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+
+            Rectangle {
+                anchors.fill: parent
+                color: Styles.Theme.chatBackground
+                visible: selectedModelId !== ""
+
+                ListView {
+                    id: chatListView
+                    anchors.fill: parent
+                    anchors.leftMargin: Math.min(80, width * 0.08)
+                    anchors.rightMargin: Math.min(80, width * 0.08)
+                    anchors.topMargin: 28
+                    anchors.bottomMargin: 24
+                    spacing: 4
+                    clip: true
+                    model: chatViewModel ? chatViewModel.messageList : null
+
+                    ScrollBar.vertical: ScrollBar {
+                        policy: ScrollBar.AsNeeded
+                        contentItem: Rectangle { implicitWidth: 6; radius: 3; color: Styles.Theme.scrollbar }
+                    }
+
+                    delegate: ChatBubble {
+                        width: chatListView.width
+                        role: model.role
+                        content: model.content
+                    }
+
+                    onCountChanged: Qt.callLater(function() { chatListView.positionViewAtEnd() })
+                }
+            }
 
             Column {
-                anchors.centerIn: parent; spacing: 12
+                anchors.centerIn: parent
+                spacing: 10
+                visible: selectedModelId === ""
 
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "💬"; font.pixelSize: 48 }
-                Text {
+                Rectangle {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: qsTr("Please start a model first")
-                    font.pixelSize: Styles.Theme.fontSizeMedium; color: Styles.Theme.textSecondary
+                    width: 42
+                    height: 42
+                    radius: 8
+                    color: Styles.Theme.bgCard
+                    border.color: Styles.Theme.border
+                    Text {
+                        anchors.centerIn: parent
+                        text: "C"
+                        color: Styles.Theme.textSecondary
+                        font.pixelSize: 18
+                        font.weight: Font.Bold
+                    }
                 }
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: qsTr("Select a model") + " ↑"
-                    font.pixelSize: Styles.Theme.fontSizeSmall; color: Styles.Theme.textDisabled
+                    text: runningModels.length > 0 ? qsTr("Select deployed model") : qsTr("No deployed models")
+                    font.pixelSize: Styles.Theme.fontSizeMedium
+                    color: Styles.Theme.textSecondary
                 }
             }
         }
 
-        // ── Chat area ──
-        Rectangle {
-            Layout.fillWidth: true; Layout.fillHeight: true
-            color: Styles.Theme.chatBackground
-            visible: selectedModelId !== ""
-
-            ListView {
-                id: chatListView
-                anchors.fill: parent
-                anchors.topMargin: Styles.Theme.paddingSmall
-                anchors.bottomMargin: Styles.Theme.paddingSmall
-                spacing: 2; clip: true
-                model: chatViewModel ? chatViewModel.messageList : null
-
-                ScrollBar.vertical: ScrollBar {
-                    policy: ScrollBar.AsNeeded
-                    contentItem: Rectangle { implicitWidth: 6; radius: 3; color: Styles.Theme.scrollbar }
-                }
-
-                delegate: ChatBubble {
-                    width: chatListView.width
-                    role: model.role
-                    content: model.content
-                }
-
-                onCountChanged: Qt.callLater(function() { chatListView.positionViewAtEnd() })
-            }
-        }
-
-        // ── Input bar ──
         Rectangle {
             Layout.fillWidth: true
-            Layout.preferredHeight: 56
+            Layout.preferredHeight: 118
             color: Styles.Theme.bgToolbar
             visible: selectedModelId !== ""
 
@@ -168,68 +233,61 @@ Rectangle {
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: Styles.Theme.paddingMedium
-                anchors.rightMargin: Styles.Theme.paddingMedium
-                anchors.topMargin: Styles.Theme.paddingSmall
-                anchors.bottomMargin: Styles.Theme.paddingSmall
-                spacing: Styles.Theme.spacingSmall
+                anchors.leftMargin: 20
+                anchors.rightMargin: 20
+                anchors.topMargin: 12
+                anchors.bottomMargin: 12
+                spacing: 10
 
-                // Input field
                 Rectangle {
-                    Layout.fillWidth: true; Layout.fillHeight: true
-                    radius: Styles.Theme.borderRadius
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    radius: Styles.Theme.borderRadiusLarge
                     color: Styles.Theme.bgInput
-                    border.color: inputFld.activeFocus ? Styles.Theme.borderFocus : Styles.Theme.border
-                    border.width: 1
+                    border.color: inputArea.activeFocus ? Styles.Theme.borderFocus : Styles.Theme.borderLight
 
-                    TextInput {
-                        id: inputFld
-                        anchors.fill: parent; anchors.leftMargin: 12; anchors.rightMargin: 12
-                        verticalAlignment: TextInput.AlignVCenter
-                        color: Styles.Theme.textPrimary; selectionColor: Styles.Theme.accentColor
-                        font.pixelSize: Styles.Theme.fontSizeMedium; clip: true
+                    TextArea {
+                        id: inputArea
+                        anchors.fill: parent
+                        anchors.margins: 10
+                        wrapMode: TextEdit.Wrap
+                        color: Styles.Theme.textBright
+                        placeholderText: qsTr("Send a message to the model...")
+                        placeholderTextColor: Styles.Theme.textDisabled
+                        selectionColor: Styles.Theme.accentColor
                         enabled: !chatViewModel || !chatViewModel.streaming
-                        onAccepted: sendAction()
-
-                        Text {
-                            anchors.fill: parent; verticalAlignment: Text.AlignVCenter
-                            text: qsTr("Type a message...")
-                            color: Styles.Theme.textDisabled; font.pixelSize: Styles.Theme.fontSizeMedium
-                            visible: !inputFld.text && !inputFld.activeFocus
-                        }
+                        background: Rectangle { color: "transparent" }
                     }
                 }
 
-                // Send button
                 Rectangle {
-                    width: sendLbl.implicitWidth + 24; Layout.fillHeight: true
-                    radius: Styles.Theme.borderRadius
+                    Layout.preferredWidth: 48
+                    Layout.preferredHeight: 48
+                    Layout.alignment: Qt.AlignBottom
+                    radius: 24
                     color: {
-                        var canSend = inputFld.text.trim() !== "" && (!chatViewModel || !chatViewModel.streaming)
-                        return canSend ? (sendMa.containsMouse ? Styles.Theme.primaryHover : Styles.Theme.primaryColor)
-                                       : Styles.Theme.bgInput
+                        var canSend = selectedModelId !== "" && inputArea.text.trim() !== "" && (!chatViewModel || !chatViewModel.streaming)
+                        return canSend ? (sendMouse.containsMouse ? Styles.Theme.primaryHover : Styles.Theme.primaryColor)
+                                       : Styles.Theme.bgCardHover
                     }
 
                     Text {
-                        id: sendLbl; anchors.centerIn: parent
-                        text: qsTr("Send"); font.pixelSize: Styles.Theme.fontSizeMedium
-                        color: (inputFld.text.trim() !== "" && (!chatViewModel || !chatViewModel.streaming))
-                               ? Styles.Theme.textOnAccent : Styles.Theme.textDisabled
+                        anchors.centerIn: parent
+                        text: ">"
+                        color: inputArea.text.trim() !== "" ? Styles.Theme.textOnAccent : Styles.Theme.textDisabled
+                        font.pixelSize: 20
+                        font.weight: Font.Bold
                     }
 
                     MouseArea {
-                        id: sendMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                        id: sendMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
                         onClicked: sendAction()
                     }
                 }
             }
-        }
-    }
-
-    function sendAction() {
-        if (chatViewModel && inputFld.text.trim() !== "") {
-            chatViewModel.sendMessage(inputFld.text)
-            inputFld.text = ""
         }
     }
 

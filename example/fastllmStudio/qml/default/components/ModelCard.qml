@@ -1,12 +1,11 @@
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 import "../styles" as Styles
 
 Rectangle {
     id: card
     width: parent ? parent.width : 400
-    height: 72
+    height: 88
     radius: Styles.Theme.borderRadius
     color: cardMa.containsMouse ? Styles.Theme.bgCardHover : Styles.Theme.bgCard
     border.color: running ? Styles.Theme.successColor : Styles.Theme.border
@@ -19,6 +18,9 @@ Rectangle {
     property string modelPath: ""
     property bool running: false
     property int modelPort: 0
+    property string device: ""
+    property string apiModelName: ""
+    property int configPort: 0
 
     signal settingsClicked(string mid)
     signal startClicked(string mid)
@@ -42,7 +44,9 @@ Rectangle {
 
         // Status dot
         Rectangle {
-            width: 8; height: 8; radius: 4
+            Layout.preferredWidth: 8
+            Layout.preferredHeight: 8
+            radius: 4
             color: card.running ? Styles.Theme.successColor : Styles.Theme.textDisabled
             Layout.alignment: Qt.AlignVCenter
         }
@@ -69,20 +73,32 @@ Rectangle {
                 Layout.fillWidth: true
             }
 
-            // Status badge
-            Rectangle {
-                width: statusLabel.implicitWidth + 12
-                height: 18
-                radius: 9
-                color: card.running ? Styles.Theme.runningBadgeBg : Styles.Theme.stoppedBadgeBg
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Styles.Theme.spacingSmall
+
+                Rectangle {
+                    Layout.preferredWidth: statusLabel.implicitWidth + 12
+                    Layout.preferredHeight: 18
+                    radius: 9
+                    color: card.running ? Styles.Theme.runningBadgeBg : Styles.Theme.stoppedBadgeBg
+                    Text {
+                        id: statusLabel
+                        anchors.centerIn: parent
+                        text: card.running
+                              ? qsTr("Running :%1").arg(card.modelPort)
+                              : qsTr("Stopped")
+                        font.pixelSize: Styles.Theme.fontSizeTiny
+                        color: card.running ? Styles.Theme.runningBadgeText : Styles.Theme.stoppedBadgeText
+                    }
+                }
+
                 Text {
-                    id: statusLabel
-                    anchors.centerIn: parent
-                    text: card.running
-                          ? qsTr("Running on port %1").arg(card.modelPort)
-                          : qsTr("Stopped")
+                    text: (card.apiModelName || card.modelName) + "  " + (card.device || "auto")
                     font.pixelSize: Styles.Theme.fontSizeTiny
-                    color: card.running ? Styles.Theme.runningBadgeText : Styles.Theme.stoppedBadgeText
+                    color: Styles.Theme.textDisabled
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
                 }
             }
         }
@@ -113,7 +129,7 @@ Rectangle {
                 }
                 MouseArea {
                     id: stopMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: card.running ? card.stopClicked(card.modelId) : card.startClicked(card.modelId)
+                        onClicked: card.running ? card.stopClicked(card.modelId) : card.startClicked(card.modelId)
                 }
             }
 

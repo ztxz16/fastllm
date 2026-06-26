@@ -26,8 +26,19 @@ class ModelStore:
                 return m
         return None
 
-    def add_model(self, name: str, path: str, source: str = "local") -> ModelItem:
-        item = ModelItem(name=name, path=path, source=source)
+    def add_model(
+        self,
+        name: str,
+        path: str,
+        source: str = "local",
+        launch_config: Optional[ModelLaunchConfig] = None,
+    ) -> ModelItem:
+        item = ModelItem(
+            name=name,
+            path=path,
+            source=source,
+            launch_config=launch_config or ModelLaunchConfig(),
+        )
         self._models.append(item)
         self._save()
         return item

@@ -9,7 +9,7 @@ Dialog {
     modal: true
     standardButtons: Dialog.NoButton
     width: 420
-    height: 380
+    height: 430
     dim: true
 
     property string modelId: ""
@@ -17,8 +17,17 @@ Dialog {
     property int threads: 4
     property string dtype: "auto"
     property int configPort: 0
+    property string apiModelName: ""
 
-    signal saved(string mid, string device, int threads, string dtype, int port)
+    signal saved(string mid, string device, int threads, string dtype, int port, string apiModelName)
+
+    onOpened: {
+        deviceCombo.currentIndex = Math.max(0, deviceCombo.model.indexOf(dlg.device))
+        threadsSpin.value = dlg.threads
+        dtypeCombo.currentIndex = Math.max(0, dtypeCombo.model.indexOf(dlg.dtype))
+        portSpin.value = dlg.configPort
+        apiNameField.text = dlg.apiModelName
+    }
 
     Overlay.modal: Rectangle { color: "#80000000" }
 
@@ -64,6 +73,21 @@ Dialog {
                 palette.window: Styles.Theme.bgInput
                 palette.text: Styles.Theme.textPrimary
                 palette.buttonText: Styles.Theme.textPrimary
+            }
+
+            Text { text: qsTr("model_name"); font.pixelSize: Styles.Theme.fontSizeMedium; color: Styles.Theme.textSecondary }
+            TextField {
+                id: apiNameField
+                Layout.fillWidth: true
+                color: Styles.Theme.textPrimary
+                placeholderText: qsTr("Default to model name")
+                placeholderTextColor: Styles.Theme.textDisabled
+                selectionColor: Styles.Theme.accentColor
+                background: Rectangle {
+                    color: Styles.Theme.bgInput
+                    border.color: apiNameField.activeFocus ? Styles.Theme.borderFocus : Styles.Theme.border
+                    radius: Styles.Theme.borderRadius
+                }
             }
 
             Text { text: qsTr("Threads"); font.pixelSize: Styles.Theme.fontSizeMedium; color: Styles.Theme.textSecondary }
@@ -114,7 +138,9 @@ Dialog {
             Item { Layout.fillWidth: true }
 
             Rectangle {
-                width: cancelLbl.implicitWidth + 24; height: 30; radius: Styles.Theme.borderRadius
+                Layout.preferredWidth: cancelLbl.implicitWidth + 24
+                Layout.preferredHeight: 30
+                radius: Styles.Theme.borderRadius
                 color: cancelMa.containsMouse ? Styles.Theme.bgInput : "transparent"
                 border.color: Styles.Theme.border; border.width: 1
                 Text { id: cancelLbl; anchors.centerIn: parent; text: qsTr("Cancel"); font.pixelSize: Styles.Theme.fontSizeMedium; color: Styles.Theme.textPrimary }
@@ -122,12 +148,14 @@ Dialog {
             }
 
             Rectangle {
-                width: saveLbl.implicitWidth + 24; height: 30; radius: Styles.Theme.borderRadius
+                Layout.preferredWidth: saveLbl.implicitWidth + 24
+                Layout.preferredHeight: 30
+                radius: Styles.Theme.borderRadius
                 color: saveMa.containsMouse ? Styles.Theme.primaryHover : Styles.Theme.primaryColor
                 Text { id: saveLbl; anchors.centerIn: parent; text: qsTr("Save"); font.pixelSize: Styles.Theme.fontSizeMedium; color: Styles.Theme.textOnAccent }
                 MouseArea {
                     id: saveMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: { dlg.saved(dlg.modelId, deviceCombo.currentText, threadsSpin.value, dtypeCombo.currentText, portSpin.value); dlg.accept() }
+                    onClicked: { dlg.saved(dlg.modelId, deviceCombo.currentText, threadsSpin.value, dtypeCombo.currentText, portSpin.value, apiNameField.text.trim()); dlg.accept() }
                 }
             }
         }

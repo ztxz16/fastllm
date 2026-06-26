@@ -7,19 +7,17 @@ import "pages"
 ApplicationWindow {
     id: root
     visible: true
-    width: 1200
+    width: 1240
     height: 780
-    minimumWidth: 860
-    minimumHeight: 520
-    title: " "
+    minimumWidth: 980
+    minimumHeight: 620
+    title: "Fastllm Studio"
     color: Styles.Theme.bgBase
 
-    // ── Activity Bar (narrow icon strip) + Sidebar + Content ──
     RowLayout {
         anchors.fill: parent
         spacing: 0
 
-        // ── Activity Bar ──
         Rectangle {
             Layout.fillHeight: true
             Layout.preferredWidth: Styles.Theme.sidebarWidth
@@ -27,46 +25,78 @@ ApplicationWindow {
 
             ColumnLayout {
                 anchors.fill: parent
-                spacing: 0
+                anchors.topMargin: 10
+                anchors.bottomMargin: 10
+                spacing: 8
 
-                // Nav icons
-                Repeater {
-                    model: ListModel {
-                        ListElement { icon: "📦"; pageIdx: 0; tip: QT_TR_NOOP("Model Repository") }
-                        ListElement { icon: "💬"; pageIdx: 1; tip: QT_TR_NOOP("Local Chat") }
+                Rectangle {
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.preferredWidth: 30
+                    Layout.preferredHeight: 30
+                    radius: 7
+                    color: Styles.Theme.bgCard
+                    border.color: Styles.Theme.borderLight
+
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 20
+                        height: 20
+                        radius: 5
+                        color: Styles.Theme.accentColor
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "F"
+                            color: Styles.Theme.textOnAccent
+                            font.pixelSize: 13
+                            font.weight: Font.Bold
+                        }
                     }
-                    delegate: Rectangle {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: Styles.Theme.sidebarWidth
-                        color: pageStack.currentIndex === model.pageIdx
-                              ? Styles.Theme.sidebarItemActive
-                              : actBarMa.containsMouse
-                                ? Styles.Theme.sidebarItemHover
-                                : "transparent"
+                }
 
-                        // Active indicator bar
+                Repeater {
+                    model: [
+                        { icon: "D", label: QT_TR_NOOP("Deploy"), page: 0 },
+                        { icon: "C", label: QT_TR_NOOP("Chat"), page: 1 }
+                    ]
+
+                    delegate: Rectangle {
+                        Layout.alignment: Qt.AlignHCenter
+                        Layout.preferredWidth: 38
+                        Layout.preferredHeight: 38
+                        radius: 7
+                        color: pageStack.currentIndex === modelData.page || railMouse.containsMouse
+                               ? Styles.Theme.sidebarItemActive : "transparent"
+
                         Rectangle {
-                            width: 2
-                            height: parent.height
-                            color: pageStack.currentIndex === model.pageIdx
+                            anchors.left: parent.left
+                            anchors.leftMargin: -6
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 3
+                            height: 22
+                            radius: 2
+                            color: pageStack.currentIndex === modelData.page
                                    ? Styles.Theme.sidebarIndicator : "transparent"
                         }
 
                         Text {
                             anchors.centerIn: parent
-                            text: model.icon
-                            font.pixelSize: 20
+                            text: modelData.icon
+                            color: pageStack.currentIndex === modelData.page
+                                   ? Styles.Theme.textBright : Styles.Theme.textSecondary
+                            font.pixelSize: 13
+                            font.weight: Font.DemiBold
                         }
 
                         MouseArea {
-                            id: actBarMa
+                            id: railMouse
                             anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: pageStack.currentIndex = model.pageIdx
+                            onClicked: pageStack.currentIndex = modelData.page
 
-                            ToolTip.visible: actBarMa.containsMouse
-                            ToolTip.text: qsTr(model.tip)
+                            ToolTip.visible: railMouse.containsMouse
+                            ToolTip.text: qsTr(modelData.label)
                             ToolTip.delay: 500
                         }
                     }
@@ -74,20 +104,23 @@ ApplicationWindow {
 
                 Item { Layout.fillHeight: true }
 
-                // Language selector
                 Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: Styles.Theme.sidebarWidth
-                    color: langMa.containsMouse ? Styles.Theme.sidebarItemHover : "transparent"
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.preferredWidth: 38
+                    Layout.preferredHeight: 38
+                    radius: 7
+                    color: langMouse.containsMouse ? Styles.Theme.sidebarItemHover : "transparent"
 
                     Text {
                         anchors.centerIn: parent
-                        text: "🌐"
-                        font.pixelSize: 18
+                        text: "A"
+                        color: Styles.Theme.textSecondary
+                        font.pixelSize: 13
+                        font.weight: Font.DemiBold
                     }
 
                     MouseArea {
-                        id: langMa
+                        id: langMouse
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
@@ -97,10 +130,151 @@ ApplicationWindow {
             }
         }
 
-        // ── Thin separator ──
         Rectangle { Layout.fillHeight: true; Layout.preferredWidth: 1; color: Styles.Theme.border }
 
-        // ── Content area ──
+        Rectangle {
+            Layout.fillHeight: true
+            Layout.preferredWidth: Styles.Theme.sidebarExpandedWidth
+            color: Styles.Theme.bgSidebar
+
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 0
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 82
+                    Layout.leftMargin: 14
+                    Layout.rightMargin: 14
+                    Layout.topMargin: 16
+                    spacing: 2
+
+                    Text {
+                        text: qsTr("Workspace")
+                        color: Styles.Theme.textDisabled
+                        font.pixelSize: Styles.Theme.fontSizeTiny
+                        font.weight: Font.Bold
+                    }
+                    Text {
+                        text: "Fastllm Studio"
+                        color: Styles.Theme.textBright
+                        font.pixelSize: 17
+                        font.weight: Font.DemiBold
+                    }
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 8
+                    Layout.rightMargin: 8
+                    spacing: 6
+
+                    Repeater {
+                        model: [
+                            { key: "01", label: QT_TR_NOOP("Model Deploy"), detail: QT_TR_NOOP("Configs and runtime"), page: 0 },
+                            { key: "02", label: QT_TR_NOOP("Chat"), detail: QT_TR_NOOP("Running models"), page: 1 }
+                        ]
+
+                        delegate: Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 44
+                            radius: Styles.Theme.borderRadius
+                            color: pageStack.currentIndex === modelData.page || navMouse.containsMouse
+                                   ? Styles.Theme.sidebarItemHover : "transparent"
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 10
+                                spacing: 10
+
+                                Rectangle {
+                                    Layout.preferredWidth: 7
+                                    Layout.preferredHeight: 7
+                                    radius: 4
+                                    color: pageStack.currentIndex === modelData.page
+                                           ? Styles.Theme.accentColor : Styles.Theme.textDisabled
+                                }
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 0
+                                    Text {
+                                        text: qsTr(modelData.label)
+                                        color: pageStack.currentIndex === modelData.page
+                                               ? Styles.Theme.textBright : Styles.Theme.textPrimary
+                                        font.pixelSize: Styles.Theme.fontSizeMedium
+                                        font.weight: Font.DemiBold
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                    }
+                                    Text {
+                                        text: qsTr(modelData.detail)
+                                        color: Styles.Theme.textDisabled
+                                        font.pixelSize: Styles.Theme.fontSizeTiny
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                    }
+                                }
+
+                                Text {
+                                    text: modelData.key
+                                    color: Styles.Theme.textDisabled
+                                    font.pixelSize: Styles.Theme.fontSizeTiny
+                                }
+                            }
+
+                            MouseArea {
+                                id: navMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: pageStack.currentIndex = modelData.page
+                            }
+                        }
+                    }
+                }
+
+                Item { Layout.fillHeight: true }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 34
+                    color: "transparent"
+                    border.color: Styles.Theme.border
+                    border.width: 1
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 12
+                        anchors.rightMargin: 12
+                        spacing: 8
+
+                        Rectangle {
+                            Layout.preferredWidth: 7
+                            Layout.preferredHeight: 7
+                            radius: 4
+                            color: Styles.Theme.successColor
+                        }
+                        Text {
+                            text: qsTr("Local runtime")
+                            color: Styles.Theme.textSecondary
+                            font.pixelSize: Styles.Theme.fontSizeTiny
+                            Layout.fillWidth: true
+                        }
+                        Text {
+                            text: "ftllm"
+                            color: Styles.Theme.infoColor
+                            font.pixelSize: Styles.Theme.fontSizeTiny
+                            font.weight: Font.DemiBold
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { Layout.fillHeight: true; Layout.preferredWidth: 1; color: Styles.Theme.border }
+
         StackLayout {
             id: pageStack
             Layout.fillWidth: true
@@ -151,7 +325,7 @@ ApplicationWindow {
 
             Repeater {
                 model: [
-                    { code: "zh_CN", label: "简体中文" },
+                    { code: "zh_CN", label: "Simplified Chinese" },
                     { code: "en_US", label: "English" }
                 ]
 
@@ -161,7 +335,7 @@ ApplicationWindow {
                     Layout.leftMargin: Styles.Theme.paddingMedium
                     Layout.rightMargin: Styles.Theme.paddingMedium
                     radius: Styles.Theme.borderRadius
-                    color: langItemMa.containsMouse ? Styles.Theme.bgCardHover : "transparent"
+                    color: langItemMouse.containsMouse ? Styles.Theme.bgCardHover : "transparent"
 
                     property bool isCurrent: langManager && langManager.currentLanguage === modelData.code
 
@@ -178,14 +352,14 @@ ApplicationWindow {
                             Layout.fillWidth: true
                         }
                         Text {
-                            text: isCurrent ? "✓" : ""
-                            font.pixelSize: 14
+                            text: isCurrent ? "OK" : ""
+                            font.pixelSize: 11
                             color: Styles.Theme.accentColor
                         }
                     }
 
                     MouseArea {
-                        id: langItemMa
+                        id: langItemMouse
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor

@@ -2,70 +2,67 @@ pragma Singleton
 import QtQuick
 
 QtObject {
-    // VS Dark palette
-    readonly property color primaryColor: "#0E639C"
-    readonly property color primaryHover: "#1177BB"
-    readonly property color primaryPressed: "#0D5689"
-    readonly property color accentColor: "#007ACC"
+    readonly property color primaryColor: "#6374F2"
+    readonly property color primaryHover: "#7B8AFF"
+    readonly property color primaryPressed: "#5364D8"
+    readonly property color accentColor: "#6374F2"
 
-    // Surfaces — layered grays like VS Code
-    readonly property color bgBase: "#1E1E1E"
-    readonly property color bgSidebar: "#252526"
-    readonly property color bgEditor: "#1E1E1E"
-    readonly property color bgInput: "#3C3C3C"
-    readonly property color bgCard: "#2D2D2D"
-    readonly property color bgCardHover: "#333333"
-    readonly property color bgToolbar: "#323233"
-    readonly property color bgPopup: "#252526"
+    readonly property color bgBase: "#070A0D"
+    readonly property color bgSidebar: "#11171D"
+    readonly property color bgEditor: "#0D1318"
+    readonly property color bgInput: "#101820"
+    readonly property color bgCard: "#151C23"
+    readonly property color bgCardHover: "#202A35"
+    readonly property color bgToolbar: "#0B1116"
+    readonly property color bgPopup: "#151C23"
 
     // Sidebar
-    readonly property color sidebarBg: "#333333"
-    readonly property color sidebarItemHover: "#2A2D2E"
-    readonly property color sidebarItemActive: "#37373D"
-    readonly property color sidebarIndicator: "#007ACC"
+    readonly property color sidebarBg: "#0B1014"
+    readonly property color sidebarItemHover: "#202A35"
+    readonly property color sidebarItemActive: "#202A35"
+    readonly property color sidebarIndicator: "#6374F2"
 
     // Borders
-    readonly property color border: "#3E3E42"
-    readonly property color borderLight: "#474747"
-    readonly property color borderFocus: "#007ACC"
+    readonly property color border: "#24303B"
+    readonly property color borderLight: "#344250"
+    readonly property color borderFocus: "#6374F2"
 
     // Text
-    readonly property color textPrimary: "#CCCCCC"
-    readonly property color textSecondary: "#858585"
-    readonly property color textBright: "#E0E0E0"
-    readonly property color textDisabled: "#5A5A5A"
-    readonly property color textLink: "#3794FF"
+    readonly property color textPrimary: "#D8DEE6"
+    readonly property color textSecondary: "#8E9AA8"
+    readonly property color textBright: "#F4F7FB"
+    readonly property color textDisabled: "#64717E"
+    readonly property color textLink: "#46B9D8"
     readonly property color textOnAccent: "#FFFFFF"
 
-    // Chat bubbles — VS-themed
-    readonly property color userBubbleColor: "#264F78"
-    readonly property color userBubbleText: "#D4D4D4"
-    readonly property color assistantBubbleColor: "#333333"
-    readonly property color assistantBubbleText: "#D4D4D4"
-    readonly property color chatBackground: "#1E1E1E"
+    readonly property color userBubbleColor: "#1A222B"
+    readonly property color userBubbleText: "#F4F7FB"
+    readonly property color assistantBubbleColor: "#0D1318"
+    readonly property color assistantBubbleText: "#D8DEE6"
+    readonly property color chatBackground: "#0D1318"
 
     // Status
-    readonly property color successColor: "#4EC9B0"
-    readonly property color errorColor: "#F14C4C"
-    readonly property color warningColor: "#CCA700"
-    readonly property color infoColor: "#3794FF"
+    readonly property color successColor: "#3FD08F"
+    readonly property color errorColor: "#F05C68"
+    readonly property color warningColor: "#D7A348"
+    readonly property color infoColor: "#46B9D8"
 
     // Badge / tag
-    readonly property color badgeBg: "#4D4D4D"
-    readonly property color badgeText: "#CCCCCC"
-    readonly property color runningBadgeBg: "#1B3A2D"
-    readonly property color runningBadgeText: "#4EC9B0"
-    readonly property color stoppedBadgeBg: "#3E3E42"
-    readonly property color stoppedBadgeText: "#858585"
+    readonly property color badgeBg: "#27313B"
+    readonly property color badgeText: "#D8DEE6"
+    readonly property color runningBadgeBg: "#163628"
+    readonly property color runningBadgeText: "#3FD08F"
+    readonly property color stoppedBadgeBg: "#27313B"
+    readonly property color stoppedBadgeText: "#8E9AA8"
 
     // Scrollbar
-    readonly property color scrollbar: "#424242"
-    readonly property color scrollbarHover: "#4F4F4F"
+    readonly property color scrollbar: "#344250"
+    readonly property color scrollbarHover: "#455466"
 
     // Dimensions
-    readonly property int sidebarWidth: 48
-    readonly property int sidebarExpandedWidth: 220
-    readonly property int toolbarHeight: 52
+    readonly property int sidebarWidth: 50
+    readonly property int sidebarExpandedWidth: 252
+    readonly property int toolbarHeight: 48
     readonly property int borderRadius: 4
     readonly property int borderRadiusLarge: 6
     readonly property int spacing: 10

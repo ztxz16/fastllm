@@ -17,6 +17,7 @@ class ModelListModel(QAbstractListModel):
     ThreadsRole = Qt.ItemDataRole.UserRole + 8
     DtypeRole = Qt.ItemDataRole.UserRole + 9
     ConfigPortRole = Qt.ItemDataRole.UserRole + 10
+    ApiModelNameRole = Qt.ItemDataRole.UserRole + 11
 
     def __init__(self, store: ModelStore, server_mgr: ServerManager, parent=None):
         super().__init__(parent)
@@ -57,6 +58,8 @@ class ModelListModel(QAbstractListModel):
             return item.launch_config.dtype
         if role == self.ConfigPortRole:
             return item.launch_config.port
+        if role == self.ApiModelNameRole:
+            return item.launch_config.model_name
         return None
 
     def roleNames(self):
@@ -71,6 +74,7 @@ class ModelListModel(QAbstractListModel):
             self.ThreadsRole: b"threads",
             self.DtypeRole: b"dtype",
             self.ConfigPortRole: b"configPort",
+            self.ApiModelNameRole: b"apiModelName",
         }
 
 
@@ -105,6 +109,53 @@ class ModelRepoViewModel(QObject):
         self._list_model.reload()
         self.modelsChanged.emit()
 
+    def _default_name_from_path(self, path: str) -> str:
+        normalized = path.rstrip(os.sep)
+        return os.path.basename(normalized) if normalized else ""
+
+    def _make_launch_config(self, device, model_name, threads, dtype, port):
+        return ModelLaunchConfig(
+            device=device,
+            threads=threads,
+            dtype=dtype,
+            port=port,
+            model_name=model_name,
+        )
+
+    @Slot(str, str, str, str, int, str, int)
+    def addModelConfig(self, name, path, device, model_name, threads, dtype, port):
+        path = path.strip()
+        if not path:
+            return
+        display_name = name.strip() or model_name.strip() or self._default_name_from_path(path)
+        config = self._make_launch_config(device, model_name.strip(), threads, dtype, port)
+        self._store.add_model(
+            name=display_name,
+            path=path,
+            source="local",
+            launch_config=config,
+        )
+        self._list_model.reload()
+        self.modelsChanged.emit()
+
+    @Slot(str, str, str, str, int, str, int)
+    def deployModelConfig(self, name, path, device, model_name, threads, dtype, port):
+        path = path.strip()
+        if not path:
+            return
+        display_name = name.strip() or model_name.strip() or self._default_name_from_path(path)
+        config = self._make_launch_config(device, model_name.strip(), threads, dtype, port)
+        item = self._store.add_model(
+            name=display_name,
+            path=path,
+            source="local",
+            launch_config=config,
+        )
+        started_port = self._server_manager.start_server(item)
+        self._list_model.reload()
+        self.modelsChanged.emit()
+        self.modelStarted.emit(item.model_id, started_port)
+
     @Slot(str, str, str)
     def addDownloadedModel(self, name, path, source):
         self._store.add_model(name=name, path=path, source=source)
@@ -135,13 +186,14 @@ class ModelRepoViewModel(QObject):
         self.modelsChanged.emit()
         self.modelStopped.emit(model_id)
 
-    @Slot(str, str, int, str, int)
-    def updateLaunchConfig(self, model_id, device, threads, dtype, port):
+    @Slot(str, str, int, str, int, str)
+    def updateLaunchConfig(self, model_id, device, threads, dtype, port, model_name):
         config = ModelLaunchConfig(
             device=device,
             threads=threads,
             dtype=dtype,
             port=port,
+            model_name=model_name,
         )
         self._store.update_launch_config(model_id, config)
         self._list_model.reload()
