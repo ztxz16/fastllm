@@ -1314,6 +1314,7 @@ namespace fastllm {
         std::vector <std::vector <uint8_t> > uinputsDown;
         std::vector <std::vector <float> > inputSumsDown;
         std::vector <std::vector <float> > iscalesDown, izerosDown;
+        std::vector <std::vector <uint8_t> > uinputsGate;
     } moeIntSingleVarManager;
 
     struct moeFloatSingleVarManager {
@@ -2613,15 +2614,6 @@ namespace fastllm {
                 int nRow = input.dims[0], m = input.dims[1];
                 float *inputData = floatInput + o * m;
 
-                std::vector <uint8_t> &q8kInputs = moeIntSingleVarManager.uinput;
-                int rowCount = m / QK_K; // 每行有多少个block
-                q8kInputs.resize(ggml_row_size(ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType), m));
-                iqk_quantize_row_q8_K (
-                    inputData, q8kInputs.data(), m, 
-                    ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType),
-                    (ggml_type)weights[2]->ggmlType
-                );
-
                 std::vector <std::vector <float> > &middles = moeIntSingleVarManager.middles;
                 std::vector <std::vector <float> > &results = moeIntSingleVarManager.results;
                 middles.resize(v.size());
@@ -2638,6 +2630,32 @@ namespace fastllm {
 
                 std::vector <std::vector <uint8_t> > &q8kInputsDown = moeIntSingleVarManager.uinputsDown;
                 q8kInputsDown.resize(v.size());
+                std::vector <std::vector <uint8_t> > &q8kInputsGate = moeIntSingleVarManager.uinputsGate;
+                std::vector <int> q8kInputGateIds(v.size());
+                std::vector <int> q8kInputGateTypes;
+                q8kInputsGate.clear();
+                for (int j = 0; j < v.size(); j++) {
+                    int idx = v[j].first;
+                    ggml_type gateType = (ggml_type)weights[idx * 2]->ggmlType;
+                    int id = -1;
+                    for (int t = 0; t < q8kInputGateTypes.size(); t++) {
+                        if (q8kInputGateTypes[t] == gateType) {
+                            id = t;
+                            break;
+                        }
+                    }
+                    if (id < 0) {
+                        id = (int)q8kInputsGate.size();
+                        q8kInputGateTypes.push_back(gateType);
+                        q8kInputsGate.push_back(std::vector <uint8_t>());
+                        q8kInputsGate.back().resize(ggml_row_size(ggml_type_vec_dot_type(gateType), m));
+                        iqk_quantize_row_q8_K (
+                            inputData, q8kInputsGate.back().data(), m,
+                            ggml_type_vec_dot_type(gateType), gateType
+                        );
+                    }
+                    q8kInputGateIds[j] = id;
+                }
 
                 for (int st = 0; st < v.size(); st++) {
                     int k = weights[v[st].first * 2]->dims[0];
@@ -2666,8 +2684,8 @@ namespace fastllm {
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
                         
-                        LaunchLinearQ8KGGUF(q8kInputs.data(), weightData, outputData, biasData, weight, 
-                            1, m, curK, ops, pool, threadSt, curThread);
+                        LaunchLinearQ8KGGUF(q8kInputsGate[q8kInputGateIds[l]].data(), weightData,
+                            outputData, biasData, weight, 1, m, curK, ops, pool, threadSt, curThread);
                         threadSt += curThread;
                     }
                     for (int j = 0; j < ops.size(); j++) {
