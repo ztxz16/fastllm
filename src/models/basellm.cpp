@@ -2229,6 +2229,9 @@ namespace fastllm {
                     } else {
                         maxTotalLens = kvCacheLimit / 1024 / 1024;
                     }
+                    if (fastllm::GetMaxTokens() > 0) {
+                        maxTotalLens = fastllm::GetMaxTokens();
+                    }
                     if (model->tokensLimit > 0) {
                         maxTotalLens = model->tokensLimit;
                     }
