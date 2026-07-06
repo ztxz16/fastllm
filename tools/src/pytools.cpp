@@ -488,7 +488,9 @@ extern "C" {
 #ifdef USE_ROCM
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
-            if (model->use_new_engine
+            if (model->model_type == "glm_moe_dsa") {
+                model->SetDataType(fastllm::DataType::FLOAT32);
+            } else if (model->use_new_engine
                 || model->model_struct == "chatglm" 
                 || model->model_struct == "llama"
                 || model->model_struct == "qwen3_moe"
