@@ -222,6 +222,10 @@ class ToolParserManager:
                 target = "deepseek_v31"
             elif ("<minimax:tool_call>" in chat_template):
                 target = "minimax_m2"
+            elif ("<tool_call>" in chat_template
+                  and "<arg_key>" in chat_template
+                  and "<arg_value>" in chat_template):
+                target = "glm47"
             elif is_qwen_xml_tool_template(chat_template):
                 target = "qwen3_coder"
             if (target == ""):
@@ -240,6 +244,8 @@ class ToolParserManager:
                 target = 'qwen3_coder'
             else:
                 target = 'hermes'
+        elif model_type == 'glm_moe_dsa':
+            target = 'glm47'
         elif model_type == 'glm4_moe':
             target = 'glm45'
         elif model_type == 'minimax_m2':
