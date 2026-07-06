@@ -900,6 +900,7 @@ namespace fastllm {
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
         this->ggmlType = ori.ggmlType;
         this->IsRepacked = ori.IsRepacked;
+        this->forceGGUFFp32Dequant = ori.forceGGUFFp32Dequant;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
         if (needRebuildGGUFTensor ||

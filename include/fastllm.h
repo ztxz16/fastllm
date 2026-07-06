@@ -474,6 +474,7 @@ namespace fastllm {
         void *ggmlTensor = nullptr;
         int ggmlType = -1;
         bool IsRepacked = false;
+        bool forceGGUFFp32Dequant = false;
 
         std::vector <uint8_t*> numasData; // numa数据
         bool isPinned = false; // 是否使用pinned memory (page-locked)

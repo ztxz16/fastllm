@@ -7,6 +7,8 @@
 // https://github.com/ikawrakow/ik_llama.cpp
 
 #include <set>
+#include <cctype>
+#include <string>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/sequence.h>
@@ -39,7 +41,6 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
 }
 
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
-#define CUDA_QUANTIZE_BLOCK_SIZE_MMQ 128
 
 template <typename T>
 static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded) {
@@ -1443,6 +1444,36 @@ static void dequantize_block_q8_0_bf16_cuda(const void * __restrict__ vx,
     dequantize_block_q8_0_bf16<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
 }
 
+static __global__ void dequantize_block_q8_0_f32(const void * __restrict__ vx,
+                                                 float * __restrict__ y,
+                                                 const int64_t k) {
+    const int64_t i = (int64_t)2 * (blockDim.x * blockIdx.x + threadIdx.x);
+
+    if (i >= k) {
+        return;
+    }
+
+    const block_q8_0 * x = (const block_q8_0 *) vx;
+    const int64_t ib = i / QK8_0;
+    const int64_t iqs = i % QK8_0;
+    const float d = __half2float(x[ib].d);
+
+    y[i + 0] = d * x[ib].qs[iqs + 0];
+    if (i + 1 < k) {
+        y[i + 1] = d * x[ib].qs[iqs + 1];
+    }
+}
+
+static void dequantize_block_q8_0_f32_cuda(const void * __restrict__ vx,
+                                           float * __restrict__ y,
+                                           const int64_t nrows,
+                                           const int64_t n_per_row,
+                                           cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int num_blocks = (k + 2 * CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2 * CUDA_DEQUANTIZE_BLOCK_SIZE);
+    dequantize_block_q8_0_f32<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
+
 
 static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
     if (j < 4) {
@@ -1878,6 +1909,259 @@ typedef to_t_cuda_t<float> to_fp32_cuda_t;
 typedef to_t_cuda_t<half> to_fp16_cuda_t;
 typedef to_t_cuda_t<__nv_bfloat16> to_bf16_cuda_t;
 
+static bool FastllmGGUFIsKQuantType(ggml_type type) {
+    return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q4_K ||
+           type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
+           type == GGML_TYPE_Q2_K_R4 || type == GGML_TYPE_Q4_K_R4 ||
+           type == GGML_TYPE_Q5_K_R4 || type == GGML_TYPE_Q6_K_R4;
+}
+
+static bool FastllmGGUFMatchesFp32DequantMode(const std::string &mode,
+                                              const fastllm::Data &weight,
+                                              ggml_type type) {
+    if (mode == "1" || mode == "true" || mode == "on" || mode == "all") {
+        return true;
+    }
+    if (mode == "q8") {
+        return type == GGML_TYPE_Q8_0;
+    }
+    if (mode == "kquant") {
+        return FastllmGGUFIsKQuantType(type);
+    }
+    if (mode == "lm_head" || mode == "output") {
+        return weight.name == "lm_head.weight";
+    }
+    if (mode == "shared" || mode == "shexp") {
+        return weight.name.find(".mlp.shared_experts.") != std::string::npos;
+    }
+    if (mode == "shared_gateup" || mode == "shexp_gateup") {
+        return weight.name.find(".mlp.shared_experts.gateup_proj.") != std::string::npos ||
+               weight.name.find(".mlp.shared_experts.gate_proj.") != std::string::npos ||
+               weight.name.find(".mlp.shared_experts.up_proj.") != std::string::npos;
+    }
+    if (mode == "shared_down" || mode == "shexp_down") {
+        return weight.name.find(".mlp.shared_experts.down_proj.") != std::string::npos;
+    }
+    if (mode == "attn_output" || mode == "o_proj") {
+        return weight.name.find(".self_attn.o_proj.") != std::string::npos;
+    }
+    if (mode == "ffn" || mode == "mlp") {
+        return weight.name.find(".mlp.") != std::string::npos;
+    }
+    if (mode == "ffn_dense" || mode == "dense_ffn") {
+        return weight.name.find(".mlp.gate_proj.") != std::string::npos ||
+               weight.name.find(".mlp.up_proj.") != std::string::npos ||
+               weight.name.find(".mlp.down_proj.") != std::string::npos;
+    }
+    if (mode == "ffn_dense_gateup" || mode == "dense_ffn_gateup" ||
+        mode == "ffn_gateup" || mode == "dense_gateup") {
+        return weight.name.find(".mlp.gate_proj.") != std::string::npos ||
+               weight.name.find(".mlp.up_proj.") != std::string::npos;
+    }
+    if (mode == "ffn_dense_down" || mode == "dense_ffn_down" ||
+        mode == "ffn_down" || mode == "dense_down") {
+        return weight.name.find(".mlp.down_proj.") != std::string::npos;
+    }
+    return false;
+}
+
+static bool FastllmGGUFUseFp32Dequant(const fastllm::Data &weight, ggml_type type) {
+    if (weight.forceGGUFFp32Dequant) {
+        return true;
+    }
+
+    const char *env = std::getenv("FASTLLM_GGUF_FP32_DEQUANT");
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+
+    std::string modes(env);
+    std::string cur;
+    for (char ch : modes) {
+        if (ch == ',' || ch == ';' || ch == ':') {
+            if (FastllmGGUFMatchesFp32DequantMode(cur, weight, type)) {
+                return true;
+            }
+            cur.clear();
+        } else if (!std::isspace((unsigned char) ch)) {
+            cur.push_back((char) std::tolower((unsigned char) ch));
+        }
+    }
+    return FastllmGGUFMatchesFp32DequantMode(cur, weight, type);
+}
+
+static bool FastllmGGUFUsePedanticSgemm(const fastllm::Data &weight, ggml_type type) {
+    const char *env = std::getenv("FASTLLM_GGUF_PEDANTIC_SGEMM");
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+
+    std::string modes(env);
+    std::string cur;
+    for (char ch : modes) {
+        if (ch == ',' || ch == ';' || ch == ':') {
+            if (FastllmGGUFMatchesFp32DequantMode(cur, weight, type)) {
+                return true;
+            }
+            cur.clear();
+        } else if (!std::isspace((unsigned char) ch)) {
+            cur.push_back((char) std::tolower((unsigned char) ch));
+        }
+    }
+    return FastllmGGUFMatchesFp32DequantMode(cur, weight, type);
+}
+
+static bool FastllmGGUFUseForceMmvq(const fastllm::Data &weight, ggml_type type) {
+    const char *env = std::getenv("FASTLLM_GGUF_FORCE_MMVQ");
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+
+    std::string modes(env);
+    std::string cur;
+    for (char ch : modes) {
+        if (ch == ',' || ch == ';' || ch == ':') {
+            if (FastllmGGUFMatchesFp32DequantMode(cur, weight, type)) {
+                return true;
+            }
+            cur.clear();
+        } else if (!std::isspace((unsigned char) ch)) {
+            cur.push_back((char) std::tolower((unsigned char) ch));
+        }
+    }
+    return FastllmGGUFMatchesFp32DequantMode(cur, weight, type);
+}
+
+static cublasStatus_t FastllmGGUFSgemmFloat(
+        cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+        int m, int n, int k, const float *alpha,
+        const float *A, int lda, const float *B, int ldb,
+        const float *beta, float *C, int ldc, bool pedantic) {
+#if CUBLAS_VERSION >= 11000
+    if (pedantic) {
+        return cublasGemmEx(
+                handle, transa, transb, m, n, k,
+                alpha,
+                A, CUDA_R_32F, lda,
+                B, CUDA_R_32F, ldb,
+                beta,
+                C, CUDA_R_32F, ldc,
+                CUBLAS_COMPUTE_32F_PEDANTIC,
+                CUBLAS_GEMM_DEFAULT);
+    }
+#endif
+    return cublasSgemm(
+            handle, transa, transb, m, n, k,
+            alpha, A, lda, B, ldb, beta, C, ldc);
+}
+
+static bool FastllmGGUFIsR4Type(ggml_type type) {
+    return type == GGML_TYPE_Q2_K_R4 || type == GGML_TYPE_Q4_K_R4 ||
+           type == GGML_TYPE_Q5_K_R4 || type == GGML_TYPE_Q6_K_R4;
+}
+
+static size_t FastllmGGUFAlignBytes(size_t bytes) {
+    const size_t align = 256;
+    return ((bytes + align - 1) / align) * align;
+}
+
+static const char *FastllmGGUFWeightDisplayName(const fastllm::Data &weight) {
+    return weight.name.empty() ? "(unnamed)" : weight.name.c_str();
+}
+
+static void *FastllmGGUFGetDequantWorkspace(size_t *workspaceBytes,
+                                            const fastllm::Data &weight,
+                                            const char *context) {
+    void *workspace = FastllmCudaGetFlashInferFloatWorkspace(workspaceBytes);
+    if (workspace == nullptr || workspaceBytes == nullptr || *workspaceBytes == 0) {
+        fastllm::ErrorInFastLLM(
+                "Fastllm GGUF CUDA " + std::string(context) +
+                " failed to get dequant workspace, weight = " +
+                FastllmGGUFWeightDisplayName(weight) + ".\n");
+    }
+    return workspace;
+}
+
+static int FastllmGGUFDequantRowGroup(ggml_type type) {
+    return FastllmGGUFIsR4Type(type) ? 4 : 1;
+}
+
+static int FastllmGGUFCalcChunkRows(size_t workspaceBytes, int m, int k,
+                                    size_t bytesPerElement, size_t extraBytesPerElement,
+                                    int rowGroup,
+                                    const fastllm::Data &weight,
+                                    const char *context) {
+    if (m <= 0 || k <= 0) {
+        return 0;
+    }
+    if (rowGroup > 1 && k % rowGroup != 0) {
+        fastllm::ErrorInFastLLM(
+                "Fastllm GGUF CUDA " + std::string(context) +
+                " requires output rows aligned to " + std::to_string(rowGroup) +
+                " for R4 dequant, got rows = " + std::to_string(k) +
+                ", weight = " + FastllmGGUFWeightDisplayName(weight) + ".\n");
+    }
+
+    size_t bytesPerRow = (size_t)m * (bytesPerElement + extraBytesPerElement);
+    int rows = bytesPerRow == 0 ? 0 : (int)std::min<size_t>((size_t)k, workspaceBytes / bytesPerRow);
+    if (rowGroup > 1) {
+        rows = (rows / rowGroup) * rowGroup;
+    }
+
+    while (rows > 0) {
+        size_t mainBytes = (size_t)rows * m * bytesPerElement;
+        size_t totalBytes = FastllmGGUFAlignBytes(mainBytes) +
+                            (size_t)rows * m * extraBytesPerElement;
+        if (totalBytes <= workspaceBytes) {
+            return rows;
+        }
+        rows -= rowGroup;
+    }
+
+    size_t minRows = rowGroup;
+    size_t minMainBytes = minRows * (size_t)m * bytesPerElement;
+    size_t minBytes = FastllmGGUFAlignBytes(minMainBytes) +
+                      minRows * (size_t)m * extraBytesPerElement;
+    fastllm::ErrorInFastLLM(
+            "Fastllm GGUF CUDA " + std::string(context) +
+            " dequant workspace is too small, need at least " +
+            std::to_string(minBytes) + " bytes, got " +
+            std::to_string(workspaceBytes) + " bytes, weight = " +
+            FastllmGGUFWeightDisplayName(weight) + ".\n");
+    return 0;
+}
+
+to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            return dequantize_block_q8_0_f32_cuda;
+        case GGML_TYPE_Q2_K:
+            return dequantize_row_q2_K_cuda;
+        case GGML_TYPE_Q4_K:
+            return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_Q4_K_R4:
+            return dequantize_row_q4_K_r4_cuda;
+        case GGML_TYPE_Q2_K_R4:
+            return dequantize_row_q2_K_r4_cuda;
+        case GGML_TYPE_Q5_K:
+            return dequantize_row_q5_K_cuda;
+        case GGML_TYPE_Q5_K_R4:
+            return dequantize_row_q5_K_r4_cuda;
+        case GGML_TYPE_Q6_K:
+            return dequantize_row_q6_K_cuda;
+        case GGML_TYPE_Q6_K_R4:
+            return dequantize_row_q6_K_r4_cuda;
+        default: {
+            static std::set<ggml_type> warned_types;
+            if (warned_types.find(type) == warned_types.end()) {
+                warned_types.insert(type);
+                printf("Warning: Type %s doesn't have FP32 dequant func. Prefill may be very slow...\n", ggml_type_name(type));
+            }
+            return nullptr;
+        }
+    }
+}
+
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
         // case GGML_TYPE_Q4_0:
@@ -2030,73 +2314,108 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
 
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
-    // block_q8_1 * q8Input = (block_q8_1*)FastllmCudaMalloc(n * m / QK8_1 * sizeof(block_q8_1));
-    block_q8_1 * q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
-    quantize_row_q8_1_cuda (
-        cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, nullptr
-    );
+    block_q8_1 * q8Input = nullptr;
 
     ggml_backend_cuda_context ctx;
 
-    auto dequant = ggml_get_to_fp16_cuda((ggml_type)weight.ggmlType);
+    ggml_type ggufType = (ggml_type)weight.ggmlType;
+    auto dequantFp32 = FastllmGGUFUseFp32Dequant(weight, ggufType) ? ggml_get_to_fp32_cuda(ggufType) : nullptr;
+    bool pedanticSgemm = FastllmGGUFUsePedanticSgemm(weight, ggufType);
+    auto dequantFp16 = ggml_get_to_fp16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+    bool forceMmvq = FastllmGGUFUseForceMmvq(weight, ggufType) && has_vec_dot;
+    if (forceMmvq) {
+        dequantFp32 = nullptr;
+        dequantFp16 = nullptr;
+    }
+    cudaStream_t stream = cudaStreamPerThread;
     // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
-    if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
-        half *cudaFp16Input, *cudaFp16Output;
-        cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
-        cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
-
-        {
-            int len = n * m;
-            int threadPerBlock = std::min(256, len);
-            FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input, len);
-        }
-
+    if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp32 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
-        // GGML 的 dequant 是 type-specific 的整行回调，不容易按行 chunk；
-        // 只在 workspace 一次能装下整张权重时借用，否则回退到老路径。
-        size_t needBytes = (size_t)k * m * sizeof(half);
         size_t wsBytes = 0;
-        bool ownScratch = false;
-        half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch(needBytes, &wsBytes, &ownScratch);
-        if (!ownScratch && wsBytes < needBytes) {
-            cudaFp16Weight = (half *) FastllmCudaMalloc(needBytes);
-            ownScratch = true;
-        }
+        float *cudaFp32Weight = (float *) FastllmGGUFGetDequantWorkspace(
+                &wsBytes, weight, "FP32 SGEMM");
+        int rowGroup = FastllmGGUFDequantRowGroup(ggufType);
+        int maxRowsPerChunk = FastllmGGUFCalcChunkRows(
+                wsBytes, m, k, sizeof(float), 0, rowGroup, weight, "FP32 SGEMM");
+        size_t srcRowBytes = ggml_row_size(ggufType, m);
 
-        __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
-        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
         cublasStatus_t status;
 
-        int len = k * m;
-        int threadPerBlock = std::min(256, len);
-        dequant((const char *)weight.cudaData, cudaFp16Weight, k, m, nullptr);
+        float h_alpha = 1.0f, h_beta = 0.0f;
+        for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+            int kc = std::min(maxRowsPerChunk, k - kOff);
+            dequantFp32((const char *)weight.cudaData + (size_t)kOff * srcRowBytes,
+                        cudaFp32Weight, kc, m, stream);
 
-        status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                k, n, m,
-                                &h_alpha, cudaFp16Weight, AType,
-                                m, cudaFp16Input, BType,
-                                m, &h_beta,
-                                cudaFp16Output, CType,
-                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error.\n");
-            throw("cublas error");
-            exit(0);
+            status = FastllmGGUFSgemmFloat(
+                    fastllmCublasHandle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    kc, n, m,
+                    &h_alpha, cudaFp32Weight,
+                    m, cudaInput,
+                    m, &h_beta,
+                    cudaOutput + kOff,
+                    k, pedanticSgemm);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("Error: cublas error.\n");
+                throw("cublas error");
+                exit(0);
+            }
         }
+    } else if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp16 != nullptr) {
+        auto fastllmCublasHandle = getFastllmCublasHandle();
 
-        {
-            len = n * k;
-            FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput, len);
+        size_t wsBytes = 0;
+        uint8_t *workspace = (uint8_t *) FastllmGGUFGetDequantWorkspace(
+                &wsBytes, weight, "FP16-to-FP32 SGEMM");
+        int rowGroup = FastllmGGUFDequantRowGroup(ggufType);
+        int maxRowsPerChunk = FastllmGGUFCalcChunkRows(
+                wsBytes, m, k, sizeof(half), sizeof(float), rowGroup,
+                weight, "FP16-to-FP32 SGEMM");
+        size_t srcRowBytes = ggml_row_size(ggufType, m);
+
+        cublasStatus_t status;
+
+        float h_alpha = 1.0f, h_beta = 0.0f;
+        for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+            int kc = std::min(maxRowsPerChunk, k - kOff);
+            size_t fp16Bytes = (size_t)kc * m * sizeof(half);
+            half *cudaFp16Weight = (half *)workspace;
+            float *cudaFp32Weight = (float *)(workspace + FastllmGGUFAlignBytes(fp16Bytes));
+
+            int len = kc * m;
+            int threadPerBlock = std::min(256, len);
+            dequantFp16((const char *)weight.cudaData + (size_t)kOff * srcRowBytes,
+                        cudaFp16Weight, kc, m, stream);
+            FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock, 0, stream >>>(
+                    cudaFp16Weight, cudaFp32Weight, len);
+
+            status = FastllmGGUFSgemmFloat(
+                    fastllmCublasHandle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    kc, n, m,
+                    &h_alpha, cudaFp32Weight,
+                    m, cudaInput,
+                    m, &h_beta,
+                    cudaOutput + kOff,
+                    k, pedanticSgemm);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("Error: cublas error.\n");
+                throw("cublas error");
+                exit(0);
+            }
         }
+    } else {
+        q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
+        quantize_row_q8_1_cuda (
+            cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, nullptr
+        );
+    }
 
-        FastllmCudaFree(cudaFp16Input);
-        FastllmCudaFree(cudaFp16Output);
-        FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
-    } else if (n > 1) {
+    if (q8Input != nullptr && n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
             ggml_cuda_op_mul_mat_vec_q_impl (
@@ -2118,10 +2437,10 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, n - i, m, nullptr 
+                    0, k, n - i, m, nullptr
             );        
         }
-    } else {
+    } else if (q8Input != nullptr) {
         ggml_cuda_op_mul_mat_vec_q_impl (
                 ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                 0, 0, 0, 0,
@@ -2130,10 +2449,12 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
         );
     }
     if (bias.dims.size() > 0) {
-        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        FastllmCudaBiasKernel <<< n, 256, 0, stream >>> (cudaOutput, cudaBiasData, k);
     }
 
-    FastllmCudaFree(q8Input);
+    if (q8Input != nullptr) {
+        FastllmCudaFree(q8Input);
+    }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
