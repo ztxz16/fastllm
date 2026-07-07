@@ -10088,6 +10088,8 @@ namespace fastllm {
             swap(dst.ggmlTensor, src.ggmlTensor);
             swap(dst.ggmlType, src.ggmlType);
             swap(dst.IsRepacked, src.IsRepacked);
+            swap(dst.disableGGUFRepack, src.disableGGUFRepack);
+            swap(dst.forceGGUFFp32Dequant, src.forceGGUFFp32Dequant);
             swap(dst.isPinned, src.isPinned);
             swap(dst.cpuIntDatas, src.cpuIntDatas);
         };

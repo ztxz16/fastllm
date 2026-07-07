@@ -1239,6 +1239,7 @@ namespace fastllm {
         weight.zeros.clear();
         weight.halfScales.clear();
         weight.perChannelsConfigs.clear();
+        weight.disableGGUFRepack = false;
         weight.blockK = -1;
         weight.blockM = -1;
         weight.perChannelAxis = -1;

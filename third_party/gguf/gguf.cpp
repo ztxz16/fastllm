@@ -991,6 +991,9 @@ namespace fastllm {
 
                     if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                         name = std::regex_replace(name, it.pattern, it.names[0]);
+                        if (name == "ignore") {
+                            break;
+                        }
                         tasks.push_back (
                                 ReadGGUFTask (
                                     name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second
@@ -999,6 +1002,9 @@ namespace fastllm {
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
                                 it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
                         name = std::regex_replace(name, it.pattern, it.names[0]);
+                        if (name == "ignore") {
+                            break;
+                        }
                         tasks.push_back (
                             ReadGGUFTask (
                                 name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second, 

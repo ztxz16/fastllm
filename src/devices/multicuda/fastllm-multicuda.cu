@@ -609,6 +609,8 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     dst.isGGUFData = src.isGGUFData || src.dataType == fastllm::DataType::DATA_GGUF_FORMAT;
     dst.ggmlType = src.ggmlType;
     dst.IsRepacked = src.IsRepacked;
+    dst.disableGGUFRepack = src.disableGGUFRepack;
+    dst.forceGGUFFp32Dequant = src.forceGGUFFp32Dequant;
     dst.tpLinearType = src.tpLinearType;
     dst.tpPackType = src.tpPackType;
     dst.tpQHeads = src.tpQHeads;

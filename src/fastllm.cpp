@@ -918,6 +918,7 @@ namespace fastllm {
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
         this->ggmlType = ori.ggmlType;
         this->IsRepacked = ori.IsRepacked;
+        this->disableGGUFRepack = ori.disableGGUFRepack;
         this->forceGGUFFp32Dequant = ori.forceGGUFFp32Dequant;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
@@ -2521,7 +2522,7 @@ namespace fastllm {
     }
 
     void Data::Repack() {
-        if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT) {
+        if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT || this->disableGGUFRepack) {
             return;
         }
         if (GetEnableAMX() && cpuInstructInfo.hasAMX) {

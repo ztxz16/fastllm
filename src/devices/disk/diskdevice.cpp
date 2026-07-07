@@ -252,6 +252,8 @@ namespace fastllm {
         loaded->isGGUFData = weight->isGGUFData;
         loaded->ggmlType = weight->ggmlType;
         loaded->IsRepacked = weight->IsRepacked;
+        loaded->disableGGUFRepack = weight->disableGGUFRepack;
+        loaded->forceGGUFFp32Dequant = weight->forceGGUFFp32Dequant;
         if (weight->ggmlTensor != nullptr) {
             loaded->ggmlTensor = (void*)(new ggml_tensor());
             (*(ggml_tensor*)loaded->ggmlTensor) = (*(ggml_tensor*)weight->ggmlTensor);
@@ -272,6 +274,8 @@ namespace fastllm {
                 dstOffset += part.bytes;
             }
             loaded->IsRepacked = false;
+            loaded->disableGGUFRepack = weight->disableGGUFRepack;
+            loaded->forceGGUFFp32Dequant = weight->forceGGUFFp32Dequant;
             return loaded;
         }
 
