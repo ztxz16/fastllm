@@ -211,7 +211,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executo
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/qwen3_next.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
-        src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/gpt_oss.cpp
+        src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp
         third_party/json11/json11.cpp
         third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp

@@ -29,6 +29,7 @@
 #include "hunyuan.h"
 #include "deepseekv2.h"
 #include "deepseekv4.h"
+#include "glm5_moe_dsa.h"
 #include "qwen.h"
 #include "glm.h"
 #include "minicpm.h"
@@ -482,7 +483,11 @@ namespace fastllm {
             model = (basellm*)(new MinimaxM2Model());
         } else if (modelType == "qwen3_next") {
             model = (basellm*)(new Qwen3NextModel());
-        } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2" || modelType == "deepseek_v32") {
+        } else if (modelType == "glm_moe_dsa") {
+            model = (basellm*)(new Glm5MoeDsaModel());
+            model->model_type = "glm_moe_dsa";
+        } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2" ||
+                   modelType == "deepseek_v32") {
             model = (basellm*)(new DeepSeekV2Model());
             model->model_type = modelType;
         } else if (modelType == "deepseek_v4") {
@@ -1996,6 +2001,7 @@ namespace fastllm {
             {"qwen2", "qwen2"}, // llama
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"glm4_moe", "glm4_moe"}, // glm4_moe
+            {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2
             {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
         };
@@ -2005,6 +2011,61 @@ namespace fastllm {
             printf("Warning: Can't convert type \"%s\", try use original type.\n", type.c_str());
             return type;
         }
+    }
+
+    static int GetGLMDSAGGUFMainLayerCount(const json11::Json &params,
+                                           const std::string &arch,
+                                           const basellm *model) {
+        if (model == nullptr || model->model_type != "glm_moe_dsa") {
+            return -1;
+        }
+
+        std::string ggufArch = params["general.architecture"].string_value();
+        if (ggufArch.empty()) {
+            ggufArch = arch;
+        }
+
+        int blockCount = model->block_cnt;
+        if (!params[ggufArch + ".block_count"].is_null()) {
+            blockCount = params[ggufArch + ".block_count"].int_value();
+        } else if (!params[arch + ".block_count"].is_null()) {
+            blockCount = params[arch + ".block_count"].int_value();
+        }
+        if (blockCount <= 0) {
+            return -1;
+        }
+
+        int nextnPredictLayers = 0;
+        if (!params[ggufArch + ".nextn_predict_layers"].is_null()) {
+            nextnPredictLayers = params[ggufArch + ".nextn_predict_layers"].int_value();
+        } else if (!params[arch + ".nextn_predict_layers"].is_null()) {
+            nextnPredictLayers = params[arch + ".nextn_predict_layers"].int_value();
+        }
+        if (nextnPredictLayers > 0 && blockCount >= nextnPredictLayers) {
+            return blockCount - nextnPredictLayers;
+        }
+        return blockCount;
+    }
+
+    static bool IsGGUFTaskBeyondMainLayers(const std::string &weightName, int mainLayerCount) {
+        if (mainLayerCount < 0) {
+            return false;
+        }
+        const std::string prefix = "model.layers.";
+        if (!StartWith(weightName, prefix)) {
+            return false;
+        }
+
+        int pos = (int)prefix.size();
+        int layerId = 0;
+        bool hasLayerId = false;
+        while (pos < (int)weightName.size() && weightName[pos] >= '0' && weightName[pos] <= '9') {
+            hasLayerId = true;
+            layerId = layerId * 10 + weightName[pos] - '0';
+            pos++;
+        }
+        return hasLayerId && pos < (int)weightName.size() && weightName[pos] == '.' &&
+               layerId >= mainLayerCount;
     }
 
     extern void RegisterNumas(fastllm::Data *data, std::string weightType);
@@ -2100,6 +2161,66 @@ namespace fastllm {
                 printf("Load block_cnt = %d\n", model->block_cnt);
             }
 
+            if (arch == "glm-dsa" || arch == "glm_moe_dsa") {
+                int blockCount = model->block_cnt;
+                int nextnPredictLayers = params[arch + ".nextn_predict_layers"].is_null() ?
+                                         0 : params[arch + ".nextn_predict_layers"].int_value();
+                if (nextnPredictLayers > 0 && blockCount >= nextnPredictLayers) {
+                    blockCount -= nextnPredictLayers;
+                    model->block_cnt = blockCount;
+                    printf("Load GLM-DSA main block_cnt = %d\n", model->block_cnt);
+                }
+
+                auto addIntDict = [&](const std::string &dictKey, const std::string &ggufKey) {
+                    if (!params[arch + "." + ggufKey].is_null()) {
+                        model->weight.AddDict(dictKey, std::to_string(params[arch + "." + ggufKey].int_value()));
+                    }
+                };
+                auto addFloatDict = [&](const std::string &dictKey, const std::string &ggufKey) {
+                    if (!params[arch + "." + ggufKey].is_null()) {
+                        model->weight.AddDict(dictKey, std::to_string(params[arch + "." + ggufKey].number_value()));
+                    }
+                };
+
+                model->weight.AddDict("model_type", "glm_moe_dsa");
+                model->weight.AddDict("num_hidden_layers", std::to_string(model->block_cnt));
+                addIntDict("hidden_size", "embedding_length");
+                addIntDict("num_attention_heads", "attention.head_count");
+                addIntDict("num_key_value_heads", "attention.head_count_kv");
+                addIntDict("q_lora_rank", "attention.q_lora_rank");
+                addIntDict("kv_lora_rank", "attention.kv_lora_rank");
+                addIntDict("qk_rope_head_dim", "rope.dimension_count");
+                addIntDict("v_head_dim", "attention.value_length_mla");
+                addIntDict("n_routed_experts", "expert_count");
+                addIntDict("n_shared_experts", "expert_shared_count");
+                addIntDict("num_experts_per_tok", "expert_used_count");
+                addIntDict("first_k_dense_replace", "leading_dense_block_count");
+                addIntDict("intermediate_size", "feed_forward_length");
+                addIntDict("moe_intermediate_size", "expert_feed_forward_length");
+                addIntDict("max_position_embeddings", "context_length");
+                addFloatDict("rms_norm_eps", "attention.layer_norm_rms_epsilon");
+                addFloatDict("rope_parameters.rope_theta", "rope.freq_base");
+                addFloatDict("rope_theta", "rope.freq_base");
+                addFloatDict("routed_scaling_factor", "expert_weights_scale");
+                model->weight.AddDict("rope_parameters.rope_type", "default");
+
+                if (!params[arch + ".expert_weights_norm"].is_null()) {
+                    model->weight.AddDict("norm_topk_prob",
+                                          params[arch + ".expert_weights_norm"].bool_value() ? "true" : "false");
+                }
+                int gatingFunc = params[arch + ".expert_gating_func"].is_null() ?
+                                 2 : params[arch + ".expert_gating_func"].int_value();
+                model->weight.AddDict("scoring_func", gatingFunc == 2 ? "sigmoid" : "softmax");
+
+                int qkRopeHeadDim = params[arch + ".rope.dimension_count"].is_null() ?
+                                    0 : params[arch + ".rope.dimension_count"].int_value();
+                int qkMlaHeadDim = params[arch + ".attention.key_length_mla"].is_null() ?
+                                   0 : params[arch + ".attention.key_length_mla"].int_value();
+                if (qkMlaHeadDim > qkRopeHeadDim) {
+                    model->weight.AddDict("qk_nope_head_dim", std::to_string(qkMlaHeadDim - qkRopeHeadDim));
+                }
+            }
+
             if (!params[arch + ".attention.head_count"].is_null()) {
                 model->num_attention_heads = params[arch + ".attention.head_count"].int_value();
                 printf("Load num_attention_heads = %d\n", model->num_attention_heads);
@@ -2152,6 +2273,7 @@ namespace fastllm {
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);
+        int ggufMainLayerCount = GetGLMDSAGGUFMainLayerCount(params, arch, model);
 
         // 3.0 更新模型信息
         model->InitParams();
@@ -2166,20 +2288,9 @@ namespace fastllm {
         }
         for (int i = 0; i < readGGUFTasks.size(); i++) {
             std::string &weightName = readGGUFTasks[i].name;
-/*
-if (false) {
-    std::string prefix = "model.layers.";
-    if (StartWith(weightName, prefix)) {
-        int id = 0;
-        for (int i = prefix.size(); weightName[i] >= '0' && weightName[i] <= '9'; i++) {
-            id = id * 10 + weightName[i] - '0';
-        }
-        if (id > 3) {
-            continue;
-        }
-    }
-}
-*/
+            if (IsGGUFTaskBeyondMainLayers(weightName, ggufMainLayerCount)) {
+                continue;
+            }
             tensors.push_back(weightName);
             allWeightNames.insert(weightName);
             model->weight.AddEmptyWeight(weightName, {1}, DataType::FLOAT32);

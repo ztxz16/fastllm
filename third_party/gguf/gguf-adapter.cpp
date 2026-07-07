@@ -315,6 +315,13 @@ namespace fastllm {
             }
         };
 
+        if (arch == "glm-dsa" || arch == "glm_moe_dsa") {
+            auto rules = originalArchRulesDict["deepseek_v2"];
+            // llama.cpp currently runs GLM_DSA with the DeepSeek2 graph, so indexer tensors are unused.
+            rules.insert(rules.begin(), GGUFWeightReplaceRule(std::regex(R"(blk\.(\d+)\.indexer\..*)"), "ignore"));
+            return rules;
+        }
+
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > archRulesDict = {
             {"qwen2", originalArchRulesDict["default"]},
             {"kimi_k2", originalArchRulesDict["deepseek_v2"]},
