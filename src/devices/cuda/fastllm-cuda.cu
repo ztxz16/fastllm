@@ -2559,6 +2559,53 @@ static std::vector<FastllmCudaMemPoolView> FastllmSnapshotCudaMemPoolViews() {
     return views;
 }
 
+static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMemoryBuffer> &bigBuffers) {
+    size_t released = 0;
+    std::vector<CudaMemoryBuffer> keep;
+    keep.reserve(bigBuffers.size());
+    cudaError_t state = cudaSetDevice(id);
+    if (cudaSuccess != state) {
+        checkCudaErrors("Error: CUDA error when set device before release idle memory!", state);
+        return 0;
+    }
+    if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
+        cudaDeviceSynchronize();
+    }
+    for (auto &buffer : bigBuffers) {
+        if (buffer.busy) {
+            keep.push_back(buffer);
+            continue;
+        }
+        state = cudaFree(buffer.data);
+        if (cudaSuccess == state) {
+            released += buffer.size;
+        } else {
+            printf("Error: CUDA error when release idle pooled memory on device %d!", id);
+            checkCudaErrors("", state);
+            keep.push_back(buffer);
+        }
+    }
+    bigBuffers.swap(keep);
+    return released;
+}
+
+static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
+        void **ret, size_t size, int id, FastllmCudaMemPoolView &view, const char *file, int line) {
+    if (ret != nullptr) {
+        *ret = nullptr;
+    }
+    cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
+    if (cudaSuccess == state || fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        return state;
+    }
+    cudaGetLastError();
+    size_t released = FastllmCudaReleaseIdleBigBuffersLocked(id, *view.bigBuffers);
+    if (released == 0) {
+        return state;
+    }
+    return FastllmCudaCheckedMalloc(ret, size, file, line);
+}
+
 static size_t fastllmCudaMemPoolAllocated = 0;
 static size_t fastllmCudaMemPoolPeak = 0;
 
@@ -2885,8 +2932,13 @@ static void CudaMemDebugRemove(void *ptr) {
 #endif // CUDA_MEM_DEBUG
 
 void * FastllmCudaDirectMalloc(size_t size) {
-    void * ret;
-    cudaError_t state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+    void * ret = nullptr;
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    checkCudaErrors("Error: CUDA error when find device!", state);
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    state = FastllmCudaCheckedMallocWithIdlePoolRetry(&ret, size, id, view, __FILE__, __LINE__);
     if (cudaSuccess != state) {
         printf("Error: CUDA error when allocating %lu kB memory! maybe there's no enough memory left on device.", size >> 10);
         checkCudaErrors("", state);
@@ -3091,7 +3143,7 @@ void * FastllmCudaMalloc(size_t size) {
             }
         }
 
-        void * ret;
+        void * ret = nullptr;
         if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
         }
@@ -3147,7 +3199,7 @@ void * FastllmCudaMalloc(size_t size) {
             return bigBuffers[selId].data;
         }
     }
-    void * ret;
+    void * ret = nullptr;
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
     }
@@ -3348,13 +3400,13 @@ void FastllmCudaFree(void *ret) {
 }
 
 void FastllmCudaMallocBigBuffer(size_t size) {
-    void * ret;
+    void * ret = nullptr;
     int id = -1;
     cudaGetDevice(&id);
     FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
     std::lock_guard<std::mutex> lock(*view.lock);
     auto &bigBuffers = *view.bigBuffers;
-    auto state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+    auto state = FastllmCudaCheckedMallocWithIdlePoolRetry(&ret, size, id, view, __FILE__, __LINE__);
     if (cudaSuccess != state) {
         printf("Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory left on device.", size >> 20);
         checkCudaErrors("", state);
@@ -3491,6 +3543,14 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
 
 void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size) {
     if (size == 0 || dst == src) {
+        return;
+    }
+    if (dst == nullptr || src == nullptr) {
+        char buffer[512];
+        snprintf(buffer, sizeof(buffer),
+                 "Error: CUDA copy Between GPUs got null pointer. dstId = %d, srcId = %d, dst = %p, src = %p, size = %lu.\n",
+                 dstId, srcId, dst, src, size);
+        fastllm::ErrorInFastLLM(std::string(buffer));
         return;
     }
     int oriId = FastllmCudaGetDevice();

@@ -110,6 +110,24 @@ namespace fastllm {
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
 
+        static void CheckCudaMallocForData(const Data &data, void *ptr, uint64_t bytes, const char *context) {
+            if (ptr != nullptr) {
+                return;
+            }
+            std::string msg = "Error: cuda malloc failed in " + std::string(context) +
+                              ". requestBytes = " + std::to_string(bytes) +
+                              ", dataType = " + GetDataTypeName(data.dataType) + ", dims = [";
+            for (int i = 0; i < (int)data.dims.size(); i++) {
+                msg += (i == 0 ? "" : ", ") + std::to_string(data.dims[i]);
+            }
+            msg += "]";
+            if (!data.name.empty()) {
+                msg += ", name = " + data.name;
+            }
+            msg += ".\n";
+            ErrorInFastLLM(msg);
+        }
+
         static void CudaFreeForData(const Data &data, void *ptr) {
             if (data.cudaDataBorrowed && ptr == data.cudaData) {
                 return;
@@ -1765,16 +1783,7 @@ namespace fastllm {
                 this->cudaData = FastllmCudaMalloc(this->expansionBytes);
             }
             this->cudaDataBorrowed = false;
-            if (this->cudaData == nullptr) {
-                std::string msg = "Error: cuda malloc failed in Data::MallocSpace. requestBytes = " +
-                                  std::to_string(this->expansionBytes) +
-                                  ", dataType = " + GetDataTypeName(this->dataType) + ", dims = [";
-                for (int i = 0; i < (int)this->dims.size(); i++) {
-                    msg += (i == 0 ? "" : ", ") + std::to_string(this->dims[i]);
-                }
-                msg += "].\n";
-                ErrorInFastLLM(msg);
-            }
+            CheckCudaMallocForData(*this, this->cudaData, this->expansionBytes, "Data::MallocSpace");
             if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
                 for (auto it : this->multiDeviceDatas) {
                     delete it.second;
@@ -2326,6 +2335,7 @@ namespace fastllm {
                         if (this->cudaData == nullptr) {
                             this->cudaData = CudaMallocForData(*this, expansionBytes);
                             this->cudaDataBorrowed = false;
+                            CheckCudaMallocForData(*this, this->cudaData, expansionBytes, "Data::ToDevice CPU->CUDA");
                         }
 
                         if (cpuData != nullptr) {
@@ -2364,6 +2374,7 @@ namespace fastllm {
                         if (this->cudaData == nullptr) {
                             this->cudaData = CudaMallocForData(*this, expansionBytes);
                             this->cudaDataBorrowed = false;
+                            CheckCudaMallocForData(*this, this->cudaData, expansionBytes, "Data::ToDevice CPU->CUDA");
                         }
                     }
                 }
@@ -2393,6 +2404,7 @@ namespace fastllm {
                     if (sourceDevice != destDevice) {
                                         FastllmCudaSetDevice(destDevice);
                                         void *newCudaData = CudaMallocForData(*this, expansionBytes);
+                                        CheckCudaMallocForData(*this, newCudaData, expansionBytes, "Data::ToDevice CUDA->CUDA");
                                         if (copyData) {
                                             FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
                                         }
