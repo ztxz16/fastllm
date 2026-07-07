@@ -6145,7 +6145,7 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     float beta = 0;
     auto fastllmCublasHandle = getFastllmCublasHandle();
-    cublasStatus_t status;
+    cublasStatus_t status = CUBLAS_STATUS_NOT_SUPPORTED;
 
     if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT32) {
         status = cublasSgemmStridedBatched(fastllmCublasHandle,
@@ -6165,21 +6165,70 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
                 &h_beta,
                 (half*)cudaOutput, k, k * n, batch);
     } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
-        half *tempInput0 = (half*)FastllmCudaMalloc(input0.Count(0) * sizeof(half));
-        half *tempOutput = (half*)FastllmCudaMalloc(output.Count(0) * sizeof(half));
-        FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
+        auto runHalfGemm = [&]() {
+            size_t tempInput0Bytes = input0.Count(0) * sizeof(half);
+            size_t tempOutputBytes = output.Count(0) * sizeof(half);
+            size_t tempInput0AlignedBytes = FastllmCudaAlignBytes(tempInput0Bytes, 256);
+            size_t needBytes = tempInput0AlignedBytes + tempOutputBytes;
+            size_t workspaceBytes = 0;
+            bool workspaceOwn = false;
+            uint8_t *workspace = (uint8_t*)FastllmBorrowCudaTempBuffer(needBytes, &workspaceBytes, &workspaceOwn);
+            bool useWorkspace = workspace != nullptr && workspaceBytes >= needBytes;
+            half *tempInput0 = nullptr;
+            half *tempOutput = nullptr;
+            if (useWorkspace) {
+                tempInput0 = (half*)workspace;
+                tempOutput = (half*)(workspace + tempInput0AlignedBytes);
+            } else {
+                FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+                tempInput0 = (half*)FastllmCudaMalloc(tempInput0Bytes);
+                tempOutput = (half*)FastllmCudaMalloc(tempOutputBytes);
+                if (tempInput0 == nullptr || tempOutput == nullptr) {
+                    FastllmCudaFree(tempInput0);
+                    FastllmCudaFree(tempOutput);
+                    return CUBLAS_STATUS_ALLOC_FAILED;
+                }
+            }
+            FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
 
-        half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
-        status = cublasHgemmStridedBatched(fastllmCublasHandle,
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                k, n, m, &h_alpha,
-                (half*)cudaInput1, input1Stride, input1Spatial,
-                (half*)tempInput0, input0Stride, input0Spatial,
-                &h_beta,
-                (half*)tempOutput, k, k * n, batch);
-        FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
-        FastllmCudaFree(tempInput0);
-        FastllmCudaFree(tempOutput);
+            half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
+            cublasStatus_t halfStatus = cublasHgemmStridedBatched(fastllmCublasHandle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    k, n, m, &h_alpha,
+                    (half*)cudaInput1, input1Stride, input1Spatial,
+                    (half*)tempInput0, input0Stride, input0Spatial,
+                    &h_beta,
+                    (half*)tempOutput, k, k * n, batch);
+            if (halfStatus == CUBLAS_STATUS_SUCCESS) {
+                FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
+            }
+            if (useWorkspace) {
+                FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+            } else {
+                FastllmCudaFree(tempInput0);
+                FastllmCudaFree(tempOutput);
+            }
+            return halfStatus;
+        };
+
+        size_t tempInput1Bytes = input1.Count(0) * sizeof(float);
+        size_t workspaceBytes = 0;
+        bool workspaceOwn = false;
+        float *tempInput1 = (float*)FastllmBorrowCudaTempBuffer(tempInput1Bytes, &workspaceBytes, &workspaceOwn);
+        if (tempInput1 != nullptr && workspaceBytes >= tempInput1Bytes) {
+            FastllmHalfToFloat(cudaInput1, tempInput1, input1.Count(0));
+            status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    k, n, m, &alpha,
+                    tempInput1, input1Stride, input1Spatial,
+                    cudaInput0, input0Stride, input0Spatial,
+                    &beta,
+                    cudaOutput, k, k * n, batch);
+            FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
+        } else {
+            FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
+            status = runHalfGemm();
+        }
     }
 
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -6205,7 +6254,7 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     float beta = 0;
     auto fastllmCublasHandle = getFastllmCublasHandle();
-    cublasStatus_t status;
+    cublasStatus_t status = CUBLAS_STATUS_NOT_SUPPORTED;
 
     if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT32) {
         status = cublasSgemmStridedBatched(fastllmCublasHandle,
@@ -6225,21 +6274,70 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                         &h_beta,
                                         (half*)cudaOutput, k, k * n, batch);
     } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
-        half *tempInput0 = (half*)FastllmCudaMalloc(input0.Count(0) * sizeof(half));
-        half *tempOutput = (half*)FastllmCudaMalloc(output.Count(0) * sizeof(half));
-        FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
+        auto runHalfGemm = [&]() {
+            size_t tempInput0Bytes = input0.Count(0) * sizeof(half);
+            size_t tempOutputBytes = output.Count(0) * sizeof(half);
+            size_t tempInput0AlignedBytes = FastllmCudaAlignBytes(tempInput0Bytes, 256);
+            size_t needBytes = tempInput0AlignedBytes + tempOutputBytes;
+            size_t workspaceBytes = 0;
+            bool workspaceOwn = false;
+            uint8_t *workspace = (uint8_t*)FastllmBorrowCudaTempBuffer(needBytes, &workspaceBytes, &workspaceOwn);
+            bool useWorkspace = workspace != nullptr && workspaceBytes >= needBytes;
+            half *tempInput0 = nullptr;
+            half *tempOutput = nullptr;
+            if (useWorkspace) {
+                tempInput0 = (half*)workspace;
+                tempOutput = (half*)(workspace + tempInput0AlignedBytes);
+            } else {
+                FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+                tempInput0 = (half*)FastllmCudaMalloc(tempInput0Bytes);
+                tempOutput = (half*)FastllmCudaMalloc(tempOutputBytes);
+                if (tempInput0 == nullptr || tempOutput == nullptr) {
+                    FastllmCudaFree(tempInput0);
+                    FastllmCudaFree(tempOutput);
+                    return CUBLAS_STATUS_ALLOC_FAILED;
+                }
+            }
+            FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
 
-        half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
-        status = cublasHgemmStridedBatched(fastllmCublasHandle,
-                                        CUBLAS_OP_T, CUBLAS_OP_N,
-                                        k, n, m, &h_alpha,
-                                        (half*)cudaInput1, input1Stride, input1Spatial,
-                                        (half*)tempInput0, input0Stride, input0Spatial,
-                                        &h_beta,
-                                        (half*)tempOutput, k, k * n, batch);
-        FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
-        FastllmCudaFree(tempInput0);
-        FastllmCudaFree(tempOutput);
+            half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
+            cublasStatus_t halfStatus = cublasHgemmStridedBatched(fastllmCublasHandle,
+                                            CUBLAS_OP_T, CUBLAS_OP_N,
+                                            k, n, m, &h_alpha,
+                                            (half*)cudaInput1, input1Stride, input1Spatial,
+                                            (half*)tempInput0, input0Stride, input0Spatial,
+                                            &h_beta,
+                                            (half*)tempOutput, k, k * n, batch);
+            if (halfStatus == CUBLAS_STATUS_SUCCESS) {
+                FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
+            }
+            if (useWorkspace) {
+                FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+            } else {
+                FastllmCudaFree(tempInput0);
+                FastllmCudaFree(tempOutput);
+            }
+            return halfStatus;
+        };
+
+        size_t tempInput1Bytes = input1.Count(0) * sizeof(float);
+        size_t workspaceBytes = 0;
+        bool workspaceOwn = false;
+        float *tempInput1 = (float*)FastllmBorrowCudaTempBuffer(tempInput1Bytes, &workspaceBytes, &workspaceOwn);
+        if (tempInput1 != nullptr && workspaceBytes >= tempInput1Bytes) {
+            FastllmHalfToFloat(cudaInput1, tempInput1, input1.Count(0));
+            status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                            CUBLAS_OP_T, CUBLAS_OP_N,
+                                            k, n, m, &alpha,
+                                            tempInput1, input1Stride, input1Spatial,
+                                            cudaInput0, input0Stride, input0Spatial,
+                                            &beta,
+                                            cudaOutput, k, k * n, batch);
+            FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
+        } else {
+            FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
+            status = runHalfGemm();
+        }
     }
 
     if (status != CUBLAS_STATUS_SUCCESS) {
