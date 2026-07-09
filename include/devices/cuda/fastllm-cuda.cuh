@@ -118,6 +118,12 @@ bool FastllmCudaGraphLaunch(void *exec);
 void FastllmCudaGraphDestroy(void *graph);
 void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
+bool FastllmCudaGraphCaptureInvalidated();
+
+// 线程级 CUDA 错误标志：showError 报错时置位；graph 捕获路径用于错误熔断。
+void FastllmCudaClearThreadError();
+void FastllmCudaSetThreadError();
+bool FastllmCudaGetThreadError();
 
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();

@@ -29,9 +29,26 @@
 #include <execinfo.h>
 #endif
 
+// 线程级 CUDA 错误标志：showError 报错时置位。CUDA graph 捕获路径在捕获体前清零、
+// 捕获体后检查，任何算子报错都能被感知并中止捕获，避免带着坏状态继续运行。
+static thread_local bool fastllmCudaThreadErrorFlag = false;
+
+void FastllmCudaClearThreadError() {
+    fastllmCudaThreadErrorFlag = false;
+}
+
+void FastllmCudaSetThreadError() {
+    fastllmCudaThreadErrorFlag = true;
+}
+
+bool FastllmCudaGetThreadError() {
+    return fastllmCudaThreadErrorFlag;
+}
+
 void showError(cudaError_t result, char const* const message, const char* const file,
            int const line) {
     if (cudaSuccess != result) {
+        fastllmCudaThreadErrorFlag = true;
         printf("%s\n  CUDA error = %d, %s at %s:%d\n  '%s'\n",
             message, result, cudaGetErrorName(result), file, line, cudaGetErrorString(result));
         fflush(stdout);
@@ -390,6 +407,19 @@ static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
 bool FastllmCudaGraphBeginCapture() {
     cudaError_t state = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
     return FastllmCudaGraphSetError("cudaStreamBeginCapture", state);
+}
+
+// 检查当前线程的捕获是否已被 invalidate（捕获体内任何算子报错都会导致失效）。
+// 不通过 showError 上报的错误路径（如 FlashInfer、独立 kernel 封装内的 printf）
+// 也会 invalidate 捕获，因此该检查是错误标志之外的兜底。
+bool FastllmCudaGraphCaptureInvalidated() {
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaError_t state = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return true;
+    }
+    return captureStatus == cudaStreamCaptureStatusInvalidated;
 }
 
 bool FastllmCudaGraphEndCapture(void **graph) {

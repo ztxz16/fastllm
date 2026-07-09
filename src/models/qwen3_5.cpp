@@ -6165,9 +6165,18 @@ namespace fastllm {
         }
 
         if (!state.warmed) {
+            FastllmCudaClearThreadError();
             bool usedUnsafeMoeFallback = runWithoutGraph();
             if (usedUnsafeMoeFallback) {
                 printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during warmup.\n",
+                       gpuId);
+                fflush(stdout);
+                Qwen35DestroyCudaGraph(state);
+                state.disabled = true;
+                return true;
+            }
+            if (FastllmCudaGetThreadError()) {
+                printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because CUDA errors occurred during warmup run.\n",
                        gpuId);
                 fflush(stdout);
                 Qwen35DestroyCudaGraph(state);
@@ -6179,6 +6188,7 @@ namespace fastllm {
         }
 
         void *capturedGraph = nullptr;
+        FastllmCudaClearThreadError();
         if (!FastllmCudaGraphBeginCapture()) {
             printf("Warning: Qwen3.5 CUDA graph begin capture failed on gpu %d: %s. Disable graph for this GPU.\n",
                    gpuId, FastllmCudaGraphLastError());
@@ -6191,6 +6201,16 @@ namespace fastllm {
         bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
         if (usedUnsafeMoeFallback) {
             printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during capture.\n",
+                   gpuId);
+            fflush(stdout);
+            Qwen35AbortCudaGraphCapture();
+            Qwen35DestroyCudaGraph(state);
+            state.disabled = true;
+            runWithoutGraph();
+            return true;
+        }
+        if (FastllmCudaGetThreadError() || FastllmCudaGraphCaptureInvalidated()) {
+            printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because errors occurred inside capture body. Fallback to eager mode.\n",
                    gpuId);
             fflush(stdout);
             Qwen35AbortCudaGraphCapture();

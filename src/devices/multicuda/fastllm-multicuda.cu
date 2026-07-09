@@ -1703,8 +1703,24 @@ ncclComm_t GetNcclComm(int deviceId) {
 
 // 集合通信发射后是否立即同步：warmup/权重加载阶段返回 true 以防跨 rank 死锁，
 // warmup 结束后返回 false，稳态前向异步发射以恢复通信/计算重叠(见 FastllmCudaSetNcclForceSync)。
-static bool FastllmNcclPostSyncEnabled() {
-    return FastllmCudaGetNcclForceSync();
+// 流捕获期间必须返回 false：cudaStreamSynchronize 属于捕获期间被禁止的调用，会直接
+// invalidate 正在进行的 CUDA graph 捕获；捕获期间集合通信只是被录制、并未真正执行，
+// 不存在与真实 cudaMalloc 争用驱动锁的死锁风险，跳过同步是安全的。
+static bool FastllmNcclPostSyncEnabled(cudaStream_t stream) {
+    if (!FastllmCudaGetNcclForceSync()) {
+        return false;
+    }
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaError_t captureState = cudaStreamIsCapturing(stream, &captureStatus);
+    if (captureState != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        cudaGetLastError();
+        return false;
+    }
+    if (captureStatus != cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    return true;
 }
 
 // 功能：将 root 设备上的 data 数据广播到所有卡 (In-place 操作)
@@ -1731,6 +1747,7 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
     }
     if (comm == nullptr) {
         printf("Error: FastllmNcclBroadcast failed, comm is null for device %d\n", deviceId);
+        FastllmCudaSetThreadError();
         return;
     }
 
@@ -1744,6 +1761,7 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
         ncclType = ncclFloat;
     } else {
         printf("Error: Unknown dataType %d for NCCL Broadcast\n", dataType);
+        FastllmCudaSetThreadError();
         return;
     }
 
@@ -1760,6 +1778,7 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
     }
     if (rootRank < 0 || rootRank >= g_ncclWorldSize) {
         printf("Error: invalid root %d for NCCL Broadcast on device %d\n", root, deviceId);
+        FastllmCudaSetThreadError();
         return;
     }
     
@@ -1767,13 +1786,15 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
     
     if (res != ncclSuccess) {
         printf("Error: ncclBroadcast failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
+        FastllmCudaSetThreadError();
         return;
     }
     // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
     // 若集合通信在途时另一线程触发真实 cudaMalloc(持 CUDA 驱动锁并隐式同步)，会与 NCCL 主机 proxy
     // 争用驱动锁形成跨 rank 死锁。同步发射可彻底消除该竞态。
-    if (FastllmNcclPostSyncEnabled()) {
-        cudaStreamSynchronize(stream);
+    if (FastllmNcclPostSyncEnabled(stream)) {
+        cudaError_t syncState = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: CUDA error when synchronizing NCCL broadcast!", syncState);
     }
 }
 
@@ -1802,6 +1823,7 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
     }
     if (comm == nullptr) {
         printf("Error: FastllmNcclAllReduce failed, comm is null for device %d\n", deviceId);
+        FastllmCudaSetThreadError();
         return;
     }
 
@@ -1816,6 +1838,7 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
     } else {
         // 如果有其他类型，需在此补充
         printf("Error: Unknown dataType %d for NCCL\n", dataType);
+        FastllmCudaSetThreadError();
         return;
     }
 
@@ -1828,12 +1851,14 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
     
     if (res != ncclSuccess) {
         printf("Error: ncclAllReduce failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
+        FastllmCudaSetThreadError();
         return;
     }
     // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
     // 若集合通信在途时另一线程触发真实 cudaMalloc(持 CUDA 驱动锁并隐式同步)，会与 NCCL 主机 proxy
     // 争用驱动锁形成跨 rank 死锁。同步发射可彻底消除该竞态。
-    if (FastllmNcclPostSyncEnabled()) {
-        cudaStreamSynchronize(stream);
+    if (FastllmNcclPostSyncEnabled(stream)) {
+        cudaError_t syncState = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: CUDA error when synchronizing NCCL allreduce!", syncState);
     }
 }
