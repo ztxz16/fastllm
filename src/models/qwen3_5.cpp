@@ -6045,6 +6045,7 @@ namespace fastllm {
                 AssertInFastLLM(!Qwen35LayerUsesMappedNonCudaMoe(this, i),
                                 "Qwen3.5 CUDA graph doesn't support non-CUDA moe_device layers.\n");
 
+                bool sharedExpertPending = false;
                 if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
                     AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
                                     "Qwen3.5 CUDA graph requires merged shared expert gateup weight.\n");
@@ -6068,7 +6069,9 @@ namespace fastllm {
                         }
                         Qwen35CudaMulTo(cudaRunner, buf.sharedOutput, buf.sharedGate);
                     }
-                    addPartialToResidualReduce(buf.sharedOutput);
+                    // 共享专家输出不单独归约：延后与路由专家输出本地相加后一次 allReduce，
+                    // 每个 MoE 层省一次集合通信（小 hidden 下 allReduce 为纯延迟型，TP 解码收益明显）。
+                    sharedExpertPending = true;
                 }
 
                 int localBatch = buf.attenInput.dims[0];
@@ -6118,6 +6121,13 @@ namespace fastllm {
                     }
                 }
                 buf.moeFinal.Reshape(buf.hiddenStates.dims);
+                if (sharedExpertPending) {
+                    if (buf.sharedOutput.dataType != buf.moeFinal.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, buf.sharedOutput, buf.moeFinal.dataType);
+                    }
+                    buf.sharedOutput.Reshape(buf.moeFinal.dims);
+                    Qwen3CudaAddTo(cudaRunner, buf.moeFinal, buf.sharedOutput);
+                }
                 addPartialToResidualReduce(buf.moeFinal);
             }
 
@@ -7285,6 +7295,7 @@ namespace fastllm {
             AssertInFastLLM(weight.weight.find(gateWeightName) != weight.weight.end(),
                             "Qwen3.5 ForwardGPU layer has neither dense MLP nor router gate weight.\n");
 
+            bool sharedExpertPending = false;
             if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
                 AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
                                 "Qwen3.5 ForwardGPU requires merged shared expert gateup weight.\n");
@@ -7308,7 +7319,8 @@ namespace fastllm {
                     }
                     Qwen35CudaMulTo(cudaRunner, sharedOutput, sharedGate);
                 }
-                addPartialToResidualReduce(sharedOutput);
+                // 共享专家输出延后与路由专家输出本地相加后一次 allReduce，每层省一次集合通信。
+                sharedExpertPending = true;
             }
 
             int localBatch = attenInput.dims[0];
@@ -7376,6 +7388,13 @@ namespace fastllm {
                 }
             }
             moeFinal.Reshape(hiddenStates.dims);
+            if (sharedExpertPending) {
+                if (sharedOutput.dataType != moeFinal.dataType) {
+                    Qwen3CudaToDataType(cudaRunner, sharedOutput, moeFinal.dataType);
+                }
+                sharedOutput.Reshape(moeFinal.dims);
+                Qwen3CudaAddTo(cudaRunner, moeFinal, sharedOutput);
+            }
             addPartialToResidualReduce(moeFinal);
         }
         mtpWorkerProfileSyncMark(mtpWorkerProfileLayersUs);
