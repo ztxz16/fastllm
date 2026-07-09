@@ -3572,19 +3572,42 @@ namespace fastllm {
         };
 
         auto runSamplingPrefillWarmup = [&](int targetBatch, const char *label) {
-            if (len <= 2 || targetBatch <= 1) {
+            int warmLen = len;
+            int budgetPages = 0;
+            if (pageLen > 0 && fastllm::GetMaxTokens() > 0) {
+                budgetPages = (fastllm::GetMaxTokens() + pageLen - 1) / pageLen;
+                warmLen = std::min(warmLen, budgetPages * pageLen);
+            }
+            if (warmLen <= 2 || targetBatch <= 1) {
                 return;
             }
-            int samplingPrefillBatch = std::max(1, std::min(targetBatch, len));
+            int samplingPrefillBatch = std::max(1, std::min(targetBatch, warmLen));
+            if (budgetPages > 0) {
+                // 按每条请求 ceil(seqLen / pageLen) 计算实际占用页数;
+                // 均分后每条请求可能跨多页, 直接用 batch 数估页会低估, 导致 warmup 超出页预算
+                auto splitPages = [&](int batch) {
+                    int pages = 0;
+                    int base = warmLen / batch;
+                    int extra = warmLen % batch;
+                    for (int i = 0; i < batch; i++) {
+                        int seqLen = base + (i < extra ? 1 : 0);
+                        pages += (seqLen + pageLen - 1) / pageLen;
+                    }
+                    return pages;
+                };
+                while (samplingPrefillBatch > 1 && splitPages(samplingPrefillBatch) > budgetPages) {
+                    samplingPrefillBatch--;
+                }
+            }
             std::vector<int> samplingPrefillSeqLens(
-                samplingPrefillBatch, len / samplingPrefillBatch);
-            int extraTokens = len % samplingPrefillBatch;
+                samplingPrefillBatch, warmLen / samplingPrefillBatch);
+            int extraTokens = warmLen % samplingPrefillBatch;
             for (int i = 0; i < extraTokens; i++) {
                 samplingPrefillSeqLens[i]++;
             }
             int maxTokensPerRequest = samplingPrefillSeqLens.empty() ? 0 : samplingPrefillSeqLens[0];
             printf("[Fastllm] AutoWarmup CUDA sampling prefill warmup (%s): batch %d, total tokens %d, max tokens/request %d.\n",
-                   label, samplingPrefillBatch, len, maxTokensPerRequest);
+                   label, samplingPrefillBatch, warmLen, maxTokensPerRequest);
             runBatchSeqWarmup(samplingPrefillSeqLens, true);
         };
 
@@ -3721,24 +3744,7 @@ namespace fastllm {
                     printf("[Fastllm] AutoWarmup CUDA sampling small prefill warmup: tokens %d.\n", warmLen);
                     runBatchSeqWarmup({warmLen}, true);
                 }
-                int prePagePrefillBatch = prePageWarmupBatch;
-                if (pageLen > 0 && minPages > 0) {
-                    auto prePagePrefillPages = [&](int batch) {
-                        int pages = 0;
-                        int base = len / batch;
-                        int extra = len % batch;
-                        for (int i = 0; i < batch; i++) {
-                            int seqLen = base + (i < extra ? 1 : 0);
-                            pages += (seqLen + pageLen - 1) / pageLen;
-                        }
-                        return pages;
-                    };
-                    while (prePagePrefillBatch > 1 &&
-                           prePagePrefillPages(prePagePrefillBatch) > minPages) {
-                        prePagePrefillBatch--;
-                    }
-                }
-                runSamplingPrefillWarmup(prePagePrefillBatch, "pre-page");
+                runSamplingPrefillWarmup(prePageWarmupBatch, "pre-page");
 
                 pastKeyValuesStorage.clear();
                 pastKeyValues.clear();
