@@ -2625,14 +2625,11 @@ void FastllmCudaFree(void *ret) {
     }
     int oriId = FastllmCudaGetDevice();
 
-    // 逐设备各自加锁查找该指针所属的池并归还。归还只做标记（busy=false），
-    // 不调用任何 CUDA API；因此即使在张量并行下，也不会出现"持锁 + 隐式同步本设备"
-    // 而阻塞其它 rank 进入 NCCL 集合通信、形成跨 rank 死锁的情况。
+    // 优先只查当前 rank 的本地池。归还池内指针只修改 busy 标记，
+    // 不调用 CUDA API。若本地未命中，再在不持锁时查询指针真实设备，
+    // 仅检查 owner 的池；避免其它 rank 为释放本地临时张量而先抢 device 0 的锁。
     std::vector<FastllmCudaMemPoolView> views = FastllmSnapshotCudaMemPoolViews();
-    if (views.empty()) {
-        return;
-    }
-    for (auto &view : views) {
+    auto releaseFromPool = [&](FastllmCudaMemPoolView &view) {
         std::lock_guard<std::mutex> lock(*view.lock);
         auto &cudaBuffers = *view.smallBuffers;
         for (int i = 0; i < cudaBuffers.size(); i++) {
@@ -2643,7 +2640,7 @@ void FastllmCudaFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRemove(ret);
 #endif
-                return;
+                return true;
             }
         }
         auto &bigBuffers = *view.bigBuffers;
@@ -2653,6 +2650,54 @@ void FastllmCudaFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRemove(ret);
 #endif
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto currentView = std::find_if(views.begin(), views.end(),
+                                    [&](const FastllmCudaMemPoolView &view) {
+                                        return view.device == oriId;
+                                    });
+    if (currentView != views.end() && releaseFromPool(*currentView)) {
+        return;
+    }
+
+    int pointerDevice = -1;
+    cudaPointerAttributes attributes;
+    cudaError_t attributeState = cudaPointerGetAttributes(&attributes, ret);
+    if (attributeState == cudaSuccess) {
+#if (CUDART_VERSION < 10000) && !(defined(USE_ROCM))
+        if (attributes.memoryType == cudaMemoryTypeDevice) {
+#else
+        if (attributes.type == cudaMemoryTypeDevice ||
+            attributes.type == cudaMemoryTypeManaged) {
+#endif
+            pointerDevice = attributes.device;
+        }
+    } else {
+        cudaGetLastError();
+    }
+
+    if (pointerDevice >= 0) {
+        if (pointerDevice != oriId) {
+            auto ownerView = std::find_if(views.begin(), views.end(),
+                                          [&](const FastllmCudaMemPoolView &view) {
+                                              return view.device == pointerDevice;
+                                          });
+            if (ownerView != views.end() && releaseFromPool(*ownerView)) {
+                return;
+            }
+        }
+    } else {
+        // Compatibility fallback for pointers whose attributes cannot be
+        // queried. Never hold more than one device lock at a time.
+        for (auto &view : views) {
+            if (currentView != views.end() && view.lock == currentView->lock) {
+                continue;
+            }
+            if (releaseFromPool(view)) {
                 return;
             }
         }
@@ -2662,13 +2707,24 @@ void FastllmCudaFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
+    if (pointerDevice >= 0 && pointerDevice != oriId) {
+        cudaError_t switchState = cudaSetDevice(pointerDevice);
+        if (switchState != cudaSuccess) {
+            checkCudaErrors("CUDA error when switching to the pointer owner before release!", switchState);
+            cudaError_t restoreState = cudaSetDevice(oriId);
+            checkCudaErrors("CUDA error when restoring device after a failed release switch!", restoreState);
+            return;
+        }
+    }
     if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
         // 同 cudaMalloc：真实 cudaFree 前排空在途 NCCL，避免争用 CUDA 驱动锁导致跨 rank 死锁。
-        cudaDeviceSynchronize();
+        cudaError_t syncState = cudaDeviceSynchronize();
+        checkCudaErrors("CUDA error when synchronizing before release!", syncState);
     }
     cudaError_t state = cudaFree(ret);
-    FastllmCudaSetDevice(oriId);
+    cudaError_t restoreState = cudaSetDevice(oriId);
     checkCudaErrors("CUDA error when release memory!", state);
+    checkCudaErrors("CUDA error when restoring device after release!", restoreState);
 }
 
 void FastllmCudaMallocBigBuffer(size_t size) {
