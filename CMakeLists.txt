@@ -521,6 +521,9 @@ if (UNIT_TEST)
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)
+    if (USE_CUDA AND NOT USE_ROCM)
+        target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    endif()
 endif()
 
 add_executable(webui example/webui/webui.cpp)
