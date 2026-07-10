@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -6917,6 +6918,132 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluTwoTokenHalfKernel(
 #endif
 }
 
+static constexpr int FASTLLM_CUDA_MTP_FAST_SEQ_MAX = 6;
+static constexpr int FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX =
+    FASTLLM_CUDA_MTP_FAST_SEQ_MAX - 1;
+
+static bool FastllmCudaDataHasDenseStrides(const fastllm::Data &data) {
+    if (data.dims.empty() || data.strides.size() != data.dims.size()) {
+        return false;
+    }
+    uint64_t expected = 1;
+    for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+        if (data.dims[i] < 0 || data.strides[i] != expected) {
+            return false;
+        }
+        if (data.dims[i] > 0 && expected > ~(uint64_t)0 / (uint64_t)data.dims[i]) {
+            return false;
+        }
+        expected *= (uint64_t)data.dims[i];
+    }
+    return true;
+}
+
+static bool FastllmCudaResolveDataDeviceId(const fastllm::Data &data,
+                                            int &deviceId) {
+    if (data.dataDevice != fastllm::DataDevice::CUDA ||
+        data.dataDeviceIds.size() > 1) {
+        return false;
+    }
+    if (data.cudaData == nullptr) {
+        return false;
+    }
+    // Fake/view tensors may omit dataDeviceIds, and a reused view may retain a
+    // stale id from its previous owner.  Resolve the allocation itself and,
+    // when metadata is present, require both sources to agree.
+    int pointerDevice = GetPointerDeviceId(data.cudaData);
+    if (pointerDevice < 0 ||
+        (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != pointerDevice)) {
+        return false;
+    }
+    deviceId = pointerDevice;
+    return true;
+}
+
+static bool FastllmCudaDataCanShareDevice(const fastllm::Data &reference,
+                                          const fastllm::Data &other) {
+    if (reference.multiDeviceData || other.multiDeviceData ||
+        reference.dataDevice != fastllm::DataDevice::CUDA ||
+        other.dataDevice != fastllm::DataDevice::CUDA ||
+        reference.dataDeviceIds.size() > 1 || other.dataDeviceIds.size() > 1) {
+        return false;
+    }
+    int referenceDevice = -1;
+    int otherDevice = -1;
+    return FastllmCudaResolveDataDeviceId(reference, referenceDevice) &&
+           FastllmCudaResolveDataDeviceId(other, otherDevice) &&
+           referenceDevice == otherDevice;
+}
+
+// 处理最多6个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
+// 把当时的滑窗状态写入对应快照 (用于MTP验证的逐token状态回滚)。
+__global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
+    half *cache, const half *newTokens, const float *weight, const float *bias,
+    half *output,
+    half *snap0, half *snap1, half *snap2, half *snap3, half *snap4, half *snap5,
+    int numSnaps,
+    int batch, int channels, int numTokens) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (row >= total) {
+        return;
+    }
+
+    int c = row % channels;
+    half *cacheRow = cache + (size_t)row * 4;
+    const half *tokenRow = newTokens + (size_t)row * numTokens;
+    half x0 = cacheRow[0];
+    half x1 = cacheRow[1];
+    half x2 = cacheRow[2];
+    half x3 = cacheRow[3];
+
+    const float *curWeight = weight + (size_t)c * 4;
+    float biasVal = bias ? bias[c] : 0.0f;
+    half *outputRow = output + (size_t)row * numTokens;
+    for (int t = 0; t < numTokens; t++) {
+        x0 = x1;
+        x1 = x2;
+        x2 = x3;
+        x3 = tokenRow[t];
+        float value = biasVal;
+        value += __half2float(x0) * curWeight[0];
+        value += __half2float(x1) * curWeight[1];
+        value += __half2float(x2) * curWeight[2];
+        value += __half2float(x3) * curWeight[3];
+        half conv = __float2half_rn(value);
+#ifdef CUDA_NO_TENSOR_CORE
+        float y = __half2float(conv);
+        outputRow[t] = __float2half(y / (1.0f + expf(-y)));
+#else
+        outputRow[t] = __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+        half *snapBase = nullptr;
+        if (t < numSnaps) {
+            switch (t) {
+                case 0: snapBase = snap0; break;
+                case 1: snapBase = snap1; break;
+                case 2: snapBase = snap2; break;
+                case 3: snapBase = snap3; break;
+                case 4: snapBase = snap4; break;
+                case 5: snapBase = snap5; break;
+                default: break;
+            }
+        }
+        if (snapBase != nullptr) {
+            half *snapRow = snapBase + (size_t)row * 4;
+            snapRow[0] = x0;
+            snapRow[1] = x1;
+            snapRow[2] = x2;
+            snapRow[3] = x3;
+        }
+    }
+
+    cacheRow[0] = x0;
+    cacheRow[1] = x1;
+    cacheRow[2] = x2;
+    cacheRow[3] = x3;
+}
+
 __global__ void FastllmShiftAppendConv1DPerChannelSiluSingleTokenHalfPointerKernel(
     half **caches, const half *newToken, const float *weight, const float *bias,
     half *output, int batch, int channels) {
@@ -7127,6 +7254,130 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluTwoTokenFloat16(fastllm::Data &ca
         cudaCache, cudaNewTokens, cudaWeight, cudaBias, cudaOutput, cudaFirstTokenCache, batch, channels
     );
     checkCudaErrors("Error: CUDA error in FastllmCudaShiftAppendConv1DPerChannelSiluTwoTokenFloat16.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
+    fastllm::Data &cache, const fastllm::Data &newTokens,
+    fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output,
+    fastllm::Data **tokenCaches, int numTokenCaches) {
+    if (!FastllmCudaDataCanShareDevice(cache, newTokens) ||
+        !FastllmCudaDataCanShareDevice(cache, weight) ||
+        (bias.dims.size() > 0 && !FastllmCudaDataCanShareDevice(cache, bias)) ||
+        output.isFake || output.cudaDataBorrowed || output.isPagedKVCache || output.multiDeviceData ||
+        &output == &cache || &output == &weight || &output == &bias ||
+        static_cast<const fastllm::Data*>(&output) == &newTokens) {
+        return false;
+    }
+    int cacheDevice = -1;
+    if (!FastllmCudaResolveDataDeviceId(cache, cacheDevice) ||
+        FastllmCudaGetDevice() != cacheDevice) {
+        return false;
+    }
+    if (cache.dataType != fastllm::DataType::FLOAT16 || newTokens.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        (bias.dims.size() > 0 && (bias.dataDevice != fastllm::DataDevice::CUDA || bias.dataType != fastllm::DataType::FLOAT32))) {
+        return false;
+    }
+    if (cache.dims.size() != 3 || cache.dims[0] <= 0 || cache.dims[1] <= 0 || cache.dims[2] != 4 ||
+        newTokens.dims.size() != 3 || newTokens.dims[0] != cache.dims[0] ||
+        newTokens.dims[1] != cache.dims[1] ||
+        newTokens.dims[2] < 1 ||
+        newTokens.dims[2] > FASTLLM_CUDA_MTP_FAST_SEQ_MAX ||
+        !FastllmCudaDataHasDenseStrides(cache) ||
+        !FastllmCudaDataHasDenseStrides(newTokens) ||
+        (bias.dims.size() > 0 && (bias.dims.size() != 1 || bias.dims[0] != cache.dims[1]))) {
+        return false;
+    }
+    bool validWeightShape =
+        (weight.dims.size() == 2 && weight.dims[0] == cache.dims[1] && weight.dims[1] == 4) ||
+        (weight.dims.size() == 3 && weight.dims[0] == cache.dims[1] && weight.dims[1] == 1 && weight.dims[2] == 4);
+    if (!validWeightShape || !FastllmCudaDataHasDenseStrides(weight) ||
+        (bias.dims.size() > 0 && !FastllmCudaDataHasDenseStrides(bias)) ||
+        cache.cudaData == nullptr || newTokens.cudaData == nullptr || weight.cudaData == nullptr ||
+        (bias.dims.size() > 0 && bias.cudaData == nullptr) ||
+        numTokenCaches < 0 ||
+        numTokenCaches > FASTLLM_CUDA_MTP_FAST_SEQ_MAX ||
+        numTokenCaches > newTokens.dims[2] ||
+        (numTokenCaches > 0 && tokenCaches == nullptr)) {
+        return false;
+    }
+
+    for (int t = 0; t < numTokenCaches; t++) {
+        fastllm::Data *snap = tokenCaches[t];
+        if (snap == nullptr) {
+            continue;
+        }
+        if (snap->isFake || snap->cudaDataBorrowed || snap->isPagedKVCache ||
+            snap->multiDeviceData || snap == &cache || snap == &weight ||
+            snap == &bias || snap == &output ||
+            static_cast<const fastllm::Data*>(snap) == &newTokens) {
+            return false;
+        }
+        for (int other = 0; other < t; other++) {
+            if (tokenCaches[other] == snap) {
+                return false;
+            }
+        }
+    }
+
+    int numTokens = newTokens.dims[2];
+    uint64_t totalRows = (uint64_t)cache.dims[0] * cache.dims[1];
+    if (totalRows > 0x7fffffffULL) {
+        return false;
+    }
+    output.dataType = cache.dataType;
+    output.Resize({cache.dims[0], cache.dims[1], numTokens});
+    output.ToDevice(cache.dataDevice, std::vector<int>{cacheDevice});
+    output.Allocate();
+    output.isKVCache = false;
+    output.isLinearAttention = false;
+    output.isLinearAttentionTransposed = false;
+    if (output.cudaData == nullptr || !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(cache, output)) {
+        return false;
+    }
+
+    half *snaps[FASTLLM_CUDA_MTP_FAST_SEQ_MAX] = {};
+    for (int t = 0; t < numTokenCaches; t++) {
+        fastllm::Data *snap = tokenCaches[t];
+        if (snap == nullptr) {
+            continue;
+        }
+        snap->dataType = cache.dataType;
+        snap->Resize(cache.dims);
+        snap->ToDevice(cache.dataDevice, std::vector<int>{cacheDevice});
+        snap->Allocate();
+        snap->isLinearAttentionTransposed = false;
+        if (snap->cudaData == nullptr || !FastllmCudaDataHasDenseStrides(*snap) ||
+            !FastllmCudaDataCanShareDevice(cache, *snap)) {
+            return false;
+        }
+        snaps[t] = (half *) snap->cudaData;
+    }
+
+    int batch = cache.dims[0];
+    int channels = cache.dims[1];
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (int)((totalRows + threadsPerBlock - 1) / threadsPerBlock);
+    cudaError_t pendingState = cudaGetLastError();
+    if (pendingState != cudaSuccess) {
+        checkCudaErrors("Error: stale CUDA error before FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16.", pendingState);
+        return false;
+    }
+    FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        (half *) cache.cudaData, (const half *) newTokens.cudaData,
+        (const float *) weight.cudaData,
+        bias.dims.size() > 0 ? (const float *) bias.cudaData : nullptr,
+        (half *) output.cudaData,
+        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5],
+        numTokenCaches, batch, channels, numTokens
+    );
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors("Error: CUDA error in FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16.", launchState);
+        return false;
+    }
     return true;
 }
 
@@ -8711,7 +8962,9 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     half *last_recurrent_state,
     half *core_attn_out,
     int seqLen, int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale,
+    half *snap0, half *snap1, half *snap2, half *snap3, half *snap4,
+    int numSnaps) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
@@ -8820,9 +9073,26 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
                            __shfl_sync(0xffffffff, sumK, 0)) * ba_values[0];
 
             float sumQ = 0.0f;
+            half *snapBase = nullptr;
+            if (token < numSnaps) {
+                switch (token) {
+                    case 0: snapBase = snap0; break;
+                    case 1: snapBase = snap1; break;
+                    case 2: snapBase = snap2; break;
+                    case 3: snapBase = snap3; break;
+                    case 4: snapBase = snap4; break;
+                    default: break;
+                }
+            }
+            half *snap_row = snapBase != nullptr ?
+                snapBase + stateHeadBase + (size_t)v_col * headKDim : nullptr;
             for (int j = lane_id; j < headKDim; j += 32) {
                 float updated = __half2float(state_row[j]) * gVal + k_norm[j] * delta;
-                state_row[j] = __float2half_rn(updated);
+                half updatedHalf = __float2half_rn(updated);
+                state_row[j] = updatedHalf;
+                if (snap_row != nullptr) {
+                    snap_row[j] = updatedHalf;
+                }
                 sumQ += updated * (q_norm[j] * qScale);
             }
             for (int offset = 16; offset > 0; offset >>= 1) {
@@ -9046,12 +9316,30 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale) {
-    if (convOutput.dataDevice != fastllm::DataDevice::CUDA ||
-        ba.dataDevice != fastllm::DataDevice::CUDA ||
-        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
-        aLog.dataDevice != fastllm::DataDevice::CUDA ||
-        dtBias.dataDevice != fastllm::DataDevice::CUDA ||
-        last_recurrent_state.dataDevice != fastllm::DataDevice::CUDA ||
+    return FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
+        convOutput, ba, normWeight, aLog, dtBias,
+        last_recurrent_state, core_attn_out,
+        nullptr, 0,
+        numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
+}
+
+bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
+    fastllm::Data **tokenStates, int numTokenStates,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    if (!FastllmCudaDataCanShareDevice(last_recurrent_state, convOutput) ||
+        !FastllmCudaDataCanShareDevice(last_recurrent_state, ba) ||
+        !FastllmCudaDataCanShareDevice(last_recurrent_state, normWeight) ||
+        !FastllmCudaDataCanShareDevice(last_recurrent_state, aLog) ||
+        !FastllmCudaDataCanShareDevice(last_recurrent_state, dtBias) ||
+        core_attn_out.isFake || core_attn_out.cudaDataBorrowed ||
+        core_attn_out.isPagedKVCache || core_attn_out.multiDeviceData ||
+        &core_attn_out == &convOutput || &core_attn_out == &ba ||
+        &core_attn_out == &normWeight || &core_attn_out == &aLog ||
+        &core_attn_out == &dtBias || &core_attn_out == &last_recurrent_state ||
         convOutput.dataType != fastllm::DataType::FLOAT16 ||
         ba.dataType != fastllm::DataType::FLOAT16 ||
         normWeight.dataType != fastllm::DataType::FLOAT32 ||
@@ -9061,41 +9349,128 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
         !last_recurrent_state.isLinearAttentionTransposed ||
         convOutput.cudaData == nullptr ||
         ba.cudaData == nullptr ||
+        normWeight.cudaData == nullptr ||
+        aLog.cudaData == nullptr ||
+        dtBias.cudaData == nullptr ||
         last_recurrent_state.cudaData == nullptr) {
         return false;
     }
-    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    int stateDevice = -1;
+    if (!FastllmCudaResolveDataDeviceId(last_recurrent_state, stateDevice) ||
+        FastllmCudaGetDevice() != stateDevice) {
+        return false;
+    }
     if (numKHeads <= 0 || numVHeads <= 0 || headKDim != 128 || headVDim <= 0 ||
-        numVHeads % numKHeads != 0 ||
-        convOutput.dims.size() != 3 || convOutput.dims[0] != 1 ||
+        headVDim > 8 * 65535 || numVHeads % numKHeads != 0 ||
+        !std::isfinite(eps) || eps < 0.0f || !std::isfinite(qScale)) {
+        return false;
+    }
+    if (convOutput.dims.size() != 3 || ba.dims.size() != 3) {
+        return false;
+    }
+    int seqLen = convOutput.dims[1];
+    if (seqLen <= 1 || seqLen > FASTLLM_CUDA_MTP_FAST_SEQ_MAX) {
+        return false;
+    }
+    long long qkvDim64 = 2LL * numKHeads * headKDim + 1LL * numVHeads * headVDim;
+    long long baDim64 = 2LL * numVHeads;
+    long long stateElements = 1LL * numVHeads * headKDim * headVDim;
+    long long outputElements = 1LL * seqLen * numVHeads * headVDim;
+    if (qkvDim64 <= 0 || qkvDim64 > 0x7fffffffLL || (qkvDim64 & 1) != 0 ||
+        baDim64 <= 0 || baDim64 > 0x7fffffffLL ||
+        stateElements <= 0 || stateElements > 0x7fffffffLL ||
+        1LL * seqLen * qkvDim64 > 0x7fffffffLL ||
+        1LL * seqLen * baDim64 > 0x7fffffffLL ||
+        outputElements > 0x7fffffffLL ||
+        ((uintptr_t)convOutput.cudaData & (alignof(half2) - 1)) != 0) {
+        return false;
+    }
+    int qkvDim = (int)qkvDim64;
+    if (convOutput.dims[0] != 1 ||
+        !FastllmCudaDataHasDenseStrides(convOutput) ||
         convOutput.dims.back() != qkvDim ||
-        ba.dims.size() != 3 || ba.dims[0] != 1 ||
-        ba.dims.back() != numVHeads * 2 ||
+        ba.dims[0] != 1 ||
+        ba.dims.back() != (int)baDim64 || !FastllmCudaDataHasDenseStrides(ba) ||
         convOutput.dims[1] != ba.dims[1] ||
-        convOutput.dims[1] <= 1 || convOutput.dims[1] > 4 ||
         normWeight.dims.size() != 1 || normWeight.dims[0] != headKDim ||
+        !FastllmCudaDataHasDenseStrides(normWeight) ||
         aLog.dims.size() != 1 || aLog.dims[0] != numVHeads ||
+        !FastllmCudaDataHasDenseStrides(aLog) ||
         dtBias.dims.size() != 1 || dtBias.dims[0] != numVHeads ||
+        !FastllmCudaDataHasDenseStrides(dtBias) ||
         last_recurrent_state.dims.size() != 4 ||
         last_recurrent_state.dims[0] != 1 ||
         last_recurrent_state.dims[1] != numVHeads ||
         last_recurrent_state.dims[2] != headKDim ||
-        last_recurrent_state.dims[3] != headVDim) {
+        last_recurrent_state.dims[3] != headVDim ||
+        !FastllmCudaDataHasDenseStrides(last_recurrent_state)) {
         return false;
     }
 
-    int seqLen = convOutput.dims[1];
+    if (numTokenStates < 0 ||
+        numTokenStates > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
+        numTokenStates > seqLen ||
+        (numTokenStates > 0 && tokenStates == nullptr)) {
+        return false;
+    }
+    for (int t = 0; t < numTokenStates; t++) {
+        fastllm::Data *snap = tokenStates[t];
+        if (snap == nullptr) {
+            continue;
+        }
+        if (snap->isFake || snap->cudaDataBorrowed || snap->isPagedKVCache ||
+            snap->multiDeviceData || snap == &convOutput || snap == &ba ||
+            snap == &normWeight || snap == &aLog || snap == &dtBias ||
+            snap == &last_recurrent_state || snap == &core_attn_out) {
+            return false;
+        }
+        for (int other = 0; other < t; other++) {
+            if (tokenStates[other] == snap) {
+                return false;
+            }
+        }
+    }
     core_attn_out.dataType = last_recurrent_state.dataType;
-    core_attn_out.dataDevice = fastllm::DataDevice::CUDA;
-    core_attn_out.dataDeviceIds = last_recurrent_state.dataDeviceIds;
     core_attn_out.Resize({1, seqLen, numVHeads, headVDim});
+    core_attn_out.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{stateDevice});
     core_attn_out.Allocate(false);
+    core_attn_out.isKVCache = false;
+    core_attn_out.isLinearAttention = false;
+    core_attn_out.isLinearAttentionTransposed = false;
+    if (core_attn_out.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(core_attn_out) ||
+        !FastllmCudaDataCanShareDevice(last_recurrent_state, core_attn_out)) {
+        return false;
+    }
+
+    half *snaps[FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX] = {};
+    for (int t = 0; t < numTokenStates; t++) {
+        fastllm::Data *snap = tokenStates[t];
+        if (snap == nullptr) {
+            continue;
+        }
+        snap->dataType = last_recurrent_state.dataType;
+        snap->Resize(last_recurrent_state.dims);
+        snap->ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{stateDevice});
+        snap->Allocate();
+        snap->isLinearAttentionTransposed = true;
+        if (snap->cudaData == nullptr || !FastllmCudaDataHasDenseStrides(*snap) ||
+            !FastllmCudaDataCanShareDevice(last_recurrent_state, *snap)) {
+            return false;
+        }
+        snaps[t] = (half*)snap->cudaData;
+    }
 
     constexpr int tileV = 8;
     int threadsPerBlock = tileV * 32;
     size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
     dim3 gridDim(numVHeads, (headVDim + tileV - 1) / tileV);
 
+    cudaError_t pendingState = cudaGetLastError();
+    if (pendingState != cudaSuccess) {
+        checkCudaErrors("Error: stale CUDA error before FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16.", pendingState);
+        return false;
+    }
     FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
         (const half*)convOutput.cudaData,
         (const half*)ba.cudaData,
@@ -9104,10 +9479,15 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
         (const float*)dtBias.cudaData,
         (half*)last_recurrent_state.cudaData,
         (half*)core_attn_out.cudaData,
-        seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale
+        seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], numTokenStates
     );
 
-    checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16.", cudaGetLastError());
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16.", launchState);
+        return false;
+    }
     return true;
 }
 
