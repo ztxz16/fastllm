@@ -81,6 +81,9 @@ namespace {
 
     std::vector<float> ToFloatVector(fastllm::Data data) {
         data.ToDevice(fastllm::DataDevice::CPU);
+        if (data.dataType != fastllm::DataType::FLOAT32) {
+            fastllm::ToDataTypeForceCPU(data, fastllm::DataType::FLOAT32);
+        }
         int count = (int) data.Count(0);
         std::vector<float> values(count);
         Expect(data.dataType == fastllm::DataType::FLOAT32, "Only FLOAT32 tensors are supported here.");
@@ -107,6 +110,8 @@ namespace {
                          float atol, float rtol, const std::string &name) {
         Expect(expected.size() == actual.size(), name + " size mismatch.");
         for (size_t i = 0; i < expected.size(); i++) {
+            Expect(std::isfinite(expected[i]) && std::isfinite(actual[i]),
+                   name + " contains a non-finite value at index " + std::to_string(i));
             float diff = std::fabs(expected[i] - actual[i]);
             float limit = atol + rtol * std::fabs(expected[i]);
             if (diff > limit) {
@@ -309,6 +314,8 @@ namespace {
             );
         }
 
+        Expect(output.dataType == fastllm::DataType::FLOAT32,
+               "MergeMOE output dtype mismatch.");
         return ToFloatVector(output);
     }
 
