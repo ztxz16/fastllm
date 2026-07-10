@@ -954,15 +954,23 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     weight.multiDeviceData = true;
     bias.multiDeviceData = true;
     int k = weight.dims[0], m = weight.dims[1];
+    const size_t kSize = static_cast<size_t>(k);
+    const size_t mSize = static_cast<size_t>(m);
+    const size_t unitSize = static_cast<size_t>(weight.unitSize);
+    const size_t unitSizeDiv = static_cast<size_t>(weight.unitSizeDiv);
+    const auto packedByteCount = [unitSize, unitSizeDiv] (size_t rows, size_t cols) -> size_t {
+        return rows * cols * unitSize / unitSizeDiv;
+    };
+    const size_t biasBytes = kSize * sizeof(float);
     cudaError_t state = cudaSuccess;
     float *cudaBiasData = nullptr;
     if (hasBias) {
-        cudaBiasData = (float*)FastllmCudaMalloc(k * sizeof(float));
+        cudaBiasData = (float*)FastllmCudaMalloc(biasBytes);
         if (cudaBiasData == nullptr) {
             fastllm::ErrorInFastLLM("SplitMultiCudaWeight failed to allocate temporary bias for \"" +
                                     weight.name + "\".\n");
         }
-        state = cudaMemcpy(cudaBiasData, (uint8_t *) bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+        state = cudaMemcpy(cudaBiasData, (uint8_t *) bias.cudaData, biasBytes, cudaMemcpyDeviceToDevice);
     }
     if (state != cudaSuccess) {
         if (cudaBiasData != nullptr) {
@@ -1019,14 +1027,16 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 size_t rowBytes = GetRowContiguousNumaGateUpRowBytes(weight, m);
                 for (auto &it : div) {
                     int copyLen = it.second - it.first;
-                    int srcRow = it.first < mid ? it.first * 2 : (it.first - mid) * 2 + 1;
+                    size_t srcRow = it.first < mid
+                        ? static_cast<size_t>(it.first) * 2
+                        : static_cast<size_t>(it.first - mid) * 2 + 1;
                     state = FastllmCudaMemcpy2D(
                         (uint8_t*)deviceWeightData + (size_t)curLen * rowBytes,
                         rowBytes,
                         (uint8_t*)weight.cudaData + (size_t)srcRow * rowBytes,
                         rowBytes * 2,
                         rowBytes,
-                        copyLen,
+                        static_cast<size_t>(copyLen),
                         GetCudaMemcpyType(mallocType, 1),
                         deviceId,
                         rootDevice);
@@ -1093,7 +1103,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 size_t rowBytes = fastllm::GetNVFP4WeightBytes(1, m);
                 size_t srcWeightBytes = fastllm::GetNVFP4WeightBytes(k, m);
                 size_t dstWeightBytes = fastllm::GetNVFP4WeightBytes(len, m);
-                int scaleCols = (m - 1) / weight.blockM + 1;
+                size_t scaleCols = static_cast<size_t>((m - 1) / weight.blockM + 1);
                 if (mallocType == 0) {
                     cudaSetDevice(rootDevice);
                 }
@@ -1109,10 +1119,10 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                         break;
                     }
                     state = cudaMemcpy((uint8_t*)deviceWeightData + dstWeightBytes +
-                                           (size_t)(curLen / weight.blockK) * scaleCols,
+                                           static_cast<size_t>(curLen / weight.blockK) * scaleCols,
                                        (uint8_t*)weight.cudaData + srcWeightBytes +
-                                           (size_t)(it.first / weight.blockK) * scaleCols,
-                                       (size_t)(copyLen / weight.blockK) * scaleCols,
+                                           static_cast<size_t>(it.first / weight.blockK) * scaleCols,
+                                       static_cast<size_t>(copyLen / weight.blockK) * scaleCols,
                                        GetCudaMemcpyType(mallocType, 1));
                     if (state != cudaSuccess) {
                         break;
@@ -1128,14 +1138,19 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 }
             } else {
                 for (auto &it : div) {
-                    state = cudaMemcpy((uint8_t*)deviceWeightData + curLen * m * weight.unitSize / weight.unitSizeDiv, 
-                                        (uint8_t*)weight.cudaData + it.first * m * weight.unitSize / weight.unitSizeDiv, 
-                                        (it.second - it.first) * m * weight.unitSize / weight.unitSizeDiv, GetCudaMemcpyType(mallocType, 1));
+                    size_t dstOffsetBytes = packedByteCount(static_cast<size_t>(curLen), mSize);
+                    size_t srcOffsetBytes = packedByteCount(static_cast<size_t>(it.first), mSize);
+                    size_t copyBytes = packedByteCount(static_cast<size_t>(it.second - it.first), mSize);
+                    state = cudaMemcpy((uint8_t*)deviceWeightData + dstOffsetBytes,
+                                       (uint8_t*)weight.cudaData + srcOffsetBytes,
+                                       copyBytes, GetCudaMemcpyType(mallocType, 1));
                     if (state != cudaSuccess) {
                         break;
                     }
                     if (hasBias) {
-                        state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                        state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                           static_cast<size_t>(it.second - it.first) * sizeof(float),
+                                           GetCudaMemcpyType(mallocType, 1));
                         if (state != cudaSuccess) {
                             break;
                         }
@@ -1183,7 +1198,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                                                 (uint8_t*)weight.cudaData + srcOffsetBytes,
                                                 srcRowBytes,
                                                 copyBytes,
-                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                                                kSize, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                     if (state != cudaSuccess) {
                         break;
                     }
@@ -1209,7 +1224,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                                                 (uint8_t*)weight.cudaData + srcOffsetBytes,
                                                 srcRowBytes,
                                                 copyBytes,
-                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                                                kSize, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                     if (state != cudaSuccess) {
                         break;
                     }
@@ -1222,9 +1237,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 size_t dstRowBytes = fastllm::GetNVFP4WeightBytes(1, len);
                 size_t srcWeightBytes = fastllm::GetNVFP4WeightBytes(k, m);
                 size_t dstWeightBytes = fastllm::GetNVFP4WeightBytes(k, len);
-                int srcScaleCols = (m - 1) / weight.blockM + 1;
-                int dstScaleCols = (len - 1) / weight.blockM + 1;
-                int scaleRows = (k - 1) / weight.blockK + 1;
+                size_t srcScaleCols = static_cast<size_t>((m - 1) / weight.blockM + 1);
+                size_t dstScaleCols = static_cast<size_t>((len - 1) / weight.blockM + 1);
+                size_t scaleRows = static_cast<size_t>((k - 1) / weight.blockK + 1);
                 for (auto &it : div) {
                     int copyLen = it.second - it.first;
                     fastllm::AssertInFastLLM((it.first & 1) == 0 && (copyLen & 1) == 0 &&
@@ -1233,20 +1248,22 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (mallocType == 0) {
                         cudaSetDevice(rootDevice);
                     }
-                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + (curLen >> 1),
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + (static_cast<size_t>(curLen) >> 1),
                                                 dstRowBytes,
-                                                (uint8_t*)weight.cudaData + (it.first >> 1),
+                                                (uint8_t*)weight.cudaData + (static_cast<size_t>(it.first) >> 1),
                                                 srcRowBytes,
-                                                (size_t)copyLen >> 1,
-                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                                                static_cast<size_t>(copyLen) >> 1,
+                                                kSize, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                     if (state != cudaSuccess) {
                         break;
                     }
-                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstWeightBytes + curLen / weight.blockM,
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstWeightBytes +
+                                                    static_cast<size_t>(curLen / weight.blockM),
                                                 dstScaleCols,
-                                                (uint8_t*)weight.cudaData + srcWeightBytes + it.first / weight.blockM,
+                                                (uint8_t*)weight.cudaData + srcWeightBytes +
+                                                    static_cast<size_t>(it.first / weight.blockM),
                                                 srcScaleCols,
-                                                (size_t)copyLen / weight.blockM,
+                                                static_cast<size_t>(copyLen / weight.blockM),
                                                 scaleRows, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                     if (state != cudaSuccess) {
                         break;
@@ -1258,12 +1275,17 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (mallocType == 0) {
                         cudaSetDevice(rootDevice);
                     }
-                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
-                                                (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
-                                                (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv,
-                                                m * weight.unitSize / weight.unitSizeDiv,
-                                                (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
-                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    size_t copyLen = static_cast<size_t>(it.second - it.first);
+                    size_t dstOffsetBytes = packedByteCount(1, static_cast<size_t>(curLen));
+                    size_t dstRowBytes = packedByteCount(1, copyLen);
+                    size_t srcOffsetBytes = packedByteCount(1, static_cast<size_t>(it.first));
+                    size_t srcRowBytes = packedByteCount(1, mSize);
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
+                                                dstRowBytes,
+                                                (uint8_t*)weight.cudaData + srcOffsetBytes,
+                                                srcRowBytes,
+                                                dstRowBytes,
+                                                kSize, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                     if (state != cudaSuccess) {
                         break;
                     }
@@ -1272,9 +1294,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             }
             if (state == cudaSuccess && !emptyShard && hasBias) {
                 if (i == 0) {
-                    state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                    state = cudaMemcpy(deviceBiasData, cudaBiasData, biasBytes, GetCudaMemcpyType(mallocType, 1));
                 } else {
-                    state = AutoMemset(deviceBiasData, 0, k * sizeof(float), mallocType);
+                    state = AutoMemset(deviceBiasData, 0, biasBytes, mallocType);
                 }
             }
         }
@@ -1312,25 +1334,30 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             auto curDevice = weight.multiDeviceDatas[deviceId];
             curDevice->blockK = weight.blockK;
             curDevice->blockM = weight.blockM;
-            int ks = (curDevice->dims[0] - 1) / curDevice->blockK + 1;
-            int ms = (curDevice->dims[1] - 1) / curDevice->blockM + 1;
+            size_t ks = static_cast<size_t>((curDevice->dims[0] - 1) / curDevice->blockK + 1);
+            size_t ms = static_cast<size_t>((curDevice->dims[1] - 1) / curDevice->blockM + 1);
             curDevice->scales.resize(ks * ms);
             if (splitAxis == 0) {
-                int curLen = 0;
+                size_t curLen = 0;
                 for (auto &it : div) {
-                    memcpy(curDevice->scales.data() + curLen * ms, weight.scales.data() + it.first / curDevice->blockM * ms, 
-                        (it.second - it.first) / curDevice->blockM * ms * sizeof(float));
-                    curLen += (it.second - it.first) / curDevice->blockM;
+                    size_t copyLen = static_cast<size_t>((it.second - it.first) / curDevice->blockM);
+                    size_t srcOffset = static_cast<size_t>(it.first / curDevice->blockM) * ms;
+                    memcpy(curDevice->scales.data() + curLen * ms,
+                           weight.scales.data() + srcOffset,
+                           copyLen * ms * sizeof(float));
+                    curLen += copyLen;
                 }
             } else {
-                int oriMs = weight.scales.size() / ks;
-                for (int i = 0; i < ks; i++) {
-                    int curLen = 0;
+                size_t oriMs = weight.scales.size() / ks;
+                for (size_t row = 0; row < ks; row++) {
                     for (auto &it : div) {
-                        memcpy(curDevice->scales.data() + i * ms, weight.scales.data() + i * oriMs + it.first / curDevice->blockM, 
-                            (it.second - it.first) / curDevice->blockM * sizeof(float));
-                        curLen += (it.second - it.first) / curDevice->blockM;
-                    }   
+                        size_t srcOffset = row * oriMs +
+                                           static_cast<size_t>(it.first / curDevice->blockM);
+                        size_t copyLen = static_cast<size_t>((it.second - it.first) / curDevice->blockM);
+                        memcpy(curDevice->scales.data() + row * ms,
+                               weight.scales.data() + srcOffset,
+                               copyLen * sizeof(float));
+                    }
                 }
             }
         }
@@ -1338,17 +1365,19 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
         // 1. mins, scales
         if (weight.mins.size() > 0) {
             int weightGroup = weight.group < 0 ? 1 : weight.group;
-            std::vector <int> zeropoints = std::vector <int> (k * weightGroup, 0);
+            size_t weightGroupSize = static_cast<size_t>(weightGroup);
+            size_t kGroupCount = kSize * weightGroupSize;
+            std::vector <int> zeropoints = std::vector <int> (kGroupCount, 0);
             if (weight.perChannelsConfigs.size() > 0) {
-                for (int i = 0; i < k * weightGroup; i++) {
+                for (size_t i = 0; i < kGroupCount; i++) {
                     zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
                 }
             } else if (weight.zeros.size() > 0) {
-                for (int i = 0; i < k * weightGroup; i++) {
+                for (size_t i = 0; i < kGroupCount; i++) {
                     zeropoints[i] = weight.zeros[i];
                 }
             } else {
-                for (int i = 0; i < k * weightGroup; i++) {
+                for (size_t i = 0; i < kGroupCount; i++) {
                     zeropoints[i] = 0;
                 }
             }
@@ -1370,46 +1399,61 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 if (splitAxis == 0) {
                     curDevice->group = weight.group;
                     curDevice->groupCnt = weight.groupCnt;
-                    curDevice->scales.resize(len * weightGroup);
-                    curDevice->mins.resize(len * weightGroup);
+                    size_t lenGroupCount = static_cast<size_t>(len) * weightGroupSize;
+                    curDevice->scales.resize(lenGroupCount);
+                    curDevice->mins.resize(lenGroupCount);
                     if (weight.dataType == fastllm::DataType::INT4_GROUP) {
                         int curLen = 0;
                         for (auto &it : div) {
-                            memcpy(curDevice->scales.data() + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
-                            memcpy(curDevice->mins.data() + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                            size_t dstOffset = static_cast<size_t>(curLen) * weightGroupSize;
+                            size_t srcOffset = static_cast<size_t>(it.first) * weightGroupSize;
+                            size_t copyCount = static_cast<size_t>(it.second - it.first) * weightGroupSize;
+                            memcpy(curDevice->scales.data() + dstOffset, weight.scales.data() + srcOffset,
+                                   copyCount * sizeof(float));
+                            memcpy(curDevice->mins.data() + dstOffset, weight.mins.data() + srcOffset,
+                                   copyCount * sizeof(float));
                             curLen += (it.second - it.first);
                         }
                     } else {
-                        curDevice->zeros.resize(len * weightGroup);
+                        curDevice->zeros.resize(lenGroupCount);
                         int curLen = 0;
                         for (auto &it : div) {
-                            memcpy(curDevice->scales.data() + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
-                            memcpy(curDevice->mins.data() + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
-                            memcpy(curDevice->zeros.data() + curLen * weightGroup, zeropoints.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(int));
+                            size_t dstOffset = static_cast<size_t>(curLen) * weightGroupSize;
+                            size_t srcOffset = static_cast<size_t>(it.first) * weightGroupSize;
+                            size_t copyCount = static_cast<size_t>(it.second - it.first) * weightGroupSize;
+                            memcpy(curDevice->scales.data() + dstOffset, weight.scales.data() + srcOffset,
+                                   copyCount * sizeof(float));
+                            memcpy(curDevice->mins.data() + dstOffset, weight.mins.data() + srcOffset,
+                                   copyCount * sizeof(float));
+                            memcpy(curDevice->zeros.data() + dstOffset, zeropoints.data() + srcOffset,
+                                   copyCount * sizeof(int));
                             curLen += (it.second - it.first);
                         }
                     }
                 } else {
-                    curDevice->scales.resize(k * weightGroup);
-                    curDevice->mins.resize(k * weightGroup);
+                    curDevice->scales.resize(kGroupCount);
+                    curDevice->mins.resize(kGroupCount);
                     curDevice->group = weight.group;
                     curDevice->groupCnt = weight.groupCnt;
                     if (weight.dataType == fastllm::DataType::INT4_GROUP) {
                         int base = div[0].first / weight.groupCnt;
                         std::vector <float> scales, mins;
-                        for (int i = 0; i < weight.scales.size(); i++) {
-                            scales.push_back((i + base < weight.scales.size() ? weight.scales[i + base] : 0.0f));
+                        size_t baseOffset = static_cast<size_t>(base);
+                        for (size_t i = 0; i < weight.scales.size(); i++) {
+                            size_t src = i + baseOffset;
+                            scales.push_back(src < weight.scales.size() ? weight.scales[src] : 0.0f);
                         }
-                        for (int i = 0; i < weight.mins.size(); i++) {
-                            mins.push_back((i + base < weight.mins.size() ? weight.mins[i + base] : 0.0f));
+                        for (size_t i = 0; i < weight.mins.size(); i++) {
+                            size_t src = i + baseOffset;
+                            mins.push_back(src < weight.mins.size() ? weight.mins[src] : 0.0f);
                         }
-                        memcpy(curDevice->scales.data(), scales.data(), k * weightGroup * sizeof(float));
-                        memcpy(curDevice->mins.data(), mins.data(), k * weightGroup * sizeof(float));
+                        memcpy(curDevice->scales.data(), scales.data(), kGroupCount * sizeof(float));
+                        memcpy(curDevice->mins.data(), mins.data(), kGroupCount * sizeof(float));
                     } else {
-                        curDevice->zeros.resize(k * weightGroup);
-                        memcpy(curDevice->scales.data(), weight.scales.data(), k * weightGroup * sizeof(float));
-                        memcpy(curDevice->mins.data(), weight.mins.data(), k * weightGroup * sizeof(float));
-                        memcpy(curDevice->zeros.data(), zeropoints.data(), k * weightGroup * sizeof(int));
+                        curDevice->zeros.resize(kGroupCount);
+                        memcpy(curDevice->scales.data(), weight.scales.data(), kGroupCount * sizeof(float));
+                        memcpy(curDevice->mins.data(), weight.mins.data(), kGroupCount * sizeof(float));
+                        memcpy(curDevice->zeros.data(), zeropoints.data(), kGroupCount * sizeof(int));
                     }
                 }
             }
