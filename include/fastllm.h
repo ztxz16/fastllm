@@ -397,7 +397,7 @@ namespace fastllm {
         int pageLen = 128; // 每个page的长度（token数）
         PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号
-        int lastPageLen; // 最后一个Page中使用了多少长度
+        int lastPageLen = 0; // 最后一个Page中使用了多少长度
 
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
