@@ -4850,7 +4850,17 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> devices;
         std::map<int, int> ratios;
-        return GetQwen35ThreadTpDevices(this->deviceMap, devices, ratios);
+        return CanUseGPUForward() &&
+               GetQwen35ThreadTpDevices(this->deviceMap, devices, ratios);
+#else
+        return false;
+#endif
+    }
+
+    bool Qwen3_5Model::CanUseGPUForward() const {
+#ifdef USE_CUDA
+        return !GetKVCacheInCPU() &&
+               Qwen35CanUseGPUForward(this->deviceMap, this->moeDeviceMap);
 #else
         return false;
 #endif
@@ -5322,12 +5332,9 @@ namespace fastllm {
 #ifndef USE_CUDA
         return false;
 #else
-        std::vector<int> devices;
-        std::map<int, int> ratios;
         return !Qwen35MtpDisabledByEnv() &&
                HasMtpWeights() &&
-               GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
-               !devices.empty();
+               CanUseGPUForward();
 #endif
     }
 
@@ -8171,7 +8178,8 @@ namespace fastllm {
         };
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios)) {
+        if (!CanUseGPUForward() ||
+            !GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios)) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }

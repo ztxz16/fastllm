@@ -695,7 +695,17 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> devices;
         std::map<int, int> ratios;
-        return GetMinimaxM2ThreadTpDevices(this->deviceMap, devices, ratios);
+        return CanUseGPUForward() &&
+               GetMinimaxM2ThreadTpDevices(this->deviceMap, devices, ratios);
+#else
+        return false;
+#endif
+    }
+
+    bool MinimaxM2Model::CanUseGPUForward() const {
+#ifdef USE_CUDA
+        return !GetKVCacheInCPU() &&
+               MinimaxM2CanUseGPUForward(this->deviceMap, this->moeDeviceMap);
 #else
         return false;
 #endif
@@ -782,16 +792,11 @@ namespace fastllm {
         }
         std::vector <std::vector <float>*> batchLogits;
         batchLogits.push_back(retLogits);
-#ifdef USE_CUDA
-        std::vector<int> devices;
-        std::map<int, int> ratios;
-        if (MinimaxM2CanUseGPUForward(this->deviceMap, this->moeDeviceMap) &&
-            GetMinimaxM2GPUForwardDevices(this->deviceMap, devices, ratios)) {
+        if (CanUseGPUForward()) {
             return ForwardGPU(1, inputIds, attentionMasks, positionIdsVec, seqLens,
                               pagedPastKeyValues, generationConfigs, lastTokens,
                               &batchLogits)[0];
         }
-#endif
         return ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens,
                          pagedPastKeyValues, generationConfigs, lastTokens, &batchLogits)[0];
     }
@@ -1087,7 +1092,7 @@ namespace fastllm {
 #else
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!MinimaxM2CanUseGPUForward(this->deviceMap, this->moeDeviceMap) ||
+        if (!CanUseGPUForward() ||
             !GetMinimaxM2GPUForwardDevices(this->deviceMap, devices, ratios)) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();

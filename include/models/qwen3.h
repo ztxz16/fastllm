@@ -89,6 +89,8 @@ namespace fastllm {
 
         virtual void WarmUp(); // 预热
 
+        virtual bool CanUseGPUForward() const override;
+
         virtual void OnAutoWarmupFinished() override;
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;

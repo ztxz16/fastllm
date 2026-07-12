@@ -2333,7 +2333,21 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> devices;
         std::map<int, int> ratios;
-        return GetStep3p5ThreadTpDevices(this->deviceMap, devices, ratios);
+        return CanUseGPUForward() &&
+               GetStep3p5ThreadTpDevices(this->deviceMap, devices, ratios);
+#else
+        return false;
+#endif
+    }
+
+    bool Step3p5Model::CanUseGPUForward() const {
+#ifdef USE_CUDA
+        if (GetKVCacheInCPU()) {
+            return false;
+        }
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        return GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios);
 #else
         return false;
 #endif
@@ -4447,14 +4461,10 @@ namespace fastllm {
         }
         std::vector <std::vector <float>*> batchLogits;
         batchLogits.push_back(retLogits);
-#ifdef USE_CUDA
-        std::vector<int> devices;
-        std::map<int, int> ratios;
-        if (GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios)) {
+        if (CanUseGPUForward()) {
             return ForwardGPU(1, inputIds, attentionMasks, positionIdsVec, seqLens,
                               pagedPastKeyValues, generationConfigs, lastTokens, &batchLogits)[0];
         }
-#endif
         return ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens,
                          pagedPastKeyValues, generationConfigs, lastTokens, &batchLogits)[0];
     }
@@ -4520,9 +4530,7 @@ namespace fastllm {
         ErrorInFastLLM("Step3.7 multimodal currently requires CUDA text forward.\n");
         return ret;
 #else
-        std::vector<int> devices;
-        std::map<int, int> ratios;
-        bool useThreadTpForward = GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios);
+        bool useThreadTpForward = CanUseGPUForward();
 
         std::vector <std::pair <Data*, Data*> > pagedPastKeyValues;
         for (int i = 0; i < (int)pastKeyValues.size(); i++) {
@@ -4608,7 +4616,8 @@ namespace fastllm {
         (void)attentionMask;
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios)) {
+        if (!CanUseGPUForward() ||
+            !GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios)) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }

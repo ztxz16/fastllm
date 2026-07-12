@@ -385,6 +385,10 @@ namespace fastllm {
         return maxBatch;
     }
 
+    bool basellm::CanUseGPUForward() const {
+        return IsPureGpuMode(this);
+    }
+
     int ResponseContextDict::CreateHandle() {
         locker.lock();
         int newId = 0;
@@ -2179,7 +2183,7 @@ namespace fastllm {
                         }
                     }
                     if (useNewEngine) {
-                        if (IsPureGpuMode(this)) {
+                        if (this->CanUseGPUForward()) {
                             mainLoop = new std::thread([](basellm *model) {
                                 model->GPUMainLoop();
                             }, this);
@@ -3342,7 +3346,7 @@ namespace fastllm {
 #endif
         int minPages = -1;
         PagedCacheManager *autoWarmupPagedCacheManager = nullptr;
-        bool useGPUForwardForWarmup = IsPureGpuMode(this);
+        bool useGPUForwardForWarmup = this->CanUseGPUForward();
 
 #ifdef USE_CUDA
         auto printCudaWarmupPoolStats = [&](const char *stage) {

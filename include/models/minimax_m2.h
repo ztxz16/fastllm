@@ -66,6 +66,8 @@ namespace fastllm {
         
         virtual void WarmUp(); // 预热
 
+        virtual bool CanUseGPUForward() const override;
+
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
 

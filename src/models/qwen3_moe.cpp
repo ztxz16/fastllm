@@ -1955,7 +1955,17 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> devices;
         std::map<int, int> ratios;
-        return GetQwen3MoeThreadTpDevices(this->deviceMap, devices, ratios);
+        return CanUseGPUForward() &&
+               GetQwen3MoeThreadTpDevices(this->deviceMap, devices, ratios);
+#else
+        return false;
+#endif
+    }
+
+    bool Qwen3MOEModel::CanUseGPUForward() const {
+#ifdef USE_CUDA
+        return !GetKVCacheInCPU() &&
+               Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap);
 #else
         return false;
 #endif
@@ -2920,16 +2930,11 @@ namespace fastllm {
         }
         std::vector <std::vector <float>*> batchLogits;
         batchLogits.push_back(retLogits);
-#ifdef USE_CUDA
-        std::vector<int> devices;
-        std::map<int, int> ratios;
-        if (Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) &&
-            GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios)) {
+        if (CanUseGPUForward()) {
             return ForwardGPU(1, inputIds, attentionMasks, positionIdsVec, seqLens,
                               pagedPastKeyValues, generationConfigs, lastTokens,
                               &batchLogits)[0];
         }
-#endif
         return ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens,
                          pagedPastKeyValues, generationConfigs, lastTokens, &batchLogits)[0];
     }
@@ -3873,7 +3878,7 @@ namespace fastllm {
 #else
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!Qwen3MoeCanUseGPUForward(this->deviceMap, this->moeDeviceMap) ||
+        if (!CanUseGPUForward() ||
             !GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios)) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();

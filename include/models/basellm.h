@@ -326,6 +326,10 @@ namespace fastllm {
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
 
+        // 当前运行配置是否可以使用 ForwardGPU。
+        // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
+        virtual bool CanUseGPUForward() const;
+
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
         virtual void AddPromptCache(const std::vector <int> &inputTokens);
