@@ -22,6 +22,7 @@
 #include "qwen2.h"
 #include "qwen3.h"
 #include "qwen3_moe.h"
+#include "hy_v3.h"
 #include "qwen3_next.h"
 #include "qwen3_5.h"
 #include "step3p5.h"
@@ -315,6 +316,7 @@ namespace fastllm {
                                                   const std::vector<int> &deviceIds,
                                                   std::map<int, int> &ratios) {
         if ((model->model_type != "qwen3_moe" &&
+             model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
              model->model_type != "minimax_m2") ||
             !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
@@ -479,6 +481,9 @@ namespace fastllm {
             model = (basellm*)(new MoeModel());
         } else if (modelType == "qwen3_moe") {
             model = (basellm*)(new Qwen3MOEModel());
+        } else if (modelType == "hy_v3" || modelType == "HYV3ForCausalLM") {
+            model = (basellm*)(new HyV3Model());
+            model->model_type = "hy_v3";
         } else if (modelType == "minimax_m2") {
             model = (basellm*)(new MinimaxM2Model());
         } else if (modelType == "qwen3_next") {

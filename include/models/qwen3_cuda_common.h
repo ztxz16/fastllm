@@ -465,6 +465,13 @@ namespace fastllm {
                    FloatDict(), IntDict{{"axis", axis}}, {"output"});
     }
 
+    inline void Qwen3CudaSigmoid(Qwen3CudaDirectRunner &runner,
+                                 const Data &input, Data &output) {
+        runner.Run("Sigmoid",
+                   DataDict{{"input", (Data*)&input}, {"output", &output}},
+                   FloatDict(), IntDict(), {"output"});
+    }
+
     inline void Qwen3CudaSelectExpert(Qwen3CudaDirectRunner &runner,
                                       const Data &logits, Data &index, Data &score,
                                       int topk, bool needNorm,

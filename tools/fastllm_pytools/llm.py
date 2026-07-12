@@ -887,7 +887,7 @@ def _is_step3p5_model_dir(path):
         return False
 
 def _attach_local_chat_template(tokenizer, path):
-    if tokenizer is None or not _is_step3p5_model_dir(path):
+    if tokenizer is None:
         return tokenizer
     if not getattr(tokenizer, "chat_template", None):
         template_path = os.path.join(path, "chat_template.jinja")
