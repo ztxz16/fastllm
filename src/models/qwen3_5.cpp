@@ -760,6 +760,26 @@ namespace fastllm {
         weight.weightSum.shrink_to_fit();
     }
 
+    static bool Qwen35NeedRepeatPenalty(const GenerationConfig &config) {
+        float diff = config.repeat_penalty - 1.0f;
+        return diff > 1e-6f || diff < -1e-6f;
+    }
+
+    static bool Qwen35MtpSupportsGenerationConfig(
+            const GenerationConfig &config) {
+        if (config.output_logits ||
+            !config.tool_call_allowed_token_ids.empty() ||
+            Qwen35NeedRepeatPenalty(config)) {
+            return false;
+        }
+        if (config.IsSimpleGreedy()) {
+            return true;
+        }
+        return config.top_k > 1 &&
+               config.temperature > 0.0f &&
+               config.top_p > 0.0f && config.top_p <= 1.0f;
+    }
+
 #ifdef USE_CUDA
     namespace {
         static std::atomic<int> qwen35ThreadTpNextPagedCacheBase(3000000);
@@ -780,26 +800,6 @@ namespace fastllm {
             std::transform(v.begin(), v.end(), v.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
             return v.empty() || v == "false" || v == "off" || v == "none" || v == "disable";
-        }
-
-        static bool Qwen35NeedRepeatPenalty(const GenerationConfig &config) {
-            float diff = config.repeat_penalty - 1.0f;
-            return diff > 1e-6f || diff < -1e-6f;
-        }
-
-        static bool Qwen35MtpSupportsGenerationConfig(
-                const GenerationConfig &config) {
-            if (config.output_logits ||
-                !config.tool_call_allowed_token_ids.empty() ||
-                Qwen35NeedRepeatPenalty(config)) {
-                return false;
-            }
-            if (config.IsSimpleGreedy()) {
-                return true;
-            }
-            return config.top_k > 1 &&
-                   config.temperature > 0.0f &&
-                   config.top_p > 0.0f && config.top_p <= 1.0f;
         }
 
         static bool Qwen35IsLogitsEnvEnabled(const char *value) {
