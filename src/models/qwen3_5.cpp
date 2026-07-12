@@ -2577,6 +2577,10 @@ namespace fastllm {
             long long timestamp = 0;
             std::vector<int> tokens;
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
+            bool mtpValid = false;
+            int mtpTokens = 0;
+            Data mtpKey;
+            Data mtpValue;
         };
 
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
@@ -2855,11 +2859,33 @@ namespace fastllm {
             return !dst.multiDeviceDatas.empty();
         }
 
+        static bool Qwen35RestoreMtpSnapshotTensor(
+                const Data &snapshot,
+                Data &dst,
+                int device) {
+            dst.FreeSpace();
+            dst.CopyFrom(snapshot);
+            dst.isPagedKVCache = false;
+            dst.pagedKVCacheData = nullptr;
+            dst.pageIndex.clear();
+            dst.lastPageLen = 0;
+            dst.multiDeviceData = false;
+            dst.multiDeviceDatas.clear();
+            dst.ClearTensorParallelLayout();
+            if (dst.expansionDims.size() != dst.dims.size()) {
+                dst.expansionDims = dst.dims;
+            }
+            dst.ToDevice(DataDevice::CUDA, {device}, true);
+            return dst.dataDevice == DataDevice::CUDA &&
+                   dst.cudaData != nullptr && dst.dims.size() >= 2;
+        }
+
         static const Qwen35LinearPrefixSnapshot *Qwen35FindLinearPrefixSnapshotLocked(
                 const Qwen3_5Model *model,
                 const std::vector<int> &tokens,
                 int maxCachedLen,
-                int exactLen = -1) {
+                int exactLen = -1,
+                bool requireMtp = false) {
             auto &all = Qwen35LinearPrefixSnapshots();
             auto it = all.find(model);
             if (it == all.end()) {
@@ -2878,6 +2904,14 @@ namespace fastllm {
                 }
                 if ((int)snapshot->tokens.size() != snapshot->cachedLen ||
                     !std::equal(snapshot->tokens.begin(), snapshot->tokens.end(), tokens.begin())) {
+                    continue;
+                }
+                if (requireMtp &&
+                    (!snapshot->mtpValid || snapshot->mtpTokens != snapshot->cachedLen ||
+                     snapshot->mtpKey.dims.size() < 2 ||
+                     snapshot->mtpValue.dims.size() < 2 ||
+                     snapshot->mtpKey.dims[1] != snapshot->cachedLen ||
+                     snapshot->mtpValue.dims[1] != snapshot->cachedLen)) {
                     continue;
                 }
                 if (best == nullptr ||
@@ -3851,6 +3885,10 @@ namespace fastllm {
             long long timestamp = 0;
             std::vector<int> tokens;
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
+            bool mtpValid = false;
+            int mtpTokens = 0;
+            Data mtpKey;
+            Data mtpValue;
         };
 
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
@@ -3935,11 +3973,13 @@ namespace fastllm {
                 const Qwen3_5Model *model,
                 const std::vector<int> &tokens,
                 int maxCachedLen,
-                int exactLen = -1) {
+                int exactLen = -1,
+                bool requireMtp = false) {
             (void)model;
             (void)tokens;
             (void)maxCachedLen;
             (void)exactLen;
+            (void)requireMtp;
             return nullptr;
         }
 
@@ -4922,6 +4962,16 @@ namespace fastllm {
         return basellm::GetPagedKVCacheManagers(layerIndex, isKey);
     }
 
+    bool Qwen3_5Model::RequiresMtpPrefixSnapshot(const ResponseContext *context) const {
+        if (context == nullptr) {
+            return false;
+        }
+        return !Qwen35MtpDisabledByEnv() &&
+               HasMtpWeights() &&
+               context->generationConfig.IsSimpleGreedy() &&
+               !context->generationConfig.output_logits;
+    }
+
     bool Qwen3_5Model::TryRecordPagedPrefixCacheExtra(ResponseContext *context) {
         if (context == nullptr || !Qwen35LinearPrefixCacheEnabled() ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
@@ -4969,19 +5019,46 @@ namespace fastllm {
             }
         }
 
+        bool requireMtp = RequiresMtpPrefixSnapshot(context);
+        if (requireMtp) {
+#ifdef USE_CUDA
+            std::lock_guard<std::mutex> guard(mtpCacheMutex);
+            auto mtpIt = mtpCaches.find(context);
+            if (mtpIt == mtpCaches.end() ||
+                mtpIt->second.tokens != currentLen ||
+                mtpIt->second.key.dims.size() < 2 ||
+                mtpIt->second.value.dims.size() < 2 ||
+                mtpIt->second.key.dims[1] != currentLen ||
+                mtpIt->second.value.dims[1] != currentLen ||
+                !Qwen35SnapshotCopyTensor(mtpIt->second.key, snapshot->mtpKey) ||
+                !Qwen35SnapshotCopyTensor(mtpIt->second.value, snapshot->mtpValue)) {
+                return false;
+            }
+            snapshot->mtpValid = true;
+            snapshot->mtpTokens = currentLen;
+#else
+            return false;
+#endif
+        }
+
         {
             std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
             auto &items = Qwen35LinearPrefixSnapshots()[this];
-            snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
             for (auto it = items.begin(); it != items.end(); ) {
                 Qwen35LinearPrefixSnapshot *old = it->get();
                 if (old != nullptr && old->cachedLen == snapshot->cachedLen &&
                     old->tokens == snapshot->tokens) {
+                    // MTP snapshots also contain everything needed by non-MTP requests.
+                    if (old->mtpValid && !snapshot->mtpValid) {
+                        snapshot = std::move(*it);
+                    }
                     it = items.erase(it);
                 } else {
                     ++it;
                 }
             }
+            snapshot->requestId = requestId;
+            snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
             items.push_back(std::move(snapshot));
             int maxPerRequest = Qwen35LinearPrefixSnapshotMaxPerRequest();
             int requestRecords = 0;
@@ -5026,9 +5103,11 @@ namespace fastllm {
         if (!Qwen35LinearPrefixCacheEnabled()) {
             return 0;
         }
+        bool requireMtp = RequiresMtpPrefixSnapshot(context);
         std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
         const Qwen35LinearPrefixSnapshot *snapshot =
-            Qwen35FindLinearPrefixSnapshotLocked(this, context->currentTokens, maxCachedLen);
+            Qwen35FindLinearPrefixSnapshotLocked(
+                this, context->currentTokens, maxCachedLen, -1, requireMtp);
         return snapshot == nullptr ? 0 : snapshot->cachedLen;
     }
 
@@ -5037,11 +5116,12 @@ namespace fastllm {
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
             return true;
         }
+        bool requireMtp = RequiresMtpPrefixSnapshot(context);
         const Qwen35LinearPrefixSnapshot *snapshot = nullptr;
         {
             std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
             snapshot = Qwen35FindLinearPrefixSnapshotLocked(
-                this, context->currentTokens, cachedLen, cachedLen);
+                this, context->currentTokens, cachedLen, cachedLen, requireMtp);
             if (snapshot == nullptr || (int)snapshot->layers.size() < this->block_cnt) {
                 return false;
             }
@@ -5066,6 +5146,30 @@ namespace fastllm {
                                                 context->pastKeyValues[i].second)) {
                     return false;
                 }
+            }
+            if (requireMtp) {
+#ifdef USE_CUDA
+                std::vector<int> devices;
+                std::map<int, int> ratios;
+                if (!snapshot->mtpValid || snapshot->mtpTokens != cachedLen ||
+                    !GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
+                    devices.empty()) {
+                    return false;
+                }
+                std::lock_guard<std::mutex> mtpGuard(mtpCacheMutex);
+                mtpCaches.erase(context);
+                MtpKvCache &mtpCache = mtpCaches[context];
+                if (!Qwen35RestoreMtpSnapshotTensor(
+                        snapshot->mtpKey, mtpCache.key, devices[0]) ||
+                    !Qwen35RestoreMtpSnapshotTensor(
+                        snapshot->mtpValue, mtpCache.value, devices[0])) {
+                    mtpCaches.erase(context);
+                    return false;
+                }
+                mtpCache.tokens = cachedLen;
+#else
+                return false;
+#endif
             }
         }
         return true;
@@ -7588,7 +7692,8 @@ namespace fastllm {
         }
         Data lastHiddenStates;
         Data *headInput = &hiddenStates;
-        bool keepAllRowsForSpeculative = speculativeCollectAllLogits && batch == 1;
+        bool keepAllRowsForSpeculative =
+            (speculativeCollectAllLogits || speculativeCaptureAllHiddenStates) && batch == 1;
         if (!all1 && !keepAllRowsForSpeculative) {
             int total = 0;
             std::vector<Data> lastToks(seqLens.size());
@@ -7610,6 +7715,13 @@ namespace fastllm {
                          rms_norm_eps, *headInput);
         if (keepAllRowsForSpeculative && (!tensorParallel || firstTensorParallelRank)) {
             speculativeHiddenStates.CopyFrom(*headInput);
+        }
+        if (!all1 && speculativeCaptureAllHiddenStates &&
+            !speculativeCollectAllLogits) {
+            Qwen3CudaSplit(cudaRunner, *headInput, 1,
+                           headInput->dims[1] - 1, headInput->dims[1],
+                           lastHiddenStates);
+            headInput = &lastHiddenStates;
         }
         Qwen3CudaLinear(cudaRunner, *headInput,
                         *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
@@ -11303,6 +11415,197 @@ namespace fastllm {
             return false;
         };
 
+        auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
+            if (ctx == nullptr || ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
+                return 0;
+            }
+            auto probeRefs = model->GetPagedKVCacheManagers(model->kvCacheId, true);
+            PagedCacheManager *probeManager = nullptr;
+            for (auto &ref : probeRefs) {
+                if (ref.second != nullptr) {
+                    probeManager = ref.second;
+                    break;
+                }
+            }
+            if (probeManager == nullptr) {
+                return 0;
+            }
+
+            std::map<PagedCacheManager*, std::vector<int> > queriedPages;
+            auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
+                auto it = queriedPages.find(manager);
+                if (it == queriedPages.end()) {
+                    std::vector<int> pages;
+                    manager->Query(ctx->currentTokens, pages);
+                    it = queriedPages.emplace(manager, std::move(pages)).first;
+                }
+                return it->second;
+            };
+
+            int minCachedPages = (int)queryManager(probeManager).size();
+            if (minCachedPages <= 0) {
+                return 0;
+            }
+            for (int layer = 0; layer < model->block_cnt; layer++) {
+                for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                    auto refs = model->GetPagedKVCacheManagers(layer, keyFlag == 0);
+                    for (auto &ref : refs) {
+                        PagedCacheManager *manager = ref.second;
+                        if (manager == nullptr ||
+                            manager->pageLen != probeManager->pageLen) {
+                            continue;
+                        }
+                        minCachedPages = std::min(
+                            minCachedPages, (int)queryManager(manager).size());
+                    }
+                }
+            }
+            if (minCachedPages <= 0) {
+                return 0;
+            }
+
+            int cachedLen = minCachedPages * probeManager->pageLen;
+            if (cachedLen >= (int)ctx->currentTokens.size()) {
+                minCachedPages--;
+                cachedLen = minCachedPages * probeManager->pageLen;
+            }
+            if (minCachedPages <= 0) {
+                return 0;
+            }
+
+            int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
+            extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
+            minCachedPages = extraCachedLen / probeManager->pageLen;
+            if (minCachedPages <= 0) {
+                return 0;
+            }
+            cachedLen = minCachedPages * probeManager->pageLen;
+            if (!model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
+                return -1;
+            }
+
+            auto managerDevice = [](PagedCacheManager *manager) {
+                if (manager == nullptr) {
+                    return -1;
+                }
+                Data *managerData = (Data*)manager;
+                return managerData->dataDeviceIds.empty() ?
+                    -1 : managerData->dataDeviceIds[0];
+            };
+            auto restoreOne = [&](Data &cache,
+                                  PagedCacheManager *manager,
+                                  const std::vector<int> &pages) {
+                if (manager == nullptr ||
+                    (int)pages.size() < minCachedPages) {
+                    return false;
+                }
+                Data *managerData = (Data*)manager;
+                if (managerData->dims.size() < 4) {
+                    return false;
+                }
+                cache.isKVCache = true;
+                cache.isLinearAttention = false;
+                cache.isPagedKVCache = true;
+                cache.pagedKVCacheData = manager;
+                cache.pageLen = manager->pageLen;
+                cache.pageIndex.assign(
+                    pages.begin(), pages.begin() + minCachedPages);
+                manager->Pick(cache.pageIndex);
+                cache.lastPageLen = manager->pageLen;
+                cache.dataType = managerData->dataType;
+                cache.UpdateUnitSize();
+                cache.dataDevice = managerData->dataDevice;
+                cache.dataDeviceIds = managerData->dataDeviceIds;
+                cache.Resize({managerData->dims[2], cachedLen,
+                              managerData->dims[3]});
+                return true;
+            };
+            auto restorePagedCache = [&]
+                    (Data &cache,
+                     const std::vector<std::pair<int, PagedCacheManager*> > &refs) {
+                std::vector<std::pair<int, PagedCacheManager*> > validRefs;
+                for (auto ref : refs) {
+                    if (ref.second == nullptr ||
+                        ref.second->pageLen != probeManager->pageLen ||
+                        (int)queryManager(ref.second).size() < minCachedPages) {
+                        continue;
+                    }
+                    validRefs.push_back(ref);
+                }
+                if (validRefs.empty()) {
+                    return refs.empty();
+                }
+                if (validRefs.size() == 1) {
+                    return restoreOne(cache, validRefs[0].second,
+                                      queryManager(validRefs[0].second));
+                }
+
+                cache.multiDeviceData = true;
+                cache.dataDevice = DataDevice::CUDA;
+                cache.dataDeviceIds.clear();
+                cache.isKVCache = true;
+                cache.isLinearAttention = false;
+                cache.isPagedKVCache = true;
+                Data *firstLocal = nullptr;
+                for (auto &ref : validRefs) {
+                    int device = ref.first >= 0 ?
+                        ref.first : managerDevice(ref.second);
+                    if (device < 0) {
+                        continue;
+                    }
+                    cache.dataDeviceIds.push_back(device);
+                    Data *managerData = (Data*)ref.second;
+                    Data *&local = cache.multiDeviceDatas[device];
+                    if (local == nullptr) {
+                        local = new Data(managerData->dataType);
+                        local->SetKVCache();
+                        local->cacheUid = cache.cacheUid;
+                    }
+                    if (!restoreOne(*local, ref.second,
+                                    queryManager(ref.second))) {
+                        return false;
+                    }
+                    if (firstLocal == nullptr) {
+                        firstLocal = local;
+                    }
+                }
+                if (firstLocal == nullptr) {
+                    cache.multiDeviceData = false;
+                    cache.isPagedKVCache = false;
+                    cache.pagedKVCacheData = nullptr;
+                    cache.pageIndex.clear();
+                    return false;
+                }
+                cache.dataType = firstLocal->dataType;
+                cache.UpdateUnitSize();
+                cache.cudaData = nullptr;
+                cache.pageLen = firstLocal->pageLen;
+                cache.pageIndex = firstLocal->pageIndex;
+                cache.lastPageLen = firstLocal->lastPageLen;
+                cache.pagedKVCacheData = firstLocal->pagedKVCacheData;
+                cache.dims = firstLocal->dims;
+                return true;
+            };
+
+            for (int layer = 0; layer < model->block_cnt; layer++) {
+                auto keyRefs = model->GetPagedKVCacheManagers(layer, true);
+                auto valueRefs = model->GetPagedKVCacheManagers(layer, false);
+                if (!restorePagedCache(ctx->pastKeyValues[layer].first, keyRefs) ||
+                    !restorePagedCache(ctx->pastKeyValues[layer].second, valueRefs)) {
+                    return -1;
+                }
+            }
+            ctx->currentTokens.erase(
+                ctx->currentTokens.begin(),
+                ctx->currentTokens.begin() + cachedLen);
+            ctx->cacheLen = cachedLen;
+            if (model->verbose) {
+                printf("[Qwen3.5 MTP] prefix cache hit: tokens=%d.\n", cachedLen);
+                fflush(stdout);
+            }
+            return cachedLen;
+        };
+
         auto createPendingResultLogits = [](const GenerationConfig &config) {
             return config.output_logits ? new std::vector<float>() : nullptr;
         };
@@ -11481,6 +11784,10 @@ namespace fastllm {
                     if (!isPrompt && ctx->preTokens == 0) {
                         continue;
                     }
+                    if (isPrompt && ctx->cacheLen == 0 &&
+                        tryRestorePrefixCache(ctx) < 0) {
+                        releaseAndReinitRequest(ctx);
+                    }
 
                     if ((maxTotalLens > 0 &&
                          ctx->cacheLen + (int)ctx->currentTokens.size() > maxTotalLens) ||
@@ -11647,6 +11954,88 @@ namespace fastllm {
                     if (pastKeyValue1 == nullptr) {
                         ret.push_back(model->eos_token_id);
                     } else {
+                        std::vector<int> longPrefillMtpDevices;
+                        std::map<int, int> longPrefillMtpRatios;
+                        int longPrefillMtpDrafts = Qwen35MtpDraftsPerStep();
+                        bool seedLongPrefillMtp =
+                            !Qwen35MtpDisabledByEnv() &&
+                            longPrefillMtpDrafts > 0 &&
+                            model->HasMtpWeights() &&
+                            generationConfigs.size() == 1 &&
+                            generationConfigs[0].IsSimpleGreedy() &&
+                            !generationConfigs[0].output_logits &&
+                            positionIds[0] != nullptr &&
+                            GetQwen35GPUForwardDevices(
+                                model->deviceMap, longPrefillMtpDevices,
+                                longPrefillMtpRatios) &&
+                            !longPrefillMtpDevices.empty();
+                        int longPrefillMtpBaseTokens = singleContext->cacheLen;
+                        if (seedLongPrefillMtp) {
+                            std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                            if (longPrefillMtpBaseTokens == 0) {
+                                model->mtpCaches.erase(singleContext);
+                            } else {
+                                auto mtpIt = model->mtpCaches.find(singleContext);
+                                seedLongPrefillMtp =
+                                    mtpIt != model->mtpCaches.end() &&
+                                    mtpIt->second.tokens == longPrefillMtpBaseTokens &&
+                                    mtpIt->second.key.dims.size() >= 2 &&
+                                    mtpIt->second.value.dims.size() >= 2 &&
+                                    mtpIt->second.key.dims[1] == longPrefillMtpBaseTokens &&
+                                    mtpIt->second.value.dims[1] == longPrefillMtpBaseTokens;
+                            }
+                        }
+                        auto eraseLongPrefillMtpCache = [&]() {
+                            std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                            model->mtpCaches.erase(singleContext);
+                        };
+                        auto appendLongPrefillMtpCache =
+                            [&](const Data &targetHiddenStates,
+                                const std::vector<int> &mtpInputTokens,
+                                const Data &mtpPositionIds,
+                                int expectedTokens, bool cacheOnly,
+                                int &draftToken) {
+                                std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                                auto cacheIt = model->mtpCaches.find(singleContext);
+                                if (cacheIt == model->mtpCaches.end()) {
+                                    if (expectedTokens != 0) {
+                                        return false;
+                                    }
+                                    cacheIt = model->mtpCaches.emplace(
+                                        singleContext, MtpKvCache()).first;
+                                }
+                                MtpKvCache &cache = cacheIt->second;
+                                if (cache.tokens != expectedTokens) {
+                                    model->mtpCaches.erase(cacheIt);
+                                    return false;
+                                }
+                                try {
+                                    draftToken = model->RunMtpGreedyDraft(
+                                        longPrefillMtpDevices[0],
+                                        longPrefillMtpDevices, cache,
+                                        targetHiddenStates, mtpInputTokens,
+                                        mtpPositionIds,
+                                        (int)mtpInputTokens.size() - 1,
+                                        nullptr, cacheOnly);
+                                } catch (...) {
+                                    model->mtpCaches.erase(singleContext);
+                                    throw;
+                                }
+                                int newTokens = expectedTokens +
+                                    (int)mtpInputTokens.size();
+                                bool valid = cache.tokens == newTokens &&
+                                    cache.key.dims.size() >= 2 &&
+                                    cache.value.dims.size() >= 2 &&
+                                    cache.key.dims[1] == newTokens &&
+                                    cache.value.dims[1] == newTokens;
+                                if (!valid) {
+                                    model->mtpCaches.erase(singleContext);
+                                }
+                                return valid;
+                            };
+
+                        int longPrefillFirstDraft = -1;
+                        bool longPrefillMtpSeeded = false;
                         auto prefillStartTime = std::chrono::system_clock::now();
                         for (int st = 0; st < len; ) {
                             int curLen = std::min(prefillChunkSize, len - st);
@@ -11674,11 +12063,59 @@ namespace fastllm {
                                     std::make_pair(&(*pastKeyValue1)[i].first,
                                                    &(*pastKeyValue1)[i].second));
                             }
-                            ret = model->ForwardGPU(1, curInput, curAttentionMasks,
-                                                    curPositionIdsVec, curSeqLens,
-                                                    curPastKeyValues, generationConfigs,
-                                                    tokensManager, &logits);
+                            bool oldCaptureAllHiddenStates =
+                                model->speculativeCaptureAllHiddenStates;
+                            model->speculativeCaptureAllHiddenStates = seedLongPrefillMtp;
+                            if (seedLongPrefillMtp) {
+                                model->speculativeHiddenStates.FreeSpace();
+                                model->speculativeHiddenStates.dims.clear();
+                                model->speculativeHiddenStates.strides.clear();
+                                model->speculativeHiddenStates.expansionDims.clear();
+                            }
+                            try {
+                                ret = model->ForwardGPU(1, curInput, curAttentionMasks,
+                                                        curPositionIdsVec, curSeqLens,
+                                                        curPastKeyValues, generationConfigs,
+                                                        tokensManager, &logits);
+                            } catch (...) {
+                                model->speculativeCaptureAllHiddenStates =
+                                    oldCaptureAllHiddenStates;
+                                if (seedLongPrefillMtp) {
+                                    eraseLongPrefillMtpCache();
+                                }
+                                throw;
+                            }
+                            model->speculativeCaptureAllHiddenStates =
+                                oldCaptureAllHiddenStates;
+
+                            bool isLastChunk = st + curLen == len;
+                            if (seedLongPrefillMtp) {
+                                AssertInFastLLM(!ret.empty(),
+                                                "Qwen3.5 long prefill returned no token.\n");
+                                std::vector<int> mtpInputTokens(curLen);
+                                for (int i = 0; i < curLen; i++) {
+                                    int nextIndex = st + i + 1;
+                                    mtpInputTokens[i] = nextIndex < len ?
+                                        (int)(ids[nextIndex] + 1e-3f) : ret.back();
+                                }
+                                int draftToken = -1;
+                                bool appended = appendLongPrefillMtpCache(
+                                    model->speculativeHiddenStates,
+                                    mtpInputTokens, curPositionIds,
+                                    longPrefillMtpBaseTokens + st,
+                                    !isLastChunk, draftToken);
+                                if (!appended) {
+                                    seedLongPrefillMtp = false;
+                                } else if (isLastChunk) {
+                                    longPrefillFirstDraft = draftToken;
+                                    longPrefillMtpSeeded = draftToken >= 0;
+                                }
+                            }
                             st += curLen;
+                            int cachedTokens = longPrefillMtpBaseTokens + st;
+                            if (cachedTokens % pageLen == 0) {
+                                singleContext->TryRecordPagedCache(model);
+                            }
                             if (model->verbose) {
                                 auto chunkEndTime = std::chrono::system_clock::now();
                                 float chunkSpend = GetSpan(chunkStartTime, chunkEndTime);
@@ -11688,6 +12125,26 @@ namespace fastllm {
                                 printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
                                        st, len, st * 100 / len, chunkSpeed);
                             }
+                        }
+                        if (longPrefillMtpSeeded) {
+                            int nextToken = ret.back();
+                            usedMtpForward = true;
+                            acceptedTokenLists = {{nextToken}};
+                            nextInputTokenLists = {
+                                {nextToken, longPrefillFirstDraft}
+                            };
+                            keptInputLens = {len};
+                            if (!model->mtpLogPrinted.exchange(true)) {
+                                printf("[Qwen3.5 MTP] enabled: layers=%d, drafts_per_step=%d, root_device=cuda:%d, tp_devices=%zu, log_interval=%d validations.\n",
+                                       model->mtp_num_hidden_layers,
+                                       longPrefillMtpDrafts,
+                                       longPrefillMtpDevices[0],
+                                       longPrefillMtpDevices.size(),
+                                       QWEN35_MTP_LOG_INTERVAL);
+                            }
+                            printf("[Qwen3.5 MTP] long prefill cache seeded: tokens=%d.\n",
+                                   longPrefillMtpBaseTokens + len);
+                            fflush(stdout);
                         }
                     }
                 } else {
@@ -13661,7 +14118,8 @@ namespace fastllm {
                                         const Data &targetHiddenStates,
                                         const std::vector<int> &inputTokens,
                                         const Data &positionIds, int sampleRow,
-                                        Data *sampledHiddenStates) {
+                                        Data *sampledHiddenStates,
+                                        bool cacheOnly) {
 #ifndef USE_CUDA
         (void)device;
         (void)devices;
@@ -13671,6 +14129,7 @@ namespace fastllm {
         (void)positionIds;
         (void)sampleRow;
         (void)sampledHiddenStates;
+        (void)cacheOnly;
         return -1;
 #else
         std::vector<int> draftDevices = devices.empty() ? std::vector<int>{device} : devices;
@@ -13774,8 +14233,15 @@ namespace fastllm {
                 past.dataDeviceIds = {device};
             }
             int unitLen = 128;
-            while ((past.dims.size() == 0 && (past.expansionDims.size() == 0 || cur.dims[1] > past.expansionDims[1]))
-                || (past.dims.size() > 0 && past.dims[1] + cur.dims[1] > past.expansionDims[1])) {
+            auto needsExpansion = [&]() {
+                if (past.dims.empty()) {
+                    return past.expansionDims.size() != cur.dims.size() ||
+                           cur.dims[1] > past.expansionDims[1];
+                }
+                return past.expansionDims.size() != past.dims.size() ||
+                       past.dims[1] + cur.dims[1] > past.expansionDims[1];
+            };
+            while (needsExpansion()) {
                 std::vector<int> newDims;
                 if (past.Count(0) == 0 || past.dims.size() == 0) {
                     newDims = {cur.dims[0], ((cur.dims[1] - 1) / unitLen + 1) * unitLen, cur.dims[2]};
@@ -13790,6 +14256,9 @@ namespace fastllm {
         appendMtpCache(cache.key, k);
         appendMtpCache(cache.value, v);
         cache.tokens += seqLen;
+        if (cacheOnly) {
+            return -1;
+        }
 
         Attention(q, cache.key, cache.value, *GetEmptyData(), attenOutput,
                   q.dims[0] / cache.key.dims[0], 1.0f / std::sqrt((float)this->head_dim), 1);
