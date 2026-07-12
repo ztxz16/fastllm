@@ -9764,12 +9764,33 @@ namespace fastllm {
             return ret;
         };
 
-        auto runTarget = [&](const Data &curInputIds,
-                             const std::vector<Data*> &curAttentionMask,
-                             const std::vector<Data*> &curPositionIds,
-                             const std::vector<int> &curSeqLens) {
-            return runTargetWithPast(curInputIds, curAttentionMask, curPositionIds,
-                                     curSeqLens, pastKeyValues);
+        auto runTargetSeed = [&](const Data &curInputIds,
+                                 const std::vector<Data*> &curAttentionMask,
+                                 const std::vector<Data*> &curPositionIds,
+                                 const std::vector<int> &curSeqLens) {
+            bool oldSpeculativeCollectAllLogits = speculativeCollectAllLogits;
+            bool oldSpeculativeCaptureAllHiddenStates = speculativeCaptureAllHiddenStates;
+            speculativeCollectAllLogits = false;
+            speculativeCaptureAllHiddenStates = true;
+            speculativeTypicalAccepted.clear();
+            speculativeHiddenStates.FreeSpace();
+            speculativeHiddenStates.dims.clear();
+            speculativeHiddenStates.strides.clear();
+            speculativeHiddenStates.expansionDims.clear();
+            std::vector<int> ret;
+            try {
+                ret = ForwardGPU(1, curInputIds, curAttentionMask,
+                                 curPositionIds, curSeqLens,
+                                 pastKeyValues, generationConfigs,
+                                 LastTokensManager(), nullptr);
+            } catch (...) {
+                speculativeCaptureAllHiddenStates = oldSpeculativeCaptureAllHiddenStates;
+                speculativeCollectAllLogits = oldSpeculativeCollectAllLogits;
+                throw;
+            }
+            speculativeCaptureAllHiddenStates = oldSpeculativeCaptureAllHiddenStates;
+            speculativeCollectAllLogits = oldSpeculativeCollectAllLogits;
+            return ret;
         };
         auto runTargetCacheOnly = [&](const Data &curInputIds,
                                       const std::vector<Data*> &curAttentionMask,
@@ -9949,11 +9970,11 @@ namespace fastllm {
             seqLen >= 2 && seqLen <= mtpDraftsPerStep + 1 &&
             mtpCache.tokens > 0 && context->preTokens > seqLen;
         if (!isSpeculativeValidation) {
-            targetRet = runTarget(inputIds, attentionMask, positionIds, seqLens);
+            targetRet = runTargetSeed(inputIds, attentionMask, positionIds, seqLens);
             mtpProfileMark(mtpProfileTargetUs);
-            AssertInFastLLM((int)targetRet.size() >= seqLen,
+            AssertInFastLLM(!targetRet.empty(),
                             "Qwen3.5 MTP target forward returned no token.\n");
-            int nextToken = targetRet[seqLen - 1];
+            int nextToken = targetRet.back();
             std::vector<int> mtpInputTokens;
             mtpInputTokens.reserve(seqLen);
             for (int i = 1; i < seqLen; i++) {
