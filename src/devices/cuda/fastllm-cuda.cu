@@ -6337,14 +6337,103 @@ __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, flo
     }
 }
 
-bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
+template <int BLOCK_THREADS>
+__global__ void FastllmTypicalAcceptanceKernel(
+        const float *probs, const int *candidateIds,
+        const int *topKArr, const float *topPArr,
+        unsigned char *accepted, int *recoveredIds,
+        int vocabSize, float posteriorThreshold, float posteriorAlpha) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    const float *row = probs + (long long)bid * vocabSize;
+    int candidateId = candidateIds[bid];
+    float candidateProb = candidateId >= 0 && candidateId < vocabSize ?
+                          row[candidateId] : 0.0f;
+
+    float localEntropy = 0.0f;
+    float localGreaterMass = 0.0f;
+    float localGreaterCount = 0.0f;
+    float localMax = -1.0f;
+    int localMaxId = 0;
+    for (int i = tid; i < vocabSize; i += BLOCK_THREADS) {
+        float p = row[i];
+        localEntropy -= p * logf(p + 1.0e-5f);
+        if (p > candidateProb) {
+            localGreaterMass += p;
+            localGreaterCount += 1.0f;
+        }
+        if (p > localMax) {
+            localMax = p;
+            localMaxId = i;
+        }
+    }
+
+    typedef cub::BlockReduce<float, BLOCK_THREADS> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage reduceStorage;
+    __shared__ float entropy;
+    __shared__ float greaterMass;
+    __shared__ float greaterCount;
+    float blockEntropy = BlockReduce(reduceStorage).Sum(localEntropy);
+    if (tid == 0) {
+        entropy = blockEntropy;
+    }
+    __syncthreads();
+    float blockGreaterMass = BlockReduce(reduceStorage).Sum(localGreaterMass);
+    if (tid == 0) {
+        greaterMass = blockGreaterMass;
+    }
+    __syncthreads();
+    float blockGreaterCount = BlockReduce(reduceStorage).Sum(localGreaterCount);
+    if (tid == 0) {
+        greaterCount = blockGreaterCount;
+    }
+    __syncthreads();
+
+    __shared__ float maxData[BLOCK_THREADS];
+    __shared__ int maxIdData[BLOCK_THREADS];
+    maxData[tid] = localMax;
+    maxIdData[tid] = localMaxId;
+    __syncthreads();
+    for (int stride = BLOCK_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && maxData[tid] < maxData[tid + stride]) {
+            maxData[tid] = maxData[tid + stride];
+            maxIdData[tid] = maxIdData[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        // Medusa/vLLM typical acceptance: p(candidate) > min(epsilon, alpha * exp(-H)).
+        float dynamicThreshold = fminf(
+            posteriorThreshold, expf(-entropy) * posteriorAlpha);
+        bool allowedByTopK = topKArr[bid] <= 0 || greaterCount < topKArr[bid];
+        bool allowedByTopP = topPArr[bid] >= 1.0f || greaterMass < topPArr[bid];
+        accepted[bid] = allowedByTopK && allowedByTopP &&
+                        candidateProb > dynamicThreshold ? 1 : 0;
+        recoveredIds[bid] = maxIdData[0];
+    }
+}
+
+bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+                                  float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
-                                  int batch, int vocabSize) {
+                                  int batch, int vocabSize,
+                                  const int *typicalCandidateIds,
+                                  unsigned char *typicalAccepted,
+                                  int *typicalRecoveredIds,
+                                  int typicalCount,
+                                  float typicalPosteriorThreshold,
+                                  float typicalPosteriorAlpha) {
     size_t probsBytes = (size_t)batch * vocabSize * sizeof(float);
+    int actualTypicalCount = typicalCandidateIds != nullptr &&
+                             typicalAccepted != nullptr &&
+                             typicalRecoveredIds != nullptr ?
+                             std::max(0, std::min(typicalCount, batch)) : 0;
 
-    // temperatures (float * batch) | topKArr (int * batch) | topPArr (float * batch) | output (int * batch)
-    size_t paramBytes = batch * (sizeof(float) + sizeof(int) + sizeof(float) + sizeof(int));
+    // temperatures | top-k | top-p | sampled ids | candidates | recovered ids | accepted flags
+    size_t paramBytes = batch * (sizeof(float) + sizeof(int) + sizeof(float) + sizeof(int)) +
+                        actualTypicalCount * (sizeof(int) + sizeof(int) + sizeof(unsigned char));
     size_t alignedProbsBytes = FastllmCudaAlignBytes(probsBytes, 256);
     size_t alignedParamBytes = FastllmCudaAlignBytes(paramBytes, 256);
     size_t scratchBytes = 0;
@@ -6363,6 +6452,10 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
     int   *cudaTopKArr      = (int   *)(cudaParamBuf + batch * sizeof(float));
     float *cudaTopPArr      = (float *)(cudaParamBuf + batch * (sizeof(float) + sizeof(int)));
     int   *cudaOutput       = (int   *)(cudaParamBuf + batch * (sizeof(float) + sizeof(int) + sizeof(float)));
+    int   *cudaTypicalCandidates = cudaOutput + batch;
+    int   *cudaTypicalRecovered = cudaTypicalCandidates + actualTypicalCount;
+    unsigned char *cudaTypicalAccepted =
+        (unsigned char *)(cudaTypicalRecovered + actualTypicalCount);
 
     static thread_local std::vector<uint8_t> hostParamBuf;
     hostParamBuf.resize(batch * (sizeof(float) + sizeof(int) + sizeof(float)));
@@ -6370,8 +6463,19 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
     memcpy(hostParamBuf.data() + batch * sizeof(float), topKArr, batch * sizeof(int));
     memcpy(hostParamBuf.data() + batch * (sizeof(float) + sizeof(int)), topPArr, batch * sizeof(float));
     FastllmCudaCopyFromHostToDevice(cudaParamBuf, hostParamBuf.data(), hostParamBuf.size());
+    if (actualTypicalCount > 0) {
+        FastllmCudaCopyFromHostToDevice(cudaTypicalCandidates,
+                                        (void*)typicalCandidateIds,
+                                        actualTypicalCount * sizeof(int));
+    }
 
     FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(logits, cudaProbs, cudaTemperatures, vocabSize);
+    if (actualTypicalCount > 0) {
+        FastllmTypicalAcceptanceKernel<1024><<<actualTypicalCount, 1024>>>(
+            cudaProbs, cudaTypicalCandidates, cudaTopKArr, cudaTopPArr,
+            cudaTypicalAccepted, cudaTypicalRecovered, vocabSize,
+            typicalPosteriorThreshold, typicalPosteriorAlpha);
+    }
 
     static std::mt19937 rng(std::random_device{}());
     uint64_t seed = rng();
@@ -6383,10 +6487,26 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
         (uint32_t)vocabSize, false, seed, 0, 0);
 
     FastllmCudaCopyFromDeviceToHost(output, cudaOutput, batch * sizeof(int));
+    if (actualTypicalCount > 0) {
+        FastllmCudaCopyFromDeviceToHost(typicalAccepted, cudaTypicalAccepted,
+                                        actualTypicalCount * sizeof(unsigned char));
+        FastllmCudaCopyFromDeviceToHost(typicalRecoveredIds,
+                                        cudaTypicalRecovered,
+                                        actualTypicalCount * sizeof(int));
+    }
     DeviceSync();
 
     FastllmReleaseDequantScratch(scratch, scratchOwn);
     return true;
+}
+
+bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
+                                  int *topKArr, float *topPArr,
+                                  int *output,
+                                  int batch, int vocabSize) {
+    return FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+        logits, temperatures, topKArr, topPArr, output, batch, vocabSize,
+        nullptr, nullptr, nullptr, 0, 0.09f, 0.3f);
 }
 
 template <int THREAD_PER_BLOCK>

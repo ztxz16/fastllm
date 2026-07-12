@@ -206,6 +206,7 @@ namespace fastllm {
         bool speculativeCaptureAllHiddenStates = false;
         bool speculativeCacheOnlyForward = false;
         Data speculativeHiddenStates;
+        std::vector<unsigned char> speculativeTypicalAccepted;
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;

@@ -436,6 +436,17 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
                                   int batch, int vocabSize);
+bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+                                  float *logits, float *temperatures,
+                                  int *topKArr, float *topPArr,
+                                  int *output,
+                                  int batch, int vocabSize,
+                                  const int *typicalCandidateIds,
+                                  unsigned char *typicalAccepted,
+                                  int *typicalRecoveredIds,
+                                  int typicalCount,
+                                  float typicalPosteriorThreshold,
+                                  float typicalPosteriorAlpha);
 bool FastllmCudaGreedySampling(float *logits, int *output,
                                int batch, int vocabSize);
 bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
