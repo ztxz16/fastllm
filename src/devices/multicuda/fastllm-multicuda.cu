@@ -1106,6 +1106,29 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     }
                     curLen += copyLen;
                 }
+            } else if (weight.dataType == fastllm::DataType::FP8_E4M3_PERCHANNEL) {
+                size_t rowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
+                if (mallocType == 0) {
+                    cudaSetDevice(rootDevice);
+                }
+                for (auto &it : div) {
+                    int copyLen = it.second - it.first;
+                    state = cudaMemcpy((uint8_t*)deviceWeightData + (size_t)curLen * rowBytes,
+                                       (uint8_t*)weight.cudaData + (size_t)it.first * rowBytes,
+                                       (size_t)copyLen * rowBytes,
+                                       GetCudaMemcpyType(mallocType, 1));
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    if (hasBias) {
+                        state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                           (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                        if (state != cudaSuccess) {
+                            break;
+                        }
+                    }
+                    curLen += copyLen;
+                }
             } else if (weight.dataType == fastllm::DataType::NVFP4 &&
                        weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) {
                 size_t rowBytes = fastllm::GetNVFP4WeightBytes(1, m);
@@ -1262,6 +1285,35 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     }
                     dstOffsetBytes += copyBytes;
                     curLen += copyLen;
+                }
+            } else if (weight.dataType == fastllm::DataType::FP8_E4M3_PERCHANNEL) {
+                size_t srcRowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
+                size_t dstRowBytes = fastllm::GetDataBytes(weight.dataType, 1, len);
+                size_t dstOffsetBytes = 0;
+                if (mallocType == 0) {
+                    cudaSetDevice(rootDevice);
+                }
+                for (auto &it : div) {
+                    int copyLen = it.second - it.first;
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
+                                                dstRowBytes,
+                                                (uint8_t*)weight.cudaData + it.first,
+                                                srcRowBytes,
+                                                (size_t)copyLen,
+                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    dstOffsetBytes += copyLen;
+                    curLen += copyLen;
+                }
+                if (state == cudaSuccess) {
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + len,
+                                                dstRowBytes,
+                                                (uint8_t*)weight.cudaData + m,
+                                                srcRowBytes,
+                                                sizeof(float),
+                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4 &&
                        weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) {

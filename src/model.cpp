@@ -638,8 +638,9 @@ namespace fastllm {
         struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
 
         void CreateBufferWithScale(DataType dstType, SafeTensorItem &scale, SafeTensorItem *scale2 = nullptr) {
-            AssertInFastLLM(this->shape.size() >= 2 && scale.shape.size() >= 2,
-                            "CreateBufferWithScale error: shape.size() should be >= 2.");
+            bool isScalarScale = scale.len == 1 && scale.shape.size() <= 1;
+            AssertInFastLLM(this->shape.size() >= 2 && (isScalarScale || scale.shape.size() >= 2),
+                            "CreateBufferWithScale error: weight shape should be >= 2 and scale should be scalar or >= 2.");
             bool isFp8 = this->dtype == "F8_E4M3";
             bool isPackedFp4 = this->dtype == "I8" || this->dtype == "U8";
             if (!isFp8 && !isPackedFp4) {
@@ -649,16 +650,29 @@ namespace fastllm {
             for (int i = 0; i + 1 < (int)this->shape.size(); i++) {
                 n64 *= this->shape[i];
             }
-            for (int i = 0; i + 1 < (int)scale.shape.size(); i++) {
-                ns64 *= scale.shape[i];
+            if (!isScalarScale) {
+                for (int i = 0; i + 1 < (int)scale.shape.size(); i++) {
+                    ns64 *= scale.shape[i];
+                }
             }
             AssertInFastLLM(n64 <= INT_MAX && ns64 <= INT_MAX &&
-                            this->shape.back() <= INT_MAX && scale.shape.back() <= INT_MAX,
+                            this->shape.back() <= INT_MAX &&
+                            (isScalarScale || scale.shape.back() <= INT_MAX),
                             "CreateBufferWithScale error: shape is too large.");
             int n = (int)n64, packedM = (int)this->shape.back();
             int m = isPackedFp4 ? packedM * 2 : packedM;
-            int ns = (int)ns64, ms = (int)scale.shape.back();
-            int blockN = n / ns, blockM = m / ms;
+            int ns, ms, blockN, blockM;
+            if (isScalarScale) {
+                ns = n;
+                ms = 1;
+                blockN = 1;
+                blockM = m;
+            } else {
+                ns = (int)ns64;
+                ms = (int)scale.shape.back();
+                blockN = n / ns;
+                blockM = m / ms;
+            }
 
             while ((blockN & -blockN) != blockN && blockN < n) {
                 blockN++;
@@ -681,6 +695,9 @@ namespace fastllm {
                 }
                 if ((dstType == DataType::NVFP4_BLOCK_16 || dstType == DataType::NVFP4_BLOCK_16_E8M0) && !isPackedFp4) {
                     ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8/U8 can be loaded as NVFP4_BLOCK_16.");
+                }
+                if (isScalarScale && dstType != DataType::FP8_E4M3) {
+                    ErrorInFastLLM("CreateBufferWithScale error: scalar scale is only supported for FP8_E4M3.");
                 }
                 this->blockK = blockN;
                 this->blockM = blockM;
@@ -783,10 +800,18 @@ namespace fastllm {
                     AssertInFastLLM(ret == scale.bytes,
                                     "CreateBufferWithScale error: read NVFP4 scale failed.");
                 } else {
+                    AssertInFastLLM(scale.buffer != nullptr,
+                                    "CreateBufferWithScale error: scale buffer is empty.");
                     scalesBuffer = new float[ns * ms];
-                    memcpy(scalesBuffer, scale.buffer, ns * ms * sizeof(float));
+                    if (isScalarScale) {
+                        std::fill(scalesBuffer, scalesBuffer + ns * ms, ((float*)scale.buffer)[0]);
+                    } else {
+                        memcpy(scalesBuffer, scale.buffer, ns * ms * sizeof(float));
+                    }
                 }
             } else {
+                AssertInFastLLM(scale.buffer != nullptr,
+                                "CreateBufferWithScale error: scale buffer is empty.");
                 buffer = new uint8_t[n * m * sizeof(float)];
                 float *floatBuffer = (float*)buffer;
 
@@ -801,7 +826,8 @@ namespace fastllm {
                 ret = fread(ori, 1, this->bytes, fi);
                 for (int bi = 0; bi < ns; bi++) {
                     for (int bj = 0; bj < ms; bj++) {
-                        float curScale = ((float*)scale.buffer)[bi * ms + bj];
+                        float curScale = isScalarScale ?
+                            ((float*)scale.buffer)[0] : ((float*)scale.buffer)[bi * ms + bj];
                         for (int i = bi * blockN; i < (bi + 1) * blockN && i < n; i++) {
                             for (int j = bj * blockM; j < (bj + 1) * blockM && j < m; j++) {
                                 if (isFp8) {
@@ -1311,23 +1337,39 @@ namespace fastllm {
         weight.diskWeightParts.push_back(part);
 
         if (scaleTensor != nullptr) {
+            bool isScalarScale = scaleTensor->len == 1 && scaleTensor->shape.size() <= 1;
+            AssertInFastLLM(tensor.shape.size() >= 2 && (isScalarScale || scaleTensor->shape.size() >= 2),
+                            "Disk MoE scaled tensor shape should be >= 2 and scale should be scalar or >= 2: " + weight.name + "\n");
             long long n64 = 1, ns64 = 1;
             for (int i = 0; i + 1 < (int)tensor.shape.size(); i++) {
                 n64 *= tensor.shape[i];
             }
-            for (int i = 0; i + 1 < (int)scaleTensor->shape.size(); i++) {
-                ns64 *= scaleTensor->shape[i];
+            if (!isScalarScale) {
+                for (int i = 0; i + 1 < (int)scaleTensor->shape.size(); i++) {
+                    ns64 *= scaleTensor->shape[i];
+                }
             }
             AssertInFastLLM(n64 <= INT_MAX && ns64 <= INT_MAX &&
-                            tensor.shape.back() <= INT_MAX && scaleTensor->shape.back() <= INT_MAX,
+                            tensor.shape.back() <= INT_MAX &&
+                            (isScalarScale || scaleTensor->shape.back() <= INT_MAX),
                             "Disk MoE scaled tensor shape is too large: " + weight.name + "\n");
             int n = (int)n64;
             int m = (int)tensor.shape.back();
             if (targetDataType == DataType::NVFP4) {
                 m *= 2;
             }
-            int ns = (int)ns64, ms = (int)scaleTensor->shape.back();
-            int blockK = n / ns, blockM = m / ms;
+            int ns, ms, blockK, blockM;
+            if (isScalarScale) {
+                ns = n;
+                ms = 1;
+                blockK = 1;
+                blockM = m;
+            } else {
+                ns = (int)ns64;
+                ms = (int)scaleTensor->shape.back();
+                blockK = n / ns;
+                blockM = m / ms;
+            }
             while ((blockK & -blockK) != blockK && blockK < n) {
                 blockK++;
             }
@@ -1337,6 +1379,9 @@ namespace fastllm {
             weight.blockK = blockK;
             weight.blockM = blockM;
             if (targetDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0") {
+                if (isScalarScale) {
+                    ErrorInFastLLM("Disk MoE compact NVFP4 does not support scalar scale: " + weight.name + "\n");
+                }
                 AssertInFastLLM(scaleTensor->bytes == GetNVFP4ScaleBytes(n, m, blockK, blockM),
                                 "Disk MoE NVFP4 scale tensor bytes mismatch: " + weight.name + "\n");
                 DiskWeightPart scalePart;
@@ -1349,8 +1394,14 @@ namespace fastllm {
                 weight.diskWeightParts.push_back(scalePart);
                 weight.scales.clear();
             } else {
+                AssertInFastLLM(scaleTensor->buffer != nullptr,
+                                "Disk MoE scaled tensor scale buffer is empty: " + weight.name + "\n");
                 weight.scales.resize(ns * ms);
-                memcpy(weight.scales.data(), scaleTensor->buffer, ns * ms * sizeof(float));
+                if (isScalarScale) {
+                    std::fill(weight.scales.begin(), weight.scales.end(), ((float*)scaleTensor->buffer)[0]);
+                } else {
+                    memcpy(weight.scales.data(), scaleTensor->buffer, ns * ms * sizeof(float));
+                }
             }
         }
     }

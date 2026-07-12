@@ -1488,7 +1488,8 @@ namespace fastllm {
                 this->dataType == DataType::FLOAT16) {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
-        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3) {
+        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
+                   this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::NVFP4) {
@@ -1521,6 +1522,7 @@ namespace fastllm {
         }
 
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1743,6 +1745,7 @@ namespace fastllm {
             return GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
         }
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1759,6 +1762,7 @@ namespace fastllm {
     void Data::MallocSpace(uint64_t size, bool zero) {
         this->expansionSize = size;
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;

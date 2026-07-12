@@ -153,6 +153,19 @@ __global__ void FastllmCudaFP8E4M3BLOCK1282HalfKernel(uint8_t* a, half *b) {
     b[tid] = __float2half((float)__ushort_as_half(((a[tid] & 0x80) << 8) | ((a[tid] & 0x7F) << 7)) * *(float*)(a + 128));
 }
 
+__global__ void FastllmCudaFP8E4M3PERCHANNEL2HalfKernel(uint8_t* a, half *b, int m) {
+    unsigned int tid = threadIdx.x;
+    unsigned int st = blockIdx.x;
+    size_t perRow = (size_t)m + sizeof(float);
+    uint8_t *row = a + (size_t)st * perRow;
+    half *out = b + (size_t)st * m;
+    float scale = *(float*)(row + m);
+
+    for (int i = tid; i < m; i += blockDim.x) {
+        out[i] = __float2half((float)__ushort_as_half(((row[i] & 0x80) << 8) | ((row[i] & 0x7F) << 7)) * scale);
+    }
+}
+
 __global__ void FastllmCudaFP8E4M32HalfKernel(uint8_t* a, float *scales, half *b, int k, int m, int blockK, int blockM) {
     unsigned int tid = threadIdx.x;
     unsigned int st = blockIdx.x;
@@ -796,6 +809,68 @@ bool FastllmCudaMatMulFloatFP8E4M3Block128(const fastllm::Data &input, fastllm::
     return true;
 }
 
+bool FastllmCudaMatMulFloatFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    FastllmCudaFP8E4M3Block128EnsureBiasOnDevice(weight, bias, k);
+
+    float *cudaBiasData = (float*)weight.extraCudaData[0];
+    float *cudaInput = (float*)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+
+    auto fastllmCublasHandle = getFastllmCublasHandle();
+    half *cudaFp16Input = (half *) FastllmCudaMalloc((size_t)n * m * sizeof(half));
+    half *cudaFp16Output = (half *) FastllmCudaMalloc((size_t)n * k * sizeof(half));
+
+    size_t wsBytes = 0;
+    bool ownScratch = false;
+    half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(half), &wsBytes, &ownScratch);
+    size_t bytesPerRow = (size_t)m * sizeof(half);
+    int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
+
+    __half h_alpha = __float2half_rn(exp2f(8.0f)), h_beta = __float2half_rn(0.0);
+    cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+    const size_t perRow = (size_t)m + sizeof(float);
+
+    int len = n * m;
+    int threadPerBlock = std::min(256, len);
+    FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaInput, cudaFp16Input, len);
+
+    for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+        int kc = std::min(maxRowsPerChunk, k - kOff);
+        FastllmCudaFP8E4M3PERCHANNEL2HalfKernel <<< kc, 256 >>>(
+            (uint8_t*)weight.cudaData + (size_t)kOff * perRow, cudaFp16Weight, m);
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              kc, n, m,
+                              &h_alpha, cudaFp16Weight, AType,
+                              m, cudaFp16Input, BType,
+                              m, &h_beta,
+                              cudaFp16Output + kOff, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error (FloatMatMulFP8E4M3PerChannel).\n");
+            throw("cublas error");
+            exit(0);
+        }
+    }
+
+    len = n * k;
+    threadPerBlock = std::min(256, len);
+    FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput, len);
+    if (bias.dims.size() > 0) {
+        FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+    }
+
+    FastllmCudaFree(cudaFp16Input);
+    FastllmCudaFree(cudaFp16Output);
+    FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaScales;
@@ -1281,6 +1356,56 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3Block128(const fastllm::Data &input, fastl
     return true;
 }
 
+bool FastllmCudaHalfMatMulFloatFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(weight, bias, k);
+
+    half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];
+    half *cudaInput = (half*)FastllmCudaPrepareInput(input);
+    half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
+
+    auto fastllmCublasHandle = getFastllmCublasHandle();
+    size_t wsBytes = 0;
+    bool ownScratch = false;
+    half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(half), &wsBytes, &ownScratch);
+    size_t bytesPerRow = (size_t)m * sizeof(half);
+    int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
+
+    const size_t perRow = (size_t)m + sizeof(float);
+    __half h_alpha = __float2half_rn(exp2f(8.0f));
+    __half h_beta = __float2half_rn(0.0);
+    cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+
+    for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+        int kc = std::min(maxRowsPerChunk, k - kOff);
+        FastllmCudaFP8E4M3PERCHANNEL2HalfKernel <<< kc, 256 >>>(
+            (uint8_t*)weight.cudaData + (size_t)kOff * perRow, cudaFp16Weight, m);
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              kc, n, m,
+                              &h_alpha, cudaFp16Weight, AType,
+                              m, cudaInput, BType,
+                              m, &h_beta,
+                              cudaOutput + kOff, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error (HalfMatMulFP8E4M3PerChannel).\n");
+            throw("cublas error");
+            exit(0);
+        }
+    }
+
+    if (cudaBiasData != nullptr) {
+        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+    }
+
+    FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 // ==================== BFloat16 x FP8_E4M3_BLOCK_128 ====================
 
 // FP8 BLOCK_128 -> BF16 转换 kernel
@@ -1295,6 +1420,21 @@ __global__ void FastllmCudaFP8E4M3BLOCK1282BF16Kernel(uint8_t* a, __nv_bfloat16 
     uint16_t bf16_bits = ((a[tid] & 0x80) << 8) | ((a[tid] & 0x7F) << 4);
     float val = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&bf16_bits)) * *(float*)(a + 128);
     b[tid] = __float2bfloat16_rn(val);
+}
+
+__global__ void FastllmCudaFP8E4M3PERCHANNEL2BF16Kernel(uint8_t* a, __nv_bfloat16 *b, int m) {
+    unsigned int tid = threadIdx.x;
+    unsigned int st = blockIdx.x;
+    size_t perRow = (size_t)m + sizeof(float);
+    uint8_t *row = a + (size_t)st * perRow;
+    __nv_bfloat16 *out = b + (size_t)st * m;
+    float scale = *(float*)(row + m);
+
+    for (int i = tid; i < m; i += blockDim.x) {
+        uint16_t bf16_bits = ((row[i] & 0x80) << 8) | ((row[i] & 0x7F) << 4);
+        float val = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&bf16_bits)) * scale;
+        out[i] = __float2bfloat16_rn(val);
+    }
 }
 
 template <int THREAD_PER_BLOCK, int PART>
@@ -1556,6 +1696,55 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastll
         LaunchFastllmGemmBF16FP8E4M3Block128(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBF16Bias, n, m, k, perRow);
     }
 
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    FastllmCudaFP8E4M3Block128EnsureBFloat16BiasOnDevice(weight, bias, k);
+
+    __nv_bfloat16 *cudaBF16Bias = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *) weight.extraCudaHalfData[0];
+    __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
+    __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
+
+    auto fastllmCublasHandle = getFastllmCublasHandle();
+    size_t wsBytes = 0;
+    bool ownScratch = false;
+    __nv_bfloat16 *cudaBF16Weight = (__nv_bfloat16 *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(__nv_bfloat16), &wsBytes, &ownScratch);
+    size_t bytesPerRow = (size_t)m * sizeof(__nv_bfloat16);
+    int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
+
+    const size_t perRow = (size_t)m + sizeof(float);
+    float h_alpha = exp2f(120.0), h_beta = 0.0f;
+    cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+
+    for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
+        int kc = std::min(maxRowsPerChunk, k - kOff);
+        FastllmCudaFP8E4M3PERCHANNEL2BF16Kernel <<< kc, 256 >>>(
+            (uint8_t*)weight.cudaData + (size_t)kOff * perRow, cudaBF16Weight, m);
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              kc, n, m,
+                              &h_alpha, cudaBF16Weight, AType,
+                              m, cudaInput, BType,
+                              m, &h_beta,
+                              cudaOutput + kOff, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error (BFloat16MatMulFP8E4M3PerChannel).\n");
+            throw("cublas error");
+            exit(0);
+        }
+    }
+
+    if (cudaBF16Bias != nullptr) {
+        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBF16Bias, k);
+    }
+
+    FastllmReleaseDequantScratch(cudaBF16Weight, ownScratch);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
