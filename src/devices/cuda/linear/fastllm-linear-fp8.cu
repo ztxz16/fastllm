@@ -5,6 +5,8 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#include <cstdlib>
+
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
 #endif
@@ -1502,6 +1504,28 @@ __device__ __forceinline__ __nv_bfloat16 FastllmCudaNVFP4FloatToValue<__nv_bfloa
     return __float2bfloat16_rn(value);
 }
 
+__device__ __forceinline__ float FastllmCudaNVFP4Dot4(
+        const float *input, int i, float w0, float w1, float w2, float w3) {
+    const float4 values = *reinterpret_cast<const float4 *>(input + i);
+    return values.x * w0 + values.y * w1 + values.z * w2 + values.w * w3;
+}
+
+__device__ __forceinline__ float FastllmCudaNVFP4Dot4(
+        const half *input, int i, float w0, float w1, float w2, float w3) {
+    union_half4 values;
+    values.in = *reinterpret_cast<const uint2 *>(input + i);
+    return __half2float(values.out[0]) * w0 + __half2float(values.out[1]) * w1
+         + __half2float(values.out[2]) * w2 + __half2float(values.out[3]) * w3;
+}
+
+__device__ __forceinline__ float FastllmCudaNVFP4Dot4(
+        const __nv_bfloat16 *input, int i, float w0, float w1, float w2, float w3) {
+    union_bf16_4_fp8 values;
+    values.in = *reinterpret_cast<const uint2 *>(input + i);
+    return __bfloat162float(values.out[0]) * w0 + __bfloat162float(values.out[1]) * w1
+         + __bfloat162float(values.out[2]) * w2 + __bfloat162float(values.out[3]) * w3;
+}
+
 template <typename BiasT>
 __device__ __forceinline__ float FastllmCudaNVFP4BiasValue(BiasT *bias, int idx) {
     return bias == nullptr ? 0.0f : FastllmCudaNVFP4ValueToFloat(bias[idx]);
@@ -1652,6 +1676,90 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
     }
 }
 
+// Float-scale NVFP4 stores each 16-weight block as 8 packed bytes followed by one
+// float scale. Four neighboring threads consume exactly that block. Let three of
+// them load one consecutive uint32 each and exchange the words within the 4-lane
+// group. This turns three strided warp loads into one fully coalesced 12-byte/block
+// load and keeps the dot accumulator in a register until reduction.
+template <int THREAD_PER_BLOCK, typename InputT, typename OutputT, typename BiasT>
+__global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
+        const InputT * __restrict__ A, const uint8_t * __restrict__ B,
+        OutputT * __restrict__ C, const BiasT * __restrict__ bias,
+        int m, int k, int perRow) {
+    static_assert(THREAD_PER_BLOCK >= 32 && THREAD_PER_BLOCK % 32 == 0,
+                  "NVFP4 coalesced GEMV requires whole warps");
+    constexpr int WARP_COUNT = THREAD_PER_BLOCK / 32;
+    __shared__ float warpSums[WARP_COUNT];
+    const unsigned int tid = threadIdx.x;
+    const int laneId = tid & 31;
+    const int warpId = tid >> 5;
+    const int laneInGroup = laneId & 3;
+    const int groupBaseLane = laneId & ~3;
+    const int row = blockIdx.x;
+    const uint8_t *rowData = B + (size_t)row * perRow;
+    float acc = 0.0f;
+
+    for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+        const uint8_t *blockData = rowData + (size_t)(i >> 4) * 12;
+        const uint32_t loaded = laneInGroup < 3
+                ? *(const uint32_t *)(blockData + laneInGroup * 4)
+                : 0u;
+        const unsigned int mask = __activemask();
+        const uint32_t weightWord0 = __shfl_sync(mask, loaded, groupBaseLane);
+        const uint32_t weightWord1 = __shfl_sync(mask, loaded, groupBaseLane + 1);
+        const uint32_t scaleWord = __shfl_sync(mask, loaded, groupBaseLane + 2);
+        const uint16_t packed4 = laneInGroup < 2
+                ? (uint16_t)(weightWord0 >> (laneInGroup * 16))
+                : (uint16_t)(weightWord1 >> ((laneInGroup - 2) * 16));
+
+        const uint8_t packed01 = packed4 & 0xFF;
+        const uint8_t packed23 = packed4 >> 8;
+        const float w0 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed01 & 0xF);
+        const float w1 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed01 >> 4);
+        const float w2 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 & 0xF);
+        const float w3 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 >> 4);
+        const float blockSum = FastllmCudaNVFP4Dot4(A, i, w0, w1, w2, w3);
+        acc += blockSum * (__uint_as_float(scaleWord) * FastllmCudaNVFP4MagicScale());
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+    if (laneId == 0) warpSums[warpId] = acc;
+    __syncthreads();
+
+    if (warpId == 0) {
+        acc = laneId < WARP_COUNT ? warpSums[laneId] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_down_sync(0xffffffff, acc, offset);
+        }
+        if (laneId == 0) {
+            C[row] = FastllmCudaNVFP4FloatToValue<OutputT>(
+                    acc + FastllmCudaNVFP4BiasValue((BiasT *)bias, row));
+        }
+    }
+}
+
+static inline int FastllmCudaNVFP4Block16ThreadsPerRow(int m) {
+    static const int overrideThreads = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_NVFP4_BLOCK16_THREADS");
+        if (env == nullptr) return 0;
+        return std::atoi(env) >= 96 ? 128 : 64;
+    }();
+    if (overrideThreads != 0) return overrideThreads;
+    return m >= 4096 ? 128 : 64;
+}
+
+static inline bool FastllmCudaNVFP4Block16CoalescedEnabled() {
+    static const bool enabled = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_NVFP4_BLOCK16_COALESCED");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 template <typename InputT, typename OutputT, typename BiasT>
 static void LaunchFastllmGemmNVFP4(InputT *input, uint8_t *packedWeight, uint8_t *scaleBytes,
                                    OutputT *output, BiasT *bias,
@@ -1710,11 +1818,25 @@ static void LaunchFastllmGemmNVFP4(InputT *input, uint8_t *packedWeight, uint8_t
 template <bool SCALE_E8M0, typename InputT, typename OutputT, typename BiasT>
 static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, OutputT *output,
                                           BiasT *bias, int n, int m, int k, int perRow) {
+    if (n == 1) {
+        const int threads = FastllmCudaNVFP4Block16ThreadsPerRow(m);
+        if (!SCALE_E8M0 && (m & 15) == 0 && FastllmCudaNVFP4Block16CoalescedEnabled()) {
+            if (threads == 128) {
+                FastllmGemvNVFP4Block16Kernel1Coalesced<128> <<< k, 128 >>>(
+                        input, weight, output, bias, m, k, perRow);
+            } else {
+                FastllmGemvNVFP4Block16Kernel1Coalesced<64> <<< k, 64 >>>(
+                        input, weight, output, bias, m, k, perRow);
+            }
+            return;
+        }
+        FastllmGemvNVFP4Block16Kernel1MultiRow<64, 1, SCALE_E8M0> <<< k, 64 >>>(
+                input, weight, output, bias, m, k, perRow);
+        return;
+    }
 #define FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(PART, IN, OUT) \
     FastllmGemvNVFP4Block16Kernel1MultiRow<64, PART, SCALE_E8M0> <<< k, 64 >>>(IN, weight, OUT, bias, m, k, perRow)
-    if (n == 1) {
-        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(1, input, output);
-    } else if (n == 2) {
+    if (n == 2) {
         FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(2, input, output);
     } else if (n == 3) {
         FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(3, input, output);
