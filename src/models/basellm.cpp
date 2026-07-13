@@ -2638,6 +2638,7 @@ namespace fastllm {
         int handleId = responseContextDict.CreateHandle();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         context->Init(this->block_cnt, this->dataType, this->kvCacheDataType);
+        context->inputTokens = (int)inputTokens.size();
         context->currentTokens = inputTokens;
         context->allTokens = inputTokens;
         context->generationConfig = generationConfig;
@@ -2689,6 +2690,24 @@ namespace fastllm {
         } else {
             return (context->resultTokenQueue.size() > 0 || context->isEnding);
         }
+    }
+
+    bool basellm::GetResponseStatistics(int handleId, int &cachedInputTokens,
+                                        int &missedInputTokens, int &outputTokens) {
+        std::unique_lock<std::mutex> dictLocker(this->dictLocker);
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        cachedInputTokens = 0;
+        missedInputTokens = 0;
+        outputTokens = 0;
+        if (context == nullptr) {
+            return false;
+        }
+
+        int inputTokens = std::max(0, context->inputTokens);
+        cachedInputTokens = std::min(inputTokens, std::max(0, context->cacheLen));
+        missedInputTokens = inputTokens - cachedInputTokens;
+        outputTokens = std::max(0, context->curTokens);
+        return true;
     }
 
     void basellm::AbortResponse(int handleId) {

@@ -1332,14 +1332,119 @@ class FastLLmCompletion:
           tool_choice = self._convert_responses_tool_choice(request.tool_choice),
       )
 
+  def _response_token_counts(
+      self,
+      handle: Optional[int],
+      response_statistics: Optional[Dict[str, int]],
+      fallback_input_tokens: int,
+      fallback_output_tokens: int,
+  ) -> Tuple[int, int, int, int]:
+      statistics = dict(response_statistics or {})
+      get_statistics = getattr(self.model, "get_response_statistics", None)
+      if handle is not None and callable(get_statistics):
+          latest = get_statistics(handle)
+          if latest is not None:
+              statistics.update(latest)
+              if response_statistics is not None:
+                  response_statistics.update(latest)
+
+      if ("cached_input_tokens" in statistics or
+              "missed_input_tokens" in statistics):
+          cached_tokens = max(0, int(statistics.get(
+              "cached_input_tokens", 0) or 0))
+          missed_tokens = max(0, int(statistics.get(
+              "missed_input_tokens", 0) or 0))
+          input_tokens = cached_tokens + missed_tokens
+      else:
+          input_tokens = max(0, int(fallback_input_tokens or 0))
+          cached_tokens = 0
+          missed_tokens = input_tokens
+
+      output_tokens = max(0, int(statistics.get(
+          "output_tokens", fallback_output_tokens) or 0))
+      return input_tokens, cached_tokens, missed_tokens, output_tokens
+
+  def _stream_response_handle_with_statistics(
+      self,
+      handle: int,
+      response_statistics: Dict[str, int],
+  ) -> AsyncIterator:
+      stream_fn = self.model.stream_response_handle_async
+      try:
+          parameters = inspect.signature(stream_fn).parameters
+      except (TypeError, ValueError):
+          return stream_fn(handle)
+
+      statistics_parameter = parameters.get("response_statistics")
+      if statistics_parameter is not None:
+          if statistics_parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+              return stream_fn(handle, response_statistics)
+          return stream_fn(
+              handle, response_statistics = response_statistics)
+      if any(parameter.kind == inspect.Parameter.VAR_KEYWORD
+             for parameter in parameters.values()):
+          return stream_fn(
+              handle, response_statistics = response_statistics)
+      if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL
+             for parameter in parameters.values()):
+          return stream_fn(handle, response_statistics)
+      return stream_fn(handle)
+
+  def _chat_usage(
+      self,
+      handle: Optional[int],
+      response_statistics: Optional[Dict[str, int]],
+      fallback_input_tokens: int,
+      fallback_output_tokens: int,
+  ) -> UsageInfo:
+      input_tokens, cached_tokens, missed_tokens, output_tokens = (
+          self._response_token_counts(
+              handle, response_statistics,
+              fallback_input_tokens, fallback_output_tokens))
+      return UsageInfo(
+          prompt_tokens = input_tokens,
+          completion_tokens = output_tokens,
+          total_tokens = input_tokens + output_tokens,
+          prompt_tokens_details = PromptTokensDetails(
+              cached_tokens = cached_tokens,
+              missed_tokens = missed_tokens,
+          ),
+      )
+
+  def _anthropic_usage(
+      self,
+      handle: Optional[int],
+      response_statistics: Optional[Dict[str, int]],
+      fallback_input_tokens: int,
+      fallback_output_tokens: int,
+  ) -> AnthropicUsage:
+      _, cached_tokens, missed_tokens, output_tokens = (
+          self._response_token_counts(
+              handle, response_statistics,
+              fallback_input_tokens, fallback_output_tokens))
+      return AnthropicUsage(
+          input_tokens = missed_tokens,
+          cache_creation_input_tokens = 0,
+          cache_read_input_tokens = cached_tokens,
+          output_tokens = output_tokens,
+      )
+
   def _responses_usage_from_chat_usage(self, usage: Optional[UsageInfo]) -> ResponsesUsageInfo:
       if usage is None:
           return ResponsesUsageInfo()
       prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
       completion_tokens = getattr(usage, "completion_tokens", 0) or 0
       total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or 0
+      prompt_details = getattr(usage, "prompt_tokens_details", None)
+      cached_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
+      missed_tokens = getattr(
+          prompt_details, "missed_tokens", prompt_tokens - cached_tokens) or 0
       return ResponsesUsageInfo(
           input_tokens = prompt_tokens,
+          input_tokens_details = {
+              "cached_tokens": cached_tokens,
+              "missed_tokens": missed_tokens,
+          },
           output_tokens = completion_tokens,
           total_tokens = total_tokens,
       )
@@ -1351,8 +1456,17 @@ class FastLLmCompletion:
       completion_tokens = usage.get(
           "completion_tokens", usage.get("output_tokens", 0)) or 0
       total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens) or 0
+      prompt_details = usage.get(
+          "prompt_tokens_details", usage.get("input_tokens_details", {})) or {}
+      cached_tokens = prompt_details.get("cached_tokens", 0) or 0
+      missed_tokens = prompt_details.get(
+          "missed_tokens", prompt_tokens - cached_tokens) or 0
       return ResponsesUsageInfo(
           input_tokens = prompt_tokens,
+          input_tokens_details = {
+              "cached_tokens": cached_tokens,
+              "missed_tokens": missed_tokens,
+          },
           output_tokens = completion_tokens,
           total_tokens = total_tokens,
       )
@@ -1968,18 +2082,22 @@ class FastLLmCompletion:
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       self.conversation_handles[request_id] = handle
-      result_generator = self.model.stream_response_handle_async(handle)
+      response_statistics: Dict[str, int] = {}
+      result_generator = self._stream_response_handle_with_statistics(
+          handle, response_statistics)
 
       if request.stream:
           return (self.anthropic_message_stream_generator(
-              request, raw_request, result_generator, request_id, input_token_len,
-              parser_request),
+              request, raw_request, result_generator, request_id,
+              input_token_len, parser_request, handle = handle,
+              response_statistics = response_statistics),
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
               return await self.anthropic_message_full_generator(
                   request, raw_request, handle, result_generator, request_id,
-                  input_token_len, parser_request)
+                  input_token_len, parser_request,
+                  response_statistics = response_statistics)
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -2113,7 +2231,9 @@ class FastLLmCompletion:
       # Store the mapping between conversation ID and handle
       self.conversation_handles[request_id] = handle
       # logging.info(f"Created conversation: {request_id}, handle: {handle}")
-      result_generator = self.model.stream_response_handle_async(handle)
+      response_statistics: Dict[str, int] = {}
+      result_generator = self._stream_response_handle_with_statistics(
+          handle, response_statistics)
       # --think 是用户显式指定"在输出前补 <think>\n 起始标签"的开关，
       # 严格按用户意愿执行，与 enable_thinking（是否进入思考模式）解耦。
       need_think_prefix = self.think
@@ -2121,14 +2241,18 @@ class FastLLmCompletion:
       # Streaming response
       if request.stream:
           return (self.chat_completion_stream_generator(
-              request, raw_request, result_generator, request_id, input_token_len,
-              think = need_think_prefix, emit_reasoning_content = emit_reasoning_content),
+              request, raw_request, result_generator, request_id,
+              input_token_len, think = need_think_prefix,
+              emit_reasoning_content = emit_reasoning_content,
+              handle = handle, response_statistics = response_statistics),
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
               return await self.chat_completion_full_generator(
-                  request, raw_request, handle, result_generator, request_id, input_token_len,
-                  think = need_think_prefix, emit_reasoning_content = emit_reasoning_content)
+                  request, raw_request, handle, result_generator, request_id,
+                  input_token_len, think = need_think_prefix,
+                  emit_reasoning_content = emit_reasoning_content,
+                  response_statistics = response_statistics)
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -2152,7 +2276,9 @@ class FastLLmCompletion:
               request_id: str,
               input_token_len: int,
               think: bool = False,
-              emit_reasoning_content: bool = False) -> Union[ErrorResponse, ChatCompletionResponse]:
+              emit_reasoning_content: bool = False,
+              response_statistics: Optional[Dict[str, int]] = None
+              ) -> Union[ErrorResponse, ChatCompletionResponse]:
       model_name = self.model_name
       created_time = int(time.time())
       result = "" if emit_reasoning_content else ("<think>\n" if think else "")
@@ -2171,6 +2297,9 @@ class FastLLmCompletion:
           result, emit_reasoning_content)
       result, stopped_by_stop_string = self._truncate_at_stop(
           result, self._normalize_stop_strings(request.stop))
+      usage = self._chat_usage(
+          handle, response_statistics, input_token_len, completion_tokens)
+      output_tokens = usage.completion_tokens or 0
 
       tool_call_info = self._parse_non_stream_tool_calls(result, request)
       if isinstance(tool_call_info, ErrorResponse):
@@ -2200,7 +2329,7 @@ class FastLLmCompletion:
               ),
               logprobs=None,
               finish_reason=self._chat_finish_reason(
-                  completion_tokens, request.max_tokens or 32768,
+                  output_tokens, request.max_tokens or 32768,
                   stopped_by_stop_string),
           )
 
@@ -2209,9 +2338,7 @@ class FastLLmCompletion:
           created = created_time,
           model = model_name,
           choices = [choice_data],
-          usage = UsageInfo(prompt_tokens = input_token_len,
-                            total_tokens = input_token_len + completion_tokens,
-                            completion_tokens = completion_tokens)
+          usage = usage,
       )
 
       # After completion, remove the conversation from tracking dictionary
@@ -2226,8 +2353,12 @@ class FastLLmCompletion:
           self, request: ChatCompletionRequest, raw_request: Request,
           result_generator: AsyncIterator,
           request_id: str,
-          input_token_len: int, think: bool,
-          emit_reasoning_content: bool = False) -> AsyncGenerator[str, None]:
+          input_token_len: int,
+          think: bool,
+          emit_reasoning_content: bool = False,
+          handle: Optional[int] = None,
+          response_statistics: Optional[Dict[str, int]] = None
+          ) -> AsyncGenerator[str, None]:
       model_name = self.model_name
       created_time = int(time.time())
       chunk_object_type = "chat.completion.chunk"
@@ -2460,8 +2591,10 @@ class FastLLmCompletion:
             reasoning_state["buffer"] = ""
 
         # 3. 结束标志
+        usage = self._chat_usage(
+            handle, response_statistics, input_token_len, completion_tokens)
         finish_reason = self._chat_finish_reason(
-            completion_tokens, request.max_tokens or 32768,
+            usage.completion_tokens or 0, request.max_tokens or 32768,
             stopped_by_stop_string)
         final_stream_error_data = None
         if request.tools and tool_call_parser:
@@ -2490,11 +2623,7 @@ class FastLLmCompletion:
                     "delta": {},
                     "finish_reason": finish_reason,
                 }],
-                "usage": {
-                    "prompt_tokens": input_token_len,
-                    "total_tokens": input_token_len + completion_tokens,
-                    "completion_tokens": completion_tokens,
-                },
+                "usage": usage.model_dump(),
             })
         else:
             choice_data = ChatCompletionResponseStreamChoice(
@@ -2508,9 +2637,7 @@ class FastLLmCompletion:
                 created = created_time,
                 choices = [choice_data],
                 model = model_name,
-                usage = UsageInfo(prompt_tokens = input_token_len,
-                                  total_tokens = input_token_len + completion_tokens,
-                                  completion_tokens = completion_tokens))
+                usage = usage)
             data = chunk.model_dump_json(exclude_unset = True,
                                         exclude_none = True)
         if (final_stream_error_data is None and request.tools
@@ -2554,7 +2681,9 @@ class FastLLmCompletion:
               result_generator: AsyncIterator,
               request_id: str,
               input_token_len: int,
-              parser_request: Optional[ChatCompletionRequest]) -> Union[ErrorResponse, AnthropicMessageResponse]:
+              parser_request: Optional[ChatCompletionRequest],
+              response_statistics: Optional[Dict[str, int]] = None
+              ) -> Union[ErrorResponse, AnthropicMessageResponse]:
       model_name = self.model_name
       result = ""
       completion_tokens = 0
@@ -2578,6 +2707,8 @@ class FastLLmCompletion:
           tool_call_info = ExtractedToolCallInformation(
               tools_called = False, tool_calls = [], content = result)
 
+      usage = self._anthropic_usage(
+          handle, response_statistics, input_token_len, completion_tokens)
       response = AnthropicMessageResponse(
           id = request_id,
           content = self._build_anthropic_response_blocks(
@@ -2585,9 +2716,8 @@ class FastLLmCompletion:
           model = model_name,
           stop_reason = ("tool_use" if tool_call_info.tools_called
                          else self._get_anthropic_stop_reason(
-                             completion_tokens, request.max_tokens)),
-          usage = AnthropicUsage(input_tokens = input_token_len,
-                                 output_tokens = completion_tokens)
+                             usage.output_tokens, request.max_tokens)),
+          usage = usage,
       )
 
       if request_id in self.conversation_handles:
@@ -2600,7 +2730,10 @@ class FastLLmCompletion:
           result_generator: AsyncIterator,
           request_id: str,
           input_token_len: int,
-          parser_request: Optional[ChatCompletionRequest]) -> AsyncGenerator[str, None]:
+          parser_request: Optional[ChatCompletionRequest],
+          handle: Optional[int] = None,
+          response_statistics: Optional[Dict[str, int]] = None
+          ) -> AsyncGenerator[str, None]:
       model_name = self.model_name
       completion_tokens = 0
       next_content_index = 0
@@ -2744,17 +2877,19 @@ class FastLLmCompletion:
               yield self._create_anthropic_sse_event(
                   "content_block_stop",
                   ContentBlockStopEvent(index = tool_state["content_index"]))
+          usage = self._anthropic_usage(
+              handle, response_statistics, input_token_len,
+              completion_tokens)
           yield self._create_anthropic_sse_event(
               "message_delta",
               MessageDeltaEvent(
                   delta = AnthropicMessageDelta(
                       stop_reason = ("tool_use" if emitted_tool_use
                                      else self._get_anthropic_stop_reason(
-                                         completion_tokens, request.max_tokens)),
+                                         usage.output_tokens, request.max_tokens)),
                       stop_sequence = None,
                   ),
-                  usage = AnthropicUsage(input_tokens = input_token_len,
-                                         output_tokens = completion_tokens),
+                  usage = usage,
               ))
           yield self._create_anthropic_sse_event(
               "message_stop",

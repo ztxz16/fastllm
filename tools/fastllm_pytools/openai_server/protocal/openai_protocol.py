@@ -45,10 +45,17 @@ class ModelList(BaseModel):
     data: List[ModelCard] = []
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+    missed_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    prompt_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails)
 
 
 class LogProbs(BaseModel):
@@ -209,6 +216,7 @@ class ResponsesUsageInfo(BaseModel):
     input_tokens: int = 0
     input_tokens_details: Dict[str, Any] = Field(default_factory=lambda: {
         "cached_tokens": 0,
+        "missed_tokens": 0,
     })
     output_tokens: int = 0
     output_tokens_details: Dict[str, Any] = Field(default_factory=lambda: {

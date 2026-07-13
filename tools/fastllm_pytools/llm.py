@@ -324,6 +324,13 @@ fastllm_lib.fetch_response_str_llm_model.restype = ctypes.c_char_p
 fastllm_lib.can_fetch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.can_fetch_response_llm_model.restype = ctypes.c_bool
 
+fastllm_lib.get_response_statistics_llm_model.argtypes = [
+    ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int)
+]
+fastllm_lib.get_response_statistics_llm_model.restype = ctypes.c_bool
+
 fastllm_lib.abort_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
 fastllm_lib.make_history_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
@@ -2096,6 +2103,23 @@ class model:
             except:
                 pass
         fastllm_lib.abort_response_llm_model(self.model, handle)
+
+    def get_response_statistics(self, handle):
+        cached_input_tokens = ctypes.c_int(0)
+        missed_input_tokens = ctypes.c_int(0)
+        output_tokens = ctypes.c_int(0)
+        found = fastllm_lib.get_response_statistics_llm_model(
+            self.model, handle,
+            ctypes.byref(cached_input_tokens),
+            ctypes.byref(missed_input_tokens),
+            ctypes.byref(output_tokens))
+        if not found:
+            return None
+        return {
+            "cached_input_tokens": cached_input_tokens.value,
+            "missed_input_tokens": missed_input_tokens.value,
+            "output_tokens": output_tokens.value,
+        }
     
     def stream_response_handle(self, handle):
         if self._has_hf_chat_template():
@@ -2158,10 +2182,17 @@ class model:
                     pending_tokens.clear()
                 yield cur
 
-    async def stream_response_handle_async(self, handle):
+    async def stream_response_handle_async(self, handle, response_statistics = None):
         import time
         is_prefill = True
         start_time = time.time()
+
+        def capture_response_statistics():
+            if response_statistics is None:
+                return
+            statistics = self.get_response_statistics(handle)
+            if statistics is not None:
+                response_statistics.update(statistics)
 
         if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
@@ -2174,6 +2205,7 @@ class model:
                     await asyncio.sleep(0)
                     continue
                 is_prefill = False
+                capture_response_statistics()
                 cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
                 if (cur <= -1):
                     if (cur == -2):
@@ -2209,6 +2241,7 @@ class model:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     await asyncio.sleep(0)
                     continue
+                capture_response_statistics()
                 if (self.save_history and handle in self.current_tokenizer_cache):
                     token = fastllm_lib.fetch_response_llm_model(self.model, handle)
                     if (token <= -1):

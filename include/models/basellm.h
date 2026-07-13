@@ -47,6 +47,7 @@ namespace fastllm {
 
         int preTokens = 0;
         int curTokens = 0;
+        int inputTokens = 0;
         std::map <std::string, int> intParams;
 
         int cacheLen = 0;
@@ -309,6 +310,9 @@ namespace fastllm {
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 
 
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
+
+        virtual bool GetResponseStatistics(int handleId, int &cachedInputTokens,
+                                           int &missedInputTokens, int &outputTokens);
 
         virtual void AbortResponse(int handleId); // 中断handleId的请求
 

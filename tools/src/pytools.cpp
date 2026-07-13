@@ -658,6 +658,25 @@ extern "C" {
         return model->CanFetchResponse(handleId);
     }
 
+    DLL_EXPORT bool get_response_statistics_llm_model(int modelId, int handleId,
+                                                       int *cachedInputTokens,
+                                                       int *missedInputTokens,
+                                                       int *outputTokens) {
+        auto model = models.GetModel(modelId);
+        int cached = 0, missed = 0, output = 0;
+        bool ret = model->GetResponseStatistics(handleId, cached, missed, output);
+        if (cachedInputTokens != nullptr) {
+            *cachedInputTokens = cached;
+        }
+        if (missedInputTokens != nullptr) {
+            *missedInputTokens = missed;
+        }
+        if (outputTokens != nullptr) {
+            *outputTokens = output;
+        }
+        return ret;
+    }
+
     // 终止handleId的请求
     DLL_EXPORT void abort_response_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
