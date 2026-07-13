@@ -536,10 +536,13 @@ static size_t GetRowContiguousNumaGateUpRowBytes(const fastllm::Data &data, int 
                               : fastllm::GetDataBytes(data.dataType, 1, columns);
 }
 
-static int GetMultiCudaSplitUnit(const fastllm::Data &data) {
+static int GetMultiCudaSplitUnit(const fastllm::Data &data, int splitAxis) {
     int unit = data.groupCnt <= 0 ? 128 : data.groupCnt;
     if (data.dataType == fastllm::DataType::FP8_E4M3) {
-        unit = data.blockM;
+        int blockSize = splitAxis == 0 ? data.blockK : data.blockM;
+        if (blockSize > 0) {
+            unit = blockSize;
+        }
     } else if (data.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128) {
         unit = 128;
     }
@@ -839,7 +842,7 @@ DivisionScheme BuildMultiCudaRowSplitScheme(fastllm::Data &weight, std::vector <
 
     if (weight.tpPackType == fastllm::TP_PACK_GATEUP) {
         int mid = weight.dims[0] / 2;
-        int unit = GetMultiCudaSplitUnit(weight);
+        int unit = GetMultiCudaSplitUnit(weight, 0);
         fastllm::AssertInFastLLM(!IsGGUFTensor(weight) || mid % unit == 0,
                                  "GGUF GateUp tensor parallel requires aligned split unit " +
                                  std::to_string(unit) + ".\n");
@@ -853,7 +856,7 @@ DivisionScheme BuildMultiCudaRowSplitScheme(fastllm::Data &weight, std::vector <
         return divisionScheme;
     }
 
-    int unit = GetMultiCudaSplitUnit(weight);
+    int unit = GetMultiCudaSplitUnit(weight, 0);
     fastllm::AssertInFastLLM(!IsGGUFTensor(weight) || weight.dims[0] % unit == 0,
                              "GGUF row split requires aligned split unit " + std::to_string(unit) + ".\n");
     std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, weight.dims[0], unit);
@@ -867,7 +870,7 @@ DivisionScheme BuildMultiCudaColumnSplitScheme(fastllm::Data &weight, std::vecto
     DivisionScheme divisionScheme;
     fastllm::AssertInFastLLM(weight.dims.size() == 2,
                              "Column split requires 2D weight \"" + weight.name + "\".\n");
-    int unit = GetMultiCudaSplitUnit(weight);
+    int unit = GetMultiCudaSplitUnit(weight, 1);
     fastllm::AssertInFastLLM(!IsGGUFTensor(weight) || weight.dims[1] % unit == 0,
                              "GGUF column split requires aligned split unit " + std::to_string(unit) + ".\n");
     std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, weight.dims[1], unit);
@@ -1385,29 +1388,92 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             auto curDevice = weight.multiDeviceDatas[deviceId];
             curDevice->blockK = weight.blockK;
             curDevice->blockM = weight.blockM;
+            if (len == 0) {
+                curDevice->scales.clear();
+                continue;
+            }
             size_t ks = static_cast<size_t>((curDevice->dims[0] - 1) / curDevice->blockK + 1);
             size_t ms = static_cast<size_t>((curDevice->dims[1] - 1) / curDevice->blockM + 1);
             curDevice->scales.resize(ks * ms);
             if (splitAxis == 0) {
-                size_t curLen = 0;
+                size_t oriKs = static_cast<size_t>((k - 1) / weight.blockK + 1);
+                size_t oriMs = static_cast<size_t>((m - 1) / weight.blockM + 1);
+                fastllm::AssertInFastLLM(weight.scales.size() == oriKs * oriMs && ms == oriMs,
+                                         "FP8 tensor parallel row split scale shape mismatch.\n");
+                std::vector<int> sourceScaleRows(ks, -1);
+                size_t localRow = 0;
                 for (auto &it : div) {
-                    size_t copyLen = static_cast<size_t>((it.second - it.first) / curDevice->blockM);
-                    size_t srcOffset = static_cast<size_t>(it.first / curDevice->blockM) * ms;
-                    memcpy(curDevice->scales.data() + curLen * ms,
-                           weight.scales.data() + srcOffset,
-                           copyLen * ms * sizeof(float));
-                    curLen += copyLen;
+                    size_t sourceRow = static_cast<size_t>(it.first);
+                    size_t sourceEnd = static_cast<size_t>(it.second);
+                    while (sourceRow < sourceEnd) {
+                        size_t localScaleRow = localRow / static_cast<size_t>(weight.blockK);
+                        size_t sourceScaleRow = sourceRow / static_cast<size_t>(weight.blockK);
+                        fastllm::AssertInFastLLM(localScaleRow < ks && sourceScaleRow < oriKs,
+                                                 "FP8 tensor parallel row split scale index overflow.\n");
+                        if (sourceScaleRows[localScaleRow] < 0) {
+                            sourceScaleRows[localScaleRow] = static_cast<int>(sourceScaleRow);
+                        } else {
+                            fastllm::AssertInFastLLM(sourceScaleRows[localScaleRow] == (int)sourceScaleRow,
+                                                     "FP8 tensor parallel row split crosses incompatible scale blocks.\n");
+                        }
+                        size_t localRemain = static_cast<size_t>(weight.blockK) -
+                                             localRow % static_cast<size_t>(weight.blockK);
+                        size_t sourceRemain = static_cast<size_t>(weight.blockK) -
+                                              sourceRow % static_cast<size_t>(weight.blockK);
+                        size_t step = std::min(sourceEnd - sourceRow, std::min(localRemain, sourceRemain));
+                        localRow += step;
+                        sourceRow += step;
+                    }
+                }
+                fastllm::AssertInFastLLM(localRow == static_cast<size_t>(curDevice->dims[0]),
+                                         "FP8 tensor parallel row split scale length mismatch.\n");
+                for (size_t row = 0; row < ks; row++) {
+                    fastllm::AssertInFastLLM(sourceScaleRows[row] >= 0,
+                                             "FP8 tensor parallel row split has an unmapped scale block.\n");
+                    memcpy(curDevice->scales.data() + row * ms,
+                           weight.scales.data() + static_cast<size_t>(sourceScaleRows[row]) * oriMs,
+                           ms * sizeof(float));
                 }
             } else {
-                size_t oriMs = weight.scales.size() / ks;
+                size_t oriKs = static_cast<size_t>((k - 1) / weight.blockK + 1);
+                size_t oriMs = static_cast<size_t>((m - 1) / weight.blockM + 1);
+                fastllm::AssertInFastLLM(weight.scales.size() == oriKs * oriMs && ks == oriKs,
+                                         "FP8 tensor parallel column split scale shape mismatch.\n");
+                std::vector<int> sourceScaleColumns(ms, -1);
+                size_t localColumn = 0;
+                for (auto &it : div) {
+                    size_t sourceColumn = static_cast<size_t>(it.first);
+                    size_t sourceEnd = static_cast<size_t>(it.second);
+                    while (sourceColumn < sourceEnd) {
+                        size_t localScaleColumn = localColumn / static_cast<size_t>(weight.blockM);
+                        size_t sourceScaleColumn = sourceColumn / static_cast<size_t>(weight.blockM);
+                        fastllm::AssertInFastLLM(localScaleColumn < ms && sourceScaleColumn < oriMs,
+                                                 "FP8 tensor parallel column split scale index overflow.\n");
+                        if (sourceScaleColumns[localScaleColumn] < 0) {
+                            sourceScaleColumns[localScaleColumn] = static_cast<int>(sourceScaleColumn);
+                        } else {
+                            fastllm::AssertInFastLLM(sourceScaleColumns[localScaleColumn] == (int)sourceScaleColumn,
+                                                     "FP8 tensor parallel column split crosses incompatible scale blocks.\n");
+                        }
+                        size_t localRemain = static_cast<size_t>(weight.blockM) -
+                                             localColumn % static_cast<size_t>(weight.blockM);
+                        size_t sourceRemain = static_cast<size_t>(weight.blockM) -
+                                              sourceColumn % static_cast<size_t>(weight.blockM);
+                        size_t step = std::min(sourceEnd - sourceColumn, std::min(localRemain, sourceRemain));
+                        localColumn += step;
+                        sourceColumn += step;
+                    }
+                }
+                fastllm::AssertInFastLLM(localColumn == static_cast<size_t>(curDevice->dims[1]),
+                                         "FP8 tensor parallel column split scale length mismatch.\n");
+                for (size_t column = 0; column < ms; column++) {
+                    fastllm::AssertInFastLLM(sourceScaleColumns[column] >= 0,
+                                             "FP8 tensor parallel column split has an unmapped scale block.\n");
+                }
                 for (size_t row = 0; row < ks; row++) {
-                    for (auto &it : div) {
-                        size_t srcOffset = row * oriMs +
-                                           static_cast<size_t>(it.first / curDevice->blockM);
-                        size_t copyLen = static_cast<size_t>((it.second - it.first) / curDevice->blockM);
-                        memcpy(curDevice->scales.data() + row * ms,
-                               weight.scales.data() + srcOffset,
-                               copyLen * sizeof(float));
+                    for (size_t column = 0; column < ms; column++) {
+                        curDevice->scales[row * ms + column] =
+                            weight.scales[row * oriMs + static_cast<size_t>(sourceScaleColumns[column])];
                     }
                 }
             }

@@ -471,10 +471,13 @@ namespace fastllm {
         return IsGGUFTensor(data) ? (int)ggml_blck_size((ggml_type)data.ggmlType) : 1;
     }
 
-    static int GetMultiCudaSplitUnit(const fastllm::Data &data) {
+    static int GetMultiCudaSplitUnit(const fastllm::Data &data, int splitAxis) {
         int unit = data.groupCnt <= 0 ? 128 : data.groupCnt;
         if (data.dataType == fastllm::DataType::FP8_E4M3) {
-            unit = data.blockM;
+            int blockSize = splitAxis == 0 ? data.blockK : data.blockM;
+            if (blockSize > 0) {
+                unit = blockSize;
+            }
         }
         if (data.dataType == fastllm::DataType::NVFP4) {
             if (data.blockK > 0) {
@@ -491,7 +494,10 @@ namespace fastllm {
     }
 
     static int GetMultiCudaSplitUnit(const fastllm::Data &data0, const fastllm::Data &data1) {
-        int unit = GetMultiCudaSplitUnit(data0);
+        int unit = GetMultiCudaSplitUnit(data0, 0);
+        if (data1.dataType == fastllm::DataType::FP8_E4M3 && data1.blockM > 0) {
+            unit = LcmInt(unit, data1.blockM);
+        }
         if (IsGGUFTensor(data1)) {
             unit = LcmInt(unit, GetGGUFBlockSize(data1));
         }
@@ -3678,7 +3684,7 @@ auto st = std::chrono::system_clock::now();
         int m = input.dims.back();
         int k = output.dims.back();
 
-        int unit = GetMultiCudaSplitUnit(weight);
+        int unit = GetMultiCudaSplitUnit(weight, 0);
         AssertInFastLLM(!IsGGUFTensor(weight) || weight.dims[0] % unit == 0,
                         "GGUF row split requires aligned split unit " + std::to_string(unit) + ".\n");
         std::vector <int> devices;
@@ -4427,7 +4433,7 @@ auto st = std::chrono::system_clock::now();
                         continue;
                     }
                     int k = weights[i]->dims[0];
-                    int unit = weights[i + 1] == nullptr ? GetMultiCudaSplitUnit(*weights[i])
+                    int unit = weights[i + 1] == nullptr ? GetMultiCudaSplitUnit(*weights[i], 0)
                                                          : GetMultiCudaSplitUnit(*weights[i], *weights[i + 1]);
                     AssertInFastLLM((!IsGGUFTensor(*weights[i]) && (weights[i + 1] == nullptr || !IsGGUFTensor(*weights[i + 1]))) ||
                                     (k / 2) % unit == 0,
