@@ -130,6 +130,13 @@ namespace fastllm {
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_MAX =
         QWEN35_MTP_FAST_SEQ_MAX - 1;
+    static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
+
+    class Qwen35MtpBatchFastPathUnavailable final : public std::runtime_error {
+    public:
+        explicit Qwen35MtpBatchFastPathUnavailable(const std::string &message)
+            : std::runtime_error(message) {}
+    };
 
     enum Qwen35MtpProfilePath {
         QWEN35_MTP_PROFILE_SEED = 0,
@@ -3532,18 +3539,20 @@ namespace fastllm {
                 Data &kCaches = *(*batchPastKeys)[0];
                 Data &vCaches = *(*batchPastValues)[0];
                 Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType);
-                Qwen3CudaGeneratePagedBatchParams(runner, qForAttention, *batchPastKeys, batch,
-                                                  *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                                                  seqLens);
-                Qwen3CudaAttentionPagedBatch(runner, qForAttention,
-                                             kCaches, vCaches,
-                                             *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                                             *attenOutput, group,
-                                             1.0f / std::sqrt((float)headDim),
-                                             1, layerIdx > 0,
-                                             enableFlashInferCudaGraph,
-                                             flashInferCudaGraph);
-                attenOutput->Reshape({1, seqlen, numAttentionHeads * headDim});
+                Qwen3CudaGeneratePagedBatchParams(
+                    runner, qForAttention, *batchPastKeys, batch,
+                    *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                    seqLens);
+                Qwen3CudaAttentionPagedBatch(
+                    runner, qForAttention, kCaches, vCaches,
+                    *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                    *attenOutput, group,
+                    1.0f / std::sqrt((float)headDim),
+                    1, layerIdx > 0,
+                    enableFlashInferCudaGraph,
+                    flashInferCudaGraph);
+                attenOutput->Reshape(
+                    {1, seqlen, numAttentionHeads * headDim});
             } else {
                 Data &kCaches = *(*batchPastKeys)[0];
                 Data &vCaches = *(*batchPastValues)[0];
@@ -3845,6 +3854,7 @@ namespace fastllm {
                 bool allSimple,
                 const std::vector<GenerationConfig> &generationConfigs,
                 const std::vector<int> *typicalCandidateIds = nullptr,
+                const std::vector<int> *typicalCandidateRows = nullptr,
                 std::vector<unsigned char> *typicalAccepted = nullptr,
                 std::vector<int> *typicalRecoveredIds = nullptr) {
             FastllmCudaSetDevice(rootDevice);
@@ -3866,6 +3876,10 @@ namespace fastllm {
                 int vocabSize = fullLogits.dims.back();
                 int typicalCount = typicalCandidateIds == nullptr ? 0 :
                     std::min(batch, (int)typicalCandidateIds->size());
+                if (typicalCandidateRows != nullptr) {
+                    typicalCount = std::min(
+                        typicalCount, (int)typicalCandidateRows->size());
+                }
                 if (typicalAccepted != nullptr) {
                     typicalAccepted->assign(typicalCount, 0);
                 }
@@ -3877,6 +3891,8 @@ namespace fastllm {
                     temperatures.data(), topKs.data(), topPs.data(),
                     lastRet.data(), batch, vocabSize,
                     typicalCount > 0 ? typicalCandidateIds->data() : nullptr,
+                    typicalCount > 0 && typicalCandidateRows != nullptr ?
+                        typicalCandidateRows->data() : nullptr,
                     typicalCount > 0 && typicalAccepted != nullptr ?
                         typicalAccepted->data() : nullptr,
                     typicalCount > 0 && typicalRecoveredIds != nullptr ?
@@ -4828,31 +4844,38 @@ namespace fastllm {
         std::vector<int> devices;
         std::map<int, int> ratios;
         if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
-            devices.empty() || devices[0] != deviceId) {
+            devices.empty() ||
+            std::find(devices.begin(), devices.end(), deviceId) == devices.end()) {
             return 0;
         }
 
-        auto it = this->weight.weight.find("lm_head.weight");
-        if (it == this->weight.weight.end()) {
-            it = this->weight.weight.find(language_prefix + "embed_tokens.weight");
-        }
-        if (it == this->weight.weight.end() || it->second.dims.empty() || it->second.dims[0] <= 0) {
-            return 0;
-        }
-
-        long long vocabSize = it->second.dims[0];
         DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
-        long long localLogitsBytes = computeType == DataType::FLOAT32 ? 0 :
-            (long long)GetDataBytes(computeType, (size_t)batch, (size_t)vocabSize);
-        long long reserveBytes =
-            (long long)batch * vocabSize * (long long)sizeof(float) +
-            localLogitsBytes +
-            (long long)batch * (long long)sizeof(int) +
-            Qwen35CudaRuntimeScratchReserveBytes();
+        long long reserveBytes = 0;
+        if (devices[0] == deviceId) {
+            auto it = this->weight.weight.find("lm_head.weight");
+            if (it == this->weight.weight.end()) {
+                it = this->weight.weight.find(language_prefix + "embed_tokens.weight");
+            }
+            if (it != this->weight.weight.end() && !it->second.dims.empty() &&
+                it->second.dims[0] > 0) {
+                long long vocabSize = it->second.dims[0];
+                long long localLogitsBytes = computeType == DataType::FLOAT32 ? 0 :
+                    (long long)GetDataBytes(computeType, (size_t)batch,
+                                            (size_t)vocabSize);
+                reserveBytes +=
+                    (long long)batch * vocabSize * (long long)sizeof(float) +
+                    localLogitsBytes +
+                    (long long)batch * (long long)sizeof(int) +
+                    Qwen35CudaRuntimeScratchReserveBytes();
+            }
+        }
 
         int mtpDrafts = Qwen35MtpDraftsPerStep();
         if (!Qwen35MtpDisabledByEnv() && mtpDrafts > 0 && HasMtpWeights() &&
-            devices.size() == 1) {
+            num_k_heads > 0 && num_v_heads > 0 &&
+            num_v_heads % num_k_heads == 0 &&
+            head_k_dim > 0 && head_v_dim > 0) {
+            bool tensorParallel = devices.size() > 1;
             long long linearStateBytes = 0;
             for (int layer = 0; layer < block_cnt; layer++) {
                 std::string prefix = language_prefix + "layers." +
@@ -4867,17 +4890,51 @@ namespace fastllm {
                 if (!isLinearAttentionLayer) {
                     continue;
                 }
-                long long localKd = (long long)num_k_heads * head_k_dim;
-                long long localVd = (long long)num_v_heads * head_v_dim;
+                int localKeyHeads = num_k_heads;
+                int localValueHeads = num_v_heads;
+                if (tensorParallel) {
+                    DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
+                        devices, ratios, num_k_heads);
+                    std::string qkvzWeightName =
+                        prefix + "linear_attn.in_proj_qkvz.weight";
+                    std::string qkvzbaWeightName =
+                        prefix + "linear_attn.in_proj_qkvzba.weight";
+                    BalanceMultiCudaDivisionSchemeByLayer(
+                        this->weight.weight.find(qkvzbaWeightName) !=
+                                this->weight.weight.end() ?
+                            qkvzbaWeightName : qkvzWeightName,
+                        devices, keyScheme);
+                    DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
+                        keyScheme, num_v_heads / num_k_heads);
+                    localKeyHeads = Qwen35LocalHeads(keyScheme, deviceId);
+                    localValueHeads = Qwen35LocalHeads(valueScheme, deviceId);
+                }
+                if (localKeyHeads <= 0 || localValueHeads <= 0) {
+                    continue;
+                }
+                long long localKd = (long long)localKeyHeads * head_k_dim;
+                long long localVd = (long long)localValueHeads * head_v_dim;
                 long long keyElements = (localKd * 2 + localVd) * 4;
                 long long valueElements =
-                    (long long)num_v_heads * head_k_dim * head_v_dim;
+                    (long long)localValueHeads * head_k_dim * head_v_dim;
                 linearStateBytes += (long long)GetDataBytes(
                     computeType, 1, (size_t)(keyElements + valueElements));
             }
-            // MTP validation keeps one temporary linear cache plus one
-            // snapshot for each partial draft position.
-            reserveBytes += (long long)batch * (mtpDrafts + 1) * linearStateBytes;
+            long long scratchSlots = 0;
+            if (tensorParallel) {
+                // TP keeps every prefix snapshot so rejected requests do not
+                // need another synchronized target-model replay.
+                scratchSlots = (long long)batch * (mtpDrafts + 1);
+            } else {
+                // Small batches keep prefix snapshots; large batches retain
+                // one rollback state per request and replay rejected prefixes.
+                long long snapshotBatch = std::min(
+                    batch, QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX);
+                scratchSlots = std::max(
+                    (long long)batch,
+                    snapshotBatch * (long long)(mtpDrafts + 1));
+            }
+            reserveBytes += scratchSlots * linearStateBytes;
         }
         return reserveBytes;
 #else
@@ -5251,6 +5308,23 @@ namespace fastllm {
                HasMtpWeights() &&
                GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
                !devices.empty();
+#endif
+    }
+
+    bool Qwen3_5Model::CanUseQwen35MTPBatchForward(int draftsPerStep) const {
+#ifndef USE_CUDA
+        (void)draftsPerStep;
+        return false;
+#else
+        return draftsPerStep > 0 &&
+               HasMtpWeights() &&
+               ResolveQwen35ThreadTpComputeType(this->dataType) == DataType::FLOAT16 &&
+               head_k_dim == 128 && head_v_dim > 0 &&
+               num_k_heads > 0 && num_v_heads > 0 &&
+               num_v_heads % num_k_heads == 0 &&
+               std::isfinite(rms_norm_eps) && rms_norm_eps >= 0.0f &&
+               inv_scale_data.dataType == DataType::FLOAT32 &&
+               inv_scale_data.dims == std::vector<int>({head_k_dim});
 #endif
     }
 
@@ -6679,7 +6753,6 @@ namespace fastllm {
         bool generatedDecodeParams = false;
         auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
         auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
-
         auto addPartialToResidualReduce = [&](Data &partial) {
             if (partial.dataType != hiddenStates.dataType) {
                 Qwen3CudaToDataType(cudaRunner, partial, hiddenStates.dataType);
@@ -6876,9 +6949,15 @@ namespace fastllm {
                 bool keepCombinedBaForSmallDecode =
                     speculativeCaptureFirstTokenLinearState && batch == 1 && bsz == 1 &&
                     seqlen > 1 && seqlen <= QWEN35_MTP_FAST_SEQ_MAX;
+                bool keepCombinedBaForBatchSpeculative =
+                    speculativeCollectAllLogits &&
+                    speculativeCaptureFirstTokenLinearState &&
+                    batch > 1 && !all1 && bsz == 1;
                 bool keepCombinedBaForBatchRecurrent = batch > 1 && all1;
                 bool keepCombinedBa =
-                    keepCombinedBaForSmallDecode || keepCombinedBaForBatchRecurrent;
+                    keepCombinedBaForSmallDecode ||
+                    keepCombinedBaForBatchSpeculative ||
+                    keepCombinedBaForBatchRecurrent;
                 bool baSplitReady = false;
                 if (hasMergedGdnInLinear) {
                     if (keepCombinedBa) {
@@ -6927,7 +7006,29 @@ namespace fastllm {
                     pastKey.dataDeviceIds = {gpuId};
                     pastValue.dataDeviceIds = {gpuId};
                 }
-                if (batch == 1 && all1 && pastKey.dims.size() > 0) {
+                bool batchedSpeculativeSequence =
+                    keepCombinedBaForBatchSpeculative &&
+                    (int)seqLens.size() == batch;
+                int batchedSpeculativeTotalTokens = 0;
+                if (batchedSpeculativeSequence) {
+                    int expectedCaptureSlots = 0;
+                    int commonSeqLen = seqLens[0];
+                    for (int len : seqLens) {
+                        batchedSpeculativeSequence &=
+                            len == commonSeqLen && len > 1 &&
+                            len <= QWEN35_MTP_FAST_SEQ_MAX;
+                        batchedSpeculativeTotalTokens += len;
+                        expectedCaptureSlots += std::max(0, len - 1);
+                    }
+                    batchedSpeculativeSequence &=
+                        batchedSpeculativeTotalTokens == seqlen &&
+                        (speculativeLinearStateCaptureSlots == 0 ||
+                         expectedCaptureSlots <= speculativeLinearStateCaptureSlots);
+                }
+                if (batchedSpeculativeSequence) {
+                    // Keep the flattened token-major projection. Each request
+                    // is transposed independently before its cache update.
+                } else if (batch == 1 && all1 && pastKey.dims.size() > 0) {
                     SwapSingleTokenSeqHeadByReshape(qkvConvInput);
                 } else if (batch > 1 && all1) {
                     qkvConvInput.Reshape({batch, qkvConvInput.dims.back(), 1});
@@ -6936,7 +7037,57 @@ namespace fastllm {
                 }
                 z.Reshape({bsz, seqlen, localValueHeads, head_v_dim});
 
-                if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
+                if (batchedSpeculativeSequence) {
+                    int requestSeqLen = seqLens[0];
+                    qkvConvInput.Reshape(
+                        {batch, requestSeqLen, qkvConvInput.dims.back()});
+                    Qwen3CudaPermuteSelf(cudaRunner, qkvConvInput, {0, 2, 1});
+                    std::vector<Data*> requestPastKeys(batch);
+                    std::vector<Data*> tokenConvCaches;
+                    int captureTokens = speculativeLinearStateCaptureSlots > 0 ?
+                        requestSeqLen - 1 : 0;
+                    tokenConvCaches.reserve(batch * captureTokens);
+                    for (int rb = 0; rb < batch; rb++) {
+                        Data *requestPastKey = pastKeyValues[rb * block_cnt + i].first;
+                        AssertInFastLLM(requestPastKey != nullptr,
+                                        "Qwen3.5 batched MTP missing linear conv cache.\n");
+                        Qwen35PrepareLinearAttentionCache(*requestPastKey, computeType);
+                        requestPastKey->dataDeviceIds = {gpuId};
+                        requestPastKeys[rb] = requestPastKey;
+                        int captureOffset = rb * captureTokens;
+                        for (int tokenIndex = 0; tokenIndex < captureTokens;
+                             tokenIndex++) {
+                            tokenConvCaches.push_back(
+                                getLinearCaptureSlot(captureOffset + tokenIndex, true));
+                        }
+                    }
+                    bool fused =
+                        FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
+                            requestPastKeys, qkvConvInput,
+                            *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                            convOutput, tokenConvCaches, captureTokens);
+                    if (!fused) {
+                        throw Qwen35MtpBatchFastPathUnavailable(
+                            "Qwen3.5 batched MTP linear conv fast path is unavailable.");
+                    }
+                    for (int rb = 0; rb < batch; rb++) {
+                        int captureOffset = rb * captureTokens;
+                        for (int tokenIndex = 0; tokenIndex < captureTokens;
+                             tokenIndex++) {
+                            Data *snapshot =
+                                tokenConvCaches[captureOffset + tokenIndex];
+                            if (snapshot != nullptr) {
+                                snapshot->cacheUid = requestPastKeys[rb]->cacheUid;
+                                Qwen35PrepareLinearAttentionCache(
+                                    *snapshot, computeType);
+                                markLinearCaptured(captureOffset + tokenIndex, 1);
+                            }
+                        }
+                    }
+                    Qwen3CudaPermuteSelf(cudaRunner, convOutput, {0, 2, 1});
+                    convOutput.Reshape({1, seqlen, convOutput.dims.back()});
+                } else if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
                     bool fusedDecodeConvSilu = false;
                     bool canTryFusedDecodeConvSilu =
                         pastKey.dataDevice == DataDevice::CUDA &&
@@ -7089,7 +7240,10 @@ namespace fastllm {
                     Qwen35CudaSilu(cudaRunner, convOutput, convOutput);
                 }
 
-                if (batch == 1 && all1 && pastKey.dims.size() > 0) {
+                if (batchedSpeculativeSequence) {
+                    // Request-local outputs are already [1, seq, channels]
+                    // and concatenated in flattened request order.
+                } else if (batch == 1 && all1 && pastKey.dims.size() > 0) {
                     SwapSingleTokenSeqHeadByReshape(convOutput);
                 } else if (batch > 1 && all1) {
                     convOutput.Reshape({1, batch, convOutput.dims[1]});
@@ -7110,6 +7264,66 @@ namespace fastllm {
                     convQkvSplitReady = true;
                 };
 
+                bool fusedBatchSpeculativeSequence = false;
+                if (batchedSpeculativeSequence) {
+                    int requestSeqLen = seqLens[0];
+                    convOutput.Reshape(
+                        {batch, requestSeqLen, convOutput.dims.back()});
+                    baMerged.Reshape(
+                        {batch, requestSeqLen, baMerged.dims.back()});
+                    std::vector<Data*> requestPastValues(batch);
+                    std::vector<Data*> tokenValueStates;
+                    int captureTokens = speculativeLinearStateCaptureSlots > 0 ?
+                        requestSeqLen - 1 : 0;
+                    tokenValueStates.reserve(batch * captureTokens);
+                    for (int rb = 0; rb < batch; rb++) {
+                        Data *requestPastValue =
+                            pastKeyValues[rb * block_cnt + i].second;
+                        AssertInFastLLM(requestPastValue != nullptr &&
+                                        Qwen35EnsureCudaLinearAttnStateTransposed(
+                                            *requestPastValue),
+                                        "Qwen3.5 batched MTP missing transposed recurrent state.\n");
+                        requestPastValues[rb] = requestPastValue;
+                        int captureOffset = rb * captureTokens;
+                        for (int tokenIndex = 0; tokenIndex < captureTokens;
+                             tokenIndex++) {
+                            tokenValueStates.push_back(
+                                getLinearCaptureSlot(captureOffset + tokenIndex, false));
+                        }
+                    }
+                    bool fused =
+                        FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
+                            convOutput, baMerged,
+                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                            *requireLocal(weight[aLogName], aLogName),
+                            *requireLocal(weight[dtBiasName], dtBiasName),
+                            requestPastValues, coreAttnOut,
+                            tokenValueStates, captureTokens,
+                            localKeyHeads, localValueHeads,
+                            head_k_dim, head_v_dim, rms_norm_eps,
+                            1.0f / std::sqrt((float)head_k_dim));
+                    if (!fused) {
+                        throw Qwen35MtpBatchFastPathUnavailable(
+                            "Qwen3.5 batched MTP recurrent fast path is unavailable.");
+                    }
+                    for (int rb = 0; rb < batch; rb++) {
+                        int captureOffset = rb * captureTokens;
+                        for (int tokenIndex = 0; tokenIndex < captureTokens;
+                             tokenIndex++) {
+                            Data *snapshot =
+                                tokenValueStates[captureOffset + tokenIndex];
+                            if (snapshot != nullptr) {
+                                snapshot->cacheUid = requestPastValues[rb]->cacheUid;
+                                Qwen35PrepareLinearAttentionCache(
+                                    *snapshot, computeType);
+                                markLinearCaptured(captureOffset + tokenIndex, 2);
+                            }
+                        }
+                    }
+                    coreAttnOut.Reshape(
+                        {1, seqlen, localValueHeads, head_v_dim});
+                    fusedBatchSpeculativeSequence = true;
+                }
                 bool fusedBatchRecurrentFromConvBa = false;
 #ifdef USE_CUDA
                 std::vector<Data*> fusedRecurrentStates;
@@ -7295,7 +7509,10 @@ namespace fastllm {
                         Qwen3CudaPermuteSelf(cudaRunner, coreAttnOut, {0, 2, 1, 3});
                     }
                 };
-                if (fusedBatchRecurrentFromConvBa) {
+                if (fusedBatchSpeculativeSequence) {
+                    // coreAttnOut is already produced request-by-request by
+                    // the small-sequence recurrent kernels above.
+                } else if (fusedBatchRecurrentFromConvBa) {
                     // coreAttnOut is already produced by the fused batch recurrent path.
                 } else if (isSingleTokenLinearDecode) {
                     ensureConvQkvSplit();
@@ -7731,7 +7948,8 @@ namespace fastllm {
         Data lastHiddenStates;
         Data *headInput = &hiddenStates;
         bool keepAllRowsForSpeculative =
-            (speculativeCollectAllLogits || speculativeCaptureAllHiddenStates) && batch == 1;
+            speculativeCollectAllLogits ||
+            (speculativeCaptureAllHiddenStates && batch == 1);
         if (!all1 && !keepAllRowsForSpeculative) {
             int total = 0;
             std::vector<Data> lastToks(seqLens.size());
@@ -7940,7 +8158,11 @@ namespace fastllm {
             return true;
         };
 
-        if (batch > 1 && (!all1 || !canRunFusedBatchDecode())) {
+        bool canRunFusedBatchSpeculative =
+            batch > 1 && !all1 && speculativeCollectAllLogits &&
+            speculativeCaptureFirstTokenLinearState;
+        if (batch > 1 && ((!all1 && !canRunFusedBatchSpeculative) ||
+                          (all1 && !canRunFusedBatchDecode()))) {
             return runSplitBatchForward();
         }
 
@@ -8655,7 +8877,19 @@ namespace fastllm {
             logitRows = localVocab > 0 ? (int)(localLogits[0].Count(0) / localVocab) : 0;
             AssertInFastLLM(logitRows > 0,
                             "Qwen3.5 speculative forward produced empty logits.\n");
-            std::vector<GenerationConfig> rowConfigs(logitRows, generationConfigs[0]);
+            int expectedRows = 0;
+            for (int b = 0; b < batch; b++) {
+                expectedRows += seqLens[b];
+            }
+            AssertInFastLLM(expectedRows == logitRows,
+                            "Qwen3.5 speculative logits row mapping mismatch.\n");
+            std::vector<GenerationConfig> rowConfigs;
+            rowConfigs.reserve(logitRows);
+            for (int b = 0; b < batch; b++) {
+                for (int token = 0; token < seqLens[b]; token++) {
+                    rowConfigs.push_back(generationConfigs[b]);
+                }
+            }
             auto getCacheLenForMtpReset = [](const Data *cache) {
                 if (cache == nullptr) {
                     return 0;
@@ -8674,13 +8908,16 @@ namespace fastllm {
                 }
                 return 0;
             };
-            auto getTokenGrowingCacheLenForMtpReset = [&]() {
+            auto getTokenGrowingCacheLenForMtpReset = [&](int requestIndex) {
+                int requestBase = requestIndex * block_cnt;
                 auto tryGetLen = [&](int idx) {
-                    if (idx < 0 || idx >= (int)pastKeyValues.size()) {
+                    int cacheIndex = requestBase + idx;
+                    if (idx < 0 || idx >= block_cnt ||
+                        cacheIndex < 0 || cacheIndex >= (int)pastKeyValues.size()) {
                         return 0;
                     }
-                    Data *pastKey = pastKeyValues[idx].first;
-                    Data *pastValue = pastKeyValues[idx].second;
+                    Data *pastKey = pastKeyValues[cacheIndex].first;
+                    Data *pastValue = pastKeyValues[cacheIndex].second;
                     if (pastKey == nullptr || pastValue == nullptr ||
                         pastKey->isLinearAttention || pastValue->isLinearAttention) {
                         return 0;
@@ -8692,7 +8929,7 @@ namespace fastllm {
                 if (len > 0) {
                     return len;
                 }
-                for (int i = 0; i < (int)pastKeyValues.size(); i++) {
+                for (int i = 0; i < block_cnt; i++) {
                     len = tryGetLen(i);
                     if (len > 0) {
                         return len;
@@ -8700,27 +8937,73 @@ namespace fastllm {
                 }
                 return 0;
             };
-            bool resetEosForMtp = false;
-            std::vector<int> eosIdsForMtp;
-            if (generationConfigs[0].output_token_least > 0) {
-                int cacheLen = getTokenGrowingCacheLenForMtpReset();
-                resetEosForMtp =
-                    generationConfigs[0].output_token_least - cacheLen +
-                    generationConfigs[0].input_token_length > 0;
-                if (resetEosForMtp) {
-                    eosIdsForMtp.push_back(this->eos_token_id);
-                    eosIdsForMtp.insert(eosIdsForMtp.end(),
-                                        this->eos_token_ids.begin(),
-                                        this->eos_token_ids.end());
-                    eosIdsForMtp.insert(eosIdsForMtp.end(),
-                                        generationConfigs[0].stop_token_ids.begin(),
-                                        generationConfigs[0].stop_token_ids.end());
+            auto buildEosIdsForMtpReset = [&](const GenerationConfig &config) {
+                std::vector<int> ids;
+                ids.push_back(this->eos_token_id);
+                ids.insert(ids.end(), this->eos_token_ids.begin(),
+                           this->eos_token_ids.end());
+                ids.insert(ids.end(), config.stop_token_ids.begin(),
+                           config.stop_token_ids.end());
+                return ids;
+            };
+            std::vector<int> resetLengths(logitRows, 0);
+            std::vector<int> resetEosNums;
+            std::vector<int> resetEosIds;
+            resetEosNums.reserve(logitRows);
+            bool anyRowNeedsEosReset = false;
+            bool allRowsNeedEosReset = true;
+            bool sameResetEosIds = true;
+            std::vector<int> commonResetEosIds;
+            int row = 0;
+            for (int b = 0; b < batch; b++) {
+                int finalCacheLen = getTokenGrowingCacheLenForMtpReset(b);
+                for (int token = 0; token < seqLens[b]; token++, row++) {
+                    const GenerationConfig &config = generationConfigs[b];
+                    int rowCacheLen = finalCacheLen;
+                    if (finalCacheLen > 0) {
+                        rowCacheLen = std::max(
+                            0, finalCacheLen - (seqLens[b] - token - 1));
+                    }
+                    if (config.output_token_least > 0) {
+                        resetLengths[row] = config.output_token_least - rowCacheLen +
+                                            config.input_token_length;
+                    }
+                    bool curNeedsReset = resetLengths[row] > 0;
+                    anyRowNeedsEosReset |= curNeedsReset;
+                    allRowsNeedEosReset &= curNeedsReset;
+
+                    std::vector<int> rowEosIds =
+                        buildEosIdsForMtpReset(config);
+                    if (row == 0) {
+                        commonResetEosIds = rowEosIds;
+                    } else if (rowEosIds != commonResetEosIds) {
+                        sameResetEosIds = false;
+                    }
+                    resetEosNums.push_back((int)rowEosIds.size());
+                    resetEosIds.insert(resetEosIds.end(), rowEosIds.begin(),
+                                       rowEosIds.end());
                 }
             }
-            if (devices.size() > 1 && generationConfigs[0].IsSimpleGreedy()) {
+            auto resetMtpLogitsOfEos = [&](Data *mtpLogits) {
+                if (!anyRowNeedsEosReset) {
+                    return;
+                }
+                FastllmCudaSetDevice(devices[0]);
+                ToDataType(*mtpLogits, DataType::FLOAT32);
+                FastllmResetLogitsOfEOS(logitRows, mtpLogits, resetLengths,
+                                        resetEosNums, resetEosIds);
+            };
+            bool allRowsSimpleGreedy = true;
+            for (const GenerationConfig &config : rowConfigs) {
+                allRowsSimpleGreedy &= config.IsSimpleGreedy();
+            }
+            bool canResetDirectlyOnShards = !anyRowNeedsEosReset ||
+                (allRowsNeedEosReset && sameResetEosIds);
+            if (devices.size() > 1 && allRowsSimpleGreedy &&
+                canResetDirectlyOnShards) {
                 std::vector<int> sampled = Qwen35SampleGreedyFromShardedCudaLogits(
                     devices, *lmHeadScheme, localLogits, logitRows, vocabSize,
-                    resetEosForMtp, eosIdsForMtp);
+                    anyRowNeedsEosReset, commonResetEosIds);
                 mtpTargetProfileMark(mtpTargetProfileSamplingUs);
                 mtpTargetProfileRecord(logitRows);
                 return sampled;
@@ -8739,14 +9022,25 @@ namespace fastllm {
                                                   fullCudaLogits);
                 sampleLogits = &fullCudaLogits;
             }
-            ResetLogitsOfEOS(logitRows, sampleLogits, pastKeyValues, rowConfigs);
+            resetMtpLogitsOfEos(sampleLogits);
             SetCurrentThreadExecutor(oldExecutor);
-            bool allSimple = generationConfigs[0].IsSimpleGreedy();
-            int maxTopK = allSimple ? 1 : generationConfigs[0].top_k;
+            bool allSimple = allRowsSimpleGreedy;
+            int maxTopK = 1;
+            for (const GenerationConfig &config : rowConfigs) {
+                int curTopK = config.IsSimpleGreedy() ? 1 : config.top_k;
+                maxTopK = std::max(maxTopK, curTopK);
+            }
+            std::vector<int> typicalCandidateRows;
             std::vector<int> typicalCandidateIds;
+            std::vector<unsigned char> typicalAccepted;
             std::vector<int> typicalRecoveredIds;
-            if (!allSimple && logitRows > 1 &&
-                logitRows <= QWEN35_MTP_MAX_DRAFTS + 1) {
+            int typicalCandidateCount = 0;
+            for (int b = 0; b < batch; b++) {
+                if (!generationConfigs[b].IsSimpleGreedy() && seqLens[b] > 1) {
+                    typicalCandidateCount += seqLens[b] - 1;
+                }
+            }
+            if (typicalCandidateCount > 0) {
                 Data inputCpu;
                 inputCpu.CopyFrom(inputIds);
                 inputCpu.ToDevice(DataDevice::CPU);
@@ -8757,19 +9051,39 @@ namespace fastllm {
                 AssertInFastLLM(inputCpu.Count(0) >= logitRows,
                                 "Qwen3.5 typical acceptance input shape mismatch.\n");
                 float *inputPtr = (float*)inputCpu.cpuData;
-                typicalCandidateIds.reserve(logitRows - 1);
-                for (int i = 1; i < logitRows; i++) {
-                    typicalCandidateIds.push_back((int)(inputPtr[i] + 1.0e-3f));
+                typicalCandidateRows.reserve(typicalCandidateCount);
+                typicalCandidateIds.reserve(typicalCandidateCount);
+                int rowOffset = 0;
+                for (int b = 0; b < batch; b++) {
+                    if (!generationConfigs[b].IsSimpleGreedy()) {
+                        for (int token = 0; token + 1 < seqLens[b]; token++) {
+                            typicalCandidateRows.push_back(rowOffset + token);
+                            typicalCandidateIds.push_back((int)(
+                                inputPtr[rowOffset + token + 1] + 1.0e-3f));
+                        }
+                    }
+                    rowOffset += seqLens[b];
                 }
             }
             std::vector<int> sampled = Qwen35SampleFromRootCudaLogits(
                 devices[0], *sampleLogits, logitRows, maxTopK, allSimple,
                 rowConfigs,
                 typicalCandidateIds.empty() ? nullptr : &typicalCandidateIds,
-                typicalCandidateIds.empty() ? nullptr : &speculativeTypicalAccepted,
+                typicalCandidateIds.empty() ? nullptr : &typicalCandidateRows,
+                typicalCandidateIds.empty() ? nullptr : &typicalAccepted,
                 typicalCandidateIds.empty() ? nullptr : &typicalRecoveredIds);
-            for (int i = 0; i < (int)typicalRecoveredIds.size(); i++) {
-                sampled[i] = typicalRecoveredIds[i];
+            if (!typicalCandidateIds.empty()) {
+                AssertInFastLLM(
+                    typicalCandidateRows.size() == typicalCandidateIds.size() &&
+                    typicalAccepted.size() == typicalCandidateIds.size() &&
+                    typicalRecoveredIds.size() == typicalCandidateIds.size(),
+                    "Qwen3.5 typical acceptance output shape mismatch.\n");
+                speculativeTypicalAccepted.assign(logitRows, 0);
+                for (int i = 0; i < (int)typicalCandidateRows.size(); i++) {
+                    int row = typicalCandidateRows[i];
+                    speculativeTypicalAccepted[row] = typicalAccepted[i];
+                    sampled[row] = typicalRecoveredIds[i];
+                }
             }
             mtpTargetProfileMark(mtpTargetProfileSamplingUs);
             mtpTargetProfileRecord(logitRows);
@@ -8943,6 +9257,18 @@ namespace fastllm {
         }
         if (mtpCache.tokens == 0 && context->preTokens > seqLens[0]) {
             logMtpSkip("MTP cache was not seeded during prefill");
+            return false;
+        }
+        int expectedMtpTokens = context->cacheLen + context->preTokens - seqLens[0];
+        bool validMtpCacheShape = mtpCache.tokens == 0 ||
+            (mtpCache.key.dims.size() >= 2 &&
+             mtpCache.value.dims.size() >= 2 &&
+             mtpCache.key.dims[1] == mtpCache.tokens &&
+             mtpCache.value.dims[1] == mtpCache.tokens);
+        if (expectedMtpTokens < 0 || mtpCache.tokens != expectedMtpTokens ||
+            !validMtpCacheShape) {
+            logMtpSkip("MTP cache is not aligned with the target cache");
+            mtpCaches.erase(context);
             return false;
         }
 
@@ -11163,18 +11489,39 @@ namespace fastllm {
 
         mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
         if (!canCommitValidationCachePrefix(commitLen)) {
+            // The generic target path (for example BF16 or a validation
+            // sequence longer than QWEN35_MTP_FAST_SEQ_MAX) cannot capture a
+            // per-token recurrent-state snapshot. The validation ran against
+            // isolated caches, so keep MTP alive by discarding those temporary
+            // caches and replaying only the verified prefix into the real
+            // target cache. This mirrors the TP copy-path fallback above.
             releaseValidationPagedViews(baseKeyMetas, baseValueMetas);
             clearSpeculativeLinearCapture();
-            singleCleanupArmed = false;
-            // The validation cache is still isolated, so fall back before
-            // touching the real target cache. Its MTP draft cache must be
-            // discarded because the caller will advance only the target model.
-            mtpCaches.erase(context);
-            return false;
+            Data replayInputIds = buildInputIdsSlice(0, commitLen);
+            Data replayPositionIds = BuildMtpPositionIdsSlice(
+                allPositionIds, 0, commitLen, 0);
+            std::vector<Data*> replayAttentionMask = {nullptr};
+            std::vector<Data*> replayPositionIdVec = {&replayPositionIds};
+            std::vector<int> replaySeqLens = {commitLen};
+            bool replayOldCaptureFirstTokenLinearState =
+                speculativeCaptureFirstTokenLinearState;
+            speculativeCaptureFirstTokenLinearState = true;
+            try {
+                runTargetCacheOnly(replayInputIds, replayAttentionMask,
+                                   replayPositionIdVec, replaySeqLens);
+            } catch (...) {
+                speculativeCaptureFirstTokenLinearState =
+                    replayOldCaptureFirstTokenLinearState;
+                throw;
+            }
+            speculativeCaptureFirstTokenLinearState =
+                replayOldCaptureFirstTokenLinearState;
+            mtpProfileMark(mtpProfileRetryUs);
+        } else {
+            singleCleanupPrefixTokens = commitLen;
+            commitValidationCachePrefix(commitLen);
+            mtpProfileMark(mtpProfileRollbackUs);
         }
-        singleCleanupPrefixTokens = commitLen;
-        commitValidationCachePrefix(commitLen);
-        mtpProfileMark(mtpProfileRollbackUs);
         Data hiddenForMtp;
         Split(speculativeHiddenStates, 1, 0, commitLen, hiddenForMtp);
         Data mtpPositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
@@ -11200,6 +11547,1091 @@ namespace fastllm {
 #endif
     }
 
+    bool Qwen3_5Model::Qwen35MTPBatchForward(
+        bool useGPUForward,
+        const std::vector<ResponseContext*> &contexts,
+        const Data &inputIds,
+        const std::vector<Data*> &attentionMask,
+        const std::vector<Data*> &positionIds,
+        const std::vector<int> &seqLens,
+        std::vector<std::pair<Data*, Data*> > &pastKeyValues,
+        const std::vector<GenerationConfig> &generationConfigs,
+        std::vector<std::vector<int> > &acceptedTokens,
+        std::vector<std::vector<int> > &nextInputTokens,
+        std::vector<int> &keptInputLens) {
+#ifndef USE_CUDA
+        (void)useGPUForward;
+        (void)contexts;
+        (void)inputIds;
+        (void)attentionMask;
+        (void)positionIds;
+        (void)seqLens;
+        (void)pastKeyValues;
+        (void)generationConfigs;
+        (void)acceptedTokens;
+        (void)nextInputTokens;
+        (void)keptInputLens;
+        return false;
+#else
+        const int batch = (int)contexts.size();
+        if (!useGPUForward || batch <= 1 ||
+            (int)seqLens.size() != batch ||
+            (int)positionIds.size() < batch ||
+            (int)generationConfigs.size() < batch ||
+            (int)pastKeyValues.size() < batch * block_cnt) {
+            return false;
+        }
+
+        const int configuredDraftsPerStep = Qwen35MtpDraftsPerStep();
+        if (configuredDraftsPerStep <= 0) {
+            return false;
+        }
+        if (!CanUseQwen35MTPBatchForward(configuredDraftsPerStep)) {
+            return false;
+        }
+        // The fused target-validation kernels keep at most five per-token
+        // recurrent-state snapshots. Servers configured with more drafts keep
+        // batching, but validate only the supported prefix instead of falling
+        // back to plain decode or serializing every request.
+        const int draftsPerStep = std::min(
+            configuredDraftsPerStep, QWEN35_MTP_PREFIX_SNAPSHOT_MAX);
+        int totalTokens = 0;
+        int captureSlots = 0;
+        for (int b = 0; b < batch; b++) {
+            if (contexts[b] == nullptr || positionIds[b] == nullptr ||
+                seqLens[b] != seqLens[0] ||
+                seqLens[b] < 2 || seqLens[b] > draftsPerStep + 1 ||
+                seqLens[b] > QWEN35_MTP_FAST_SEQ_MAX ||
+                !Qwen35MtpSupportsGenerationConfig(generationConfigs[b])) {
+                return false;
+            }
+            totalTokens += seqLens[b];
+            captureSlots += seqLens[b] - 1;
+        }
+        if (captureSlots <= 0) {
+            return false;
+        }
+
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
+            devices.empty() || !HasMtpWeights()) {
+            return false;
+        }
+        const bool tensorParallel = devices.size() > 1;
+        const int rootDevice = devices[0];
+
+        std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
+        std::vector<MtpKvCache*> requestMtpCaches(batch, nullptr);
+        for (int b = 0; b < batch; b++) {
+            auto cacheIt = mtpCaches.find(contexts[b]);
+            int expectedMtpTokens = contexts[b]->cacheLen +
+                contexts[b]->preTokens - seqLens[b];
+            if (cacheIt == mtpCaches.end() || expectedMtpTokens <= 0 ||
+                cacheIt->second.tokens != expectedMtpTokens ||
+                cacheIt->second.key.dims.size() < 2 ||
+                cacheIt->second.value.dims.size() < 2 ||
+                cacheIt->second.key.dims[1] != expectedMtpTokens ||
+                cacheIt->second.value.dims[1] != expectedMtpTokens) {
+                return false;
+            }
+            requestMtpCaches[b] = &cacheIt->second;
+        }
+
+        std::vector<uint8_t> attentionLayerMask(block_cnt, 0);
+        for (int layer = 0; layer < block_cnt; layer++) {
+            std::string outputWeightName = language_prefix + "layers." +
+                std::to_string(layer) + ".self_attn.o_proj.weight";
+            attentionLayerMask[layer] =
+                weight.weight.find(outputWeightName) != weight.weight.end();
+        }
+        auto isAttentionLayerAt = [&](int layer) {
+            return layer >= 0 && layer < block_cnt && attentionLayerMask[layer] != 0;
+        };
+        auto getLocalCache = [&](Data &root, int device) -> Data* {
+            if (!tensorParallel) {
+                return device == rootDevice ? &root : nullptr;
+            }
+            auto it = root.multiDeviceDatas.find(device);
+            return it == root.multiDeviceDatas.end() ? nullptr : it->second;
+        };
+        auto localAttentionHeads = [&](int layer, int device) {
+            if (!tensorParallel) {
+                return device == rootDevice && isAttentionLayerAt(layer) ?
+                    num_key_value_heads : -1;
+            }
+            if (layer < 0 ||
+                layer >= (int)threadTpAttentionKVHeadSchemes.size()) {
+                return -1;
+            }
+            auto schemeIt = threadTpAttentionKVHeadSchemes[layer].find(device);
+            if (schemeIt == threadTpAttentionKVHeadSchemes[layer].end()) {
+                return -1;
+            }
+            int heads = 0;
+            for (const auto &range : schemeIt->second) {
+                if (range.first < 0 || range.second < range.first ||
+                    range.second > num_key_value_heads) {
+                    return -1;
+                }
+                heads += range.second - range.first;
+            }
+            return heads;
+        };
+        auto validEmptyAttention = [](const Data *cache, int device) {
+            return cache != nullptr && !cache->isFake && cache->isKVCache &&
+                   !cache->isLinearAttention && !cache->isPagedKVCache &&
+                   cache->pagedKVCacheData == nullptr && cache->pageIndex.empty() &&
+                   cache->lastPageLen == 0 && cache->dims.empty() &&
+                   cache->cudaData == nullptr && !cache->multiDeviceData &&
+                   cache->dataDevice == DataDevice::CUDA &&
+                   cache->dataDeviceIds == std::vector<int>({device});
+        };
+        auto validPagedAttention = [&](const Data *cache, int device,
+                                       int expectedHeads) {
+            if (cache == nullptr || expectedHeads <= 0 || cache->isFake ||
+                !cache->isKVCache || cache->isLinearAttention ||
+                !cache->isPagedKVCache || cache->pagedKVCacheData == nullptr ||
+                cache->pageLen <= 0 || cache->dataDevice != DataDevice::CUDA ||
+                cache->dataDeviceIds != std::vector<int>({device}) ||
+                cache->dims.size() != 3 || cache->dims[0] != expectedHeads ||
+                cache->dims[2] != head_dim) {
+                return false;
+            }
+            if (cache->pageIndex.empty()) {
+                return cache->lastPageLen == 0 && cache->dims[1] == 0;
+            }
+            if (cache->lastPageLen <= 0 || cache->lastPageLen > cache->pageLen) {
+                return false;
+            }
+            int cachedTokens = ((int)cache->pageIndex.size() - 1) * cache->pageLen +
+                               cache->lastPageLen;
+            return cache->dims[1] == cachedTokens;
+        };
+
+        struct BatchCacheMeta {
+            bool isPagedKVCache = false;
+            int pageLen = 128;
+            PagedCacheManager *manager = nullptr;
+            std::vector<int> pageIndex;
+            int lastPageLen = 0;
+            std::vector<int> dims;
+            std::vector<uint64_t> strides;
+            std::vector<int> expansionDims;
+            uint64_t expansionSize = 0;
+            uint64_t expansionBytes = 0;
+        };
+        auto makeMeta = [](const Data &cache) {
+            BatchCacheMeta meta;
+            meta.isPagedKVCache = cache.isPagedKVCache;
+            meta.pageLen = cache.pageLen;
+            meta.manager = cache.pagedKVCacheData;
+            meta.pageIndex = cache.pageIndex;
+            meta.lastPageLen = cache.lastPageLen;
+            meta.dims = cache.dims;
+            meta.strides = cache.strides;
+            meta.expansionDims = cache.expansionDims;
+            meta.expansionSize = cache.expansionSize;
+            meta.expansionBytes = cache.expansionBytes;
+            return meta;
+        };
+        auto assignMetaNoRelease = [](Data &cache, const BatchCacheMeta &meta) {
+            cache.isPagedKVCache = meta.isPagedKVCache;
+            cache.pageLen = meta.pageLen;
+            cache.pagedKVCacheData = meta.manager;
+            cache.pageIndex = meta.pageIndex;
+            cache.lastPageLen = meta.lastPageLen;
+            cache.dims = meta.dims;
+            cache.strides = meta.strides;
+            cache.expansionDims = meta.expansionDims;
+            cache.expansionSize = meta.expansionSize;
+            cache.expansionBytes = meta.expansionBytes;
+        };
+        auto restoreMeta = [&](Data &cache, const BatchCacheMeta &meta) {
+            PagedCacheManager *oldManager = cache.pagedKVCacheData;
+            std::vector<int> releasePages;
+            if (cache.isPagedKVCache && oldManager != nullptr) {
+                for (int page : cache.pageIndex) {
+                    if (std::find(meta.pageIndex.begin(), meta.pageIndex.end(), page) ==
+                        meta.pageIndex.end()) {
+                        releasePages.push_back(page);
+                    }
+                }
+            }
+            assignMetaNoRelease(cache, meta);
+            if (!releasePages.empty() && oldManager != nullptr) {
+                oldManager->ReleasePageIndices(releasePages);
+            }
+        };
+        auto tryPrefixMeta = [](const BatchCacheMeta &base, const Data &finalCache,
+                                int tokens, BatchCacheMeta &prefix) {
+            if (!base.isPagedKVCache || base.manager == nullptr ||
+                !finalCache.isPagedKVCache ||
+                finalCache.pagedKVCacheData != base.manager ||
+                base.pageLen <= 0 || tokens <= 0) {
+                return false;
+            }
+            int baseTokens = 0;
+            if (!base.pageIndex.empty()) {
+                if (base.lastPageLen <= 0 || base.lastPageLen > base.pageLen) {
+                    return false;
+                }
+                baseTokens = ((int)base.pageIndex.size() - 1) * base.pageLen +
+                             base.lastPageLen;
+            }
+            int newTokens = baseTokens + tokens;
+            int newPages = (newTokens + base.pageLen - 1) / base.pageLen;
+            if (newPages > (int)finalCache.pageIndex.size()) {
+                return false;
+            }
+            prefix = base;
+            prefix.pageIndex.assign(finalCache.pageIndex.begin(),
+                                    finalCache.pageIndex.begin() + newPages);
+            prefix.lastPageLen = newTokens % base.pageLen;
+            if (newTokens > 0 && prefix.lastPageLen == 0) {
+                prefix.lastPageLen = base.pageLen;
+            }
+            if (prefix.dims.size() >= 2) {
+                prefix.dims[1] += tokens;
+                if (prefix.expansionDims.empty()) {
+                    prefix.strides.assign(prefix.dims.size(), 1);
+                    for (int d = (int)prefix.dims.size() - 2; d >= 0; d--) {
+                        prefix.strides[d] =
+                            (uint64_t)prefix.dims[d + 1] * prefix.strides[d + 1];
+                    }
+                }
+            }
+            return true;
+        };
+        auto copyTensor = [](Data &dst, const Data &src, int device) {
+            int oldDevice = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(device);
+            bool reusable = dst.dataDevice == DataDevice::CUDA &&
+                dst.cudaData != nullptr && src.cudaData != nullptr &&
+                dst.dataType == src.dataType && dst.dims == src.dims &&
+                dst.GetBytes() == src.GetBytes();
+            if (reusable) {
+                FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData,
+                                                  src.GetBytes());
+                dst.isKVCache = src.isKVCache;
+                dst.isLinearAttention = src.isLinearAttention;
+                dst.isLinearAttentionTransposed = src.isLinearAttentionTransposed;
+                dst.cacheUid = src.cacheUid;
+                dst.strides = src.strides;
+                dst.expansionDims = src.expansionDims;
+                dst.expansionSize = src.expansionSize;
+                dst.expansionBytes = src.expansionBytes;
+            } else {
+                dst.dataDeviceIds = {device};
+                dst.CopyFrom(src);
+                dst.dataDeviceIds = {device};
+            }
+            FastllmCudaSetDevice(oldDevice);
+        };
+
+        using MetaByLayer = std::vector<BatchCacheMeta>;
+        using LocalMetaByLayer = std::vector<std::map<int, BatchCacheMeta> >;
+        std::vector<MetaByLayer> baseRootKeys(batch, MetaByLayer(block_cnt));
+        std::vector<MetaByLayer> baseRootValues(batch, MetaByLayer(block_cnt));
+        std::vector<LocalMetaByLayer> baseLocalKeys(
+            batch, LocalMetaByLayer(block_cnt));
+        std::vector<LocalMetaByLayer> baseLocalValues(
+            batch, LocalMetaByLayer(block_cnt));
+
+        for (int b = 0; b < batch; b++) {
+            for (int layer = 0; layer < block_cnt; layer++) {
+                Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
+                Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
+                if (rootKey == nullptr || rootValue == nullptr) {
+                    return false;
+                }
+                if (isAttentionLayerAt(layer)) {
+                    baseRootKeys[b][layer] = makeMeta(*rootKey);
+                    baseRootValues[b][layer] = makeMeta(*rootValue);
+                    for (int device : devices) {
+                        int heads = localAttentionHeads(layer, device);
+                        Data *localKey = getLocalCache(*rootKey, device);
+                        Data *localValue = getLocalCache(*rootValue, device);
+                        if (heads < 0 ||
+                            (heads == 0 &&
+                             (!validEmptyAttention(localKey, device) ||
+                              !validEmptyAttention(localValue, device))) ||
+                            (heads > 0 &&
+                             (!validPagedAttention(localKey, device, heads) ||
+                              !validPagedAttention(localValue, device, heads)))) {
+                            return false;
+                        }
+                        if (heads > 0) {
+                            baseLocalKeys[b][layer][device] = makeMeta(*localKey);
+                            baseLocalValues[b][layer][device] = makeMeta(*localValue);
+                        }
+                    }
+                } else {
+                    for (int device : devices) {
+                        Data *localKey = getLocalCache(*rootKey, device);
+                        Data *localValue = getLocalCache(*rootValue, device);
+                        if (localKey == nullptr || localValue == nullptr ||
+                            localKey->dataDevice != DataDevice::CUDA ||
+                            localValue->dataDevice != DataDevice::CUDA ||
+                            localKey->dataType != DataType::FLOAT16 ||
+                            localValue->dataType != DataType::FLOAT16 ||
+                            localKey->cudaData == nullptr ||
+                            localValue->cudaData == nullptr ||
+                            localKey->dims.size() != 3 || localKey->dims[0] != 1 ||
+                            localKey->dims[2] != 4 ||
+                            localValue->dims.size() != 4 || localValue->dims[0] != 1 ||
+                            localValue->dims[2] != head_k_dim) {
+                            return false;
+                        }
+                        int oldDevice = FastllmCudaGetDevice();
+                        FastllmCudaSetDevice(device);
+                        bool transposed =
+                            Qwen35EnsureCudaLinearAttnStateTransposed(*localValue);
+                        FastllmCudaSetDevice(oldDevice);
+                        if (!transposed) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prefix snapshots avoid an extra target-model replay after a rejected
+        // draft.  They are especially valuable for small batches, where there
+        // are too few rejected requests to amortize a grouped replay.  Keep the
+        // large-batch single-GPU path on one rollback state per request so the
+        // snapshot scratch footprint stays bounded.
+        const bool useLinearPrefixSnapshots = tensorParallel ||
+            batch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX;
+        const int linearCaptureSlots =
+            useLinearPrefixSnapshots ? captureSlots : 0;
+        const int rollbackSlotBase = linearCaptureSlots;
+        const int scratchSlots = linearCaptureSlots + batch;
+        auto scratchRootReady = [&](const Data &root) {
+            if (!tensorParallel) {
+                return !root.multiDeviceData &&
+                    root.dataDevice == DataDevice::CUDA &&
+                    root.dataDeviceIds == devices &&
+                    root.cudaData != nullptr && !root.dims.empty();
+            }
+            if (!root.multiDeviceData || root.dataDevice != DataDevice::CUDA ||
+                root.dataDeviceIds != devices ||
+                root.multiDeviceDatas.size() != devices.size()) {
+                return false;
+            }
+            for (int device : devices) {
+                auto it = root.multiDeviceDatas.find(device);
+                if (it == root.multiDeviceDatas.end() || it->second == nullptr ||
+                    it->second->multiDeviceData) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        bool rebuildScratch = speculativeLinearStates.size() != (size_t)block_cnt;
+        for (int layer = 0; layer < block_cnt && !rebuildScratch; layer++) {
+            if (isAttentionLayerAt(layer)) {
+                continue;
+            }
+            if ((int)speculativeLinearStates[layer].size() < scratchSlots) {
+                rebuildScratch = true;
+                break;
+            }
+            for (int slot = 0; slot < scratchSlots; slot++) {
+                if (!scratchRootReady(speculativeLinearStates[layer][slot].first) ||
+                    !scratchRootReady(speculativeLinearStates[layer][slot].second)) {
+                    rebuildScratch = true;
+                    break;
+                }
+            }
+        }
+        if (rebuildScratch) {
+            speculativeLinearStates.clear();
+            speculativeLinearStates.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; layer++) {
+                if (isAttentionLayerAt(layer)) {
+                    continue;
+                }
+                speculativeLinearStates[layer].resize(scratchSlots);
+                for (int slot = 0; slot < scratchSlots; slot++) {
+                    Data *roots[2] = {
+                        &speculativeLinearStates[layer][slot].first,
+                        &speculativeLinearStates[layer][slot].second
+                    };
+                    for (Data *root : roots) {
+                        root->dataDevice = DataDevice::CUDA;
+                        root->dataDeviceIds = devices;
+                        if (tensorParallel) {
+                            root->multiDeviceData = true;
+                            for (int device : devices) {
+                                root->multiDeviceDatas[device] = new Data();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (int layer = 0; layer < block_cnt; layer++) {
+            if (isAttentionLayerAt(layer)) {
+                continue;
+            }
+            for (int slot = 0; slot < linearCaptureSlots; slot++) {
+                for (int device : devices) {
+                    getLocalCache(speculativeLinearStates[layer][slot].first,
+                                  device)->cacheUid = LLONG_MIN;
+                    getLocalCache(speculativeLinearStates[layer][slot].second,
+                                  device)->cacheUid = LLONG_MIN;
+                }
+            }
+        }
+
+        std::vector<std::exception_ptr> backupErrors(devices.size());
+        auto backupLinearStates = [&](int deviceIndex) {
+            int device = devices[deviceIndex];
+            for (int b = 0; b < batch; b++) {
+                int rollbackSlot = rollbackSlotBase + b;
+                for (int layer = 0; layer < block_cnt; layer++) {
+                    if (isAttentionLayerAt(layer)) {
+                        continue;
+                    }
+                    Data *realKey = getLocalCache(
+                        *pastKeyValues[b * block_cnt + layer].first, device);
+                    Data *realValue = getLocalCache(
+                        *pastKeyValues[b * block_cnt + layer].second, device);
+                    Data *backupKey = getLocalCache(
+                        speculativeLinearStates[layer][rollbackSlot].first, device);
+                    Data *backupValue = getLocalCache(
+                        speculativeLinearStates[layer][rollbackSlot].second, device);
+                    if (realKey == nullptr || realValue == nullptr ||
+                        backupKey == nullptr || backupValue == nullptr) {
+                        throw std::runtime_error(
+                            "Qwen3.5 batched MTP cannot prepare rollback state.");
+                    }
+                    copyTensor(*backupKey, *realKey, device);
+                    copyTensor(*backupValue, *realValue, device);
+                }
+            }
+            FastllmCudaSetDevice(device);
+            ForceDeviceSync();
+        };
+        if (tensorParallel) {
+            threadTpWorkerGroup.Run(devices, backupLinearStates, backupErrors);
+        } else {
+            try {
+                backupLinearStates(0);
+            } catch (...) {
+                backupErrors[0] = std::current_exception();
+            }
+        }
+        for (auto &error : backupErrors) {
+            if (error) {
+                std::rethrow_exception(error);
+            }
+        }
+
+        bool rollbackArmed = true;
+        auto eraseRequestMtpCaches = [&]() {
+            for (ResponseContext *context : contexts) {
+                mtpCaches.erase(context);
+            }
+        };
+        auto rollbackTargetCaches = [&]() {
+            if (!rollbackArmed) {
+                return;
+            }
+            int oldDevice = FastllmCudaGetDevice();
+            for (int device : devices) {
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+            }
+            FastllmCudaSetDevice(oldDevice);
+            for (int b = 0; b < batch; b++) {
+                int rollbackSlot = rollbackSlotBase + b;
+                for (int layer = 0; layer < block_cnt; layer++) {
+                    Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
+                    Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
+                    if (isAttentionLayerAt(layer)) {
+                        if (!tensorParallel) {
+                            restoreMeta(*rootKey, baseRootKeys[b][layer]);
+                            restoreMeta(*rootValue, baseRootValues[b][layer]);
+                        } else {
+                            for (int device : devices) {
+                                int heads = localAttentionHeads(layer, device);
+                                if (heads <= 0) {
+                                    continue;
+                                }
+                                restoreMeta(*getLocalCache(*rootKey, device),
+                                            baseLocalKeys[b][layer].at(device));
+                                restoreMeta(*getLocalCache(*rootValue, device),
+                                            baseLocalValues[b][layer].at(device));
+                            }
+                            assignMetaNoRelease(*rootKey, baseRootKeys[b][layer]);
+                            assignMetaNoRelease(*rootValue, baseRootValues[b][layer]);
+                        }
+                    } else {
+                        for (int device : devices) {
+                            copyTensor(
+                                *getLocalCache(*rootKey, device),
+                                *getLocalCache(
+                                    speculativeLinearStates[layer][rollbackSlot].first,
+                                    device),
+                                device);
+                            copyTensor(
+                                *getLocalCache(*rootValue, device),
+                                *getLocalCache(
+                                    speculativeLinearStates[layer][rollbackSlot].second,
+                                    device),
+                                device);
+                        }
+                    }
+                }
+            }
+            rollbackArmed = false;
+            eraseRequestMtpCaches();
+        };
+        int rollbackToken = 0;
+        auto rollbackDeleter = [&](int*) noexcept {
+            if (!rollbackArmed) {
+                return;
+            }
+            try {
+                rollbackTargetCaches();
+            } catch (...) {
+                std::terminate();
+            }
+        };
+        std::unique_ptr<int, decltype(rollbackDeleter)> rollbackGuard(
+            &rollbackToken, rollbackDeleter);
+
+        bool oldCollectAllLogits = speculativeCollectAllLogits;
+        bool oldCaptureLinearState = speculativeCaptureFirstTokenLinearState;
+        int oldCaptureSlots = speculativeLinearStateCaptureSlots;
+        speculativeCollectAllLogits = true;
+        speculativeCaptureFirstTokenLinearState = true;
+        speculativeLinearStateCaptureSlots = linearCaptureSlots;
+        speculativeHiddenStates.FreeSpace();
+        speculativeHiddenStates.dims.clear();
+        speculativeHiddenStates.strides.clear();
+        speculativeHiddenStates.expansionDims.clear();
+        std::vector<int> targetRet;
+        try {
+            targetRet = ForwardGPU(batch, inputIds, attentionMask, positionIds,
+                                   seqLens, pastKeyValues, generationConfigs,
+                                   LastTokensManager(), nullptr);
+        } catch (const Qwen35MtpBatchFastPathUnavailable &) {
+            speculativeLinearStateCaptureSlots = oldCaptureSlots;
+            speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
+            speculativeCollectAllLogits = oldCollectAllLogits;
+            rollbackTargetCaches();
+            return false;
+        } catch (...) {
+            speculativeLinearStateCaptureSlots = oldCaptureSlots;
+            speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
+            speculativeCollectAllLogits = oldCollectAllLogits;
+            throw;
+        }
+        speculativeLinearStateCaptureSlots = oldCaptureSlots;
+        speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
+        speculativeCollectAllLogits = oldCollectAllLogits;
+        if ((int)targetRet.size() < totalTokens) {
+            rollbackTargetCaches();
+            return false;
+        }
+
+        Data inputCpu;
+        inputCpu.CopyFrom(inputIds);
+        inputCpu.ToDevice(DataDevice::CPU);
+        if (inputCpu.dataType != DataType::FLOAT32) {
+            ToDataType(inputCpu, DataType::FLOAT32);
+            inputCpu.ToDevice(DataDevice::CPU);
+        }
+        float *inputPtr = (float*)inputCpu.cpuData;
+        std::vector<int> tokenOffsets(batch, 0);
+        std::vector<int> captureOffsets(batch, 0);
+        for (int b = 1; b < batch; b++) {
+            tokenOffsets[b] = tokenOffsets[b - 1] + seqLens[b - 1];
+            captureOffsets[b] = captureOffsets[b - 1] + seqLens[b - 1] - 1;
+        }
+        bool needsTypicalAcceptance = false;
+        for (int b = 0; b < batch; b++) {
+            needsTypicalAcceptance |= !generationConfigs[b].IsSimpleGreedy();
+        }
+        if (needsTypicalAcceptance &&
+            (int)speculativeTypicalAccepted.size() < totalTokens) {
+            rollbackTargetCaches();
+            return false;
+        }
+        std::vector<int> matchedDrafts(batch, 0);
+        std::vector<int> commitLens(batch, 0);
+        std::vector<char> deferredFullAcceptBonus(batch, 0);
+        for (int b = 0; b < batch; b++) {
+            int proposalCount = seqLens[b] - 1;
+            bool useTypicalAcceptance =
+                !generationConfigs[b].IsSimpleGreedy();
+            while (matchedDrafts[b] < proposalCount) {
+                int row = tokenOffsets[b] + matchedDrafts[b];
+                bool accepted = useTypicalAcceptance ?
+                    speculativeTypicalAccepted[row] != 0 :
+                    targetRet[row] ==
+                        (int)(inputPtr[row + 1] + 1.0e-3f);
+                if (!accepted) {
+                    break;
+                }
+                matchedDrafts[b]++;
+            }
+            if (matchedDrafts[b] == proposalCount) {
+                // The final validation row only produces the speculative
+                // bonus token.  Its batched multi-token linear state is not
+                // decode-equivalent, while the state after every proposal is
+                // already available in a prefix snapshot.  Emit all accepted
+                // proposals and defer the bonus so the next step resumes from
+                // that verified prefix.  This also preserves stochastic
+                // acceptance because no accepted proposal is replaced by a
+                // newly sampled target token.
+                deferredFullAcceptBonus[b] = 1;
+                commitLens[b] = proposalCount;
+            } else {
+                commitLens[b] = matchedDrafts[b] + 1;
+            }
+        }
+        // A partial-prefix replay may reuse speculativeHiddenStates as regular
+        // forward scratch. Preserve the committed target hidden rows first;
+        // these are the inputs to the MTP draft model after cache commit.
+        std::vector<Data> committedTargetHidden(batch);
+        for (int b = 0; b < batch; b++) {
+            Split(speculativeHiddenStates, 1, tokenOffsets[b],
+                  tokenOffsets[b] + commitLens[b],
+                  committedTargetHidden[b]);
+        }
+
+        if (useLinearPrefixSnapshots) {
+            std::vector<MetaByLayer> prefixRootKeys(batch, MetaByLayer(block_cnt));
+            std::vector<MetaByLayer> prefixRootValues(batch, MetaByLayer(block_cnt));
+            std::vector<LocalMetaByLayer> prefixLocalKeys(
+                batch, LocalMetaByLayer(block_cnt));
+            std::vector<LocalMetaByLayer> prefixLocalValues(
+                batch, LocalMetaByLayer(block_cnt));
+            for (int b = 0; b < batch; b++) {
+                if (commitLens[b] == seqLens[b]) {
+                    continue;
+                }
+                int captureSlot = captureOffsets[b] + commitLens[b] - 1;
+                for (int layer = 0; layer < block_cnt; layer++) {
+                    Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
+                    Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
+                    if (isAttentionLayerAt(layer)) {
+                        if (!tryPrefixMeta(baseRootKeys[b][layer], *rootKey,
+                                           commitLens[b], prefixRootKeys[b][layer]) ||
+                            !tryPrefixMeta(baseRootValues[b][layer], *rootValue,
+                                           commitLens[b], prefixRootValues[b][layer])) {
+                            rollbackTargetCaches();
+                            return false;
+                        }
+                        for (int device : devices) {
+                            int heads = localAttentionHeads(layer, device);
+                            if (heads <= 0) {
+                                continue;
+                            }
+                            BatchCacheMeta keyMeta, valueMeta;
+                            if (!tryPrefixMeta(baseLocalKeys[b][layer].at(device),
+                                               *getLocalCache(*rootKey, device),
+                                               commitLens[b], keyMeta) ||
+                                !tryPrefixMeta(baseLocalValues[b][layer].at(device),
+                                               *getLocalCache(*rootValue, device),
+                                               commitLens[b], valueMeta)) {
+                                rollbackTargetCaches();
+                                return false;
+                            }
+                            prefixLocalKeys[b][layer][device] = std::move(keyMeta);
+                            prefixLocalValues[b][layer][device] = std::move(valueMeta);
+                        }
+                    } else {
+                        for (int device : devices) {
+                            Data *snapshotKey = getLocalCache(
+                                speculativeLinearStates[layer][captureSlot].first,
+                                device);
+                            Data *snapshotValue = getLocalCache(
+                                speculativeLinearStates[layer][captureSlot].second,
+                                device);
+                            Data *realKey = getLocalCache(*rootKey, device);
+                            Data *realValue = getLocalCache(*rootValue, device);
+                            if (snapshotKey == nullptr || snapshotValue == nullptr ||
+                                realKey == nullptr || realValue == nullptr ||
+                                snapshotKey->cacheUid == LLONG_MIN ||
+                                snapshotValue->cacheUid == LLONG_MIN ||
+                                snapshotKey->cudaData == nullptr ||
+                                snapshotValue->cudaData == nullptr ||
+                                snapshotKey->dims != realKey->dims ||
+                                snapshotValue->dims != realValue->dims) {
+                                rollbackTargetCaches();
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (int b = 0; b < batch; b++) {
+                if (commitLens[b] == seqLens[b]) {
+                    continue;
+                }
+                int captureSlot = captureOffsets[b] + commitLens[b] - 1;
+                for (int layer = 0; layer < block_cnt; layer++) {
+                    Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
+                    Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
+                    if (isAttentionLayerAt(layer)) {
+                        if (!tensorParallel) {
+                            // The root is the physical cache on one GPU, so
+                            // restoreMeta must see the speculative suffix in
+                            // order to release any pages that are no longer
+                            // part of the committed prefix.
+                            restoreMeta(*rootKey, prefixRootKeys[b][layer]);
+                            restoreMeta(*rootValue, prefixRootValues[b][layer]);
+                        } else {
+                            assignMetaNoRelease(*rootKey,
+                                                prefixRootKeys[b][layer]);
+                            assignMetaNoRelease(*rootValue,
+                                                prefixRootValues[b][layer]);
+                            for (int device : devices) {
+                                int heads = localAttentionHeads(layer, device);
+                                if (heads <= 0) {
+                                    continue;
+                                }
+                                restoreMeta(*getLocalCache(*rootKey, device),
+                                            prefixLocalKeys[b][layer].at(device));
+                                restoreMeta(*getLocalCache(*rootValue, device),
+                                            prefixLocalValues[b][layer].at(device));
+                            }
+                        }
+                    } else {
+                        for (int device : devices) {
+                            copyTensor(
+                                *getLocalCache(*rootKey, device),
+                                *getLocalCache(
+                                    speculativeLinearStates[layer][captureSlot].first,
+                                    device),
+                                device);
+                            copyTensor(
+                                *getLocalCache(*rootValue, device),
+                                *getLocalCache(
+                                    speculativeLinearStates[layer][captureSlot].second,
+                                    device),
+                                device);
+                        }
+                    }
+                }
+            }
+
+        } else {
+            // Without prefix snapshots, restore every request whose validated
+            // suffix is longer than its committed prefix, then replay that
+            // prefix. Full acceptance also needs this after deferring the bonus
+            // token. The single-GPU scheduler is capped to the snapshot batch
+            // limit, so this remains a defensive path rather than the normal
+            // large-batch decode path.
+            for (int b = 0; b < batch; b++) {
+                if (commitLens[b] == seqLens[b]) {
+                    continue;
+                }
+                int rollbackSlot = rollbackSlotBase + b;
+                for (int layer = 0; layer < block_cnt; layer++) {
+                    Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
+                    Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
+                    if (isAttentionLayerAt(layer)) {
+                        restoreMeta(*rootKey, baseRootKeys[b][layer]);
+                        restoreMeta(*rootValue, baseRootValues[b][layer]);
+                    } else {
+                        copyTensor(
+                            *rootKey,
+                            speculativeLinearStates[layer][rollbackSlot].first,
+                            rootDevice);
+                        copyTensor(
+                            *rootValue,
+                            speculativeLinearStates[layer][rollbackSlot].second,
+                            rootDevice);
+                    }
+                }
+            }
+
+            // Requests with the same committed length use the same small
+            // continuation shape. Run each such group in one fused forward
+            // instead of serially replaying every rejected request.
+            std::map<int, std::vector<int> > replayGroups;
+            for (int b = 0; b < batch; b++) {
+                if (commitLens[b] != seqLens[b]) {
+                    replayGroups[commitLens[b]].push_back(b);
+                }
+            }
+            for (const auto &replayGroup : replayGroups) {
+                int commitLen = replayGroup.first;
+                const std::vector<int> &members = replayGroup.second;
+                int replayBatch = (int)members.size();
+                std::vector<float> replayIds(replayBatch * commitLen);
+                std::vector<Data> replayPositionStorage(replayBatch);
+                std::vector<Data*> replayAttentionMasks(replayBatch, nullptr);
+                std::vector<Data*> replayPositionIdVec(replayBatch, nullptr);
+                std::vector<int> replaySeqLens(replayBatch, commitLen);
+                std::vector<std::pair<Data*, Data*> > replayPastKeyValues;
+                replayPastKeyValues.reserve(replayBatch * block_cnt);
+                std::vector<GenerationConfig> replayGenerationConfigs;
+                replayGenerationConfigs.reserve(replayBatch);
+                for (int replayIndex = 0; replayIndex < replayBatch;
+                     replayIndex++) {
+                    int b = members[replayIndex];
+                    for (int row = 0; row < commitLen; row++) {
+                        replayIds[replayIndex * commitLen + row] =
+                            inputPtr[tokenOffsets[b] + row];
+                    }
+                    Data replayPositionIds = BuildMtpPositionIdsSlice(
+                        *positionIds[b], 0, commitLen, 0);
+                    replayPositionStorage[replayIndex].CopyFrom(
+                        replayPositionIds);
+                    replayPositionIdVec[replayIndex] =
+                        &replayPositionStorage[replayIndex];
+                    for (int layer = 0; layer < block_cnt; layer++) {
+                        replayPastKeyValues.push_back(
+                            pastKeyValues[b * block_cnt + layer]);
+                    }
+                    replayGenerationConfigs.push_back(generationConfigs[b]);
+                }
+                Data replayInputIds(DataType::FLOAT32,
+                                    {1, replayBatch * commitLen}, replayIds);
+                bool replayOldCollectAllLogits = speculativeCollectAllLogits;
+                bool replayOldCacheOnly = speculativeCacheOnlyForward;
+                bool replayOldCaptureLinear =
+                    speculativeCaptureFirstTokenLinearState;
+                int replayOldCaptureSlots = speculativeLinearStateCaptureSlots;
+                speculativeCollectAllLogits =
+                    replayBatch > 1 && commitLen > 1;
+                speculativeCacheOnlyForward = true;
+                // A multi-token continuation must consume the existing
+                // conv/recurrent cache. The regular prefill path assumes an
+                // empty cache, while the small speculative path has the
+                // required cached-sequence kernels. No prefix snapshots are
+                // requested during replay.
+                speculativeCaptureFirstTokenLinearState = true;
+                speculativeLinearStateCaptureSlots = 0;
+                try {
+                    ForwardGPU(replayBatch, replayInputIds,
+                               replayAttentionMasks,
+                               replayPositionIdVec, replaySeqLens,
+                               replayPastKeyValues, replayGenerationConfigs,
+                               LastTokensManager(), nullptr);
+                } catch (const Qwen35MtpBatchFastPathUnavailable &) {
+                    speculativeLinearStateCaptureSlots = replayOldCaptureSlots;
+                    speculativeCaptureFirstTokenLinearState =
+                        replayOldCaptureLinear;
+                    speculativeCacheOnlyForward = replayOldCacheOnly;
+                    speculativeCollectAllLogits = replayOldCollectAllLogits;
+                    rollbackTargetCaches();
+                    return false;
+                } catch (...) {
+                    speculativeLinearStateCaptureSlots = replayOldCaptureSlots;
+                    speculativeCaptureFirstTokenLinearState =
+                        replayOldCaptureLinear;
+                    speculativeCacheOnlyForward = replayOldCacheOnly;
+                    speculativeCollectAllLogits = replayOldCollectAllLogits;
+                    throw;
+                }
+                speculativeLinearStateCaptureSlots = replayOldCaptureSlots;
+                speculativeCaptureFirstTokenLinearState =
+                    replayOldCaptureLinear;
+                speculativeCacheOnlyForward = replayOldCacheOnly;
+                speculativeCollectAllLogits = replayOldCollectAllLogits;
+            }
+        }
+
+        struct RuntimeDataMeta {
+            std::vector<int> dims;
+            std::vector<uint64_t> strides;
+            std::vector<int> expansionDims;
+            uint64_t expansionSize = 0;
+            uint64_t expansionBytes = 0;
+        };
+        auto makeRuntimeDataMeta = [](const Data &data) {
+            RuntimeDataMeta meta;
+            meta.dims = data.dims;
+            meta.strides = data.strides;
+            meta.expansionDims = data.expansionDims;
+            meta.expansionSize = data.expansionSize;
+            meta.expansionBytes = data.expansionBytes;
+            return meta;
+        };
+        auto restoreRuntimeDataMeta = [](Data &data, const RuntimeDataMeta &meta) {
+            data.dims = meta.dims;
+            data.strides = meta.strides;
+            data.expansionDims = meta.expansionDims;
+            data.expansionSize = meta.expansionSize;
+            data.expansionBytes = meta.expansionBytes;
+        };
+
+        acceptedTokens.assign(batch, std::vector<int>());
+        nextInputTokens.assign(batch, std::vector<int>());
+        keptInputLens = commitLens;
+        auto commitAcceptedTokens = [&](int b) {
+            int tokenOffset = tokenOffsets[b];
+            acceptedTokens[b].clear();
+            acceptedTokens[b].reserve(commitLens[b]);
+            for (int pos = 0; pos < matchedDrafts[b]; pos++) {
+                acceptedTokens[b].push_back((int)(
+                    inputPtr[tokenOffset + pos + 1] + 1.0e-3f));
+            }
+            if (!deferredFullAcceptBonus[b]) {
+                acceptedTokens[b].push_back(
+                    targetRet[tokenOffset + matchedDrafts[b]]);
+            }
+        };
+        {
+            std::vector<Data> mtpPositionStorage(batch);
+            std::vector<const Data*> hiddenInputs(batch, nullptr);
+            std::vector<Data*> mtpPositionPtrs(batch, nullptr);
+            std::vector<std::vector<int> > mtpInputTokens(batch);
+            std::vector<int> sampleRows(batch, 0), lastTargetTokens(batch, 0);
+            for (int b = 0; b < batch; b++) {
+                int commitLen = commitLens[b];
+                int tokenOffset = tokenOffsets[b];
+                hiddenInputs[b] = &committedTargetHidden[b];
+                Data mtpPosition = BuildMtpPositionIdsSlice(
+                    *positionIds[b], 0, commitLen, 0);
+                mtpPositionStorage[b].CopyFrom(mtpPosition);
+                mtpPositionPtrs[b] = &mtpPositionStorage[b];
+                mtpInputTokens[b].reserve(commitLen);
+                for (int row = 1; row < commitLen; row++) {
+                    mtpInputTokens[b].push_back(
+                        (int)(inputPtr[tokenOffset + row] + 1e-3f));
+                }
+                lastTargetTokens[b] = deferredFullAcceptBonus[b] ?
+                    (int)(inputPtr[tokenOffset + commitLen] + 1.0e-3f) :
+                    targetRet[tokenOffset + commitLen - 1];
+                mtpInputTokens[b].push_back(lastTargetTokens[b]);
+                sampleRows[b] = commitLen - 1;
+            }
+
+            std::vector<Data> firstDraftHidden;
+            std::vector<int> firstDrafts =
+                RunMtpGreedyDraftBatch(
+                    rootDevice, devices, requestMtpCaches, hiddenInputs,
+                    mtpInputTokens, mtpPositionPtrs, sampleRows,
+                    draftsPerStep > 1 ? &firstDraftHidden : nullptr);
+            AssertInFastLLM((int)firstDrafts.size() == batch,
+                            "Qwen3.5 batched MTP draft returned invalid output.\n");
+            std::vector<std::vector<int> > drafts(batch);
+            for (int b = 0; b < batch; b++) {
+                drafts[b].reserve(draftsPerStep);
+                drafts[b].push_back(firstDrafts[b]);
+            }
+
+            if (draftsPerStep > 1) {
+                std::vector<RuntimeDataMeta> keyMetas(batch), valueMetas(batch);
+                std::vector<int> cacheTokens(batch, 0);
+                for (int b = 0; b < batch; b++) {
+                    keyMetas[b] = makeRuntimeDataMeta(requestMtpCaches[b]->key);
+                    valueMetas[b] = makeRuntimeDataMeta(requestMtpCaches[b]->value);
+                    cacheTokens[b] = requestMtpCaches[b]->tokens;
+                }
+                auto restoreDraftCaches = [&]() {
+                    for (int b = 0; b < batch; b++) {
+                        restoreRuntimeDataMeta(requestMtpCaches[b]->key,
+                                               keyMetas[b]);
+                        restoreRuntimeDataMeta(requestMtpCaches[b]->value,
+                                               valueMetas[b]);
+                        requestMtpCaches[b]->tokens = cacheTokens[b];
+                    }
+                };
+
+                std::vector<Data> extraHiddenBuffers[2];
+                std::vector<const Data*> previousHidden(batch, nullptr);
+                std::vector<int> previousDraft = firstDrafts;
+                for (int b = 0; b < batch; b++) {
+                    previousHidden[b] = &firstDraftHidden[b];
+                }
+                try {
+                    for (int extra = 1; extra < draftsPerStep; extra++) {
+                        std::vector<Data> extraPositionStorage(batch);
+                        std::vector<Data*> extraPositionPtrs(batch, nullptr);
+                        std::vector<std::vector<int> > extraInputTokens(
+                            batch, std::vector<int>(1));
+                        std::vector<int> extraSampleRows(batch, 0);
+                        for (int b = 0; b < batch; b++) {
+                            Data extraPosition = BuildMtpPositionIdsSlice(
+                                *positionIds[b], commitLens[b] - 1,
+                                commitLens[b], extra);
+                            extraPositionStorage[b].CopyFrom(extraPosition);
+                            extraPositionPtrs[b] = &extraPositionStorage[b];
+                            extraInputTokens[b][0] = previousDraft[b];
+                        }
+                        bool needHidden = extra + 1 < draftsPerStep;
+                        std::vector<Data> *nextHidden = nullptr;
+                        if (needHidden) {
+                            extraHiddenBuffers[extra & 1].clear();
+                            nextHidden = &extraHiddenBuffers[extra & 1];
+                        }
+                        std::vector<int> nextDrafts =
+                            RunMtpGreedyDraftBatch(
+                                rootDevice, devices, requestMtpCaches, previousHidden,
+                                extraInputTokens, extraPositionPtrs,
+                                extraSampleRows, nextHidden);
+                        AssertInFastLLM((int)nextDrafts.size() == batch,
+                                        "Qwen3.5 batched MTP extra draft returned invalid output.\n");
+                        for (int b = 0; b < batch; b++) {
+                            drafts[b].push_back(nextDrafts[b]);
+                        }
+                        if (needHidden) {
+                            for (int b = 0; b < batch; b++) {
+                                previousHidden[b] = &(*nextHidden)[b];
+                            }
+                        }
+                        previousDraft.swap(nextDrafts);
+                    }
+                } catch (...) {
+                    restoreDraftCaches();
+                    throw;
+                }
+                restoreDraftCaches();
+            }
+
+            for (int b = 0; b < batch; b++) {
+                commitAcceptedTokens(b);
+                nextInputTokens[b].reserve(1 + drafts[b].size());
+                nextInputTokens[b].push_back(lastTargetTokens[b]);
+                nextInputTokens[b].insert(nextInputTokens[b].end(),
+                                          drafts[b].begin(), drafts[b].end());
+                int proposalCount = seqLens[b] - 1;
+                for (int pos = 0;
+                     pos < proposalCount && pos < QWEN35_MTP_MAX_DRAFTS;
+                     pos++) {
+                    mtpDraftPositionAttempts[pos].fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (matchedDrafts[b] > pos) {
+                        mtpDraftPositionAccepts[pos].fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                }
+                mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        long long validations = mtpValidationCount.load(std::memory_order_relaxed);
+        if (validations > 0 && validations % QWEN35_MTP_LOG_INTERVAL == 0) {
+            printf("[Qwen3.5 MTP] pos_accept_rate=[");
+            for (int pos = 0; pos < draftsPerStep; pos++) {
+                long long attempts = mtpDraftPositionAttempts[pos].load(
+                    std::memory_order_relaxed);
+                long long accepts = mtpDraftPositionAccepts[pos].load(
+                    std::memory_order_relaxed);
+                double rate = attempts > 0 ?
+                    (double)accepts * 100.0 / (double)attempts : 0.0;
+                printf("%s%.2f%%", pos == 0 ? "" : ", ", rate);
+            }
+            printf("].\n");
+            fflush(stdout);
+        }
+
+        rollbackArmed = false;
+        return true;
+#endif
+    }
+
     void Qwen3_5Model::Qwen35MTPLoop() {
 #ifndef USE_CUDA
         NewMainLoop();
@@ -11210,7 +12642,29 @@ namespace fastllm {
         int pagesLimit = 0;
         int pageLen = fastllm::GetPageLen();
 
-        const int mtpSchedulerLanes = 1;
+        const int mtpDraftsPerStep = Qwen35MtpDraftsPerStep();
+        const bool canUseMtpBatchForward =
+            model->CanUseQwen35MTPBatchForward(mtpDraftsPerStep);
+        const int configuredMtpSchedulerLanes =
+            std::max(1, model->maxBatch > 0 ? model->maxBatch : 1);
+        // Configurations outside the batched target fast path remain supported
+        // by Qwen35MTPForward. Keep them on one scheduler lane so a failed batch
+        // does not discard valid draft caches and silently disable MTP.
+        int mtpSchedulerLanes = 1;
+        if (canUseMtpBatchForward) {
+            // The single-GPU path keeps prefix snapshots only for small batches.
+            // Larger batches would otherwise roll back and replay every accepted
+            // prefix after each validation, which can be slower than plain decode.
+            // Keep TP at the configured concurrency because every TP batch keeps
+            // its rank-local prefix snapshots.
+            mtpSchedulerLanes = model->IsThreadTensorParallelEnabled() ?
+                configuredMtpSchedulerLanes :
+                std::min(configuredMtpSchedulerLanes,
+                         QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX);
+        }
+        const bool useMtpBatchScheduling = mtpSchedulerLanes > 1;
+        const int mtpBatchDecodeTokens = std::min(
+            mtpDraftsPerStep + 1, QWEN35_MTP_FAST_SEQ_MAX);
         int prefillChunkSize = model->GetChunkedPrefillSize();
 
         auto releasePagedCachePages = [](Data &cache, bool clearDims = false) {
@@ -11270,6 +12724,17 @@ namespace fastllm {
             ctx->preTokens = 0;
             ctx->cacheLen = 0;
             ctx->intParams.clear();
+        };
+
+        auto scheduledDecodeTokens = [&](const ResponseContext *ctx) {
+            if (ctx == nullptr) {
+                return 0;
+            }
+            int tokens = (int)ctx->currentTokens.size();
+            if (useMtpBatchScheduling && ctx->preTokens > 0 && tokens > 1) {
+                tokens = std::min(tokens, mtpBatchDecodeTokens);
+            }
+            return tokens;
         };
 
         auto getPagedManagerFromCache = [](Data &cache) -> PagedCacheManager* {
@@ -11444,7 +12909,7 @@ namespace fastllm {
         auto collectDecodePageNeeds = [&](ResponseContext *ctx) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
             int decodeTokens = ctx == nullptr ? 1 :
-                std::max(1, (int)ctx->currentTokens.size());
+                std::max(1, scheduledDecodeTokens(ctx));
             // Multi-token MTP validation runs against a paged-cache view. A
             // partial last page is cloned before appending so rejected draft
             // tokens cannot overwrite the real cache.
@@ -11519,6 +12984,18 @@ namespace fastllm {
                 }
             }
             return false;
+        };
+        auto accumulatePagedManagerNeeds = [](
+                std::map<PagedCacheManager*, int> &total,
+                const std::map<PagedCacheManager*, int> &extra) {
+            for (const auto &it : extra) {
+                if (it.first == nullptr || it.second <= 0) {
+                    continue;
+                }
+                int &current = total[it.first];
+                current = current >= INT_MAX - it.second ?
+                    INT_MAX : current + it.second;
+            }
         };
 
         auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
@@ -11766,6 +13243,12 @@ namespace fastllm {
         } else if (model->verbose) {
             printf("Fastllm Scheduler: Qwen3.5 MTP (lane=%d).\n", mtpSchedulerLanes);
         }
+        if (model->verbose && useMtpBatchScheduling &&
+            mtpDraftsPerStep + 1 > QWEN35_MTP_FAST_SEQ_MAX) {
+            printf("[Qwen3.5 MTP] batched validation uses %d of %d configured drafts per step.\n",
+                   mtpBatchDecodeTokens - 1, mtpDraftsPerStep);
+            fflush(stdout);
+        }
 
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
@@ -11792,20 +13275,21 @@ namespace fastllm {
             bool selectedNeedLastTokens = false;
             bool selectedIsPrompt = false;
             bool selectedMultimodal = false;
+            std::map<PagedCacheManager*, int> selectedDecodePageNeeds;
 
-            attentionMasks.reserve(1);
-            positionIds.reserve(1);
-            ownedAttentionMasks.reserve(1);
-            ownedPositionIds.reserve(1);
-            pastKeyValues.reserve(model->block_cnt);
-            ids.reserve(4);
-            seqLens.reserve(1);
-            handles.reserve(1);
-            generationConfigs.reserve(1);
-            tokenContexts.reserve(1);
-            logits.reserve(1);
-            decodePositionValues.reserve(1);
-            decodePositionIds.reserve(1);
+            attentionMasks.reserve(mtpSchedulerLanes);
+            positionIds.reserve(mtpSchedulerLanes);
+            ownedAttentionMasks.reserve(mtpSchedulerLanes);
+            ownedPositionIds.reserve(mtpSchedulerLanes);
+            pastKeyValues.reserve(mtpSchedulerLanes * model->block_cnt);
+            ids.reserve(mtpSchedulerLanes * (Qwen35MtpDraftsPerStep() + 1));
+            seqLens.reserve(mtpSchedulerLanes);
+            handles.reserve(mtpSchedulerLanes);
+            generationConfigs.reserve(mtpSchedulerLanes);
+            tokenContexts.reserve(mtpSchedulerLanes);
+            logits.reserve(mtpSchedulerLanes);
+            decodePositionValues.reserve(mtpSchedulerLanes);
+            decodePositionIds.reserve(mtpSchedulerLanes);
 
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
             auto &forwardLocker = model->forwardLocker;
@@ -11846,7 +13330,7 @@ namespace fastllm {
                 if (ctx->preTokens == 0) {
                     hasPrefill = true;
                 }
-                orders.push_back({-(int)ctx->currentTokens.size(), it.first, ctx});
+                orders.push_back({-scheduledDecodeTokens(ctx), it.first, ctx});
             }
             for (int handle : abortHandles) {
                 model->RemoveResponseContext(handle);
@@ -11894,10 +13378,24 @@ namespace fastllm {
                         tryRestorePrefixCache(ctx) < 0) {
                         releaseAndReinitRequest(ctx);
                     }
+                    if (!isPrompt && !seqLens.empty() &&
+                        scheduledDecodeTokens(ctx) != seqLens[0]) {
+                        continue;
+                    }
 
+                    bool isMultimodal = !ctx->multimodalInput.empty();
+                    if (selectedMultimodal && !isMultimodal) {
+                        continue;
+                    }
+                    if (isMultimodal && !seqLens.empty()) {
+                        continue;
+                    }
+
+                    int scheduledTokens = isPrompt ?
+                        (int)ctx->currentTokens.size() : scheduledDecodeTokens(ctx);
                     if ((maxTotalLens > 0 &&
-                         ctx->cacheLen + (int)ctx->currentTokens.size() > maxTotalLens) ||
-                        ctx->cacheLen + (int)ctx->currentTokens.size() > model->max_positions) {
+                         ctx->cacheLen + scheduledTokens > maxTotalLens) ||
+                        ctx->cacheLen + scheduledTokens > model->max_positions) {
                         ctx->isEnding = true;
                         ctx->error = ResponseContextErrorPromptTooLong;
                         continue;
@@ -11909,6 +13407,18 @@ namespace fastllm {
                             releaseAndReinitRequest(ctx);
                             continue;
                         }
+                        if (!pageNeeds.empty()) {
+                            auto combinedPageNeeds = selectedDecodePageNeeds;
+                            accumulatePagedManagerNeeds(combinedPageNeeds, pageNeeds);
+                            if (hasPagedManagerShortage(combinedPageNeeds)) {
+                                // This request fits by itself, but not together
+                                // with the requests already selected for this
+                                // forward. Leave it untouched for the next
+                                // scheduler iteration instead of rebuilding it.
+                                continue;
+                            }
+                            selectedDecodePageNeeds.swap(combinedPageNeeds);
+                        }
                     }
 
                     tokenContexts.push_back(ctx);
@@ -11918,10 +13428,10 @@ namespace fastllm {
                     selectedNeedLastTokens |= Qwen35NeedRepeatPenalty(ctx->generationConfig) ||
                                               ctx->generationConfig.output_logits;
                     selectedIsPrompt = isPrompt != 0;
-                    selectedMultimodal = !ctx->multimodalInput.empty();
+                    selectedMultimodal = isMultimodal;
 
                     if (!isPrompt && !selectedMultimodal && !ctx->currentTokens.empty()) {
-                        int seqLen = (int)ctx->currentTokens.size();
+                        int seqLen = scheduledDecodeTokens(ctx);
                         if (seqLen == 1) {
                             ids.push_back((float)ctx->currentTokens[0]);
                             seqLens.push_back(1);
@@ -11937,8 +13447,8 @@ namespace fastllm {
                         } else {
                             int keyLen = (int)ctx->allTokens.size() + seqLen - 1;
                             int startPosition = keyLen - seqLen;
-                            for (int token : ctx->currentTokens) {
-                                ids.push_back((float)token);
+                            for (int token = 0; token < seqLen; token++) {
+                                ids.push_back((float)ctx->currentTokens[token]);
                             }
                             seqLens.push_back(seqLen);
 
@@ -12014,7 +13524,10 @@ namespace fastllm {
                         pastKeyValues.push_back(std::make_pair(&ctx->pastKeyValues[i].first,
                                                                &ctx->pastKeyValues[i].second));
                     }
-                    break;
+                    if (isPrompt || selectedMultimodal ||
+                        (int)seqLens.size() >= mtpSchedulerLanes) {
+                        break;
+                    }
                 }
             }
 
@@ -12255,27 +13768,58 @@ namespace fastllm {
                     }
                 } else {
                     auto batchStartTime = std::chrono::system_clock::now();
-                    usedMtpForward = model->Qwen35MTPForward(
-                        true, singleContext, inputIds, attentionMasks, positionIds,
-                        seqLens, pastKeyValues, generationConfigs,
-                        acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                    if (seqLens.size() > 1) {
+                        usedMtpForward = model->Qwen35MTPBatchForward(
+                            true, tokenContexts, inputIds, attentionMasks, positionIds,
+                            seqLens, pastKeyValues, generationConfigs,
+                            acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                    } else {
+                        usedMtpForward = model->Qwen35MTPForward(
+                            true, singleContext, inputIds, attentionMasks, positionIds,
+                            seqLens, pastKeyValues, generationConfigs,
+                            acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                    }
 
-                    if (!usedMtpForward && !selectedIsPrompt && seqLens[0] > 1 &&
-                        singleContext != nullptr && !singleContext->currentTokens.empty()) {
-                        singleContext->preTokens -= seqLens[0];
-                        std::vector<float> fallbackIds = {
-                            (float)singleContext->currentTokens[0]
-                        };
-                        Data fallbackInputIds(DataType::FLOAT32, {1, 1}, fallbackIds);
-                        float position = singleContext->allTokens.empty() ?
-                            0.0f : (float)((int)singleContext->allTokens.size() - 1);
-                        Data fallbackPositionIds(DataType::FLOAT32, {1, 1},
-                                                 DataDevice::CPU, (void*)&position);
-                        std::vector<Data*> fallbackAttentionMasks = {nullptr};
-                        std::vector<Data*> fallbackPositionIdVec = {&fallbackPositionIds};
-                        std::vector<int> fallbackSeqLens = {1};
-                        singleContext->preTokens += 1;
-                        ret = model->ForwardGPU(1, fallbackInputIds,
+                    if (!usedMtpForward && !selectedIsPrompt &&
+                        !seqLens.empty() && seqLens[0] > 1) {
+                        // The fallback advances only the target cache by one
+                        // token. Any existing draft cache still describes the
+                        // pre-fallback prefix and must not be reused next turn.
+                        for (ResponseContext *ctx : tokenContexts) {
+                            eraseMtpCache(ctx);
+                        }
+                        std::vector<float> fallbackIds;
+                        std::vector<float> fallbackPositions;
+                        std::vector<Data> fallbackPositionStorage;
+                        std::vector<Data*> fallbackPositionIdVec;
+                        std::vector<Data*> fallbackAttentionMasks(
+                            tokenContexts.size(), nullptr);
+                        std::vector<int> fallbackSeqLens(tokenContexts.size(), 1);
+                        fallbackIds.reserve(tokenContexts.size());
+                        fallbackPositions.reserve(tokenContexts.size());
+                        fallbackPositionStorage.reserve(tokenContexts.size());
+                        fallbackPositionIdVec.reserve(tokenContexts.size());
+                        for (int b = 0; b < (int)tokenContexts.size(); b++) {
+                            ResponseContext *ctx = tokenContexts[b];
+                            AssertInFastLLM(ctx != nullptr && !ctx->currentTokens.empty(),
+                                            "Qwen3.5 MTP fallback lost request input.\n");
+                            ctx->preTokens -= seqLens[b] - 1;
+                            fallbackIds.push_back((float)ctx->currentTokens[0]);
+                            fallbackPositions.push_back(ctx->allTokens.empty() ?
+                                0.0f : (float)((int)ctx->allTokens.size() - 1));
+                        }
+                        for (int b = 0; b < (int)tokenContexts.size(); b++) {
+                            fallbackPositionStorage.emplace_back(
+                                DataType::FLOAT32, decodeScalarDims,
+                                DataDevice::CPU, (void*)&fallbackPositions[b]);
+                            fallbackPositionIdVec.push_back(
+                                &fallbackPositionStorage.back());
+                        }
+                        Data fallbackInputIds(
+                            DataType::FLOAT32,
+                            {1, (int)fallbackIds.size()}, fallbackIds);
+                        ret = model->ForwardGPU((int)tokenContexts.size(),
+                                                fallbackInputIds,
                                                 fallbackAttentionMasks,
                                                 fallbackPositionIdVec,
                                                 fallbackSeqLens, pastKeyValues,
@@ -14217,6 +15761,448 @@ namespace fastllm {
             }
         }
         return Data(DataType::FLOAT32, {rows, len}, values);
+    }
+
+    std::vector<int> Qwen3_5Model::RunMtpGreedyDraftBatch(
+            int device,
+            const std::vector<int> &devices,
+            const std::vector<MtpKvCache*> &caches,
+            const std::vector<const Data*> &targetHiddenStates,
+            const std::vector<std::vector<int> > &inputTokens,
+            const std::vector<Data*> &positionIds,
+            const std::vector<int> &sampleRows,
+            std::vector<Data> *sampledHiddenStates) {
+#ifndef USE_CUDA
+        (void)device;
+        (void)devices;
+        (void)caches;
+        (void)targetHiddenStates;
+        (void)inputTokens;
+        (void)positionIds;
+        (void)sampleRows;
+        (void)sampledHiddenStates;
+        return {};
+#else
+        std::vector<int> draftDevices =
+            devices.empty() ? std::vector<int>{device} : devices;
+        bool tensorParallelDraft = draftDevices.size() > 1;
+        const int batch = (int)caches.size();
+        AssertInFastLLM(batch > 0 &&
+                        (int)targetHiddenStates.size() == batch &&
+                        (int)inputTokens.size() == batch &&
+                        (int)positionIds.size() == batch &&
+                        (int)sampleRows.size() == batch,
+                        "Qwen3.5 batched MTP draft input size mismatch.\n");
+        PrepareMtpWeightsForDevice(device, !tensorParallelDraft);
+        AssertInFastLLM(HasMtpWeights(), "Qwen3.5 MTP weights are missing.\n");
+
+        Qwen35ScopedGenericExecutor mtpExecutor("cuda:" + std::to_string(device));
+        FastllmCudaSetDevice(device);
+
+        std::vector<int> seqLens(batch, 0), tokenOffsets(batch, 0);
+        int totalTokens = 0;
+        int hiddenSize = -1;
+        std::vector<Data> convertedHidden(batch);
+        std::vector<const Data*> hiddenInputs(batch, nullptr);
+        for (int b = 0; b < batch; b++) {
+            AssertInFastLLM(caches[b] != nullptr && targetHiddenStates[b] != nullptr &&
+                            positionIds[b] != nullptr && !inputTokens[b].empty(),
+                            "Qwen3.5 batched MTP draft got null request data.\n");
+            seqLens[b] = (int)inputTokens[b].size();
+            tokenOffsets[b] = totalTokens;
+            totalTokens += seqLens[b];
+            const Data *hidden = targetHiddenStates[b];
+            if (hidden->dataType != this->dataType) {
+                convertedHidden[b].CopyFrom(*hidden);
+                ToDataType(convertedHidden[b], this->dataType);
+                convertedHidden[b].ToDevice(DataDevice::CUDA, {device}, true);
+                hidden = &convertedHidden[b];
+            }
+            AssertInFastLLM(hidden->dims.size() == 3 && hidden->dims[0] == 1 &&
+                            hidden->dims[1] == seqLens[b] &&
+                            hidden->dataDevice == DataDevice::CUDA &&
+                            hidden->cudaData != nullptr,
+                            "Qwen3.5 batched MTP hidden states are invalid.\n");
+            if (hiddenSize < 0) {
+                hiddenSize = hidden->dims[2];
+            }
+            AssertInFastLLM(hidden->dims[2] == hiddenSize &&
+                            hidden->dataType == this->dataType,
+                            "Qwen3.5 batched MTP hidden shape mismatch.\n");
+            hiddenInputs[b] = hidden;
+        }
+
+        Data flatHidden(this->dataType);
+        flatHidden.dataDevice = DataDevice::CUDA;
+        flatHidden.dataDeviceIds = {device};
+        flatHidden.Resize({1, totalTokens, hiddenSize});
+        flatHidden.Allocate(false);
+        const size_t hiddenRowBytes =
+            (size_t)hiddenSize * flatHidden.unitSize / flatHidden.unitSizeDiv;
+        for (int b = 0; b < batch; b++) {
+            FastllmCudaCopyFromDeviceToDevice(
+                (uint8_t*)flatHidden.cudaData +
+                    (size_t)tokenOffsets[b] * hiddenRowBytes,
+                hiddenInputs[b]->cudaData,
+                (size_t)seqLens[b] * hiddenRowBytes);
+        }
+
+        std::vector<float> tokenValues;
+        tokenValues.reserve(totalTokens);
+        for (const auto &requestTokens : inputTokens) {
+            for (int token : requestTokens) {
+                tokenValues.push_back((float)token);
+            }
+        }
+        Data tokenIds(DataType::FLOAT32, {1, totalTokens}, tokenValues);
+        Data allPositionIds = BuildFlattenedPositionIds(
+            positionIds, seqLens,
+            std::all_of(seqLens.begin(), seqLens.end(), [](int len) {
+                return len == 1;
+            }));
+        allPositionIds.ToDevice(DataDevice::CUDA, {device}, true);
+
+        Data inputEmbeds, normEmbeds, normHidden, fusedInput, hiddenStates;
+        Data &embedWeight = weight[language_prefix + "embed_tokens.weight"];
+        Data *embedWeightForMtp = &embedWeight;
+        if (embedWeight.multiDeviceData) {
+            auto embedIt = embedWeight.multiDeviceDatas.find(device);
+            if (embedIt != embedWeight.multiDeviceDatas.end() &&
+                embedIt->second != nullptr) {
+                embedWeightForMtp = embedIt->second;
+            }
+        }
+        bool useCudaEmbeddingForMtp =
+            GetCudaEmbedding() && !GetLowMemMode() &&
+            embedWeightForMtp->dataDevice == DataDevice::CUDA &&
+            embedWeightForMtp->cudaData != nullptr &&
+            !embedWeightForMtp->dataDeviceIds.empty() &&
+            embedWeightForMtp->dataDeviceIds[0] == device;
+        if (!useCudaEmbeddingForMtp) {
+            Qwen35CpuEmbeddingDirect(tokenIds, embedWeight, inputEmbeds,
+                                     flatHidden.dataType);
+            inputEmbeds.ToDevice(DataDevice::CUDA, {device}, true);
+        } else {
+            tokenIds.ToDevice(DataDevice::CUDA, {device}, true);
+            Embedding(tokenIds, *embedWeightForMtp, inputEmbeds);
+        }
+        if (inputEmbeds.dataType != flatHidden.dataType) {
+            ToDataType(inputEmbeds, flatHidden.dataType);
+        }
+        RMSNorm(inputEmbeds, weight["mtp.pre_fc_norm_embedding.weight"],
+                rms_norm_eps, normEmbeds);
+        RMSNorm(flatHidden, weight["mtp.pre_fc_norm_hidden.weight"],
+                rms_norm_eps, normHidden);
+        Cat(normEmbeds, normHidden, -1, fusedInput);
+        Linear(fusedInput, weight["mtp.fc.weight"], *GetEmptyData(), hiddenStates);
+
+        std::string prefix = "mtp.layers.0.";
+        Data attenInput, qgate, q, gate, k, v, mergedQkv;
+        RMSNorm(hiddenStates, weight[prefix + "input_layernorm.weight"],
+                rms_norm_eps, attenInput);
+        std::string mergeQkvWeightName = prefix + "self_attn.mergeqkv.weight";
+        if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
+            Linear(attenInput, weight[mergeQkvWeightName],
+                   *GetEmptyData(), mergedQkv);
+            int qgateDim = num_attention_heads * this->head_dim * 2;
+            int kvDim = num_key_value_heads * this->head_dim;
+            Split(mergedQkv, -1, 0, qgateDim, qgate);
+            Split(mergedQkv, -1, qgateDim, qgateDim + kvDim, k);
+            Split(mergedQkv, -1, qgateDim + kvDim,
+                  qgateDim + kvDim * 2, v);
+        } else {
+            Linear(attenInput, weight[prefix + "self_attn.q_proj.weight"],
+                   *GetEmptyData(), qgate);
+            Linear(attenInput, weight[prefix + "self_attn.k_proj.weight"],
+                   *GetEmptyData(), k);
+            Linear(attenInput, weight[prefix + "self_attn.v_proj.weight"],
+                   *GetEmptyData(), v);
+        }
+
+        qgate.Reshape({1, totalTokens, -1, this->head_dim * 2});
+        Split(qgate, -1, 0, this->head_dim, q);
+        Split(qgate, -1, this->head_dim, qgate.dims.back(), gate);
+        gate.Reshape({1, totalTokens, -1});
+        k.Reshape({1, totalTokens, -1, this->head_dim});
+        v.Reshape({1, totalTokens, -1, this->head_dim});
+        RMSNorm(q, weight[prefix + "self_attn.q_norm.weight"], rms_norm_eps, q);
+        RMSNorm(k, weight[prefix + "self_attn.k_norm.weight"], rms_norm_eps, k);
+        float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
+        ApplyMultimodalRotary(q, allPositionIds, ropeScale);
+        ApplyMultimodalRotary(k, allPositionIds, ropeScale);
+        PermuteSelf(q, {0, 2, 1, 3});
+        PermuteSelf(k, {0, 2, 1, 3});
+        PermuteSelf(v, {0, 2, 1, 3});
+        q.Reshape({-1, totalTokens, this->head_dim});
+        k.Reshape({-1, totalTokens, this->head_dim});
+        v.Reshape({-1, totalTokens, this->head_dim});
+
+        std::vector<Data> requestQ(batch), requestK(batch), requestV(batch);
+        auto appendMtpCache = [&](Data &past, Data &cur) {
+            if (past.dims.empty() && past.expansionDims.empty()) {
+                Data typed(cur.dataType);
+                past.CopyFrom(typed);
+                past.dataDevice = DataDevice::CUDA;
+                past.dataDeviceIds = {device};
+            }
+            const int unitLen = 128;
+            while ((past.dims.empty() &&
+                    (past.expansionDims.empty() ||
+                     cur.dims[1] > past.expansionDims[1])) ||
+                   (!past.dims.empty() &&
+                    past.dims[1] + cur.dims[1] > past.expansionDims[1])) {
+                std::vector<int> newDims;
+                if (past.Count(0) == 0 || past.dims.empty()) {
+                    newDims = {cur.dims[0],
+                               ((cur.dims[1] - 1) / unitLen + 1) * unitLen,
+                               cur.dims[2]};
+                } else {
+                    newDims = past.dims;
+                    newDims[1] +=
+                        ((cur.dims[1] - 1) / unitLen + 1) * unitLen;
+                }
+                past.Expansion(newDims);
+            }
+            CatDirect(past, cur, 1);
+        };
+        for (int b = 0; b < batch; b++) {
+            int begin = tokenOffsets[b];
+            int end = begin + seqLens[b];
+            Split(q, 1, begin, end, requestQ[b]);
+            Split(k, 1, begin, end, requestK[b]);
+            Split(v, 1, begin, end, requestV[b]);
+            appendMtpCache(caches[b]->key, requestK[b]);
+            appendMtpCache(caches[b]->value, requestV[b]);
+            caches[b]->tokens += seqLens[b];
+        }
+
+        const int attentionWidth = num_attention_heads * this->head_dim;
+        Data attentionOutput(this->dataType);
+        attentionOutput.dataDevice = DataDevice::CUDA;
+        attentionOutput.dataDeviceIds = {device};
+        attentionOutput.Resize({1, totalTokens, attentionWidth});
+        attentionOutput.Allocate(false);
+        bool allSingleToken = std::all_of(
+            seqLens.begin(), seqLens.end(), [](int len) { return len == 1; });
+        if (allSingleToken) {
+            std::vector<Data*> qs(batch), keys(batch), values(batch), masks(batch, nullptr),
+                               contexts(batch);
+            std::vector<Data> outputViews(batch);
+            for (int b = 0; b < batch; b++) {
+                qs[b] = &requestQ[b];
+                keys[b] = &caches[b]->key;
+                values[b] = &caches[b]->value;
+                outputViews[b].FakeFrom(
+                    attentionOutput,
+                    (size_t)b * attentionWidth * attentionOutput.unitSize /
+                        attentionOutput.unitSizeDiv);
+                contexts[b] = &outputViews[b];
+            }
+            AttentionBatch(qs, keys, values, masks, contexts,
+                           requestQ[0].dims[0] / caches[0]->key.dims[0],
+                           1.0f / std::sqrt((float)this->head_dim), 1);
+        } else {
+            const size_t attentionRowBytes =
+                (size_t)attentionWidth * attentionOutput.unitSize /
+                attentionOutput.unitSizeDiv;
+            for (int b = 0; b < batch; b++) {
+                Data requestOutput;
+                Attention(requestQ[b], caches[b]->key, caches[b]->value,
+                          *GetEmptyData(), requestOutput,
+                          requestQ[b].dims[0] / caches[b]->key.dims[0],
+                          1.0f / std::sqrt((float)this->head_dim), 1);
+                PermuteSelf(requestOutput, {1, 0, 2});
+                requestOutput.Reshape({1, seqLens[b], attentionWidth});
+                FastllmCudaCopyFromDeviceToDevice(
+                    (uint8_t*)attentionOutput.cudaData +
+                        (size_t)tokenOffsets[b] * attentionRowBytes,
+                    requestOutput.cudaData,
+                    (size_t)seqLens[b] * attentionRowBytes);
+            }
+        }
+
+        Sigmoid(gate, gate);
+        if (gate.dataType != attentionOutput.dataType) {
+            ToDataType(gate, attentionOutput.dataType);
+        }
+        MulTo(attentionOutput, gate);
+        Data projected;
+        Linear(attentionOutput, weight[prefix + "self_attn.o_proj.weight"],
+               *GetEmptyData(), projected);
+        AddTo(hiddenStates, projected);
+
+        Data mlpInput, gateupResult, swigluResult;
+        RMSNorm(hiddenStates, weight[prefix + "post_attention_layernorm.weight"],
+                rms_norm_eps, mlpInput);
+        MLPBlock(&mlpInput, &weight[prefix + "mlp.gateup_proj.weight"],
+                 &weight[prefix + "mlp.down_proj.weight"],
+                 &gateupResult, &swigluResult, &hiddenStates);
+
+        Data sampleHiddenBatch(hiddenStates.dataType);
+        sampleHiddenBatch.dataDevice = DataDevice::CUDA;
+        sampleHiddenBatch.dataDeviceIds = {device};
+        sampleHiddenBatch.Resize({1, batch, hiddenSize});
+        sampleHiddenBatch.Allocate(false);
+        for (int b = 0; b < batch; b++) {
+            int row = std::max(0, std::min(sampleRows[b], seqLens[b] - 1));
+            FastllmCudaCopyFromDeviceToDevice(
+                (uint8_t*)sampleHiddenBatch.cudaData +
+                    (size_t)b * hiddenRowBytes,
+                (uint8_t*)hiddenStates.cudaData +
+                    (size_t)(tokenOffsets[b] + row) * hiddenRowBytes,
+                hiddenRowBytes);
+        }
+        RMSNorm(sampleHiddenBatch, weight["mtp.norm.weight"],
+                rms_norm_eps, sampleHiddenBatch);
+        if (sampledHiddenStates != nullptr) {
+            sampledHiddenStates->clear();
+            sampledHiddenStates->resize(batch);
+            for (int b = 0; b < batch; b++) {
+                Split(sampleHiddenBatch, 1, b, b + 1,
+                      (*sampledHiddenStates)[b]);
+            }
+        }
+
+        auto sampleGreedyFromCudaLogits = [&](Data &cudaLogits) {
+            ToDataType(cudaLogits, DataType::FLOAT32);
+            AssertInFastLLM(cudaLogits.dataDevice == DataDevice::CUDA &&
+                            cudaLogits.cudaData != nullptr,
+                            "Qwen3.5 batched MTP logits must stay on CUDA.\n");
+            Data &cudaOutput = Qwen35ThreadLocalCudaSamplingOutput();
+            Qwen3CudaPrepareLocalOutput(cudaOutput, device);
+            cudaOutput.dataType = DataType::INT32;
+            cudaOutput.UpdateUnitSize();
+            cudaOutput.Resize({batch});
+            cudaOutput.Allocate();
+            FastllmCudaGreedySampling((float*)cudaLogits.cudaData,
+                                      (int*)cudaOutput.cudaData,
+                                      batch, cudaLogits.dims.back());
+            std::vector<int> drafts(batch, 0);
+            FastllmCudaCopyFromDeviceToHost(
+                drafts.data(), cudaOutput.cudaData,
+                (size_t)batch * sizeof(int));
+            return drafts;
+        };
+
+        Data &lmHead = weight["lm_head.weight"];
+        if (!tensorParallelDraft) {
+            Data logits;
+            Linear(sampleHiddenBatch, lmHead, *GetEmptyData(), logits);
+            return sampleGreedyFromCudaLogits(logits);
+        }
+
+        AssertInFastLLM(threadTpWeightsPrepared.load(std::memory_order_acquire) &&
+                        threadTpPreparedDevices == draftDevices &&
+                        lmHead.multiDeviceData &&
+                        !threadTpLmHeadScheme.empty(),
+                        "Qwen3.5 batched MTP TP draft requires prepared lm_head shards.\n");
+        using namespace qwen3cuda;
+        Data replicatedHidden;
+        replicatedHidden.CopyFrom(sampleHiddenBatch);
+        PrepareMultiCudaReplicatedData(replicatedHidden, draftDevices, true);
+
+        Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
+        const int tpSize = (int)draftDevices.size();
+        std::vector<Data> localLogits(tpSize);
+        std::vector<std::vector<int> > localBestIds(
+            tpSize, std::vector<int>(batch, -1));
+        std::vector<std::vector<float> > localBestScores(
+            tpSize, std::vector<float>(batch, -1.0e30f));
+        std::vector<int> localBestReady(tpSize, 0);
+        std::vector<std::exception_ptr> errors(tpSize);
+        threadTpWorkerGroup.Run(draftDevices, [&](int r) {
+            int localDevice = draftDevices[r];
+            auto hiddenIt = replicatedHidden.multiDeviceDatas.find(localDevice);
+            auto weightIt = lmHead.multiDeviceDatas.find(localDevice);
+            auto biasIt = lmHeadBias.multiDeviceDatas.find(localDevice);
+            AssertInFastLLM(hiddenIt != replicatedHidden.multiDeviceDatas.end() &&
+                            hiddenIt->second != nullptr &&
+                            weightIt != lmHead.multiDeviceDatas.end() &&
+                            weightIt->second != nullptr &&
+                            biasIt != lmHeadBias.multiDeviceDatas.end() &&
+                            biasIt->second != nullptr,
+                            "Qwen3.5 batched MTP TP draft missing local lm_head data.\n");
+            FastllmCudaSetDevice(localDevice);
+            Qwen3CudaDirectRunner cudaRunner(localDevice);
+            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *weightIt->second,
+                            *biasIt->second, localLogits[r]);
+            Qwen3CudaToDataType(cudaRunner, localLogits[r], DataType::FLOAT32);
+            Data localBestId(DataType::INT32), localBestScore(DataType::FLOAT32);
+            Qwen3CudaPrepareLocalOutput(localBestId, localDevice);
+            Qwen3CudaPrepareLocalOutput(localBestScore, localDevice);
+            localBestId.Resize({batch});
+            localBestScore.Resize({batch});
+            localBestId.Allocate();
+            localBestScore.Allocate();
+            bool sampled = FastllmCudaGreedySamplingWithScores(
+                (float*)localLogits[r].cudaData,
+                (int*)localBestId.cudaData,
+                (float*)localBestScore.cudaData,
+                batch, localLogits[r].dims.back());
+            if (sampled) {
+                FastllmCudaCopyFromDeviceToHost(
+                    localBestIds[r].data(), localBestId.cudaData,
+                    (size_t)batch * sizeof(int));
+                FastllmCudaCopyFromDeviceToHost(
+                    localBestScores[r].data(), localBestScore.cudaData,
+                    (size_t)batch * sizeof(float));
+                localBestReady[r] = 1;
+            } else {
+                ForceDeviceSync();
+            }
+        }, errors);
+        for (auto &error : errors) {
+            if (error) {
+                std::rethrow_exception(error);
+            }
+        }
+
+        bool allBestReady = true;
+        for (int ready : localBestReady) {
+            allBestReady = allBestReady && (ready != 0);
+        }
+        if (allBestReady) {
+            std::vector<int> drafts(batch, 0);
+            for (int b = 0; b < batch; b++) {
+                float bestScore = -1.0e30f;
+                int bestToken = 0;
+                for (int r = 0; r < tpSize; r++) {
+                    int localDevice = draftDevices[r];
+                    int localId = localBestIds[r][b];
+                    int globalId = -1;
+                    int localOffset = 0;
+                    auto schemeIt = threadTpLmHeadScheme.find(localDevice);
+                    AssertInFastLLM(schemeIt != threadTpLmHeadScheme.end(),
+                                    "Qwen3.5 batched MTP TP draft missing lm_head split scheme.\n");
+                    for (auto &range : schemeIt->second) {
+                        int len = range.second - range.first;
+                        if (localId >= localOffset &&
+                            localId < localOffset + len) {
+                            globalId = range.first + (localId - localOffset);
+                            break;
+                        }
+                        localOffset += len;
+                    }
+                    AssertInFastLLM(globalId >= 0,
+                                    "Qwen3.5 batched MTP TP draft local greedy id is out of range.\n");
+                    float score = localBestScores[r][b];
+                    if (score > bestScore ||
+                        (score == bestScore && globalId < bestToken)) {
+                        bestScore = score;
+                        bestToken = globalId;
+                    }
+                }
+                drafts[b] = bestToken;
+            }
+            return drafts;
+        }
+
+        Data &fullCudaLogits = Qwen35ThreadLocalCudaSamplingFullLogits();
+        Qwen35GatherShardLogitsToRootCuda(
+            device, draftDevices, threadTpLmHeadScheme,
+            localLogits, batch, lmHead.dims[0], fullCudaLogits);
+        return sampleGreedyFromCudaLogits(fullCudaLogits);
+#endif
     }
 
     int Qwen3_5Model::RunMtpGreedyDraft(int device, const std::vector<int> &devices,

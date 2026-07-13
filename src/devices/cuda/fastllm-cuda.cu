@@ -6340,13 +6340,15 @@ __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, flo
 template <int BLOCK_THREADS>
 __global__ void FastllmTypicalAcceptanceKernel(
         const float *probs, const int *candidateIds,
+        const int *candidateRows,
         const int *topKArr, const float *topPArr,
         unsigned char *accepted, int *recoveredIds,
         int vocabSize, float posteriorThreshold, float posteriorAlpha) {
-    int bid = blockIdx.x;
+    int candidateIndex = blockIdx.x;
+    int rowIndex = candidateRows[candidateIndex];
     int tid = threadIdx.x;
-    const float *row = probs + (long long)bid * vocabSize;
-    int candidateId = candidateIds[bid];
+    const float *row = probs + (long long)rowIndex * vocabSize;
+    int candidateId = candidateIds[candidateIndex];
     float candidateProb = candidateId >= 0 && candidateId < vocabSize ?
                           row[candidateId] : 0.0f;
 
@@ -6406,11 +6408,13 @@ __global__ void FastllmTypicalAcceptanceKernel(
         // Medusa/vLLM typical acceptance: p(candidate) > min(epsilon, alpha * exp(-H)).
         float dynamicThreshold = fminf(
             posteriorThreshold, expf(-entropy) * posteriorAlpha);
-        bool allowedByTopK = topKArr[bid] <= 0 || greaterCount < topKArr[bid];
-        bool allowedByTopP = topPArr[bid] >= 1.0f || greaterMass < topPArr[bid];
-        accepted[bid] = allowedByTopK && allowedByTopP &&
-                        candidateProb > dynamicThreshold ? 1 : 0;
-        recoveredIds[bid] = maxIdData[0];
+        bool allowedByTopK = topKArr[rowIndex] <= 0 ||
+                             greaterCount < topKArr[rowIndex];
+        bool allowedByTopP = topPArr[rowIndex] >= 1.0f ||
+                             greaterMass < topPArr[rowIndex];
+        accepted[candidateIndex] = allowedByTopK && allowedByTopP &&
+                                   candidateProb > dynamicThreshold ? 1 : 0;
+        recoveredIds[candidateIndex] = maxIdData[0];
     }
 }
 
@@ -6420,6 +6424,7 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int *output,
                                   int batch, int vocabSize,
                                   const int *typicalCandidateIds,
+                                  const int *typicalCandidateRows,
                                   unsigned char *typicalAccepted,
                                   int *typicalRecoveredIds,
                                   int typicalCount,
@@ -6430,10 +6435,20 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                              typicalAccepted != nullptr &&
                              typicalRecoveredIds != nullptr ?
                              std::max(0, std::min(typicalCount, batch)) : 0;
+    if (typicalCandidateRows != nullptr) {
+        for (int i = 0; i < actualTypicalCount; i++) {
+            if (typicalCandidateRows[i] < 0 ||
+                typicalCandidateRows[i] >= batch) {
+                return false;
+            }
+        }
+    }
 
-    // temperatures | top-k | top-p | sampled ids | candidates | recovered ids | accepted flags
+    // temperatures | top-k | top-p | sampled ids | candidates | candidate rows |
+    // recovered ids | accepted flags
     size_t paramBytes = batch * (sizeof(float) + sizeof(int) + sizeof(float) + sizeof(int)) +
-                        actualTypicalCount * (sizeof(int) + sizeof(int) + sizeof(unsigned char));
+                        actualTypicalCount * (sizeof(int) + sizeof(int) + sizeof(int) +
+                                              sizeof(unsigned char));
     size_t alignedProbsBytes = FastllmCudaAlignBytes(probsBytes, 256);
     size_t alignedParamBytes = FastllmCudaAlignBytes(paramBytes, 256);
     size_t scratchBytes = 0;
@@ -6453,7 +6468,8 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     float *cudaTopPArr      = (float *)(cudaParamBuf + batch * (sizeof(float) + sizeof(int)));
     int   *cudaOutput       = (int   *)(cudaParamBuf + batch * (sizeof(float) + sizeof(int) + sizeof(float)));
     int   *cudaTypicalCandidates = cudaOutput + batch;
-    int   *cudaTypicalRecovered = cudaTypicalCandidates + actualTypicalCount;
+    int   *cudaTypicalRows = cudaTypicalCandidates + actualTypicalCount;
+    int   *cudaTypicalRecovered = cudaTypicalRows + actualTypicalCount;
     unsigned char *cudaTypicalAccepted =
         (unsigned char *)(cudaTypicalRecovered + actualTypicalCount);
 
@@ -6467,12 +6483,27 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
         FastllmCudaCopyFromHostToDevice(cudaTypicalCandidates,
                                         (void*)typicalCandidateIds,
                                         actualTypicalCount * sizeof(int));
+        if (typicalCandidateRows != nullptr) {
+            FastllmCudaCopyFromHostToDevice(cudaTypicalRows,
+                                            (void*)typicalCandidateRows,
+                                            actualTypicalCount * sizeof(int));
+        } else {
+            static thread_local std::vector<int> identityTypicalRows;
+            identityTypicalRows.resize(actualTypicalCount);
+            for (int i = 0; i < actualTypicalCount; i++) {
+                identityTypicalRows[i] = i;
+            }
+            FastllmCudaCopyFromHostToDevice(cudaTypicalRows,
+                                            identityTypicalRows.data(),
+                                            actualTypicalCount * sizeof(int));
+        }
     }
 
     FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(logits, cudaProbs, cudaTemperatures, vocabSize);
     if (actualTypicalCount > 0) {
         FastllmTypicalAcceptanceKernel<1024><<<actualTypicalCount, 1024>>>(
-            cudaProbs, cudaTypicalCandidates, cudaTopKArr, cudaTopPArr,
+            cudaProbs, cudaTypicalCandidates, cudaTypicalRows,
+            cudaTopKArr, cudaTopPArr,
             cudaTypicalAccepted, cudaTypicalRecovered, vocabSize,
             typicalPosteriorThreshold, typicalPosteriorAlpha);
     }
@@ -6506,7 +6537,7 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int batch, int vocabSize) {
     return FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
         logits, temperatures, topKArr, topPArr, output, batch, vocabSize,
-        nullptr, nullptr, nullptr, 0, 0.09f, 0.3f);
+        nullptr, nullptr, nullptr, nullptr, 0, 0.09f, 0.3f);
 }
 
 template <int THREAD_PER_BLOCK>
@@ -7095,6 +7126,47 @@ static bool FastllmCudaDataCanShareDevice(const fastllm::Data &reference,
            referenceDevice == otherDevice;
 }
 
+// MTP batch kernels consume small arrays of request-local cache pointers.
+// Keep one device staging buffer per TP worker thread so every layer only
+// enqueues a tiny H2D copy instead of cudaMalloc/cudaFree synchronization.
+static void **FastllmCudaStageMtpPointers(const std::vector<void*> &pointers) {
+    struct PointerScratch {
+        void *data = nullptr;
+        size_t capacity = 0;
+        int device = -1;
+
+        ~PointerScratch() {
+            if (data == nullptr || device < 0) {
+                return;
+            }
+            int oldDevice = 0;
+            cudaGetDevice(&oldDevice);
+            cudaSetDevice(device);
+            FastllmCudaFree(data);
+            cudaSetDevice(oldDevice);
+        }
+    };
+    static thread_local PointerScratch scratch;
+    if (pointers.empty()) {
+        return nullptr;
+    }
+    int device = FastllmCudaGetDevice();
+    size_t bytes = pointers.size() * sizeof(void*);
+    if (scratch.device != device || scratch.capacity < bytes) {
+        if (scratch.data != nullptr) {
+            FastllmCudaFree(scratch.data);
+        }
+        scratch.data = FastllmCudaMalloc(bytes);
+        scratch.capacity = bytes;
+        scratch.device = device;
+    }
+    checkCudaErrors(
+        "Error: CUDA error when staging MTP cache pointers.",
+        cudaMemcpyAsync(scratch.data, pointers.data(), bytes,
+                        cudaMemcpyHostToDevice));
+    return (void**)scratch.data;
+}
+
 // 处理最多6个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
 // 把当时的滑窗状态写入对应快照 (用于MTP验证的逐token状态回滚)。
 __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
@@ -7158,6 +7230,61 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
         }
     }
 
+    cacheRow[0] = x0;
+    cacheRow[1] = x1;
+    cacheRow[2] = x2;
+    cacheRow[3] = x3;
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKernel(
+    half **pointers, const half *newTokens, const float *weight,
+    const float *bias, half *output, int batch, int channels,
+    int numTokens, int numSnaps) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (row >= total) {
+        return;
+    }
+    int batchIndex = row / channels;
+    int channel = row - batchIndex * channels;
+    half *cacheRow = pointers[batchIndex] + (size_t)channel * 4;
+    const half *tokenRow = newTokens + (size_t)row * numTokens;
+    half x0 = cacheRow[0];
+    half x1 = cacheRow[1];
+    half x2 = cacheRow[2];
+    half x3 = cacheRow[3];
+    const float *curWeight = weight + (size_t)channel * 4;
+    float biasValue = bias == nullptr ? 0.0f : bias[channel];
+    half *outputRow = output + (size_t)row * numTokens;
+    for (int token = 0; token < numTokens; token++) {
+        x0 = x1;
+        x1 = x2;
+        x2 = x3;
+        x3 = tokenRow[token];
+        float value = biasValue;
+        value += __half2float(x0) * curWeight[0];
+        value += __half2float(x1) * curWeight[1];
+        value += __half2float(x2) * curWeight[2];
+        value += __half2float(x3) * curWeight[3];
+        half conv = __float2half_rn(value);
+#ifdef CUDA_NO_TENSOR_CORE
+        float y = __half2float(conv);
+        outputRow[token] = __float2half(y / (1.0f + expf(-y)));
+#else
+        outputRow[token] =
+            __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+        if (token < numSnaps) {
+            half *snapshot = pointers[batch + batchIndex * numSnaps + token];
+            if (snapshot != nullptr) {
+                half *snapshotRow = snapshot + (size_t)channel * 4;
+                snapshotRow[0] = x0;
+                snapshotRow[1] = x1;
+                snapshotRow[2] = x2;
+                snapshotRow[3] = x3;
+            }
+        }
+    }
     cacheRow[0] = x0;
     cacheRow[1] = x1;
     cacheRow[2] = x2;
@@ -7496,6 +7623,132 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors("Error: CUDA error in FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16.", launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
+    const std::vector<fastllm::Data*> &caches,
+    const fastllm::Data &newTokens,
+    fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output,
+    const std::vector<fastllm::Data*> &tokenCaches, int numTokenCaches) {
+    if (caches.empty() || caches[0] == nullptr || numTokenCaches < 0 ||
+        numTokenCaches > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
+        tokenCaches.size() != caches.size() * (size_t)numTokenCaches ||
+        output.isFake || output.cudaDataBorrowed || output.isPagedKVCache ||
+        output.multiDeviceData) {
+        return false;
+    }
+    std::set<const fastllm::Data*> tensors = {
+        &newTokens, &weight, &bias, &output
+    };
+    if (tensors.size() != 4) {
+        return false;
+    }
+    fastllm::Data &first = *caches[0];
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(first, device) ||
+        FastllmCudaGetDevice() != device ||
+        first.dataType != fastllm::DataType::FLOAT16 ||
+        first.dims.size() != 3 || first.dims[0] != 1 ||
+        first.dims[1] <= 0 || first.dims[2] != 4 ||
+        !FastllmCudaDataHasDenseStrides(first) ||
+        newTokens.dataType != fastllm::DataType::FLOAT16 ||
+        newTokens.dims.size() != 3 ||
+        newTokens.dims[0] != (int)caches.size() ||
+        newTokens.dims[1] != first.dims[1] ||
+        newTokens.dims[2] <= 1 ||
+        newTokens.dims[2] > FASTLLM_CUDA_MTP_FAST_SEQ_MAX ||
+        numTokenCaches > newTokens.dims[2] ||
+        !FastllmCudaDataHasDenseStrides(newTokens) ||
+        !FastllmCudaDataCanShareDevice(first, newTokens) ||
+        !FastllmCudaDataCanShareDevice(first, weight) ||
+        (bias.dims.size() > 0 &&
+         !FastllmCudaDataCanShareDevice(first, bias)) ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        (bias.dims.size() > 0 && bias.dataType != fastllm::DataType::FLOAT32)) {
+        return false;
+    }
+    int batch = (int)caches.size();
+    int channels = first.dims[1];
+    int numTokens = newTokens.dims[2];
+    bool validWeightShape =
+        (weight.dims.size() == 2 && weight.dims[0] == channels &&
+         weight.dims[1] == 4) ||
+        (weight.dims.size() == 3 && weight.dims[0] == channels &&
+         weight.dims[1] == 1 && weight.dims[2] == 4);
+    if (!validWeightShape || !FastllmCudaDataHasDenseStrides(weight) ||
+        (bias.dims.size() > 0 &&
+         (bias.dims.size() != 1 || bias.dims[0] != channels ||
+          !FastllmCudaDataHasDenseStrides(bias)))) {
+        return false;
+    }
+
+    std::vector<void*> pointers;
+    pointers.reserve(batch * (1 + numTokenCaches));
+    for (fastllm::Data *cache : caches) {
+        if (cache == nullptr || cache->dataType != first.dataType ||
+            cache->dims != first.dims ||
+            !FastllmCudaDataHasDenseStrides(*cache) ||
+            !FastllmCudaDataCanShareDevice(first, *cache) ||
+            !tensors.insert(cache).second) {
+            return false;
+        }
+        pointers.push_back(cache->cudaData);
+    }
+    for (int b = 0; b < batch; b++) {
+        for (int token = 0; token < numTokenCaches; token++) {
+            fastllm::Data *snapshot =
+                tokenCaches[b * numTokenCaches + token];
+            if (snapshot == nullptr || snapshot->isFake ||
+                snapshot->cudaDataBorrowed || snapshot->isPagedKVCache ||
+                snapshot->multiDeviceData ||
+                !tensors.insert(snapshot).second) {
+                return false;
+            }
+            snapshot->dataType = first.dataType;
+            snapshot->Resize(first.dims);
+            snapshot->ToDevice(fastllm::DataDevice::CUDA,
+                               std::vector<int>{device});
+            snapshot->Allocate();
+            snapshot->isLinearAttentionTransposed = false;
+            if (snapshot->cudaData == nullptr ||
+                !FastllmCudaDataHasDenseStrides(*snapshot) ||
+                !FastllmCudaDataCanShareDevice(first, *snapshot)) {
+                return false;
+            }
+            pointers.push_back(snapshot->cudaData);
+        }
+    }
+
+    output.dataType = first.dataType;
+    output.Resize({batch, channels, numTokens});
+    output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
+    output.Allocate();
+    output.isKVCache = false;
+    output.isLinearAttention = false;
+    output.isLinearAttentionTransposed = false;
+    if (output.cudaData == nullptr || !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(first, output)) {
+        return false;
+    }
+    void **devicePointers = FastllmCudaStageMtpPointers(pointers);
+    int total = batch * channels;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKernel
+        <<<blocks, threads>>>(
+            (half**)devicePointers, (const half*)newTokens.cudaData,
+            (const float*)weight.cudaData,
+            bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
+            (half*)output.cudaData, batch, channels, numTokens,
+            numTokenCaches);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in batched multi-token MTP conv.",
+            launchState);
         return false;
     }
     return true;
@@ -9079,12 +9332,12 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     const float *normWeight,
     const float *aLog,
     const float *dtBias,
-    half *last_recurrent_state,
+    half *last_recurrent_state, half **statePointers,
     half *core_attn_out,
     int seqLen, int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale,
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4,
-    int numSnaps) {
+    half **snapshotPointers, int numSnaps) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
@@ -9108,17 +9361,22 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     float *scales = warp_k + 2;
     float *ba_values = scales + 2;
 
+    int batchIndex = blockIdx.z;
+    if (statePointers != nullptr) {
+        last_recurrent_state = statePointers[batchIndex];
+    }
     int stateHeadBase = head_idx * headKDim * headVDim;
     half *state_row = activeV ?
         last_recurrent_state + stateHeadBase + (size_t)v_col * headKDim :
         last_recurrent_state;
 
     for (int token = 0; token < seqLen; token++) {
-        int convBase = token * qkvDim;
+        int convBase = (batchIndex * seqLen + token) * qkvDim;
         int qOffset = convBase + qHead * headKDim;
         int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
         int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
-        int outBase = (token * numVHeads + head_idx) * headVDim;
+        int outBase = ((batchIndex * seqLen + token) * numVHeads + head_idx) *
+                      headVDim;
 
         if (tid < 64) {
             const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
@@ -9171,7 +9429,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
         }
 
         if (tid == 0) {
-            const half *baRow = ba + (size_t)token * (numVHeads * 2);
+            const half *baRow = ba +
+                (size_t)(batchIndex * seqLen + token) * (numVHeads * 2);
             float bRaw = __half2float(baRow[head_idx]);
             float aRaw = __half2float(baRow[numVHeads + head_idx]);
             float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
@@ -9194,7 +9453,9 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
 
             float sumQ = 0.0f;
             half *snapBase = nullptr;
-            if (token < numSnaps) {
+            if (token < numSnaps && snapshotPointers != nullptr) {
+                snapBase = snapshotPointers[batchIndex * numSnaps + token];
+            } else if (token < numSnaps) {
                 switch (token) {
                     case 0: snapBase = snap0; break;
                     case 1: snapBase = snap1; break;
@@ -9597,15 +9858,157 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         (const float*)normWeight.cudaData,
         (const float*)aLog.cudaData,
         (const float*)dtBias.cudaData,
-        (half*)last_recurrent_state.cudaData,
+        (half*)last_recurrent_state.cudaData, nullptr,
         (half*)core_attn_out.cudaData,
         seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], numTokenStates
+        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4],
+        nullptr, numTokenStates
     );
 
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16.", launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    const std::vector<fastllm::Data*> &lastRecurrentStates,
+    fastllm::Data &coreAttnOut,
+    const std::vector<fastllm::Data*> &tokenStates, int numTokenStates,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    if (lastRecurrentStates.empty() || lastRecurrentStates[0] == nullptr ||
+        numTokenStates < 0 ||
+        numTokenStates > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
+        tokenStates.size() !=
+            lastRecurrentStates.size() * (size_t)numTokenStates ||
+        coreAttnOut.isFake || coreAttnOut.cudaDataBorrowed ||
+        coreAttnOut.isPagedKVCache || coreAttnOut.multiDeviceData) {
+        return false;
+    }
+    std::set<const fastllm::Data*> tensors = {
+        &convOutput, &ba, &normWeight, &aLog, &dtBias, &coreAttnOut
+    };
+    if (tensors.size() != 6) {
+        return false;
+    }
+    fastllm::Data &first = *lastRecurrentStates[0];
+    int device = -1;
+    int batch = (int)lastRecurrentStates.size();
+    if (!FastllmCudaResolveDataDeviceId(first, device) ||
+        FastllmCudaGetDevice() != device ||
+        convOutput.dataType != fastllm::DataType::FLOAT16 ||
+        ba.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        first.dataType != fastllm::DataType::FLOAT16 ||
+        !first.isLinearAttentionTransposed ||
+        convOutput.dims.size() != 3 || convOutput.dims[0] != batch ||
+        ba.dims.size() != 3 || ba.dims[0] != batch ||
+        convOutput.dims[1] <= 1 ||
+        convOutput.dims[1] > FASTLLM_CUDA_MTP_FAST_SEQ_MAX ||
+        ba.dims[1] != convOutput.dims[1] ||
+        numTokenStates > convOutput.dims[1] ||
+        !FastllmCudaDataHasDenseStrides(convOutput) ||
+        !FastllmCudaDataHasDenseStrides(ba) ||
+        !FastllmCudaDataCanShareDevice(first, convOutput) ||
+        !FastllmCudaDataCanShareDevice(first, ba) ||
+        !FastllmCudaDataCanShareDevice(first, normWeight) ||
+        !FastllmCudaDataCanShareDevice(first, aLog) ||
+        !FastllmCudaDataCanShareDevice(first, dtBias) ||
+        numKHeads <= 0 || numVHeads <= 0 || headKDim != 128 ||
+        headVDim <= 0 || numVHeads % numKHeads != 0 ||
+        !std::isfinite(eps) || eps < 0.0f || !std::isfinite(qScale)) {
+        return false;
+    }
+    int seqLen = convOutput.dims[1];
+    int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    if (convOutput.dims[2] != qkvDim || ba.dims[2] != numVHeads * 2 ||
+        normWeight.dims != std::vector<int>({headKDim}) ||
+        aLog.dims != std::vector<int>({numVHeads}) ||
+        dtBias.dims != std::vector<int>({numVHeads}) ||
+        first.dims != std::vector<int>({1, numVHeads, headKDim, headVDim})) {
+        return false;
+    }
+
+    std::vector<void*> pointers;
+    pointers.reserve(batch * (1 + numTokenStates));
+    for (fastllm::Data *state : lastRecurrentStates) {
+        if (state == nullptr || state->dims != first.dims ||
+            state->dataType != first.dataType ||
+            !state->isLinearAttentionTransposed ||
+            !FastllmCudaDataHasDenseStrides(*state) ||
+            !FastllmCudaDataCanShareDevice(first, *state) ||
+            !tensors.insert(state).second) {
+            return false;
+        }
+        pointers.push_back(state->cudaData);
+    }
+    for (int b = 0; b < batch; b++) {
+        for (int token = 0; token < numTokenStates; token++) {
+            fastllm::Data *snapshot =
+                tokenStates[b * numTokenStates + token];
+            if (snapshot == nullptr || snapshot->isFake ||
+                snapshot->cudaDataBorrowed || snapshot->isPagedKVCache ||
+                snapshot->multiDeviceData ||
+                !tensors.insert(snapshot).second) {
+                return false;
+            }
+            snapshot->dataType = first.dataType;
+            snapshot->Resize(first.dims);
+            snapshot->ToDevice(fastllm::DataDevice::CUDA,
+                               std::vector<int>{device});
+            snapshot->Allocate();
+            snapshot->isLinearAttentionTransposed = true;
+            if (snapshot->cudaData == nullptr ||
+                !FastllmCudaDataHasDenseStrides(*snapshot) ||
+                !FastllmCudaDataCanShareDevice(first, *snapshot)) {
+                return false;
+            }
+            pointers.push_back(snapshot->cudaData);
+        }
+    }
+    void **devicePointers = FastllmCudaStageMtpPointers(pointers);
+
+    coreAttnOut.dataType = first.dataType;
+    coreAttnOut.Resize({batch, seqLen, numVHeads, headVDim});
+    coreAttnOut.ToDevice(fastllm::DataDevice::CUDA,
+                         std::vector<int>{device});
+    coreAttnOut.Allocate(false);
+    coreAttnOut.isKVCache = false;
+    coreAttnOut.isLinearAttention = false;
+    coreAttnOut.isLinearAttentionTransposed = false;
+    if (coreAttnOut.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(coreAttnOut) ||
+        !FastllmCudaDataCanShareDevice(first, coreAttnOut)) {
+        return false;
+    }
+    constexpr int tileV = 8;
+    int threads = tileV * 32;
+    size_t sharedBytes = (2 * (size_t)headKDim + 8) * sizeof(float);
+    dim3 grid(numVHeads, (headVDim + tileV - 1) / tileV, batch);
+    FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV>
+        <<<grid, threads, sharedBytes>>>(
+            (const half*)convOutput.cudaData,
+            (const half*)ba.cudaData,
+            (const float*)normWeight.cudaData,
+            (const float*)aLog.cudaData,
+            (const float*)dtBias.cudaData,
+            nullptr, (half**)devicePointers,
+            (half*)coreAttnOut.cudaData,
+            seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+            nullptr, nullptr, nullptr, nullptr, nullptr,
+            (half**)(devicePointers + batch), numTokenStates);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in batched sequence MTP recurrent kernel.",
+            launchState);
         return false;
     }
     return true;

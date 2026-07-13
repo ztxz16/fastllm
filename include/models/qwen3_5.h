@@ -320,6 +320,7 @@ namespace fastllm {
                                         const Data &mropePositionDelta,
                                         Data &adjustedPositionIds);
         bool HasMtpWeights() const;
+        bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
         bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
@@ -332,10 +333,31 @@ namespace fastllm {
                               const Data &positionIds, int sampleRow,
                               Data *sampledHiddenStates = nullptr,
                               bool cacheOnly = false);
+        std::vector<int> RunMtpGreedyDraftBatch(
+                              int device,
+                              const std::vector<int> &devices,
+                              const std::vector<MtpKvCache*> &caches,
+                              const std::vector<const Data*> &targetHiddenStates,
+                              const std::vector<std::vector<int> > &inputTokens,
+                              const std::vector<Data*> &positionIds,
+                              const std::vector<int> &sampleRows,
+                              std::vector<Data> *sampledHiddenStates = nullptr);
         void Qwen35MTPLoop();
         bool Qwen35MTPForward(
                 bool useGPUForward,
                 ResponseContext *context,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                std::vector <std::vector <int> > &acceptedTokens,
+                std::vector <std::vector <int> > &nextInputTokens,
+                std::vector <int> &keptInputLens);
+        bool Qwen35MTPBatchForward(
+                bool useGPUForward,
+                const std::vector <ResponseContext*> &contexts,
                 const Data &inputIds,
                 const std::vector <Data*> &attentionMask,
                 const std::vector <Data*> &positionIds,
