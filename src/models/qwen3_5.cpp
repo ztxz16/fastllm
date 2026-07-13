@@ -12187,7 +12187,6 @@ namespace fastllm {
         }
         std::vector<int> matchedDrafts(batch, 0);
         std::vector<int> commitLens(batch, 0);
-        std::vector<char> deferredFullAcceptBonus(batch, 0);
         for (int b = 0; b < batch; b++) {
             int proposalCount = seqLens[b] - 1;
             bool useTypicalAcceptance =
@@ -12204,16 +12203,12 @@ namespace fastllm {
                 matchedDrafts[b]++;
             }
             if (matchedDrafts[b] == proposalCount) {
-                // The final validation row only produces the speculative
-                // bonus token.  Its batched multi-token linear state is not
-                // decode-equivalent, while the state after every proposal is
-                // already available in a prefix snapshot.  Emit all accepted
-                // proposals and defer the bonus so the next step resumes from
-                // that verified prefix.  This also preserves stochastic
-                // acceptance because no accepted proposal is replaced by a
-                // newly sampled target token.
-                deferredFullAcceptBonus[b] = 1;
-                commitLens[b] = proposalCount;
+                // Every proposal was accepted, so the final target row is the
+                // speculative bonus token. The batched recurrent/conv kernels
+                // have already left the real target cache at this full prefix;
+                // commit it directly instead of discarding the bonus and
+                // paying for the same last proposal again on the next step.
+                commitLens[b] = seqLens[b];
             } else {
                 commitLens[b] = matchedDrafts[b] + 1;
             }
@@ -12349,8 +12344,7 @@ namespace fastllm {
         } else {
             // Without prefix snapshots, restore every request whose validated
             // suffix is longer than its committed prefix, then replay that
-            // prefix. Full acceptance also needs this after deferring the bonus
-            // token. The single-GPU scheduler is capped to the snapshot batch
+            // prefix. The single-GPU scheduler is capped to the snapshot batch
             // limit, so this remains a defensive path rather than the normal
             // large-batch decode path.
             for (int b = 0; b < batch; b++) {
@@ -12500,10 +12494,8 @@ namespace fastllm {
                 acceptedTokens[b].push_back((int)(
                     inputPtr[tokenOffset + pos + 1] + 1.0e-3f));
             }
-            if (!deferredFullAcceptBonus[b]) {
-                acceptedTokens[b].push_back(
-                    targetRet[tokenOffset + matchedDrafts[b]]);
-            }
+            acceptedTokens[b].push_back(
+                targetRet[tokenOffset + matchedDrafts[b]]);
         };
         {
             std::vector<Data> mtpPositionStorage(batch);
@@ -12524,8 +12516,7 @@ namespace fastllm {
                     mtpInputTokens[b].push_back(
                         (int)(inputPtr[tokenOffset + row] + 1e-3f));
                 }
-                lastTargetTokens[b] = deferredFullAcceptBonus[b] ?
-                    (int)(inputPtr[tokenOffset + commitLen] + 1.0e-3f) :
+                lastTargetTokens[b] =
                     targetRet[tokenOffset + commitLen - 1];
                 mtpInputTokens[b].push_back(lastTargetTokens[b]);
                 sampleRows[b] = commitLen - 1;
