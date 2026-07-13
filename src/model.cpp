@@ -1142,6 +1142,31 @@ namespace fastllm {
         return "";
     }
 
+    static DataType ResolveSafeTensorAutoDataType(const SafeTensors &safeTensors,
+                                                  const std::string &tensorName,
+                                                  DataType tensorDataType,
+                                                  DataType linearDataType,
+                                                  DataType originalDataType) {
+        bool useLinearDataType = tensorDataType == DataType::DATA_AUTO_LINEAR ||
+                                 tensorDataType == DataType::DATA_AUTO_CONV;
+        DataType requestedDataType = useLinearDataType ? linearDataType : tensorDataType;
+        if (requestedDataType == DataType::DATA_AUTO_SOURCE) {
+            auto tensorIt = safeTensors.itmeDict.find(tensorName);
+            if (tensorIt != safeTensors.itmeDict.end() && tensorIt->second.dtype == "F8_E4M3" &&
+                !FindSafeTensorScaleTensorName(safeTensors, tensorName).empty()) {
+                return DataType::FP8_E4M3;
+            }
+            return DataType::FLOAT16;
+        }
+        if (useLinearDataType) {
+            return linearDataType;
+        }
+        if (tensorDataType >= DataType::DATA_AUTO_NONE) {
+            return originalDataType;
+        }
+        return tensorDataType;
+    }
+
     static bool IsDiskMoeWeight(basellm *model, const std::string &weightName) {
         return model != nullptr &&
                model->moeLinears.find(weightName) != model->moeLinears.end() &&
@@ -1886,7 +1911,12 @@ namespace fastllm {
     static void ResolveExportDataTypeForTensor(const SafeTensorItem &tensor, bool isPackedFp4,
                                                DataType linearDataType, DataType oriDataType,
                                                DataType &dataType) {
-        if (dataType >= DATA_AUTO_NONE) {
+        if (linearDataType == DataType::DATA_AUTO_SOURCE) {
+            linearDataType = DataType::FLOAT16;
+        }
+        if (dataType == DataType::DATA_AUTO_SOURCE) {
+            dataType = DataType::FLOAT16;
+        } else if (dataType >= DATA_AUTO_NONE) {
             DataType autoType = dataType;
             dataType = IsExportLinearAutoDataType(autoType) ? linearDataType : oriDataType;
             if (isPackedFp4 && !IsExportLinearAutoDataType(autoType)) {
@@ -2622,7 +2652,9 @@ if (false) {
 
                 if (dataType >= DATA_AUTO_NONE) {
                     // AUTO类型
-                    dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
+                    dataType = ResolveSafeTensorAutoDataType(safeTensors, tensorName,
+                                                             dataType, linearDataType,
+                                                             oriDataType);
                     
                     // 如果原始权重不是FP8_E4M3格式，目前不做转换
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
@@ -2771,7 +2803,9 @@ if (false) {
                             }
                             if (dataType >= DATA_AUTO_NONE) {
                                 // AUTO类型
-                                dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
+                                dataType = ResolveSafeTensorAutoDataType(safeTensors, tensorName,
+                                                                         dataType, linearDataType,
+                                                                         oriDataType);
                             }
                             if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                                 dataType = DataType::FLOAT16;

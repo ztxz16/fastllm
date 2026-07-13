@@ -383,6 +383,7 @@ fastllm_lib.t2s_decode.restype = ctypes.POINTER(ctypes.c_int64)
 
 fastllm_data_type_dict = {
     "": 0,
+    "auto": 100003,
     "int2g": 11,
     "int4g": 9,
     "int4": 8,
