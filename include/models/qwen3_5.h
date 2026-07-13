@@ -127,6 +127,18 @@ namespace fastllm {
     protected:
         bool IsThreadTensorParallelEnabled() const;
 
+        std::vector <int> ForwardGPUWithHiddenStates(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits,
+                Data *precomputedHiddenStates);
+
         std::vector <int> ForwardV2ThreadTensorParallel(
                 int batch,
                 const Data &inputIds,

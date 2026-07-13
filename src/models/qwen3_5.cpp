@@ -8000,7 +8000,24 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
+        return ForwardGPUWithHiddenStates(
+            batch, inputIds, attentionMask, positionIds, seqLens,
+            pastKeyValues, generationConfigs, lastTokens, retLogits, nullptr);
+    }
+
+    std::vector <int> Qwen3_5Model::ForwardGPUWithHiddenStates(
+        int batch,
+        const Data &inputIds,
+        const std::vector <Data*> &attentionMask,
+        const std::vector <Data*> &positionIds,
+        const std::vector <int> &seqLens,
+        std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+        const std::vector <GenerationConfig> &generationConfigs,
+        const LastTokensManager &lastTokens,
+        std::vector <std::vector <float>*> *retLogits,
+        Data *precomputedHiddenStates) {
 #ifndef USE_CUDA
+        (void)precomputedHiddenStates;
         return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
 #else
@@ -8678,8 +8695,15 @@ namespace fastllm {
         mtpTargetProfileMark(mtpTargetProfileWeightPrepUs);
 
         Data cpuEmbeddingHiddenStates;
-        Data *precomputedHiddenStates = nullptr;
-        if (useCpuEmbedding) {
+        if (precomputedHiddenStates != nullptr) {
+            AssertInFastLLM(batch == 1 && precomputedHiddenStates->dims.size() == 3 &&
+                            precomputedHiddenStates->dims[0] == 1 &&
+                            precomputedHiddenStates->dims[1] == seqLens[0],
+                            "Qwen3.5 ForwardGPU precomputed hidden states shape mismatch.\n");
+            precomputedHiddenStates->ToDevice(DataDevice::CPU);
+            PrepareQwen35CpuEmbeddingHiddenStates(*precomputedHiddenStates, devices,
+                                                   threadTpWorkerGroup);
+        } else if (useCpuEmbedding) {
             Data cpuInputIds;
             cpuInputIds.CopyFrom(inputIds);
             Qwen35CpuEmbeddingDirect(cpuInputIds, weight[language_prefix + "embed_tokens.weight"],
@@ -17460,18 +17484,6 @@ namespace fastllm {
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         MergeMultimodalFeaturesIntoText(*mmTypeIt->second[0], imageEmbeds, videoEmbeds, hiddenStates);
 
-        Data &embedWeight = this->weight[language_prefix + "embed_tokens.weight"];
-        if (embedWeight.dataDevice != DataDevice::CPU) {
-            if (!embedWeight.dataDeviceIds.empty()) {
-                hiddenStates.ToDevice(embedWeight.dataDevice, embedWeight.dataDeviceIds);
-            } else {
-                hiddenStates.ToDevice(embedWeight.dataDevice);
-            }
-        }
-        if (hiddenStates.dataType != this->dataType) {
-            ToDataType(hiddenStates, this->dataType);
-        }
-
         Data mropePositionIds;
         mropePositionIds.CopyFrom(*mropeIt->second[0]);
         mropePositionIds.ToDevice(DataDevice::CPU);
@@ -17489,6 +17501,28 @@ namespace fastllm {
         std::vector <std::pair <Data*, Data*> > pagedPastKeyValues;
         for (int i = 0; i < pastKeyValues.size(); i++) {
             pagedPastKeyValues.push_back(std::make_pair(&pastKeyValues[i].first, &pastKeyValues[i].second));
+        }
+#ifdef USE_CUDA
+        if (IsThreadTensorParallelEnabled()) {
+            hiddenStates.ToDevice(DataDevice::CPU);
+            std::vector <Data*> positionIds = {&mropePositionIds};
+            return ForwardGPUWithHiddenStates(
+                1, inputIds, attentionMasks, positionIds, seqLens,
+                pagedPastKeyValues, generationConfigs, lastTokens,
+                retLogits, &hiddenStates);
+        }
+#endif
+
+        Data &embedWeight = this->weight[language_prefix + "embed_tokens.weight"];
+        if (embedWeight.dataDevice != DataDevice::CPU) {
+            if (!embedWeight.dataDeviceIds.empty()) {
+                hiddenStates.ToDevice(embedWeight.dataDevice, embedWeight.dataDeviceIds);
+            } else {
+                hiddenStates.ToDevice(embedWeight.dataDevice);
+            }
+        }
+        if (hiddenStates.dataType != this->dataType) {
+            ToDataType(hiddenStates, this->dataType);
         }
         return ForwardFromHiddenStates(1, inputIds, attentionMasks, mropePositionIds, seqLens,
                                        pagedPastKeyValues, generationConfigs, lastTokens,
