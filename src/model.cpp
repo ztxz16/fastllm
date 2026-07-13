@@ -696,6 +696,11 @@ namespace fastllm {
                         AssertInFastLLM(scale2->len == 1,
                                         "CreateBufferWithScale error: NVFP4 scale2 should be scalar.");
                         scale2Value = ((float*)scale2->buffer)[0];
+                        if (StringEndWith(scale2->tensorName, ".weight_global_scale")) {
+                            AssertInFastLLM(scale2Value != 0.0f,
+                                            "CreateBufferWithScale error: NVFP4 weight_global_scale should be non-zero.");
+                            scale2Value = 1.0f / scale2Value;
+                        }
                     }
 
                     size_t blockBytes = dstType == DataType::NVFP4_BLOCK_16 ? 8 + sizeof(float) : 9;
@@ -1084,6 +1089,22 @@ namespace fastllm {
             return it != safeTensors.itmeDict.end() &&
                    (it->second.dtype == "F8_E4M3" || IsPackedFP4StorageDType(it->second.dtype));
         };
+        if (StringEndWith(name, ".weight_scale")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_scale"));
+            return isQuantTensor(prefix + ".weight") || isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".weight_scale_2")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_scale_2"));
+            return isQuantTensor(prefix + ".weight") || isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".weight_global_scale")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_global_scale"));
+            return isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".input_global_scale")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".input_global_scale"));
+            return isQuantTensor(prefix + ".weight_packed");
+        }
         if (StringEndWith(name, "_scale_inv")) {
             return isQuantTensor(name.substr(0, name.size() - strlen("_scale_inv")));
         }
@@ -1095,12 +1116,6 @@ namespace fastllm {
         }
         if (StringEndWith(name, ".scale")) {
             return isQuantTensor(name.substr(0, name.size() - strlen(".scale")) + ".weight");
-        }
-        if (StringEndWith(name, ".weight_scale")) {
-            return isQuantTensor(name.substr(0, name.size() - strlen(".weight_scale")) + ".weight");
-        }
-        if (StringEndWith(name, ".weight_scale_2")) {
-            return isQuantTensor(name.substr(0, name.size() - strlen(".weight_scale_2")) + ".weight");
         }
         return false;
     }
@@ -1115,6 +1130,9 @@ namespace fastllm {
             std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight"));
             candidates.push_back(prefix + ".scale_inv");
             candidates.push_back(prefix + ".scale");
+            candidates.push_back(prefix + ".weight_scale");
+        } else if (StringEndWith(tensorName, ".weight_packed")) {
+            std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight_packed"));
             candidates.push_back(prefix + ".weight_scale");
         }
         for (auto &candidate : candidates) {
@@ -1133,6 +1151,9 @@ namespace fastllm {
         if (StringEndWith(tensorName, ".weight")) {
             std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight"));
             candidates.push_back(prefix + ".weight_scale_2");
+        } else if (StringEndWith(tensorName, ".weight_packed")) {
+            std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight_packed"));
+            candidates.push_back(prefix + ".weight_global_scale");
         }
         for (auto &candidate : candidates) {
             if (safeTensors.itmeDict.find(candidate) != safeTensors.itmeDict.end()) {

@@ -774,6 +774,8 @@ namespace fastllm {
             std::string realName = name;
             if (StringEndWith(name, ".qweight")) {
                 realName = name.substr(0, name.size() - 7) + "weight";
+            } else if (StringEndWith(name, ".weight_packed")) {
+                realName = name.substr(0, name.size() - strlen(".weight_packed")) + ".weight";
             }
             WeightType weightType = this->weight.GetWeightType(realName);
             DataType dataType = DataType::DATA_AUTO_NONE;
