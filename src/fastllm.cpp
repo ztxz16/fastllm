@@ -352,6 +352,10 @@ namespace fastllm {
         return cudaEmbedding || GetFastllmEnv().cudaGraph;
     }
 
+    bool GetCudaEmbeddingRequested() {
+        return cudaEmbedding;
+    }
+
     void SetCudaSlabMB(int mb) {
         cudaSlabMB = std::max(0, mb);
 #ifdef USE_CUDA

@@ -2369,7 +2369,9 @@ namespace fastllm {
 
         static int Qwen35PreCaptureMaxBatch(const Qwen3_5Model *model) {
             int maxGraphBatch = Qwen35MaxCudaGraphDecodeBatch();
-            (void)model;
+            if (model != nullptr && model->maxBatch > 0) {
+                maxGraphBatch = std::min(maxGraphBatch, model->maxBatch);
+            }
             return std::max(1, maxGraphBatch);
         }
 
@@ -8074,7 +8076,9 @@ namespace fastllm {
                 mtpTargetProfileMetaSyncUs, mtpTargetProfileSamplingUs,
                 totalUs);
         };
-        bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
+        // Decode graph accepts precomputed hidden states, so graph mode alone
+        // does not need to replicate the full embedding table on every GPU.
+        bool useCpuEmbedding = !GetCudaEmbeddingRequested() || GetLowMemMode();
         const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
 
         AssertInFastLLM((int)pastKeyValues.size() >= batch * block_cnt,
@@ -15704,7 +15708,7 @@ namespace fastllm {
                 it->second.ToDevice(DataDevice::CUDA, {device}, true);
             }
         };
-        if (includeSharedWeights && GetCudaEmbedding() && !GetLowMemMode()) {
+        if (includeSharedWeights && GetCudaEmbeddingRequested() && !GetLowMemMode()) {
             moveWeight(language_prefix + "embed_tokens.weight");
         }
         if (includeSharedWeights) {
@@ -16277,7 +16281,7 @@ namespace fastllm {
             }
         }
         bool useCudaEmbeddingForMtp =
-            GetCudaEmbedding() && !GetLowMemMode() &&
+            GetCudaEmbeddingRequested() && !GetLowMemMode() &&
             embedWeightForMtp->dataDevice == DataDevice::CUDA &&
             embedWeightForMtp->cudaData != nullptr &&
             !embedWeightForMtp->dataDeviceIds.empty() &&
