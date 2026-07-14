@@ -961,6 +961,169 @@ namespace {
         };
     }
 
+    struct RecurrentFromConvFp16BenchState {
+        std::string path;
+        int tileV = 8;
+        bool exactNorm = false;
+        int numKHeads = 8;
+        int numVHeads = 16;
+        int headKDim = 128;
+        int headVDim = 128;
+        float eps = 1.0e-6f;
+        float qScale = 1.0f / std::sqrt(128.0f);
+        fastllm::Data conv, ba, normWeight, aLog, dtBias;
+        fastllm::Data workState, workOutput;
+
+        static void PrepareFp16Tensor(fastllm::Data &data,
+                                      const std::vector<int> &dims,
+                                      float seed, float scale) {
+            data.CopyFrom(MakeTensor(dims, seed, scale));
+            fastllm::ToDataType(data, fastllm::DataType::FLOAT16);
+            data.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        void PrepareState(fastllm::Data &state) const {
+            PrepareFp16Tensor(state,
+                              {1, numVHeads, headKDim, headVDim},
+                              0.517f, 0.035f);
+            state.isLinearAttentionTransposed = true;
+        }
+
+        void RunOne(fastllm::Data &state, fastllm::Data &output,
+                    int selectedTileV, bool selectedExactNorm) {
+            if (!FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16WithConfig(
+                    conv, ba, normWeight, aLog, dtBias,
+                    state, output,
+                    numKHeads, numVHeads, headKDim, headVDim,
+                    eps, qScale, selectedTileV, selectedExactNorm)) {
+                throw std::runtime_error("configured recurrent kernel launch failed");
+            }
+        }
+
+        void Check() {
+            fastllm::Data legacyState, candidateState;
+            fastllm::Data legacyOutput, candidateOutput;
+            PrepareState(legacyState);
+            PrepareState(candidateState);
+            RunOne(legacyState, legacyOutput, 8, false);
+            RunOne(candidateState, candidateOutput, tileV, exactNorm);
+            ForceDeviceSync();
+            RmsNormFp16BenchState::ExpectExact(
+                legacyOutput, candidateOutput, "recurrent output");
+            RmsNormFp16BenchState::ExpectExact(
+                legacyState, candidateState, "recurrent state");
+        }
+
+        void Init(const OpTestParams &params) {
+#ifdef USE_CUDA
+            FastllmCudaSetDevice(0);
+            path = params.GetString("path");
+            tileV = params.GetInt("tile_v");
+            exactNorm = params.GetInt("exact_norm") != 0;
+            numKHeads = params.GetInt("k_heads");
+            numVHeads = params.GetInt("v_heads");
+            headVDim = params.GetInt("v_dim");
+            eps = params.GetFloat("eps");
+            headKDim = 128;
+            qScale = 1.0f / std::sqrt((float)headKDim);
+            int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
+
+            PrepareFp16Tensor(conv, {1, 1, qkvDim}, 0.271f, 0.08f);
+            PrepareFp16Tensor(ba, {1, 1, numVHeads * 2}, 0.913f, 0.10f);
+            normWeight.CopyFrom(MakeRampTensor({headKDim}, 0.85f));
+            normWeight.ToDevice(fastllm::DataDevice::CUDA);
+            aLog.CopyFrom(MakeTensor({numVHeads}, 0.419f, 0.15f));
+            aLog.ToDevice(fastllm::DataDevice::CUDA);
+            dtBias.CopyFrom(MakeTensor({numVHeads}, 0.731f, 0.10f));
+            dtBias.ToDevice(fastllm::DataDevice::CUDA);
+
+            Check();
+            PrepareState(workState);
+#else
+            (void)params;
+            throw std::runtime_error("recurrent_from_conv_fp16 benchmark requires USE_CUDA");
+#endif
+        }
+
+        void Run() {
+            if (path == "legacy") {
+                RunOne(workState, workOutput, 8, false);
+            } else if (path == "fast") {
+                RunOne(workState, workOutput, tileV, exactNorm);
+            } else {
+                throw std::runtime_error("path must be legacy or fast");
+            }
+        }
+    };
+
+    static BenchmarkResult BenchmarkRecurrentFromConvFp16Cuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<RecurrentFromConvFp16BenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto end = Clock::now();
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("recurrent_from_conv_fp16 benchmark requires USE_CUDA");
+#endif
+    }
+
+    static OpCase MakeRecurrentFromConvFp16Case() {
+        return {
+            "recurrent_from_conv_fp16",
+            "benchmark the exact Qwen3.5 recurrent-from-conv normalization path",
+            []() {
+                OpTestParams params;
+                params.Add("path", "fast", "legacy or fast");
+                params.Add("tile_v", "8", "value columns per CTA (currently 8)");
+                params.Add("exact_norm", "1", "use exact single-warp q/k norm");
+                params.Add("k_heads", "8", "local key heads");
+                params.Add("v_heads", "16", "local value heads");
+                params.Add("v_dim", "128", "value head dimension");
+                params.Add("eps", "1e-6", "RMSNorm epsilon");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkRecurrentFromConvFp16Cuda,
+            [](const OpTestParams &params) {
+                double stateElements = (double)params.GetInt("v_heads") * 128.0 *
+                                       params.GetInt("v_dim");
+                return stateElements * 4.0;
+            },
+            [](const OpTestParams &params) {
+                double stateElements = (double)params.GetInt("v_heads") * 128.0 *
+                                       params.GetInt("v_dim");
+                return stateElements * 8.0;
+            },
+            true
+        };
+    }
+
     static OpCase MakeLinearCase() {
         return {
             "linear",
@@ -2428,6 +2591,7 @@ namespace {
             MakeSwigluCase(),
             MakeAttentionCase(),
             MakeRmsNormFp16SpecializedCase(),
+            MakeRecurrentFromConvFp16Case(),
             MakeLinearFp8Block128Case(),
             MakeMergeMoeFp8Case(),
             MakeFusedMoeFp8Case(),

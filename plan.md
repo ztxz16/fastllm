@@ -137,20 +137,36 @@
   - 两组当前版合并均值为 `221.541 tokens/s`，相对旧版提升 `0.644%`，每 token 节省约 `0.029 ms`。
 - 验证：`bash install.sh`、`regressionOps`、专用算子正确性矩阵、Nsight microbenchmark 与真实 TP2 batch-1 CUDA Graph 服务均通过。
 
+## 阶段 6：Linear-attention recurrent kernel（已完成）
+
+### 完成结果（2026-07-14）
+
+- Graph 热路径复核：30 个 linear-attention 层在 batch 1 decode 中已经依次命中 slot Conv+SiLU、融合 recurrent-state 更新、RMSNorm+SiLU+mul 三个 kernel；不存在可继续删除的大块中间算子链。
+- 实现：针对 TP2 真实局部形状 `k_heads=8, v_heads=16, k_dim=v_dim=128`，用一个 warp 同时保留旧实现的两棵 q/k RMS reduction tree；复用首次加载的 q/k，令另一个线程并行计算 B/A gate，并把三次 block barrier 压缩为一次。
+- 数值语义：reduction 和最终相加顺序与 legacy 保持一致；没有缓存 `state * decay` 或改变 state update 的舍入位置，因为该原型会造成 1 ULP state 差异，已完整删除。
+- 默认路径：batch 1 且命中上述真实形状时直接选择新 kernel，不使用环境变量；其他 batch 和 shape 继续走 legacy specialization。
+- 最终 Nsight microbenchmark（5200 次，真实 TP2 局部形状）：
+  - legacy：`2540.1 ns`，中位数 `2528 ns`，标准差 `16.1 ns`；
+  - 单 warp 精确归一化：`2057.9 ns`，中位数 `2048 ns`，标准差 `16.3 ns`；
+  - 单 kernel 降低 `19.0%`，每层节省 `0.482 us`，30 层理论累计约 `14.47 us/token`，对应端到端上限约 `0.3%`。
+- 正确性：目标形状的 output 和原地更新 recurrent state 均与 legacy 逐 bit 一致；`regressionOps` 的 snapshot、paged-batch、NUMA MergeMOE 全部通过；真实模型所有 greedy 输出保持 hash `23f0b80085ccb381355cc49382e97730bef91844323d813b8fa8ac45f90ac83d`。
+- TP2 端到端交错测试：候选 A 为 `221.401 ± 0.114 tokens/s`，热稳态旧版 B2 为 `221.615 ± 0.461 tokens/s`，候选 C 为 `221.885 ± 0.336 tokens/s`；后续候选 C2 又因动态降频出现 `220.989 ± 1.349 tokens/s`。约 1–2% 的 DVFS 波动显著大于本优化约 0.3% 的理论上限，因此只判定为“无可检测回归、端到端收益未达到统计显著”，不把冷态轮次计为优化收益。
+- 验证：目标构建、算子逐 bit 校验、`regressionOps`、最终 Nsight A/B 和真实 TP2 batch-1 CUDA Graph 服务均通过。
+
 ## 后续优化与剩余空间
 
-当前匹配 A/B 吞吐约为 `221.5 tokens/s`（约 `4.513 ms/token`）。Router 链和 128 维 RMSNorm 已接近小 kernel 优化的收益上限；同时已经排除 batch-1 activation quant 融合和 2048 维 RMSNorm 改线程数这两个方向。后续收益会互相重叠，不能把各项上界直接相加：
+当前热稳态吞吐约为 `221–222 tokens/s`（约 `4.50–4.52 ms/token`）。Router 链、128 维 RMSNorm 和 recurrent q/k norm 已接近小 kernel 优化的收益上限；同时已经排除 batch-1 activation quant 融合、2048 维 RMSNorm 改线程数、recurrent state 寄存器缓存和扩大 `TILE_V` 这几个方向。后续收益会互相重叠，不能把各项上界直接相加：
 
 1. **继续压缩 linear-attention 的非 RMSNorm 短链**
-   - 重点转为 recurrent-state 更新、gate/decay 等逐元素中间读写，以及确认已有 slot/fused kernel 是否全部进入 graph 关键路径。
-   - 单项可见空间约 `0.03–0.07 ms/token`，约 `0.7–1.6%`；需要避免破坏 cache 原地更新和 graph replay 地址稳定性。
+   - 剩余重点是 slot Conv+SiLU 的加载/布局和三个已融合 kernel 之间的边界；recurrent 主体继续改 state 舍入或缓存会破坏逐 bit 语义。
+   - 单项可见空间下调到约 `0.01–0.03 ms/token`，约 `0.2–0.7%`；收益小，需要继续以独立 kernel A/B 筛选。
 2. **Graph/collective 调度优化**
    - 两次/层的 TP collective 已确认不是 129 us 的异常 AllReduce；空间主要来自隐藏规约尾延迟和缩短 token 间 graph 调度空隙，而不是重写 NCCL。
    - 单项可见空间约 `0.03–0.08 ms/token`，约 `0.7–1.8%`，正确性和调度风险高于算子融合。
 3. **更深层的持久化 graph 或 attention/MoE 重构**
    - 可能突破上述范围，但会改变跨 token 调度、缓存生命周期或分支资源占用，不能按普通 kernel patch 的风险等级交付。
 
-综合判断：剩余**较现实、可兑现**的空间约 `0.06–0.14 ms/token`，即再提升约 `1.3–3.2%`，稳定目标约 `225–229 tokens/s`。更深重构的激进目标仍可看 `235 tokens/s` 以上，但不应作为当前计划的稳定承诺。下一步优先核对 linear-attention 已有融合 kernel 的 graph 覆盖率；若关键路径已经充分融合，则转向 graph/collective 调度，不再继续堆叠低收益的 RMSNorm 原型。
+综合判断：剩余**较现实、可兑现**的空间约 `0.04–0.11 ms/token`，即再提升约 `0.9–2.5%`，稳定目标约 `224–227 tokens/s`。更深重构的激进目标仍可看 `235 tokens/s` 以上，但不应作为当前计划的稳定承诺。下一步先微测 slot Conv+SiLU 的向量化/单 warp 方案；若不能稳定节省至少约 `0.3 us/层`，则停止堆叠 linear-attention 小 kernel，转向 graph/collective 调度。
 
 ## 风险与回退原则
 
