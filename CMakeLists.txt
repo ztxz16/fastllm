@@ -143,6 +143,36 @@ string(REGEX REPLACE "^([0-9]+)\\.[0-9]+\\.[0-9]+$" "\\1" CXX_MAJOR_VERSION "${C
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2")
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mavx2 -mfma -mf16c")
+        set_source_files_properties(
+            "src/devices/cpu/avx512f.cpp"
+            PROPERTIES
+            COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl"
+        )
+        set_source_files_properties(
+            "src/devices/cpu/avx512vnni.cpp"
+            PROPERTIES
+            COMPILE_OPTIONS "-mavx512vnni;-mavx512f"
+        )
+        if (CXX_MAJOR_VERSION GREATER_EQUAL 10)
+            set_source_files_properties(
+                "src/devices/cpu/avx512bf16.cpp"
+                PROPERTIES
+                COMPILE_OPTIONS "-mavx512bf16;-mavx512f;-mavx512bw;-mavx512vl"
+            )
+        endif()
+        set(AMX_COMPILE_OPTIONS "-mavx512bf16;-mavx512f;-mavx512bw;-mavx512vl")
+        if (CXX_MAJOR_VERSION GREATER_EQUAL 11)
+            list(APPEND AMX_COMPILE_OPTIONS "-mamx-tile" "-mamx-bf16")
+            message(STATUS "AMX support enabled (clang >= 11)")
+        endif()
+        set_source_files_properties(
+            "src/devices/cpu/amx.cpp"
+            PROPERTIES
+            COMPILE_OPTIONS "${AMX_COMPILE_OPTIONS}"
+        )
+    endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     string(REPLACE "/Ob2" "/Ob1 /Gy" CMAKE_CXX_FLAGS_RELEASE ${CMAKE_CXX_FLAGS_RELEASE})
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8")

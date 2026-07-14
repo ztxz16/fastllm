@@ -96,6 +96,14 @@ namespace fastllm {
     public:
         using value_type = T;
         
+        alignedAllocator() = default;
+
+        template<typename U, std::size_t Align>
+        alignedAllocator(const alignedAllocator<U, Align> &) noexcept {}
+
+        template<typename U, std::size_t Align>
+        alignedAllocator(alignedAllocator<U, Align> &&) noexcept {}
+
         T* allocate(std::size_t n) {
             std::size_t size = n * sizeof(T);
             

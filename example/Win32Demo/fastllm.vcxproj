@@ -95,7 +95,7 @@
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>NOMINMAX;WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\blocks;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\disk;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\gguf;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
@@ -112,7 +112,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>NOMINMAX;WIN64;__AVX__;__AVX2__;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\blocks;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\disk;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\gguf;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
@@ -133,7 +133,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NOMINMAX;WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\blocks;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\disk;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\gguf;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
@@ -156,7 +156,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NOMINMAX;__AVX__;__AVX2__;WIN64;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\blocks;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\disk;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\gguf;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
@@ -171,11 +171,13 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\..\include\blocks\baseblock.h" />
     <ClInclude Include="..\..\include\device.h" />
     <ClInclude Include="..\..\include\devices\cpu\alivethreadpool.h" />
     <ClInclude Include="..\..\include\devices\cpu\computeutils.h" />
     <ClInclude Include="..\..\include\devices\cpu\cpudevice.h" />
     <ClInclude Include="..\..\include\devices\cpu\cputhreadpool.h" />
+    <ClInclude Include="..\..\include\devices\disk\diskdevice.h" />
     <ClInclude Include="..\..\include\executor.h" />
     <ClInclude Include="..\..\include\fastllm.h" />
     <ClInclude Include="..\..\include\graph.h" />
@@ -185,9 +187,13 @@
     <ClInclude Include="..\..\include\models\chatglm.h" />
     <ClInclude Include="..\..\include\models\cogvlm.h" />
     <ClInclude Include="..\..\include\models\deepseekv2.h" />
+    <ClInclude Include="..\..\include\models\deepseekv4.h" />
     <ClInclude Include="..\..\include\models\ernie4_5.h" />
     <ClInclude Include="..\..\include\models\factoryllm.h" />
+    <ClInclude Include="..\..\include\models\gemma4.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
+    <ClInclude Include="..\..\include\models\glm4_moe.h" />
+    <ClInclude Include="..\..\include\models\gpt_oss.h" />
     <ClInclude Include="..\..\include\models\graphllm.h" />
     <ClInclude Include="..\..\include\models\hunyuan.h" />
     <ClInclude Include="..\..\include\models\internlm2.h" />
@@ -195,26 +201,44 @@
     <ClInclude Include="..\..\include\models\minicpm.h" />
     <ClInclude Include="..\..\include\models\minicpm3.h" />
     <ClInclude Include="..\..\include\models\minimax.h" />
+    <ClInclude Include="..\..\include\models\minimax_m2.h" />
     <ClInclude Include="..\..\include\models\moe.h" />
     <ClInclude Include="..\..\include\models\moss.h" />
     <ClInclude Include="..\..\include\models\pangu_moe.h" />
     <ClInclude Include="..\..\include\models\phi3.h" />
     <ClInclude Include="..\..\include\models\qwen.h" />
+    <ClInclude Include="..\..\include\models\qwen2.h" />
     <ClInclude Include="..\..\include\models\qwen3.h" />
+    <ClInclude Include="..\..\include\models\qwen3_5.h" />
     <ClInclude Include="..\..\include\models\qwen3_moe.h" />
+    <ClInclude Include="..\..\include\models\qwen3_next.h" />
+    <ClInclude Include="..\..\include\models\step3p5.h" />
     <ClInclude Include="..\..\include\models\xlmroberta.h" />
     <ClInclude Include="..\..\include\template.h" />
     <ClInclude Include="..\..\include\utils\armMath.h" />
     <ClInclude Include="..\..\include\utils\utils.h" />
+    <ClInclude Include="..\..\third_party\gguf\gguf.h" />
     <ClInclude Include="..\..\third_party\json11\json11.hpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="..\..\src\blocks\attentionpagedblock.cpp" />
+    <ClCompile Include="..\..\src\blocks\embeddingblock.cpp" />
+    <ClCompile Include="..\..\src\blocks\linearaddblock.cpp" />
+    <ClCompile Include="..\..\src\blocks\linearswiglublock.cpp" />
+    <ClCompile Include="..\..\src\blocks\llmsamplingblock.cpp" />
+    <ClCompile Include="..\..\src\blocks\mergemoeblock.cpp" />
+    <ClCompile Include="..\..\src\blocks\mlpblock.cpp" />
     <ClCompile Include="..\..\src\device.cpp" />
+    <ClCompile Include="..\..\src\devices\cpu\amx.cpp" />
+    <ClCompile Include="..\..\src\devices\cpu\avx2.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\avx512bf16.cpp" />
+    <ClCompile Include="..\..\src\devices\cpu\avx512f.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\avx512vnni.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\cpudevice.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\cpudevicebatch.cpp" />
+    <ClCompile Include="..\..\src\devices\cpu\deepseekv4ops.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\linear.cpp" />
+    <ClCompile Include="..\..\src\devices\disk\diskdevice.cpp" />
     <ClCompile Include="..\..\src\executor.cpp" />
     <ClCompile Include="..\..\src\fastllm.cpp" />
     <ClCompile Include="..\..\src\graph.cpp" />
@@ -224,12 +248,15 @@
     <ClCompile Include="..\..\src\models\chatglm.cpp" />
     <ClCompile Include="..\..\src\models\cogvlm.cpp" />
     <ClCompile Include="..\..\src\models\deepseekv2.cpp" />
+    <ClCompile Include="..\..\src\models\deepseekv4.cpp" />
     <ClCompile Include="..\..\src\models\ernie4_5.cpp" />
+    <ClCompile Include="..\..\src\models\gemma4.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
+    <ClCompile Include="..\..\src\models\glm4_moe.cpp" />
+    <ClCompile Include="..\..\src\models\gpt_oss.cpp" />
     <ClCompile Include="..\..\src\models\graphllm.cpp" />
     <ClCompile Include="..\..\src\models\graph\fastllmjson.cpp" />
     <ClCompile Include="..\..\src\models\graph\gemma2.cpp" />
-    <ClCompile Include="..\..\src\models\graph\qwen2.cpp" />
     <ClCompile Include="..\..\src\models\graph\telechat.cpp" />
     <ClCompile Include="..\..\src\models\hunyuan.cpp" />
     <ClCompile Include="..\..\src\models\internlm2.cpp" />
@@ -237,16 +264,26 @@
     <ClCompile Include="..\..\src\models\minicpm.cpp" />
     <ClCompile Include="..\..\src\models\minicpm3.cpp" />
     <ClCompile Include="..\..\src\models\minimax.cpp" />
+    <ClCompile Include="..\..\src\models\minimax_m2.cpp" />
     <ClCompile Include="..\..\src\models\moe.cpp" />
     <ClCompile Include="..\..\src\models\moss.cpp" />
     <ClCompile Include="..\..\src\models\pangu_moe.cpp" />
     <ClCompile Include="..\..\src\models\phi3.cpp" />
     <ClCompile Include="..\..\src\models\qwen.cpp" />
+    <ClCompile Include="..\..\src\models\qwen2.cpp" />
     <ClCompile Include="..\..\src\models\qwen3.cpp" />
+    <ClCompile Include="..\..\src\models\qwen3_5.cpp" />
     <ClCompile Include="..\..\src\models\qwen3_moe.cpp" />
+    <ClCompile Include="..\..\src\models\qwen3_next.cpp" />
+    <ClCompile Include="..\..\src\models\step3p5.cpp" />
     <ClCompile Include="..\..\src\models\xlmroberta.cpp" />
     <ClCompile Include="..\..\src\template.cpp" />
     <ClCompile Include="..\..\src\tokenizer.cpp" />
+    <ClCompile Include="..\..\third_party\gguf\gguf-adapter.cpp" />
+    <ClCompile Include="..\..\third_party\gguf\ggml-dequantize.cpp" />
+    <ClCompile Include="..\..\third_party\gguf\ggml-iqk.cpp" />
+    <ClCompile Include="..\..\third_party\gguf\ggml-quant.cpp" />
+    <ClCompile Include="..\..\third_party\gguf\gguf.cpp" />
     <ClCompile Include="..\..\third_party\json11\json11.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

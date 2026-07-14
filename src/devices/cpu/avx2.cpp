@@ -235,8 +235,8 @@ namespace fastllm {
         size_t stride_c
     ) {
 #ifdef __AVX2__
-        constexpr int UNROLL = 4;  // 展开因子
-        constexpr int SIMD_WIDTH = 8;
+        const int UNROLL = 4;  // 展开因子
+        const int SIMD_WIDTH = 8;
         
         int nb = n / (SIMD_WIDTH * UNROLL);
         int remainder = n % (SIMD_WIDTH * UNROLL);
@@ -632,7 +632,7 @@ namespace fastllm {
 
 #ifdef __AVX2__
     void print_m256i_epi16_v2(const char* name, __m256i vec) {
-        int16_t values[16] __attribute__((aligned(32)));
+        alignas(32) int16_t values[16];
         _mm256_store_si256((__m256i*)values, vec);
         
         printf("%s: ", name);
@@ -664,7 +664,7 @@ namespace fastllm {
         printf("]\n");
     }
 
-    __attribute__((always_inline)) inline __m128i fp32_to_bf16_vec(__m256 float_vals) {
+    forceinline inline __m128i fp32_to_bf16_vec(__m256 float_vals) {
         __m256i shifted = _mm256_srli_epi32(_mm256_castps_si256(float_vals), 16);
         __m128i lo = _mm256_castsi256_si128(shifted);
         __m128i hi = _mm256_extracti128_si256(shifted, 1);
