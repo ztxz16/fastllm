@@ -88,6 +88,33 @@
 2. 在本地相加及 AllReduce 前 join，保持现有数值语义。
 3. 评估显存带宽竞争；预计可额外隐藏 0.1–0.25 ms/token，但只在阶段 1、2 稳定后实施。
 
+### 完成结果（2026-07-14）
+
+- 实现：在 graph capture 期间为每个 MoE 层插入 fork/shared-done/routed-begin/join 标记；capture 完成后重写依赖，将 shared expert 与 router/routed expert 变成两个分支，并在本地相加前 join。标记节点在 instantiate 前全部删除，replay 不增加额外 kernel。
+- 默认启用：Qwen3.5 CUDA Graph 捕获成功后直接执行依赖重写，不新增环境变量；非捕获路径没有 marker kernel，重写失败时禁用该 GPU 的 graph 并安全回退。
+- 拓扑验证：真实 batch-1 图识别到全部 40 个 MoE 层；Nsight API trace 记录到 160 个 marker node 被删除，并完成 81 组依赖添加。独立 CUDA Graph 自测验证双分支 join 的结果为 `11 + 31 = 42`。
+- 数值验证：五次 512-token greedy 输出均保持 hash `36f0db830cf5094626be1a992ff6af3e7af42a6930b340a6804442d253d68ba7`，与阶段 2 完全一致。
+- TP2 CUDA Graph 端到端：512-token 五次为 `215.592 / 216.379 / 216.590 / 215.994 / 216.088 tokens/s`，均值 `216.129 tokens/s`，标准差 `0.382 tokens/s`。
+- 收益：相对阶段 2 的 `204.291 tokens/s` 提升约 `5.79%`；每 token 延迟 `4.895 -> 4.627 ms`，节省约 `0.268 ms/token`，略高于原先预计上界。
+- 验证：`bash install.sh`、`regressionOps`、真实 TP2 的 batch 1/2/3/4 graph capture/replay 均通过。
+- Profile 说明：Nsight Systems 2025.6 的 `--cuda-graph-trace=node` 会干扰这类 capture 后依赖重写，实际触发进程崩溃；普通 API trace 可验证图已重写，但逐节点时间不用于吞吐结论。性能结论以无 profiler 的固定输出 A/B 为准。
+
+## 后续优化与剩余空间
+
+当前稳定基线为 `216.129 tokens/s`（`4.627 ms/token`）。后续收益会互相重叠，不能把各项上界直接相加；按优先级估计如下：
+
+1. **Router GEMV + fused softmax/top-k 继续融合，并微调 routed FP8 MoE kernel**
+   - 避免 router logits 的中间写回，减少 40 次/ token 的小 kernel 边界；继续针对 `hidden=2048, experts=256, topk=8` 调整 CTA/warp 映射。
+   - 预计节省 `0.08–0.15 ms/token`，约 `1.8–3.4%`。
+2. **RMSNorm/quant 与线性层入口融合，合并 linear-attention 的短 kernel 链**
+   - 重点是 40 层中重复的 RMSNorm、dtype/quant 转换和 30 个 linear-attention 层的逐元素读写。
+   - 预计再节省 `0.08–0.18 ms/token`，约 `1.8–4.1%`。
+3. **Graph/collective 调度优化**
+   - 两次/层的 TP collective 已确认不是 129 us 的异常 AllReduce；继续空间主要来自隐藏部分规约尾延迟和缩短 token 间 graph 调度空隙，而不是重新实现 NCCL。
+   - 预计节省 `0.05–0.12 ms/token`，约 `1.1–2.7%`，实现复杂度和正确性风险较高。
+
+综合判断：剩余**较现实、可兑现**的空间约 `0.18–0.37 ms/token`，即再提升约 `4–9%`，目标区间约 `225–235 tokens/s`；若重构持久化多 token graph 或更深度地融合 attention/MoE，激进上限约 `240 tokens/s`，但不应作为稳定交付承诺。下一步优先做第 1 项，并在实现前先建立 router+MoE 单层 microbenchmark。
+
 ## 风险与回退原则
 
 - correction bias 作用于 softmax 概率而非 raw logits，融合实现不得改变排序语义。

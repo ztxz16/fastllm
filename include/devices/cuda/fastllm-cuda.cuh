@@ -120,6 +120,17 @@ void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
 bool FastllmCudaGraphCaptureInvalidated();
 
+// Qwen3.5 MoE graph markers are emitted only while the per-thread stream is
+// being captured. After capture, the optimizer rewires the sequential region
+// into shared/routed expert branches and removes every marker node. It returns
+// the number of parallelized MoE layers, or -1 on an invalid graph/error.
+void FastllmCudaGraphMarkQwen35MoeFork(int layer);
+void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer);
+void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer);
+void FastllmCudaGraphMarkQwen35MoeJoin(int layer);
+int FastllmCudaGraphOptimizeQwen35Moe(void *graph);
+bool FastllmCudaGraphQwen35MoeSelfTest();
+
 // 线程级 CUDA 错误标志：showError 报错时置位；graph 捕获路径用于错误熔断。
 void FastllmCudaClearThreadError();
 void FastllmCudaSetThreadError();

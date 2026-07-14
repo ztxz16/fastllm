@@ -6423,6 +6423,7 @@ namespace fastllm {
                 if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
                     AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
                                     "Qwen3.5 CUDA graph requires merged shared expert gateup weight.\n");
+                    FastllmCudaGraphMarkQwen35MoeFork(i);
                     Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
                                           *requireLocal(weight[sharedGateupWeightName], sharedGateupWeightName),
                                           *requireLocal(GetThreadTensorParallelBias(sharedGateupWeightName + ".tp_bias"),
@@ -6446,8 +6447,12 @@ namespace fastllm {
                     // 共享专家输出不单独归约：延后与路由专家输出本地相加后一次 allReduce，
                     // 每个 MoE 层省一次集合通信（小 hidden 下 allReduce 为纯延迟型，TP 解码收益明显）。
                     sharedExpertPending = true;
+                    FastllmCudaGraphMarkQwen35MoeSharedDone(i);
                 }
 
+                if (sharedExpertPending) {
+                    FastllmCudaGraphMarkQwen35MoeRoutedBegin(i);
+                }
                 int localBatch = buf.attenInput.dims[0];
                 int localLen = buf.attenInput.dims[1];
                 buf.attenInput.Reshape({localBatch * localLen, buf.attenInput.dims[2]});
@@ -6501,6 +6506,7 @@ namespace fastllm {
                 }
                 buf.moeFinal.Reshape(buf.hiddenStates.dims);
                 if (sharedExpertPending) {
+                    FastllmCudaGraphMarkQwen35MoeJoin(i);
                     if (buf.sharedOutput.dataType != buf.moeFinal.dataType) {
                         Qwen3CudaToDataType(cudaRunner, buf.sharedOutput, buf.moeFinal.dataType);
                     }
@@ -6619,6 +6625,18 @@ namespace fastllm {
             if (capturedGraph != nullptr) {
                 FastllmCudaGraphDestroy(capturedGraph);
             }
+            Qwen35DestroyCudaGraph(state);
+            state.disabled = true;
+            runWithoutGraph();
+            return true;
+        }
+
+        int parallelMoeLayers = FastllmCudaGraphOptimizeQwen35Moe(capturedGraph);
+        if (parallelMoeLayers < 0) {
+            printf("Warning: Qwen3.5 CUDA graph MoE parallelization failed on gpu %d: %s. Disable graph for this GPU.\n",
+                   gpuId, FastllmCudaGraphLastError());
+            fflush(stdout);
+            FastllmCudaGraphDestroy(capturedGraph);
             Qwen35DestroyCudaGraph(state);
             state.disabled = true;
             runWithoutGraph();

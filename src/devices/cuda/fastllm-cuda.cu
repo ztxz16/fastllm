@@ -423,6 +423,338 @@ bool FastllmCudaGraphCaptureInvalidated() {
     return captureStatus == cudaStreamCaptureStatusInvalidated;
 }
 
+namespace {
+    __global__ void FastllmCudaQwen35MoeForkMarkerKernel(int layer) {
+        (void)layer;
+    }
+
+    __global__ void FastllmCudaQwen35MoeSharedDoneMarkerKernel(int layer) {
+        (void)layer;
+    }
+
+    __global__ void FastllmCudaQwen35MoeRoutedBeginMarkerKernel(int layer) {
+        (void)layer;
+    }
+
+    __global__ void FastllmCudaQwen35MoeJoinMarkerKernel(int layer) {
+        (void)layer;
+    }
+
+    static bool FastllmCudaGraphIsCapturingCurrentThread() {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        return cudaStreamIsCapturing(cudaStreamPerThread, &status) == cudaSuccess &&
+               status == cudaStreamCaptureStatusActive;
+    }
+
+    static bool FastllmCudaGraphGetAdjacentNodes(cudaGraphNode_t node, bool dependents,
+                                                 std::vector<cudaGraphNode_t> &result) {
+        size_t count = 0;
+        cudaError_t state;
+#if CUDART_VERSION >= 12030
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes(node, nullptr, nullptr, &count)
+            : cudaGraphNodeGetDependencies(node, nullptr, nullptr, &count);
+#else
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes(node, nullptr, &count)
+            : cudaGraphNodeGetDependencies(node, nullptr, &count);
+#endif
+        if (state != cudaSuccess) {
+            FastllmCudaGraphSetError(dependents ? "cudaGraphNodeGetDependentNodes(count)"
+                                                : "cudaGraphNodeGetDependencies(count)", state);
+            return false;
+        }
+        result.resize(count);
+        if (count == 0) {
+            return true;
+        }
+#if CUDART_VERSION >= 12030
+        std::vector<cudaGraphEdgeData> edgeData(count);
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes(node, result.data(), edgeData.data(), &count)
+            : cudaGraphNodeGetDependencies(node, result.data(), edgeData.data(), &count);
+#else
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes(node, result.data(), &count)
+            : cudaGraphNodeGetDependencies(node, result.data(), &count);
+#endif
+        if (state != cudaSuccess) {
+            FastllmCudaGraphSetError(dependents ? "cudaGraphNodeGetDependentNodes"
+                                                : "cudaGraphNodeGetDependencies", state);
+            return false;
+        }
+        result.resize(count);
+        return true;
+    }
+
+    static cudaError_t FastllmCudaGraphAddDefaultDependencies(
+            cudaGraph_t graph, const std::vector<cudaGraphNode_t> &from,
+            const std::vector<cudaGraphNode_t> &to) {
+        if (from.empty()) {
+            return cudaSuccess;
+        }
+#if CUDART_VERSION >= 12030
+        return cudaGraphAddDependencies(graph, from.data(), to.data(), nullptr, from.size());
+#else
+        return cudaGraphAddDependencies(graph, from.data(), to.data(), from.size());
+#endif
+    }
+
+    struct FastllmCudaQwen35MoeMarkerNodes {
+        cudaGraphNode_t fork = nullptr;
+        cudaGraphNode_t sharedDone = nullptr;
+        cudaGraphNode_t routedBegin = nullptr;
+        cudaGraphNode_t join = nullptr;
+    };
+}
+
+void FastllmCudaGraphMarkQwen35MoeFork(int layer) {
+    if (FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaQwen35MoeForkMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+    }
+}
+
+void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer) {
+    if (FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaQwen35MoeSharedDoneMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+    }
+}
+
+void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer) {
+    if (FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaQwen35MoeRoutedBeginMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+    }
+}
+
+void FastllmCudaGraphMarkQwen35MoeJoin(int layer) {
+    if (FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaQwen35MoeJoinMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+    }
+}
+
+int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
+    if (graph == nullptr) {
+        fastllmCudaGraphLastError = "Qwen3.5 MoE graph optimizer received a null graph";
+        return -1;
+    }
+    cudaGraph_t cudaGraph = (cudaGraph_t)graph;
+    size_t nodeCount = 0;
+    cudaError_t state = cudaGraphGetNodes(cudaGraph, nullptr, &nodeCount);
+    if (!FastllmCudaGraphSetError("cudaGraphGetNodes(count)", state)) {
+        return -1;
+    }
+    std::vector<cudaGraphNode_t> nodes(nodeCount);
+    state = cudaGraphGetNodes(cudaGraph, nodes.data(), &nodeCount);
+    if (!FastllmCudaGraphSetError("cudaGraphGetNodes", state)) {
+        return -1;
+    }
+    nodes.resize(nodeCount);
+
+    std::map<int, FastllmCudaQwen35MoeMarkerNodes> markers;
+    size_t markerCount = 0;
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        state = cudaGraphNodeGetType(node, &type);
+        if (!FastllmCudaGraphSetError("cudaGraphNodeGetType", state)) {
+            return -1;
+        }
+        if (type != cudaGraphNodeTypeKernel) {
+            continue;
+        }
+        cudaKernelNodeParams params = {};
+        state = cudaGraphKernelNodeGetParams(node, &params);
+        // NCCL and runtime-loaded module kernels can be captured into the same
+        // graph, but CUDA 13 does not always expose their function handles to
+        // cudaGraphKernelNodeGetParams.  They cannot be one of our statically
+        // linked marker kernels, so skip just those opaque nodes and clear the
+        // runtime's sticky error before inspecting the remaining graph.
+        if (state == cudaErrorInvalidDeviceFunction) {
+            cudaGetLastError();
+            continue;
+        }
+        if (!FastllmCudaGraphSetError("cudaGraphKernelNodeGetParams", state)) {
+            return -1;
+        }
+        cudaGraphNode_t FastllmCudaQwen35MoeMarkerNodes::*slot = nullptr;
+        if (params.func == (void*)FastllmCudaQwen35MoeForkMarkerKernel) {
+            slot = &FastllmCudaQwen35MoeMarkerNodes::fork;
+        } else if (params.func == (void*)FastllmCudaQwen35MoeSharedDoneMarkerKernel) {
+            slot = &FastllmCudaQwen35MoeMarkerNodes::sharedDone;
+        } else if (params.func == (void*)FastllmCudaQwen35MoeRoutedBeginMarkerKernel) {
+            slot = &FastllmCudaQwen35MoeMarkerNodes::routedBegin;
+        } else if (params.func == (void*)FastllmCudaQwen35MoeJoinMarkerKernel) {
+            slot = &FastllmCudaQwen35MoeMarkerNodes::join;
+        }
+        if (slot == nullptr) {
+            continue;
+        }
+        if (params.kernelParams == nullptr || params.kernelParams[0] == nullptr) {
+            fastllmCudaGraphLastError = "Qwen3.5 MoE graph marker has no layer argument";
+            return -1;
+        }
+        int layer = *(int*)params.kernelParams[0];
+        auto &layerMarkers = markers[layer];
+        if (layerMarkers.*slot != nullptr) {
+            fastllmCudaGraphLastError = "Qwen3.5 MoE graph contains duplicate markers for layer " +
+                                        std::to_string(layer);
+            return -1;
+        }
+        layerMarkers.*slot = node;
+        markerCount++;
+    }
+
+    if (markerCount == 0) {
+        fastllmCudaGraphLastError.clear();
+        return 0;
+    }
+    if (markerCount != markers.size() * 4) {
+        fastllmCudaGraphLastError = "Qwen3.5 MoE graph has an incomplete marker set";
+        return -1;
+    }
+
+    std::set<std::pair<cudaGraphNode_t, cudaGraphNode_t> > desiredEdges;
+    std::vector<cudaGraphNode_t> markerNodes;
+    markerNodes.reserve(markerCount);
+    for (auto &it : markers) {
+        auto &m = it.second;
+        if (m.fork == nullptr || m.sharedDone == nullptr ||
+            m.routedBegin == nullptr || m.join == nullptr) {
+            fastllmCudaGraphLastError = "Qwen3.5 MoE graph is missing a marker for layer " +
+                                        std::to_string(it.first);
+            return -1;
+        }
+        std::vector<cudaGraphNode_t> forkDependencies, sharedRoots;
+        std::vector<cudaGraphNode_t> sharedTails, routedRoots;
+        std::vector<cudaGraphNode_t> routedTails, joinRoots;
+        if (!FastllmCudaGraphGetAdjacentNodes(m.fork, false, forkDependencies) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.fork, true, sharedRoots) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.sharedDone, false, sharedTails) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.routedBegin, true, routedRoots) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.join, false, routedTails) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.join, true, joinRoots)) {
+            return -1;
+        }
+        if (forkDependencies.empty() || sharedRoots.empty() || sharedTails.empty() ||
+            routedRoots.empty() || routedTails.empty() || joinRoots.empty()) {
+            fastllmCudaGraphLastError = "Qwen3.5 MoE graph marker adjacency is empty for layer " +
+                                        std::to_string(it.first);
+            return -1;
+        }
+        for (cudaGraphNode_t dependency : forkDependencies) {
+            for (cudaGraphNode_t root : sharedRoots) {
+                desiredEdges.insert({dependency, root});
+            }
+            for (cudaGraphNode_t root : routedRoots) {
+                desiredEdges.insert({dependency, root});
+            }
+        }
+        for (cudaGraphNode_t tail : sharedTails) {
+            for (cudaGraphNode_t root : joinRoots) {
+                desiredEdges.insert({tail, root});
+            }
+        }
+        for (cudaGraphNode_t tail : routedTails) {
+            for (cudaGraphNode_t root : joinRoots) {
+                desiredEdges.insert({tail, root});
+            }
+        }
+        markerNodes.push_back(m.fork);
+        markerNodes.push_back(m.sharedDone);
+        markerNodes.push_back(m.routedBegin);
+        markerNodes.push_back(m.join);
+    }
+
+    std::vector<cudaGraphNode_t> from;
+    std::vector<cudaGraphNode_t> to;
+    from.reserve(desiredEdges.size());
+    to.reserve(desiredEdges.size());
+    for (auto &edge : desiredEdges) {
+        from.push_back(edge.first);
+        to.push_back(edge.second);
+    }
+    state = FastllmCudaGraphAddDefaultDependencies(cudaGraph, from, to);
+    if (!FastllmCudaGraphSetError("cudaGraphAddDependencies(Qwen3.5 MoE)", state)) {
+        return -1;
+    }
+    for (cudaGraphNode_t marker : markerNodes) {
+        state = cudaGraphDestroyNode(marker);
+        if (!FastllmCudaGraphSetError("cudaGraphDestroyNode(Qwen3.5 MoE marker)", state)) {
+            return -1;
+        }
+    }
+    fastllmCudaGraphLastError.clear();
+    return (int)markers.size();
+}
+
+namespace {
+    __global__ void FastllmCudaQwen35MoeSelfTestBranchKernel(int *output, int value) {
+        if (threadIdx.x == 0) {
+            *output = value;
+        }
+    }
+
+    __global__ void FastllmCudaQwen35MoeSelfTestJoinKernel(
+            const int *shared, const int *routed, int *output) {
+        if (threadIdx.x == 0) {
+            *output = *shared + *routed;
+        }
+    }
+}
+
+bool FastllmCudaGraphQwen35MoeSelfTest() {
+    int *shared = nullptr;
+    int *routed = nullptr;
+    int *output = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    auto cleanup = [&]() {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        if (shared != nullptr) cudaFree(shared);
+        if (routed != nullptr) cudaFree(routed);
+        if (output != nullptr) cudaFree(output);
+    };
+    if (cudaMalloc(&shared, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&routed, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&output, sizeof(int)) != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+    if (!FastllmCudaGraphBeginCapture()) {
+        cleanup();
+        return false;
+    }
+    cudaMemsetAsync(shared, 0, sizeof(int), cudaStreamPerThread);
+    cudaMemsetAsync(routed, 0, sizeof(int), cudaStreamPerThread);
+    cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
+    FastllmCudaGraphMarkQwen35MoeFork(0);
+    FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(shared, 11);
+    FastllmCudaGraphMarkQwen35MoeSharedDone(0);
+    FastllmCudaGraphMarkQwen35MoeRoutedBegin(0);
+    FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(routed, 31);
+    FastllmCudaGraphMarkQwen35MoeJoin(0);
+    FastllmCudaQwen35MoeSelfTestJoinKernel<<<1, 1, 0, cudaStreamPerThread>>>(
+        shared, routed, output);
+    void *capturedGraph = nullptr;
+    if (!FastllmCudaGraphEndCapture(&capturedGraph) || capturedGraph == nullptr) {
+        cleanup();
+        return false;
+    }
+    graph = (cudaGraph_t)capturedGraph;
+    if (FastllmCudaGraphOptimizeQwen35Moe(graph) != 1 ||
+        cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess ||
+        cudaGraphLaunch(exec, cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+    int result = 0;
+    bool ok = cudaMemcpy(&result, output, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess &&
+              result == 42;
+    cleanup();
+    return ok;
+}
+
 bool FastllmCudaGraphEndCapture(void **graph) {
     cudaGraph_t cudaGraph = nullptr;
     cudaError_t state = cudaStreamEndCapture(cudaStreamPerThread, &cudaGraph);
