@@ -2365,7 +2365,14 @@ namespace fastllm {
                                     continue;
                                 }
 */
-                                if (isPrompt && lenSum + it.second->currentTokens.size() + (currentActivate + 1) * 256 > maxTotalLens) {
+                                // The reserve is an admission-control heuristic.  It must not
+                                // reject the only pending request forever when the configured
+                                // token budget is smaller than the fixed 256-token reserve.
+                                // A lone request can still make progress and the decode path
+                                // below will stop it when no more KV space is available.
+                                if (isPrompt && currentActivate > 0 &&
+                                    lenSum + it.second->currentTokens.size() +
+                                        (currentActivate + 1) * 256 > maxTotalLens) {
                                     continue;
                                 }
 
