@@ -9,6 +9,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -51,18 +52,53 @@ static bool FastllmCudaW4A8PrepareActivationEnabled() {
     return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+static bool FastllmCudaW4A8PrepareOutputEnabled() {
+    const char *env = std::getenv("FASTLLM_CUDA_W4A8_PREPARE_OUTPUT");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 static bool FastllmCudaW4A8BasicShapeSupported(int m, int k) {
     return m > 0 && k > 0 && (m % 128) == 0 && (k % 128) == 0;
 }
+
+static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight, int m, int k);
 
 static bool FastllmCudaW4A8CanQuantizeActivation(const fastllm::Data &input,
                                                  int n,
                                                  int m) {
     return n > 0 &&
            m > 0 &&
-           input.cudaData != nullptr &&
            (input.dataType == fastllm::DataType::FLOAT16 ||
             input.dataType == fastllm::DataType::BFLOAT16);
+}
+
+static bool FastllmCudaW4A8LinearSemanticsSupported(const fastllm::Data &input,
+                                                    const fastllm::Data &weight,
+                                                    const fastllm::Data &bias,
+                                                    const fastllm::Data &output,
+                                                    int n,
+                                                    int m,
+                                                    int k) {
+    if (n <= 0 || m <= 0 || k <= 0 ||
+        input.dims.empty() ||
+        output.dims.empty() ||
+        input.dims.back() != m ||
+        output.dims.back() != k ||
+        input.Count(0) != n * m ||
+        output.Count(0) != n * k ||
+        output.dataType != input.dataType ||
+        !FastllmCudaW4A8CanQuantizeActivation(input, n, m) ||
+        !FastllmCudaW4A8BasicShapeSupported(m, k)) {
+        return false;
+    }
+
+    if (bias.dims.size() > 0 &&
+        (bias.dataType != fastllm::DataType::FLOAT32 ||
+         bias.cudaData == nullptr ||
+         bias.Count(0) != k)) {
+        return false;
+    }
+    return FastllmCudaW4A8CanUseInt4GroupSource(weight, m, k);
 }
 
 static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight, int m, int k) {
@@ -125,6 +161,33 @@ __device__ inline float FastllmCudaW4A8ToFloat(half v) {
 
 __device__ inline float FastllmCudaW4A8ToFloat(__nv_bfloat16 v) {
     return __bfloat162float(v);
+}
+
+template <typename T>
+__device__ inline T FastllmCudaW4A8FromFloat(float v);
+
+template <>
+__device__ inline half FastllmCudaW4A8FromFloat<half>(float v) {
+    return __float2half(v);
+}
+
+template <>
+__device__ inline __nv_bfloat16 FastllmCudaW4A8FromFloat<__nv_bfloat16>(float v) {
+    return __float2bfloat16(v);
+}
+
+template <typename T>
+__global__ void FastllmCudaW4A8AddFloatBiasKernel(T *output,
+                                                  const float *bias,
+                                                  int tokens,
+                                                  int outChannels) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)tokens * outChannels;
+    if (idx >= total) {
+        return;
+    }
+    int col = (int)(idx % outChannels);
+    output[idx] = FastllmCudaW4A8FromFloat<T>(FastllmCudaW4A8ToFloat(output[idx]) + bias[col]);
 }
 
 template <typename T>
@@ -201,10 +264,11 @@ static void FastllmCudaW4A8ReleaseActivationScratch(W4A8ActivationScratch &scrat
 }
 
 static bool FastllmCudaW4A8QuantizeActivation(const fastllm::Data &input,
+                                              const void *inputData,
                                               int n,
                                               int m,
                                               W4A8ActivationScratch &scratch) {
-    if (!FastllmCudaW4A8CanQuantizeActivation(input, n, m)) {
+    if (!FastllmCudaW4A8CanQuantizeActivation(input, n, m) || inputData == nullptr) {
         return false;
     }
 
@@ -223,16 +287,45 @@ static bool FastllmCudaW4A8QuantizeActivation(const fastllm::Data &input,
     dim3 grid(n);
     if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmCudaW4A8QuantizeActivationPerTokenKernel<<<grid, 256>>>(
-            (const half*)input.cudaData, scratch.fp8, scratch.tokenScales, n, m);
+            (const half*)inputData, scratch.fp8, scratch.tokenScales, n, m);
     } else {
         FastllmCudaW4A8QuantizeActivationPerTokenKernel<<<grid, 256>>>(
-            (const __nv_bfloat16*)input.cudaData, scratch.fp8, scratch.tokenScales, n, m);
+            (const __nv_bfloat16*)inputData, scratch.fp8, scratch.tokenScales, n, m);
     }
     if (cudaGetLastError() != cudaSuccess) {
         FastllmCudaW4A8ReleaseActivationScratch(scratch);
         return false;
     }
     return true;
+}
+
+static bool FastllmCudaW4A8ApplyFloatBias(const fastllm::Data &output,
+                                          void *outputData,
+                                          const fastllm::Data &bias,
+                                          int n,
+                                          int k) {
+    if (bias.dims.empty()) {
+        return true;
+    }
+    if (outputData == nullptr ||
+        bias.cudaData == nullptr ||
+        bias.dataType != fastllm::DataType::FLOAT32 ||
+        bias.Count(0) != k) {
+        return false;
+    }
+
+    int threads = 256;
+    int blocks = (int)std::min<size_t>(4096, ((size_t)n * k + threads - 1) / threads);
+    if (output.dataType == fastllm::DataType::FLOAT16) {
+        FastllmCudaW4A8AddFloatBiasKernel<<<blocks, threads>>>(
+            (half*)outputData, (const float*)bias.cudaData, n, k);
+    } else if (output.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmCudaW4A8AddFloatBiasKernel<<<blocks, threads>>>(
+            (__nv_bfloat16*)outputData, (const float*)bias.cudaData, n, k);
+    } else {
+        return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
 }
 
 static void FastllmCudaW4A8ReleasePackedWeightCache(fastllm::Data &weight) {
@@ -326,20 +419,55 @@ static bool FastllmCudaW4A8EnsurePackedWeightCache(fastllm::Data &weight,
 bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
                         const fastllm::Data &bias, fastllm::Data &output,
                         int n, int m, int k) {
-    (void)bias;
-    (void)output;
+    bool prepareCache = FastllmCudaW4A8PrepareCacheEnabled();
+    bool prepareActivation = FastllmCudaW4A8PrepareActivationEnabled();
+    bool prepareOutput = FastllmCudaW4A8PrepareOutputEnabled();
+    if (!prepareCache && !prepareActivation && !prepareOutput) {
+        return false;
+    }
+    if (!FastllmCudaW4A8LinearSemanticsSupported(input, weight, bias, output, n, m, k)) {
+        return false;
+    }
 
-    if (FastllmCudaW4A8PrepareCacheEnabled()) {
+    if (prepareCache) {
         (void)FastllmCudaW4A8EnsurePackedWeightCache(weight, m, k);
     }
-    if (FastllmCudaW4A8PrepareActivationEnabled()) {
-        W4A8ActivationScratch activation;
-        (void)FastllmCudaW4A8QuantizeActivation(input, n, m, activation);
-        FastllmCudaW4A8ReleaseActivationScratch(activation);
+
+    void *inputData = nullptr;
+    void *outputData = nullptr;
+    if (prepareActivation) {
+        inputData = FastllmCudaPrepareInput(input);
+        if (inputData == nullptr) {
+            return false;
+        }
+    }
+    if (prepareOutput) {
+        outputData = FastllmCudaPrepareOutput(output);
+        if (outputData == nullptr) {
+            if (inputData != nullptr) {
+                FastllmCudaFinishInput(input, inputData);
+            }
+            return false;
+        }
     }
 
-    // Stage 4 only prepares independent weight/activation intermediates. The
-    // actual W4A8 GEMM dispatch is wired in later stages after scale packing
-    // and output handling are available.
+    if (prepareActivation) {
+        W4A8ActivationScratch activation;
+        (void)FastllmCudaW4A8QuantizeActivation(input, inputData, n, m, activation);
+        FastllmCudaW4A8ReleaseActivationScratch(activation);
+    }
+    if (prepareActivation && outputData == nullptr) {
+        DeviceSync();
+    }
+    if (inputData != nullptr) {
+        FastllmCudaFinishInput(input, inputData);
+    }
+    if (outputData != nullptr) {
+        FastllmCudaFinishOutput(output, outputData);
+    }
+
+    // Stage 5 only prepares independent weight/activation/output semantics.
+    // The actual W4A8 GEMM dispatch is wired in later stages after scale
+    // packing and final kernel launch are available.
     return false;
 }
