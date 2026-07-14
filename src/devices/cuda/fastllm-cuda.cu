@@ -1949,6 +1949,43 @@ __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *out
     }
 }
 
+// The legacy hidden=128 launch uses two warps.  One physical warp can evaluate
+// both reductions independently and combine the two old warp sums in the exact
+// same final addition, avoiding block-wide shared-memory barriers.
+__global__ __launch_bounds__(32) void FastllmRMSNormHalf128ExactKernel(
+        const half *input, const float *weight, half *output, float eps) {
+    constexpr int CHANNELS = 128;
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    input += (size_t)row * CHANNELS;
+    output += (size_t)row * CHANNELS;
+    const half2 *input2 = reinterpret_cast<const half2 *>(input);
+
+    float2 value0 = __half22float2(input2[lane]);
+    float2 value1 = __half22float2(input2[lane + 32]);
+    float sum0 = value0.x * value0.x + value0.y * value0.y;
+    float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+        scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+    }
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+    float2 normalized0, normalized1;
+    normalized0.x = value0.x * scale * __ldg(weight + lane * 2);
+    normalized0.y = value0.y * scale * __ldg(weight + lane * 2 + 1);
+    normalized1.x = value1.x * scale * __ldg(weight + (lane + 32) * 2);
+    normalized1.y = value1.y * scale * __ldg(weight + (lane + 32) * 2 + 1);
+    output2[lane] = __float22half2_rn(normalized0);
+    output2[lane + 32] = __float22half2_rn(normalized1);
+}
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, __nv_bfloat16 *output, int outer, int channels, float eps) {
     int o = blockIdx.x;
@@ -4234,6 +4271,55 @@ bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
+static bool LaunchFastllmRMSNormFloat16(
+        const half *input, const float *weight, half *output,
+        int outer, int channels, float eps, int threadCount) {
+    if (channels == 128 && threadCount == 32) {
+        FastllmRMSNormHalf128ExactKernel<<<outer, 32>>>(
+            input, weight, output, eps);
+        return true;
+    }
+    if (threadCount != 0) {
+        return false;
+    }
+    if (channels < 512) {
+        FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
+            (half*)input, (float*)weight, output, outer, channels, eps);
+    } else if (channels < 4096) {
+        FastllmRMSNormKernelInner1<512><<<outer, 512>>>(
+            (half*)input, (float*)weight, output, outer, channels, eps);
+    } else {
+        FastllmRMSNormKernelInner1<1024><<<outer, 1024>>>(
+            (half*)input, (float*)weight, output, outer, channels, eps);
+    }
+    return true;
+}
+
+bool FastllmCudaRMSNormFloat16WithThreadCount(
+        const fastllm::Data &input, fastllm::Data &weight,
+        fastllm::Data &output, float eps, int threadCount) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        input.dims.empty() || input.dims != output.dims ||
+        input.strides.empty() || output.strides.empty() ||
+        input.strides.back() != 1 || output.strides.back() != 1 ||
+        weight.dims.size() != 1 || weight.dims[0] != input.dims.back() ||
+        input.cudaData == nullptr || output.cudaData == nullptr ||
+        weight.cudaData == nullptr) {
+        return false;
+    }
+    int axis = (int)input.dims.size() - 1;
+    int outer = input.Count(0) / input.Count(axis);
+    int channels = input.dims[axis];
+    return LaunchFastllmRMSNormFloat16(
+        (const half*)input.cudaData, (const float*)weight.cudaData,
+        (half*)output.cudaData, outer, channels, eps, threadCount);
+}
+
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareInput(output);
@@ -4258,16 +4344,9 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
                                                                  channels, eps);
         }
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        if (channels < 512) {
-            FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
-                                                             channels, eps);
-        } else if (channels < 4096) {
-            FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
-                                                               channels, eps);
-        } else {
-            FastllmRMSNormKernelInner1<1024> <<< outer, 1024 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
-                                                                 channels, eps);
-        }
+        LaunchFastllmRMSNormFloat16(
+            (half*)cudaInput, (float*)weight.cudaData, (half*)cudaOutput,
+            outer, channels, eps, channels == 128 ? 32 : 0);
     } else if (input.dataType == fastllm::DataType::BFLOAT16) {
         if (channels < 512) {
             FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
@@ -4385,8 +4464,94 @@ __global__ void FastllmRMSNormSiluMulHalfKernel(const half *input, const float *
     }
 }
 
-bool FastllmCudaRMSNormSiluMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
-                                      const fastllm::Data &gateInput, fastllm::Data &output, float eps) {
+// Apply the same exact two-reduction mapping to the fused recurrent gate path,
+// while keeping both input and gate values in registers for in-place safety.
+__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128ExactKernel(
+        const half *input, const float *weight, const half *gateInput,
+        half *output, float eps) {
+    constexpr int CHANNELS = 128;
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    input += (size_t)row * CHANNELS;
+    gateInput += (size_t)row * CHANNELS;
+    output += (size_t)row * CHANNELS;
+    const half2 *input2 = reinterpret_cast<const half2 *>(input);
+    const half2 *gate2 = reinterpret_cast<const half2 *>(gateInput);
+
+    float2 value0 = __half22float2(input2[lane]);
+    float2 value1 = __half22float2(input2[lane + 32]);
+    float sum0 = value0.x * value0.x + value0.y * value0.y;
+    float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+        scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+    }
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+
+    float2 inputValues[2] = {value0, value1};
+    half2 gateValues[2] = {gate2[lane], gate2[lane + 32]};
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+#pragma unroll
+    for (int part = 0; part < 2; part++) {
+        int index = lane + part * 32;
+        float2 value = inputValues[part];
+        half gate0In = __low2half(gateValues[part]);
+        half gate1In = __high2half(gateValues[part]);
+#ifdef CUDA_NO_TENSOR_CORE
+        float gate0Float = __half2float(gate0In);
+        float gate1Float = __half2float(gate1In);
+        half gate0 = __float2half(gate0Float / (1.0f + expf(-gate0Float)));
+        half gate1 = __float2half(gate1Float / (1.0f + expf(-gate1Float)));
+#else
+        half gate0 = __hdiv(gate0In, __hadd(__float2half(1.0f), hexp(-gate0In)));
+        half gate1 = __hdiv(gate1In, __hadd(__float2half(1.0f), hexp(-gate1In)));
+#endif
+        half rms0 = __float2half_rn(value.x * scale * __ldg(weight + index * 2));
+        half rms1 = __float2half_rn(value.y * scale * __ldg(weight + index * 2 + 1));
+#ifdef CUDA_NO_TENSOR_CORE
+        half out0 = __float2half(__half2float(rms0) * __half2float(gate0));
+        half out1 = __float2half(__half2float(rms1) * __half2float(gate1));
+#else
+        half out0 = __hmul(rms0, gate0);
+        half out1 = __hmul(rms1, gate1);
+#endif
+        output2[index] = __halves2half2(out0, out1);
+    }
+}
+
+static bool LaunchFastllmRMSNormSiluMulFloat16(
+        const half *input, const float *weight, const half *gateInput,
+        half *output, int outer, int channels, float eps, int threadCount) {
+    if (channels == 128 && threadCount == 32) {
+        FastllmRMSNormSiluMulHalf128ExactKernel<<<outer, 32>>>(
+            input, weight, gateInput, output, eps);
+        return true;
+    }
+    if (threadCount != 0) {
+        return false;
+    }
+    if (channels < 512) {
+        FastllmRMSNormSiluMulHalfKernel<64><<<outer, 64>>>(
+            input, weight, gateInput, output, channels, eps);
+    } else if (channels < 4096) {
+        FastllmRMSNormSiluMulHalfKernel<512><<<outer, 512>>>(
+            input, weight, gateInput, output, channels, eps);
+    } else {
+        FastllmRMSNormSiluMulHalfKernel<1024><<<outer, 1024>>>(
+            input, weight, gateInput, output, channels, eps);
+    }
+    return true;
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &gateInput, fastllm::Data &output,
+        float eps, int threadCount) {
     if (input.dataDevice != fastllm::DataDevice::CUDA || gateInput.dataDevice != fastllm::DataDevice::CUDA ||
         output.dataDevice != fastllm::DataDevice::CUDA || weight.dataDevice != fastllm::DataDevice::CUDA) {
         return false;
@@ -4409,15 +4574,21 @@ bool FastllmCudaRMSNormSiluMulFloat16(const fastllm::Data &input, fastllm::Data 
     const half *cudaGateInput = (const half *) gateInput.cudaData;
     half *cudaOutput = (half *) output.cudaData;
 
-    if (channels < 512) {
-        FastllmRMSNormSiluMulHalfKernel<64><<<outer, 64>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
-    } else if (channels < 4096) {
-        FastllmRMSNormSiluMulHalfKernel<512><<<outer, 512>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
-    } else {
-        FastllmRMSNormSiluMulHalfKernel<1024><<<outer, 1024>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
+    if (!LaunchFastllmRMSNormSiluMulFloat16(
+            cudaInput, cudaWeight, cudaGateInput, cudaOutput,
+            outer, channels, eps, threadCount)) {
+        return false;
     }
     checkCudaErrors("Error: CUDA error in FastllmCudaRMSNormSiluMulFloat16.", cudaGetLastError());
     return true;
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &gateInput, fastllm::Data &output, float eps) {
+    return FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
+        input, weight, gateInput, output, eps,
+        !input.dims.empty() && input.dims.back() == 128 ? 32 : 0);
 }
 
 template <int THREAD_PER_BLOCK>

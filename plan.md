@@ -118,20 +118,39 @@
 - 正确性：FP16/BF16/FP32、batch 1/4/4096、有/无 bias、norm 开/关、普通/并列 logits 共 72 组 index 和 score 均与旧路径逐 bit 一致；真实 512-token greedy 输出保持 hash `23f0b80085ccb381355cc49382e97730bef91844323d813b8fa8ac45f90ac83d`。
 - 验证：`bash install.sh`、`regressionOps`、算子 microbenchmark 及真实 TP2 batch-1 CUDA Graph 服务均通过。
 
+## 阶段 5：Linear-attention 小维度 RMSNorm（已完成）
+
+### 完成结果（2026-07-14）
+
+- Profile 结论：batch-1 原生 FP8 GEMV 直接读取 FP16 activation，没有独立 activation quant kernel，因此原计划中的 RMSNorm+quant 融合在这条真实路径上并不存在可融合边界。
+- `hidden=2048` RMSNorm 原型已否决：legacy 512-thread kernel 为 `1445.2 ns`，候选 256/128/64-thread 分别为 `1537.6 / 2463.3 / 4354.7 ns`；所有原型代码均已删除。
+- 实现：针对 linear-attention 的 `channels=128` FP16 RMSNorm 与融合 RMSNorm+SiLU+mul，使用单 warp 同时计算旧 64-thread kernel 的两个独立 warp reduction，再按旧次序合并两项；去掉 shared memory 和两次 block barrier，并复用已加载的 input。
+- 默认路径：目标 dtype/shape 自动选择 32-thread 专用 kernel，不新增环境变量；其他 dtype 和 shape 保持原实现。
+- 单 kernel 热态耗时（RTX 5090，`outer=16`）：
+  - RMSNorm：`1083.6 -> 659.1 ns`，降低 `39.2%`；
+  - RMSNorm+SiLU+mul：`1161.0 -> 673.4 ns`，降低 `42.0%`。
+- 正确性：两类 kernel、`outer=1/8/16/32/128`、`eps=1e-6/1e-5`，out-of-place 与 in-place 均与 legacy 输出逐 bit 一致；真实模型所有 512-token greedy 输出保持 hash `23f0b80085ccb381355cc49382e97730bef91844323d813b8fa8ac45f90ac83d`。
+- 独立 worktree、当前/旧版/当前的反向启动顺序 TP2 A/B：
+  - 当前版 A：`221.200 ± 0.222 tokens/s`；
+  - 阶段 4 旧版 B：`220.124 ± 0.264 tokens/s`；
+  - 当前版 C：`221.881 ± 0.416 tokens/s`；
+  - 两组当前版合并均值为 `221.541 tokens/s`，相对旧版提升 `0.644%`，每 token 节省约 `0.029 ms`。
+- 验证：`bash install.sh`、`regressionOps`、专用算子正确性矩阵、Nsight microbenchmark 与真实 TP2 batch-1 CUDA Graph 服务均通过。
+
 ## 后续优化与剩余空间
 
-当前匹配 A/B 基线约为 `220.5 tokens/s`（约 `4.535 ms/token`）。阶段 4 说明 Router 这条链已经接近“小 kernel 优化”的收益上限，下一步不再优先强行融合 Router GEMV 与 top-k；后续收益会互相重叠，不能把各项上界直接相加：
+当前匹配 A/B 吞吐约为 `221.5 tokens/s`（约 `4.513 ms/token`）。Router 链和 128 维 RMSNorm 已接近小 kernel 优化的收益上限；同时已经排除 batch-1 activation quant 融合和 2048 维 RMSNorm 改线程数这两个方向。后续收益会互相重叠，不能把各项上界直接相加：
 
-1. **RMSNorm/quant 与线性层入口融合，合并 linear-attention 的短 kernel 链**
-   - 重点是 40 层中重复的 RMSNorm、dtype/quant 转换，以及 30 个 linear-attention 层的逐元素中间读写。
-   - 单项可见空间约 `0.06–0.14 ms/token`，约 `1.3–3.2%`；需要先用 graph 拓扑确认哪些节点没有被现有分支并行隐藏。
+1. **继续压缩 linear-attention 的非 RMSNorm 短链**
+   - 重点转为 recurrent-state 更新、gate/decay 等逐元素中间读写，以及确认已有 slot/fused kernel 是否全部进入 graph 关键路径。
+   - 单项可见空间约 `0.03–0.07 ms/token`，约 `0.7–1.6%`；需要避免破坏 cache 原地更新和 graph replay 地址稳定性。
 2. **Graph/collective 调度优化**
    - 两次/层的 TP collective 已确认不是 129 us 的异常 AllReduce；空间主要来自隐藏规约尾延迟和缩短 token 间 graph 调度空隙，而不是重写 NCCL。
    - 单项可见空间约 `0.03–0.08 ms/token`，约 `0.7–1.8%`，正确性和调度风险高于算子融合。
 3. **更深层的持久化 graph 或 attention/MoE 重构**
    - 可能突破上述范围，但会改变跨 token 调度、缓存生命周期或分支资源占用，不能按普通 kernel patch 的风险等级交付。
 
-综合判断：剩余**较现实、可兑现**的空间约 `0.10–0.20 ms/token`，即再提升约 `2–5%`，稳定目标约 `225–231 tokens/s`。更深重构的激进目标仍可看 `235–240 tokens/s`，但不应作为当前计划的稳定承诺。下一步优先 profile RMSNorm/quant 和 linear-attention 短链，先确认真实 critical path 再选择融合边界。
+综合判断：剩余**较现实、可兑现**的空间约 `0.06–0.14 ms/token`，即再提升约 `1.3–3.2%`，稳定目标约 `225–229 tokens/s`。更深重构的激进目标仍可看 `235 tokens/s` 以上，但不应作为当前计划的稳定承诺。下一步优先核对 linear-attention 已有融合 kernel 的 graph 覆盖率；若关键路径已经充分融合，则转向 graph/collective 调度，不再继续堆叠低收益的 RMSNorm 原型。
 
 ## 风险与回退原则
 

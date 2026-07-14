@@ -792,6 +792,175 @@ namespace {
         };
     }
 
+    struct RmsNormFp16BenchState {
+        std::string kind;
+        std::string path;
+        int threads = 0;
+        float eps = 1.0e-6f;
+        fastllm::Data input, weight, gate;
+        fastllm::Data legacyOutput, fastOutput;
+
+        static void PrepareFp16Tensor(fastllm::Data &data, const std::vector<int> &dims, float seed) {
+            data.CopyFrom(MakeTensor(dims, seed, 0.25f));
+            fastllm::ToDataType(data, fastllm::DataType::FLOAT16);
+            data.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        static void PrepareOutput(fastllm::Data &data, const std::vector<int> &dims) {
+            data.dataType = fastllm::DataType::FLOAT16;
+            data.UpdateUnitSize();
+            data.Resize(dims);
+            data.Allocate(false);
+            data.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        void RunOne(const fastllm::Data &source, fastllm::Data &output, int threadCount) {
+            bool ok = false;
+            if (kind == "rmsnorm") {
+                ok = FastllmCudaRMSNormFloat16WithThreadCount(
+                    source, weight, output, eps, threadCount);
+            } else if (kind == "rmsnorm_silu_mul") {
+                ok = FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
+                    source, weight, gate, output, eps, threadCount);
+            } else {
+                throw std::runtime_error("kind must be rmsnorm or rmsnorm_silu_mul");
+            }
+            if (!ok) {
+                throw std::runtime_error("FP16 RMSNorm specialized launch failed");
+            }
+        }
+
+        static void ExpectExact(const fastllm::Data &expectedData,
+                                const fastllm::Data &actualData,
+                                const char *label) {
+            std::vector<float> expected = ToFloatVector(ConvertToFloat32Data(expectedData));
+            std::vector<float> actual = ToFloatVector(ConvertToFloat32Data(actualData));
+            if (expected == actual) {
+                return;
+            }
+            for (size_t i = 0; i < expected.size(); i++) {
+                if (expected[i] != actual[i]) {
+                    std::ostringstream os;
+                    os << label << " mismatch at " << i
+                       << ": expected=" << expected[i]
+                       << " actual=" << actual[i];
+                    throw std::runtime_error(os.str());
+                }
+            }
+        }
+
+        void Check(const std::vector<int> &dims) {
+            RunOne(input, legacyOutput, 0);
+            RunOne(input, fastOutput, threads);
+            ForceDeviceSync();
+            ExpectExact(legacyOutput, fastOutput, "out-of-place FP16 RMSNorm");
+
+            fastllm::Data legacyInplace, fastInplace;
+            PrepareFp16Tensor(legacyInplace, dims, 0.413f);
+            PrepareFp16Tensor(fastInplace, dims, 0.413f);
+            RunOne(legacyInplace, legacyInplace, 0);
+            RunOne(fastInplace, fastInplace, threads);
+            ForceDeviceSync();
+            ExpectExact(legacyInplace, fastInplace, "in-place FP16 RMSNorm");
+        }
+
+        void Init(const OpTestParams &params) {
+#ifdef USE_CUDA
+            FastllmCudaSetDevice(0);
+            kind = params.GetString("kind");
+            path = params.GetString("path");
+            threads = params.GetInt("threads");
+            eps = params.GetFloat("eps");
+            int outer = params.GetInt("outer");
+            int hidden = params.GetInt("hidden");
+            std::vector<int> dims = {outer, hidden};
+            PrepareFp16Tensor(input, dims, 0.413f);
+            PrepareFp16Tensor(gate, dims, 0.927f);
+            weight.CopyFrom(MakeRampTensor({hidden}, 0.731f));
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+            PrepareOutput(legacyOutput, dims);
+            PrepareOutput(fastOutput, dims);
+            Check(dims);
+#else
+            (void)params;
+            throw std::runtime_error("rmsnorm_fp16_specialized benchmark requires USE_CUDA");
+#endif
+        }
+
+        void Run() {
+            if (path == "legacy") {
+                RunOne(input, legacyOutput, 0);
+            } else if (path == "fast") {
+                RunOne(input, fastOutput, threads);
+            } else {
+                throw std::runtime_error("path must be legacy or fast");
+            }
+        }
+    };
+
+    static BenchmarkResult BenchmarkRmsNormFp16Cuda(
+            const OpTestParams &params, const std::string &device, int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<RmsNormFp16BenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto end = Clock::now();
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("rmsnorm_fp16_specialized benchmark requires USE_CUDA");
+#endif
+    }
+
+    static OpCase MakeRmsNormFp16SpecializedCase() {
+        return {
+            "rmsnorm_fp16_specialized",
+            "benchmark exact FP16 RMSNorm and RMSNorm+SiLU+mul specializations",
+            []() {
+                OpTestParams params;
+                params.Add("kind", "rmsnorm", "rmsnorm or rmsnorm_silu_mul");
+                params.Add("path", "fast", "legacy or fast");
+                params.Add("outer", "16", "number of rows");
+                params.Add("hidden", "128", "channels per row");
+                params.Add("threads", "32", "fast thread count");
+                params.Add("eps", "1e-6", "epsilon");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkRmsNormFp16Cuda,
+            [](const OpTestParams &params) {
+                int outer = params.GetInt("outer"), hidden = params.GetInt("hidden");
+                return (double)(outer * hidden * 2 * 2 + hidden * 4);
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("outer") * params.GetInt("hidden") * 6.0;
+            },
+            true
+        };
+    }
+
     static OpCase MakeLinearCase() {
         return {
             "linear",
@@ -2258,6 +2427,7 @@ namespace {
             MakeGeluNewCase(),
             MakeSwigluCase(),
             MakeAttentionCase(),
+            MakeRmsNormFp16SpecializedCase(),
             MakeLinearFp8Block128Case(),
             MakeMergeMoeFp8Case(),
             MakeFusedMoeFp8Case(),
