@@ -167,6 +167,86 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
     __syncthreads();
 }
 
+// Qwen3.5 batch-1 router specialization (1x2048 @ 256x2048).  One 64-thread
+// CTA computes one expert logit.  Each thread reproduces four lanes of the
+// legacy 256-thread kernel, including its compensated reduction order, then
+// replaces only the final five block barriers with the equivalent warp tree.
+// This keeps the FP16 router logits bit-identical while reducing synchronization
+// and scheduled-warps overhead on latency-bound GEMV shapes.
+__global__ __launch_bounds__(64) void FastllmGemvFp16Fp16Router2048x256Kernel(
+        const half *A, const half *B, half *C, const half *bias, bool addTo) {
+    constexpr int THREADS = 64;
+    constexpr int HIDDEN = 2048;
+    int tid = threadIdx.x;
+    int row = blockIdx.x;
+    const half *baseB = B + (size_t)row * HIDDEN;
+
+    int offset0 = tid * 8;
+    int offset1 = (tid + THREADS) * 8;
+    int offset2 = (tid + THREADS * 2) * 8;
+    int offset3 = (tid + THREADS * 3) * 8;
+    union_half8 a0, a1, a2, a3, b0, b1, b2, b3;
+    a0.in = *reinterpret_cast<const uint4 *>(A + offset0);
+    b0.in = *reinterpret_cast<const uint4 *>(baseB + offset0);
+    a1.in = *reinterpret_cast<const uint4 *>(A + offset1);
+    b1.in = *reinterpret_cast<const uint4 *>(baseB + offset1);
+    a2.in = *reinterpret_cast<const uint4 *>(A + offset2);
+    b2.in = *reinterpret_cast<const uint4 *>(baseB + offset2);
+    a3.in = *reinterpret_cast<const uint4 *>(A + offset3);
+    b3.in = *reinterpret_cast<const uint4 *>(baseB + offset3);
+
+    float part0 = 0.0f;
+    float part1 = 0.0f;
+    float part2 = 0.0f;
+    float part3 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        part0 += (float)a0.out[i] * (float)b0.out[i];
+        part1 += (float)a1.out[i] * (float)b1.out[i];
+        part2 += (float)a2.out[i] * (float)b2.out[i];
+        part3 += (float)a3.out[i] * (float)b3.out[i];
+    }
+
+    // Emulate legacy strides 128 and 64 before reducing the 64 live values.
+    float diff = 0.0f;
+    float other = part2 - diff;
+    float value0 = part0 + other;
+    diff = (value0 - part0) - other;
+    float diff1 = 0.0f;
+    other = part3 - diff1;
+    float value1 = part1 + other;
+    other = value1 - diff;
+    float value = value0 + other;
+    diff = (value - value0) - other;
+
+    __shared__ float sdata[THREADS];
+    sdata[tid] = value;
+    __syncthreads();
+
+    if (tid < 32) {
+        other = sdata[tid + 32] - diff;
+        float sumTmp = value + other;
+        diff = (sumTmp - value) - other;
+        value = sumTmp;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float laneOther = __shfl_down_sync(0xffffffffu, value, offset);
+            if (tid < offset) {
+                other = laneOther - diff;
+                sumTmp = value + other;
+                diff = (sumTmp - value) - other;
+                value = sumTmp;
+            }
+        }
+        if (tid == 0) {
+            if (bias != nullptr) {
+                value += (float)__ldg(bias + row);
+            }
+            C[row] = addTo ? (half)(value + (float)C[row]) : (half)value;
+        }
+    }
+}
+
 template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow(half *A, half *B, half *C, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
@@ -456,8 +536,14 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
     return true;
 }
 
-void LaunchFastllmGemmFp16Fp16(half *input, half *weight, half *output, half *bias, int n, int m, int k, bool addTo) {
-    if (n == 1) {
+void LaunchFastllmGemmFp16Fp16(half *input, half *weight, half *output, half *bias,
+                               int n, int m, int k, bool addTo,
+                               bool allowRouterSpecialization) {
+    if (allowRouterSpecialization && n == 1 && m == 2048 && k == 256 &&
+        bias == nullptr && !addTo) {
+        FastllmGemvFp16Fp16Router2048x256Kernel<<<k, 64>>>(
+            input, weight, output, bias, addTo);
+    } else if (n == 1) {
         FastllmGemvFp16Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
     } else if (n == 2) {
         FastllmGemvFp16Fp16Kernel2MultiRow<256, 2> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
@@ -498,7 +584,11 @@ void LaunchFastllmGemmFp16Fp16AddToNoBias(half *input, half *weight, half *outpu
     }
 }
 
-bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo) {
+bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                                 const fastllm::Data &input, fastllm::Data &weight,
+                                 const fastllm::Data &bias, fastllm::Data &output,
+                                 int n, int m, int k, bool addTo,
+                                 bool allowRouterSpecialization) {
     FastllmCudaFP16EnsureBiasOnDevice(weight, bias, k);
     FastllmCudaFP16EnsureBiasHalfOnDevice(weight, bias, k);
 
@@ -507,7 +597,8 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
     half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];
 
     if (n < 8) {
-        LaunchFastllmGemmFp16Fp16(cudaInput, (half*)weight.cudaData, cudaOutput, cudaBiasData, n, m, k, addTo);
+        LaunchFastllmGemmFp16Fp16(cudaInput, (half*)weight.cudaData, cudaOutput, cudaBiasData,
+                                  n, m, k, addTo, allowRouterSpecialization);
     } else {
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
@@ -562,6 +653,13 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
+}
+
+bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
+                                 const fastllm::Data &bias, fastllm::Data &output,
+                                 int n, int m, int k, bool addTo) {
+    return FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+        input, weight, bias, output, n, m, k, addTo, true);
 }
 
 bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k) {

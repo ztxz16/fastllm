@@ -5092,88 +5092,106 @@ __global__ void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
     int warp = tid >> 5;
     const T *tokenLogits = logits + (size_t)token * EXPERTS;
 
-    // Preserve the old 64-thread softmax reduction order. This minimizes the
-    // chance that correction-bias ranking changes at a close top-k boundary.
-    float localMax = NEG_INF;
-#pragma unroll
-    for (int part = 0; part < 4; part++) {
-        int expert = tid + part * THREADS;
-        localMax = fmaxf(localMax, FastllmRouterLogitToFloat(tokenLogits[expert]));
-    }
-    reduceData[tid] = localMax;
+    // Use all 256 threads for the expensive exponential while preserving the
+    // old 64-thread softmax reduction tree exactly.  Each of the first 64
+    // threads still combines experts tid + {0, 64, 128, 192} in the original
+    // order, so scores and close correction-bias boundaries remain unchanged.
+    probabilities[tid] = FastllmRouterLogitToFloat(tokenLogits[tid]);
     __syncthreads();
+
+    float localMax = NEG_INF;
+    if (tid < THREADS) {
 #pragma unroll
-    for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            reduceData[tid] = fmaxf(reduceData[tid], reduceData[tid + stride]);
+        for (int part = 0; part < 4; part++) {
+            int expert = tid + part * THREADS;
+            localMax = fmaxf(localMax, probabilities[expert]);
         }
-        __syncthreads();
+        reduceData[tid] = localMax;
     }
-    if (tid == 0) {
-        maxValue = reduceData[0];
+    __syncthreads();
+    if (warp == 0) {
+        float reducedMax = fmaxf(localMax, reduceData[lane + 32]);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffffu, reducedMax, offset);
+            if (lane < offset) {
+                reducedMax = fmaxf(reducedMax, other);
+            }
+        }
+        if (lane == 0) {
+            maxValue = reducedMax;
+        }
     }
+    __syncthreads();
+
+    probabilities[tid] = expf(probabilities[tid] - maxValue);
     __syncthreads();
 
     float localSum = 0.0f;
+    if (tid < THREADS) {
 #pragma unroll
-    for (int part = 0; part < 4; part++) {
-        int expert = tid + part * THREADS;
-        float value = expf(FastllmRouterLogitToFloat(tokenLogits[expert]) - maxValue);
-        probabilities[expert] = value;
-        localSum += value;
-    }
-    reduceData[tid] = localSum;
-    __syncthreads();
-#pragma unroll
-    for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            reduceData[tid] += reduceData[tid + stride];
+        for (int part = 0; part < 4; part++) {
+            localSum += probabilities[tid + part * THREADS];
         }
-        __syncthreads();
+        reduceData[tid] = localSum;
     }
-    if (tid == 0) {
-        sumValue = fabsf(reduceData[0]) < 1.0e-6f ? 1.0e-4f : reduceData[0];
+    __syncthreads();
+    if (warp == 0) {
+        float reducedSum = localSum + reduceData[lane + 32];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffffu, reducedSum, offset);
+            if (lane < offset) {
+                reducedSum += other;
+            }
+        }
+        if (lane == 0) {
+            sumValue = fabsf(reducedSum) < 1.0e-6f ? 1.0e-4f : reducedSum;
+        }
     }
+    __syncthreads();
+
+    probabilities[tid] /= sumValue;
     __syncthreads();
 
     FastllmRouterCandidate local[4];
+    if (tid < THREADS) {
 #pragma unroll
-    for (int part = 0; part < 4; part++) {
-        int expert = tid + part * THREADS;
-        float probability = probabilities[expert] / sumValue;
-        probabilities[expert] = probability;
-        local[part].key = probability + (hasBias ? bias[expert] : 0.0f);
-        local[part].id = expert;
-    }
+        for (int part = 0; part < 4; part++) {
+            int expert = tid + part * THREADS;
+            local[part].key = probabilities[expert] + (hasBias ? bias[expert] : 0.0f);
+            local[part].id = expert;
+        }
 
-    FastllmRouterCandidateCompareSwap(local[0], local[1]);
-    FastllmRouterCandidateCompareSwap(local[2], local[3]);
-    FastllmRouterCandidateCompareSwap(local[0], local[2]);
-    FastllmRouterCandidateCompareSwap(local[1], local[3]);
-    FastllmRouterCandidateCompareSwap(local[1], local[2]);
+        FastllmRouterCandidateCompareSwap(local[0], local[1]);
+        FastllmRouterCandidateCompareSwap(local[2], local[3]);
+        FastllmRouterCandidateCompareSwap(local[0], local[2]);
+        FastllmRouterCandidateCompareSwap(local[1], local[3]);
+        FastllmRouterCandidateCompareSwap(local[1], local[2]);
 
-    unsigned int warpMask = 0xffffffffu;
-    int cursor = 0;
+        unsigned int warpMask = 0xffffffffu;
+        int cursor = 0;
 #pragma unroll
-    for (int rank = 0; rank < CANDIDATES; rank++) {
-        FastllmRouterCandidate best = cursor < 4 ?
-            local[cursor] : FastllmRouterCandidate{NEG_INF, -1};
+        for (int rank = 0; rank < CANDIDATES; rank++) {
+            FastllmRouterCandidate best = cursor < 4 ?
+                local[cursor] : FastllmRouterCandidate{NEG_INF, -1};
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            FastllmRouterCandidate other;
-            other.key = __shfl_down_sync(warpMask, best.key, offset);
-            other.id = __shfl_down_sync(warpMask, best.id, offset);
-            if (lane + offset < 32 && FastllmRouterCandidateBetter(other, best)) {
-                best = other;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                FastllmRouterCandidate other;
+                other.key = __shfl_down_sync(warpMask, best.key, offset);
+                other.id = __shfl_down_sync(warpMask, best.id, offset);
+                if (lane + offset < 32 && FastllmRouterCandidateBetter(other, best)) {
+                    best = other;
+                }
             }
-        }
-        int winner = __shfl_sync(warpMask, best.id, 0);
-        if (lane == 0) {
-            warpTopKeys[warp][rank] = best.key;
-            warpTopIds[warp][rank] = best.id;
-        }
-        if (cursor < 4 && local[cursor].id == winner) {
-            cursor++;
+            int winner = __shfl_sync(warpMask, best.id, 0);
+            if (lane == 0) {
+                warpTopKeys[warp][rank] = best.key;
+                warpTopIds[warp][rank] = best.id;
+            }
+            if (cursor < 4 && local[cursor].id == winner) {
+                cursor++;
+            }
         }
     }
     __syncthreads();
@@ -5208,26 +5226,28 @@ __global__ void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
     __syncthreads();
 
     if (useLegacyMerge) {
-#pragma unroll
-        for (int rank = 0; rank < TOPK; rank++) {
-            selectKeys[tid][rank] = -1.0e100;
-            selectIds[tid][rank] = -1.0f;
-        }
-#pragma unroll
-        for (int part = 0; part < 4; part++) {
-            int expert = tid + part * THREADS;
-            float key = probabilities[expert] + (hasBias ? bias[expert] : 0.0f);
+        if (tid < THREADS) {
 #pragma unroll
             for (int rank = 0; rank < TOPK; rank++) {
-                if (key > selectKeys[tid][rank]) {
+                selectKeys[tid][rank] = -1.0e100;
+                selectIds[tid][rank] = -1.0f;
+            }
 #pragma unroll
-                    for (int shift = TOPK - 1; shift > rank; shift--) {
-                        selectKeys[tid][shift] = selectKeys[tid][shift - 1];
-                        selectIds[tid][shift] = selectIds[tid][shift - 1];
+            for (int part = 0; part < 4; part++) {
+                int expert = tid + part * THREADS;
+                float key = probabilities[expert] + (hasBias ? bias[expert] : 0.0f);
+#pragma unroll
+                for (int rank = 0; rank < TOPK; rank++) {
+                    if (key > selectKeys[tid][rank]) {
+#pragma unroll
+                        for (int shift = TOPK - 1; shift > rank; shift--) {
+                            selectKeys[tid][shift] = selectKeys[tid][shift - 1];
+                            selectIds[tid][shift] = selectIds[tid][shift - 1];
+                        }
+                        selectKeys[tid][rank] = key;
+                        selectIds[tid][rank] = (float)expert;
+                        break;
                     }
-                    selectKeys[tid][rank] = key;
-                    selectIds[tid][rank] = (float)expert;
-                    break;
                 }
             }
         }
@@ -5359,15 +5379,15 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
 
     int tokens = logits.Count(0) / 256;
     if (logits.dataType == fastllm::DataType::FLOAT16) {
-        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 64>>>(
+        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
             (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
             tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
     } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 64>>>(
+        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
             (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
             tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
     } else {
-        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 64>>>(
+        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
             (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
             tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
     }

@@ -1897,6 +1897,133 @@ namespace {
         };
     }
 
+    struct RouterLinearFp16BenchState {
+        std::string path;
+        fastllm::Data input, weight, bias;
+        fastllm::Data legacyOutput, fastOutput;
+
+        static void PrepareOutput(fastllm::Data &data) {
+            data.dataType = fastllm::DataType::FLOAT16;
+            data.UpdateUnitSize();
+            data.Resize({1, 256});
+            data.Allocate(false);
+            data.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        void RunOne(fastllm::Data &output, bool allowSpecialization) {
+            bool ok = FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                input, weight, bias, output, 1, 2048, 256, false,
+                allowSpecialization);
+            if (!ok) {
+                throw std::runtime_error("FP16 router GEMV launch failed");
+            }
+        }
+
+        void Check() {
+            RunOne(legacyOutput, false);
+            RunOne(fastOutput, true);
+            ForceDeviceSync();
+            std::vector<float> expected = ToFloatVector(ConvertToFloat32Data(legacyOutput));
+            std::vector<float> actual = ToFloatVector(ConvertToFloat32Data(fastOutput));
+            if (expected != actual) {
+                for (size_t i = 0; i < expected.size(); i++) {
+                    if (expected[i] != actual[i]) {
+                        std::ostringstream os;
+                        os << "FP16 router GEMV mismatch at " << i
+                           << ": expected=" << expected[i]
+                           << " actual=" << actual[i];
+                        throw std::runtime_error(os.str());
+                    }
+                }
+            }
+        }
+
+        void Init(const OpTestParams &params) {
+#ifdef USE_CUDA
+            FastllmCudaSetDevice(0);
+            path = params.GetString("path");
+            input.CopyFrom(MakeTensor({1, 2048}, 0.271f, 0.25f));
+            fastllm::ToDataType(input, fastllm::DataType::FLOAT16);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            weight.CopyFrom(MakeTensor({256, 2048}, 0.619f, 0.125f));
+            fastllm::ToDataType(weight, fastllm::DataType::FLOAT16);
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+            PrepareOutput(legacyOutput);
+            PrepareOutput(fastOutput);
+            Check();
+#else
+            (void)params;
+            throw std::runtime_error("router_linear_fp16 benchmark requires USE_CUDA");
+#endif
+        }
+
+        void Run() {
+            if (path == "fast") {
+                RunOne(fastOutput, true);
+            } else if (path == "legacy") {
+                RunOne(legacyOutput, false);
+            } else {
+                throw std::runtime_error("path must be legacy or fast");
+            }
+        }
+    };
+    static BenchmarkResult BenchmarkRouterLinearFp16Cuda(
+            const OpTestParams &params, const std::string &device, int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<RouterLinearFp16BenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto end = Clock::now();
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("router_linear_fp16 benchmark requires USE_CUDA");
+#endif
+    }
+
+    static OpCase MakeRouterLinearFp16Case() {
+        return {
+            "router_linear_fp16",
+            "benchmark and validate Qwen3.5 batch-1 FP16 router GEMV",
+            []() {
+                OpTestParams params;
+                params.Add("path", "fast", "legacy or fast");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkRouterLinearFp16Cuda,
+            [](const OpTestParams&) {
+                return (double)(2048 + 256 * 2048 + 256) * 2.0;
+            },
+            [](const OpTestParams&) {
+                return 2.0 * 2048.0 * 256.0;
+            },
+            true
+        };
+    }
+
     struct FusedRouterTopKBenchState {
         int batch = 1;
         bool withBias = true;
@@ -2134,6 +2261,7 @@ namespace {
             MakeLinearFp8Block128Case(),
             MakeMergeMoeFp8Case(),
             MakeFusedMoeFp8Case(),
+            MakeRouterLinearFp16Case(),
             MakeFusedRouterTopKCase()
         };
     }

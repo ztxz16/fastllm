@@ -99,21 +99,39 @@
 - 验证：`bash install.sh`、`regressionOps`、真实 TP2 的 batch 1/2/3/4 graph capture/replay 均通过。
 - Profile 说明：Nsight Systems 2025.6 的 `--cuda-graph-trace=node` 会干扰这类 capture 后依赖重写，实际触发进程崩溃；普通 API trace 可验证图已重写，但逐节点时间不用于吞吐结论。性能结论以无 profiler 的固定输出 A/B 为准。
 
+## 阶段 4：Router GEMV 与融合 Softmax/Top-K 微调（已完成）
+
+### 完成结果（2026-07-14）
+
+- Router GEMV：为真实 batch-1 形状 `1x2048 @ 256x2048` 增加 64-thread FP16 专用 kernel。每个线程复现旧 kernel 的四个 lane，并保持补偿求和次序，因此 256 个 FP16 logits 与旧路径逐 bit 一致；不满足形状、dtype、bias 或 `addTo` 条件时自动回退。
+- 融合 Softmax/Top-K：将 `256 experts/top8` kernel 从 64 线程调整到 256 线程，全部线程并行完成 logits 加载、`exp` 和归一化；前 64 线程仍保持原来的 reduction 和 top-k 归并次序，并保留并列键 legacy fallback。
+- 默认路径：两项优化在支持条件满足时直接启用，不新增环境变量；测试入口只用于显式比较 legacy 与专用 Router GEMV。
+- 单 kernel 热态耗时（RTX 5090，Nsight Systems）：
+  - Router GEMV：`1737.9 -> 1480.5 ns`，降低 `14.81%`；
+  - fused softmax/top-k：`4688.3 -> 4433.2 ns`，降低 `5.44%`；
+  - 合计每层节省约 `0.512 us`，40 层理论累计约 `20.5 us/token`。
+- 直接融合原型已否决：cooperative-grid 版本会阻断阶段 3 的 shared/routed 并行；无 cooperative 的 last-CTA atomic 版本虽支持 graph capture 且结果一致，但热态 `6184.7 ns`，慢于分离后的 `5913.8 ns`，因此原型代码全部删除。
+- 独立 worktree、相反启动顺序的两轮 TP2 A/B：
+  - 第一轮：阶段 3 `219.228`，当前 `220.344 tokens/s`，提升 `0.509%`；
+  - 反向顺序：阶段 3 `219.706`，当前 `220.590 tokens/s`，提升 `0.402%`；
+  - 两组匹配均值：`219.467 -> 220.467 tokens/s`，提升 `0.456%`，延迟节省约 `0.0207 ms/token`，与 kernel 累计值吻合。
+- 正确性：FP16/BF16/FP32、batch 1/4/4096、有/无 bias、norm 开/关、普通/并列 logits 共 72 组 index 和 score 均与旧路径逐 bit 一致；真实 512-token greedy 输出保持 hash `23f0b80085ccb381355cc49382e97730bef91844323d813b8fa8ac45f90ac83d`。
+- 验证：`bash install.sh`、`regressionOps`、算子 microbenchmark 及真实 TP2 batch-1 CUDA Graph 服务均通过。
+
 ## 后续优化与剩余空间
 
-当前稳定基线为 `216.129 tokens/s`（`4.627 ms/token`）。后续收益会互相重叠，不能把各项上界直接相加；按优先级估计如下：
+当前匹配 A/B 基线约为 `220.5 tokens/s`（约 `4.535 ms/token`）。阶段 4 说明 Router 这条链已经接近“小 kernel 优化”的收益上限，下一步不再优先强行融合 Router GEMV 与 top-k；后续收益会互相重叠，不能把各项上界直接相加：
 
-1. **Router GEMV + fused softmax/top-k 继续融合，并微调 routed FP8 MoE kernel**
-   - 避免 router logits 的中间写回，减少 40 次/ token 的小 kernel 边界；继续针对 `hidden=2048, experts=256, topk=8` 调整 CTA/warp 映射。
-   - 预计节省 `0.08–0.15 ms/token`，约 `1.8–3.4%`。
-2. **RMSNorm/quant 与线性层入口融合，合并 linear-attention 的短 kernel 链**
-   - 重点是 40 层中重复的 RMSNorm、dtype/quant 转换和 30 个 linear-attention 层的逐元素读写。
-   - 预计再节省 `0.08–0.18 ms/token`，约 `1.8–4.1%`。
-3. **Graph/collective 调度优化**
-   - 两次/层的 TP collective 已确认不是 129 us 的异常 AllReduce；继续空间主要来自隐藏部分规约尾延迟和缩短 token 间 graph 调度空隙，而不是重新实现 NCCL。
-   - 预计节省 `0.05–0.12 ms/token`，约 `1.1–2.7%`，实现复杂度和正确性风险较高。
+1. **RMSNorm/quant 与线性层入口融合，合并 linear-attention 的短 kernel 链**
+   - 重点是 40 层中重复的 RMSNorm、dtype/quant 转换，以及 30 个 linear-attention 层的逐元素中间读写。
+   - 单项可见空间约 `0.06–0.14 ms/token`，约 `1.3–3.2%`；需要先用 graph 拓扑确认哪些节点没有被现有分支并行隐藏。
+2. **Graph/collective 调度优化**
+   - 两次/层的 TP collective 已确认不是 129 us 的异常 AllReduce；空间主要来自隐藏规约尾延迟和缩短 token 间 graph 调度空隙，而不是重写 NCCL。
+   - 单项可见空间约 `0.03–0.08 ms/token`，约 `0.7–1.8%`，正确性和调度风险高于算子融合。
+3. **更深层的持久化 graph 或 attention/MoE 重构**
+   - 可能突破上述范围，但会改变跨 token 调度、缓存生命周期或分支资源占用，不能按普通 kernel patch 的风险等级交付。
 
-综合判断：剩余**较现实、可兑现**的空间约 `0.18–0.37 ms/token`，即再提升约 `4–9%`，目标区间约 `225–235 tokens/s`；若重构持久化多 token graph 或更深度地融合 attention/MoE，激进上限约 `240 tokens/s`，但不应作为稳定交付承诺。下一步优先做第 1 项，并在实现前先建立 router+MoE 单层 microbenchmark。
+综合判断：剩余**较现实、可兑现**的空间约 `0.10–0.20 ms/token`，即再提升约 `2–5%`，稳定目标约 `225–231 tokens/s`。更深重构的激进目标仍可看 `235–240 tokens/s`，但不应作为当前计划的稳定承诺。下一步优先 profile RMSNorm/quant 和 linear-attention 短链，先确认真实 critical path 再选择融合边界。
 
 ## 风险与回退原则
 
