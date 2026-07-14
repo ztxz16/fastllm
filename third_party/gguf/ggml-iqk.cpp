@@ -1904,6 +1904,62 @@ static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
     }
 }
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+static inline float q8_0_scale(const block_q8_0 &block) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)block.d)));
+}
+
+static inline void accumulate_q8_0_q8_0_vnni(const block_q8_0 &x,
+                                               __m256i qy, float dy,
+                                               __m256 &acc) {
+    const __m256i qx = _mm256_loadu_si256((const __m256i *)x.qs);
+    const __m256i ax = _mm256_abs_epi8(qx);
+    const __m256i sy = _mm256_sign_epi8(qy, qx);
+    const __m256i dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy);
+    const float scale = q8_0_scale(x) * dy;
+    acc = _mm256_fmadd_ps(_mm256_set1_ps(scale), _mm256_cvtepi32_ps(dot), acc);
+}
+
+static inline float horizontal_sum_q8_0(__m256 value) {
+    __m128 sum = _mm256_extractf128_ps(value, 1);
+    sum = _mm_add_ps(sum, _mm256_castps256_ps128(value));
+    sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+    sum = _mm_add_ss(sum, _mm_movehdup_ps(sum));
+    return _mm_cvtss_f32(sum);
+}
+#endif
+
+template <int nrc_y>
+static void mul_mat_q8_0_q8_0_fast(int n, const void * vx, size_t bx,
+                                    const DataInfo& info, int nrc_x) {
+    const int blocks = n / QK8_0;
+    assert(n % QK8_0 == 0);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        const auto * x = (const block_q8_0 *)((const char *)vx + ix * bx);
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            const auto * y = (const block_q8_0 *)info.src1_row(iy);
+            __m256 acc0 = _mm256_setzero_ps();
+            for (int ib = 0; ib < blocks; ++ib) {
+                const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+                accumulate_q8_0_q8_0_vnni(x[ib], qy, q8_0_scale(y[ib]), acc0);
+            }
+            info.store(ix, iy, horizontal_sum_q8_0(acc0));
+        }
+    }
+#else
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        const void * x = (const char *)vx + ix * bx;
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            float result = 0.0f;
+            ggml_vec_dot_q8_0_q8_0(n, &result, 0, x, 0,
+                                    info.src1_row(iy), 0, 1);
+            info.store(ix, iy, result);
+        }
+    }
+#endif
+}
+
 static void mul_mat_empty(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     return;
 }
@@ -1920,7 +1976,9 @@ static void mul_mat_empty(int n, const void * vx, size_t bx, const DataInfo& inf
     return nullptr;
 
 mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
-    if (type == GGML_TYPE_IQ2_XXS_R4) {
+    if (type == GGML_TYPE_Q8_0) {
+        RETURN_MATMUL_FUNCTION(mul_mat_q8_0_q8_0_fast, nrc_y)
+    } else if (type == GGML_TYPE_IQ2_XXS_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xxs_r4_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ2_XS_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xs_r4_q8_k, nrc_y)
