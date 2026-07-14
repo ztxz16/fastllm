@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <unordered_map>
@@ -57,11 +58,56 @@ static bool FastllmCudaW4A8PrepareOutputEnabled() {
     return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+static bool FastllmCudaW4A8ValidateEnabled() {
+    const char *env = std::getenv("FASTLLM_CUDA_W4A8_VALIDATE");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static bool FastllmCudaW4A8TraceEnabled() {
+    const char *env = std::getenv("FASTLLM_CUDA_W4A8_TRACE");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static bool FastllmCudaW4A8RuntimeArchSupported(int arch) {
+    return arch >= 900 && arch < 1000;
+}
+
+static void FastllmCudaW4A8TraceSkip(const char *reason,
+                                     int n,
+                                     int m,
+                                     int k,
+                                     int arch,
+                                     const fastllm::Data &input,
+                                     const fastllm::Data &weight,
+                                     const fastllm::Data &bias,
+                                     const fastllm::Data &output) {
+    if (!FastllmCudaW4A8TraceEnabled() && !FastllmCudaW4A8ValidateEnabled()) {
+        return;
+    }
+    printf("[FastLLM][W4A8] skip: %s n=%d m=%d k=%d arch=%d input=%d weight=%d bias=%d output=%d\n",
+           reason, n, m, k, arch, (int)input.dataType, (int)weight.dataType,
+           (int)bias.dataType, (int)output.dataType);
+}
+
+static void FastllmCudaW4A8TraceReady(const char *stage,
+                                      int n,
+                                      int m,
+                                      int k,
+                                      int arch) {
+    if (!FastllmCudaW4A8TraceEnabled() && !FastllmCudaW4A8ValidateEnabled()) {
+        return;
+    }
+    printf("[FastLLM][W4A8] %s ready: n=%d m=%d k=%d arch=%d\n", stage, n, m, k, arch);
+}
+
 static bool FastllmCudaW4A8BasicShapeSupported(int m, int k) {
     return m > 0 && k > 0 && (m % 128) == 0 && (k % 128) == 0;
 }
 
-static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight, int m, int k);
+static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight,
+                                                 int m,
+                                                 int k,
+                                                 const char **reason = nullptr);
 
 static bool FastllmCudaW4A8CanQuantizeActivation(const fastllm::Data &input,
                                                  int n,
@@ -78,17 +124,48 @@ static bool FastllmCudaW4A8LinearSemanticsSupported(const fastllm::Data &input,
                                                     const fastllm::Data &output,
                                                     int n,
                                                     int m,
-                                                    int k) {
-    if (n <= 0 || m <= 0 || k <= 0 ||
-        input.dims.empty() ||
-        output.dims.empty() ||
-        input.dims.back() != m ||
-        output.dims.back() != k ||
-        input.Count(0) != n * m ||
-        output.Count(0) != n * k ||
-        output.dataType != input.dataType ||
-        !FastllmCudaW4A8CanQuantizeActivation(input, n, m) ||
-        !FastllmCudaW4A8BasicShapeSupported(m, k)) {
+                                                    int k,
+                                                    const char **reason = nullptr) {
+    if (n <= 0 || m <= 0 || k <= 0) {
+        if (reason != nullptr) {
+            *reason = "invalid n/m/k";
+        }
+        return false;
+    }
+    if (input.dims.empty() || output.dims.empty()) {
+        if (reason != nullptr) {
+            *reason = "empty input/output dims";
+        }
+        return false;
+    }
+    if (input.dims.back() != m || output.dims.back() != k) {
+        if (reason != nullptr) {
+            *reason = "linear dimension mismatch";
+        }
+        return false;
+    }
+    if (input.Count(0) != n * m || output.Count(0) != n * k) {
+        if (reason != nullptr) {
+            *reason = "flattened shape mismatch";
+        }
+        return false;
+    }
+    if (output.dataType != input.dataType) {
+        if (reason != nullptr) {
+            *reason = "output dtype mismatch";
+        }
+        return false;
+    }
+    if (!FastllmCudaW4A8CanQuantizeActivation(input, n, m)) {
+        if (reason != nullptr) {
+            *reason = "input dtype is not fp16/bf16";
+        }
+        return false;
+    }
+    if (!FastllmCudaW4A8BasicShapeSupported(m, k)) {
+        if (reason != nullptr) {
+            *reason = "m/k is not 128-aligned";
+        }
         return false;
     }
 
@@ -96,22 +173,53 @@ static bool FastllmCudaW4A8LinearSemanticsSupported(const fastllm::Data &input,
         (bias.dataType != fastllm::DataType::FLOAT32 ||
          bias.cudaData == nullptr ||
          bias.Count(0) != k)) {
+        if (reason != nullptr) {
+            *reason = "bias is not float32[k]";
+        }
         return false;
     }
-    return FastllmCudaW4A8CanUseInt4GroupSource(weight, m, k);
+    return FastllmCudaW4A8CanUseInt4GroupSource(weight, m, k, reason);
 }
 
-static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight, int m, int k) {
-    if (weight.dataType != fastllm::DataType::INT4_GROUP ||
-        weight.cudaData == nullptr ||
-        weight.dims.size() != 2 ||
-        weight.dims[0] != k ||
-        weight.dims[1] != m ||
-        weight.groupCnt != 128 ||
-        weight.group != m / 128 ||
-        weight.scales.size() != (size_t)k * weight.group ||
-        weight.mins.size() != (size_t)k * weight.group ||
-        !FastllmCudaW4A8BasicShapeSupported(m, k)) {
+static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight,
+                                                 int m,
+                                                 int k,
+                                                 const char **reason) {
+    if (weight.dataType != fastllm::DataType::INT4_GROUP) {
+        if (reason != nullptr) {
+            *reason = "weight dtype is not INT4_GROUP";
+        }
+        return false;
+    }
+    if (weight.cudaData == nullptr) {
+        if (reason != nullptr) {
+            *reason = "weight cudaData is null";
+        }
+        return false;
+    }
+    if (weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m) {
+        if (reason != nullptr) {
+            *reason = "weight shape is not [k, m]";
+        }
+        return false;
+    }
+    if (weight.groupCnt != 128 || weight.group != m / 128) {
+        if (reason != nullptr) {
+            *reason = "weight group is not 128";
+        }
+        return false;
+    }
+    if (weight.scales.size() != (size_t)k * weight.group ||
+        weight.mins.size() != (size_t)k * weight.group) {
+        if (reason != nullptr) {
+            *reason = "weight scale/min shape mismatch";
+        }
+        return false;
+    }
+    if (!FastllmCudaW4A8BasicShapeSupported(m, k)) {
+        if (reason != nullptr) {
+            *reason = "m/k is not 128-aligned";
+        }
         return false;
     }
 
@@ -122,6 +230,9 @@ static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight, in
         float expectedMin = -8.0f * weight.scales[i];
         float tol = 1e-6f * (std::fabs(weight.scales[i]) > 1.0f ? std::fabs(weight.scales[i]) : 1.0f);
         if (std::fabs(weight.mins[i] - expectedMin) > tol) {
+            if (reason != nullptr) {
+                *reason = "weight min/scale is not signed-int4 compatible";
+            }
             return false;
         }
     }
@@ -422,15 +533,36 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
     bool prepareCache = FastllmCudaW4A8PrepareCacheEnabled();
     bool prepareActivation = FastllmCudaW4A8PrepareActivationEnabled();
     bool prepareOutput = FastllmCudaW4A8PrepareOutputEnabled();
-    if (!prepareCache && !prepareActivation && !prepareOutput) {
+    bool validate = FastllmCudaW4A8ValidateEnabled();
+    if (!prepareCache && !prepareActivation && !prepareOutput && !validate) {
         return false;
     }
-    if (!FastllmCudaW4A8LinearSemanticsSupported(input, weight, bias, output, n, m, k)) {
+
+    int arch = FastllmCudaRuntimeArch();
+    if (!FastllmCudaW4A8RuntimeArchSupported(arch)) {
+        FastllmCudaW4A8TraceSkip("runtime arch is not SM90", n, m, k, arch,
+                                 input, weight, bias, output);
+        return false;
+    }
+
+    const char *skipReason = nullptr;
+    if (!FastllmCudaW4A8LinearSemanticsSupported(input, weight, bias, output, n, m, k, &skipReason)) {
+        FastllmCudaW4A8TraceSkip(skipReason == nullptr ? "linear semantics unsupported" : skipReason,
+                                 n, m, k, arch, input, weight, bias, output);
+        return false;
+    }
+    FastllmCudaW4A8TraceReady("validation", n, m, k, arch);
+    if (validate && !prepareCache && !prepareActivation && !prepareOutput) {
         return false;
     }
 
     if (prepareCache) {
-        (void)FastllmCudaW4A8EnsurePackedWeightCache(weight, m, k);
+        if (FastllmCudaW4A8EnsurePackedWeightCache(weight, m, k)) {
+            FastllmCudaW4A8TraceReady("weight-cache", n, m, k, arch);
+        } else {
+            FastllmCudaW4A8TraceSkip("weight cache preparation failed", n, m, k, arch,
+                                     input, weight, bias, output);
+        }
     }
 
     void *inputData = nullptr;
@@ -438,6 +570,8 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
     if (prepareActivation) {
         inputData = FastllmCudaPrepareInput(input);
         if (inputData == nullptr) {
+            FastllmCudaW4A8TraceSkip("input prepare failed", n, m, k, arch,
+                                     input, weight, bias, output);
             return false;
         }
     }
@@ -447,13 +581,21 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
             if (inputData != nullptr) {
                 FastllmCudaFinishInput(input, inputData);
             }
+            FastllmCudaW4A8TraceSkip("output prepare failed", n, m, k, arch,
+                                     input, weight, bias, output);
             return false;
         }
+        FastllmCudaW4A8TraceReady("output-buffer", n, m, k, arch);
     }
 
     if (prepareActivation) {
         W4A8ActivationScratch activation;
-        (void)FastllmCudaW4A8QuantizeActivation(input, inputData, n, m, activation);
+        if (FastllmCudaW4A8QuantizeActivation(input, inputData, n, m, activation)) {
+            FastllmCudaW4A8TraceReady("activation-quant", n, m, k, arch);
+        } else {
+            FastllmCudaW4A8TraceSkip("activation quantization failed", n, m, k, arch,
+                                     input, weight, bias, output);
+        }
         FastllmCudaW4A8ReleaseActivationScratch(activation);
     }
     if (prepareActivation && outputData == nullptr) {
@@ -466,8 +608,8 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
         FastllmCudaFinishOutput(output, outputData);
     }
 
-    // Stage 5 only prepares independent weight/activation/output semantics.
-    // The actual W4A8 GEMM dispatch is wired in later stages after scale
-    // packing and final kernel launch are available.
+    // Stage 6 validates independent weight/activation/output semantics and
+    // traces why a candidate is skipped. The actual W4A8 GEMM dispatch is wired
+    // in later stages after scale packing and final kernel launch are available.
     return false;
 }
