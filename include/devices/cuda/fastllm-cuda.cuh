@@ -506,14 +506,16 @@ bool FastllmCudaHalfMergeMOEFP8E4M3Batch1(const fastllm::Data &input, fastllm::D
                                           bool scoresOnCuda, int topk, int hidden, int inter);
 bool FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                  fastllm::Data **weights, int weightsBatch, const int32_t *indices,
-                                                 const float *scores, int topk, int hidden, int inter);
+                                                 const float *scores, int topk, int hidden, int inter,
+                                                 bool allowWarpSpecialization = true);
 bool FastllmCudaHalfMergeMOEFP8E4M3Block128Batch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                          fastllm::Data **weights, int weightsBatch, const int32_t *indices,
                                                          const float *scores, int topk, int hidden, int inter);
 bool FastllmCudaHalfFusedMOEFP8E4M3(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
                                     fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
                                     fastllm::Data &w1, fastllm::Data &output,
-                                    int batch, int topk, int hidden, int inter, int experts, float swigluLimit);
+                                    int batch, int topk, int hidden, int inter, int experts, float swigluLimit,
+                                    bool allowWarpSpecialization = true);
 bool FastllmCudaHalfFusedMOEFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
                                             fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
                                             fastllm::Data &w1, fastllm::Data &output,
@@ -563,14 +565,16 @@ bool FastllmCudaBFloat16MergeMOEFP8E4M3Batch1(const fastllm::Data &input, fastll
                                               bool scoresOnCuda, int topk, int hidden, int inter);
 bool FastllmCudaBFloat16MergeMOEFP8E4M3Batch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                      fastllm::Data **weights, int weightsBatch, const int32_t *indices,
-                                                     const float *scores, int topk, int hidden, int inter);
+                                                     const float *scores, int topk, int hidden, int inter,
+                                                     bool allowWarpSpecialization = true);
 bool FastllmCudaBFloat16MergeMOEFP8E4M3Block128Batch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                              fastllm::Data **weights, int weightsBatch, const int32_t *indices,
                                                              const float *scores, int topk, int hidden, int inter);
 bool FastllmCudaBFloat16FusedMOEFP8E4M3(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
                                         fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
                                         fastllm::Data &w1, fastllm::Data &output,
-                                        int batch, int topk, int hidden, int inter, int experts, float swigluLimit);
+                                        int batch, int topk, int hidden, int inter, int experts, float swigluLimit,
+                                        bool allowWarpSpecialization = true);
 bool FastllmCudaBFloat16FusedMOEFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
                                                 fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
                                                 fastllm::Data &w1, fastllm::Data &output,

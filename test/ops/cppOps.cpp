@@ -1429,8 +1429,10 @@ namespace {
         int inter = 768;
         int experts = 82;
         int block = 128;
+        std::string path = "operator";
         fastllm::Data input, index, score, output;
         fastllm::Data w1, w2, w3, curInput, curOutput;
+        fastllm::Data referenceW1, referenceOutput;
         std::vector<std::unique_ptr<fastllm::Data>> ownedWeights;
         std::vector<fastllm::Data*> weights;
         std::vector<fastllm::Data*> biass;
@@ -1464,6 +1466,7 @@ namespace {
             inter = params.GetInt("inter");
             experts = params.GetInt("experts");
             block = params.GetInt("block");
+            path = params.GetString("path");
             FastllmCudaSetDevice(0);
 
             fastllm::Data fp32Input = MakeTensor({batch, hidden}, 0.11f, 0.02f);
@@ -1516,16 +1519,79 @@ namespace {
             output.ToDevice(fastllm::DataDevice::CUDA);
             output.Allocate(false);
             ForceDeviceSync();
+            CheckWarpSpecialization();
 #else
             (void)params;
             throw std::runtime_error("mergemoe_fp8 benchmark requires USE_CUDA");
 #endif
         }
 
+        bool RunIndexed(fastllm::Data &work, fastllm::Data &result,
+                        bool allowWarpSpecialization) {
+#ifdef USE_CUDA
+            const int32_t *indices = reinterpret_cast<const int32_t*>(index.cudaData);
+            const float *scores = reinterpret_cast<const float*>(score.cudaData);
+            if (input.dataType == fastllm::DataType::FLOAT16) {
+                return FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(
+                    input, work, result, weights.data(), (int)weights.size(),
+                    indices, scores, topk, hidden, inter, allowWarpSpecialization);
+            }
+            return FastllmCudaBFloat16MergeMOEFP8E4M3Batch1Indexed(
+                input, work, result, weights.data(), (int)weights.size(),
+                indices, scores, topk, hidden, inter, allowWarpSpecialization);
+#else
+            (void)work;
+            (void)result;
+            (void)allowWarpSpecialization;
+            return false;
+#endif
+        }
+
+        void CheckWarpSpecialization() {
+#ifdef USE_CUDA
+            if (batch != 1 || topk != 8 || hidden != 2048 || inter != 256 || block != 128) {
+                return;
+            }
+            if (!RunIndexed(referenceW1, referenceOutput, false)) {
+                throw std::runtime_error("legacy MergeMOE FP8 launch failed");
+            }
+            ForceDeviceSync();
+            std::vector<float> expected = ToFloatVector(ConvertToFloat32Data(referenceOutput));
+            if (!RunIndexed(w1, output, true)) {
+                throw std::runtime_error("warp MergeMOE FP8 launch failed");
+            }
+            ForceDeviceSync();
+            std::vector<float> actual = ToFloatVector(ConvertToFloat32Data(output));
+            if (expected.size() != actual.size()) {
+                throw std::runtime_error("MergeMOE FP8 output size mismatch");
+            }
+            for (size_t i = 0; i < expected.size(); i++) {
+                if (expected[i] != actual[i]) {
+                    std::ostringstream os;
+                    os << "MergeMOE FP8 warp mismatch at " << i
+                       << ": expected=" << expected[i] << ", actual=" << actual[i];
+                    throw std::runtime_error(os.str());
+                }
+            }
+#endif
+        }
+
         void Run() {
-            fastllm::MergeMOE(input, index, score, weights, biass,
-                              w1, w2, w3, curInput, curOutput,
-                              0.0f, output, 0, fastllm::MoeGateSwiglu);
+            if (path == "operator") {
+                fastllm::MergeMOE(input, index, score, weights, biass,
+                                  w1, w2, w3, curInput, curOutput,
+                                  0.0f, output, 0, fastllm::MoeGateSwiglu);
+            } else if (path == "legacy") {
+                if (!RunIndexed(w1, output, false)) {
+                    throw std::runtime_error("legacy MergeMOE FP8 launch failed");
+                }
+            } else if (path == "warp") {
+                if (!RunIndexed(w1, output, true)) {
+                    throw std::runtime_error("warp MergeMOE FP8 launch failed");
+                }
+            } else {
+                throw std::runtime_error("path must be operator, legacy or warp");
+            }
         }
     };
 
@@ -1585,6 +1651,7 @@ namespace {
                 params.Add("topk", "8", "experts per token");
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "fp16", "fp16 or bf16");
+                params.Add("path", "operator", "operator, legacy or warp");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
@@ -1599,6 +1666,229 @@ namespace {
             [](const OpTestParams&) {
                 return 0.0;
             },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("batch") * params.GetInt("topk") *
+                       6.0 * (double)params.GetInt("hidden") * params.GetInt("inter");
+            },
+            true
+        };
+    }
+
+    struct FusedMoeFp8BenchState {
+        int batch = 1;
+        int topk = 8;
+        int hidden = 2048;
+        int inter = 256;
+        int experts = 16;
+        int block = 128;
+        std::string path = "warp";
+        fastllm::Data input, index, score;
+        fastllm::Data gate, up, down;
+        fastllm::Data w1, output, referenceW1, referenceOutput;
+
+        static void InitWeight(fastllm::Data &weight, const std::vector<int> &dims,
+                               int block, int seed) {
+            weight.dataType = fastllm::DataType::FP8_E4M3;
+            weight.UpdateUnitSize();
+            weight.Resize(dims);
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.blockK = block;
+            weight.blockM = block;
+            weight.Allocate(false);
+            uint8_t *ptr = reinterpret_cast<uint8_t*>(weight.cpuData);
+            for (uint64_t i = 0; i < weight.GetBytes(); i++) {
+                ptr[i] = static_cast<uint8_t>(0x20 + ((i + (uint64_t)seed * 17) & 0x1f));
+            }
+            int scaleRows = (dims[dims.size() - 2] + block - 1) / block;
+            int scaleCols = (dims.back() + block - 1) / block;
+            weight.scales.resize((size_t)dims[0] * scaleRows * scaleCols);
+            for (size_t i = 0; i < weight.scales.size(); i++) {
+                weight.scales[i] = 0.015f + 0.0001f * (float)((i + seed) % 7);
+            }
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data emptyBias;
+            FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, emptyBias, 1);
+        }
+
+        bool RunDirect(fastllm::Data &work, fastllm::Data &result,
+                       bool allowWarpSpecialization) {
+#ifdef USE_CUDA
+            if (input.dataType == fastllm::DataType::FLOAT16) {
+                return FastllmCudaHalfFusedMOEFP8E4M3(
+                    input, gate, up, down, index, score, work, result,
+                    batch, topk, hidden, inter, experts, 0.0f,
+                    allowWarpSpecialization);
+            }
+            return FastllmCudaBFloat16FusedMOEFP8E4M3(
+                input, gate, up, down, index, score, work, result,
+                batch, topk, hidden, inter, experts, 0.0f,
+                allowWarpSpecialization);
+#else
+            (void)work;
+            (void)result;
+            (void)allowWarpSpecialization;
+            return false;
+#endif
+        }
+
+        void CheckWarpSpecialization() {
+#ifdef USE_CUDA
+            if (batch != 1 || topk != 8 || hidden != 2048 || inter != 256 || block != 128) {
+                return;
+            }
+            if (!RunDirect(referenceW1, referenceOutput, false)) {
+                throw std::runtime_error("legacy FusedMOE FP8 launch failed");
+            }
+            ForceDeviceSync();
+            std::vector<float> expected = ToFloatVector(ConvertToFloat32Data(referenceOutput));
+            if (!RunDirect(w1, output, true)) {
+                throw std::runtime_error("warp FusedMOE FP8 launch failed");
+            }
+            ForceDeviceSync();
+            std::vector<float> actual = ToFloatVector(ConvertToFloat32Data(output));
+            if (expected.size() != actual.size()) {
+                throw std::runtime_error("FusedMOE FP8 output size mismatch");
+            }
+            for (size_t i = 0; i < expected.size(); i++) {
+                if (expected[i] != actual[i]) {
+                    std::ostringstream os;
+                    os << "FusedMOE FP8 warp mismatch at " << i
+                       << ": expected=" << expected[i] << ", actual=" << actual[i];
+                    throw std::runtime_error(os.str());
+                }
+            }
+#endif
+        }
+
+        void Init(const OpTestParams &params) {
+#ifdef USE_CUDA
+            batch = params.GetInt("batch");
+            topk = params.GetInt("topk");
+            hidden = params.GetInt("hidden");
+            inter = params.GetInt("inter");
+            experts = params.GetInt("experts");
+            block = params.GetInt("block");
+            path = params.GetString("path");
+            FastllmCudaSetDevice(0);
+
+            fastllm::Data fp32Input = MakeTensor({batch, hidden}, 0.11f, 0.02f);
+            input.CopyFrom(fp32Input);
+            std::string inputType = params.GetString("input_type");
+            if (inputType == "fp16") {
+                fastllm::ToDataType(input, fastllm::DataType::FLOAT16);
+            } else if (inputType == "bf16") {
+                fastllm::ToDataType(input, fastllm::DataType::BFLOAT16);
+            } else {
+                throw std::runtime_error("input_type must be fp16 or bf16");
+            }
+            input.ToDevice(fastllm::DataDevice::CUDA);
+
+            index.dataType = fastllm::DataType::INT32;
+            index.UpdateUnitSize();
+            index.Resize({batch, topk});
+            index.Allocate(false);
+            score.dataType = fastllm::DataType::FLOAT32;
+            score.UpdateUnitSize();
+            score.Resize({batch, topk});
+            score.Allocate(false);
+            int32_t *indexPtr = reinterpret_cast<int32_t*>(index.cpuData);
+            float *scorePtr = reinterpret_cast<float*>(score.cpuData);
+            for (int b = 0; b < batch; b++) {
+                for (int j = 0; j < topk; j++) {
+                    indexPtr[b * topk + j] = (b * topk + j) % experts;
+                    scorePtr[b * topk + j] = 1.0f / std::max(topk, 1);
+                }
+            }
+            index.ToDevice(fastllm::DataDevice::CUDA);
+            score.ToDevice(fastllm::DataDevice::CUDA);
+
+            InitWeight(gate, {experts, inter, hidden}, block, 3);
+            InitWeight(up, {experts, inter, hidden}, block, 17);
+            InitWeight(down, {experts, hidden, inter}, block, 29);
+            ForceDeviceSync();
+            CheckWarpSpecialization();
+#else
+            (void)params;
+            throw std::runtime_error("fusedmoe_fp8 benchmark requires USE_CUDA");
+#endif
+        }
+
+        void Run() {
+            if (path == "legacy") {
+                if (!RunDirect(w1, output, false)) {
+                    throw std::runtime_error("legacy FusedMOE FP8 launch failed");
+                }
+            } else if (path == "warp") {
+                if (!RunDirect(w1, output, true)) {
+                    throw std::runtime_error("warp FusedMOE FP8 launch failed");
+                }
+            } else {
+                throw std::runtime_error("path must be legacy or warp");
+            }
+        }
+    };
+
+    static BenchmarkResult BenchmarkFusedMoeFp8Cuda(
+            const OpTestParams &params, const std::string &device, int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<FusedMoeFp8BenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto end = Clock::now();
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        result.flops = (double)params.GetInt("batch") * params.GetInt("topk") *
+                       6.0 * (double)params.GetInt("hidden") * params.GetInt("inter");
+        double seconds = result.avgMs / 1000.0;
+        if (seconds > 0.0) {
+            result.computeTFlops = result.flops / seconds / 1e12;
+        }
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("fusedmoe_fp8 benchmark requires USE_CUDA");
+#endif
+    }
+
+    static OpCase MakeFusedMoeFp8Case() {
+        return {
+            "fusedmoe_fp8",
+            "benchmark and validate Qwen3.5 fused-weight FP8 MoE",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "token batch size");
+                params.Add("hidden", "2048", "Qwen3.5 hidden size");
+                params.Add("inter", "256", "TP-local MoE intermediate size");
+                params.Add("experts", "16", "number of routed experts in the test table");
+                params.Add("topk", "8", "experts per token");
+                params.Add("block", "128", "FP8 scale block size");
+                params.Add("input_type", "fp16", "fp16 or bf16");
+                params.Add("path", "warp", "legacy or warp");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkFusedMoeFp8Cuda,
+            [](const OpTestParams&) { return 0.0; },
             [](const OpTestParams &params) {
                 return (double)params.GetInt("batch") * params.GetInt("topk") *
                        6.0 * (double)params.GetInt("hidden") * params.GetInt("inter");
@@ -1843,6 +2133,7 @@ namespace {
             MakeAttentionCase(),
             MakeLinearFp8Block128Case(),
             MakeMergeMoeFp8Case(),
+            MakeFusedMoeFp8Case(),
             MakeFusedRouterTopKCase()
         };
     }

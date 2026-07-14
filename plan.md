@@ -58,12 +58,29 @@
 - CUDA Graph 512-token 三次实测：`197.85 / 197.67 / 197.46 tokens/s`，均值 `197.66 tokens/s`；相对原诊断基线约 187 tokens/s 提升约 5.7%。
 - 默认路径：无需设置环境变量即可启用融合；不满足支持条件时自动回退旧链路。
 
-## 阶段 2：Batch-1 FP8 MoE warp kernel
+## 阶段 2：Batch-1 FP8 MoE warp kernel（已完成）
 
-1. `gate/up + SwiGLU` 攓为 warp-per-output、8 warps/CTA、`uint4` FP8 向量加载和 warp shuffle 归约。
-2. `down + top8 reduce` 攓为 warp-per-hidden-output，消除当前 top8 循环中约 65 次 block barrier。
+1. `gate/up + SwiGLU` 改为 warp-per-output、8 warps/CTA、合并 FP8 加载和 warp shuffle 归约。
+2. `down + top8 reduce` 改为 warp-per-hidden-output，消除当前 top8 循环中的 block barrier。
 3. 为 TP2 实际形状 `hidden=2048, localInter=256, topk=8, block=128x128` 提供专用路径，其他形状回退。
 4. 预计再节省约 0.15–0.25 ms/token，累计达到约 205–212 tokens/s。
+
+### 完成结果（2026-07-14）
+
+- 路径核对：Qwen3.5 的三维融合权重实际走 `CudaFusedMOE`，专用 kernel 已接入该真实热路径；同时也优化了相同形状的 indexed-weight `MergeMOE` 路径。
+- 实现：一个 warp 负责一个输出、每 CTA 8 个 warp；每个 lane 复现旧 64-thread kernel 中两个 lane 的工作，并按旧归约树先合并 stride-32，再用 warp shuffle 完成归约。
+- 加载策略：每 lane 使用 4-byte FP8 读取，整个 warp 合并成 128B 事务。没有强行使用每线程 `uint4`，因为当前映射已经覆盖完整内存事务，而 `uint4` 不会减少事务数且会破坏逐 bit 对齐旧归约树的简单映射。
+- 默认启用：支持条件满足时直接选择专用 kernel，不需要环境变量；不支持的 batch、shape、topk、block 或 dtype 自动回退旧实现。
+- 数值验证：FP16、BF16 的 legacy/warp 输出逐元素完全一致；真实模型 512-token greedy 输出 hash 保持为 `36f0db830cf5094626be1a992ff6af3e7af42a6930b340a6804442d253d68ba7`。
+- 单算子耗时（RTX 5090，真实 TP2 局部形状）：
+  - FP16：`13.3 -> 7.9 us`，降低约 40.6%；
+  - BF16：`13.3 -> 8.4 us`，降低约 36.8%。
+- Nsight kernel 分项（FP16）：
+  - `gate/up + SwiGLU`：`5.31 -> 3.82 us`；
+  - `down + top8 reduce`：`7.59 -> 3.58 us`；
+  - 合计：`12.90 -> 7.41 us`。
+- TP2 CUDA Graph 端到端：512-token 三次为 `204.490 / 204.277 / 204.107 tokens/s`，均值 `204.291 tokens/s`；相对阶段 2 前同轮均值 `196.085 tokens/s` 提升约 4.19%，每 token 延迟 `5.100 -> 4.895 ms`，节省约 `0.205 ms/token`。
+- 验证：完整 `bash install.sh -DUSE_CUDA=ON`、`regressionOps`、FP16/BF16 `fusedmoe_fp8` 与非目标形状 `mergemoe_fp8` fallback 均通过。
 
 ## 阶段 3：Shared Expert 与 Routed Expert 并行
 
