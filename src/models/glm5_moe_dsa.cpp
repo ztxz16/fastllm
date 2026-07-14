@@ -8,6 +8,8 @@
 
 #include "utils.h"
 
+#include "gguf.h"
+
 #include <sstream>
 
 #include <random>
@@ -19,6 +21,8 @@
 #include <algorithm>
 
 #include <cstdlib>
+
+#include <mutex>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -444,6 +448,144 @@ namespace fastllm {
 
     static bool Glm5MoeDsaNeedPermuteKVB(const Data &kv0, int kvLoraRank, int qkNopeHeadDim) {
         return kv0.dims.size() == 3 && kv0.dims[1] == kvLoraRank && kv0.dims[2] == qkNopeHeadDim;
+    }
+
+    static void Glm5MoeDsaMakeCpuLinearView(Data &source, int rows, int columns,
+                                             Data &view, ggml_tensor *ggmlView) {
+        AssertInFastLLM(source.dataDevice == DataDevice::CPU,
+                        "Glm5MoeDsa split KV-B weight should be on CPU.\n");
+        uint64_t elementCount = 1;
+        for (int dim : source.dims) {
+            elementCount *= dim;
+        }
+        AssertInFastLLM(elementCount == (uint64_t)rows * columns,
+                        "Glm5MoeDsa split KV-B weight's shape error.\n");
+
+        static std::mutex ggufRepackMutex;
+        std::unique_lock<std::mutex> ggufRepackLock;
+        if (source.dataType == DataType::DATA_GGUF_FORMAT) {
+            ggufRepackLock = std::unique_lock<std::mutex>(ggufRepackMutex);
+        }
+
+        view.FakeFrom(source, 0);
+        if (source.dataType == DataType::DATA_GGUF_FORMAT) {
+            AssertInFastLLM(source.ggmlTensor != nullptr && ggmlView != nullptr,
+                            "Glm5MoeDsa GGUF linear view is missing tensor metadata.\n");
+            *ggmlView = *(ggml_tensor*)source.ggmlTensor;
+            view.ggmlType = source.ggmlType;
+            view.ggmlTensor = ggmlView;
+            view.isGGUFData = true;
+            view.IsRepacked = source.IsRepacked;
+            view.disableGGUFRepack = source.disableGGUFRepack;
+            view.forceGGUFFp32Dequant = source.forceGGUFFp32Dequant;
+        }
+        view.Resize({rows, columns});
+        view.expansionSize = elementCount;
+        view.expansionBytes = source.GetBytes();
+        view.name = source.name;
+        view.isModelWeight = source.isModelWeight;
+        view.lockInCPU = source.lockInCPU;
+        view.weightType = source.weightType;
+
+        if (source.dataType == DataType::DATA_GGUF_FORMAT) {
+            const uint64_t sourceBytes = source.GetBytes();
+            view.Repack();
+
+            // The view borrows source.cpuData, so an in-place repack also changes the
+            // source bytes. Persist the matching metadata before another view is made.
+            source.IsRepacked = view.IsRepacked;
+            if (source.ggmlType != view.ggmlType) {
+                source.ggmlType = view.ggmlType;
+                ggml_tensor *sourceTensor = (ggml_tensor*)source.ggmlTensor;
+                sourceTensor->type = (ggml_type)source.ggmlType;
+                sourceTensor->nb[0] = ggml_type_size(sourceTensor->type);
+                sourceTensor->nb[1] = sourceTensor->nb[0] *
+                                      (sourceTensor->ne[0] / ggml_blck_size(sourceTensor->type));
+                for (int i = 2; i < GGML_MAX_DIMS; i++) {
+                    sourceTensor->nb[i] = sourceTensor->nb[i - 1] * sourceTensor->ne[i - 1];
+                }
+                AssertInFastLLM(source.GetBytes() == sourceBytes,
+                                "Glm5MoeDsa GGUF repack changed the weight's byte size.\n");
+            }
+        }
+    }
+
+    static void Glm5MoeDsaLoadCpuLinearBias(WeightMap &weight, const std::string &name,
+                                             int rows, Data &bias) {
+        auto it = weight.weight.find(name);
+        if (it == weight.weight.end() || it->second.dims.empty()) {
+            return;
+        }
+
+        ToDataType(it->second, bias, DataType::FLOAT32);
+        AssertInFastLLM(bias.Count(0) == (uint64_t)rows,
+                        "Glm5MoeDsa KV-B bias's shape error.\n");
+        bias.Reshape({rows});
+    }
+
+    static void Glm5MoeDsaProjectCpuKVB(Data &kvLn, WeightMap &weight,
+                                         const std::string &kvWeightName,
+                                         const std::string &kvBiasName,
+                                         int batch, int seqlen, int numHeads,
+                                         int kvLoraRank, int qkNopeHeadDim, int vHeadDim,
+                                         Data &kv, Data &kNope, Data &v) {
+        auto combinedIt = weight.weight.find(kvWeightName);
+        if (combinedIt != weight.weight.end() && !combinedIt->second.dims.empty()) {
+            Data bias;
+            Glm5MoeDsaLoadCpuLinearBias(weight, kvBiasName,
+                                        numHeads * (qkNopeHeadDim + vHeadDim), bias);
+            Linear(kvLn, combinedIt->second, bias, kv);
+            kv.Reshape({batch, seqlen, numHeads, qkNopeHeadDim + vHeadDim});
+            PermuteSelf(kv, {0, 2, 1, 3});
+            Split(kv, -1, 0, qkNopeHeadDim, kNope);
+            Split(kv, -1, qkNopeHeadDim, qkNopeHeadDim + vHeadDim, v);
+            return;
+        }
+
+        const std::string kWeightName = kvWeightName + "__0";
+        const std::string vWeightName = kvWeightName + "__1";
+        auto kIt = weight.weight.find(kWeightName);
+        auto vIt = weight.weight.find(vWeightName);
+        AssertInFastLLM(kIt != weight.weight.end() && !kIt->second.dims.empty(),
+                        "Glm5MoeDsa missing split KV-B K weight \"" + kWeightName + "\".\n");
+        AssertInFastLLM(vIt != weight.weight.end() && !vIt->second.dims.empty(),
+                        "Glm5MoeDsa missing split KV-B V weight \"" + vWeightName + "\".\n");
+
+        Data &kWeight = kIt->second;
+        Data &vWeight = vIt->second;
+        if (Glm5MoeDsaNeedPermuteKVB(kWeight, kvLoraRank, qkNopeHeadDim)) {
+            PermuteSelf(kWeight, {0, 2, 1});
+        }
+        if (vWeight.dims.size() == 3 &&
+            vWeight.dims[1] == kvLoraRank && vWeight.dims[2] == vHeadDim) {
+            PermuteSelf(vWeight, {0, 2, 1});
+        }
+
+        AssertInFastLLM(kWeight.dims == std::vector<int>({numHeads, qkNopeHeadDim, kvLoraRank}),
+                        "Glm5MoeDsa split KV-B K weight's shape error.\n");
+        AssertInFastLLM(vWeight.dims == std::vector<int>({numHeads, vHeadDim, kvLoraRank}),
+                        "Glm5MoeDsa split KV-B V weight's shape error.\n");
+
+        ggml_tensor kGGUFView = {}, vGGUFView = {};
+        Data kLinearWeight, vLinearWeight;
+        Glm5MoeDsaMakeCpuLinearView(kWeight, numHeads * qkNopeHeadDim,
+                                    kvLoraRank, kLinearWeight, &kGGUFView);
+        Glm5MoeDsaMakeCpuLinearView(vWeight, numHeads * vHeadDim,
+                                    kvLoraRank, vLinearWeight, &vGGUFView);
+
+        Data kBias, vBias;
+        Glm5MoeDsaLoadCpuLinearBias(weight, kvBiasName + "__0",
+                                    numHeads * qkNopeHeadDim, kBias);
+        Glm5MoeDsaLoadCpuLinearBias(weight, kvBiasName + "__1",
+                                    numHeads * vHeadDim, vBias);
+
+        Linear(kvLn, kLinearWeight, kBias, kNope);
+        kNope.Reshape({batch, seqlen, numHeads, qkNopeHeadDim});
+        PermuteSelf(kNope, {0, 2, 1, 3});
+
+        Linear(kvLn, vLinearWeight, vBias, v);
+        v.Reshape({batch, seqlen, numHeads, vHeadDim});
+        PermuteSelf(v, {0, 2, 1, 3});
     }
 
     Glm5MoeDsaModel::Glm5MoeDsaModel() {
@@ -1533,11 +1675,9 @@ namespace fastllm {
 
                 ToDataType(attenOutput, DataType::FLOAT32);
             } else {
-                Linear(kv_ln, this->weight[kvWeightName], this->weight[kvBiasName], kv);
-                kv.Reshape({bsz, seqlen, num_attention_heads, qk_nope_head_dim + v_head_dim});
-                PermuteSelf(kv, {0, 2, 1, 3});
-                Split(kv, -1, 0, qk_nope_head_dim, k_nope);
-                Split(kv, -1, qk_nope_head_dim, qk_nope_head_dim + v_head_dim, v);
+                Glm5MoeDsaProjectCpuKVB(kv_ln, this->weight, kvWeightName, kvBiasName,
+                                         bsz, seqlen, num_attention_heads, kv_lora_rank,
+                                         qk_nope_head_dim, v_head_dim, kv, k_nope, v);
                 Cat(q_nope, q_pe, -1, q);
 
                 Repeat(k_pe, 1, k_nope.dims[1], k_pe_repeat);
@@ -2158,11 +2298,9 @@ namespace fastllm {
                 PermuteSelf(attenOutput, {1, 0, 2});
                 ToDataType(attenOutput, DataType::FLOAT32);
             } else {
-                Linear(kv_ln, this->weight[kvWeightName], this->weight[kvBiasName], kv);
-                kv.Reshape({bsz, seqlen, num_attention_heads, qk_nope_head_dim + v_head_dim});
-                PermuteSelf(kv, {0, 2, 1, 3});
-                Split(kv, -1, 0, qk_nope_head_dim, k_nope);
-                Split(kv, -1, qk_nope_head_dim, qk_nope_head_dim + v_head_dim, v);
+                Glm5MoeDsaProjectCpuKVB(kv_ln, this->weight, kvWeightName, kvBiasName,
+                                         bsz, seqlen, num_attention_heads, kv_lora_rank,
+                                         qk_nope_head_dim, v_head_dim, kv, k_nope, v);
                 Cat(q_nope, q_pe, -1, q);
 
                 Repeat(k_pe, 1, k_nope.dims[1], k_pe_repeat);

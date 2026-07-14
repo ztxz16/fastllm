@@ -1,4 +1,5 @@
 #include "gguf.h"
+#include "executor.h"
 
 namespace fastllm {
     std::vector <GGUFWeightReplaceRule> GetGGUFWeightReplaceRules(const std::string &arch) {
@@ -319,6 +320,35 @@ namespace fastllm {
             auto rules = originalArchRulesDict["deepseek_v2"];
             // llama.cpp currently runs GLM_DSA with the DeepSeek2 graph, so indexer tensors are unused.
             rules.insert(rules.begin(), GGUFWeightReplaceRule(std::regex(R"(blk\.(\d+)\.indexer\..*)"), "ignore"));
+            const auto deviceMap = GetDeviceMap();
+            bool mainDeviceUsesCuda = false;
+            if (deviceMap.empty()) {
+                // An empty map means the executor's current default is used. On a
+                // CUDA-capable host that default is CUDA, so treating an empty map
+                // as CPU-only would leave V-B quantized for the CUDA attention path.
+                auto *executor = static_cast<Executor*>(GetExecutor());
+                if (executor != nullptr) {
+                    const std::string firstDevice = executor->GetFirstDeviceType();
+                    mainDeviceUsesCuda = firstDevice == "cuda" || firstDevice == "multicuda";
+                }
+            } else {
+                for (const auto &device : deviceMap) {
+                    if (device.first.find("cuda") != std::string::npos) {
+                        mainDeviceUsesCuda = true;
+                        break;
+                    }
+                }
+            }
+            if (!mainDeviceUsesCuda) {
+                // V-B is already laid out as [heads, v_head_dim, kv_lora_rank], so a
+                // pure CPU model can keep it quantized and view it directly as a 2-D
+                // linear weight. CUDA's absorbed-attention path still consumes V-B
+                // through MatMulTransB, which currently requires FP16/FP32; in that
+                // case retain the original DeepSeek2 ForceFP16 rule below.
+                rules.insert(rules.begin(), GGUFWeightReplaceRule(
+                    std::regex(R"(blk\.(\d+)\.attn_v_b\.(weight|bias))"),
+                    "model.layers.$1.self_attn.kv_b_proj.$2__1"));
+            }
             return rules;
         }
 
