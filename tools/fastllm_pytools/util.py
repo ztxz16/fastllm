@@ -532,8 +532,9 @@ def make_normal_llm_model(args):
     llm.set_cpu_low_mem(args.low)
     if (args.cuda_embedding):
         llm.set_cuda_embedding(True)
-    if (args.cuda_shared_expert.lower() not in ["", "false", "0", "off"]):
-        llm.set_cuda_shared_expert(True)
+    llm.set_cuda_shared_expert(
+        args.cuda_shared_expert.lower() not in ["", "false", "0", "off"]
+    )
     if (args.enable_amx.lower() not in ["", "false", "0", "off"]):
         llm.set_enable_amx(True)
     if (args.tokens > 0):
