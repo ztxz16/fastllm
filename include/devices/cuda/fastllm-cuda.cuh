@@ -549,7 +549,7 @@ bool FastllmCudaPermuteTo(const fastllm::Data &input, fastllm::Data &output,
 bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
                            const fastllm::Data &bias, fastllm::Data &output,
                            int numTokens, int inChannels, int outChannels);
-#ifdef ENABLE_VLLM_KERNEL
+#ifdef FASTLLM_ENABLE_VLLM_CUTLASS_W4A8
 bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
                         const fastllm::Data &bias, fastllm::Data &output,
                         int n, int m, int k);
