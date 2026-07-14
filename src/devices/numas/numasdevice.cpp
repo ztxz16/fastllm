@@ -1337,6 +1337,57 @@ namespace fastllm {
             }
         }
 
+        // GGUF MoE weights in the same layer do not necessarily use the same
+        // quantization type.  In particular, mixed quant models commonly keep
+        // the shared expert in Q8_0 while routed experts use Q4_K/Q5_K.  Their
+        // dot kernels require different activation row formats (Q8_0 vs Q8_K),
+        // so one converted input/down-input buffer cannot be shared between
+        // those experts.  Split active CPU experts by both required activation
+        // formats and accumulate the partial outputs.
+        std::map<std::pair<int, int>, std::unordered_set<int> > expertTypeGroups;
+        for (int e : cpuExperts) {
+            if (e < 0 || e >= (int)expertTasks.size() || expertTasks[e].empty() ||
+                weights[e * 2] == nullptr || weights[e * 2 + 1] == nullptr) {
+                continue;
+            }
+            DataType gateActType = GetNumasLinearActDataType(weights[e * 2], bs);
+            DataType downActType = GetNumasLinearActDataType(weights[e * 2 + 1], bs);
+            expertTypeGroups[std::make_pair((int)gateActType, (int)downActType)].insert(e);
+        }
+        if (expertTypeGroups.empty()) {
+            uint8_t *emptyOutput = cpuOutputBuffer != nullptr ? cpuOutputBuffer : output.cpuData;
+            AssertInFastLLM(emptyOutput != nullptr,
+                            "NumasMergeMOE has no writable CPU output.\n");
+            memset(emptyOutput, 0, output.GetBytes());
+            return;
+        }
+        if (expertTypeGroups.size() > 1) {
+            bool firstGroup = true;
+            for (auto &group : expertTypeGroups) {
+                if (firstGroup) {
+                    DoNumasMergeMOEOnCPU(
+                        input, output, index, score, weights, biass,
+                        sharedScale, weightsBatch, topk, group.second,
+                        fastllmMoeDataManagerNumas, nullptr
+                    );
+                    firstGroup = false;
+                } else {
+                    Data partialOutput(output.dataType, output.dims);
+                    partialOutput.Allocate();
+                    DoNumasMergeMOEOnCPU(
+                        input, partialOutput, index, score, weights, biass,
+                        sharedScale, weightsBatch, topk, group.second,
+                        fastllmMoeDataManagerNumas, nullptr
+                    );
+                    AddTo(output, partialOutput);
+                }
+            }
+            if (cpuOutputBuffer != nullptr) {
+                memcpy(cpuOutputBuffer, output.cpuData, output.GetBytes());
+            }
+            return;
+        }
+
         int totalLines = 0;
         for (int e = 0; e < (int)expertTasks.size(); e++) {
             if (weights[e * 2] != nullptr && cpuExperts.count(e)) {
@@ -1344,8 +1395,18 @@ namespace fastllm {
             }
         }
 
-        DataType startDataType = GetNumasLinearActDataType(weights[2], bs);
-        DataType downInputDataType = GetNumasLinearActDataType(weights[3], bs);
+        int representativeExpert = -1;
+        for (int e : cpuExperts) {
+            if (e >= 0 && e < (int)expertTasks.size() && !expertTasks[e].empty() &&
+                weights[e * 2] != nullptr && weights[e * 2 + 1] != nullptr) {
+                representativeExpert = e;
+                break;
+            }
+        }
+        AssertInFastLLM(representativeExpert >= 0,
+                        "NumasMergeMOE has no active CPU expert.\n");
+        DataType startDataType = GetNumasLinearActDataType(weights[representativeExpert * 2], bs);
+        DataType downInputDataType = GetNumasLinearActDataType(weights[representativeExpert * 2 + 1], bs);
 
         // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
         auto& realInput = fastllmMoeDataManagerNumas.realInput;
@@ -2010,6 +2071,39 @@ namespace fastllm {
             bucket += now - profileLast;
             profileLast = now;
         };
+
+        // The small-batch fast path uses one activation format for all selected
+        // experts.  Fall back to the grouped implementation when a mixed-quant
+        // layer needs more than one format (for example Q8_0 shared + Q4_K/Q5_K
+        // routed experts).  Homogeneous layers keep the existing fast path.
+        std::unordered_set<int> activeExperts;
+        if (weights[0] != nullptr && weights[1] != nullptr) {
+            activeExperts.insert(0);
+        }
+        for (int row = 0; row < n; row++) {
+            for (int j = 0; j < topk; j++) {
+                int expert = indexData[row * topk + j] + 1;
+                if (expert >= 0 && expert * 2 + 1 < weightsBatch &&
+                    weights[expert * 2] != nullptr && weights[expert * 2 + 1] != nullptr) {
+                    activeExperts.insert(expert);
+                }
+            }
+        }
+        std::set<std::pair<int, int> > activeTypePairs;
+        for (int expert : activeExperts) {
+            activeTypePairs.insert(std::make_pair(
+                (int)GetNumasLinearActDataType(weights[expert * 2], n),
+                (int)GetNumasLinearActDataType(weights[expert * 2 + 1], n)
+            ));
+        }
+        if (activeTypePairs.size() > 1) {
+            DoNumasMergeMOEOnCPU(
+                input, output, index, score, weights, biass,
+                sharedScale, weightsBatch, topk, activeExperts,
+                fastllmMoeDataManagerNumas, nullptr
+            );
+            return;
+        }
 
         if (input.dims[0] < 32) {
 // auto st = std::chrono::system_clock::now();
