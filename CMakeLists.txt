@@ -314,6 +314,7 @@ if (USE_CUDA)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
         src/devices/cuda/fastllm-cuda.cu 
+        src/devices/cuda/linear/fastllm-linear-w4a8-cutlass.cu
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
         src/devices/cuda/attention/fastllm-attention.cu

@@ -3348,7 +3348,11 @@ namespace fastllm {
                                    ", bias.dataType = " + GetDataTypeName(bias.dataType) + ".";
         if (!IsCudaLinearDataTypeSupported(input.dataType, weight.dataType, bias.dataType)) {
             ErrorInFastLLM("Linear error: unsupported dataType combination." + dataTypeInfo);
-        } else if (input.dataType == DataType::FLOAT16) {
+        }
+        if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) {
+            return;
+        }
+        if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT32) {
                 FastllmCudaHalfMatMulFloat32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FLOAT16) {
