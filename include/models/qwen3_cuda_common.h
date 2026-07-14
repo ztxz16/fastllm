@@ -479,6 +479,31 @@ namespace fastllm {
                    {"index", "score"});
     }
 
+    inline bool Qwen3CudaTryFusedSoftmaxSelectExpert(
+            Qwen3CudaDirectRunner &runner, const Data &logits,
+            Data &index, Data &score, int topk, bool needNorm,
+            float routeScale, const Data *gateBias) {
+        if (logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 || topk != 8 ||
+            (logits.dataType != DataType::FLOAT16 &&
+             logits.dataType != DataType::BFLOAT16 &&
+             logits.dataType != DataType::FLOAT32)) {
+            return false;
+        }
+        if (gateBias != nullptr && !gateBias->dims.empty() &&
+            (gateBias->dataType != DataType::FLOAT32 || gateBias->Count(0) != 256)) {
+            return false;
+        }
+        DataDict datas = {{"logits", (Data*)&logits}, {"index", &index}, {"score", &score}};
+        if (gateBias != nullptr) {
+            datas["gateBias"] = (Data*)gateBias;
+        }
+        runner.Run("FusedSoftmaxSelectExpert", datas,
+                   FloatDict{{"routeScale", routeScale}},
+                   IntDict{{"topk", topk}, {"needNorm", needNorm ? 1 : 0}},
+                   {"index", "score"});
+        return true;
+    }
+
     inline void Qwen3CudaToDataType(Qwen3CudaDirectRunner &runner, Data &input, DataType dataType) {
         if (input.dataType == dataType) {
             return;

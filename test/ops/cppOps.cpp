@@ -237,6 +237,16 @@ namespace {
         throw std::runtime_error("only FLOAT32 outputs are supported in optest currently");
     }
 
+    static std::vector<int32_t> ToInt32Vector(fastllm::Data data) {
+        data.ToDevice(fastllm::DataDevice::CPU);
+        size_t count = data.Count(0);
+        if (data.dataType != fastllm::DataType::INT32) {
+            throw std::runtime_error("only INT32 index outputs are supported");
+        }
+        const int32_t *ptr = reinterpret_cast<const int32_t*>(data.cpuData);
+        return std::vector<int32_t>(ptr, ptr + count);
+    }
+
     static fastllm::Data ConvertToFloat32Data(const fastllm::Data &data) {
         fastllm::Data output;
         fastllm::ToDataType(data, output, fastllm::DataType::FLOAT32);
@@ -1597,6 +1607,224 @@ namespace {
         };
     }
 
+    struct FusedRouterTopKBenchState {
+        int batch = 1;
+        bool withBias = true;
+        bool needNorm = true;
+        float routeScale = 1.0f;
+        std::string path;
+        fastllm::Data logits, bias;
+        fastllm::Data fusedIndex, fusedScore;
+        fastllm::Data referenceLogits, referenceProb, referenceIndex, referenceScore;
+
+        static void PrepareOutput(fastllm::Data &data, fastllm::DataType type,
+                                  const std::vector<int> &dims) {
+            data.dataType = type;
+            data.UpdateUnitSize();
+            data.Resize(dims);
+            data.Allocate(false);
+            data.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        void RunReference() {
+            fastllm::ToDataType(logits, referenceLogits, fastllm::DataType::FLOAT32);
+            fastllm::Softmax(referenceLogits, referenceProb, -1);
+            fastllm::SelectExpert(referenceProb, referenceIndex, referenceScore, 8,
+                                  needNorm, routeScale, withBias ? &bias : nullptr);
+        }
+
+        void RunFused() {
+            bool ok = FastllmCudaFusedSoftmaxSelectExpert(
+                logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
+                8, needNorm, routeScale);
+            if (!ok) {
+                throw std::runtime_error("fused router top-k launch failed");
+            }
+        }
+
+        void Check() {
+            RunReference();
+            RunFused();
+            ForceDeviceSync();
+            std::vector<int32_t> expectedIndex = ToInt32Vector(referenceIndex);
+            std::vector<int32_t> actualIndex = ToInt32Vector(fusedIndex);
+            if (expectedIndex != actualIndex) {
+                std::ostringstream os;
+                os << "fused router index mismatch:";
+                size_t mismatch = 0;
+                for (size_t i = 0; i < expectedIndex.size(); i++) {
+                    if (expectedIndex[i] != actualIndex[i]) {
+                        os << " pos=" << i << " expected=" << expectedIndex[i]
+                           << " actual=" << actualIndex[i];
+                        mismatch = i;
+                        break;
+                    }
+                }
+                size_t tokenStart = (mismatch / 8) * 8;
+                os << " expected_top8=";
+                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                    os << (i == tokenStart ? "[" : ",") << expectedIndex[i];
+                }
+                os << "] actual_top8=";
+                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                    os << (i == tokenStart ? "[" : ",") << actualIndex[i];
+                }
+                os << "] expected_prob=";
+                std::vector<float> referenceProbValues = ToFloatVector(referenceProb);
+                size_t probStart = (mismatch / 8) * 256;
+                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                    os << (i == tokenStart ? "[" : ",")
+                       << referenceProbValues[probStart + expectedIndex[i]];
+                }
+                os << "]";
+                throw std::runtime_error(os.str());
+            }
+            std::vector<float> expectedScore = ToFloatVector(referenceScore);
+            std::vector<float> actualScore = ToFloatVector(fusedScore);
+            float maxAbsDiff = 0.0f;
+            for (size_t i = 0; i < expectedScore.size(); i++) {
+                maxAbsDiff = std::max(maxAbsDiff, std::fabs(expectedScore[i] - actualScore[i]));
+            }
+            if (maxAbsDiff > 0.0f) {
+                std::ostringstream os;
+                os << "fused router score mismatch: max_abs_diff=" << maxAbsDiff;
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        void Init(const OpTestParams &params) {
+#ifdef USE_CUDA
+            FastllmCudaSetDevice(0);
+            batch = params.GetInt("batch");
+            withBias = params.GetInt("bias") != 0;
+            needNorm = params.GetInt("norm") != 0;
+            routeScale = params.GetFloat("route_scale");
+            path = params.GetString("path");
+
+            std::string pattern = params.GetString("pattern");
+            fastllm::Data fp32Logits;
+            if (pattern == "unique") {
+                fastllm::Data generated = MakeTensor({batch, 256}, 0.731f, 1.7f);
+                fp32Logits.CopyFrom(generated);
+            } else if (pattern == "tied") {
+                std::vector<float> values((size_t)batch * 256);
+                for (int token = 0; token < batch; token++) {
+                    for (int expert = 0; expert < 256; expert++) {
+                        values[(size_t)token * 256 + expert] =
+                            (float)((expert * 17 + token * 13) & 7) * 0.25f;
+                    }
+                }
+                fastllm::Data generated(fastllm::DataType::FLOAT32,
+                                        {batch, 256}, values);
+                fp32Logits.CopyFrom(generated);
+            } else {
+                throw std::runtime_error("pattern must be unique or tied");
+            }
+            logits.CopyFrom(fp32Logits);
+            std::string inputType = params.GetString("input_type");
+            if (inputType == "fp16") {
+                fastllm::ToDataType(logits, fastllm::DataType::FLOAT16);
+            } else if (inputType == "bf16") {
+                fastllm::ToDataType(logits, fastllm::DataType::BFLOAT16);
+            } else if (inputType != "fp32") {
+                throw std::runtime_error("input_type must be fp16, bf16 or fp32");
+            }
+            logits.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data fp32Bias;
+            if (pattern == "unique") {
+                fastllm::Data generated = MakeTensor({256}, 1.217f, 0.015f);
+                fp32Bias.CopyFrom(generated);
+            } else {
+                std::vector<float> values(256);
+                for (int expert = 0; expert < 256; expert++) {
+                    values[expert] = (float)(expert & 3) * 0.001f;
+                }
+                fastllm::Data generated(fastllm::DataType::FLOAT32,
+                                        {256}, values);
+                fp32Bias.CopyFrom(generated);
+            }
+            bias.CopyFrom(fp32Bias);
+            bias.ToDevice(fastllm::DataDevice::CUDA);
+            PrepareOutput(fusedIndex, fastllm::DataType::INT32, {batch, 8});
+            PrepareOutput(fusedScore, fastllm::DataType::FLOAT32, {batch, 8});
+            Check();
+#else
+            (void)params;
+            throw std::runtime_error("fused_router_topk benchmark requires USE_CUDA");
+#endif
+        }
+
+        void Run() {
+            if (path == "fused") {
+                RunFused();
+            } else if (path == "reference") {
+                RunReference();
+            } else {
+                throw std::runtime_error("path must be fused or reference");
+            }
+        }
+    };
+
+    static BenchmarkResult BenchmarkFusedRouterTopKCuda(
+            const OpTestParams &params, const std::string &device, int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<FusedRouterTopKBenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; i++) {
+            state->Run();
+        }
+        ForceDeviceSync();
+        auto end = Clock::now();
+        BenchmarkResult result;
+        result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
+                       std::max(iters, 1);
+        return result;
+#else
+        (void)params;
+        (void)device;
+        (void)warmup;
+        (void)iters;
+        throw std::runtime_error("fused_router_topk benchmark requires USE_CUDA");
+#endif
+    }
+
+    static OpCase MakeFusedRouterTopKCase() {
+        return {
+            "fused_router_topk",
+            "benchmark and validate fused softmax + SelectExpert top8/256",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "token batch size");
+                params.Add("input_type", "fp16", "fp16, bf16 or fp32");
+                params.Add("bias", "1", "whether correction bias is present");
+                params.Add("norm", "1", "normalize selected probabilities");
+                params.Add("route_scale", "1.0", "router score scale");
+                params.Add("path", "fused", "fused or reference");
+                params.Add("pattern", "unique", "unique or tied ranking keys");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkFusedRouterTopKCuda,
+            [](const OpTestParams&) { return 0.0; },
+            [](const OpTestParams&) { return 0.0; },
+            true
+        };
+    }
+
     static std::vector<OpCase> BuildRegistry() {
         return {
             MakeAddToCase(),
@@ -1614,7 +1842,8 @@ namespace {
             MakeSwigluCase(),
             MakeAttentionCase(),
             MakeLinearFp8Block128Case(),
-            MakeMergeMoeFp8Case()
+            MakeMergeMoeFp8Case(),
+            MakeFusedRouterTopKCase()
         };
     }
 

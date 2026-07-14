@@ -6454,17 +6454,22 @@ namespace fastllm {
                 Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                 *requireLocal(weight[gateWeightName], gateWeightName),
                                 *GetEmptyData(), buf.routerLogits, true);
-                Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits,
-                                           buf.routerLogitsTemp, DataType::FLOAT32);
-                Qwen3CudaSoftmax(cudaRunner, buf.routerLogitsTemp, buf.routerLogitsTemp, -1);
                 Data *localGateBias = nullptr;
                 if (weight.weight.find(gateBiasName) != weight.weight.end()) {
                     localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
                 }
-                Qwen3CudaSelectExpert(cudaRunner, buf.routerLogitsTemp,
-                                      buf.expertIndex, buf.expertScore,
-                                      this->num_experts_per_tok, this->norm_topk_prob,
-                                      this->routed_scaling_factor, localGateBias);
+                if (!Qwen3CudaTryFusedSoftmaxSelectExpert(
+                        cudaRunner, buf.routerLogits, buf.expertIndex, buf.expertScore,
+                        this->num_experts_per_tok, this->norm_topk_prob,
+                        this->routed_scaling_factor, localGateBias)) {
+                    Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits,
+                                               buf.routerLogitsTemp, DataType::FLOAT32);
+                    Qwen3CudaSoftmax(cudaRunner, buf.routerLogitsTemp, buf.routerLogitsTemp, -1);
+                    Qwen3CudaSelectExpert(cudaRunner, buf.routerLogitsTemp,
+                                          buf.expertIndex, buf.expertScore,
+                                          this->num_experts_per_tok, this->norm_topk_prob,
+                                          this->routed_scaling_factor, localGateBias);
+                }
 
                 if (HasFusedMoeWeights(i)) {
                     Data *localGate = GetFusedMoeWeightForDevice(moeGate3DWeights[i], gpuId);
@@ -7917,15 +7922,20 @@ namespace fastllm {
             Qwen3CudaLinear(cudaRunner, attenInput,
                             *requireLocal(weight[gateWeightName], gateWeightName),
                             *GetEmptyData(), routerLogits, true);
-            Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerLogitsTemp, DataType::FLOAT32);
-            Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp, routerLogitsTemp, -1);
             Data *localGateBias = nullptr;
             if (weight.weight.find(gateBiasName) != weight.weight.end()) {
                 localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
             }
-            Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
-                                  this->num_experts_per_tok, this->norm_topk_prob,
-                                  this->routed_scaling_factor, localGateBias);
+            if (!Qwen3CudaTryFusedSoftmaxSelectExpert(
+                    cudaRunner, routerLogits, expertIndex, expertScore,
+                    this->num_experts_per_tok, this->norm_topk_prob,
+                    this->routed_scaling_factor, localGateBias)) {
+                Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerLogitsTemp, DataType::FLOAT32);
+                Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp, routerLogitsTemp, -1);
+                Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
+                                      this->num_experts_per_tok, this->norm_topk_prob,
+                                      this->routed_scaling_factor, localGateBias);
+            }
 
             bool layerMappedNonCudaMoe = Qwen35LayerUsesMappedNonCudaMoe(this, i);
             if (layerMappedNonCudaMoe) {
