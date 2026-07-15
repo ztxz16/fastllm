@@ -424,6 +424,8 @@ bool FastllmCudaGraphCaptureInvalidated() {
 }
 
 namespace {
+    static thread_local bool fastllmCudaGraphQwen35MoeMarkersEnabled = true;
+
     __global__ void FastllmCudaQwen35MoeForkMarkerKernel(int layer) {
         (void)layer;
     }
@@ -508,26 +510,36 @@ namespace {
     };
 }
 
+bool FastllmCudaGraphSetQwen35MoeMarkersEnabled(bool enabled) {
+    bool previous = fastllmCudaGraphQwen35MoeMarkersEnabled;
+    fastllmCudaGraphQwen35MoeMarkersEnabled = enabled;
+    return previous;
+}
+
 void FastllmCudaGraphMarkQwen35MoeFork(int layer) {
-    if (FastllmCudaGraphIsCapturingCurrentThread()) {
+    if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
+        FastllmCudaGraphIsCapturingCurrentThread()) {
         FastllmCudaQwen35MoeForkMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
     }
 }
 
 void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer) {
-    if (FastllmCudaGraphIsCapturingCurrentThread()) {
+    if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
+        FastllmCudaGraphIsCapturingCurrentThread()) {
         FastllmCudaQwen35MoeSharedDoneMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
     }
 }
 
 void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer) {
-    if (FastllmCudaGraphIsCapturingCurrentThread()) {
+    if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
+        FastllmCudaGraphIsCapturingCurrentThread()) {
         FastllmCudaQwen35MoeRoutedBeginMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
     }
 }
 
 void FastllmCudaGraphMarkQwen35MoeJoin(int layer) {
-    if (FastllmCudaGraphIsCapturingCurrentThread()) {
+    if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
+        FastllmCudaGraphIsCapturingCurrentThread()) {
         FastllmCudaQwen35MoeJoinMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
     }
 }
@@ -549,6 +561,25 @@ int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
         return -1;
     }
     nodes.resize(nodeCount);
+
+    // CUDA forbids destroying nodes in a graph containing allocation/free
+    // nodes. Detect that structural restriction before adding dependencies so
+    // the caller can safely discard this untouched graph and recapture without
+    // markers.
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        state = cudaGraphNodeGetType(node, &type);
+        if (!FastllmCudaGraphSetError("cudaGraphNodeGetType(memory preflight)", state)) {
+            return -1;
+        }
+#if CUDART_VERSION >= 11040
+        if (type == cudaGraphNodeTypeMemAlloc ||
+            type == cudaGraphNodeTypeMemFree) {
+            fastllmCudaGraphLastError.clear();
+            return FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS;
+        }
+#endif
+    }
 
     std::map<int, FastllmCudaQwen35MoeMarkerNodes> markers;
     size_t markerCount = 0;
@@ -701,7 +732,7 @@ namespace {
     }
 }
 
-bool FastllmCudaGraphQwen35MoeSelfTest() {
+static bool FastllmCudaGraphQwen35MoeParallelSelfTest() {
     int *shared = nullptr;
     int *routed = nullptr;
     int *output = nullptr;
@@ -753,6 +784,123 @@ bool FastllmCudaGraphQwen35MoeSelfTest() {
               result == 42;
     cleanup();
     return ok;
+}
+
+static bool FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest() {
+#if CUDART_VERSION < 11040
+    return true;
+#else
+    int device = 0;
+    int driverVersion = 0;
+    int memoryPoolsSupported = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDriverGetVersion(&driverVersion) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (driverVersion < 11040) {
+        return true;
+    }
+    if (cudaDeviceGetAttribute(&memoryPoolsSupported,
+                               cudaDevAttrMemoryPoolsSupported,
+                               device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (!memoryPoolsSupported) {
+        return true;
+    }
+
+    int *shared = nullptr;
+    int *routed = nullptr;
+    int *output = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    auto cleanup = [&]() {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        if (shared != nullptr) cudaFree(shared);
+        if (routed != nullptr) cudaFree(routed);
+        if (output != nullptr) cudaFree(output);
+    };
+    if (cudaMalloc(&shared, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&routed, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&output, sizeof(int)) != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+
+    auto capture = [&](bool enableMarkers, cudaGraph_t &captured) {
+        bool previousMarkers =
+            FastllmCudaGraphSetQwen35MoeMarkersEnabled(enableMarkers);
+        void *temporary = nullptr;
+        void *capturedGraph = nullptr;
+        bool began = FastllmCudaGraphBeginCapture();
+        bool ok = began;
+        if (ok) {
+            ok = cudaMallocAsync(&temporary, 4096, cudaStreamPerThread) ==
+                     cudaSuccess;
+        }
+        if (ok) {
+            cudaMemsetAsync(shared, 0, sizeof(int), cudaStreamPerThread);
+            cudaMemsetAsync(routed, 0, sizeof(int), cudaStreamPerThread);
+            cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
+            cudaMemsetAsync(temporary, 0, 4096, cudaStreamPerThread);
+            FastllmCudaGraphMarkQwen35MoeFork(0);
+            FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(shared, 11);
+            FastllmCudaGraphMarkQwen35MoeSharedDone(0);
+            FastllmCudaGraphMarkQwen35MoeRoutedBegin(0);
+            FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(routed, 31);
+            FastllmCudaGraphMarkQwen35MoeJoin(0);
+            FastllmCudaQwen35MoeSelfTestJoinKernel<<<1, 1, 0, cudaStreamPerThread>>>(
+                shared, routed, output);
+            ok = cudaFreeAsync(temporary, cudaStreamPerThread) == cudaSuccess;
+        }
+        bool ended = began && FastllmCudaGraphEndCapture(&capturedGraph);
+        FastllmCudaGraphSetQwen35MoeMarkersEnabled(previousMarkers);
+        if (!ok || !ended || capturedGraph == nullptr) {
+            if (capturedGraph != nullptr) {
+                FastllmCudaGraphDestroy(capturedGraph);
+            }
+            cudaGetLastError();
+            return false;
+        }
+        captured = (cudaGraph_t)capturedGraph;
+        return true;
+    };
+
+    // The first graph contains both markers and graph allocation/free nodes.
+    // The optimizer must reject it before mutating any dependencies.
+    if (!capture(true, graph) ||
+        FastllmCudaGraphOptimizeQwen35Moe(graph) !=
+            FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS) {
+        cleanup();
+        return false;
+    }
+    cudaGraphDestroy(graph);
+    graph = nullptr;
+
+    // A markerless recapture preserves the original sequential MoE topology
+    // and remains a valid executable graph even with allocation/free nodes.
+    if (!capture(false, graph) ||
+        cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess ||
+        cudaGraphLaunch(exec, cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+    int result = 0;
+    bool ok = cudaMemcpy(&result, output, sizeof(int), cudaMemcpyDeviceToHost) ==
+                  cudaSuccess &&
+              result == 42;
+    cleanup();
+    return ok;
+#endif
+}
+
+bool FastllmCudaGraphQwen35MoeSelfTest() {
+    return FastllmCudaGraphQwen35MoeParallelSelfTest() &&
+           FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest();
 }
 
 bool FastllmCudaGraphEndCapture(void **graph) {

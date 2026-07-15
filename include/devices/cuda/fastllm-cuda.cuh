@@ -122,12 +122,18 @@ bool FastllmCudaGraphCaptureInvalidated();
 
 // Qwen3.5 MoE graph markers are emitted only while the per-thread stream is
 // being captured. After capture, the optimizer rewires the sequential region
-// into shared/routed expert branches and removes every marker node. It returns
-// the number of parallelized MoE layers, or -1 on an invalid graph/error.
+// into shared/routed expert branches and removes every marker node. CUDA does
+// not allow node removal from graphs containing allocation/free nodes; in that
+// case the optimizer leaves the graph untouched and asks the caller to capture
+// again with markers disabled.
+static constexpr int FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS = -2;
+bool FastllmCudaGraphSetQwen35MoeMarkersEnabled(bool enabled);
 void FastllmCudaGraphMarkQwen35MoeFork(int layer);
 void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer);
 void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer);
 void FastllmCudaGraphMarkQwen35MoeJoin(int layer);
+// Returns the number of parallelized layers, the recapture status above, or
+// -1 on an invalid graph/runtime error.
 int FastllmCudaGraphOptimizeQwen35Moe(void *graph);
 bool FastllmCudaGraphQwen35MoeSelfTest();
 

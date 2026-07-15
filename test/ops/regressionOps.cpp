@@ -943,7 +943,7 @@ int main() {
         if (fastllm::HasDeviceType("cuda")) {
 #ifdef USE_CUDA
             Expect(FastllmCudaGraphQwen35MoeSelfTest(),
-                   "Qwen3.5 CUDA graph shared/routed MoE parallelization self-test failed");
+                   "Qwen3.5 CUDA graph shared/routed MoE parallelization/fallback self-test failed");
             RunCudaConvMultiTokenSnapshotsRegression();
             ranCrossDeviceViewRegression = RunCudaCrossDeviceViewRejectionRegression();
 #ifndef USE_ROCM

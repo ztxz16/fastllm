@@ -6587,44 +6587,74 @@ namespace fastllm {
             return true;
         }
 
-        void *capturedGraph = nullptr;
-        FastllmCudaClearThreadError();
-        if (!FastllmCudaGraphBeginCapture()) {
-            printf("Warning: Qwen3.5 CUDA graph begin capture failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
-        FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
-        runGraphBody();
-        bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
-        if (usedUnsafeMoeFallback) {
-            printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during capture.\n",
-                   gpuId);
-            fflush(stdout);
-            Qwen35AbortCudaGraphCapture();
-            Qwen35DestroyCudaGraph(state);
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
-        if (FastllmCudaGetThreadError() || FastllmCudaGraphCaptureInvalidated()) {
-            printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because errors occurred inside capture body. Fallback to eager mode.\n",
-                   gpuId);
-            fflush(stdout);
-            Qwen35AbortCudaGraphCapture();
-            Qwen35DestroyCudaGraph(state);
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
-        if (!FastllmCudaGraphEndCapture(&capturedGraph) || capturedGraph == nullptr) {
-            printf("Warning: Qwen3.5 CUDA graph end capture failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
-            if (capturedGraph != nullptr) {
-                FastllmCudaGraphDestroy(capturedGraph);
+        enum class Qwen35GraphCaptureFailure {
+            None,
+            Begin,
+            UnsafeMoeFallback,
+            Body,
+            End
+        };
+        auto capturePreparedGraph = [&](bool enableMoeMarkers,
+                                        void *&capturedGraph) {
+            struct MoeMarkerScope {
+                bool previous;
+                explicit MoeMarkerScope(bool enabled) :
+                    previous(FastllmCudaGraphSetQwen35MoeMarkersEnabled(enabled)) {}
+                ~MoeMarkerScope() {
+                    FastllmCudaGraphSetQwen35MoeMarkersEnabled(previous);
+                }
+            } markerScope(enableMoeMarkers);
+
+            capturedGraph = nullptr;
+            FastllmCudaClearThreadError();
+            if (!FastllmCudaGraphBeginCapture()) {
+                return Qwen35GraphCaptureFailure::Begin;
             }
+            FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+            runGraphBody();
+            if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) {
+                Qwen35AbortCudaGraphCapture();
+                return Qwen35GraphCaptureFailure::UnsafeMoeFallback;
+            }
+            if (FastllmCudaGetThreadError() ||
+                FastllmCudaGraphCaptureInvalidated()) {
+                Qwen35AbortCudaGraphCapture();
+                return Qwen35GraphCaptureFailure::Body;
+            }
+            if (!FastllmCudaGraphEndCapture(&capturedGraph) ||
+                capturedGraph == nullptr) {
+                if (capturedGraph != nullptr) {
+                    FastllmCudaGraphDestroy(capturedGraph);
+                    capturedGraph = nullptr;
+                }
+                return Qwen35GraphCaptureFailure::End;
+            }
+            return Qwen35GraphCaptureFailure::None;
+        };
+        auto reportCaptureFailure = [&](Qwen35GraphCaptureFailure failure,
+                                        bool markerless) {
+            const char *phase = markerless ? "markerless recapture" : "capture";
+            if (failure == Qwen35GraphCaptureFailure::Begin) {
+                printf("Warning: Qwen3.5 CUDA graph %s begin failed on gpu %d: %s. Disable graph for this GPU.\n",
+                       phase, gpuId, FastllmCudaGraphLastError());
+            } else if (failure == Qwen35GraphCaptureFailure::UnsafeMoeFallback) {
+                printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during %s.\n",
+                       gpuId, phase);
+            } else if (failure == Qwen35GraphCaptureFailure::Body) {
+                printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because errors occurred inside %s body. Fallback to eager mode.\n",
+                       gpuId, phase);
+            } else if (failure == Qwen35GraphCaptureFailure::End) {
+                printf("Warning: Qwen3.5 CUDA graph %s end failed on gpu %d: %s. Disable graph for this GPU.\n",
+                       phase, gpuId, FastllmCudaGraphLastError());
+            }
+            fflush(stdout);
+        };
+
+        void *capturedGraph = nullptr;
+        Qwen35GraphCaptureFailure captureFailure =
+            capturePreparedGraph(true, capturedGraph);
+        if (captureFailure != Qwen35GraphCaptureFailure::None) {
+            reportCaptureFailure(captureFailure, false);
             Qwen35DestroyCudaGraph(state);
             state.disabled = true;
             runWithoutGraph();
@@ -6632,6 +6662,20 @@ namespace fastllm {
         }
 
         int parallelMoeLayers = FastllmCudaGraphOptimizeQwen35Moe(capturedGraph);
+        if (parallelMoeLayers ==
+            FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS) {
+            FastllmCudaGraphDestroy(capturedGraph);
+            capturedGraph = nullptr;
+            captureFailure = capturePreparedGraph(false, capturedGraph);
+            if (captureFailure != Qwen35GraphCaptureFailure::None) {
+                reportCaptureFailure(captureFailure, true);
+                Qwen35DestroyCudaGraph(state);
+                state.disabled = true;
+                runWithoutGraph();
+                return true;
+            }
+            parallelMoeLayers = 0;
+        }
         if (parallelMoeLayers < 0) {
             printf("Warning: Qwen3.5 CUDA graph MoE parallelization failed on gpu %d: %s. Disable graph for this GPU.\n",
                    gpuId, FastllmCudaGraphLastError());
