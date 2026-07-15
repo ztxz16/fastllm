@@ -1,11 +1,14 @@
 #include "executor.h"
 #include "fastllm.h"
+#include "models/basellm.h"
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include <cuda_runtime_api.h>
 #endif
 
 #ifdef USE_CUDA
+#include "devices/cpu/cpudevice.h"
+#include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -16,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -24,6 +28,18 @@
 #include <vector>
 
 namespace {
+    class MoeAtypeConfigTestModel final : public fastllm::basellm {
+    public:
+        std::string MakeInput(const std::string &, int, const std::string &) override {
+            return "";
+        }
+
+        std::string MakeHistory(const std::string &, int, const std::string &,
+                                const std::string &) override {
+            return "";
+        }
+    };
+
     class ScopedFirstDevice {
     public:
         explicit ScopedFirstDevice(const std::string &device) {
@@ -48,6 +64,63 @@ namespace {
             throw std::runtime_error(message);
         }
     }
+
+    void RunMoeAtypeConfigRegression() {
+        MoeAtypeConfigTestModel model;
+        Expect(!model.useCustomMoeAtype, "moe_atype should default to auto.");
+
+        model.SetMoeAtype(fastllm::DataType::FLOAT32);
+        Expect(model.useCustomMoeAtype && model.moeAtype == fastllm::DataType::FLOAT32,
+               "explicit float32 moe_atype was not preserved.");
+
+        model.SetMoeAtype(fastllm::DataType::DATA_AUTO_NONE);
+        Expect(!model.useCustomMoeAtype,
+               "auto moe_atype did not clear the explicit configuration.");
+        Expect(model.moeAtype == fastllm::DataType::FLOAT32,
+               "auto moe_atype did not restore the compatibility sentinel.");
+
+        model.SetMoeAtype(fastllm::DataType::BFLOAT16);
+        Expect(model.useCustomMoeAtype && model.moeAtype == fastllm::DataType::BFLOAT16,
+               "explicit bfloat16 moe_atype was not preserved.");
+        model.SetMoeAtype(fastllm::DataType::DATA_AUTO_NONE);
+        Expect(!model.useCustomMoeAtype,
+               "auto moe_atype did not reset a previous bfloat16 configuration.");
+    }
+
+#ifdef USE_CUDA
+    void RunCudaLinearDataTypeCapabilityRegression() {
+        using fastllm::DataType;
+        using fastllm::IsCudaLinearDataTypeSupported;
+
+        Expect(IsCudaLinearDataTypeSupported(DataType::FLOAT16, DataType::INT4_GROUP128,
+                                             DataType::FLOAT32),
+               "FLOAT16 + INT4_GROUP128 should be supported by CUDA Linear.");
+        Expect(!IsCudaLinearDataTypeSupported(DataType::FLOAT32, DataType::INT4_GROUP128,
+                                              DataType::FLOAT32),
+               "FLOAT32 + INT4_GROUP128 should be rejected by CUDA Linear.");
+        Expect(!IsCudaLinearDataTypeSupported(DataType::BFLOAT16, DataType::INT8,
+                                              DataType::FLOAT32),
+               "BFLOAT16 + INT8 should be rejected by CUDA Linear.");
+        Expect(IsCudaLinearDataTypeSupported(DataType::BFLOAT16, DataType::FLOAT16,
+                                             DataType::FLOAT32),
+               "BFLOAT16 + FLOAT16 should be supported by CUDA Linear.");
+        Expect(IsCudaLinearDataTypeSupported(DataType::FLOAT16, DataType::FP8_E4M3_PERCHANNEL,
+                                             DataType::FLOAT32),
+               "FLOAT16 + FP8_E4M3_PERCHANNEL should be supported by CUDA Linear.");
+        Expect(IsCudaLinearDataTypeSupported(DataType::FLOAT32, DataType::FP8_E4M3_PERCHANNEL,
+                                             DataType::FLOAT32),
+               "FLOAT32 + FP8_E4M3_PERCHANNEL should be supported by CUDA Linear.");
+        Expect(IsCudaLinearDataTypeSupported(DataType::BFLOAT16, DataType::FP8_E4M3_PERCHANNEL,
+                                             DataType::FLOAT32),
+               "BFLOAT16 + FP8_E4M3_PERCHANNEL should be supported by CUDA Linear.");
+        Expect(!IsCudaLinearDataTypeSupported(DataType::FLOAT16, DataType::INT8_PERCHANNEL,
+                                              DataType::FLOAT32),
+               "internal per-channel weights should be rejected by CUDA Linear.");
+        Expect(!IsCudaLinearDataTypeSupported(DataType::FLOAT16, DataType::FLOAT16,
+                                              DataType::FLOAT16),
+               "non-FLOAT32 bias should be rejected by CUDA Linear.");
+    }
+#endif
 
     fastllm::Data MakeTensor(fastllm::DataType dataType, const std::vector<int> &dims, float seed = 0.0f) {
         int count = 1;
@@ -1038,6 +1111,71 @@ namespace {
     }
 
 #ifndef USE_ROCM
+    void RunMultiCudaInt4GroupColumnSplitRegression() {
+        constexpr int rows = 3;
+        constexpr int columns = 128;
+        constexpr int groupCnt = 32;
+        constexpr int globalGroup = columns / groupCnt;
+        constexpr int splitBegin = 32;
+        constexpr int splitEnd = 96;
+        constexpr int localColumns = splitEnd - splitBegin;
+        constexpr int localGroup = localColumns / groupCnt;
+
+        const int originalDevice = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(0);
+        fastllm::Data weight(fastllm::DataType::INT4_GROUP, {rows, columns});
+        weight.name = "regression.int4_group_column_split.weight";
+        weight.group = globalGroup;
+        weight.groupCnt = groupCnt;
+        weight.perChannelAxis = 0;
+        weight.scales.resize(rows * globalGroup);
+        weight.mins.resize(rows * globalGroup);
+        weight.zeros.resize(rows * globalGroup);
+        weight.Allocate(true);
+        for (int row = 0; row < rows; row++) {
+            for (int group = 0; group < globalGroup; group++) {
+                size_t index = static_cast<size_t>(row) * globalGroup + group;
+                weight.scales[index] = 100.0f * row + group + 0.25f;
+                weight.mins[index] = -100.0f * row - group - 0.5f;
+                weight.zeros[index] = row * globalGroup + group + 1;
+            }
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA, {0});
+
+        fastllm::Data bias;
+        std::vector<int> devices = {0};
+        DivisionScheme scheme;
+        scheme[0] = {{splitBegin, splitEnd}};
+        Expect(SplitMultiCudaWeight(weight, bias, devices, scheme, 1, true),
+               "failed to split INT4_GROUP weight by columns");
+
+        auto localIt = weight.multiDeviceDatas.find(0);
+        Expect(localIt != weight.multiDeviceDatas.end() && localIt->second != nullptr,
+               "INT4_GROUP column split did not create the local tensor");
+        fastllm::Data *local = localIt->second;
+        Expect(local->dims == std::vector<int>({rows, localColumns}),
+               "INT4_GROUP column split produced the wrong local shape");
+        Expect(local->group == localGroup && local->groupCnt == groupCnt,
+               "INT4_GROUP column split kept the global group count");
+        Expect(local->scales.size() == static_cast<size_t>(rows * localGroup) &&
+                   local->mins.size() == static_cast<size_t>(rows * localGroup) &&
+                   local->zeros.size() == static_cast<size_t>(rows * localGroup),
+               "INT4_GROUP column split produced the wrong quantization metadata shape");
+        for (int row = 0; row < rows; row++) {
+            for (int group = 0; group < localGroup; group++) {
+                size_t localIndex = static_cast<size_t>(row) * localGroup + group;
+                size_t sourceIndex = static_cast<size_t>(row) * globalGroup +
+                                     splitBegin / groupCnt + group;
+                Expect(local->scales[localIndex] == weight.scales[sourceIndex] &&
+                           local->mins[localIndex] == weight.mins[sourceIndex] &&
+                           local->zeros[localIndex] == weight.zeros[sourceIndex],
+                       "INT4_GROUP column split copied quantization metadata from the wrong row/group");
+            }
+        }
+
+        FastllmCudaSetDevice(originalDevice);
+    }
+
     bool RunMultiCudaLargeWeightOffsetRegression() {
         if (FastllmCudaGetDeviceCount() < 1) {
             std::cout << "multi-CUDA large-weight offset regression: SKIP (CUDA unavailable)\n";
@@ -1476,6 +1614,461 @@ namespace {
         fastllm::ClearAllPagedCacheManagers();
     }
 
+    void RunCpuInt4GroupAwqLinearRegression() {
+        const int batch = 3;
+        const int inputDim = 2048;
+        const int outputDim = 1024;
+        const int groupCnt = 32;
+        const int group = inputDim / groupCnt;
+
+        std::vector<float> inputValues((size_t)batch * inputDim);
+        for (int b = 0; b < batch; b++) {
+            for (int x = 0; x < inputDim; x++) {
+                inputValues[(size_t)b * inputDim + x] =
+                    (float)((x * (b + 3) + 11 * b) % 251 - 125) / 64.0f;
+            }
+        }
+
+        fastllm::Data quantWeight(fastllm::DataType::INT4_GROUP, {outputDim, inputDim});
+        quantWeight.group = group;
+        quantWeight.groupCnt = groupCnt;
+        quantWeight.perChannelAxis = 0;
+        quantWeight.scales.resize((size_t)outputDim * group);
+        quantWeight.mins.resize((size_t)outputDim * group);
+        quantWeight.zeros.resize((size_t)outputDim * group);
+        quantWeight.Allocate(true);
+
+        std::vector<float> floatWeightValues((size_t)outputDim * inputDim);
+        for (int y = 0; y < outputDim; y++) {
+            for (int g = 0; g < group; g++) {
+                int zero = (y * 3 + g * 5 + 1) & 15;
+                float scale = 0.0025f * (1 + ((y + 2 * g) % 7));
+                int gid = y * group + g;
+                quantWeight.scales[gid] = scale;
+                quantWeight.mins[gid] = -scale * zero;
+                quantWeight.zeros[gid] = zero;
+                for (int x = g * groupCnt; x < (g + 1) * groupCnt; x++) {
+                    int q = (y * 7 + x * 5 + g * 3) & 15;
+                    size_t byteId = ((size_t)y * inputDim + x) / 2;
+                    if ((x & 1) == 0) {
+                        quantWeight.cpuData[byteId] |= (uint8_t)(q << 4);
+                    } else {
+                        quantWeight.cpuData[byteId] |= (uint8_t)q;
+                    }
+                    floatWeightValues[(size_t)y * inputDim + x] = (q - zero) * scale;
+                }
+            }
+        }
+
+        fastllm::Data input(fastllm::DataType::FLOAT32, {batch, inputDim}, inputValues);
+        fastllm::Data floatWeight(fastllm::DataType::FLOAT32,
+                                  {outputDim, inputDim}, floatWeightValues);
+        fastllm::Data emptyBias, expected, actual;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(input, floatWeight, emptyBias, expected);
+            fastllm::Linear(input, quantWeight, emptyBias, actual);
+        }
+
+        ExpectFloatNear(ToFloatVector(expected), ToFloatVector(actual),
+                        3e-2f, 2e-2f, "CPU AWQ-style INT4_GROUP linear");
+    }
+
+#ifdef USE_CUDA
+    void RunCudaInt4Group32AwqLinearRegression() {
+        const int inputDim = 128;
+        const int outputDim = 64;
+        const int groupCnt = 32;
+        const int group = inputDim / groupCnt;
+
+        fastllm::Data quantWeight(fastllm::DataType::INT4_GROUP, {outputDim, inputDim});
+        quantWeight.name = "regression.cuda_int4_group32.weight";
+        quantWeight.group = group;
+        quantWeight.groupCnt = groupCnt;
+        quantWeight.perChannelAxis = 0;
+        quantWeight.scales.resize((size_t)outputDim * group);
+        quantWeight.mins.resize((size_t)outputDim * group);
+        quantWeight.zeros.resize((size_t)outputDim * group);
+        quantWeight.Allocate(true);
+
+        std::vector<float> floatWeightValues((size_t)outputDim * inputDim);
+        for (int y = 0; y < outputDim; y++) {
+            for (int g = 0; g < group; g++) {
+                int zero = (y * 3 + g * 5 + 1) & 15;
+                float scale = 0.0025f * (1 + ((y + 2 * g) % 7));
+                int gid = y * group + g;
+                quantWeight.scales[gid] = scale;
+                quantWeight.mins[gid] = -scale * zero;
+                quantWeight.zeros[gid] = zero;
+                for (int x = g * groupCnt; x < (g + 1) * groupCnt; x++) {
+                    int q = (y * 7 + x * 5 + g * 3) & 15;
+                    size_t byteId = ((size_t)y * inputDim + x) / 2;
+                    if ((x & 1) == 0) {
+                        quantWeight.cpuData[byteId] |= (uint8_t)(q << 4);
+                    } else {
+                        quantWeight.cpuData[byteId] |= (uint8_t)q;
+                    }
+                    floatWeightValues[(size_t)y * inputDim + x] = (q - zero) * scale;
+                }
+            }
+        }
+
+        fastllm::Data floatWeight(fastllm::DataType::FLOAT32,
+                                  {outputDim, inputDim}, floatWeightValues);
+        quantWeight.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data emptyBias;
+
+        for (int batch : {1, 3, 33}) {
+            std::vector<float> inputValues((size_t)batch * inputDim);
+            for (int b = 0; b < batch; b++) {
+                for (int x = 0; x < inputDim; x++) {
+                    inputValues[(size_t)b * inputDim + x] =
+                        (float)((x * (b + 3) + 11 * b) % 97 - 48) / 64.0f;
+                }
+            }
+
+            fastllm::Data inputFloat(fastllm::DataType::FLOAT32,
+                                     {batch, inputDim}, inputValues);
+            fastllm::Data expected;
+            {
+                ScopedFirstDevice guard("cpu");
+                fastllm::Linear(inputFloat, floatWeight, emptyBias, expected);
+            }
+
+            fastllm::Data inputHalf(fastllm::DataType::FLOAT16,
+                                    {batch, inputDim}, inputValues);
+            inputHalf.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data actual;
+            {
+                ScopedFirstDevice guard("cuda");
+                fastllm::Linear(inputHalf, quantWeight, emptyBias, actual);
+            }
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+            int cudaDevice = 0, major = 0, minor = 0;
+            if (cudaGetDevice(&cudaDevice) == cudaSuccess &&
+                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, cudaDevice) == cudaSuccess &&
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, cudaDevice) == cudaSuccess &&
+                major * 10 + minor >= 75) {
+                Expect(quantWeight.cudaData == nullptr,
+                       "CUDA INT4_GROUP(32) regression did not select Marlin on SM75+.");
+            }
+#endif
+            ExpectFloatNear(ToFloatVector(expected), ToFloatVector(actual),
+                            2e-2f, 2e-2f,
+                            "CUDA AWQ-style INT4_GROUP(32) linear batch " + std::to_string(batch));
+        }
+    }
+
+    void RunCudaInt4GroupHalfWeightRoundingRegression() {
+        const int inputDim = 160;
+        const int outputDim = 1;
+        const int groupCnt = 32;
+        const int group = inputDim / groupCnt;
+        const int zero = 4;
+        const int q = 7;
+        const float sourceScale = 0.0005f;
+
+        fastllm::Data weight(fastllm::DataType::INT4_GROUP, {outputDim, inputDim});
+        // Routed-expert weights intentionally retain the source AWQ layout and
+        // exercise the small-batch GEMV rather than the Marlin repack path.
+        weight.name = "regression.model.layers.0.mlp.experts.0.gate_up_proj.weight";
+        weight.group = group;
+        weight.groupCnt = groupCnt;
+        weight.perChannelAxis = 0;
+        weight.scales.assign(group, sourceScale);
+        weight.mins.assign(group, -sourceScale * zero);
+        weight.zeros.assign(group, zero);
+        weight.Allocate(true);
+        for (int x = 0; x < inputDim; x += 2) {
+            weight.cpuData[x / 2] = (uint8_t)((q << 4) | q);
+        }
+
+        std::vector<float> inputValues(inputDim, 1.0f);
+        fastllm::Data input(fastllm::DataType::FLOAT16, {1, inputDim}, inputValues);
+        input.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        weight.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data output;
+        fastllm::Data emptyBias;
+        {
+            ScopedFirstDevice guard("cuda");
+            fastllm::Linear(input, weight, emptyBias, output);
+        }
+
+        float halfScale = fastllm::half_to_float(fastllm::float_to_half(sourceScale));
+        float halfWeight = fastllm::half_to_float(
+            fastllm::float_to_half(halfScale * (q - zero)));
+        float expected = fastllm::half_to_float(
+            fastllm::float_to_half(halfWeight * inputDim));
+        float unrounded = fastllm::half_to_float(
+            fastllm::float_to_half(halfScale * (q - zero) * inputDim));
+        Expect(expected != unrounded,
+               "INT4_GROUP rounding regression fixture does not distinguish A16 semantics.");
+        std::vector<float> actual = ToFloatVector(output);
+        Expect(actual.size() == 1 && actual[0] == expected,
+               "CUDA INT4_GROUP GEMV did not round dequantized weights to FP16 before accumulation: expected " +
+               std::to_string(expected) + ", got " +
+               (actual.empty() ? std::string("<empty>") : std::to_string(actual[0])));
+    }
+
+    void RunCudaInt4GroupBatch1MoeRegression() {
+        const int expertCount = 4;
+        const int hidden = 128;
+        const int inter = 32;
+        const int topk = 2;
+        const int groupCnt = 32;
+
+        std::vector<float> inputValues(hidden);
+        for (int x = 0; x < hidden; x++) {
+            inputValues[x] = (float)((x * 13 + 7) % 67 - 33) / 48.0f;
+        }
+
+        std::vector<std::unique_ptr<fastllm::Data>> ownedWeights;
+        std::vector<fastllm::Data*> weights((size_t)expertCount * 2 + 2, nullptr);
+        std::vector<std::vector<float>> gateupFloat(expertCount);
+        std::vector<std::vector<float>> downFloat(expertCount);
+
+        auto makeWeight = [&](int rows, int cols, int expert, int salt,
+                              std::vector<float> &dequantized) {
+            auto weight = std::make_unique<fastllm::Data>(
+                fastllm::DataType::INT4_GROUP, std::vector<int>{rows, cols});
+            weight->name = "regression.cuda_int4_group32.moe." + std::to_string(expert) +
+                           "." + std::to_string(salt);
+            weight->groupCnt = groupCnt;
+            weight->group = cols / groupCnt;
+            weight->perChannelAxis = 0;
+            weight->scales.resize((size_t)rows * weight->group);
+            weight->mins.resize((size_t)rows * weight->group);
+            weight->zeros.resize((size_t)rows * weight->group);
+            weight->Allocate(true);
+            dequantized.resize((size_t)rows * cols);
+            for (int row = 0; row < rows; row++) {
+                for (int g = 0; g < weight->group; g++) {
+                    int zero = (expert * 5 + row * 3 + g * 7 + salt) & 15;
+                    float scale = 0.002f * (1 + ((expert + row + g + salt) % 5));
+                    size_t meta = (size_t)row * weight->group + g;
+                    weight->scales[meta] = scale;
+                    weight->mins[meta] = -scale * zero;
+                    weight->zeros[meta] = zero;
+                    for (int col = g * groupCnt; col < (g + 1) * groupCnt; col++) {
+                        int q = (expert * 11 + row * 7 + col * 3 + salt) & 15;
+                        size_t byte = ((size_t)row * cols + col) / 2;
+                        if ((col & 1) == 0) {
+                            weight->cpuData[byte] |= (uint8_t)(q << 4);
+                        } else {
+                            weight->cpuData[byte] |= (uint8_t)q;
+                        }
+                        dequantized[(size_t)row * cols + col] = (q - zero) * scale;
+                    }
+                }
+            }
+            weight->ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            return weight;
+        };
+
+        for (int expert = 0; expert < expertCount; expert++) {
+            auto gateup = makeWeight(inter * 2, hidden, expert, 1, gateupFloat[expert]);
+            auto down = makeWeight(hidden, inter, expert, 9, downFloat[expert]);
+            weights[(expert + 1) * 2] = gateup.get();
+            weights[(expert + 1) * 2 + 1] = down.get();
+            ownedWeights.push_back(std::move(gateup));
+            ownedWeights.push_back(std::move(down));
+        }
+
+        const std::vector<int32_t> routeIndices = {1, 3};
+        const std::vector<float> routeScores = {0.625f, 0.375f};
+        std::vector<float> expected(hidden, 0.0f);
+        for (int route = 0; route < topk; route++) {
+            int expert = routeIndices[route];
+            std::vector<float> middle(inter);
+            for (int j = 0; j < inter; j++) {
+                float gate = 0.0f, up = 0.0f;
+                for (int x = 0; x < hidden; x++) {
+                    gate += inputValues[x] * gateupFloat[expert][(size_t)j * hidden + x];
+                    up += inputValues[x] * gateupFloat[expert][(size_t)(inter + j) * hidden + x];
+                }
+                middle[j] = (gate / (1.0f + std::exp(-gate))) * up;
+            }
+            for (int out = 0; out < hidden; out++) {
+                float value = 0.0f;
+                for (int j = 0; j < inter; j++) {
+                    value += middle[j] * downFloat[expert][(size_t)out * inter + j];
+                }
+                expected[out] += routeScores[route] * value;
+            }
+        }
+
+        fastllm::Data input(fastllm::DataType::FLOAT16, {1, hidden}, inputValues);
+        input.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data index = MakeIntTensor({1, topk}, routeIndices);
+        index.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data score(fastllm::DataType::FLOAT32, {1, topk}, routeScores);
+        score.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data scratch;
+        scratch.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+        fastllm::Data output(fastllm::DataType::FLOAT16);
+        output.Resize({1, hidden});
+        output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+        output.Allocate(false);
+
+        bool ok = FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(
+            input, scratch, output, weights.data(), (int)weights.size(),
+            (const int32_t*)index.cudaData, (const float*)score.cudaData, topk);
+        Expect(ok, "CUDA INT4_GROUP batch-1 fused MoE path was not selected.");
+        ExpectFloatNear(expected, ToFloatVector(output), 3e-2f, 3e-2f,
+                        "CUDA INT4_GROUP batch-1 fused MoE");
+
+        fastllm::Data graphOutput(fastllm::DataType::FLOAT16);
+        graphOutput.Resize({1, hidden});
+        graphOutput.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+        graphOutput.Allocate(false);
+        FastllmCudaMemset0(output.cudaData, output.GetBytes());
+        FastllmCudaMemset0(graphOutput.cudaData, graphOutput.GetBytes());
+
+        void *graph = nullptr;
+        void *graphExec = nullptr;
+        Expect(FastllmCudaGraphBeginCapture(),
+               "CUDA INT4_GROUP batch-1 fused MoE graph capture did not start.");
+        ok = FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(
+            input, scratch, output, weights.data(), (int)weights.size(),
+            (const int32_t*)index.cudaData, (const float*)score.cudaData, topk);
+        Expect(ok, "CUDA INT4_GROUP batch-1 fused MoE path failed during graph capture.");
+        // Also verify that a downstream operation captured after the fused MoE
+        // observes its completed result during graph replay.
+        FastllmCudaCopyFromDeviceToDevice(graphOutput.cudaData, output.cudaData,
+                                          output.GetBytes());
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "CUDA INT4_GROUP batch-1 fused MoE graph capture failed.");
+        Expect(FastllmCudaGraphInstantiate(graph, &graphExec) && graphExec != nullptr,
+               "CUDA INT4_GROUP batch-1 fused MoE graph instantiate failed.");
+        Expect(FastllmCudaGraphLaunch(graphExec),
+               "CUDA INT4_GROUP batch-1 fused MoE graph replay failed.");
+        ExpectFloatNear(expected, ToFloatVector(graphOutput), 3e-2f, 3e-2f,
+                        "CUDA INT4_GROUP batch-1 fused MoE graph downstream consumer");
+        FastllmCudaGraphExecDestroy(graphExec);
+        FastllmCudaGraphDestroy(graph);
+    }
+
+    void RunCudaInt8Batch1MoeRegression() {
+        const int expertCount = 4;
+        const int hidden = 128;
+        const int inter = 32;
+        const int topk = 2;
+        std::vector<float> inputValues(hidden);
+        for (int x = 0; x < hidden; x++) {
+            inputValues[x] = (float)((x * 17 + 5) % 73 - 36) / 56.0f;
+        }
+
+        std::vector<std::unique_ptr<fastllm::Data>> ownedWeights;
+        std::vector<fastllm::Data*> weights((size_t)expertCount * 2 + 2, nullptr);
+        std::vector<std::vector<float>> gateupFloat(expertCount), downFloat(expertCount);
+        auto makeWeight = [&](int rows, int cols, int expert, int salt,
+                              std::vector<float> &dequantized) {
+            auto weight = std::make_unique<fastllm::Data>(
+                fastllm::DataType::INT8, std::vector<int>{rows, cols});
+            weight->name = "regression.cuda_int8.moe." + std::to_string(expert) +
+                           "." + std::to_string(salt);
+            weight->perChannelAxis = 0;
+            weight->scales.resize(rows);
+            weight->zeros.resize(rows);
+            weight->Allocate(true);
+            dequantized.resize((size_t)rows * cols);
+            for (int row = 0; row < rows; row++) {
+                int zero = 96 + ((expert * 11 + row * 3 + salt) % 65);
+                float scale = 0.0008f * (1 + ((expert + row + salt) % 7));
+                weight->scales[row] = scale;
+                weight->zeros[row] = zero;
+                for (int col = 0; col < cols; col++) {
+                    int delta = ((expert * 13 + row * 7 + col * 5 + salt) % 61) - 30;
+                    int q = std::max(0, std::min(255, zero + delta));
+                    weight->cpuData[(size_t)row * cols + col] = (uint8_t)q;
+                    dequantized[(size_t)row * cols + col] = (q - zero) * scale;
+                }
+            }
+            weight->ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            return weight;
+        };
+
+        for (int expert = 0; expert < expertCount; expert++) {
+            auto gateup = makeWeight(inter * 2, hidden, expert, 3, gateupFloat[expert]);
+            auto down = makeWeight(hidden, inter, expert, 7, downFloat[expert]);
+            weights[(expert + 1) * 2] = gateup.get();
+            weights[(expert + 1) * 2 + 1] = down.get();
+            ownedWeights.push_back(std::move(gateup));
+            ownedWeights.push_back(std::move(down));
+        }
+
+        const std::vector<int32_t> routeIndices = {0, 3};
+        const std::vector<float> routeScores = {0.45f, 0.55f};
+        std::vector<float> expected(hidden, 0.0f);
+        for (int route = 0; route < topk; route++) {
+            int expert = routeIndices[route];
+            std::vector<float> middle(inter);
+            for (int j = 0; j < inter; j++) {
+                float gate = 0.0f, up = 0.0f;
+                for (int x = 0; x < hidden; x++) {
+                    gate += inputValues[x] * gateupFloat[expert][(size_t)j * hidden + x];
+                    up += inputValues[x] * gateupFloat[expert][(size_t)(inter + j) * hidden + x];
+                }
+                middle[j] = (gate / (1.0f + std::exp(-gate))) * up;
+            }
+            for (int out = 0; out < hidden; out++) {
+                float value = 0.0f;
+                for (int j = 0; j < inter; j++) {
+                    value += middle[j] * downFloat[expert][(size_t)out * inter + j];
+                }
+                expected[out] += routeScores[route] * value;
+            }
+        }
+
+        fastllm::Data input(fastllm::DataType::FLOAT16, {1, hidden}, inputValues);
+        input.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data index = MakeIntTensor({1, topk}, routeIndices);
+        index.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data score(fastllm::DataType::FLOAT32, {1, topk}, routeScores);
+        score.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data scratch;
+        scratch.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+        fastllm::Data output(fastllm::DataType::FLOAT16);
+        output.Resize({1, hidden});
+        output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+        output.Allocate(false);
+        bool ok = FastllmCudaHalfMergeMOEInt8Batch1Indexed(
+            input, scratch, output, weights.data(), (int)weights.size(),
+            (const int32_t*)index.cudaData, (const float*)score.cudaData, topk);
+        Expect(ok, "CUDA INT8 batch-1 fused MoE path was not selected.");
+        ExpectFloatNear(expected, ToFloatVector(output), 2e-2f, 2e-2f,
+                        "CUDA INT8 batch-1 fused MoE");
+
+        fastllm::Data graphOutput(fastllm::DataType::FLOAT16);
+        graphOutput.Resize({1, hidden});
+        graphOutput.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+        graphOutput.Allocate(false);
+        FastllmCudaMemset0(output.cudaData, output.GetBytes());
+        FastllmCudaMemset0(graphOutput.cudaData, graphOutput.GetBytes());
+
+        void *graph = nullptr;
+        void *graphExec = nullptr;
+        Expect(FastllmCudaGraphBeginCapture(),
+               "CUDA INT8 batch-1 fused MoE graph capture did not start.");
+        ok = FastllmCudaHalfMergeMOEInt8Batch1Indexed(
+            input, scratch, output, weights.data(), (int)weights.size(),
+            (const int32_t*)index.cudaData, (const float*)score.cudaData, topk);
+        Expect(ok, "CUDA INT8 batch-1 fused MoE path failed during graph capture.");
+        FastllmCudaCopyFromDeviceToDevice(graphOutput.cudaData, output.cudaData,
+                                          output.GetBytes());
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "CUDA INT8 batch-1 fused MoE graph capture failed.");
+        Expect(FastllmCudaGraphInstantiate(graph, &graphExec) && graphExec != nullptr,
+               "CUDA INT8 batch-1 fused MoE graph instantiate failed.");
+        Expect(FastllmCudaGraphLaunch(graphExec),
+               "CUDA INT8 batch-1 fused MoE graph replay failed.");
+        ExpectFloatNear(expected, ToFloatVector(graphOutput), 2e-2f, 2e-2f,
+                        "CUDA INT8 batch-1 fused MoE graph downstream consumer");
+        FastllmCudaGraphExecDestroy(graphExec);
+        FastllmCudaGraphDestroy(graph);
+    }
+#endif
+
     struct MoeWeights {
         fastllm::Data routedGate;
         fastllm::Data routedDown;
@@ -1491,12 +2084,40 @@ namespace {
         return weights;
     }
 
-    std::vector<float> RunMergeMoeOnDevice(const std::string &device, MoeWeights &weights) {
-        const int batch = 32;
-        const int inputDim = 64;
-        const int outputDim = 64;
+    fastllm::Data MakeInt4GroupWeight(int outputDim, int inputDim, float seed) {
+        fastllm::Data source = MakeFloatTensor({outputDim, inputDim}, seed);
+        fastllm::Data weight(fastllm::DataType::INT4_GROUP, {outputDim, inputDim});
+        weight.CreateFromOriData(fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
+                                 source.cpuData, nullptr, nullptr, 128);
+        return weight;
+    }
+
+    MoeWeights MakeInt4GroupMoeWeights(int inputDim, int interDim, int outputDim, float seed) {
+        MoeWeights weights {
+            MakeInt4GroupWeight(interDim * 2, inputDim, seed),
+            MakeInt4GroupWeight(outputDim, interDim, seed + 1.0f)
+        };
+        weights.routedGate.name = "test.int4g_routed_gate";
+        weights.routedDown.name = "test.int4g_routed_down";
+        return weights;
+    }
+
+    std::vector<float> RunMergeMoeOnDevice(const std::string &device, MoeWeights &weights,
+                                           int batch = 32, bool keepCudaInputMirror = false) {
+        const int inputDim = weights.routedGate.dims[1];
+        const int outputDim = weights.routedDown.dims[0];
 
         fastllm::Data input = MakeFloatTensor({batch, inputDim}, 0.7f);
+        if (keepCudaInputMirror) {
+#ifdef USE_CUDA
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            input.ToDevice(fastllm::DataDevice::CPU);
+            Expect(input.cudaData != nullptr,
+                   "failed to retain a CUDA input mirror for NUMA GPU-prefill regression.");
+#else
+            throw std::runtime_error("CUDA input mirror requested in a non-CUDA build.");
+#endif
+        }
         fastllm::Data output(fastllm::DataType::FLOAT32, {batch, outputDim});
         fastllm::Data index = MakeIntTensor({batch, 1}, std::vector<int32_t>(batch, 0));
         fastllm::Data score(fastllm::DataType::FLOAT32, {batch, 1}, std::vector<float>(batch, 1.0f));
@@ -1538,6 +2159,32 @@ namespace {
         Expect(numasWeights.routedGate.cpuData == nullptr, "routed gate CPU buffer should be released after NUMA registration.");
         Expect(numasWeights.routedDown.cpuData == nullptr, "routed down CPU buffer should be released after NUMA registration.");
     }
+
+#ifdef USE_CUDA
+    void RunNumasCudaPrefillFallbackRegression() {
+        const int inputDim = 128;
+        const int interDim = 128;
+        const int outputDim = 128;
+
+        MoeWeights numasWeights = MakeInt4GroupMoeWeights(inputDim, interDim, outputDim, 2.3f);
+
+        // Prime NUMA registration with a small batch. INT4_GROUP(128) becomes the
+        // internal INT4_GROUP128 format, which FLOAT32 CUDA Linear cannot consume.
+        RunMergeMoeOnDevice("numa", numasWeights, 1);
+        Expect(numasWeights.routedGate.dataType == fastllm::DataType::INT4_GROUP128,
+               "NUMA gate weight was not converted to INT4_GROUP128.");
+        Expect(numasWeights.routedDown.dataType == fastllm::DataType::INT4_GROUP128,
+               "NUMA down weight was not converted to INT4_GROUP128.");
+
+        // With no CUDA mirror, NUMA must use its CPU implementation. Repeating the
+        // same input with a CUDA mirror should hit the compatibility check and
+        // produce the same CPU fallback result.
+        std::vector<float> expected = RunMergeMoeOnDevice("numa", numasWeights);
+        std::vector<float> actual = RunMergeMoeOnDevice("numa", numasWeights, 32, true);
+        ExpectFloatNear(expected, actual, 1e-4f, 1e-5f,
+                        "NUMA unsupported CUDA-prefill fallback output");
+    }
+#endif
 }
 
 int main() {
@@ -1547,6 +2194,16 @@ int main() {
 #ifndef USE_ROCM
         bool ranLargeWeightOffsetRegression = false;
 #endif
+
+        RunMoeAtypeConfigRegression();
+        std::cout << "moe_atype auto/explicit configuration regression: PASS\n";
+        ranAny = true;
+
+        if (fastllm::HasDeviceType("cpu")) {
+            RunCpuInt4GroupAwqLinearRegression();
+            std::cout << "cpu AWQ-style INT4_GROUP linear regression: PASS\n";
+            ranAny = true;
+        }
 
         if (fastllm::HasDeviceType("cuda")) {
 #ifdef USE_CUDA
@@ -1558,10 +2215,16 @@ int main() {
             RunCudaDeepSeekV4FusedHcPreNormRegression();
             RunCudaDeepSeekV4FusedQKVRopeCacheRegression();
             RunCudaGraphMemoryPoolOwnershipRegression();
+            RunCudaLinearDataTypeCapabilityRegression();
+            RunCudaInt4Group32AwqLinearRegression();
+            RunCudaInt4GroupHalfWeightRoundingRegression();
+            RunCudaInt4GroupBatch1MoeRegression();
+            RunCudaInt8Batch1MoeRegression();
             RunCudaConvMultiTokenSnapshotsRegression();
             ranCrossDeviceViewRegression = RunCudaCrossDeviceViewRejectionRegression();
             RunMultiCudaReplicatedExpansionRegression();
 #ifndef USE_ROCM
+            RunMultiCudaInt4GroupColumnSplitRegression();
             ranLargeWeightOffsetRegression = RunMultiCudaLargeWeightOffsetRegression();
 #endif
             RunCudaRecurrentSnapshotsRegression();
@@ -1587,6 +2250,12 @@ int main() {
         if (fastllm::HasDeviceType("numa") && !fastllm::GetFastllmEnv().activateNuma) {
             RunNumasMergeMoeRegression();
             std::cout << "numa MergeMOE regression: PASS\n";
+#ifdef USE_CUDA
+            if (fastllm::HasDeviceType("cuda")) {
+                RunNumasCudaPrefillFallbackRegression();
+                std::cout << "numa CUDA-prefill fallback regression: PASS\n";
+            }
+#endif
             ranAny = true;
         } else if (fastllm::HasDeviceType("numa")) {
             std::cout << "numa MergeMOE regression: SKIP (legacy numa device is active)\n";
