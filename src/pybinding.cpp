@@ -418,6 +418,7 @@ PYBIND11_MODULE(pyfastllm, m) {
 	  .def_readwrite("max_length", &fastllm::GenerationConfig::output_token_limit) 
 	  .def_readwrite("last_n", &fastllm::GenerationConfig::last_n) 
 	  .def_readwrite("repeat_penalty", &fastllm::GenerationConfig::repeat_penalty) 
+	  .def_readwrite("do_sample", &fastllm::GenerationConfig::do_sample)
 	  .def_readwrite("top_k", &fastllm::GenerationConfig::top_k) 
 	  .def_readwrite("top_p", &fastllm::GenerationConfig::top_p) 
 	  .def_readwrite("temperature", &fastllm::GenerationConfig::temperature)

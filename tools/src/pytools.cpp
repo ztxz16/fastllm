@@ -177,6 +177,7 @@ extern "C" {
         fastllm::GenerationConfig config;
         config.output_token_limit = max_length;
         config.output_token_least = min_length;
+        config.do_sample = do_sample;
         config.temperature = temperature;
         config.repeat_penalty = repeat_penalty;
         if (do_sample) {
