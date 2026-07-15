@@ -2988,7 +2988,7 @@ namespace fastllm {
         };
 
         const DataType computeType = ResolveQwen3MoeThreadTpComputeType(this->dataType);
-        const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
+        const DataType threadTpMoeAtype = this->useCustomMoeAtype ? this->moeAtype : computeType;
         auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
         auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
         int graphHidden = embed_dim;
@@ -3618,7 +3618,7 @@ namespace fastllm {
         };
 
             const DataType computeType = ResolveQwen3MoeThreadTpComputeType(this->dataType);
-            const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
+            const DataType threadTpMoeAtype = this->useCustomMoeAtype ? this->moeAtype : computeType;
             Data localHiddenStates;
             Data *hiddenStatesPtr = nullptr;
             if (precomputedHiddenStates != nullptr) {

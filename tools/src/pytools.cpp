@@ -469,14 +469,16 @@ extern "C" {
     DLL_EXPORT void set_model_moe_atype(int modelId, char *moe_atype) {
         auto model = models.GetModel(modelId);
         std::string atypeStr = moe_atype;
-        if (atypeStr == "float16" || atypeStr == "half") {
+        if (atypeStr == "" || atypeStr == "auto") {
+            model->SetMoeAtype(fastllm::DataType::DATA_AUTO_NONE);
+        } else if (atypeStr == "float16" || atypeStr == "half") {
             model->SetMoeAtype(fastllm::DataType::FLOAT16);
         } else if (atypeStr == "bfloat16" || atypeStr == "bf16") {
             model->SetMoeAtype(fastllm::DataType::BFLOAT16);
-        } else if (atypeStr == "float" || atypeStr == "float32" || atypeStr == "" || atypeStr == "auto") {
+        } else if (atypeStr == "float" || atypeStr == "float32") {
             model->SetMoeAtype(fastllm::DataType::FLOAT32);
         } else {
-            fastllm::ErrorInFastLLM("set_model_moe_atype error: moe_atype should be float32, float16 or bfloat16.");
+            fastllm::ErrorInFastLLM("set_model_moe_atype error: moe_atype should be auto, float32, float16 or bfloat16.");
         }
         return;
     }

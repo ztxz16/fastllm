@@ -493,6 +493,7 @@ namespace fastllm {
         DataType moeAtype = DataType::FLOAT32; // MOE 层激活类型，可由 --moe_atype 设定
         bool isFree = false; // 是否释放
         bool useCustomKVCacheDataType = false;
+        bool useCustomMoeAtype = false;
 
         int kvCacheId = 0; // 最早使用kv_cache的层编号 （因为有一些混合架构的模型，其中一些block是线性attention）
         bool canDoBatchForward = true; // 是否支持batch推理

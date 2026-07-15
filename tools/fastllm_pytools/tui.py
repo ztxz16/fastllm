@@ -312,7 +312,7 @@ FIELDS: Sequence[FormField] = (
     FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16 或 fp8。", KV_CACHE_DTYPE_CHOICES),
     FormField("mtp", "MTP", "text", "Qwen3.5 MTP 每步生成的 draft token 数；0 表示关闭，1-8 开启，auto 表示不指定。"),
     FormField("max_batch", "最大Batch", "text", "每次最多同时推理的询问数量；auto 表示不指定。"),
-    FormField("moe_atype", "MOE激活类型", "choice", "MOE层激活类型，可使用 float32、float16 或 bfloat16。", MOE_ATYPE_CHOICES),
+    FormField("moe_atype", "MOE激活类型", "choice", "MOE层激活类型，可使用 auto、float32、float16 或 bfloat16。", MOE_ATYPE_CHOICES),
     FormField("enable_thinking", "思考开关", "choice", "是否开启硬思考开关，需要模型支持。", ENABLE_THINKING_CHOICES),
     FormField("tokens", "tokens数量", "text", "设置总 token 数量；auto 表示不指定。"),
     FormField("threads", "线程数", "text", "线程数量；auto 表示由 fastllm 自动估算。"),

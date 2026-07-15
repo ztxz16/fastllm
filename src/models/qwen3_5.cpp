@@ -6040,7 +6040,7 @@ namespace fastllm {
         }
 
         const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
-        const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
+        const DataType threadTpMoeAtype = this->useCustomMoeAtype ? this->moeAtype : computeType;
         auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
         auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
         auto localHeadsFromScheme = [&](const DivisionScheme &scheme, int defaultHeads) {
@@ -6809,7 +6809,7 @@ namespace fastllm {
         };
 
         const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
-        const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
+        const DataType threadTpMoeAtype = this->useCustomMoeAtype ? this->moeAtype : computeType;
         Data localHiddenStates;
         Data *hiddenStatesPtr = nullptr;
         if (!speculativeCollectAllLogits &&

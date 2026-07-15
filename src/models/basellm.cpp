@@ -3031,10 +3031,14 @@ namespace fastllm {
     }
 
     void basellm::SetMoeAtype(DataType type) {
-        if (type == DataType::FLOAT32 || type == DataType::FLOAT16 || type == DataType::BFLOAT16) {
+        if (type == DataType::DATA_AUTO_NONE) {
+            this->moeAtype = DataType::FLOAT32;
+            this->useCustomMoeAtype = false;
+        } else if (type == DataType::FLOAT32 || type == DataType::FLOAT16 || type == DataType::BFLOAT16) {
             this->moeAtype = type;
+            this->useCustomMoeAtype = true;
         } else {
-            ErrorInFastLLM("SetMoeAtype Error: moe_atype should be float32, float16 or bfloat16");
+            ErrorInFastLLM("SetMoeAtype Error: moe_atype should be auto, float32, float16 or bfloat16");
         }
     }
 

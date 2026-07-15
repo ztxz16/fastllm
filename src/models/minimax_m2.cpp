@@ -848,7 +848,7 @@ namespace fastllm {
         };
 
         const DataType computeType = ResolveMinimaxM2ThreadTpComputeType(this->dataType);
-        const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
+        const DataType threadTpMoeAtype = this->useCustomMoeAtype ? this->moeAtype : computeType;
         Data localHiddenStates;
         Data *hiddenStatesPtr = nullptr;
         if (precomputedHiddenStates != nullptr) {
