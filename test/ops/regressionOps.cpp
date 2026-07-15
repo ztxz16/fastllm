@@ -13,11 +13,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -132,6 +134,18 @@ namespace {
     }
 
 #ifdef USE_CUDA
+    bool RegressionEnvFlagDefaultEnabled(const char *name, bool fallback) {
+        const char *value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return fallback;
+        }
+        return std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "FALSE") != 0 &&
+               std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "OFF") != 0;
+    }
+
     fastllm::Data MakeCudaTensor(fastllm::DataType dataType, const std::vector<int> &dims,
                                  const std::vector<float> &values) {
         fastllm::Data data(dataType, dims, values);
@@ -161,6 +175,559 @@ namespace {
                                  0.5f * std::cos((i + 3) * 0.043f - seed));
         }
         return values;
+    }
+
+    void RunCudaDeepSeekV4TritonWoARegression() {
+        bool tritonEnabled = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_FP8_WOA", true);
+        FastllmCudaSetDevice(0);
+        constexpr int groups = 2;
+        constexpr int heads = 4;
+        constexpr int headDim = 64;
+        constexpr int hidden = (heads / groups) * headDim;
+        constexpr int outRank = 128;
+
+        std::vector<float> inputValues(heads * headDim, 1.0f);
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, heads, headDim}, inputValues);
+
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::FP8_E4M3;
+        weight.UpdateUnitSize();
+        weight.Resize({groups * outRank, hidden});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = 128;
+        weight.blockM = 128;
+        weight.Allocate(false);
+        uint8_t *weightBytes = reinterpret_cast<uint8_t*>(weight.cpuData);
+        for (uint64_t i = 0; i < weight.GetBytes(); i++) {
+            weightBytes[i] = static_cast<uint8_t>(0x20 + (i & 0x1f));
+        }
+        weight.scales = {1.0f / 64.0f, 1.0f / 32.0f};
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+
+        fastllm::Data reference;
+        Expect(FastllmCudaDeepSeekV4WoA(
+                   input, weight, groups, outRank, reference, false),
+               "built-in DeepSeek-V4 WoA reference rejected its test input");
+
+        fastllm::Data actual = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, groups * outRank},
+            std::vector<float>(groups * outRank, 0.0f));
+        bool usedTriton = fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
+            input, weight, groups, outRank, actual);
+        if (tritonEnabled) {
+            Expect(usedTriton,
+                   "Triton DeepSeek-V4 WoA rejected its supported test input");
+        } else {
+            Expect(!usedTriton,
+                   "DeepSeek-V4 WoA ignored its disabled Triton gate");
+            Expect(FastllmCudaDeepSeekV4WoA(
+                       input, weight, groups, outRank, actual),
+                   "built-in DeepSeek-V4 WoA fallback rejected its test input");
+        }
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                        2e-2f, 2e-3f, "DeepSeek-V4 Triton WoA output");
+        std::cout << "DeepSeek-V4 Triton WoA regression: PASS ("
+                  << (tritonEnabled ? "Triton" : "disabled-gate fallback")
+                  << ")\n";
+    }
+
+    void RunCudaDeepSeekV4TritonSparseDecodeRegression() {
+        bool tritonEnabled = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_SPARSE_DECODE", true);
+        FastllmCudaSetDevice(0);
+        constexpr int heads = 4;
+        constexpr int headDim = 64;
+        constexpr int windowSize = 8;
+        constexpr int compressedCapacity = 4;
+        constexpr int startPos = 13;
+        constexpr int ropeDim = 16;
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, heads, headDim},
+            MakeRegressionValues(heads * headDim, 0.31f, 0.16f));
+        fastllm::Data windowKV = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, windowSize, headDim},
+            MakeRegressionValues(windowSize * headDim, 0.73f, 0.12f));
+        fastllm::Data compressedKV = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, compressedCapacity, headDim},
+            MakeRegressionValues(compressedCapacity * headDim, 1.07f, 0.10f));
+        fastllm::Data sink = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {heads},
+            MakeRegressionValues(heads, 1.41f, 0.08f));
+        fastllm::Data decodeMeta = MakeIntTensor({2}, {startPos, 123});
+        decodeMeta.ToDevice(fastllm::DataDevice::CUDA);
+        const int32_t *decodeMetaPtr =
+            reinterpret_cast<const int32_t*>(decodeMeta.cudaData);
+        float softmaxScale = 1.0f / std::sqrt((float)headDim);
+
+        const int compressRatios[] = {0, 4, 128};
+        for (int compressRatio : compressRatios) {
+            fastllm::Data reference;
+            Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
+                       q, windowKV, compressedKV, sink, windowSize, compressRatio,
+                       decodeMetaPtr, ropeDim, 10000.0f, 4096, 8.0f, 32, 1,
+                       softmaxScale, reference, false),
+                   "built-in DeepSeek-V4 sparse decode rejected ratio=" +
+                       std::to_string(compressRatio));
+
+            fastllm::Data directOutput = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {1, 1, heads, headDim},
+                std::vector<float>(heads * headDim, 0.0f));
+            bool usedTriton =
+                fastllm::FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
+                    q, windowKV, compressedKV, sink, windowSize, compressRatio,
+                    decodeMetaPtr, softmaxScale,
+                    reinterpret_cast<float*>(directOutput.cudaData));
+            fastllm::Data actual;
+            if (tritonEnabled) {
+                Expect(usedTriton,
+                       "Triton DeepSeek-V4 sparse decode rejected ratio=" +
+                           std::to_string(compressRatio));
+            } else {
+                Expect(!usedTriton,
+                       "DeepSeek-V4 sparse decode ignored its disabled Triton gate");
+            }
+            // The trial entry writes the pre-RoPE FLOAT32 attention result.
+            // Compare final outputs through the production wrapper, which
+            // applies the rotary cast after either Triton or native fallback.
+            Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
+                       q, windowKV, compressedKV, sink, windowSize, compressRatio,
+                       decodeMetaPtr, ropeDim, 10000.0f, 4096, 8.0f, 32, 1,
+                       softmaxScale, actual),
+                   "DeepSeek-V4 sparse decode wrapper rejected ratio=" +
+                       std::to_string(compressRatio));
+            ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                            3e-2f, 3e-3f,
+                            "DeepSeek-V4 Triton sparse decode output ratio=" +
+                                std::to_string(compressRatio));
+        }
+        std::cout << "DeepSeek-V4 Triton sparse decode regression: PASS ("
+                  << (tritonEnabled ? "Triton" : "disabled-gate fallback")
+                  << ")\n";
+    }
+
+    void RunCudaDeepSeekV4HashRouteCacheRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int topk = 2;
+        fastllm::Data logits = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, 4},
+            {0.3f, -0.1f, 0.8f, 0.2f});
+        fastllm::Data routeTable = MakeIntTensor(
+            {2, topk}, {0, 1, 2, 3});
+        int inputId = 0;
+        fastllm::Data expertIndex, expertScore;
+        Expect(FastllmCudaDeepSeekV4HashRouteScore(
+                   logits, routeTable, &inputId, 1, topk, 0, 1.0f,
+                   expertIndex, expertScore),
+               "DeepSeek-V4 eager hash route rejected its cache test input");
+        ExpectIntEqual({0, 1}, ToIntVector(expertIndex),
+                       "DeepSeek-V4 eager hash route initial table");
+
+        // Mutable non-model tensors must refresh even when the CPU address,
+        // shape and element count stay unchanged.
+        int32_t *routeValues = reinterpret_cast<int32_t*>(routeTable.cpuData);
+        routeValues[0] = 3;
+        routeValues[1] = 2;
+        fastllm::Data decodeMeta = MakeIntTensor({2}, {0, inputId});
+        decodeMeta.ToDevice(fastllm::DataDevice::CUDA);
+        Expect(FastllmCudaDeepSeekV4HashRouteScoreGraph(
+                   logits, routeTable,
+                   reinterpret_cast<const int32_t*>(decodeMeta.cudaData),
+                   1, topk, 0, 1.0f, expertIndex, expertScore),
+               "DeepSeek-V4 graph hash route rejected its refreshed table");
+        ExpectIntEqual({3, 2}, ToIntVector(expertIndex),
+                       "DeepSeek-V4 graph hash route refreshed table");
+
+        // Model weights skip per-token hashing because they are immutable.
+        // Explicit retirement must nevertheless make a reloaded table upload
+        // fresh contents, even if the same Data object is reused by a test.
+        routeTable.isModelWeight = true;
+        FastllmCudaReleaseDeepSeekV4RouteTableCache(&routeTable);
+        routeValues[0] = 1;
+        routeValues[1] = 3;
+        Expect(FastllmCudaDeepSeekV4HashRouteScore(
+                   logits, routeTable, &inputId, 1, topk, 0, 1.0f,
+                   expertIndex, expertScore),
+               "DeepSeek-V4 eager hash route rejected its retired cache");
+        ExpectIntEqual({1, 3}, ToIntVector(expertIndex),
+                       "DeepSeek-V4 eager hash route after cache retirement");
+
+        std::cout << "DeepSeek-V4 hash route cache regression: PASS\n";
+    }
+
+    void RunCudaDeepSeekV4FusedHcPreNormRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int hcMult = 4;
+        constexpr int hidden = 4096;
+        constexpr int mixHc = (2 + hcMult) * hcMult;
+        constexpr int flat = hcMult * hidden;
+        constexpr int sinkhornIters = 20;
+        constexpr float eps = 1e-6f;
+
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, hcMult, hidden},
+            MakeRegressionValues(flat, 0.23f, 0.06f));
+        fastllm::Data hcFn = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {mixHc, flat},
+            MakeRegressionValues(mixHc * flat, 0.67f, 0.008f));
+        fastllm::Data hcScale = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {3}, {0.71f, 0.83f, 0.57f});
+        fastllm::Data hcBase = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {mixHc},
+            MakeRegressionValues(mixHc, 1.11f, 0.12f));
+        std::vector<float> normValues(hidden);
+        for (int i = 0; i < hidden; i++) {
+            normValues[i] = 1.0f + 0.08f * std::sin((i + 1) * 0.013f);
+        }
+        fastllm::Data normWeight = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {hidden}, normValues);
+
+        fastllm::Data preOutput, referencePost, referenceComb;
+        Expect(FastllmCudaDeepSeekV4HcPre(
+                   input, hcFn, hcScale, hcBase, hcMult, sinkhornIters,
+                   eps, eps, preOutput, referencePost, referenceComb),
+               "built-in DeepSeek-V4 HcPre rejected fused-norm regression input");
+        fastllm::Data referenceNorm = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, hidden},
+            std::vector<float>(hidden, 0.0f));
+        Expect(FastllmCudaRMSNorm(preOutput, normWeight, referenceNorm, eps),
+               "built-in RMSNorm rejected fused HcPre regression input");
+
+        fastllm::Data actualNorm, actualPost, actualComb;
+        Expect(FastllmCudaDeepSeekV4HcPreNorm(
+                   input, hcFn, hcScale, hcBase, normWeight, hcMult,
+                   sinkhornIters, eps, eps, actualNorm, actualPost, actualComb),
+               "fused DeepSeek-V4 HcPreNorm rejected its decode shape");
+        ExpectFloatNear(ToFloatVector(referenceNorm), ToFloatVector(actualNorm),
+                        2e-2f, 2e-3f, "DeepSeek-V4 fused HcPreNorm output");
+        ExpectFloatNear(ToFloatVector(referencePost), ToFloatVector(actualPost),
+                        2e-5f, 2e-5f, "DeepSeek-V4 fused HcPreNorm post mix");
+        ExpectFloatNear(ToFloatVector(referenceComb), ToFloatVector(actualComb),
+                        2e-5f, 2e-5f, "DeepSeek-V4 fused HcPreNorm comb mix");
+
+        fastllm::Data layerOutput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, hidden},
+            MakeRegressionValues(hidden, 0.91f, 0.09f));
+        fastllm::Data previousPost = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, 1, hcMult},
+            {0.62f, 0.48f, 0.71f, 0.55f});
+        fastllm::Data previousComb = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, 1, hcMult, hcMult},
+            {0.70f, 0.12f, 0.09f, 0.09f,
+             0.10f, 0.72f, 0.08f, 0.10f,
+             0.08f, 0.11f, 0.73f, 0.08f,
+             0.12f, 0.07f, 0.10f, 0.71f});
+        fastllm::Data referenceResidual;
+        Expect(FastllmCudaDeepSeekV4HcPostCudaMix(
+                   layerOutput, input, previousPost, previousComb,
+                   1, 1, hcMult, hidden, referenceResidual),
+               "built-in DeepSeek-V4 HcPost rejected transition regression input");
+        fastllm::Data transitionReferenceNorm;
+        fastllm::Data transitionReferencePost;
+        fastllm::Data transitionReferenceComb;
+        Expect(FastllmCudaDeepSeekV4HcPreNorm(
+                   referenceResidual, hcFn, hcScale, hcBase, normWeight,
+                   hcMult, sinkhornIters, eps, eps, transitionReferenceNorm,
+                   transitionReferencePost, transitionReferenceComb),
+               "built-in DeepSeek-V4 HcPreNorm rejected transition reference");
+
+        fastllm::Data transitionResidual;
+        fastllm::Data transitionNorm;
+        fastllm::Data transitionPost;
+        fastllm::Data transitionComb;
+        Expect(FastllmCudaDeepSeekV4HcPostPreNorm(
+                   layerOutput, input, previousPost, previousComb, hcFn,
+                   hcScale, hcBase, normWeight, hcMult, sinkhornIters,
+                   eps, eps, transitionResidual, transitionNorm,
+                   transitionPost, transitionComb),
+               "fused DeepSeek-V4 HcPostPreNorm rejected its decode shape");
+        ExpectFloatNear(ToFloatVector(referenceResidual),
+                        ToFloatVector(transitionResidual), 4e-3f, 2e-3f,
+                        "DeepSeek-V4 fused HcPostPreNorm residual");
+        ExpectFloatNear(ToFloatVector(transitionReferenceNorm),
+                        ToFloatVector(transitionNorm), 3e-2f, 4e-3f,
+                        "DeepSeek-V4 fused HcPostPreNorm norm output");
+        ExpectFloatNear(ToFloatVector(transitionReferencePost),
+                        ToFloatVector(transitionPost), 2e-3f, 2e-3f,
+                        "DeepSeek-V4 fused HcPostPreNorm post mix");
+        ExpectFloatNear(ToFloatVector(transitionReferenceComb),
+                        ToFloatVector(transitionComb), 2e-3f, 2e-3f,
+                        "DeepSeek-V4 fused HcPostPreNorm comb mix");
+
+        std::cout << "DeepSeek-V4 fused HcPreNorm regression: PASS\n";
+    }
+
+    void RunCudaDeepSeekV4FusedQKVRopeCacheRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int heads = 64;
+        constexpr int headDim = 512;
+        constexpr int ropeDim = 64;
+        constexpr int windowSize = 128;
+        constexpr int position = 173;
+        constexpr float eps = 1e-6f;
+
+        std::vector<float> qValues =
+            MakeRegressionValues(heads * headDim, 0.47f, 0.65f);
+        std::vector<float> kvValues =
+            MakeRegressionValues(headDim, 1.31f, 0.72f);
+        std::vector<float> weightValues(headDim);
+        for (int i = 0; i < headDim; i++) {
+            weightValues[i] = 1.0f + 0.09f * std::sin((i + 1) * 0.019f);
+        }
+        std::vector<float> cacheValues(windowSize * headDim);
+        for (int i = 0; i < (int)cacheValues.size(); i++) {
+            cacheValues[i] = -0.4f + 0.03f * std::sin((i + 1) * 0.007f);
+        }
+
+        fastllm::Data decodeMeta = MakeIntTensor({2}, {position, 123});
+        decodeMeta.ToDevice(fastllm::DataDevice::CUDA);
+        const int32_t *decodeMetaPtr =
+            reinterpret_cast<const int32_t*>(decodeMeta.cudaData);
+        fastllm::Data kvNormWeight = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {headDim}, weightValues);
+
+        fastllm::Data referenceQ = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, heads, headDim}, qValues);
+        fastllm::Data referenceKVInput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, 1, headDim}, kvValues);
+        fastllm::Data referenceKV = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, 1, headDim},
+            std::vector<float>(headDim, 0.0f));
+        Expect(FastllmCudaRMSNorm(referenceKVInput, kvNormWeight, referenceKV, eps),
+               "built-in RMSNorm rejected fused QKV reference input");
+        Expect(FastllmCudaDeepSeekV4ScaleQRotaryGraph(
+                   referenceQ, ropeDim, 160000.0f, decodeMetaPtr,
+                   4096, 4.0f, 32, 1, eps),
+               "built-in Q rotary rejected fused QKV reference input");
+        Expect(FastllmCudaDeepSeekV4RotaryQuantGraph(
+                   referenceKV, ropeDim, 160000.0f, decodeMetaPtr,
+                   4096, 4.0f, 32, 1, headDim - ropeDim, 64, 1),
+               "built-in KV rotary rejected fused QKV reference input");
+        referenceKV.Reshape({1, 1, headDim});
+        fastllm::Data referenceCache = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, windowSize, headDim}, cacheValues);
+        Expect(FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(
+                   referenceKV, decodeMetaPtr, windowSize, referenceCache),
+               "built-in cache update rejected fused QKV reference input");
+
+        fastllm::Data actualQ = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, heads, headDim}, qValues);
+        fastllm::Data actualKV = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, 1, headDim}, kvValues);
+        fastllm::Data actualCache = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, windowSize, headDim}, cacheValues);
+        Expect(FastllmCudaDeepSeekV4FusedQKVRopeCacheGraph(
+                   actualQ, actualKV, kvNormWeight, decodeMetaPtr,
+                   ropeDim, 160000.0f, 4096, 4.0f, 32, 1, eps,
+                   headDim - ropeDim, 64, windowSize, actualCache),
+               "fused DeepSeek-V4 QKV rope/cache rejected its decode shape");
+
+        ExpectFloatNear(ToFloatVector(referenceQ), ToFloatVector(actualQ),
+                        3e-2f, 3e-3f, "DeepSeek-V4 fused Q output");
+        ExpectFloatNear(ToFloatVector(referenceKV), ToFloatVector(actualKV),
+                        3e-2f, 3e-3f, "DeepSeek-V4 fused KV output");
+        ExpectFloatNear(ToFloatVector(referenceCache), ToFloatVector(actualCache),
+                        3e-2f, 3e-3f, "DeepSeek-V4 fused window cache");
+
+        // TP8 shards the model's 64 global query heads into eight local heads.
+        // Keep this shape covered so the fused path cannot silently fall back to
+        // the three-kernel reference sequence in tensor-parallel decode.
+        {
+            constexpr int localHeads = 8;
+            std::vector<float> localQValues =
+                MakeRegressionValues(localHeads * headDim, 0.91f, 0.58f);
+            fastllm::Data localReferenceQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, 1, localHeads, headDim}, localQValues);
+            fastllm::Data localReferenceKVInput = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, {1, 1, 1, headDim}, kvValues);
+            fastllm::Data localReferenceKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, {1, 1, 1, headDim},
+                std::vector<float>(headDim, 0.0f));
+            Expect(FastllmCudaRMSNorm(
+                       localReferenceKVInput, kvNormWeight,
+                       localReferenceKV, eps),
+                   "built-in RMSNorm rejected TP8 fused QKV reference input");
+            Expect(FastllmCudaDeepSeekV4ScaleQRotaryGraph(
+                       localReferenceQ, ropeDim, 160000.0f, decodeMetaPtr,
+                       4096, 4.0f, 32, 1, eps),
+                   "built-in Q rotary rejected TP8 fused QKV reference input");
+            Expect(FastllmCudaDeepSeekV4RotaryQuantGraph(
+                       localReferenceKV, ropeDim, 160000.0f, decodeMetaPtr,
+                       4096, 4.0f, 32, 1, headDim - ropeDim, 64, 1),
+                   "built-in KV rotary rejected TP8 fused QKV reference input");
+            localReferenceKV.Reshape({1, 1, headDim});
+            fastllm::Data localReferenceCache = MakeCudaTensor(
+                fastllm::DataType::FLOAT32,
+                {1, windowSize, headDim}, cacheValues);
+            Expect(FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(
+                       localReferenceKV, decodeMetaPtr,
+                       windowSize, localReferenceCache),
+                   "built-in cache update rejected TP8 fused QKV reference input");
+
+            fastllm::Data localActualQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, 1, localHeads, headDim}, localQValues);
+            fastllm::Data localActualKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, {1, 1, 1, headDim}, kvValues);
+            fastllm::Data localActualCache = MakeCudaTensor(
+                fastllm::DataType::FLOAT32,
+                {1, windowSize, headDim}, cacheValues);
+            Expect(FastllmCudaDeepSeekV4FusedQKVRopeCacheGraph(
+                       localActualQ, localActualKV, kvNormWeight, decodeMetaPtr,
+                       ropeDim, 160000.0f, 4096, 4.0f, 32, 1, eps,
+                       headDim - ropeDim, 64, windowSize, localActualCache),
+                   "fused DeepSeek-V4 QKV rope/cache rejected TP8 local heads");
+            ExpectFloatNear(ToFloatVector(localReferenceQ),
+                            ToFloatVector(localActualQ),
+                            3e-2f, 3e-3f,
+                            "DeepSeek-V4 TP8 fused Q output");
+            ExpectFloatNear(ToFloatVector(localReferenceKV),
+                            ToFloatVector(localActualKV),
+                            3e-2f, 3e-3f,
+                            "DeepSeek-V4 TP8 fused KV output");
+            ExpectFloatNear(ToFloatVector(localReferenceCache),
+                            ToFloatVector(localActualCache),
+                            3e-2f, 3e-3f,
+                            "DeepSeek-V4 TP8 fused window cache");
+        }
+
+        std::cout << "DeepSeek-V4 fused QKV rope/cache regression: PASS\n";
+    }
+
+    void RunCudaGraphMemoryPoolOwnershipRegression() {
+        FastllmCudaSetDevice(0);
+
+        // A pointer released by a participating capture stream must not be
+        // handed to an unrelated allocator thread before finalization pins it.
+        constexpr size_t concurrentBytes = 19 * 1024 * 1024 + 4096;
+        void *warm = FastllmCudaMalloc(concurrentBytes);
+        Expect(warm != nullptr, "graph pool concurrency warmup allocation failed");
+        FastllmCudaFree(warm);
+
+        Expect(FastllmCudaGraphMemoryPoolBegin(),
+               "graph pool concurrency capture begin failed");
+        Expect(FastllmCudaGraphBeginCapture(),
+               "graph pool concurrency stream capture begin failed");
+        void *captured = FastllmCudaMalloc(concurrentBytes);
+        Expect(captured != nullptr,
+               "graph pool concurrency capture allocation failed");
+        Expect(cudaMemsetAsync(captured, 0, concurrentBytes,
+                               cudaStreamPerThread) == cudaSuccess,
+               "graph pool concurrency captured memset failed");
+        FastllmCudaFree(captured);
+
+        void *external = nullptr;
+        std::thread allocator([&]() {
+            FastllmCudaSetDevice(0);
+            external = FastllmCudaMalloc(concurrentBytes);
+        });
+        allocator.join();
+        Expect(external != nullptr,
+               "graph pool external allocation failed");
+        Expect(external != captured,
+               "external allocator reused a pointer owned by active capture");
+
+        void *graph = nullptr;
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "graph pool concurrency stream capture end failed");
+        std::vector<void*> reserved;
+        Expect(FastllmCudaGraphMemoryPoolEnd(reserved),
+               "graph pool concurrency finalization failed");
+        Expect(std::find(reserved.begin(), reserved.end(), captured) !=
+                   reserved.end(),
+               "idle captured pointer was not pinned");
+        FastllmCudaGraphDestroy(graph);
+        FastllmCudaGraphMemoryPoolRelease(reserved);
+        FastllmCudaFree(external);
+
+        // If a released temporary is immediately reused by a persistent owner
+        // on the capture stream, the graph and Data must hold independent
+        // references so releasing the graph first cannot expose the Data buffer.
+        constexpr size_t persistentBytes = 23 * 1024 * 1024 + 8192;
+        warm = FastllmCudaMalloc(persistentBytes);
+        Expect(warm != nullptr, "graph pool persistent warmup allocation failed");
+        FastllmCudaFree(warm);
+
+        Expect(FastllmCudaGraphMemoryPoolBegin(),
+               "graph pool persistent capture begin failed");
+        Expect(FastllmCudaGraphBeginCapture(),
+               "graph pool persistent stream capture begin failed");
+        void *temporary = FastllmCudaMalloc(persistentBytes);
+        Expect(temporary != nullptr,
+               "graph pool persistent temporary allocation failed");
+        Expect(cudaMemsetAsync(temporary, 0, persistentBytes,
+                               cudaStreamPerThread) == cudaSuccess,
+               "graph pool persistent captured memset failed");
+        FastllmCudaFree(temporary);
+        void *persistentOwner = FastllmCudaMalloc(persistentBytes);
+        Expect(persistentOwner == temporary,
+               "capture stream did not reuse its released temporary");
+
+        graph = nullptr;
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "graph pool persistent stream capture end failed");
+        reserved.clear();
+        Expect(FastllmCudaGraphMemoryPoolEnd(reserved),
+               "graph pool persistent finalization failed");
+        Expect(std::find(reserved.begin(), reserved.end(), persistentOwner) !=
+                   reserved.end(),
+               "persistent captured owner did not receive an independent graph pin");
+        FastllmCudaGraphDestroy(graph);
+        FastllmCudaGraphMemoryPoolRelease(reserved);
+
+        void *probe = FastllmCudaMalloc(persistentBytes);
+        Expect(probe != nullptr && probe != persistentOwner,
+               "graph release exposed a buffer still owned by persistent Data");
+        FastllmCudaFree(probe);
+        FastllmCudaFree(persistentOwner);
+
+        // Exercise the opposite release order: a Data owner may disappear while
+        // the graph is alive, but its address must remain unavailable until the
+        // graph pin is released.
+        constexpr size_t ownerFirstBytes = 29 * 1024 * 1024 + 12288;
+        warm = FastllmCudaMalloc(ownerFirstBytes);
+        Expect(warm != nullptr, "graph pool owner-first warmup allocation failed");
+        FastllmCudaFree(warm);
+        Expect(FastllmCudaGraphMemoryPoolBegin(),
+               "graph pool owner-first capture begin failed");
+        Expect(FastllmCudaGraphBeginCapture(),
+               "graph pool owner-first stream capture begin failed");
+        temporary = FastllmCudaMalloc(ownerFirstBytes);
+        Expect(temporary != nullptr,
+               "graph pool owner-first temporary allocation failed");
+        Expect(cudaMemsetAsync(temporary, 0, ownerFirstBytes,
+                               cudaStreamPerThread) == cudaSuccess,
+               "graph pool owner-first captured memset failed");
+        FastllmCudaFree(temporary);
+        persistentOwner = FastllmCudaMalloc(ownerFirstBytes);
+        Expect(persistentOwner == temporary,
+               "owner-first capture did not reuse its temporary");
+        graph = nullptr;
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "graph pool owner-first stream capture end failed");
+        reserved.clear();
+        Expect(FastllmCudaGraphMemoryPoolEnd(reserved),
+               "graph pool owner-first finalization failed");
+        FastllmCudaFree(persistentOwner);
+        probe = FastllmCudaMalloc(ownerFirstBytes);
+        Expect(probe != nullptr && probe != persistentOwner,
+               "Data release exposed an address still pinned by the graph");
+        FastllmCudaFree(probe);
+        FastllmCudaGraphDestroy(graph);
+        FastllmCudaClearThreadError();
+        FastllmCudaGraphMemoryPoolRelease(reserved);
+        Expect(!FastllmCudaGetThreadError(),
+               "graph pin release lost its owner-first pool entry");
+        void *afterRelease = FastllmCudaMalloc(ownerFirstBytes);
+        Expect(afterRelease != nullptr,
+               "allocation failed after releasing the owner-first graph pin");
+        FastllmCudaFree(afterRelease);
+        std::cout << "CUDA graph memory-pool ownership regression: PASS\n";
     }
 
     std::vector<float> ExtractLastAxisToken(const std::vector<float> &values,
@@ -427,6 +994,47 @@ namespace {
                "multi-token conv left its output on the wrong CUDA device");
         FastllmCudaSetDevice(originalDevice);
         return true;
+    }
+
+    void RunMultiCudaReplicatedExpansionRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "multi-CUDA replicated expansion regression: SKIP (two GPUs required)\n";
+            return;
+        }
+
+        const int originalDevice = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(0);
+        fastllm::Data data = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, 3, 8}, MakeRegressionValues(24, 10.9f, 0.2f));
+        data.Expansion({1, 16, 8});
+        const size_t bytes = data.GetBytes();
+        Expect(bytes == data.expansionBytes && bytes > 24 * sizeof(float),
+               "expanded replication fixture did not retain padded backing storage");
+
+        std::vector<uint8_t> expected(bytes);
+        FastllmCudaCopyFromDeviceToHost(expected.data(), data.cudaData, bytes);
+        std::vector<int> devices = {0, 1};
+        PrepareMultiCudaReplicatedData(data, devices, true);
+        Expect(data.IsTensorParallelReplicated() && data.multiDeviceData,
+               "expanded tensor did not become a replicated multi-CUDA tensor");
+
+        for (int device : devices) {
+            auto it = data.multiDeviceDatas.find(device);
+            Expect(it != data.multiDeviceDatas.end() && it->second != nullptr,
+                   "expanded tensor is missing a device replica");
+            fastllm::Data *local = it->second;
+            Expect(local->dims == data.dims && local->strides == data.strides &&
+                       local->expansionDims == data.expansionDims &&
+                       local->expansionBytes >= bytes,
+                   "expanded tensor replica lost its backing layout");
+            Expect(GetPointerDeviceId(local->cudaData) == device,
+                   "expanded tensor replica was allocated on the wrong device");
+            FastllmCudaSetDevice(device);
+            std::vector<uint8_t> actual(bytes);
+            FastllmCudaCopyFromDeviceToHost(actual.data(), local->cudaData, bytes);
+            Expect(actual == expected, "expanded tensor replica data mismatch");
+        }
+        FastllmCudaSetDevice(originalDevice);
     }
 
 #ifndef USE_ROCM
@@ -944,8 +1552,15 @@ int main() {
 #ifdef USE_CUDA
             Expect(FastllmCudaGraphQwen35MoeSelfTest(),
                    "Qwen3.5 CUDA graph shared/routed MoE parallelization/fallback self-test failed");
+            RunCudaDeepSeekV4TritonWoARegression();
+            RunCudaDeepSeekV4TritonSparseDecodeRegression();
+            RunCudaDeepSeekV4HashRouteCacheRegression();
+            RunCudaDeepSeekV4FusedHcPreNormRegression();
+            RunCudaDeepSeekV4FusedQKVRopeCacheRegression();
+            RunCudaGraphMemoryPoolOwnershipRegression();
             RunCudaConvMultiTokenSnapshotsRegression();
             ranCrossDeviceViewRegression = RunCudaCrossDeviceViewRejectionRegression();
+            RunMultiCudaReplicatedExpansionRegression();
 #ifndef USE_ROCM
             ranLargeWeightOffsetRegression = RunMultiCudaLargeWeightOffsetRegression();
 #endif

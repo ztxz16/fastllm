@@ -270,6 +270,80 @@ static bool LaunchFastllmLinearFp8NativeQuant128(
     return cudaGetLastError() == cudaSuccess;
 }
 
+template <typename T>
+__global__ void FastllmDeepSeekV4WoAQuant128Kernel(
+    const T *__restrict__ input, uint8_t *__restrict__ output, float *__restrict__ scales,
+    int totalGroups) {
+    constexpr int groupSize = 128;
+    constexpr int threadsPerGroup = 16;
+    constexpr int valuesPerThread = groupSize / threadsPerGroup;
+
+    int localGroup = threadIdx.x / threadsPerGroup;
+    int lane = threadIdx.x % threadsPerGroup;
+    int groupsPerBlock = blockDim.x / threadsPerGroup;
+    int globalGroup = blockIdx.x * groupsPerBlock + localGroup;
+    if (globalGroup >= totalGroups) {
+        return;
+    }
+
+    int base = globalGroup * groupSize;
+    float values[valuesPerThread];
+    float localAbsMax = 1.0e-10f;
+#pragma unroll
+    for (int i = 0; i < valuesPerThread; i++) {
+        int offset = lane + i * threadsPerGroup;
+        float value = static_cast<float>(input[base + offset]);
+        values[i] = value;
+        localAbsMax = fmaxf(localAbsMax, fabsf(value));
+    }
+
+    unsigned int mask = (threadIdx.x % 32 >= 16) ? 0xffff0000u : 0x0000ffffu;
+    localAbsMax = fmaxf(localAbsMax, __shfl_xor_sync(mask, localAbsMax, 8));
+    localAbsMax = fmaxf(localAbsMax, __shfl_xor_sync(mask, localAbsMax, 4));
+    localAbsMax = fmaxf(localAbsMax, __shfl_xor_sync(mask, localAbsMax, 2));
+    localAbsMax = fmaxf(localAbsMax, __shfl_xor_sync(mask, localAbsMax, 1));
+
+    // DeepSeek-V4 stores activation scales with UE8M0 semantics.  vLLM keeps
+    // the SM12x buffer as FP32, but still rounds every scale up to a power of
+    // two before quantizing.
+    float scaleRaw = localAbsMax * (1.0f / 448.0f);
+    float scale = exp2f(ceilf(log2f(scaleRaw)));
+    if (lane == 0) {
+        scales[globalGroup] = scale;
+    }
+    float invScale = 1.0f / scale;
+#pragma unroll
+    for (int i = 0; i < valuesPerThread; i++) {
+        int offset = lane + i * threadsPerGroup;
+        float q = fminf(fmaxf(values[i] * invScale, -448.0f), 448.0f);
+        output[base + offset] = __nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+static bool LaunchFastllmDeepSeekV4WoAQuant128(
+    const void *input, fastllm::DataType inputType,
+    uint8_t *output, float *scales, int elements) {
+    if (input == nullptr || output == nullptr || scales == nullptr ||
+        elements <= 0 || (elements % 128) != 0) {
+        return false;
+    }
+    int totalGroups = elements / 128;
+    constexpr int groupsPerBlock = 8;
+    dim3 block(groupsPerBlock * 16);
+    dim3 grid((totalGroups + groupsPerBlock - 1) / groupsPerBlock);
+    cudaGetLastError();
+    if (inputType == fastllm::DataType::BFLOAT16) {
+        FastllmDeepSeekV4WoAQuant128Kernel<__nv_bfloat16><<<grid, block>>>(
+            (const __nv_bfloat16*)input, output, scales, totalGroups);
+    } else if (inputType == fastllm::DataType::FLOAT16) {
+        FastllmDeepSeekV4WoAQuant128Kernel<half><<<grid, block>>>(
+            (const half*)input, output, scales, totalGroups);
+    } else {
+        return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 struct TritonMoeFp8ExpertTable {
     bool inited = false;
     int experts = 0;
@@ -449,6 +523,43 @@ static bool EnsureTritonLinearFp8Scratch(
         FreeTritonScratchPtr(cached.inputScale);
         cached.inputScaleCapacity = inputScaleElements;
         cached.inputScale = (float*)FastllmCudaMalloc((size_t)inputScaleElements * sizeof(float));
+    }
+    if (cached.inputQuant == nullptr || cached.inputScale == nullptr) {
+        return false;
+    }
+    scratch = &cached;
+    return true;
+}
+
+struct TritonDeepSeekV4WoAScratch {
+    int inputQuantCapacity = 0;
+    int inputScaleCapacity = 0;
+    uint8_t *inputQuant = nullptr;
+    float *inputScale = nullptr;
+};
+
+static std::mutex g_tritonDeepSeekV4WoAScratchMutex;
+static std::map<int, TritonDeepSeekV4WoAScratch> g_tritonDeepSeekV4WoAScratch;
+
+static bool EnsureTritonDeepSeekV4WoAScratch(
+    int inputQuantElements, int inputScaleElements,
+    TritonDeepSeekV4WoAScratch *&scratch) {
+    if (inputQuantElements <= 0 || inputScaleElements <= 0) {
+        return false;
+    }
+    int deviceId = FastllmCudaGetDevice();
+    std::lock_guard<std::mutex> guard(g_tritonDeepSeekV4WoAScratchMutex);
+    TritonDeepSeekV4WoAScratch &cached = g_tritonDeepSeekV4WoAScratch[deviceId];
+    if (cached.inputQuantCapacity < inputQuantElements) {
+        FreeTritonScratchPtr(cached.inputQuant);
+        cached.inputQuantCapacity = inputQuantElements;
+        cached.inputQuant = (uint8_t*)FastllmCudaMalloc((size_t)inputQuantElements);
+    }
+    if (cached.inputScaleCapacity < inputScaleElements) {
+        FreeTritonScratchPtr(cached.inputScale);
+        cached.inputScaleCapacity = inputScaleElements;
+        cached.inputScale = (float*)FastllmCudaMalloc(
+            (size_t)inputScaleElements * sizeof(float));
     }
     if (cached.inputQuant == nullptr || cached.inputScale == nullptr) {
         return false;
@@ -1043,6 +1154,146 @@ extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
     FastllmCudaFinishInput(input, inputData);
     FastllmCudaFinishOutput(output, outputData);
     return CheckCu(result, "cuLaunchKernel linear_fp8_block128_matmul");
+}
+
+extern "C" bool FastllmCudaTritonDeepSeekV4WoA(
+    const char *cubinPath, const char *kernelName, int numWarps, int shared,
+    int blockTokens, int blockOut, int blockHidden,
+    const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output,
+    int numTokens, int groups, int outRank, int hiddenSize) {
+    if (cubinPath == nullptr || kernelName == nullptr || numWarps <= 0 ||
+        blockTokens <= 0 || blockOut != 128 || blockHidden != 128 ||
+        numTokens <= 0 || groups <= 0 || outRank <= 0 || hiddenSize <= 0 ||
+        numTokens > blockTokens || (outRank % blockOut) != 0 ||
+        (hiddenSize % blockHidden) != 0 ||
+        input.dataType != fastllm::DataType::BFLOAT16 ||
+        weight.dataType != fastllm::DataType::FP8_E4M3 ||
+        output.dataType != fastllm::DataType::BFLOAT16 ||
+        input.cudaData == nullptr || weight.cudaData == nullptr ||
+        output.cudaData == nullptr || weight.blockK != 128 || weight.blockM != 128 ||
+        weight.scales.size() !=
+            (size_t)groups * (outRank / blockOut) * (hiddenSize / blockHidden)) {
+        return false;
+    }
+
+    fastllm::Data emptyBias;
+    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, emptyBias, groups * outRank);
+    if (weight.extraCudaData.empty() || weight.extraCudaData[0] == nullptr) {
+        return false;
+    }
+
+    LoadedTritonKernel *kernel = LoadTritonKernel(cubinPath, kernelName, shared);
+    if (kernel == nullptr) {
+        return false;
+    }
+
+    int inputElements = numTokens * groups * hiddenSize;
+    int inputScaleElements = inputElements / blockHidden;
+    TritonDeepSeekV4WoAScratch *scratch = nullptr;
+    if (!EnsureTritonDeepSeekV4WoAScratch(
+            inputElements, inputScaleElements, scratch)) {
+        return false;
+    }
+
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *outputData = FastllmCudaPrepareOutput(output);
+    if (inputData == nullptr || outputData == nullptr) {
+        FastllmCudaFinishInput(input, inputData);
+        FastllmCudaFinishOutput(output, outputData);
+        return false;
+    }
+    if (!LaunchFastllmDeepSeekV4WoAQuant128(
+            inputData, input.dataType, scratch->inputQuant,
+            scratch->inputScale, inputElements)) {
+        FastllmCudaFinishInput(input, inputData);
+        FastllmCudaFinishOutput(output, outputData);
+        return false;
+    }
+
+    CUdeviceptr inputQuantPtr = (CUdeviceptr)scratch->inputQuant;
+    CUdeviceptr inputScalePtr = (CUdeviceptr)scratch->inputScale;
+    CUdeviceptr weightPtr = (CUdeviceptr)weight.cudaData;
+    CUdeviceptr weightScalePtr = (CUdeviceptr)weight.extraCudaData[0];
+    CUdeviceptr outputPtr = (CUdeviceptr)outputData;
+    CUdeviceptr globalScratch = 0;
+    CUdeviceptr profileScratch = 0;
+    void *args[] = {
+        &inputQuantPtr,
+        &inputScalePtr,
+        &weightPtr,
+        &weightScalePtr,
+        &outputPtr,
+        &globalScratch,
+        &profileScratch,
+    };
+    CUresult result = LaunchTritonKernel(
+        kernel,
+        (unsigned int)((numTokens + blockTokens - 1) / blockTokens),
+        (unsigned int)(outRank / blockOut),
+        (unsigned int)groups,
+        (unsigned int)(numWarps * 32),
+        (unsigned int)shared,
+        args);
+
+    FastllmCudaFinishInput(input, inputData);
+    FastllmCudaFinishOutput(output, outputData);
+    return CheckCu(result, "cuLaunchKernel deepseek_v4_fp8_woa");
+}
+
+extern "C" bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
+    const char *cubinPath, const char *kernelName, int numWarps, int shared,
+    int headBlock, int blockD, const fastllm::Data &q,
+    const fastllm::Data &windowKV, const fastllm::Data &compressedKV,
+    const fastllm::Data &attnSink, int windowSize, int compressRatio,
+    const int32_t *decodeMeta, float softmaxScale, float *output) {
+    if (cubinPath == nullptr || kernelName == nullptr || numWarps <= 0 ||
+        (headBlock != 1 && headBlock != 2 && headBlock != 4) ||
+        blockD <= 0 || blockD > 1024 || windowSize <= 0 || compressRatio < 0 ||
+        decodeMeta == nullptr || output == nullptr ||
+        q.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::BFLOAT16 || q.cudaData == nullptr ||
+        q.dims.size() != 4 || q.dims[0] != 1 || q.dims[1] != 1 ||
+        q.dims[2] <= 0 || q.dims[3] <= 0 || blockD < q.dims[3] ||
+        windowKV.dataDevice != fastllm::DataDevice::CUDA ||
+        windowKV.dataType != fastllm::DataType::FLOAT32 ||
+        windowKV.cudaData == nullptr ||
+        compressedKV.dataDevice != fastllm::DataDevice::CUDA ||
+        compressedKV.dataType != fastllm::DataType::BFLOAT16 ||
+        compressedKV.cudaData == nullptr ||
+        attnSink.dataDevice != fastllm::DataDevice::CUDA ||
+        attnSink.dataType != fastllm::DataType::FLOAT32 ||
+        attnSink.cudaData == nullptr) {
+        return false;
+    }
+    LoadedTritonKernel *kernel = LoadTritonKernel(cubinPath, kernelName, shared);
+    if (kernel == nullptr) {
+        return false;
+    }
+    int numHeads = q.dims[2];
+    CUdeviceptr qPtr = (CUdeviceptr)q.cudaData;
+    CUdeviceptr windowPtr = (CUdeviceptr)windowKV.cudaData;
+    CUdeviceptr compressedPtr = (CUdeviceptr)compressedKV.cudaData;
+    CUdeviceptr sinkPtr = (CUdeviceptr)attnSink.cudaData;
+    CUdeviceptr decodeMetaPtr = (CUdeviceptr)decodeMeta;
+    CUdeviceptr outputPtr = (CUdeviceptr)output;
+    float scaleArg = softmaxScale;
+    CUdeviceptr globalScratch = 0;
+    CUdeviceptr profileScratch = 0;
+    void *args[] = {
+        &qPtr,
+        &windowPtr,
+        &compressedPtr,
+        &sinkPtr,
+        &decodeMetaPtr,
+        &outputPtr,
+        &scaleArg,
+        &globalScratch,
+        &profileScratch,
+    };
+    CUresult result = LaunchTritonKernel(
+        kernel, 1, (unsigned int)((numHeads + headBlock - 1) / headBlock), 1,
+        (unsigned int)(numWarps * 32), (unsigned int)shared, args);
+    return CheckCu(result, "cuLaunchKernel deepseek_v4_sparse_decode");
 }
 
 static bool LaunchTritonMergeMOEFP8E4M3Table(

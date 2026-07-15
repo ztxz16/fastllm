@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <mutex>
 
 namespace {
@@ -14,6 +16,104 @@ constexpr int kDeepSeekV4SparseMaxKeys = kDeepSeekV4Sparse1MCompressedKeys + 64 
 constexpr int kDeepSeekV4SparseDecodeMaxKeys = kDeepSeekV4SparseMaxKeys;
 constexpr int kDeepSeekV4SparsePrefillMaxKeys = kDeepSeekV4SparseMaxKeys;
 constexpr size_t kDeepSeekV4SparsePrefillDefaultTempBytes = 256ULL * 1024ULL * 1024ULL;
+
+struct DeepSeekV4RouteTableCacheEntry {
+    void *cudaData = nullptr;
+    const void *sourceData = nullptr;
+    uint64_t count = 0;
+    fastllm::DataType dataType = fastllm::DataType::FLOAT32;
+    bool verifyContent = false;
+    uint64_t fingerprint = 0;
+    // A changed non-model table can still have an in-flight kernel referring
+    // to the old address. Keep superseded replicas alive until the owning Data
+    // is retired instead of making them immediately reusable.
+    std::vector<void*> retiredCudaData;
+};
+
+using DeepSeekV4RouteTableDeviceCache =
+    std::map<int, DeepSeekV4RouteTableCacheEntry>;
+using DeepSeekV4RouteTableCache =
+    std::map<const fastllm::Data*, DeepSeekV4RouteTableDeviceCache,
+             std::less<const fastllm::Data*> >;
+
+std::mutex &DeepSeekV4RouteTableCacheMutex() {
+    // Data objects can be destroyed by language bindings during shared-library
+    // teardown. Keep the registry primitives alive until process exit so a
+    // late Data destructor never touches an already-destroyed static mutex.
+    static std::mutex *mutex = new std::mutex();
+    return *mutex;
+}
+
+DeepSeekV4RouteTableCache &DeepSeekV4RouteTableCaches() {
+    // Entries are explicitly retired by Data::~Data. Intentionally retain the
+    // empty registry object itself to avoid cross-translation-unit static
+    // destruction ordering hazards in Python extension shutdown.
+    static DeepSeekV4RouteTableCache *cache = new DeepSeekV4RouteTableCache();
+    return *cache;
+}
+
+uint64_t DeepSeekV4RouteTableFingerprint(const void *data, size_t bytes) {
+    const uint8_t *p = static_cast<const uint8_t*>(data);
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < bytes; ++i) {
+        hash ^= p[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+const void *DeepSeekV4GetCudaRouteTable(fastllm::Data &routeTable) {
+    if (routeTable.dataDevice == fastllm::DataDevice::CUDA &&
+        routeTable.cudaData != nullptr) {
+        return routeTable.cudaData;
+    }
+    if (routeTable.dataDevice != fastllm::DataDevice::CPU ||
+        routeTable.cpuData == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t count = routeTable.Count(0);
+    if (count == 0 || count > SIZE_MAX / sizeof(int32_t)) {
+        return nullptr;
+    }
+    size_t bytes = (size_t)count * sizeof(int32_t);
+    // Loaded model weights are immutable after construction, so hashing a
+    // multi-megabyte route table on every decode token would be pure overhead.
+    // Non-model tensors remain mutable and are fingerprinted on every lookup.
+    bool verifyContent = !routeTable.isModelWeight;
+    uint64_t fingerprint = verifyContent ?
+        DeepSeekV4RouteTableFingerprint(routeTable.cpuData, bytes) : 0;
+    int device = FastllmCudaGetDevice();
+
+    std::lock_guard<std::mutex> guard(DeepSeekV4RouteTableCacheMutex());
+    DeepSeekV4RouteTableCacheEntry &entry =
+        DeepSeekV4RouteTableCaches()[&routeTable][device];
+    bool matches = entry.cudaData != nullptr &&
+                   entry.sourceData == routeTable.cpuData &&
+                   entry.count == count &&
+                   entry.dataType == routeTable.dataType &&
+                   entry.verifyContent == verifyContent &&
+                   (!verifyContent || entry.fingerprint == fingerprint);
+    if (matches) {
+        return entry.cudaData;
+    }
+
+    void *next = FastllmCudaMalloc(bytes);
+    if (next == nullptr) {
+        return nullptr;
+    }
+    FastllmCudaCopyFromHostToDevice(next, routeTable.cpuData, bytes);
+    if (entry.cudaData != nullptr) {
+        entry.retiredCudaData.push_back(entry.cudaData);
+    }
+    entry.cudaData = next;
+    entry.sourceData = routeTable.cpuData;
+    entry.count = count;
+    entry.dataType = routeTable.dataType;
+    entry.verifyContent = verifyContent;
+    entry.fingerprint = fingerprint;
+    return entry.cudaData;
+}
 
 size_t DeepSeekV4SparsePrefillTempBytesLimit() {
     size_t ret = kDeepSeekV4SparsePrefillDefaultTempBytes;
@@ -244,6 +344,78 @@ __global__ void DeepSeekV4WoAPairBlockReduceKernel(const InT *o, const WT *w, __
     }
 }
 
+// The checkpoint stores wo_a as block-scaled FP8 E4M3, but the legacy path
+// expands it to FP16 while loading.  Decode is bandwidth-bound on this 64 MiB
+// matrix.  Read the original 8-bit payload and reproduce the legacy FP16
+// dequantization in registers so the dot-product order and rounded weight
+// values stay unchanged while global weight traffic is halved.
+__device__ __forceinline__ float DeepSeekV4Fp8E4M3ScaledHalfToFloat(uint8_t value,
+                                                                    float scale) {
+    uint16_t pseudoHalfBits = ((value & 0x80u) << 8) | ((value & 0x7fu) << 7);
+    half pseudoHalf = __ushort_as_half(pseudoHalfBits);
+    half rounded = __float2half_rn(__half2float(pseudoHalf) * scale * 0x1p8f);
+    return __half2float(rounded);
+}
+
+template <typename InT>
+__global__ void DeepSeekV4WoAFp8PairBlockReduceKernel(
+        const InT *o, const uint8_t *w, const float *scales, __nv_bfloat16 *output,
+        int bsz, int seqlen, int heads, int headDim, int groups, int oRank,
+        int blockK, int blockM, int scaleCols) {
+    extern __shared__ float partial[];
+    float *partial0 = partial;
+    float *partial1 = partial + blockDim.x;
+    int pairsPerGroup = oRank / 2;
+    int idx = blockIdx.x;
+    int total = bsz * seqlen * groups * pairsPerGroup;
+    if (idx >= total) {
+        return;
+    }
+
+    int pair = idx % pairsPerGroup;
+    int r0 = pair * 2;
+    int r1 = r0 + 1;
+    int tmp = idx / pairsPerGroup;
+    int g = tmp % groups;
+    tmp /= groups;
+    int s = tmp % seqlen;
+    int b = tmp / seqlen;
+
+    int headsPerGroup = heads / groups;
+    int groupDim = headsPerGroup * headDim;
+    int weightRow0 = g * oRank + r0;
+    const uint8_t *wrow0 = w + (uint64_t)weightRow0 * groupDim;
+    const uint8_t *wrow1 = wrow0 + groupDim;
+    const InT *src = o + (((uint64_t)b * seqlen + s) * heads + g * headsPerGroup) * headDim;
+    const float *rowScales = scales + (weightRow0 / blockK) * scaleCols;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int d = threadIdx.x; d < groupDim; d += blockDim.x) {
+        float x = Dsv4ToFloat(src[d]);
+        float scale = rowScales[d / blockM];
+        sum0 += x * DeepSeekV4Fp8E4M3ScaledHalfToFloat(wrow0[d], scale);
+        sum1 += x * DeepSeekV4Fp8E4M3ScaledHalfToFloat(wrow1[d], scale);
+    }
+    partial0[threadIdx.x] = sum0;
+    partial1[threadIdx.x] = sum1;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial0[threadIdx.x] += partial0[threadIdx.x + stride];
+            partial1[threadIdx.x] += partial1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        uint64_t outBase = (((uint64_t)b * seqlen + s) * groups + g) * oRank;
+        output[outBase + r0] = __float2bfloat16_rn(partial0[0]);
+        output[outBase + r1] = __float2bfloat16_rn(partial1[0]);
+    }
+}
+
 template <typename InT, typename WT>
 __global__ void DeepSeekV4WoAFloatAccKernel(const InT *o, const WT *w, __nv_bfloat16 *output,
                                             int bsz, int seqlen, int heads, int headDim,
@@ -408,7 +580,8 @@ template <typename T>
 __global__ void DeepSeekV4ScaleQRotaryBlockKernel(T *q, int rows, int seqlen, int heads, int dim,
                                                   int ropeDim, float ropeBase, int startPos,
                                                   int originalSeqLen, float ropeFactor,
-                                                  int betaFast, int betaSlow, float eps) {
+                                                  int betaFast, int betaSlow, float eps,
+                                                  const int32_t *decodeMeta) {
     extern __shared__ float partial[];
     int row = blockIdx.x;
     if (row >= rows) {
@@ -439,7 +612,8 @@ __global__ void DeepSeekV4ScaleQRotaryBlockKernel(T *q, int rows, int seqlen, in
     __syncthreads();
 
     int s = (row / heads) % seqlen;
-    int pos = startPos + s;
+    int dynamicStartPos = decodeMeta == nullptr ? startPos : decodeMeta[0];
+    int pos = dynamicStartPos + s;
     int off = dim - ropeDim;
     for (int i = threadIdx.x * 2; i < ropeDim; i += blockDim.x * 2) {
         float inv = DeepSeekV4InvFreq(i / 2, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
@@ -498,7 +672,8 @@ __global__ void DeepSeekV4RotaryQuantBlockKernel(T *x, int rows, int seqlen, int
                                                  int ropeDim, float ropeBase, int startPos,
                                                  int originalSeqLen, float ropeFactor,
                                                  int betaFast, int betaSlow, int quantDim,
-                                                 int blockSize, int posStep) {
+                                                 int blockSize, int posStep,
+                                                 const int32_t *decodeMeta) {
     extern __shared__ float partial[];
     int row = blockIdx.x;
     if (row >= rows) {
@@ -506,7 +681,8 @@ __global__ void DeepSeekV4RotaryQuantBlockKernel(T *x, int rows, int seqlen, int
     }
     T *ptr = x + (uint64_t)row * dim;
     int s = (row / heads) % seqlen;
-    int pos = startPos + s * posStep;
+    int dynamicStartPos = decodeMeta == nullptr ? startPos : decodeMeta[0];
+    int pos = dynamicStartPos + s * posStep;
     int off = dim - ropeDim;
     for (int i = threadIdx.x * 2; i < ropeDim; i += blockDim.x * 2) {
         float inv = DeepSeekV4InvFreq(i / 2, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
@@ -548,10 +724,162 @@ __global__ void DeepSeekV4RotaryQuantBlockKernel(T *x, int rows, int seqlen, int
     }
 }
 
+__device__ __forceinline__ float DeepSeekV4WarpSum(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float DeepSeekV4Warp4Max(float value) {
+    value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 1));
+    value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 2));
+    return value;
+}
+
+// Horizontally fuse the single-token Q and KV post-projection work.  The warp
+// layout follows vLLM's DeepSeek-V4 kernel, while the arithmetic deliberately
+// preserves FastLLM's two observable BF16 boundaries:
+//   Q RMSNorm -> BF16 -> RoPE -> BF16
+//   KV weighted RMSNorm -> BF16 -> (RoPE / quant round-trip) -> BF16
+// One warp owns one 512-wide Q head; the final warp owns KV and also writes the
+// FLOAT32 sliding-window cache.  RoPE sin/cos are computed once per CTA rather
+// than once per head.
+__global__ void DeepSeekV4FusedQKVRopeCache512Kernel(
+        __nv_bfloat16 *q, __nv_bfloat16 *kv, const float *kvNormWeight,
+        float *windowKV, const int32_t *decodeMeta, int windowSize,
+        int qHeads,
+        float ropeBase, int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow, float eps) {
+    constexpr int kHeadDim = 512;
+    constexpr int kRopeDim = 64;
+    constexpr int kNopeDim = kHeadDim - kRopeDim;
+    constexpr int kElemsPerLane = kHeadDim / 32;
+    constexpr float kQuantMax = 448.0f;
+
+    __shared__ float ropeCos[kRopeDim / 2];
+    __shared__ float ropeSin[kRopeDim / 2];
+    if (threadIdx.x < kRopeDim / 2) {
+        int pair = threadIdx.x;
+        float inv = DeepSeekV4InvFreq(pair, kRopeDim, ropeBase,
+                                      originalSeqLen, ropeFactor,
+                                      betaFast, betaSlow);
+        float angle = (float)decodeMeta[0] * inv;
+        float c = cosf(angle);
+        float s = sinf(angle);
+        ropeCos[pair] = c;
+        ropeSin[pair] = s;
+    }
+    __syncthreads();
+
+    int warpsPerBlock = blockDim.x / 32;
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x & 31;
+    int slot = blockIdx.x * warpsPerBlock + warp;
+    if (slot > qHeads) {
+        return;
+    }
+    bool isKV = slot == qHeads;
+    int dimBase = lane * kElemsPerLane;
+    __nv_bfloat16 *row = isKV ? kv : q + (uint64_t)slot * kHeadDim;
+
+    uint4 raw0 = *reinterpret_cast<const uint4 *>(row + dimBase);
+    uint4 raw1 = *reinterpret_cast<const uint4 *>(row + dimBase + 8);
+    const __nv_bfloat162 *pair0 = reinterpret_cast<const __nv_bfloat162 *>(&raw0);
+    const __nv_bfloat162 *pair1 = reinterpret_cast<const __nv_bfloat162 *>(&raw1);
+    float values[kElemsPerLane];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float2 value = __bfloat1622float2(pair0[i]);
+        values[i * 2] = value.x;
+        values[i * 2 + 1] = value.y;
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float2 value = __bfloat1622float2(pair1[i]);
+        values[8 + i * 2] = value.x;
+        values[8 + i * 2 + 1] = value.y;
+    }
+
+    float sumSquares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        sumSquares += values[i] * values[i];
+    }
+    sumSquares = DeepSeekV4WarpSum(sumSquares);
+    float normScale = __shfl_sync(0xffffffffu,
+                                  rsqrtf(sumSquares / (float)kHeadDim + eps), 0);
+#pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+        float value = values[i] * normScale;
+        if (isKV) {
+            value *= __ldg(kvNormWeight + dimBase + i);
+        }
+        // Match the standalone Q/KV RMSNorm output before applying RoPE.
+        values[i] = __bfloat162float(__float2bfloat16_rn(value));
+    }
+
+    if (dimBase >= kNopeDim) {
+        int ropePairBase = (dimBase - kNopeDim) / 2;
+#pragma unroll
+        for (int pair = 0; pair < kElemsPerLane / 2; pair++) {
+            float even = values[pair * 2];
+            float odd = values[pair * 2 + 1];
+            float c = ropeCos[ropePairBase + pair];
+            float s = ropeSin[ropePairBase + pair];
+            values[pair * 2] = __bfloat162float(
+                __float2bfloat16_rn(even * c - odd * s));
+            values[pair * 2 + 1] = __bfloat162float(
+                __float2bfloat16_rn(even * s + odd * c));
+        }
+    } else if (isKV) {
+        // Four adjacent lanes jointly own one 64-element quant block.
+        float amax = 1e-4f;
+#pragma unroll
+        for (int i = 0; i < kElemsPerLane; i++) {
+            amax = fmaxf(amax, fabsf(values[i]));
+        }
+        amax = DeepSeekV4Warp4Max(amax);
+        float quantScale = exp2f(ceilf(log2f(amax / kQuantMax)));
+#pragma unroll
+        for (int i = 0; i < kElemsPerLane; i++) {
+            float quantValue = fminf(kQuantMax,
+                                     fmaxf(-kQuantMax, values[i] / quantScale));
+            float rounded = __bfloat162float(__float2bfloat16_rn(quantValue)) *
+                            quantScale;
+            values[i] = __bfloat162float(__float2bfloat16_rn(rounded));
+        }
+    }
+
+    uint4 out0, out1;
+    __nv_bfloat162 *outPair0 = reinterpret_cast<__nv_bfloat162 *>(&out0);
+    __nv_bfloat162 *outPair1 = reinterpret_cast<__nv_bfloat162 *>(&out1);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        outPair0[i].x = __float2bfloat16_rn(values[i * 2]);
+        outPair0[i].y = __float2bfloat16_rn(values[i * 2 + 1]);
+        outPair1[i].x = __float2bfloat16_rn(values[8 + i * 2]);
+        outPair1[i].y = __float2bfloat16_rn(values[8 + i * 2 + 1]);
+    }
+    *reinterpret_cast<uint4 *>(row + dimBase) = out0;
+    *reinterpret_cast<uint4 *>(row + dimBase + 8) = out1;
+
+    if (isKV) {
+        int cacheSlot = decodeMeta[0] % windowSize;
+        float *cache = windowKV + (uint64_t)cacheSlot * kHeadDim + dimBase;
+#pragma unroll
+        for (int i = 0; i < kElemsPerLane; i += 4) {
+            *reinterpret_cast<float4 *>(cache + i) =
+                make_float4(values[i], values[i + 1], values[i + 2], values[i + 3]);
+        }
+    }
+}
+
 template <typename T>
 __global__ void DeepSeekV4UpdateWindowKVCacheKernel(const T *kv, float *windowKV,
                                                     int bsz, int seqlen, int headDim, int startPos,
-                                                    int windowSize) {
+                                                    int windowSize, const int32_t *decodeMeta) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = bsz * seqlen * headDim;
     if (idx >= total) {
@@ -561,7 +889,8 @@ __global__ void DeepSeekV4UpdateWindowKVCacheKernel(const T *kv, float *windowKV
     int tmp = idx / headDim;
     int s = tmp % seqlen;
     int b = tmp / seqlen;
-    windowKV[((uint64_t)b * windowSize + ((startPos + s) % windowSize)) * headDim + d] =
+    int dynamicStartPos = decodeMeta == nullptr ? startPos : decodeMeta[0];
+    windowKV[((uint64_t)b * windowSize + ((dynamicStartPos + s) % windowSize)) * headDim + d] =
         Dsv4ToFloat(kv[((uint64_t)b * seqlen + s) * headDim + d]);
 }
 
@@ -684,6 +1013,181 @@ __global__ void DeepSeekV4BuildCompressedKVKernel(const T *kv, const T *score, c
     compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] = value / fmaxf(sum, 1e-30f);
 }
 
+template <typename T>
+__global__ void DeepSeekV4InitGraphRawRingKernel(const T *raw, T *ring,
+                                                 int bsz, int rawLen, int wideDim,
+                                                 int rawTokenBase, int ringCapacity) {
+    uint64_t total = (uint64_t)bsz * rawLen * wideDim;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int d = idx % wideDim;
+    uint64_t tmp = idx / wideDim;
+    int s = tmp % rawLen;
+    int b = tmp / rawLen;
+    int slot = (rawTokenBase + s) % ringCapacity;
+    ring[((uint64_t)b * ringCapacity + slot) * wideDim + d] = raw[idx];
+}
+
+template <typename T>
+__global__ void DeepSeekV4StoreGraphCompressorRawKernel(const T *kv, const T *score,
+                                                        T *kvRing, T *scoreRing,
+                                                        const int32_t *decodeMeta,
+                                                        int bsz, int wideDim,
+                                                        int ringCapacity) {
+    uint64_t total = (uint64_t)bsz * wideDim;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int d = idx % wideDim;
+    int b = idx / wideDim;
+    int startPos = decodeMeta[0];
+    int slot = startPos % ringCapacity;
+    uint64_t dst = ((uint64_t)b * ringCapacity + slot) * wideDim + d;
+    kvRing[dst] = kv[(uint64_t)b * wideDim + d];
+    scoreRing[dst] = score[(uint64_t)b * wideDim + d];
+}
+
+template <typename T, typename WT>
+__global__ void DeepSeekV4UpdateCompressedKVGraphKernel(
+                                                        const T *kvRing, const T *scoreRing,
+                                                        const float *ape, const WT *normWeight,
+                                                        const int32_t *decodeMeta,
+                                                        __nv_bfloat16 *compressedKV,
+                                                        int bsz, int ringCapacity,
+                                                        int compressedCapacity,
+                                                        int compressRatio, int headDim,
+                                                        int wideDim, int ropeDim,
+                                                        float ropeBase, int originalSeqLen,
+                                                        float ropeFactor, int betaFast,
+                                                        int betaSlow) {
+    extern __shared__ float shared[];
+    float *values = shared;
+    float *red = values + headDim;
+    int b = blockIdx.x;
+    if (b >= bsz) {
+        return;
+    }
+    int startPos = decodeMeta[0];
+    int totalLen = startPos + 1;
+    if (totalLen <= 0 || totalLen % compressRatio != 0) {
+        return;
+    }
+    int block = totalLen / compressRatio - 1;
+    if (block < 0 || block >= compressedCapacity) {
+        return;
+    }
+    bool overlap = compressRatio == 4;
+
+    for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
+        float mx = -INFINITY;
+        if (overlap && block > 0) {
+            for (int r = 0; r < compressRatio; r++) {
+                int token = (block - 1) * compressRatio + r;
+                int slot = token % ringCapacity;
+                uint64_t off = ((uint64_t)b * ringCapacity + slot) * wideDim + d;
+                mx = fmaxf(mx, Dsv4ToFloat(scoreRing[off]) + ape[(uint64_t)r * wideDim + d]);
+            }
+        }
+        int currentBase = block * compressRatio;
+        int currentDimOffset = overlap ? headDim : 0;
+        for (int r = 0; r < compressRatio; r++) {
+            int token = currentBase + r;
+            int slot = token % ringCapacity;
+            uint64_t off = ((uint64_t)b * ringCapacity + slot) * wideDim + currentDimOffset + d;
+            mx = fmaxf(mx, Dsv4ToFloat(scoreRing[off]) +
+                            ape[(uint64_t)r * wideDim + currentDimOffset + d]);
+        }
+
+        float sum = 0.0f, value = 0.0f;
+        if (overlap && block > 0) {
+            for (int r = 0; r < compressRatio; r++) {
+                int token = (block - 1) * compressRatio + r;
+                int slot = token % ringCapacity;
+                uint64_t off = ((uint64_t)b * ringCapacity + slot) * wideDim + d;
+                float e = expf(Dsv4ToFloat(scoreRing[off]) +
+                               ape[(uint64_t)r * wideDim + d] - mx);
+                sum += e;
+                value += e * Dsv4ToFloat(kvRing[off]);
+            }
+        }
+        for (int r = 0; r < compressRatio; r++) {
+            int token = currentBase + r;
+            int slot = token % ringCapacity;
+            uint64_t off = ((uint64_t)b * ringCapacity + slot) * wideDim + currentDimOffset + d;
+            float e = expf(Dsv4ToFloat(scoreRing[off]) +
+                           ape[(uint64_t)r * wideDim + currentDimOffset + d] - mx);
+            sum += e;
+            value += e * Dsv4ToFloat(kvRing[off]);
+        }
+        // Match the existing pipeline's FP32 -> BF16 conversion before RMSNorm.
+        values[d] = __bfloat162float(__float2bfloat16_rn(value / fmaxf(sum, 1e-30f)));
+    }
+    __syncthreads();
+
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
+        ss += values[d] * values[d];
+    }
+    red[threadIdx.x] = ss;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] += red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    float normScale = rsqrtf(red[0] / headDim + 1.0e-6f);
+    for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
+        values[d] = __bfloat162float(__float2bfloat16_rn(
+            values[d] * normScale * Dsv4ToFloat(normWeight[d])));
+    }
+    __syncthreads();
+
+    int ropeOffset = headDim - ropeDim;
+    int rotaryPos = block * compressRatio;
+    for (int i = threadIdx.x * 2; i < ropeDim; i += blockDim.x * 2) {
+        float inv = DeepSeekV4InvFreq(i / 2, ropeDim, ropeBase, originalSeqLen,
+                                      ropeFactor, betaFast, betaSlow);
+        float angle = rotaryPos * inv;
+        float c = cosf(angle), s = sinf(angle);
+        float a = values[ropeOffset + i];
+        float bb = values[ropeOffset + i + 1];
+        values[ropeOffset + i] = __bfloat162float(__float2bfloat16_rn(a * c - bb * s));
+        values[ropeOffset + i + 1] = __bfloat162float(__float2bfloat16_rn(a * s + bb * c));
+    }
+    __syncthreads();
+
+    for (int groupStart = 0; groupStart < ropeOffset; groupStart += 64) {
+        int groupEnd = min(groupStart + 64, ropeOffset);
+        float amax = 1.0e-4f;
+        for (int d = groupStart + threadIdx.x; d < groupEnd; d += blockDim.x) {
+            amax = fmaxf(amax, fabsf(values[d]));
+        }
+        red[threadIdx.x] = amax;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        float qScale = powf(2.0f, ceilf(log2f(red[0] / 448.0f)));
+        for (int d = groupStart + threadIdx.x; d < groupEnd; d += blockDim.x) {
+            float qv = fminf(448.0f, fmaxf(-448.0f, values[d] / qScale));
+            values[d] = __bfloat162float(__float2bfloat16_rn(qv)) * qScale;
+        }
+        __syncthreads();
+    }
+
+    for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
+        compressedKV[((uint64_t)b * compressedCapacity + block) * headDim + d] =
+            __float2bfloat16_rn(values[d]);
+    }
+}
+
 __device__ __forceinline__ float DeepSeekV4Sigmoid(float x) {
     if (x >= 0.0f) {
         float z = expf(-x);
@@ -691,6 +1195,19 @@ __device__ __forceinline__ float DeepSeekV4Sigmoid(float x) {
     }
     float z = expf(x);
     return z / (1.0f + z);
+}
+
+__device__ __forceinline__ float DeepSeekV4SinkhornIteration4x4(
+        float value, float eps) {
+    float rowSum = value;
+    rowSum += __shfl_xor_sync(0xffffffffu, rowSum, 1, 4);
+    rowSum += __shfl_xor_sync(0xffffffffu, rowSum, 2, 4);
+    value /= rowSum + eps;
+
+    float colSum = value;
+    colSum += __shfl_xor_sync(0xffffffffu, colSum, 4, 16);
+    colSum += __shfl_xor_sync(0xffffffffu, colSum, 8, 16);
+    return value / (colSum + eps);
 }
 
 __device__ __forceinline__ float DeepSeekV4Softplus(float x) {
@@ -745,10 +1262,13 @@ __global__ void DeepSeekV4RouteScoreTransformKernel(float *logits, int rows, int
     }
 }
 
-__global__ void DeepSeekV4HashRouteScoreKernel(float *logits, const float *tid2eid,
-                                               const int *inputIds, int32_t *index,
+template <typename RouteT>
+__global__ void DeepSeekV4HashRouteScoreKernel(float *logits, const RouteT *tid2eid,
+                                               const int *inputIds, int singleTokenId,
+                                               int32_t *index,
                                                float *score, int tokens, int experts,
-                                               int topk, int mode, float routeScale) {
+                                               int topk, int mode, float routeScale,
+                                               int routeRows) {
     int row = blockIdx.x;
     if (row >= tokens) {
         return;
@@ -756,8 +1276,9 @@ __global__ void DeepSeekV4HashRouteScoreKernel(float *logits, const float *tid2e
     float *rowData = logits + (uint64_t)row * experts;
     int32_t *outIndex = index + (uint64_t)row * topk;
     float *outScore = score + (uint64_t)row * topk;
-    int tokenId = inputIds[row];
-    const float *routeRow = tid2eid + (uint64_t)tokenId * topk;
+    int tokenId = inputIds != nullptr ? inputIds[row] : singleTokenId;
+    tokenId = max(0, min(tokenId, routeRows - 1));
+    const RouteT *routeRow = tid2eid + (uint64_t)tokenId * topk;
 
     __shared__ float red[256];
     if (mode == 0) {
@@ -789,7 +1310,7 @@ __global__ void DeepSeekV4HashRouteScoreKernel(float *logits, const float *tid2e
         }
         float denom = fmaxf(red[0], 1e-30f);
         for (int k = threadIdx.x; k < topk; k += blockDim.x) {
-            int expert = (int)(routeRow[k] + 0.5f);
+            int expert = (int)routeRow[k];
             expert = max(0, min(expert, experts - 1));
             outIndex[k] = expert;
             outScore[k] = expf(rowData[expert] - mx) / denom * routeScale;
@@ -800,7 +1321,7 @@ __global__ void DeepSeekV4HashRouteScoreKernel(float *logits, const float *tid2e
     if (threadIdx.x == 0) {
         float sum = 0.0f;
         for (int k = 0; k < topk; k++) {
-            int expert = (int)(routeRow[k] + 0.5f);
+            int expert = (int)routeRow[k];
             expert = max(0, min(expert, experts - 1));
             float raw = rowData[expert];
             float v = mode == 1 ? DeepSeekV4Sigmoid(raw) : sqrtf(DeepSeekV4Softplus(raw));
@@ -1056,6 +1577,236 @@ __global__ void DeepSeekV4HcPreFinishKernel(const XT *x, const float *dots, cons
             }
             yrow[d] = Dsv4FromFloat<XT>(v);
         }
+    }
+}
+
+// Decode specialization for hc_mult=4 and hidden_size=4096.  The legacy
+// HcPre finish grid uses 16 CTAs and consequently repeats the scalar mix and
+// 20 Sinkhorn iterations in every CTA.  This kernel computes those values
+// once, keeps the BF16 pre-mix result in shared memory, and immediately
+// applies RMSNorm.  The explicit BF16 round before the norm matches the
+// observable HcPre -> RMSNorm boundary of the unfused path.
+__global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
+        const __nv_bfloat16 *x, const float *dots, const float *scale,
+        const float *base, const float *normWeight, __nv_bfloat16 *normOutput,
+        float *post, float *comb, int tokens, int sinkhornIters,
+        float eps, float normEps, int dotsStride, int dotParts) {
+    constexpr int hcMult = 4;
+    constexpr int dim = 4096;
+    constexpr int flatDim = hcMult * dim;
+    constexpr int mixHc = (2 + hcMult) * hcMult;
+    constexpr int hcSq = hcMult * hcMult;
+    constexpr int pairCount = dim / 2;
+
+    __shared__ float mixes[mixHc];
+    __shared__ float pre[hcMult];
+    __shared__ float warpSums[32];
+    __shared__ float normScale;
+    __shared__ __nv_bfloat162 yShared[pairCount];
+
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    const __nv_bfloat16 *xrow = x + (uint64_t)token * flatDim;
+
+    if (threadIdx.x == 0) {
+        float sqSum = 0.0f;
+        uint64_t sqBase = ((uint64_t)token * dotsStride + mixHc) * dotParts;
+        for (int part = 0; part < dotParts; part++) {
+            sqSum += dots[sqBase + part];
+        }
+        normScale = rsqrtf(sqSum / flatDim + normEps);
+    }
+    __syncthreads();
+
+    if (threadIdx.x < mixHc) {
+        int m = threadIdx.x;
+        float dotSum = 0.0f;
+        uint64_t dotBase = ((uint64_t)token * dotsStride + m) * dotParts;
+        for (int part = 0; part < dotParts; part++) {
+            dotSum += dots[dotBase + part];
+        }
+        mixes[m] = dotSum * normScale;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < hcMult) {
+        int h = threadIdx.x;
+        pre[h] = DeepSeekV4Sigmoid(mixes[h] * scale[0] + base[h]) + eps;
+        post[(uint64_t)token * hcMult + h] =
+            2.0f * DeepSeekV4Sigmoid(mixes[h + hcMult] * scale[1] + base[h + hcMult]);
+    }
+    __syncthreads();
+
+    // One warp owns the tiny 4x4 Sinkhorn transform.  Keep one matrix element
+    // in each of the first 16 lanes and use width-4/width-16 shuffles for row
+    // and column reductions.  This mirrors TileLang's fragment reduction and
+    // avoids four shared-memory round trips and syncwarps per iteration.
+    if (threadIdx.x < 32) {
+        int lane = threadIdx.x;
+        float combValue = 0.0f;
+        if (lane < hcSq) {
+            int mixIdx = lane + 2 * hcMult;
+            combValue = mixes[mixIdx] * scale[2] + base[mixIdx];
+        }
+
+        float rowMax = combValue;
+        rowMax = fmaxf(rowMax,
+                       __shfl_xor_sync(0xffffffffu, rowMax, 1, 4));
+        rowMax = fmaxf(rowMax,
+                       __shfl_xor_sync(0xffffffffu, rowMax, 2, 4));
+        combValue = expf(combValue - rowMax);
+
+        float rowSum = combValue;
+        rowSum += __shfl_xor_sync(0xffffffffu, rowSum, 1, 4);
+        rowSum += __shfl_xor_sync(0xffffffffu, rowSum, 2, 4);
+        combValue = combValue / rowSum + eps;
+
+        float colSum = combValue;
+        colSum += __shfl_xor_sync(0xffffffffu, colSum, 4, 16);
+        colSum += __shfl_xor_sync(0xffffffffu, colSum, 8, 16);
+        combValue /= colSum + eps;
+
+        if (sinkhornIters == 20) {
+#pragma unroll
+            for (int it = 1; it < 20; it++) {
+                combValue = DeepSeekV4SinkhornIteration4x4(combValue, eps);
+            }
+        } else {
+            for (int it = 1; it < sinkhornIters; it++) {
+                combValue = DeepSeekV4SinkhornIteration4x4(combValue, eps);
+            }
+        }
+        if (lane < hcSq) {
+            comb[(uint64_t)token * hcSq + lane] = combValue;
+        }
+    }
+
+    // Warp 0 is busy with Sinkhorn; distribute BF16 pre-mix pairs across the
+    // remaining warps.  Accumulate the rounded values' square sum while they
+    // are still in registers, avoiding a full shared-memory read and an extra
+    // block synchronization before RMSNorm.
+    int yThread = (int)threadIdx.x - 32;
+    int yThreads = (int)blockDim.x - 32;
+    float sum2 = 0.0f;
+    if (yThread >= 0) {
+        for (int i = yThread; i < pairCount; i += yThreads) {
+            float lo = 0.0f;
+            float hi = 0.0f;
+#pragma unroll
+            for (int h = 0; h < hcMult; h++) {
+                float p = pre[h];
+                const __nv_bfloat162 *hcRow =
+                    reinterpret_cast<const __nv_bfloat162 *>(
+                        xrow + (uint64_t)h * dim);
+                float2 values = __bfloat1622float2(hcRow[i]);
+                lo += p * values.x;
+                hi += p * values.y;
+            }
+            __nv_bfloat162 rounded = __floats2bfloat162_rn(lo, hi);
+            yShared[i] = rounded;
+            float2 roundedValues = __bfloat1622float2(rounded);
+            sum2 += roundedValues.x * roundedValues.x +
+                    roundedValues.y * roundedValues.y;
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    if (lane == 0) {
+        warpSums[warp] = sum2;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int numWarps = blockDim.x >> 5;
+        float value = lane < numWarps ? warpSums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffff, value, offset);
+        }
+        if (lane == 0) {
+            normScale = rsqrtf(value / dim + normEps);
+        }
+    }
+    __syncthreads();
+
+    __nv_bfloat16 *out = normOutput + (uint64_t)token * dim;
+    float finalScale = normScale;
+    __nv_bfloat162 *outPairs = reinterpret_cast<__nv_bfloat162 *>(out);
+    const float2 *weightPairs = reinterpret_cast<const float2 *>(normWeight);
+    for (int i = threadIdx.x; i < pairCount; i += blockDim.x) {
+        float2 values = __bfloat1622float2(yShared[i]);
+        float2 weights = __ldg(weightPairs + i);
+        outPairs[i] = __floats2bfloat162_rn(
+            values.x * finalScale * weights.x,
+            values.y * finalScale * weights.y);
+    }
+}
+
+template <typename XT>
+__global__ void DeepSeekV4HcHeadFinishKernel(const XT *x, const float *dots,
+                                             const float *scale, const float *base,
+                                             XT *output, int tokens, int dim,
+                                             int hcMult, float eps, float normEps) {
+    extern __shared__ float shared[];
+    float *pre = shared;
+    float *rsqrtValue = pre + hcMult;
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    int flatDim = hcMult * dim;
+    int dotsStride = hcMult + 1;
+    if (threadIdx.x == 0) {
+        float sqSum = dots[(uint64_t)token * dotsStride + hcMult];
+        rsqrtValue[0] = rsqrtf(sqSum / flatDim + normEps);
+        for (int h = 0; h < hcMult; h++) {
+            pre[h] = DeepSeekV4Sigmoid(
+                dots[(uint64_t)token * dotsStride + h] * rsqrtValue[0] * scale[0] + base[h]) + eps;
+        }
+    }
+    __syncthreads();
+    const XT *xrow = x + (uint64_t)token * flatDim;
+    XT *out = output + (uint64_t)token * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float value = 0.0f;
+        for (int h = 0; h < hcMult; h++) {
+            value += pre[h] * Dsv4ToFloat(xrow[(uint64_t)h * dim + d]);
+        }
+        out[d] = Dsv4FromFloat<XT>(value);
+    }
+}
+
+template <typename XT, typename WT>
+__global__ void DeepSeekV4HcHeadDotsKernel(const XT *x, const WT *weight,
+                                           float *dots, int tokens,
+                                           int flatDim, int hcMult,
+                                           int dotsStride) {
+    extern __shared__ double hcHeadRed[];
+    int index = blockIdx.x;
+    int token = index / hcMult;
+    int h = index - token * hcMult;
+    if (token >= tokens) {
+        return;
+    }
+    const XT *xrow = x + (uint64_t)token * flatDim;
+    const WT *wrow = weight + (uint64_t)h * flatDim;
+    double sum = 0.0;
+    for (int k = threadIdx.x; k < flatDim; k += blockDim.x) {
+        sum += (double)Dsv4ToFloat(xrow[k]) * Dsv4ToFloat(wrow[k]);
+    }
+    hcHeadRed[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            hcHeadRed[threadIdx.x] += hcHeadRed[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        dots[(uint64_t)token * dotsStride + h] = (float)hcHeadRed[0];
     }
 }
 
@@ -1366,7 +2117,9 @@ __global__ void DeepSeekV4SparseAttentionDecodeCachedOnlineKernel(const QT *q, c
                                                                   const CT *compressedKV, const float *sink,
                                                                   float *output, int bsz, int heads, int dim,
                                                                   int windowSize, int startPos, int compressedCount,
-                                                                  float softmaxScale) {
+                                                                  float softmaxScale,
+                                                                  const int32_t *decodeMeta,
+                                                                  int compressRatio) {
     constexpr int kMaxDimsPerThread = 4;
     __shared__ float red[256];
     __shared__ float mxShared;
@@ -1380,6 +2133,10 @@ __global__ void DeepSeekV4SparseAttentionDecodeCachedOnlineKernel(const QT *q, c
     const QT *qrow = q + ((uint64_t)b * heads + h) * dim;
     float *orow = output + ((uint64_t)b * heads + h) * dim;
 
+    if (decodeMeta != nullptr) {
+        startPos = decodeMeta[0];
+        compressedCount = compressRatio > 0 ? (startPos + 1) / compressRatio : 0;
+    }
     int liveWindow = startPos >= windowSize - 1 ? windowSize : (startPos + 1);
     int idxCount = liveWindow + compressedCount;
     if (idxCount <= 0 || idxCount > kDeepSeekV4SparseDecodeMaxKeys ||
@@ -1999,7 +2756,8 @@ __global__ void DeepSeekV4SparseDecodeRotaryCastKernel(const float *input, __nv_
                                                        int rows, int dim, int ropeDim,
                                                        float ropeBase, int startPos,
                                                        int originalSeqLen, float ropeFactor,
-                                                       int betaFast, int betaSlow) {
+                                                       int betaFast, int betaSlow,
+                                                       const int32_t *decodeMeta) {
     int off = dim - ropeDim;
     int ropePairs = ropeDim >> 1;
     int workPerRow = off + ropePairs;
@@ -2018,7 +2776,8 @@ __global__ void DeepSeekV4SparseDecodeRotaryCastKernel(const float *input, __nv_
     }
     int i = (item - off) << 1;
     float inv = DeepSeekV4InvFreq(i / 2, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
-    float ang = startPos * inv;
+    int dynamicStartPos = decodeMeta == nullptr ? startPos : decodeMeta[0];
+    float ang = dynamicStartPos * inv;
     float c = cosf(ang);
     float sn = -sinf(ang);
     float a = src[off + i];
@@ -2125,11 +2884,147 @@ __global__ void DeepSeekV4HcPost4Kernel(const XT *x, const RT *residual, const f
     outRow[(uint64_t)3 * dim] = Dsv4FromFloat<OT>((float)v3);
 }
 
+// Decode specialization matching vLLM's small-FMA mHC transition kernel.
+// It combines the previous block's post mapping with the next block's 24
+// pre-norm projections.  Keeping newResidual in registers avoids writing and
+// re-reading 4 * 4096 BF16 values for every projection.  The projection and
+// square-sum intentionally consume the unrounded FP32 value, while the value
+// used by the following pre-mix is explicitly written through BF16.  This is
+// the same numerical boundary used by vLLM's mhc_fused_tilelang kernel.
+__global__ void DeepSeekV4HcPostPreDots4x4096Kernel(
+        const __nv_bfloat16 *x, const __nv_bfloat16 *residual,
+        const float *post, const float *comb, const float *nextFn,
+        float *dots, __nv_bfloat16 *residualOutput, int tokens) {
+    constexpr int hcMult = 4;
+    constexpr int dim = 4096;
+    constexpr int flatDim = hcMult * dim;
+    constexpr int mixHc = (2 + hcMult) * hcMult;
+    constexpr int dotsStride = mixHc + 1;
+    constexpr int tileN = 2;
+    constexpr int splitK = 8;
+    constexpr int hiddenPerSplit = dim / splitK;
+    constexpr int numWarps = 8;
+
+    __shared__ float warpSums[numWarps][tileN + 1];
+
+    int tile = blockIdx.x;
+    int part = blockIdx.y;
+    int token = blockIdx.z;
+    if (token >= tokens || tile >= mixHc / tileN || part >= splitK) {
+        return;
+    }
+
+    const __nv_bfloat16 *xRow = x + (uint64_t)token * dim;
+    const __nv_bfloat16 *residualRow =
+        residual + (uint64_t)token * flatDim;
+    __nv_bfloat16 *outputRow =
+        residualOutput + (uint64_t)token * flatDim;
+    const float *postRow = post + (uint64_t)token * hcMult;
+    const float *combRow = comb + (uint64_t)token * hcMult * hcMult;
+
+    int n0 = tile * tileN;
+    const float *weight0 = nextFn + (uint64_t)n0 * flatDim;
+    const float *weight1 = weight0 + flatDim;
+    int hiddenStart = part * hiddenPerSplit;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float square = 0.0f;
+
+#pragma unroll
+    for (int iteration = 0; iteration < hiddenPerSplit / 256; iteration++) {
+        int d = hiddenStart + iteration * 256 + threadIdx.x;
+        float xv = __bfloat162float(xRow[d]);
+        float r0 = __bfloat162float(residualRow[d]);
+        float r1 = __bfloat162float(residualRow[dim + d]);
+        float r2 = __bfloat162float(residualRow[2 * dim + d]);
+        float r3 = __bfloat162float(residualRow[3 * dim + d]);
+
+        float new0 = postRow[0] * xv;
+        float new1 = postRow[1] * xv;
+        float new2 = postRow[2] * xv;
+        float new3 = postRow[3] * xv;
+        new0 += combRow[0] * r0 + combRow[4] * r1 +
+                combRow[8] * r2 + combRow[12] * r3;
+        new1 += combRow[1] * r0 + combRow[5] * r1 +
+                combRow[9] * r2 + combRow[13] * r3;
+        new2 += combRow[2] * r0 + combRow[6] * r1 +
+                combRow[10] * r2 + combRow[14] * r3;
+        new3 += combRow[3] * r0 + combRow[7] * r1 +
+                combRow[11] * r2 + combRow[15] * r3;
+
+        // Every n-tile computes the transition in registers, but only tile 0
+        // owns the residual and square-sum output to avoid write races.
+        if (tile == 0) {
+            outputRow[d] = __float2bfloat16_rn(new0);
+            outputRow[dim + d] = __float2bfloat16_rn(new1);
+            outputRow[2 * dim + d] = __float2bfloat16_rn(new2);
+            outputRow[3 * dim + d] = __float2bfloat16_rn(new3);
+            square += new0 * new0 + new1 * new1 +
+                      new2 * new2 + new3 * new3;
+        }
+
+        acc0 += weight0[d] * new0 + weight0[dim + d] * new1 +
+                weight0[2 * dim + d] * new2 +
+                weight0[3 * dim + d] * new3;
+        acc1 += weight1[d] * new0 + weight1[dim + d] * new1 +
+                weight1[2 * dim + d] * new2 +
+                weight1[3 * dim + d] * new3;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc0 += __shfl_down_sync(0xffffffff, acc0, offset);
+        acc1 += __shfl_down_sync(0xffffffff, acc1, offset);
+        if (tile == 0) {
+            square += __shfl_down_sync(0xffffffff, square, offset);
+        }
+    }
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    if (lane == 0) {
+        warpSums[warp][0] = acc0;
+        warpSums[warp][1] = acc1;
+        if (tile == 0) {
+            warpSums[warp][2] = square;
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float value0 = lane < numWarps ? warpSums[lane][0] : 0.0f;
+        float value1 = lane < numWarps ? warpSums[lane][1] : 0.0f;
+        float squareValue =
+            tile == 0 && lane < numWarps ? warpSums[lane][2] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value0 += __shfl_down_sync(0xffffffff, value0, offset);
+            value1 += __shfl_down_sync(0xffffffff, value1, offset);
+            if (tile == 0) {
+                squareValue +=
+                    __shfl_down_sync(0xffffffff, squareValue, offset);
+            }
+        }
+        if (lane == 0) {
+            dots[((uint64_t)token * dotsStride + n0) * splitK + part] =
+                value0;
+            dots[((uint64_t)token * dotsStride + n0 + 1) * splitK + part] =
+                value1;
+            if (tile == 0) {
+                dots[((uint64_t)token * dotsStride + mixHc) * splitK + part] =
+                    squareValue;
+            }
+        }
+    }
+}
+
 bool DeepSeekV4PrepareCudaOutput(fastllm::Data &output, fastllm::DataType dataType,
                                  const std::vector<int> &dims) {
     output.dataType = dataType;
     output.Resize(dims);
-    output.ToDevice(fastllm::DataDevice::CUDA, false);
+    // MultiCuda delegates this CUDA operator from one worker per device.  The
+    // generic ToDevice(CUDA) overload resolves the executor's default CUDA
+    // device (normally device 0), which would switch non-root workers back to
+    // GPU 0 before launching the kernel.  Keep temporary/output tensors on the
+    // worker's current CUDA device instead.
+    output.ToDevice(fastllm::DataDevice::CUDA, {FastllmCudaGetDevice()}, false);
     output.Allocate(false);
     return output.cudaData != nullptr;
 }
@@ -2295,6 +3190,30 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
     const InT *oData = (const InT *)o.cudaData;
     __nv_bfloat16 *outData = (__nv_bfloat16 *)output.cudaData;
 
+    if (woA.dataType == fastllm::DataType::FP8_E4M3) {
+        int headsPerGroup = heads / groups;
+        int groupDim = headsPerGroup * headDim;
+        int weightRows = groups * oRank;
+        int scaleRows = woA.blockK > 0 ? (weightRows + woA.blockK - 1) / woA.blockK : 0;
+        int scaleCols = woA.blockM > 0 ? (groupDim + woA.blockM - 1) / woA.blockM : 0;
+        if ((oRank & 1) != 0 || woA.blockK <= 0 || woA.blockM <= 0 ||
+            woA.scales.size() != (size_t)scaleRows * scaleCols) {
+            return false;
+        }
+        fastllm::Data &mutableWeight = const_cast<fastllm::Data&>(woA);
+        fastllm::Data emptyBias;
+        FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(mutableWeight, emptyBias, weightRows);
+        if (mutableWeight.extraCudaData.empty() || mutableWeight.extraCudaData[0] == nullptr) {
+            return false;
+        }
+        DeepSeekV4WoAFp8PairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
+            oData, (const uint8_t*)woA.cudaData,
+            (const float*)mutableWeight.extraCudaData[0], outData,
+            bsz, seqlen, heads, headDim, groups, oRank,
+            woA.blockK, woA.blockM, scaleCols);
+        return true;
+    }
+
     if (woA.dataType == fastllm::DataType::BFLOAT16) {
         if (usePair) {
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const __nv_bfloat16 *)woA.cudaData, outData,
@@ -2447,6 +3366,14 @@ bool DeepSeekV4LaunchSparseDecodeCublas(const void *cudaQ, const void *cudaCompr
     if (std::getenv("FASTLLM_DSV4_DISABLE_CUBLAS_SPARSE_DECODE") != nullptr) {
         return false;
     }
+    // A TP shard can contain only a handful of heads.  For small decode
+    // problems, converting/gathering into FP32 and launching two GEMMs costs
+    // more than the fused online kernel.  Keep cuBLAS for sufficiently large
+    // head-key products, where reusing the gathered KV starts to pay off.
+    constexpr int minCublasWork = 1024;
+    if ((uint64_t)bsz * heads * keyCount < (uint64_t)minCublasWork) {
+        return false;
+    }
     int maxCublasKeys = kDeepSeekV4SparseDecodeMaxKeys;
     if (const char *env = std::getenv("FASTLLM_DSV4_CUBLAS_SPARSE_DECODE_MAX_KEYS")) {
         maxCublasKeys = std::max(1, std::atoi(env));
@@ -2579,19 +3506,19 @@ bool DeepSeekV4LaunchSparseDecodeByCompressed(const void *cudaQ, const void *cud
         if (compressedCount == 0 || cudaCompressed == nullptr) {
             DeepSeekV4SparseAttentionDecodeCachedOnlineKernel<QT, float><<<blocks, 256>>>(
                 qData, cudaWindow, (const float *)nullptr, cudaSink, outData,
-                bsz, heads, dim, windowSize, startPos, 0, softmaxScale);
+                bsz, heads, dim, windowSize, startPos, 0, softmaxScale, nullptr, 0);
         } else if (compressedType == fastllm::DataType::BFLOAT16) {
             DeepSeekV4SparseAttentionDecodeCachedOnlineKernel<QT, __nv_bfloat16><<<blocks, 256>>>(
                 qData, cudaWindow, (const __nv_bfloat16 *)cudaCompressed, cudaSink, outData,
-                bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+                bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale, nullptr, 0);
         } else if (compressedType == fastllm::DataType::FLOAT16) {
             DeepSeekV4SparseAttentionDecodeCachedOnlineKernel<QT, half><<<blocks, 256>>>(
                 qData, cudaWindow, (const half *)cudaCompressed, cudaSink, outData,
-                bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+                bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale, nullptr, 0);
         } else if (compressedType == fastllm::DataType::FLOAT32) {
             DeepSeekV4SparseAttentionDecodeCachedOnlineKernel<QT, float><<<blocks, 256>>>(
                 qData, cudaWindow, (const float *)cudaCompressed, cudaSink, outData,
-                bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+                bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale, nullptr, 0);
         } else {
             return false;
         }
@@ -3461,6 +4388,32 @@ bool DeepSeekV4LaunchHcPreDotsByWeight(const fastllm::Data &x, const fastllm::Da
     return true;
 }
 
+template <typename XT>
+bool DeepSeekV4LaunchHcHeadDotsByWeight(const fastllm::Data &x,
+                                        const fastllm::Data &hcFn,
+                                        float *dots, int tokens, int flatDim,
+                                        int hcMult, int dotsStride) {
+    constexpr int threads = 256;
+    int blocks = tokens * hcMult;
+    size_t sharedBytes = threads * sizeof(double);
+    if (hcFn.dataType == fastllm::DataType::BFLOAT16) {
+        DeepSeekV4HcHeadDotsKernel<<<blocks, threads, sharedBytes>>>(
+            (const XT *)x.cudaData, (const __nv_bfloat16 *)hcFn.cudaData,
+            dots, tokens, flatDim, hcMult, dotsStride);
+    } else if (hcFn.dataType == fastllm::DataType::FLOAT16) {
+        DeepSeekV4HcHeadDotsKernel<<<blocks, threads, sharedBytes>>>(
+            (const XT *)x.cudaData, (const half *)hcFn.cudaData,
+            dots, tokens, flatDim, hcMult, dotsStride);
+    } else if (hcFn.dataType == fastllm::DataType::FLOAT32) {
+        DeepSeekV4HcHeadDotsKernel<<<blocks, threads, sharedBytes>>>(
+            (const XT *)x.cudaData, (const float *)hcFn.cudaData,
+            dots, tokens, flatDim, hcMult, dotsStride);
+    } else {
+        return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 } // namespace
 
 extern "C" bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data &hcFn,
@@ -3543,6 +4496,178 @@ extern "C" bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data
     return ok;
 }
 
+extern "C" bool FastllmCudaDeepSeekV4HcPreNorm(const fastllm::Data &x,
+                                                fastllm::Data &hcFn,
+                                                fastllm::Data &hcScale,
+                                                fastllm::Data &hcBase,
+                                                fastllm::Data &normWeight,
+                                                int hcMult, int sinkhornIters,
+                                                float eps, float normEps,
+                                                fastllm::Data &normOutput,
+                                                fastllm::Data &post,
+                                                fastllm::Data &comb) {
+    // This specialization intentionally covers the DeepSeek-V4 decode shape
+    // only.  Returning false preserves the established HcPre + RMSNorm path
+    // for prefill, other dtypes, and future model variants.
+    if (x.dataDevice != fastllm::DataDevice::CUDA ||
+        hcFn.dataDevice != fastllm::DataDevice::CUDA ||
+        hcScale.dataDevice != fastllm::DataDevice::CUDA ||
+        hcBase.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        x.dataType != fastllm::DataType::BFLOAT16 ||
+        hcFn.dataType != fastllm::DataType::FLOAT32 ||
+        hcScale.dataType != fastllm::DataType::FLOAT32 ||
+        hcBase.dataType != fastllm::DataType::FLOAT32 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        x.dims.size() != 4 || x.dims[2] != 4 || x.dims[3] != 4096 ||
+        hcMult != 4 || sinkhornIters <= 0 || x.dims[1] != 1) {
+        return false;
+    }
+
+    int bsz = x.dims[0];
+    int seqlen = x.dims[1];
+    int tokens = bsz * seqlen;
+    constexpr int dim = 4096;
+    constexpr int flatDim = 4 * dim;
+    constexpr int mixHc = 24;
+    constexpr int dotsStride = mixHc + 1;
+    int dotParts = DeepSeekV4HcPreDotParts(flatDim, 256);
+    if (tokens <= 0 || hcFn.Count(0) != (uint64_t)mixHc * flatDim ||
+        hcScale.Count(0) < 3 || hcBase.Count(0) < mixHc ||
+        normWeight.Count(0) < dim) {
+        return false;
+    }
+    if (!DeepSeekV4PrepareCudaOutput(normOutput, fastllm::DataType::BFLOAT16,
+                                     {bsz, seqlen, dim}) ||
+        !DeepSeekV4PrepareCudaOutput(post, fastllm::DataType::FLOAT32,
+                                     {bsz, seqlen, hcMult}) ||
+        !DeepSeekV4PrepareCudaOutput(comb, fastllm::DataType::FLOAT32,
+                                     {bsz, seqlen, hcMult, hcMult})) {
+        return false;
+    }
+
+    size_t dotsBytes = (size_t)tokens * dotsStride * dotParts * sizeof(float);
+    float *dots = (float *)FastllmCudaMalloc(dotsBytes);
+    if (dots == nullptr) {
+        return false;
+    }
+    int dotThreads = 256;
+    int dotBlocks = tokens * dotsStride * dotParts;
+    DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, dotThreads,
+                                     dotThreads * sizeof(float)>>>(
+        (const __nv_bfloat16 *)x.cudaData,
+        (const float *)hcFn.cudaData, dots, tokens, flatDim,
+        mixHc, dotsStride, dotParts);
+
+    constexpr int finishThreads = 512;
+    DeepSeekV4HcPreFinishNorm4x4096Kernel<<<tokens, finishThreads>>>(
+        (const __nv_bfloat16 *)x.cudaData, dots,
+        (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
+        (const float *)normWeight.cudaData,
+        (__nv_bfloat16 *)normOutput.cudaData,
+        (float *)post.cudaData, (float *)comb.cudaData,
+        tokens, sinkhornIters, eps, normEps, dotsStride, dotParts);
+    DeviceSync();
+    FastllmCudaFree(dots);
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4HcPostPreNorm(
+        const fastllm::Data &x, const fastllm::Data &residual,
+        const fastllm::Data &previousPost,
+        const fastllm::Data &previousComb, fastllm::Data &nextHcFn,
+        fastllm::Data &nextHcScale, fastllm::Data &nextHcBase,
+        fastllm::Data &nextNormWeight, int hcMult, int sinkhornIters,
+        float eps, float normEps, fastllm::Data &residualOutput,
+        fastllm::Data &normOutput, fastllm::Data &nextPost,
+        fastllm::Data &nextComb) {
+    // Keep this path deliberately narrow.  The generic HcPost + HcPreNorm
+    // sequence remains the fallback for prefill and non-DeepSeek-V4 shapes.
+    constexpr int dim = 4096;
+    constexpr int flatDim = 4 * dim;
+    constexpr int mixHc = 24;
+    constexpr int dotsStride = mixHc + 1;
+    constexpr int dotParts = 8;
+    if (x.dataDevice != fastllm::DataDevice::CUDA ||
+        residual.dataDevice != fastllm::DataDevice::CUDA ||
+        previousPost.dataDevice != fastllm::DataDevice::CUDA ||
+        previousComb.dataDevice != fastllm::DataDevice::CUDA ||
+        nextHcFn.dataDevice != fastllm::DataDevice::CUDA ||
+        nextHcScale.dataDevice != fastllm::DataDevice::CUDA ||
+        nextHcBase.dataDevice != fastllm::DataDevice::CUDA ||
+        nextNormWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        x.dataType != fastllm::DataType::BFLOAT16 ||
+        residual.dataType != fastllm::DataType::BFLOAT16 ||
+        previousPost.dataType != fastllm::DataType::FLOAT32 ||
+        previousComb.dataType != fastllm::DataType::FLOAT32 ||
+        nextHcFn.dataType != fastllm::DataType::FLOAT32 ||
+        nextHcScale.dataType != fastllm::DataType::FLOAT32 ||
+        nextHcBase.dataType != fastllm::DataType::FLOAT32 ||
+        nextNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        residual.dims.size() != 4 || residual.dims[2] != 4 ||
+        residual.dims[3] != dim || residual.dims[1] != 1 ||
+        hcMult != 4 || sinkhornIters <= 0) {
+        return false;
+    }
+
+    int bsz = residual.dims[0];
+    int seqlen = residual.dims[1];
+    int tokens = bsz * seqlen;
+    if (tokens <= 0 || x.Count(0) != (uint64_t)tokens * dim ||
+        residual.Count(0) != (uint64_t)tokens * flatDim ||
+        previousPost.Count(0) != (uint64_t)tokens * hcMult ||
+        previousComb.Count(0) != (uint64_t)tokens * hcMult * hcMult ||
+        nextHcFn.Count(0) != (uint64_t)mixHc * flatDim ||
+        nextHcScale.Count(0) < 3 || nextHcBase.Count(0) < mixHc ||
+        nextNormWeight.Count(0) < dim) {
+        return false;
+    }
+    if (!DeepSeekV4PrepareCudaOutput(
+            residualOutput, fastllm::DataType::BFLOAT16,
+            {bsz, seqlen, hcMult, dim}) ||
+        !DeepSeekV4PrepareCudaOutput(
+            normOutput, fastllm::DataType::BFLOAT16,
+            {bsz, seqlen, dim}) ||
+        !DeepSeekV4PrepareCudaOutput(
+            nextPost, fastllm::DataType::FLOAT32,
+            {bsz, seqlen, hcMult}) ||
+        !DeepSeekV4PrepareCudaOutput(
+            nextComb, fastllm::DataType::FLOAT32,
+            {bsz, seqlen, hcMult, hcMult})) {
+        return false;
+    }
+
+    size_t dotsBytes =
+        (size_t)tokens * dotsStride * dotParts * sizeof(float);
+    float *dots = (float *)FastllmCudaMalloc(dotsBytes);
+    if (dots == nullptr) {
+        return false;
+    }
+
+    dim3 transitionGrid(mixHc / 2, dotParts, tokens);
+    DeepSeekV4HcPostPreDots4x4096Kernel<<<transitionGrid, 256>>>(
+        (const __nv_bfloat16 *)x.cudaData,
+        (const __nv_bfloat16 *)residual.cudaData,
+        (const float *)previousPost.cudaData,
+        (const float *)previousComb.cudaData,
+        (const float *)nextHcFn.cudaData, dots,
+        (__nv_bfloat16 *)residualOutput.cudaData, tokens);
+
+    constexpr int finishThreads = 512;
+    DeepSeekV4HcPreFinishNorm4x4096Kernel<<<tokens, finishThreads>>>(
+        (const __nv_bfloat16 *)residualOutput.cudaData, dots,
+        (const float *)nextHcScale.cudaData,
+        (const float *)nextHcBase.cudaData,
+        (const float *)nextNormWeight.cudaData,
+        (__nv_bfloat16 *)normOutput.cudaData,
+        (float *)nextPost.cudaData, (float *)nextComb.cudaData,
+        tokens, sinkhornIters, eps, normEps, dotsStride, dotParts);
+    bool ok = cudaGetLastError() == cudaSuccess;
+    DeviceSync();
+    FastllmCudaFree(dots);
+    return ok;
+}
+
 extern "C" bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fastllm::Data &hcFn,
                                                int hcMult, fastllm::Data &dotsFloat) {
     if (x.dataDevice != fastllm::DataDevice::CUDA || hcFn.dataDevice != fastllm::DataDevice::CUDA ||
@@ -3577,10 +4702,89 @@ extern "C" bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fas
     return ok;
 }
 
-extern "C" bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase,
-                                                  int startPos, int originalSeqLen,
-                                                  float ropeFactor, int betaFast, int betaSlow,
-                                                  float eps) {
+extern "C" bool FastllmCudaDeepSeekV4HcHead(const fastllm::Data &x,
+                                             const fastllm::Data &hcFn,
+                                             const fastllm::Data &hcScale,
+                                             const fastllm::Data &hcBase,
+                                             int hcMult, float eps, float normEps,
+                                             fastllm::Data &output) {
+    if (x.dataDevice != fastllm::DataDevice::CUDA ||
+        hcFn.dataDevice != fastllm::DataDevice::CUDA ||
+        hcScale.dataDevice != fastllm::DataDevice::CUDA ||
+        hcBase.dataDevice != fastllm::DataDevice::CUDA ||
+        x.dims.size() != 4 || hcMult <= 0 || x.dims[2] != hcMult ||
+        hcScale.dataType != fastllm::DataType::FLOAT32 ||
+        hcBase.dataType != fastllm::DataType::FLOAT32) {
+        return false;
+    }
+    int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
+    int tokens = bsz * seqlen;
+    int flatDim = hcMult * dim;
+    if (hcFn.Count(0) != (uint64_t)hcMult * flatDim ||
+        hcScale.Count(0) < 1 || hcBase.Count(0) < (uint64_t)hcMult ||
+        !DeepSeekV4PrepareCudaOutput(output, x.dataType, {bsz, seqlen, dim})) {
+        return false;
+    }
+
+    int dotsStride = hcMult + 1;
+    float *dots = (float *)FastllmCudaMalloc((size_t)tokens * dotsStride * sizeof(float));
+    if (dots == nullptr) {
+        return false;
+    }
+    bool dotsOk = false;
+    if (x.dataType == hcFn.dataType) {
+        dotsOk = DeepSeekV4LaunchHcPreCublasDots(
+            x, hcFn, dots, tokens, flatDim, hcMult, dotsStride);
+    }
+    if (!dotsOk && x.dataType == fastllm::DataType::BFLOAT16) {
+        dotsOk = DeepSeekV4LaunchHcHeadDotsByWeight<__nv_bfloat16>(
+            x, hcFn, dots, tokens, flatDim, hcMult, dotsStride);
+    } else if (!dotsOk && x.dataType == fastllm::DataType::FLOAT16) {
+        dotsOk = DeepSeekV4LaunchHcHeadDotsByWeight<half>(
+            x, hcFn, dots, tokens, flatDim, hcMult, dotsStride);
+    } else if (!dotsOk && x.dataType == fastllm::DataType::FLOAT32) {
+        dotsOk = DeepSeekV4LaunchHcHeadDotsByWeight<float>(
+            x, hcFn, dots, tokens, flatDim, hcMult, dotsStride);
+    }
+    if (!dotsOk) {
+        FastllmCudaFree(dots);
+        return false;
+    }
+    int threads = 256;
+    bool ok = true;
+    if (x.dataType == fastllm::DataType::BFLOAT16) {
+        DeepSeekV4HcPreSqSumKernel<<<tokens, threads, threads * sizeof(float)>>>(
+            (const __nv_bfloat16 *)x.cudaData, dots, tokens, flatDim, dotsStride);
+        DeepSeekV4HcHeadFinishKernel<<<tokens, threads, (hcMult + 1) * sizeof(float)>>>(
+            (const __nv_bfloat16 *)x.cudaData, dots,
+            (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
+            (__nv_bfloat16 *)output.cudaData, tokens, dim, hcMult, eps, normEps);
+    } else if (x.dataType == fastllm::DataType::FLOAT16) {
+        DeepSeekV4HcPreSqSumKernel<<<tokens, threads, threads * sizeof(float)>>>(
+            (const half *)x.cudaData, dots, tokens, flatDim, dotsStride);
+        DeepSeekV4HcHeadFinishKernel<<<tokens, threads, (hcMult + 1) * sizeof(float)>>>(
+            (const half *)x.cudaData, dots,
+            (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
+            (half *)output.cudaData, tokens, dim, hcMult, eps, normEps);
+    } else if (x.dataType == fastllm::DataType::FLOAT32) {
+        DeepSeekV4HcPreSqSumKernel<<<tokens, threads, threads * sizeof(float)>>>(
+            (const float *)x.cudaData, dots, tokens, flatDim, dotsStride);
+        DeepSeekV4HcHeadFinishKernel<<<tokens, threads, (hcMult + 1) * sizeof(float)>>>(
+            (const float *)x.cudaData, dots,
+            (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
+            (float *)output.cudaData, tokens, dim, hcMult, eps, normEps);
+    } else {
+        ok = false;
+    }
+    DeviceSync();
+    FastllmCudaFree(dots);
+    return ok;
+}
+
+static bool FastllmCudaDeepSeekV4ScaleQRotaryImpl(fastllm::Data &q, int ropeDim, float ropeBase,
+                                                  int startPos, const int32_t *decodeMeta,
+                                                  int originalSeqLen, float ropeFactor,
+                                                  int betaFast, int betaSlow, float eps) {
     if (q.dataDevice != fastllm::DataDevice::CUDA || q.dims.size() != 4 ||
         ropeDim <= 0 || ropeDim > q.dims[3]) {
         return false;
@@ -3593,15 +4797,15 @@ extern "C" bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim,
     if (q.dataType == fastllm::DataType::BFLOAT16) {
         DeepSeekV4ScaleQRotaryBlockKernel<<<blocks, threads, sharedBytes>>>(
             (__nv_bfloat16 *)q.cudaData, rows, seqlen, heads, dim, ropeDim, ropeBase, startPos,
-            originalSeqLen, ropeFactor, betaFast, betaSlow, eps);
+            originalSeqLen, ropeFactor, betaFast, betaSlow, eps, decodeMeta);
     } else if (q.dataType == fastllm::DataType::FLOAT16) {
         DeepSeekV4ScaleQRotaryBlockKernel<<<blocks, threads, sharedBytes>>>(
             (half *)q.cudaData, rows, seqlen, heads, dim, ropeDim, ropeBase, startPos,
-            originalSeqLen, ropeFactor, betaFast, betaSlow, eps);
+            originalSeqLen, ropeFactor, betaFast, betaSlow, eps, decodeMeta);
     } else if (q.dataType == fastllm::DataType::FLOAT32) {
         DeepSeekV4ScaleQRotaryBlockKernel<<<blocks, threads, sharedBytes>>>(
             (float *)q.cudaData, rows, seqlen, heads, dim, ropeDim, ropeBase, startPos,
-            originalSeqLen, ropeFactor, betaFast, betaSlow, eps);
+            originalSeqLen, ropeFactor, betaFast, betaSlow, eps, decodeMeta);
     } else {
         return false;
     }
@@ -3609,10 +4813,31 @@ extern "C" bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim,
     return true;
 }
 
-extern "C" bool FastllmCudaDeepSeekV4RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase,
-                                                 int startPos, int originalSeqLen,
-                                                 float ropeFactor, int betaFast, int betaSlow,
-                                                 int quantDim, int blockSize, int posStep) {
+extern "C" bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase,
+                                                    int startPos, int originalSeqLen,
+                                                    float ropeFactor, int betaFast, int betaSlow,
+                                                    float eps) {
+    return FastllmCudaDeepSeekV4ScaleQRotaryImpl(q, ropeDim, ropeBase, startPos, nullptr,
+                                                 originalSeqLen, ropeFactor, betaFast, betaSlow, eps);
+}
+
+extern "C" bool FastllmCudaDeepSeekV4ScaleQRotaryGraph(
+                                                    fastllm::Data &q, int ropeDim, float ropeBase,
+                                                    const int32_t *decodeMeta, int originalSeqLen,
+                                                    float ropeFactor, int betaFast, int betaSlow,
+                                                    float eps) {
+    if (decodeMeta == nullptr) {
+        return false;
+    }
+    return FastllmCudaDeepSeekV4ScaleQRotaryImpl(q, ropeDim, ropeBase, 0, decodeMeta,
+                                                 originalSeqLen, ropeFactor, betaFast, betaSlow, eps);
+}
+
+static bool FastllmCudaDeepSeekV4RotaryQuantImpl(fastllm::Data &x, int ropeDim, float ropeBase,
+                                                 int startPos, const int32_t *decodeMeta,
+                                                 int originalSeqLen, float ropeFactor,
+                                                 int betaFast, int betaSlow, int quantDim,
+                                                 int blockSize, int posStep) {
     if (x.dataDevice != fastllm::DataDevice::CUDA || x.dims.size() < 3 || x.dims.size() > 4 ||
         ropeDim <= 0 || blockSize <= 0) {
         return false;
@@ -3630,18 +4855,89 @@ extern "C" bool FastllmCudaDeepSeekV4RotaryQuant(fastllm::Data &x, int ropeDim, 
     if (x.dataType == fastllm::DataType::BFLOAT16) {
         DeepSeekV4RotaryQuantBlockKernel<<<blocks, threads, sharedBytes>>>(
             (__nv_bfloat16 *)x.cudaData, rows, seqlen, heads, dim, ropeDim, ropeBase, startPos,
-            originalSeqLen, ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep);
+            originalSeqLen, ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep, decodeMeta);
     } else if (x.dataType == fastllm::DataType::FLOAT16) {
         DeepSeekV4RotaryQuantBlockKernel<<<blocks, threads, sharedBytes>>>(
             (half *)x.cudaData, rows, seqlen, heads, dim, ropeDim, ropeBase, startPos,
-            originalSeqLen, ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep);
+            originalSeqLen, ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep, decodeMeta);
     } else if (x.dataType == fastllm::DataType::FLOAT32) {
         DeepSeekV4RotaryQuantBlockKernel<<<blocks, threads, sharedBytes>>>(
             (float *)x.cudaData, rows, seqlen, heads, dim, ropeDim, ropeBase, startPos,
-            originalSeqLen, ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep);
+            originalSeqLen, ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep, decodeMeta);
     } else {
         return false;
     }
+    DeviceSync();
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase,
+                                                   int startPos, int originalSeqLen,
+                                                   float ropeFactor, int betaFast, int betaSlow,
+                                                   int quantDim, int blockSize, int posStep) {
+    return FastllmCudaDeepSeekV4RotaryQuantImpl(x, ropeDim, ropeBase, startPos, nullptr,
+                                                originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                                quantDim, blockSize, posStep);
+}
+
+extern "C" bool FastllmCudaDeepSeekV4RotaryQuantGraph(
+                                                   fastllm::Data &x, int ropeDim, float ropeBase,
+                                                   const int32_t *decodeMeta, int originalSeqLen,
+                                                   float ropeFactor, int betaFast, int betaSlow,
+                                                   int quantDim, int blockSize, int posStep) {
+    if (decodeMeta == nullptr) {
+        return false;
+    }
+    return FastllmCudaDeepSeekV4RotaryQuantImpl(x, ropeDim, ropeBase, 0, decodeMeta,
+                                                originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                                quantDim, blockSize, posStep);
+}
+
+extern "C" bool FastllmCudaDeepSeekV4FusedQKVRopeCacheGraph(
+                                                   fastllm::Data &q, fastllm::Data &kv,
+                                                   fastllm::Data &kvNormWeight,
+                                                   const int32_t *decodeMeta,
+                                                   int ropeDim, float ropeBase,
+                                                   int originalSeqLen, float ropeFactor,
+                                                   int betaFast, int betaSlow, float eps,
+                                                   int quantDim, int quantBlockSize,
+                                                   int windowSize, fastllm::Data &windowKV) {
+    // Keep this specialization intentionally narrow.  The caller retains the
+    // established RMSNorm/rotary/cache-update sequence as the fallback.
+    if (decodeMeta == nullptr || q.dataDevice != fastllm::DataDevice::CUDA ||
+        kv.dataDevice != fastllm::DataDevice::CUDA ||
+        kvNormWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        windowKV.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::BFLOAT16 ||
+        kv.dataType != fastllm::DataType::BFLOAT16 ||
+        kvNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        windowKV.dataType != fastllm::DataType::FLOAT32 ||
+        q.cudaData == nullptr || kv.cudaData == nullptr ||
+        kvNormWeight.cudaData == nullptr || windowKV.cudaData == nullptr ||
+        q.dims.size() != 4 || q.dims[0] != 1 || q.dims[1] != 1 ||
+        q.dims[2] <= 0 || q.dims[2] > 64 || q.dims[3] != 512 ||
+        kv.dims != std::vector<int>({1, 1, 1, 512}) ||
+        kvNormWeight.Count(0) != 512 ||
+        windowKV.dims != std::vector<int>({1, windowSize, 512}) ||
+        ropeDim != 64 || quantDim != 448 || quantBlockSize != 64 ||
+        windowSize <= 0 || eps <= 0.0f) {
+        return false;
+    }
+    int qDevice = GetPointerDeviceId(q.cudaData);
+    int metaDevice = GetPointerDeviceId((void*)decodeMeta);
+    if (qDevice < 0 || (metaDevice >= 0 && metaDevice != qDevice)) {
+        return false;
+    }
+
+    constexpr int threads = 256;
+    int qHeads = q.dims[2];
+    int warps = threads / 32;
+    int blocks = (qHeads + 1 + warps - 1) / warps;
+    DeepSeekV4FusedQKVRopeCache512Kernel<<<blocks, threads>>>(
+        (__nv_bfloat16 *)q.cudaData, (__nv_bfloat16 *)kv.cudaData,
+        (const float *)kvNormWeight.cudaData, (float *)windowKV.cudaData,
+        decodeMeta, windowSize, qHeads, ropeBase, originalSeqLen, ropeFactor,
+        betaFast, betaSlow, eps);
     DeviceSync();
     return true;
 }
@@ -3675,8 +4971,9 @@ extern "C" bool FastllmCudaDeepSeekV4StoreWindowKVCache(const fastllm::Data &kv,
     return true;
 }
 
-extern "C" bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
-                                                         int windowSize, fastllm::Data &windowKV) {
+static bool FastllmCudaDeepSeekV4UpdateWindowKVCacheImpl(const fastllm::Data &kv, int startPos,
+                                                         const int32_t *decodeMeta, int windowSize,
+                                                         fastllm::Data &windowKV) {
     if (kv.dataDevice != fastllm::DataDevice::CUDA || kv.dims.size() != 3 || kv.dims[1] <= 0 ||
         startPos < 0 || windowSize <= 0) {
         return false;
@@ -3690,18 +4987,36 @@ extern "C" bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv
     int blocks = (total + threads - 1) / threads;
     if (kv.dataType == fastllm::DataType::BFLOAT16) {
         DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
-            (__nv_bfloat16 *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
+            (__nv_bfloat16 *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim,
+            startPos, windowSize, decodeMeta);
     } else if (kv.dataType == fastllm::DataType::FLOAT16) {
         DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
-            (half *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
+            (half *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim,
+            startPos, windowSize, decodeMeta);
     } else if (kv.dataType == fastllm::DataType::FLOAT32) {
         DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
-            (float *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
+            (float *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim,
+            startPos, windowSize, decodeMeta);
     } else {
         return false;
     }
     DeviceSync();
     return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
+                                                           int windowSize, fastllm::Data &windowKV) {
+    return FastllmCudaDeepSeekV4UpdateWindowKVCacheImpl(kv, startPos, nullptr, windowSize, windowKV);
+}
+
+extern "C" bool FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(
+                                                           const fastllm::Data &kv,
+                                                           const int32_t *decodeMeta,
+                                                           int windowSize, fastllm::Data &windowKV) {
+    if (decodeMeta == nullptr) {
+        return false;
+    }
+    return FastllmCudaDeepSeekV4UpdateWindowKVCacheImpl(kv, 0, decodeMeta, windowSize, windowKV);
 }
 
 extern "C" bool FastllmCudaDeepSeekV4BuildWindowKVPrefix(const fastllm::Data &windowKV, int startPos,
@@ -3786,6 +5101,165 @@ extern "C" bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv,
     return true;
 }
 
+extern "C" bool FastllmCudaDeepSeekV4InitGraphRawRing(const fastllm::Data &raw,
+                                                       int rawTokenBase,
+                                                       fastllm::Data &ring) {
+    if (raw.dataDevice != fastllm::DataDevice::CUDA ||
+        ring.dataDevice != fastllm::DataDevice::CUDA ||
+        raw.cudaData == nullptr || ring.cudaData == nullptr ||
+        raw.dataType != ring.dataType || raw.dims.size() != 3 ||
+        ring.dims.size() != 3 || raw.dims[0] != ring.dims[0] ||
+        raw.dims[2] != ring.dims[2] || rawTokenBase < 0 || ring.dims[1] <= 0) {
+        return false;
+    }
+    int bsz = raw.dims[0], rawLen = raw.dims[1], wideDim = raw.dims[2];
+    int ringCapacity = ring.dims[1];
+    uint64_t total = (uint64_t)bsz * rawLen * wideDim;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    if (raw.dataType == fastllm::DataType::BFLOAT16) {
+        DeepSeekV4InitGraphRawRingKernel<<<blocks, threads>>>(
+            (const __nv_bfloat16 *)raw.cudaData, (__nv_bfloat16 *)ring.cudaData,
+            bsz, rawLen, wideDim, rawTokenBase, ringCapacity);
+    } else if (raw.dataType == fastllm::DataType::FLOAT16) {
+        DeepSeekV4InitGraphRawRingKernel<<<blocks, threads>>>(
+            (const half *)raw.cudaData, (half *)ring.cudaData,
+            bsz, rawLen, wideDim, rawTokenBase, ringCapacity);
+    } else if (raw.dataType == fastllm::DataType::FLOAT32) {
+        DeepSeekV4InitGraphRawRingKernel<<<blocks, threads>>>(
+            (const float *)raw.cudaData, (float *)ring.cudaData,
+            bsz, rawLen, wideDim, rawTokenBase, ringCapacity);
+    } else {
+        return false;
+    }
+    DeviceSync();
+    return true;
+}
+
+template <typename T>
+static bool DeepSeekV4LaunchUpdateCompressedKVGraph(
+                                            const fastllm::Data &kv,
+                                            const fastllm::Data &score,
+                                            const fastllm::Data &ape,
+                                            const fastllm::Data &normWeight,
+                                            const int32_t *decodeMeta,
+                                            int compressRatio, int headDim,
+                                            int ropeDim, float ropeBase,
+                                            int originalSeqLen, float ropeFactor,
+                                            int betaFast, int betaSlow,
+                                            fastllm::Data &kvRing,
+                                            fastllm::Data &scoreRing,
+                                            fastllm::Data &compressedKV,
+                                            int bsz, int ringCapacity,
+                                            int compressedCapacity, int wideDim) {
+    uint64_t rawTotal = (uint64_t)bsz * wideDim;
+    int threads = 256;
+    DeepSeekV4StoreGraphCompressorRawKernel<<<
+        (int)((rawTotal + threads - 1) / threads), threads>>>(
+            (const T *)kv.cudaData, (const T *)score.cudaData,
+            (T *)kvRing.cudaData, (T *)scoreRing.cudaData,
+            decodeMeta, bsz, wideDim, ringCapacity);
+
+    size_t sharedBytes = (size_t)(headDim + threads) * sizeof(float);
+    if (normWeight.dataType == fastllm::DataType::BFLOAT16) {
+        DeepSeekV4UpdateCompressedKVGraphKernel<<<bsz, threads, sharedBytes>>>(
+            (const T *)kvRing.cudaData, (const T *)scoreRing.cudaData,
+            (const float *)ape.cudaData, (const __nv_bfloat16 *)normWeight.cudaData,
+            decodeMeta, (__nv_bfloat16 *)compressedKV.cudaData,
+            bsz, ringCapacity, compressedCapacity, compressRatio, headDim,
+            wideDim, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    } else if (normWeight.dataType == fastllm::DataType::FLOAT16) {
+        DeepSeekV4UpdateCompressedKVGraphKernel<<<bsz, threads, sharedBytes>>>(
+            (const T *)kvRing.cudaData, (const T *)scoreRing.cudaData,
+            (const float *)ape.cudaData, (const half *)normWeight.cudaData,
+            decodeMeta, (__nv_bfloat16 *)compressedKV.cudaData,
+            bsz, ringCapacity, compressedCapacity, compressRatio, headDim,
+            wideDim, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    } else if (normWeight.dataType == fastllm::DataType::FLOAT32) {
+        DeepSeekV4UpdateCompressedKVGraphKernel<<<bsz, threads, sharedBytes>>>(
+            (const T *)kvRing.cudaData, (const T *)scoreRing.cudaData,
+            (const float *)ape.cudaData, (const float *)normWeight.cudaData,
+            decodeMeta, (__nv_bfloat16 *)compressedKV.cudaData,
+            bsz, ringCapacity, compressedCapacity, compressRatio, headDim,
+            wideDim, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4UpdateCompressedKVGraph(
+                                            const fastllm::Data &kv,
+                                            const fastllm::Data &score,
+                                            const fastllm::Data &ape,
+                                            const fastllm::Data &normWeight,
+                                            const int32_t *decodeMeta,
+                                            int compressRatio, int headDim,
+                                            int ropeDim, float ropeBase,
+                                            int originalSeqLen, float ropeFactor,
+                                            int betaFast, int betaSlow,
+                                            fastllm::Data &kvRing,
+                                            fastllm::Data &scoreRing,
+                                            fastllm::Data &compressedKV) {
+    if (decodeMeta == nullptr || compressRatio <= 0 || headDim <= 0 ||
+        ropeDim <= 0 || ropeDim > headDim || kv.dataDevice != fastllm::DataDevice::CUDA ||
+        score.dataDevice != fastllm::DataDevice::CUDA ||
+        ape.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        kvRing.dataDevice != fastllm::DataDevice::CUDA ||
+        scoreRing.dataDevice != fastllm::DataDevice::CUDA ||
+        compressedKV.dataDevice != fastllm::DataDevice::CUDA ||
+        kv.cudaData == nullptr || score.cudaData == nullptr || ape.cudaData == nullptr ||
+        normWeight.cudaData == nullptr || kvRing.cudaData == nullptr ||
+        scoreRing.cudaData == nullptr || compressedKV.cudaData == nullptr ||
+        kv.dataType != score.dataType || kv.dataType != kvRing.dataType ||
+        kv.dataType != scoreRing.dataType || ape.dataType != fastllm::DataType::FLOAT32 ||
+        compressedKV.dataType != fastllm::DataType::BFLOAT16 ||
+        kv.dims.size() != 3 || score.dims != kv.dims ||
+        kvRing.dims.size() != 3 || scoreRing.dims != kvRing.dims ||
+        compressedKV.dims.size() != 3) {
+        return false;
+    }
+    int bsz = kv.dims[0];
+    int wideDim = (compressRatio == 4 ? 2 : 1) * headDim;
+    int ringCapacity = kvRing.dims[1];
+    int compressedCapacity = compressedKV.dims[1];
+    if (compressedKV.expansionDims.size() >= 3) {
+        compressedCapacity = std::max(compressedCapacity, compressedKV.expansionDims[1]);
+    }
+    if (kv.dims[1] != 1 || kv.dims[2] != wideDim ||
+        kvRing.dims[0] != bsz || kvRing.dims[2] != wideDim ||
+        ringCapacity < (compressRatio == 4 ? 2 * compressRatio : compressRatio) ||
+        compressedCapacity <= 0 || compressedKV.dims[0] != bsz ||
+        compressedKV.dims[2] != headDim ||
+        ape.Count(0) < (uint64_t)compressRatio * wideDim ||
+        normWeight.Count(0) < (uint64_t)headDim) {
+        return false;
+    }
+    bool ok = false;
+    if (kv.dataType == fastllm::DataType::BFLOAT16) {
+        ok = DeepSeekV4LaunchUpdateCompressedKVGraph<__nv_bfloat16>(
+            kv, score, ape, normWeight, decodeMeta, compressRatio, headDim,
+            ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow,
+            kvRing, scoreRing, compressedKV, bsz, ringCapacity,
+            compressedCapacity, wideDim);
+    } else if (kv.dataType == fastllm::DataType::FLOAT16) {
+        ok = DeepSeekV4LaunchUpdateCompressedKVGraph<half>(
+            kv, score, ape, normWeight, decodeMeta, compressRatio, headDim,
+            ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow,
+            kvRing, scoreRing, compressedKV, bsz, ringCapacity,
+            compressedCapacity, wideDim);
+    } else if (kv.dataType == fastllm::DataType::FLOAT32) {
+        ok = DeepSeekV4LaunchUpdateCompressedKVGraph<float>(
+            kv, score, ape, normWeight, decodeMeta, compressRatio, headDim,
+            ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow,
+            kvRing, scoreRing, compressedKV, bsz, ringCapacity,
+            compressedCapacity, wideDim);
+    }
+    DeviceSync();
+    return ok;
+}
+
 extern "C" bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, int scoreFuncMode) {
     if (logits.dataDevice != fastllm::DataDevice::CUDA || logits.dataType != fastllm::DataType::FLOAT32 ||
         logits.dims.empty() || scoreFuncMode < 0 || scoreFuncMode > 2) {
@@ -3801,6 +5275,36 @@ extern "C" bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, 
     return true;
 }
 
+void FastllmCudaReleaseDeepSeekV4RouteTableCache(
+        const fastllm::Data *routeTable) {
+    if (routeTable == nullptr) {
+        return;
+    }
+
+    DeepSeekV4RouteTableDeviceCache retired;
+    {
+        std::lock_guard<std::mutex> guard(DeepSeekV4RouteTableCacheMutex());
+        DeepSeekV4RouteTableCache &cache = DeepSeekV4RouteTableCaches();
+        auto it = cache.find(routeTable);
+        if (it == cache.end()) {
+            return;
+        }
+        retired = std::move(it->second);
+        cache.erase(it);
+    }
+
+    int originalDevice = FastllmCudaGetDevice();
+    for (auto &deviceEntry : retired) {
+        FastllmCudaSetDevice(deviceEntry.first);
+        DeepSeekV4RouteTableCacheEntry &entry = deviceEntry.second;
+        FastllmCudaFree(entry.cudaData);
+        for (void *ptr : entry.retiredCudaData) {
+            FastllmCudaFree(ptr);
+        }
+    }
+    FastllmCudaSetDevice(originalDevice);
+}
+
 extern "C" bool FastllmCudaDeepSeekV4HashRouteScore(const fastllm::Data &logits,
                                                     fastllm::Data &tid2eid,
                                                     const int *inputIds, int tokens,
@@ -3812,7 +5316,9 @@ extern "C" bool FastllmCudaDeepSeekV4HashRouteScore(const fastllm::Data &logits,
         logits.dataType != fastllm::DataType::FLOAT32 ||
         logits.dims.empty() || inputIds == nullptr ||
         tokens <= 0 || topk <= 0 || scoreFuncMode < 0 || scoreFuncMode > 2 ||
-        tid2eid.dataType != fastllm::DataType::FLOAT32) {
+        (tid2eid.dataType != fastllm::DataType::FLOAT32 &&
+         tid2eid.dataType != fastllm::DataType::INT32 &&
+         tid2eid.dataType != fastllm::DataType::INT32PARAM)) {
         return false;
     }
     int experts = logits.dims.back();
@@ -3830,25 +5336,96 @@ extern "C" bool FastllmCudaDeepSeekV4HashRouteScore(const fastllm::Data &logits,
     if (tid2eid.Count(0) < (uint64_t)(maxInputId + 1) * topk) {
         return false;
     }
-    tid2eid.ToDevice(fastllm::DataDevice::CUDA);
-    if (tid2eid.cudaData == nullptr ||
+    const void *cudaRouteTable = DeepSeekV4GetCudaRouteTable(tid2eid);
+    bool intRouteTable = tid2eid.dataType == fastllm::DataType::INT32 ||
+                         tid2eid.dataType == fastllm::DataType::INT32PARAM;
+    if (cudaRouteTable == nullptr ||
         !DeepSeekV4PrepareCudaOutput(expertIndex, fastllm::DataType::INT32, {tokens, topk}) ||
         !DeepSeekV4PrepareCudaOutput(expertScore, fastllm::DataType::FLOAT32, {tokens, topk})) {
         return false;
     }
 
-    size_t inputBytes = (size_t)tokens * sizeof(int);
-    int *cudaInputIds = (int *)FastllmCudaMalloc(inputBytes);
-    if (cudaInputIds == nullptr) {
+    int *cudaInputIds = nullptr;
+    int singleTokenId = tokens == 1 ? inputIds[0] : -1;
+    if (tokens > 1) {
+        size_t inputBytes = (size_t)tokens * sizeof(int);
+        cudaInputIds = (int *)FastllmCudaMalloc(inputBytes);
+        if (cudaInputIds == nullptr) {
+            return false;
+        }
+        FastllmCudaCopyFromHostToDevice(cudaInputIds, (void *)inputIds, inputBytes);
+    }
+    if (intRouteTable) {
+        DeepSeekV4HashRouteScoreKernel<<<tokens, 256>>>(
+            (float *)logits.cudaData, (const int32_t *)cudaRouteTable,
+            cudaInputIds, singleTokenId,
+            (int32_t *)expertIndex.cudaData, (float *)expertScore.cudaData,
+            tokens, experts, topk, scoreFuncMode, routeScale,
+            (int)(tid2eid.Count(0) / topk));
+    } else {
+        DeepSeekV4HashRouteScoreKernel<<<tokens, 256>>>(
+            (float *)logits.cudaData, (const float *)cudaRouteTable,
+            cudaInputIds, singleTokenId,
+            (int32_t *)expertIndex.cudaData, (float *)expertScore.cudaData,
+            tokens, experts, topk, scoreFuncMode, routeScale,
+            (int)(tid2eid.Count(0) / topk));
+    }
+    DeviceSync();
+    if (cudaInputIds != nullptr) {
+        FastllmCudaFree(cudaInputIds);
+    }
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4HashRouteScoreGraph(
+                                                    const fastllm::Data &logits,
+                                                    fastllm::Data &tid2eid,
+                                                    const int32_t *decodeMeta,
+                                                    int tokens, int topk,
+                                                    int scoreFuncMode,
+                                                    float routeScale,
+                                                    fastllm::Data &expertIndex,
+                                                    fastllm::Data &expertScore) {
+    if (decodeMeta == nullptr || tokens != 1 ||
+        logits.dataDevice != fastllm::DataDevice::CUDA ||
+        logits.dataType != fastllm::DataType::FLOAT32 || logits.dims.empty() ||
+        topk <= 0 || scoreFuncMode < 0 || scoreFuncMode > 2 ||
+        tid2eid.Count(0) < (uint64_t)topk ||
+        (tid2eid.dataType != fastllm::DataType::FLOAT32 &&
+         tid2eid.dataType != fastllm::DataType::INT32 &&
+         tid2eid.dataType != fastllm::DataType::INT32PARAM)) {
         return false;
     }
-    FastllmCudaCopyFromHostToDevice(cudaInputIds, (void *)inputIds, inputBytes);
-    DeepSeekV4HashRouteScoreKernel<<<tokens, 256>>>(
-        (float *)logits.cudaData, (const float *)tid2eid.cudaData, cudaInputIds,
-        (int32_t *)expertIndex.cudaData, (float *)expertScore.cudaData,
-        tokens, experts, topk, scoreFuncMode, routeScale);
+    int experts = logits.dims.back();
+    if ((int)(logits.Count(0) / experts) != tokens || experts <= 0 || experts > 256) {
+        return false;
+    }
+
+    const void *cudaRouteTable = DeepSeekV4GetCudaRouteTable(tid2eid);
+    bool intRouteTable = tid2eid.dataType == fastllm::DataType::INT32 ||
+                         tid2eid.dataType == fastllm::DataType::INT32PARAM;
+    if (cudaRouteTable == nullptr ||
+        !DeepSeekV4PrepareCudaOutput(expertIndex, fastllm::DataType::INT32, {tokens, topk}) ||
+        !DeepSeekV4PrepareCudaOutput(expertScore, fastllm::DataType::FLOAT32, {tokens, topk})) {
+        return false;
+    }
+
+    int routeRows = (int)(tid2eid.Count(0) / topk);
+    const int *cudaInputIds = (const int *)(decodeMeta + 1);
+    if (intRouteTable) {
+        DeepSeekV4HashRouteScoreKernel<<<tokens, 256>>>(
+            (float *)logits.cudaData, (const int32_t *)cudaRouteTable,
+            cudaInputIds, -1, (int32_t *)expertIndex.cudaData,
+            (float *)expertScore.cudaData, tokens, experts, topk,
+            scoreFuncMode, routeScale, routeRows);
+    } else {
+        DeepSeekV4HashRouteScoreKernel<<<tokens, 256>>>(
+            (float *)logits.cudaData, (const float *)cudaRouteTable,
+            cudaInputIds, -1, (int32_t *)expertIndex.cudaData,
+            (float *)expertScore.cudaData, tokens, experts, topk,
+            scoreFuncMode, routeScale, routeRows);
+    }
     DeviceSync();
-    FastllmCudaFree(cudaInputIds);
     return true;
 }
 
@@ -4029,7 +5606,7 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
         int blocks = (rows * rotaryWorkPerRow + threads - 1) / threads;
         DeepSeekV4SparseDecodeRotaryCastKernel<<<blocks, threads>>>(
             cudaTemp, (__nv_bfloat16 *)output.cudaData, rows, dim, ropeDim, ropeBase,
-            startPos, originalSeqLen, ropeFactor, betaFast, betaSlow);
+            startPos, originalSeqLen, ropeFactor, betaFast, betaSlow, nullptr);
         DeviceSync();
     }
     if (sparseDecodeStats) {
@@ -4072,6 +5649,120 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
         }
     }
 
+    FastllmCudaFree(cudaTemp);
+    return ok;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
+                                                                 const fastllm::Data &q,
+                                                                 const fastllm::Data &windowKV,
+                                                                 const fastllm::Data &compressedKV,
+                                                                 fastllm::Data &attnSink,
+                                                                 int windowSize, int compressRatio,
+                                                                 const int32_t *decodeMeta,
+                                                                 int ropeDim, float ropeBase,
+                                                                 int originalSeqLen,
+                                                                 float ropeFactor, int betaFast,
+                                                                 int betaSlow, float softmaxScale,
+                                                                 fastllm::Data &output,
+                                                                 bool allowTriton) {
+    if (decodeMeta == nullptr || q.dims.size() != 4 || q.dims[1] != 1 ||
+        q.dataDevice != fastllm::DataDevice::CUDA ||
+        windowKV.dataDevice != fastllm::DataDevice::CUDA ||
+        windowKV.dataType != fastllm::DataType::FLOAT32 ||
+        compressedKV.dataDevice != fastllm::DataDevice::CUDA ||
+        compressedKV.cudaData == nullptr ||
+        attnSink.dataDevice != fastllm::DataDevice::CUDA ||
+        attnSink.dataType != fastllm::DataType::FLOAT32 ||
+        windowSize <= 0 || compressRatio < 0 || ropeDim <= 0 ||
+        ropeDim > q.dims[3]) {
+        return false;
+    }
+    int bsz = q.dims[0], heads = q.dims[2], dim = q.dims[3];
+    int compressedCapacity = compressedKV.dims.size() >= 3 ? compressedKV.dims[1] : 0;
+    if (compressedKV.expansionDims.size() >= 3) {
+        compressedCapacity = std::max(compressedCapacity, compressedKV.expansionDims[1]);
+    }
+    if (attnSink.Count(0) != (uint64_t)heads ||
+        windowKV.Count(0) != (uint64_t)bsz * windowSize * dim ||
+        compressedCapacity <= 0 || compressedKV.dims.size() < 3 ||
+        compressedKV.dims[0] != bsz || compressedKV.dims[2] != dim ||
+        windowSize + compressedCapacity > kDeepSeekV4SparseDecodeMaxKeys) {
+        return false;
+    }
+
+    int curDevice = FastllmCudaGetDevice();
+    int qDevice = q.cudaData == nullptr ? -1 : GetPointerDeviceId(q.cudaData);
+    int windowDevice = windowKV.cudaData == nullptr ? -1 : GetPointerDeviceId(windowKV.cudaData);
+    int compressedDevice = GetPointerDeviceId(compressedKV.cudaData);
+    int sinkDevice = attnSink.cudaData == nullptr ? -1 : GetPointerDeviceId(attnSink.cudaData);
+    int metaDevice = GetPointerDeviceId((void*)decodeMeta);
+    int kernelDevice = qDevice >= 0 ? qDevice : curDevice;
+    if ((qDevice >= 0 && qDevice != curDevice) ||
+        (windowDevice >= 0 && windowDevice != kernelDevice) ||
+        (compressedDevice >= 0 && compressedDevice != kernelDevice) ||
+        (sinkDevice >= 0 && sinkDevice != kernelDevice) ||
+        (metaDevice >= 0 && metaDevice != kernelDevice)) {
+        return false;
+    }
+    if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::BFLOAT16,
+                                     {bsz, 1, heads, dim})) {
+        return false;
+    }
+
+    size_t tempBytes = (size_t)bsz * heads * dim * sizeof(float);
+    float *cudaTemp = (float *)FastllmCudaMalloc(tempBytes);
+    if (cudaTemp == nullptr) {
+        return false;
+    }
+    bool ok = allowTriton &&
+        fastllm::FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
+            q, windowKV, compressedKV, attnSink, windowSize, compressRatio,
+            decodeMeta, softmaxScale, cudaTemp);
+    int blocks = bsz * heads;
+    if (!ok) {
+        if (q.dataType == fastllm::DataType::BFLOAT16 &&
+            compressedKV.dataType == fastllm::DataType::BFLOAT16) {
+            DeepSeekV4SparseAttentionDecodeCachedOnlineKernel<__nv_bfloat16, __nv_bfloat16>
+                <<<blocks, 256>>>((const __nv_bfloat16 *)q.cudaData,
+                                  (const float *)windowKV.cudaData,
+                                  (const __nv_bfloat16 *)compressedKV.cudaData,
+                                  (const float *)attnSink.cudaData, cudaTemp,
+                                  bsz, heads, dim, windowSize, 0, 0, softmaxScale,
+                                  decodeMeta, compressRatio);
+            ok = true;
+        } else if (q.dataType == fastllm::DataType::FLOAT16 &&
+                   compressedKV.dataType == fastllm::DataType::BFLOAT16) {
+            DeepSeekV4SparseAttentionDecodeCachedOnlineKernel<half, __nv_bfloat16>
+                <<<blocks, 256>>>((const half *)q.cudaData,
+                                  (const float *)windowKV.cudaData,
+                                  (const __nv_bfloat16 *)compressedKV.cudaData,
+                                  (const float *)attnSink.cudaData, cudaTemp,
+                                  bsz, heads, dim, windowSize, 0, 0, softmaxScale,
+                                  decodeMeta, compressRatio);
+            ok = true;
+        } else if (q.dataType == fastllm::DataType::FLOAT32 &&
+                   compressedKV.dataType == fastllm::DataType::BFLOAT16) {
+            DeepSeekV4SparseAttentionDecodeCachedOnlineKernel<float, __nv_bfloat16>
+                <<<blocks, 256>>>((const float *)q.cudaData,
+                                  (const float *)windowKV.cudaData,
+                                  (const __nv_bfloat16 *)compressedKV.cudaData,
+                                  (const float *)attnSink.cudaData, cudaTemp,
+                                  bsz, heads, dim, windowSize, 0, 0, softmaxScale,
+                                  decodeMeta, compressRatio);
+            ok = true;
+        }
+    }
+    if (ok) {
+        int rows = bsz * heads;
+        int threads = 128;
+        int rotaryWorkPerRow = dim - ropeDim + (ropeDim >> 1);
+        int rotaryBlocks = (rows * rotaryWorkPerRow + threads - 1) / threads;
+        DeepSeekV4SparseDecodeRotaryCastKernel<<<rotaryBlocks, threads>>>(
+            cudaTemp, (__nv_bfloat16 *)output.cudaData, rows, dim, ropeDim, ropeBase,
+            0, originalSeqLen, ropeFactor, betaFast, betaSlow, decodeMeta);
+        DeviceSync();
+    }
     FastllmCudaFree(cudaTemp);
     return ok;
 }
@@ -4244,7 +5935,8 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedBatch(
 }
 
 extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
-                                         int groups, int oRank, fastllm::Data &output) {
+                                         int groups, int oRank, fastllm::Data &output,
+                                         bool allowTriton) {
     if (o.dataDevice != fastllm::DataDevice::CUDA || woA.dataDevice != fastllm::DataDevice::CUDA ||
         o.dims.size() != 4 || groups <= 0 || oRank <= 0) {
         return false;
@@ -4262,6 +5954,13 @@ extern "C" bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::
     if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::BFLOAT16,
                                      {bsz, seqlen, groups * oRank})) {
         return false;
+    }
+
+    fastllm::Data &mutableWoA = const_cast<fastllm::Data&>(woA);
+    if (allowTriton && fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
+            o, mutableWoA, groups, oRank, output)) {
+        DeviceSync();
+        return true;
     }
 
     bool ok = false;

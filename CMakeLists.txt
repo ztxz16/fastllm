@@ -323,6 +323,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
+        src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
@@ -379,7 +380,10 @@ if (USE_CUDA)
         PROPERTIES LANGUAGE CUDA)
 
     include_directories(include/devices/multicuda)
-    set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
+    set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES}
+        src/devices/multicuda/multicudadevice.cpp
+        src/devices/multicuda/fastllm-multicuda.cu
+        src/devices/multicuda/fastllm-custom-allreduce.cu)
 
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas nccl cuda)

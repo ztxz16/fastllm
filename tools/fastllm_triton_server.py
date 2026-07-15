@@ -424,6 +424,205 @@ if triton is not None:
 
 
     @triton.jit
+    def fastllm_deepseek_v4_fp8_woa_kernel(
+        a_ptr,
+        a_scale_ptr,
+        b_ptr,
+        b_scale_ptr,
+        out_ptr,
+        NUM_TOKENS: tl.constexpr,
+        NUM_GROUPS: tl.constexpr,
+        OUT_RANK: tl.constexpr,
+        HIDDEN_SIZE: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+        BLOCK_OUT: tl.constexpr,
+        BLOCK_HIDDEN: tl.constexpr,
+        UPCAST_FP8: tl.constexpr,
+    ):
+        """DeepSeek-V4 ``bhr,hdr->bhd`` block-scaled FP8 output projection.
+
+        The decode input is contiguous as [token, group, hidden].  Weight and
+        scale layouts match the checkpoint directly: [group, out, hidden] and
+        [group, out/128, hidden/128].  This is the SM89/SM12x vLLM einsum
+        schedule, specialized here so the AOT launcher only passes pointers.
+        """
+        token_block = tl.program_id(0)
+        out_block = tl.program_id(1)
+        group = tl.program_id(2)
+
+        token_offsets = token_block * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+        out_offsets = out_block * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+        hidden_offsets = tl.arange(0, BLOCK_HIDDEN)
+        accum = tl.zeros((BLOCK_TOKENS, BLOCK_OUT), dtype=tl.float32)
+
+        hidden_blocks: tl.constexpr = HIDDEN_SIZE // BLOCK_HIDDEN
+        out_blocks: tl.constexpr = OUT_RANK // BLOCK_OUT
+        for hidden_block in range(0, hidden_blocks):
+            hidden = hidden_block * BLOCK_HIDDEN + hidden_offsets
+            a = tl.load(
+                a_ptr
+                + (token_offsets[:, None] * NUM_GROUPS + group) * HIDDEN_SIZE
+                + hidden[None, :],
+                mask=token_offsets[:, None] < NUM_TOKENS,
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptr
+                + (group * OUT_RANK + out_offsets[None, :]) * HIDDEN_SIZE
+                + hidden[:, None],
+                mask=out_offsets[None, :] < OUT_RANK,
+                other=0.0,
+            )
+            if UPCAST_FP8:
+                # Ada does not expose the native FP8 dot used by SM12x.
+                a = a.to(tl.bfloat16)
+                b = b.to(tl.bfloat16)
+            raw = tl.dot(a, b, out_dtype=tl.float32)
+            a_scale = tl.load(
+                a_scale_ptr
+                + (token_offsets * NUM_GROUPS + group) * hidden_blocks
+                + hidden_block,
+                mask=token_offsets < NUM_TOKENS,
+                other=0.0,
+            )
+            b_scale = tl.load(
+                b_scale_ptr
+                + (group * out_blocks + out_offsets // BLOCK_OUT) * hidden_blocks
+                + hidden_block,
+                mask=out_offsets < OUT_RANK,
+                other=0.0,
+            )
+            accum += raw * a_scale[:, None] * b_scale[None, :]
+
+        tl.store(
+            out_ptr
+            + (token_offsets[:, None] * NUM_GROUPS + group) * OUT_RANK
+            + out_offsets[None, :],
+            accum,
+            mask=(token_offsets[:, None] < NUM_TOKENS)
+            & (out_offsets[None, :] < OUT_RANK),
+        )
+
+
+    @triton.jit
+    def fastllm_deepseek_v4_sparse_decode_kernel(
+        q_ptr,
+        window_kv_ptr,
+        compressed_kv_ptr,
+        sink_ptr,
+        decode_meta_ptr,
+        output_ptr,
+        softmax_scale,
+        BATCH: tl.constexpr,
+        NUM_HEADS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        WINDOW_SIZE: tl.constexpr,
+        COMPRESS_RATIO: tl.constexpr,
+        HEAD_BLOCK: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Graph-safe DeepSeek-V4 sparse MLA single-token decode.
+
+        This follows vLLM's FP8DS online-softmax schedule, while consuming
+        FastLLM's existing FP32 sliding-window cache and BF16 compressed cache.
+        A Triton program owns one (batch, head-block) tile, keeps the query and
+        online-softmax state in registers, and avoids the CUDA fallback's
+        block-wide synchronization for every candidate key.
+        """
+        batch_idx = tl.program_id(0)
+        head_block_idx = tl.program_id(1)
+        head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+        dim_offsets = tl.arange(0, BLOCK_D)
+        head_mask = head_offsets < NUM_HEADS
+        dim_mask = dim_offsets < HEAD_DIM
+        matrix_mask = head_mask[:, None] & dim_mask[None, :]
+
+        q = tl.load(
+            q_ptr
+            + (batch_idx * NUM_HEADS + head_offsets[:, None]) * HEAD_DIM
+            + dim_offsets[None, :],
+            mask=matrix_mask,
+            other=0.0,
+        ).to(tl.float32)
+        running_max = tl.full((HEAD_BLOCK,), -float("inf"), tl.float32)
+        running_denom = tl.zeros((HEAD_BLOCK,), tl.float32)
+        running_acc = tl.zeros((HEAD_BLOCK, BLOCK_D), tl.float32)
+
+        start_pos = tl.load(decode_meta_ptr)
+        live_window = tl.minimum(start_pos + 1, WINDOW_SIZE)
+        ring_pos = start_pos % WINDOW_SIZE
+        ring_full = start_pos >= WINDOW_SIZE - 1
+        for candidate_idx in range(0, live_window):
+            window_idx = tl.where(
+                ring_full,
+                (ring_pos + 1 + candidate_idx) % WINDOW_SIZE,
+                candidate_idx,
+            )
+            kv = tl.load(
+                window_kv_ptr
+                + (batch_idx * WINDOW_SIZE + window_idx) * HEAD_DIM
+                + dim_offsets,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            score = tl.sum(q * kv[None, :], axis=1) * softmax_scale
+            next_max = tl.maximum(running_max, score)
+            previous_weight = tl.exp(running_max - next_max)
+            candidate_weight = tl.exp(score - next_max)
+            running_acc = (
+                running_acc * previous_weight[:, None]
+                + kv[None, :] * candidate_weight[:, None]
+            )
+            running_denom = running_denom * previous_weight + candidate_weight
+            running_max = next_max
+
+        if COMPRESS_RATIO > 0:
+            compressed_count = (start_pos + 1) // COMPRESS_RATIO
+            for candidate_idx in range(0, compressed_count):
+                kv = tl.load(
+                    compressed_kv_ptr
+                    + batch_idx * compressed_count * HEAD_DIM
+                    + candidate_idx * HEAD_DIM
+                    + dim_offsets,
+                    mask=dim_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                score = tl.sum(q * kv[None, :], axis=1) * softmax_scale
+                next_max = tl.maximum(running_max, score)
+                previous_weight = tl.exp(running_max - next_max)
+                candidate_weight = tl.exp(score - next_max)
+                running_acc = (
+                    running_acc * previous_weight[:, None]
+                    + kv[None, :] * candidate_weight[:, None]
+                )
+                running_denom = running_denom * previous_weight + candidate_weight
+                running_max = next_max
+
+        sink = tl.load(sink_ptr + head_offsets, mask=head_mask, other=-float("inf"))
+        has_tokens = running_denom > 0.0
+        has_sink = sink > -float("inf")
+        valid_max = tl.where(has_tokens, running_max, -float("inf"))
+        valid_sink = tl.where(has_sink, sink, -float("inf"))
+        merge_max = tl.maximum(valid_max, valid_sink)
+        has_any = has_tokens | has_sink
+        safe_merge_max = tl.where(has_any, merge_max, 0.0)
+        safe_running_max = tl.where(has_tokens, running_max, safe_merge_max)
+        safe_sink = tl.where(has_sink, sink, safe_merge_max)
+        subset_scale = tl.where(
+            has_tokens, tl.exp(safe_running_max - safe_merge_max), 0.0
+        )
+        sink_weight = tl.where(has_sink, tl.exp(safe_sink - safe_merge_max), 0.0)
+        total_weight = running_denom * subset_scale + sink_weight
+        inv_total = tl.where(total_weight > 0.0, 1.0 / total_weight, 0.0)
+        final = running_acc * subset_scale[:, None] * inv_total[:, None]
+        output_offsets = (
+            (batch_idx * NUM_HEADS + head_offsets[:, None]) * HEAD_DIM
+            + dim_offsets[None, :]
+        )
+        tl.store(output_ptr + output_offsets, final, mask=matrix_mask)
+
+
+    @triton.jit
     def fastllm_merge_moe_fp8_swiglu_quant_kernel(
         gateup_ptr,
         c_ptr,
@@ -941,6 +1140,47 @@ def linear_fp8_block128_cache_paths(payload):
     return cubins, cache_dir / f"{name}.json"
 
 
+def deepseek_v4_fp8_woa_cache_paths(payload):
+    arch = require_int(payload, "arch")
+    num_tokens = require_int(payload, "num_tokens", 1)
+    num_groups = require_int(payload, "num_groups", 8)
+    out_rank = require_int(payload, "out_rank", 1024)
+    hidden_size = require_int(payload, "hidden_size", 4096)
+    block_tokens = require_int(payload, "block_tokens", 16)
+    block_out = require_int(payload, "block_out", 128)
+    block_hidden = require_int(payload, "block_hidden", 128)
+    num_warps = require_int(payload, "num_warps", 4)
+    num_stages = require_int(payload, "num_stages", 3)
+    cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
+    name = (
+        f"deepseek_v4_fp8_woa_v1_sm{arch}"
+        f"_t{num_tokens}_g{num_groups}_r{out_rank}_h{hidden_size}"
+        f"_bt{block_tokens}_bo{block_out}_bh{block_hidden}"
+        f"_nw{num_warps}_ns{num_stages}"
+    )
+    return cache_dir / f"{name}.cubin", cache_dir / f"{name}.json"
+
+
+def deepseek_v4_sparse_decode_cache_paths(payload):
+    arch = require_int(payload, "arch")
+    batch = require_int(payload, "batch", 1)
+    num_heads = require_int(payload, "num_heads", 64)
+    head_dim = require_int(payload, "head_dim", 512)
+    window_size = require_int(payload, "window_size", 128)
+    compress_ratio = require_nonnegative_int(payload, "compress_ratio", 0)
+    head_block = require_int(payload, "head_block", 1)
+    block_d = require_int(payload, "block_d", 512)
+    num_warps = require_int(payload, "num_warps", 4)
+    num_stages = require_int(payload, "num_stages", 2)
+    cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
+    name = (
+        f"deepseek_v4_sparse_decode_v1_sm{arch}"
+        f"_b{batch}_h{num_heads}_d{head_dim}_w{window_size}_cr{compress_ratio}"
+        f"_hb{head_block}_bd{block_d}_nw{num_warps}_ns{num_stages}"
+    )
+    return cache_dir / f"{name}.cubin", cache_dir / f"{name}.json"
+
+
 def merge_moe_fp8_cache_paths(payload):
     arch = require_int(payload, "arch")
     input_dtype = require_dtype(payload, "input_dtype")
@@ -1235,6 +1475,173 @@ def compile_linear_fp8_block128(payload):
         "packed_weight": packed_weight,
         "has_bias": has_bias,
         "matmul_variant": matmul_variant,
+    }
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
+def compile_deepseek_v4_fp8_woa(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+
+    arch = require_int(payload, "arch")
+    if arch != 89 and arch not in {120, 121}:
+        raise ValueError("DeepSeek-V4 FP8 WoA supports SM89 and SM12x")
+    num_tokens = require_int(payload, "num_tokens", 1)
+    num_groups = require_int(payload, "num_groups", 8)
+    out_rank = require_int(payload, "out_rank", 1024)
+    hidden_size = require_int(payload, "hidden_size", 4096)
+    block_tokens = require_int(payload, "block_tokens", 16)
+    block_out = require_int(payload, "block_out", 128)
+    block_hidden = require_int(payload, "block_hidden", 128)
+    num_warps = require_int(payload, "num_warps", 4)
+    num_stages = require_int(payload, "num_stages", 3)
+    if num_tokens > block_tokens:
+        raise ValueError("DeepSeek-V4 FP8 WoA currently requires num_tokens <= block_tokens")
+    if block_out != 128 or block_hidden != 128:
+        raise ValueError("DeepSeek-V4 FP8 WoA requires 128x128 weight scales")
+    if out_rank % block_out != 0 or hidden_size % block_hidden != 0:
+        raise ValueError("DeepSeek-V4 FP8 WoA shape must be divisible by its block sizes")
+
+    cubin_path, meta_path = deepseek_v4_fp8_woa_cache_paths(payload)
+    if cubin_path.exists() and meta_path.exists():
+        return json.loads(meta_path.read_text())
+
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    signature = {
+        "a_ptr": "*fp8e4nv",
+        "a_scale_ptr": "*fp32",
+        "b_ptr": "*fp8e4nv",
+        "b_scale_ptr": "*fp32",
+        "out_ptr": "*bf16",
+        "NUM_TOKENS": "constexpr",
+        "NUM_GROUPS": "constexpr",
+        "OUT_RANK": "constexpr",
+        "HIDDEN_SIZE": "constexpr",
+        "BLOCK_TOKENS": "constexpr",
+        "BLOCK_OUT": "constexpr",
+        "BLOCK_HIDDEN": "constexpr",
+        "UPCAST_FP8": "constexpr",
+    }
+    constexprs = {
+        "NUM_TOKENS": num_tokens,
+        "NUM_GROUPS": num_groups,
+        "OUT_RANK": out_rank,
+        "HIDDEN_SIZE": hidden_size,
+        "BLOCK_TOKENS": block_tokens,
+        "BLOCK_OUT": block_out,
+        "BLOCK_HIDDEN": block_hidden,
+        "UPCAST_FP8": arch == 89,
+    }
+    ccinfo = _compile_cubin(
+        fastllm_deepseek_v4_fp8_woa_kernel,
+        signature,
+        constexprs,
+        arch,
+        num_warps,
+        num_stages,
+        cubin_path,
+    )
+    meta = {
+        "ok": True,
+        "op": "deepseek_v4_fp8_woa",
+        "cubin": str(cubin_path),
+        "kernel": ccinfo.metadata.name,
+        "shared": int(ccinfo.metadata.shared),
+        "num_warps": int(ccinfo.metadata.num_warps),
+        "num_stages": num_stages,
+        "arch": arch,
+        "num_tokens": num_tokens,
+        "num_groups": num_groups,
+        "out_rank": out_rank,
+        "hidden_size": hidden_size,
+        "block_tokens": block_tokens,
+        "block_out": block_out,
+        "block_hidden": block_hidden,
+    }
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
+def compile_deepseek_v4_sparse_decode(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+
+    arch = require_int(payload, "arch")
+    if arch != 89 and arch not in {120, 121}:
+        raise ValueError("DeepSeek-V4 sparse decode supports SM89 and SM12x")
+    batch = require_int(payload, "batch", 1)
+    num_heads = require_int(payload, "num_heads", 64)
+    head_dim = require_int(payload, "head_dim", 512)
+    window_size = require_int(payload, "window_size", 128)
+    compress_ratio = require_nonnegative_int(payload, "compress_ratio", 0)
+    head_block = require_int(payload, "head_block", 1)
+    block_d = require_int(payload, "block_d", 512)
+    num_warps = require_int(payload, "num_warps", 4)
+    num_stages = require_int(payload, "num_stages", 2)
+    if batch != 1:
+        raise ValueError("DeepSeek-V4 sparse decode currently requires batch=1")
+    if head_block not in {1, 2, 4}:
+        raise ValueError("DeepSeek-V4 sparse decode head_block must be 1, 2, or 4")
+    if block_d < head_dim or block_d > 1024 or (block_d & (block_d - 1)) != 0:
+        raise ValueError("DeepSeek-V4 sparse decode block_d must be a power of two covering head_dim")
+    if num_heads <= 0 or head_dim <= 0 or window_size <= 0:
+        raise ValueError("DeepSeek-V4 sparse decode dimensions must be positive")
+    cubin_path, meta_path = deepseek_v4_sparse_decode_cache_paths(payload)
+    if cubin_path.exists() and meta_path.exists():
+        return json.loads(meta_path.read_text())
+
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    signature = {
+        "q_ptr": "*bf16",
+        "window_kv_ptr": "*fp32",
+        "compressed_kv_ptr": "*bf16",
+        "sink_ptr": "*fp32",
+        "decode_meta_ptr": "*i32",
+        "output_ptr": "*fp32",
+        "softmax_scale": "fp32",
+        "BATCH": "constexpr",
+        "NUM_HEADS": "constexpr",
+        "HEAD_DIM": "constexpr",
+        "WINDOW_SIZE": "constexpr",
+        "COMPRESS_RATIO": "constexpr",
+        "HEAD_BLOCK": "constexpr",
+        "BLOCK_D": "constexpr",
+    }
+    constexprs = {
+        "BATCH": batch,
+        "NUM_HEADS": num_heads,
+        "HEAD_DIM": head_dim,
+        "WINDOW_SIZE": window_size,
+        "COMPRESS_RATIO": compress_ratio,
+        "HEAD_BLOCK": head_block,
+        "BLOCK_D": block_d,
+    }
+    ccinfo = _compile_cubin(
+        fastllm_deepseek_v4_sparse_decode_kernel,
+        signature,
+        constexprs,
+        arch,
+        num_warps,
+        num_stages,
+        cubin_path,
+    )
+    meta = {
+        "ok": True,
+        "op": "deepseek_v4_sparse_decode",
+        "cubin": str(cubin_path),
+        "kernel": ccinfo.metadata.name,
+        "shared": int(ccinfo.metadata.shared),
+        "num_warps": int(ccinfo.metadata.num_warps),
+        "num_stages": num_stages,
+        "arch": arch,
+        "batch": batch,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "window_size": window_size,
+        "compress_ratio": compress_ratio,
+        "head_block": head_block,
+        "block_d": block_d,
     }
     meta_path.write_text(json.dumps(meta, sort_keys=True))
     return meta
@@ -1767,6 +2174,10 @@ def handle_compile(payload):
             return compile_linear(payload)
         if op == "linear_fp8_block128":
             return compile_linear_fp8_block128(payload)
+        if op == "deepseek_v4_fp8_woa":
+            return compile_deepseek_v4_fp8_woa(payload)
+        if op == "deepseek_v4_sparse_decode":
+            return compile_deepseek_v4_sparse_decode(payload)
         if op == "merge_moe_fp8":
             return compile_merge_moe_fp8(payload)
         raise ValueError(f"unsupported op: {op}")

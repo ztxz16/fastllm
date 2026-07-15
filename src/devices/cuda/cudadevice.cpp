@@ -158,6 +158,28 @@ namespace fastllm {
         std::string matmulVariant = "fastllm";
     };
 
+    struct CudaTritonDeepSeekV4WoAMeta {
+        CudaTritonKernelMeta kernel;
+        int numTokens = 1;
+        int numGroups = 1;
+        int outRank = 1024;
+        int hiddenSize = 4096;
+        int blockTokens = 16;
+        int blockOut = 128;
+        int blockHidden = 128;
+    };
+
+    struct CudaTritonDeepSeekV4SparseDecodeMeta {
+        CudaTritonKernelMeta kernel;
+        int batch = 1;
+        int numHeads = 64;
+        int headDim = 512;
+        int windowSize = 128;
+        int compressRatio = 0;
+        int headBlock = 1;
+        int blockD = 512;
+    };
+
     struct CudaTritonMergeMoeFp8Meta {
         CudaTritonKernelMeta kernels[kCudaTritonMergeMoeFp8KernelCount];
         int routeBlockT = 1024;
@@ -275,6 +297,33 @@ namespace fastllm {
         return os.str();
     }
 
+    static std::string CudaTritonDeepSeekV4WoABaseName(
+        int arch, int numTokens, int numGroups, int outRank, int hiddenSize,
+        int blockTokens, int blockOut, int blockHidden,
+        int numWarps, int numStages) {
+        std::ostringstream os;
+        os << "deepseek_v4_fp8_woa_v1_sm" << arch
+           << "_t" << numTokens << "_g" << numGroups
+           << "_r" << outRank << "_h" << hiddenSize
+           << "_bt" << blockTokens << "_bo" << blockOut
+           << "_bh" << blockHidden
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonDeepSeekV4SparseDecodeBaseName(
+        int arch, int batch, int numHeads, int headDim, int windowSize,
+        int compressRatio, int headBlock, int blockD,
+        int numWarps, int numStages) {
+        std::ostringstream os;
+        os << "deepseek_v4_sparse_decode_v1_sm" << arch
+           << "_b" << batch << "_h" << numHeads << "_d" << headDim
+           << "_w" << windowSize << "_cr" << compressRatio
+           << "_hb" << headBlock << "_bd" << blockD
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
     static std::string CudaTritonMergeMoeFp8BaseName(
         const std::string &inputDtype, int arch,
         int routeBlockT, int maxExperts, int topk, int hidden, int inter,
@@ -346,6 +395,67 @@ namespace fastllm {
             }
         }
         return true;
+    }
+
+    static bool CudaTritonReadDeepSeekV4WoAMeta(
+        const std::string &path, CudaTritonDeepSeekV4WoAMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "deepseek_v4_fp8_woa") {
+            return false;
+        }
+        meta.kernel.cubinPath = json["cubin"].string_value();
+        meta.kernel.kernelName = json["kernel"].string_value();
+        meta.kernel.shared = json["shared"].int_value();
+        meta.kernel.numWarps = json["num_warps"].int_value();
+        meta.numTokens = json["num_tokens"].int_value();
+        meta.numGroups = json["num_groups"].int_value();
+        meta.outRank = json["out_rank"].int_value();
+        meta.hiddenSize = json["hidden_size"].int_value();
+        meta.blockTokens = json["block_tokens"].int_value();
+        meta.blockOut = json["block_out"].int_value();
+        meta.blockHidden = json["block_hidden"].int_value();
+        return !meta.kernel.cubinPath.empty() && !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 && CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.numTokens > 0 && meta.numGroups > 0 && meta.outRank > 0 &&
+               meta.hiddenSize > 0 && meta.blockTokens > 0 &&
+               meta.blockOut == 128 && meta.blockHidden == 128;
+    }
+
+    static bool CudaTritonReadDeepSeekV4SparseDecodeMeta(
+        const std::string &path, CudaTritonDeepSeekV4SparseDecodeMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "deepseek_v4_sparse_decode") {
+            return false;
+        }
+        meta.kernel.cubinPath = json["cubin"].string_value();
+        meta.kernel.kernelName = json["kernel"].string_value();
+        meta.kernel.shared = json["shared"].int_value();
+        meta.kernel.numWarps = json["num_warps"].int_value();
+        meta.batch = json["batch"].int_value();
+        meta.numHeads = json["num_heads"].int_value();
+        meta.headDim = json["head_dim"].int_value();
+        meta.windowSize = json["window_size"].int_value();
+        meta.compressRatio = json["compress_ratio"].int_value();
+        meta.headBlock = json["head_block"].int_value();
+        meta.blockD = json["block_d"].int_value();
+        return !meta.kernel.cubinPath.empty() && !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 && CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.batch == 1 && meta.numHeads > 0 && meta.headDim > 0 &&
+               meta.windowSize > 0 && meta.compressRatio >= 0 &&
+               (meta.headBlock == 1 || meta.headBlock == 2 || meta.headBlock == 4) &&
+               meta.blockD >= meta.headDim && meta.blockD <= 1024;
     }
 
     static bool CudaTritonReadMergeMoeFp8Meta(const std::string &path, CudaTritonMergeMoeFp8Meta &meta) {
@@ -487,13 +597,58 @@ namespace fastllm {
         return "tools/fastllm_triton_server.py";
     }
 
+    static std::string CudaTritonDefaultPython() {
+        auto isPythonExecutable = [](const std::string &path) {
+            size_t slash = path.find_last_of('/');
+            std::string name = path.substr(
+                slash == std::string::npos ? 0 : slash + 1);
+            return name.find("python") != std::string::npos ||
+                   name.find("pypy") != std::string::npos;
+        };
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        std::string executable;
+        if (cmdline.good() && std::getline(cmdline, executable, '\0') &&
+            isPythonExecutable(executable)) {
+            if (executable.find('/') == std::string::npos ||
+                access(executable.c_str(), X_OK) == 0) {
+                return executable;
+            }
+        }
+
+        static const char *environmentPrefixes[] = {
+            "VIRTUAL_ENV", "CONDA_PREFIX",
+        };
+        for (const char *name : environmentPrefixes) {
+            const char *prefix = std::getenv(name);
+            if (prefix != nullptr && prefix[0] != '\0') {
+                std::string candidate = CudaTritonJoinPath(prefix, "bin/python");
+                if (access(candidate.c_str(), X_OK) == 0) {
+                    return candidate;
+                }
+            }
+        }
+
+        std::vector<char> resolved(4096);
+        ssize_t length = readlink("/proc/self/exe", resolved.data(),
+                                  resolved.size() - 1);
+        if (length > 0 && static_cast<size_t>(length) < resolved.size() - 1) {
+            resolved[length] = '\0';
+            executable.assign(resolved.data());
+            if (isPythonExecutable(executable) &&
+                access(executable.c_str(), X_OK) == 0) {
+                return executable;
+            }
+        }
+        return "python3";
+    }
+
     static bool CudaTritonStartServer() {
         std::string script = CudaTritonServerScript();
         if (!CudaTritonFileExists(script)) {
             printf("Fastllm Triton: server script not found: %s\n", script.c_str());
             return false;
         }
-        std::string python = "python3";
+        std::string python = CudaTritonDefaultPython();
         const char *pythonEnv = std::getenv("FASTLLM_CUDA_TRITON_PYTHON");
         if (pythonEnv != nullptr && pythonEnv[0] != '\0') {
             python = pythonEnv;
@@ -656,6 +811,208 @@ namespace fastllm {
                     quantNumWarps, matmulNumWarps, numStages, matmulVariant, loaded)) {
                 return false;
             }
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestDeepSeekV4WoAKernel(
+        const std::string &cacheDir, int arch,
+        int numTokens, int numGroups, int outRank, int hiddenSize,
+        int blockTokens, int blockOut, int blockHidden,
+        int numWarps, int numStages,
+        CudaTritonDeepSeekV4WoAMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "deepseek_v4_fp8_woa"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"num_tokens", numTokens},
+            {"num_groups", numGroups},
+            {"out_rank", outRank},
+            {"hidden_size", hiddenSize},
+            {"block_tokens", blockTokens},
+            {"block_out", blockOut},
+            {"block_hidden", blockHidden},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() || !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: DeepSeek-V4 FP8 WoA compile failed; "
+                       "falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.kernel.cubinPath = response["cubin"].string_value();
+        meta.kernel.kernelName = response["kernel"].string_value();
+        meta.kernel.shared = response["shared"].int_value();
+        meta.kernel.numWarps = response["num_warps"].int_value();
+        meta.numTokens = response["num_tokens"].int_value();
+        meta.numGroups = response["num_groups"].int_value();
+        meta.outRank = response["out_rank"].int_value();
+        meta.hiddenSize = response["hidden_size"].int_value();
+        meta.blockTokens = response["block_tokens"].int_value();
+        meta.blockOut = response["block_out"].int_value();
+        meta.blockHidden = response["block_hidden"].int_value();
+        return !meta.kernel.cubinPath.empty() && !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 && CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.numTokens == numTokens && meta.numGroups == numGroups &&
+               meta.outRank == outRank && meta.hiddenSize == hiddenSize &&
+               meta.blockTokens == blockTokens && meta.blockOut == blockOut &&
+               meta.blockHidden == blockHidden;
+    }
+
+    static bool CudaTritonGetDeepSeekV4WoAMeta(
+        const std::string &cacheDir, const std::string &base, int arch,
+        int numTokens, int numGroups, int outRank, int hiddenSize,
+        int blockTokens, int blockOut, int blockHidden,
+        int numWarps, int numStages,
+        const CudaTritonDeepSeekV4WoAMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonDeepSeekV4WoAMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonDeepSeekV4WoAMeta loaded;
+        if (!CudaTritonReadDeepSeekV4WoAMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestDeepSeekV4WoAKernel(
+                    cacheDir, arch, numTokens, numGroups, outRank, hiddenSize,
+                    blockTokens, blockOut, blockHidden, numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.numTokens != numTokens || loaded.numGroups != numGroups ||
+            loaded.outRank != outRank || loaded.hiddenSize != hiddenSize ||
+            loaded.blockTokens != blockTokens || loaded.blockOut != blockOut ||
+            loaded.blockHidden != blockHidden) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestDeepSeekV4SparseDecodeKernel(
+        const std::string &cacheDir, int arch, int batch, int numHeads,
+        int headDim, int windowSize, int compressRatio, int headBlock,
+        int blockD, int numWarps, int numStages,
+        CudaTritonDeepSeekV4SparseDecodeMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "deepseek_v4_sparse_decode"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"batch", batch},
+            {"num_heads", numHeads},
+            {"head_dim", headDim},
+            {"window_size", windowSize},
+            {"compress_ratio", compressRatio},
+            {"head_block", headBlock},
+            {"block_d", blockD},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() || !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: DeepSeek-V4 sparse decode compile failed; "
+                       "falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.kernel.cubinPath = response["cubin"].string_value();
+        meta.kernel.kernelName = response["kernel"].string_value();
+        meta.kernel.shared = response["shared"].int_value();
+        meta.kernel.numWarps = response["num_warps"].int_value();
+        meta.batch = response["batch"].int_value();
+        meta.numHeads = response["num_heads"].int_value();
+        meta.headDim = response["head_dim"].int_value();
+        meta.windowSize = response["window_size"].int_value();
+        meta.compressRatio = response["compress_ratio"].int_value();
+        meta.headBlock = response["head_block"].int_value();
+        meta.blockD = response["block_d"].int_value();
+        return !meta.kernel.cubinPath.empty() && !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 && CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.batch == batch && meta.numHeads == numHeads &&
+               meta.headDim == headDim && meta.windowSize == windowSize &&
+               meta.compressRatio == compressRatio && meta.headBlock == headBlock &&
+               meta.blockD == blockD;
+    }
+
+    static bool CudaTritonGetDeepSeekV4SparseDecodeMeta(
+        const std::string &cacheDir, const std::string &base, int arch,
+        int batch, int numHeads, int headDim, int windowSize, int compressRatio,
+        int headBlock, int blockD, int numWarps, int numStages,
+        const CudaTritonDeepSeekV4SparseDecodeMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonDeepSeekV4SparseDecodeMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonDeepSeekV4SparseDecodeMeta loaded;
+        if (!CudaTritonReadDeepSeekV4SparseDecodeMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestDeepSeekV4SparseDecodeKernel(
+                    cacheDir, arch, batch, numHeads, headDim, windowSize,
+                    compressRatio, headBlock, blockD, numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.batch != batch || loaded.numHeads != numHeads ||
+            loaded.headDim != headDim || loaded.windowSize != windowSize ||
+            loaded.compressRatio != compressRatio || loaded.headBlock != headBlock ||
+            loaded.blockD != blockD) {
+            return false;
         }
 
         std::lock_guard<std::mutex> guard(mutex);
@@ -916,6 +1273,142 @@ namespace fastllm {
         return ok;
     }
 
+    bool FastllmCudaTryTritonDeepSeekV4WoA(
+        const Data &input, Data &weight, int groups, int oRank, Data &output) {
+        if (!GetFastllmEnv().cudaTriton ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_FP8_WOA", true)) {
+            return false;
+        }
+        if (input.dataDevice != DataDevice::CUDA || input.cudaData == nullptr ||
+            input.dataType != DataType::BFLOAT16 || input.dims.size() != 4 ||
+            weight.dataDevice != DataDevice::CUDA || weight.cudaData == nullptr ||
+            weight.dataType != DataType::FP8_E4M3 || weight.blockK != 128 ||
+            weight.blockM != 128 || weight.scales.empty() ||
+            output.dataDevice != DataDevice::CUDA || output.cudaData == nullptr ||
+            output.dataType != DataType::BFLOAT16 || groups <= 0 || oRank <= 0) {
+            return false;
+        }
+        int numTokens = input.dims[0] * input.dims[1];
+        int heads = input.dims[2];
+        int headDim = input.dims[3];
+        if (numTokens != 1 || heads <= 0 || headDim <= 0 ||
+            heads % groups != 0 || (oRank % 128) != 0) {
+            return false;
+        }
+        int hiddenSize = (heads / groups) * headDim;
+        int weightRows = groups * oRank;
+        if ((hiddenSize % 128) != 0 ||
+            weight.Count(0) != (uint64_t)weightRows * hiddenSize ||
+            weight.scales.size() !=
+                (size_t)(weightRows / 128) * (hiddenSize / 128)) {
+            return false;
+        }
+
+        int arch = CudaTritonRuntimeArch();
+        if (arch != 89 && arch != 120 && arch != 121) {
+            return false;
+        }
+        constexpr int blockTokens = 16;
+        constexpr int blockOut = 128;
+        constexpr int blockHidden = 128;
+        constexpr int numWarps = 4;
+        constexpr int numStages = 3;
+
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonDeepSeekV4WoABaseName(
+            arch, numTokens, groups, oRank, hiddenSize,
+            blockTokens, blockOut, blockHidden, numWarps, numStages);
+        const CudaTritonDeepSeekV4WoAMeta *meta = nullptr;
+        if (!CudaTritonGetDeepSeekV4WoAMeta(
+                cacheDir, base, arch, numTokens, groups, oRank, hiddenSize,
+                blockTokens, blockOut, blockHidden, numWarps, numStages, meta) ||
+            meta == nullptr) {
+            return false;
+        }
+
+        bool ok = FastllmCudaTritonDeepSeekV4WoA(
+            meta->kernel.cubinPath.c_str(), meta->kernel.kernelName.c_str(),
+            meta->kernel.numWarps, meta->kernel.shared,
+            meta->blockTokens, meta->blockOut, meta->blockHidden,
+            input, weight, output, numTokens, groups, oRank, hiddenSize);
+        return ok;
+    }
+
+    static bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraphImpl(
+        const Data &q, const Data &windowKV, const Data &compressedKV,
+        const Data &attnSink, int windowSize, int compressRatio,
+        const int32_t *decodeMeta, float softmaxScale, float *output) {
+        if (!GetFastllmEnv().cudaTriton ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_SPARSE_DECODE", true)) {
+            return false;
+        }
+        if (decodeMeta == nullptr || output == nullptr || windowSize <= 0 ||
+            compressRatio < 0 || q.dataDevice != DataDevice::CUDA ||
+            q.dataType != DataType::BFLOAT16 || q.cudaData == nullptr ||
+            q.dims.size() != 4 || q.dims[0] != 1 || q.dims[1] != 1 ||
+            windowKV.dataDevice != DataDevice::CUDA ||
+            windowKV.dataType != DataType::FLOAT32 || windowKV.cudaData == nullptr ||
+            windowKV.dims.size() != 3 || windowKV.dims[0] != 1 ||
+            windowKV.dims[1] != windowSize ||
+            compressedKV.dataDevice != DataDevice::CUDA ||
+            compressedKV.dataType != DataType::BFLOAT16 ||
+            compressedKV.cudaData == nullptr || compressedKV.dims.size() != 3 ||
+            compressedKV.dims[0] != 1 ||
+            attnSink.dataDevice != DataDevice::CUDA ||
+            attnSink.dataType != DataType::FLOAT32 || attnSink.cudaData == nullptr) {
+            return false;
+        }
+        int numHeads = q.dims[2];
+        int headDim = q.dims[3];
+        if (numHeads <= 0 || headDim <= 0 || headDim > 1024 ||
+            windowKV.dims[2] != headDim || compressedKV.dims[2] != headDim ||
+            attnSink.Count(0) != (uint64_t)numHeads) {
+            return false;
+        }
+
+        int blockD = 1;
+        while (blockD < headDim) {
+            blockD <<= 1;
+        }
+        constexpr int headBlock = 1;
+        constexpr int numWarps = 4;
+        constexpr int numStages = 2;
+        int arch = CudaTritonRuntimeArch();
+        if (arch != 89 && arch != 120 && arch != 121) {
+            return false;
+        }
+
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonDeepSeekV4SparseDecodeBaseName(
+            arch, 1, numHeads, headDim, windowSize, compressRatio,
+            headBlock, blockD, numWarps, numStages);
+        const CudaTritonDeepSeekV4SparseDecodeMeta *meta = nullptr;
+        if (!CudaTritonGetDeepSeekV4SparseDecodeMeta(
+                cacheDir, base, arch, 1, numHeads, headDim, windowSize,
+                compressRatio, headBlock, blockD, numWarps, numStages, meta) ||
+            meta == nullptr) {
+            return false;
+        }
+        bool ok = FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
+            meta->kernel.cubinPath.c_str(), meta->kernel.kernelName.c_str(),
+            meta->kernel.numWarps, meta->kernel.shared,
+            meta->headBlock, meta->blockD, q, windowKV, compressedKV,
+            attnSink, windowSize, compressRatio, decodeMeta,
+            softmaxScale, output);
+        return ok;
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
+        const Data &q, const Data &windowKV, const Data &compressedKV,
+        const Data &attnSink, int windowSize, int compressRatio,
+        const int32_t *decodeMeta, float softmaxScale, float *output) {
+        return FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraphImpl(
+            q, windowKV, compressedKV, attnSink, windowSize, compressRatio,
+            decodeMeta, softmaxScale, output);
+    }
+
     static bool TryCudaTritonMergeMOEFp8Indexed(
         Data &input, Data &output, Data &index, Data &score, int batch, int topk,
         Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
@@ -1117,6 +1610,17 @@ namespace fastllm {
             batch, topk, hidden, inter, experts);
     }
 #else
+    bool FastllmCudaTryTritonDeepSeekV4WoA(
+        const Data &, Data &, int, int, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
+        const Data &, const Data &, const Data &, const Data &, int, int,
+        const int32_t *, float, float *) {
+        return false;
+    }
+
     static bool TryCudaTritonLinearFp8Block128(
         Data &, Data &, const Data &, Data &, int, int, int) {
         return false;
@@ -2411,13 +2915,14 @@ namespace fastllm {
         }
 
         Data compressedForNorm(DataType::BFLOAT16, {bsz, blockCount, headDim});
-        compressedForNorm.ToDevice(DataDevice::CUDA, false);
+        std::vector<int> currentDevice = {FastllmCudaGetDevice()};
+        compressedForNorm.ToDevice(DataDevice::CUDA, currentDevice, false);
         compressedForNorm.Allocate(false);
         FastllmFloatToBF16(compressed.cudaData, compressedForNorm.cudaData,
                            (int)compressed.Count(0));
 
         Data newRows(DataType::BFLOAT16, {bsz, blockCount, headDim});
-        newRows.ToDevice(DataDevice::CUDA, false);
+        newRows.ToDevice(DataDevice::CUDA, currentDevice, false);
         newRows.Allocate(false);
         if (!FastllmCudaRMSNorm(compressedForNorm, normWeight, newRows, 1e-6f)) {
             ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: rmsnorm failed.\n");
@@ -2433,7 +2938,7 @@ namespace fastllm {
             cache.cudaData == nullptr) {
             cache.CopyFrom(newRows);
             cache.SetKVCache();
-            cache.ToDevice(DataDevice::CUDA);
+            cache.ToDevice(DataDevice::CUDA, currentDevice);
             return;
         }
         AssertInFastLLM(cache.dataType == DataType::BFLOAT16 &&
@@ -2443,7 +2948,7 @@ namespace fastllm {
 
         Data merged(DataType::BFLOAT16, {bsz, totalBlocks, headDim});
         merged.SetKVCache();
-        merged.ToDevice(DataDevice::CUDA, false);
+        merged.ToDevice(DataDevice::CUDA, currentDevice, false);
         merged.Allocate(false);
         size_t unit = sizeof(uint16_t);
         size_t oldPitch = (size_t)cache.dims[1] * headDim * unit;
@@ -2458,7 +2963,7 @@ namespace fastllm {
                                           addPitch, bsz);
         cache.CopyFrom(merged);
         cache.SetKVCache();
-        cache.ToDevice(DataDevice::CUDA);
+        cache.ToDevice(DataDevice::CUDA, currentDevice);
     }
 
     bool CudaDeepSeekV4StoreWindowKVCacheOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
@@ -4240,10 +4745,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             weightsBatch < 4) {
             return false;
         }
-        if (weights[0] != nullptr && sharedScale != 0.0f) {
-            return false;
-        }
-
+        bool hasSharedExpert = weights[0] != nullptr && weights[1] != nullptr && sharedScale != 0.0f;
         const int hidden = input.dims.back();
         Data *gateup = weights[2];
         Data *down = weights[3];
@@ -4263,6 +4765,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         }
 
         int inter = down->dims[1];
+        if (hasSharedExpert && !isNVFP4) {
+            return false;
+        }
         if (isFp8) {
             if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, 1, topk,
                                                 w1, weights, weightsBatch, sharedScale, gateType)) {
@@ -4285,13 +4790,26 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                                                                         (const int32_t*)index.cudaData, (const float*)score.cudaData,
                                                                         topk, hidden, inter);
         }
-        bool ok = input.dataType == DataType::FLOAT16 ?
-            FastllmCudaHalfMergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
-                                                      (const int32_t*)index.cudaData, (const float*)score.cudaData,
-                                                      topk, hidden, inter) :
-            FastllmCudaBFloat16MergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
+        bool ok;
+        if (hasSharedExpert) {
+            ok = input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOENVFP4Batch1IndexedSharedFP8(
+                    input, w1, output, weights, weightsBatch,
+                    (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                    sharedScale, topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOENVFP4Batch1IndexedSharedFP8(
+                    input, w1, output, weights, weightsBatch,
+                    (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                    sharedScale, topk, hidden, inter);
+        } else {
+            ok = input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
                                                           (const int32_t*)index.cudaData, (const float*)score.cudaData,
-                                                          topk, hidden, inter);
+                                                          topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                              (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                              topk, hidden, inter);
+        }
         return ok;
     }
 
@@ -4447,15 +4965,22 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 // static std::map<std::string, float> mergeMoeTimeCnt;
 // auto st = std::chrono::system_clock::now();
         int curDeviceId = FastllmCudaGetDevice();
-        if (output.cudaData != nullptr) {
-            int outputPtrDevice = GetPointerDeviceId(output.cudaData);
-            if (outputPtrDevice >= 0 && outputPtrDevice != curDeviceId) {
-                FastllmCudaSetDevice(outputPtrDevice);
-                FastllmCudaFree(output.cudaData);
-                FastllmCudaSetDevice(curDeviceId);
-                output.cudaData = FastllmCudaMalloc(output.expansionBytes);
+        auto clearIfOnOtherDevice = [curDeviceId](Data &data) {
+            if (data.cudaData == nullptr) {
+                return;
             }
-        }
+            int ptrDevice = GetPointerDeviceId(data.cudaData);
+            if (ptrDevice >= 0 && ptrDevice != curDeviceId) {
+                FastllmCudaSetDevice(ptrDevice);
+                FastllmCudaFree(data.cudaData);
+                FastllmCudaSetDevice(curDeviceId);
+                data.cudaData = nullptr;
+            }
+        };
+        clearIfOnOtherDevice(w1);
+        clearIfOnOtherDevice(w2);
+        clearIfOnOtherDevice(w3);
+        clearIfOnOtherDevice(output);
         output.Allocate();
 // ForceDeviceSync(); mergeMoeTimeCnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         {

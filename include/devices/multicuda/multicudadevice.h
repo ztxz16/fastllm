@@ -132,6 +132,16 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class MultiCudaDeepSeekV4Op : BaseOperator {
+    public:
+        explicit MultiCudaDeepSeekV4Op(BaseOperator *cudaOp) : cudaOp(cudaOp) {}
+
+    private:
+        BaseOperator *cudaOp;
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class MultiCudaAppendPagedCacheOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);

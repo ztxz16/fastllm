@@ -1470,9 +1470,11 @@ namespace {
             }
             weight.ToDevice(fastllm::DataDevice::CUDA);
 
-            fastllm::Data fp32Bias = MakeRampTensor({out}, -0.1f);
-            bias.CopyFrom(fp32Bias);
-            bias.ToDevice(fastllm::DataDevice::CUDA);
+            if (params.GetInt("has_bias") != 0) {
+                fastllm::Data fp32Bias = MakeRampTensor({out}, -0.1f);
+                bias.CopyFrom(fp32Bias);
+                bias.ToDevice(fastllm::DataDevice::CUDA);
+            }
             output.dataType = input.dataType;
             output.UpdateUnitSize();
             output.Resize({batch, out});
@@ -1727,6 +1729,7 @@ namespace {
                 params.Add("input_type", "bf16", "fp16 or bf16");
                 params.Add("input_pattern", "blocky", "smooth or blocky");
                 params.Add("weight_layout", "packed", "packed or separate");
+                params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
                 params.Add("check", "0", "1 linear check, 2 fused swiglu+quant check");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;

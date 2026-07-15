@@ -2586,8 +2586,8 @@ static bool FastllmCudaMarlinCurrentDeviceSupported() {
     return major * 10 + minor >= 75;
 }
 
-extern "C" bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t *out,
-                                            int size_k, int size_n) {
+extern "C" bool FastllmCudaGptqMarlinRepackStream(const uint32_t *b_q_weight, uint32_t *out,
+                                                   int size_k, int size_n, void *streamPtr) {
     if (!FastllmCudaMarlinCurrentDeviceSupported()) {
         return false;
     }
@@ -2607,7 +2607,7 @@ extern "C" bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t
     }
     const uint32_t *b_q_weight_ptr = b_q_weight;
     uint32_t *out_ptr = out;
-    cudaStream_t stream = 0;
+    cudaStream_t stream = (cudaStream_t)streamPtr;
     if (false) {
     }
     CALL_IF(4, false)
@@ -2615,6 +2615,11 @@ extern "C" bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t
         return false;
     }
     return true;
+}
+
+extern "C" bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t *out,
+                                            int size_k, int size_n) {
+    return FastllmCudaGptqMarlinRepackStream(b_q_weight, out, size_k, size_n, nullptr);
 }
 
 #undef CALL_IF
