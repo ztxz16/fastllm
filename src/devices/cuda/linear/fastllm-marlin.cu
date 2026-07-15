@@ -2149,16 +2149,20 @@ exec_config_t determine_thread_config(int prob_m, int prob_n, int prob_k,
 
   // FastLLM only calls this file through FastllmCudaMarlinHalfInt4Gemm:
   // half activations, uint4 weights, AWQ-style zero points, no act-order,
-  // group_size == 128 (group_blocks == 8), and fp16 reduction.
-  #define FASTLLM_INT4GROUP_CALL_IF(N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
-    __CALL_IF(vllm::kU4, 1, N_BLOCKS, K_BLOCKS, false, true, 8,           \
-              NUM_THREADS, false)                                        \
-    __CALL_IF(vllm::kU4, 2, N_BLOCKS, K_BLOCKS, false, true, 8,           \
-              NUM_THREADS, false)                                        \
-    __CALL_IF(vllm::kU4, 3, N_BLOCKS, K_BLOCKS, false, true, 8,           \
-              NUM_THREADS, false)                                        \
-    __CALL_IF(vllm::kU4, 4, N_BLOCKS, K_BLOCKS, false, true, 8,           \
+  // group_size 32/128 (group_blocks 2/8), and fp16 reduction.
+  #define FASTLLM_INT4GROUP_CALL_IF_GROUP(GROUP_BLOCKS, N_BLOCKS, K_BLOCKS, NUM_THREADS) \
+    __CALL_IF(vllm::kU4, 1, N_BLOCKS, K_BLOCKS, false, true, GROUP_BLOCKS,                \
+              NUM_THREADS, false)                                                         \
+    __CALL_IF(vllm::kU4, 2, N_BLOCKS, K_BLOCKS, false, true, GROUP_BLOCKS,                \
+              NUM_THREADS, false)                                                         \
+    __CALL_IF(vllm::kU4, 3, N_BLOCKS, K_BLOCKS, false, true, GROUP_BLOCKS,                \
+              NUM_THREADS, false)                                                         \
+    __CALL_IF(vllm::kU4, 4, N_BLOCKS, K_BLOCKS, false, true, GROUP_BLOCKS,                \
               NUM_THREADS, false)
+
+  #define FASTLLM_INT4GROUP_CALL_IF(N_BLOCKS, K_BLOCKS, NUM_THREADS)              \
+    FASTLLM_INT4GROUP_CALL_IF_GROUP(2, N_BLOCKS, K_BLOCKS, NUM_THREADS)            \
+    FASTLLM_INT4GROUP_CALL_IF_GROUP(8, N_BLOCKS, K_BLOCKS, NUM_THREADS)
 
 template <typename scalar_t>
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
@@ -2323,6 +2327,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
 }
 
 #undef FASTLLM_INT4GROUP_CALL_IF
+#undef FASTLLM_INT4GROUP_CALL_IF_GROUP
 #undef __CALL_IF
 
 }  // namespace marlin
@@ -2631,7 +2636,8 @@ extern "C" bool FastllmCudaMarlinHalfInt4Gemm(const void *a, const uint32_t *b_q
     if (!FastllmCudaMarlinCurrentDeviceSupported()) {
         return false;
     }
-    if (size_m <= 0 || size_n <= 0 || size_k <= 0 || group_size != 128 ||
+    if (size_m <= 0 || size_n <= 0 || size_k <= 0 ||
+        (group_size != 32 && group_size != 128) ||
         size_k % group_size != 0) {
         return false;
     }

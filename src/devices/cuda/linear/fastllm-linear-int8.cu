@@ -176,12 +176,19 @@ void LaunchFastllmGemmFp32Int8(float *input, uint8_t *weight, float *output, flo
 }
 
 static void FastllmCudaInt8EnsureScalesZerosAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
+    if (weight.cudaData == nullptr) {
+        return;
+    }
+    if (weight.extraCudaData.size() < 3 || weight.extraCudaData[0] == nullptr ||
+        weight.extraCudaData[1] == nullptr || weight.extraCudaData[2] == nullptr) {
+        if (weight.extraCudaData.size() < 3) {
+            weight.extraCudaData.resize(3, nullptr);
+        }
         cudaError_t state = cudaSuccess;
         float *cudaScales;
         state = cudaMalloc(&cudaScales, k * sizeof(float));
         state = cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
-        weight.extraCudaData.push_back((void*)cudaScales);
+        weight.extraCudaData[0] = (void*)cudaScales;
 
         uint8_t *cudaZeropoints;
         state = cudaMalloc(&cudaZeropoints, k);
@@ -191,7 +198,7 @@ static void FastllmCudaInt8EnsureScalesZerosAndBiasOnDevice(fastllm::Data &weigh
         }
         state = cudaMemcpy(cudaZeropoints, zeropoints, k, cudaMemcpyHostToDevice);
         delete[] zeropoints;
-        weight.extraCudaData.push_back((void*)cudaZeropoints);
+        weight.extraCudaData[1] = (void*)cudaZeropoints;
 
         float *cudaBiasData;
         state = cudaMalloc(&cudaBiasData, k * sizeof(float));
@@ -201,7 +208,7 @@ static void FastllmCudaInt8EnsureScalesZerosAndBiasOnDevice(fastllm::Data &weigh
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaData.push_back((void*)cudaBiasData);
+        weight.extraCudaData[2] = (void*)cudaBiasData;
     }
 }
 
@@ -316,10 +323,15 @@ void LaunchFastllmGemmFp16Int8(half *input, uint8_t *weight, half *output, half 
 }
 
 static void FastllmCudaInt8EnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    if (weight.cudaData == nullptr || weight.extraCudaHalfData.size() == 0) {
+    if (weight.cudaData == nullptr) {
+        return;
+    }
+    if (weight.extraCudaHalfData.size() < 3 || weight.extraCudaHalfData[0] == nullptr ||
+        weight.extraCudaHalfData[1] == nullptr || weight.extraCudaHalfData[2] == nullptr) {
         FastllmCudaInt8EnsureScalesZerosAndBiasOnDevice(weight, bias, k);
-        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[0]);
-        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[1]);
+        weight.extraCudaHalfData.resize(3, nullptr);
+        weight.extraCudaHalfData[0] = (void*)weight.extraCudaData[0];
+        weight.extraCudaHalfData[1] = (void*)weight.extraCudaData[1];
 
         half *cudaBiasData;
         cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(half));
@@ -334,8 +346,305 @@ static void FastllmCudaInt8EnsureHalfBiasOnDevice(fastllm::Data &weight, const f
             state = cudaMemset(cudaBiasData, 0, k * sizeof(half));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaHalfData.push_back((void*)cudaBiasData);
+        weight.extraCudaHalfData[2] = (void*)cudaBiasData;
     }
+}
+
+namespace {
+    static constexpr int INT8_MOE_POINTER_TABLE_IDX = 3;
+    static constexpr int INT8_MOE_SCALE_TABLE_IDX = 4;
+    static constexpr int INT8_MOE_ZERO_TABLE_IDX = 5;
+    static constexpr int INT8_MOE_WARPS = 8;
+
+    struct Int8MoeBatch1Table {
+        const uint8_t **gateupWeights = nullptr;
+        const uint8_t **downWeights = nullptr;
+        const float *gateupScales = nullptr;
+        const float *downScales = nullptr;
+        const uint8_t *gateupZeros = nullptr;
+        const uint8_t *downZeros = nullptr;
+        int expertCount = 0;
+        int hidden = 0;
+        int inter = 0;
+        int gateupRows = 0;
+    };
+
+    static bool PrepareInt8MoeBatch1Table(fastllm::Data **weights,
+                                          int weightsBatch,
+                                          Int8MoeBatch1Table &table) {
+        if (weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) != 0 ||
+            weights[0] != nullptr || weights[1] != nullptr ||
+            weights[2] == nullptr || weights[3] == nullptr) {
+            return false;
+        }
+        const int expertCount = weightsBatch / 2 - 1;
+        fastllm::Data &firstGateup = *weights[2];
+        fastllm::Data &firstDown = *weights[3];
+        if (firstGateup.dataType != fastllm::DataType::INT8 ||
+            firstDown.dataType != fastllm::DataType::INT8 ||
+            firstGateup.dims.size() != 2 || firstDown.dims.size() != 2 ||
+            (firstGateup.dims[0] & 1) != 0) {
+            return false;
+        }
+        const int gateupRows = firstGateup.dims[0];
+        const int inter = gateupRows / 2;
+        const int hidden = firstGateup.dims[1];
+        if (expertCount <= 0 || hidden <= 0 || inter <= 0 ||
+            hidden % 8 != 0 || inter % 8 != 0 ||
+            firstDown.dims[0] != hidden || firstDown.dims[1] != inter) {
+            return false;
+        }
+
+        for (int expert = 0; expert < expertCount; expert++) {
+            fastllm::Data *gateup = weights[(expert + 1) * 2];
+            fastllm::Data *down = weights[(expert + 1) * 2 + 1];
+            if (gateup == nullptr || down == nullptr ||
+                gateup->dataType != fastllm::DataType::INT8 ||
+                down->dataType != fastllm::DataType::INT8 ||
+                gateup->dims != firstGateup.dims || down->dims != firstDown.dims ||
+                gateup->cudaData == nullptr || down->cudaData == nullptr ||
+                gateup->scales.size() != (size_t)gateupRows ||
+                gateup->zeros.size() != (size_t)gateupRows ||
+                down->scales.size() != (size_t)hidden ||
+                down->zeros.size() != (size_t)hidden) {
+                return false;
+            }
+        }
+
+        if ((int)firstGateup.extraCudaData.size() <= INT8_MOE_ZERO_TABLE_IDX) {
+            firstGateup.extraCudaData.resize(INT8_MOE_ZERO_TABLE_IDX + 1, nullptr);
+        }
+        void *pointerBlock = firstGateup.extraCudaData[INT8_MOE_POINTER_TABLE_IDX];
+        void *scaleBlock = firstGateup.extraCudaData[INT8_MOE_SCALE_TABLE_IDX];
+        void *zeroBlock = firstGateup.extraCudaData[INT8_MOE_ZERO_TABLE_IDX];
+        if (pointerBlock == nullptr || scaleBlock == nullptr || zeroBlock == nullptr) {
+            std::vector<uint8_t*> hostPointers((size_t)expertCount * 2);
+            const size_t gateupCount = (size_t)expertCount * gateupRows;
+            const size_t downCount = (size_t)expertCount * hidden;
+            std::vector<float> hostScales(gateupCount + downCount);
+            std::vector<uint8_t> hostZeros(gateupCount + downCount);
+            for (int expert = 0; expert < expertCount; expert++) {
+                const fastllm::Data &gateup = *weights[(expert + 1) * 2];
+                const fastllm::Data &down = *weights[(expert + 1) * 2 + 1];
+                hostPointers[expert] = (uint8_t*)gateup.cudaData;
+                hostPointers[expertCount + expert] = (uint8_t*)down.cudaData;
+                std::copy(gateup.scales.begin(), gateup.scales.end(),
+                          hostScales.begin() + (size_t)expert * gateupRows);
+                std::copy(gateup.zeros.begin(), gateup.zeros.end(),
+                          hostZeros.begin() + (size_t)expert * gateupRows);
+                std::copy(down.scales.begin(), down.scales.end(),
+                          hostScales.begin() + gateupCount + (size_t)expert * hidden);
+                std::copy(down.zeros.begin(), down.zeros.end(),
+                          hostZeros.begin() + gateupCount + (size_t)expert * hidden);
+            }
+
+            pointerBlock = FastllmCudaMalloc(hostPointers.size() * sizeof(uint8_t*));
+            scaleBlock = FastllmCudaMalloc(hostScales.size() * sizeof(float));
+            zeroBlock = FastllmCudaMalloc(hostZeros.size() * sizeof(uint8_t));
+            if (pointerBlock == nullptr || scaleBlock == nullptr || zeroBlock == nullptr) {
+                if (pointerBlock != nullptr) FastllmCudaFree(pointerBlock);
+                if (scaleBlock != nullptr) FastllmCudaFree(scaleBlock);
+                if (zeroBlock != nullptr) FastllmCudaFree(zeroBlock);
+                return false;
+            }
+            FastllmCudaCopyFromHostToDevice(pointerBlock, hostPointers.data(),
+                                            hostPointers.size() * sizeof(uint8_t*));
+            FastllmCudaCopyFromHostToDevice(scaleBlock, hostScales.data(),
+                                            hostScales.size() * sizeof(float));
+            FastllmCudaCopyFromHostToDevice(zeroBlock, hostZeros.data(),
+                                            hostZeros.size() * sizeof(uint8_t));
+            firstGateup.extraCudaData[INT8_MOE_POINTER_TABLE_IDX] = pointerBlock;
+            firstGateup.extraCudaData[INT8_MOE_SCALE_TABLE_IDX] = scaleBlock;
+            firstGateup.extraCudaData[INT8_MOE_ZERO_TABLE_IDX] = zeroBlock;
+        }
+
+        const size_t gateupCount = (size_t)expertCount * gateupRows;
+        table.gateupWeights = (const uint8_t**)pointerBlock;
+        table.downWeights = table.gateupWeights + expertCount;
+        table.gateupScales = (const float*)scaleBlock;
+        table.downScales = table.gateupScales + gateupCount;
+        table.gateupZeros = (const uint8_t*)zeroBlock;
+        table.downZeros = table.gateupZeros + gateupCount;
+        table.expertCount = expertCount;
+        table.hidden = hidden;
+        table.inter = inter;
+        table.gateupRows = gateupRows;
+        return true;
+    }
+
+    template <int WARPS_PER_BLOCK>
+    __global__ void FastllmCudaInt8MoeGateupSwigluBatch1Kernel(
+            const half *input,
+            const uint8_t *const *gateupWeights,
+            const float *scales,
+            const uint8_t *zeros,
+            const int32_t *indices,
+            half *middle,
+            int topk, int expertCount, int hidden, int inter, int gateupRows) {
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        const int task = blockIdx.x * WARPS_PER_BLOCK + warp;
+        if (task >= topk * inter) {
+            return;
+        }
+        const int route = task / inter;
+        const int out = task - route * inter;
+        const int expert = __ldg(indices + route);
+        float gateAcc = 0.0f, upAcc = 0.0f;
+        float gateScale = 0.0f, upScale = 0.0f;
+        if (expert >= 0 && expert < expertCount) {
+            const uint8_t *weight = gateupWeights[expert];
+            if (weight != nullptr) {
+                const int gateRow = out;
+                const int upRow = inter + out;
+                const uint8_t gateZero = __ldg(zeros + (size_t)expert * gateupRows + gateRow);
+                const uint8_t upZero = __ldg(zeros + (size_t)expert * gateupRows + upRow);
+                gateScale = __ldg(scales + (size_t)expert * gateupRows + gateRow);
+                upScale = __ldg(scales + (size_t)expert * gateupRows + upRow);
+                const uint8_t *gateWeight = weight + (size_t)gateRow * hidden;
+                const uint8_t *upWeight = weight + (size_t)upRow * hidden;
+                const int units = hidden >> 3;
+                for (int unit = lane; unit < units; unit += 32) {
+                    const int x = unit << 3;
+                    union_half8 inputValues;
+                    union_char8 gateValues, upValues;
+                    inputValues.in = *reinterpret_cast<const uint4*>(input + x);
+                    gateValues.in = *reinterpret_cast<const uint2*>(gateWeight + x);
+                    upValues.in = *reinterpret_cast<const uint2*>(upWeight + x);
+#pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        const float a = __half2float(inputValues.out[i]);
+                        gateAcc += a * ((float)gateValues.out[i] - (float)gateZero);
+                        upAcc += a * ((float)upValues.out[i] - (float)upZero);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gateAcc += __shfl_down_sync(0xffffffff, gateAcc, offset);
+            upAcc += __shfl_down_sync(0xffffffff, upAcc, offset);
+        }
+        if (lane == 0) {
+            const float gate = gateAcc * gateScale;
+            const float up = upAcc * upScale;
+            middle[(size_t)route * inter + out] =
+                __float2half_rn((gate / (1.0f + expf(-gate))) * up);
+        }
+    }
+
+    template <int WARPS_PER_BLOCK>
+    __global__ void FastllmCudaInt8MoeDownReduceBatch1Kernel(
+            const half *middle,
+            const uint8_t *const *downWeights,
+            const float *scales,
+            const uint8_t *zeros,
+            const int32_t *indices,
+            const float *scores,
+            half *output,
+            int topk, int expertCount, int hidden, int inter) {
+        __shared__ float routeValues[WARPS_PER_BLOCK];
+        const int route = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        const int out = blockIdx.x;
+        float acc = 0.0f, scale = 0.0f;
+        if (route < topk) {
+            const int expert = __ldg(indices + route);
+            if (expert >= 0 && expert < expertCount) {
+                const uint8_t *weight = downWeights[expert];
+                if (weight != nullptr) {
+                    const uint8_t zero = __ldg(zeros + (size_t)expert * hidden + out);
+                    scale = __ldg(scales + (size_t)expert * hidden + out);
+                    const uint8_t *rowWeight = weight + (size_t)out * inter;
+                    const half *routeInput = middle + (size_t)route * inter;
+                    const int units = inter >> 3;
+                    for (int unit = lane; unit < units; unit += 32) {
+                        const int x = unit << 3;
+                        union_half8 inputValues;
+                        union_char8 weightValues;
+                        inputValues.in = *reinterpret_cast<const uint4*>(routeInput + x);
+                        weightValues.in = *reinterpret_cast<const uint2*>(rowWeight + x);
+#pragma unroll
+                        for (int i = 0; i < 8; i++) {
+                            acc += __half2float(inputValues.out[i]) *
+                                   ((float)weightValues.out[i] - (float)zero);
+                        }
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_down_sync(0xffffffff, acc, offset);
+        }
+        if (lane == 0) {
+            routeValues[route] = route < topk ? acc * scale * __ldg(scores + route) : 0.0f;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < WARPS_PER_BLOCK; i++) {
+                sum += routeValues[i];
+            }
+            output[out] = __float2half_rn(sum);
+        }
+    }
+}
+
+bool FastllmCudaHalfMergeMOEInt8Batch1Indexed(const fastllm::Data &input,
+                                              fastllm::Data &scratch,
+                                              fastllm::Data &output,
+                                              fastllm::Data **weights,
+                                              int weightsBatch,
+                                              const int32_t *indices,
+                                              const float *scores,
+                                              int topk) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        input.dims.size() != 2 || input.dims[0] != 1 ||
+        input.cudaData == nullptr || output.cudaData == nullptr ||
+        indices == nullptr || scores == nullptr || topk <= 0 || topk > INT8_MOE_WARPS) {
+        return false;
+    }
+    Int8MoeBatch1Table table;
+    if (!PrepareInt8MoeBatch1Table(weights, weightsBatch, table) ||
+        input.dims[1] != table.hidden) {
+        return false;
+    }
+    scratch.dataType = fastllm::DataType::FLOAT16;
+    scratch.dataDevice = fastllm::DataDevice::CUDA;
+    scratch.dataDeviceIds = input.dataDeviceIds;
+    scratch.Resize({topk, table.inter});
+    scratch.Allocate(false);
+    if (scratch.cudaData == nullptr) {
+        return false;
+    }
+
+    const int gateupTasks = topk * table.inter;
+    FastllmCudaInt8MoeGateupSwigluBatch1Kernel<INT8_MOE_WARPS>
+        <<< (gateupTasks + INT8_MOE_WARPS - 1) / INT8_MOE_WARPS,
+             INT8_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
+            (const half*)input.cudaData, table.gateupWeights,
+            table.gateupScales, table.gateupZeros, indices,
+            (half*)scratch.cudaData, topk, table.expertCount,
+            table.hidden, table.inter, table.gateupRows);
+    FastllmCudaInt8MoeDownReduceBatch1Kernel<INT8_MOE_WARPS>
+        <<< table.hidden, INT8_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
+            (const half*)scratch.cudaData, table.downWeights,
+            table.downScales, table.downZeros, indices, scores,
+            (half*)output.cudaData, topk, table.expertCount,
+            table.hidden, table.inter);
+    cudaError_t state = cudaGetLastError();
+    if (state != cudaSuccess) {
+        checkCudaErrors("Error: CUDA INT8 batch-1 fused MoE failed.", state);
+        return false;
+    }
+    return true;
+#endif
 }
 
 bool FastllmCudaHalfMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
