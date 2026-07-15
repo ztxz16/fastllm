@@ -58,6 +58,11 @@ static bool FastllmCudaW4A8PrepareOutputEnabled() {
     return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+static bool FastllmCudaW4A8GemmEnabled() {
+    const char *env = std::getenv("FASTLLM_CUDA_W4A8_ENABLE_GEMM");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 static bool FastllmCudaW4A8ValidateEnabled() {
     const char *env = std::getenv("FASTLLM_CUDA_W4A8_VALIDATE");
     return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -533,8 +538,9 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
     bool prepareCache = FastllmCudaW4A8PrepareCacheEnabled();
     bool prepareActivation = FastllmCudaW4A8PrepareActivationEnabled();
     bool prepareOutput = FastllmCudaW4A8PrepareOutputEnabled();
+    bool enableGemm = FastllmCudaW4A8GemmEnabled();
     bool validate = FastllmCudaW4A8ValidateEnabled();
-    if (!prepareCache && !prepareActivation && !prepareOutput && !validate) {
+    if (!prepareCache && !prepareActivation && !prepareOutput && !enableGemm && !validate) {
         return false;
     }
 
@@ -552,8 +558,17 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
         return false;
     }
     FastllmCudaW4A8TraceReady("validation", n, m, k, arch);
-    if (validate && !prepareCache && !prepareActivation && !prepareOutput) {
+    if (validate && !prepareCache && !prepareActivation && !prepareOutput && !enableGemm) {
         return false;
+    }
+
+    // Development guard: W4A8 GEMM is allowed to take over DoCudaLinear only
+    // when this explicit switch is set. Later stages can remove this or flip it
+    // to an opt-out guard after correctness and performance are verified.
+    if (enableGemm) {
+        prepareCache = true;
+        prepareActivation = true;
+        prepareOutput = true;
     }
 
     if (prepareCache) {

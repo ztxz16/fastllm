@@ -77,6 +77,12 @@ export FASTLLM_CUDA_W4A8_PREPARE_ACTIVATION=1
 export FASTLLM_CUDA_W4A8_PREPARE_OUTPUT=1
 ```
 
+真正允许 W4A8 GEMM 接管 `DoCudaLinear` 时，再打开：
+
+```bash
+export FASTLLM_CUDA_W4A8_ENABLE_GEMM=1
+```
+
 合法性用例应覆盖：
 
 ```text
