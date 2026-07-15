@@ -1002,6 +1002,108 @@ __global__ void FastllmTransposeByRowKernel(uint8_t *dst, uint8_t *ori, int n, i
     }
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmTransposeLastTwoByBatchKernel(
+        uint8_t *dst, const uint8_t *ori, int batch, int n, int m, int k) {
+    int batchIndex = blockIdx.x / (n * m);
+    int inner = blockIdx.x % (n * m);
+    int row = inner / m;
+    int col = inner % m;
+    const uint8_t *curInput = ori +
+        ((batchIndex * n + row) * m + col) * k;
+    uint8_t *curOutput = dst +
+        ((batchIndex * m + col) * n + row) * k;
+    for (int i = threadIdx.x; i < k; i += THREAD_PER_BLOCK) {
+        curOutput[i] = curInput[i];
+    }
+}
+
+// The Qwen3.5 MTP verify path transposes [1, 4, channels] to
+// [1, channels, 4], then performs the inverse transpose after conv1d.  Moving
+// four 16-bit values per thread keeps both the strided side and the packed side
+// coalesced without launching one CUDA block per scalar element.
+__global__ void FastllmTransposeN4HalfKernel(
+        uint16_t *dst, const uint16_t *ori, int batch, int m) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * m;
+    if (index >= total) {
+        return;
+    }
+    int batchIndex = index / m;
+    int col = index - batchIndex * m;
+    const uint16_t *input = ori + batchIndex * 4 * m + col;
+    uint2 value;
+    value.x = (uint32_t)input[0] | ((uint32_t)input[m] << 16);
+    value.y = (uint32_t)input[2 * m] | ((uint32_t)input[3 * m] << 16);
+    ((uint2*)dst)[index] = value;
+}
+
+__global__ void FastllmTransposeM4HalfKernel(
+        uint16_t *dst, const uint16_t *ori, int batch, int n) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * n;
+    if (index >= total) {
+        return;
+    }
+    int batchIndex = index / n;
+    int row = index - batchIndex * n;
+    uint2 value = ((const uint2*)ori)[index];
+    uint16_t value0 = (uint16_t)value.x;
+    uint16_t value1 = (uint16_t)(value.x >> 16);
+    uint16_t value2 = (uint16_t)value.y;
+    uint16_t value3 = (uint16_t)(value.y >> 16);
+    uint16_t *output = dst + batchIndex * 4 * n + row;
+    output[0] = value0;
+    output[n] = value1;
+    output[2 * n] = value2;
+    output[3 * n] = value3;
+}
+
+template <typename T>
+__global__ void FastllmTransposeLastTwoElementKernel(
+        T *dst, const T *ori, int n, int m, int len) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= len) {
+        return;
+    }
+    int batchIndex = index / (n * m);
+    int inner = index - batchIndex * n * m;
+    int row = inner / m;
+    int col = inner - row * m;
+    dst[(batchIndex * m + col) * n + row] = ori[index];
+}
+
+static bool FastllmLaunchTransposeLastTwo(
+        void *dst, const void *ori, int batch, int n, int m,
+        int unitSize, cudaStream_t stream) {
+    int len = batch * n * m;
+    int blocks = (len + 255) / 256;
+    if (unitSize == 2 && n == 4) {
+        int packedBlocks = (batch * m + 255) / 256;
+        FastllmTransposeN4HalfKernel<<<packedBlocks, 256, 0, stream>>>(
+            (uint16_t*)dst, (const uint16_t*)ori, batch, m);
+    } else if (unitSize == 2 && m == 4) {
+        int packedBlocks = (batch * n + 255) / 256;
+        FastllmTransposeM4HalfKernel<<<packedBlocks, 256, 0, stream>>>(
+            (uint16_t*)dst, (const uint16_t*)ori, batch, n);
+    } else if (unitSize == 4) {
+        FastllmTransposeLastTwoElementKernel<uint32_t>
+            <<<blocks, 256, 0, stream>>>(
+                (uint32_t*)dst, (const uint32_t*)ori, n, m, len);
+    } else if (unitSize == 2) {
+        FastllmTransposeLastTwoElementKernel<uint16_t>
+            <<<blocks, 256, 0, stream>>>(
+                (uint16_t*)dst, (const uint16_t*)ori, n, m, len);
+    } else if (unitSize == 1) {
+        FastllmTransposeLastTwoElementKernel<uint8_t>
+            <<<blocks, 256, 0, stream>>>(
+                (uint8_t*)dst, (const uint8_t*)ori, n, m, len);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 template <typename T>
 __global__ void FastllmPermuteKernel(T *dst, T *ori, int *temp, int axisLen, int len) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -4763,6 +4865,7 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     size_t tempBytes = (size_t)len * input.unitSize;
     bool permuteFastPath =
         axis == std::vector <int> {1, 0, 2} ||
+        axis == std::vector <int> {0, 2, 1} ||
         axis == std::vector <int> {2, 0, 1, 3} ||
         axis == std::vector <int> {1, 2, 0, 3} ||
         (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1);
@@ -4804,6 +4907,18 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
                 ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
         input.Resize(new_dims);
+    } else if (axis == std::vector <int> {0, 2, 1}) {
+        int batch = input.dims[0];
+        int n = input.dims[1];
+        int m = input.dims[2];
+        if (!FastllmLaunchTransposeLastTwo(
+                input.cudaData, tempData, batch, n, m,
+                input.unitSize, 0)) {
+            FastllmTransposeLastTwoByBatchKernel<256><<<batch * n * m, 256>>>(
+                (uint8_t*)input.cudaData, (uint8_t*)tempData,
+                batch, n, m, input.unitSize);
+        }
+        input.Resize(new_dims);
     } else if (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1) {
         int n = input.dims[1];
         int m = input.dims[2];
@@ -4844,6 +4959,43 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     DeviceSync();
     FastllmReleaseCudaTempBuffer(tempData, tempOwn);
     return true;
+}
+
+bool FastllmCudaPermuteTo(const fastllm::Data &input, fastllm::Data &output,
+                          const std::vector<int> &axis) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || output.cudaData == nullptr ||
+        axis.size() != input.dims.size() ||
+        input.dataType != output.dataType ||
+        input.Count(0) != output.Count(0)) {
+        return false;
+    }
+
+    if (axis == std::vector<int>{0, 2, 1} && input.dims.size() == 3) {
+        int batch = input.dims[0];
+        int n = input.dims[1];
+        int m = input.dims[2];
+        if (!FastllmLaunchTransposeLastTwo(
+                output.cudaData, input.cudaData, batch, n, m,
+                input.unitSize, cudaStreamPerThread)) {
+            return false;
+        }
+    } else if (axis == std::vector<int>{0, 2, 1, 3} &&
+               input.dims.size() == 4) {
+        int batch = input.dims[0];
+        int n = input.dims[1];
+        int m = input.dims[2];
+        int rowBytes = input.dims[3] * input.unitSize;
+        FastllmTransposeLastTwoByBatchKernel<256><<<batch * n * m, 256,
+                                                   0, cudaStreamPerThread>>>(
+            (uint8_t*)output.cudaData, (const uint8_t*)input.cudaData,
+            batch, n, m, rowBytes);
+    } else {
+        return false;
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmFloatToHalf(void *a, void *b, int len) {

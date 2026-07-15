@@ -409,6 +409,28 @@ namespace fastllm {
                    FloatDict(), IntDict());
     }
 
+    inline void Qwen3CudaPermuteTo(Qwen3CudaDirectRunner &runner,
+                                   const Data &input,
+                                   const std::vector<int> &axis,
+                                   Data &output) {
+        AssertInFastLLM(axis.size() == input.dims.size(),
+                        "Qwen3CudaPermuteTo got incompatible axis.\n");
+        std::vector<int> outputDims;
+        outputDims.reserve(axis.size());
+        for (int dim : axis) {
+            AssertInFastLLM(dim >= 0 && dim < (int)input.dims.size(),
+                            "Qwen3CudaPermuteTo got invalid axis.\n");
+            outputDims.push_back(input.dims[dim]);
+        }
+        Qwen3CudaPrepareLocalOutput(output, runner.DeviceId());
+        output.dataType = input.dataType;
+        output.UpdateUnitSize();
+        output.Resize(outputDims);
+        output.Allocate(false);
+        AssertInFastLLM(FastllmCudaPermuteTo(input, output, axis),
+                        "Qwen3CudaPermuteTo CUDA kernel failed.\n");
+    }
+
     inline void Qwen3CudaRopeEncoding(Qwen3CudaDirectRunner &runner,
                                       Data &input, const Data &positionIds,
                                       int rotaryDim, float ropeTheta, float ropeScale) {
