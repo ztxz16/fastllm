@@ -3500,6 +3500,7 @@ namespace fastllm {
         this->kvCacheId = 0;
         elementsInKVCachePerToken = 0;
         bool foundTokenGrowingCache = false;
+        bool hasCudaTokenGrowingCache = false;
         std::vector <long long> layerElementsPerToken(block_cnt, 0);
         int tokenGrowingLayerCount = 0, linearLayerCount = 0;
         long long linearFixedBytes = 0;
@@ -3514,6 +3515,21 @@ namespace fastllm {
             if (pastKey.dims.size() < 3 || pastValue.dims.size() < 3) {
                 continue;
             }
+#ifdef USE_CUDA
+            auto cacheUsesCuda = [](const Data &cache) {
+                if (cache.dataDevice == DataDevice::CUDA) {
+                    return true;
+                }
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr && it.second->dataDevice == DataDevice::CUDA) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            hasCudaTokenGrowingCache = hasCudaTokenGrowingCache ||
+                                       cacheUsesCuda(pastKey) || cacheUsesCuda(pastValue);
+#endif
             tokenGrowingLayerCount++;
             if (!foundTokenGrowingCache) {
                 this->kvCacheId = i;
@@ -3651,7 +3667,7 @@ namespace fastllm {
             runBatchSeqWarmup(samplingPrefillSeqLens, true);
         };
 
-        if (autoCalcPages) {
+        if (autoCalcPages && hasCudaTokenGrowingCache) {
 #ifdef USE_CUDA
             std::set <int> deviceIds;
 
@@ -3712,18 +3728,20 @@ namespace fastllm {
                 }
 
                 if (!accountedByLocalShard) {
-                    int id = 0;
-                    if (pastKey.dataDevice == DataDevice::CUDA && !pastKey.dataDeviceIds.empty()) {
-                        id = pastKey.dataDeviceIds[0];
-                    } else if (pastValue.dataDevice == DataDevice::CUDA && !pastValue.dataDeviceIds.empty()) {
-                        id = pastValue.dataDeviceIds[0];
+                    int id = -1;
+                    if (pastKey.dataDevice == DataDevice::CUDA) {
+                        id = pastKey.dataDeviceIds.empty() ? 0 : pastKey.dataDeviceIds[0];
+                    } else if (pastValue.dataDevice == DataDevice::CUDA) {
+                        id = pastValue.dataDeviceIds.empty() ? 0 : pastValue.dataDeviceIds[0];
                     }
-                    deviceIds.insert(id);
-                    deviceBytesPerPage[id] += layerBytesPerPage;
-                    long long keyElementsPerToken = (long long)pastKey.dims[0] * pastKey.dims[2];
-                    long long valueElementsPerToken = (long long)pastValue.dims[0] * pastValue.dims[2];
-                    updateDelayedCacheReserve(id, keyElementsPerToken, valueElementsPerToken);
-                    deviceLayerCount[id]++;
+                    if (id >= 0) {
+                        deviceIds.insert(id);
+                        deviceBytesPerPage[id] += layerBytesPerPage;
+                        long long keyElementsPerToken = (long long)pastKey.dims[0] * pastKey.dims[2];
+                        long long valueElementsPerToken = (long long)pastValue.dims[0] * pastValue.dims[2];
+                        updateDelayedCacheReserve(id, keyElementsPerToken, valueElementsPerToken);
+                        deviceLayerCount[id]++;
+                    }
                 }
                 bytesPerPage += layerBytesPerPage;
             }
@@ -3882,23 +3900,33 @@ namespace fastllm {
             if (deviceBytesPerPage.size() > 1) {
                 // 多卡模式：对每张实际承载 token-growing cache 的卡分别限流，取最小值
                 int maxPages = INT_MAX;
+                bool hasUnusableCacheDevice = false;
                 for (auto &it : deviceBytesPerPage) {
                     int id = it.first;
-                    if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
+                    long long perPageOnDevice = it.second;
+                    if (id >= 0 && id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
                         long long reserved = (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
                         long long rawAvail = freeSizes[id] - reserved;
                         long long runtimeHeadroom = getCudaRuntimeHeadroom(id, rawAvail);
                         long long avail = rawAvail - runtimeHeadroom;
-                        long long perPageOnDevice = it.second;
                         updateLinearAttentionBatchLimit(avail);
                         printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, availForKV=%.2f GB, localKVPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                id, freeSizes[id] / 1e9, totalSizes[id] / 1e9, reserved / 1e9,
                                runtimeHeadroom / 1e6, avail / 1e9, perPageOnDevice / 1e6,
                                deviceLayerCount.count(id) ? deviceLayerCount[id] : 0);
-                        if (perPageOnDevice > 0 && avail > 0) {
+                        if (perPageOnDevice > 0) {
                             int pages = fitPagesWithLinearReserve(id, avail, perPageOnDevice);
                             maxPages = std::min(maxPages, pages);
+                            hasUnusableCacheDevice = hasUnusableCacheDevice || pages <= 0;
+                        } else {
+                            maxPages = 0;
+                            hasUnusableCacheDevice = true;
                         }
+                    } else {
+                        // Missing telemetry for a cache-bearing GPU must not make another
+                        // GPU's positive budget look safe for the whole tensor-parallel cache.
+                        maxPages = 0;
+                        hasUnusableCacheDevice = true;
                     }
                 }
                 if (maxPages > 0 && maxPages < INT_MAX) {
@@ -3916,7 +3944,9 @@ namespace fastllm {
                         }
                     }
                 } else {
-                    fallbackReason = "no GPU has positive availForKV / kvPerPage after reserve.";
+                    fallbackReason = hasUnusableCacheDevice ?
+                        "at least one cache-bearing GPU has no usable KV budget after reserve." :
+                        "multi-GPU page calculation did not find a cache-bearing GPU.";
                 }
             } else {
                 // 单卡模式：只看真正承载 paged KV cache 的设备
@@ -4012,6 +4042,100 @@ namespace fastllm {
                 if (warmupAddPrefillEffectiveBatch != warmupMaxPrefillBatch) {
                     runSamplingPrefillWarmup(warmupAddPrefillBatch, "add-prefill");
                 }
+
+                // The full-batch prefill above materializes the real CUDA scratch
+                // pool. It can be substantially larger than the small pre-page
+                // warmup, especially for hybrid linear-attention models. Recheck
+                // the actual free memory before allocating long-lived sampling
+                // buffers and give memory back from the auto-sized KV cache when
+                // necessary. Otherwise the page estimate can leave enough room on
+                // paper while the following runtime-buffer allocations still OOM.
+                auto shrinkCachePagesForRuntimeBuffers = [&]() {
+                    if (!updatedPages || pageLen <= 0 || deviceBytesPerPage.empty()) {
+                        return;
+                    }
+
+                    int currentPages = std::max(
+                        1, (fastllm::GetMaxTokens() + pageLen - 1) / pageLen);
+                    int calibratedPages = currentPages;
+                    auto freeBeforeRuntime = FastllmCudaGetFreeSizes();
+                    auto totalBeforeRuntime = FastllmCudaGetTotalSizes();
+                    std::map<int, long long> deviceTargetFree;
+                    std::map<int, long long> deviceRemovePages;
+
+                    for (auto &it : deviceBytesPerPage) {
+                        int id = it.first;
+                        long long bytesPerPageOnDevice = it.second;
+                        if (bytesPerPageOnDevice <= 0 || id < 0 ||
+                            id >= (int)freeBeforeRuntime.size() ||
+                            id >= (int)totalBeforeRuntime.size()) {
+                            continue;
+                        }
+
+                        long long finalSafety = std::max(
+                            128LL * 1024LL * 1024LL,
+                            totalBeforeRuntime[id] / 200);
+                        finalSafety = std::min(
+                            finalSafety, 512LL * 1024LL * 1024LL);
+                        long long targetFree =
+                            (long long)(totalBeforeRuntime[id] *
+                                        (1.0 - fastllm::GetGpuMemRatio())) +
+                            finalSafety +
+                            std::max(
+                                0LL,
+                                this->GetAutoWarmupCudaRuntimeReserveBytes(
+                                    id, warmupMaxBatch));
+                        deviceTargetFree[id] = targetFree;
+
+                        long long deficit = targetFree - freeBeforeRuntime[id];
+                        if (deficit <= 0) {
+                            deviceRemovePages[id] = 0;
+                            continue;
+                        }
+                        long long removePages =
+                            (deficit + bytesPerPageOnDevice - 1) /
+                            bytesPerPageOnDevice;
+                        deviceRemovePages[id] = removePages;
+                        long long devicePages = std::max<long long>(
+                            std::max(1, minPages),
+                            (long long)currentPages - removePages);
+                        calibratedPages = std::min(
+                            calibratedPages,
+                            (int)std::min<long long>(devicePages, INT_MAX));
+                    }
+
+                    if (calibratedPages >= currentPages) {
+                        return;
+                    }
+
+                    printf("[Fastllm] AutoWarmup shrink cache pages for CUDA runtime buffers: %d -> %d (tokens: %lld -> %lld).\n",
+                           currentPages, calibratedPages,
+                           (long long)currentPages * pageLen,
+                           (long long)calibratedPages * pageLen);
+                    for (auto &it : deviceBytesPerPage) {
+                        int id = it.first;
+                        if (id < 0 || id >= (int)freeBeforeRuntime.size() ||
+                            id >= (int)totalBeforeRuntime.size()) {
+                            continue;
+                        }
+                        printf("  GPU %d: freeBeforeRuntime=%.2f GB, targetFree=%.2f GB, localKVPerPage=%.2f MB, removePages=%lld.\n",
+                               id, freeBeforeRuntime[id] / 1e9,
+                               deviceTargetFree.count(id) ?
+                                   deviceTargetFree[id] / 1e9 : 0.0,
+                               it.second / 1e6,
+                               deviceRemovePages.count(id) ?
+                                   deviceRemovePages[id] : 0);
+                    }
+
+                    autoWarmupPagedCacheManager = nullptr;
+                    ClearAllPagedCacheManagers();
+                    fastllm::SetMaxTokens(calibratedPages * pageLen);
+                    calculatedMaxPages = calibratedPages;
+                    runUniformBatchWarmup(1, 1, false);
+                    printCudaWarmupPoolStats(
+                        "runtime-reserved paged cache allocation");
+                };
+                shrinkCachePagesForRuntimeBuffers();
                 this->WarmupCudaRuntimeBuffers(warmupMaxBatch);
                 printCudaWarmupPoolStats("batch and sampling warmup");
 
