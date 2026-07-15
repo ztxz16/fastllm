@@ -2237,6 +2237,57 @@ namespace fastllm {
         return true;
     }
 
+    bool IsCudaLinearDataTypeSupported(DataType inputType, DataType weightType, DataType biasType) {
+        if (biasType != DataType::FLOAT32) {
+            return false;
+        }
+        if (inputType == DataType::FLOAT16) {
+            return weightType == DataType::FLOAT32 ||
+                   weightType == DataType::FLOAT16 ||
+                   weightType == DataType::BFLOAT16 ||
+                   weightType == DataType::INT8 ||
+                   weightType == DataType::INT4_GROUP ||
+                   weightType == DataType::INT4_GROUP128 ||
+                   weightType == DataType::INT4_NOZERO ||
+                   weightType == DataType::FP8_E4M3 ||
+                   weightType == DataType::FP8_E4M3_BLOCK_128 ||
+                   weightType == DataType::FP8_E4M3_PERCHANNEL ||
+                   weightType == DataType::NVFP4 ||
+                   weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   weightType == DataType::DATA_GGUF_FORMAT;
+        }
+        if (inputType == DataType::FLOAT32) {
+            return weightType == DataType::FLOAT32 ||
+                   weightType == DataType::FLOAT16 ||
+                   weightType == DataType::BFLOAT16 ||
+                   weightType == DataType::INT8 ||
+                   weightType == DataType::INT4 ||
+                   weightType == DataType::INT4_NOZERO ||
+                   weightType == DataType::INT4_GROUP ||
+                   weightType == DataType::FP8_E4M3 ||
+                   weightType == DataType::FP8_E4M3_BLOCK_128 ||
+                   weightType == DataType::FP8_E4M3_PERCHANNEL ||
+                   weightType == DataType::NVFP4 ||
+                   weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   weightType == DataType::DATA_GGUF_FORMAT;
+        }
+        if (inputType == DataType::BFLOAT16) {
+            return weightType == DataType::BFLOAT16 ||
+                   weightType == DataType::FLOAT32 ||
+                   weightType == DataType::FLOAT16 ||
+                   weightType == DataType::FP8_E4M3 ||
+                   weightType == DataType::FP8_E4M3_BLOCK_128 ||
+                   weightType == DataType::FP8_E4M3_PERCHANNEL ||
+                   weightType == DataType::NVFP4 ||
+                   weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   weightType == DataType::DATA_GGUF_FORMAT;
+        }
+        return false;
+    }
+
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
         output.Allocate(false);
         int n = input.Count(0) / input.dims.back();
@@ -2245,8 +2296,8 @@ namespace fastllm {
         std::string dataTypeInfo = " input.dataType = " + GetDataTypeName(input.dataType) +
                                    ", weight.dataType = " + GetDataTypeName(weight.dataType) +
                                    ", bias.dataType = " + GetDataTypeName(bias.dataType) + ".";
-        if (bias.dataType != DataType::FLOAT32) {
-            ErrorInFastLLM("Linear error: unsupport bias' dataType." + dataTypeInfo);
+        if (!IsCudaLinearDataTypeSupported(input.dataType, weight.dataType, bias.dataType)) {
+            ErrorInFastLLM("Linear error: unsupported dataType combination." + dataTypeInfo);
         } else if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT32) {
                 FastllmCudaHalfMatMulFloat32(input, weight, bias, output, n, m, k);

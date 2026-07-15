@@ -35,6 +35,7 @@
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/cudadevice.h"
 #endif
 
 namespace fastllm {
@@ -760,6 +761,19 @@ namespace fastllm {
     }
 
     static DataType GetNumasLinearActDataType(Data *weight, int batchSize) {
+        // Mixed-quant MoE grouping queries the activation type before the
+        // selected weights are registered. Mirror RegisterNumas' native
+        // quantized-weight conversions so the pre-registration and registered
+        // forms select the same activation buffer format.
+        if (weight != nullptr &&
+            (weight->dataType == DataType::INT8 ||
+             weight->dataType == DataType::INT4_NOZERO)) {
+            return DataType::INF_INT8_PERCHANNEL;
+        }
+        if (weight != nullptr && weight->dataType == DataType::INT4_GROUP &&
+            weight->groupCnt == 128) {
+            return DataType::INF_INT8_GROUP128;
+        }
         if (weight != nullptr &&
             (weight->dataType == DataType::NVFP4 ||
              weight->dataType == DataType::NVFP4_BLOCK_16 ||
@@ -767,6 +781,31 @@ namespace fastllm {
             return DataType::BFLOAT16;
         }
         return weight->GetLinearActDataType(batchSize);
+    }
+
+    static bool CanUseCudaMoePrefill(DataType inputType, Data **weights, int weightsBatch) {
+#ifndef USE_CUDA
+        return false;
+#else
+        for (int i = 0; i < weightsBatch; i++) {
+            if (weights[i] == nullptr) {
+                continue;
+            }
+            // Match DoCudaLinear's dispatch key. GetDataType() expands GGUF into
+            // its concrete ggml subtype, while the CUDA path accepts the common
+            // DATA_GGUF_FORMAT storage type.
+            DataType weightType = weights[i]->dataType;
+            if (!IsCudaLinearDataTypeSupported(inputType, weightType, DataType::FLOAT32)) {
+                static std::once_flag warningOnce;
+                std::call_once(warningOnce, [inputType, weightType]() {
+                    printf("[Fastllm] NUMA GPU prefill disabled: CUDA Linear does not support %s activations with %s MoE weights.\n",
+                           GetDataTypeName(inputType).c_str(), GetDataTypeName(weightType).c_str());
+                });
+                return false;
+            }
+        }
+        return true;
+#endif
     }
 
     struct NumaWorkStealingOp : MultiThreadBaseOp {
@@ -2452,6 +2491,9 @@ namespace fastllm {
             gpuPrefill = false;
 #endif
             if (input.cudaData == nullptr) {
+                gpuPrefill = false;
+            }
+            if (gpuPrefill && !CanUseCudaMoePrefill(input.dataType, weights, weightsBatch)) {
                 gpuPrefill = false;
             }
             if (gpuPrefill && input.cudaData != nullptr && output.cudaData == nullptr) {
