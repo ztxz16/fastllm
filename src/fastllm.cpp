@@ -1283,6 +1283,40 @@ namespace fastllm {
                 data.scales.resize(k * group);
                 memcpy(data.mins.data(), oriMins, k * group * sizeof(float));
                 memcpy(data.scales.data(), oriScales, k * group * sizeof(float));
+                // AWQ stores an integer zero point separately from its FP16
+                // scale.  Keep that integer when the supplied affine metadata
+                // is exactly representable as (q - zero) * scale.  Rebuilding
+                // a FP16 min later introduces an avoidable second rounding and
+                // can accumulate across many recurrent MoE layers.
+                data.zeros.resize(k * group);
+                bool hasIntegerZeroPoints = true;
+                for (int i = 0; i < k * group; i++) {
+                    const float scale = data.scales[i];
+                    const float minValue = data.mins[i];
+                    if (!std::isfinite(scale) || !std::isfinite(minValue)) {
+                        hasIntegerZeroPoints = false;
+                        break;
+                    }
+                    if (scale == 0.0f) {
+                        if (minValue != 0.0f) {
+                            hasIntegerZeroPoints = false;
+                            break;
+                        }
+                        data.zeros[i] = 0;
+                        continue;
+                    }
+                    const int zero = (int)std::lroundf(-minValue / scale);
+                    const float error = std::fabs(minValue + scale * zero);
+                    const float tolerance = std::max(1e-7f, std::fabs(scale) * 1e-4f);
+                    if (zero < 0 || zero > 15 || error > tolerance) {
+                        hasIntegerZeroPoints = false;
+                        break;
+                    }
+                    data.zeros[i] = zero;
+                }
+                if (!hasIntegerZeroPoints) {
+                    data.zeros.clear();
+                }
                 data.perChannelAxis = 0;
                 /* data.perChannelsConfigs.resize(k * group);
                 for (int i = 0; i < k * group; i++) {

@@ -1636,6 +1636,11 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curDevice->scales.resize(lenGroupCount);
                     curDevice->mins.resize(lenGroupCount);
                     if (weight.dataType == fastllm::DataType::INT4_GROUP) {
+                        if (!weight.zeros.empty()) {
+                            fastllm::AssertInFastLLM(weight.zeros.size() == kGroupCount,
+                                                     "INT4_GROUP tensor parallel row split zero-point shape mismatch.\n");
+                            curDevice->zeros.resize(lenGroupCount);
+                        }
                         int curLen = 0;
                         for (auto &it : div) {
                             size_t dstOffset = static_cast<size_t>(curLen) * weightGroupSize;
@@ -1645,6 +1650,10 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                                    copyCount * sizeof(float));
                             memcpy(curDevice->mins.data() + dstOffset, weight.mins.data() + srcOffset,
                                    copyCount * sizeof(float));
+                            if (!weight.zeros.empty()) {
+                                memcpy(curDevice->zeros.data() + dstOffset, weight.zeros.data() + srcOffset,
+                                       copyCount * sizeof(int));
+                            }
                             curLen += (it.second - it.first);
                         }
                     } else {
@@ -1664,25 +1673,79 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                         }
                     }
                 } else {
-                    curDevice->scales.resize(kGroupCount);
-                    curDevice->mins.resize(kGroupCount);
-                    curDevice->group = weight.group;
                     curDevice->groupCnt = weight.groupCnt;
                     if (weight.dataType == fastllm::DataType::INT4_GROUP) {
-                        int base = div[0].first / weight.groupCnt;
-                        std::vector <float> scales, mins;
-                        size_t baseOffset = static_cast<size_t>(base);
-                        for (size_t i = 0; i < weight.scales.size(); i++) {
-                            size_t src = i + baseOffset;
-                            scales.push_back(src < weight.scales.size() ? weight.scales[src] : 0.0f);
+                        fastllm::AssertInFastLLM(weight.groupCnt > 0 && weight.group > 0,
+                                                 "INT4_GROUP tensor parallel column split requires valid group metadata.\n");
+                        fastllm::AssertInFastLLM(weight.scales.size() == kGroupCount &&
+                                                 weight.mins.size() == kGroupCount,
+                                                 "INT4_GROUP tensor parallel column split scale shape mismatch.\n");
+
+                        int localGroup = len == 0 ? 0 : (len - 1) / weight.groupCnt + 1;
+                        curDevice->group = localGroup;
+                        curDevice->scales.resize(kSize * static_cast<size_t>(localGroup));
+                        curDevice->mins.resize(kSize * static_cast<size_t>(localGroup));
+                        if (!weight.zeros.empty()) {
+                            fastllm::AssertInFastLLM(weight.zeros.size() == kGroupCount,
+                                                     "INT4_GROUP tensor parallel column split zero-point shape mismatch.\n");
+                            curDevice->zeros.resize(kSize * static_cast<size_t>(localGroup));
                         }
-                        for (size_t i = 0; i < weight.mins.size(); i++) {
-                            size_t src = i + baseOffset;
-                            mins.push_back(src < weight.mins.size() ? weight.mins[src] : 0.0f);
+                        if (len == 0) {
+                            continue;
                         }
-                        memcpy(curDevice->scales.data(), scales.data(), kGroupCount * sizeof(float));
-                        memcpy(curDevice->mins.data(), mins.data(), kGroupCount * sizeof(float));
+
+                        std::vector<int> sourceGroups(static_cast<size_t>(localGroup), -1);
+                        size_t localColumn = 0;
+                        for (auto &it : div) {
+                            fastllm::AssertInFastLLM(it.first >= 0 && it.second >= it.first && it.second <= m,
+                                                     "INT4_GROUP tensor parallel column split range is invalid.\n");
+                            size_t sourceColumn = static_cast<size_t>(it.first);
+                            size_t sourceEnd = static_cast<size_t>(it.second);
+                            while (sourceColumn < sourceEnd) {
+                                size_t localScaleColumn = localColumn / static_cast<size_t>(weight.groupCnt);
+                                size_t sourceScaleColumn = sourceColumn / static_cast<size_t>(weight.groupCnt);
+                                fastllm::AssertInFastLLM(localScaleColumn < sourceGroups.size() &&
+                                                         sourceScaleColumn < weightGroupSize,
+                                                         "INT4_GROUP tensor parallel column split scale index overflow.\n");
+                                if (sourceGroups[localScaleColumn] < 0) {
+                                    sourceGroups[localScaleColumn] = static_cast<int>(sourceScaleColumn);
+                                } else {
+                                    fastllm::AssertInFastLLM(
+                                        sourceGroups[localScaleColumn] == static_cast<int>(sourceScaleColumn),
+                                        "INT4_GROUP tensor parallel column split crosses incompatible groups.\n");
+                                }
+                                size_t localRemain = static_cast<size_t>(weight.groupCnt) -
+                                                     localColumn % static_cast<size_t>(weight.groupCnt);
+                                size_t sourceRemain = static_cast<size_t>(weight.groupCnt) -
+                                                      sourceColumn % static_cast<size_t>(weight.groupCnt);
+                                size_t step = std::min(sourceEnd - sourceColumn,
+                                                       std::min(localRemain, sourceRemain));
+                                localColumn += step;
+                                sourceColumn += step;
+                            }
+                        }
+                        fastllm::AssertInFastLLM(localColumn == static_cast<size_t>(len),
+                                                 "INT4_GROUP tensor parallel column split scale length mismatch.\n");
+                        for (int group = 0; group < localGroup; group++) {
+                            fastllm::AssertInFastLLM(sourceGroups[group] >= 0,
+                                                     "INT4_GROUP tensor parallel column split has an unmapped group.\n");
+                        }
+                        for (size_t row = 0; row < kSize; row++) {
+                            for (int group = 0; group < localGroup; group++) {
+                                size_t dst = row * static_cast<size_t>(localGroup) + static_cast<size_t>(group);
+                                size_t src = row * weightGroupSize +
+                                             static_cast<size_t>(sourceGroups[group]);
+                                curDevice->scales[dst] = weight.scales[src];
+                                curDevice->mins[dst] = weight.mins[src];
+                                if (!weight.zeros.empty()) {
+                                    curDevice->zeros[dst] = weight.zeros[src];
+                                }
+                            }
+                        }
                     } else {
+                        curDevice->scales.resize(kGroupCount);
+                        curDevice->mins.resize(kGroupCount);
+                        curDevice->group = weight.group;
                         curDevice->zeros.resize(kGroupCount);
                         memcpy(curDevice->scales.data(), weight.scales.data(), kGroupCount * sizeof(float));
                         memcpy(curDevice->mins.data(), weight.mins.data(), kGroupCount * sizeof(float));

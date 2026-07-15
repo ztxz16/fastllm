@@ -336,7 +336,8 @@ namespace fastllm {
              model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
              model->model_type != "minimax_m2" &&
-             model->model_type != "deepseek_v4") ||
+             model->model_type != "deepseek_v4" &&
+             model->model_struct != "qwen3_5") ||
             !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
             data.isDiskWeight || data.dims.size() != 2 ||
             (data.cpuData == nullptr && data.cudaData == nullptr && data.numasData.empty())) {
@@ -1258,6 +1259,23 @@ namespace fastllm {
             return originalDataType;
         }
         return tensorDataType;
+    }
+
+    static bool ResolveAwqUnquantizedDataType(const std::string &sourceDataType,
+                                              DataType &dataType) {
+        if (dataType != DataType::DATA_AUTO_LINEAR && dataType != DataType::DATA_AUTO_CONV) {
+            return false;
+        }
+        if (sourceDataType == "F32") {
+            dataType = DataType::FLOAT32;
+        } else if (sourceDataType == "F16") {
+            dataType = DataType::FLOAT16;
+        } else if (sourceDataType == "BF16") {
+            dataType = DataType::BFLOAT16;
+        } else {
+            return false;
+        }
+        return true;
     }
 
     static bool IsDiskMoeWeight(basellm *model, const std::string &weightName) {
@@ -2760,6 +2778,7 @@ namespace fastllm {
                 if (linearDataType != DataType::INT4_GROUP || groupCnt != awqGroupCnt) {
                     printf("WARNING: It is recommended to use \"--dtype int4g%d\" for this AWQ models.\n", awqGroupCnt);
                 }
+                printf("[Fastllm] AWQ: keep unquantized floating-point tensors in source dtype.\n");
             }
         }
         basellm *model = CreateModelWithType(modelType);
@@ -2821,15 +2840,41 @@ namespace fastllm {
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
 
-        // 如果有需要，为moe设置特定的量化参数
-        if (model->moeLinears.size() > 0 && useMoeDataType) {
+        // 如果有需要，为moe设置特定的量化参数。AWQ 的专家权重使用
+        // .qweight 保存，即使名称模式未把它识别成普通 LINEAR，也必须走
+        // 全局线性量化类型；否则会按普通 I32 参数加载。
+        bool awqArmCpuMoeInt8Fallback = false;
+        if (model->moeLinears.size() > 0 && (useMoeDataType || isAwqModel)) {
             for (auto &it : tensorMap) {
                 for (auto &weight : it.second) {
                     if (model->moeLinears.find(weight.first) != model->moeLinears.end()) {
-                        weight.second = moeDataType;
+                        if (useMoeDataType) {
+                            weight.second = moeDataType;
+                        } else if (dtypeConfigString.empty()) {
+#if defined(__aarch64__)
+                            std::string selectedDevice = GetMoeWeightSelectedDevice(model, weight.first);
+                            if (isAwqModel && model->model_struct == "qwen3_5" &&
+                                (DeviceNameMatchesType(selectedDevice, "cpu") ||
+                                 DeviceNameMatchesType(selectedDevice, "numa"))) {
+                                // The ARM CPU INT4_GROUP path is numerically stable in isolated
+                                // linears, but Qwen3.5 AWQ MoE diverges after many recurrent layers.
+                                // Keep this model-specific workaround from changing unrelated AWQ
+                                // MoE families. An explicit --moe_dtype still wins.
+                                weight.second = DataType::INT8;
+                                awqArmCpuMoeInt8Fallback = true;
+                                continue;
+                            }
+#endif
+                            weight.second = linearDataType;
+                        } else {
+                            weight.second = DataType::DATA_AUTO_LINEAR;
+                        }
                     }
                 }
             }
+        }
+        if (awqArmCpuMoeInt8Fallback) {
+            printf("[Fastllm] Qwen3.5 AWQ ARM CPU: load MoE expert weights as INT8 for stable inference.\n");
         }
 
         std::vector <std::pair <std::string, std::string> > dtypeRules;
@@ -2873,6 +2918,10 @@ namespace fastllm {
                         dataType = DataType::FLOAT16;
                     }
                     ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
+                }
+
+                if (isAwqModel) {
+                    ResolveAwqUnquantizedDataType(tensor.dtype, dataType);
                 }
 
                 if (dataType >= DATA_AUTO_NONE) {
@@ -3014,7 +3063,14 @@ namespace fastllm {
                             auto dataType = it.second;
                             int ggmlType = -1;
 
-                            int curGroupCnt = model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt;
+                            bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
+                            // With no explicit --moe_dtype, AWQ experts inherit the global
+                            // INT4_GROUP type and must also inherit the source AWQ group size.
+                            // The Python API's unused moeGroupCnt default is 128, which would
+                            // otherwise reinterpret group-32 expert weights as group-128.
+                            int curGroupCnt = isMoeLinear
+                                    ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
+                                    : groupCnt;
 
                             if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                                 ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
@@ -3025,6 +3081,9 @@ namespace fastllm {
                                 }
                                 printf("\n");
 */
+                            }
+                            if (isAwqModel) {
+                                ResolveAwqUnquantizedDataType(tensor.dtype, dataType);
                             }
                             if (dataType >= DATA_AUTO_NONE) {
                                 // AUTO类型
@@ -3076,7 +3135,7 @@ namespace fastllm {
                                 AssertInFastLLM(safeTensors.itmeDict.find(scaleTensorName) != safeTensors.itmeDict.end() &&
                                                 safeTensors.itmeDict.find(qzeroTensorName) != safeTensors.itmeDict.end(),
                                                 "Tensor error: can't find AWQ scalse / qzeros.");
-                                if (dataType == INT4_GROUP && groupCnt == awqGroupCnt) {
+                                if (dataType == INT4_GROUP && curGroupCnt == awqGroupCnt) {
                                     oriDataType = INT4_GROUP;
                                 }
                             }
