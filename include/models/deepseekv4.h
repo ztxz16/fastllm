@@ -60,6 +60,16 @@ namespace fastllm {
         int rawTailStartPos = 0;
         Data compressorTailKV;
         Data compressorTailScore;
+
+        // 单 token CUDA Graph 使用固定地址的原始 compressor ring 和压缩 KV。
+        // 这些是运行时派生缓存，不进入 history/prefix cache 的拷贝。
+        bool cudaGraphCacheReady = false;
+        int cudaGraphRawCapacity = 0;
+        int cudaGraphCompressedCapacity = 0;
+        Data cudaGraphCompressorKVRing;
+        Data cudaGraphCompressorScoreRing;
+        Data cudaGraphApe;
+        Data cudaGraphNormWeight;
     };
 
     struct DeepSeekV4HistoryLayerCache {
@@ -112,6 +122,7 @@ namespace fastllm {
     struct DeepSeekV4RequestState {
         std::vector<DeepSeekV4DecodeLayerCache> decodeLayerCaches;
         std::vector<int> historyTokens;
+        std::shared_ptr<void> cudaGraphState;
     };
 
     class DeepSeekV4Model : public basellm {
@@ -260,6 +271,7 @@ namespace fastllm {
         std::map<const void*, std::shared_ptr<DeepSeekV4RequestState> > requestStates;
         std::map<const void*, std::shared_ptr<DeepSeekV4RequestState> > requestStatesByFirstKey;
         std::shared_ptr<DeepSeekV4RequestState> pendingRequestState;
+        std::shared_ptr<void> fallbackCudaGraphState;
 
         bool RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory);
         bool RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory,

@@ -122,7 +122,8 @@ namespace fastllm {
         float sharedScale, Data *output, int layer,
         DataType dataType, DataType moeAtype,
         Data *moeInputTemp, Data *moeOutputTemp,
-        MoeGateType gateType = MoeGateSwiglu
+        MoeGateType gateType = MoeGateSwiglu,
+        bool expertParallel = false
     );
 
     class basellm;
@@ -150,7 +151,11 @@ namespace fastllm {
         const std::vector<GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector<std::vector<float>*> *retLogits,
-        std::vector<int> &lastRet
+        std::vector<int> &lastRet,
+        Data *precomputedLogits = nullptr,
+        Data *precomputedGreedyIds = nullptr,
+        Data *precomputedGreedyScores = nullptr,
+        const std::map<int, void*> *precomputedReadyEvents = nullptr
     );
 }
 

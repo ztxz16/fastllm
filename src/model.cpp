@@ -281,6 +281,23 @@ namespace fastllm {
                spec == "none" || spec == "disable";
     }
 
+    static int ParseRoutedExpertIndex(const std::string &weightName) {
+        const std::string marker = ".ffn.experts.";
+        size_t pos = weightName.find(marker);
+        if (pos == std::string::npos) {
+            return -1;
+        }
+        pos += marker.size();
+        size_t end = pos;
+        while (end < weightName.size() && std::isdigit((unsigned char)weightName[end])) {
+            end++;
+        }
+        if (end == pos || end >= weightName.size() || weightName[end] != '.') {
+            return -1;
+        }
+        return std::atoi(weightName.substr(pos, end - pos).c_str());
+    }
+
     static bool IsThreadTensorParallelLoadEnabled() {
         const char *envNames[] = {
             "FASTLLM_TP",
@@ -318,7 +335,8 @@ namespace fastllm {
         if ((model->model_type != "qwen3_moe" &&
              model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
-             model->model_type != "minimax_m2") ||
+             model->model_type != "minimax_m2" &&
+             model->model_type != "deepseek_v4") ||
             !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
             data.isDiskWeight || data.dims.size() != 2 ||
             (data.cpuData == nullptr && data.cudaData == nullptr && data.numasData.empty())) {
@@ -333,9 +351,24 @@ namespace fastllm {
         Data emptyBias;
         bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
+        int routedExpert = ParseRoutedExpertIndex(weightName);
+        if (model->model_type == "deepseek_v4" && routedExpert >= 0) {
+            constexpr int ownerOffset = 0;
+            int ownerCount = (int)devices.size();
+            if (ownerCount <= 0) {
+                return false;
+            }
+            int owner = devices[ownerOffset + routedExpert % ownerCount];
+            return PlaceMultiCudaWeightOnDevice(data, devices, owner);
+        }
         if (typeIt->second == "linearSwiglu") {
             data.tpLinearType = TP_LINEAR_ROW;
             data.tpPackType = TP_PACK_GATEUP;
+            DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
+            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
+        }
+        if (typeIt->second == "linearRow") {
+            data.tpLinearType = TP_LINEAR_ROW;
             DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
             return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
         }
@@ -413,7 +446,9 @@ namespace fastllm {
             return false;
         }
         std::string selectedDevice = GetSpecialWeightSelectedDevice(this, weightName);
-        if (!DeviceNameMatchesType(selectedDevice, "cuda")) {
+        bool selectedCuda = DeviceNameMatchesType(selectedDevice, "cuda");
+        bool selectedMultiCuda = DeviceNameMatchesType(selectedDevice, "multicuda");
+        if (!selectedCuda && !selectedMultiCuda) {
             return false;
         }
 #ifdef USE_CUDA
@@ -421,7 +456,8 @@ namespace fastllm {
             return false;
         }
         std::map <int, int> ratios;
-        std::vector <int> deviceIds = ParseDeviceIds(selectedDevice, "cuda", ratios);
+        std::vector <int> deviceIds = ParseDeviceIds(selectedDevice,
+            selectedMultiCuda ? "multicuda" : "cuda", ratios);
         if (SplitSpecialWeightToCudaTpDevices(this, weightName, data, deviceIds, ratios)) {
             return true;
         }

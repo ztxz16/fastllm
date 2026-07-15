@@ -34,6 +34,50 @@
 
 namespace fastllm {
 #ifdef USE_CUDA
+    static bool KeepMultiCudaMergeMoeTensorOnSource(const std::string &opType,
+                                                     const std::string &name,
+                                                     BaseDevice *device,
+                                                     const Data *data,
+                                                     const IntDict &intParams) {
+        auto expertParallelIt = intParams.find("expertParallel");
+        bool expertParallel =
+            expertParallelIt != intParams.end() && expertParallelIt->second != 0;
+        if (opType != "MergeMOE" || device == nullptr || device->deviceType != "multicuda" ||
+            data == nullptr || !expertParallel) {
+            return false;
+        }
+
+        // The batch-1 collective EP path accepts any participating CUDA device
+        // as its root.  Keep the hidden state and GPU route results together on
+        // the layer's current device instead of first copying all three tensors
+        // to multicuda's deviceIds[0].  That device then packs the single NCCL
+        // broadcast packet and receives the final reduce result directly.
+        if (data->dataDevice == DataDevice::CUDA && data->cudaData != nullptr &&
+            !data->multiDeviceData) {
+            if (name == "input") {
+                return data->dims.size() > 0 && data->dims[0] == 1 &&
+                       (data->dataType == DataType::FLOAT16 ||
+                        data->dataType == DataType::BFLOAT16 ||
+                        data->dataType == DataType::FLOAT32);
+            }
+            if (data->dims.size() >= 2 && data->dims[0] == 1 && data->dims[1] <= 16) {
+                return (name == "index" && data->dataType == DataType::INT32) ||
+                       (name == "score" && data->dataType == DataType::FLOAT32);
+            }
+        }
+
+        // CPU routing is retained as a fallback.  Letting the generic executor
+        // move these tiny tensors to a CUDA root would make MultiCudaMergeMOE
+        // copy them straight back before dispatching ranks.
+        if (data->dataDevice == DataDevice::CPU && (name == "index" || name == "score")) {
+            return true;
+        }
+        return false;
+    }
+
+#endif
+
+#ifdef USE_CUDA
     static void SyncCudaDeviceForProfiler(BaseDevice *device) {
         if (!GetFastllmEnv().cudaSync || device == nullptr) {
             return;
@@ -204,7 +248,14 @@ namespace fastllm {
                             } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
                                 copyData = false;
                             }
+#ifdef USE_CUDA
+                            if (!KeepMultiCudaMergeMoeTensorOnSource(
+                                    opType, it.first, device, it.second, intParams)) {
+                                it.second->ToDevice((void *) device, copyData);
+                            }
+#else
                             it.second->ToDevice((void *) device, copyData);
+#endif
                         }
                     }
                 }
@@ -276,7 +327,14 @@ namespace fastllm {
                         } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
                             copyData = false;
                         }
+#ifdef USE_CUDA
+                        if (!KeepMultiCudaMergeMoeTensorOnSource(
+                                opType, it.first, device, it.second, intParams)) {
+                            it.second->ToDevice((void *) device, copyData);
+                        }
+#else
                         it.second->ToDevice((void *) device, copyData);
+#endif
                     }
                 }
             }

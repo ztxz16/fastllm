@@ -35,6 +35,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "fastllm-multicuda.cuh"
 #endif
 
 #ifdef PY_API
@@ -1782,11 +1783,7 @@ namespace fastllm {
             }
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            if (this->directMemory) {
-                this->cudaData = FastllmCudaDirectMalloc(this->expansionBytes);
-            } else {
-                this->cudaData = FastllmCudaMalloc(this->expansionBytes);
-            }
+            this->cudaData = CudaMallocForData(*this, this->expansionBytes);
             this->cudaDataBorrowed = false;
             CheckCudaMallocForData(*this, this->cudaData, this->expansionBytes, "Data::MallocSpace");
             if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
@@ -1957,6 +1954,21 @@ namespace fastllm {
     }
 
     Data::~Data() {
+#ifdef USE_CUDA
+        // Hash-route tables keep per-device CUDA replicas while the owning
+        // Data is alive. Retire them before either this object or its CPU
+        // allocation can be reused by a subsequently loaded model.
+        FastllmCudaReleaseDeepSeekV4RouteTableCache(this);
+
+        // Retire routed-expert caches owned by this Data before its address can
+        // be reused by a subsequently loaded model. These calls are no-ops for
+        // weights that were never used as cache keys.
+        if (this->dataType == DataType::NVFP4 && this->isModelWeight &&
+            this->directMemory) {
+            MultiCudaReleaseMoeWeightCaches(this);
+            FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
+        }
+#endif
         if (isFake) {
             return;
         }
@@ -2263,6 +2275,19 @@ namespace fastllm {
 
     void Data::ToDevice(void *device, bool copyData) {
         BaseDevice *dev = (BaseDevice*)device;
+        if (dev->deviceType == "multicuda" && this->multiDeviceData) {
+            bool alreadyDistributed = !this->multiDeviceDatas.empty();
+            for (int deviceId : dev->deviceIds) {
+                auto it = this->multiDeviceDatas.find(deviceId);
+                if (it == this->multiDeviceDatas.end() || it->second == nullptr) {
+                    alreadyDistributed = false;
+                    break;
+                }
+            }
+            if (alreadyDistributed) {
+                return;
+            }
+        }
         if (dev->deviceType == "cuda" || dev->deviceType == "multicuda") {
             this->ToDevice(DataDevice::CUDA, dev->deviceIds, copyData);
         } else {
@@ -3679,7 +3704,8 @@ namespace fastllm {
 
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
-                float sharedScale, Data &output, int layer, MoeGateType gateType) {
+                float sharedScale, Data &output, int layer, MoeGateType gateType,
+                bool expertParallel) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
@@ -3687,7 +3713,9 @@ namespace fastllm {
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
         }, {{"sharedScale", sharedScale}}, 
-                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}, {"layer", layer}, {"gateType", (int)gateType}});
+                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
+                                         {"layer", layer}, {"gateType", (int)gateType},
+                                         {"expertParallel", expertParallel ? 1 : 0}});
     }
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
