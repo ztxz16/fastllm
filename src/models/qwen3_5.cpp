@@ -15840,6 +15840,25 @@ namespace fastllm {
                         (int)positionIds.size() == batch &&
                         (int)sampleRows.size() == batch,
                         "Qwen3.5 batched MTP draft input size mismatch.\n");
+        if (batch == 1) {
+            AssertInFastLLM(caches[0] != nullptr &&
+                            targetHiddenStates[0] != nullptr &&
+                            positionIds[0] != nullptr &&
+                            !inputTokens[0].empty(),
+                            "Qwen3.5 single-request MTP draft got null input.\n");
+            Data singleHidden;
+            int draft = RunMtpGreedyDraft(
+                device, draftDevices, *caches[0], *targetHiddenStates[0],
+                inputTokens[0], *positionIds[0], sampleRows[0],
+                sampledHiddenStates != nullptr ? &singleHidden : nullptr,
+                false);
+            if (sampledHiddenStates != nullptr) {
+                sampledHiddenStates->clear();
+                sampledHiddenStates->resize(1);
+                (*sampledHiddenStates)[0].CopyFrom(singleHidden);
+            }
+            return std::vector<int>{draft};
+        }
         PrepareMtpWeightsForDevice(device, !tensorParallelDraft);
         AssertInFastLLM(HasMtpWeights(), "Qwen3.5 MTP weights are missing.\n");
 
@@ -16470,7 +16489,7 @@ namespace fastllm {
         std::vector<float> localBestScores(draftDevices.size(), -1.0e30f);
         std::vector<int> localBestReady(draftDevices.size(), 0);
         std::vector<std::exception_ptr> errors(draftDevices.size());
-        threadTpWorkerGroup.Run(draftDevices, [&](int r) {
+        threadTpWorkerGroup.RunWithCaller(draftDevices, [&](int r) {
             int localDevice = draftDevices[r];
             auto hiddenIt = replicatedHidden.multiDeviceDatas.find(localDevice);
             auto weightIt = lmHead.multiDeviceDatas.find(localDevice);

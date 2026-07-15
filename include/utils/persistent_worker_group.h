@@ -46,6 +46,7 @@ namespace fastllm {
                 currentErrors = &errors;
                 activeCount = (int)workerKeys.size();
                 finishedCount = 0;
+                skippedWorkerRank = -1;
                 taskId++;
             }
             cv.notify_all();
@@ -58,6 +59,54 @@ namespace fastllm {
                 currentErrors = nullptr;
                 activeCount = 0;
                 finishedCount = 0;
+                skippedWorkerRank = -1;
+            }
+        }
+
+        // Run rank 0 on the submitting thread while the persistent workers run
+        // the remaining ranks. This keeps the root CUDA work on the caller's
+        // per-thread stream and avoids a worker hand-off on latency-sensitive
+        // tensor-parallel paths.
+        void RunWithCaller(const std::vector<int> &workerKeys,
+                           const std::function<void(int)> &task,
+                           std::vector<std::exception_ptr> &errors) {
+            if (workerKeys.empty()) {
+                return;
+            }
+
+            std::lock_guard<std::mutex> submitGuard(submitMutex);
+            EnsureLocked(workerKeys);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                currentTask = task;
+                currentErrors = &errors;
+                activeCount = (int)workerKeys.size();
+                finishedCount = 0;
+                skippedWorkerRank = 0;
+                taskId++;
+            }
+            cv.notify_all();
+
+            std::exception_ptr callerError;
+            try {
+                task(0);
+            } catch (...) {
+                callerError = std::current_exception();
+            }
+            if (!errors.empty()) {
+                errors[0] = callerError;
+            }
+
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                doneCv.wait(lock, [&]() {
+                    return finishedCount >= activeCount;
+                });
+                currentTask = nullptr;
+                currentErrors = nullptr;
+                activeCount = 0;
+                finishedCount = 0;
+                skippedWorkerRank = -1;
             }
         }
 
@@ -80,6 +129,7 @@ namespace fastllm {
                 taskId = 0;
                 activeCount = 0;
                 finishedCount = 0;
+                skippedWorkerRank = -1;
             }
 
             std::vector<std::thread> nextWorkers;
@@ -125,6 +175,7 @@ namespace fastllm {
                     taskId = 0;
                     activeCount = 0;
                     finishedCount = 0;
+                    skippedWorkerRank = -1;
                     return;
                 }
                 stop = true;
@@ -145,6 +196,7 @@ namespace fastllm {
                 taskId = 0;
                 activeCount = 0;
                 finishedCount = 0;
+                skippedWorkerRank = -1;
             }
         }
 
@@ -153,6 +205,7 @@ namespace fastllm {
             while (true) {
                 std::function<void(int)> task;
                 std::vector<std::exception_ptr> *errors = nullptr;
+                bool skipTask = false;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
                     cv.wait(lock, [&]() {
@@ -164,18 +217,22 @@ namespace fastllm {
                     lastTaskId = taskId;
                     task = currentTask;
                     errors = currentErrors;
+                    skipTask = rank == skippedWorkerRank;
                 }
 
                 std::exception_ptr error;
-                try {
-                    task(rank);
-                } catch (...) {
-                    error = std::current_exception();
+                if (!skipTask) {
+                    try {
+                        task(rank);
+                    } catch (...) {
+                        error = std::current_exception();
+                    }
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if (errors != nullptr && rank >= 0 && rank < (int)errors->size()) {
+                    if (!skipTask && errors != nullptr &&
+                        rank >= 0 && rank < (int)errors->size()) {
                         (*errors)[rank] = error;
                     }
                     finishedCount++;
@@ -197,6 +254,7 @@ namespace fastllm {
         uint64_t taskId = 0;
         int activeCount = 0;
         int finishedCount = 0;
+        int skippedWorkerRank = -1;
         bool stop = false;
     };
 }
