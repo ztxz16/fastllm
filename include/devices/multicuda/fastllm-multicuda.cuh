@@ -17,6 +17,15 @@ using DivisionScheme = std::map <int, std::vector <std::pair <int, int> > >;
 bool FastllmInitNccl(const std::vector<int>& devices);
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId);
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
+// Returns whether the TP=2 peer-access fast path can be used for this tensor.
+// Callers use this preflight to preserve their existing NCCL fallback without
+// first changing the reduction's compute or accumulation order.
+bool FastllmCanUseTP2P2PAllReduceAdd(int count, int dataType, int deviceId);
+// Computes dest = allreduce(data) + dest over CUDA peer access. This keeps TP
+// ranks on an identical pre-reduction path and folds the replicated residual
+// addition into the communication kernel. Returns false without modifying the
+// tensors when the topology, data type or runtime state is not suitable.
+bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count, int dataType, int deviceId);
 void FastllmCudaSyncDevice(int deviceId);
 
 std::vector <int> FastllmMultiCudaGetSplitPoints(std::vector <int> &multiCudaCurrentDevices, std::map <int, int> &multiCudaCurrentRatios, int total, int unit);

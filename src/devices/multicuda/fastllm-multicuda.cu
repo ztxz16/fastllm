@@ -5,6 +5,7 @@
 #include <cuda_profiler_api.h>
 #include <cublas_v2.h>
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -15,6 +16,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <mutex>
 #include <set>
 
 #include "fastllm-cuda.cuh"
@@ -1880,6 +1883,368 @@ static bool FastllmNcclPostSyncEnabled(cudaStream_t stream) {
     }
     if (captureStatus != cudaStreamCaptureStatusNone) {
         return false;
+    }
+    return true;
+}
+
+namespace {
+
+// Speculative verification uses 2--4 rows of hidden states. At TP=2 these
+// tensors are only tens of KiB, where NCCL launch/protocol latency is larger
+// than the actual peer transfer. Keep this path deliberately narrow: single
+// process, two peer-accessible CUDA devices, residual-fused reductions, and
+// tensors large enough to be the multi-token verification path. Everything
+// else uses the existing NCCL implementation.
+constexpr int FASTLLM_TP2_P2P_MIN_ELEMENTS = 4096;
+constexpr int FASTLLM_TP2_P2P_MAX_ELEMENTS = 65536;
+constexpr int FASTLLM_TP2_P2P_MAX_BLOCKS = 36;
+
+struct alignas(128) FastllmTP2P2PSignal {
+    // Two synchronization points and two alternating slots prevent a faster
+    // rank from overwriting a flag before its peer has observed it.
+    uint32_t flags[2][2][FASTLLM_TP2_P2P_MAX_BLOCKS][2];
+    uint64_t inputPointers[2][FASTLLM_TP2_P2P_MAX_BLOCKS][2];
+};
+
+struct FastllmTP2P2PState {
+    std::mutex initMutex;
+    bool initialized = false;
+    bool available = false;
+    int devices[2] = {-1, -1};
+    FastllmTP2P2PSignal *signals[2] = {nullptr, nullptr};
+    std::atomic<uint32_t> sequence[2];
+
+    FastllmTP2P2PState() {
+        sequence[0].store(0, std::memory_order_relaxed);
+        sequence[1].store(0, std::memory_order_relaxed);
+    }
+};
+
+FastllmTP2P2PState &FastllmGetTP2P2PState() {
+    static FastllmTP2P2PState state;
+    return state;
+}
+
+bool FastllmTP2P2PEnabled() {
+    static bool enabled = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_TP2_P2P_ALLREDUCE");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        std::string value(env);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return value != "0" && value != "false" && value != "off" &&
+               value != "no";
+    }();
+    return enabled;
+}
+
+__device__ __forceinline__ void FastllmTP2StoreRelease(uint32_t *address,
+                                                       uint32_t value) {
+    // Like vLLM's one-stage custom all-reduce, this barrier only coordinates
+    // kernel progress; it does not publish preceding writes.
+    asm volatile("st.volatile.global.u32 [%1], %0;" ::
+                 "r"(value), "l"(address));
+}
+
+__device__ __forceinline__ uint32_t FastllmTP2LoadAcquire(
+        const uint32_t *address) {
+    uint32_t value;
+    asm volatile("ld.volatile.global.u32 %0, [%1];" :
+                 "=r"(value) : "l"(address));
+    return value;
+}
+
+__device__ __forceinline__ void FastllmTP2StoreReleaseSystem(
+        uint32_t *address, uint32_t value) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    asm volatile("st.release.sys.global.u32 [%1], %0;" ::
+                 "r"(value), "l"(address));
+#else
+    asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::
+                 "r"(value), "l"(address));
+#endif
+}
+
+__device__ __forceinline__ uint32_t FastllmTP2LoadAcquireSystem(
+        const uint32_t *address) {
+    uint32_t value;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" :
+                 "=r"(value) : "l"(address));
+#else
+    asm volatile("ld.volatile.global.u32 %0, [%1]; membar.gl;" :
+                 "=r"(value) : "l"(address));
+#endif
+    return value;
+}
+
+template <typename T>
+__device__ __forceinline__ T FastllmTP2AddValue(T a, T b);
+
+template <>
+__device__ __forceinline__ half FastllmTP2AddValue(half a, half b) {
+    return __hadd(a, b);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 FastllmTP2AddValue(
+        __nv_bfloat16 a, __nv_bfloat16 b) {
+    return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
+}
+
+template <>
+__device__ __forceinline__ float FastllmTP2AddValue(float a, float b) {
+    return a + b;
+}
+
+template <typename T>
+struct alignas(16) FastllmTP2Packed {
+    T values[16 / sizeof(T)];
+};
+
+template <typename T>
+__global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceAddDirectKernel(
+        T *dst, const T *residual, const T *localInput, int count,
+        FastllmTP2P2PSignal *selfSignal,
+        FastllmTP2P2PSignal *peerSignal,
+        int rank, uint32_t sequence) {
+    const int peerRank = 1 - rank;
+    const int slot = sequence & 1;
+    if (threadIdx.x == 0) {
+        peerSignal->inputPointers[slot][blockIdx.x][rank] =
+            (uint64_t)(uintptr_t)localInput;
+        // The pointer is published by this kernel. A system release/acquire
+        // pair makes that remote pointer visible before either rank
+        // dereferences it.
+        FastllmTP2StoreReleaseSystem(
+            &peerSignal->flags[0][slot][blockIdx.x][rank], sequence);
+        while (FastllmTP2LoadAcquireSystem(
+                   &selfSignal->flags[0][slot][blockIdx.x][peerRank]) !=
+               sequence) {
+        }
+    }
+    __syncthreads();
+
+    using Packed = FastllmTP2Packed<T>;
+    constexpr int valuesPerPack = 16 / sizeof(T);
+    const int packedCount = count / valuesPerPack;
+    Packed *packedDst = (Packed*)dst;
+    const Packed *packedResidual = (const Packed*)residual;
+    const Packed *packedLocal = (const Packed*)localInput;
+    const Packed *packedPeer = (const Packed*)(uintptr_t)
+        selfSignal->inputPointers[slot][blockIdx.x][peerRank];
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < packedCount; index += gridDim.x * blockDim.x) {
+        Packed localValue = packedLocal[index];
+        Packed peerValue = packedPeer[index];
+        Packed rank0 = rank == 0 ? localValue : peerValue;
+        Packed rank1 = rank == 0 ? peerValue : localValue;
+        Packed residualValue = packedResidual[index];
+#pragma unroll
+        for (int i = 0; i < valuesPerPack; i++) {
+            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
+                                                 rank1.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
+                                                 residualValue.values[i]);
+        }
+        packedDst[index] = rank0;
+    }
+
+    // Keep localInput alive until the peer has completed all remote reads.
+    // No memory publication is needed here, so the lightweight final barrier
+    // is sufficient and matches vLLM's one-stage all-reduce protocol.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        FastllmTP2StoreRelease(
+            &peerSignal->flags[1][slot][blockIdx.x][rank], sequence);
+        while (FastllmTP2LoadAcquire(
+                   &selfSignal->flags[1][slot][blockIdx.x][peerRank]) !=
+               sequence) {
+        }
+    }
+}
+
+bool FastllmInitTP2P2PState(FastllmTP2P2PState &state) {
+    std::lock_guard<std::mutex> guard(state.initMutex);
+    if (state.initialized) {
+        return state.available;
+    }
+    if (!FastllmTP2P2PEnabled()) {
+        state.initialized = true;
+        return false;
+    }
+    // NCCL establishes the rank-to-device mapping. If it is not ready yet,
+    // leave initialization retryable rather than permanently disabling the
+    // fast path during model warmup.
+    if (g_ncclWorldSize != 2 || g_ncclRanks.size() != 2) {
+        return false;
+    }
+
+    for (auto &it : g_ncclRanks) {
+        if (it.second < 0 || it.second >= 2) {
+            state.initialized = true;
+            return false;
+        }
+        state.devices[it.second] = it.first;
+    }
+    if (state.devices[0] < 0 || state.devices[1] < 0) {
+        state.initialized = true;
+        return false;
+    }
+
+    int canAccess01 = 0, canAccess10 = 0;
+    if (cudaDeviceCanAccessPeer(&canAccess01, state.devices[0], state.devices[1]) != cudaSuccess ||
+        cudaDeviceCanAccessPeer(&canAccess10, state.devices[1], state.devices[0]) != cudaSuccess ||
+        !canAccess01 || !canAccess10) {
+        cudaGetLastError();
+        state.initialized = true;
+        return false;
+    }
+
+    int oldDevice = 0;
+    cudaGetDevice(&oldDevice);
+    bool ok = true;
+    for (int rank = 0; rank < 2; rank++) {
+        cudaSetDevice(state.devices[rank]);
+        cudaError_t peerState = cudaDeviceEnablePeerAccess(state.devices[1 - rank], 0);
+        if (peerState == cudaErrorPeerAccessAlreadyEnabled) {
+            cudaGetLastError();
+        } else if (peerState != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+        if (cudaMalloc((void**)&state.signals[rank],
+                       sizeof(FastllmTP2P2PSignal)) != cudaSuccess ||
+            cudaMemset(state.signals[rank], 0,
+                       sizeof(FastllmTP2P2PSignal)) != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+    }
+
+    if (!ok) {
+        for (int rank = 0; rank < 2; rank++) {
+            if (state.devices[rank] < 0) {
+                continue;
+            }
+            cudaSetDevice(state.devices[rank]);
+            if (state.signals[rank] != nullptr) {
+                cudaFree(state.signals[rank]);
+                state.signals[rank] = nullptr;
+            }
+        }
+    }
+    cudaSetDevice(oldDevice);
+    state.available = ok;
+    state.initialized = true;
+    if (state.available) {
+        printf("[Fastllm] TP2 P2P small-tensor allreduce enabled for cuda:%d,%d.\n",
+               state.devices[0], state.devices[1]);
+        fflush(stdout);
+    }
+    return state.available;
+}
+
+template <typename T>
+void FastllmLaunchTP2P2PReduceAddDirect(
+        T *dst, const T *residual, const T *localInput, int count,
+        FastllmTP2P2PSignal *selfSignal,
+        FastllmTP2P2PSignal *peerSignal,
+        int rank, uint32_t sequence, cudaStream_t stream) {
+    constexpr int valuesPerPack = 16 / sizeof(T);
+    int packedCount = count / valuesPerPack;
+    int blocks = std::max(1, std::min(FASTLLM_TP2_P2P_MAX_BLOCKS,
+                                     (packedCount + 511) / 512));
+    FastllmTP2P2PReduceAddDirectKernel<T><<<blocks, 512, 0, stream>>>(
+        dst, residual, localInput, count,
+        selfSignal, peerSignal, rank, sequence);
+}
+
+} // namespace
+
+static bool FastllmCanUseTP2P2PAllReduceAddImpl(
+        int count, int dataType, int deviceId, int *rankOut) {
+    if (count < FASTLLM_TP2_P2P_MIN_ELEMENTS ||
+        count > FASTLLM_TP2_P2P_MAX_ELEMENTS ||
+        ((size_t)count * (dataType == fastllm::DataType::FLOAT32
+             ? sizeof(float) : sizeof(uint16_t))) % 16 != 0 ||
+        (dataType != fastllm::DataType::FLOAT16 &&
+         dataType != fastllm::DataType::BFLOAT16 &&
+         dataType != fastllm::DataType::FLOAT32) ||
+        FastllmCudaGetNcclForceSync() || fastllm::GetFastllmEnv().cudaGraph) {
+        return false;
+    }
+
+    FastllmTP2P2PState &state = FastllmGetTP2P2PState();
+    if (!FastllmInitTP2P2PState(state)) {
+        return false;
+    }
+    auto rankIt = g_ncclRanks.find(deviceId);
+    if (rankIt == g_ncclRanks.end() || rankIt->second < 0 || rankIt->second >= 2) {
+        static std::atomic<bool> loggedMissingRank(false);
+        if (!loggedMissingRank.exchange(true)) {
+            printf("[Fastllm] TP2 P2P rank lookup failed for cuda:%d.\n", deviceId);
+        }
+        return false;
+    }
+    if (rankOut != nullptr) {
+        *rankOut = rankIt->second;
+    }
+    return true;
+}
+
+bool FastllmCanUseTP2P2PAllReduceAdd(int count, int dataType, int deviceId) {
+    return FastllmCanUseTP2P2PAllReduceAddImpl(
+        count, dataType, deviceId, nullptr);
+}
+
+bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count,
+                                  int dataType, int deviceId) {
+    if (data == nullptr || dest == nullptr) {
+        return false;
+    }
+
+    int rank = -1;
+    if (!FastllmCanUseTP2P2PAllReduceAddImpl(
+            count, dataType, deviceId, &rank)) {
+        return false;
+    }
+    FastllmTP2P2PState &state = FastllmGetTP2P2PState();
+    uint32_t sequence = state.sequence[rank].fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    cudaSetDevice(deviceId);
+    cudaStream_t stream = cudaStreamPerThread;
+    if (dataType == fastllm::DataType::FLOAT16) {
+        FastllmLaunchTP2P2PReduceAddDirect(
+            (half*)dest, (const half*)dest, (const half*)data, count,
+            state.signals[rank], state.signals[1 - rank],
+            rank, sequence, stream);
+    } else if (dataType == fastllm::DataType::BFLOAT16) {
+        FastllmLaunchTP2P2PReduceAddDirect(
+            (__nv_bfloat16*)dest, (const __nv_bfloat16*)dest,
+            (const __nv_bfloat16*)data, count,
+            state.signals[rank], state.signals[1 - rank],
+            rank, sequence, stream);
+    } else {
+        FastllmLaunchTP2P2PReduceAddDirect(
+            (float*)dest, (const float*)dest, (const float*)data, count,
+            state.signals[rank], state.signals[1 - rank],
+            rank, sequence, stream);
+    }
+    cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess) {
+        printf("[Fastllm] TP2 P2P allreduce-add launch failed on cuda:%d (%s).\n",
+               deviceId, cudaGetErrorString(result));
+        FastllmCudaSetThreadError();
     }
     return true;
 }

@@ -6045,13 +6045,20 @@ namespace fastllm {
                     Qwen3CudaToDataType(cudaRunner, partial, buf.hiddenStates.dataType);
                 }
                 if (tensorParallel) {
-                    if (firstTensorParallelRank) {
-                        Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
-                    } else {
-                        Qwen35CudaCopyTensor(cudaRunner, partial, buf.hiddenStates);
+                    if (!Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                            partial, buf.hiddenStates, gpuId)) {
+                        if (firstTensorParallelRank) {
+                            Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
+                        } else {
+                            Qwen35CudaCopyTensor(
+                                cudaRunner, partial, buf.hiddenStates);
+                        }
+                        FastllmNcclAllReduce(
+                            buf.hiddenStates.cudaData,
+                            buf.hiddenStates.cudaData,
+                            buf.hiddenStates.Count(0),
+                            buf.hiddenStates.dataType, gpuId);
                     }
-                    FastllmNcclAllReduce(buf.hiddenStates.cudaData, buf.hiddenStates.cudaData,
-                                         buf.hiddenStates.Count(0), buf.hiddenStates.dataType, gpuId);
                 } else {
                     Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
                 }
@@ -6125,7 +6132,8 @@ namespace fastllm {
                             *requireLocal(weight[oWeightName], oWeightName),
                             *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
                             buf.attenLastOutput, buf.hiddenStates,
-                            tensorParallel, firstTensorParallelRank, gpuId);
+                            tensorParallel, firstTensorParallelRank, gpuId,
+                            true);
                     } else {
                         Qwen35ZeroCudaLike(buf.attenLastOutput, buf.hiddenStates, gpuId);
                         addPartialToResidualReduce(buf.attenLastOutput);
@@ -6352,7 +6360,7 @@ namespace fastllm {
                         *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                       outProjWeightName + ".tp_bias"),
                         buf.attenLastOutput, buf.hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId);
+                        tensorParallel, firstTensorParallelRank, gpuId, true);
                 }
 
                 Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
@@ -6377,7 +6385,8 @@ namespace fastllm {
                             cudaRunner, buf.swigluResult,
                             downWeight, downBias,
                             buf.mlpPart, buf.hiddenStates,
-                            tensorParallel, firstTensorParallelRank, gpuId);
+                            tensorParallel, firstTensorParallelRank, gpuId,
+                            true);
                     }
                     continue;
                 }
@@ -6760,13 +6769,18 @@ namespace fastllm {
                 Qwen3CudaToDataType(cudaRunner, partial, hiddenStates.dataType);
             }
             if (tensorParallel) {
-                if (firstTensorParallelRank) {
-                    Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
-                } else {
-                    Qwen35CudaCopyTensor(cudaRunner, partial, hiddenStates);
+                if (!Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                        partial, hiddenStates, gpuId)) {
+                    if (firstTensorParallelRank) {
+                        Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
+                    } else {
+                        Qwen35CudaCopyTensor(
+                            cudaRunner, partial, hiddenStates);
+                    }
+                    FastllmNcclAllReduce(
+                        hiddenStates.cudaData, hiddenStates.cudaData,
+                        hiddenStates.Count(0), hiddenStates.dataType, gpuId);
                 }
-                FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
-                                     hiddenStates.Count(0), hiddenStates.dataType, gpuId);
             } else {
                 Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
             }
@@ -6837,7 +6851,7 @@ namespace fastllm {
                         *requireLocal(weight[oWeightName], oWeightName),
                         *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
                         attenLastOutput, hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId);
+                        tensorParallel, firstTensorParallelRank, gpuId, true);
                 } else {
                     Qwen35ZeroCudaLike(attenLastOutput, hiddenStates, gpuId);
                     addPartialToResidualReduce(attenLastOutput);
@@ -7800,7 +7814,7 @@ namespace fastllm {
                     *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                   outProjWeightName + ".tp_bias"),
                     attenLastOutput, hiddenStates,
-                    tensorParallel, firstTensorParallelRank, gpuId);
+                    tensorParallel, firstTensorParallelRank, gpuId, true);
             }
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
@@ -7824,7 +7838,7 @@ namespace fastllm {
                         cudaRunner, swigluResult,
                         downWeight, downBias,
                         mlpPart, hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId);
+                        tensorParallel, firstTensorParallelRank, gpuId, true);
                 }
                 continue;
             }

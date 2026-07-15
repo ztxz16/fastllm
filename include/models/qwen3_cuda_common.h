@@ -425,6 +425,17 @@ namespace fastllm {
                    FloatDict{{"alpha", alpha}}, IntDict());
     }
 
+    inline bool Qwen3CudaTryTP2P2PAllReduceAddResidual(
+            Data &partial, Data &hiddenStates, int gpuId) {
+        AssertInFastLLM(partial.dataType == hiddenStates.dataType &&
+                        partial.Count(0) == hiddenStates.Count(0),
+                        "Qwen3CudaTryTP2P2PAllReduceAddResidual got "
+                        "incompatible tensors.\n");
+        return FastllmTryTP2P2PAllReduceAdd(
+            partial.cudaData, hiddenStates.cudaData,
+            hiddenStates.Count(0), (int)hiddenStates.dataType, gpuId);
+    }
+
     inline void Qwen3CudaSoftmax(Qwen3CudaDirectRunner &runner,
                                  const Data &input, Data &output, int axis) {
         runner.Run("SoftMax",
@@ -466,14 +477,26 @@ namespace fastllm {
             Data &input, Data &weight, Data &bias,
             Data &middle, Data &hiddenStates,
             bool tensorParallel, bool firstTensorParallelRank,
-            int gpuId) {
+            int gpuId, bool enableTP2P2PAllReduce = false) {
         DataType residualType = hiddenStates.dataType;
         bool canAddDirectly = input.dataType == residualType;
+
+        if (tensorParallel && enableTP2P2PAllReduce &&
+            FastllmCanUseTP2P2PAllReduceAdd(
+                hiddenStates.Count(0), (int)residualType, gpuId)) {
+            Qwen3CudaLinear(runner, input, weight, bias, middle);
+            Qwen3CudaToDataType(runner, middle, residualType);
+            if (Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                    middle, hiddenStates, gpuId)) {
+                return;
+            }
+        }
 
         if (tensorParallel) {
             if (firstTensorParallelRank) {
                 if (canAddDirectly) {
-                    Qwen3CudaLinearAddBlock(runner, &input, &weight, &bias, &middle, &hiddenStates);
+                    Qwen3CudaLinearAddBlock(runner, &input, &weight, &bias,
+                                            &middle, &hiddenStates);
                 } else {
                     Qwen3CudaLinear(runner, input, weight, bias, middle);
                     Qwen3CudaToDataType(runner, middle, residualType);
@@ -484,7 +507,8 @@ namespace fastllm {
                 Qwen3CudaToDataType(runner, hiddenStates, residualType);
             }
             FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
-                                 hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+                                 hiddenStates.Count(0), hiddenStates.dataType,
+                                 gpuId);
             return;
         }
 
