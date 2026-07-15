@@ -241,6 +241,15 @@ namespace fastllm {
         return enabled;
     }
 
+    static bool Qwen35MtpFp8DraftHeadEnabled() {
+        static bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_MTP_FP8_DRAFT_HEAD");
+            return env == nullptr || env[0] == '\0' ||
+                   Qwen35MoeIsTrueString(env);
+        }();
+        return enabled;
+    }
+
     static int Qwen35MtpProfileInterval() {
         static int interval = []() {
             const char *env = std::getenv("FASTLLM_QWEN35_MTP_PROFILE");
@@ -4825,6 +4834,15 @@ namespace fastllm {
         Qwen35EraseLinearPrefixSnapshots(this);
 #ifdef USE_CUDA
         Qwen35EraseCudaGraphDecodeStates(this);
+        int previousDevice = FastllmCudaGetDevice();
+        for (auto &it : mtpDraftLmHeadWeights) {
+            FastllmCudaSetDevice(it.first);
+            delete it.second;
+        }
+        mtpDraftLmHeadWeights.clear();
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
 #endif
     }
 
@@ -8625,6 +8643,7 @@ namespace fastllm {
                     threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
                     AssertInFastLLM(SplitMultiCudaWeight(lmHead, lmHeadBias, devCopy, threadTpLmHeadScheme, 0, true),
                                     "Qwen3.5 ForwardGPU failed to split lm_head.weight.\n");
+                    PrepareMtpDraftLmHeadWeights(devices);
 
                     threadTpPreparedDevices = devices;
                     threadTpPreparedRatios = ratios;
@@ -15775,6 +15794,78 @@ namespace fastllm {
 #endif
     }
 
+    void Qwen3_5Model::PrepareMtpDraftLmHeadWeights(
+            const std::vector<int> &devices) {
+#ifdef USE_CUDA
+        int previousDevice = FastllmCudaGetDevice();
+        auto restoreDevice = [&]() {
+            if (previousDevice >= 0) {
+                FastllmCudaSetDevice(previousDevice);
+            }
+        };
+        auto clearPrepared = [&]() {
+            for (auto &it : mtpDraftLmHeadWeights) {
+                FastllmCudaSetDevice(it.first);
+                delete it.second;
+            }
+            mtpDraftLmHeadWeights.clear();
+        };
+        clearPrepared();
+        if (devices.size() <= 1 || Qwen35MtpDisabledByEnv() ||
+            !Qwen35MtpFp8DraftHeadEnabled()) {
+            restoreDevice();
+            return;
+        }
+        auto lmHeadIt = weight.weight.find("lm_head.weight");
+        if (lmHeadIt == weight.weight.end() ||
+            !lmHeadIt->second.multiDeviceData) {
+            restoreDevice();
+            return;
+        }
+
+        size_t originalBytes = 0, quantizedBytes = 0;
+        for (int device : devices) {
+            auto localIt = lmHeadIt->second.multiDeviceDatas.find(device);
+            if (localIt == lmHeadIt->second.multiDeviceDatas.end() ||
+                localIt->second == nullptr ||
+                localIt->second->dataDevice != DataDevice::CUDA ||
+                localIt->second->cudaData == nullptr ||
+                localIt->second->dims.size() != 2 ||
+                localIt->second->dims[1] % 128 != 0 ||
+                (localIt->second->dataType != DataType::FLOAT16 &&
+                 localIt->second->dataType != DataType::BFLOAT16)) {
+                clearPrepared();
+                restoreDevice();
+                return;
+            }
+            Data *draftWeight = new Data(DataType::FP8_E4M3_BLOCK_128);
+            if (!FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
+                    *localIt->second, *draftWeight)) {
+                delete draftWeight;
+                clearPrepared();
+                restoreDevice();
+                return;
+            }
+            draftWeight->name = localIt->second->name + ".mtp_draft_fp8";
+            draftWeight->weightType = WeightType::LINEAR;
+            draftWeight->isModelWeight = true;
+            draftWeight->tpLinearType = localIt->second->tpLinearType;
+            draftWeight->tpPackType = localIt->second->tpPackType;
+            originalBytes += localIt->second->GetBytes();
+            quantizedBytes += draftWeight->GetBytes();
+            mtpDraftLmHeadWeights[device] = draftWeight;
+        }
+        printf("[Qwen3.5 MTP] FP8 draft lm_head prepared on %zu GPUs "
+               "(source retained: %.2f GB, extra FP8 copy: %.2f GB).\n",
+               mtpDraftLmHeadWeights.size(), originalBytes / 1.0e9,
+               quantizedBytes / 1.0e9);
+        fflush(stdout);
+        restoreDevice();
+#else
+        (void)devices;
+#endif
+    }
+
     Data Qwen3_5Model::BuildMtpPositionIds(const Data &positionIds, int row, int delta) {
         return BuildMtpPositionIdsSlice(positionIds, row, row + 1, delta);
     }
@@ -16188,9 +16279,15 @@ namespace fastllm {
                             biasIt != lmHeadBias.multiDeviceDatas.end() &&
                             biasIt->second != nullptr,
                             "Qwen3.5 batched MTP TP draft missing local lm_head data.\n");
+            Data *draftLmHead = weightIt->second;
+            auto draftWeightIt = mtpDraftLmHeadWeights.find(localDevice);
+            if (draftWeightIt != mtpDraftLmHeadWeights.end() &&
+                draftWeightIt->second != nullptr) {
+                draftLmHead = draftWeightIt->second;
+            }
             FastllmCudaSetDevice(localDevice);
             Qwen3CudaDirectRunner cudaRunner(localDevice);
-            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *weightIt->second,
+            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *draftLmHead,
                             *biasIt->second, localLogits[r]);
             Qwen3CudaToDataType(cudaRunner, localLogits[r], DataType::FLOAT32);
             Data localBestId(DataType::INT32), localBestScore(DataType::FLOAT32);
@@ -16501,9 +16598,15 @@ namespace fastllm {
                             biasIt != lmHeadBias.multiDeviceDatas.end() &&
                             biasIt->second != nullptr,
                             "Qwen3.5 MTP TP draft missing local lm_head data.\n");
+            Data *draftLmHead = weightIt->second;
+            auto draftWeightIt = mtpDraftLmHeadWeights.find(localDevice);
+            if (draftWeightIt != mtpDraftLmHeadWeights.end() &&
+                draftWeightIt->second != nullptr) {
+                draftLmHead = draftWeightIt->second;
+            }
             FastllmCudaSetDevice(localDevice);
             Qwen3CudaDirectRunner cudaRunner(localDevice);
-            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *weightIt->second,
+            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *draftLmHead,
                             *biasIt->second, localLogits[r]);
             Qwen3CudaToDataType(cudaRunner, localLogits[r], DataType::FLOAT32);
             Data localBestId(DataType::INT32), localBestScore(DataType::FLOAT32);

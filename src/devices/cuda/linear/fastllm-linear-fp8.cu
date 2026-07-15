@@ -6,6 +6,7 @@
 #include "fastllm.h"
 
 #include <cstdlib>
+#include <cuda_fp8.h>
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -19,6 +20,129 @@ typedef union __align__(16) _union_bf16_4_fp8 {
       // Do nothing
     }
 } union_bf16_4_fp8;
+
+template <typename T>
+__device__ __forceinline__ float FastllmFp8QuantLoad(const T *input,
+                                                     size_t index);
+
+template <>
+__device__ __forceinline__ float FastllmFp8QuantLoad(
+        const half *input, size_t index) {
+    return __half2float(input[index]);
+}
+
+template <>
+__device__ __forceinline__ float FastllmFp8QuantLoad(
+        const __nv_bfloat16 *input, size_t index) {
+    return __bfloat162float(input[index]);
+}
+
+template <typename T>
+__global__ void FastllmQuantizeLinearWeightFP8E4M3Block128Kernel(
+        const T *input, uint8_t *output, int rows, int columns,
+        int packedRowBytes, int blocksPerRow, int totalBlocks) {
+    constexpr int warpsPerBlock = 8;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    int tile = blockIdx.x * warpsPerBlock + warp;
+    const int tileStride = gridDim.x * warpsPerBlock;
+
+    for (; tile < totalBlocks; tile += tileStride) {
+        int row = tile / blocksPerRow;
+        int columnBlock = tile - row * blocksPerRow;
+        int columnStart = columnBlock * 128;
+        float localMax = 0.0f;
+#pragma unroll
+        for (int i = lane; i < 128; i += 32) {
+            float value = FastllmFp8QuantLoad(
+                input, (size_t)row * columns + columnStart + i);
+            localMax = fmaxf(localMax, fabsf(value));
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            localMax = fmaxf(
+                localMax, __shfl_down_sync(0xffffffff, localMax, offset));
+        }
+        float scale = __shfl_sync(0xffffffff, localMax, 0) / 448.0f;
+        if (!(scale > 0.0f)) {
+            scale = 1.0f;
+        }
+
+        uint8_t *packedBlock = output + (size_t)row * packedRowBytes +
+                               (size_t)columnBlock * (128 + sizeof(float));
+        if (lane == 0) {
+            *reinterpret_cast<float*>(packedBlock + 128) = scale;
+        }
+        float inverseScale = 1.0f / scale;
+#pragma unroll
+        for (int i = lane; i < 128; i += 32) {
+            float value = FastllmFp8QuantLoad(
+                input, (size_t)row * columns + columnStart + i);
+            packedBlock[i] = (uint8_t)__nv_cvt_float_to_fp8(
+                value * inverseScale, __NV_SATFINITE, __NV_E4M3);
+        }
+    }
+}
+
+bool FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
+        const fastllm::Data &input, fastllm::Data &output) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || input.dims.size() != 2 ||
+        input.dims[0] <= 0 || input.dims[1] <= 0 ||
+        input.dims[1] % 128 != 0 ||
+        (input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16) ||
+        input.dataDeviceIds.empty()) {
+        return false;
+    }
+
+    int device = input.dataDeviceIds[0];
+    cudaSetDevice(device);
+    output.FreeSpace();
+    output.dataType = fastllm::DataType::FP8_E4M3_BLOCK_128;
+    output.UpdateUnitSize();
+    output.dataDevice = fastllm::DataDevice::CUDA;
+    output.dataDeviceIds = {device};
+    output.Resize(input.dims);
+    output.Allocate(false);
+    if (output.cudaData == nullptr) {
+        return false;
+    }
+
+    int rows = input.dims[0];
+    int columns = input.dims[1];
+    int blocksPerRow = columns / 128;
+    int packedRowBytes = columns + blocksPerRow * (int)sizeof(float);
+    int totalBlocks = rows * blocksPerRow;
+    cudaDeviceProp properties;
+    if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+        cudaGetLastError();
+        output.FreeSpace();
+        return false;
+    }
+    int grid = std::max(1, std::min(totalBlocks,
+                                    properties.multiProcessorCount * 8));
+    if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmQuantizeLinearWeightFP8E4M3Block128Kernel<<<grid, 256>>>(
+            (const half*)input.cudaData, (uint8_t*)output.cudaData,
+            rows, columns, packedRowBytes, blocksPerRow, totalBlocks);
+    } else {
+        FastllmQuantizeLinearWeightFP8E4M3Block128Kernel<<<grid, 256>>>(
+            (const __nv_bfloat16*)input.cudaData, (uint8_t*)output.cudaData,
+            rows, columns, packedRowBytes, blocksPerRow, totalBlocks);
+    }
+    cudaError_t state = cudaGetLastError();
+    if (state == cudaSuccess) {
+        state = cudaDeviceSynchronize();
+    }
+    if (state != cudaSuccess) {
+        printf("Error: FP8 draft lm_head quantization failed on cuda:%d (%s).\n",
+               device, cudaGetErrorString(state));
+        output.FreeSpace();
+        return false;
+    }
+    return true;
+}
 
 __global__ void FastllmCudaFP8E4M3BLOCK1282HalfKernel(uint8_t* a, half *b) {
     unsigned int tid = threadIdx.x;
