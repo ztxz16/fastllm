@@ -1946,6 +1946,168 @@ namespace {
                         "CUDA INT4_GROUP batch-1 fused MoE graph downstream consumer");
         FastllmCudaGraphExecDestroy(graphExec);
         FastllmCudaGraphDestroy(graph);
+
+        const int smallBatch = 4;
+        std::vector<float> batchInputValues((size_t)smallBatch * hidden);
+        for (int b = 0; b < smallBatch; b++) {
+            for (int x = 0; x < hidden; x++) {
+                batchInputValues[(size_t)b * hidden + x] =
+                    inputValues[x] * (0.75f + 0.125f * b) +
+                    (float)(b - 1) / 64.0f;
+            }
+        }
+        const std::vector<int32_t> batchRouteIndices = {
+            1, 3,
+            0, 2,
+            3, 1,
+            2, 0
+        };
+        const std::vector<float> batchRouteScores = {
+            0.625f, 0.375f,
+            0.55f, 0.45f,
+            0.2f, 0.8f,
+            0.7f, 0.3f
+        };
+        std::vector<float> batchExpected((size_t)smallBatch * hidden, 0.0f);
+        for (int b = 0; b < smallBatch; b++) {
+            const float *rowInput = batchInputValues.data() + (size_t)b * hidden;
+            for (int route = 0; route < topk; route++) {
+                int routed = b * topk + route;
+                int expert = batchRouteIndices[routed];
+                std::vector<float> middle(inter);
+                for (int j = 0; j < inter; j++) {
+                    float gate = 0.0f, up = 0.0f;
+                    for (int x = 0; x < hidden; x++) {
+                        gate += rowInput[x] *
+                                gateupFloat[expert][(size_t)j * hidden + x];
+                        up += rowInput[x] *
+                              gateupFloat[expert][(size_t)(inter + j) * hidden + x];
+                    }
+                    middle[j] = (gate / (1.0f + std::exp(-gate))) * up;
+                }
+                for (int out = 0; out < hidden; out++) {
+                    float value = 0.0f;
+                    for (int j = 0; j < inter; j++) {
+                        value += middle[j] *
+                                 downFloat[expert][(size_t)out * inter + j];
+                    }
+                    batchExpected[(size_t)b * hidden + out] +=
+                        batchRouteScores[routed] * value;
+                }
+            }
+        }
+
+        fastllm::Data batchInput(fastllm::DataType::FLOAT16,
+                                 {smallBatch, hidden}, batchInputValues);
+        batchInput.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data batchIndex = MakeIntTensor(
+            {smallBatch, topk}, batchRouteIndices);
+        batchIndex.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data batchScore(fastllm::DataType::FLOAT32,
+                                 {smallBatch, topk}, batchRouteScores);
+        batchScore.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data batchScratch;
+        batchScratch.ToDevice(fastllm::DataDevice::CUDA,
+                              std::vector<int>{0}, false);
+        fastllm::Data batchOutput(fastllm::DataType::FLOAT16);
+        batchOutput.Resize({smallBatch, hidden});
+        batchOutput.ToDevice(fastllm::DataDevice::CUDA,
+                             std::vector<int>{0}, false);
+        batchOutput.Allocate(false);
+        ok = FastllmCudaHalfMergeMOEInt4GroupSmallBatchIndexed(
+            batchInput, batchScratch, batchOutput,
+            weights.data(), (int)weights.size(),
+            (const int32_t*)batchIndex.cudaData,
+            (const float*)batchScore.cudaData, smallBatch, topk);
+        Expect(ok, "CUDA INT4_GROUP small-batch fused MoE path was not selected.");
+        ExpectFloatNear(batchExpected, ToFloatVector(batchOutput),
+                        3e-2f, 3e-2f,
+                        "CUDA INT4_GROUP small-batch fused MoE");
+
+        std::vector<float> rowWiseOutput;
+        rowWiseOutput.reserve((size_t)smallBatch * hidden);
+        for (int b = 0; b < smallBatch; b++) {
+            std::vector<float> rowInputValues(
+                batchInputValues.begin() + (size_t)b * hidden,
+                batchInputValues.begin() + (size_t)(b + 1) * hidden);
+            std::vector<int32_t> rowIndices(
+                batchRouteIndices.begin() + b * topk,
+                batchRouteIndices.begin() + (b + 1) * topk);
+            std::vector<float> rowScores(
+                batchRouteScores.begin() + b * topk,
+                batchRouteScores.begin() + (b + 1) * topk);
+            fastllm::Data rowInput(fastllm::DataType::FLOAT16,
+                                   {1, hidden}, rowInputValues);
+            rowInput.ToDevice(fastllm::DataDevice::CUDA,
+                              std::vector<int>{0}, true);
+            fastllm::Data rowIndex = MakeIntTensor({1, topk}, rowIndices);
+            rowIndex.ToDevice(fastllm::DataDevice::CUDA,
+                              std::vector<int>{0}, true);
+            fastllm::Data rowScore(fastllm::DataType::FLOAT32,
+                                   {1, topk}, rowScores);
+            rowScore.ToDevice(fastllm::DataDevice::CUDA,
+                              std::vector<int>{0}, true);
+            fastllm::Data rowScratch;
+            rowScratch.ToDevice(fastllm::DataDevice::CUDA,
+                                std::vector<int>{0}, false);
+            fastllm::Data rowOutput(fastllm::DataType::FLOAT16);
+            rowOutput.Resize({1, hidden});
+            rowOutput.ToDevice(fastllm::DataDevice::CUDA,
+                               std::vector<int>{0}, false);
+            rowOutput.Allocate(false);
+            ok = FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(
+                rowInput, rowScratch, rowOutput,
+                weights.data(), (int)weights.size(),
+                (const int32_t*)rowIndex.cudaData,
+                (const float*)rowScore.cudaData, topk);
+            Expect(ok, "CUDA INT4_GROUP row-wise fused MoE path was not selected.");
+            std::vector<float> actualRow = ToFloatVector(rowOutput);
+            rowWiseOutput.insert(rowWiseOutput.end(),
+                                 actualRow.begin(), actualRow.end());
+        }
+        ExpectFloatNear(rowWiseOutput, ToFloatVector(batchOutput),
+                        1e-3f, 1e-3f,
+                        "CUDA INT4_GROUP small-batch versus row-wise fused MoE");
+
+        fastllm::Data fallbackIndex = MakeIntTensor(
+            {smallBatch, topk}, batchRouteIndices);
+        fallbackIndex.ToDevice(fastllm::DataDevice::CUDA,
+                               std::vector<int>{0}, true);
+        fastllm::Data fallbackScore(fastllm::DataType::FLOAT32,
+                                    {smallBatch, topk}, batchRouteScores);
+        fallbackScore.ToDevice(fastllm::DataDevice::CUDA,
+                               std::vector<int>{0}, true);
+        fastllm::Data fallbackW1, fallbackW2, fallbackW3;
+        fastllm::Data fallbackInput, fallbackIntermediate;
+        fastllm::Data fallbackOutput(fastllm::DataType::FLOAT16);
+        fallbackOutput.Resize({smallBatch, hidden});
+        fallbackOutput.ToDevice(fastllm::DataDevice::CUDA,
+                                std::vector<int>{0}, false);
+        std::vector<fastllm::Data*> biases(weights.size(), nullptr);
+
+        const char *oldSmallBatchEnv =
+            std::getenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH");
+        const bool hadSmallBatchEnv = oldSmallBatchEnv != nullptr;
+        const std::string oldSmallBatchEnvValue =
+            hadSmallBatchEnv ? oldSmallBatchEnv : "";
+        setenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH", "0", 1);
+        {
+            ScopedFirstDevice guard("cuda");
+            fastllm::MergeMOE(
+                batchInput, fallbackIndex, fallbackScore, weights, biases,
+                fallbackW1, fallbackW2, fallbackW3,
+                fallbackInput, fallbackIntermediate,
+                0.0f, fallbackOutput);
+        }
+        if (hadSmallBatchEnv) {
+            setenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH",
+                   oldSmallBatchEnvValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH");
+        }
+        ExpectFloatNear(ToFloatVector(fallbackOutput), ToFloatVector(batchOutput),
+                        0.0f, 0.0f,
+                        "CUDA INT4_GROUP small-batch fused versus generic MergeMOE");
     }
 
     void RunCudaInt8Batch1MoeRegression() {

@@ -1200,6 +1200,205 @@ namespace {
     }
 
     template <int WARPS_PER_BLOCK>
+    __global__ void FastllmCudaInt4GroupMoeGateupSwigluSmallBatchKernel(
+            const half *input,
+            const uint8_t *const *gateupWeights,
+            const half *scales,
+            const half *mins,
+            const int32_t *indices,
+            half *middle,
+            int batch, int topk, int expertCount, int hidden, int inter,
+            int gateupRows, int group, int groupCnt, bool useZeroPoint) {
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        const int task = blockIdx.x * WARPS_PER_BLOCK + warp;
+        const int totalTasks = batch * topk * inter;
+        if (task >= totalTasks) {
+            return;
+        }
+
+        const int routedRow = task / inter;
+        const int out = task - routedRow * inter;
+        const int inputRow = routedRow / topk;
+        const int expert = __ldg(indices + routedRow);
+        const half *rowInput = input + (size_t)inputRow * hidden;
+        float gateAcc = 0.0f;
+        float upAcc = 0.0f;
+        if (expert >= 0 && expert < expertCount) {
+            const uint8_t *weight = gateupWeights[expert];
+            if (weight != nullptr) {
+                const int gateRow = out;
+                const int upRow = inter + out;
+                const uint8_t *gateWeight = weight + (size_t)gateRow * hidden / 2;
+                const uint8_t *upWeight = weight + (size_t)upRow * hidden / 2;
+                const half *gateScales = scales + ((size_t)expert * gateupRows + gateRow) * group;
+                const half *gateMins = mins + ((size_t)expert * gateupRows + gateRow) * group;
+                const half *upScales = scales + ((size_t)expert * gateupRows + upRow) * group;
+                const half *upMins = mins + ((size_t)expert * gateupRows + upRow) * group;
+                const int units = hidden >> 4;
+                for (int unit = lane; unit < units; unit += 32) {
+                    const int x = unit << 4;
+                    const int gid = x / groupCnt;
+                    const float gateScale = __half2float(__ldg(gateScales + gid));
+                    const float gateMin = __half2float(__ldg(gateMins + gid));
+                    const float upScale = __half2float(__ldg(upScales + gid));
+                    const float upMin = __half2float(__ldg(upMins + gid));
+                    union_char8 gatePacked, upPacked;
+                    union_half8 input0, input1;
+                    gatePacked.in = *reinterpret_cast<const uint2*>(gateWeight + (size_t)unit * 8);
+                    upPacked.in = *reinterpret_cast<const uint2*>(upWeight + (size_t)unit * 8);
+                    input0.in = *reinterpret_cast<const uint4*>(rowInput + x);
+                    input1.in = *reinterpret_cast<const uint4*>(rowInput + x + 8);
+                    float gateSum = 0.0f;
+                    float upSum = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        const int pair = (i & 3) * 2;
+                        const float a0 = i < 4 ? __half2float(input0.out[pair])
+                                               : __half2float(input1.out[pair]);
+                        const float a1 = i < 4 ? __half2float(input0.out[pair + 1])
+                                               : __half2float(input1.out[pair + 1]);
+                        const uint8_t g0 = gatePacked.out[i];
+                        const uint8_t u0 = upPacked.out[i];
+                        gateSum += a0 * FastllmCudaDequantInt4GroupHalfValue(
+                            (float)(g0 >> 4), gateScale, gateMin, useZeroPoint);
+                        gateSum += a1 * FastllmCudaDequantInt4GroupHalfValue(
+                            (float)(g0 & 15), gateScale, gateMin, useZeroPoint);
+                        upSum += a0 * FastllmCudaDequantInt4GroupHalfValue(
+                            (float)(u0 >> 4), upScale, upMin, useZeroPoint);
+                        upSum += a1 * FastllmCudaDequantInt4GroupHalfValue(
+                            (float)(u0 & 15), upScale, upMin, useZeroPoint);
+                    }
+                    // Keep the same reduction grouping as the standalone
+                    // small-row INT4_GROUP GEMV used by the generic MoE path.
+                    gateAcc += gateSum;
+                    upAcc += upSum;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gateAcc += __shfl_down_sync(0xffffffff, gateAcc, offset);
+            upAcc += __shfl_down_sync(0xffffffff, upAcc, offset);
+        }
+        if (lane == 0) {
+            // The generic path materializes gate/up in FP16 before running its
+            // FP16 SwiGLU kernel. Preserve those rounding points for speculative
+            // multi-token validation.
+            half gateValue = __float2half_rn(gateAcc);
+            half upValue = __float2half_rn(upAcc);
+            half activated = __hmul(
+                __hdiv(gateValue,
+                       __hadd(__float2half(1.0f), hexp(-gateValue))),
+                upValue);
+            middle[(size_t)routedRow * inter + out] = activated;
+        }
+    }
+
+    template <int WARPS_PER_BLOCK>
+    __global__ void FastllmCudaInt4GroupMoeDownReduceSmallBatchKernel(
+            const half *middle,
+            const uint8_t *const *downWeights,
+            const half *scales,
+            const half *mins,
+            const int32_t *indices,
+            const float *scores,
+            half *output,
+            int batch, int topk, int expertCount, int hidden, int inter,
+            int group, int groupCnt, bool useZeroPoint) {
+        __shared__ float routeValues[WARPS_PER_BLOCK];
+        const int route = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        const int inputRow = blockIdx.x / hidden;
+        const int out = blockIdx.x - inputRow * hidden;
+        float acc = 0.0f;
+        if (inputRow < batch && route < topk) {
+            const int routedRow = inputRow * topk + route;
+            const int expert = __ldg(indices + routedRow);
+            if (expert >= 0 && expert < expertCount) {
+                const uint8_t *weight = downWeights[expert];
+                if (weight != nullptr) {
+                    const uint8_t *rowWeight = weight + (size_t)out * inter / 2;
+                    const half *rowScales = scales + ((size_t)expert * hidden + out) * group;
+                    const half *rowMins = mins + ((size_t)expert * hidden + out) * group;
+                    const half *routeInput = middle + (size_t)routedRow * inter;
+                    const int units = inter >> 4;
+                    for (int unit = lane; unit < units; unit += 32) {
+                        const int x = unit << 4;
+                        const int gid = x / groupCnt;
+                        const float scale = __half2float(__ldg(rowScales + gid));
+                        const float minValue = __half2float(__ldg(rowMins + gid));
+                        union_char8 packed;
+                        union_half8 input0, input1;
+                        packed.in = *reinterpret_cast<const uint2*>(rowWeight + (size_t)unit * 8);
+                        input0.in = *reinterpret_cast<const uint4*>(routeInput + x);
+                        input1.in = *reinterpret_cast<const uint4*>(routeInput + x + 8);
+#pragma unroll
+                        for (int i = 0; i < 8; i++) {
+                            const uint8_t q = packed.out[i];
+                            const int pair = (i & 3) * 2;
+                            const float a0 = i < 4 ? __half2float(input0.out[pair])
+                                                   : __half2float(input1.out[pair]);
+                            const float a1 = i < 4 ? __half2float(input0.out[pair + 1])
+                                                   : __half2float(input1.out[pair + 1]);
+                            acc += a0 * FastllmCudaDequantInt4GroupHalfValue(
+                                (float)(q >> 4), scale, minValue, useZeroPoint);
+                            acc += a1 * FastllmCudaDequantInt4GroupHalfValue(
+                                (float)(q & 15), scale, minValue, useZeroPoint);
+                        }
+                    }
+                }
+            }
+        }
+
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_down_sync(0xffffffff, acc, offset);
+        }
+        if (lane == 0) {
+            // The generic path rounds each expert's down projection to FP16
+            // before applying the router score.
+            routeValues[route] = inputRow < batch && route < topk ?
+                __half2float(__float2half_rn(acc)) : 0.0f;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            // Generic MergeMOE visits experts in ascending expert-id order and
+            // rounds the destination after every scored add.
+            unsigned int usedRoutes = 0;
+            half sum = __float2half(0.0f);
+            for (int step = 0; step < topk; step++) {
+                int bestRoute = -1;
+                int bestExpert = expertCount;
+                for (int candidate = 0; candidate < topk; candidate++) {
+                    if ((usedRoutes & (1u << candidate)) != 0) {
+                        continue;
+                    }
+                    int expert = __ldg(indices + inputRow * topk + candidate);
+                    if (expert < bestExpert) {
+                        bestExpert = expert;
+                        bestRoute = candidate;
+                    }
+                }
+                if (bestRoute < 0 || bestExpert < 0 || bestExpert >= expertCount) {
+                    break;
+                }
+                usedRoutes |= 1u << bestRoute;
+                int routedRow = inputRow * topk + bestRoute;
+                sum = __float2half_rn(
+                    __half2float(sum) +
+                    __ldg(scores + routedRow) * routeValues[bestRoute]);
+            }
+            output[(size_t)inputRow * hidden + out] = sum;
+        }
+    }
+
+    // Keep the established batch-1 kernels separate and byte-for-byte
+    // equivalent to the pre-MTP path. Speculative validation uses different
+    // FP16 materialization points, but enabling it must not perturb ordinary
+    // token-at-a-time decode.
+    template <int WARPS_PER_BLOCK>
     __global__ void FastllmCudaInt4GroupMoeGateupSwigluBatch1Kernel(
             const half *input,
             const uint8_t *const *gateupWeights,
@@ -1351,6 +1550,70 @@ namespace {
             output[out] = __float2half_rn(sum);
         }
     }
+}
+
+bool FastllmCudaHalfMergeMOEInt4GroupSmallBatchIndexed(
+        const fastllm::Data &input,
+        fastllm::Data &scratch,
+        fastllm::Data &output,
+        fastllm::Data **weights,
+        int weightsBatch,
+        const int32_t *indices,
+        const float *scores,
+        int batch,
+        int topk) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        input.dims.size() != 2 || input.dims[0] != batch ||
+        input.cudaData == nullptr || output.cudaData == nullptr ||
+        indices == nullptr || scores == nullptr ||
+        batch <= 1 || batch > 64 ||
+        topk <= 0 || topk > INT4GROUP_MOE_WARPS) {
+        return false;
+    }
+
+    Int4GroupMoeBatch1Table table;
+    if (!PrepareInt4GroupMoeBatch1Table(weights, weightsBatch, table) ||
+        input.dims[1] != table.hidden) {
+        return false;
+    }
+
+    scratch.dataType = fastllm::DataType::FLOAT16;
+    scratch.dataDevice = fastllm::DataDevice::CUDA;
+    scratch.dataDeviceIds = input.dataDeviceIds;
+    scratch.Resize({batch * topk, table.inter});
+    scratch.Allocate(false);
+    if (scratch.cudaData == nullptr) {
+        return false;
+    }
+
+    const int gateupTasks = batch * topk * table.inter;
+    const int blocks =
+        (gateupTasks + INT4GROUP_MOE_WARPS - 1) / INT4GROUP_MOE_WARPS;
+    FastllmCudaInt4GroupMoeGateupSwigluSmallBatchKernel<INT4GROUP_MOE_WARPS>
+        <<< blocks, INT4GROUP_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
+            (const half*)input.cudaData, table.gateupWeights,
+            table.gateupScales, table.gateupOffsets, indices,
+            (half*)scratch.cudaData, batch, topk, table.expertCount,
+            table.hidden, table.inter, table.gateupRows,
+            table.gateupGroup, table.gateupGroupCnt, table.useZeroPoint);
+    FastllmCudaInt4GroupMoeDownReduceSmallBatchKernel<INT4GROUP_MOE_WARPS>
+        <<< batch * table.hidden, INT4GROUP_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
+            (const half*)scratch.cudaData, table.downWeights,
+            table.downScales, table.downOffsets, indices, scores,
+            (half*)output.cudaData, batch, topk, table.expertCount,
+            table.hidden, table.inter, table.downGroup, table.downGroupCnt,
+            table.useZeroPoint);
+    cudaError_t state = cudaGetLastError();
+    if (state != cudaSuccess) {
+        checkCudaErrors("Error: CUDA INT4_GROUP small-batch fused MoE failed.", state);
+        return false;
+    }
+    return true;
+#endif
 }
 
 bool FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(const fastllm::Data &input,
