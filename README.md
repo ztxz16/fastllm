@@ -315,6 +315,10 @@ numactl -C 0-31 -m 0 ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --
 - `--api_key`:
   - **描述**: server模式设定api_key。
   - **示例**: `ftllm server --api_key xxxxxxxx` 
+
+- `--max_context_length`:
+  - **描述**: server模式限制单会话输入与输出合计的最大 token 数。默认取模型上下文上限与共享 KV Cache 总容量的较小值；`/v1/models` 会返回实际生效值。
+  - **示例**: `ftllm server Qwen/Qwen3.6-27B-FP8 --max_context_length 131072`
  
 - `--max_token`:
   - **描述**: webui模式指定最大输出。

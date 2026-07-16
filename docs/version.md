@@ -7,6 +7,7 @@
 - 优化Qwen3 FP8 MLP融合路径
 - 完善auto模式下的FP8权重识别、NVFP4权重加载及多卡切分，优化NVFP4单Token GEMV，修复FP8多卡缩放因子切分
 - 支持OpenAI Responses API
+- API server支持`--max_context_length`限制单会话上下文，并在`/v1/models`返回模型、KV Cache及实际上下文容量
 - 完善工具调用解析和流式、非流式校验，支持tool_choice、strict参数校验以及工具名和参数名生成约束
 - 修复多种工具流解析状态及聊天结束原因，补充DeepSeek V4等工具调用回归和手动测试
 - 修复think模式下KV Cache复用失败，以及CPU Qwen3数据类型、重复输出和乱码问题

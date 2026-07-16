@@ -955,6 +955,22 @@ extern "C" {
         model->maxBatch = batch;
     }
 
+    DLL_EXPORT int set_max_context_length_llm_model(int modelId, int length) {
+        auto model = models.GetModel(modelId);
+        if (length > 0 && length < model->max_positions) {
+            model->max_positions = length;
+        }
+        return model->max_positions;
+    }
+
+    DLL_EXPORT int get_kv_cache_token_limit_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        if (model->tokensLimit > 0) {
+            return model->tokensLimit;
+        }
+        return fastllm::GetMaxTokens();
+    }
+
     DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {
         auto model = models.GetModel(modelId);
         model->SetChunkedPrefillSize(size);

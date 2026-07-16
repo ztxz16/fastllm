@@ -317,7 +317,15 @@ def _fastllm_server(args, startup_progress):
                                            hide_input = args.hide_input)
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
-    fastllm_model = FastLLmModel(model_name = args.model_name)
+    fastllm_model = FastLLmModel(model_name = args.model_name, model = model)
+    logging.info(
+        "Model context window: %d tokens per session "
+        "(model=%s, shared KV cache=%s, configured limit=%s)",
+        fastllm_model.context_window,
+        fastllm_model.model_context_window,
+        fastllm_model.kv_cache_token_limit,
+        fastllm_model.configured_context_window_limit,
+    )
     default_workers = args.max_batch if args.max_batch > 0 else 64
     default_workers = max(32, min(128, default_workers))
     workers_env = os.getenv("FASTLLM_API_THREADPOOL_WORKERS", "")

@@ -412,6 +412,12 @@ fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int6
 
 fastllm_lib.set_max_batch_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
+fastllm_lib.set_max_context_length_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_max_context_length_llm_model.restype = ctypes.c_int
+
+fastllm_lib.get_kv_cache_token_limit_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
+
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
 fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
@@ -2576,6 +2582,14 @@ class model:
     
     def set_max_batch(self, batch: int):
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
+
+    def set_max_context_length(self, length: int):
+        """限制单会话输入与输出合计的最大 token 数。"""
+        return fastllm_lib.set_max_context_length_llm_model(self.model, length)
+
+    def get_kv_cache_token_limit(self):
+        """返回所有并发会话共享的 KV Cache token 总容量。"""
+        return fastllm_lib.get_kv_cache_token_limit_llm_model(self.model)
 
     def set_chunked_prefill_size(self, size: int):
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""

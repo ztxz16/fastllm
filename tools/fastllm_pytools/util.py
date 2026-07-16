@@ -4,6 +4,15 @@ import sys
 import subprocess
 import glob
 
+def _positive_int(value: str) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
 def _has_cuda_device() -> bool:
     if os.path.exists("/dev/nvidia0") or os.path.isdir("/proc/driver/nvidia/gpus"):
         return True
@@ -254,6 +263,9 @@ def add_server_args(parser):
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--api_key", type = str, default = "", help = "API Key")
+    parser.add_argument("--max_context_length", "--max-context-length", dest = "max_context_length",
+                        type = _positive_int, default = -1,
+                        help = "限制单会话输入和输出合计的最大token数；默认取模型上限和KV Cache总容量的较小值")
     parser.add_argument("--temperature", type = float, default = None, help = "覆盖服务端默认 temperature，未指定则使用模型默认值")
     parser.add_argument("--top_p", type = float, default = None, help = "覆盖服务端默认 top_p，未指定则使用模型默认值")
     parser.add_argument("--top_k", type = int, default = None, help = "覆盖服务端默认 top_k，未指定则使用模型默认值")
@@ -611,6 +623,17 @@ def make_normal_llm_model(args, startup_progress = None):
             model.set_moe_experts(args.moe_experts)
         if (args.max_batch > 0):
             model.set_max_batch(args.max_batch)
+        model.native_context_window = model.get_max_input_len()
+        model.configured_context_window_limit = None
+        max_context_length = getattr(args, "max_context_length", -1)
+        if (max_context_length == 0 or max_context_length < -1):
+            raise ValueError("--max_context_length must be a positive integer")
+        if (max_context_length > 0):
+            model.configured_context_window_limit = max_context_length
+            effective_context_length = model.set_max_context_length(max_context_length)
+            print("[Fastllm] Per-session context window limit: %d tokens "
+                  "(requested=%d, model max=%d)." %
+                  (effective_context_length, max_context_length, model.native_context_window))
         if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
             model.set_kv_cache_limit(args.kv_cache_limit)
         if (args.chunked_prefill_size > 0):

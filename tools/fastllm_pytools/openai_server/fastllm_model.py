@@ -1,9 +1,29 @@
-
 class FastLLmModel:
     def __init__(self,
                  model_name,
+                 model = None,
                  ):
         self.model_name = model_name
+        current_model_context_window = self._read_positive_int(model, "get_max_input_len")
+        native_model_context_window = self._positive_int(
+            getattr(model, "native_context_window", None)
+        ) or current_model_context_window
+        kv_cache_token_limit = self._read_positive_int(model, "get_kv_cache_token_limit")
+        configured_context_window_limit = self._positive_int(
+            getattr(model, "configured_context_window_limit", None)
+        )
+
+        context_window_candidates = [
+            value for value in (current_model_context_window, kv_cache_token_limit)
+            if value is not None
+        ]
+        context_window = min(context_window_candidates) if context_window_candidates else 32768
+        auto_compact_token_limit = max(1, context_window * 9 // 10)
+
+        self.context_window = context_window
+        self.model_context_window = native_model_context_window
+        self.kv_cache_token_limit = kv_cache_token_limit
+        self.configured_context_window_limit = configured_context_window_limit
         codex_model = {
                 "slug": model_name,
                 "id": model_name,
@@ -106,9 +126,12 @@ class FastLLmModel:
                 },
                 "supports_parallel_tool_calls": True,
                 "supports_image_detail_original": False,
-                "context_window": 32768,
-                "max_context_window": 32768,
-                "auto_compact_token_limit": 24000,
+                "context_window": context_window,
+                "max_context_window": context_window,
+                "auto_compact_token_limit": auto_compact_token_limit,
+                "model_context_window": native_model_context_window,
+                "kv_cache_token_limit": kv_cache_token_limit,
+                "configured_context_window_limit": configured_context_window_limit,
                 "comp_hash": "",
                 "experimental_supported_tools": [],
                 "supports_search_tool": False,
@@ -136,3 +159,21 @@ class FastLLmModel:
             "verifications": [],
             "object": "list"
         }
+
+    @staticmethod
+    def _positive_int(value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @classmethod
+    def _read_positive_int(cls, model, method_name):
+        method = getattr(model, method_name, None)
+        if not callable(method):
+            return None
+        try:
+            return cls._positive_int(method())
+        except Exception:
+            return None
