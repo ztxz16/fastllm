@@ -2372,12 +2372,22 @@ namespace fastllm {
             return *pools;
         }
 
-        static int Qwen35MaxCudaGraphDecodeBatch() {
+        static int Qwen35MaxCudaGraphDecodeBatch(const Qwen3_5Model *model) {
+            // MTP validates several target tokens per request and keeps extra
+            // per-request rollback state.  Retaining one CUDA graph for every
+            // batch up to 32 consumes the memory that the MTP scheduler needs
+            // for those runtime buffers, while MTP's multi-token validation
+            // does not use the single-token decode graph anyway.  Keep the
+            // batch-1 graph for fallback/single-token work, and use eager
+            // execution for larger MTP batches.
+            if (model != nullptr && !Qwen35MtpDisabledByEnv()) {
+                return 1;
+            }
             return 32;
         }
 
         static int Qwen35PreCaptureMaxBatch(const Qwen3_5Model *model) {
-            int maxGraphBatch = Qwen35MaxCudaGraphDecodeBatch();
+            int maxGraphBatch = Qwen35MaxCudaGraphDecodeBatch(model);
             if (model != nullptr && model->maxBatch > 0) {
                 maxGraphBatch = std::min(maxGraphBatch, model->maxBatch);
             }
@@ -4813,6 +4823,16 @@ namespace fastllm {
             "mtp.layers.*.mlp.up_proj.weight",
             "mtp.layers.*.mlp.gate_proj.weight",
             "mtp.layers.*.mlp.gateup_proj.weight",
+            "mtp.layers.*.mlp.gate.weight",
+            "mtp.layers.*.mlp.shared_expert_gate.weight",
+            "mtp.layers.*.mlp.shared_expert.gate_proj.weight",
+            "mtp.layers.*.mlp.shared_expert.up_proj.weight",
+            "mtp.layers.*.mlp.shared_expert.down_proj.weight",
+            "mtp.layers.*.mlp.shared_expert.gateup_proj.weight",
+            "mtp.layers.*.mlp.experts.*.gate_proj.weight",
+            "mtp.layers.*.mlp.experts.*.up_proj.weight",
+            "mtp.layers.*.mlp.experts.*.down_proj.weight",
+            "mtp.layers.*.mlp.experts.*.gateup_proj.weight",
             "mtp.layers.*.self_attn.o_proj.weight",
             "mtp.layers.*.self_attn.q_proj.weight",
             "mtp.layers.*.self_attn.k_proj.weight",
@@ -5431,7 +5451,12 @@ namespace fastllm {
             return;
         }
 
+        const bool mtpEnabled = !Qwen35MtpDisabledByEnv() && HasMtpWeights();
         int maxWarmupBatch = Qwen35PreCaptureMaxBatch(this);
+        if (mtpEnabled && this->maxBatch > maxWarmupBatch) {
+            printf("[Fastllm] Qwen3.5 CUDA graph: MTP is enabled; "
+                   "capture batch 1 only to preserve runtime memory for speculative validation.\n");
+        }
         int linearSlotCapacity = Qwen35LinearSlotCapacity(this, maxWarmupBatch);
         PreAllocateLinearSlotPoolsForCudaGraph(devices, ratios, linearSlotCapacity);
 
@@ -5560,7 +5585,7 @@ namespace fastllm {
         return false;
 #else
         (void)ratios;
-        const int maxCudaGraphDecodeBatch = Qwen35MaxCudaGraphDecodeBatch();
+        const int maxCudaGraphDecodeBatch = Qwen35MaxCudaGraphDecodeBatch(this);
         if (!Qwen35CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
             !all1 || isPrefill || (int)seqLens.size() < batch ||
             (int)pastKeyValues.size() < batch * block_cnt || seqLens[0] != 1 ||
@@ -14306,6 +14331,35 @@ namespace fastllm {
                                                         mtpGateupWeightName, std::string("linearSwiglu"))})
             );
 
+            if (num_experts > 0) {
+                std::string mtpMlpPrefix = "mtp.layers." + std::to_string(i) + ".mlp.";
+                std::string sharedGateWeightName = mtpMlpPrefix + "shared_expert.gate_proj.weight";
+                std::string sharedUpWeightName = mtpMlpPrefix + "shared_expert.up_proj.weight";
+                std::string sharedGateupWeightName = mtpMlpPrefix + "shared_expert.gateup_proj.weight";
+                this->weightMergeRules.push_back(
+                    WeightMergeRule({WeightMergeRuleSingle(
+                        {sharedGateWeightName, sharedUpWeightName},
+                        sharedGateupWeightName, std::string("linearSwiglu"))})
+                );
+
+                for (int j = 0; j < num_experts; j++) {
+                    std::string expertPrefix = mtpMlpPrefix + "experts." +
+                                               std::to_string(j) + ".";
+                    std::string expertGateWeightName = expertPrefix + "gate_proj.weight";
+                    std::string expertUpWeightName = expertPrefix + "up_proj.weight";
+                    std::string expertGateupWeightName = expertPrefix + "gateup_proj.weight";
+                    std::string expertDownWeightName = expertPrefix + "down_proj.weight";
+                    this->weightMergeRules.push_back(
+                        WeightMergeRule({WeightMergeRuleSingle(
+                            {expertGateWeightName, expertUpWeightName},
+                            expertGateupWeightName, std::string("linearSwiglu"))})
+                    );
+                    this->moeLinears.insert(expertGateWeightName);
+                    this->moeLinears.insert(expertUpWeightName);
+                    this->moeLinears.insert(expertDownWeightName);
+                }
+            }
+
             std::string mtpQWeightName = "mtp.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string mtpKWeightName = "mtp.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
             std::string mtpVWeightName = "mtp.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
@@ -15788,6 +15842,35 @@ namespace fastllm {
         }
     }
 
+    bool Qwen3_5Model::HasMtpMoeWeights() const {
+        if (mtp_num_hidden_layers <= 0 || num_experts <= 0 ||
+            num_experts_per_tok <= 0) {
+            return false;
+        }
+        const std::string prefix = "mtp.layers.0.mlp.";
+        if (weight.weight.find(prefix + "gate.weight") == weight.weight.end()) {
+            return false;
+        }
+        for (int expert = 0; expert < num_experts; expert++) {
+            std::string expertPrefix = prefix + "experts." +
+                                       std::to_string(expert) + ".";
+            if (weight.weight.find(expertPrefix + "gateup_proj.weight") ==
+                    weight.weight.end() ||
+                weight.weight.find(expertPrefix + "down_proj.weight") ==
+                    weight.weight.end()) {
+                return false;
+            }
+        }
+        if (n_shared_experts > 0 &&
+            (weight.weight.find(prefix + "shared_expert.gateup_proj.weight") ==
+                 weight.weight.end() ||
+             weight.weight.find(prefix + "shared_expert.down_proj.weight") ==
+                 weight.weight.end())) {
+            return false;
+        }
+        return true;
+    }
+
     bool Qwen3_5Model::HasMtpWeights() const {
         if (mtp_num_hidden_layers <= 0) {
             return false;
@@ -15797,14 +15880,18 @@ namespace fastllm {
             (weight.weight.find("mtp.layers.0.self_attn.q_proj.weight") != weight.weight.end() &&
              weight.weight.find("mtp.layers.0.self_attn.k_proj.weight") != weight.weight.end() &&
              weight.weight.find("mtp.layers.0.self_attn.v_proj.weight") != weight.weight.end());
+        bool hasMtpDenseMlp =
+            weight.weight.find("mtp.layers.0.mlp.gateup_proj.weight") !=
+                weight.weight.end() &&
+            weight.weight.find("mtp.layers.0.mlp.down_proj.weight") !=
+                weight.weight.end();
         return weight.weight.find("mtp.fc.weight") != weight.weight.end() &&
                weight.weight.find("mtp.norm.weight") != weight.weight.end() &&
                weight.weight.find("mtp.pre_fc_norm_embedding.weight") != weight.weight.end() &&
                weight.weight.find("mtp.pre_fc_norm_hidden.weight") != weight.weight.end() &&
                hasMtpQkv &&
                weight.weight.find("mtp.layers.0.self_attn.o_proj.weight") != weight.weight.end() &&
-               weight.weight.find("mtp.layers.0.mlp.gateup_proj.weight") != weight.weight.end() &&
-               weight.weight.find("mtp.layers.0.mlp.down_proj.weight") != weight.weight.end();
+               (hasMtpDenseMlp || HasMtpMoeWeights());
     }
 
     void Qwen3_5Model::AddMtpRmsNormOffset() {
@@ -15828,7 +15915,15 @@ namespace fastllm {
         if (!HasMtpWeights()) {
             return;
         }
-        if (mtpWeightsPrepared && mtpWeightsPreparedDevice == device) {
+        if (mtpWeightsPreparedDevice != device) {
+            mtpWeightsPrepared = false;
+            mtpSharedWeightsPrepared = false;
+            mtpMoeWeights.clear();
+            mtpMoeBiass.clear();
+            mtpWeightsPreparedDevice = device;
+        }
+        if (mtpWeightsPrepared &&
+            (!includeSharedWeights || mtpSharedWeightsPrepared)) {
             return;
         }
         auto moveWeight = [&](const std::string &name) {
@@ -15837,42 +15932,192 @@ namespace fastllm {
                 it->second.ToDevice(DataDevice::CUDA, {device}, true);
             }
         };
-        if (includeSharedWeights && GetCudaEmbeddingRequested() && !GetLowMemMode()) {
-            moveWeight(language_prefix + "embed_tokens.weight");
-        }
-        if (includeSharedWeights) {
-            moveWeight("lm_head.weight");
-        }
-        moveWeight("mtp.fc.weight");
-        moveWeight("mtp.pre_fc_norm_embedding.weight");
-        moveWeight("mtp.pre_fc_norm_hidden.weight");
-        moveWeight("mtp.norm.weight");
-        for (int i = 0; i < mtp_num_hidden_layers; i++) {
-            std::string prefix = "mtp.layers." + std::to_string(i) + ".";
-            bool hasMergedQkv = weight.weight.find(prefix + "self_attn.mergeqkv.weight") != weight.weight.end();
-            moveWeight(prefix + "input_layernorm.weight");
-            if (hasMergedQkv) {
-                moveWeight(prefix + "self_attn.mergeqkv.weight");
-            } else {
-                moveWeight(prefix + "self_attn.q_proj.weight");
-                moveWeight(prefix + "self_attn.k_proj.weight");
-                moveWeight(prefix + "self_attn.v_proj.weight");
+        if (!mtpWeightsPrepared) {
+            moveWeight("mtp.fc.weight");
+            moveWeight("mtp.pre_fc_norm_embedding.weight");
+            moveWeight("mtp.pre_fc_norm_hidden.weight");
+            moveWeight("mtp.norm.weight");
+            for (int i = 0; i < mtp_num_hidden_layers; i++) {
+                std::string prefix = "mtp.layers." + std::to_string(i) + ".";
+                bool hasMergedQkv =
+                    weight.weight.find(prefix + "self_attn.mergeqkv.weight") !=
+                    weight.weight.end();
+                moveWeight(prefix + "input_layernorm.weight");
+                if (hasMergedQkv) {
+                    moveWeight(prefix + "self_attn.mergeqkv.weight");
+                } else {
+                    moveWeight(prefix + "self_attn.q_proj.weight");
+                    moveWeight(prefix + "self_attn.k_proj.weight");
+                    moveWeight(prefix + "self_attn.v_proj.weight");
+                }
+                moveWeight(prefix + "self_attn.o_proj.weight");
+                moveWeight(prefix + "self_attn.q_norm.weight");
+                moveWeight(prefix + "self_attn.k_norm.weight");
+                moveWeight(prefix + "post_attention_layernorm.weight");
+
+                std::string denseGateupName = prefix + "mlp.gateup_proj.weight";
+                std::string denseDownName = prefix + "mlp.down_proj.weight";
+                if (weight.weight.find(denseGateupName) != weight.weight.end() &&
+                    weight.weight.find(denseDownName) != weight.weight.end()) {
+                    weight[denseGateupName].tpPackType = TP_PACK_GATEUP;
+                    moveWeight(denseGateupName);
+                    moveWeight(denseDownName);
+                    continue;
+                }
+
+                std::string mlpPrefix = prefix + "mlp.";
+                moveWeight(mlpPrefix + "gate.weight");
+                moveWeight(mlpPrefix + "gate.e_score_correction_bias");
+                std::string sharedGateupName =
+                    mlpPrefix + "shared_expert.gateup_proj.weight";
+                if (weight.weight.find(sharedGateupName) != weight.weight.end()) {
+                    weight[sharedGateupName].tpPackType = TP_PACK_GATEUP;
+                    moveWeight(sharedGateupName);
+                    moveWeight(mlpPrefix + "shared_expert.down_proj.weight");
+                    moveWeight(mlpPrefix + "shared_expert_gate.weight");
+                }
+
+                if (i == 0 && HasMtpMoeWeights()) {
+                    mtpMoeWeights.assign(2, nullptr);
+                    mtpMoeBiass.assign(2, nullptr);
+                    mtpMoeWeights.reserve(2 + num_experts * 2);
+                    mtpMoeBiass.reserve(2 + num_experts * 2);
+                    for (int expert = 0; expert < num_experts; expert++) {
+                        std::string expertPrefix = mlpPrefix + "experts." +
+                                                   std::to_string(expert) + ".";
+                        std::string gateupName =
+                            expertPrefix + "gateup_proj.weight";
+                        std::string downName = expertPrefix + "down_proj.weight";
+                        weight[gateupName].tpPackType = TP_PACK_GATEUP;
+                        moveWeight(gateupName);
+                        moveWeight(downName);
+                        mtpMoeWeights.push_back(&weight[gateupName]);
+                        mtpMoeWeights.push_back(&weight[downName]);
+                        mtpMoeBiass.push_back(nullptr);
+                        mtpMoeBiass.push_back(nullptr);
+                    }
+                }
             }
-            moveWeight(prefix + "self_attn.o_proj.weight");
-            moveWeight(prefix + "self_attn.q_norm.weight");
-            moveWeight(prefix + "self_attn.k_norm.weight");
-            moveWeight(prefix + "post_attention_layernorm.weight");
-            weight[prefix + "mlp.gateup_proj.weight"].tpPackType = TP_PACK_GATEUP;
-            moveWeight(prefix + "mlp.gateup_proj.weight");
-            moveWeight(prefix + "mlp.down_proj.weight");
-        }
-        if (includeSharedWeights) {
             mtpWeightsPrepared = true;
-            mtpWeightsPreparedDevice = device;
+        }
+        if (includeSharedWeights && !mtpSharedWeightsPrepared) {
+            if (GetCudaEmbeddingRequested() && !GetLowMemMode()) {
+                moveWeight(language_prefix + "embed_tokens.weight");
+            }
+            moveWeight("lm_head.weight");
+            mtpSharedWeightsPrepared = true;
         }
 #else
         (void)device;
         (void)includeSharedWeights;
+#endif
+    }
+
+    void Qwen3_5Model::RunMtpFeedForward(int device, Data &hiddenStates) {
+#ifndef USE_CUDA
+        (void)device;
+        (void)hiddenStates;
+#else
+        const std::string prefix = "mtp.layers.0.mlp.";
+        Data mlpInput;
+        RMSNorm(hiddenStates,
+                weight["mtp.layers.0.post_attention_layernorm.weight"],
+                rms_norm_eps, mlpInput);
+
+        std::string denseGateupName = prefix + "gateup_proj.weight";
+        std::string denseDownName = prefix + "down_proj.weight";
+        if (weight.weight.find(denseGateupName) != weight.weight.end() &&
+            weight.weight.find(denseDownName) != weight.weight.end()) {
+            Data gateupResult, swigluResult;
+            MLPBlock(&mlpInput, &weight[denseGateupName], &weight[denseDownName],
+                     &gateupResult, &swigluResult, &hiddenStates);
+            return;
+        }
+
+        AssertInFastLLM(HasMtpMoeWeights(),
+                        "Qwen3.5 MTP MoE weights are incomplete.\n");
+        AssertInFastLLM(mtpMoeWeights.size() ==
+                            (size_t)(2 + num_experts * 2) &&
+                        mtpMoeBiass.size() == mtpMoeWeights.size(),
+                        "Qwen3.5 MTP MoE weights were not prepared.\n");
+
+        using namespace qwen3cuda;
+        FastllmCudaSetDevice(device);
+        Qwen3CudaDirectRunner cudaRunner(device);
+        Data gateupResult, swigluResult, sharedOutput, sharedGate;
+        std::string sharedGateupName =
+            prefix + "shared_expert.gateup_proj.weight";
+        std::string sharedDownName = prefix + "shared_expert.down_proj.weight";
+        bool hasSharedExpert =
+            weight.weight.find(sharedGateupName) != weight.weight.end() &&
+            weight.weight.find(sharedDownName) != weight.weight.end();
+        if (hasSharedExpert) {
+            Qwen3CudaLinearSwiglu(cudaRunner, mlpInput,
+                                  weight[sharedGateupName], *GetEmptyData(),
+                                  gateupResult, swigluResult);
+            Qwen3CudaLinear(cudaRunner, swigluResult,
+                            weight[sharedDownName], *GetEmptyData(),
+                            sharedOutput);
+            std::string sharedExpertGateName =
+                prefix + "shared_expert_gate.weight";
+            if (weight.weight.find(sharedExpertGateName) != weight.weight.end()) {
+                Qwen3CudaLinear(cudaRunner, mlpInput,
+                                weight[sharedExpertGateName], *GetEmptyData(),
+                                sharedGate);
+                Qwen35CudaSigmoid(cudaRunner, sharedGate, sharedGate);
+                if (sharedGate.dataType != sharedOutput.dataType) {
+                    Qwen3CudaToDataType(cudaRunner, sharedGate,
+                                        sharedOutput.dataType);
+                }
+                Qwen35CudaMulTo(cudaRunner, sharedOutput, sharedGate);
+            }
+        }
+
+        int flatBatch = mlpInput.dims[0];
+        int flatLen = mlpInput.dims[1];
+        mlpInput.Reshape({flatBatch * flatLen, mlpInput.dims[2]});
+        Data routerLogits, routerLogitsTemp, expertIndex, expertScore;
+        Qwen3CudaLinear(cudaRunner, mlpInput, weight[prefix + "gate.weight"],
+                        *GetEmptyData(), routerLogits, true);
+        Data *gateBias = nullptr;
+        std::string gateBiasName = prefix + "gate.e_score_correction_bias";
+        if (weight.weight.find(gateBiasName) != weight.weight.end()) {
+            gateBias = &weight[gateBiasName];
+        }
+        if (!Qwen3CudaTryFusedSoftmaxSelectExpert(
+                cudaRunner, routerLogits, expertIndex, expertScore,
+                num_experts_per_tok, norm_topk_prob,
+                routed_scaling_factor, gateBias)) {
+            Qwen3CudaConvertToDataType(cudaRunner, routerLogits,
+                                       routerLogitsTemp, DataType::FLOAT32);
+            Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp,
+                             routerLogitsTemp, -1);
+            Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp,
+                                  expertIndex, expertScore,
+                                  num_experts_per_tok, norm_topk_prob,
+                                  routed_scaling_factor, gateBias);
+        }
+
+        Data w1, w2, w3, tempInput, tempOutput;
+        Data moeInputTemp, moeOutputTemp, moeOutput;
+        DataType computeType = hiddenStates.dataType;
+        DataType mtpMoeAtype = useCustomMoeAtype ? moeAtype : computeType;
+        Qwen3CudaMergeMOEBlock(
+            cudaRunner, &mlpInput, &expertIndex, &expertScore,
+            &mtpMoeWeights, &mtpMoeBiass,
+            &w1, &w2, &w3, &tempInput, &tempOutput,
+            1.0f, &moeOutput, block_cnt,
+            computeType, mtpMoeAtype, &moeInputTemp, &moeOutputTemp);
+        moeOutput.Reshape(hiddenStates.dims);
+        if (hasSharedExpert) {
+            if (sharedOutput.dataType != moeOutput.dataType) {
+                Qwen3CudaToDataType(cudaRunner, sharedOutput,
+                                    moeOutput.dataType);
+            }
+            sharedOutput.Reshape(hiddenStates.dims);
+            Qwen3CudaAddTo(cudaRunner, moeOutput, sharedOutput);
+        }
+        Qwen3CudaAddTo(cudaRunner, hiddenStates, moeOutput);
 #endif
     }
 
@@ -16270,12 +16515,7 @@ namespace fastllm {
                *GetEmptyData(), projected);
         AddTo(hiddenStates, projected);
 
-        Data mlpInput, gateupResult, swigluResult;
-        RMSNorm(hiddenStates, weight[prefix + "post_attention_layernorm.weight"],
-                rms_norm_eps, mlpInput);
-        MLPBlock(&mlpInput, &weight[prefix + "mlp.gateup_proj.weight"],
-                 &weight[prefix + "mlp.down_proj.weight"],
-                 &gateupResult, &swigluResult, &hiddenStates);
+        RunMtpFeedForward(device, hiddenStates);
 
         Data sampleHiddenBatch(hiddenStates.dataType);
         sampleHiddenBatch.dataDevice = DataDevice::CUDA;
@@ -16609,11 +16849,7 @@ namespace fastllm {
         Linear(attenOutput, weight[prefix + "self_attn.o_proj.weight"], *GetEmptyData(), projected);
         AddTo(hiddenStates, projected);
 
-        Data mlpInput, gateupResult, swigluResult;
-        RMSNorm(hiddenStates, weight[prefix + "post_attention_layernorm.weight"], rms_norm_eps, mlpInput);
-        MLPBlock(&mlpInput, &weight[prefix + "mlp.gateup_proj.weight"],
-                 &weight[prefix + "mlp.down_proj.weight"],
-                 &gateupResult, &swigluResult, &hiddenStates);
+        RunMtpFeedForward(device, hiddenStates);
 
         sampleRow = std::max(0, std::min(sampleRow, seqLen - 1));
         Data logits, sampleHidden;

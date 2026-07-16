@@ -215,7 +215,10 @@ namespace fastllm {
             int tokens = 0;
         };
         bool mtpWeightsPrepared = false;
+        bool mtpSharedWeightsPrepared = false;
         int mtpWeightsPreparedDevice = -1;
+        std::vector <Data*> mtpMoeWeights;
+        std::vector <Data*> mtpMoeBiass;
         bool speculativeCollectAllLogits = false;
         bool speculativeCaptureAllHiddenStates = false;
         bool speculativeCacheOnlyForward = false;
@@ -335,10 +338,12 @@ namespace fastllm {
                                         const Data &mropePositionDelta,
                                         Data &adjustedPositionIds);
         bool HasMtpWeights() const;
+        bool HasMtpMoeWeights() const;
         bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
         bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
+        void RunMtpFeedForward(int device, Data &hiddenStates);
         void PrepareMtpDraftLmHeadWeights(const std::vector<int> &devices);
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
         Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
