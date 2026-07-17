@@ -174,6 +174,14 @@ namespace fastllm {
 
         virtual ~basellm();
 
+    protected:
+        // Stop the scheduler and release every request context.  The operation
+        // is idempotent so a derived destructor can drop model-specific cache
+        // managers only after no request Data object still references them.
+        void ShutdownRuntime();
+
+    public:
+
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
 
         virtual void InitParams(); // 初始化参数信息 

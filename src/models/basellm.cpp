@@ -739,7 +739,7 @@ namespace fastllm {
         locker.unlock();
     }
 
-    basellm::~basellm() {
+    void basellm::ShutdownRuntime() {
         {
             std::lock_guard<std::mutex> guard(dictLocker);
             this->isFree = true;
@@ -767,7 +767,10 @@ namespace fastllm {
             }
             responseContextDict.dicts.clear();
         }
+    }
 
+    basellm::~basellm() {
+        ShutdownRuntime();
         this->weight.ReleaseWeight();
     }
 

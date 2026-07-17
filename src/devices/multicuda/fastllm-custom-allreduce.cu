@@ -162,6 +162,61 @@ void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
     CustomArBarrierEnd<Ranks>(allSignals, selfSignal, rank);
 }
 
+template <typename T>
+__device__ __forceinline__ T CustomArAdd(T a, T b);
+
+template <>
+__device__ __forceinline__ half CustomArAdd(half a, half b) {
+    return __hadd(a, b);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 CustomArAdd(
+        __nv_bfloat16 a, __nv_bfloat16 b) {
+    return __hadd(a, b);
+}
+
+template <>
+__device__ __forceinline__ float CustomArAdd(float a, float b) {
+    return a + b;
+}
+
+// Qwen's tensor-parallel row projections reduce a rank-local partial and then
+// add a replicated residual. Folding both operations into the direct-read
+// kernel removes the rank-0 add/rank-1 copy, in-place scratch output and
+// scratch copy-back that the generic graph path otherwise needs. The two
+// half-precision additions intentionally preserve the eager TP=2 order:
+// (rank0 + rank1) + residual.
+template <typename T>
+__global__ __launch_bounds__(kCustomArThreads, 1)
+void FastllmCustomAllReduceAddKernel(CustomArRankData *rankData,
+                                     CustomArRankSignals allSignals,
+                                     CustomArSignal *selfSignal,
+                                     const T *__restrict__ residual,
+                                     T *__restrict__ output,
+                                     int rank, int packedCount) {
+    using P = typename CustomArPacked<T>::P;
+    CustomArRankData pointers = *rankData;
+    CustomArBarrierStart<2>(allSignals, selfSignal, rank);
+    const P *rank0 = reinterpret_cast<const P *>(pointers.ptrs[0]);
+    const P *rank1 = reinterpret_cast<const P *>(pointers.ptrs[1]);
+    const P *packedResidual = reinterpret_cast<const P *>(residual);
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < packedCount; index += gridDim.x * blockDim.x) {
+        P first = rank0[index];
+        P second = rank1[index];
+        P residualValue = packedResidual[index];
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            first.data[item] = CustomArAdd(first.data[item], second.data[item]);
+            first.data[item] = CustomArAdd(first.data[item],
+                                           residualValue.data[item]);
+        }
+        reinterpret_cast<P *>(output)[index] = first;
+    }
+    CustomArBarrierEnd<2>(allSignals, selfSignal, rank);
+}
+
 struct CustomArState {
     std::mutex mutex;
     std::condition_variable condition;
@@ -192,7 +247,10 @@ CustomArState &GetCustomArState() {
 }
 
 constexpr size_t CustomArMaxBytes() {
-    return 256ULL * 1024ULL;
+    // Match vLLM's custom-all-reduce registration envelope. TP=2 always uses
+    // the one-stage direct-read kernel; batch 32 x hidden 5120 is already
+    // 320 KiB and must not fall back to NCCL at the old DeepSeek-only limit.
+    return 8ULL * 1024ULL * 1024ULL;
 }
 
 size_t CustomArTypeBytes(int dataType) {
@@ -374,6 +432,35 @@ bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
     return true;
 }
 
+template <typename T>
+bool LaunchCustomArAdd(CustomArState &state, CustomArRankData *rankData,
+                       const T *residual, T *output,
+                       int rank, int count) {
+    if (state.devices.size() != 2) {
+        return false;
+    }
+    constexpr int packedWidth = CustomArPacked<T>::size;
+    int packedCount = count / packedWidth;
+    int blocks = std::max(1, std::min(kCustomArMaxBlocks,
+                          (packedCount + kCustomArThreads - 1) /
+                              kCustomArThreads));
+    FastllmCustomAllReduceAddKernel<T>
+        <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(
+            rankData, state.allSignals, state.allSignals.signals[rank],
+            residual, output, rank, packedCount);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr,
+                     "[Fastllm] fused custom all-reduce-add launch failed "
+                     "on GPU %d: %s.\n",
+                     state.devices[rank], cudaGetErrorString(launchState));
+        std::fflush(stderr);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
@@ -532,4 +619,53 @@ bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
         }
     }
     return true;
+}
+
+bool FastllmCudaCustomAllReduceAdd(void *data, void *dest, int count,
+                                   int dataType, int deviceId) {
+    if (data == nullptr || dest == nullptr || count <= 0) {
+        return false;
+    }
+    size_t typeBytes = CustomArTypeBytes(dataType);
+    size_t bytes = (size_t)count * typeBytes;
+    if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
+        bytes % 16 != 0) {
+        return false;
+    }
+
+    CustomArState &state = GetCustomArState();
+    int rank = -1;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!state.initialized || state.devices.size() != 2) {
+            return false;
+        }
+        auto rankIt = state.rankByDevice.find(deviceId);
+        if (rankIt == state.rankByDevice.end()) {
+            return false;
+        }
+        rank = rankIt->second;
+    }
+
+    CustomArRankData *rankData = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, data, count,
+                                        dataType, rankData)) {
+        return false;
+    }
+    if (dataType == fastllm::DataType::FLOAT16) {
+        return LaunchCustomArAdd(
+            state, rankData, reinterpret_cast<const half *>(dest),
+            reinterpret_cast<half *>(dest), rank, count);
+    }
+    if (dataType == fastllm::DataType::BFLOAT16) {
+        return LaunchCustomArAdd(
+            state, rankData, reinterpret_cast<const __nv_bfloat16 *>(dest),
+            reinterpret_cast<__nv_bfloat16 *>(dest), rank, count);
+    }
+    if (dataType == fastllm::DataType::FLOAT32) {
+        return LaunchCustomArAdd(
+            state, rankData, reinterpret_cast<const float *>(dest),
+            reinterpret_cast<float *>(dest), rank, count);
+    }
+    return false;
 }
