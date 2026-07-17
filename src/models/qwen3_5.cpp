@@ -15971,6 +15971,13 @@ namespace fastllm {
             if (qkvzIt == this->weight.weight.end() || baIt == this->weight.weight.end()) {
                 continue;
             }
+            // GGUF weights use a packed row layout and may be backed by lazy-loaded
+            // storage. Keep qkvz and ba separate instead of rebuilding a merged
+            // tensor here; every forward path already supports the split form.
+            if (qkvzIt->second.dataType == DataType::DATA_GGUF_FORMAT ||
+                baIt->second.dataType == DataType::DATA_GGUF_FORMAT) {
+                continue;
+            }
 
             Data &mergedWeight = this->weight.weight[mergedWeightName];
             if (!CreateMergedLinearWeight(qkvzIt->second, baIt->second, mergedWeightName, mergedWeight)) {
