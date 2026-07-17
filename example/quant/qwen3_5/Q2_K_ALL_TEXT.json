@@ -1,0 +1,12 @@
+[
+    {
+        "key": "(.)*",
+        "dtype": "float16",
+        "comment": "Keep embeddings, lm_head, vision weights and other linear weights in float16."
+    },
+    {
+        "key": "^(model\\.language_model\\.layers\\.[0-9]+|mtp\\.layers\\.[0-9]+)\\.(mlp\\.(gate_proj|up_proj|down_proj)|self_attn\\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\\.(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj))\\.weight$",
+        "dtype": "ggml_q2_k",
+        "comment": "Experimental maximum compression: quantize every text transformer linear weight to GGML Q2_K."
+    }
+]

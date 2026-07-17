@@ -1,0 +1,17 @@
+[
+    {
+        "key": "(.)*",
+        "dtype": "float16",
+        "comment": "Keep embeddings, lm_head, vision weights, norms, biases and small recurrent gates in float16."
+    },
+    {
+        "key": "^(model\\.language_model\\.layers\\.[0-9]+|mtp\\.layers\\.[0-9]+)\\.(mlp\\.(gate_proj|up_proj|down_proj)|self_attn\\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\\.(in_proj_qkv|in_proj_z|out_proj))\\.weight$",
+        "dtype": "ggml_q4_k",
+        "comment": "Use Q4_K for attention paths and MLP output projections, which are more sensitive to quantization error."
+    },
+    {
+        "key": "^(model\\.language_model\\.layers\\.[0-9]+|mtp\\.layers\\.[0-9]+)\\.mlp\\.(gate_proj|up_proj)\\.weight$",
+        "dtype": "ggml_q2_k",
+        "comment": "Keep the two largest MLP input projections in Q2_K for most of the compression benefit."
+    }
+]

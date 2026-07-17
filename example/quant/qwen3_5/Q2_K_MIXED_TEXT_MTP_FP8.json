@@ -1,0 +1,22 @@
+[
+    {
+        "key": "(.)*",
+        "dtype": "float16",
+        "comment": "Keep embeddings, lm_head, vision weights, norms, biases and small recurrent gates in float16."
+    },
+    {
+        "key": "^model\\.language_model\\.layers\\.[0-9]+\\.(mlp\\.(gate_proj|up_proj|down_proj)|self_attn\\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\\.(in_proj_qkv|in_proj_z|out_proj))\\.weight$",
+        "dtype": "ggml_q4_k",
+        "comment": "Use Q4_K for the main model's attention paths and MLP output projections."
+    },
+    {
+        "key": "^model\\.language_model\\.layers\\.[0-9]+\\.mlp\\.(gate_proj|up_proj)\\.weight$",
+        "dtype": "ggml_q2_k",
+        "comment": "Use Q2_K for the main model's two largest MLP input projections."
+    },
+    {
+        "key": "^mtp\\..*\\.weight$",
+        "dtype": "fp8_e4m3",
+        "comment": "Preserve source FP8 MTP matrices to maximize exact speculative-decoding acceptance; non-FP8 MTP tensors fall back to float16."
+    }
+]
