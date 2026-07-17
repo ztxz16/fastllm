@@ -83,6 +83,56 @@ export FASTLLM_CUDA_W4A8_PREPARE_OUTPUT=1
 export FASTLLM_CUDA_W4A8_ENABLE_GEMM=1
 ```
 
+步骤 5 新增了最小独立测试：
+
+```bash
+cmake --build build-fastllm --target test_w4a8_cutlass_linear -j$(nproc)
+./build-fastllm/test/cuda/test_w4a8_cutlass_linear
+```
+
+这个 target 只会在 CMake 判定 `FASTLLM_CUTLASS_W4A8_ENABLED=ON` 时生成。
+也就是需要同时满足：
+
+```text
+USE_CUDA=ON
+ENABLE_CUDA_TESTS=ON
+ENABLE_VLLM_KERNEL=ON
+CUTLASS include 可用
+CUDA_ARCH 包含 90 / 90a / 9.0a
+CUDA 编译器版本 >= 12.0
+```
+
+不满足时 CMake 会打印：
+
+```text
+CUDA W4A8 CUTLASS test: OFF
+```
+
+此时不会生成 `test_w4a8_cutlass_linear`，普通构建和其它 CUDA 测试不受影响。
+
+第一版测试先覆盖入口行为：
+
+```text
+编译未开启 FASTLLM_ENABLE_VLLM_CUTLASS_W4A8 时返回 false
+非 SM90 时返回 false
+m/k 非 128 对齐时返回 false
+input/weight dtype 不满足时返回 false
+bias 不满足时返回 false
+groupCnt 不是 128 时返回 false
+```
+
+当编译开启 W4A8 且运行在 SM90 上时，测试会继续打开
+`FASTLLM_CUDA_W4A8_ENABLE_GEMM=1`，跑最小数值比较：
+
+```text
+W4A8 output vs CPU baseline
+n = 1
+n = 4 / 8 / 16
+n = 64 / 128
+with bias / no bias
+FP16 input / BF16 input
+```
+
 合法性用例应覆盖：
 
 ```text
