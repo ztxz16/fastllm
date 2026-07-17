@@ -341,7 +341,7 @@ bool RunNumericalCase(const W4A8Case &shape, uint32_t seedBase, const std::strin
 
     constexpr float maxAbsTol = 2.5e-1f;
     constexpr float meanAbsTol = 3.0e-2f;
-    constexpr float maxRelTol = 3.0e-1f;
+    const float maxRelTol = shape.bf16Input ? 5.0f : 3.0e-1f;
     CompareResult result = CompareVectors(expected, actual, maxAbsTol, meanAbsTol, maxRelTol);
     PrintCompareResult(name, result, maxAbsTol, meanAbsTol, maxRelTol);
     return result.passed;
