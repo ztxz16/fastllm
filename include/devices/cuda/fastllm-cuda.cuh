@@ -451,6 +451,13 @@ bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
 namespace fastllm {
 bool FastllmCudaTryTritonDeepSeekV4WoA(const Data &o, Data &woA,
                                        int groups, int oRank, Data &output);
+bool FastllmCudaTryTritonChunkGdnPostConv(
+        const Data &qInput, const Data &kInput, const Data &vInput,
+        const Data &gInput, const Data &betaInput,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float qScale,
+        Data &q, Data &k, Data &v, Data &g, Data &beta,
+        Data &kBeta, Data &vBeta);
 bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
         const Data &q, const Data &windowKV, const Data &compressedKV,
         const Data &attnSink, int windowSize, int compressRatio,
@@ -827,6 +834,26 @@ bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
     const fastllm::Data &windowKV, const fastllm::Data &compressedKV,
     const fastllm::Data &attnSink, int windowSize, int compressRatio,
     const int32_t *decodeMeta, float softmaxScale, float *output);
+
+bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
+    const char *hCubinPath, const char *hKernelName, int hNumWarps, int hShared,
+    const char *oCubinPath, const char *oKernelName, int oNumWarps, int oShared,
+    int chunks, int chunkSize, int kDim, int vDim, int blockV,
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn, fastllm::Data &kCumdecay,
+    fastllm::Data &lastRecurrentState, fastllm::Data &coreAttnOut);
+
+bool FastllmCudaTritonChunkGdnPostConv(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared, int blockT,
+    const fastllm::Data &qInput, const fastllm::Data &kInput,
+    const fastllm::Data &vInput, const fastllm::Data &gInput,
+    const fastllm::Data &betaInput,
+    int batch, int seqLen, int keyHeads, int valueHeads,
+    int kDim, int vDim, float qScale,
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &beta,
+    fastllm::Data &kBeta, fastllm::Data &vBeta);
 
 bool FastllmCudaTritonMergeMOEFP8E4M3Indexed(
     const char *const *cubinPaths, const char *const *kernelNames,

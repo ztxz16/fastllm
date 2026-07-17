@@ -18,7 +18,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -248,6 +250,200 @@ namespace {
                                  0.5f * std::cos((i + 3) * 0.043f - seed));
         }
         return values;
+    }
+
+    void RunCudaTritonChunkGdnPrefillRegression() {
+        bool tritonEnabled = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL", true);
+        FastllmCudaSetDevice(0);
+        int arch = FastllmCudaRuntimeArch();
+        if (!tritonEnabled || arch < 80) {
+            std::cout << "Triton chunk GDN prefill regression: SKIP\n";
+            return;
+        }
+
+        constexpr int batch = 8;
+        constexpr int heads = 1;
+        constexpr int chunks = 2;
+        constexpr int chunkSize = 64;
+        constexpr int kDim = 128;
+        constexpr int vDim = 128;
+        const std::vector<int> qDims = {batch, heads, chunks, chunkSize, kDim};
+        const std::vector<int> vDims = {batch, heads, chunks, chunkSize, vDim};
+        const std::vector<int> gDims = {batch, heads, chunks, chunkSize};
+        const std::vector<int> attnDims = {
+            batch, heads, chunks, chunkSize, chunkSize};
+        const std::vector<int> stateDims = {batch, heads, kDim, vDim};
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * kDim, 0.11f, 0.008f));
+        fastllm::Data k = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * kDim, 0.37f, 0.007f));
+        fastllm::Data v = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, vDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * vDim, 0.59f, 0.012f));
+        fastllm::Data g = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize, 0.83f, 0.003f));
+        fastllm::Data attn = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, attnDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * chunkSize,
+                1.07f, 0.002f));
+        fastllm::Data kCumdecay = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * kDim, 1.31f, 0.006f));
+        const std::vector<float> initialState = MakeRegressionValues(
+            batch * heads * kDim * vDim, 1.73f, 0.015f);
+        fastllm::Data referenceState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data tritonState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+
+        fastllm::Data referenceOutput;
+        FastllmChunkGatedDeltaRulePrefill(
+            q, k, v, g, attn, kCumdecay, referenceState, referenceOutput);
+        FastllmCudaSyncCurrentThreadStream();
+        const std::vector<float> referenceStateValues = ToFloatVector(referenceState);
+        const std::vector<float> referenceOutputValues = ToFloatVector(referenceOutput);
+
+        fastllm::Data tritonOutput;
+        {
+            ScopedFirstDevice device("cuda:0");
+            fastllm::ChunkGatedDeltaRulePrefill(
+                q, k, v, g, attn, kCumdecay, tritonState, tritonOutput);
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(referenceStateValues, ToFloatVector(tritonState),
+                        1e-3f, 1e-3f,
+                        "Triton chunk GDN prefill recurrent state");
+        ExpectFloatNear(referenceOutputValues, ToFloatVector(tritonOutput),
+                        1e-3f, 1e-3f,
+                        "Triton chunk GDN prefill output");
+
+        auto envIntRange = [](const char *name, int fallback,
+                              int minValue, int maxValue) {
+            const char *text = std::getenv(name);
+            if (text == nullptr || text[0] == '\0') {
+                return fallback;
+            }
+            char *end = nullptr;
+            long value = std::strtol(text, &end, 10);
+            return end == text || value < minValue || value > maxValue
+                ? fallback : (int)value;
+        };
+        int blockV = envIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_BLOCK_V", 64, 32, 64);
+        if (blockV != 32 && blockV != 64) {
+            blockV = 64;
+        }
+        int numWarps = envIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_WARPS", 4, 1, 32);
+        int numStages = envIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_STAGES", 2, 1, 8);
+
+        std::string cacheDir;
+        const char *cacheEnv = std::getenv("FASTLLM_CUDA_TRITON_CACHE_DIR");
+        if (cacheEnv != nullptr && cacheEnv[0] != '\0') {
+            cacheDir = cacheEnv;
+        } else {
+            const char *xdg = std::getenv("XDG_CACHE_HOME");
+            const char *home = std::getenv("HOME");
+            if (xdg != nullptr && xdg[0] != '\0') {
+                cacheDir = std::string(xdg) + "/fastllm/triton";
+            } else if (home != nullptr && home[0] != '\0') {
+                cacheDir = std::string(home) + "/.cache/fastllm/triton";
+            } else {
+                cacheDir = "/tmp/fastllm-triton";
+            }
+        }
+        if (cacheDir.size() > 1 && cacheDir[0] == '~' && cacheDir[1] == '/') {
+            const char *home = std::getenv("HOME");
+            if (home != nullptr && home[0] != '\0') {
+                cacheDir = std::string(home) + cacheDir.substr(1);
+            }
+        }
+        std::string separator = cacheDir.empty() || cacheDir.back() == '/'
+            ? "" : "/";
+        std::string base = cacheDir + separator +
+            "chunk_gdn_prefill_v2_fp16_sm" + std::to_string(arch) +
+            "_c2_t64_k128_v128_bv" + std::to_string(blockV) +
+            "_nw" + std::to_string(numWarps) +
+            "_ns" + std::to_string(numStages);
+        std::ifstream metaFile(base + ".json", std::ios::binary);
+        Expect(metaFile.good(),
+               "Triton chunk GDN prefill metadata was not generated");
+        std::string metaText(
+            (std::istreambuf_iterator<char>(metaFile)),
+            std::istreambuf_iterator<char>());
+        std::string jsonError;
+        json11::Json meta = json11::Json::parse(metaText, jsonError);
+        Expect(jsonError.empty() && meta["ok"].bool_value(),
+               "Triton chunk GDN prefill metadata is invalid");
+        json11::Json hMeta = meta["kernels"]["h"];
+        json11::Json oMeta = meta["kernels"]["o"];
+        std::string hCubin = hMeta["cubin"].string_value();
+        std::string hKernel = hMeta["kernel"].string_value();
+        int hNumWarps = hMeta["num_warps"].int_value();
+        int hShared = hMeta["shared"].int_value();
+        std::string oCubin = oMeta["cubin"].string_value();
+        std::string oKernel = oMeta["kernel"].string_value();
+        int oNumWarps = oMeta["num_warps"].int_value();
+        int oShared = oMeta["shared"].int_value();
+        Expect(!hCubin.empty() && !hKernel.empty() && hNumWarps > 0 &&
+                   !oCubin.empty() && !oKernel.empty() && oNumWarps > 0,
+               "Triton chunk GDN prefill kernel metadata is incomplete");
+
+        fastllm::Data directState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data directOutput;
+        Expect(FastllmCudaTritonChunkGatedDeltaRulePrefill(
+                   hCubin.c_str(), hKernel.c_str(), hNumWarps, hShared,
+                   oCubin.c_str(), oKernel.c_str(), oNumWarps, oShared,
+                   chunks, chunkSize, kDim, vDim, blockV,
+                   q, k, v, g, attn, kCumdecay, directState, directOutput),
+               "direct Triton chunk GDN prefill launch failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(referenceStateValues, ToFloatVector(directState),
+                        1e-3f, 1e-3f,
+                        "direct Triton chunk GDN recurrent state");
+        ExpectFloatNear(referenceOutputValues, ToFloatVector(directOutput),
+                        1e-3f, 1e-3f,
+                        "direct Triton chunk GDN output");
+
+        fastllm::Data failedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        const std::vector<float> initialFp16 = ToFloatVector(failedState);
+        fastllm::Data failedOutput;
+        bool accepted = FastllmCudaTritonChunkGatedDeltaRulePrefill(
+            hCubin.c_str(), hKernel.c_str(), hNumWarps, hShared,
+            oCubin.c_str(), oKernel.c_str(), 1024, oShared,
+            chunks, chunkSize, kDim, vDim, blockV,
+            q, k, v, g, attn, kCumdecay, failedState, failedOutput);
+        Expect(!accepted,
+               "fault-injected Triton chunk GDN O launch unexpectedly succeeded");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(initialFp16, ToFloatVector(failedState), 0.0f, 0.0f,
+                        "failed Triton chunk GDN launch state transaction");
+
+        FastllmChunkGatedDeltaRulePrefill(
+            q, k, v, g, attn, kCumdecay, failedState, failedOutput);
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(referenceStateValues, ToFloatVector(failedState),
+                        0.0f, 0.0f,
+                        "Triton chunk GDN native fallback recurrent state");
+        ExpectFloatNear(referenceOutputValues, ToFloatVector(failedOutput),
+                        0.0f, 0.0f,
+                        "Triton chunk GDN native fallback output");
+        std::cout << "Triton chunk GDN prefill transaction regression: PASS\n";
     }
 
     void RunCudaDeepSeekV4TritonWoARegression() {
@@ -2371,6 +2567,7 @@ int main() {
 #ifdef USE_CUDA
             Expect(FastllmCudaGraphQwen35MoeSelfTest(),
                    "Qwen3.5 CUDA graph shared/routed MoE parallelization/fallback self-test failed");
+            RunCudaTritonChunkGdnPrefillRegression();
             RunCudaDeepSeekV4TritonWoARegression();
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
             RunCudaDeepSeekV4HashRouteCacheRegression();

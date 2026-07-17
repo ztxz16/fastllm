@@ -6503,7 +6503,7 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         axis == std::vector <int> {0, 2, 1} ||
         axis == std::vector <int> {2, 0, 1, 3} ||
         axis == std::vector <int> {1, 2, 0, 3} ||
-        (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1);
+        axis == std::vector <int> {0, 2, 1, 3};
     size_t alignedTempBytes = FastllmCudaAlignBytes(tempBytes, 256);
     size_t axisTempBytes = permuteFastPath ? 0 : FastllmCudaAlignBytes(axis.size() * 3 * sizeof(int), 256);
     size_t tempBufferBytes = 0;
@@ -6554,12 +6554,15 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
                 batch, n, m, input.unitSize);
         }
         input.Resize(new_dims);
-    } else if (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1) {
+    } else if (axis == std::vector <int> {0, 2, 1, 3}) {
+        int batch = input.dims[0];
         int n = input.dims[1];
         int m = input.dims[2];
-        int k = input.dims[3];
-        FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
-                ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
+        int rowBytes = input.dims[3] * input.unitSize;
+        FastllmTransposeLastTwoByBatchKernel<256>
+            <<<batch * n * m, 256, 0, cudaStreamPerThread>>>(
+                (uint8_t*)input.cudaData, (const uint8_t*)tempData,
+                batch, n, m, rowBytes);
         input.Resize(new_dims);
     } else {
         std::vector<int> temp;
@@ -8628,15 +8631,31 @@ bool FastllmCudaCatBatch(fastllm::Data **inputs, fastllm::Data &output, int axis
     int inner = output.strides[axis];
     int unitSize = output.unitSize;
 
-    uint8_t ** pointers = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * part);
-    uint8_t ** cpuPointers = new uint8_t*[part];
+    // CatBatch is commonly placed between operators running on
+    // cudaStreamPerThread (FlashInfer, cuBLAS and NCCL).  Launching this copy
+    // on the legacy default stream can race both its producers and consumers.
+    // Keep a small per-thread/per-device pointer table alive so it also cannot
+    // be returned to FastLLM's caching allocator while the kernel is in flight.
+    thread_local static std::map<int, std::pair<uint8_t**, int> > pointerBuffers;
+    int device = FastllmCudaGetDevice();
+    auto &pointerBuffer = pointerBuffers[device];
+    if (pointerBuffer.second < part) {
+        if (pointerBuffer.first != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(pointerBuffer.first);
+        }
+        pointerBuffer.first = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * part);
+        pointerBuffer.second = part;
+    }
+    uint8_t **pointers = pointerBuffer.first;
+    uint8_t **cpuPointers = new uint8_t*[part];
     for (int i = 0; i < part; i++) {
         cpuPointers[i] = (uint8_t*)inputs[i]->cudaData;
     }
     cudaMemcpy(pointers, cpuPointers, sizeof(uint8_t*) * part, cudaMemcpyHostToDevice);
-    FastllmCatBatchKernel <256> <<< part * outer, 256 >>> (pointers, (uint8_t*)output.cudaData, outer, part, inner * unitSize);
+    FastllmCatBatchKernel <256> <<< part * outer, 256, 0, cudaStreamPerThread >>> (
+        pointers, (uint8_t*)output.cudaData, outer, part, inner * unitSize);
 
-    FastllmCudaFree(pointers);
     delete[] cpuPointers;
 
     DeviceSync();
@@ -8951,6 +8970,10 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluTwoTokenHalfKernel(
 static constexpr int FASTLLM_CUDA_MTP_FAST_SEQ_MAX = 6;
 static constexpr int FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX =
     FASTLLM_CUDA_MTP_FAST_SEQ_MAX - 1;
+// Ordinary batched prefill does not materialize per-token MTP snapshots.  Its
+// conv cache update can therefore reuse the pointer kernel for a much longer
+// sequence without growing the fixed snapshot-pointer array.
+static constexpr int FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX = 4096;
 
 static bool FastllmCudaDataHasDenseStrides(const fastllm::Data &data) {
     if (data.dims.empty() || data.strides.size() != data.dims.size()) {
@@ -9005,10 +9028,14 @@ static bool FastllmCudaDataCanShareDevice(const fastllm::Data &reference,
            referenceDevice == otherDevice;
 }
 
-// MTP batch kernels consume small arrays of request-local cache pointers.
-// Keep one device staging buffer per TP worker thread so every layer only
-// enqueues a tiny H2D copy instead of cudaMalloc/cudaFree synchronization.
-static void **FastllmCudaStageMtpPointers(const std::vector<void*> &pointers) {
+// Batched linear-attention kernels consume small arrays of request-local
+// cache pointers. Keep one device staging buffer per TP worker thread so the
+// hot decode path only enqueues a tiny H2D copy instead of allocating, copying
+// synchronously (which waits for all earlier work), and freeing on every
+// layer. The std::vector storage is pageable, so the CUDA runtime stages the
+// source before this function returns; the device copy and its consumer stay
+// ordered on cudaStreamPerThread.
+static void **FastllmCudaStagePointers(const std::vector<void*> &pointers) {
     struct PointerScratch {
         void *data = nullptr;
         size_t capacity = 0;
@@ -9033,6 +9060,7 @@ static void **FastllmCudaStageMtpPointers(const std::vector<void*> &pointers) {
     size_t bytes = pointers.size() * sizeof(void*);
     if (scratch.device != device || scratch.capacity < bytes) {
         if (scratch.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
             FastllmCudaFree(scratch.data);
         }
         scratch.data = FastllmCudaMalloc(bytes);
@@ -9040,9 +9068,9 @@ static void **FastllmCudaStageMtpPointers(const std::vector<void*> &pointers) {
         scratch.device = device;
     }
     checkCudaErrors(
-        "Error: CUDA error when staging MTP cache pointers.",
+        "Error: CUDA error when staging batched cache pointers.",
         cudaMemcpyAsync(scratch.data, pointers.data(), bytes,
-                        cudaMemcpyHostToDevice));
+                        cudaMemcpyHostToDevice, cudaStreamPerThread));
     return (void**)scratch.data;
 }
 
@@ -9168,6 +9196,132 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKerne
     cacheRow[1] = x1;
     cacheRow[2] = x2;
     cacheRow[3] = x3;
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillHalfPointerKernel(
+    half **pointers, const half *newTokens, const float *weight,
+    const float *bias, half *output, int channels, int numTokens,
+    size_t totalElements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= totalElements) {
+        return;
+    }
+
+    int token = index % numTokens;
+    size_t row = index / numTokens;
+    int batchIndex = row / channels;
+    int channel = row - (size_t)batchIndex * channels;
+    const half *cacheRow =
+        pointers[batchIndex] + (size_t)channel * 4;
+    const half *tokenRow = newTokens + row * numTokens;
+    const float *curWeight = weight + (size_t)channel * 4;
+
+    float value = bias == nullptr ? 0.0f : bias[channel];
+#pragma unroll
+    for (int kernelIndex = 0; kernelIndex < 4; kernelIndex++) {
+        int sourceToken = token + kernelIndex - 3;
+        half source = sourceToken < 0
+            ? cacheRow[sourceToken + 4]
+            : tokenRow[sourceToken];
+        value += __half2float(source) * curWeight[kernelIndex];
+    }
+
+    half conv = __float2half_rn(value);
+#ifdef CUDA_NO_TENSOR_CORE
+    float x = __half2float(conv);
+    output[index] = __float2half(x / (1.0f + expf(-x)));
+#else
+    output[index] =
+        __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelPrefillCacheHalfPointerKernel(
+    half **pointers, const half *newTokens, int channels, int numTokens,
+    size_t totalRows) {
+    size_t row = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= totalRows) {
+        return;
+    }
+
+    int batchIndex = row / channels;
+    int channel = row - (size_t)batchIndex * channels;
+    half *cacheRow = pointers[batchIndex] + (size_t)channel * 4;
+    const half *tokenRow = newTokens + row * numTokens;
+    half oldCache[4] = {
+        cacheRow[0], cacheRow[1], cacheRow[2], cacheRow[3]
+    };
+#pragma unroll
+    for (int cacheIndex = 0; cacheIndex < 4; cacheIndex++) {
+        int sourceToken = numTokens - 4 + cacheIndex;
+        cacheRow[cacheIndex] = sourceToken < 0
+            ? oldCache[sourceToken + 4]
+            : tokenRow[sourceToken];
+    }
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerKernel(
+    half **pointers, const half *newTokens, const float *weight,
+    const float *bias, half *output, int channels, int numTokens,
+    size_t totalElements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= totalElements) {
+        return;
+    }
+
+    int channel = index % channels;
+    size_t tokenRow = index / channels;
+    int token = tokenRow % numTokens;
+    int batchIndex = tokenRow / numTokens;
+    const half *cacheRow =
+        pointers[batchIndex] + (size_t)channel * 4;
+    const float *curWeight = weight + (size_t)channel * 4;
+
+    float value = bias == nullptr ? 0.0f : bias[channel];
+#pragma unroll
+    for (int kernelIndex = 0; kernelIndex < 4; kernelIndex++) {
+        int sourceToken = token + kernelIndex - 3;
+        half source = sourceToken < 0
+            ? cacheRow[sourceToken + 4]
+            : newTokens[
+                ((size_t)batchIndex * numTokens + sourceToken) *
+                    channels + channel];
+        value += __half2float(source) * curWeight[kernelIndex];
+    }
+
+    half conv = __float2half_rn(value);
+#ifdef CUDA_NO_TENSOR_CORE
+    float x = __half2float(conv);
+    output[index] = __float2half(x / (1.0f + expf(-x)));
+#else
+    output[index] =
+        __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelPrefillCacheTokenMajorHalfPointerKernel(
+    half **pointers, const half *newTokens, int channels, int numTokens,
+    size_t totalRows) {
+    size_t row = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= totalRows) {
+        return;
+    }
+
+    int batchIndex = row / channels;
+    int channel = row - (size_t)batchIndex * channels;
+    half *cacheRow = pointers[batchIndex] + (size_t)channel * 4;
+    half oldCache[4] = {
+        cacheRow[0], cacheRow[1], cacheRow[2], cacheRow[3]
+    };
+#pragma unroll
+    for (int cacheIndex = 0; cacheIndex < 4; cacheIndex++) {
+        int sourceToken = numTokens - 4 + cacheIndex;
+        cacheRow[cacheIndex] = sourceToken < 0
+            ? oldCache[sourceToken + 4]
+            : newTokens[
+                ((size_t)batchIndex * numTokens + sourceToken) *
+                    channels + channel];
+    }
 }
 
 __global__ void FastllmShiftAppendConv1DPerChannelSiluSingleTokenHalfPointerKernel(
@@ -9536,10 +9690,6 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
         newTokens.dataType != fastllm::DataType::FLOAT16 ||
         newTokens.dims.size() != 3 ||
         newTokens.dims[0] != (int)caches.size() ||
-        newTokens.dims[1] != first.dims[1] ||
-        newTokens.dims[2] <= 1 ||
-        newTokens.dims[2] > FASTLLM_CUDA_MTP_FAST_SEQ_MAX ||
-        numTokenCaches > newTokens.dims[2] ||
         !FastllmCudaDataHasDenseStrides(newTokens) ||
         !FastllmCudaDataCanShareDevice(first, newTokens) ||
         !FastllmCudaDataCanShareDevice(first, weight) ||
@@ -9551,7 +9701,25 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     }
     int batch = (int)caches.size();
     int channels = first.dims[1];
-    int numTokens = newTokens.dims[2];
+    bool tokenMajorPrefill =
+        numTokenCaches == 0 &&
+        newTokens.dims[2] == channels &&
+        newTokens.dims[1] > 1 &&
+        newTokens.dims[1] <= FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX;
+    bool channelMajor =
+        newTokens.dims[1] == channels &&
+        newTokens.dims[2] > 1 &&
+        newTokens.dims[2] <= (numTokenCaches == 0 ?
+            FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX :
+            FASTLLM_CUDA_MTP_FAST_SEQ_MAX);
+    if (!tokenMajorPrefill && !channelMajor) {
+        return false;
+    }
+    int numTokens =
+        tokenMajorPrefill ? newTokens.dims[1] : newTokens.dims[2];
+    if (numTokenCaches > numTokens) {
+        return false;
+    }
     bool validWeightShape =
         (weight.dims.size() == 2 && weight.dims[0] == channels &&
          weight.dims[1] == 4) ||
@@ -9602,7 +9770,9 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     }
 
     output.dataType = first.dataType;
-    output.Resize({batch, channels, numTokens});
+    output.Resize(tokenMajorPrefill ?
+        std::vector<int>{batch, numTokens, channels} :
+        std::vector<int>{batch, channels, numTokens});
     output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
     output.Allocate();
     output.isKVCache = false;
@@ -9612,17 +9782,49 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
         !FastllmCudaDataCanShareDevice(first, output)) {
         return false;
     }
-    void **devicePointers = FastllmCudaStageMtpPointers(pointers);
+    void **devicePointers = FastllmCudaStagePointers(pointers);
     int total = batch * channels;
     int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKernel
-        <<<blocks, threads>>>(
-            (half**)devicePointers, (const half*)newTokens.cudaData,
-            (const float*)weight.cudaData,
-            bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
-            (half*)output.cudaData, batch, channels, numTokens,
-            numTokenCaches);
+    if (numTokenCaches == 0) {
+        size_t totalElements = (size_t)total * numTokens;
+        int elementBlocks =
+            (int)((totalElements + threads - 1) / threads);
+        int cacheBlocks = (total + threads - 1) / threads;
+        if (tokenMajorPrefill) {
+            FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerKernel
+                <<<elementBlocks, threads>>>(
+                    (half**)devicePointers, (const half*)newTokens.cudaData,
+                    (const float*)weight.cudaData,
+                    bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
+                    (half*)output.cudaData, channels, numTokens,
+                    totalElements);
+            FastllmShiftAppendConv1DPerChannelPrefillCacheTokenMajorHalfPointerKernel
+                <<<cacheBlocks, threads>>>(
+                    (half**)devicePointers, (const half*)newTokens.cudaData,
+                    channels, numTokens, (size_t)total);
+        } else {
+            FastllmShiftAppendConv1DPerChannelSiluPrefillHalfPointerKernel
+                <<<elementBlocks, threads>>>(
+                    (half**)devicePointers, (const half*)newTokens.cudaData,
+                    (const float*)weight.cudaData,
+                    bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
+                    (half*)output.cudaData, channels, numTokens,
+                    totalElements);
+            FastllmShiftAppendConv1DPerChannelPrefillCacheHalfPointerKernel
+                <<<cacheBlocks, threads>>>(
+                    (half**)devicePointers, (const half*)newTokens.cudaData,
+                    channels, numTokens, (size_t)total);
+        }
+    } else {
+        int blocks = (total + threads - 1) / threads;
+        FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKernel
+            <<<blocks, threads>>>(
+                (half**)devicePointers, (const half*)newTokens.cudaData,
+                (const float*)weight.cudaData,
+                bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
+                (half*)output.cudaData, batch, channels, numTokens,
+                numTokenCaches);
+    }
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors(
@@ -9680,19 +9882,14 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(
         }
     }
 
-    void **cpuPointers = new void*[batch];
+    std::vector<void*> pointers(batch);
     for (int i = 0; i < batch; i++) {
-        cpuPointers[i] = caches[i]->cudaData;
+        pointers[i] = caches[i]->cudaData;
     }
-    void **cudaPointers = (void**)FastllmCudaMalloc(sizeof(void*) * batch);
-    cudaError_t state = cudaMemcpy(cudaPointers, cpuPointers, sizeof(void*) * batch, cudaMemcpyHostToDevice);
-    delete[] cpuPointers;
-    checkCudaErrors("Error: CUDA error when copy conv cache pointers to GPU!", state);
+    void **cudaPointers = FastllmCudaStagePointers(pointers);
 
-    bool ret = FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchDevicePointers(
+    return FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchDevicePointers(
         cudaPointers, batch, *first, newToken, weight, bias, output);
-    FastllmCudaFree(cudaPointers);
-    return ret;
 }
 
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchDevicePointers(
@@ -10274,6 +10471,35 @@ __global__ void FastllmLinearAttentionStateTransposeHalfKernel(
     }
 }
 
+__global__ void FastllmLinearAttentionStateTransposeTiledHalfKernel(
+    const half *input, half *output, int rows, int cols, size_t stride) {
+    size_t head = blockIdx.z;
+    int inputRow = blockIdx.y * 32 + threadIdx.y;
+    int inputCol = blockIdx.x * 32 + threadIdx.x;
+    __shared__ half tile[32][33];
+
+#pragma unroll
+    for (int offset = 0; offset < 32; offset += 8) {
+        int row = inputRow + offset;
+        if (row < rows && inputCol < cols) {
+            tile[threadIdx.y + offset][threadIdx.x] =
+                input[head * stride + (size_t)row * cols + inputCol];
+        }
+    }
+    __syncthreads();
+
+    int outputRow = blockIdx.x * 32 + threadIdx.y;
+    int outputCol = blockIdx.y * 32 + threadIdx.x;
+#pragma unroll
+    for (int offset = 0; offset < 32; offset += 8) {
+        int row = outputRow + offset;
+        if (row < cols && outputCol < rows) {
+            output[head * stride + (size_t)row * rows + outputCol] =
+                tile[threadIdx.x][threadIdx.y + offset];
+        }
+    }
+}
+
 template <int TILE_V>
 __global__ void FastllmRecurrentGatedDeltaRuleNormBaTransposedHalfWarpKernel(
     half* last_recurrent_state,  // physical [n0, n1, n3, n2], logical [n0, n1, n2, n3]
@@ -10680,11 +10906,24 @@ static bool FastllmLinearAttentionStateTransposeFloat16(fastllm::Data &last_recu
         return false;
     }
 
-    int threads = 256;
-    int blocks = (int)std::min<size_t>((total + threads - 1) / threads, 65535);
-    FastllmLinearAttentionStateTransposeHalfKernel<<<blocks, threads>>>(
-        (const half*)oldData, (half*)newData, totalHeads, n2, n3, kvToVk
-    );
+    if (totalHeads <= 65535) {
+        int rows = kvToVk ? n2 : n3;
+        int cols = kvToVk ? n3 : n2;
+        dim3 blocks((cols + 31) / 32, (rows + 31) / 32,
+                    (unsigned int)totalHeads);
+        dim3 threads(32, 8);
+        FastllmLinearAttentionStateTransposeTiledHalfKernel
+            <<<blocks, threads>>>(
+                (const half*)oldData, (half*)newData, rows, cols,
+                (size_t)n2 * n3);
+    } else {
+        int threads = 256;
+        int blocks =
+            (int)std::min<size_t>((total + threads - 1) / threads, 65535);
+        FastllmLinearAttentionStateTransposeHalfKernel<<<blocks, threads>>>(
+            (const half*)oldData, (half*)newData, totalHeads, n2, n3,
+            kvToVk);
+    }
     checkCudaErrors("Error: CUDA error in FastllmLinearAttentionStateTransposeFloat16.", cudaGetLastError());
 
     if (!oldBorrowed) {
@@ -10940,18 +11179,14 @@ bool FastllmRecurrentGatedDeltaRuleBatchDevicePointers(
 
 void FastllmRecurrentGatedDeltaRuleBatch(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out, float qScale) {
     int batch = (int)last_recurrent_states.size();
-    void **cpuPointers = new void*[batch];
+    std::vector<void*> pointers(batch);
     for (int i = 0; i < batch; i++) {
-        cpuPointers[i] = last_recurrent_states[i]->cudaData;
+        pointers[i] = last_recurrent_states[i]->cudaData;
     }
-    void **cudaPointers = (void**)FastllmCudaMalloc(sizeof(void*) * batch);
-    cudaError_t state = cudaMemcpy(cudaPointers, cpuPointers, sizeof(void*) * batch, cudaMemcpyHostToDevice);
-    delete[] cpuPointers;
-    checkCudaErrors("Error: CUDA error when copy recurrent state pointers to GPU!", state);
+    void **cudaPointers = FastllmCudaStagePointers(pointers);
 
     FastllmRecurrentGatedDeltaRuleBatchDevicePointers(
         q, k, v, g, b, *last_recurrent_states[0], cudaPointers, batch, core_attn_out, qScale);
-    FastllmCudaFree(cudaPointers);
 }
 
 __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel(
@@ -11253,8 +11488,12 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpK
         __syncthreads();
     }
 
-    int v_col = v_base + warp_id;
-    if (warp_id >= TILE_V || v_col >= headVDim) {
+    constexpr int warpsPerBlock = 8;
+    static_assert(TILE_V % warpsPerBlock == 0,
+                  "recurrent V tile must divide evenly across eight warps");
+    constexpr int rowsPerWarp = TILE_V / warpsPerBlock;
+    int first_v_col = v_base + warp_id * rowsPerWarp;
+    if (warp_id >= warpsPerBlock || first_v_col >= headVDim) {
         return;
     }
 
@@ -11262,30 +11501,49 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpK
         (slotIds == nullptr ? statePool : statePool + (size_t)slotIds[batch_idx] * stateStride) :
         last_recurrent_states[batch_idx];
     int stateHeadBase = head_idx * headKDim * headVDim;
-    half *state_row = last_recurrent_state + stateHeadBase + (size_t)v_col * headKDim;
     float gVal = ba_values[1];
 
-    float sumK = 0.0f;
-    for (int j = lane_id; j < headKDim; j += 32) {
-        sumK += (__half2float(state_row[j]) * gVal) * k_norm[j];
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sumK += __shfl_down_sync(0xffffffff, sumK, offset);
-    }
-    float delta = (__half2float(convOutput[vOffset + v_col]) -
-                   __shfl_sync(0xffffffff, sumK, 0)) * ba_values[0];
+    // headKDim is fixed to 128 for this specialization. For large batches a
+    // warp processes four adjacent V rows. This matches vLLM's 32-row packed
+    // decode tile and amortizes Q/K normalization and block scheduling four
+    // ways, while completing one row at a time keeps register pressure close
+    // to the original 8-row kernel.
+#pragma unroll
+    for (int row = 0; row < rowsPerWarp; row++) {
+        int v_col = first_v_col + row;
+        if (v_col >= headVDim) {
+            continue;
+        }
+        half *state_row = last_recurrent_state + stateHeadBase +
+                          (size_t)v_col * headKDim;
+        float decayedState[4];
+        float sumK = 0.0f;
+#pragma unroll
+        for (int item = 0; item < 4; item++) {
+            int j = lane_id + item * 32;
+            decayedState[item] = __half2float(state_row[j]) * gVal;
+            sumK += decayedState[item] * k_norm[j];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sumK += __shfl_down_sync(0xffffffff, sumK, offset);
+        }
+        float delta = (__half2float(convOutput[vOffset + v_col]) -
+                       __shfl_sync(0xffffffff, sumK, 0)) * ba_values[0];
 
-    float sumQ = 0.0f;
-    for (int j = lane_id; j < headKDim; j += 32) {
-        float updated = __half2float(state_row[j]) * gVal + k_norm[j] * delta;
-        state_row[j] = __float2half_rn(updated);
-        sumQ += updated * (q_norm[j] * qScale);
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
-    }
-    if (lane_id == 0) {
-        core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
+        float sumQ = 0.0f;
+#pragma unroll
+        for (int item = 0; item < 4; item++) {
+            int j = lane_id + item * 32;
+            float updated = decayedState[item] + k_norm[j] * delta;
+            state_row[j] = __float2half_rn(updated);
+            sumQ += updated * (q_norm[j] * qScale);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
+        }
+        if (lane_id == 0) {
+            core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
+        }
     }
 }
 
@@ -11300,10 +11558,11 @@ static bool LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWar
     if (headKDim != 128 || tileV != 8) {
         return false;
     }
-    constexpr int tile = 8;
-    constexpr int threads = tile * 32;
+    constexpr int threads = 8 * 32;
+    bool useTile32 = batch >= 8 &&
+        !FastllmCudaEnvFlagEnabled(
+            "FASTLLM_QWEN35_DISABLE_RECURRENT_TILE32");
     size_t sharedBytes = (2 * (size_t)headKDim + 8) * sizeof(float);
-    dim3 grid(batch, numVHeads, (headVDim + tile - 1) / tile);
 
 #define FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA(TILE, EXACT) \
     FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel<TILE, EXACT> \
@@ -11312,9 +11571,14 @@ static bool LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWar
             coreAttnOut, batch, numKHeads, numVHeads, headKDim, headVDim, \
             eps, qScale, statePool, slotIds, stateStride)
 
-    if (exactNorm128) {
+    if (useTile32) {
+        dim3 grid(batch, numVHeads, (headVDim + 31) / 32);
+        FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA(32, false);
+    } else if (exactNorm128) {
+        dim3 grid(batch, numVHeads, (headVDim + 7) / 8);
         FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA(8, true);
     } else {
+        dim3 grid(batch, numVHeads, (headVDim + 7) / 8);
         FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA(8, false);
     }
 #undef FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA
@@ -11990,7 +12254,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             pointers.push_back(snapshot->cudaData);
         }
     }
-    void **devicePointers = FastllmCudaStageMtpPointers(pointers);
+    void **devicePointers = FastllmCudaStagePointers(pointers);
 
     coreAttnOut.dataType = first.dataType;
     coreAttnOut.Resize({batch, seqLen, numVHeads, headVDim});
@@ -12097,19 +12361,15 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
     int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale) {
     int batch = (int)last_recurrent_states.size();
-    void **cpuPointers = new void*[batch];
+    std::vector<void*> pointers(batch);
     for (int i = 0; i < batch; i++) {
-        cpuPointers[i] = last_recurrent_states[i]->cudaData;
+        pointers[i] = last_recurrent_states[i]->cudaData;
     }
-    void **cudaPointers = (void**)FastllmCudaMalloc(sizeof(void*) * batch);
-    cudaError_t state = cudaMemcpy(cudaPointers, cpuPointers, sizeof(void*) * batch, cudaMemcpyHostToDevice);
-    delete[] cpuPointers;
-    checkCudaErrors("Error: CUDA error when copy recurrent state pointers to GPU!", state);
+    void **cudaPointers = FastllmCudaStagePointers(pointers);
 
     FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
         convOutput, ba, normWeight, aLog, dtBias, *last_recurrent_states[0], cudaPointers, batch,
         core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
-    FastllmCudaFree(cudaPointers);
 }
 
 void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
@@ -12119,19 +12379,15 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
     int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale) {
     int batch = (int)last_recurrent_states.size();
-    void **cpuPointers = new void*[batch];
+    std::vector<void*> pointers(batch);
     for (int i = 0; i < batch; i++) {
-        cpuPointers[i] = last_recurrent_states[i]->cudaData;
+        pointers[i] = last_recurrent_states[i]->cudaData;
     }
-    void **cudaPointers = (void**)FastllmCudaMalloc(sizeof(void*) * batch);
-    cudaError_t state = cudaMemcpy(cudaPointers, cpuPointers, sizeof(void*) * batch, cudaMemcpyHostToDevice);
-    delete[] cpuPointers;
-    checkCudaErrors("Error: CUDA error when copy transposed recurrent state pointers to GPU!", state);
+    void **cudaPointers = FastllmCudaStagePointers(pointers);
 
     FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
         convOutput, ba, normWeight, aLog, dtBias, *last_recurrent_states[0], cudaPointers, batch,
         core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
-    FastllmCudaFree(cudaPointers);
 }
 
 template <typename T>
