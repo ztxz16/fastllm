@@ -1,10 +1,10 @@
 #include "fastllm-cuda.cuh"
-#include "libtorch_stable/cutlass_extensions/epilogue/broadcast_load_epilogue_c3x.hpp"
 #include "libtorch_stable/quantization/cutlass_w4a8/w4a8_utils.cuh"
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_load_tma_warpspecialized.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/gemm.h"
@@ -76,10 +76,10 @@ using W4A8LayoutBReordered = decltype(cute::tile_to_shape(
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct FastllmCudaW4A8ScaledEpilogue {
     using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
-    using ChannelScale = cutlass::epilogue::fusion::Sm90ColOrScalarBroadcast<
-        0, TileShape, float, cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
-    using TokenScale = cutlass::epilogue::fusion::Sm90RowOrScalarBroadcast<
-        0, TileShape, float, cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
+    using ChannelScale = cutlass::epilogue::fusion::Sm90ColBroadcast<
+        0, TileShape, float, float, cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
+    using TokenScale = cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0, TileShape, float, float, cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
     using Compute0 = cutlass::epilogue::fusion::Sm90Compute<
         cutlass::multiplies, float, float,
@@ -96,8 +96,8 @@ struct FastllmCudaW4A8ScaledEpilogue {
 
     static ArgumentType prepare_args(const float *channelScales,
                                      const float *tokenScales) {
-        typename ChannelScale::Arguments channelArgs{channelScales, true};
-        typename TokenScale::Arguments tokenArgs{tokenScales, true};
+        typename ChannelScale::Arguments channelArgs{channelScales, 0.0f, {}};
+        typename TokenScale::Arguments tokenArgs{tokenScales, 0.0f, {}};
         typename EVTCompute0::Arguments evt0Args{tokenArgs, {}, {}};
         return ArgumentType{channelArgs, evt0Args, {}};
     }
