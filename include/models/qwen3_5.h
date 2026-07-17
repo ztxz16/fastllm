@@ -105,6 +105,8 @@ namespace fastllm {
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
         virtual int GetChunkedPrefillSize() override;
 
+        virtual int GetBatchedPrefillTokenLimit() override;
+
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
 
         virtual void WarmupCudaRuntimeBuffers(int batch) override;
@@ -294,6 +296,7 @@ namespace fastllm {
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearKeyHeadSchemes;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearValueHeadSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        std::vector <uint8_t> threadTpLinearAttentionLayers;
         std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
         PersistentWorkerGroup threadTpWorkerGroup;
 

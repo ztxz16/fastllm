@@ -1897,7 +1897,14 @@ namespace fastllm {
             }
         } if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            if (this->dataType == DataType::FLOAT32) {
+            // IEEE float32/float16/bfloat16 all represent zero with all bits
+            // cleared.  Initializing large CUDA caches through a pageable host
+            // vector turns one logical memset into a synchronous H2D copy for
+            // every request and layer, which is especially expensive during
+            // batched prefill.
+            if (v == 0.0f) {
+                FastllmCudaMemset0(this->cudaData, this->expansionBytes);
+            } else if (this->dataType == DataType::FLOAT32) {
                 std::vector <float> f = std::vector <float> (Count(0), v);
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(float));
             } else if (this->dataType == DataType::FLOAT16) {

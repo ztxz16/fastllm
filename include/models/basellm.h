@@ -385,6 +385,13 @@ namespace fastllm {
 
         virtual int GetChunkedPrefillSize();
 
+        // Maximum aggregate token count when several independent short
+        // prompts are combined into one prefill.  This is normally identical
+        // to the per-request chunk size, but hybrid models may use smaller
+        // per-request chunks for recurrent-state snapshots while retaining a
+        // larger aggregate batching limit.
+        virtual int GetBatchedPrefillTokenLimit();
+
         virtual void SetDataType(DataType dataType);
 
         virtual void SetKVCacheDataType(DataType dataType);

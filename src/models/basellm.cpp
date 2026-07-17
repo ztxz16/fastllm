@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <set>
+#include <tuple>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -432,9 +433,17 @@ namespace fastllm {
 
     void ResponseContext::Init(int blocks, DataType, DataType kvCacheDataType) {
         pastKeyValues.clear();
+        // A request owns two cache descriptors per transformer block.  Without
+        // reserving here, vector growth repeatedly copy-constructs every Data
+        // descriptor already inserted.  Qwen3.5 has enough blocks for that
+        // O(blocks^2) setup work to serialize a burst of HTTP requests and
+        // split one batch into multiple prefills before any GPU work starts.
+        pastKeyValues.reserve(blocks);
         for (int i = 0; i < blocks; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(kvCacheDataType),
-                                                   Data(kvCacheDataType)));
+            pastKeyValues.emplace_back(
+                std::piecewise_construct,
+                std::forward_as_tuple(kvCacheDataType),
+                std::forward_as_tuple(kvCacheDataType));
             pastKeyValues.back().first.SetKVCache();
             pastKeyValues.back().second.SetKVCache();
         }
@@ -1189,6 +1198,8 @@ namespace fastllm {
         maxBatch = NormalizeMaxBatchByModelCapability(model, maxBatch);
 
         int prefillChunkSize = model->GetChunkedPrefillSize();
+        int batchedPrefillTokenLimit = std::max(
+            prefillChunkSize, model->GetBatchedPrefillTokenLimit());
 
         // 辅助lambda：释放一个请求占用的所有KV Cache分页，并以allTokens重新初始化为pending prefill状态
         auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
@@ -1232,9 +1243,59 @@ namespace fastllm {
             return model->GetPagedKVCacheManager(model->kvCacheId, true);
         };
 
+        // Attention layers allocate pages in lockstep.  Most decode steps are
+        // not page-boundary steps, so probing one representative cache per
+        // request avoids walking every layer and every TP-local cache just to
+        // produce an empty page-needs map.
+        std::function<int(Data&)> probeDecodePageNeed = [&](Data &cache) -> int {
+            if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                bool foundPagedLocal = false;
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second == nullptr) {
+                        continue;
+                    }
+                    int localNeed = probeDecodePageNeed(*it.second);
+                    if (localNeed > 0) {
+                        return 1;
+                    }
+                    foundPagedLocal |= localNeed == 0;
+                }
+                if (foundPagedLocal) {
+                    return 0;
+                }
+            }
+            if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr ||
+                cache.pagedKVCacheData->type !=
+                    PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                return -1;
+            }
+            return cache.pageIndex.empty() || cache.lastPageLen >= cache.pageLen;
+        };
+
         auto collectDecodePageNeeds =
                 [&](const std::vector<ResponseContext*> &contexts) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
+            bool representativeCachesKnown = true;
+            for (auto *ctx : contexts) {
+                if (ctx == nullptr || model->kvCacheId < 0 ||
+                    model->kvCacheId >= (int)ctx->pastKeyValues.size()) {
+                    representativeCachesKnown = false;
+                    break;
+                }
+                int need = probeDecodePageNeed(
+                    ctx->pastKeyValues[model->kvCacheId].first);
+                if (need > 0) {
+                    representativeCachesKnown = false;
+                    break;
+                }
+                if (need < 0) {
+                    representativeCachesKnown = false;
+                    break;
+                }
+            }
+            if (representativeCachesKnown) {
+                return needs;
+            }
             std::function<void(Data&)> addCacheNeed = [&](Data &cache) {
                 if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                     bool usedLocal = false;
@@ -1403,8 +1464,28 @@ namespace fastllm {
 
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
-        const bool canUseFastDecodeInput = (model->model_type == "qwen3");
+        const bool canUseFastDecodeInput =
+            model->model_type == "qwen3" || model->model_type == "qwen3_5";
         const bool printProfile = GetFastllmEnv().printProfile;
+        int idlePrefillBatchWaitUs =
+            useGPUForward && maxBatch > 1 && model->model_type == "qwen3_5" ?
+            50000 : 0;
+        int idlePrefillBatchQuietUs = idlePrefillBatchWaitUs > 0 ? 20000 : 0;
+        if (useGPUForward && maxBatch > 1) {
+            const char *waitEnv = std::getenv("FASTLLM_IDLE_PREFILL_BATCH_WAIT_US");
+            if (waitEnv != nullptr) {
+                idlePrefillBatchWaitUs = std::max(0, std::atoi(waitEnv));
+            }
+            const char *quietEnv = std::getenv("FASTLLM_IDLE_PREFILL_BATCH_QUIET_US");
+            if (quietEnv != nullptr) {
+                idlePrefillBatchQuietUs = std::max(0, std::atoi(quietEnv));
+            }
+            idlePrefillBatchQuietUs = std::min(idlePrefillBatchQuietUs,
+                                               idlePrefillBatchWaitUs);
+        }
+        std::chrono::steady_clock::time_point idlePrefillBatchDeadline;
+        std::chrono::steady_clock::time_point idlePrefillBatchHardDeadline;
+        size_t idlePrefillBatchObservedSize = 0;
         while (true) {
             if (model->isFree) {
                 break;
@@ -1488,6 +1569,41 @@ namespace fastllm {
                 }
                 return a.handle < b.handle;
             });
+
+            // When the GPU is completely idle, the first HTTP request can wake
+            // this loop and take dictLocker before the sibling requests in the
+            // same burst have registered.  That turns one uniform batched
+            // prefill into a small prefill followed by a second large prefill.
+            // Give only the idle/no-active case a short, bounded collection
+            // window.  HTTP request preparation can span several milliseconds,
+            // so finish after a short quiet period instead of measuring only
+            // from the first request.  The hard deadline bounds single-request
+            // latency even when requests keep trickling in.  Once decode has
+            // started we never delay an iteration.
+            if (idlePrefillBatchWaitUs > 0 && currentActivate == 0 && hasPrefill &&
+                (int)orders.size() < maxBatch) {
+                auto now = std::chrono::steady_clock::now();
+                if (idlePrefillBatchHardDeadline == std::chrono::steady_clock::time_point()) {
+                    idlePrefillBatchHardDeadline =
+                        now + std::chrono::microseconds(idlePrefillBatchWaitUs);
+                    idlePrefillBatchObservedSize = orders.size();
+                    idlePrefillBatchDeadline = std::min(
+                        idlePrefillBatchHardDeadline,
+                        now + std::chrono::microseconds(idlePrefillBatchQuietUs));
+                } else if (orders.size() > idlePrefillBatchObservedSize) {
+                    idlePrefillBatchObservedSize = orders.size();
+                    idlePrefillBatchDeadline = std::min(
+                        idlePrefillBatchHardDeadline,
+                        now + std::chrono::microseconds(idlePrefillBatchQuietUs));
+                }
+                if (now < idlePrefillBatchDeadline) {
+                    model->dictCV.wait_until(dictLocker, idlePrefillBatchDeadline);
+                    continue;
+                }
+            }
+            idlePrefillBatchDeadline = std::chrono::steady_clock::time_point();
+            idlePrefillBatchHardDeadline = std::chrono::steady_clock::time_point();
+            idlePrefillBatchObservedSize = 0;
 
             // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
             if (totalPages > 0) {
@@ -1730,7 +1846,11 @@ namespace fastllm {
                             }
                         }
 
-                        if (currentActivate + (int)seqLens.size() >= maxBatch) {
+                        // currentActivate already includes every pending
+                        // prefill selected earlier in this pass.  Adding
+                        // seqLens.size() again halves the usable capacity on
+                        // every pass (32 -> 16 -> 8 -> 4 ...).
+                        if (currentActivate >= maxBatch) {
                             continue;
                         }
 
@@ -1769,7 +1889,7 @@ namespace fastllm {
                                 continue;
                             }
                         } else {
-                            if (prefillTokenCount + thisLen > prefillChunkSize && seqLens.size() > 0) {
+                            if (prefillTokenCount + thisLen > batchedPrefillTokenLimit && seqLens.size() > 0) {
                                 continue;
                             }
                         }
@@ -1876,11 +1996,33 @@ namespace fastllm {
                     while (hasPagedManagerShortage(pageNeeds)) {
                         // 空闲分页不够，从本轮decode批次中选择上下文最长的请求驱逐
                         int maxLen = -1, evictIdx = -1;
+                        std::function<int(const Data&)> getCacheLen =
+                                [&](const Data &cache) -> int {
+                            int len = 0;
+                            if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                                for (auto &it : cache.multiDeviceDatas) {
+                                    if (it.second != nullptr) {
+                                        len = std::max(len, getCacheLen(*it.second));
+                                    }
+                                }
+                                if (len > 0) {
+                                    return len;
+                                }
+                            }
+                            if (cache.isPagedKVCache && !cache.pageIndex.empty()) {
+                                return ((int)cache.pageIndex.size() - 1) * cache.pageLen +
+                                       cache.lastPageLen;
+                            }
+                            if (cache.expansionDims.size() > 1) {
+                                return cache.expansionDims[1];
+                            }
+                            return cache.dims.size() > 1 ? cache.dims[1] : 0;
+                        };
                         for (int i = 0; i < (int)handles.size(); i++) {
                             auto &ctx = *tokenContexts[i];
                             auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
-                            if (kvFirst.pageIndex.size() > 0) {
-                                int curLen = (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
+                            int curLen = getCacheLen(kvFirst);
+                            if (curLen > 0) {
                                 if (curLen > maxLen) {
                                     maxLen = curLen;
                                     evictIdx = i;
@@ -2970,6 +3112,10 @@ namespace fastllm {
         return this->defaultChunkedPrefillSize;
     }
 
+    int basellm::GetBatchedPrefillTokenLimit() {
+        return this->GetChunkedPrefillSize();
+    }
+
     void basellm::SetDataType(DataType dataType) {
         if (dataType == DataType::FLOAT32) {
 
@@ -3606,7 +3752,11 @@ namespace fastllm {
                 for (int i = 0; i < seqLen; i++) {
                     shortPos[i] = (float)i;
                 }
-                shortPositionIdsStorage.push_back(Data(this->dataType, {1, seqLen}, shortPos));
+                // Position ids are scalar indices, independent of the model's
+                // activation/weight dtype.  Keeping them in FP32 also avoids
+                // callers accidentally interpreting a packed FP16 buffer as
+                // float values.
+                shortPositionIdsStorage.push_back(Data(DataType::FLOAT32, {1, seqLen}, shortPos));
                 shortPositionIdsVec.push_back(&shortPositionIdsStorage.back());
             }
             std::vector <Data*> shortAttentionMasks(batch, nullptr);
