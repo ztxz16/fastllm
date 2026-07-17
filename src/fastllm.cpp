@@ -655,6 +655,9 @@ namespace fastllm {
 
     std::string ModelLoader::ReadString() {
         int length = ReadInt();
+        if (length < 0 || (size_t)(ptr - data) + (size_t)length > size) {
+            ErrorInFastLLM("ModelLoader::ReadString: string length out of file bounds (corrupt model).");
+        }
         std::string s(ptr, ptr + length);
         ptr += length;
         return s;
@@ -670,6 +673,9 @@ namespace fastllm {
 
     uint8_t* ModelLoader::ReadBytes(uint64_t bytes){
         // memcpy(buffer, ptr, bytes);
+        if ((size_t)(ptr - data) + bytes > size) {
+            ErrorInFastLLM("ModelLoader::ReadBytes: length out of file bounds (corrupt model).");
+        }
         uint8_t* buffer = (uint8_t *) ptr;
         ptr += bytes;
         return buffer;
