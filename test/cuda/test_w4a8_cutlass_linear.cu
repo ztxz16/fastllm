@@ -1,6 +1,7 @@
 #include "test_utils.h"
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "cutlass/float8.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -102,6 +103,47 @@ std::vector<float> RoundInputForDtype(const std::vector<float> &input, fastllm::
         }
     }
     return rounded;
+}
+
+float RoundFp8E4M3(float value) {
+    return (float)cutlass::float_e4m3_t(value);
+}
+
+std::vector<float> QuantizeActivationReference(const std::vector<float> &input,
+                                               const W4A8Case &shape) {
+    std::vector<float> result(input.size());
+    for (int token = 0; token < shape.n; ++token) {
+        size_t rowOffset = (size_t)token * shape.m;
+        float absMax = 0.0f;
+        for (int ic = 0; ic < shape.m; ++ic) {
+            absMax = std::max(absMax, std::fabs(input[rowOffset + ic]));
+        }
+        float scale = std::max(absMax, 1.0e-10f) * (1.0f / 448.0f);
+        for (int ic = 0; ic < shape.m; ++ic) {
+            float q = std::max(-448.0f, std::min(448.0f, input[rowOffset + ic] / scale));
+            result[rowOffset + ic] = RoundFp8E4M3(q) * scale;
+        }
+    }
+    return result;
+}
+
+std::vector<float> QuantizeScaleReference(const std::vector<float> &scales,
+                                          const W4A8Case &shape) {
+    int groupCnt = 128;
+    int groups = shape.m / groupCnt;
+    std::vector<float> result(scales.size());
+    for (int oc = 0; oc < shape.k; ++oc) {
+        float channelAbsMax = 0.0f;
+        size_t rowOffset = (size_t)oc * groups;
+        for (int group = 0; group < groups; ++group) {
+            channelAbsMax = std::max(channelAbsMax, std::fabs(scales[rowOffset + group]));
+        }
+        float channelScale = std::max(channelAbsMax, 1.0e-10f) * 8.0f;
+        for (int group = 0; group < groups; ++group) {
+            result[rowOffset + group] = RoundFp8E4M3(scales[rowOffset + group] / channelScale) * channelScale;
+        }
+    }
+    return result;
 }
 
 std::vector<uint8_t> MakeSignedCompatibleInt4Weights(int outChannels, int inChannels, uint32_t seed) {
@@ -291,8 +333,10 @@ bool RunNumericalCase(const W4A8Case &shape, uint32_t seedBase, const std::strin
 
     std::vector<float> expectedInput = RoundInputForDtype(
         input, shape.bf16Input ? fastllm::DataType::BFLOAT16 : fastllm::DataType::FLOAT16);
+    expectedInput = QuantizeActivationReference(expectedInput, shape);
+    std::vector<float> expectedScales = QuantizeScaleReference(scales, shape);
     const std::vector<float> *biasPtr = shape.withBias ? &biasValues : nullptr;
-    std::vector<float> expected = CpuReference(expectedInput, qweight, scales, biasPtr, shape);
+    std::vector<float> expected = CpuReference(expectedInput, qweight, expectedScales, biasPtr, shape);
     std::vector<float> actual = DataToFloat(outputData);
 
     constexpr float maxAbsTol = 2.5e-1f;

@@ -691,10 +691,10 @@ static bool FastllmCudaW4A8BuildScaleCaches(
         for (int group = 0; group < weight.group; group++) {
             channelAbsMax = std::max(channelAbsMax, std::fabs(weight.scales[rowOffset + group]));
         }
-        float channelScale = std::max(channelAbsMax, 1.0e-10f);
+        float channelScale = std::max(channelAbsMax, 1.0e-10f) * 8.0f;
         hostChannelScales[out] = channelScale;
         for (int group = 0; group < weight.group; group++) {
-            groupScalesFp8[rowOffset + group] =
+            groupScalesFp8[(size_t)group * k + out] =
                 W4A8MmaType(weight.scales[rowOffset + group] / channelScale);
         }
     }
