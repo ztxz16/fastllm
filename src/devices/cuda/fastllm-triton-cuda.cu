@@ -483,6 +483,7 @@ struct TritonMoeFp8Scratch {
     uint8_t *gateUp = nullptr;
     uint8_t *activationQuant = nullptr;
     float *activationScale = nullptr;
+    std::vector<void*> retiredPointers;
 };
 
 static std::mutex g_tritonMoeFp8ScratchMutex;
@@ -494,6 +495,59 @@ static void FreeTritonScratchPtr(T *&ptr) {
         FastllmCudaFree(ptr);
         ptr = nullptr;
     }
+}
+
+template <typename T>
+static void ReleaseOrRetainTritonScratchPtr(
+    T *&ptr, std::vector<void*> &retiredPointers) {
+    if (ptr == nullptr) {
+        return;
+    }
+    // Captured graphs keep the scratch addresses embedded in their kernel
+    // nodes. Preserve old generations in graph mode; geometric growth keeps
+    // their total size below the current generation's capacity.
+    if (fastllm::GetFastllmEnv().cudaGraph) {
+        retiredPointers.push_back(ptr);
+        ptr = nullptr;
+    } else {
+        FreeTritonScratchPtr(ptr);
+    }
+}
+
+static bool PreserveTritonScratchAddresses() {
+    return fastllm::GetFastllmEnv().cudaGraph;
+}
+
+static int NextTritonScratchCapacity(int current, int required) {
+    if (current <= 0) {
+        return required;
+    }
+    int64_t doubled = (int64_t)current * 2;
+    return doubled > required && doubled <= INT32_MAX ? (int)doubled : required;
+}
+
+template <typename T>
+static bool GrowTritonScratchPtr(
+    T *&ptr, int &capacity, int required, std::vector<void*> &retiredPointers) {
+    if (capacity >= required && ptr != nullptr) {
+        return true;
+    }
+    int newCapacity = NextTritonScratchCapacity(
+        ptr == nullptr ? 0 : capacity, required);
+    if (!PreserveTritonScratchAddresses()) {
+        FreeTritonScratchPtr(ptr);
+    }
+    T *replacement = (T*)FastllmCudaMalloc((size_t)newCapacity * sizeof(T));
+    if (replacement == nullptr) {
+        if (ptr == nullptr) {
+            capacity = 0;
+        }
+        return false;
+    }
+    ReleaseOrRetainTritonScratchPtr(ptr, retiredPointers);
+    ptr = replacement;
+    capacity = newCapacity;
+    return true;
 }
 
 struct TritonLinearFp8Scratch {
@@ -656,60 +710,118 @@ static bool EnsureTritonMoeFp8Scratch(
     std::lock_guard<std::mutex> guard(g_tritonMoeFp8ScratchMutex);
     TritonMoeFp8Scratch &cached = g_tritonMoeFp8Scratch[deviceId];
 
-    if (cached.expertCapacity < experts) {
-        FreeTritonScratchPtr(cached.expertCounts);
-        FreeTritonScratchPtr(cached.expertOffsets);
-        FreeTritonScratchPtr(cached.expertCursors);
-        FreeTritonScratchPtr(cached.expertBlockOffsets);
-        cached.expertCapacity = experts;
-        cached.expertCounts = (int32_t*)FastllmCudaMalloc((size_t)experts * sizeof(int32_t));
-        cached.expertOffsets = (int32_t*)FastllmCudaMalloc((size_t)(experts + 1) * sizeof(int32_t));
-        cached.expertCursors = (int32_t*)FastllmCudaMalloc((size_t)experts * sizeof(int32_t));
-        cached.expertBlockOffsets = (int32_t*)FastllmCudaMalloc((size_t)experts * sizeof(int32_t));
+    if (cached.expertCapacity < experts || cached.expertCounts == nullptr ||
+        cached.expertOffsets == nullptr || cached.expertCursors == nullptr ||
+        cached.expertBlockOffsets == nullptr) {
+        int currentCapacity = cached.expertCounts == nullptr ||
+                              cached.expertOffsets == nullptr ||
+                              cached.expertCursors == nullptr ||
+                              cached.expertBlockOffsets == nullptr ?
+            0 : cached.expertCapacity;
+        int newCapacity = NextTritonScratchCapacity(currentCapacity, experts);
+        if (!PreserveTritonScratchAddresses()) {
+            FreeTritonScratchPtr(cached.expertCounts);
+            FreeTritonScratchPtr(cached.expertOffsets);
+            FreeTritonScratchPtr(cached.expertCursors);
+            FreeTritonScratchPtr(cached.expertBlockOffsets);
+        }
+        int32_t *expertCounts =
+            (int32_t*)FastllmCudaMalloc((size_t)newCapacity * sizeof(int32_t));
+        int32_t *expertOffsets =
+            (int32_t*)FastllmCudaMalloc((size_t)(newCapacity + 1) * sizeof(int32_t));
+        int32_t *expertCursors =
+            (int32_t*)FastllmCudaMalloc((size_t)newCapacity * sizeof(int32_t));
+        int32_t *expertBlockOffsets =
+            (int32_t*)FastllmCudaMalloc((size_t)newCapacity * sizeof(int32_t));
+        if (expertCounts == nullptr || expertOffsets == nullptr ||
+            expertCursors == nullptr || expertBlockOffsets == nullptr) {
+            FreeTritonScratchPtr(expertCounts);
+            FreeTritonScratchPtr(expertOffsets);
+            FreeTritonScratchPtr(expertCursors);
+            FreeTritonScratchPtr(expertBlockOffsets);
+            if (cached.expertCounts == nullptr || cached.expertOffsets == nullptr ||
+                cached.expertCursors == nullptr ||
+                cached.expertBlockOffsets == nullptr) {
+                cached.expertCapacity = 0;
+            }
+            return false;
+        }
+        ReleaseOrRetainTritonScratchPtr(
+            cached.expertCounts, cached.retiredPointers);
+        ReleaseOrRetainTritonScratchPtr(
+            cached.expertOffsets, cached.retiredPointers);
+        ReleaseOrRetainTritonScratchPtr(
+            cached.expertCursors, cached.retiredPointers);
+        ReleaseOrRetainTritonScratchPtr(
+            cached.expertBlockOffsets, cached.retiredPointers);
+        cached.expertCapacity = newCapacity;
+        cached.expertCounts = expertCounts;
+        cached.expertOffsets = expertOffsets;
+        cached.expertCursors = expertCursors;
+        cached.expertBlockOffsets = expertBlockOffsets;
     }
-    if (cached.taskCapacity < totalTasks) {
-        FreeTritonScratchPtr(cached.sortedTasks);
-        FreeTritonScratchPtr(cached.blockExperts);
-        FreeTritonScratchPtr(cached.blockStarts);
-        cached.taskCapacity = totalTasks;
-        cached.sortedTasks = (int32_t*)FastllmCudaMalloc((size_t)totalTasks * sizeof(int32_t));
-        cached.blockExperts = (int32_t*)FastllmCudaMalloc((size_t)totalTasks * sizeof(int32_t));
-        cached.blockStarts = (int32_t*)FastllmCudaMalloc((size_t)totalTasks * sizeof(int32_t));
+    if (cached.taskCapacity < totalTasks || cached.sortedTasks == nullptr ||
+        cached.blockExperts == nullptr || cached.blockStarts == nullptr) {
+        int currentCapacity = cached.sortedTasks == nullptr ||
+                              cached.blockExperts == nullptr ||
+                              cached.blockStarts == nullptr ?
+            0 : cached.taskCapacity;
+        int newCapacity = NextTritonScratchCapacity(currentCapacity, totalTasks);
+        if (!PreserveTritonScratchAddresses()) {
+            FreeTritonScratchPtr(cached.sortedTasks);
+            FreeTritonScratchPtr(cached.blockExperts);
+            FreeTritonScratchPtr(cached.blockStarts);
+        }
+        int32_t *sortedTasks =
+            (int32_t*)FastllmCudaMalloc((size_t)newCapacity * sizeof(int32_t));
+        int32_t *blockExperts =
+            (int32_t*)FastllmCudaMalloc((size_t)newCapacity * sizeof(int32_t));
+        int32_t *blockStarts =
+            (int32_t*)FastllmCudaMalloc((size_t)newCapacity * sizeof(int32_t));
+        if (sortedTasks == nullptr || blockExperts == nullptr || blockStarts == nullptr) {
+            FreeTritonScratchPtr(sortedTasks);
+            FreeTritonScratchPtr(blockExperts);
+            FreeTritonScratchPtr(blockStarts);
+            if (cached.sortedTasks == nullptr || cached.blockExperts == nullptr ||
+                cached.blockStarts == nullptr) {
+                cached.taskCapacity = 0;
+            }
+            return false;
+        }
+        ReleaseOrRetainTritonScratchPtr(
+            cached.sortedTasks, cached.retiredPointers);
+        ReleaseOrRetainTritonScratchPtr(
+            cached.blockExperts, cached.retiredPointers);
+        ReleaseOrRetainTritonScratchPtr(
+            cached.blockStarts, cached.retiredPointers);
+        cached.taskCapacity = newCapacity;
+        cached.sortedTasks = sortedTasks;
+        cached.blockExperts = blockExperts;
+        cached.blockStarts = blockStarts;
     }
     if (cached.totalBlocks == nullptr) {
         cached.totalBlocks = (int32_t*)FastllmCudaMalloc(sizeof(int32_t));
     }
-    if (cached.downOutputCapacity < downOutputBytes) {
-        FreeTritonScratchPtr(cached.downOutput);
-        cached.downOutputCapacity = downOutputBytes;
-        cached.downOutput = (uint8_t*)FastllmCudaMalloc((size_t)downOutputBytes);
-    }
-    if (cached.inputQuantCapacity < inputQuantElements) {
-        FreeTritonScratchPtr(cached.inputQuant);
-        cached.inputQuantCapacity = inputQuantElements;
-        cached.inputQuant = (uint8_t*)FastllmCudaMalloc((size_t)inputQuantElements);
-    }
-    if (cached.inputScaleCapacity < inputScaleElements) {
-        FreeTritonScratchPtr(cached.inputScale);
-        cached.inputScaleCapacity = inputScaleElements;
-        cached.inputScale = (float*)FastllmCudaMalloc((size_t)inputScaleElements * sizeof(float));
-    }
-    if (cached.gateUpCapacity < gateUpBytes) {
-        FreeTritonScratchPtr(cached.gateUp);
-        cached.gateUpCapacity = gateUpBytes;
-        cached.gateUp = (uint8_t*)FastllmCudaMalloc((size_t)gateUpBytes);
-    }
-    if (cached.activationQuantCapacity < activationQuantElements) {
-        FreeTritonScratchPtr(cached.activationQuant);
-        cached.activationQuantCapacity = activationQuantElements;
-        cached.activationQuant = (uint8_t*)FastllmCudaMalloc((size_t)activationQuantElements);
-    }
-    if (cached.activationScaleCapacity < activationScaleElements) {
-        FreeTritonScratchPtr(cached.activationScale);
-        cached.activationScaleCapacity = activationScaleElements;
-        cached.activationScale = (float*)FastllmCudaMalloc((size_t)activationScaleElements * sizeof(float));
-    }
-    if (cached.expertCounts == nullptr || cached.expertOffsets == nullptr ||
+    if (cached.totalBlocks == nullptr ||
+        !GrowTritonScratchPtr(
+            cached.downOutput, cached.downOutputCapacity, downOutputBytes,
+            cached.retiredPointers) ||
+        !GrowTritonScratchPtr(
+            cached.inputQuant, cached.inputQuantCapacity, inputQuantElements,
+            cached.retiredPointers) ||
+        !GrowTritonScratchPtr(
+            cached.inputScale, cached.inputScaleCapacity, inputScaleElements,
+            cached.retiredPointers) ||
+        !GrowTritonScratchPtr(
+            cached.gateUp, cached.gateUpCapacity, gateUpBytes,
+            cached.retiredPointers) ||
+        !GrowTritonScratchPtr(
+            cached.activationQuant, cached.activationQuantCapacity,
+            activationQuantElements, cached.retiredPointers) ||
+        !GrowTritonScratchPtr(
+            cached.activationScale, cached.activationScaleCapacity,
+            activationScaleElements, cached.retiredPointers) ||
+        cached.expertCounts == nullptr || cached.expertOffsets == nullptr ||
         cached.expertCursors == nullptr || cached.expertBlockOffsets == nullptr ||
         cached.sortedTasks == nullptr || cached.blockExperts == nullptr ||
         cached.blockStarts == nullptr || cached.totalBlocks == nullptr ||
@@ -1551,6 +1663,17 @@ static bool LaunchTritonMergeMOEFP8E4M3Table(
     const char *hostBlocksEnv = std::getenv("FASTLLM_CUDA_TRITON_MERGE_MOE_HOST_BLOCKS");
     bool useHostBlocks = hostBlocksEnv == nullptr || hostBlocksEnv[0] == '\0' ||
                          TritonEnvFlagEnabled("FASTLLM_CUDA_TRITON_MERGE_MOE_HOST_BLOCKS");
+    // A synchronous device-to-host read invalidates CUDA stream capture.
+    // During capture, launch the safe upper-bound grid and let device-side
+    // routing metadata mask unused blocks.
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaError_t captureState = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
+    bool isCapturing = captureState == cudaSuccess &&
+                       captureStatus != cudaStreamCaptureStatusNone;
+    if (captureState != cudaSuccess) {
+        cudaGetLastError();
+    }
+    useHostBlocks = useHostBlocks && !isCapturing;
     if (useHostBlocks) {
         int32_t hostBlocks = 0;
         cudaError_t copyResult = cudaMemcpy(&hostBlocks, scratch->totalBlocks, sizeof(int32_t), cudaMemcpyDeviceToHost);
