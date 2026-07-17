@@ -145,6 +145,56 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+#define VDR_Q2_K_Q8_1_MMVQ 1
+#define VDR_Q2_K_Q8_1_MMQ  2
+
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
+    const int & v, const int * __restrict__ u, const uint8_t * __restrict__ scales,
+    const half2 & dm2, const float * __restrict__ d8) {
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        const int sc = scales[2*i];
+        const int vi = (v >> (2*i)) & 0x03030303;
+
+        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF));
+
+        int m = sc >> 4;
+        m |= m << 8;
+        m |= m << 16;
+        sumf_m += d8[i] * ggml_cuda_dp4a(m, u[i], 0);
+    }
+
+    const float2 dm2f = __half22float2(dm2);
+    return dm2f.x * sumf_d - dm2f.y * sumf_m;
+}
+
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+    const int & kbx, const int & iqs) {
+
+    const block_q2_K * bq2_K = (const block_q2_K *) vbq + kbx;
+    const int bq8_offset = QR2_K * (iqs / QI8_1);
+    const int scale_offset =
+        iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const uint8_t * scales = bq2_K->scales + scale_offset;
+
+    const int v = get_int_b4(bq2_K->qs, iqs);
+    int u[QR2_K];
+    float d8[QR2_K];
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        u[i] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
+}
+
 #define VDR_Q3_K_Q8_1_MMVQ 1
 #define VDR_Q3_K_Q8_1_MMQ  2
 
@@ -734,6 +784,7 @@ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_
 
 bool get_has_vec_dot_q_cuda(ggml_type type) {
     switch (type) {        
+        case GGML_TYPE_Q2_K   : return true;
         case GGML_TYPE_Q3_K   : return true;
         case GGML_TYPE_IQ3_XXS: return true;
         case GGML_TYPE_IQ3_S  : return true;
@@ -751,6 +802,7 @@ bool get_has_vec_dot_q_cuda(ggml_type type) {
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {        
+        case GGML_TYPE_Q2_K   : return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K   : return vec_dot_q3_K_q8_1;
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
         case GGML_TYPE_IQ3_S  : return vec_dot_iq3_s_q8_1;
@@ -771,6 +823,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 
 static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q2_K    : return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K    : return VDR_Q3_K_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS : return VDR_IQ3_XXS_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_S : return VDR_IQ3_S_Q8_1_MMVQ;
@@ -788,6 +841,13 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
 
 template <ggml_type type>
 struct ggml_cuda_type_traits;
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR2_K;
+    static constexpr int qi = QI2_K;
+};
 
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q3_K> {
@@ -1038,6 +1098,9 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
     const int64_t nrows_dst = true ? ne0 : row_diff;
 
     switch (type) {
+        case GGML_TYPE_Q2_K:
+            mul_mat_vec_q_cuda_T<GGML_TYPE_Q2_K, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            break;
         case GGML_TYPE_Q3_K:
             mul_mat_vec_q_cuda_T<GGML_TYPE_Q3_K, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
@@ -2411,7 +2474,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     } else {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
-            cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, nullptr
+            cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
         );
     }
 
@@ -2425,7 +2488,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, MMVQ_MAX_BATCH_SIZE, m, nullptr 
+                    0, k, MMVQ_MAX_BATCH_SIZE, m, stream
             );        
         }
 
@@ -2437,7 +2500,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, n - i, m, nullptr
+                    0, k, n - i, m, stream
             );        
         }
     } else if (q8Input != nullptr) {
@@ -2445,7 +2508,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                 ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                 0, 0, 0, 0,
                 (char*)weight.cudaData, (char*)q8Input, cudaOutput, nullptr, 
-                0, k, n, m, nullptr 
+                0, k, n, m, stream
         );
     }
     if (bias.dims.size() > 0) {
@@ -2484,16 +2547,13 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
-
-    block_q8_1 * q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
-    quantize_row_q8_1_cuda (
-        cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, nullptr
-    );
+    block_q8_1 * q8Input = nullptr;
 
     ggml_backend_cuda_context ctx;
 
     auto dequant = ggml_get_to_fp16_cuda((ggml_type)weight.ggmlType);
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+    cudaStream_t stream = cudaStreamPerThread;
     // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
     if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
@@ -2514,7 +2574,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
         int len = k * m;
         int threadPerBlock = std::min(256, len);
-        dequant((const char *)weight.cudaData, cudaFp16Weight, k, m, nullptr);
+        dequant((const char *)weight.cudaData, cudaFp16Weight, k, m, stream);
 
         status = cublasGemmEx(fastllmCublasHandle,
                                 CUBLAS_OP_T, CUBLAS_OP_N,
@@ -2531,7 +2591,14 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
         }
 
         FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
-    } else if (n > 1) {
+    } else {
+        q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
+        quantize_row_q8_1_cuda (
+            cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
+        );
+    }
+
+    if (q8Input != nullptr && n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
             ggml_cuda_op_mul_mat_vec_q_impl (
@@ -2541,7 +2608,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, MMVQ_MAX_BATCH_SIZE, m, nullptr 
+                    0, k, MMVQ_MAX_BATCH_SIZE, m, stream
             );        
         }
 
@@ -2553,22 +2620,24 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, n - i, m, nullptr 
+                    0, k, n - i, m, stream
             );        
         }
-    } else {
+    } else if (q8Input != nullptr) {
         ggml_cuda_op_mul_mat_vec_q_impl (
                 ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                 0, 0, 0, 0,
                 (char*)weight.cudaData, (char*)q8Input, cudaOutput, nullptr, 
-                0, k, n, m, nullptr 
+                0, k, n, m, stream
         );
     }
     if (bias.dims.size() > 0) {
-        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        FastllmCudaBiasKernel <<< n, 256, 0, stream >>> (cudaOutput, cudaBiasData, k);
     }
 
-    FastllmCudaFree(q8Input);
+    if (q8Input != nullptr) {
+        FastllmCudaFree(q8Input);
+    }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
 
@@ -2598,16 +2667,13 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     __nv_bfloat16 *cudaBiasData = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *)weight.extraCudaHalfData[0];
     __nv_bfloat16 *cudaInput = (__nv_bfloat16 *)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16 *)FastllmCudaPrepareOutput(output);
-
-    block_q8_1 *q8Input = (block_q8_1 *)FastllmCudaMalloc(n * m * sizeof(__nv_bfloat16));
-    quantize_row_q8_1_cuda(
-        cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, nullptr
-    );
+    block_q8_1 *q8Input = nullptr;
 
     ggml_backend_cuda_context ctx;
 
     auto dequant = ggml_get_to_bf16_cuda((ggml_type)weight.ggmlType);
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+    cudaStream_t stream = cudaStreamPerThread;
 
     if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -2620,7 +2686,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
             cudaBf16Weight = (__nv_bfloat16 *) FastllmCudaMalloc(needBytes);
             ownScratch = true;
         }
-        dequant((const char *)weight.cudaData, cudaBf16Weight, k, m, nullptr);
+        dequant((const char *)weight.cudaData, cudaBf16Weight, k, m, stream);
 
         float h_alpha = 1.0f, h_beta = 0.0f;
         cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
@@ -2641,7 +2707,14 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
         }
 
         FastllmReleaseDequantScratch(cudaBf16Weight, ownScratch);
-    } else if (n > 1) {
+    } else {
+        q8Input = (block_q8_1 *)FastllmCudaMalloc(n * m * sizeof(__nv_bfloat16));
+        quantize_row_q8_1_cuda(
+            cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
+        );
+    }
+
+    if (q8Input != nullptr && n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
             ggml_cuda_op_mul_mat_vec_q_impl(
@@ -2651,7 +2724,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
                 (char *)(q8Input + i * (m / QK8_1)),
                 cudaOutput + i * k,
                 nullptr,
-                0, k, MMVQ_MAX_BATCH_SIZE, m, nullptr
+                0, k, MMVQ_MAX_BATCH_SIZE, m, stream
             );
         }
 
@@ -2663,23 +2736,25 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
                 (char *)(q8Input + i * (m / QK8_1)),
                 cudaOutput + i * k,
                 nullptr,
-                0, k, n - i, m, nullptr
+                0, k, n - i, m, stream
             );
         }
-    } else {
+    } else if (q8Input != nullptr) {
         ggml_cuda_op_mul_mat_vec_q_impl(
             ctx, (ggml_type)weight.ggmlType, m, k, 1,
             0, 0, 0, 0,
             (char *)weight.cudaData, (char *)q8Input, cudaOutput, nullptr,
-            0, k, n, m, nullptr
+            0, k, n, m, stream
         );
     }
 
     if (bias.dims.size() > 0) {
-        FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, cudaBiasData, k);
+        FastllmCudaBiasKernel <<<n, 256, 0, stream>>>(cudaOutput, cudaBiasData, k);
     }
 
-    FastllmCudaFree(q8Input);
+    if (q8Input != nullptr) {
+        FastllmCudaFree(q8Input);
+    }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
 
