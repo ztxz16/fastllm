@@ -63,7 +63,7 @@ void CheckCuda(cudaError_t state, const char *message) {
 
 bool RuntimeSm90() {
     int arch = FastllmCudaRuntimeArch();
-    return arch >= 900 && arch < 1000;
+    return arch == 90;
 }
 
 std::vector<float> DataToFloat(fastllm::Data &data) {

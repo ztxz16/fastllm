@@ -254,7 +254,7 @@ static bool FastllmCudaW4A8TraceEnabled() {
 }
 
 static bool FastllmCudaW4A8RuntimeArchSupported(int arch) {
-    return arch >= 900 && arch < 1000;
+    return arch == 90;
 }
 
 static void FastllmCudaW4A8TraceSkip(const char *reason,
