@@ -448,7 +448,7 @@ __global__ void FastllmCudaW4A8PackInt4GroupToVllmBKernel(const uint8_t *src,
         uint32_t signedQ = (q - 8) & 0xF;
         packed |= signedQ << (i * 4);
     }
-    dst[idx] = packed;
+    dst[(size_t)out * (inChannels / 8) + packRow] = packed;
 }
 
 __device__ inline float FastllmCudaW4A8ToFloat(half v) {
