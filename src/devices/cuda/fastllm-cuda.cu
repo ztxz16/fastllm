@@ -615,10 +615,16 @@ namespace {
                                                  std::vector<cudaGraphNode_t> &result) {
         size_t count = 0;
         cudaError_t state;
-#if CUDART_VERSION >= 12030
+        // CUDA 12.3-12.x exposes edge-data queries as *_v2; CUDA 13 promotes
+        // those signatures to the unversioned runtime APIs.
+#if CUDART_VERSION >= 13000
         state = dependents
             ? cudaGraphNodeGetDependentNodes(node, nullptr, nullptr, &count)
             : cudaGraphNodeGetDependencies(node, nullptr, nullptr, &count);
+#elif CUDART_VERSION >= 12030
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes_v2(node, nullptr, nullptr, &count)
+            : cudaGraphNodeGetDependencies_v2(node, nullptr, nullptr, &count);
 #else
         state = dependents
             ? cudaGraphNodeGetDependentNodes(node, nullptr, &count)
@@ -635,9 +641,15 @@ namespace {
         }
 #if CUDART_VERSION >= 12030
         std::vector<cudaGraphEdgeData> edgeData(count);
+#if CUDART_VERSION >= 13000
         state = dependents
             ? cudaGraphNodeGetDependentNodes(node, result.data(), edgeData.data(), &count)
             : cudaGraphNodeGetDependencies(node, result.data(), edgeData.data(), &count);
+#else
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes_v2(node, result.data(), edgeData.data(), &count)
+            : cudaGraphNodeGetDependencies_v2(node, result.data(), edgeData.data(), &count);
+#endif
 #else
         state = dependents
             ? cudaGraphNodeGetDependentNodes(node, result.data(), &count)
@@ -658,8 +670,10 @@ namespace {
         if (from.empty()) {
             return cudaSuccess;
         }
-#if CUDART_VERSION >= 12030
+#if CUDART_VERSION >= 13000
         return cudaGraphAddDependencies(graph, from.data(), to.data(), nullptr, from.size());
+#elif CUDART_VERSION >= 12030
+        return cudaGraphAddDependencies_v2(graph, from.data(), to.data(), nullptr, from.size());
 #else
         return cudaGraphAddDependencies(graph, from.data(), to.data(), from.size());
 #endif
