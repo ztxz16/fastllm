@@ -40,7 +40,7 @@ namespace fastllm {
                 return false;
             }
             int tokens = (int)(input->Count(0) / input->dims.back());
-            int minBatch = EnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+            int minBatch = EnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
             if (tokens < minBatch) {
                 return false;
             }

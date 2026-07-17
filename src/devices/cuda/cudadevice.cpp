@@ -1151,7 +1151,7 @@ namespace fastllm {
             return false;
         }
 
-        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
         if (n < minBatch) {
             return false;
         }
@@ -2495,7 +2495,7 @@ namespace fastllm {
             return false;
         }
         int n = input.Count(0) / gateup;
-        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
         if (n < minBatch) {
             return false;
         }

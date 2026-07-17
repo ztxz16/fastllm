@@ -163,6 +163,11 @@ struct FastllmCutlassFp8Scratch {
     float *inputScales = nullptr;
     size_t inputElems = 0;
     size_t scaleElems = 0;
+    // CUDA graphs retain the exact scratch addresses observed during capture.
+    // Qwen3.5 pre-captures increasing batch sizes, so growing this buffer must
+    // not free storage that an earlier graph still references.
+    std::vector<cutlass::float_e4m3_t*> retiredInputs;
+    std::vector<float*> retiredInputScales;
 };
 
 struct FastllmCutlassFp8WeightCache {
@@ -481,17 +486,27 @@ static bool FastllmCutlassEnsureScratch(
         return false;
     }
     if (deviceScratch.inputElems < inputElems) {
-        if (deviceScratch.input != nullptr) {
-            FastllmCudaFree(deviceScratch.input);
+        cutlass::float_e4m3_t *newInput =
+            (cutlass::float_e4m3_t*)FastllmCudaMalloc(inputElems);
+        if (newInput == nullptr) {
+            return false;
         }
-        deviceScratch.input = (cutlass::float_e4m3_t*)FastllmCudaMalloc(inputElems);
+        if (deviceScratch.input != nullptr) {
+            deviceScratch.retiredInputs.push_back(deviceScratch.input);
+        }
+        deviceScratch.input = newInput;
         deviceScratch.inputElems = inputElems;
     }
     if (deviceScratch.scaleElems < scaleElems) {
-        if (deviceScratch.inputScales != nullptr) {
-            FastllmCudaFree(deviceScratch.inputScales);
+        float *newInputScales =
+            (float*)FastllmCudaMalloc(scaleElems * sizeof(float));
+        if (newInputScales == nullptr) {
+            return false;
         }
-        deviceScratch.inputScales = (float*)FastllmCudaMalloc(scaleElems * sizeof(float));
+        if (deviceScratch.inputScales != nullptr) {
+            deviceScratch.retiredInputScales.push_back(deviceScratch.inputScales);
+        }
+        deviceScratch.inputScales = newInputScales;
         deviceScratch.scaleElems = scaleElems;
     }
     scratch = &deviceScratch;
@@ -660,14 +675,11 @@ static bool FastllmDispatchCutlassFp8Blockwise(
     cutlass::float_e4m3_t *input, cutlass::float_e4m3_t *weightTN,
     float *inputScales, float *weightScales, OutType *output,
     int batch, int outFeatures, int inFeatures, cudaStream_t stream) {
-    bool swapAB = (batch <= 64) || (batch % 4 != 0);
-    if (swapAB) {
-        using Gemm = typename FastllmSm120Fp8SwapABConfig<OutType>::Gemm;
-        return FastllmRunCutlassFp8Blockwise<Gemm>(
-            input, weightTN, inputScales, weightScales, output, batch, outFeatures, inFeatures, stream);
-    }
+    // The SM120 ping-pong blockwise kernel can produce run-to-run differences
+    // for Qwen3.5's wide projections (for example a 92-token prefill), which
+    // is enough to change greedy decoding. Use the deterministic SwapAB path.
     if (batch <= 256) {
-        using Gemm = typename FastllmSm120Fp8PingpongConfig<OutType>::Gemm;
+        using Gemm = typename FastllmSm120Fp8SwapABConfig<OutType>::Gemm;
         return FastllmRunCutlassFp8Blockwise<Gemm>(
             input, weightTN, inputScales, weightScales, output, batch, outFeatures, inFeatures, stream);
     }
@@ -796,7 +808,7 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
     if (!FastllmCutlassUseFusedSwigluQuant() || !FastllmCutlassUseWarpQuant()) {
         return false;
     }
-    int minBatch = FastllmCutlassEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+    int minBatch = FastllmCutlassEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
     if (n < minBatch) {
         return false;
     }

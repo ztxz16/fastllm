@@ -694,7 +694,7 @@ namespace fastllm {
         }
 
         static bool Qwen3CudaShouldTryCutlassSwigluLinearAdd(int tokens) {
-            int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+            int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
             return tokens >= minBatch;
         }
 
@@ -715,7 +715,7 @@ namespace fastllm {
             int inter = down.dims[1];
             int hidden = hiddenStates.dims.back();
             int n = input.Count(0) / input.dims.back();
-            int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 7);
+            int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
             if (n < minBatch) {
                 return false;
             }
