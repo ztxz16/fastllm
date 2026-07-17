@@ -2049,7 +2049,7 @@ class FastLLmCompletion:
           logging.warning("Anthropic stop_sequences are not supported yet and will be ignored.")
 
       if (not(self.hide_input)):
-         logging.info(f"fastllm anthropic input message: {messages}")
+         logging.debug("fastllm anthropic input message: %s", messages)
 
       model_images = media.images if media.images else None
       model_videos = media.videos if media.videos else None
@@ -2191,7 +2191,7 @@ class FastLLmCompletion:
 
       #logging.info(request)
       if (not(self.hide_input)):
-         logging.info(f"fastllm input message: {messages}")
+         logging.debug("fastllm input message: %s", messages)
       #logging.info(f"input tokens: {input_token_len}")
 
       model_images = media.images if media.images else None
@@ -2199,33 +2199,48 @@ class FastLLmCompletion:
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
 
-      try:
-          input_token_len = self._compute_multimodal_input_token_len(
+      launch_kwargs = {
+          "max_length": max_length,
+          "min_length": min_length,
+          "do_sample": do_sample,
+          "top_p": top_p,
+          "top_k": top_k,
+          "temperature": temperature,
+          "repeat_penalty": frequency_penalty,
+          "tools": tools,
+          "one_by_one": True,
+          "enable_thinking": enable_thinking,
+          "images": model_images,
+          "videos": model_videos,
+          "stop_token_ids": stop_token_ids,
+      }
+      self._attach_tool_call_constraint_if_supported(
+          launch_kwargs, request)
+
+      def prepare_and_launch_text_request():
+          # Token counting and launch both apply the chat template.  Keep them
+          # on one worker thread so llm.py can reuse the one-shot tokenization,
+          # while independent HTTP requests prepare concurrently instead of
+          # serializing the FastAPI event loop.
+          input_len = self._compute_multimodal_input_token_len(
               messages,
               enable_thinking = enable_thinking,
               images = model_images,
               videos = model_videos,
               tools = tools)
-
-          launch_kwargs = {
-              "max_length": max_length,
-              "min_length": min_length,
-              "do_sample": do_sample,
-              "top_p": top_p,
-              "top_k": top_k,
-              "temperature": temperature,
-              "repeat_penalty": frequency_penalty,
-              "tools": tools,
-              "one_by_one": True,
-              "enable_thinking": enable_thinking,
-              "images": model_images,
-              "videos": model_videos,
-              "stop_token_ids": stop_token_ids,
-          }
-          self._attach_tool_call_constraint_if_supported(
-              launch_kwargs, request)
-          handle = self.model.launch_stream_response(
+          launched_handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
+          return input_len, launched_handle
+
+      try:
+          can_prepare_concurrently = (
+              not model_images and not model_videos and not tools and
+              "tool_call_constraint" not in launch_kwargs)
+          if can_prepare_concurrently:
+              input_token_len, handle = await asyncio.to_thread(
+                  prepare_and_launch_text_request)
+          else:
+              input_token_len, handle = prepare_and_launch_text_request()
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle

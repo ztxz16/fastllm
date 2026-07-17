@@ -1,7 +1,12 @@
 import argparse
+import asyncio
+import concurrent.futures
 import fastapi
 import logging
+import os
 import sys
+import threading
+import time
 import uvicorn
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -21,6 +26,8 @@ global fastllm_embed
 global fastllm_reranker
 global fastllm_model
 global dev_mode_enabled
+global api_thread_pool_workers
+global request_executor
 
 # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L630
 def set_ulimit(target_soft_limit: int = 65535):
@@ -72,9 +79,48 @@ fastllm_completion:FastLLmCompletion
 fastllm_embed:FastLLmEmbed
 fastllm_model:FastLLmModel
 dev_mode_enabled:bool = False
+api_thread_pool_workers:int = 32
+request_executor = None
+
+def _prewarm_request_executor(executor, workers: int) -> int:
+    started = 0
+    ready = threading.Condition()
+    release = threading.Event()
+
+    def warm_worker():
+        nonlocal started
+        with ready:
+            started += 1
+            ready.notify_all()
+        release.wait()
+
+    futures = [executor.submit(warm_worker) for _ in range(workers)]
+    deadline = time.monotonic() + 5.0
+    with ready:
+        while started < workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready.wait(timeout = remaining)
+    release.set()
+    for future in futures:
+        future.result()
+    return started
 
 class FastLLMUvicornServer(uvicorn.Server):
     async def startup(self, sockets = None):
+        global request_executor
+        loop = asyncio.get_running_loop()
+        if request_executor is None:
+            request_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers = api_thread_pool_workers,
+                thread_name_prefix = "fastllm-api")
+            loop.set_default_executor(request_executor)
+            started = _prewarm_request_executor(
+                request_executor, api_thread_pool_workers)
+            logging.info(
+                "FastLLM API request thread pool: workers=%d, prewarmed=%d",
+                api_thread_pool_workers, started)
         await super().startup(sockets)
         if self.started and not self.should_exit:
             from .llm import disable_cuda_malloc
@@ -240,6 +286,7 @@ def fastllm_server(args):
     global fastllm_reranker
     global fastllm_model
     global dev_mode_enabled
+    global api_thread_pool_workers
     
     # Set development mode from args
     dev_mode_enabled = args.dev_mode
@@ -264,6 +311,14 @@ def fastllm_server(args):
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     fastllm_model = FastLLmModel(model_name = args.model_name)
+    default_workers = args.max_batch if args.max_batch > 0 else 64
+    default_workers = max(32, min(128, default_workers))
+    workers_env = os.getenv("FASTLLM_API_THREADPOOL_WORKERS", "")
+    try:
+        api_thread_pool_workers = int(workers_env) if workers_env else default_workers
+    except ValueError:
+        api_thread_pool_workers = default_workers
+    api_thread_pool_workers = max(1, min(256, api_thread_pool_workers))
     set_ulimit()
     config = uvicorn.Config(app, host = args.host, port = args.port)
     FastLLMUvicornServer(config).run()
