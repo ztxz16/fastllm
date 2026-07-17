@@ -19,6 +19,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #if !defined(_WIN32) && !defined(USE_ROCM)
@@ -1505,7 +1506,7 @@ namespace fastllm {
         return ok;
     }
 
-    static bool TryCudaTritonLinearFp8Block128(
+    static bool RunCudaTritonLinearFp8Block128(
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
         if (!GetFastllmEnv().cudaTriton ||
             !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8", true)) {
@@ -1536,10 +1537,6 @@ namespace fastllm {
             return false;
         }
 
-        int minBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MIN_BATCH", 8);
-        if (n < minBatch) {
-            return false;
-        }
         int defaultMaxBatch = arch == 89 ? 256 : 64;
         int maxBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MAX_BATCH", defaultMaxBatch);
         if (maxBatch > 0 && n > maxBatch) {
@@ -1610,6 +1607,234 @@ namespace fastllm {
             }
         }
         return ok;
+    }
+
+    struct CudaLinearFp8AutotuneKey {
+        int device;
+        int dataType;
+        int cudaGraph;
+        int n;
+        int m;
+        int k;
+
+        bool operator<(const CudaLinearFp8AutotuneKey &other) const {
+            return std::tie(device, dataType, cudaGraph, n, m, k) <
+                   std::tie(other.device, other.dataType, other.cudaGraph,
+                            other.n, other.m, other.k);
+        }
+    };
+
+    static bool RunCudaNativeLinearFp8Block128(
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k) {
+        if (input.dataType == DataType::FLOAT16) {
+            return FastllmCudaHalfMatMulFloatFP8E4M3(
+                input, weight, bias, output, n, m, k);
+        }
+        if (input.dataType == DataType::BFLOAT16) {
+            return FastllmCudaBFloat16MatMulFP8E4M3(
+                input, weight, bias, output, n, m, k);
+        }
+        return false;
+    }
+
+    static bool PreferCudaTritonLinearFp8Sm89Fallback(
+        DataType inputType, int n, int m, int k) {
+        // At n >= 32 the native implementation dequantizes the full weight
+        // before cuBLAS. Isolated repetitions can make that path look fast by
+        // keeping one layer's weight in L2, but full-model decode continually
+        // changes weights and is consistently faster with direct FP8 Triton.
+        if (n >= 32) {
+            return true;
+        }
+        if (n < 12) {
+            return false;
+        }
+        int64_t weightElements = (int64_t)m * k;
+        if (n < 16) {
+            int64_t minWeightElements = inputType == DataType::BFLOAT16
+                ? 8LL * 1024 * 1024 : 12LL * 1024 * 1024;
+            return k > m && weightElements >= minWeightElements;
+        }
+        if (n < 24) {
+            return k > m && weightElements >= 8LL * 1024 * 1024;
+        }
+        return k > m || (k == m && weightElements >= 8LL * 1024 * 1024);
+    }
+
+    static float BenchmarkCudaLinearFp8Path(
+        bool triton, bool cudaGraph, int iterations,
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k, bool &ok) {
+        if (!cudaGraph) {
+            FastllmCudaSyncCurrentThreadStream();
+            auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                bool currentOk = triton
+                    ? RunCudaTritonLinearFp8Block128(
+                          input, weight, bias, output, n, m, k)
+                    : RunCudaNativeLinearFp8Block128(
+                          input, weight, bias, output, n, m, k);
+                ok = ok && currentOk;
+                if (!currentOk) {
+                    break;
+                }
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            auto end = std::chrono::steady_clock::now();
+            float elapsedMs = std::chrono::duration<float, std::milli>(
+                end - start).count();
+            return elapsedMs / std::max(iterations, 1);
+        }
+
+        void *start = FastllmCudaEventCreateTiming();
+        void *end = FastllmCudaEventCreateTiming();
+        FastllmCudaEventRecordCurrentThread(start);
+        for (int i = 0; i < iterations; i++) {
+            bool currentOk = triton
+                ? RunCudaTritonLinearFp8Block128(
+                      input, weight, bias, output, n, m, k)
+                : RunCudaNativeLinearFp8Block128(
+                      input, weight, bias, output, n, m, k);
+            ok = ok && currentOk;
+            if (!currentOk) {
+                break;
+            }
+        }
+        FastllmCudaEventRecordCurrentThread(end);
+        FastllmCudaEventSynchronize(end);
+        float elapsedMs = FastllmCudaEventElapsedTime(start, end);
+        FastllmCudaEventDestroy(start);
+        FastllmCudaEventDestroy(end);
+        return elapsedMs / std::max(iterations, 1);
+    }
+
+    static bool TryCudaTritonLinearFp8Block128(
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
+        if (!GetFastllmEnv().cudaTriton ||
+            !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8", true)) {
+            return false;
+        }
+
+        int arch = CudaTritonRuntimeArch();
+        bool hasBias = bias.dims.size() > 0;
+        bool separateScalesWeight = weight.dataType == DataType::FP8_E4M3 &&
+                                    weight.blockK == 128 && weight.blockM == 128 &&
+                                    !weight.scales.empty();
+
+        const char *minBatchEnv = std::getenv(
+            "FASTLLM_CUDA_TRITON_LINEAR_FP8_MIN_BATCH");
+        if (minBatchEnv != nullptr && minBatchEnv[0] != '\0') {
+            int defaultMinBatch =
+                arch == 89 && separateScalesWeight && !hasBias ? 32 : 8;
+            int minBatch = CudaEnvInt(
+                "FASTLLM_CUDA_TRITON_LINEAR_FP8_MIN_BATCH", defaultMinBatch);
+            if (n < minBatch) {
+                return false;
+            }
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+
+        bool canAutotune = arch == 89 && separateScalesWeight && !hasBias &&
+                           n >= 12 && n < 32;
+        if (!canAutotune) {
+            if (arch == 89 && separateScalesWeight && !hasBias) {
+                if (!PreferCudaTritonLinearFp8Sm89Fallback(
+                        input.dataType, n, m, k)) {
+                    return false;
+                }
+            } else if (n < 8) {
+                return false;
+            }
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+
+        bool cudaGraph = GetFastllmEnv().cudaGraph;
+        CudaLinearFp8AutotuneKey key = {
+            FastllmCudaGetDevice(), (int)input.dataType, cudaGraph ? 1 : 0,
+            n, m, k};
+        // The cache is per inference thread, avoiding a mutex in every eager
+        // linear call while still keeping decisions isolated by CUDA device.
+        static thread_local std::map<CudaLinearFp8AutotuneKey, bool> decisions;
+        auto decision = decisions.find(key);
+        if (decision != decisions.end()) {
+            if (!decision->second) {
+                return false;
+            }
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+
+        // Event synchronization is illegal during graph capture. Qwen3.5 and
+        // the other graph users execute an eager warmup before capture, so the
+        // normal path reaches this point and populates the cache first.
+        if (FastllmCudaGraphIsCapturing()) {
+            if (!PreferCudaTritonLinearFp8Sm89Fallback(
+                    input.dataType, n, m, k)) {
+                return false;
+            }
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+
+        // Warm both implementations before timing so one-time scale uploads,
+        // scratch allocation, kernel loading and GPU clock ramp do not decide
+        // the steady-state path.
+        if (!RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k)) {
+            decisions[key] = false;
+            return false;
+        }
+        if (!RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k)) {
+            decisions[key] = true;
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+        for (int i = 0; i < 2; i++) {
+            RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+            RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+        FastllmCudaSyncCurrentThreadStream();
+
+        constexpr int iterations = 32;
+        bool tritonOk = true, nativeOk = true;
+        float tritonMs = BenchmarkCudaLinearFp8Path(
+            true, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, tritonOk);
+        float nativeMs = BenchmarkCudaLinearFp8Path(
+            false, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, nativeOk);
+        // Repeat in the opposite order and keep the best sample for each path
+        // to reduce clock and cache-order bias.
+        float nativeMs2 = BenchmarkCudaLinearFp8Path(
+            false, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, nativeOk);
+        float tritonMs2 = BenchmarkCudaLinearFp8Path(
+            true, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, tritonOk);
+        tritonMs = std::min(tritonMs, tritonMs2);
+        nativeMs = std::min(nativeMs, nativeMs2);
+
+        // Eager dispatch has a few microseconds of framework overhead that is
+        // hidden once the GPU work is long enough and disappears on graph
+        // replay. Require a wider eager margin for very small kernels; graph
+        // mode can use the direct GPU-event comparison.
+        float tritonMargin = cudaGraph ? 0.98f : 0.90f;
+        bool useTriton = tritonOk &&
+                         (!nativeOk || tritonMs < nativeMs * tritonMargin);
+        decisions[key] = useTriton;
+
+        if (useTriton) {
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+        return RunCudaNativeLinearFp8Block128(
+            input, weight, bias, output, n, m, k);
     }
 
     static bool TryCudaTritonChunkGdnPrefill(

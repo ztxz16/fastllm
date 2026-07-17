@@ -107,10 +107,12 @@ void FastllmCudaStreamDestroy(void *stream);
 void FastllmCudaStreamSynchronize(void *stream);
 
 void *FastllmCudaEventCreate();
+void *FastllmCudaEventCreateTiming();
 void FastllmCudaEventDestroy(void *event);
 void FastllmCudaEventRecord(void *event, void *stream = nullptr);
 void FastllmCudaEventRecordCurrentThread(void *event);
 void FastllmCudaEventSynchronize(void *event);
+float FastllmCudaEventElapsedTime(void *start, void *end);
 void FastllmCudaStreamWaitEvent(void *stream, void *event);
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event);
 
@@ -127,6 +129,7 @@ bool FastllmCudaGraphLaunch(void *exec);
 void FastllmCudaGraphDestroy(void *graph);
 void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
+bool FastllmCudaGraphIsCapturing();
 bool FastllmCudaGraphCaptureInvalidated();
 
 // Qwen3.5 MoE graph markers are emitted only while the per-thread stream is

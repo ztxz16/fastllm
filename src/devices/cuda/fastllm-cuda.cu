@@ -522,6 +522,13 @@ void *FastllmCudaEventCreate() {
     return (void*)event;
 }
 
+void *FastllmCudaEventCreateTiming() {
+    cudaEvent_t event;
+    cudaError_t state = cudaEventCreate(&event);
+    checkCudaErrors("Error: CUDA error when creating timing event!", state);
+    return (void*)event;
+}
+
 void FastllmCudaEventDestroy(void *event) {
     cudaError_t state = cudaEventDestroy((cudaEvent_t)event);
     checkCudaErrors("Error: CUDA error when destroying event!", state);
@@ -540,6 +547,14 @@ void FastllmCudaEventRecordCurrentThread(void *event) {
 void FastllmCudaEventSynchronize(void *event) {
     cudaError_t state = cudaEventSynchronize((cudaEvent_t)event);
     checkCudaErrors("Error: CUDA error when synchronizing event!", state);
+}
+
+float FastllmCudaEventElapsedTime(void *start, void *end) {
+    float elapsedMs = 0.0f;
+    cudaError_t state = cudaEventElapsedTime(
+        &elapsedMs, (cudaEvent_t)start, (cudaEvent_t)end);
+    checkCudaErrors("Error: CUDA error when measuring event time!", state);
+    return elapsedMs;
 }
 
 void FastllmCudaStreamWaitEvent(void *stream, void *event) {
@@ -584,6 +599,16 @@ bool FastllmCudaGraphCaptureInvalidated() {
         return true;
     }
     return captureStatus == cudaStreamCaptureStatusInvalidated;
+}
+
+bool FastllmCudaGraphIsCapturing() {
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaError_t state = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return captureStatus != cudaStreamCaptureStatusNone;
 }
 
 namespace {
