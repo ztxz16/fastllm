@@ -16004,6 +16004,16 @@ namespace fastllm {
                         this->weight.weight.find(visual_prefix + "merger.linear_fc2.bias") != this->weight.weight.end(),
                         "Qwen3.5 multimodal needs model.visual.* vision weights.");
 
+        Data &patchWeight = this->weight[visual_prefix + "patch_embed.proj.weight"];
+        const int patchDim = 3 * vision_temporal_patch_size * vision_patch_size * vision_patch_size;
+        AssertInFastLLM(patchWeight.Count(0) == vision_hidden_size * patchDim,
+                        "Qwen3.5 vision patch embedding weight shape is invalid.");
+        if (patchWeight.dims.size() != 2 ||
+            patchWeight.dims[0] != vision_hidden_size ||
+            patchWeight.dims[1] != patchDim) {
+            patchWeight.Reshape({vision_hidden_size, patchDim});
+        }
+
         const int maxVisionPos = 8192;
         const int rotaryQuarter = vision_head_dim / 4;
         std::vector<float> invFreq;
@@ -16031,14 +16041,30 @@ namespace fastllm {
         AssertInFastLLM(input.dims.size() == 4 && input.dims.back() % 4 == 0,
                         "Qwen3.5 vision rotary expects [batch, seq, heads, dim] with dim divisible by 4.");
         int axis = (int) input.dims.size() - 1;
-        int half = input.dims.back() / 2;
-        int rotaryHalf = input.dims.back() / 4;
-        Data xPart, yPart, rotated;
-        Split(input, axis, 0, half, xPart);
-        Split(input, axis, half, input.dims.back(), yPart);
-        LlamaRotatePosition2DPart(xPart, posX, visionSinData, visionCosData, rotaryHalf, half);
-        LlamaRotatePosition2DPart(yPart, posY, visionSinData, visionCosData, rotaryHalf, half);
-        Cat(xPart, yPart, axis, rotated);
+        int quarter = input.dims.back() / 4;
+        int half = quarter * 2;
+
+        // Transformers builds the vision rotary embedding as
+        // [row, col, row, col].  rotate_half therefore pairs the first and
+        // third quarters for rows, and the second and fourth for columns.
+        Data a, b, c, d, rowPair, colPair;
+        Split(input, axis, 0, quarter, a);
+        Split(input, axis, quarter, half, b);
+        Split(input, axis, half, half + quarter, c);
+        Split(input, axis, half + quarter, input.dims.back(), d);
+        Cat(a, c, axis, rowPair);
+        Cat(b, d, axis, colPair);
+        LlamaRotatePosition2DPart(rowPair, posX, visionSinData, visionCosData, quarter, half);
+        LlamaRotatePosition2DPart(colPair, posY, visionSinData, visionCosData, quarter, half);
+
+        Data rotatedA, rotatedB, rotatedC, rotatedD, firstHalf, secondHalf, rotated;
+        Split(rowPair, axis, 0, quarter, rotatedA);
+        Split(rowPair, axis, quarter, half, rotatedC);
+        Split(colPair, axis, 0, quarter, rotatedB);
+        Split(colPair, axis, quarter, half, rotatedD);
+        Cat(rotatedA, rotatedB, axis, firstHalf);
+        Cat(rotatedC, rotatedD, axis, secondHalf);
+        Cat(firstHalf, secondHalf, axis, rotated);
         input.CopyFrom(rotated);
     }
 
@@ -16057,27 +16083,31 @@ namespace fastllm {
 
         Data gridCpu(*gridThwData);
         gridCpu.ToDevice(DataDevice::CPU);
-        if (gridCpu.dataType != DataType::FLOAT32) {
-            // ToDataType 通过 Executor 调度时可能优先在 CUDA 上完成转换并释放 cpuData,
-            // 后续会直接读取 cpuData, 必须再次 ToDevice(CPU).
-            ToDataType(gridCpu, DataType::FLOAT32);
-            gridCpu.ToDevice(DataDevice::CPU);
-        }
         AssertInFastLLM(gridCpu.dims.size() == 2 && gridCpu.dims[0] == (int) rawInputs.size() && gridCpu.dims[1] == 3,
                         "Qwen3.5 grid_thw should have shape [count, 3].");
+        AssertInFastLLM(gridCpu.dataType == DataType::FLOAT32 ||
+                        gridCpu.dataType == DataType::INT32 ||
+                        gridCpu.dataType == DataType::INT32PARAM,
+                        "Qwen3.5 grid_thw should use float32 or int32 values.");
+
+        auto readGridValue = [&](int index) -> int {
+            if (gridCpu.dataType == DataType::FLOAT32) {
+                return (int) ((float*) gridCpu.cpuData)[index];
+            }
+            return ((int*) gridCpu.cpuData)[index];
+        };
 
         const std::string patchWeightName = visual_prefix + "patch_embed.proj.weight";
         const std::string patchBiasName = visual_prefix + "patch_embed.proj.bias";
         const float attnScale = powf((float) vision_head_dim, -0.5f);
         std::vector<float> mergedFeatures;
         int totalFeatureCount = 0;
-        float *gridPtr = (float*) gridCpu.cpuData;
 
         for (int mediaIndex = 0; mediaIndex < (int) rawInputs.size(); mediaIndex++) {
             std::vector<int> grid = {
-                (int) gridPtr[mediaIndex * 3 + 0],
-                (int) gridPtr[mediaIndex * 3 + 1],
-                (int) gridPtr[mediaIndex * 3 + 2],
+                readGridValue(mediaIndex * 3 + 0),
+                readGridValue(mediaIndex * 3 + 1),
+                readGridValue(mediaIndex * 3 + 2),
             };
             gridThwList.push_back(grid);
 
@@ -16126,6 +16156,8 @@ namespace fastllm {
 
             const int patchDim = 3 * vision_temporal_patch_size * vision_patch_size * vision_patch_size;
             const int patchCount = grid[0] * grid[1] * grid[2];
+            const int temporalChunks = grid[0];
+            const int spatialPatchCount = grid[1] * grid[2];
             AssertInFastLLM((int) posH.size() == patchCount && (int) posW.size() == patchCount,
                             "Qwen3.5 vision patch positions count mismatch.");
             AssertInFastLLM((int) patchTokens.size() == patchCount * patchDim,
@@ -16186,8 +16218,12 @@ namespace fastllm {
             Data posHData(DataType::FLOAT32, {1, patchCount}, posH);
             Data posWData(DataType::FLOAT32, {1, patchCount}, posW);
 
-            Data blockInput, qkv, q, k, v, attnOutput, residual, mlpHidden, mlpOutput;
             for (int layer = 0; layer < vision_depth; layer++) {
+                // Keep each block's temporaries independent.  Some of them are
+                // converted in place (notably the MLP activation), so reusing
+                // the same Data object in the next block can leave its CUDA
+                // capacity/type metadata inconsistent with Linear's output.
+                Data blockInput, qkv, q, k, v, attnOutput, residual, mlpHidden, mlpOutput;
                 const std::string pre = visual_prefix + "blocks." + std::to_string(layer);
                 Mul(hiddenStates, 1.0f, residual);
                 LayerNorm(hiddenStates,
@@ -16207,13 +16243,17 @@ namespace fastllm {
                 PermuteSelf(q, {0, 2, 1, 3});
                 PermuteSelf(k, {0, 2, 1, 3});
                 PermuteSelf(v, {0, 2, 1, 3});
-                q.Reshape({vision_num_heads, patchCount, vision_head_dim});
-                k.Reshape({vision_num_heads, patchCount, vision_head_dim});
-                v.Reshape({vision_num_heads, patchCount, vision_head_dim});
+                // Match Transformers' cu_seqlens behavior: every temporal
+                // patch is an independent spatial attention sequence.  The
+                // tensors are laid out as [head, time, spatial, dim], so fold
+                // head and time into Attention's batch dimension.
+                q.Reshape({vision_num_heads * temporalChunks, spatialPatchCount, vision_head_dim});
+                k.Reshape({vision_num_heads * temporalChunks, spatialPatchCount, vision_head_dim});
+                v.Reshape({vision_num_heads * temporalChunks, spatialPatchCount, vision_head_dim});
                 Attention(q, k, v, *GetEmptyData(), attnOutput, 1, attnScale, 2);
-                PermuteSelf(attnOutput, {1, 0, 2});
-                attnOutput.Reshape({patchCount, 1, vision_hidden_size});
-                PermuteSelf(attnOutput, {1, 0, 2});
+                attnOutput.Reshape({vision_num_heads, temporalChunks, spatialPatchCount, vision_head_dim});
+                PermuteSelf(attnOutput, {1, 2, 0, 3});
+                attnOutput.Reshape({1, patchCount, vision_hidden_size});
                 Linear(attnOutput,
                        this->weight[pre + ".attn.proj.weight"],
                        this->weight[pre + ".attn.proj.bias"],
@@ -16258,33 +16298,44 @@ namespace fastllm {
             const int mergeUnit = vision_spatial_merge_size * vision_spatial_merge_size;
             AssertInFastLLM(patchCount % mergeUnit == 0, "Qwen3.5 merger input length must be divisible by merge unit.");
             mergerInput.Reshape({patchCount / mergeUnit, vision_hidden_size * mergeUnit});
+            Data mergerHidden, mergerOutput;
             Linear(mergerInput,
                    this->weight[visual_prefix + "merger.linear_fc1.weight"],
                    this->weight[visual_prefix + "merger.linear_fc1.bias"],
-                   mlpHidden);
-            if (mlpHidden.dataType != DataType::FLOAT32) {
-                ToDataType(mlpHidden, DataType::FLOAT32);
+                   mergerHidden);
+            if (mergerHidden.dataType != DataType::FLOAT32) {
+                ToDataType(mergerHidden, DataType::FLOAT32);
             }
-            GeluNew(mlpHidden, mlpHidden);
-            Linear(mlpHidden,
+            // Vision blocks use gelu_pytorch_tanh, but the official patch
+            // merger uses torch.nn.GELU's exact formulation.
+            Gelu(mergerHidden, mergerHidden);
+            Linear(mergerHidden,
                    this->weight[visual_prefix + "merger.linear_fc2.weight"],
                    this->weight[visual_prefix + "merger.linear_fc2.bias"],
-                   mlpOutput);
-            mlpOutput.ToDevice(DataDevice::CPU);
-            if (mlpOutput.dataType != DataType::FLOAT32) {
+                   mergerOutput);
+#ifdef USE_CUDA
+            // CUDA kernels and cuBLAS run on cudaStreamPerThread, while the
+            // generic CUDA->CPU transfer below uses the legacy default stream.
+            // Make the visual merger result visible before reading it on CPU.
+            if (mergerOutput.dataDevice == DataDevice::CUDA) {
+                FastllmCudaSyncCurrentThreadStream();
+            }
+#endif
+            mergerOutput.ToDevice(DataDevice::CPU);
+            if (mergerOutput.dataType != DataType::FLOAT32) {
                 // ToDataType 经 Executor 调度可能在 CUDA 上完成并释放 CPU 镜像,
                 // mergedFeatures 直接读取 cpuData, 必须再次 ToDevice(CPU).
-                ToDataType(mlpOutput, DataType::FLOAT32);
-                mlpOutput.ToDevice(DataDevice::CPU);
+                ToDataType(mergerOutput, DataType::FLOAT32);
+                mergerOutput.ToDevice(DataDevice::CPU);
             }
-            AssertInFastLLM(mlpOutput.dims.size() == 2 && mlpOutput.dims[1] == vision_out_hidden_size,
+            AssertInFastLLM(mergerOutput.dims.size() == 2 && mergerOutput.dims[1] == vision_out_hidden_size,
                             "Qwen3.5 merger output shape is invalid.");
             mergedFeatures.insert(
                 mergedFeatures.end(),
-                (float*) mlpOutput.cpuData,
-                (float*) mlpOutput.cpuData + mlpOutput.Count(0)
+                (float*) mergerOutput.cpuData,
+                (float*) mergerOutput.cpuData + mergerOutput.Count(0)
             );
-            totalFeatureCount += mlpOutput.dims[0];
+            totalFeatureCount += mergerOutput.dims[0];
         }
 
         if (totalFeatureCount > 0) {
