@@ -279,6 +279,7 @@ if (USE_CUDA)
         add_compile_definitions(CUDA_MEM_DEBUG)
     endif()
     include_directories(include/devices/cuda)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cuda/linear/marlin_dense_fp8)
     set(FASTLLM_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
     set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM120_ENABLED OFF)
@@ -321,6 +322,8 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
         src/devices/cuda/linear/fastllm-linear-fp8.cu
+        src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
+        src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu

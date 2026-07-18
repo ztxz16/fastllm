@@ -223,10 +223,26 @@ bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t *out,
                                  int size_k, int size_n);
 bool FastllmCudaGptqMarlinRepackStream(const uint32_t *b_q_weight, uint32_t *out,
                                        int size_k, int size_n, void *stream);
+bool FastllmCudaGptqMarlinRepackBits(const uint32_t *b_q_weight, uint32_t *out,
+                                     int size_k, int size_n, int num_bits);
+bool FastllmCudaGptqMarlinRepackBitsStream(const uint32_t *b_q_weight, uint32_t *out,
+                                           int size_k, int size_n, int num_bits,
+                                           void *stream);
 bool FastllmCudaMarlinHalfInt4Gemm(const void *a, const uint32_t *b_q_weight,
                                    const void *b_scales, const uint32_t *b_zeros,
                                    void *c, int size_m, int size_n, int size_k,
                                    int group_size, int *workspace);
+// SM75+ weight-only FP8 Marlin (W8A16), for small-batch / MTP verify (n<=8).
+// Returns false to fall back to native FP8 GEMV.
+bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
+                                  const void *b_scales, void *c,
+                                  int size_m, int size_n, int size_k,
+                                  int group_size, int *workspace);
+bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
+                                                fastllm::Data &weight,
+                                                const fastllm::Data &bias,
+                                                fastllm::Data &output,
+                                                int n, int m, int k);
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);

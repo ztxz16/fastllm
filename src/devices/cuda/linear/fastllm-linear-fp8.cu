@@ -1003,7 +1003,9 @@ bool FastllmCudaMatMulFloatFP8E4M3PerChannel(const fastllm::Data &input, fastllm
 }
 
 void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
+    // Note: after FP8 Marlin convert, weight.cudaData may be released while
+    // scales/bias remain in extraCudaData — do not re-init based on cudaData.
+    if (weight.extraCudaData.size() == 0) {
         float *cudaScales;
         cudaError_t state = cudaSuccess;
         state = cudaMalloc(&cudaScales, weight.scales.size() * sizeof(float));
@@ -1023,8 +1025,7 @@ void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const 
 }
 
 static void FastllmCudaFP8E4M3EnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    if (weight.cudaData == nullptr ||
-        (weight.extraCudaHalfData.size() == 0 && bias.dims.size() > 0)) {
+    if (weight.extraCudaHalfData.size() == 0 && bias.dims.size() > 0) {
         half *cudaBiasData;
         cudaError_t state = cudaSuccess;
         state = cudaMalloc(&cudaBiasData, k * sizeof(half));
@@ -1130,6 +1131,18 @@ bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &we
 bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);
     FastllmCudaFP8E4M3EnsureHalfBiasOnDevice(weight, bias, k);
+
+    // SM75+: weight-only FP8 Marlin (vLLM-style W8A16). SM<75 skips at runtime
+    // and keeps GEMV. After convert, original FP8 is released.
+    if (n > 0 &&
+        FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k)) {
+        return true;
+    }
+    if (weight.cudaData == nullptr) {
+        printf("Error: FP8 weight has no cudaData and Marlin path unavailable "
+               "(n=%d, m=%d, k=%d).\n", n, m, k);
+        return false;
+    }
 
     float *cudaScales = (float*)weight.extraCudaData[0];
     half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];

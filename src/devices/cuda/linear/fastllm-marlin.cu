@@ -2591,15 +2591,16 @@ static bool FastllmCudaMarlinCurrentDeviceSupported() {
     return major * 10 + minor >= 75;
 }
 
-extern "C" bool FastllmCudaGptqMarlinRepackStream(const uint32_t *b_q_weight, uint32_t *out,
-                                                   int size_k, int size_n, void *streamPtr) {
+extern "C" bool FastllmCudaGptqMarlinRepackBitsStream(const uint32_t *b_q_weight, uint32_t *out,
+                                                      int size_k, int size_n, int num_bits,
+                                                      void *streamPtr) {
     if (!FastllmCudaMarlinCurrentDeviceSupported()) {
         return false;
     }
-    if (size_k % marlin::tile_k_size != 0 || size_n % marlin::tile_n_size != 0) {
+    if ((num_bits != 4 && num_bits != 8) ||
+        size_k % marlin::tile_k_size != 0 || size_n % marlin::tile_n_size != 0) {
         return false;
     }
-    constexpr int num_bits = 4;
     constexpr bool has_perm = false;
     int dev = 0;
     cudaGetDevice(&dev);
@@ -2616,15 +2617,26 @@ extern "C" bool FastllmCudaGptqMarlinRepackStream(const uint32_t *b_q_weight, ui
     if (false) {
     }
     CALL_IF(4, false)
+    CALL_IF(8, false)
     else {
         return false;
     }
     return true;
 }
 
+extern "C" bool FastllmCudaGptqMarlinRepackStream(const uint32_t *b_q_weight, uint32_t *out,
+                                                   int size_k, int size_n, void *streamPtr) {
+    return FastllmCudaGptqMarlinRepackBitsStream(b_q_weight, out, size_k, size_n, 4, streamPtr);
+}
+
+extern "C" bool FastllmCudaGptqMarlinRepackBits(const uint32_t *b_q_weight, uint32_t *out,
+                                                 int size_k, int size_n, int num_bits) {
+    return FastllmCudaGptqMarlinRepackBitsStream(b_q_weight, out, size_k, size_n, num_bits, nullptr);
+}
+
 extern "C" bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t *out,
                                             int size_k, int size_n) {
-    return FastllmCudaGptqMarlinRepackStream(b_q_weight, out, size_k, size_n, nullptr);
+    return FastllmCudaGptqMarlinRepackBitsStream(b_q_weight, out, size_k, size_n, 4, nullptr);
 }
 
 #undef CALL_IF
