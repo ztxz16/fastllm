@@ -37,7 +37,7 @@ MODEL_PROFILES = {
     ),
     "qwen35": ModelProfile(
         name="qwen35",
-        architectures=("Qwen3_5ForConditionalGeneration",),
+        architectures=("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"),
         default_prompt="Describe the uploaded image and video together in one short sentence. Mention the main colors and moving shapes.",
         text_only_prompt="Reply with one short sentence confirming the text pipeline is working.",
         description="Qwen3.5 图像+视频测试配置。",

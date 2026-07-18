@@ -1506,7 +1506,7 @@ class model:
                     enable_thinking = enable_thinking,
                 )
                 return len(native_inputs["input_ids"])
-            if architecture == "Qwen3_5ForConditionalGeneration":
+            if architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
                 qwen_conversation = normalize_qwen35_conversation(
                     copy.deepcopy(conversation),
                     len(multimodal_images),
@@ -1627,7 +1627,7 @@ class model:
                 from ftllm.encoding_dsv4 import encode_messages
                 thinking_mode = "thinking" if enable_thinking else "chat"
                 prompt = encode_messages(conversation, thinking_mode=thinking_mode)
-            elif architecture == "Qwen3_5ForConditionalGeneration":
+            elif architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
                 prompt = build_qwen35_prompt(
                     tokenizer = None,
                     conversation = copy.deepcopy(conversation),
@@ -2004,7 +2004,7 @@ class model:
                     False, stop_token_len, stop_token_list
                 )
                 return handle
-            elif (architecture == "Qwen3_5ForConditionalGeneration"):
+            elif architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
                 tokenizer = self.hf_tokenizer
                 qwen_conversation = None
                 if (conversation != None and len(conversation) != 0):
@@ -2145,7 +2145,7 @@ class model:
             except:
                 architecture = ""
             if (conversation != None and len(conversation) != 0):
-                if architecture == "Qwen3_5ForConditionalGeneration":
+                if architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
                     prompt = build_qwen35_prompt(
                         tokenizer = None,
                         conversation = copy.deepcopy(conversation),

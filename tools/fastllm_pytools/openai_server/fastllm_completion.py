@@ -609,7 +609,7 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
           )
           return len(native_inputs["input_ids"])
-      if architecture == "Qwen3_5ForConditionalGeneration":
+      if architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
           tokenizer = getattr(self.model, "hf_tokenizer", None)
           qwen_conversation = normalize_qwen35_conversation(
               copy.deepcopy(token_len_messages), len(images or []), len(videos or []))
