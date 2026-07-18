@@ -9921,25 +9921,58 @@ namespace fastllm {
         int cudaSamplingTopK = 1;
         if (Qwen35CanUseCudaFullLogitsSampling(generationConfigs, retLogits, batch,
                                                allSimpleCudaSampling, cudaSamplingTopK)) {
-            bool hasMinOutputLength = false;
-            for (const GenerationConfig &config : generationConfigs) {
-                hasMinOutputLength |= config.output_token_least > 0;
-            }
-            // Greedy TP sampling only needs the maximum logit from each shard.
-            // Avoid reconstructing the full vocabulary on rank 0 through many
-            // small, synchronous 2D copies.  Keep the established full-logits
-            // path for per-row EOS masking and logits diagnostics.
+            // For tensor-parallel greedy decode, sampling each vocabulary shard
+            // locally avoids copying the complete FP32 logits to the root GPU.
+            // The common minimum-length case can reset EOS directly on every
+            // shard; mixed reset requirements keep the full-logits fallback.
             if (Qwen35ShardedGreedyEnabled() && devices.size() > 1 &&
-                allSimpleCudaSampling && !hasMinOutputLength &&
-                !Qwen35ShouldPrintLogits()) {
-                static const std::vector<int> noEosIds;
-                std::vector<int> sampled = Qwen35SampleGreedyFromShardedCudaLogits(
-                    devices, *lmHeadScheme, localLogits, batch, vocabSize,
-                    false, noEosIds);
-                mtpTargetProfileMark(mtpTargetProfileSamplingUs);
-                mtpTargetProfileRecord(batch);
-                return sampled;
+                allSimpleCudaSampling && !Qwen35ShouldPrintLogits()) {
+                auto buildEosIds = [&](const GenerationConfig &config) {
+                    std::vector<int> ids;
+                    ids.push_back(this->eos_token_id);
+                    ids.insert(ids.end(), this->eos_token_ids.begin(),
+                               this->eos_token_ids.end());
+                    ids.insert(ids.end(), config.stop_token_ids.begin(),
+                               config.stop_token_ids.end());
+                    return ids;
+                };
+
+                bool anyRowNeedsReset = false;
+                bool allRowsNeedReset = true;
+                std::vector<int> resetLengths = GetMinOutputResetLengths(
+                    batch, pastKeyValues, generationConfigs);
+                for (int b = 0; b < batch; b++) {
+                    bool needsReset = resetLengths[b] > 0;
+                    anyRowNeedsReset |= needsReset;
+                    allRowsNeedReset &= needsReset;
+                }
+                if (!anyRowNeedsReset) {
+                    std::vector<int> sampled = Qwen35SampleGreedyFromShardedCudaLogits(
+                        devices, *lmHeadScheme, localLogits, batch, vocabSize,
+                        false, {});
+                    mtpTargetProfileMark(mtpTargetProfileSamplingUs);
+                    mtpTargetProfileRecord(batch);
+                    return sampled;
+                }
+                if (allRowsNeedReset) {
+                    std::vector<int> commonEosIds = buildEosIds(
+                        generationConfigs[0]);
+                    bool sameEosIds = true;
+                    for (int b = 1; b < batch; b++) {
+                        sameEosIds &= buildEosIds(generationConfigs[b]) ==
+                            commonEosIds;
+                    }
+                    if (sameEosIds) {
+                        std::vector<int> sampled = Qwen35SampleGreedyFromShardedCudaLogits(
+                            devices, *lmHeadScheme, localLogits, batch,
+                            vocabSize, true, commonEosIds);
+                        mtpTargetProfileMark(mtpTargetProfileSamplingUs);
+                        mtpTargetProfileRecord(batch);
+                        return sampled;
+                    }
+                }
             }
+
             Data *rootCudaLogits = nullptr;
             if (devices.size() == 1) {
                 rootCudaLogits = &localLogits[0];
