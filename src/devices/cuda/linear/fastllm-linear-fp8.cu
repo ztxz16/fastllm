@@ -321,79 +321,200 @@ __global__ void FastllmGemvHalfFP8E4M3Kernel1MultiRow(half *A, uint8_t *B, half 
     __syncthreads();
 }
 
-// 优化版本: 每个 warp 负责一行输出, 每个 lane 一次加载 16 个 FP8 权重 (uint4),
-// 使用 warp shuffle 归约, 不再依赖 shared memory 与 __syncthreads, 显著提升访存带宽利用率。
-// 要求 m % 16 == 0 (FP8 block 量化 blockM=128 时恒成立)。
-template <int WARPS_PER_BLOCK, int PART>
+// Pack 4 sequential FP8-E4M3 bytes into 2×half2 via high-byte layout + >>1
+// (same numeric mapping as the previous per-byte shift path).
+__device__ __forceinline__ void FastllmDequantFp8E4M3x4(uint32_t bb, half2 &h01, half2 &h23) {
+    uint32_t q01 = ((bb & 0x000000FFu) << 8) | ((bb & 0x0000FF00u) << 16);
+    uint32_t q23 = ((bb & 0x00FF0000u) >> 8) | (bb & 0xFF000000u);
+    uint32_t o01 = (q01 & 0x80008000u) | ((q01 & 0x7F007F00u) >> 1);
+    uint32_t o23 = (q23 & 0x80008000u) | ((q23 & 0x7F007F00u) >> 1);
+    h01 = *reinterpret_cast<const half2 *>(&o01);
+    h23 = *reinterpret_cast<const half2 *>(&o23);
+}
+
+__device__ __forceinline__ void FastllmDequantFp8E4M3x16(uint4 bw, half2 Bv[8]) {
+    FastllmDequantFp8E4M3x4(bw.x, Bv[0], Bv[1]);
+    FastllmDequantFp8E4M3x4(bw.y, Bv[2], Bv[3]);
+    FastllmDequantFp8E4M3x4(bw.z, Bv[4], Bv[5]);
+    FastllmDequantFp8E4M3x4(bw.w, Bv[6], Bv[7]);
+}
+
+// Warp MultiRow GEMV: each warp owns ROWS consecutive output channels and
+// reuses the same activation tile across those rows (cuts A traffic ~ROWS×).
+// Requires m % 16 == 0. Generic blockM/blockK path.
+template <int WARPS_PER_BLOCK, int PART, int ROWS>
 __global__ void FastllmGemvHalfFP8E4M3KernelWarpMultiRow(const half * __restrict__ A, const uint8_t * __restrict__ B,
                                                     half * __restrict__ C, const half * __restrict__ bias,
                                                     const float * __restrict__ scales,
                                                     int m, int k, int blockM, int blockK) {
     const int warpId = threadIdx.x >> 5;
     const int laneId = threadIdx.x & 31;
-    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
-    if (st >= k) return;
+    const int st0 = blockIdx.x * (WARPS_PER_BLOCK * ROWS) + warpId * ROWS;
+    if (st0 >= k) return;
+
+    int nValid = 0;
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (st0 + r < k) nValid = r + 1;
+    }
 
     const int ms = (m - 1) / blockM + 1;
-    const float magicScaleConstant = exp2f(8.0f);
-    const float *rowScales = scales + (st / blockK) * ms;
-    const uint8_t *baseB = B + (size_t)st * m;
-
-    float acc[PART];
+    float acc[PART][ROWS];
 #pragma unroll
-    for (int x = 0; x < PART; x++) acc[x] = 0.0f;
+    for (int x = 0; x < PART; x++) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) acc[x][r] = 0.0f;
+    }
 
-    const int numGroups = m >> 4; // 每组 16 个元素
+    const int numGroups = m >> 4;
     for (int g = laneId; g < numGroups; g += 32) {
         const int i = g << 4;
-        const float curScale = rowScales[i / blockM];
-
-        uint4 bw = *reinterpret_cast<const uint4*>(baseB + i); // 16 个 FP8 权重
-        const uint32_t words[4] = {bw.x, bw.y, bw.z, bw.w};
-        half2 Bv[8];
+        half2 Bv[ROWS][8];
 #pragma unroll
-        for (int wi = 0; wi < 4; wi++) {
-            const uint32_t bb = words[wi];
-            Bv[wi * 2]     = make_half2(__short_as_half((short)((((bb >> 0)  & 0x80) << 8) | (((bb >> 0)  & 0x7F) << 7))),
-                                        __short_as_half((short)((((bb >> 8)  & 0x80) << 8) | (((bb >> 8)  & 0x7F) << 7))));
-            Bv[wi * 2 + 1] = make_half2(__short_as_half((short)((((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 7))),
-                                        __short_as_half((short)((((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 7))));
+        for (int r = 0; r < ROWS; r++) {
+            if (r >= nValid) continue;
+            const int st = st0 + r;
+            const float curScale = scales[(st / blockK) * ms + (i / blockM)] * 256.0f;
+            FastllmDequantFp8E4M3x16(*reinterpret_cast<const uint4 *>(B + (size_t)st * m + i), Bv[r]);
+            const half2 hs = __float2half2_rn(curScale);
+#pragma unroll
+            for (int wi = 0; wi < 8; wi++) Bv[r][wi] = __hmul2(Bv[r][wi], hs);
         }
-
 #pragma unroll
         for (int x = 0; x < PART; x++) {
-            const half *Ax = A + (size_t)x * m + i;
             union_half8 a0, a1;
-            a0.in = *reinterpret_cast<const uint4*>(Ax);
-            a1.in = *reinterpret_cast<const uint4*>(Ax + 8);
+            a0.in = *reinterpret_cast<const uint4 *>(A + (size_t)x * m + i);
+            a1.in = *reinterpret_cast<const uint4 *>(A + (size_t)x * m + i + 8);
             const half2 ah[8] = {a0.out2[0], a0.out2[1], a0.out2[2], a0.out2[3],
                                  a1.out2[0], a1.out2[1], a1.out2[2], a1.out2[3]};
-            float gsum = 0.0f;
 #pragma unroll
-            for (int wi = 0; wi < 4; wi++) {
-                half2 p = __hadd2(__hmul2(ah[wi * 2], Bv[wi * 2]), __hmul2(ah[wi * 2 + 1], Bv[wi * 2 + 1]));
-                gsum += __half2float(p.x) + __half2float(p.y);
+            for (int r = 0; r < ROWS; r++) {
+                if (r >= nValid) continue;
+                float gsum = 0.0f;
+#pragma unroll
+                for (int wi = 0; wi < 4; wi++) {
+                    half2 p = __hadd2(__hmul2(ah[wi * 2], Bv[r][wi * 2]),
+                                      __hmul2(ah[wi * 2 + 1], Bv[r][wi * 2 + 1]));
+                    gsum += __half2float(p.x) + __half2float(p.y);
+                }
+                acc[x][r] += gsum;
             }
-            acc[x] += gsum * curScale;
         }
     }
 
 #pragma unroll
     for (int x = 0; x < PART; x++) {
-        float v = acc[x];
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffff, v, off);
+        for (int r = 0; r < ROWS; r++) {
+            if (r >= nValid) continue;
+            float v = acc[x][r];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down_sync(0xffffffff, v, off);
+            }
+            if (laneId == 0) {
+                if (bias != nullptr) v += (float)bias[st0 + r];
+                C[(st0 + r) + (size_t)k * x] = (half)v;
+            }
         }
-        acc[x] = v;
+    }
+}
+
+// Specialized for blockM=blockK=128: shift indexing, float scale, software
+// prefetch of the next weight tile to overlap DRAM latency on SM70/75.
+template <int WARPS_PER_BLOCK, int PART, int ROWS>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * 32, 8)
+FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128(const half * __restrict__ A, const uint8_t * __restrict__ B,
+                                                    half * __restrict__ C, const half * __restrict__ bias,
+                                                    const float * __restrict__ scales,
+                                                    int m, int k) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st0 = blockIdx.x * (WARPS_PER_BLOCK * ROWS) + warpId * ROWS;
+    if (st0 >= k) return;
+
+    int nValid = 0;
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (st0 + r < k) nValid = r + 1;
     }
 
-    if (laneId == 0) {
+    const int ms = m >> 7;
+    float acc[PART][ROWS];
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) acc[x][r] = 0.0f;
+    }
+
+    const int numGroups = m >> 4;
+    // Prefetch first weight tile for each valid output row.
+    uint4 bw[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        if (r < nValid && laneId < numGroups) {
+            bw[r] = *reinterpret_cast<const uint4 *>(B + (size_t)(st0 + r) * m + (laneId << 4));
+        }
+    }
+
+    for (int g = laneId; g < numGroups; g += 32) {
+        const int i = g << 4;
+        const int scaleCol = i >> 7;
+        half2 Bv[ROWS][8];
+        float sc[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            if (r >= nValid) continue;
+            sc[r] = scales[((st0 + r) >> 7) * ms + scaleCol] * 256.0f;
+            FastllmDequantFp8E4M3x16(bw[r], Bv[r]);
+        }
+
+        // Prefetch next tile while computing current.
+        const int gNext = g + 32;
+        if (gNext < numGroups) {
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                if (r >= nValid) continue;
+                bw[r] = *reinterpret_cast<const uint4 *>(B + (size_t)(st0 + r) * m + (gNext << 4));
+            }
+        }
+
 #pragma unroll
         for (int x = 0; x < PART; x++) {
-            float r = acc[x] * magicScaleConstant;
-            if (bias != nullptr) r += (float)bias[st];
-            C[st + (size_t)k * x] = (half)r;
+            union_half8 a0, a1;
+            a0.in = *reinterpret_cast<const uint4 *>(A + (size_t)x * m + i);
+            a1.in = *reinterpret_cast<const uint4 *>(A + (size_t)x * m + i + 8);
+            const half2 ah[8] = {a0.out2[0], a0.out2[1], a0.out2[2], a0.out2[3],
+                                 a1.out2[0], a1.out2[1], a1.out2[2], a1.out2[3]};
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                if (r >= nValid) continue;
+                float gsum = 0.0f;
+#pragma unroll
+                for (int wi = 0; wi < 4; wi++) {
+                    half2 p = __hadd2(__hmul2(ah[wi * 2], Bv[r][wi * 2]),
+                                      __hmul2(ah[wi * 2 + 1], Bv[r][wi * 2 + 1]));
+                    gsum += __half2float(p.x) + __half2float(p.y);
+                }
+                acc[x][r] += gsum * sc[r];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            if (r >= nValid) continue;
+            float v = acc[x][r];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down_sync(0xffffffff, v, off);
+            }
+            if (laneId == 0) {
+                if (bias != nullptr) v += (float)bias[st0 + r];
+                C[(st0 + r) + (size_t)k * x] = (half)v;
+            }
         }
     }
 }
@@ -444,11 +565,21 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
         return;
     }
 
-    constexpr int W = 8; // 每个 block 8 个 warp (256 线程)
-    const int grid = (k + W - 1) / W;
-#define FASTLLM_FP8_WARP_LAUNCH(PARTVAL, AOFF, COFF) \
-    FastllmGemvHalfFP8E4M3KernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
-        input + (AOFF) * m, weight, output + (COFF) * k, bias, scales, m, k, blockM, blockK)
+    // SM75 microbench: W=2, ROWS=4 + weight prefetch wins on gate/up/o/qkv.
+    constexpr int W = 2;
+    constexpr int ROWS = 4;
+    const int grid = (k + W * ROWS - 1) / (W * ROWS);
+    const bool useBlock128 = (blockM == 128 && blockK == 128 && (m & 127) == 0);
+
+#define FASTLLM_FP8_WARP_LAUNCH(PARTVAL, AOFF, COFF) do { \
+    if (useBlock128) { \
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128<W, PARTVAL, ROWS> <<< grid, W * 32 >>>( \
+            input + (AOFF) * m, weight, output + (COFF) * k, bias, scales, m, k); \
+    } else { \
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRow<W, PARTVAL, ROWS> <<< grid, W * 32 >>>( \
+            input + (AOFF) * m, weight, output + (COFF) * k, bias, scales, m, k, blockM, blockK); \
+    } \
+} while (0)
 
     switch (n) {
         case 1:  FASTLLM_FP8_WARP_LAUNCH(1, 0, 0);  return;
