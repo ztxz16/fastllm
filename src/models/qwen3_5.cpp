@@ -833,7 +833,8 @@ namespace fastllm {
             std::string v = value;
             std::transform(v.begin(), v.end(), v.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
-            return v.empty() || v == "false" || v == "off" || v == "none" || v == "disable";
+            return v.empty() || v == "0" || v == "false" || v == "off" ||
+                v == "no" || v == "none" || v == "disable";
         }
 
         static bool Qwen35IsLogitsEnvEnabled(const char *value) {
@@ -1182,10 +1183,17 @@ namespace fastllm {
                 hiddenStates.multiDeviceDatas[device] =
                     CreateQwen35CudaReplicaLike(hiddenStates, device);
             }
-            FastllmCudaSetDevice(rootDevice);
-            FastllmCudaCopyFromHostToDevice(hiddenStates.multiDeviceDatas[rootDevice]->cudaData,
-                                            hiddenStates.cpuData,
-                                            hiddenStates.GetBytes());
+
+            constexpr size_t directCopyLimit = 1 << 20;
+            size_t hiddenBytes = hiddenStates.GetBytes();
+            bool directCopy = devices.size() > 1 &&
+                hiddenBytes <= directCopyLimit;
+            if (!directCopy) {
+                FastllmCudaSetDevice(rootDevice);
+                FastllmCudaCopyFromHostToDevice(
+                    hiddenStates.multiDeviceDatas[rootDevice]->cudaData,
+                    hiddenStates.cpuData, hiddenBytes);
+            }
 
             std::vector<std::exception_ptr> errors(devices.size());
             workerGroup.Run(devices, [&](int r) {
@@ -1194,10 +1202,15 @@ namespace fastllm {
                 AssertInFastLLM(it != hiddenStates.multiDeviceDatas.end() && it->second != nullptr,
                                 "Qwen3.5 ForwardGPU CPU embedding missing local CUDA replica.\n");
                 FastllmCudaSetDevice(device);
-                FastllmNcclBroadcast(it->second->cudaData, (int)count,
-                                     (int)hiddenStates.dataType,
-                                     rootDevice, device);
-                ForceDeviceSync();
+                if (directCopy) {
+                    FastllmCudaCopyFromHostToDevice(
+                        it->second->cudaData, hiddenStates.cpuData, hiddenBytes);
+                } else {
+                    FastllmNcclBroadcast(it->second->cudaData, (int)count,
+                                         (int)hiddenStates.dataType,
+                                         rootDevice, device);
+                    ForceDeviceSync();
+                }
             }, errors);
             for (auto &error : errors) {
                 if (error) {
@@ -9122,6 +9135,7 @@ namespace fastllm {
                 AssertInFastLLM((int)threadTpAttentionKVHeadSchemes.size() == block_cnt &&
                                 (int)threadTpLinearKeyHeadSchemes.size() == block_cnt &&
                                 (int)threadTpLinearValueHeadSchemes.size() == block_cnt &&
+                                (int)threadTpLinearConvSchemes.size() == block_cnt &&
                                 !threadTpLmHeadScheme.empty() &&
                                 hasMoeCache(threadTpMoeWeights, threadTpMoeBiass),
                                 "Qwen3.5 ForwardGPU thread TP cached weight schemes are incomplete.\n");
@@ -9151,6 +9165,7 @@ namespace fastllm {
                     threadTpAttentionKVHeadSchemes.assign(block_cnt, DivisionScheme());
                     threadTpLinearKeyHeadSchemes.assign(block_cnt, DivisionScheme());
                     threadTpLinearValueHeadSchemes.assign(block_cnt, DivisionScheme());
+                    threadTpLinearConvSchemes.assign(block_cnt, DivisionScheme());
 
                     for (int i = 0; i < block_cnt; i++) {
                         std::string prefix = language_prefix + "layers." + std::to_string(i) + ".";
@@ -9247,6 +9262,7 @@ namespace fastllm {
 
                             DivisionScheme convScheme = BuildQwen35LinearConvScheme(
                                 keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
+                            threadTpLinearConvSchemes[i] = convScheme;
                             AssertInFastLLM(SplitQwen35Conv1DWeight(weight[conv1dWeightName],
                                                                     weight[conv1dBiasName],
                                                                     devices, convScheme),
@@ -9505,26 +9521,28 @@ namespace fastllm {
         if (tensorParallel) {
             localPastKeyValues.resize(devices.size());
             for (int r = 0; r < (int)devices.size(); r++) {
-                int device = devices[r];
                 localPastKeyValues[r].resize(pastKeyValues.size());
-                for (int idx = 0; idx < (int)pastKeyValues.size(); idx++) {
-                    int layer = idx % block_cnt;
-                    bool isLinearLayer = linearAttentionLayers[layer] != 0;
-                    DataType keyCacheType;
-                    DataType valueCacheType;
-                    if (isLinearLayer) {
-                        keyCacheType = computeType;
-                        valueCacheType = computeType;
-                        Qwen35PrepareLinearAttentionCache(*pastKeyValues[idx].first, keyCacheType);
-                        Qwen35PrepareLinearAttentionCache(*pastKeyValues[idx].second, valueCacheType);
-                    } else {
-                        pastKeyValues[idx].first->isLinearAttention = false;
-                        pastKeyValues[idx].second->isLinearAttention = false;
-                        keyCacheType = ResolveQwen35ThreadTpCacheType(
-                            pastKeyValues[idx].first->dataType, computeType);
-                        valueCacheType = ResolveQwen35ThreadTpCacheType(
-                            pastKeyValues[idx].second->dataType, computeType);
-                    }
+            }
+            for (int idx = 0; idx < (int)pastKeyValues.size(); idx++) {
+                int layer = idx % block_cnt;
+                bool isLinearLayer = !threadTpLinearConvSchemes[layer].empty();
+                DataType keyCacheType;
+                DataType valueCacheType;
+                if (isLinearLayer) {
+                    keyCacheType = computeType;
+                    valueCacheType = computeType;
+                    Qwen35PrepareLinearAttentionCache(*pastKeyValues[idx].first, keyCacheType);
+                    Qwen35PrepareLinearAttentionCache(*pastKeyValues[idx].second, valueCacheType);
+                } else {
+                    pastKeyValues[idx].first->isLinearAttention = false;
+                    pastKeyValues[idx].second->isLinearAttention = false;
+                    keyCacheType = ResolveQwen35ThreadTpCacheType(
+                        pastKeyValues[idx].first->dataType, computeType);
+                    valueCacheType = ResolveQwen35ThreadTpCacheType(
+                        pastKeyValues[idx].second->dataType, computeType);
+                }
+                for (int r = 0; r < (int)devices.size(); r++) {
+                    int device = devices[r];
                     localPastKeyValues[r][idx].first = EnsureQwen35ThreadTpLocalCache(
                         *pastKeyValues[idx].first, device, keyCacheType);
                     localPastKeyValues[r][idx].second = EnsureQwen35ThreadTpLocalCache(
@@ -9603,17 +9621,16 @@ namespace fastllm {
                 return data != nullptr && data->dims.size() >= 3;
             };
             int globalLinearConvDim = num_k_heads * head_k_dim * 2 + num_v_heads * head_v_dim;
-            std::vector<DivisionScheme> linearConvSchemes(block_cnt);
-            for (int i = 0; i < block_cnt; i++) {
-                if (linearAttentionLayers[i] == 0) {
-                    continue;
-                }
-                linearConvSchemes[i] = BuildQwen35LinearConvScheme(
-                    (*linearKeySchemes)[i], num_k_heads, num_v_heads,
-                    head_k_dim, head_v_dim);
-            }
+            const std::vector<int> globalLinearConvDims = {1, globalLinearConvDim, 4};
+            const std::vector<int> globalLinearValueDims = {
+                1, num_v_heads, head_k_dim, head_v_dim};
+            std::vector<int> globalAttentionDims = {
+                num_key_value_heads, 0, head_dim};
             for (int b = 0; b < batch; b++) {
                 for (int i = 0; i < block_cnt; i++) {
+                    bool isLinearLayer = !threadTpLinearConvSchemes[i].empty();
+                    const DivisionScheme &cacheScheme = isLinearLayer ?
+                        threadTpLinearConvSchemes[i] : (*attentionKvSchemes)[i];
                     int idx = b * block_cnt + i;
                     Data *localKeyMeta = !localPastKeyValues.empty() &&
                         idx < (int)localPastKeyValues[0].size() ? localPastKeyValues[0][idx].first : nullptr;
@@ -9635,27 +9652,24 @@ namespace fastllm {
                             }
                         }
                     }
-                    bool isLinearLayer = linearAttentionLayers[i] != 0;
                     if (isLinearLayer) {
                         SyncQwen35ThreadTpRootCacheMetaFromLocal(
-                            *pastKeyValues[idx].first, localKeyMeta, devices,
-                            linearConvSchemes[i],
-                            {1, globalLinearConvDim, 4}, 1, true);
+                            *pastKeyValues[idx].first, localKeyMeta, devices, cacheScheme,
+                            globalLinearConvDims, 1, true);
                         SyncQwen35ThreadTpRootCacheMetaFromLocal(
                             *pastKeyValues[idx].second, localValueMeta, devices,
                             (*linearValueSchemes)[i],
-                            {1, num_v_heads, head_k_dim, head_v_dim}, 1, true);
+                            globalLinearValueDims, 1, true);
                     } else {
-                        std::vector<int> globalDims = {num_key_value_heads,
-                                                       localKeyMeta != nullptr && localKeyMeta->dims.size() > 1 ?
-                                                           localKeyMeta->dims[1] : 0,
-                                                       head_dim};
+                        globalAttentionDims[1] =
+                            localKeyMeta != nullptr && localKeyMeta->dims.size() > 1 ?
+                                localKeyMeta->dims[1] : 0;
                         SyncQwen35ThreadTpRootCacheMetaFromLocal(
                             *pastKeyValues[idx].first, localKeyMeta, devices,
-                            (*attentionKvSchemes)[i], globalDims, 0, false);
+                            cacheScheme, globalAttentionDims, 0, false);
                         SyncQwen35ThreadTpRootCacheMetaFromLocal(
                             *pastKeyValues[idx].second, localValueMeta, devices,
-                            (*attentionKvSchemes)[i], globalDims, 0, false);
+                            cacheScheme, globalAttentionDims, 0, false);
                     }
                 }
             }

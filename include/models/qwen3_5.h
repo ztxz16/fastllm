@@ -295,6 +295,7 @@ namespace fastllm {
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpAttentionKVHeadSchemes;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearKeyHeadSchemes;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearValueHeadSchemes;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearConvSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
         std::vector <uint8_t> threadTpLinearAttentionLayers;
         std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
