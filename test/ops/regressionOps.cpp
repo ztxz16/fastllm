@@ -89,6 +89,58 @@ namespace {
                "auto moe_atype did not reset a previous bfloat16 configuration.");
     }
 
+    void RunPerRequestMinOutputLengthRegression() {
+        MoeAtypeConfigTestModel model;
+        model.block_cnt = 3;
+        model.kvCacheId = 1;
+        model.eos_token_id = 2;
+
+        const int batch = 4;
+        const int generatedTokens[batch] = {2, 4, 6, 0};
+        const int inputTokens[batch] = {10, 20, 30, 40};
+        std::vector<fastllm::Data> keys;
+        std::vector<fastllm::Data> values;
+        std::vector<std::pair<fastllm::Data*, fastllm::Data*> > pastKeyValues;
+        keys.reserve(batch * model.block_cnt);
+        values.reserve(batch * model.block_cnt);
+        pastKeyValues.reserve(batch * model.block_cnt);
+        for (int b = 0; b < batch; b++) {
+            int cacheLen = inputTokens[b] + generatedTokens[b];
+            for (int layer = 0; layer < model.block_cnt; layer++) {
+                keys.emplace_back(fastllm::DataType::FLOAT32,
+                                  std::vector<int>{1, cacheLen, 1});
+                values.emplace_back(fastllm::DataType::FLOAT32,
+                                    std::vector<int>{1, cacheLen, 1});
+                pastKeyValues.push_back({&keys.back(), &values.back()});
+            }
+        }
+
+        std::vector<fastllm::GenerationConfig> configs(batch);
+        for (int b = 0; b < batch; b++) {
+            configs[b].input_token_length = inputTokens[b];
+            configs[b].output_token_least = b == batch - 1 ? 0 : 5;
+        }
+        std::vector<int> resetLengths = model.GetMinOutputResetLengths(
+            batch, pastKeyValues, configs);
+        Expect(resetLengths == std::vector<int>({3, 1, -1, 0}),
+               "minimum output length did not use each request's KV cache length.");
+
+        std::vector<float> logits(batch * 5, -3.0f);
+        for (int b = 0; b < batch; b++) {
+            logits[b * 5 + model.eos_token_id] = 7.0f;
+        }
+        fastllm::Data logitsData(fastllm::DataType::FLOAT32,
+                                 {batch, 5}, logits);
+        model.ResetLogitsOfEOS(batch, &logitsData, pastKeyValues, configs);
+        float *logitsPtr = (float*)logitsData.cpuData;
+        Expect(logitsPtr[model.eos_token_id] == 0.0f &&
+               logitsPtr[5 + model.eos_token_id] == 0.0f,
+               "EOS was not reset for requests below min_tokens.");
+        Expect(logitsPtr[10 + model.eos_token_id] == 7.0f &&
+               logitsPtr[15 + model.eos_token_id] == 7.0f,
+               "EOS was reset for requests that already met min_tokens.");
+    }
+
 #ifdef USE_CUDA
     void RunCudaLinearDataTypeCapabilityRegression() {
         using fastllm::DataType;
@@ -2556,6 +2608,9 @@ int main() {
         RunMoeAtypeConfigRegression();
         std::cout << "moe_atype auto/explicit configuration regression: PASS\n";
         ranAny = true;
+
+        RunPerRequestMinOutputLengthRegression();
+        std::cout << "per-request minimum output length regression: PASS\n";
 
         if (fastllm::HasDeviceType("cpu")) {
             RunCpuInt4GroupAwqLinearRegression();

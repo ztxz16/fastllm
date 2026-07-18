@@ -415,6 +415,10 @@ namespace fastllm {
         virtual std::vector <int> ApplyChatTemplateToTokens(const JinjaVar &var);
 
         // 输出未满足最低长度时阻止产生EOS
+        std::vector<int> GetMinOutputResetLengths(
+            int batch,
+            const std::vector<std::pair<Data*, Data*> > &pastKeyValues,
+            const std::vector<GenerationConfig> &generationConfigs) const;
         virtual void ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues, 
             const GenerationConfig &generationConfig);
         virtual void ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues, 

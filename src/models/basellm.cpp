@@ -3324,8 +3324,22 @@ namespace fastllm {
         return 0;
     }
 
-    static int GetTokenGrowingCacheLen(const basellm *model, std::vector <std::pair <Data*, Data*> > &pastKeyValues) {
-        auto tryGetLen = [&](int idx) {
+    static int GetTokenGrowingCacheLen(
+            const basellm *model,
+            const std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+            int requestIndex,
+            int batch) {
+        int cacheBegin = 0;
+        int cacheEnd = (int)pastKeyValues.size();
+        bool flattenedByRequest = batch > 0 && model->block_cnt > 0 &&
+            (int)pastKeyValues.size() == batch * model->block_cnt;
+        if (flattenedByRequest) {
+            cacheBegin = requestIndex * model->block_cnt;
+            cacheEnd = cacheBegin + model->block_cnt;
+        }
+
+        auto tryGetLen = [&](int layerIndex) {
+            int idx = flattenedByRequest ? cacheBegin + layerIndex : layerIndex;
             if (idx < 0 || idx >= (int)pastKeyValues.size()) {
                 return 0;
             }
@@ -3348,13 +3362,32 @@ namespace fastllm {
         if (len > 0) {
             return len;
         }
-        for (int i = 0; i < (int)pastKeyValues.size(); i++) {
+        int layerCount = flattenedByRequest ? model->block_cnt : cacheEnd - cacheBegin;
+        for (int i = 0; i < layerCount; i++) {
             len = tryGetLen(i);
             if (len > 0) {
                 return len;
             }
         }
         return 0;
+    }
+
+    std::vector<int> basellm::GetMinOutputResetLengths(
+            int batch,
+            const std::vector<std::pair<Data*, Data*> > &pastKeyValues,
+            const std::vector<GenerationConfig> &generationConfigs) const {
+        std::vector<int> resetLengths(batch, 0);
+        for (int b = 0; b < batch; b++) {
+            const GenerationConfig &config = generationConfigs[b];
+            if (config.output_token_least <= 0) {
+                continue;
+            }
+            int cacheLen = GetTokenGrowingCacheLen(
+                this, pastKeyValues, b, batch);
+            resetLengths[b] = config.output_token_least - cacheLen +
+                config.input_token_length;
+        }
+        return resetLengths;
     }
 
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues,
@@ -3401,17 +3434,15 @@ namespace fastllm {
 
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues,
             const std::vector <GenerationConfig> &generationConfigs) {
-        bool hasMinOutputLength = false;
-        for (int b = 0; b < batch; b++) {
-            if (generationConfigs[b].output_token_least > 0) {
-                hasMinOutputLength = true;
-                break;
-            }
+        std::vector<int> resetLengths = GetMinOutputResetLengths(
+            batch, pastKeyValues, generationConfigs);
+        bool needReset = false;
+        for (int remaining : resetLengths) {
+            needReset |= remaining > 0;
         }
-        if (!hasMinOutputLength) {
+        if (!needReset) {
             return;
         }
-        int cacheLen = GetTokenGrowingCacheLen(this, pastKeyValues);
         if (logits->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             auto buildEosIds = [&](const GenerationConfig &config) {
@@ -3425,12 +3456,11 @@ namespace fastllm {
                 }
                 return ids;
             };
-            bool need_reset = false, all_need_reset = true, same_eos_ids = true;
+            bool all_need_reset = true, same_eos_ids = true;
             std::vector<int> common_eos_ids;
             for (int b = 0; b < batch; b++) {
                 auto &config = generationConfigs[b];
-                bool curNeedReset = config.output_token_least - cacheLen + config.input_token_length > 0;
-                need_reset |= curNeedReset;
+                bool curNeedReset = resetLengths[b] > 0;
                 all_need_reset &= curNeedReset;
                 std::vector<int> cur_eos_ids = buildEosIds(config);
                 if (b == 0) {
@@ -3439,28 +3469,25 @@ namespace fastllm {
                     same_eos_ids = false;
                 }
             }
-            if (need_reset) {
-                ToDataType(*logits, DataType::FLOAT32);
-                if (all_need_reset && same_eos_ids) {
-                    FastllmResetLogitsOfEOSAll(batch, logits, common_eos_ids);
-                } else {
-                    std::vector<int> res_lens, eos_nums, eos_ids;
-                    for (int b = 0; b < batch; b++) {
-                        auto &config = generationConfigs[b];
-                        res_lens.push_back(config.output_token_least - cacheLen + config.input_token_length);
-                        std::vector<int> cur_eos_ids = buildEosIds(config);
-                        eos_nums.push_back((int)cur_eos_ids.size());
-                        eos_ids.insert(eos_ids.end(), cur_eos_ids.begin(), cur_eos_ids.end());
-                    }
-                    FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
+            ToDataType(*logits, DataType::FLOAT32);
+            if (all_need_reset && same_eos_ids) {
+                FastllmResetLogitsOfEOSAll(batch, logits, common_eos_ids);
+            } else {
+                std::vector<int> eos_nums, eos_ids;
+                for (int b = 0; b < batch; b++) {
+                    auto &config = generationConfigs[b];
+                    std::vector<int> cur_eos_ids = buildEosIds(config);
+                    eos_nums.push_back((int)cur_eos_ids.size());
+                    eos_ids.insert(eos_ids.end(), cur_eos_ids.begin(), cur_eos_ids.end());
                 }
+                FastllmResetLogitsOfEOS(batch, logits, resetLengths, eos_nums, eos_ids);
             }
 #endif
         } else {
+            ToDataType(*logits, DataType::FLOAT32);
             for (int b = 0; b < batch; b++) {
                 auto &config = generationConfigs[b];
-                if (config.output_token_least > cacheLen - config.input_token_length) {
-                    ToDataType(*logits, DataType::FLOAT32);
+                if (resetLengths[b] > 0) {
                     float *logit = ((float*)logits->cpuData) + logits->Count(0) / batch * b;
                     logit[this->eos_token_id] = 0;
                     for (auto id: this->eos_token_ids)
