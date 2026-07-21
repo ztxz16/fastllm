@@ -1490,6 +1490,29 @@ namespace {
         void Run() {
             fastllm::Linear(input, weight, bias, output);
         }
+
+        void ConvertWeightToMarlin() {
+#ifdef USE_CUDA
+            fastllm::Data fp32Warmup = MakeTensor({2, in}, 0.31f, 0.02f);
+            fastllm::Data warmupInput;
+            warmupInput.CopyFrom(fp32Warmup);
+            fastllm::ToDataType(warmupInput, fastllm::DataType::FLOAT16);
+            warmupInput.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data warmupOutput;
+            warmupOutput.dataType = fastllm::DataType::FLOAT16;
+            warmupOutput.UpdateUnitSize();
+            warmupOutput.Resize({2, out});
+            warmupOutput.Allocate(false);
+            warmupOutput.ToDevice(fastllm::DataDevice::CUDA, false);
+            FastllmCudaSetNcclForceSync(true);
+            bool ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+                warmupInput, weight, bias, warmupOutput, 2, in, out);
+            if (!ok) {
+                throw std::runtime_error("FP8 Marlin benchmark conversion failed");
+            }
+            ForceDeviceSync();
+#endif
+        }
     };
 
     static fastllm::Data MakeCudaOutputLike(fastllm::DataType dataType, int batch, int out) {
@@ -1539,7 +1562,7 @@ namespace {
                   << ", max_rel_diff=" << maxRelDiff
                   << ", mean_abs_diff=" << (expected.empty() ? 0.0 : sumAbsDiff / expected.size())
                   << ", idx=" << maxIndex << " (" << row << ", " << col << ")"
-                  << ", ref=" << expected[maxIndex] << ", cutlass=" << actual[maxIndex] << "\n";
+                  << ", ref=" << expected[maxIndex] << ", actual=" << actual[maxIndex] << "\n";
         std::cout << "  abs_diff>1e-2: " << over1e2
                   << ", >1e-1: " << over1e1
                   << ", >1: " << over1e0 << "\n";
@@ -1592,6 +1615,105 @@ namespace {
             scales.Print("linear_fp8_check.weight_scales");
             ref32.Print("linear_fp8_check.ref.float32");
             cutlass32.Print("linear_fp8_check.cutlass.float32");
+        }
+    }
+
+    static void CheckLinearFp8MarlinCuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "separate" ||
+            params.GetString("input_type") != "fp16") {
+            throw std::runtime_error(
+                "FP8 Marlin check requires weight_layout=separate and input_type=fp16");
+        }
+
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+        if (state->batch <= 8) {
+            throw std::runtime_error("FP8 Marlin tail check requires batch > 8");
+        }
+
+        fastllm::Data referenceWeight;
+        LinearFp8Block128BenchState::InitSeparateScaleWeight(
+            referenceWeight, state->out, state->in, state->block, 0.7f);
+        referenceWeight.ToDevice(fastllm::DataDevice::CUDA);
+
+        fastllm::Data reference = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+        fastllm::Data actual = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+        fastllm::Data warmup = MakeCudaOutputLike(
+            state->input.dataType, 2, state->out);
+        fastllm::Data actualSingle = MakeCudaOutputLike(
+            state->input.dataType, 1, state->out);
+
+        // A fresh weight with M > 8 stays on the legacy FP8 path and provides
+        // the reference. A two-row call converts the second weight to Marlin;
+        // the following calls exercise its large bulk/tail split and its
+        // dedicated batch-one GEMV.
+        bool ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, referenceWeight, state->bias, reference,
+            state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("legacy FP8 reference path failed");
+        }
+        ForceDeviceSync();
+
+        ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, warmup,
+            2, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("FP8 Marlin warmup conversion failed");
+        }
+        ForceDeviceSync();
+
+        ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, actual,
+            state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("FP8 Marlin bulk/tail path failed");
+        }
+        ForceDeviceSync();
+
+        ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, actualSingle,
+            1, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("FP8 Marlin-layout batch-one GEMV failed");
+        }
+        ForceDeviceSync();
+
+        std::vector<float> expected = ToFloatVector(ConvertToFloat32Data(reference));
+        std::vector<float> observed = ToFloatVector(ConvertToFloat32Data(actual));
+        PrintLinearFp8Block128CheckStats(
+            expected, observed, state->batch, state->out);
+
+        int mismatches = 0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            float diff = std::fabs(expected[i] - observed[i]);
+            float tolerance = 0.1f + 0.05f * std::fabs(expected[i]);
+            if (!std::isfinite(observed[i]) || diff > tolerance) {
+                mismatches++;
+            }
+        }
+        if (mismatches != 0) {
+            throw std::runtime_error(
+                "FP8 Marlin output mismatch count: " + std::to_string(mismatches));
+        }
+
+        expected.resize(state->out);
+        observed = ToFloatVector(ConvertToFloat32Data(actualSingle));
+        PrintLinearFp8Block128CheckStats(expected, observed, 1, state->out);
+        mismatches = 0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            float diff = std::fabs(expected[i] - observed[i]);
+            float tolerance = 0.1f + 0.05f * std::fabs(expected[i]);
+            if (!std::isfinite(observed[i]) || diff > tolerance) {
+                mismatches++;
+            }
+        }
+        if (mismatches != 0) {
+            throw std::runtime_error(
+                "FP8 Marlin-layout batch-one GEMV mismatch count: " +
+                std::to_string(mismatches));
         }
     }
 
@@ -1673,10 +1795,27 @@ namespace {
         } else if (params.GetInt("check") == 2) {
             CheckLinearFp8Block128SwigluCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 3) {
+            CheckLinearFp8MarlinCuda(params);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
         state->Init(params);
+
+        bool oldForceSync = FastllmCudaGetNcclForceSync();
+        std::string kernel = params.GetString("kernel");
+        if (kernel == "legacy") {
+            FastllmCudaSetNcclForceSync(false);
+        } else if (kernel == "marlin_batch1") {
+            if (state->batch != 1) {
+                throw std::runtime_error("marlin_batch1 benchmark requires batch=1");
+            }
+            state->ConvertWeightToMarlin();
+            FastllmCudaSetNcclForceSync(false);
+        } else if (kernel != "auto") {
+            throw std::runtime_error("kernel must be auto, legacy, or marlin_batch1");
+        }
 
         for (int i = 0; i < warmup; i++) {
             state->Run();
@@ -1689,6 +1828,7 @@ namespace {
         }
         ForceDeviceSync();
         auto end = Clock::now();
+        FastllmCudaSetNcclForceSync(oldForceSync);
         double totalMs = std::chrono::duration<double, std::milli>(end - begin).count();
 
         int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
@@ -1730,7 +1870,8 @@ namespace {
                 params.Add("input_pattern", "blocky", "smooth or blocky");
                 params.Add("weight_layout", "packed", "packed or separate");
                 params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
-                params.Add("check", "0", "1 linear check, 2 fused swiglu+quant check");
+                params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
+                params.Add("check", "0", "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail check");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },

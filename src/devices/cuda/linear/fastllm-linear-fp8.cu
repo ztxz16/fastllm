@@ -1003,8 +1003,8 @@ bool FastllmCudaMatMulFloatFP8E4M3PerChannel(const fastllm::Data &input, fastllm
 }
 
 void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    // Note: after FP8 Marlin convert, weight.cudaData may be released while
-    // scales/bias remain in extraCudaData — do not re-init based on cudaData.
+    // After FP8 Marlin converts cudaData in place, scales/bias remain in
+    // extraCudaData. Do not use the weight layout as the cache-init signal.
     if (weight.extraCudaData.size() == 0) {
         float *cudaScales;
         cudaError_t state = cudaSuccess;
@@ -1133,7 +1133,7 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data
     FastllmCudaFP8E4M3EnsureHalfBiasOnDevice(weight, bias, k);
 
     // SM75+: weight-only FP8 Marlin (vLLM-style W8A16). SM<75 skips at runtime
-    // and keeps GEMV. After convert, original FP8 is released.
+    // and keeps GEMV. Conversion reuses cudaData for the Marlin layout.
     if (n > 0 &&
         FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k)) {
         return true;

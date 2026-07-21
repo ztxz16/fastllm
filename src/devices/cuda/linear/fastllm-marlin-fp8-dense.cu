@@ -146,7 +146,10 @@ static bool PrepareKernels(int device) {
               maxShared > 0;
     static const int tiles[][2] = {{64, 128}, {128, 64}, {128, 128}, {64, 256}};
     if (ok) {
-        for (int m : {4, 8, 16, 32, 64}) {
+        // Cover every non-m8 thread_m specialization. In particular, rows
+        // 33..48 select thread_m=3; without preparing that specialization its
+        // first real launch can fail with too much dynamic shared memory.
+        for (int m : {4, 8, 16, 32, 48, 64}) {
             for (auto &t : tiles) {
                 for (int gb : {8, -1}) {
                     int threads = 0;
@@ -224,33 +227,53 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
     cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
     if (sms <= 0 || maxShared <= 0) return false;
 
-    int threadK = 0, threadN = 0;
-    if (!SelectTile(size_m, size_n, size_k, threadK, threadN)) return false;
-
-    int threads = 0;
-    int groupBlocks = (group_size == -1) ? -1 : (group_size / 16);
-    bool m8 = size_m <= 8;
-    KernelFn kernel = PickKernel(size_m, threadK, threadN, groupBlocks, m8, threads);
-    if (kernel == nullptr) return false;
-
     // vLLM: c_tmp = sms * max_m_block * max_thread_n
-    int maxMBlock = m8 ? 8 : std::min(64, ((size_m + 15) / 16) * 16);
+    int maxMBlock = size_m <= 8 ? 8 : std::min(64, ((size_m + 15) / 16) * 16);
     size_t cTmpElems = (size_t)sms * maxMBlock * 256;
     if (!EnsureCTmp(dev, cTmpElems)) return false;
 
     int numGroups = (group_size == -1) ? 1 : (size_k / group_size);
-    int blocks = sms;
+    int groupBlocks = (group_size == -1) ? -1 : (group_size / 16);
 
-    kernel<<<blocks, threads, maxShared, nullptr>>>(
-        reinterpret_cast<const int4 *>(a),
-        reinterpret_cast<const int4 *>(b_q_weight),
-        reinterpret_cast<int4 *>(c),
-        reinterpret_cast<int4 *>(GetCTmp(dev).ptr),
-        nullptr, nullptr,
-        reinterpret_cast<const int4 *>(b_scales),
-        nullptr, nullptr, nullptr,
-        numGroups, size_m, size_n, size_k, size_k, workspace,
-        /*has_bias=*/false, /*use_atomic_add=*/false,
-        /*use_fp32_reduce=*/true, maxShared);
-    return cudaPeekAtLastError() == cudaSuccess;
+    // A Marlin kernel invocation can process many complete 64-row blocks, but
+    // its internal parallel count is deliberately integral. Launch the bulk
+    // and the final partial block separately; otherwise e.g. M=534 computes
+    // only 512 rows and leaves the tail uninitialised.
+    int row = 0;
+    int remaining = size_m;
+    const int maxParallel = size_n <= 4096 ? 128 : 16;
+    while (remaining > 0) {
+        int chunkM = remaining;
+        if (remaining >= 64) {
+            chunkM = std::min(remaining / 64, maxParallel) * 64;
+        }
+
+        int threadK = 0, threadN = 0;
+        if (!SelectTile(chunkM, size_n, size_k, threadK, threadN)) return false;
+
+        int threads = 0;
+        bool m8 = chunkM <= 8;
+        KernelFn kernel = PickKernel(chunkM, threadK, threadN, groupBlocks, m8, threads);
+        if (kernel == nullptr) return false;
+
+        const half *chunkA = reinterpret_cast<const half *>(a) +
+                             (size_t)row * size_k;
+        half *chunkC = reinterpret_cast<half *>(c) + (size_t)row * size_n;
+        kernel<<<sms, threads, maxShared, cudaStreamPerThread>>>(
+            reinterpret_cast<const int4 *>(chunkA),
+            reinterpret_cast<const int4 *>(b_q_weight),
+            reinterpret_cast<int4 *>(chunkC),
+            reinterpret_cast<int4 *>(GetCTmp(dev).ptr),
+            nullptr, nullptr,
+            reinterpret_cast<const int4 *>(b_scales),
+            nullptr, nullptr, nullptr,
+            numGroups, chunkM, size_n, size_k, size_k, workspace,
+            /*has_bias=*/false, /*use_atomic_add=*/false,
+            /*use_fp32_reduce=*/true, maxShared);
+        if (cudaPeekAtLastError() != cudaSuccess) return false;
+
+        row += chunkM;
+        remaining -= chunkM;
+    }
+    return true;
 }
