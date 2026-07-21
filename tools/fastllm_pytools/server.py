@@ -21,6 +21,7 @@ from .openai_server.fastllm_model import FastLLmModel
 from .util import make_normal_parser
 from .util import add_server_args
 from .util import apply_page_size_default
+from .startup_progress import StartupProgressReporter
 global fastllm_completion
 global fastllm_embed
 global fastllm_reranker
@@ -108,6 +109,10 @@ def _prewarm_request_executor(executor, workers: int) -> int:
     return started
 
 class FastLLMUvicornServer(uvicorn.Server):
+    def __init__(self, config, startup_progress = None):
+        super().__init__(config)
+        self.startup_progress = startup_progress
+
     async def startup(self, sockets = None):
         global request_executor
         loop = asyncio.get_running_loop()
@@ -125,6 +130,8 @@ class FastLLMUvicornServer(uvicorn.Server):
         if self.started and not self.should_exit:
             from .llm import disable_cuda_malloc
             disable_cuda_malloc()
+            if self.startup_progress is not None:
+                self.startup_progress.ready()
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
@@ -263,7 +270,7 @@ def apply_default_generation_config_overrides(model, args):
     if overrides:
         logging.info("Override default generation config from cli: %s", overrides)
 
-def fastllm_server(args):
+def _fastllm_server(args, startup_progress):
     if args.api_key:
         @app.middleware("http")
         async def authentication(request: Request, call_next):
@@ -297,7 +304,7 @@ def fastllm_server(args):
     init_logging()
     logging.info(args)
     from .util import make_normal_llm_model
-    model = make_normal_llm_model(args)
+    model = make_normal_llm_model(args, startup_progress = startup_progress)
     apply_default_generation_config_overrides(model, args)
     model.set_verbose(True)
     if (args.model_name is None or args.model_name == ''):
@@ -321,7 +328,21 @@ def fastllm_server(args):
     api_thread_pool_workers = max(1, min(256, api_thread_pool_workers))
     set_ulimit()
     config = uvicorn.Config(app, host = args.host, port = args.port)
-    FastLLMUvicornServer(config).run()
+    startup_progress.progress("server_starting", 1, 1)
+    FastLLMUvicornServer(config, startup_progress = startup_progress).run()
+
+def fastllm_server(args):
+    startup_progress = StartupProgressReporter(
+        getattr(args, "startup_progress", "off")
+    )
+    startup_progress.progress("initializing", 0, 1)
+    try:
+        return _fastllm_server(args, startup_progress)
+    except BaseException as error:
+        startup_progress.fail(error)
+        raise
+    finally:
+        startup_progress.close()
 
 if __name__ == "__main__":
     args = parse_args()

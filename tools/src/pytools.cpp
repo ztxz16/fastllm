@@ -34,6 +34,27 @@ struct FASTLLM_PYTOOLS_INIT {
 } fastllm_pytools_init;
 
 extern "C" {
+    typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
+                                                     uint64_t current,
+                                                     uint64_t total,
+                                                     uint64_t completedBytes,
+                                                     uint64_t totalBytes);
+
+    DLL_EXPORT void set_model_load_progress_callback(FastllmModelLoadProgressCallback callback) {
+        if (callback == nullptr) {
+            fastllm::ClearModelLoadProgressCallback();
+            return;
+        }
+        fastllm::SetModelLoadProgressCallback(
+            [callback](const fastllm::ModelLoadProgress &progress) {
+                callback(progress.stage.c_str(),
+                         progress.current,
+                         progress.total,
+                         progress.completedBytes,
+                         progress.totalBytes);
+            });
+    }
+
     DLL_EXPORT void print_cpu_ins() {
         fastllm::PrintInstructionInfo();
     }

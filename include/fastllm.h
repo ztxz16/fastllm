@@ -53,6 +53,24 @@ namespace fastllm {
 
     const FastllmEnv &GetFastllmEnv();
 
+    struct ModelLoadProgress {
+        std::string stage;
+        uint64_t current = 0;
+        uint64_t total = 0;
+        uint64_t completedBytes = 0;
+        uint64_t totalBytes = 0;
+    };
+
+    using ModelLoadProgressCallback = std::function<void(const ModelLoadProgress &)>;
+
+    void SetModelLoadProgressCallback(const ModelLoadProgressCallback &callback);
+    void ClearModelLoadProgressCallback();
+    void ReportModelLoadProgress(const std::string &stage,
+                                 uint64_t current = 0,
+                                 uint64_t total = 0,
+                                 uint64_t completedBytes = 0,
+                                 uint64_t totalBytes = 0);
+
     void SetDeviceMap(const std::map <std::string, int> &deviceMap);
     void SetMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
     void SetLayeredMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);

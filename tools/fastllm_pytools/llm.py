@@ -257,6 +257,61 @@ else:
         print("Load fastllm failed. (Try update glibc)")
         exit(0)
 
+_MODEL_LOAD_PROGRESS_CALLBACK_TYPE = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
+_model_load_progress_callback_ref = None
+_model_load_progress_handler = None
+
+if hasattr(fastllm_lib, "set_model_load_progress_callback"):
+    fastllm_lib.set_model_load_progress_callback.argtypes = [ctypes.c_void_p]
+    fastllm_lib.set_model_load_progress_callback.restype = None
+
+def _dispatch_model_load_progress(stage, current, total, completed_bytes, total_bytes):
+    handler = _model_load_progress_handler
+    if handler is None:
+        return
+    try:
+        handler(
+            stage.decode("utf-8", errors="replace") if stage else "",
+            int(current),
+            int(total),
+            int(completed_bytes),
+            int(total_bytes),
+        )
+    except Exception:
+        logging.exception("Model load progress callback failed")
+
+def set_model_load_progress_callback(callback):
+    global _model_load_progress_callback_ref
+    global _model_load_progress_handler
+
+    native_setter = getattr(fastllm_lib, "set_model_load_progress_callback", None)
+    if callback is None:
+        if native_setter is not None:
+            native_setter(None)
+        _model_load_progress_handler = None
+        _model_load_progress_callback_ref = None
+        return
+
+    _model_load_progress_handler = callback
+    _model_load_progress_callback_ref = _MODEL_LOAD_PROGRESS_CALLBACK_TYPE(
+        _dispatch_model_load_progress
+    )
+    if native_setter is not None:
+        native_setter(ctypes.cast(_model_load_progress_callback_ref, ctypes.c_void_p))
+
+def report_model_load_progress(stage, current = 0, total = 0,
+                               completed_bytes = 0, total_bytes = 0):
+    handler = _model_load_progress_handler
+    if handler is not None:
+        handler(stage, current, total, completed_bytes, total_bytes)
+
 fastllm_lib.has_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.has_device.restype = ctypes.c_bool
 
@@ -1079,7 +1134,14 @@ class model:
         else:
             if len(path) > 5 and path[-5:].lower() == ".gguf":
                 # GGUF 文件
-                self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
+                if ori_model_path and os.path.isdir(ori_model_path):
+                    report_model_load_progress("tokenizer", 0, 1)
+                    try:
+                        self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
+                    finally:
+                        report_model_load_progress("tokenizer", 1, 1)
+                else:
+                    self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
                 self.model = fastllm_lib.create_llm_model_from_gguf(path.encode(), ori_model_path.encode())
                 # 配置目录：优先用 ori_model_path（若存在且为目录），否则用 GGUF 文件所在目录
                 if ori_model_path and os.path.isdir(ori_model_path):
@@ -1093,7 +1155,11 @@ class model:
             elif os.path.isdir(path):
                 # HuggingFace 格式目录
                 if tokenizer_type != "fastllm":
-                    self.hf_tokenizer = try_load_hf_tokenizer(path)
+                    report_model_load_progress("tokenizer", 0, 1)
+                    try:
+                        self.hf_tokenizer = try_load_hf_tokenizer(path)
+                    finally:
+                        report_model_load_progress("tokenizer", 1, 1)
                     if chat_template != "":
                         self.hf_tokenizer.chat_template = chat_template
                         self.force_chat_template = True

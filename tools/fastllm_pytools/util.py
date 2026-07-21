@@ -262,6 +262,12 @@ def add_server_args(parser):
     parser.add_argument("--think", type = str, default = "false", help="if <think> lost")
     parser.add_argument("--hide_input", action = 'store_true', help = "不显示请求信息")
     parser.add_argument("--dev_mode", action = 'store_true', help = "开发模式, 启用后能够获取对话列表并主动停止")
+    parser.add_argument(
+        "--startup-progress",
+        choices = ["off", "ndjson"],
+        default = "off",
+        help = "启动进度输出格式；ndjson 会向 stderr 输出 FTLLM_PROGRESS 事件",
+    )
 
 def expand_cudapp_device(device_str):
     if not device_str or not device_str.startswith("cudapp="):
@@ -280,7 +286,9 @@ def expand_cudapp_device(device_str):
         weights = [1] * n
     return str({f'cuda:{i}': w for i, w in enumerate(weights)})
 
-def make_normal_llm_model(args):
+def make_normal_llm_model(args, startup_progress = None):
+    if startup_progress is not None:
+        startup_progress.progress("initializing", 0, 1)
     if (args.model and args.model != ''):
         if (args.model.endswith(".json") and os.path.exists(args.model)):
             import json
@@ -582,28 +590,39 @@ def make_normal_llm_model(args):
     if (args.chat_template != "" and os.path.exists(args.chat_template)):
         with open(args.chat_template, "r", encoding="utf-8") as file:
             args.chat_template = file.read()
-    model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
-                        moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora, 
-                        dtype_config = args.dtype_config, ori_model_path = args.ori, chat_template = args.chat_template, tool_call_parser = args.tool_call_parser)
-    if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
-        model.enable_thinking = False
-    model.set_atype(args.atype)
-    if (args.moe_atype != ""):
-        model.set_moe_atype(args.moe_atype)
-    if (args.cache_history.lower() not in ["", "false", "0", "off"]):
-        model.set_save_history(True)
-        if (args.cache_fast in ["", "false", "0", "off"]):
-            llm.set_cpu_historycache(True)
-    if (args.moe_experts > 0):
-        model.set_moe_experts(args.moe_experts)
-    if (args.max_batch > 0):
-        model.set_max_batch(args.max_batch)
-    if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
-        model.set_kv_cache_limit(args.kv_cache_limit)
-    if (args.chunked_prefill_size > 0):
-        model.set_chunked_prefill_size(args.chunked_prefill_size)
-    model.warmup()
-    return model
+    if startup_progress is not None:
+        startup_progress.progress("initializing", 1, 1)
+        llm.set_model_load_progress_callback(startup_progress.model_load_progress)
+    try:
+        model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
+                            moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
+                            dtype_config = args.dtype_config, ori_model_path = args.ori, chat_template = args.chat_template, tool_call_parser = args.tool_call_parser)
+        llm.report_model_load_progress("weights_finalize", 0, 1)
+        if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
+            model.enable_thinking = False
+        model.set_atype(args.atype)
+        if (args.moe_atype != ""):
+            model.set_moe_atype(args.moe_atype)
+        if (args.cache_history.lower() not in ["", "false", "0", "off"]):
+            model.set_save_history(True)
+            if (args.cache_fast in ["", "false", "0", "off"]):
+                llm.set_cpu_historycache(True)
+        if (args.moe_experts > 0):
+            model.set_moe_experts(args.moe_experts)
+        if (args.max_batch > 0):
+            model.set_max_batch(args.max_batch)
+        if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
+            model.set_kv_cache_limit(args.kv_cache_limit)
+        if (args.chunked_prefill_size > 0):
+            model.set_chunked_prefill_size(args.chunked_prefill_size)
+        llm.report_model_load_progress("weights_finalize", 1, 1)
+        llm.report_model_load_progress("warmup", 0, 1)
+        model.warmup()
+        llm.report_model_load_progress("warmup", 1, 1)
+        return model
+    finally:
+        if startup_progress is not None:
+            llm.set_model_load_progress_callback(None)
 
 def make_download_parser(add_help = True):
     parser = argparse.ArgumentParser(

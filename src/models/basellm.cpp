@@ -10,6 +10,7 @@
 #include <climits>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <set>
 #include <tuple>
 
@@ -3501,14 +3502,21 @@ namespace fastllm {
     }
 
     void basellm::AutoWarmup() {
+        ReportModelLoadProgress("warmup", 0, 1);
         if (GetFastllmEnv().skipWarmup) {
+            ReportModelLoadProgress("warmup", 1, 1);
             return;
         }
         struct AutoWarmupFinishGuard {
             basellm *model;
-            AutoWarmupFinishGuard(basellm *model) : model(model) {}
+            int uncaughtExceptions;
+            AutoWarmupFinishGuard(basellm *model)
+                : model(model), uncaughtExceptions(std::uncaught_exceptions()) {}
             ~AutoWarmupFinishGuard() {
                 model->OnAutoWarmupFinished();
+                if (std::uncaught_exceptions() == uncaughtExceptions) {
+                    ReportModelLoadProgress("warmup", 1, 1);
+                }
 #ifdef USE_CUDA
                 // warmup 结束后切回异步集合通信：此时内存池已热，稳态前向基本不再触发真实 cudaMalloc，
                 // 异步发射安全且能恢复通信/计算重叠的吞吐。warmup 及之前(权重加载)保持同步以防死锁。
