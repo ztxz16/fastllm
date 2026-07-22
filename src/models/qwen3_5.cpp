@@ -5213,6 +5213,18 @@ namespace fastllm {
 #endif
     }
 
+    bool Qwen3_5Model::ShouldEnforceAutoWarmupRuntimeBatchLimit() const {
+        return !Qwen35MtpDisabledByEnv() &&
+               Qwen35MtpDraftsPerStep() > 0 && HasMtpWeights();
+    }
+
+    int Qwen3_5Model::GetAutoWarmupLinearAttentionBatchBudgetPercent() const {
+        // Qwen3.5 is a hybrid linear-attention model. Its per-request recurrent
+        // state is large, and MTP may add several rollback snapshots on top of
+        // it. Favor token-growing KV/context over default scheduler concurrency.
+        return 25;
+    }
+
     long long Qwen3_5Model::GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const {
 #ifdef USE_CUDA
         if (batch <= 0) {
@@ -14226,7 +14238,15 @@ namespace fastllm {
                     pagesLimit = totalPages * 4 / 5;
                 }
             }
-            bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
+            // A prefetched request owns its hybrid linear-attention state and
+            // MTP rollback snapshots even while it is not selected for the
+            // current decode forward.  Limiting only seqLens below therefore
+            // limits per-step compute, not resident per-request CUDA memory.
+            // Keep excess requests pending before prefill so the number of
+            // resident request states cannot exceed the startup-validated MTP
+            // scheduler capacity.
+            bool canAddPrefill = currentActivate < mtpSchedulerLanes &&
+                ((pagesLimit > 0) ? (busyPages < pagesLimit) : true);
 
             for (int isPrompt = 1; isPrompt >= 0 && seqLens.empty(); isPrompt--) {
                 if (isPrompt == 1 && !canAddPrefill) {

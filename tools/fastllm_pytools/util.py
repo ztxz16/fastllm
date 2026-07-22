@@ -642,6 +642,16 @@ def make_normal_llm_model(args, startup_progress = None):
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()
         llm.report_model_load_progress("warmup", 1, 1)
+        effective_max_batch = model.get_max_batch()
+        if (mtp > 0 and args.max_batch > 0 and
+                effective_max_batch > 0 and effective_max_batch < args.max_batch):
+            raise RuntimeError(
+                "MTP startup validation failed: requested --max_batch=%d, but "
+                "the current model/TP/MTP/GPU memory configuration safely "
+                "supports at most %d concurrent requests. Lower --max_batch "
+                "to %d or less, reduce --mtp, or use GPUs with more memory."
+                % (args.max_batch, effective_max_batch, effective_max_batch)
+            )
         return model
     finally:
         if startup_progress is not None:

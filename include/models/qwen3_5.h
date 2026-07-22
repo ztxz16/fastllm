@@ -109,6 +109,10 @@ namespace fastllm {
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
 
+        virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const override;
+
+        virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const override;
+
         virtual void WarmupCudaRuntimeBuffers(int batch) override;
 
         virtual void OnResponseContextCreated(ResponseContext *context) override;

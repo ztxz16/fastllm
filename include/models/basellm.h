@@ -336,6 +336,12 @@ namespace fastllm {
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
 
+        // AutoWarmup 最多允许 linear-attention 固定状态和模型 runtime buffer
+        // 占用多少比例的可用 KV 预算。其余空间优先留给 token-growing KV cache。
+        virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const { return 50; }
+
+        virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
+
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
 
         // 当前运行配置是否可以使用 ForwardGPU。

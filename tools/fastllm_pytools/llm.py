@@ -412,6 +412,9 @@ fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int6
 
 fastllm_lib.set_max_batch_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
+fastllm_lib.get_max_batch_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.get_max_batch_llm_model.restype = ctypes.c_int
+
 fastllm_lib.set_max_context_length_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_max_context_length_llm_model.restype = ctypes.c_int
 
@@ -2582,6 +2585,10 @@ class model:
     
     def set_max_batch(self, batch: int):
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
+
+    def get_max_batch(self):
+        """Return the effective runtime batch limit after warmup."""
+        return fastllm_lib.get_max_batch_llm_model(self.model)
 
     def set_max_context_length(self, length: int):
         """限制单会话输入与输出合计的最大 token 数。"""

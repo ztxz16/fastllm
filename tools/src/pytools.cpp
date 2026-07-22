@@ -955,6 +955,11 @@ extern "C" {
         model->maxBatch = batch;
     }
 
+    DLL_EXPORT int get_max_batch_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        return model->maxBatch;
+    }
+
     DLL_EXPORT int set_max_context_length_llm_model(int modelId, int length) {
         auto model = models.GetModel(modelId);
         if (length > 0 && length < model->max_positions) {
