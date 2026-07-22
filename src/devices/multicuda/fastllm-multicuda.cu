@@ -2706,7 +2706,8 @@ static bool FastllmCanUseTP2P2PAllReduceAddImpl(
     // CUDA Graph uses pre-registered pointer tuples and device-side counters.
     // Avoid touching the eager path's host sequence state while capturing.
     if (fastllm::GetFastllmEnv().cudaGraph) {
-        return g_ncclWorldSize == 2 &&
+        return FastllmCudaCustomAllReduceEnabled() &&
+               g_ncclWorldSize == 2 &&
                g_ncclRanks.find(deviceId) != g_ncclRanks.end();
     }
 

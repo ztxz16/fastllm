@@ -20,8 +20,9 @@ using DivisionScheme = std::map <int, std::vector <std::pair <int, int> > >;
 
 bool FastllmInitNccl(const std::vector<int>& devices);
 // Graph-safe small-tensor all-reduce backed by direct peer reads and a GPU-side
-// barrier.  Both functions return false when disabled or unsupported so NCCL
-// remains the fallback.
+// barrier. It is opt-in through FASTLLM_CUDA_CUSTOM_ALLREDUCE=1; all functions
+// return false when disabled or unsupported so NCCL remains the fallback.
+bool FastllmCudaCustomAllReduceEnabled();
 bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);

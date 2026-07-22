@@ -13,11 +13,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -27,6 +30,31 @@ constexpr int kCustomArMaxRanks = 8;
 constexpr int kCustomArMaxBlocks = 36;
 constexpr int kCustomArThreads = 512;
 using CustomArFlag = uint32_t;
+
+bool CustomArEnabledByEnv() {
+    static const bool enabled = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE");
+        if (env == nullptr || env[0] == '\0') {
+            return false;
+        }
+        std::string value(env);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return value == "1" || value == "true" || value == "on" ||
+               value == "yes";
+    }();
+    return enabled;
+}
+
+void LogCustomArDisabledOnce() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        std::fprintf(stderr,
+                     "[Fastllm] graph-safe custom all-reduce is disabled; "
+                     "set FASTLLM_CUDA_CUSTOM_ALLREDUCE=1 to enable.\n");
+        std::fflush(stderr);
+    });
+}
 
 struct CustomArSignal {
     alignas(128) CustomArFlag start[kCustomArMaxBlocks][kCustomArMaxRanks];
@@ -463,7 +491,15 @@ bool LaunchCustomArAdd(CustomArState &state, CustomArRankData *rankData,
 
 }  // namespace
 
+bool FastllmCudaCustomAllReduceEnabled() {
+    return CustomArEnabledByEnv();
+}
+
 bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
+    if (!CustomArEnabledByEnv()) {
+        LogCustomArDisabledOnce();
+        return false;
+    }
     CustomArState &state = GetCustomArState();
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.initialized) {
@@ -558,6 +594,9 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
 
 bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
                                 int dataType, int deviceId) {
+    if (!CustomArEnabledByEnv()) {
+        return false;
+    }
     if (data == nullptr || dest == nullptr || count <= 0) {
         return false;
     }
@@ -623,6 +662,9 @@ bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
 
 bool FastllmCudaCustomAllReduceAdd(void *data, void *dest, int count,
                                    int dataType, int deviceId) {
+    if (!CustomArEnabledByEnv()) {
+        return false;
+    }
     if (data == nullptr || dest == nullptr || count <= 0) {
         return false;
     }
