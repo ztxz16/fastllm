@@ -22,7 +22,9 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -47,8 +49,9 @@ struct W4A8WeightCacheMeta {
     size_t packedGroupScaleBytes = 0;
     size_t channelScaleBytes = 0;
     const void *sourceCudaData = nullptr;
-    const float *hostScales = nullptr;
+    const void *hostScales = nullptr;
     size_t scaleCount = 0;
+    fastllm::W4A8WeightEncoding sourceEncoding = fastllm::W4A8WeightEncoding::NONE;
 };
 
 struct W4A8ActivationScratch {
@@ -222,6 +225,7 @@ struct FastllmCudaW4A8GemmKernel {
 };
 
 static std::unordered_map<const fastllm::Data*, W4A8WeightCacheMeta> g_w4a8WeightCacheMetas;
+static std::mutex g_w4a8WeightCacheMutex;
 
 static bool FastllmCudaW4A8PrepareCacheEnabled() {
     const char *env = std::getenv("FASTLLM_CUDA_W4A8_PREPARE_CACHE");
@@ -289,10 +293,10 @@ static bool FastllmCudaW4A8BasicShapeSupported(int m, int k) {
     return m > 0 && k > 0 && (m % W4A8_GROUP_SIZE) == 0 && (k % W4A8_GROUP_SIZE) == 0;
 }
 
-static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight,
-                                                 int m,
-                                                 int k,
-                                                 const char **reason = nullptr);
+static bool FastllmCudaW4A8CanUseWeightSource(const fastllm::Data &weight,
+                                              int m,
+                                              int k,
+                                              const char **reason = nullptr);
 
 static bool FastllmCudaW4A8CanQuantizeActivation(const fastllm::Data &input,
                                                  int n,
@@ -363,16 +367,18 @@ static bool FastllmCudaW4A8LinearSemanticsSupported(const fastllm::Data &input,
         }
         return false;
     }
-    return FastllmCudaW4A8CanUseInt4GroupSource(weight, m, k, reason);
+    return FastllmCudaW4A8CanUseWeightSource(weight, m, k, reason);
 }
 
-static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight,
-                                                 int m,
-                                                 int k,
-                                                 const char **reason) {
-    if (weight.dataType != fastllm::DataType::INT4_GROUP) {
+static bool FastllmCudaW4A8CanUseWeightSource(const fastllm::Data &weight,
+                                              int m,
+                                              int k,
+                                              const char **reason) {
+    bool legacyInt4Group = weight.dataType == fastllm::DataType::INT4_GROUP;
+    bool compressedW4A8 = weight.dataType == fastllm::DataType::INT4_W4A8;
+    if (!legacyInt4Group && !compressedW4A8) {
         if (reason != nullptr) {
-            *reason = "weight dtype is not INT4_GROUP";
+            *reason = "weight dtype is not INT4_GROUP/INT4_W4A8";
         }
         return false;
     }
@@ -388,16 +394,9 @@ static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight,
         }
         return false;
     }
-    if (weight.groupCnt != 128 || weight.group != m / 128) {
+    if (weight.groupCnt != W4A8_GROUP_SIZE || weight.group != m / W4A8_GROUP_SIZE) {
         if (reason != nullptr) {
             *reason = "weight group is not 128";
-        }
-        return false;
-    }
-    if (weight.scales.size() != (size_t)k * weight.group ||
-        weight.mins.size() != (size_t)k * weight.group) {
-        if (reason != nullptr) {
-            *reason = "weight scale/min shape mismatch";
         }
         return false;
     }
@@ -408,9 +407,30 @@ static bool FastllmCudaW4A8CanUseInt4GroupSource(const fastllm::Data &weight,
         return false;
     }
 
-    // vLLM cutlass_w4a8 consumes signed INT4 weights with scale-only group
-    // quantization. FastLLM INT4_GROUP can be repacked without changing
-    // quantization math only when min + uint4 * scale == (uint4 - 8) * scale.
+    size_t expectedScaleCount = (size_t)k * weight.group;
+    if (compressedW4A8) {
+        if (weight.w4a8WeightEncoding !=
+                fastllm::W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8 ||
+            weight.w4a8GroupScales.size() != expectedScaleCount ||
+            !weight.scales.empty() || !weight.mins.empty() || !weight.zeros.empty()) {
+            if (reason != nullptr) {
+                *reason = "INT4_W4A8 source metadata is inconsistent";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    if (weight.scales.size() != expectedScaleCount ||
+        weight.mins.size() != expectedScaleCount) {
+        if (reason != nullptr) {
+            *reason = "weight scale/min shape mismatch";
+        }
+        return false;
+    }
+
+    // The legacy source is valid only when its affine representation is
+    // exactly the same symmetric signed INT4 quantization used by W4A8.
     for (size_t i = 0; i < weight.mins.size(); i++) {
         float expectedMin = -8.0f * weight.scales[i];
         float tol = 1e-6f * (std::fabs(weight.scales[i]) > 1.0f ? std::fabs(weight.scales[i]) : 1.0f);
@@ -449,6 +469,18 @@ __global__ void FastllmCudaW4A8PackInt4GroupToVllmBKernel(const uint8_t *src,
         packed |= signedQ << (i * 4);
     }
     dst[(size_t)out * (inChannels / 8) + packRow] = packed;
+}
+
+__global__ void FastllmCudaW4A8ConvertUint4B8ToSignedInt4Kernel(
+    const uint8_t *src, uint8_t *dst, size_t bytes) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bytes) {
+        return;
+    }
+    uint8_t packed = src[idx];
+    uint8_t low = ((packed & 0xF) - 8) & 0xF;
+    uint8_t high = (((packed >> 4) & 0xF) - 8) & 0xF;
+    dst[idx] = low | (high << 4);
 }
 
 __device__ inline float FastllmCudaW4A8ToFloat(half v) {
@@ -660,6 +692,33 @@ static bool FastllmCudaW4A8RunGemm(const fastllm::Data &output,
     return false;
 }
 
+static size_t FastllmCudaW4A8SourceScaleCount(const fastllm::Data &weight) {
+    return weight.dataType == fastllm::DataType::INT4_W4A8
+        ? weight.w4a8GroupScales.size()
+        : weight.scales.size();
+}
+
+static const void *FastllmCudaW4A8SourceScaleData(const fastllm::Data &weight) {
+    return weight.dataType == fastllm::DataType::INT4_W4A8
+        ? static_cast<const void*>(weight.w4a8GroupScales.data())
+        : static_cast<const void*>(weight.scales.data());
+}
+
+static float FastllmCudaW4A8BFloat16ToFloat(uint16_t bits) {
+    uint32_t value = (uint32_t)bits << 16;
+    float result;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+static float FastllmCudaW4A8SourceScaleAt(const fastllm::Data &weight,
+                                          size_t index) {
+    if (weight.dataType == fastllm::DataType::INT4_W4A8) {
+        return FastllmCudaW4A8BFloat16ToFloat(weight.w4a8GroupScales[index]);
+    }
+    return weight.scales[index];
+}
+
 static bool FastllmCudaW4A8BuildScaleCaches(
     const fastllm::Data &weight,
     int m,
@@ -673,7 +732,7 @@ static bool FastllmCudaW4A8BuildScaleCaches(
         packedGroupScaleBytes == nullptr ||
         channelScaleBytes == nullptr ||
         weight.group != m / W4A8_GROUP_SIZE ||
-        weight.scales.size() != (size_t)k * weight.group) {
+        FastllmCudaW4A8SourceScaleCount(weight) != (size_t)k * weight.group) {
         return false;
     }
 
@@ -682,20 +741,33 @@ static bool FastllmCudaW4A8BuildScaleCaches(
     *packedGroupScaleBytes = 0;
     *channelScaleBytes = 0;
 
-    size_t scaleCount = weight.scales.size();
+    size_t scaleCount = FastllmCudaW4A8SourceScaleCount(weight);
     std::vector<W4A8MmaType> groupScalesFp8(scaleCount);
     std::vector<float> hostChannelScales(k, 1.0f);
+    for (size_t i = 0; i < scaleCount; ++i) {
+        float scale = FastllmCudaW4A8SourceScaleAt(weight, i);
+        if (!std::isfinite(scale) || scale < 0.0f) {
+            return false;
+        }
+    }
     for (int out = 0; out < k; out++) {
         float channelAbsMax = 0.0f;
         size_t rowOffset = (size_t)out * weight.group;
         for (int group = 0; group < weight.group; group++) {
-            channelAbsMax = std::max(channelAbsMax, std::fabs(weight.scales[rowOffset + group]));
+            channelAbsMax = std::max(
+                channelAbsMax,
+                std::fabs(FastllmCudaW4A8SourceScaleAt(weight, rowOffset + group)));
         }
-        float channelScale = std::max(channelAbsMax, 1.0e-10f) * 8.0f;
+        // This is equivalent to vLLM's per-channel FP8 quantization followed
+        // by fp8_scales /= 8 and channel_scales *= 8. The largest group scale
+        // maps to 56, preserving the same E4M3 dynamic-range usage.
+        float channelScale = std::max(channelAbsMax, 1.0e-10f) / 56.0f;
         hostChannelScales[out] = channelScale;
         for (int group = 0; group < weight.group; group++) {
             groupScalesFp8[(size_t)group * k + out] =
-                W4A8MmaType(weight.scales[rowOffset + group] / channelScale);
+                W4A8MmaType(
+                    FastllmCudaW4A8SourceScaleAt(weight, rowOffset + group) /
+                    channelScale);
         }
     }
 
@@ -843,6 +915,7 @@ static bool FastllmCudaW4A8HasPackedWeightCache(const fastllm::Data &weight,
         return false;
     }
     const W4A8WeightCacheMeta &meta = it->second;
+    size_t sourceScaleCount = FastllmCudaW4A8SourceScaleCount(weight);
     return meta.magic == W4A8_CACHE_MAGIC &&
            meta.sourceType == weight.dataType &&
            meta.inChannels == m &&
@@ -850,20 +923,22 @@ static bool FastllmCudaW4A8HasPackedWeightCache(const fastllm::Data &weight,
            meta.groupCnt == weight.groupCnt &&
            meta.group == weight.group &&
            meta.sourceCudaData == weight.cudaData &&
-           meta.hostScales == weight.scales.data() &&
-           meta.scaleCount == weight.scales.size() &&
+           meta.hostScales == FastllmCudaW4A8SourceScaleData(weight) &&
+           meta.scaleCount == sourceScaleCount &&
+           meta.sourceEncoding == weight.w4a8WeightEncoding &&
            meta.packedWeightBytes == (size_t)m * k / 2 &&
            meta.packedGroupScaleBytes ==
-               weight.scales.size() * sizeof(cutlass::Array<W4A8MmaType, W4A8_SCALE_PACK_SIZE>) &&
+               sourceScaleCount * sizeof(cutlass::Array<W4A8MmaType, W4A8_SCALE_PACK_SIZE>) &&
            meta.channelScaleBytes == (size_t)k * sizeof(float);
 }
 
 static bool FastllmCudaW4A8EnsurePackedWeightCache(fastllm::Data &weight,
                                                    int m,
                                                    int k) {
-    if (!FastllmCudaW4A8CanUseInt4GroupSource(weight, m, k)) {
+    if (!FastllmCudaW4A8CanUseWeightSource(weight, m, k)) {
         return false;
     }
+    std::lock_guard<std::mutex> guard(g_w4a8WeightCacheMutex);
     if (FastllmCudaW4A8HasPackedWeightCache(weight, m, k)) {
         return true;
     }
@@ -884,9 +959,16 @@ static bool FastllmCudaW4A8EnsurePackedWeightCache(fastllm::Data &weight,
     }
 
     int threads = 256;
-    size_t words = (size_t)(m / 8) * k;
-    FastllmCudaW4A8PackInt4GroupToVllmBKernel<<<(words + threads - 1) / threads, threads>>>(
-        (const uint8_t*)weight.cudaData, (uint32_t*)rawPackedWeight, m, k);
+    if (weight.dataType == fastllm::DataType::INT4_W4A8) {
+        FastllmCudaW4A8ConvertUint4B8ToSignedInt4Kernel<<<
+            (packedBytes + threads - 1) / threads, threads>>>(
+                (const uint8_t*)weight.cudaData, rawPackedWeight, packedBytes);
+    } else {
+        size_t words = (size_t)(m / 8) * k;
+        FastllmCudaW4A8PackInt4GroupToVllmBKernel<<<
+            (words + threads - 1) / threads, threads>>>(
+                (const uint8_t*)weight.cudaData, (uint32_t*)rawPackedWeight, m, k);
+    }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess ||
         !FastllmCudaW4A8EncodeAndReorderInt4B(rawPackedWeight, cutlassPackedWeight, m, k)) {
@@ -925,8 +1007,9 @@ static bool FastllmCudaW4A8EnsurePackedWeightCache(fastllm::Data &weight,
         packedGroupScaleBytes,
         channelScaleBytes,
         weight.cudaData,
-        weight.scales.data(),
-        weight.scales.size(),
+        FastllmCudaW4A8SourceScaleData(weight),
+        FastllmCudaW4A8SourceScaleCount(weight),
+        weight.w4a8WeightEncoding,
     };
     return true;
 }

@@ -138,7 +138,7 @@ std::vector<float> QuantizeScaleReference(const std::vector<float> &scales,
         for (int group = 0; group < groups; ++group) {
             channelAbsMax = std::max(channelAbsMax, std::fabs(scales[rowOffset + group]));
         }
-        float channelScale = std::max(channelAbsMax, 1.0e-10f) * 8.0f;
+        float channelScale = std::max(channelAbsMax, 1.0e-10f) / 56.0f;
         for (int group = 0; group < groups; ++group) {
             result[rowOffset + group] = RoundFp8E4M3(scales[rowOffset + group] / channelScale) * channelScale;
         }
@@ -148,6 +148,33 @@ std::vector<float> QuantizeScaleReference(const std::vector<float> &scales,
 
 std::vector<uint8_t> MakeSignedCompatibleInt4Weights(int outChannels, int inChannels, uint32_t seed) {
     return fastllm::cuda_test::MakeRandomInt4Weights(outChannels, inChannels, seed);
+}
+
+std::vector<uint8_t> ConvertFastllmInt4ToUint4B8(
+    const std::vector<uint8_t> &fastllmPacked) {
+    std::vector<uint8_t> uint4b8(fastllmPacked.size());
+    for (size_t i = 0; i < fastllmPacked.size(); ++i) {
+        uint4b8[i] = (fastllmPacked[i] >> 4) | (fastllmPacked[i] << 4);
+    }
+    return uint4b8;
+}
+
+std::vector<uint16_t> ConvertScalesToBFloat16(
+    const std::vector<float> &scales) {
+    std::vector<uint16_t> result(scales.size());
+    for (size_t i = 0; i < scales.size(); ++i) {
+        __nv_bfloat16 value = __float2bfloat16(scales[i]);
+        std::memcpy(&result[i], &value, sizeof(value));
+    }
+    return result;
+}
+
+std::vector<float> RoundScalesToBFloat16(const std::vector<float> &scales) {
+    std::vector<float> result(scales.size());
+    for (size_t i = 0; i < scales.size(); ++i) {
+        result[i] = __bfloat162float(__float2bfloat16(scales[i]));
+    }
+    return result;
 }
 
 void MakeSignedCompatibleScalesAndMins(size_t count, uint32_t seed,
@@ -204,10 +231,21 @@ fastllm::Data MakeWeightData(const W4A8Case &shape,
         weight.group = (shape.m + groupCnt - 1) / groupCnt;
         weight.scales = scales;
         weight.mins = mins;
+    } else if (dtype == fastllm::DataType::INT4_W4A8) {
+        weight.InitW4A8Weight(
+            fastllm::W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8);
+        std::vector<uint16_t> bf16Scales = ConvertScalesToBFloat16(scales);
+        weight.SetW4A8GroupScales(bf16Scales.data(), bf16Scales.size());
     }
     weight.Allocate(false);
-    std::memcpy(weight.cpuData, qweight.data(),
-                std::min((size_t)weight.GetBytes(), qweight.size()));
+    std::vector<uint8_t> uint4b8;
+    const std::vector<uint8_t> *packedSource = &qweight;
+    if (dtype == fastllm::DataType::INT4_W4A8) {
+        uint4b8 = ConvertFastllmInt4ToUint4B8(qweight);
+        packedSource = &uint4b8;
+    }
+    std::memcpy(weight.cpuData, packedSource->data(),
+                std::min((size_t)weight.GetBytes(), packedSource->size()));
     weight.ToDevice(fastllm::DataDevice::CUDA);
     return weight;
 }
@@ -313,7 +351,7 @@ bool RunNumericalCase(const W4A8Case &shape, uint32_t seedBase, const std::strin
     std::vector<float> biasValues = MakeRandomFloats(shape.k, -0.1f, 0.1f, seedBase + 4);
 
     fastllm::Data inputData = MakeInputData(shape, input);
-    fastllm::Data weightData = MakeWeightData(shape, fastllm::DataType::INT4_GROUP,
+    fastllm::Data weightData = MakeWeightData(shape, fastllm::DataType::INT4_W4A8,
                                               qweight, scales, mins);
     fastllm::Data outputData = MakeOutputData(shape);
     fastllm::Data emptyBias;
@@ -334,7 +372,8 @@ bool RunNumericalCase(const W4A8Case &shape, uint32_t seedBase, const std::strin
     std::vector<float> expectedInput = RoundInputForDtype(
         input, shape.bf16Input ? fastllm::DataType::BFLOAT16 : fastllm::DataType::FLOAT16);
     expectedInput = QuantizeActivationReference(expectedInput, shape);
-    std::vector<float> expectedScales = QuantizeScaleReference(scales, shape);
+    std::vector<float> expectedScales = QuantizeScaleReference(
+        RoundScalesToBFloat16(scales), shape);
     const std::vector<float> *biasPtr = shape.withBias ? &biasValues : nullptr;
     std::vector<float> expected = CpuReference(expectedInput, qweight, expectedScales, biasPtr, shape);
     std::vector<float> actual = DataToFloat(outputData);
