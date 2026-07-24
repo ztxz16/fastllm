@@ -525,6 +525,7 @@ namespace fastllm {
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
+        {DataType::INT4_W4A8, {"int4_w4a8"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
@@ -597,6 +598,7 @@ namespace fastllm {
         } else if (type == DataType::BFLOAT16 || type == DataType::FLOAT16) {
             return rows * columns * sizeof(uint16_t);
         } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP ||
+                   type == DataType::INT4_W4A8 ||
                    type == DataType::NVFP4) {
             return type == DataType::NVFP4 ? GetNVFP4WeightBytes(rows, columns) : rows * (columns / 2);
         } else if (type == DataType::INT8) {
@@ -952,6 +954,14 @@ namespace fastllm {
         this->tpQHeads = ori.tpQHeads;
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
+        if (ori.dataType == DataType::INT4_W4A8) {
+            this->group = ori.group;
+            this->groupCnt = ori.groupCnt;
+            this->perChannelAxis = ori.perChannelAxis;
+            this->w4a8GroupScales = ori.w4a8GroupScales;
+        } else {
+            this->w4a8GroupScales.clear();
+        }
         bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
                                      (this->ggmlTensor == nullptr || this->ggmlType != ori.ggmlType);
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
@@ -1592,7 +1602,8 @@ namespace fastllm {
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT4 
                 || this->dataType == DataType::INT4_NOZERO
-                || this->dataType == DataType::INT4_GROUP) {
+                || this->dataType == DataType::INT4_GROUP
+                || this->dataType == DataType::INT4_W4A8) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
         } else if (this->dataType == DataType::INT2

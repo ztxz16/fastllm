@@ -319,6 +319,7 @@ namespace fastllm {
         // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
         // The final partial block has no padding. The implicit zero point is 8.
         INT4_GROUP32 = 1008,
+        INT4_W4A8 = 1009, // compressed-tensors packed uint4b8 weight + BF16 group scales
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -494,6 +495,7 @@ namespace fastllm {
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 
         std::vector <uint16_t> halfScales; // 某些量化方式使用float16的scales
+        std::vector <uint16_t> w4a8GroupScales; // compressed-tensors W4A8的BF16 group scales
 
         bool isModelWeight = false; // 是否是模型权重
         std::string name; // weightName
