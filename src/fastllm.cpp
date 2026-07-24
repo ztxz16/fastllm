@@ -921,6 +921,11 @@ namespace fastllm {
     }
 
     void Data::FakeFrom(const Data &ori, size_t offset) {
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         this->dataType = ori.dataType;
         this->UpdateUnitSize();
         this->isFake = true;
@@ -938,6 +943,11 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+#ifdef USE_CUDA
+        if (this != &ori && !this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         this->ToDevice(ori.dataDevice);
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
@@ -1019,6 +1029,11 @@ namespace fastllm {
     }
 
     void Data::InitW4A8Weight(W4A8WeightEncoding encoding) {
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         AssertInFastLLM(this->dataType == DataType::INT4_W4A8,
                         "InitW4A8Weight requires INT4_W4A8 dtype.\n");
         AssertInFastLLM(encoding == W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8,
@@ -1043,6 +1058,11 @@ namespace fastllm {
     }
 
     void Data::SetW4A8GroupScales(const uint16_t *groupScales, size_t count) {
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         AssertInFastLLM(this->dataType == DataType::INT4_W4A8 &&
                         this->w4a8WeightEncoding != W4A8WeightEncoding::NONE,
                         "SetW4A8GroupScales requires an initialized W4A8 weight.\n");
@@ -1724,6 +1744,11 @@ namespace fastllm {
 
     void Data::Resize(const std::vector<int> &dims) {
         std::vector <int> oldDims = this->dims;
+#ifdef USE_CUDA
+        if (oldDims != dims && !this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         uint64_t oldCount = 1, newCount = 1;
         for (int v : oldDims) {
             oldCount *= v;
@@ -1989,6 +2014,11 @@ namespace fastllm {
     }
 
     void Data::FreeSpace() {
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         if (isFake)
             return;
         this->expansionSize = 0;
@@ -2149,6 +2179,10 @@ namespace fastllm {
 
     Data::~Data() {
 #ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+
         // Hash-route tables keep per-device CUDA replicas while the owning
         // Data is alive. Retire them before either this object or its CPU
         // allocation can be reused by a subsequently loaded model.
@@ -2225,6 +2259,7 @@ namespace fastllm {
                 this->dataDevice = DataDevice::CUDA;
                 this->dataDeviceIds = replica->dataDeviceIds;
                 std::swap(this->cudaData, replica->cudaData);
+                std::swap(this->w4a8CudaCaches, replica->w4a8CudaCaches);
                 std::swap(this->expansionSize, replica->expansionSize);
                 std::swap(this->expansionBytes, replica->expansionBytes);
             }
@@ -2527,6 +2562,12 @@ namespace fastllm {
         if (alreadyOnTarget) {
             return;
         }
+
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
 
         if (this->expansionBytes != 0) {
 #ifdef USE_CUDA

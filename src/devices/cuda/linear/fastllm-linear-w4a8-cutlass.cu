@@ -26,33 +26,13 @@
 #include <iostream>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace {
 
-static constexpr int W4A8_PACKED_WEIGHT_IDX = 64;
-static constexpr int W4A8_PACKED_GROUP_SCALES_IDX = 65;
-static constexpr int W4A8_CHANNEL_SCALES_IDX = 66;
 static constexpr uint64_t W4A8_CACHE_MAGIC = 0x5734413843414348ULL; // "W4A8CACH"
 static constexpr int W4A8_GROUP_SIZE = 128;
 static constexpr int W4A8_SCALE_PACK_SIZE = 8;
-
-struct W4A8WeightCacheMeta {
-    uint64_t magic = W4A8_CACHE_MAGIC;
-    fastllm::DataType sourceType = fastllm::DataType::FLOAT32;
-    int inChannels = 0;
-    int outChannels = 0;
-    int groupCnt = 0;
-    int group = 0;
-    size_t packedWeightBytes = 0;
-    size_t packedGroupScaleBytes = 0;
-    size_t channelScaleBytes = 0;
-    const void *sourceCudaData = nullptr;
-    const void *hostScales = nullptr;
-    size_t scaleCount = 0;
-    fastllm::W4A8WeightEncoding sourceEncoding = fastllm::W4A8WeightEncoding::NONE;
-};
 
 struct W4A8ActivationScratch {
     cutlass::float_e4m3_t *fp8 = nullptr;
@@ -224,7 +204,6 @@ struct FastllmCudaW4A8GemmKernel {
     }
 };
 
-static std::unordered_map<const fastllm::Data*, W4A8WeightCacheMeta> g_w4a8WeightCacheMetas;
 static std::mutex g_w4a8WeightCacheMutex;
 
 static bool FastllmCudaW4A8PrepareCacheEnabled() {
@@ -409,10 +388,8 @@ static bool FastllmCudaW4A8CanUseWeightSource(const fastllm::Data &weight,
 
     size_t expectedScaleCount = (size_t)k * weight.group;
     if (compressedW4A8) {
-        if (weight.w4a8WeightEncoding !=
-                fastllm::W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8 ||
-            weight.w4a8GroupScales.size() != expectedScaleCount ||
-            !weight.scales.empty() || !weight.mins.empty() || !weight.zeros.empty()) {
+        std::string validationReason;
+        if (!weight.ValidateW4A8Weight(&validationReason)) {
             if (reason != nullptr) {
                 *reason = "INT4_W4A8 source metadata is inconsistent";
             }
@@ -661,23 +638,27 @@ static bool FastllmCudaW4A8RunGemm(const fastllm::Data &output,
                                    int m,
                                    int k,
                                    cudaStream_t stream) {
+    int deviceId = FastllmCudaGetDevice();
+    auto cacheIt = weight.w4a8CudaCaches.find(deviceId);
     if (activation.fp8 == nullptr ||
         activation.tokenScales == nullptr ||
         outputData == nullptr ||
-        (int)weight.extraCudaData.size() <= W4A8_CHANNEL_SCALES_IDX ||
-        weight.extraCudaData[W4A8_PACKED_WEIGHT_IDX] == nullptr ||
-        weight.extraCudaData[W4A8_PACKED_GROUP_SCALES_IDX] == nullptr ||
-        weight.extraCudaData[W4A8_CHANNEL_SCALES_IDX] == nullptr) {
+        cacheIt == weight.w4a8CudaCaches.end()) {
         return false;
     }
 
+    const fastllm::W4A8CudaWeightCache &cache = cacheIt->second;
+    if (cache.packedWeight == nullptr || cache.packedGroupScales == nullptr ||
+        cache.channelScales == nullptr) {
+        return false;
+    }
     const auto *packedWeight =
-        reinterpret_cast<const W4A8QuantType*>(weight.extraCudaData[W4A8_PACKED_WEIGHT_IDX]);
+        reinterpret_cast<const W4A8QuantType*>(cache.packedWeight);
     const auto *packedGroupScales =
         reinterpret_cast<const cutlass::Array<W4A8MmaType, W4A8_SCALE_PACK_SIZE>*>(
-            weight.extraCudaData[W4A8_PACKED_GROUP_SCALES_IDX]);
+            cache.packedGroupScales);
     const float *channelScales =
-        reinterpret_cast<const float*>(weight.extraCudaData[W4A8_CHANNEL_SCALES_IDX]);
+        reinterpret_cast<const float*>(cache.channelScales);
 
     if (output.dataType == fastllm::DataType::FLOAT16) {
         return FastllmCudaW4A8DispatchForOutputType(
@@ -887,36 +868,38 @@ static bool FastllmCudaW4A8ApplyFloatBias(const fastllm::Data &output,
     return cudaGetLastError() == cudaSuccess;
 }
 
-static void FastllmCudaW4A8ReleasePackedWeightCache(fastllm::Data &weight) {
-    for (int idx : {W4A8_PACKED_WEIGHT_IDX,
-                    W4A8_PACKED_GROUP_SCALES_IDX,
-                    W4A8_CHANNEL_SCALES_IDX}) {
-        if ((int)weight.extraCudaData.size() > idx) {
-            if (weight.extraCudaData[idx] != nullptr) {
-                FastllmCudaFree(weight.extraCudaData[idx]);
-                weight.extraCudaData[idx] = nullptr;
-            }
-        }
+static void FastllmCudaW4A8ReleaseCacheEntry(fastllm::W4A8CudaWeightCache &cache) {
+    int originalDevice = FastllmCudaGetDevice();
+    if (cache.deviceId >= 0 && cache.deviceId != originalDevice) {
+        FastllmCudaSetDevice(cache.deviceId);
     }
-    g_w4a8WeightCacheMetas.erase(&weight);
+    if (cache.packedWeight != nullptr) {
+        FastllmCudaFree(cache.packedWeight);
+    }
+    if (cache.packedGroupScales != nullptr) {
+        FastllmCudaFree(cache.packedGroupScales);
+    }
+    if (cache.channelScales != nullptr) {
+        FastllmCudaFree(cache.channelScales);
+    }
+    if (cache.deviceId >= 0 && cache.deviceId != originalDevice) {
+        FastllmCudaSetDevice(originalDevice);
+    }
+    cache = fastllm::W4A8CudaWeightCache();
 }
 
 static bool FastllmCudaW4A8HasPackedWeightCache(const fastllm::Data &weight,
                                                 int m,
-                                                int k) {
-    if ((int)weight.extraCudaData.size() <= W4A8_CHANNEL_SCALES_IDX ||
-        weight.extraCudaData[W4A8_PACKED_WEIGHT_IDX] == nullptr ||
-        weight.extraCudaData[W4A8_PACKED_GROUP_SCALES_IDX] == nullptr ||
-        weight.extraCudaData[W4A8_CHANNEL_SCALES_IDX] == nullptr) {
+                                                int k,
+                                                int deviceId) {
+    auto it = weight.w4a8CudaCaches.find(deviceId);
+    if (it == weight.w4a8CudaCaches.end()) {
         return false;
     }
-    auto it = g_w4a8WeightCacheMetas.find(&weight);
-    if (it == g_w4a8WeightCacheMetas.end()) {
-        return false;
-    }
-    const W4A8WeightCacheMeta &meta = it->second;
+    const fastllm::W4A8CudaWeightCache &meta = it->second;
     size_t sourceScaleCount = FastllmCudaW4A8SourceScaleCount(weight);
     return meta.magic == W4A8_CACHE_MAGIC &&
+           meta.deviceId == deviceId &&
            meta.sourceType == weight.dataType &&
            meta.inChannels == m &&
            meta.outChannels == k &&
@@ -938,12 +921,17 @@ static bool FastllmCudaW4A8EnsurePackedWeightCache(fastllm::Data &weight,
     if (!FastllmCudaW4A8CanUseWeightSource(weight, m, k)) {
         return false;
     }
+    int deviceId = FastllmCudaGetDevice();
     std::lock_guard<std::mutex> guard(g_w4a8WeightCacheMutex);
-    if (FastllmCudaW4A8HasPackedWeightCache(weight, m, k)) {
+    if (FastllmCudaW4A8HasPackedWeightCache(weight, m, k, deviceId)) {
         return true;
     }
 
-    FastllmCudaW4A8ReleasePackedWeightCache(weight);
+    auto stale = weight.w4a8CudaCaches.find(deviceId);
+    if (stale != weight.w4a8CudaCaches.end()) {
+        FastllmCudaW4A8ReleaseCacheEntry(stale->second);
+        weight.w4a8CudaCaches.erase(stale);
+    }
 
     size_t packedBytes = (size_t)m * k / 2;
     uint8_t *rawPackedWeight = (uint8_t*)FastllmCudaMalloc(packedBytes);
@@ -990,39 +978,49 @@ static bool FastllmCudaW4A8EnsurePackedWeightCache(fastllm::Data &weight,
     }
 
     FastllmCudaFree(rawPackedWeight);
-    if ((int)weight.extraCudaData.size() <= W4A8_CHANNEL_SCALES_IDX) {
-        weight.extraCudaData.resize(W4A8_CHANNEL_SCALES_IDX + 1, nullptr);
-    }
-    weight.extraCudaData[W4A8_PACKED_WEIGHT_IDX] = cutlassPackedWeight;
-    weight.extraCudaData[W4A8_PACKED_GROUP_SCALES_IDX] = packedGroupScales;
-    weight.extraCudaData[W4A8_CHANNEL_SCALES_IDX] = channelScales;
-    g_w4a8WeightCacheMetas[&weight] = W4A8WeightCacheMeta{
-        W4A8_CACHE_MAGIC,
-        weight.dataType,
-        m,
-        k,
-        weight.groupCnt,
-        weight.group,
-        packedBytes,
-        packedGroupScaleBytes,
-        channelScaleBytes,
-        weight.cudaData,
-        FastllmCudaW4A8SourceScaleData(weight),
-        FastllmCudaW4A8SourceScaleCount(weight),
-        weight.w4a8WeightEncoding,
-    };
+    fastllm::W4A8CudaWeightCache cache;
+    cache.magic = W4A8_CACHE_MAGIC;
+    cache.deviceId = deviceId;
+    cache.sourceType = weight.dataType;
+    cache.sourceEncoding = weight.w4a8WeightEncoding;
+    cache.inChannels = m;
+    cache.outChannels = k;
+    cache.groupCnt = weight.groupCnt;
+    cache.group = weight.group;
+    cache.packedWeightBytes = packedBytes;
+    cache.packedGroupScaleBytes = packedGroupScaleBytes;
+    cache.channelScaleBytes = channelScaleBytes;
+    cache.sourceCudaData = weight.cudaData;
+    cache.hostScales = FastllmCudaW4A8SourceScaleData(weight);
+    cache.scaleCount = FastllmCudaW4A8SourceScaleCount(weight);
+    cache.packedWeight = cutlassPackedWeight;
+    cache.packedGroupScales = packedGroupScales;
+    cache.channelScales = channelScales;
+    weight.w4a8CudaCaches.emplace(deviceId, cache);
     return true;
 }
 
 } // namespace
 
+void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight) {
+    std::lock_guard<std::mutex> guard(g_w4a8WeightCacheMutex);
+    for (auto &entry : weight.w4a8CudaCaches) {
+        FastllmCudaW4A8ReleaseCacheEntry(entry.second);
+    }
+    weight.w4a8CudaCaches.clear();
+}
+
 bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
                         const fastllm::Data &bias, fastllm::Data &output,
                         int n, int m, int k) {
-    bool prepareCache = FastllmCudaW4A8PrepareCacheEnabled();
-    bool prepareActivation = FastllmCudaW4A8PrepareActivationEnabled();
-    bool prepareOutput = FastllmCudaW4A8PrepareOutputEnabled();
-    bool enableGemm = FastllmCudaW4A8GemmEnabled();
+    // INT4_W4A8 is the model-owned compressed-tensors format and therefore
+    // uses the production path automatically. The environment switches remain
+    // development-only opt-ins for the legacy signed INT4_GROUP adapter.
+    bool productionW4A8 = weight.dataType == fastllm::DataType::INT4_W4A8;
+    bool prepareCache = productionW4A8 || FastllmCudaW4A8PrepareCacheEnabled();
+    bool prepareActivation = productionW4A8 || FastllmCudaW4A8PrepareActivationEnabled();
+    bool prepareOutput = productionW4A8 || FastllmCudaW4A8PrepareOutputEnabled();
+    bool enableGemm = productionW4A8 || FastllmCudaW4A8GemmEnabled();
     bool validate = FastllmCudaW4A8ValidateEnabled();
     if (!prepareCache && !prepareActivation && !prepareOutput && !enableGemm && !validate) {
         return false;
@@ -1046,9 +1044,8 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
         return false;
     }
 
-    // Development guard: W4A8 GEMM is allowed to take over DoCudaLinear only
-    // when this explicit switch is set. Later stages can remove this or flip it
-    // to an opt-out guard after correctness and performance are verified.
+    // Enabling GEMM implies all preparation stages. For INT4_W4A8 this is the
+    // normal production route; for INT4_GROUP it is still an explicit opt-in.
     if (enableGemm) {
         prepareCache = true;
         prepareActivation = true;

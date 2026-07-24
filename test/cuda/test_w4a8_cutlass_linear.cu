@@ -307,6 +307,11 @@ bool RunEntryBehaviorTests() {
         ok = !TryCase(valid, fastllm::DataType::FLOAT16, fastllm::DataType::INT4_GROUP,
                       nullptr, 128, true) && ok;
         std::printf("[W4A8 CUTLASS] non-SM90 skip %s\n", ok ? "PASS" : "FAIL");
+    } else {
+        ok = TryCase(valid, fastllm::DataType::FLOAT16,
+                     fastllm::DataType::INT4_W4A8,
+                     nullptr, 128, false) && ok;
+        std::printf("[W4A8 CUTLASS] INT4_W4A8 production dispatch checked\n");
     }
 
     W4A8Case badShape = valid;
@@ -363,10 +368,36 @@ bool RunNumericalCase(const W4A8Case &shape, uint32_t seedBase, const std::strin
 
     ScopedEnv validateEnv("FASTLLM_CUDA_W4A8_VALIDATE", "1");
     ScopedEnv traceEnv("FASTLLM_CUDA_W4A8_TRACE", "1");
-    ScopedEnv gemmEnv("FASTLLM_CUDA_W4A8_ENABLE_GEMM", "1");
+    ScopedEnv gemmEnv("FASTLLM_CUDA_W4A8_ENABLE_GEMM", nullptr);
     bool usedW4A8 = TryCudaCutlassW4A8(inputData, weightData, bias, outputData,
                                        shape.n, shape.m, shape.k);
     Expect(usedW4A8, "TryCudaCutlassW4A8 returned false for numerical case.");
+    int cacheDevice = FastllmCudaGetDevice();
+    auto cacheIt = weightData.w4a8CudaCaches.find(cacheDevice);
+    Expect(weightData.w4a8CudaCaches.size() == 1 &&
+           cacheIt != weightData.w4a8CudaCaches.end(),
+           "W4A8 weight cache is not owned by the current device.");
+    void *firstPackedWeight = cacheIt->second.packedWeight;
+    void *firstPackedGroupScales = cacheIt->second.packedGroupScales;
+    void *firstChannelScales = cacheIt->second.channelScales;
+    Expect(firstPackedWeight != nullptr && firstPackedGroupScales != nullptr &&
+           firstChannelScales != nullptr,
+           "W4A8 weight cache contains a null CUDA buffer.");
+
+    bool reusedW4A8 = TryCudaCutlassW4A8(inputData, weightData, bias, outputData,
+                                         shape.n, shape.m, shape.k);
+    Expect(reusedW4A8, "TryCudaCutlassW4A8 failed while reusing its weight cache.");
+    cacheIt = weightData.w4a8CudaCaches.find(cacheDevice);
+    Expect(weightData.w4a8CudaCaches.size() == 1 &&
+           cacheIt != weightData.w4a8CudaCaches.end() &&
+           cacheIt->second.packedWeight == firstPackedWeight &&
+           cacheIt->second.packedGroupScales == firstPackedGroupScales &&
+           cacheIt->second.channelScales == firstChannelScales,
+           "W4A8 weight conversion was repeated instead of reusing the cache.");
+
+    fastllm::Data copiedWeight(weightData);
+    Expect(copiedWeight.w4a8CudaCaches.empty(),
+           "A copied W4A8 weight retained CUDA cache pointers from its source.");
     CheckCuda(cudaDeviceSynchronize(), "sync TryCudaCutlassW4A8");
 
     std::vector<float> expectedInput = RoundInputForDtype(
@@ -383,6 +414,9 @@ bool RunNumericalCase(const W4A8Case &shape, uint32_t seedBase, const std::strin
     const float maxRelTol = shape.bf16Input ? 5.0f : 3.0e-1f;
     CompareResult result = CompareVectors(expected, actual, maxAbsTol, meanAbsTol, maxRelTol);
     PrintCompareResult(name, result, maxAbsTol, meanAbsTol, maxRelTol);
+    weightData.FreeSpace();
+    Expect(weightData.w4a8CudaCaches.empty(),
+           "W4A8 weight cache survived Data::FreeSpace.");
     return result.passed;
 }
 

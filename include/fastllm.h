@@ -335,6 +335,26 @@ namespace fastllm {
 
     constexpr int COMPRESSED_W4A8_GROUP_SIZE = 128;
 
+    struct W4A8CudaWeightCache {
+        uint64_t magic = 0;
+        int deviceId = -1;
+        DataType sourceType = DataType::FLOAT32;
+        W4A8WeightEncoding sourceEncoding = W4A8WeightEncoding::NONE;
+        int inChannels = 0;
+        int outChannels = 0;
+        int groupCnt = 0;
+        int group = 0;
+        size_t packedWeightBytes = 0;
+        size_t packedGroupScaleBytes = 0;
+        size_t channelScaleBytes = 0;
+        const void *sourceCudaData = nullptr;
+        const void *hostScales = nullptr;
+        size_t scaleCount = 0;
+        void *packedWeight = nullptr;
+        void *packedGroupScales = nullptr;
+        void *channelScales = nullptr;
+    };
+
     std::string GetDataTypeName(DataType type);
 
     size_t GetDataBytes(DataType type, size_t rows, size_t columns);
@@ -506,6 +526,7 @@ namespace fastllm {
         // results belong to a CUDA-side cache instead of this logical weight.
         W4A8WeightEncoding w4a8WeightEncoding = W4A8WeightEncoding::NONE;
         std::vector <uint16_t> w4a8GroupScales;
+        std::map <int, W4A8CudaWeightCache> w4a8CudaCaches;
 
         bool isModelWeight = false; // 是否是模型权重
         std::string name; // weightName

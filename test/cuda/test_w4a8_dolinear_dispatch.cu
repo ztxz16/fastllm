@@ -338,11 +338,11 @@ bool RunW4A8EnterCase() {
     fastllm::Data outputData = MakeOutputData(shape);
     biasData.ToDevice(fastllm::DataDevice::CUDA);
 
-    ScopedEnv gemmEnv("FASTLLM_CUDA_W4A8_ENABLE_GEMM", "1");
+    ScopedEnv gemmEnv("FASTLLM_CUDA_W4A8_ENABLE_GEMM", nullptr);
     ScopedEnv traceEnv("FASTLLM_CUDA_W4A8_TRACE", "1");
     ScopedEnv validateEnv("FASTLLM_CUDA_W4A8_VALIDATE", "1");
     fastllm::DoCudaLinear(inputData, weightData, biasData, outputData);
-    CheckCuda(cudaDeviceSynchronize(), "sync DoCudaLinear W4A8 enter case");
+    CheckCuda(cudaDeviceSynchronize(), "sync DoCudaLinear production W4A8 case");
 
     std::vector<float> expectedInput = QuantizeActivationReference(RoundFp16(input), shape);
     std::vector<float> expectedScales = QuantizeScaleReference(
@@ -354,7 +354,8 @@ bool RunW4A8EnterCase() {
     constexpr float meanAbsTol = 3.0e-2f;
     constexpr float maxRelTol = 3.0e-1f;
     CompareResult result = CompareVectors(expected, actual, maxAbsTol, meanAbsTol, maxRelTol);
-    PrintCompareResult("W4A8 DoCudaLinear enter case", result, maxAbsTol, meanAbsTol, maxRelTol);
+    PrintCompareResult("W4A8 DoCudaLinear production dispatch", result,
+                       maxAbsTol, meanAbsTol, maxRelTol);
     return result.passed;
 #endif
 }

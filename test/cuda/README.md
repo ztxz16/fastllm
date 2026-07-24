@@ -77,7 +77,9 @@ export FASTLLM_CUDA_W4A8_PREPARE_ACTIVATION=1
 export FASTLLM_CUDA_W4A8_PREPARE_OUTPUT=1
 ```
 
-真正允许 W4A8 GEMM 接管 `DoCudaLinear` 时，再打开：
+正式的 `INT4_W4A8` 模型权重在满足 SM90、group=128、shape 和 dtype
+条件时会自动接管 `DoCudaLinear`，不需要运行时开关。下面的开关只用于让旧
+`INT4_GROUP` signed-int4 兼容格式进入 W4A8 GEMM：
 
 ```bash
 export FASTLLM_CUDA_W4A8_ENABLE_GEMM=1
@@ -121,8 +123,8 @@ bias 不满足时返回 false
 groupCnt 不是 128 时返回 false
 ```
 
-当编译开启 W4A8 且运行在 SM90 上时，测试会继续打开
-`FASTLLM_CUDA_W4A8_ENABLE_GEMM=1`，跑最小数值比较：
+当编译开启 W4A8 且运行在 SM90 上时，测试使用正式 `INT4_W4A8` dtype，
+在不设置 `FASTLLM_CUDA_W4A8_ENABLE_GEMM` 的情况下跑最小数值比较：
 
 ```text
 W4A8 output vs CPU baseline

@@ -553,11 +553,15 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
 bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
                         const fastllm::Data &bias, fastllm::Data &output,
                         int n, int m, int k);
+void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight);
 #else
 inline bool TryCudaCutlassW4A8(const fastllm::Data &, fastllm::Data &,
                                const fastllm::Data &, fastllm::Data &,
                                int, int, int) {
     return false;
+}
+inline void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight) {
+    weight.w4a8CudaCaches.clear();
 }
 #endif
 bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
