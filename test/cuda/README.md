@@ -158,4 +158,13 @@ dtype 不满足打印对应 dtype skip reason
 weight 不满足打印对应 INT4_GROUP / group / scale-min skip reason
 ```
 
-完整数值正确性和性能测试要等 W4A8 GEMM dispatch 接通后再跑，届时和 FP16 cuBLAS、Marlin INT4_GROUP、INT4_GROUP128 baseline 分别比较。
+产品分发策略：
+
+```text
+普通 INT4_GROUP：W4A8 入口拒绝后继续走原有 CUDA fallback
+专用 INT4_W4A8：非 SM90 明确报错，不隐式转换成 INT4_GROUP 或 BF16
+专用 INT4_W4A8：SM90 上构建或格式条件不满足时明确报错
+```
+
+后续如需为专用 checkpoint 增加跨 GPU fallback，应在模型加载后做一次性显式
+转换，不能在每次 Linear 调用时临时重新量化。

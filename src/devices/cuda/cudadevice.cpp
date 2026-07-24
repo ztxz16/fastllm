@@ -3327,6 +3327,7 @@ namespace fastllm {
                    weightType == DataType::FLOAT32 ||
                    weightType == DataType::FLOAT16 ||
                    weightType == DataType::INT4_GROUP32 ||
+                   weightType == DataType::INT4_W4A8 ||
                    weightType == DataType::FP8_E4M3 ||
                    weightType == DataType::FP8_E4M3_BLOCK_128 ||
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
@@ -3351,6 +3352,18 @@ namespace fastllm {
         }
         if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) {
             return;
+        }
+        if (weight.dataType == DataType::INT4_W4A8) {
+            int runtimeArch = FastllmCudaRuntimeArch();
+            if (runtimeArch != 90) {
+                ErrorInFastLLM(
+                    "Linear error: compressed-tensors W4A8 checkpoints require an "
+                    "NVIDIA Hopper SM90 GPU; runtime SM=" + std::to_string(runtimeArch) + ".\n");
+            }
+            ErrorInFastLLM(
+                "Linear error: compressed-tensors W4A8 is unavailable. The CUDA build "
+                "must enable the SM90 CUTLASS W4A8 kernel, and the weight must use "
+                "symmetric INT4 group_size=128 without zero points or act-order.\n");
         }
         if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT32) {
