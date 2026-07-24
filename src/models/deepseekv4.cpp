@@ -123,6 +123,29 @@ namespace fastllm {
             return false;
         }
 
+        static bool DeepSeekV4DeviceMapUsesSingleCuda(
+                const std::map<std::string, int> &deviceMap) {
+#ifdef USE_CUDA
+            if (deviceMap.size() != 1) {
+                return false;
+            }
+            const std::string &device = deviceMap.begin()->first;
+            if (device == "cuda") {
+                return true;
+            }
+            if (device.rfind("cuda:", 0) != 0) {
+                return false;
+            }
+            const std::string id = device.substr(5);
+            return !id.empty() &&
+                   std::all_of(
+                       id.begin(), id.end(),
+                       [](unsigned char c) { return std::isdigit(c); });
+#else
+            return false;
+#endif
+        }
+
         static bool DeepSeekV4PreferCuda() {
 #ifdef USE_CUDA
             auto *executor = (Executor*)GetExecutor();
@@ -137,6 +160,9 @@ namespace fastllm {
         }
 
         static std::vector<float> ReadFloatData(const Data &input);
+        static void WriteFloatData(const std::vector<float> &values,
+                                   const std::vector<int> &dims,
+                                   Data &output, DataType dtype);
 
 #ifdef USE_CUDA
         static int GetTensorCudaDevice(const Data &data) {
@@ -178,6 +204,30 @@ namespace fastllm {
 
         static const Data *GetTensorCudaReplica(const Data &data, int device) {
             return GetTensorCudaReplica(const_cast<Data&>(data), device);
+        }
+
+        static bool CopyDeepSeekV4CudaTensorToCpu(
+            const Data &source, Data &destination
+        ) {
+            int device = GetTensorCudaDevice(source);
+            if (device < 0) {
+                return false;
+            }
+            const Data *replica =
+                GetTensorCudaReplica(source, device);
+            if (replica == nullptr || replica->cudaData == nullptr ||
+                replica->dataType != source.dataType ||
+                replica->dims != source.dims) {
+                return false;
+            }
+            destination.dataType = source.dataType;
+            destination.Resize(source.dims);
+            destination.Allocate(false);
+            FastllmCudaSetDevice(device);
+            FastllmCudaCopyFromDeviceToHost(
+                destination.cpuData, replica->cudaData,
+                destination.GetBytes());
+            return true;
         }
 
         static std::vector<int> GetReplicatedCudaDevices(const Data &data) {
@@ -457,6 +507,92 @@ namespace fastllm {
             float ret;
             memcpy(&ret, &x, sizeof(float));
             return ret;
+        }
+
+        static bool IsDeepSeekV4QuantizedLinearWeight(const Data &weight) {
+            return weight.dataType == DataType::FP8_E4M3 ||
+                   weight.dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                   weight.dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                   weight.dataType == DataType::NVFP4 ||
+                   weight.dataType == DataType::NVFP4_BLOCK_16 ||
+                   weight.dataType == DataType::NVFP4_BLOCK_16_E8M0;
+        }
+
+        static void ResetData(Data &data);
+
+        // Match inference/kernel.py::act_quant for a non-inplace quantized
+        // Linear: BF16 -> FP8 E4M3FN with one UE8M0 (power-of-two) scale per
+        // 128 values, then dequantize back to BF16 for the CPU weight kernels.
+        // The dequantized representation is mathematically equivalent to the
+        // FP8 values and scales consumed by the official GEMM.
+        static void DeepSeekV4QuantizeLinearActivationCpu(const Data &input, Data &output) {
+            AssertInFastLLM(input.dataType == DataType::BFLOAT16 && !input.dims.empty() &&
+                            input.dims.back() % 128 == 0,
+                            "DeepSeek-V4 FP8 activation quantization expects BF16 rows divisible by 128.\n");
+            if (input.dataDevice == DataDevice::CPU && input.cpuData != nullptr &&
+                std::getenv("FASTLLM_DSV4_DISABLE_CPU_ACT_QUANT_FAST") == nullptr) {
+                static const FP8E4M3ToFP32Manager fp8;
+                ResetData(output);
+                output = Data(DataType::BFLOAT16, input.dims);
+                output.Allocate(false);
+                const uint16_t *src = (const uint16_t*)input.cpuData;
+                uint16_t *dst = (uint16_t*)output.cpuData;
+                int dim = input.dims.back();
+                uint64_t count = input.Count(0);
+                for (uint64_t rowStart = 0; rowStart < count; rowStart += dim) {
+                    for (int blockStart = 0; blockStart < dim; blockStart += 128) {
+                        uint64_t start = rowStart + blockStart;
+                        uint64_t end = std::min<uint64_t>(start + 128, rowStart + dim);
+                        float amax = 1e-4f;
+                        for (uint64_t i = start; i < end; i++) {
+                            amax = std::max(amax, std::fabs(BFloat16ToFloat(src[i])));
+                        }
+                        float normalized = amax / 448.0f;
+                        uint32_t bits;
+                        memcpy(&bits, &normalized, sizeof(bits));
+                        int exponent = (int)((bits >> 23) & 0xFF) - 127 +
+                                       ((bits & ((1u << 23) - 1)) != 0);
+                        float scale = std::ldexp(1.0f, exponent);
+                        const uint16_t *lookupRow =
+                            GetFP8E4M3BFloat16QuantizeLookupRow(exponent);
+                        if (lookupRow != nullptr) {
+                            for (uint64_t i = start; i < end; i++) {
+                                dst[i] = lookupRow[src[i]];
+                            }
+                        } else {
+                            for (uint64_t i = start; i < end; i++) {
+                                float value = BFloat16ToFloat(src[i]);
+                                float q = std::max(
+                                    -448.0f, std::min(448.0f, value / scale));
+                                dst[i] = FloatToBFloat16(
+                                    fp8.quantizeDequantize(q) * scale);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            std::vector<float> values = ReadFloatData(input);
+            int dim = input.dims.back();
+            int rows = (int)(values.size() / dim);
+            for (int row = 0; row < rows; row++) {
+                float *rowData = values.data() + (uint64_t)row * dim;
+                QuantizeDequantizeFP8E4M3Block128(rowData, dim);
+            }
+            WriteFloatData(values, input.dims, output, DataType::BFLOAT16);
+        }
+
+        static void DeepSeekV4Linear(Data &input, Data &weight, const Data &bias,
+                                     Data &output, bool keepTpReplicated = false) {
+            if (!DeepSeekV4PreferCuda() && input.dataDevice == DataDevice::CPU &&
+                input.dataType == DataType::BFLOAT16 &&
+                IsDeepSeekV4QuantizedLinearWeight(weight)) {
+                Data quantizedInput;
+                DeepSeekV4QuantizeLinearActivationCpu(input, quantizedInput);
+                Linear(quantizedInput, weight, bias, output, keepTpReplicated);
+            } else {
+                Linear(input, weight, bias, output, keepTpReplicated);
+            }
         }
 
         static void ResetData(Data &data) {
@@ -761,6 +897,30 @@ namespace fastllm {
         };
 
         static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
+            if (!DeepSeekV4PreferCuda() && input.dataDevice == DataDevice::CPU &&
+                dtype == DataType::BFLOAT16 && !input.dims.empty()) {
+                const int channels = input.dims.back();
+                const int rows = (int)(input.Count(0) / channels);
+                std::vector<float> values = ReadFloatData(input);
+                auto weightValues = ReadWeightFloatDataCached(weight);
+                std::vector<float> normalized(values.size());
+                for (int row = 0; row < rows; row++) {
+                    const float *src = values.data() + (uint64_t)row * channels;
+                    float *dst = normalized.data() + (uint64_t)row * channels;
+                    double sumSquares = 0.0;
+                    for (int channel = 0; channel < channels; channel++) {
+                        sumSquares += (double)src[channel] * src[channel];
+                    }
+                    float scale = 1.0f / std::sqrt((float)(sumSquares / channels) + eps);
+                    for (int channel = 0; channel < channels; channel++) {
+                        dst[channel] = src[channel] * scale * (*weightValues)[channel];
+                    }
+                }
+                // torch.Tensor.to(torch.bfloat16) uses round-to-nearest-even;
+                // the generic CPU RMSNorm BF16 path truncates instead.
+                WriteFloatData(normalized, input.dims, output, DataType::BFLOAT16);
+                return;
+            }
             RMSNorm(input, weight, eps, output);
             ToDataType(output, dtype);
         }
@@ -799,19 +959,28 @@ namespace fastllm {
             int dim = (dims.size() == 4) ? dims[3] : dims[2];
             int off = dim - ropeDim;
             auto invFreq = BuildInvFreqReference(ropeDim, base, originalSeqLen, factor, betaFast, betaSlow);
+            int pairs = ropeDim / 2;
+            std::vector<float> cosValues((uint64_t)seqlen * pairs);
+            std::vector<float> sinValues((uint64_t)seqlen * pairs);
+            for (int s = 0; s < seqlen; s++) {
+                int pos = startPos + s * posStep;
+                for (int p = 0; p < pairs; p++) {
+                    float ang = pos * invFreq[p];
+                    cosValues[(uint64_t)s * pairs + p] = std::cos(ang);
+                    float sn = std::sin(ang);
+                    sinValues[(uint64_t)s * pairs + p] =
+                        inverse ? -sn : sn;
+                }
+            }
             for (int b = 0; b < bsz; b++) {
                 for (int s = 0; s < seqlen; s++) {
-                    int pos = startPos + s * posStep;
                     for (int h = 0; h < heads; h++) {
                         uint64_t rowIndex = dims.size() == 4 ? (((uint64_t)b * seqlen + s) * heads + h)
                                                              : ((uint64_t)b * seqlen + s);
                         float *row = x.data() + rowIndex * dim + off;
                         for (int i = 0; i < ropeDim; i += 2) {
-                            float ang = pos * invFreq[i / 2];
-                            float c = std::cos(ang), sn = std::sin(ang);
-                            if (inverse) {
-                                sn = -sn;
-                            }
+                            float c = cosValues[(uint64_t)s * pairs + i / 2];
+                            float sn = sinValues[(uint64_t)s * pairs + i / 2];
                             float a = row[i], bb = row[i + 1];
                             row[i] = a * c - bb * sn;
                             row[i + 1] = a * sn + bb * c;
@@ -928,8 +1097,12 @@ namespace fastllm {
 
         static void ComputeCompressorRaw(WeightMap &weight, const std::string &prefix, const Data &x,
                                          Data &kv, Data &score) {
-            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kv, true);
-            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), score, true);
+            // The official Compressor explicitly promotes both the activation
+            // and its checkpoint-BF16 weights to FP32 before these projections.
+            Data xFloat;
+            ToDataType(x, xFloat, DataType::FLOAT32);
+            Linear(xFloat, weight[prefix + ".wkv.weight"], Data(), kv, true);
+            Linear(xFloat, weight[prefix + ".wgate.weight"], Data(), score, true);
         }
 
         static void AppendCompressorRaw(const Data &kv, const Data &score,
@@ -1766,6 +1939,79 @@ namespace fastllm {
             WriteFloatData(out, {bsz, seqlen, heads, dim}, output, DataType::BFLOAT16);
         }
 
+        struct SparseAttentionDecodeCachedHeadsOp : MultiThreadBaseOp {
+            const float *q;
+            const float *window;
+            const float *compressed;
+            const float *sink;
+            const int *idxs;
+            float *output;
+            int flatHeadSt, flatHeadEnd;
+            int heads, dim, windowSize, compressedCount, idxCount;
+            float softmaxScale;
+
+            SparseAttentionDecodeCachedHeadsOp(
+                const float *q, const float *window, const float *compressed,
+                const float *sink, const int *idxs, float *output,
+                int flatHeadSt, int flatHeadEnd, int heads, int dim,
+                int windowSize, int compressedCount, int idxCount,
+                float softmaxScale
+            ) : q(q), window(window), compressed(compressed), sink(sink),
+                idxs(idxs), output(output), flatHeadSt(flatHeadSt),
+                flatHeadEnd(flatHeadEnd), heads(heads), dim(dim),
+                windowSize(windowSize), compressedCount(compressedCount),
+                idxCount(idxCount), softmaxScale(softmaxScale) {}
+
+            const float *GetKVRow(int batch, int idx) const {
+                if (idx < windowSize) {
+                    return window +
+                        ((uint64_t)batch * windowSize + idx) * dim;
+                }
+                return compressed +
+                    ((uint64_t)batch * compressedCount +
+                     (idx - windowSize)) * dim;
+            }
+
+            void Run() override {
+                std::vector<float> scores(idxCount);
+                for (int flatHead = flatHeadSt;
+                     flatHead < flatHeadEnd; flatHead++) {
+                    int batch = flatHead / heads;
+                    int head = flatHead % heads;
+                    const float *qrow =
+                        q + (uint64_t)flatHead * dim;
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int k = 0; k < idxCount; k++) {
+                        const float *kvrow = GetKVRow(batch, idxs[k]);
+                        double dot = 0.0;
+                        for (int d = 0; d < dim; d++) {
+                            dot += (double)qrow[d] * kvrow[d];
+                        }
+                        scores[k] = (float)dot * softmaxScale;
+                        mx = std::max(mx, scores[k]);
+                    }
+                    float safeMx = std::isfinite(mx) ? mx : 0.0f;
+                    double denom =
+                        std::exp((double)sink[head] - safeMx);
+                    for (float score : scores) {
+                        denom += std::exp((double)score - safeMx);
+                    }
+                    float *orow =
+                        output + (uint64_t)flatHead * dim;
+                    for (int k = 0; k < idxCount; k++) {
+                        float w = (float)(
+                            std::exp((double)scores[k] - safeMx) /
+                            std::max(denom, 1e-30));
+                        const float *kvrow =
+                            GetKVRow(batch, idxs[k]);
+                        for (int d = 0; d < dim; d++) {
+                            orow[d] += w * kvrow[d];
+                        }
+                    }
+                }
+            }
+        };
+
         static void SparseAttentionDecodeCachedReference(Data &q,
                                                          const Data &windowKV,
                                                          const Data &compressedKV,
@@ -1907,7 +2153,41 @@ namespace fastllm {
                 return compressed.data() + ((uint64_t)b * compressedCount + (idx - windowSize)) * dim;
             };
 
-            for (int b = 0; b < bsz; b++) {
+            bool useParallelHeads =
+                bsz * heads > 1 &&
+                !EnvFlagEnabled(
+                    "FASTLLM_DSV4_DISABLE_CPU_SPARSE_DECODE_PARALLEL");
+            if (useParallelHeads) {
+                auto *pool = GetAlivePool();
+                int sparseThreads = idxs.size() <= 8 ? 12 : 24;
+                sparseThreads = std::min(
+                    {(int)pool->threads.size(), sparseThreads,
+                     bsz * heads});
+                std::vector<SparseAttentionDecodeCachedHeadsOp*> ops;
+                int totalHeads = bsz * heads;
+                int per = totalHeads / sparseThreads;
+                int cur = 0;
+                for (int i = 0; i < sparseThreads; i++) {
+                    int end = cur + per +
+                        (cur + per * (sparseThreads - i) < totalHeads);
+                    if (i == sparseThreads - 1) {
+                        end = totalHeads;
+                    }
+                    ops.push_back(new SparseAttentionDecodeCachedHeadsOp(
+                        qv.data(), windowValues.data(), compressed.data(),
+                        sink.data(), idxs.data(), out.data(), cur, end,
+                        heads, dim, windowSize, compressedCount,
+                        (int)idxs.size(), softmaxScale));
+                    cur = end;
+                }
+                for (int i = 0; i < sparseThreads; i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < sparseThreads; i++) {
+                    pool->Wait(i);
+                    delete ops[i];
+                }
+            } else for (int b = 0; b < bsz; b++) {
                 std::vector<float> scores(idxs.size());
                 for (int h = 0; h < heads; h++) {
                     const float *qrow = qv.data() + ((uint64_t)b * heads + h) * dim;
@@ -2014,8 +2294,10 @@ namespace fastllm {
             bool overlap = (compressRatio == 4);
             int coff = overlap ? 2 : 1;
             Data kv, score;
-            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kv, true);
-            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), score, true);
+            Data xFloat;
+            ToDataType(x, xFloat, DataType::FLOAT32);
+            Linear(xFloat, weight[prefix + ".wkv.weight"], Data(), kv, true);
+            Linear(xFloat, weight[prefix + ".wgate.weight"], Data(), score, true);
 
             int wideDim = coff * headDim;
             Data compressed;
@@ -2340,13 +2622,33 @@ namespace fastllm {
                     for (int k = 0; k < flatDim; k++) {
                         mix += (double)xrow[k] * w[k];
                     }
-                    float pre = SigmoidFloat((float)mix * rsqrt * scale[0] + base[h]) + eps;
+                    float scaledMix = (float)mix * rsqrt;
+                    float pre = SigmoidFloat(scaledMix * scale[0] + base[h]) + eps;
                     for (int d = 0; d < dim; d++) {
                         y[(uint64_t)t * dim + d] += pre * xrow[(uint64_t)h * dim + d];
                     }
                 }
             }
             WriteFloatData(y, {bsz, seqlen, dim}, output, x.dataType);
+        }
+
+        static bool DeepSeekV4HeadLogitsCpu(Data &headInput, Data &normWeight,
+                                            Data &headWeight, float normEps,
+                                            Data &logits) {
+            if (headInput.dataDevice != DataDevice::CPU || headInput.cpuData == nullptr ||
+                headInput.multiDeviceData) {
+                return false;
+            }
+            // ParallelHead stores checkpoint-BF16 values in an FP32 parameter
+            // and evaluates F.linear(norm(x).float(), weight.float()).  Keep
+            // norm's BF16 boundary, then use the CPU F32 x BF16 GEMM so logits
+            // remain FP32 instead of being rounded to BF16 before sampling.
+            Data normalized, normalizedFloat;
+            RMSNormReference(headInput, normWeight, normEps, normalized, DataType::BFLOAT16);
+            ToDataType(normalized, normalizedFloat, DataType::FLOAT32);
+            Linear(normalizedFloat, headWeight, *GetEmptyData(), logits);
+            ToDataType(logits, DataType::FLOAT32);
+            return true;
         }
     }
 
@@ -3989,6 +4291,12 @@ namespace fastllm {
 #ifdef USE_CUDA
                 FastllmCudaClearBigBuffer();
 #endif
+                std::chrono::system_clock::time_point profileStartTime;
+                const bool printProfile = GetFastllmEnv().printProfile;
+                if (printProfile) {
+                    profileStartTime = std::chrono::system_clock::now();
+                    ClearProfiler();
+                }
                 bool allDecodeTokens = true;
                 for (int seqLen : seqLens) {
                     allDecodeTokens &= (seqLen == 1);
@@ -4066,6 +4374,21 @@ namespace fastllm {
                             genTokens = 0;
                         }
                     }
+                }
+
+                if (printProfile) {
+                    PrintProfiler();
+                    int inputTokens = 0;
+                    for (int seqLen : seqLens) {
+                        inputTokens += seqLen;
+                    }
+                    float spend = GetSpan(profileStartTime, std::chrono::system_clock::now());
+                    float tokenPerSecond = spend > 0.0f ? (float)inputTokens / spend : 0.0f;
+                    printf("[fastllm-profile] loop = deepseekv4, batch = %d, input tokens = %d, "
+                           "output tokens = %d, spend = %f s, tokens / s = %f\n",
+                           (int)seqLens.size(), inputTokens, (int)ret.size(),
+                           spend, tokenPerSecond);
+                    fflush(stdout);
                 }
 
                 forwardLocker.unlock();
@@ -4360,6 +4683,14 @@ namespace fastllm {
         bool tensorParallelLoad = EnvFlagEnabled("FASTLLM_TP");
         bool tensorParallelAttention = tensorParallelLoad &&
                                        DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap);
+        // wo_a is bandwidth-bound during single-token CUDA decode.  Keep its
+        // checkpoint FP8 representation on a single CUDA device and dequantize
+        // to the legacy FP16 value in the CUDA kernel.  Other device maps
+        // retain the established load-time FP16 conversion.
+        const bool keepCudaFp8WoA =
+            !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_FP8_WOA") &&
+            (EnvFlagEnabled("FASTLLM_DSV4_CUDA_FP8_WOA") ||
+             DeepSeekV4DeviceMapUsesSingleCuda(this->deviceMap));
         for (int i = 0; i < block_cnt; i++) {
             if (tensorParallelAttention) {
                 this->AddSpecialWeight("layers." + std::to_string(i) + ".attn.wq_b.weight", "linearRow", i);
@@ -4391,7 +4722,11 @@ namespace fastllm {
                 this->moeLinears.insert(downName);
             }
             this->cantQuantLinears.insert("layers." + std::to_string(i) + ".attn.wkv.weight");
-            this->cantQuantLinears.insert("layers." + std::to_string(i) + ".attn.wo_a.weight");
+            if (!keepCudaFp8WoA) {
+                this->cantQuantLinears.insert(
+                    "layers." + std::to_string(i) +
+                    ".attn.wo_a.weight");
+            }
         }
         if (tensorParallelAttention) {
             this->AddSpecialWeight("head.weight", "linearRow", 0);
@@ -4979,6 +5314,15 @@ namespace fastllm {
 #ifdef USE_CUDA
         bool persistentTpAsync = batch == 1 && seqlen == 1 && originalStartPos > 0 &&
                                  DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap);
+        // The decode-only HcPre+RMSNorm kernel preserves the BF16 tensor
+        // boundary between both operators while avoiding a second global
+        // memory round trip.  Keep prefill and non-CUDA execution on the
+        // established generic path, and retain an explicit A/B fallback.
+        bool cudaHcPreNormDecode =
+            graphSafeDecode ||
+            (batch == 1 && seqlen == 1 && originalStartPos > 0 &&
+             DeepSeekV4PreferCuda() &&
+             !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_HCPRENORM"));
 #else
         bool persistentTpAsync = false;
 #endif
@@ -5019,6 +5363,12 @@ namespace fastllm {
 #endif
             Embedding(*embeddingInputIds, weight["embed.weight"],
                       hiddenStatesBeforeHcExpand);
+            // The official ParallelEmbedding output follows the checkpoint's
+            // BF16 dtype.  The generic CPU Embedding operator returns FLOAT32,
+            // which would otherwise skip the first hc_pre BF16 boundary.
+            if (hiddenStatesBeforeHcExpand.dataType != DataType::BFLOAT16) {
+                ToDataType(hiddenStatesBeforeHcExpand, DataType::BFLOAT16);
+            }
             hiddenStatesBeforeHcExpand.Reshape({bsz, seqlen, 1, dim});
             bool repeatedToTpReplicas = false;
 #ifdef USE_CUDA
@@ -5052,7 +5402,7 @@ namespace fastllm {
             bool fusedAttnHcPreNorm = prefetchedAttnHcPreNorm;
             prefetchedAttnHcPreNorm = false;
 #ifdef USE_CUDA
-            if (!fusedAttnHcPreNorm && graphSafeDecode) {
+            if (!fusedAttnHcPreNorm && cudaHcPreNormDecode) {
                 fusedAttnHcPreNorm = DeepSeekV4HcPreNormMultiCuda(
                     *curHiddenStates, weight[pre + ".hc_attn_fn"],
                     weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
@@ -5073,12 +5423,12 @@ namespace fastllm {
             attnMix.s = seqlen;
             attnMix.hc = hc_mult;
 
-            Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr, true);
+            DeepSeekV4Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr, true);
             RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
             weight[pre + ".attn.wq_b.weight"].tpLinearType = TP_LINEAR_ROW;
-            Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
+            DeepSeekV4Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
             q.Reshape({bsz, seqlen, num_attention_heads, head_dim_full});
-            Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv, true);
+            DeepSeekV4Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv, true);
             kv.Reshape({bsz, seqlen, 1, head_dim_full});
             DeepSeekV4DecodeLayerCache *decodeCache = nullptr;
             if (useDecodeCache && layer < (int)activeDecodeLayerCaches.size()) {
@@ -5393,7 +5743,7 @@ namespace fastllm {
                                          sparsePrefillPrefixLen);
             }
             DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
-            Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
+            DeepSeekV4Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
             bool fusedFfnHcPostPreNorm = false;
 #ifdef USE_CUDA
             if (graphSafeDecode) {
@@ -5417,7 +5767,7 @@ namespace fastllm {
             bool fusedFfnHcPreNorm = fusedFfnHcPostPreNorm;
             {
 #ifdef USE_CUDA
-                if (!fusedFfnHcPreNorm && graphSafeDecode) {
+                if (!fusedFfnHcPreNorm && cudaHcPreNormDecode) {
                     fusedFfnHcPreNorm = DeepSeekV4HcPreNormMultiCuda(
                         *curHiddenStates, weight[pre + ".hc_ffn_fn"],
                         weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
@@ -5458,6 +5808,54 @@ namespace fastllm {
                 std::vector<Data*> moeWeights = weights[layer];
                 auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
                 auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
+                Data preCopiedMoeInput;
+                Data preCopiedExpertIndex;
+                Data preCopiedExpertScore;
+                Data *routedMoeInput = &ffnInput;
+                Data *routedExpertIndex = &expertIndex;
+                Data *routedExpertScore = &expertScore;
+#ifdef USE_CUDA
+                bool preCopiedNumasMoeInputs = false;
+                bool canPreCopyNumasMoeInputs =
+                    std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_PRECOPY") == nullptr &&
+                    cudaSe && ffnInput.dims.size() > 0 &&
+                    ffnInput.dims[0] == 1 &&
+                    sharedGateupIt != weight.weight.end() &&
+                    sharedDownIt != weight.weight.end() &&
+                    !DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap) &&
+                    moeWeights.size() > 2 &&
+                    moeWeights[2] != nullptr &&
+                    !moeWeights[2]->IsTensorParallelSharded();
+                if (canPreCopyNumasMoeInputs) {
+                    std::string selectedMoeDevice =
+                        this->SelectMoeDeviceForLayer(layer);
+                    std::transform(
+                        selectedMoeDevice.begin(),
+                        selectedMoeDevice.end(),
+                        selectedMoeDevice.begin(),
+                        [](unsigned char c) {
+                            return (char)std::tolower(c);
+                        });
+                    canPreCopyNumasMoeInputs =
+                        selectedMoeDevice == "numa" ||
+                        selectedMoeDevice.rfind("numa:", 0) == 0;
+                }
+                if (canPreCopyNumasMoeInputs) {
+                    preCopiedNumasMoeInputs =
+                        CopyDeepSeekV4CudaTensorToCpu(
+                            ffnInput, preCopiedMoeInput) &&
+                        CopyDeepSeekV4CudaTensorToCpu(
+                            expertIndex, preCopiedExpertIndex) &&
+                        CopyDeepSeekV4CudaTensorToCpu(
+                            expertScore, preCopiedExpertScore);
+                    if (preCopiedNumasMoeInputs) {
+                        routedMoeInput = &preCopiedMoeInput;
+                        routedExpertIndex = &preCopiedExpertIndex;
+                        routedExpertScore = &preCopiedExpertScore;
+                    }
+                }
+#endif
                 {
                     if (cudaSe && sharedGateupIt != weight.weight.end() && sharedDownIt != weight.weight.end() &&
                         !IsDiskWeight(&sharedGateupIt->second) && !IsDiskWeight(&sharedDownIt->second)) {
@@ -5471,10 +5869,17 @@ namespace fastllm {
                         fuseSharedExpert = (routedTensorParallel || routedExpertParallel) &&
                                            ffnInput.dims.size() > 0 && ffnInput.dims[0] == 1;
                         if (!fuseSharedExpert) {
-                            LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(),
+                            Data sharedInput;
+                            Data *sharedInputPtr = &ffnInput;
+                            if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
+                                IsDeepSeekV4QuantizedLinearWeight(sharedGateupIt->second)) {
+                                DeepSeekV4QuantizeLinearActivationCpu(ffnInput, sharedInput);
+                                sharedInputPtr = &sharedInput;
+                            }
+                            LinearSwigluBlock(sharedInputPtr, &sharedGateupIt->second, GetEmptyData(),
                                               &sharedW3, &sharedW1);
-                            Linear(sharedW1, sharedDownIt->second, *GetEmptyData(),
-                                   sharedExpertOut);
+                            DeepSeekV4Linear(sharedW1, sharedDownIt->second, *GetEmptyData(),
+                                             sharedExpertOut);
                             moeWeights[0] = moeWeights[1] = nullptr;
                             hasSharedExpertOut = true;
                         }
@@ -5483,13 +5888,21 @@ namespace fastllm {
                 {
                     this->ApplyMoeDeviceMapForLayer(layer);
                     DataType effectiveMoeAtype = ffnInput.dataType;
-                    MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
+                    Data moeQuantizedInput;
+                    Data *moeInput = routedMoeInput;
+                    if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
+                        moeWeights.size() > 2 && moeWeights[2] != nullptr &&
+                        IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
+                        DeepSeekV4QuantizeLinearActivationCpu(ffnInput, moeQuantizedInput);
+                        moeInput = &moeQuantizedInput;
+                    }
+                    MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
                                   &moeWeights, &biass[layer],
                                   &w1, &w2, &w3, &tempInput, &tempOutput,
                                   1.0f, &ffnOut, layer,
                                   ffnInput.dataType, effectiveMoeAtype,
                                   &moeInputTemp, &moeOutputTemp,
-                                  MoeGateSwiglu, true);
+                                  MoeGateSwiglu, true, swiglu_limit, true);
                     ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 }
                 {
@@ -5964,6 +6377,18 @@ namespace fastllm {
             samplingHeadInputPtr = &samplingHeadInput;
         }
 #endif
+        Data officialCpuSamplingLogits;
+        Data *samplingPrecomputedLogits = nullptr;
+        if (DeepSeekV4HeadLogitsCpu(*samplingHeadInputPtr, weight["norm.weight"],
+                                    weight["head.weight"], rms_norm_eps,
+                                    officialCpuSamplingLogits)) {
+            samplingPrecomputedLogits = &officialCpuSamplingLogits;
+        }
+#ifdef USE_CUDA
+        if (asyncShardedGreedy) {
+            samplingPrecomputedLogits = &samplingLogitsFloat;
+        }
+#endif
         {
 #ifdef USE_CUDA
             struct ScopedSamplingPersistentAsync {
@@ -5985,13 +6410,13 @@ namespace fastllm {
                              rms_norm_eps, batch, true, samplingSeqLens,
                              samplingPastKeyValues, generationConfigs,
                              *samplingLastTokensPtr, retLogits, ret,
+                             samplingPrecomputedLogits,
 #ifdef USE_CUDA
-                             asyncShardedGreedy ? &samplingLogitsFloat : nullptr,
                              asyncShardedGreedy ? &samplingGreedyIds : nullptr,
                              asyncShardedGreedy ? &samplingGreedyScores : nullptr,
                              asyncShardedGreedy ? &samplingGreedyReadyEvents : nullptr
 #else
-                             nullptr, nullptr, nullptr, nullptr
+                             nullptr, nullptr, nullptr
 #endif
             );
         }
@@ -6123,6 +6548,9 @@ namespace fastllm {
 
         Data hiddenStates, hiddenStatesBeforeHcExpand;
         Embedding(decodeInputIds, weight["embed.weight"], hiddenStatesBeforeHcExpand);
+        if (hiddenStatesBeforeHcExpand.dataType != DataType::BFLOAT16) {
+            ToDataType(hiddenStatesBeforeHcExpand, DataType::BFLOAT16);
+        }
 
         int bsz = batch;
         int seqlen = 1;
@@ -6202,10 +6630,10 @@ namespace fastllm {
             attnMix.hc = hc_mult;
 
             RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
-            Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr, true);
+            DeepSeekV4Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr, true);
             RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
             weight[pre + ".attn.wq_b.weight"].tpLinearType = TP_LINEAR_ROW;
-            Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
+            DeepSeekV4Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
             q.Reshape({bsz, seqlen, num_attention_heads, head_dim_full});
 
             std::vector<Data> qParts(batch);
@@ -6218,7 +6646,7 @@ namespace fastllm {
                 qPartPtrs[b] = &qParts[b];
             }
 
-            Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv, true);
+            DeepSeekV4Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv, true);
             RMSNormReference(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv, DataType::BFLOAT16);
             kv.Reshape({bsz, seqlen, 1, head_dim_full});
             std::vector<Data> kvParts(batch);
@@ -6371,7 +6799,7 @@ namespace fastllm {
             }
 
             DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
-            Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
+            DeepSeekV4Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
             runHcPost(attnOut, attnMix);
 
             DeepSeekV4HcPre(*curHiddenStates, weight[pre + ".hc_ffn_fn"],
@@ -6405,8 +6833,15 @@ namespace fastllm {
                                        ffnInput.dims.size() > 0 && ffnInput.dims[0] == 1;
                     if (!fuseSharedExpert) {
                         Data ww1, ww3;
-                        LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
-                        Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
+                        Data sharedInput;
+                        Data *sharedInputPtr = &ffnInput;
+                        if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
+                            IsDeepSeekV4QuantizedLinearWeight(sharedGateupIt->second)) {
+                            DeepSeekV4QuantizeLinearActivationCpu(ffnInput, sharedInput);
+                            sharedInputPtr = &sharedInput;
+                        }
+                        LinearSwigluBlock(sharedInputPtr, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
+                        DeepSeekV4Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
                         moeWeights[0] = moeWeights[1] = nullptr;
                         hasSharedExpertOut = true;
                     }
@@ -6414,13 +6849,21 @@ namespace fastllm {
                 this->ApplyMoeDeviceMapForLayer(layer);
                 {
                     DataType effectiveMoeAtype = ffnInput.dataType;
-                    MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
+                    Data moeQuantizedInput;
+                    Data *moeInput = &ffnInput;
+                    if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
+                        moeWeights.size() > 2 && moeWeights[2] != nullptr &&
+                        IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
+                        DeepSeekV4QuantizeLinearActivationCpu(ffnInput, moeQuantizedInput);
+                        moeInput = &moeQuantizedInput;
+                    }
+                    MergeMOEBlock(moeInput, &expertIndex, &expertScore,
                                   &moeWeights, &biass[layer],
                                   &w1, &w2, &w3, &tempInput, &tempOutput,
                                   1.0f, &ffnOut, layer,
                                   ffnInput.dataType, effectiveMoeAtype,
                                   &moeInputTemp, &moeOutputTemp,
-                                  MoeGateSwiglu, true);
+                                  MoeGateSwiglu, true, swiglu_limit, true);
                 }
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 if (hasSharedExpertOut) {
@@ -6447,9 +6890,17 @@ namespace fastllm {
         for (int b = 0; b < batch; b++) {
             PrepareDeepSeekV4SamplingConfig(samplingGenerationConfigs[b]);
         }
+        Data officialCpuSamplingLogits;
+        Data *samplingPrecomputedLogits = nullptr;
+        if (DeepSeekV4HeadLogitsCpu(headInput, weight["norm.weight"],
+                                    weight["head.weight"], rms_norm_eps,
+                                    officialCpuSamplingLogits)) {
+            samplingPrecomputedLogits = &officialCpuSamplingLogits;
+        }
         LLMSamplingBlock(this, &headInput, &weight["norm.weight"], &weight["head.weight"],
                          rms_norm_eps, batch, true, samplingSeqLens, pastKeyValues,
-                         samplingGenerationConfigs, lastTokens, retLogits, ret);
+                         samplingGenerationConfigs, lastTokens, retLogits, ret,
+                         samplingPrecomputedLogits);
 
         for (int b = 0; b < batch; b++) {
             int finalTotalLen = startPositions[b] + 1;

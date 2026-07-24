@@ -123,7 +123,9 @@ namespace fastllm {
         DataType dataType, DataType moeAtype,
         Data *moeInputTemp, Data *moeOutputTemp,
         MoeGateType gateType = MoeGateSwiglu,
-        bool expertParallel = false
+        bool expertParallel = false,
+        float swigluLimit = 0.0f,
+        bool deepSeekV4Mode = false
     );
 
     class basellm;

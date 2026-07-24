@@ -3791,17 +3791,18 @@ namespace fastllm {
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer, MoeGateType gateType,
-                bool expertParallel) {
+                bool expertParallel, float swigluLimit, bool deepSeekV4Mode) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
                 {"w1", (Data*)&w1}, {"w2", (Data*)&w2}, {"w3", (Data*)&w3},
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
-        }, {{"sharedScale", sharedScale}}, 
+        }, {{"sharedScale", sharedScale}, {"swigluLimit", swigluLimit}},
                                         {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
                                          {"layer", layer}, {"gateType", (int)gateType},
-                                         {"expertParallel", expertParallel ? 1 : 0}});
+                                         {"expertParallel", expertParallel ? 1 : 0},
+                                         {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0}});
     }
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
