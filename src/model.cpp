@@ -1364,7 +1364,7 @@ namespace fastllm {
                 weight["type"].string_value() == "int" &&
                 weight["num_bits"].int_value() == 4 &&
                 weight["strategy"].string_value() == "group" &&
-                weight["group_size"].int_value() == 128 &&
+                weight["group_size"].int_value() == COMPRESSED_W4A8_GROUP_SIZE &&
                 weight["symmetric"].bool_value() &&
                 !weight["dynamic"].bool_value() &&
                 weight["actorder"].is_null() &&
@@ -1423,17 +1423,19 @@ namespace fastllm {
             shape.ClearBuffer();
 
             AssertInFastLLM(outFeatures > 0 && inFeatures > 0 &&
-                            outFeatures % 128 == 0 && inFeatures % 128 == 0,
+                            outFeatures % COMPRESSED_W4A8_GROUP_SIZE == 0 &&
+                            inFeatures % COMPRESSED_W4A8_GROUP_SIZE == 0,
                             "W4A8 logical shape should be positive and 128-aligned: " + shapeName + "\n");
             AssertInFastLLM(packed.intShape[0] == outFeatures &&
                             packed.intShape[1] * 8 == inFeatures,
                             "W4A8 weight_packed shape does not match weight_shape: " + packedName + "\n");
             AssertInFastLLM(scale.intShape[0] == outFeatures &&
-                            scale.intShape[1] * 128 == inFeatures,
+                            scale.intShape[1] * COMPRESSED_W4A8_GROUP_SIZE == inFeatures,
                             "W4A8 weight_scale shape does not match weight_shape: " + scaleName + "\n");
             AssertInFastLLM(packed.bytes == (uint64_t)outFeatures * inFeatures / 2,
                             "W4A8 weight_packed byte size mismatch: " + packedName + "\n");
-            AssertInFastLLM(scale.bytes == (uint64_t)outFeatures * (inFeatures / 128) * sizeof(uint16_t),
+            AssertInFastLLM(scale.bytes == (uint64_t)outFeatures *
+                            (inFeatures / COMPRESSED_W4A8_GROUP_SIZE) * sizeof(uint16_t),
                             "W4A8 weight_scale byte size mismatch: " + scaleName + "\n");
 
             bundles[packedName] = CompressedTensorsW4A8Bundle{
@@ -3493,9 +3495,8 @@ namespace fastllm {
                                                  w4a8BundleIt->second.logicalShape,
                                                  DataType::INT4_W4A8);
                     Data &weight = model->weight[weightName];
-                    weight.perChannelAxis = 0;
-                    weight.groupCnt = 128;
-                    weight.group = weight.dims[1] / weight.groupCnt;
+                    weight.InitW4A8Weight(
+                        W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8);
                 } else if (it.second == DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
@@ -3833,9 +3834,9 @@ namespace fastllm {
                                     scaleTensor.CreateBuffer(DataType::BFLOAT16);
                                     Data &weight = model->weight[weightName];
                                     size_t scaleCount = (size_t)weight.dims[0] * weight.group;
-                                    weight.w4a8GroupScales.resize(scaleCount);
-                                    memcpy(weight.w4a8GroupScales.data(), scaleTensor.buffer,
-                                           scaleCount * sizeof(uint16_t));
+                                    weight.SetW4A8GroupScales(
+                                        reinterpret_cast<const uint16_t*>(scaleTensor.buffer),
+                                        scaleCount);
                                     scaleTensor.ClearBuffer();
                                 }
 
@@ -3906,6 +3907,13 @@ namespace fastllm {
                                     model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                             tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                             curGroupCnt, tensor.blockK, tensor.blockM);
+                                }
+                                if (isW4A8PackedTensor) {
+                                    std::string reason;
+                                    AssertInFastLLM(
+                                        model->weight[weightName].ValidateW4A8Weight(&reason),
+                                        "Invalid compressed-tensors W4A8 weight " +
+                                        weightName + ": " + reason + "\n");
                                 }
                                 if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
                                     model->weight[weightName].CalcWeightSum();
@@ -4008,9 +4016,25 @@ namespace fastllm {
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.isModelWeight = true;
-                                        mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
-                                        mergeData.group = model->weight[input0].group;
-                                        mergeData.groupCnt = model->weight[input0].groupCnt;
+                                        if (mergeData.dataType == DataType::INT4_W4A8) {
+                                            for (const auto &input : it.inputs) {
+                                                std::string reason;
+                                                AssertInFastLLM(
+                                                    model->weight[input].ValidateW4A8Weight(&reason),
+                                                    "Cannot merge invalid W4A8 weight " + input +
+                                                    ": " + reason + "\n");
+                                                AssertInFastLLM(
+                                                    model->weight[input].w4a8WeightEncoding ==
+                                                        model->weight[input0].w4a8WeightEncoding,
+                                                    "Cannot merge W4A8 weights with different source encodings.\n");
+                                            }
+                                            mergeData.InitW4A8Weight(
+                                                model->weight[input0].w4a8WeightEncoding);
+                                        } else {
+                                            mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
+                                            mergeData.group = model->weight[input0].group;
+                                            mergeData.groupCnt = model->weight[input0].groupCnt;
+                                        }
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
 
@@ -4036,6 +4060,14 @@ namespace fastllm {
                                                     memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
                                                     offset += model->weight[input].GetBytes();
                                                 }
+                                            }
+
+                                            if (mergeData.dataType == DataType::INT4_W4A8) {
+                                                std::string reason;
+                                                AssertInFastLLM(
+                                                    mergeData.ValidateW4A8Weight(&reason),
+                                                    "Invalid merged W4A8 weight " + mergeName +
+                                                    ": " + reason + "\n");
                                             }
 
                                             mergeData.CalcWeightSum();

@@ -319,7 +319,7 @@ namespace fastllm {
         // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
         // The final partial block has no padding. The implicit zero point is 8.
         INT4_GROUP32 = 1008,
-        INT4_W4A8 = 1009, // compressed-tensors packed uint4b8 weight + BF16 group scales
+        INT4_W4A8 = 1009, // independent W4A8: uint4b8 source + BF16 symmetric group=128 scales
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -327,6 +327,13 @@ namespace fastllm {
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV,
         DATA_AUTO_SOURCE // auto keeps scaled FP8 source weights, otherwise uses FLOAT16
     };
+
+    enum class W4A8WeightEncoding {
+        NONE = 0,
+        COMPRESSED_TENSORS_UINT4B8 = 1
+    };
+
+    constexpr int COMPRESSED_W4A8_GROUP_SIZE = 128;
 
     std::string GetDataTypeName(DataType type);
 
@@ -495,7 +502,10 @@ namespace fastllm {
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 
         std::vector <uint16_t> halfScales; // 某些量化方式使用float16的scales
-        std::vector <uint16_t> w4a8GroupScales; // compressed-tensors W4A8的BF16 group scales
+        // Row-major uint4b8 source data and its BF16 group scales. CUTLASS reorder
+        // results belong to a CUDA-side cache instead of this logical weight.
+        W4A8WeightEncoding w4a8WeightEncoding = W4A8WeightEncoding::NONE;
+        std::vector <uint16_t> w4a8GroupScales;
 
         bool isModelWeight = false; // 是否是模型权重
         std::string name; // weightName
@@ -557,6 +567,12 @@ namespace fastllm {
                 int groupCnt = -1, int blockK = -1, int blockM = -1); // 从oriData中创建
 
         void CopyFrom(const Data &ori); // 复制
+
+        void InitW4A8Weight(W4A8WeightEncoding encoding);
+
+        void SetW4A8GroupScales(const uint16_t *groupScales, size_t count);
+
+        bool ValidateW4A8Weight(std::string *reason = nullptr) const;
 
         void FakeFrom(const Data &ori, size_t offset); // 将data指针指向ori的data + offset，delete时不销毁
 

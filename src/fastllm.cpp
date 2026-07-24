@@ -958,8 +958,10 @@ namespace fastllm {
             this->group = ori.group;
             this->groupCnt = ori.groupCnt;
             this->perChannelAxis = ori.perChannelAxis;
+            this->w4a8WeightEncoding = ori.w4a8WeightEncoding;
             this->w4a8GroupScales = ori.w4a8GroupScales;
         } else {
+            this->w4a8WeightEncoding = W4A8WeightEncoding::NONE;
             this->w4a8GroupScales.clear();
         }
         bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
@@ -1014,6 +1016,88 @@ namespace fastllm {
             FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
 #endif
         }
+    }
+
+    void Data::InitW4A8Weight(W4A8WeightEncoding encoding) {
+        AssertInFastLLM(this->dataType == DataType::INT4_W4A8,
+                        "InitW4A8Weight requires INT4_W4A8 dtype.\n");
+        AssertInFastLLM(encoding == W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8,
+                        "Unsupported W4A8 source encoding.\n");
+        AssertInFastLLM(this->dims.size() == 2 && this->dims[0] > 0 && this->dims[1] > 0,
+                        "W4A8 weight should be a positive 2D tensor.\n");
+        AssertInFastLLM(this->dims[0] % COMPRESSED_W4A8_GROUP_SIZE == 0 &&
+                        this->dims[1] % COMPRESSED_W4A8_GROUP_SIZE == 0,
+                        "W4A8 weight dimensions should be 128-aligned.\n");
+
+        this->w4a8WeightEncoding = encoding;
+        this->perChannelAxis = 0;
+        this->groupCnt = COMPRESSED_W4A8_GROUP_SIZE;
+        this->group = this->dims[1] / this->groupCnt;
+        this->perChannelsConfigs.clear();
+        this->scales.clear();
+        this->mins.clear();
+        this->zeros.clear();
+        this->halfScales.clear();
+        this->weightSum.clear();
+        this->w4a8GroupScales.clear();
+    }
+
+    void Data::SetW4A8GroupScales(const uint16_t *groupScales, size_t count) {
+        AssertInFastLLM(this->dataType == DataType::INT4_W4A8 &&
+                        this->w4a8WeightEncoding != W4A8WeightEncoding::NONE,
+                        "SetW4A8GroupScales requires an initialized W4A8 weight.\n");
+        size_t expected = (size_t)this->dims[0] * this->group;
+        AssertInFastLLM(count == expected,
+                        "W4A8 BF16 group scale count does not match the logical weight.\n");
+        AssertInFastLLM(groupScales != nullptr || count == 0,
+                        "W4A8 BF16 group scale data is null.\n");
+        this->w4a8GroupScales.assign(groupScales, groupScales + count);
+    }
+
+    bool Data::ValidateW4A8Weight(std::string *reason) const {
+        auto fail = [reason](const std::string &message) {
+            if (reason != nullptr) {
+                *reason = message;
+            }
+            return false;
+        };
+        if (this->dataType != DataType::INT4_W4A8) {
+            return fail("dtype is not INT4_W4A8");
+        }
+        if (this->w4a8WeightEncoding != W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8) {
+            return fail("source encoding is not compressed-tensors uint4b8");
+        }
+        if (this->dims.size() != 2 || this->dims[0] <= 0 || this->dims[1] <= 0) {
+            return fail("logical weight is not a positive 2D tensor");
+        }
+        if (this->dims[0] % COMPRESSED_W4A8_GROUP_SIZE != 0 ||
+            this->dims[1] % COMPRESSED_W4A8_GROUP_SIZE != 0) {
+            return fail("logical weight dimensions are not 128-aligned");
+        }
+        if (this->perChannelAxis != 0 || this->groupCnt != COMPRESSED_W4A8_GROUP_SIZE ||
+            this->group != this->dims[1] / COMPRESSED_W4A8_GROUP_SIZE) {
+            return fail("group metadata is inconsistent with group_size=128");
+        }
+        if (!this->perChannelsConfigs.empty() || !this->scales.empty() ||
+            !this->mins.empty() || !this->zeros.empty() || !this->halfScales.empty()) {
+            return fail("legacy quantization metadata is present");
+        }
+        size_t expectedScaleCount = (size_t)this->dims[0] * this->group;
+        if (this->w4a8GroupScales.size() != expectedScaleCount) {
+            return fail("BF16 group scale count does not match the logical weight");
+        }
+        uint64_t expectedPackedBytes = (uint64_t)this->dims[0] * this->dims[1] / 2;
+        if (this->GetBytes() != expectedPackedBytes) {
+            return fail("packed storage size does not match 4-bit logical dimensions");
+        }
+        if ((this->cpuData != nullptr || this->cudaData != nullptr) &&
+            this->expansionBytes < expectedPackedBytes) {
+            return fail("allocated storage is smaller than the packed weight");
+        }
+        if (reason != nullptr) {
+            reason->clear();
+        }
+        return true;
     }
 
     BF16ToFP16Manager bf16tofp16;
