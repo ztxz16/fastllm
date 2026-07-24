@@ -1,4 +1,5 @@
 #include "devices/cpu/cpudevice.h"
+#include "devices/cpu/computeutils.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -288,30 +289,83 @@ namespace fastllm {
                         "DeepSeekV4WoA error: weight shape mismatch.\n");
 
         auto ov = DeepSeekV4HcPreReadFloatData(input);
-        auto wv = DeepSeekV4HcPreReadFloatData(weight);
         std::vector<float> y((uint64_t)bsz * seqlen * groups * oRank, 0.0f);
-        int total = bsz * seqlen * groups * oRank;
         auto *pool = GetAlivePool();
-        int threadNum = std::min((int)pool->threads.size(), total);
-        if (threadNum <= 1 || total < 1024) {
-            DeepSeekV4WoAReferenceOp(&ov, &wv, y.data(), 0, total, bsz, seqlen,
-                                     heads, headDim, groups, oRank).Run();
+        int threadNum = (int)pool->threads.size();
+        bool useFastFloat16Path = weight.dataType == DataType::FLOAT16 &&
+                                  !DeepSeekV4HcPreEnvFlagEnabled(
+                                      "FASTLLM_DSV4_DISABLE_CPU_WOA_FAST");
+        if (useFastFloat16Path) {
+            const int tokens = bsz * seqlen;
+            uint16_t *weightData = (uint16_t*)weight.cpuData;
+            if (tokens == 1) {
+                const int outputRowsPerTask = 64;
+                std::vector<MultiThreadBaseOp*> ops;
+                ops.reserve((uint64_t)groups *
+                            ((oRank + outputRowsPerTask - 1) / outputRowsPerTask));
+                for (int g = 0; g < groups; g++) {
+                    float *groupInput = ov.data() + (uint64_t)g * groupDim;
+                    uint16_t *groupWeight =
+                        weightData + (uint64_t)g * oRank * groupDim;
+                    float *groupOutput = y.data() + (uint64_t)g * oRank;
+                    for (int st = 0; st < oRank; st += outputRowsPerTask) {
+                        int end = std::min(st + outputRowsPerTask, oRank);
+                        ops.push_back(new MultiThreadLinearFloat32Float16Op(
+                            groupInput, groupWeight, nullptr, groupOutput,
+                            1, groupDim, oRank, st, end));
+                    }
+                }
+                DynamicScheduleTasks(ops);
+            } else {
+                std::vector<float> groupInput((uint64_t)tokens * groupDim);
+                std::vector<float> groupOutput((uint64_t)tokens * oRank);
+                const int inputStride = heads * headDim;
+                const int outputStride = groups * oRank;
+                for (int g = 0; g < groups; g++) {
+                    for (int token = 0; token < tokens; token++) {
+                        memcpy(groupInput.data() + (uint64_t)token * groupDim,
+                               ov.data() + (uint64_t)token * inputStride +
+                                   (uint64_t)g * groupDim,
+                               (uint64_t)groupDim * sizeof(float));
+                    }
+                    RunLinearFloat32Float16(
+                        groupInput.data(),
+                        weightData + (uint64_t)g * oRank * groupDim,
+                        groupOutput.data(), nullptr,
+                        tokens, groupDim, oRank, pool, 0, threadNum);
+                    for (int token = 0; token < tokens; token++) {
+                        memcpy(y.data() + (uint64_t)token * outputStride +
+                                   (uint64_t)g * oRank,
+                               groupOutput.data() + (uint64_t)token * oRank,
+                               (uint64_t)oRank * sizeof(float));
+                    }
+                }
+            }
         } else {
-            std::vector<DeepSeekV4WoAReferenceOp*> ops;
-            int per = total / threadNum;
-            int cur = 0;
-            for (int i = 0; i < threadNum; i++) {
-                int end = (i == threadNum - 1) ? total : cur + per;
-                ops.push_back(new DeepSeekV4WoAReferenceOp(&ov, &wv, y.data(), cur, end,
-                                                           bsz, seqlen, heads, headDim, groups, oRank));
-                cur = end;
-            }
-            for (int i = 0; i < (int)ops.size(); i++) {
-                pool->PushOp(i, ops[i]);
-            }
-            for (int i = 0; i < (int)ops.size(); i++) {
-                pool->Wait(i);
-                delete ops[i];
+            auto wv = DeepSeekV4HcPreReadFloatData(weight);
+            int total = bsz * seqlen * groups * oRank;
+            int referenceThreadNum = std::min(threadNum, total);
+            if (referenceThreadNum <= 1 || total < 1024) {
+                DeepSeekV4WoAReferenceOp(&ov, &wv, y.data(), 0, total, bsz, seqlen,
+                                         heads, headDim, groups, oRank).Run();
+            } else {
+                std::vector<DeepSeekV4WoAReferenceOp*> ops;
+                int per = total / referenceThreadNum;
+                int cur = 0;
+                for (int i = 0; i < referenceThreadNum; i++) {
+                    int end = (i == referenceThreadNum - 1) ? total : cur + per;
+                    ops.push_back(new DeepSeekV4WoAReferenceOp(
+                        &ov, &wv, y.data(), cur, end, bsz, seqlen,
+                        heads, headDim, groups, oRank));
+                    cur = end;
+                }
+                for (int i = 0; i < (int)ops.size(); i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < (int)ops.size(); i++) {
+                    pool->Wait(i);
+                    delete ops[i];
+                }
             }
         }
 
@@ -678,7 +732,14 @@ namespace fastllm {
         int mixHc = (2 + hcMult) * hcMult;
         int tokens = bsz * seqlen;
         auto xv = DeepSeekV4HcPreReadFloatData(input);
-        auto fn = DeepSeekV4HcPreReadFloatData(hcFn);
+        std::vector<float> fnStorage;
+        const float *fn = nullptr;
+        if (hcFn.dataType == DataType::FLOAT32 && hcFn.cpuData != nullptr) {
+            fn = (const float*)hcFn.cpuData;
+        } else {
+            fnStorage = DeepSeekV4HcPreReadFloatData(hcFn);
+            fn = fnStorage.data();
+        }
         float *scale = (float*)hcScale.cpuData;
         float *base = (float*)hcBase.cpuData;
         std::vector<float> y((uint64_t)tokens * dim, 0.0f);
@@ -697,7 +758,7 @@ namespace fastllm {
                 ss += (double)xrow[k] * xrow[k];
             }
             float rsqrt = 1.0f / std::sqrt((float)(ss / flatDim) + normEps);
-            DeepSeekV4HcPreComputeDotsCpu(xrow, fn.data(), mixes.data(), rsqrt, flatDim, mixHc);
+            DeepSeekV4HcPreComputeDotsCpu(xrow, fn, mixes.data(), rsqrt, flatDim, mixHc);
             for (int h = 0; h < hcMult; h++) {
                 pre[h] = DeepSeekV4HcPreSigmoidFloat(mixes[h] * scale[0] + base[h]) + eps;
                 post[(uint64_t)t * hcMult + h] =
@@ -787,6 +848,44 @@ namespace fastllm {
         output.Resize({bsz, seqlen, hcMult, dim});
     }
 
+    struct DeepSeekV4HcPostBFloat16TargetOp : MultiThreadBaseOp {
+        const uint16_t *input;
+        const uint16_t *residual;
+        const float *post;
+        const float *comb;
+        uint16_t *output;
+        int dim, hcMult, token, target;
+
+        DeepSeekV4HcPostBFloat16TargetOp(
+            const uint16_t *input, const uint16_t *residual,
+            const float *post, const float *comb, uint16_t *output,
+            int dim, int hcMult, int token, int target
+        ) : input(input), residual(residual), post(post), comb(comb),
+            output(output), dim(dim), hcMult(hcMult), token(token),
+            target(target) {}
+
+        void Run() override {
+            const uint16_t *xrow = input + (uint64_t)token * dim;
+            const uint16_t *rrow =
+                residual + (uint64_t)token * hcMult * dim;
+            const float *postRow = post + (uint64_t)token * hcMult;
+            const float *combRow =
+                comb + (uint64_t)token * hcMult * hcMult;
+            uint16_t *dst =
+                output + ((uint64_t)token * hcMult + target) * dim;
+            for (int d = 0; d < dim; d++) {
+                double v = (double)postRow[target] *
+                    DeepSeekV4HcPreBFloat16ToFloat(xrow[d]);
+                for (int src = 0; src < hcMult; src++) {
+                    v += (double)combRow[src * hcMult + target] *
+                        DeepSeekV4HcPreBFloat16ToFloat(
+                            rrow[(uint64_t)src * dim + d]);
+                }
+                dst[d] = DeepSeekV4HcPreFloatToBFloat16((float)v);
+            }
+        }
+    };
+
     void CpuDeepSeekV4HcPostOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -797,6 +896,42 @@ namespace fastllm {
 
         int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
         int tokens = bsz * seqlen;
+        if (input.dataType == DataType::BFLOAT16 &&
+            residual.dataType == DataType::BFLOAT16 &&
+            output.dataType == DataType::BFLOAT16 &&
+            input.cpuData != nullptr && residual.cpuData != nullptr &&
+            postData.cpuData != nullptr && combData.cpuData != nullptr &&
+            &output != &residual &&
+            !DeepSeekV4HcPreEnvFlagEnabled(
+                "FASTLLM_DSV4_DISABLE_CPU_HCPOST_FAST")) {
+            output.Allocate(false);
+            std::vector<MultiThreadBaseOp*> ops;
+            ops.reserve(tokens * hcMult);
+            for (int token = 0; token < tokens; token++) {
+                for (int target = 0; target < hcMult; target++) {
+                    ops.push_back(new DeepSeekV4HcPostBFloat16TargetOp(
+                        (const uint16_t*)input.cpuData,
+                        (const uint16_t*)residual.cpuData,
+                        (const float*)postData.cpuData,
+                        (const float*)combData.cpuData,
+                        (uint16_t*)output.cpuData,
+                        dim, hcMult, token, target));
+                }
+            }
+            auto *pool = GetAlivePool();
+            if ((int)ops.size() <= (int)pool->threads.size()) {
+                for (int i = 0; i < (int)ops.size(); i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < (int)ops.size(); i++) {
+                    pool->Wait(i);
+                    delete ops[i];
+                }
+            } else {
+                DynamicScheduleTasks(ops);
+            }
+            return;
+        }
         auto xv = DeepSeekV4HcPreReadFloatData(input);
         auto rv = DeepSeekV4HcPreReadFloatData(residual);
         auto post = DeepSeekV4HcPreReadFloatData(postData);

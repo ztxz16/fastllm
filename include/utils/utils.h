@@ -13,7 +13,9 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <thread>
+#include <mutex>
 #include <vector>
 #include <deque>
 #include <array>
@@ -291,7 +293,147 @@ namespace fastllm {
         float dict[256] = {
             0.0, 0.001953125, 0.00390625, 0.005859375, 0.0078125, 0.009765625, 0.01171875, 0.013671875, 0.015625, 0.017578125, 0.01953125, 0.021484375, 0.0234375, 0.025390625, 0.02734375, 0.029296875, 0.03125, 0.03515625, 0.0390625, 0.04296875, 0.046875, 0.05078125, 0.0546875, 0.05859375, 0.0625, 0.0703125, 0.078125, 0.0859375, 0.09375, 0.1015625, 0.109375, 0.1171875, 0.125, 0.140625, 0.15625, 0.171875, 0.1875, 0.203125, 0.21875, 0.234375, 0.25, 0.28125, 0.3125, 0.34375, 0.375, 0.40625, 0.4375, 0.46875, 0.5, 0.5625, 0.625, 0.6875, 0.75, 0.8125, 0.875, 0.9375, 1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0, 60.0, 64.0, 72.0, 80.0, 88.0, 96.0, 104.0, 112.0, 120.0, 128.0, 144.0, 160.0, 176.0, 192.0, 208.0, 224.0, 240.0, 256.0, 288.0, 320.0, 352.0, 384.0, 416.0, 448.0, 480, -0.0, -0.001953125, -0.00390625, -0.005859375, -0.0078125, -0.009765625, -0.01171875, -0.013671875, -0.015625, -0.017578125, -0.01953125, -0.021484375, -0.0234375, -0.025390625, -0.02734375, -0.029296875, -0.03125, -0.03515625, -0.0390625, -0.04296875, -0.046875, -0.05078125, -0.0546875, -0.05859375, -0.0625, -0.0703125, -0.078125, -0.0859375, -0.09375, -0.1015625, -0.109375, -0.1171875, -0.125, -0.140625, -0.15625, -0.171875, -0.1875, -0.203125, -0.21875, -0.234375, -0.25, -0.28125, -0.3125, -0.34375, -0.375, -0.40625, -0.4375, -0.46875, -0.5, -0.5625, -0.625, -0.6875, -0.75, -0.8125, -0.875, -0.9375, -1.0, -1.125, -1.25, -1.375, -1.5, -1.625, -1.75, -1.875, -2.0, -2.25, -2.5, -2.75, -3.0, -3.25, -3.5, -3.75, -4.0, -4.5, -5.0, -5.5, -6.0, -6.5, -7.0, -7.5, -8.0, -9.0, -10.0, -11.0, -12.0, -13.0, -14.0, -15.0, -16.0, -18.0, -20.0, -22.0, -24.0, -26.0, -28.0, -30.0, -32.0, -36.0, -40.0, -44.0, -48.0, -52.0, -56.0, -60.0, -64.0, -72.0, -80.0, -88.0, -96.0, -104.0, -112.0, -120.0, -128.0, -144.0, -160.0, -176.0, -192.0, -208.0, -224.0, -240.0, -256.0, -288.0, -320.0, -352.0, -384.0, -416.0, -448.0, -480
         };
+
+        // IEEE-like E4M3FN round-to-nearest-even encoder.  Codes 0..126 are
+        // monotonic finite non-negative values; 127 is NaN in the format used
+        // by PyTorch/CUDA.  Decode the FP32 exponent directly instead of doing
+        // a binary search over the 127 positive values.
+        uint8_t quantization(float value) const {
+            if (std::isnan(value)) {
+                return std::signbit(value) ? 0xFF : 0x7F;
+            }
+            bool negative = std::signbit(value);
+            float magnitude = std::min(std::fabs(value), 448.0f);
+            int code;
+            if (magnitude < 0.015625f) {
+                // E4M3 subnormals have a fixed 2^-9 spacing.
+                float scaled = magnitude * 512.0f;
+                int lower = (int)scaled;
+                float fraction = scaled - lower;
+                code = lower + (fraction > 0.5f ||
+                                (fraction == 0.5f && (lower & 1)));
+            } else {
+                uint32_t bits;
+                memcpy(&bits, &magnitude, sizeof(bits));
+                int exponent = (int)((bits >> 23) & 0xFF) - 127;
+                float scaled = std::ldexp(magnitude, 3 - exponent);
+                int lower = (int)scaled;
+                float fraction = scaled - lower;
+                int significand = lower +
+                    (fraction > 0.5f ||
+                     (fraction == 0.5f && (lower & 1)));
+                if (significand == 16) {
+                    exponent++;
+                    significand = 8;
+                }
+                code = ((exponent + 7) << 3) + significand - 8;
+                code = std::min(code, 126);
+            }
+            return (uint8_t)(code | (negative ? 0x80 : 0));
+        }
+
+        float quantizeDequantize(float value) const {
+            return dict[quantization(value)];
+        }
     };
+
+    inline uint16_t Float32ToBFloat16RNEBits(float value) {
+        uint32_t bits;
+        memcpy(&bits, &value, sizeof(bits));
+        bits += 0x7FFFu + ((bits >> 16) & 1u);
+        return (uint16_t)(bits >> 16);
+    }
+
+    inline float BFloat16BitsToFloat32(uint16_t value) {
+        uint32_t bits = (uint32_t)value << 16;
+        float result;
+        memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+
+    inline float RoundFloat32ToBFloat16RNE(float value) {
+        return BFloat16BitsToFloat32(Float32ToBFloat16RNEBits(value));
+    }
+
+    class FP8E4M3BFloat16QuantizeLookup {
+    public:
+        static constexpr int minExponent = -32;
+        static constexpr int maxExponent = 31;
+        static constexpr int exponentCount =
+            maxExponent - minExponent + 1;
+
+        const uint16_t *GetRow(int exponent) {
+            if (exponent < minExponent || exponent > maxExponent) {
+                return nullptr;
+            }
+            int index = exponent - minExponent;
+            std::call_once(initFlags[index], [&, index, exponent]() {
+                static const FP8E4M3ToFP32Manager fp8;
+                float scale = std::ldexp(1.0f, exponent);
+                rows[index].resize(65536);
+                for (uint32_t bits = 0; bits < 65536; bits++) {
+                    float value = BFloat16BitsToFloat32((uint16_t)bits);
+                    float q = std::max(
+                        -448.0f, std::min(448.0f, value / scale));
+                    rows[index][bits] = Float32ToBFloat16RNEBits(
+                        fp8.quantizeDequantize(q) * scale);
+                }
+            });
+            return rows[index].data();
+        }
+
+    private:
+        std::array<std::once_flag, exponentCount> initFlags;
+        std::array<std::vector<uint16_t>, exponentCount> rows;
+    };
+
+    inline const uint16_t *GetFP8E4M3BFloat16QuantizeLookupRow(
+        int exponent
+    ) {
+        static FP8E4M3BFloat16QuantizeLookup lookup;
+        return lookup.GetRow(exponent);
+    }
+
+    // Simulate the official DeepSeek FP8 activation path while retaining a
+    // BF16 buffer for CPU GEMM kernels: block-128 E4M3FN, UE8M0 power-of-two
+    // scale, saturating RNE conversion, then dequantize and round to BF16.
+    inline void QuantizeDequantizeFP8E4M3Block128(float *values, int len) {
+        static const FP8E4M3ToFP32Manager fp8;
+        for (int start = 0; start < len; start += 128) {
+            int end = std::min(start + 128, len);
+            float amax = 1e-4f;
+            bool allBFloat16 = true;
+            for (int i = start; i < end; i++) {
+                amax = std::max(amax, std::fabs(values[i]));
+                uint16_t bits = Float32ToBFloat16RNEBits(values[i]);
+                allBFloat16 = allBFloat16 &&
+                    BFloat16BitsToFloat32(bits) == values[i];
+            }
+            float normalized = amax / 448.0f;
+            uint32_t bits;
+            memcpy(&bits, &normalized, sizeof(bits));
+            int exponent = (int)((bits >> 23) & 0xFF) - 127 +
+                           ((bits & ((1u << 23) - 1)) != 0);
+            float scale = std::ldexp(1.0f, exponent);
+            const uint16_t *lookupRow = allBFloat16 ?
+                GetFP8E4M3BFloat16QuantizeLookupRow(exponent) : nullptr;
+            if (lookupRow != nullptr) {
+                for (int i = start; i < end; i++) {
+                    uint16_t inputBits =
+                        Float32ToBFloat16RNEBits(values[i]);
+                    values[i] =
+                        BFloat16BitsToFloat32(lookupRow[inputBits]);
+                }
+            } else {
+                for (int i = start; i < end; i++) {
+                    float q = std::max(
+                        -448.0f, std::min(448.0f, values[i] / scale));
+                    values[i] = RoundFloat32ToBFloat16RNE(
+                        fp8.quantizeDequantize(q) * scale);
+                }
+            }
+        }
+    }
 
     static double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds> (time2 - time1);
