@@ -416,6 +416,79 @@ __global__ void DeepSeekV4WoAFp8PairBlockReduceKernel(
     }
 }
 
+template <typename InT, int RowsPerBlock>
+__global__ void DeepSeekV4WoAFp8RowsBlockReduceKernel(
+        const InT *o, const uint8_t *w, const float *scales, __nv_bfloat16 *output,
+        int bsz, int seqlen, int heads, int headDim, int groups, int oRank,
+        int blockK, int blockM, int scaleCols) {
+    extern __shared__ float partial[];
+    constexpr int threads = 256;
+    int rowBlocksPerGroup = oRank / RowsPerBlock;
+    int idx = blockIdx.x;
+    int total = bsz * seqlen * groups * rowBlocksPerGroup;
+    if (idx >= total) {
+        return;
+    }
+
+    int rowBlock = idx % rowBlocksPerGroup;
+    int rowStart = rowBlock * RowsPerBlock;
+    int tmp = idx / rowBlocksPerGroup;
+    int g = tmp % groups;
+    tmp /= groups;
+    int s = tmp % seqlen;
+    int b = tmp / seqlen;
+
+    int headsPerGroup = heads / groups;
+    int groupDim = headsPerGroup * headDim;
+    int weightRowStart = g * oRank + rowStart;
+    const uint8_t *weightRows =
+        w + (uint64_t)weightRowStart * groupDim;
+    const InT *src =
+        o + (((uint64_t)b * seqlen + s) * heads +
+             g * headsPerGroup) * headDim;
+    const float *rowScales =
+        scales + (weightRowStart / blockK) * scaleCols;
+
+    float sums[RowsPerBlock] = {};
+    for (int d = threadIdx.x; d < groupDim; d += threads) {
+        float x = Dsv4ToFloat(src[d]);
+        float scale = rowScales[d / blockM];
+#pragma unroll
+        for (int row = 0; row < RowsPerBlock; row++) {
+            sums[row] +=
+                x * DeepSeekV4Fp8E4M3ScaledHalfToFloat(
+                        weightRows[(uint64_t)row * groupDim + d], scale);
+        }
+    }
+#pragma unroll
+    for (int row = 0; row < RowsPerBlock; row++) {
+        partial[row * threads + threadIdx.x] = sums[row];
+    }
+    __syncthreads();
+
+    for (int stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+#pragma unroll
+            for (int row = 0; row < RowsPerBlock; row++) {
+                partial[row * threads + threadIdx.x] +=
+                    partial[row * threads + threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        uint64_t outBase =
+            (((uint64_t)b * seqlen + s) * groups + g) * oRank +
+            rowStart;
+#pragma unroll
+        for (int row = 0; row < RowsPerBlock; row++) {
+            output[outBase + row] =
+                __float2bfloat16_rn(partial[row * threads]);
+        }
+    }
+}
+
 template <typename InT, typename WT>
 __global__ void DeepSeekV4WoAFloatAccKernel(const InT *o, const WT *w, __nv_bfloat16 *output,
                                             int bsz, int seqlen, int heads, int headDim,
@@ -1197,19 +1270,6 @@ __device__ __forceinline__ float DeepSeekV4Sigmoid(float x) {
     return z / (1.0f + z);
 }
 
-__device__ __forceinline__ float DeepSeekV4SinkhornIteration4x4(
-        float value, float eps) {
-    float rowSum = value;
-    rowSum += __shfl_xor_sync(0xffffffffu, rowSum, 1, 4);
-    rowSum += __shfl_xor_sync(0xffffffffu, rowSum, 2, 4);
-    value /= rowSum + eps;
-
-    float colSum = value;
-    colSum += __shfl_xor_sync(0xffffffffu, colSum, 4, 16);
-    colSum += __shfl_xor_sync(0xffffffffu, colSum, 8, 16);
-    return value / (colSum + eps);
-}
-
 __device__ __forceinline__ float DeepSeekV4Softplus(float x) {
     if (x > 20.0f) {
         return x;
@@ -1600,6 +1660,9 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
 
     __shared__ float mixes[mixHc];
     __shared__ float pre[hcMult];
+    __shared__ float combLocal[hcSq];
+    __shared__ float rowStats[hcMult];
+    __shared__ float colStats[hcMult];
     __shared__ float warpSums[32];
     __shared__ float normScale;
     __shared__ __nv_bfloat162 yShared[pairCount];
@@ -1639,77 +1702,116 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
     }
     __syncthreads();
 
-    // One warp owns the tiny 4x4 Sinkhorn transform.  Keep one matrix element
-    // in each of the first 16 lanes and use width-4/width-16 shuffles for row
-    // and column reductions.  This mirrors TileLang's fragment reduction and
-    // avoids four shared-memory round trips and syncwarps per iteration.
+    // Match the established HcPre kernel's summation order exactly.  A
+    // shuffle-tree reduction is a little shorter, but its different FP32
+    // association can eventually change greedy decode tokens.
     if (threadIdx.x < 32) {
         int lane = threadIdx.x;
-        float combValue = 0.0f;
-        if (lane < hcSq) {
-            int mixIdx = lane + 2 * hcMult;
-            combValue = mixes[mixIdx] * scale[2] + base[mixIdx];
+        for (int idx = lane; idx < hcSq; idx += 32) {
+            int mixIdx = idx + 2 * hcMult;
+            combLocal[idx] = mixes[mixIdx] * scale[2] + base[mixIdx];
         }
+        __syncwarp();
 
-        float rowMax = combValue;
-        rowMax = fmaxf(rowMax,
-                       __shfl_xor_sync(0xffffffffu, rowMax, 1, 4));
-        rowMax = fmaxf(rowMax,
-                       __shfl_xor_sync(0xffffffffu, rowMax, 2, 4));
-        combValue = expf(combValue - rowMax);
-
-        float rowSum = combValue;
-        rowSum += __shfl_xor_sync(0xffffffffu, rowSum, 1, 4);
-        rowSum += __shfl_xor_sync(0xffffffffu, rowSum, 2, 4);
-        combValue = combValue / rowSum + eps;
-
-        float colSum = combValue;
-        colSum += __shfl_xor_sync(0xffffffffu, colSum, 4, 16);
-        colSum += __shfl_xor_sync(0xffffffffu, colSum, 8, 16);
-        combValue /= colSum + eps;
-
-        if (sinkhornIters == 20) {
-#pragma unroll
-            for (int it = 1; it < 20; it++) {
-                combValue = DeepSeekV4SinkhornIteration4x4(combValue, eps);
+        for (int r = lane; r < hcMult; r += 32) {
+            float rowMax = -INFINITY;
+            for (int c = 0; c < hcMult; c++) {
+                rowMax = fmaxf(rowMax, combLocal[r * hcMult + c]);
             }
-        } else {
-            for (int it = 1; it < sinkhornIters; it++) {
-                combValue = DeepSeekV4SinkhornIteration4x4(combValue, eps);
-            }
+            rowStats[r] = rowMax;
         }
-        if (lane < hcSq) {
-            comb[(uint64_t)token * hcSq + lane] = combValue;
+        __syncwarp();
+        for (int idx = lane; idx < hcSq; idx += 32) {
+            int r = idx / hcMult;
+            combLocal[idx] = expf(combLocal[idx] - rowStats[r]);
+        }
+        __syncwarp();
+        for (int r = lane; r < hcMult; r += 32) {
+            float rowSum = 0.0f;
+            for (int c = 0; c < hcMult; c++) {
+                rowSum += combLocal[r * hcMult + c];
+            }
+            rowStats[r] = rowSum;
+        }
+        __syncwarp();
+        for (int idx = lane; idx < hcSq; idx += 32) {
+            int r = idx / hcMult;
+            combLocal[idx] = combLocal[idx] / rowStats[r] + eps;
+        }
+        __syncwarp();
+
+        for (int c = lane; c < hcMult; c += 32) {
+            float colSum = 0.0f;
+            for (int r = 0; r < hcMult; r++) {
+                colSum += combLocal[r * hcMult + c];
+            }
+            colStats[c] = colSum;
+        }
+        __syncwarp();
+        for (int idx = lane; idx < hcSq; idx += 32) {
+            int c = idx % hcMult;
+            combLocal[idx] /= colStats[c] + eps;
+        }
+        __syncwarp();
+
+        for (int it = 1; it < sinkhornIters; it++) {
+            for (int r = lane; r < hcMult; r += 32) {
+                float rowSum = 0.0f;
+                for (int c = 0; c < hcMult; c++) {
+                    rowSum += combLocal[r * hcMult + c];
+                }
+                rowStats[r] = rowSum;
+            }
+            __syncwarp();
+            for (int idx = lane; idx < hcSq; idx += 32) {
+                int r = idx / hcMult;
+                combLocal[idx] /= rowStats[r] + eps;
+            }
+            __syncwarp();
+
+            for (int c = lane; c < hcMult; c += 32) {
+                float colSum = 0.0f;
+                for (int r = 0; r < hcMult; r++) {
+                    colSum += combLocal[r * hcMult + c];
+                }
+                colStats[c] = colSum;
+            }
+            __syncwarp();
+            for (int idx = lane; idx < hcSq; idx += 32) {
+                int c = idx % hcMult;
+                combLocal[idx] /= colStats[c] + eps;
+            }
+            __syncwarp();
+        }
+        for (int idx = lane; idx < hcSq; idx += 32) {
+            comb[(uint64_t)token * hcSq + idx] = combLocal[idx];
         }
     }
 
-    // Warp 0 is busy with Sinkhorn; distribute BF16 pre-mix pairs across the
-    // remaining warps.  Accumulate the rounded values' square sum while they
-    // are still in registers, avoiding a full shared-memory read and an extra
-    // block synchronization before RMSNorm.
-    int yThread = (int)threadIdx.x - 32;
-    int yThreads = (int)blockDim.x - 32;
-    float sum2 = 0.0f;
-    if (yThread >= 0) {
-        for (int i = yThread; i < pairCount; i += yThreads) {
-            float lo = 0.0f;
-            float hi = 0.0f;
+    // Compute each scalar with the same statement order as the established
+    // HcPre finish kernel, then make the BF16 boundary visible to every
+    // thread before starting the exact RMSNorm reduction.
+    __nv_bfloat16 *yScalars =
+        reinterpret_cast<__nv_bfloat16 *>(yShared);
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float value = 0.0f;
 #pragma unroll
-            for (int h = 0; h < hcMult; h++) {
-                float p = pre[h];
-                const __nv_bfloat162 *hcRow =
-                    reinterpret_cast<const __nv_bfloat162 *>(
-                        xrow + (uint64_t)h * dim);
-                float2 values = __bfloat1622float2(hcRow[i]);
-                lo += p * values.x;
-                hi += p * values.y;
-            }
-            __nv_bfloat162 rounded = __floats2bfloat162_rn(lo, hi);
-            yShared[i] = rounded;
-            float2 roundedValues = __bfloat1622float2(rounded);
-            sum2 += roundedValues.x * roundedValues.x +
-                    roundedValues.y * roundedValues.y;
+        for (int h = 0; h < hcMult; h++) {
+            value += pre[h] *
+                     Dsv4ToFloat(xrow[(uint64_t)h * dim + d]);
         }
+        yScalars[d] = Dsv4FromFloat<__nv_bfloat16>(value);
+    }
+    __syncthreads();
+
+    // Use the same 1024-thread element assignment and two-level reduction as
+    // FastllmRMSNormKernelInner1<1024>.
+    float sum2 = 0.0f;
+    for (int i = threadIdx.x; i < pairCount; i += blockDim.x) {
+        __nv_bfloat162 rounded = yShared[i];
+        float lo = __bfloat162float(rounded.x);
+        float hi = __bfloat162float(rounded.y);
+        sum2 += lo * lo + hi * hi;
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
@@ -1737,11 +1839,16 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
     __nv_bfloat162 *outPairs = reinterpret_cast<__nv_bfloat162 *>(out);
     const float2 *weightPairs = reinterpret_cast<const float2 *>(normWeight);
     for (int i = threadIdx.x; i < pairCount; i += blockDim.x) {
-        float2 values = __bfloat1622float2(yShared[i]);
+        __nv_bfloat162 rounded = yShared[i];
+        float lo = __bfloat162float(rounded.x);
+        float hi = __bfloat162float(rounded.y);
         float2 weights = __ldg(weightPairs + i);
-        outPairs[i] = __floats2bfloat162_rn(
-            values.x * finalScale * weights.x,
-            values.y * finalScale * weights.y);
+        __nv_bfloat162 normalized;
+        normalized.x = __float2bfloat16_rn(
+            lo * finalScale * weights.x);
+        normalized.y = __float2bfloat16_rn(
+            hi * finalScale * weights.y);
+        outPairs[i] = normalized;
     }
 }
 
@@ -3206,11 +3313,26 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
         if (mutableWeight.extraCudaData.empty() || mutableWeight.extraCudaData[0] == nullptr) {
             return false;
         }
-        DeepSeekV4WoAFp8PairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
-            oData, (const uint8_t*)woA.cudaData,
-            (const float*)mutableWeight.extraCudaData[0], outData,
-            bsz, seqlen, heads, headDim, groups, oRank,
-            woA.blockK, woA.blockM, scaleCols);
+        constexpr int rowsPerBlock = 4;
+        const bool rowsCompatible =
+            rowsPerBlock > 0 && oRank % rowsPerBlock == 0 &&
+            woA.blockK % rowsPerBlock == 0 &&
+            oRank % woA.blockK == 0;
+        if (rowsCompatible && rowsPerBlock == 4) {
+            int rowBlocks = bsz * seqlen * groups * (oRank / 4);
+            DeepSeekV4WoAFp8RowsBlockReduceKernel<InT, 4>
+                <<<rowBlocks, 256, 4 * 256 * sizeof(float)>>>(
+                    oData, (const uint8_t*)woA.cudaData,
+                    (const float*)mutableWeight.extraCudaData[0], outData,
+                    bsz, seqlen, heads, headDim, groups, oRank,
+                    woA.blockK, woA.blockM, scaleCols);
+        } else {
+            DeepSeekV4WoAFp8PairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
+                oData, (const uint8_t*)woA.cudaData,
+                (const float*)mutableWeight.extraCudaData[0], outData,
+                bsz, seqlen, heads, headDim, groups, oRank,
+                woA.blockK, woA.blockM, scaleCols);
+        }
         return true;
     }
 
@@ -4559,7 +4681,7 @@ extern "C" bool FastllmCudaDeepSeekV4HcPreNorm(const fastllm::Data &x,
         (const float *)hcFn.cudaData, dots, tokens, flatDim,
         mixHc, dotsStride, dotParts);
 
-    constexpr int finishThreads = 512;
+    constexpr int finishThreads = 1024;
     DeepSeekV4HcPreFinishNorm4x4096Kernel<<<tokens, finishThreads>>>(
         (const __nv_bfloat16 *)x.cudaData, dots,
         (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
@@ -4653,7 +4775,7 @@ extern "C" bool FastllmCudaDeepSeekV4HcPostPreNorm(
         (const float *)nextHcFn.cudaData, dots,
         (__nv_bfloat16 *)residualOutput.cudaData, tokens);
 
-    constexpr int finishThreads = 512;
+    constexpr int finishThreads = 1024;
     DeepSeekV4HcPreFinishNorm4x4096Kernel<<<tokens, finishThreads>>>(
         (const __nv_bfloat16 *)residualOutput.cudaData, dots,
         (const float *)nextHcScale.cudaData,
