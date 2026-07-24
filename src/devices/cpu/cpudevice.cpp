@@ -32,6 +32,7 @@
 #include "gguf.h"
 
 namespace fastllm {
+    void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
     extern bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len);
     extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
@@ -49,6 +50,215 @@ namespace fastllm {
     static double CpuProfileNowMs() {
         using Clock = std::chrono::steady_clock;
         return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+    }
+
+    struct MultiThreadDeepSeekV4MoeDownPrepareOp : MultiThreadBaseOp {
+        float *gateUpData;
+        float *swigluData;
+        uint16_t *downInputData;
+        int mid, st, end;
+        bool routed, computeActivation, quantize, convert;
+        float routeWeight, swigluLimit;
+
+        MultiThreadDeepSeekV4MoeDownPrepareOp(
+            float *gateUpData, float *swigluData, uint16_t *downInputData,
+            int mid, int st, int end, bool routed, float routeWeight,
+            float swigluLimit, bool computeActivation, bool quantize,
+            bool convert
+        ) : gateUpData(gateUpData), swigluData(swigluData),
+            downInputData(downInputData), mid(mid), st(st), end(end),
+            routed(routed), computeActivation(computeActivation),
+            quantize(quantize), convert(convert), routeWeight(routeWeight),
+            swigluLimit(swigluLimit) {}
+
+        void Run() override {
+            if (computeActivation) {
+                for (int i = st; i < end; i++) {
+                    float gate = RoundFloat32ToBFloat16RNE(gateUpData[i]);
+                    float up = RoundFloat32ToBFloat16RNE(gateUpData[mid + i]);
+                    if (routed && swigluLimit > 0.0f) {
+                        gate = std::min(gate, swigluLimit);
+                        up = std::max(-swigluLimit, std::min(up, swigluLimit));
+                    }
+                    float h = (gate / (1.0f + std::exp(-gate))) * up;
+                    swigluData[i] = RoundFloat32ToBFloat16RNE(routeWeight * h);
+                }
+            }
+            if (quantize) {
+                // Tasks are block-128 aligned, so quantizing a task at a time
+                // preserves the official per-block activation scales exactly.
+                QuantizeDequantizeFP8E4M3Block128(swigluData + st, end - st);
+            }
+            if (convert) {
+                Float32ToBFloat16(swigluData + st, downInputData + st, end - st);
+            }
+        }
+    };
+
+    struct MultiThreadDeepSeekV4MoeReduceOp : MultiThreadBaseOp {
+        std::vector<std::vector<float>> *results;
+        float *output;
+        int expertCount, st, end;
+
+        MultiThreadDeepSeekV4MoeReduceOp(
+            std::vector<std::vector<float>> *results, float *output,
+            int expertCount, int st, int end
+        ) : results(results), output(output), expertCount(expertCount),
+            st(st), end(end) {}
+
+        void Run() override {
+            for (int expert = 0; expert < expertCount; expert++) {
+                float *curOutput = (*results)[expert].data();
+                for (int d = st; d < end; d++) {
+                    curOutput[d] =
+                        RoundFloat32ToBFloat16RNE(curOutput[d]);
+                }
+                int d = st;
+#ifdef __AVX2__
+                const __m256 one = _mm256_set1_ps(1.0f);
+                for (; d + 7 < end; d += 8) {
+                    __m256 cur = _mm256_loadu_ps(curOutput + d);
+                    __m256 sum = _mm256_loadu_ps(output + d);
+                    sum = _mm256_add_ps(
+                        sum, _mm256_mul_ps(cur, one));
+                    _mm256_storeu_ps(output + d, sum);
+                }
+#endif
+                for (; d < end; d++) {
+                    output[d] += curOutput[d] * 1.0f;
+                }
+            }
+        }
+    };
+
+    struct MultiThreadDeepSeekV4MoeTaskQueueOp : MultiThreadBaseOp {
+        std::vector<MultiThreadBaseOp*> *tasks;
+        std::atomic<int> *next;
+        int firstTask;
+
+        MultiThreadDeepSeekV4MoeTaskQueueOp(
+            std::vector<MultiThreadBaseOp*> *tasks,
+            std::atomic<int> *next, int firstTask
+        ) : tasks(tasks), next(next), firstTask(firstTask) {}
+
+        void Run() override {
+            const int taskCount = (int)tasks->size();
+            if (firstTask < taskCount) {
+                (*tasks)[firstTask]->Run();
+            }
+            while (true) {
+                int taskId =
+                    next->fetch_add(1, std::memory_order_relaxed);
+                if (taskId >= taskCount) {
+                    break;
+                }
+                (*tasks)[taskId]->Run();
+            }
+        }
+    };
+
+    static void ScheduleDeepSeekV4MoeTasks(
+        std::vector<MultiThreadBaseOp*> &tasks,
+        bool deleteTasks = true
+    ) {
+        if (tasks.empty()) {
+            return;
+        }
+
+        auto *pool = GetAlivePool();
+        int workerCount = std::min(
+            (int)pool->threads.size(), (int)tasks.size());
+        std::atomic<int> next(workerCount);
+        std::vector<MultiThreadDeepSeekV4MoeTaskQueueOp> workers;
+        workers.reserve(workerCount);
+        for (int i = 0; i < workerCount; i++) {
+            workers.emplace_back(&tasks, &next, i);
+        }
+        for (int i = 0; i < workerCount; i++) {
+            pool->PushOp(i, &workers[i]);
+        }
+        for (int i = 0; i < workerCount; i++) {
+            pool->Wait(i);
+        }
+        if (deleteTasks) {
+            for (auto *task : tasks) {
+                delete task;
+            }
+        }
+    }
+
+    struct DeepSeekV4MoeLinearTaskStorage {
+        std::vector<MultiThreadLinearBFloat16FP8E4M3Op> fp8;
+        std::vector<MultiThreadLinearBFloat16NVFP4Op> nvfp4;
+        std::vector<MultiThreadLinearBFloat16BFloat16Op> bf16;
+
+        void BuildPointers(std::vector<MultiThreadBaseOp*> &tasks) {
+            tasks.clear();
+            tasks.reserve(fp8.size() + nvfp4.size() + bf16.size());
+            // FP8 rows carry roughly twice as many weight bytes as compact
+            // NVFP4 rows. Queue the heavier shared-expert work first so it
+            // cannot become a half-populated final wave.
+            for (auto &task : fp8) {
+                tasks.push_back(&task);
+            }
+            for (auto &task : nvfp4) {
+                tasks.push_back(&task);
+            }
+            for (auto &task : bf16) {
+                tasks.push_back(&task);
+            }
+        }
+    };
+
+    static void AppendDeepSeekV4MoeLinearTasks(
+        DeepSeekV4MoeLinearTaskStorage &tasks, uint16_t *linearInput,
+        Data &weight, float *linearOutput, int inputColumns, int outputRows,
+        int rowsPerTask
+    ) {
+        for (int st = 0; st < outputRows; st += rowsPerTask) {
+            int end = std::min(st + rowsPerTask, outputRows);
+            if (weight.dataType == DataType::FP8_E4M3) {
+                tasks.fp8.emplace_back(
+                    linearInput, weight.cpuData, nullptr, linearOutput,
+                    1, inputColumns, outputRows, st, end,
+                    weight.scales.data(), weight.blockK, weight.blockM);
+            } else if (weight.dataType == DataType::NVFP4) {
+                float *scaleFloats =
+                    weight.scales.empty() ? nullptr : weight.scales.data();
+                tasks.nvfp4.emplace_back(
+                    linearInput, weight.cpuData, nullptr, linearOutput,
+                    1, inputColumns, outputRows, st, end,
+                    scaleFloats, GetNVFP4ScaleData(weight),
+                    weight.blockK, weight.blockM);
+            } else if (weight.dataType == DataType::BFLOAT16) {
+                tasks.bf16.emplace_back(
+                    linearInput, (uint16_t*)weight.cpuData, nullptr,
+                    linearOutput, 1, inputColumns, outputRows, st, end);
+            }
+        }
+    }
+
+    static void ReserveDeepSeekV4MoeLinearTasks(
+        DeepSeekV4MoeLinearTaskStorage &tasks,
+        const std::vector<std::pair<int, float>> &experts,
+        Data **weights, int weightOffset, int rowsPerTask
+    ) {
+        size_t fp8Count = 0, nvfp4Count = 0, bf16Count = 0;
+        for (const auto &expert : experts) {
+            Data &weight = *weights[expert.first * 2 + weightOffset];
+            size_t taskCount =
+                (weight.dims[0] + rowsPerTask - 1) / rowsPerTask;
+            if (weight.dataType == DataType::FP8_E4M3) {
+                fp8Count += taskCount;
+            } else if (weight.dataType == DataType::NVFP4) {
+                nvfp4Count += taskCount;
+            } else if (weight.dataType == DataType::BFLOAT16) {
+                bf16Count += taskCount;
+            }
+        }
+        tasks.fp8.reserve(fp8Count);
+        tasks.nvfp4.reserve(nvfp4Count);
+        tasks.bf16.reserve(bf16Count);
     }
 
     static uint64_t GetConvertedBufferBytes(const Data &data) {
@@ -451,8 +661,12 @@ namespace fastllm {
             // Reinterpret as uint32 to access bits
             uint32x4_t u32x4 = vreinterpretq_u32_f32(f32x4);
             
-            // Shift right by 16 bits to get bfloat16 bits
-            uint32x4_t shifted = vshrq_n_u32(u32x4, 16);
+            // IEEE bfloat16 conversion uses round-to-nearest-even.  A plain
+            // shift truncates half of the values differently from PyTorch and
+            // makes every BF16 boundary in a model observably inaccurate.
+            uint32x4_t lsb = vandq_u32(vshrq_n_u32(u32x4, 16), vdupq_n_u32(1));
+            uint32x4_t rounded = vaddq_u32(u32x4, vaddq_u32(vdupq_n_u32(0x7FFFu), lsb));
+            uint32x4_t shifted = vshrq_n_u32(rounded, 16);
             
             // Narrow to 16-bit (takes bottom 16 bits from each 32-bit element)
             uint16x4_t bf16x4 = vmovn_u32(shifted);
@@ -465,7 +679,10 @@ namespace fastllm {
 #ifdef __AVX__
         for (; i + 7 < len; i += 8) {
             __m256i float_vec = _mm256_loadu_si256((__m256i*)&float32[i]);
-            __m256i shifted = _mm256_srli_epi32(float_vec, 16);
+            __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(float_vec, 16),
+                                           _mm256_set1_epi32(1));
+            __m256i rounding = _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb);
+            __m256i shifted = _mm256_srli_epi32(_mm256_add_epi32(float_vec, rounding), 16);
             __m128i lo = _mm256_castsi256_si128(shifted);
             __m128i hi = _mm256_extracti128_si256(shifted, 1);
             __m128i packed = _mm_packus_epi32(lo, hi);
@@ -476,6 +693,7 @@ namespace fastllm {
         for (; i < len; i++) {
             uint32_t val;
             memcpy(&val, &float32[i], sizeof(val));
+            val += 0x7FFFu + ((val >> 16) & 1u);
             bfloat16[i] = (uint16_t)(val >> 16);
         }
     }
@@ -2208,6 +2426,10 @@ namespace fastllm {
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
+        float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
+                            floatParams.find("swigluLimit")->second : 0.0f;
+        bool deepSeekV4Mode = intParams.find("deepSeekV4Mode") != intParams.end() &&
+                              intParams.find("deepSeekV4Mode")->second != 0;
         bool useGeglu = intParams.find("gateType") != intParams.end() &&
                         intParams.find("gateType")->second == (int)MoeGateGeglu;
         output.Allocate();
@@ -3036,6 +3258,14 @@ namespace fastllm {
                 if (weights[0] != nullptr) {
                     v.push_back(std::make_pair(0, sharedScale));
                 }
+                if (deepSeekV4Mode) {
+                    std::stable_sort(v.begin(), v.end(), [](const auto &a, const auto &b) {
+                        if (a.first == 0 || b.first == 0) {
+                            return b.first == 0 && a.first != 0;
+                        }
+                        return a.first < b.first;
+                    });
+                }
                 int m = input.dims[1];
                 float *inputData = floatInput == nullptr ? nullptr : floatInput + (uint64_t)o * m;
                 auto &bf16Input = moeFloatSingleVarManager.bf16Input;
@@ -3066,12 +3296,99 @@ namespace fastllm {
                     swigluResults[j].resize(weights[idx * 2]->dims[0]);
                     results[j].resize(weights[idx * 2 + 1]->dims[0]);
                 }
+                profileLap(profilePrepareMs);
                 std::vector<fastllm::MultiThreadBaseOp*> ops;
                 auto *pool = GetAlivePool();
                 int threads = pool->threads.size();
                 ops.resize(threads);
 
-                for (int st = 0; st < v.size(); st++) {
+                bool useDeepSeekV4MoeFast =
+                    deepSeekV4Mode && !useGeglu && cpuInstructInfo.hasAVX512BF16 &&
+                    std::getenv("FASTLLM_DSV4_DISABLE_CPU_MOE_FAST") == nullptr;
+                if (useDeepSeekV4MoeFast) {
+                    constexpr int gateRowsPerTask = 128;
+                    constexpr int downRowsPerTask = 256;
+
+                    DeepSeekV4MoeLinearTaskStorage gateTaskStorage;
+                    ReserveDeepSeekV4MoeLinearTasks(
+                        gateTaskStorage, v, weights, 0,
+                        gateRowsPerTask);
+                    for (int l = 0; l < v.size(); l++) {
+                        int idx = v[l].first;
+                        Data &weight = *weights[idx * 2];
+                        AppendDeepSeekV4MoeLinearTasks(
+                            gateTaskStorage, bf16InputData, weight,
+                            middles[l].data(),
+                            m, weight.dims[0], gateRowsPerTask);
+                    }
+                    std::vector<MultiThreadBaseOp*> gateTasks;
+                    gateTaskStorage.BuildPointers(gateTasks);
+                    ScheduleDeepSeekV4MoeTasks(gateTasks, false);
+                    profileExpertCalls += v.size();
+                    profileLap(profileGateMs);
+
+                    // Each task owns one official FP8 activation block. This
+                    // parallelizes SwiGLU, routing, quantization and BF16
+                    // conversion without changing any dtype boundary.
+                    std::vector<MultiThreadDeepSeekV4MoeDownPrepareOp>
+                        downPrepareTaskStorage;
+                    size_t downPrepareTaskCount = 0;
+                    for (int l = 0; l < v.size(); l++) {
+                        int idx = v[l].first;
+                        int mid = weights[idx * 2]->dims[0] / 2;
+                        downPrepareTaskCount += (mid + 127) / 128;
+                    }
+                    downPrepareTaskStorage.reserve(
+                        downPrepareTaskCount);
+                    for (int l = 0; l < v.size(); l++) {
+                        int idx = v[l].first;
+                        int spatial = weights[idx * 2]->dims[0];
+                        int mid = spatial / 2;
+                        Data &weightDown = *weights[idx * 2 + 1];
+                        bool quantize = weightDown.dataType == DataType::FP8_E4M3 ||
+                                        weightDown.dataType == DataType::NVFP4;
+                        bool routed = idx != 0;
+                        float routeWeight = routed ? v[l].second : 1.0f;
+                        uint16_t *downInputData =
+                            (uint16_t*)(swigluResults[l].data() + mid);
+                        for (int st = 0; st < mid; st += 128) {
+                            int end = std::min(st + 128, mid);
+                            downPrepareTaskStorage.emplace_back(
+                                middles[l].data(), swigluResults[l].data(),
+                                downInputData, mid, st, end,
+                                routed, routeWeight, swigluLimit,
+                                true, quantize, true);
+                        }
+                    }
+                    std::vector<MultiThreadBaseOp*> downPrepareTasks;
+                    downPrepareTasks.reserve(
+                        downPrepareTaskStorage.size());
+                    for (auto &task : downPrepareTaskStorage) {
+                        downPrepareTasks.push_back(&task);
+                    }
+                    ScheduleDeepSeekV4MoeTasks(
+                        downPrepareTasks, false);
+                    profileLap(profileSwigluQuantMs);
+
+                    DeepSeekV4MoeLinearTaskStorage downTaskStorage;
+                    ReserveDeepSeekV4MoeLinearTasks(
+                        downTaskStorage, v, weights, 1,
+                        downRowsPerTask);
+                    for (int l = 0; l < v.size(); l++) {
+                        int idx = v[l].first;
+                        int mid = weights[idx * 2]->dims[0] / 2;
+                        Data &weightDown = *weights[idx * 2 + 1];
+                        uint16_t *downInputData =
+                            (uint16_t*)(swigluResults[l].data() + mid);
+                        AppendDeepSeekV4MoeLinearTasks(
+                            downTaskStorage, downInputData, weightDown,
+                            results[l].data(), mid, m, downRowsPerTask);
+                    }
+                    std::vector<MultiThreadBaseOp*> downTasks;
+                    downTaskStorage.BuildPointers(downTasks);
+                    ScheduleDeepSeekV4MoeTasks(downTasks, false);
+                    profileLap(profileDownMs);
+                } else for (int st = 0; st < v.size(); st++) {
                     int k = weights[v[st].first * 2]->dims[0];
                     int end = st, selSum = 1; // 一共处理selSum * k个输出
 
@@ -3116,8 +3433,13 @@ namespace fastllm {
                         delete ops[j];
                         ops[j] = nullptr;
                     }
+                    profileExpertCalls += end - st + 1;
+                    profileLap(profileGateMs);
 
-                    // swiglu
+                    // The official DeepSeek-V4 expert has observable dtype and
+                    // operation-order boundaries: w1/w3 return BF16, routed
+                    // activations are clamped, the route weight is applied
+                    // before w2, and quantized w2 receives FP8 activations.
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
@@ -3126,6 +3448,31 @@ namespace fastllm {
                         float *outputData = middles[l].data();
                         float *swigluData = swigluResults[l].data();
                         int curK = weights[idx * 2]->dims[0];
+                        if (deepSeekV4Mode && !useGeglu) {
+                            const bool routed = idx != 0;
+                            const float routeWeight = routed ? v[l].second : 1.0f;
+                            for (int i = 0; i < mid; i++) {
+                                float gate = RoundFloat32ToBFloat16RNE(outputData[i]);
+                                float up = RoundFloat32ToBFloat16RNE(outputData[mid + i]);
+                                if (routed && swigluLimit > 0.0f) {
+                                    gate = std::min(gate, swigluLimit);
+                                    up = std::max(-swigluLimit, std::min(up, swigluLimit));
+                                }
+                                float h = (gate / (1.0f + std::exp(-gate))) * up;
+                                swigluData[i] = RoundFloat32ToBFloat16RNE(routeWeight * h);
+                            }
+                            if (weightDown->dataType == DataType::FP8_E4M3 ||
+                                weightDown->dataType == DataType::NVFP4) {
+                                QuantizeDequantizeFP8E4M3Block128(swigluData, mid);
+                            }
+                            if (weightDown->dataType == DataType::FP8_E4M3 ||
+                                (weightDown->dataType == DataType::NVFP4 && cpuInstructInfo.hasAVX512BF16) ||
+                                weightDown->dataType == DataType::BFLOAT16) {
+                                Float32ToBFloat16(swigluData, (uint16_t*)middles[l].data(), mid);
+                            }
+                            continue;
+                        }
+
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(
                             useGeglu ? (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadGegluOp(outputData, mid, mid, swigluData, 1, spatial, spatial)
@@ -3138,10 +3485,14 @@ namespace fastllm {
                         pool->PushOp(l - st, ops[l - st]);
                     }
                     for (int l = st; l <= end; l++) {
+                        if (deepSeekV4Mode && !useGeglu) {
+                            continue;
+                        }
                         pool->Wait(l - st);
                         delete ops[l - st];
                         ops[l - st] = nullptr;
                     }
+                    profileLap(profileSwigluQuantMs);
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
@@ -3170,6 +3521,7 @@ namespace fastllm {
                         delete ops[j];
                         ops[j] = nullptr;
                     }
+                    profileLap(profileDownMs);
                     st = end;
                 }
                 float *fLastOutput = ((float*)output.cpuData) + o * m;
@@ -3178,9 +3530,39 @@ namespace fastllm {
                     tempOutput.resize(m, 0);
                     fLastOutput = tempOutput.data();
                 }
-                for (int j = 0; j < v.size(); j++) {
-                    float value = v[j].second;
+                if (useDeepSeekV4MoeFast) {
+                    int reduceThreads = std::min(
+                        {(int)pool->threads.size(),
+                         16, m});
+                    std::vector<MultiThreadDeepSeekV4MoeReduceOp> reduceOps;
+                    reduceOps.reserve(reduceThreads);
+                    int per = m / reduceThreads;
+                    int cur = 0;
+                    for (int i = 0; i < reduceThreads; i++) {
+                        int end = cur + per +
+                            (cur + per * (reduceThreads - i) < m);
+                        if (i == reduceThreads - 1) {
+                            end = m;
+                        }
+                        reduceOps.emplace_back(
+                            &results, fLastOutput, (int)v.size(),
+                            cur, end);
+                        cur = end;
+                    }
+                    for (int i = 0; i < reduceThreads; i++) {
+                        pool->PushOp(i, &reduceOps[i]);
+                    }
+                    for (int i = 0; i < reduceThreads; i++) {
+                        pool->Wait(i);
+                    }
+                } else for (int j = 0; j < v.size(); j++) {
+                    float value = deepSeekV4Mode ? 1.0f : v[j].second;
                     float *curOutput = (float*)results[j].data();
+                    if (deepSeekV4Mode) {
+                        for (int d = 0; d < m; d++) {
+                            curOutput[d] = RoundFloat32ToBFloat16RNE(curOutput[d]);
+                        }
+                    }
                     int i = 0;
 #ifdef __AVX2__
                     __m256 value_vec = _mm256_set1_ps(value);
@@ -3208,11 +3590,29 @@ namespace fastllm {
                         fLastOutput[i] += curOutput[i] * value;
                     }
                 }
+                profileLap(profileReduceMs);
                 if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
                 } else if (output.dataType == DataType::BFLOAT16) {
-                    Float32ToBFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
+                    uint16_t *dst = ((uint16_t*)output.cpuData) + o * m;
+                    if (deepSeekV4Mode) {
+                        for (int d = 0; d < m; d++) {
+                            dst[d] = Float32ToBFloat16RNEBits(tempOutput[d]);
+                        }
+                    } else {
+                        Float32ToBFloat16(tempOutput.data(), dst, m);
+                    }
                 }
+                profileLap(profileOutputMs);
+            }
+            if (profileDetail) {
+                double total = profilePrepareMs + profileGateMs + profileSwigluQuantMs +
+                               profileDownMs + profileReduceMs + profileOutputMs;
+                printf("[fastllm-profile-cpu-moe] quant_small outer=%d topk=%d experts=%d prepare=%.3f gate=%.3f swiglu_quant=%.3f down=%.3f reduce=%.3f output=%.3f total=%.3f\n",
+                       outer, topk, profileExpertCalls, profilePrepareMs, profileGateMs,
+                       profileSwigluQuantMs, profileDownMs, profileReduceMs,
+                       profileOutputMs, total);
+                fflush(stdout);
             }
         } else if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32
                 && weights[2]->dataType == DataType::BFLOAT16) {
