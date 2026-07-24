@@ -168,3 +168,25 @@ weight 不满足打印对应 INT4_GROUP / group / scale-min skip reason
 
 后续如需为专用 checkpoint 增加跨 GPU fallback，应在模型加载后做一次性显式
 转换，不能在每次 Linear 调用时临时重新量化。
+
+### W4A8 加载器小范围测试
+
+`test_w4a8_loader` 不创建完整模型，只读取指定 Linear 的
+`weight_packed`、`weight_scale`、`weight_shape` 和 `lm_head` metadata：
+
+```bash
+cmake --build build-w4a8 --target test_w4a8_loader -j1
+
+FASTLLM_W4A8_TEST_MODEL=/path/to/Meta-Llama-3-8B-Instruct-W4AFP8-AWQ \
+./build-w4a8/test/cuda/test_w4a8_loader 2>&1 | tee w4a8-loader.log
+```
+
+可以用 `FASTLLM_W4A8_TEST_TENSOR` 指定其他 Linear 前缀，默认值为：
+
+```text
+model.layers.0.self_attn.q_proj
+```
+
+测试覆盖量化配置识别、三件套及 shape 校验、缺失 companion 报错、BF16
+scale 到 FP8 group/channel scale、packed nibble 解码和 CUTLASS reorder 后的
+端到端数值一致性，并确认 `lm_head` 仍为 BF16。
