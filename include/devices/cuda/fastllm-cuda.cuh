@@ -613,6 +613,9 @@ bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionI
 bool FastllmCudaLlama3RopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                    float ropeTheta, float factor, float originalMaxPosition,
                                    float lowFreqFactor, float highFreqFactor);
+bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
+                                 float ropeTheta, float factor, float attentionFactor,
+                                 float correctionLow, float correctionHigh);
 bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                       int sectionT, int sectionH, int sectionW,
                                       float ropeTheta, float ropeScale);

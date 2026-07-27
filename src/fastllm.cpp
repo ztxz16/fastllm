@@ -4536,6 +4536,33 @@ namespace fastllm {
            {{"rotaryDim", rotaryDim}});
     }
 
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor) {
+        AssertInFastLLM(rotaryDim > 0 && rotaryDim % 2 == 0,
+                        "YaRN rotary_dim must be a positive even number.");
+        AssertInFastLLM(ropeTheta > 0.0f && factor > 0.0f && originalMaxPosition > 0.0f &&
+                        betaFast > 0.0f && betaSlow > 0.0f,
+                        "YaRN theta, factor, original_max_position, beta_fast and beta_slow must be positive.");
+        auto findCorrectionDim = [&](float rotations) {
+            return (rotaryDim * std::log(originalMaxPosition /
+                    (rotations * 2.0f * (float)M_PI))) /
+                   (2.0f * std::log(ropeTheta));
+        };
+        float correctionLow = std::max(0.0f, std::floor(findCorrectionDim(betaFast)));
+        float correctionHigh = std::min((float)rotaryDim - 1.0f,
+                                        std::ceil(findCorrectionDim(betaSlow)));
+        if (correctionLow == correctionHigh) {
+            correctionHigh += 0.001f;
+        }
+        curExecutor->Run("YarnRopeEncoding", {
+            {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"factor", factor},
+            {"attentionFactor", attentionFactor},
+            {"correctionLow", correctionLow}, {"correctionHigh", correctionHigh}},
+           {{"rotaryDim", rotaryDim}});
+    }
+
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,
                                float ropeTheta, float ropeScale) {

@@ -777,6 +777,121 @@ namespace {
         }
     }
 
+    std::vector<float> ApplyCachedYarnReference(
+            const std::vector<float> &input, const std::vector<int> &dims,
+            const std::vector<float> &positions, int rotaryDim,
+            float ropeTheta, float factor, float originalMaxPosition,
+            float betaFast, float betaSlow, float attentionFactor) {
+        std::vector<float> output = input;
+        const int bs = dims[0], len = dims[1], heads = dims[2], headDim = dims[3];
+        const int half = rotaryDim / 2;
+        auto findCorrectionDim = [&](float rotations) {
+            return (rotaryDim * std::log(originalMaxPosition /
+                    (rotations * 2.0f * (float)M_PI))) /
+                   (2.0f * std::log(ropeTheta));
+        };
+        float low = std::max(0.0f, std::floor(findCorrectionDim(betaFast)));
+        float high = std::min((float)rotaryDim - 1.0f,
+                              std::ceil(findCorrectionDim(betaSlow)));
+        if (low == high) {
+            high += 0.001f;
+        }
+
+        std::vector<float> invFreq(half);
+        for (int dim = 0; dim < half; dim++) {
+            float posFreq = std::pow(ropeTheta, (float)(2 * dim) / rotaryDim);
+            float extrapolation = 1.0f / posFreq;
+            float interpolation = 1.0f / (factor * posFreq);
+            float ramp = std::max(0.0f, std::min(1.0f,
+                (dim - low) / (high - low)));
+            float extrapolationFactor = 1.0f - ramp;
+            invFreq[dim] = interpolation * (1.0f - extrapolationFactor) +
+                           extrapolation * extrapolationFactor;
+        }
+
+        for (int batch = 0; batch < bs; batch++) {
+            for (int token = 0; token < len; token++) {
+                int position = (int)positions[batch * len + token];
+                for (int dim = 0; dim < half; dim++) {
+                    float angle = position * invFreq[dim];
+                    float curSin = std::sin(angle) * attentionFactor;
+                    float curCos = std::cos(angle) * attentionFactor;
+                    for (int head = 0; head < heads; head++) {
+                        size_t offset = (((size_t)batch * len + token) * heads + head) * headDim;
+                        float a = input[offset + dim];
+                        float b = input[offset + dim + half];
+                        output[offset + dim] = a * curCos - b * curSin;
+                        output[offset + dim + half] = a * curSin + b * curCos;
+                    }
+                }
+            }
+        }
+        return output;
+    }
+
+    void RunYarnRopeEncodingRegression() {
+        const std::vector<int> dims = {2, 4, 3, 128};
+        const std::vector<float> positions = {
+            0.0f, 1.0f, 8191.0f, 8192.0f,
+            32768.0f, 131071.0f, 262143.0f, 17.75f
+        };
+        constexpr int rotaryDim = 64;
+        constexpr float ropeTheta = 500000.0f;
+        constexpr float factor = 32.0f;
+        constexpr float originalMaxPosition = 8192.0f;
+        constexpr float betaFast = 32.0f;
+        constexpr float betaSlow = 1.0f;
+        constexpr float attentionFactor = 1.3465735902799727f;
+
+        fastllm::Data initialData = MakeFloatTensor(dims, 0.37f);
+        std::vector<float> initial = ToFloatVector(initialData);
+        std::vector<float> expected = ApplyCachedYarnReference(
+            initial, dims, positions, rotaryDim, ropeTheta, factor,
+            originalMaxPosition, betaFast, betaSlow, attentionFactor);
+        fastllm::Data positionIds(fastllm::DataType::FLOAT32, {2, 4}, positions);
+
+        fastllm::Data cpuInput(fastllm::DataType::FLOAT32, dims, initial);
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::YarnRopeEncoding(
+                cpuInput, positionIds, rotaryDim, ropeTheta, factor,
+                originalMaxPosition, betaFast, betaSlow, attentionFactor);
+        }
+        ExpectFloatNear(expected, ToFloatVector(cpuInput), 2e-6f, 2e-6f,
+                        "CPU direct YaRN versus cached reference");
+
+#ifdef USE_CUDA
+        if (fastllm::HasDeviceType("cuda")) {
+            for (fastllm::DataType dataType : {
+                     fastllm::DataType::FLOAT32,
+                     fastllm::DataType::FLOAT16,
+                     fastllm::DataType::BFLOAT16}) {
+                fastllm::Data typedCpu(dataType, dims, initial);
+                fastllm::Data typedCuda(dataType, dims, initial);
+                {
+                    ScopedFirstDevice guard("cpu");
+                    fastllm::YarnRopeEncoding(
+                        typedCpu, positionIds, rotaryDim, ropeTheta, factor,
+                        originalMaxPosition, betaFast, betaSlow, attentionFactor);
+                }
+                typedCuda.ToDevice(fastllm::DataDevice::CUDA);
+                {
+                    ScopedFirstDevice guard("cuda");
+                    fastllm::YarnRopeEncoding(
+                        typedCuda, positionIds, rotaryDim, ropeTheta, factor,
+                        originalMaxPosition, betaFast, betaSlow, attentionFactor);
+                }
+                float atol = dataType == fastllm::DataType::FLOAT32 ? 5e-4f :
+                    (dataType == fastllm::DataType::FLOAT16 ? 1.5e-3f : 1e-2f);
+                float rtol = dataType == fastllm::DataType::FLOAT32 ? 2e-4f :
+                    (dataType == fastllm::DataType::FLOAT16 ? 1e-3f : 5e-3f);
+                ExpectFloatNear(ToFloatVector(typedCpu), ToFloatVector(typedCuda),
+                                atol, rtol, "CUDA direct YaRN versus CPU");
+            }
+        }
+#endif
+    }
+
 #ifdef USE_CUDA
     bool RegressionEnvFlagDefaultEnabled(const char *name, bool fallback) {
         const char *value = std::getenv(name);
@@ -5519,6 +5634,9 @@ int main() {
 
         RunPerRequestMinOutputLengthRegression();
         std::cout << "per-request minimum output length regression: PASS\n";
+
+        RunYarnRopeEncodingRegression();
+        std::cout << "direct YaRN RoPE cached-reference regression: PASS\n";
 
         if (fastllm::HasDeviceType("cpu")) {
             RunBFloat16Q8KConversionRegression();

@@ -1161,6 +1161,11 @@ namespace fastllm {
                             float factor, float originalMaxPosition,
                             float lowFreqFactor, float highFreqFactor);
 
+    // YaRN RoPE encoding computed directly from positions, without a sin/cos cache.
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor);
+
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,
                                float ropeTheta, float ropeScale); // Qwen3.5 interleaved MRoPE

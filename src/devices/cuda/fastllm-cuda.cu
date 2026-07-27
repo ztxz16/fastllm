@@ -2068,6 +2068,103 @@ __global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionId
     d[i * m + half_dim] = __float2bfloat16(va * curSin + vb * curCos);
 }
 
+__device__ __forceinline__ float FastllmYarnInvFreq(int dim, int rotateDim,
+                                                    float ropeTheta, float factor,
+                                                    float correctionLow, float correctionHigh) {
+    // CUDA powf may differ from the host result by one ULP.  Multiplying that
+    // error by a 256K position noticeably shifts the phase, so compute the
+    // power accurately and round to float at the same point as the old cache.
+    float posFreq = (float)pow((double)ropeTheta,
+                               (double)(2 * dim) / rotateDim);
+    float extrapolation = 1.0f / posFreq;
+    float interpolation = 1.0f / (factor * posFreq);
+    float ramp = fmaxf(0.0f, fminf(1.0f,
+        (dim - correctionLow) / (correctionHigh - correctionLow)));
+    float extrapolationFactor = 1.0f - ramp;
+    return interpolation * (1.0f - extrapolationFactor) +
+           extrapolation * extrapolationFactor;
+}
+
+__global__ void FastllmYarnRopeEncodingKernel(float *data, float *positionIds,
+                                               int len, int spatial, int n, int m,
+                                               int positionStride, int rotateDim,
+                                               float ropeTheta, float factor, float attentionFactor,
+                                               float correctionLow, float correctionHigh) {
+    int token = blockIdx.x;
+    int batch = token / len;
+    int localToken = token % len;
+    int dim = threadIdx.x;
+    int halfDim = rotateDim / 2;
+    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    float angle = position * FastllmYarnInvFreq(
+        dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
+    float curSin, curCos;
+    sincosf(angle, &curSin, &curCos);
+    curSin *= attentionFactor;
+    curCos *= attentionFactor;
+    float *d = data + token * spatial + dim;
+    for (int head = 0; head < n; head++) {
+        int offset = head * m;
+        float a = d[offset], b = d[offset + halfDim];
+        d[offset] = a * curCos - b * curSin;
+        d[offset + halfDim] = a * curSin + b * curCos;
+    }
+}
+
+__global__ void FastllmYarnRopeEncodingKernel(half *data, float *positionIds,
+                                               int len, int spatial, int n, int m,
+                                               int positionStride, int rotateDim,
+                                               float ropeTheta, float factor, float attentionFactor,
+                                               float correctionLow, float correctionHigh) {
+    int token = blockIdx.x;
+    int batch = token / len;
+    int localToken = token % len;
+    int dim = threadIdx.x;
+    int halfDim = rotateDim / 2;
+    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    float angle = position * FastllmYarnInvFreq(
+        dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
+    float curSin, curCos;
+    sincosf(angle, &curSin, &curCos);
+    curSin *= attentionFactor;
+    curCos *= attentionFactor;
+    half *d = data + token * spatial + dim;
+    for (int head = 0; head < n; head++) {
+        int offset = head * m;
+        float a = __half2float(d[offset]);
+        float b = __half2float(d[offset + halfDim]);
+        d[offset] = __float2half(a * curCos - b * curSin);
+        d[offset + halfDim] = __float2half(a * curSin + b * curCos);
+    }
+}
+
+__global__ void FastllmYarnRopeEncodingKernel(__nv_bfloat16 *data, float *positionIds,
+                                               int len, int spatial, int n, int m,
+                                               int positionStride, int rotateDim,
+                                               float ropeTheta, float factor, float attentionFactor,
+                                               float correctionLow, float correctionHigh) {
+    int token = blockIdx.x;
+    int batch = token / len;
+    int localToken = token % len;
+    int dim = threadIdx.x;
+    int halfDim = rotateDim / 2;
+    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    float angle = position * FastllmYarnInvFreq(
+        dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
+    float curSin, curCos;
+    sincosf(angle, &curSin, &curCos);
+    curSin *= attentionFactor;
+    curCos *= attentionFactor;
+    __nv_bfloat16 *d = data + token * spatial + dim;
+    for (int head = 0; head < n; head++) {
+        int offset = head * m;
+        float a = __bfloat162float(d[offset]);
+        float b = __bfloat162float(d[offset + halfDim]);
+        d[offset] = __float2bfloat16(a * curCos - b * curSin);
+        d[offset + halfDim] = __float2bfloat16(a * curSin + b * curCos);
+    }
+}
+
 __device__ __forceinline__ float FastllmLlama3InvFreq(float invFreq, float factor, float originalMaxPosition,
                                                       float lowFreqFactor, float highFreqFactor) {
     float wavelen = 2.0f * (float)M_PI / invFreq;
@@ -9198,6 +9295,47 @@ bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionI
         FastllmRopeEncodingKernel <<< outer * n, halfDim >>> ((__nv_bfloat16*)cudaData, cudaPositionIds,
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale);
+    }
+    FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    FastllmCudaFinishOutput(data, cudaData);
+    return true;
+}
+
+bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
+                                 float ropeTheta, float factor, float attentionFactor,
+                                 float correctionLow, float correctionHigh) {
+    fastllm::AssertInFastLLM(data.dims.size() == 4,
+                             "YaRN RoPE expects [batch, seq, heads, dim] input.");
+    fastllm::AssertInFastLLM(positionIds.dataType == fastllm::DataType::FLOAT32,
+                             "YaRN RoPE expects FLOAT32 position ids.");
+    fastllm::AssertInFastLLM(rotaryDim > 0 && rotaryDim % 2 == 0 &&
+                             rotaryDim <= data.dims[3] && rotaryDim / 2 <= 1024,
+                             "Invalid YaRN rotary_dim for CUDA input.");
+    fastllm::AssertInFastLLM(data.dataType == fastllm::DataType::FLOAT32 ||
+                             data.dataType == fastllm::DataType::FLOAT16 ||
+                             data.dataType == fastllm::DataType::BFLOAT16,
+                             "CUDA YaRN RoPE supports FLOAT32, FLOAT16 and BFLOAT16 input.");
+
+    float *cudaData = (float *)FastllmCudaPrepareInput(data);
+    float *cudaPositionIds = (float *)FastllmCudaPrepareInput(positionIds);
+    int outer = data.dims[0] * data.dims[1];
+    int spatial = data.Count(2);
+    int len = data.dims[1], n = data.dims[2], m = data.dims[3];
+    int halfDim = rotaryDim / 2;
+    int positionStride = (int)positionIds.dims.back();
+
+    if (data.dataType == fastllm::DataType::FLOAT32) {
+        FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
+            cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
+    } else if (data.dataType == fastllm::DataType::FLOAT16) {
+        FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
+            (half*)cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
+    } else {
+        FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
+            (__nv_bfloat16*)cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
     }
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishOutput(data, cudaData);

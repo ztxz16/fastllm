@@ -632,6 +632,7 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new MultiCudaLlamaRotatePosition2DOp());
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new MultiCudaLlamaRotatePosition2DPartOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new MultiCudaRopeEncodingOp());
+        this->ops["YarnRopeEncoding"] = (BaseOperator*)(new MultiCudaYarnRopeEncodingOp());
         this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new MultiCudaQwen35InterleavedRopeOp());
         BaseDevice *cudaBaseDevice = (BaseDevice*)cudaDevice;
         for (const char *opName : {
@@ -3062,6 +3063,45 @@ namespace fastllm {
             FastllmCudaRopeEncoding(*input.multiDeviceDatas[device], *positionIds.multiDeviceDatas[device], rotaryDim, ropeTheta, ropeScale);
         }
         SyncCudaAndCheckAll(devices, "MultiCudaRopeEncodingOp");
+        if (input.IsTensorParallelReplicated()) {
+            SyncReplicatedRootFromReplica(input, devices);
+        }
+    }
+
+    void MultiCudaYarnRopeEncodingOp::Run(const std::string &opType, const DataDict &datas,
+                                          const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float factor = floatParams.find("factor") != floatParams.end() ? floatParams.find("factor")->second : 1.0f;
+        float attentionFactor = floatParams.find("attentionFactor") != floatParams.end() ? floatParams.find("attentionFactor")->second : 1.0f;
+        float correctionLow = floatParams.find("correctionLow") != floatParams.end() ? floatParams.find("correctionLow")->second : 0.0f;
+        float correctionHigh = floatParams.find("correctionHigh") != floatParams.end() ? floatParams.find("correctionHigh")->second : 1.0f;
+
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.multiDeviceData) {
+            FastllmCudaYarnRopeEncoding(input, positionIds, rotaryDim, ropeTheta, factor,
+                                        attentionFactor, correctionLow, correctionHigh);
+            return;
+        }
+
+        EnsureReplicatedMultiCudaTensor(positionIds, devices, true);
+        if (input.IsTensorParallelReplicated()) {
+            SyncReplicatedLocalShapeFromRoot(input, devices);
+        } else {
+            SyncShardedLocalShapeFromRoot(input, devices);
+        }
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            FastllmCudaYarnRopeEncoding(
+                *input.multiDeviceDatas[device], *positionIds.multiDeviceDatas[device],
+                rotaryDim, ropeTheta, factor, attentionFactor,
+                correctionLow, correctionHigh);
+        }
+        SyncCudaAndCheckAll(devices, "MultiCudaYarnRopeEncodingOp");
         if (input.IsTensorParallelReplicated()) {
             SyncReplicatedRootFromReplica(input, devices);
         }

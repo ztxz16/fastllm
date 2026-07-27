@@ -54,12 +54,9 @@ namespace fastllm {
         float slidingRopeTheta = 10000.0f;
         int slidingRotaryDim = 128;
 
-        Data yarnSinData;
-        Data yarnCosData;
         Data softplusALog;
         Data softplusDtBias;
 
-        void BuildYarnCache();
         std::string MapTensorName(const std::string &name) const;
     };
 }

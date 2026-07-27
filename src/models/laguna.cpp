@@ -630,54 +630,6 @@ namespace fastllm {
 
         this->initialized_add1 = false;
         this->moeWeightsPrepared = false;
-        BuildYarnCache();
-    }
-
-    void LagunaModel::BuildYarnCache() {
-        const int rotaryHalf = this->fullRotaryDim / 2;
-        const int cacheLength = std::max(1, this->max_positions);
-        std::vector<float> invFreq(rotaryHalf);
-
-        auto findCorrectionDim = [&](float rotations) {
-            return (this->fullRotaryDim *
-                    std::log(this->fullRopeOriginalMaxPosition /
-                             (rotations * 2.0f * (float)M_PI))) /
-                   (2.0f * std::log(this->fullRopeTheta));
-        };
-        float low = std::floor(findCorrectionDim(this->fullRopeBetaFast));
-        float high = std::ceil(findCorrectionDim(this->fullRopeBetaSlow));
-        low = std::max(low, 0.0f);
-        high = std::min(high, (float)this->fullRotaryDim - 1.0f);
-        if (low == high) {
-            high += 0.001f;
-        }
-
-        for (int i = 0; i < rotaryHalf; i++) {
-            float posFreq = std::pow(
-                this->fullRopeTheta, (float)(2 * i) / this->fullRotaryDim);
-            float extrapolation = 1.0f / posFreq;
-            float interpolation = 1.0f / (this->fullRopeFactor * posFreq);
-            float ramp = std::max(0.0f, std::min(1.0f, (i - low) / (high - low)));
-            float extrapolationFactor = 1.0f - ramp;
-            invFreq[i] = interpolation * (1.0f - extrapolationFactor) +
-                         extrapolation * extrapolationFactor;
-        }
-
-        this->yarnSinData = Data(DataType::FLOAT32, {cacheLength, rotaryHalf});
-        this->yarnCosData = Data(DataType::FLOAT32, {cacheLength, rotaryHalf});
-        this->yarnSinData.Allocate();
-        this->yarnCosData.Allocate();
-        float *sinData = (float*)this->yarnSinData.cpuData;
-        float *cosData = (float*)this->yarnCosData.cpuData;
-        for (int position = 0; position < cacheLength; position++) {
-            for (int i = 0; i < rotaryHalf; i++) {
-                float angle = position * invFreq[i];
-                sinData[(size_t)position * rotaryHalf + i] =
-                    std::sin(angle) * this->fullRopeAttentionFactor;
-                cosData[(size_t)position * rotaryHalf + i] =
-                    std::cos(angle) * this->fullRopeAttentionFactor;
-            }
-        }
     }
 
     std::string LagunaModel::MapTensorName(const std::string &name) const {
@@ -827,9 +779,12 @@ namespace fastllm {
 
     void LagunaModel::ApplyStepRotary(Data &input, const Data &positionIds, int layer) {
         if (this->IsFullAttentionLayer(layer)) {
-            fastllm::LlamaRotatePosition2DPart(
-                input, positionIds, this->yarnSinData, this->yarnCosData,
-                this->fullRotaryDim / 2, this->fullRotaryDim);
+            fastllm::YarnRopeEncoding(
+                input, positionIds, this->fullRotaryDim,
+                this->fullRopeTheta, this->fullRopeFactor,
+                (float)this->fullRopeOriginalMaxPosition,
+                this->fullRopeBetaFast, this->fullRopeBetaSlow,
+                this->fullRopeAttentionFactor);
         } else {
             fastllm::RopeEncoding(
                 input, positionIds, this->slidingRotaryDim,
