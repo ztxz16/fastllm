@@ -550,8 +550,9 @@ namespace fastllm {
                 break;
             }
         }
-        if (hasLinearAttentionCache &&
-            (model == nullptr || !model->TryRecordPagedPrefixCacheExtra(this))) {
+        bool recordedPrefixExtra =
+            model != nullptr && model->TryRecordPagedPrefixCacheExtra(this);
+        if (hasLinearAttentionCache && !recordedPrefixExtra) {
             return;
         }
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
@@ -3687,6 +3688,7 @@ namespace fastllm {
         bool hasCudaTokenGrowingCache = false;
         std::vector <long long> layerElementsPerToken(block_cnt, 0);
         int tokenGrowingLayerCount = 0, linearLayerCount = 0;
+        int boundedLayerCount = 0;
         long long linearFixedBytes = 0;
 #ifdef USE_CUDA
         std::map<int, long long> deviceLinearFixedBytes;
@@ -3725,6 +3727,58 @@ namespace fastllm {
             if (pastKey.dims.size() < 3 || pastValue.dims.size() < 3) {
                 continue;
             }
+            int retainedTokens = this->GetKVCacheRetainedTokens(i);
+            if (retainedTokens >= 0) {
+                boundedLayerCount++;
+                // The generic non-paged path compacts in blocks to avoid a
+                // memmove on every decode token. Reserve one such block on top
+                // of the retained tail.
+                int compactBlock = 64;
+#ifdef USE_CUDA
+                compactBlock = 128;
+#endif
+                int capacityTokens = retainedTokens + compactBlock;
+                long long keyElements =
+                    (long long)pastKey.dims[0] * pastKey.dims[2];
+                long long valueElements =
+                    (long long)pastValue.dims[0] * pastValue.dims[2];
+                linearFixedBytes +=
+                    GetDataBytes(pastKey.dataType, capacityTokens, keyElements) +
+                    GetDataBytes(pastValue.dataType, capacityTokens, valueElements);
+#ifdef USE_CUDA
+                auto accountBoundedCudaCache = [&](const Data &cache) {
+                    bool accountedLocal = false;
+                    if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                        for (auto &it : cache.multiDeviceDatas) {
+                            Data *local = it.second;
+                            if (local == nullptr ||
+                                local->dataDevice != DataDevice::CUDA ||
+                                local->dims.size() < 3) {
+                                continue;
+                            }
+                            long long elements =
+                                (long long)local->dims[0] * local->dims[2];
+                            deviceLinearFixedBytes[it.first] += GetDataBytes(
+                                local->dataType, capacityTokens, elements);
+                            accountedLocal = true;
+                        }
+                    }
+                    if (!accountedLocal &&
+                        cache.dataDevice == DataDevice::CUDA &&
+                        cache.dims.size() >= 3) {
+                        int id = cache.dataDeviceIds.empty() ? 0 :
+                                 cache.dataDeviceIds[0];
+                        long long elements =
+                            (long long)cache.dims[0] * cache.dims[2];
+                        deviceLinearFixedBytes[id] += GetDataBytes(
+                            cache.dataType, capacityTokens, elements);
+                    }
+                };
+                accountBoundedCudaCache(pastKey);
+                accountBoundedCudaCache(pastValue);
+#endif
+                continue;
+            }
 #ifdef USE_CUDA
             auto cacheUsesCuda = [](const Data &cache) {
                 if (cache.dataDevice == DataDevice::CUDA) {
@@ -3757,12 +3811,13 @@ namespace fastllm {
             bytesPerToken = GetDataBytes(this->kvCacheDataType, 1, elementsInKVCachePerToken);
         }
         if (autoCalcPages) {
-            printf("[Fastllm] AutoWarmup stats: tokenGrowingLayers=%d, linearLayers=%d, linearFixedCacheGlobal=%.2f MB, kvBytesPerToken=%.2f KB, firstKVLayer=%d.\n",
-                   tokenGrowingLayerCount, linearLayerCount, linearFixedBytes / 1e6,
+            printf("[Fastllm] AutoWarmup stats: tokenGrowingLayers=%d, boundedLayers=%d, linearLayers=%d, fixedCachePerRequest=%.2f MB, kvBytesPerToken=%.2f KB, firstKVLayer=%d.\n",
+                   tokenGrowingLayerCount, boundedLayerCount, linearLayerCount,
+                   linearFixedBytes / 1e6,
                    bytesPerToken / 1024.0, this->kvCacheId);
 #ifdef USE_CUDA
             for (auto &it : deviceLinearFixedBytes) {
-                printf("[Fastllm] AutoWarmup GPU %d: linearFixedCache=%.2f MB/request.\n",
+                printf("[Fastllm] AutoWarmup GPU %d: fixedCache=%.2f MB/request.\n",
                        it.first, it.second / 1e6);
             }
 #endif
@@ -4259,7 +4314,7 @@ namespace fastllm {
                     int budgetPercent = std::max(
                         1, std::min(100,
                                     this->GetAutoWarmupLinearAttentionBatchBudgetPercent()));
-                    printf("[Fastllm] AutoWarmup auto max_batch limited %d -> %d: linear attention cache %.2f MB/request plus model runtime buffers, targeted to <=%d%% of availForKV.\n",
+                    printf("[Fastllm] AutoWarmup auto max_batch limited %d -> %d: fixed per-request cache %.2f MB plus model runtime buffers, targeted to <=%d%% of availForKV.\n",
                            baseBatchLimit, limitedBatch,
                            autoLinearAttentionBatchLimitBytes / 1e6,
                            budgetPercent);

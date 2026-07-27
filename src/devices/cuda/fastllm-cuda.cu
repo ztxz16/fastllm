@@ -5986,6 +5986,17 @@ __device__ __forceinline__ float FastllmRouterLogitToFloat(__nv_bfloat16 value) 
     return __bfloat162float(value);
 }
 
+__device__ __forceinline__ float FastllmRouterBiasToFloat(
+        const void *bias, int biasType, int expert) {
+    if (biasType == 1) {
+        return __half2float(((const half*)bias)[expert]);
+    }
+    if (biasType == 2) {
+        return __bfloat162float(((const __nv_bfloat16*)bias)[expert]);
+    }
+    return ((const float*)bias)[expert];
+}
+
 struct FastllmRouterCandidate {
     float key;
     int id;
@@ -6011,18 +6022,17 @@ __device__ __forceinline__ void FastllmRouterCandidateCompareSwap(
     }
 }
 
-// Qwen3.5 batch-1 decode specialization. The router has exactly 256 experts and
-// selects top-8. Softmax probabilities are kept in shared memory, so the
-// intermediate FP32 tensor never reaches global memory. Ranking deliberately
-// uses probability + correction bias while output scores use the unbiased
+// The 256-expert router keeps probabilities in shared memory, so the FP32
+// scoring intermediate never reaches global memory. Ranking deliberately uses
+// probability + correction bias while output scores use the unbiased
 // probabilities, matching SelectExpert's existing semantics.
-template <typename T>
-__global__ void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
-        const T *logits, const float *bias, int32_t *index, float *score,
-        int tokens, int hasBias, int needNorm, float routeScale) {
+template <typename T, int ROUTER_TOPK, bool ROUTER_SIGMOID>
+__global__ void FastllmFusedSelectExpert256Kernel(
+        const T *logits, const void *bias, int32_t *index, float *score,
+        int tokens, int hasBias, int biasType, int needNorm, float routeScale) {
     constexpr int THREADS = 64;
     constexpr int EXPERTS = 256;
-    constexpr int TOPK = 8;
+    constexpr int TOPK = ROUTER_TOPK;
     constexpr int CANDIDATES = TOPK + 1;
     constexpr float NEG_INF = -1.0e30f;
 
@@ -6047,66 +6057,68 @@ __global__ void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
     int warp = tid >> 5;
     const T *tokenLogits = logits + (size_t)token * EXPERTS;
 
-    // Use all 256 threads for the expensive exponential while preserving the
-    // old 64-thread softmax reduction tree exactly.  Each of the first 64
-    // threads still combines experts tid + {0, 64, 128, 192} in the original
-    // order, so scores and close correction-bias boundaries remain unchanged.
+    // Use all 256 threads for the score transform. The softmax specialization
+    // preserves the old 64-thread reduction tree exactly.
     probabilities[tid] = FastllmRouterLogitToFloat(tokenLogits[tid]);
     __syncthreads();
 
-    float localMax = NEG_INF;
-    if (tid < THREADS) {
+    if constexpr (ROUTER_SIGMOID) {
+        probabilities[tid] = 1.0f / (1.0f + expf(-probabilities[tid]));
+    } else {
+        float localMax = NEG_INF;
+        if (tid < THREADS) {
 #pragma unroll
-        for (int part = 0; part < 4; part++) {
-            int expert = tid + part * THREADS;
-            localMax = fmaxf(localMax, probabilities[expert]);
+            for (int part = 0; part < 4; part++) {
+                int expert = tid + part * THREADS;
+                localMax = fmaxf(localMax, probabilities[expert]);
+            }
+            reduceData[tid] = localMax;
         }
-        reduceData[tid] = localMax;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        float reducedMax = fmaxf(localMax, reduceData[lane + 32]);
+        __syncthreads();
+        if (warp == 0) {
+            float reducedMax = fmaxf(localMax, reduceData[lane + 32]);
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            float other = __shfl_down_sync(0xffffffffu, reducedMax, offset);
-            if (lane < offset) {
-                reducedMax = fmaxf(reducedMax, other);
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float other = __shfl_down_sync(0xffffffffu, reducedMax, offset);
+                if (lane < offset) {
+                    reducedMax = fmaxf(reducedMax, other);
+                }
+            }
+            if (lane == 0) {
+                maxValue = reducedMax;
             }
         }
-        if (lane == 0) {
-            maxValue = reducedMax;
-        }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    probabilities[tid] = expf(probabilities[tid] - maxValue);
-    __syncthreads();
+        probabilities[tid] = expf(probabilities[tid] - maxValue);
+        __syncthreads();
 
-    float localSum = 0.0f;
-    if (tid < THREADS) {
+        float localSum = 0.0f;
+        if (tid < THREADS) {
 #pragma unroll
-        for (int part = 0; part < 4; part++) {
-            localSum += probabilities[tid + part * THREADS];
+            for (int part = 0; part < 4; part++) {
+                localSum += probabilities[tid + part * THREADS];
+            }
+            reduceData[tid] = localSum;
         }
-        reduceData[tid] = localSum;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        float reducedSum = localSum + reduceData[lane + 32];
+        __syncthreads();
+        if (warp == 0) {
+            float reducedSum = localSum + reduceData[lane + 32];
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            float other = __shfl_down_sync(0xffffffffu, reducedSum, offset);
-            if (lane < offset) {
-                reducedSum += other;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float other = __shfl_down_sync(0xffffffffu, reducedSum, offset);
+                if (lane < offset) {
+                    reducedSum += other;
+                }
+            }
+            if (lane == 0) {
+                sumValue = fabsf(reducedSum) < 1.0e-6f ? 1.0e-4f : reducedSum;
             }
         }
-        if (lane == 0) {
-            sumValue = fabsf(reducedSum) < 1.0e-6f ? 1.0e-4f : reducedSum;
-        }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    probabilities[tid] /= sumValue;
+        probabilities[tid] /= sumValue;
+    }
     __syncthreads();
 
     FastllmRouterCandidate local[4];
@@ -6114,7 +6126,8 @@ __global__ void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
 #pragma unroll
         for (int part = 0; part < 4; part++) {
             int expert = tid + part * THREADS;
-            local[part].key = probabilities[expert] + (hasBias ? bias[expert] : 0.0f);
+            local[part].key = probabilities[expert] +
+                (hasBias ? FastllmRouterBiasToFloat(bias, biasType, expert) : 0.0f);
             local[part].id = expert;
         }
 
@@ -6190,7 +6203,8 @@ __global__ void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
 #pragma unroll
             for (int part = 0; part < 4; part++) {
                 int expert = tid + part * THREADS;
-                float key = probabilities[expert] + (hasBias ? bias[expert] : 0.0f);
+                float key = probabilities[expert] +
+                    (hasBias ? FastllmRouterBiasToFloat(bias, biasType, expert) : 0.0f);
 #pragma unroll
                 for (int rank = 0; rank < TOPK; rank++) {
                     if (key > selectKeys[tid][rank]) {
@@ -6305,23 +6319,15 @@ __global__ void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
     }
 }
 
-bool FastllmCudaFusedSoftmaxSelectExpert(
+template <int ROUTER_TOPK, bool ROUTER_SIGMOID>
+static bool FastllmCudaFusedSelectExpert256(
         const fastllm::Data &logits, const fastllm::Data *gateBias,
         fastllm::Data &index, fastllm::Data &score,
-        int topk, bool needNorm, float routeScale) {
-    if (topk != 8 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
-        (logits.dataType != fastllm::DataType::FLOAT16 &&
-         logits.dataType != fastllm::DataType::BFLOAT16 &&
-         logits.dataType != fastllm::DataType::FLOAT32)) {
-        return false;
-    }
+        bool needNorm, float routeScale) {
     bool hasBias = gateBias != nullptr && !gateBias->dims.empty();
-    if (hasBias && (gateBias->dataType != fastllm::DataType::FLOAT32 || gateBias->Count(0) != 256)) {
-        return false;
-    }
 
     const void *cudaLogits = FastllmCudaPrepareInput(logits);
-    const float *cudaBias = hasBias ? (const float*)FastllmCudaPrepareInput(*gateBias) : nullptr;
+    const void *cudaBias = hasBias ? FastllmCudaPrepareInput(*gateBias) : nullptr;
     int32_t *cudaIndex = (int32_t*)FastllmCudaPrepareOutput(index);
     float *cudaScore = (float*)FastllmCudaPrepareOutput(score);
     if (cudaLogits == nullptr || cudaIndex == nullptr || cudaScore == nullptr || (hasBias && cudaBias == nullptr)) {
@@ -6333,24 +6339,26 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
     }
 
     int tokens = logits.Count(0) / 256;
+    int biasType = !hasBias || gateBias->dataType == fastllm::DataType::FLOAT32 ? 0 :
+                   (gateBias->dataType == fastllm::DataType::FLOAT16 ? 1 : 2);
     if (logits.dataType == fastllm::DataType::FLOAT16) {
-        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
+        FastllmFusedSelectExpert256Kernel<half, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
             (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
     } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
+        FastllmFusedSelectExpert256Kernel<__nv_bfloat16, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
             (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
     } else {
-        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
+        FastllmFusedSelectExpert256Kernel<float, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
             (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
     }
 
     cudaError_t state = cudaGetLastError();
     bool success = state == cudaSuccess;
     if (!success) {
-        checkCudaErrors("Error: fused softmax SelectExpert launch failed!", state);
+        checkCudaErrors("Error: fused SelectExpert launch failed!", state);
     }
     FastllmCudaFinishInput(logits, (void*)cudaLogits);
     if (hasBias) {
@@ -6359,6 +6367,48 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
     FastllmCudaFinishOutput(index, cudaIndex);
     FastllmCudaFinishOutput(score, cudaScore);
     return success;
+}
+
+bool FastllmCudaFusedSoftmaxSelectExpert(
+        const fastllm::Data &logits, const fastllm::Data *gateBias,
+        fastllm::Data &index, fastllm::Data &score,
+        int topk, bool needNorm, float routeScale) {
+    if (topk != 8 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
+        (logits.dataType != fastllm::DataType::FLOAT16 &&
+         logits.dataType != fastllm::DataType::BFLOAT16 &&
+         logits.dataType != fastllm::DataType::FLOAT32)) {
+        return false;
+    }
+    bool hasBias = gateBias != nullptr && !gateBias->dims.empty();
+    if (hasBias && (gateBias->Count(0) != 256 ||
+                    (gateBias->dataType != fastllm::DataType::FLOAT32 &&
+                     gateBias->dataType != fastllm::DataType::FLOAT16 &&
+                     gateBias->dataType != fastllm::DataType::BFLOAT16))) {
+        return false;
+    }
+    return FastllmCudaFusedSelectExpert256<8, false>(
+        logits, gateBias, index, score, needNorm, routeScale);
+}
+
+bool FastllmCudaFusedSigmoidSelectExpert(
+        const fastllm::Data &logits, const fastllm::Data *gateBias,
+        fastllm::Data &index, fastllm::Data &score,
+        int topk, bool needNorm, float routeScale) {
+    if (topk != 10 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
+        (logits.dataType != fastllm::DataType::FLOAT16 &&
+         logits.dataType != fastllm::DataType::BFLOAT16 &&
+         logits.dataType != fastllm::DataType::FLOAT32)) {
+        return false;
+    }
+    bool hasBias = gateBias != nullptr && !gateBias->dims.empty();
+    if (hasBias && (gateBias->Count(0) != 256 ||
+                    (gateBias->dataType != fastllm::DataType::FLOAT32 &&
+                     gateBias->dataType != fastllm::DataType::FLOAT16 &&
+                     gateBias->dataType != fastllm::DataType::BFLOAT16))) {
+        return false;
+    }
+    return FastllmCudaFusedSelectExpert256<10, true>(
+        logits, gateBias, index, score, needNorm, routeScale);
 }
 
 // CUDA kernel for SelectExpert

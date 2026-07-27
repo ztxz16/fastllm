@@ -51,6 +51,37 @@ namespace fastllm {
     }
 
 #ifdef USE_CUDA
+    static bool Step3p5CudaFusedSigmoidSelectExpertToHost(
+            const Data &logits, const Data *gateBias,
+            Data &expertIndex, Data &expertScore,
+            int topk, bool needNorm, float routeScale) {
+        if (logits.dataDevice != DataDevice::CUDA || logits.dims.empty() ||
+            logits.dims.back() != 256 || topk != 10) {
+            return false;
+        }
+        int tokens = logits.Count(0) / logits.dims.back();
+        auto prepareHostOutput = [](Data &data, DataType dataType,
+                                    const std::vector<int> &dims) {
+            if (data.dataDevice != DataDevice::CPU) {
+                data.ToDevice(DataDevice::CPU);
+            }
+            if (data.dataType != dataType && data.expansionBytes != 0) {
+                data.FreeSpace();
+            }
+            data.dataType = dataType;
+            data.dataDevice = DataDevice::CPU;
+            data.dataDeviceIds.clear();
+            data.UpdateUnitSize();
+            data.Resize(dims);
+            data.Allocate(false);
+        };
+        prepareHostOutput(expertIndex, DataType::INT32, {tokens, topk});
+        prepareHostOutput(expertScore, DataType::FLOAT32, {tokens, topk});
+        return FastllmCudaFusedSigmoidSelectExpert(
+            logits, gateBias, expertIndex, expertScore,
+            topk, needNorm, routeScale);
+    }
+
     static void Step3p7DebugCudaMemory(const char *tag) {
         const char *env = getenv("FASTLLM_STEP3P7_DEBUG");
         if (env == nullptr || !Step3p5IsTrueString(env)) {
@@ -467,7 +498,7 @@ namespace fastllm {
         }
     }
 
-    static void Step3p5MakeGateUpWeight(Data &dst, const Data &gate, const Data &up, const std::string &name) {
+    void Step3p5MakeGateUpWeight(Data &dst, const Data &gate, const Data &up, const std::string &name) {
         AssertInFastLLM(gate.dims.size() == 2 && up.dims.size() == 2 &&
                         gate.dims[0] == up.dims[0] && gate.dims[1] == up.dims[1],
                         "Step3p5 MoE gate/up expert weights should have the same 2D shape.");
@@ -3907,6 +3938,53 @@ namespace fastllm {
         fastllm::RopeEncoding(input, positionIds, curRotaryDim, theta, ropeScale);
     }
 
+    void Step3p5Model::PrepareRuntimeWeights() {
+        if (initialized_add1) {
+            return;
+        }
+        for (int i = 0; i < block_cnt; i++) {
+            Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"]);
+            Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
+            Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
+            Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
+            std::string routerName = "model.layers." + std::to_string(i) + ".moe.gate.weight";
+            if (need_fp32_gate && weight.weight.find(routerName) != weight.weight.end()) {
+                ToDataType(this->weight[routerName], DataType::FLOAT32);
+            }
+        }
+        Step3p5Add1(this->weight["model.norm.weight"]);
+        initialized_add1 = true;
+    }
+
+    void Step3p5Model::ApplyAttentionGateActivation(Data &gate, int layer) {
+        (void)layer;
+        Sigmoid(gate, gate);
+    }
+
+    bool Step3p5Model::UsePagedAttention(int layer) const {
+        (void)layer;
+        return true;
+    }
+
+    DataType Step3p5Model::NonPagedAttentionDataType(DataType inputType) const {
+        return inputType == DataType::BFLOAT16 ? DataType::FLOAT32 : inputType;
+    }
+
+    bool Step3p5Model::UseHostMergeMoe() const {
+        return false;
+    }
+
+    Data *Step3p5Model::PrepareAttentionMask(int layer, int pastLen, int qLen,
+                                            DataType attentionType, Data *inputMask,
+                                            Data &generatedMask) {
+        (void)layer;
+        (void)pastLen;
+        (void)qLen;
+        (void)attentionType;
+        (void)generatedMask;
+        return inputMask;
+    }
+
     void Step3p5Model::PrepareStep3p7Vision() {
         if (step3p7VisionPrepared) {
             return;
@@ -5400,20 +5478,7 @@ namespace fastllm {
         }
         allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, totalLen}, vPositionIds));
 
-        if (!initialized_add1) {
-            for (int i = 0; i < block_cnt; i++) {
-                Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"]);
-                Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
-                Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
-                Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
-                std::string routerName = "model.layers." + std::to_string(i) + ".moe.gate.weight";
-                if (need_fp32_gate && weight.weight.find(routerName) != weight.weight.end()) {
-                    ToDataType(this->weight[routerName], DataType::FLOAT32);
-                }
-            }
-            Step3p5Add1(this->weight["model.norm.weight"]);
-            initialized_add1 = true;
-        }
+        PrepareRuntimeWeights();
 
         Data hiddenStates;
         if (step3p7PrecomputedHiddenStates != nullptr) {
@@ -5432,12 +5497,11 @@ namespace fastllm {
         Data attenInput, q, k, v, qkv, attenOutput, gate, mergedQkv;
         Data w1, w2, w3, routerLogits, routerProb, expertIndex, expertScore;
         Data attenPart, moePart, moeFinal, shareOutput;
-        Data tempInput, tempOutput;
+        Data tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
         Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
-
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             std::string prefix = "model.layers." + std::to_string(i) + ".";
@@ -5463,7 +5527,7 @@ namespace fastllm {
             Linear(attenInput, weight[prefix + "self_attn.g_proj.weight"], Data(), gate);
 
             bool usedFusedDecodeAttention = false;
-            if (hasMergedQkv && canRunFusedDecode() &&
+            if (UsePagedAttention(i) && hasMergedQkv && canRunFusedDecode() &&
                 mergedQkv.dataDevice == DataDevice::CUDA && !mergedQkv.multiDeviceData) {
                 for (int b = 0; b < batch; b++) {
                     batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
@@ -5549,6 +5613,15 @@ namespace fastllm {
                 q.Reshape({bsz, seqlen, qHeads, head_dim});
                 k.Reshape({bsz, seqlen, kvHeads, head_dim});
                 v.Reshape({bsz, seqlen, kvHeads, head_dim});
+                if (!UsePagedAttention(i)) {
+                    DataType attentionType =
+                        NonPagedAttentionDataType(q.dataType);
+                    if (q.dataType != attentionType) {
+                        ToDataType(q, attentionType);
+                        ToDataType(k, attentionType);
+                        ToDataType(v, attentionType);
+                    }
+                }
                 RMSNorm(q, this->weight[prefix + "self_attn.q_norm.weight"], rms_norm_eps, q);
                 RMSNorm(k, this->weight[prefix + "self_attn.k_norm.weight"], rms_norm_eps, k);
                 ApplyStepRotary(q, allPositionIds, i);
@@ -5561,7 +5634,74 @@ namespace fastllm {
                 k.Reshape({-1, seqlen, head_dim});
                 v.Reshape({-1, seqlen, head_dim});
 
-                if (batch > 1 && all1) {
+                if (!UsePagedAttention(i)) {
+                    AssertInFastLLM(batch == 1,
+                                    "Step3p5 non-paged attention expects split single-batch forwarding.");
+                    Data &pastKey = *pastKeyValues[i].first;
+                    Data &pastValue = *pastKeyValues[i].second;
+                    if (GetKVCacheInCPU()) {
+                        pastKey.lockInCPU = true;
+                        pastValue.lockInCPU = true;
+                    } else {
+                        pastKey.ToDevice(k.dataDevice, k.dataDeviceIds);
+                        pastValue.ToDevice(v.dataDevice, v.dataDeviceIds);
+                    }
+
+                    if (pastKey.dataType != q.dataType) {
+                        ToDataType(pastKey, q.dataType);
+                        ToDataType(pastValue, q.dataType);
+                    }
+
+                    int pastLen = pastKey.dims.size() > 1 ? pastKey.dims[1] : 0;
+                    int unitLen = 64;
+#ifdef USE_CUDA
+                    unitLen = 128;
+#endif
+                    auto ensureCacheCapacity = [unitLen](Data &cache, const Data &append) {
+                        int cachedLen = cache.dims.size() > 1 ? cache.dims[1] : 0;
+                        int capacity = cache.expansionDims.size() > 1
+                            ? cache.expansionDims[1] : 0;
+                        int required = cachedLen + append.dims[1];
+                        if (required > capacity) {
+                            int newCapacity =
+                                ((required - 1) / unitLen + 1) * unitLen;
+                            cache.Expansion(
+                                {append.dims[0], newCapacity, append.dims[2]});
+                        }
+                    };
+                    ensureCacheCapacity(pastKey, k);
+                    ensureCacheCapacity(pastValue, v);
+                    CatDirect(pastKey, k, 1);
+                    CatDirect(pastValue, v, 1);
+
+                    Data generatedMask;
+                    Data *inputMask = attentionMask.empty() ? nullptr : attentionMask[0];
+                    Data *activeMask = PrepareAttentionMask(
+                        i, pastLen, seqlen, q.dataType, inputMask, generatedMask);
+                    if (activeMask == nullptr) {
+                        activeMask = GetEmptyData();
+                    }
+                    Attention(q, pastKey, pastValue, *activeMask, qkv,
+                              q.dims[0] / pastKey.dims[0],
+                              1.0f / sqrt((float)head_dim), 1);
+
+                    int retainedTokens = GetKVCacheRetainedTokens(i);
+                    if (retainedTokens >= 0) {
+                        int compactThreshold = retainedTokens + unitLen;
+                        int cachedTokens = pastKey.dims.size() > 1 ?
+                                           pastKey.dims[1] : 0;
+                        if (cachedTokens > compactThreshold) {
+                            int start = cachedTokens - retainedTokens;
+                            Data compactKey, compactValue;
+                            Split(pastKey, 1, start, cachedTokens, compactKey);
+                            Split(pastValue, 1, start, cachedTokens, compactValue);
+                            pastKey.CopyFrom(compactKey);
+                            pastValue.CopyFrom(compactValue);
+                            pastKey.SetKVCache();
+                            pastValue.SetKVCache();
+                        }
+                    }
+                } else if (batch > 1 && all1) {
                     for (int b = 0; b < batch; b++) {
                         batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
                         batchPastValues[b] = pastKeyValues[b * block_cnt + i].second;
@@ -5619,9 +5759,18 @@ namespace fastllm {
                 PermuteSelf(qkv, {1, 0, 2});
             }
 
-            Sigmoid(gate, gate);
+            ApplyAttentionGateActivation(gate, i);
             gate.Reshape({bsz, seqlen, qHeads, 1});
             qkv.Reshape({bsz, seqlen, qHeads, head_dim});
+            // MulTo currently has FLOAT32/FLOAT16 kernels only.  Models such
+            // as Laguna keep the residual stream in BF16, so paged attention
+            // can also return BF16 here.  Limit the conversion to this local
+            // gate product; the projection result is converted back to the
+            // residual type below.
+            if (qkv.dataType != DataType::FLOAT32 &&
+                qkv.dataType != DataType::FLOAT16) {
+                ToDataType(qkv, DataType::FLOAT16);
+            }
             if (gate.dataType != qkv.dataType) {
                 ToDataType(gate, qkv.dataType);
             }
@@ -5629,6 +5778,9 @@ namespace fastllm {
             qkv.Reshape({bsz, seqlen, qDim});
 
             Linear(qkv, weight[prefix + "self_attn.o_proj.weight"], Data(), attenInput);
+            if (attenInput.dataType != hiddenStates.dataType) {
+                ToDataType(attenInput, hiddenStates.dataType);
+            }
             AddTo(hiddenStates, attenInput);
 
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
@@ -5674,19 +5826,33 @@ namespace fastllm {
                 int flatLen = attenInput.dims[1];
                 attenInput.Reshape({flatBatch * flatLen, attenInput.dims[2]});
                 Linear(attenInput, weight[prefix + "moe.gate.weight"], Data(), routerLogits);
-                ToDataType(routerLogits, DataType::FLOAT32);
-                Sigmoid(routerLogits, routerProb);
                 Data *gateBias = nullptr;
                 if (use_moe_router_bias && weight.weight.find(prefix + "moe.router_bias") != weight.weight.end()) {
                     gateBias = &weight[prefix + "moe.router_bias"];
                 }
-                SelectExpert(routerProb, expertIndex, expertScore, num_experts_per_tok, norm_topk_prob,
-                             routed_scaling_factor, gateBias);
 
                 bool useCudaMoe = Step3p5DeviceMapUsesCuda(this->moeDeviceMap);
                 bool useDiskMoe = Step3p5DeviceMapUsesDisk(this->moeDeviceMap);
                 std::string selectedMoeDevice = this->SelectMoeDeviceForLayer(i);
                 bool selectedCudaMoe = selectedMoeDevice.rfind("cuda", 0) == 0;
+                bool selectedHostMoe =
+                    selectedMoeDevice.rfind("cpu", 0) == 0 ||
+                    selectedMoeDevice.rfind("numa", 0) == 0;
+                bool usedFusedSigmoidRouter = false;
+#ifdef USE_CUDA
+                if (UseHostMergeMoe() && selectedHostMoe) {
+                    usedFusedSigmoidRouter = Step3p5CudaFusedSigmoidSelectExpertToHost(
+                        routerLogits, gateBias, expertIndex, expertScore,
+                        num_experts_per_tok, norm_topk_prob, routed_scaling_factor);
+                }
+#endif
+                if (!usedFusedSigmoidRouter) {
+                    ToDataType(routerLogits, routerProb, DataType::FLOAT32);
+                    Sigmoid(routerProb, routerProb);
+                    SelectExpert(routerProb, expertIndex, expertScore,
+                                 num_experts_per_tok, norm_topk_prob,
+                                 routed_scaling_factor, gateBias);
+                }
                 bool useFusedCudaMoe = selectedCudaMoe && !useDiskMoe &&
                     i < (int)moeGate3DWeights.size() &&
                     moeGate3DWeights[i] != nullptr && moeUp3DWeights[i] != nullptr && moeDown3DWeights[i] != nullptr;
@@ -5702,18 +5868,29 @@ namespace fastllm {
                              w1, moeFinal, i, MoeGateSwiglu, expertLimit);
                     ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 } else {
-                    routerProb.ToDevice(DataDevice::CPU);
                     expertIndex.ToDevice(DataDevice::CPU);
                     expertScore.ToDevice(DataDevice::CPU);
                     ToDataType(expertScore, DataType::FLOAT32);
-                    if (i < (int)weights.size() && !weights[i].empty() && (useCudaMoe || useDiskMoe)) {
+                    if (i < (int)weights.size() && !weights[i].empty() &&
+                        (useCudaMoe || useDiskMoe || UseHostMergeMoe())) {
                         Data expertInput;
                         expertInput.CopyFrom(attenInput);
                         this->ApplyMoeDeviceMapForLayer(i);
-                        MergeMOE(expertInput, expertIndex, expertScore,
-                                 weights[i], biass[i],
-                                 w1, w2, w3, tempInput, tempOutput,
-                                 1.0f, moeFinal, i);
+                        DataType effectiveMoeAtype =
+                            this->useCustomMoeAtype ? this->moeAtype : expertInput.dataType;
+                        if (!this->useCustomMoeAtype && UseHostMergeMoe() &&
+                            selectedHostMoe &&
+                            weights[i].size() > 2 && weights[i][2] != nullptr &&
+                            weights[i][2]->dataType == DataType::BFLOAT16) {
+                            effectiveMoeAtype = DataType::BFLOAT16;
+                        }
+                        MergeMOEBlock(&expertInput, &expertIndex, &expertScore,
+                                      &weights[i], &biass[i],
+                                      &w1, &w2, &w3, &tempInput, &tempOutput,
+                                      1.0f, &moeFinal, i,
+                                      expertInput.dataType, effectiveMoeAtype,
+                                      &moeInputTemp, &moeOutputTemp,
+                                      MoeGateSwiglu, false, expertLimit);
                         ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                     } else {
                         int32_t *indexData = (int32_t*)expertIndex.cpuData;
@@ -5723,6 +5900,8 @@ namespace fastllm {
                         Data expertInput;
                         expertInput.CopyFrom(attenInput);
                         expertInput.ToDevice(DataDevice::CPU);
+                        moeFinal.FreeSpace();
+                        moeFinal = Data();
                         moeFinal.dataType = hiddenStates.dataType;
                         moeFinal.dataDevice = expertInput.dataDevice;
                         moeFinal.dataDeviceIds = expertInput.dataDeviceIds;
@@ -5730,6 +5909,7 @@ namespace fastllm {
                         moeFinal.Resize({0, expertInput.dims[1]});
                         moeFinal.Expansion(expertInput.dims);
                         ApplyDeviceMap(cpuDeviceMap, 1, 1);
+                        Data expertW1, expertW2, expertW3;
                         for (int b = 0; b < flatBatch * flatLen; b++) {
                             Data *currentData = &expertInput;
                             if (flatBatch * flatLen != 1) {
@@ -5745,19 +5925,19 @@ namespace fastllm {
                             for (int j = 0; j < num_experts_per_tok; j++) {
                                 int expert = indexData[b * num_experts_per_tok + j];
                                 float score = scoreData[b * num_experts_per_tok + j];
-                                Linear(*currentData, *moeGateWeights[i][expert], Data(), w1);
-                                Silu(w1, w1);
-                                Linear(*currentData, *moeUpWeights[i][expert], Data(), w3);
+                                Linear(*currentData, *moeGateWeights[i][expert], Data(), expertW1);
+                                Silu(expertW1, expertW1);
+                                Linear(*currentData, *moeUpWeights[i][expert], Data(), expertW3);
                                 if (expertLimit != 0.0f) {
-                                    Step3p5Clamp(w1, false, 0.0f, true, expertLimit);
-                                    Step3p5Clamp(w3, true, -expertLimit, true, expertLimit);
+                                    Step3p5Clamp(expertW1, false, 0.0f, true, expertLimit);
+                                    Step3p5Clamp(expertW3, true, -expertLimit, true, expertLimit);
                                 }
-                                MulTo(w1, w3);
-                                Linear(w1, *moeDownWeights[i][expert], Data(), w2);
-                                if (w2.dataType != moePart.dataType) {
-                                    ToDataType(w2, moePart.dataType);
+                                MulTo(expertW1, expertW3);
+                                Linear(expertW1, *moeDownWeights[i][expert], Data(), expertW2);
+                                if (expertW2.dataType != moePart.dataType) {
+                                    ToDataType(expertW2, moePart.dataType);
                                 }
-                                AddTo(moePart, w2, score);
+                                AddTo(moePart, expertW2, score);
                             }
                             if (moePart.dataType != moeFinal.dataType) {
                                 ToDataType(moePart, moeFinal.dataType);

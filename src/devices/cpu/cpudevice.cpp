@@ -3307,7 +3307,8 @@ namespace fastllm {
                 profileLap(profilePrepareMs);
                 std::vector<fastllm::MultiThreadBaseOp*> ops;
                 auto *pool = GetAlivePool();
-                int threads = pool->threads.size();
+                int threads = pool->curActivateThreadInterval.second -
+                              pool->curActivateThreadInterval.first;
                 ops.resize(threads);
 
                 bool useDeepSeekV4MoeFast =
@@ -3448,6 +3449,10 @@ namespace fastllm {
                     // operation-order boundaries: w1/w3 return BF16, routed
                     // activations are clamped, the route weight is applied
                     // before w2, and quantized w2 receives FP8 activations.
+                    bool runActivationInline =
+                        !deepSeekV4Mode &&
+                        weights[v[st].first * 2]->dataType ==
+                            DataType::BFLOAT16;
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
@@ -3481,6 +3486,22 @@ namespace fastllm {
                             continue;
                         }
 
+                        if (runActivationInline) {
+                            if (useGeglu) {
+                                MultiThreadGegluOp(
+                                    outputData, mid, mid, swigluData,
+                                    1, spatial, spatial).Run();
+                            } else {
+                                MultiThreadSwigluOp(
+                                    outputData, mid, mid, swigluData,
+                                    1, spatial, spatial).Run();
+                            }
+                            Float32ToBFloat16(
+                                swigluData,
+                                (uint16_t*)middles[l].data(), mid);
+                            continue;
+                        }
+
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(
                             useGeglu ? (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadGegluOp(outputData, mid, mid, swigluData, 1, spatial, spatial)
@@ -3493,7 +3514,8 @@ namespace fastllm {
                         pool->PushOp(l - st, ops[l - st]);
                     }
                     for (int l = st; l <= end; l++) {
-                        if (deepSeekV4Mode && !useGeglu) {
+                        if ((deepSeekV4Mode && !useGeglu) ||
+                            runActivationInline) {
                             continue;
                         }
                         pool->Wait(l - st);
@@ -3622,8 +3644,11 @@ namespace fastllm {
                        profileOutputMs, total);
                 fflush(stdout);
             }
-        } else if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32
-                && weights[2]->dataType == DataType::BFLOAT16) {
+        } else if ((input.dataType == DataType::FLOAT32 ||
+                    input.dataType == DataType::BFLOAT16) &&
+                   (output.dataType == DataType::FLOAT32 ||
+                    output.dataType == DataType::BFLOAT16) &&
+                   weights[2]->dataType == DataType::BFLOAT16) {
  auto st = std::chrono::system_clock::now();
             Data gate, attenPart, moePart;
             int bs = input.dims[0];
@@ -3701,7 +3726,13 @@ namespace fastllm {
 
 //printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 0. input -> realInput
-                RunMultiThreadConvertFromFloat32(realInput.data(), DataType::BFLOAT16, (float*)input.cpuData, bs, inputDim, GetAlivePool());
+                if (input.dataType == DataType::FLOAT32) {
+                    RunMultiThreadConvertFromFloat32(realInput.data(), DataType::BFLOAT16,
+                                                     (float*)input.cpuData, bs, inputDim,
+                                                     GetAlivePool());
+                } else {
+                    memcpy(realInput.data(), input.cpuData, realInputSize);
+                }
 //printf("Float32ToBFloat16 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 1. realInput -> expandInput

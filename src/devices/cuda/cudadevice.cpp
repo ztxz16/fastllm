@@ -2587,8 +2587,21 @@ namespace fastllm {
             return;
         }
         if (data.dims.size() == 0) {
+            // Empty KV caches can already own pre-expanded storage. Widening an
+            // empty BF16/FP16 cache by only changing unitSize leaves the old
+            // two-byte allocation in place, so the first FP32 append writes
+            // past the buffer. There are no logical elements to preserve, but
+            // the capacity must be reallocated for the new element width.
+            uint64_t oldExpansionSize = data.expansionSize;
+            bool hadStorage = data.cudaData != nullptr;
+            if (hadStorage) {
+                data.FreeSpace();
+            }
             data.dataType = DataType::FLOAT32;
             data.UpdateUnitSize();
+            if (hadStorage && oldExpansionSize > 0) {
+                data.MallocSpace(oldExpansionSize);
+            }
             return;
         }
         if (data.dataType == DataType::FLOAT16) {

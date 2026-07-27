@@ -506,6 +506,8 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
 bool FastllmCudaFusedSoftmaxSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias,
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
+bool FastllmCudaFusedSigmoidSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias,
+    fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
 bool FastllmCudaMaskAndRemapExpertsForLocalRange(fastllm::Data &index, fastllm::Data &score,
                                                  int expertStart, int expertEnd);
 bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis);

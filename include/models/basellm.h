@@ -340,6 +340,15 @@ namespace fastllm {
         // 占用多少比例的可用 KV 预算。其余空间优先留给 token-growing KV cache。
         virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const { return 50; }
 
+        // A non-negative value marks an ordinary attention layer whose KV
+        // history is periodically compacted to a bounded tail.  AutoWarmup
+        // treats that storage as a per-request fixed cost instead of charging
+        // it once for every token in the advertised context length.
+        virtual int GetKVCacheRetainedTokens(int layer) const {
+            (void)layer;
+            return -1;
+        }
+
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}

@@ -2502,13 +2502,16 @@ namespace {
 
     struct FusedRouterTopKBenchState {
         int batch = 1;
+        int topk = 8;
         bool withBias = true;
         bool needNorm = true;
+        bool sigmoid = false;
         float routeScale = 1.0f;
         std::string path;
         fastllm::Data logits, bias;
         fastllm::Data fusedIndex, fusedScore;
-        fastllm::Data referenceLogits, referenceProb, referenceIndex, referenceScore;
+        fastllm::Data referenceLogits, referenceProb, referenceBias;
+        fastllm::Data referenceIndex, referenceScore;
 
         static void PrepareOutput(fastllm::Data &data, fastllm::DataType type,
                                   const std::vector<int> &dims) {
@@ -2521,15 +2524,24 @@ namespace {
 
         void RunReference() {
             fastllm::ToDataType(logits, referenceLogits, fastllm::DataType::FLOAT32);
-            fastllm::Softmax(referenceLogits, referenceProb, -1);
-            fastllm::SelectExpert(referenceProb, referenceIndex, referenceScore, 8,
-                                  needNorm, routeScale, withBias ? &bias : nullptr);
+            if (sigmoid) {
+                fastllm::Sigmoid(referenceLogits, referenceProb);
+            } else {
+                fastllm::Softmax(referenceLogits, referenceProb, -1);
+            }
+            fastllm::SelectExpert(referenceProb, referenceIndex, referenceScore, topk,
+                                  needNorm, routeScale,
+                                  withBias ? &referenceBias : nullptr);
         }
 
         void RunFused() {
-            bool ok = FastllmCudaFusedSoftmaxSelectExpert(
-                logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
-                8, needNorm, routeScale);
+            bool ok = sigmoid
+                ? FastllmCudaFusedSigmoidSelectExpert(
+                    logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
+                    topk, needNorm, routeScale)
+                : FastllmCudaFusedSoftmaxSelectExpert(
+                    logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
+                    topk, needNorm, routeScale);
             if (!ok) {
                 throw std::runtime_error("fused router top-k launch failed");
             }
@@ -2553,19 +2565,19 @@ namespace {
                         break;
                     }
                 }
-                size_t tokenStart = (mismatch / 8) * 8;
-                os << " expected_top8=";
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                size_t tokenStart = (mismatch / topk) * topk;
+                os << " expected_topk=";
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",") << expectedIndex[i];
                 }
-                os << "] actual_top8=";
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                os << "] actual_topk=";
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",") << actualIndex[i];
                 }
                 os << "] expected_prob=";
                 std::vector<float> referenceProbValues = ToFloatVector(referenceProb);
-                size_t probStart = (mismatch / 8) * 256;
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                size_t probStart = (mismatch / topk) * 256;
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",")
                        << referenceProbValues[probStart + expectedIndex[i]];
                 }
@@ -2578,7 +2590,8 @@ namespace {
             for (size_t i = 0; i < expectedScore.size(); i++) {
                 maxAbsDiff = std::max(maxAbsDiff, std::fabs(expectedScore[i] - actualScore[i]));
             }
-            if (maxAbsDiff > 0.0f) {
+            const float scoreTolerance = sigmoid ? 1.0e-6f : 0.0f;
+            if (maxAbsDiff > scoreTolerance) {
                 std::ostringstream os;
                 os << "fused router score mismatch: max_abs_diff=" << maxAbsDiff;
                 throw std::runtime_error(os.str());
@@ -2589,6 +2602,8 @@ namespace {
 #ifdef USE_CUDA
             FastllmCudaSetDevice(0);
             batch = params.GetInt("batch");
+            sigmoid = params.GetString("activation") == "sigmoid";
+            topk = sigmoid ? 10 : 8;
             withBias = params.GetInt("bias") != 0;
             needNorm = params.GetInt("norm") != 0;
             routeScale = params.GetFloat("route_scale");
@@ -2638,9 +2653,20 @@ namespace {
                 fp32Bias.CopyFrom(generated);
             }
             bias.CopyFrom(fp32Bias);
+            std::string biasType = params.GetString("bias_type");
+            if (biasType == "fp16") {
+                fastllm::ToDataType(bias, fastllm::DataType::FLOAT16);
+            } else if (biasType == "bf16") {
+                fastllm::ToDataType(bias, fastllm::DataType::BFLOAT16);
+            } else if (biasType != "fp32") {
+                throw std::runtime_error("bias_type must be fp16, bf16 or fp32");
+            }
+            referenceBias.CopyFrom(bias);
+            fastllm::ToDataType(referenceBias, fastllm::DataType::FLOAT32);
+            referenceBias.ToDevice(fastllm::DataDevice::CUDA);
             bias.ToDevice(fastllm::DataDevice::CUDA);
-            PrepareOutput(fusedIndex, fastllm::DataType::INT32, {batch, 8});
-            PrepareOutput(fusedScore, fastllm::DataType::FLOAT32, {batch, 8});
+            PrepareOutput(fusedIndex, fastllm::DataType::INT32, {batch, topk});
+            PrepareOutput(fusedScore, fastllm::DataType::FLOAT32, {batch, topk});
             Check();
 #else
             (void)params;
@@ -2691,11 +2717,13 @@ namespace {
     static OpCase MakeFusedRouterTopKCase() {
         return {
             "fused_router_topk",
-            "benchmark and validate fused softmax + SelectExpert top8/256",
+            "benchmark and validate fused softmax/sigmoid + SelectExpert for 256 experts",
             []() {
                 OpTestParams params;
                 params.Add("batch", "1", "token batch size");
                 params.Add("input_type", "fp16", "fp16, bf16 or fp32");
+                params.Add("bias_type", "fp32", "fp16, bf16 or fp32");
+                params.Add("activation", "softmax", "softmax/top8 or sigmoid/top10");
                 params.Add("bias", "1", "whether correction bias is present");
                 params.Add("norm", "1", "normalize selected probabilities");
                 params.Add("route_scale", "1.0", "router score scale");

@@ -1116,7 +1116,9 @@ namespace fastllm {
                     data->dataType == DataType::BFLOAT16 ||
                     data->dataType == DataType::FLOAT16 ||
                     data->dataType == DataType::FP8_E4M3_BLOCK_128 ||
-                    data->dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                    data->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                    data->dataType == DataType::NVFP4_BLOCK_16 ||
+                    data->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
                     uint8_t *srcData = data->cpuData;
                     std::vector<uint8_t> reordered;
@@ -2739,6 +2741,15 @@ namespace fastllm {
                         // index 存储的是专家索引（从0开始），需要+1因为0表示shared expert
                         int expertIdx = indexData[o * topk + j];
                         float expertScore = scoreData[o * topk + j];
+                        int routedExpertCount = weightsBatch / 2 - 1;
+                        if (expertIdx < 0 || expertIdx >= routedExpertCount) {
+                            ErrorInFastLLM(
+                                "NumasMergeMOE small batch: invalid routed expert " +
+                                std::to_string(expertIdx) + " at layer " +
+                                std::to_string(layer) + ", row " +
+                                std::to_string(o) + ". Valid range is [0, " +
+                                std::to_string(routedExpertCount) + ").\n");
+                        }
                         v.push_back(std::make_pair(expertIdx + 1, expertScore));
                     }
                     if (weights[0] != nullptr) {
