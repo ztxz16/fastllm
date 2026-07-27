@@ -1234,7 +1234,9 @@ namespace fastllm {
     
     void MultiThreadLinearInt8Int4GroupOp::Run() {
 #ifdef __AVX2__
-        if (group == 1) {
+        const bool canUsePackedAvx2 =
+            groupCnt > 0 && groupCnt % 32 == 0 && m % 32 == 0;
+        if (group == 1 && canUsePackedAvx2) {
             int block = 0;
             int realGroup = (m - 1) / groupCnt + 1;            
             std::vector <float> tempValue, values;
@@ -1381,7 +1383,7 @@ namespace fastllm {
                 }
             }
             return;
-        } else if (true) {
+        } else if (canUsePackedAvx2) {
             int block = 0;
             int realGroup = (m - 1) / groupCnt + 1;            
             std::vector <float> values;
@@ -1522,14 +1524,18 @@ namespace fastllm {
                         sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
                     }
                     value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
-#elif defined(__AVX2__)
-                    value += DotU4U8(weightWalk + (i * m + st) / 2, inputWalk + st, end - st);
-                    j += (end - st);
 #endif
                     for (; j + 1 < end; j += 2) {
                         int id = (i * m + j) / 2;
                         value += (weightWalk[id] >> 4) * inputWalk[j];
                         value += (weightWalk[id] & 0xF) * inputWalk[j + 1];
+                    }
+                    for (; j < end; j++) {
+                        int id = (i * m + j) / 2;
+                        int q = ((i * m + j) & 1)
+                            ? (weightWalk[id] & 0xF)
+                            : (weightWalk[id] >> 4);
+                        value += q * inputWalk[j];
                     }
                 }
 

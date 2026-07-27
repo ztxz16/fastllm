@@ -39,6 +39,9 @@ namespace fastllm {
     // c: [n * k]的float32的结果矩阵  
     bool MatMulInt8Int4_AVX512VNNI(uint8_t *a, uint8_t *b, float *c, int n, int m, int k) {
 #ifdef __AVX512VNNI__
+        if (m % 64 != 0) {
+            return false;
+        }
         float *values = c;
 
         int block = 0;
@@ -149,6 +152,12 @@ namespace fastllm {
     bool MatMulInt8Int4Group_AVX512VNNI(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
         int group, int realGroup, int groupCnt, float *iscales, float *scales, float *izeros, float *weightMins) {
 #ifdef __AVX512VNNI__
+        // Every quantization group must be representable by complete VNNI
+        // blocks. Returning false selects the AVX2/scalar implementation with
+        // the matching 32-value input layout.
+        if (groupCnt <= 0 || groupCnt % 64 != 0 || m % 64 != 0) {
+            return false;
+        }
         float *values = c;
         int block = 0;
 

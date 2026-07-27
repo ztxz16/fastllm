@@ -398,12 +398,24 @@ namespace fastllm {
     extern int DotU4U8_AVX512VNNI(uint8_t *a, uint8_t *b, int n);
 
     int DotU4U8(uint8_t *a, uint8_t *b, int n) {
-         if (cpuInstructInfo.hasAVX512VNNI) {
+         if (cpuInstructInfo.hasAVX512VNNI && n % 64 == 0) {
             return DotU4U8_AVX512VNNI(a, b, n);
          }
+        if (n % 32 != 0) {
+            int ans = 0;
+            int i = 0;
+            for (; i + 1 < n; i += 2) {
+                uint8_t packed = a[i / 2];
+                ans += (packed >> 4) * b[i];
+                ans += (packed & 0xF) * b[i + 1];
+            }
+            if (i < n) {
+                ans += (a[i / 2] >> 4) * b[i];
+            }
+            return ans;
+        }
         __m256i acc = _mm256_setzero_si256();
         int i = 0;
-        int ans = 0;
         const __m256i lowMask = _mm256_set1_epi8(0xf);
         const __m256i ones = _mm256_set1_epi16(1);
         for (; i + 31 < n; i += 32) {
@@ -413,11 +425,7 @@ namespace fastllm {
             __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
             acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(by, bx), ones));
         }
-        for (; i < n; i++) {
-            ans += a[i] * b[i];
-        }
-
-        return ans + I32sum(acc);
+        return I32sum(acc);
     };
 #endif
 
@@ -5730,8 +5738,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             // min(..., 255.0)
             __m256 vClampedHigh = _mm256_min_ps(vClampedLow, vMax);
             
-            // Convert to int32 (truncate)
-            __m256i vInt32 = _mm256_cvtps_epi32(vClampedHigh);
+            // QuantizationAll adds 0.5 explicitly, so conversion must truncate
+            // to match the scalar LowBitConfig::quantization implementation.
+            __m256i vInt32 = _mm256_cvttps_epi32(vClampedHigh);
             
             // Pack into 16-bit integers
             __m128i vInt16 = _mm_packus_epi32(
@@ -5751,8 +5760,15 @@ ops += (long long)lines * inputDim * interDim * 2;
     }
 
 #ifdef __AVX2__
-    void Avx2InputPermute(uint8_t* output, int n, int m) {
-         if (cpuInstructInfo.hasAVX512VNNI) {
+    void Avx2InputPermute(uint8_t* output, int n, int m, int groupCnt) {
+        // The packed INT4 dot-product kernels consume a matching input layout:
+        // AVX512-VNNI works on 64 values at a time, while AVX2 works on 32.
+        // Keep quantization-group boundaries intact when choosing the layout.
+        if (groupCnt <= 0 || groupCnt % 32 != 0 || m % 32 != 0) {
+            return;
+        }
+        if (cpuInstructInfo.hasAVX512VNNI &&
+            groupCnt % 64 == 0 && m % 64 == 0) {
             uint8_t *temp = new uint8_t[64];
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j + 63 < m; j += 64) {
@@ -5852,7 +5868,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         if (permuteType == 1) {
             // for INT8 * INT4
 #ifdef __AVX2__
-            Avx2InputPermute(output, n, m);
+            Avx2InputPermute(output, n, m, groupCnt);
 #endif
         }
 

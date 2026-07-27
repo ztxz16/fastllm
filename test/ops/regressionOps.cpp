@@ -1862,11 +1862,12 @@ namespace {
         fastllm::ClearAllPagedCacheManagers();
     }
 
-    void RunCpuInt4GroupAwqLinearRegression() {
+    void RunCpuInt4GroupAwqLinearRegressionCase(int inputDim, int outputDim,
+                                                int groupCnt,
+                                                const std::string &caseName) {
         const int batch = 3;
-        const int inputDim = 2048;
-        const int outputDim = 1024;
-        const int groupCnt = 32;
+        Expect(inputDim % groupCnt == 0,
+               "CPU AWQ regression requires complete quantization groups.");
         const int group = inputDim / groupCnt;
 
         std::vector<float> inputValues((size_t)batch * inputDim);
@@ -1919,7 +1920,16 @@ namespace {
         }
 
         ExpectFloatNear(ToFloatVector(expected), ToFloatVector(actual),
-                        3e-2f, 2e-2f, "CPU AWQ-style INT4_GROUP linear");
+                        3e-2f, 2e-2f,
+                        "CPU AWQ-style INT4_GROUP linear " + caseName);
+    }
+
+    void RunCpuInt4GroupAwqLinearRegression() {
+        RunCpuInt4GroupAwqLinearRegressionCase(2048, 1024, 32, "group32");
+        RunCpuInt4GroupAwqLinearRegressionCase(384, 64, 64, "group64");
+        RunCpuInt4GroupAwqLinearRegressionCase(384, 64, 96, "group96");
+        RunCpuInt4GroupAwqLinearRegressionCase(384, 64, 128, "group128");
+        RunCpuInt4GroupAwqLinearRegressionCase(72, 64, 24, "scalar-group24");
     }
 
 #ifdef USE_CUDA
