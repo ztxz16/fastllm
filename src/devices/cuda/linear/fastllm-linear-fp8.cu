@@ -228,14 +228,16 @@ __global__ void FastllmGemvFP8E4M3Kernel1MultiRow(float *A, uint8_t *B, float *C
     }
     __syncthreads();
 
-    float diff = 0.0f;
+    float diff[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) {
             #pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
+                float other = sdata[x][tid + s] - diff[x];
                 float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
+                diff[x] = (sumTmp - sdata[x][tid]) - other;
                 sdata[x][tid] = sumTmp;
             }
         }
@@ -296,14 +298,16 @@ __global__ void FastllmGemvHalfFP8E4M3Kernel1MultiRow(half *A, uint8_t *B, half 
     }
     __syncthreads();
 
-    float diff = 0.0f;
+    float diff[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) {
             #pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
+                float other = sdata[x][tid + s] - diff[x];
                 float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
+                diff[x] = (sumTmp - sdata[x][tid]) - other;
                 sdata[x][tid] = sumTmp;
             }
         }
@@ -674,14 +678,16 @@ __global__ void FastllmGemvHalfFP8E4M3Block128Kernel1MultiRow(half *A, uint8_t *
     }
     __syncthreads();
 
-    float diff = 0.0f;
+    float diff[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) {
             #pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
+                float other = sdata[x][tid + s] - diff[x];
                 float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
+                diff[x] = (sumTmp - sdata[x][tid]) - other;
                 sdata[x][tid] = sumTmp;
             }
         }
@@ -1274,14 +1280,16 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
     }
     __syncthreads();
 
-    float diff = 0.0f;
+    float diff[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) {
             #pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
+                float other = sdata[x][tid + s] - diff[x];
                 float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
+                diff[x] = (sumTmp - sdata[x][tid]) - other;
                 sdata[x][tid] = sumTmp;
             }
         }
@@ -1642,14 +1650,16 @@ __global__ void FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow(__nv_bfloat16 *A, 
     }
     __syncthreads();
 
-    float diff = 0.0f;
+    float diff[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) {
             #pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
+                float other = sdata[x][tid + s] - diff[x];
                 float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
+                diff[x] = (sumTmp - sdata[x][tid]) - other;
                 sdata[x][tid] = sumTmp;
             }
         }

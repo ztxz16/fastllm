@@ -5108,15 +5108,18 @@ static bool FastllmCudaDeepSeekV4UpdateWindowKVCacheImpl(const fastllm::Data &kv
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     if (kv.dataType == fastllm::DataType::BFLOAT16) {
-        DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
+        DeepSeekV4UpdateWindowKVCacheKernel
+            <<<blocks, threads, 0, cudaStreamPerThread>>>(
             (__nv_bfloat16 *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim,
             startPos, windowSize, decodeMeta);
     } else if (kv.dataType == fastllm::DataType::FLOAT16) {
-        DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
+        DeepSeekV4UpdateWindowKVCacheKernel
+            <<<blocks, threads, 0, cudaStreamPerThread>>>(
             (half *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim,
             startPos, windowSize, decodeMeta);
     } else if (kv.dataType == fastllm::DataType::FLOAT32) {
-        DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
+        DeepSeekV4UpdateWindowKVCacheKernel
+            <<<blocks, threads, 0, cudaStreamPerThread>>>(
             (float *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim,
             startPos, windowSize, decodeMeta);
     } else {

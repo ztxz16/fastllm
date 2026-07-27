@@ -71,14 +71,16 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
         }
     }
     __syncthreads();
-    float diff = 0.0f;
+    float diff[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
+                float other = sdata[x][tid + s] - diff[x];
                 float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
+                diff[x] = (sumTmp - sdata[x][tid]) - other;
                 sdata[x][tid] = sumTmp;
             }
         }
@@ -141,14 +143,16 @@ __global__ void FastllmGemvFp16Bf16Kernel2MultiRow(half *A, __nv_bfloat16 *B, ha
         }
     }
     __syncthreads();
-    float diff = 0.0f;
+    float diff[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
+                float other = sdata[x][tid + s] - diff[x];
                 float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
+                diff[x] = (sumTmp - sdata[x][tid]) - other;
                 sdata[x][tid] = sumTmp;
             }
         }
@@ -210,14 +214,16 @@ __global__ void FastllmGemvFp32Bf16Kernel2MultiRow(float *A, __nv_bfloat16 *B, f
         }
     }
     __syncthreads();
-    float diff = 0.0f;
+    float diff[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
+                float other = sdata[x][tid + s] - diff[x];
                 float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
+                diff[x] = (sumTmp - sdata[x][tid]) - other;
                 sdata[x][tid] = sumTmp;
             }
         }
