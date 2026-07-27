@@ -202,7 +202,8 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "Qwen3NextForCausalLM",
         "MiniMaxM2ForCausalLM",
         "HYV3ForCausalLM",
-    ] or model_type in ["deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3"] or text_model_type == "qwen3_5_moe_text")
+        "LagunaForCausalLM",
+    ] or model_type in ["deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna"] or text_model_type == "qwen3_5_moe_text")
 
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
@@ -390,6 +391,7 @@ def make_normal_llm_model(args, startup_progress = None):
 
             if (architecture == 'Qwen3ForCausalLM' or architecture == 'Qwen3MoeForCausalLM' or
                 architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4' or
+                architecture == 'LagunaForCausalLM' or model_type == 'laguna' or
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
                 architecture == 'Glm4MoeForCausalLM' or architecture == 'GlmMoeDsaForCausalLM' or

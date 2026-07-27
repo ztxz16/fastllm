@@ -511,7 +511,12 @@ extern "C" {
 #ifdef USE_ROCM
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
-            if (model->model_type == "glm_moe_dsa") {
+            if (model->model_type == "laguna") {
+                // Laguna's late-layer activations exceed the finite FP16
+                // range, so its automatic CUDA activation type must retain
+                // the checkpoint's BF16 exponent range.
+                model->SetDataType(fastllm::DataType::BFLOAT16);
+            } else if (model->model_type == "glm_moe_dsa") {
                 model->SetDataType(fastllm::DataType::FLOAT32);
             } else if (model->use_new_engine
                 || model->model_struct == "chatglm" 
