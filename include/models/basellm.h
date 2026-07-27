@@ -357,6 +357,10 @@ namespace fastllm {
         // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
         virtual bool CanUseGPUForward() const;
 
+        // AutoWarmup 时将实际放在 NUMA 上的 MoE 专家权重全部注册，
+        // 避免未命中的专家在正式解码路径中触发首次分配和拷贝。
+        void WarmupNumaMoeWeights();
+
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
         virtual void AddPromptCache(const std::vector <int> &inputTokens);

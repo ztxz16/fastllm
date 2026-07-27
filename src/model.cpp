@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <cctype>
 #include <mutex>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include "chatglm.h"
 #include "moss.h"
@@ -60,6 +63,10 @@
 #endif
 
 namespace fastllm {
+#if defined(USE_NUMAS)
+    void RegisterNumas(fastllm::Data *data, std::string weightType);
+#endif
+
     std::string ReadAllFile(const std::string &fileName) {
         std::ifstream t(fileName.c_str(), std::ios::in);
         if (!t.good()) {
@@ -421,6 +428,103 @@ namespace fastllm {
             }
         }
         return "";
+    }
+
+    void basellm::WarmupNumaMoeWeights() {
+#if defined(USE_NUMAS)
+        struct PendingNumaWeight {
+            Data *data;
+            std::string weightType;
+        };
+        std::vector<PendingNumaWeight> pending;
+        uint64_t totalBytes = 0;
+        int moeSpecialCount = 0;
+        int numaSelectedCount = 0;
+        int foundWeightCount = 0;
+        int alreadyRegisteredCount = 0;
+
+        std::set<std::string> moeSpecialWeightNames = this->moeLinears;
+        for (const auto &mergeRule : this->weightMergeRules) {
+            for (const auto &rule : mergeRule.rules) {
+                for (const auto &input : rule.inputs) {
+                    if (this->moeLinears.find(input) != this->moeLinears.end()) {
+                        moeSpecialWeightNames.insert(rule.output);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (const auto &specialWeight : this->specialWeights) {
+            const std::string &weightName = specialWeight.first;
+            if (moeSpecialWeightNames.find(weightName) == moeSpecialWeightNames.end()) {
+                continue;
+            }
+            moeSpecialCount++;
+            auto layerIt = this->specialWeightLayerIds.find(weightName);
+            if (layerIt == this->specialWeightLayerIds.end() || layerIt->second < 0 ||
+                !DeviceNameMatchesType(this->SelectMoeDeviceForLayer(layerIt->second), "numa")) {
+                continue;
+            }
+            numaSelectedCount++;
+            auto weightIt = this->weight.weight.find(weightName);
+            if (weightIt == this->weight.weight.end()) {
+                continue;
+            }
+            foundWeightCount++;
+            Data &data = weightIt->second;
+            if (!data.numasData.empty()) {
+                alreadyRegisteredCount++;
+                continue;
+            }
+            AssertInFastLLM(
+                !data.isDiskWeight && data.cpuData != nullptr && data.dims.size() == 2,
+                "AutoWarmup can't register NUMA MoE weight: " + weightName + "\n");
+            pending.push_back({&data, specialWeight.second});
+            totalBytes += data.GetBytes();
+        }
+
+        if (std::getenv("FASTLLM_PROFILE_NUMAS_MOE") != nullptr) {
+            printf("[fastllm-profile-numas-moe] warmup_scan special=%zu moe_special=%d numa_selected=%d found=%d already_registered=%d pending=%zu\n",
+                   this->specialWeights.size(), moeSpecialCount, numaSelectedCount,
+                   foundWeightCount, alreadyRegisteredCount, pending.size());
+            fflush(stdout);
+        }
+
+        if (pending.empty()) {
+            return;
+        }
+
+        printf("[Fastllm] AutoWarmup NUMA MoE: registering %zu expert weights (%.2f GiB).\n",
+               pending.size(), totalBytes / 1024.0 / 1024.0 / 1024.0);
+        fflush(stdout);
+#if defined(__linux__) && defined(__GLIBC__)
+        // PrepareMoeWeights may just have released thousands of source gate/up
+        // buffers. Return those pages before allocating the NUMA copies, then
+        // trim periodically so the allocator cache does not inflate warmup RSS.
+        malloc_trim(0);
+#endif
+        int lastProgress = -1;
+        for (int i = 0; i < (int)pending.size(); i++) {
+            RegisterNumas(pending[i].data, pending[i].weightType);
+#if defined(__linux__) && defined(__GLIBC__)
+            if ((i + 1) % 256 == 0) {
+                malloc_trim(0);
+            }
+#endif
+            int progress = (i + 1) * 100 / (int)pending.size();
+            if (progress != lastProgress) {
+                printf("\r[Fastllm] AutoWarmup NUMA MoE: %d%%", progress);
+                fflush(stdout);
+                lastProgress = progress;
+            }
+        }
+#if defined(__linux__) && defined(__GLIBC__)
+        malloc_trim(0);
+#endif
+        printf("\n[Fastllm] AutoWarmup NUMA MoE: all expert weights registered.\n");
+        fflush(stdout);
+#endif
     }
 
     bool basellm::ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const {
@@ -2325,8 +2429,6 @@ namespace fastllm {
         return hasLayerId && pos < (int)weightName.size() && weightName[pos] == '.' &&
                layerId >= mainLayerCount;
     }
-
-    extern void RegisterNumas(fastllm::Data *data, std::string weightType);
 
     std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath) {
         std::vector <ReadGGUFTask> readGGUFTasks;

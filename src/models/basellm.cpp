@@ -3535,13 +3535,16 @@ namespace fastllm {
             }
         } autoWarmupRunningGuard(this);
         if (!this->use_new_engine) {
+            WarmupNumaMoeWeights();
             WarmUp();
+            WarmupNumaMoeWeights();
             return;
         }
 
         printf("Warmup...\n");
         fflush(stdout);
         Prepare();
+        WarmupNumaMoeWeights();
 
         int pageLen = fastllm::GetPageLen();
         int len = this->GetChunkedPrefillSize();
@@ -3653,6 +3656,9 @@ namespace fastllm {
             ClearAllPagedCacheManagers();
             FastllmCudaClearBigBuffer();
             printCudaWarmupPoolStats("weight warmup cleanup");
+            // 一次前向会补全模型在 PrepareMoeWeights 中延迟生成的
+            // gateup 等派生权重；此后即可把剩余 NUMA 专家全部注册。
+            WarmupNumaMoeWeights();
         }
 #endif
 
@@ -3678,6 +3684,9 @@ namespace fastllm {
         std::vector <GenerationConfig> generationConfigs = {generationConfig};
         LastTokensManager lastTokens;
         runWarmupForward(1, inputIds, attentionMasks, positionIdsVec, seqLens, pastKeyValues, generationConfigs, lastTokens);
+        // 无 CUDA weight warmup（或模型仍有延迟权重）时在这里兜底，
+        // 确保后续 batch/decode warmup 不再触发专家首次注册。
+        WarmupNumaMoeWeights();
 #ifdef USE_CUDA
         printCudaWarmupPoolStats("initial prefill");
 #endif

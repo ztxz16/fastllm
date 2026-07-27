@@ -3144,6 +3144,45 @@ namespace {
         Expect(numasWeights.routedDown.cpuData == nullptr, "routed down CPU buffer should be released after NUMA registration.");
     }
 
+    void RunNumaMoeWarmupRegistrationRegression() {
+        MoeAtypeConfigTestModel model;
+        model.block_cnt = 1;
+        model.moeDeviceMap = {{"numa", 1}};
+
+        const std::string gateName =
+            "model.layers.0.moe.experts.0.gate_proj.weight";
+        const std::string upName =
+            "model.layers.0.moe.experts.0.up_proj.weight";
+        const std::string expertName =
+            "model.layers.0.moe.experts.0.gateup_proj.weight";
+        const std::string ordinaryName =
+            "model.layers.0.self_attn.o_proj.weight";
+        constexpr int rows = 720720; // divisible by every practical NUMA count <= 16
+        std::vector<float> expertValues(rows, 0.25f);
+        std::vector<float> ordinaryValues(rows, 0.5f);
+        model.weight.weight[expertName].CopyFrom(
+            fastllm::Data(fastllm::DataType::FLOAT32, {rows, 1}, expertValues));
+        model.weight.weight[ordinaryName].CopyFrom(
+            fastllm::Data(fastllm::DataType::FLOAT32, {rows, 1}, ordinaryValues));
+        model.moeLinears.insert(gateName);
+        model.moeLinears.insert(upName);
+        model.weightMergeRules.push_back(fastllm::WeightMergeRule({
+            fastllm::WeightMergeRuleSingle(
+                {gateName, upName}, expertName, "linearSwiglu")
+        }));
+        model.AddSpecialWeight(expertName, "linearSwiglu", 0);
+        model.AddSpecialWeight(ordinaryName, "linearColumn", 0);
+
+        model.WarmupNumaMoeWeights();
+
+        const fastllm::Data &expert = model.weight.weight[expertName];
+        const fastllm::Data &ordinary = model.weight.weight[ordinaryName];
+        Expect(!expert.numasData.empty() && expert.cpuData == nullptr,
+               "AutoWarmup did not register the NUMA MoE expert weight.");
+        Expect(ordinary.numasData.empty() && ordinary.cpuData != nullptr,
+               "AutoWarmup incorrectly registered a non-MoE special weight.");
+    }
+
     void RunNumasInt4Group32MergeMoeRegression() {
         const int inputDim = 64;
         const int interDim = 64;
@@ -3268,6 +3307,8 @@ int main() {
         }
 
         if (fastllm::HasDeviceType("numa") && !fastllm::GetFastllmEnv().activateNuma) {
+            RunNumaMoeWarmupRegistrationRegression();
+            std::cout << "numa MoE full warmup registration regression: PASS\n";
             RunNumasMergeMoeRegression();
             std::cout << "numa MergeMOE regression: PASS\n";
             RunNumasInt4Group32MergeMoeRegression();
