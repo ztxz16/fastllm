@@ -67,6 +67,28 @@ namespace {
         }
     }
 
+    void ExpectMinOutputLengthLogits(const float *logits, int batch, int stride,
+                                     int eosTokenId, const std::vector<int> &resetLengths,
+                                     const std::string &device) {
+        constexpr float suppressedLogitUpperBound = -1.0e20f;
+        for (int b = 0; b < batch; b++) {
+            float eosLogit = logits[b * stride + eosTokenId];
+            if (resetLengths[b] > 0) {
+                Expect(eosLogit <= suppressedLogitUpperBound,
+                       device + " EOS was not suppressed for a request below min_tokens.");
+            } else {
+                Expect(eosLogit == 7.0f,
+                       device + " EOS was suppressed for a request that met min_tokens.");
+            }
+            for (int token = 0; token < stride; token++) {
+                if (token != eosTokenId) {
+                    Expect(logits[b * stride + token] == -3.0f,
+                           device + " reset changed a non-EOS logit.");
+                }
+            }
+        }
+    }
+
     void RunMoeAtypeConfigRegression() {
         MoeAtypeConfigTestModel model;
         Expect(!model.useCustomMoeAtype, "moe_atype should default to auto.");
@@ -125,20 +147,28 @@ namespace {
         Expect(resetLengths == std::vector<int>({3, 1, -1, 0}),
                "minimum output length did not use each request's KV cache length.");
 
-        std::vector<float> logits(batch * 5, -3.0f);
+        const int stride = 5;
+        std::vector<float> logits(batch * stride, -3.0f);
         for (int b = 0; b < batch; b++) {
-            logits[b * 5 + model.eos_token_id] = 7.0f;
+            logits[b * stride + model.eos_token_id] = 7.0f;
         }
         fastllm::Data logitsData(fastllm::DataType::FLOAT32,
-                                 {batch, 5}, logits);
+                                 {batch, stride}, logits);
         model.ResetLogitsOfEOS(batch, &logitsData, pastKeyValues, configs);
-        float *logitsPtr = (float*)logitsData.cpuData;
-        Expect(logitsPtr[model.eos_token_id] == 0.0f &&
-               logitsPtr[5 + model.eos_token_id] == 0.0f,
-               "EOS was not reset for requests below min_tokens.");
-        Expect(logitsPtr[10 + model.eos_token_id] == 7.0f &&
-               logitsPtr[15 + model.eos_token_id] == 7.0f,
-               "EOS was reset for requests that already met min_tokens.");
+        ExpectMinOutputLengthLogits((float*)logitsData.cpuData, batch, stride,
+                                    model.eos_token_id, resetLengths, "CPU");
+
+#ifdef USE_CUDA
+        if (fastllm::HasDeviceType("cuda")) {
+            fastllm::Data cudaLogitsData(fastllm::DataType::FLOAT32,
+                                         {batch, stride}, logits);
+            cudaLogitsData.ToDevice(fastllm::DataDevice::CUDA);
+            model.ResetLogitsOfEOS(batch, &cudaLogitsData, pastKeyValues, configs);
+            cudaLogitsData.ToDevice(fastllm::DataDevice::CPU);
+            ExpectMinOutputLengthLogits((float*)cudaLogitsData.cpuData, batch, stride,
+                                        model.eos_token_id, resetLengths, "CUDA");
+        }
+#endif
     }
 
 #ifdef USE_CUDA

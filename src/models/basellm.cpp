@@ -3422,11 +3422,11 @@ namespace fastllm {
                 if (config.output_token_least > cacheLen - config.input_token_length) {
                     ToDataType(*logits, DataType::FLOAT32);
                     float *logit = ((float*)logits->cpuData) + logits->Count(0) / batch * b;
-                    logit[this->eos_token_id] = 0;
+                    logit[this->eos_token_id] = -1.0e30f;
                     for (auto id: this->eos_token_ids)
-                        logit[id] = 0;
+                        logit[id] = -1.0e30f;
                     for (auto id: config.stop_token_ids)
-                        logit[id] = 0;
+                        logit[id] = -1.0e30f;
                 }
             }
         }
@@ -3490,11 +3490,11 @@ namespace fastllm {
                 auto &config = generationConfigs[b];
                 if (resetLengths[b] > 0) {
                     float *logit = ((float*)logits->cpuData) + logits->Count(0) / batch * b;
-                    logit[this->eos_token_id] = 0;
+                    logit[this->eos_token_id] = -1.0e30f;
                     for (auto id: this->eos_token_ids)
-                        logit[id] = 0;
+                        logit[id] = -1.0e30f;
                     for (auto id: config.stop_token_ids)
-                        logit[id] = 0;
+                        logit[id] = -1.0e30f;
                 }
             }
         }

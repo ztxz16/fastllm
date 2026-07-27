@@ -10137,7 +10137,7 @@ __global__ void FastllmCudaResetLogitsOfEOS(int batch, int stride, float *logits
     for (int b = 0; b < batch; b++) {
         if (res_lens[b] > 0) {
             for (int i = 0; i < eos_nums[b]; i++) {
-                logits[stride * b + eos_ids[base + i]] = 0;
+                logits[stride * b + eos_ids[base + i]] = -1.0e30f;
             }
         }
         base += eos_nums[b];
@@ -10177,7 +10177,7 @@ __global__ void FastllmCudaResetLogitsOfEOSAll(int total, int eos_num, int strid
     }
     int b = idx / eos_num;
     int e = idx - b * eos_num;
-    logits[stride * b + eos_ids[e]] = 0;
+    logits[stride * b + eos_ids[e]] = -1.0e30f;
 }
 
 void FastllmResetLogitsOfEOSAll(int batch, fastllm::Data *logits, const std::vector<int> &eos_ids) {

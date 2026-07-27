@@ -635,7 +635,7 @@ namespace fastllm {
             logits.Print();
         }
 
-        if (allSimple) {
+        if (allSimple && !needLogits) {
             Data topk;
             TopK(logits, topk, 1);
             topk.ToDevice(DataDevice::CPU);
