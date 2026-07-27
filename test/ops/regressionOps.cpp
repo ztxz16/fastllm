@@ -501,8 +501,8 @@ namespace {
     }
 
     void RunCpuPackedInt4Group32KernelRegression() {
-        constexpr int n = 5;
-        constexpr int m = 96;
+        constexpr int n = 31;
+        constexpr int m = 128;
         constexpr int k = 5;
         constexpr int groupCnt = 32;
         constexpr int groups = m / groupCnt;
@@ -579,12 +579,23 @@ namespace {
             }
         }
 
-        Expect(fastllm::LinearINT8GROUP32_INT4GROUP32_Kernel(
-                   input.data(), weight.data(), nullptr, actual.data(),
-                   n, m, k, 0, k),
-               "packed INT4_GROUP(32) kernel rejected a valid shape.");
-        ExpectFloatNear(expected, actual, 1e-4f, 1e-5f,
-                        "packed INT4_GROUP(32) kernel");
+        // Exercise the dedicated n=1 decode path, every templated batched
+        // remainder, and multiple row blocks. All of them share the optimized
+        // compact pair-unpack primitive.
+        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8,
+                          9, 15, 16, 17, 23, 24, 25, 31}) {
+            std::fill(actual.begin(), actual.end(), 0.0f);
+            Expect(fastllm::LinearINT8GROUP32_INT4GROUP32_Kernel(
+                       input.data(), weight.data(), nullptr, actual.data(),
+                       batch, m, k, 0, k),
+                   "packed INT4_GROUP(32) kernel rejected a valid small batch.");
+            std::vector<float> batchExpected(
+                expected.begin(), expected.begin() + (size_t)batch * k);
+            std::vector<float> batchActual(
+                actual.begin(), actual.begin() + (size_t)batch * k);
+            ExpectFloatNear(batchExpected, batchActual, 1e-4f, 1e-5f,
+                            "packed INT4_GROUP(32) small-batch kernel");
+        }
 
         // Cover the parallel FLOAT32 -> INF_INT8_GROUP32 conversion used by
         // larger prefill batches before the compact kernel runs.

@@ -1117,6 +1117,28 @@ namespace fastllm {
     }
 
 #ifdef __AVX512VNNI__
+    __attribute__((always_inline)) inline __m512i
+    UnpackInt4Group32Pair_AVX512VNNI(const uint8_t *packedData) {
+        // Two neighboring group-32 payloads are contiguous in every compact
+        // four-group block. Unpack both with one 256-bit load and lane-local
+        // shuffles, producing 64 unsigned nibble values in their original
+        // order. This path is shared by decode and all batched row kernels.
+        const __m256i packed = _mm256_loadu_si256(
+            (const __m256i*)packedData);
+        const __m256i nibbleMask = _mm256_set1_epi8(0x0f);
+        const __m256i low = _mm256_and_si256(packed, nibbleMask);
+        const __m256i high = _mm256_and_si256(
+            _mm256_srli_epi16(packed, 4), nibbleMask);
+        const __m256i firstHalf = _mm256_unpacklo_epi8(high, low);
+        const __m256i secondHalf = _mm256_unpackhi_epi8(high, low);
+        const __m256i group0 = _mm256_permute2x128_si256(
+            firstHalf, secondHalf, 0x20);
+        const __m256i group1 = _mm256_permute2x128_si256(
+            firstHalf, secondHalf, 0x31);
+        __m512i unpacked = _mm512_castsi256_si512(group0);
+        return _mm512_inserti64x4(unpacked, group1, 1);
+    }
+
     template <int ROWS>
     __attribute__((always_inline)) inline void
     LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows(
@@ -1125,7 +1147,6 @@ namespace fastllm {
             int groups, size_t inputRowBytes, int k) {
         constexpr int groupCnt = 32;
         constexpr size_t inputGroupBytes = groupCnt + sizeof(float) + sizeof(int);
-        const __m128i nibbleMask = _mm_set1_epi8(0x0f);
         __m512 accum[ROWS];
         float correction[ROWS];
 #pragma unroll
@@ -1138,32 +1159,15 @@ namespace fastllm {
         for (; group + 1 < groups; group += 2) {
             const uint8_t *weightBlock0 = weightRow +
                 GetInt4Group32DataOffset(group, groups);
-            const uint8_t *weightBlock1 = weightRow +
-                GetInt4Group32DataOffset(group + 1, groups);
-            const __m128i packed0 = _mm_loadu_si128(
-                (const __m128i*)weightBlock0);
-            const __m128i packed1 = _mm_loadu_si128(
-                (const __m128i*)weightBlock1);
-            const __m128i low0 = _mm_and_si128(packed0, nibbleMask);
-            const __m128i high0 = _mm_and_si128(
-                _mm_srli_epi16(packed0, 4), nibbleMask);
-            const __m128i low1 = _mm_and_si128(packed1, nibbleMask);
-            const __m128i high1 = _mm_and_si128(
-                _mm_srli_epi16(packed1, 4), nibbleMask);
-            const __m256i q0 = _mm256_set_m128i(
-                _mm_unpackhi_epi8(high0, low0),
-                _mm_unpacklo_epi8(high0, low0));
-            const __m256i q1 = _mm256_set_m128i(
-                _mm_unpackhi_epi8(high1, low1),
-                _mm_unpacklo_epi8(high1, low1));
-            __m512i weights = _mm512_castsi256_si512(q0);
-            weights = _mm512_inserti64x4(weights, q1, 1);
+            const __m512i weights =
+                UnpackInt4Group32Pair_AVX512VNNI(weightBlock0);
+            const size_t scaleOffset =
+                GetInt4Group32ScaleOffset(group, groups);
             const float weightScale0 = BFloat16BitsToFloat32(
-                *(const uint16_t*)(weightRow +
-                    GetInt4Group32ScaleOffset(group, groups)));
+                *(const uint16_t*)(weightRow + scaleOffset));
             const float weightScale1 = BFloat16BitsToFloat32(
-                *(const uint16_t*)(weightRow +
-                    GetInt4Group32ScaleOffset(group + 1, groups)));
+                *(const uint16_t*)(weightRow + scaleOffset +
+                                   sizeof(uint16_t)));
 
 #pragma unroll
             for (int rowOffset = 0; rowOffset < ROWS; rowOffset++) {
@@ -1242,14 +1246,6 @@ namespace fastllm {
             int rowBase, int out, int groups, size_t inputRowBytes, int k) {
         constexpr int groupCnt = 32;
         constexpr size_t inputGroupBytes = groupCnt + sizeof(float) + sizeof(int);
-        const __m128i nibbleMask = _mm_set1_epi8(0x0f);
-        auto unpackInt4 = [nibbleMask](__m128i packed) {
-            const __m128i low = _mm_and_si128(packed, nibbleMask);
-            const __m128i high = _mm_and_si128(
-                _mm_srli_epi16(packed, 4), nibbleMask);
-            return _mm256_set_m128i(_mm_unpackhi_epi8(high, low),
-                                    _mm_unpacklo_epi8(high, low));
-        };
         __m512 accum0[ROWS], accum1[ROWS];
         float correction0[ROWS], correction1[ROWS];
 #pragma unroll
@@ -1265,25 +1261,14 @@ namespace fastllm {
         for (int group = 0; group < groups; group += 2) {
             const size_t dataOffset0 =
                 GetInt4Group32DataOffset(group, groups);
-            const size_t dataOffset1 =
-                GetInt4Group32DataOffset(group + 1, groups);
-            const __m256i q00 = unpackInt4(_mm_loadu_si128(
-                (const __m128i*)(weightRow0 + dataOffset0)));
-            const __m256i q01 = unpackInt4(_mm_loadu_si128(
-                (const __m128i*)(weightRow0 + dataOffset1)));
-            const __m256i q10 = unpackInt4(_mm_loadu_si128(
-                (const __m128i*)(weightRow1 + dataOffset0)));
-            const __m256i q11 = unpackInt4(_mm_loadu_si128(
-                (const __m128i*)(weightRow1 + dataOffset1)));
-            __m512i weights0 = _mm512_castsi256_si512(q00);
-            weights0 = _mm512_inserti64x4(weights0, q01, 1);
-            __m512i weights1 = _mm512_castsi256_si512(q10);
-            weights1 = _mm512_inserti64x4(weights1, q11, 1);
+            const __m512i weights0 =
+                UnpackInt4Group32Pair_AVX512VNNI(weightRow0 + dataOffset0);
+            const __m512i weights1 =
+                UnpackInt4Group32Pair_AVX512VNNI(weightRow1 + dataOffset0);
 
             const size_t scaleOffset0 =
                 GetInt4Group32ScaleOffset(group, groups);
-            const size_t scaleOffset1 =
-                GetInt4Group32ScaleOffset(group + 1, groups);
+            const size_t scaleOffset1 = scaleOffset0 + sizeof(uint16_t);
             const float weightScale00 = BFloat16BitsToFloat32(
                 *(const uint16_t*)(weightRow0 + scaleOffset0));
             const float weightScale01 = BFloat16BitsToFloat32(
@@ -1367,101 +1352,20 @@ namespace fastllm {
         const int groups = m / groupCnt;
         const size_t inputRowBytes = GetDataBytes(DataType::INF_INT8_GROUP32, 1, m);
         const size_t weightRowBytes = GetDataBytes(DataType::INT4_GROUP32, 1, m);
-        const __m128i nibbleMask = _mm_set1_epi8(0x0f);
-
-        auto unpackInt4 = [nibbleMask](__m128i packed) {
-            __m128i low = _mm_and_si128(packed, nibbleMask);
-            __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), nibbleMask);
-            return _mm256_set_m128i(_mm_unpackhi_epi8(high, low),
-                                    _mm_unpacklo_epi8(high, low));
-        };
-
-        // Decode is overwhelmingly n == 1.  Keep that case separate so the
-        // compiler does not materialize the four-row accumulator arrays on
-        // the stack for every output row.
         if (n == 1) {
-            const uint8_t *inputRow = inputData;
             for (int out = st; out < end; out++) {
-                const uint8_t *weightRow = weightData + (size_t)out * weightRowBytes;
-                __m512 accum = _mm512_setzero_ps();
-                float correction = 0.0f;
-                int group = 0;
-                for (; group + 1 < groups; group += 2) {
-                    const uint8_t *weightBlock0 = weightRow +
-                        GetInt4Group32DataOffset(group, groups);
-                    const uint8_t *weightBlock1 = weightRow +
-                        GetInt4Group32DataOffset(group + 1, groups);
-                    __m128i packed0 = _mm_loadu_si128(
-                        (const __m128i*)weightBlock0);
-                    __m128i packed1 = _mm_loadu_si128(
-                        (const __m128i*)weightBlock1);
-                    __m256i q0 = unpackInt4(packed0);
-                    __m256i q1 = unpackInt4(packed1);
-                    __m512i weights = _mm512_castsi256_si512(q0);
-                    weights = _mm512_inserti64x4(weights, q1, 1);
-
-                    const uint8_t *input0 = inputRow +
-                        (size_t)group * inputGroupBytes;
-                    const uint8_t *input1 = input0 + inputGroupBytes;
-                    __m256i a0 = _mm256_loadu_si256((const __m256i*)input0);
-                    __m256i a1 = _mm256_loadu_si256((const __m256i*)input1);
-                    __m512i activations = _mm512_castsi256_si512(a0);
-                    activations = _mm512_inserti64x4(activations, a1, 1);
-                    __m512i dots = _mm512_dpbusd_epi32(
-                        _mm512_setzero_si512(), weights, activations);
-
-                    const float scale0 = *(const float*)(input0 + groupCnt) *
-                        BFloat16BitsToFloat32(
-                            *(const uint16_t*)(weightRow +
-                                GetInt4Group32ScaleOffset(group, groups)));
-                    const float scale1 = *(const float*)(input1 + groupCnt) *
-                        BFloat16BitsToFloat32(
-                            *(const uint16_t*)(weightRow +
-                                GetInt4Group32ScaleOffset(group + 1, groups)));
-                    __m512 coefficients = _mm512_mask_blend_ps(
-                        (__mmask16)0xff00, _mm512_set1_ps(scale0),
-                        _mm512_set1_ps(scale1));
-                    accum = _mm512_fmadd_ps(
-                        _mm512_cvtepi32_ps(dots), coefficients, accum);
-
-                    const int sum0 = *(const int*)(
-                        input0 + groupCnt + sizeof(float));
-                    const int sum1 = *(const int*)(
-                        input1 + groupCnt + sizeof(float));
-                    correction -=
-                        8.0f * ((float)sum0 * scale0 + (float)sum1 * scale1);
-                }
-
-                float total = _mm512_reduce_add_ps(accum) + correction;
-                if (group < groups) {
-                    const uint8_t *inputGroup = inputRow +
-                        (size_t)group * inputGroupBytes;
-                    const int8_t *values = (const int8_t*)inputGroup;
-                    const uint8_t *packed = weightRow +
-                        GetInt4Group32DataOffset(group, groups);
-                    int dot = 0;
-                    for (int i = 0; i < groupCnt; i += 2) {
-                        dot += values[i] * (packed[i / 2] >> 4) +
-                               values[i + 1] * (packed[i / 2] & 0x0f);
-                    }
-                    const float scale = *(const float*)(inputGroup + groupCnt) *
-                        BFloat16BitsToFloat32(
-                            *(const uint16_t*)(weightRow +
-                                GetInt4Group32ScaleOffset(group, groups)));
-                    const int sum = *(const int*)(
-                        inputGroup + groupCnt + sizeof(float));
-                    total += (dot - 8 * sum) * scale;
-                }
-                if (biasData != nullptr) {
-                    total += biasData[out];
-                }
-                outputData[out] = total;
+                const uint8_t *weightRow =
+                    weightData + (size_t)out * weightRowBytes;
+                LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<1>(
+                    inputData, weightRow, biasData, outputData, 0, out,
+                    groups, inputRowBytes, k);
             }
             return true;
         }
 
-        // Block two output rows together for prefill so both dot products reuse
-        // the same activation loads. Decode keeps the dedicated n == 1 path.
+        // For batched rows, block two output rows together so both dot products
+        // reuse activation loads, scales and sums. Both this path and the
+        // dedicated n == 1 path above share the compact pair-unpack helper.
         constexpr int inputBlock = 8;
         int out = st;
         if ((groups & 1) == 0) {
