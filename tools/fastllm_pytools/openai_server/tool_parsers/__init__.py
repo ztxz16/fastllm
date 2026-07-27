@@ -18,6 +18,7 @@ from .kimi_k2_tool_parser import KimiK2ToolParser
 #from .llama_tool_parser import Llama3JsonToolParser
 #from .minimax_tool_parser import MinimaxToolParser
 from .minimax_m2_tool_parser import MinimaxM2ToolParser
+from .poolside_v1_tool_parser import PoolsideV1ToolParser
 #from .mistral_tool_parser import MistralToolParser
 #from .phi4mini_tool_parser import Phi4MiniJsonToolParser
 #from .pythonic_tool_parser import PythonicToolParser
@@ -45,6 +46,7 @@ __all__ = [
     #"xLAMToolParser",
     #"MinimaxToolParser",
     "MinimaxM2ToolParser",
+    "PoolsideV1ToolParser",
     "KimiK2ToolParser",
     #"HunyuanA13BToolParser",
     "Glm4MoeModelToolParser",

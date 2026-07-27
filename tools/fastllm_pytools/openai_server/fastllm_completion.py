@@ -229,6 +229,18 @@ class FastLLmCompletion:
   def _is_deepseek_v4_reasoning_response(self, enable_thinking: bool) -> bool:
       return enable_thinking and self._is_deepseek_v4_model()
 
+  def _is_poolside_reasoning_response(self, enable_thinking: bool) -> bool:
+      if not enable_thinking or getattr(self.model, "force_chat_template", False):
+          return False
+      try:
+          return bool(self.model._is_laguna())
+      except Exception:
+          return False
+
+  def _uses_tagged_reasoning_response(self, enable_thinking: bool) -> bool:
+      return (self._is_deepseek_v4_reasoning_response(enable_thinking)
+              or self._is_poolside_reasoning_response(enable_thinking))
+
   def _normalize_model_delta(self, text: str) -> str:
       if text == "[unused16]":
           return "<think>"
@@ -2252,7 +2264,7 @@ class FastLLmCompletion:
       # --think 是用户显式指定"在输出前补 <think>\n 起始标签"的开关，
       # 严格按用户意愿执行，与 enable_thinking（是否进入思考模式）解耦。
       need_think_prefix = self.think
-      emit_reasoning_content = self._is_deepseek_v4_reasoning_response(enable_thinking)
+      emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
       # Streaming response
       if request.stream:
           return (self.chat_completion_stream_generator(

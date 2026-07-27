@@ -234,7 +234,7 @@ class ToolParserManager:
             elif ("<tool_call>" in chat_template
                   and "<arg_key>" in chat_template
                   and "<arg_value>" in chat_template):
-                target = "glm47"
+                target = "poolside_v1" if model_type == "laguna" else "glm47"
             elif is_qwen_xml_tool_template(chat_template):
                 target = "qwen3_coder"
             if (target == ""):
@@ -249,7 +249,9 @@ class ToolParserManager:
             print("Auto tool parse detect type: " + target)
             return cls.get_tool_parser(target)
 
-        if (model_type == 'qwen3' or model_type == 'qwen2' or model_type == 'qwen3_moe'
+        if model_type == 'laguna':
+            target = 'poolside_v1'
+        elif (model_type == 'qwen3' or model_type == 'qwen2' or model_type == 'qwen3_moe'
             or model_type == "qwen3_next" or model_type == "qwen3_5"
             or model_type == "qwen3_5_text" or model_type == "qwen3_5_moe"
             or model_type == "qwen3_5_moe_text"):

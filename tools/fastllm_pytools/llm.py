@@ -1372,6 +1372,15 @@ class model:
         except Exception:
             return False
 
+    def _is_laguna(self) -> bool:
+        if self._get_architecture() in {"LagunaForCausalLM", "LagunaForConditionalGeneration"}:
+            return True
+        try:
+            mt = self.config.get("model_type", "") if isinstance(getattr(self, "config", None), dict) else ""
+            return str(mt) == "laguna"
+        except Exception:
+            return False
+
     def _has_hf_chat_template(self) -> bool:
         if self.hf_tokenizer is None:
             return False
