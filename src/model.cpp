@@ -2817,27 +2817,6 @@ namespace fastllm {
                 printf("[Fastllm] AWQ: keep unquantized floating-point tensors in source dtype.\n");
             }
 
-            // A packed NVFP4 checkpoint only quantizes the tensors selected by
-            // its compression config.  Keep the remaining linear weights in
-            // the checkpoint's declared floating-point type when the caller
-            // uses --dtype auto.  Otherwise BF16 weights are silently changed
-            // to FP16 while Laguna keeps BF16 activations, creating a slower
-            // mixed-dtype path and unnecessarily changing model numerics.
-            if (modelType == "laguna" &&
-                linearDataType == DataType::DATA_AUTO_SOURCE &&
-                !config["quantization_config"].is_null()) {
-                std::string format = config["quantization_config"]["format"].string_value();
-                if (format.find("nvfp4") != std::string::npos) {
-                    std::string sourceDataType = config["dtype"].string_value();
-                    if (sourceDataType.empty()) {
-                        sourceDataType = config["torch_dtype"].string_value();
-                    }
-                    if (sourceDataType == "bfloat16" || sourceDataType == "bf16") {
-                        linearDataType = DataType::BFLOAT16;
-                        printf("[Fastllm] NVFP4 auto dtype: keep unquantized linear weights as BF16.\n");
-                    }
-                }
-            }
         }
         basellm *model = CreateModelWithType(modelType);
         if (isJsonModel) {

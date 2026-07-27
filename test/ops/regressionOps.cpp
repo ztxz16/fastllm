@@ -1,5 +1,6 @@
 #include "executor.h"
 #include "fastllm.h"
+#include "model.h"
 #include "models/basellm.h"
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
@@ -14,10 +15,12 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -30,6 +33,36 @@
 #include <vector>
 
 namespace {
+    class ScopedTempDirectory {
+    public:
+        explicit ScopedTempDirectory(const std::string &prefix) {
+            uint64_t nonce = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            for (int attempt = 0; attempt < 100; attempt++) {
+                std::error_code error;
+                auto candidate = std::filesystem::temp_directory_path() /
+                    (prefix + std::to_string(nonce) + "_" + std::to_string(attempt));
+                if (std::filesystem::create_directory(candidate, error)) {
+                    path = std::move(candidate);
+                    return;
+                }
+            }
+            throw std::runtime_error("failed to create unique regression temp directory.");
+        }
+
+        ~ScopedTempDirectory() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+
+        const std::filesystem::path &Path() const {
+            return path;
+        }
+
+    private:
+        std::filesystem::path path;
+    };
+
     class MoeAtypeConfigTestModel final : public fastllm::basellm {
     public:
         std::string MakeInput(const std::string &, int, const std::string &) override {
@@ -109,6 +142,87 @@ namespace {
         model.SetMoeAtype(fastllm::DataType::DATA_AUTO_NONE);
         Expect(!model.useCustomMoeAtype,
                "auto moe_atype did not reset a previous bfloat16 configuration.");
+    }
+
+    void WriteLagunaAutoDtypeFixture(const std::filesystem::path &path) {
+        const std::string config = R"JSON({
+            "model_type": "laguna",
+            "architectures": ["LagunaForCausalLM"],
+            "eos_token_id": 2,
+            "torch_dtype": "bfloat16",
+            "quantization_config": {
+                "format": "nvfp4-pack-quantized",
+                "quant_method": "compressed-tensors"
+            },
+            "num_hidden_layers": 1,
+            "hidden_size": 4,
+            "head_dim": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "num_attention_heads_per_layer": [2],
+            "layer_types": ["full_attention"],
+            "intermediate_size": 4,
+            "moe_intermediate_size": 4,
+            "shared_expert_intermediate_size": 4,
+            "num_experts": 1,
+            "num_experts_per_tok": 1,
+            "max_position_embeddings": 8,
+            "sliding_window": 4
+        })JSON";
+        {
+            std::ofstream output(path / "config.json");
+            Expect(output.good(), "failed to create Laguna dtype fixture config.");
+            output << config;
+        }
+
+        const std::string packedName =
+            "model.layers.0.mlp.experts.0.down_proj.weight_packed";
+        const std::string scaleName =
+            "model.layers.0.mlp.experts.0.down_proj.weight_scale";
+        std::string header =
+            "{\"lm_head.weight\":{\"dtype\":\"BF16\",\"shape\":[2,4],\"data_offsets\":[0,16]},"
+            "\"" + packedName + "\":{\"dtype\":\"U8\",\"shape\":[4,2],\"data_offsets\":[16,24]},"
+            "\"" + scaleName + "\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[24,25]}}";
+        while (header.size() % 8 != 0) {
+            header.push_back(' ');
+        }
+
+        std::ofstream output(path / "model.safetensors", std::ios::binary);
+        Expect(output.good(), "failed to create Laguna dtype fixture weights.");
+        uint64_t headerSize = header.size();
+        output.write(reinterpret_cast<const char*>(&headerSize), sizeof(headerSize));
+        output.write(header.data(), header.size());
+        const std::vector<uint8_t> payload(25, 0);
+        output.write(reinterpret_cast<const char*>(payload.data()), payload.size());
+        Expect(output.good(), "failed to write Laguna dtype fixture weights.");
+    }
+
+    void RunLagunaNVFP4AutoDtypeRegression() {
+        ScopedTempDirectory temp("fastllm_laguna_nvfp4_auto_");
+        WriteLagunaAutoDtypeFixture(temp.Path());
+
+        auto model = fastllm::CreateLLMModelFromHF(
+            temp.Path().string(), fastllm::DataType::DATA_AUTO_SOURCE,
+            -1, true);
+        Expect(model != nullptr && model->model_type == "laguna",
+               "Laguna dtype fixture did not create a Laguna model.");
+
+        const std::string packedWeight =
+            "model.layers.0.moe.experts.0.down_proj.weight";
+        auto packed = model->weight.weight.find(packedWeight);
+        Expect(packed != model->weight.weight.end(),
+               "packed Laguna expert weight was not loaded.");
+        Expect(packed->second.dataType == fastllm::DataType::NVFP4,
+               "Laguna auto dtype did not preserve packed NVFP4 expert weight.");
+        Expect(packed->second.blockK == 4 && packed->second.blockM == 4 &&
+                   packed->second.scales.empty(),
+               "Laguna auto dtype did not preserve compact NVFP4 metadata.");
+
+        auto unquantized = model->weight.weight.find("lm_head.weight");
+        Expect(unquantized != model->weight.weight.end(),
+               "unquantized Laguna linear weight was not loaded.");
+        Expect(unquantized->second.dataType == fastllm::DataType::FLOAT16,
+               "Laguna auto dtype unexpectedly overrode the standard linear dtype.");
     }
 
     void RunPerRequestMinOutputLengthRegression() {
@@ -2648,6 +2762,9 @@ int main() {
         RunMoeAtypeConfigRegression();
         std::cout << "moe_atype auto/explicit configuration regression: PASS\n";
         ranAny = true;
+
+        RunLagunaNVFP4AutoDtypeRegression();
+        std::cout << "Laguna NVFP4 auto dtype regression: PASS\n";
 
         RunPerRequestMinOutputLengthRegression();
         std::cout << "per-request minimum output length regression: PASS\n";
