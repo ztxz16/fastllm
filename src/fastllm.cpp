@@ -524,7 +524,9 @@ namespace fastllm {
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
+        {DataType::INT4_GROUP32, {"int4_group32"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
+        {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
         {DataType::DATA_AUTO_EMBEDDING, {"data_auto_embedding"}}, {DataType::DATA_AUTO_CONV, {"data_auto_conv"}},
         {DataType::DATA_AUTO_SOURCE, {"auto"}}
@@ -620,6 +622,12 @@ namespace fastllm {
             rows *= (columns / 128);
             columns = 128;
             return rows * (columns / 2 + 2 * sizeof(float));
+        } else if (type == DataType::INT4_GROUP32) {
+            AssertInFastLLM(columns % 32 == 0,
+                            "INT4_GROUP32 columns should be divisible by 32.\n");
+            // Four groups per block: [packed INT4] [BF16 scales], without
+            // padding in the final partial block. This is still 18 bytes/group.
+            return rows * (columns / 2 + columns / 32 * sizeof(uint16_t));
         } else if (type == DataType::AWQ_4BIT_128) {
             int groups = (columns - 1) / 128 + 1;
             size_t colBytes = columns / 2 + groups + groups * sizeof(float);
@@ -629,6 +637,9 @@ namespace fastllm {
             return rows * colBytes;
         } else if (type == DataType::INF_INT8_GROUP128) {
             size_t colBytes = (columns / 128) * (128 + sizeof(float) + sizeof(int)); // [int8 values] + scale + sum
+            return rows * colBytes;
+        } else if (type == DataType::INF_INT8_GROUP32) {
+            size_t colBytes = (columns / 32) * (32 + sizeof(float) + sizeof(int));
             return rows * colBytes;
         } else if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
             size_t colBytes = ggml_row_size((ggml_type)(type - DataType::DATA_GGUF_FORMAT), columns);
@@ -1283,11 +1294,19 @@ namespace fastllm {
         data.weightType = weightType;
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
-             dataType == DataType::NVFP4_BLOCK_16_E8M0)) {
+             dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             dataType == DataType::INT4_GROUP32)) {
             this->blockK = blockK;
             this->blockM = blockM;
             if (dataType == DataType::NVFP4) {
                 this->scales.clear();
+            }
+            if (dataType == DataType::INT4_GROUP32) {
+                AssertInFastLLM(this->dims.size() == 2 && this->dims[1] % 32 == 0,
+                                "INT4_GROUP32 requires a 2D weight with columns divisible by 32.\n");
+                this->perChannelAxis = 0;
+                this->groupCnt = 32;
+                this->group = this->dims[1] / 32;
             }
             data.UpdateUnitSize();
             data.Allocate(false);
@@ -1542,6 +1561,14 @@ namespace fastllm {
     }
 
     void Data::UpdateUnitSize() {
+        if (this->dataType == DataType::INT4_GROUP32 && this->dims.size() >= 2) {
+            const int columns = this->dims.back();
+            AssertInFastLLM(columns % 32 == 0,
+                            "INT4_GROUP32 columns should be divisible by 32.\n");
+            this->perChannelAxis = 0;
+            this->groupCnt = 32;
+            this->group = columns / 32;
+        }
         if (this->dataType == DataType::FLOAT32) {
             this->unitSize = 4;
             this->unitSizeDiv = 1;
@@ -1559,7 +1586,8 @@ namespace fastllm {
             this->unitSizeDiv = 2;
         } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
-                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
+                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::INT4_GROUP32) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT4 
@@ -1586,7 +1614,8 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -1809,7 +1838,8 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             return GetDataBytes(this->dataType, rows, columns);
@@ -1826,7 +1856,8 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -2684,6 +2715,8 @@ namespace fastllm {
             int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
             ret += k * this->group * 2 * sizeof(float);
             ret += this->GetBytes();
+        } else if (this->dataType == INT4_GROUP32) {
+            ret += this->GetBytes();
         } else if (this->dataType == DATA_GGUF_FORMAT) {
             ret += sizeof(int);
             ret += this->GetBytes();
@@ -2741,6 +2774,8 @@ namespace fastllm {
                 writer.WriteFloat(this->mins[i]);
                 writer.WriteFloat(this->scales[i]);
             }
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == INT4_GROUP32) {
             writer.WriteBytes(this->cpuData, this->GetBytes());
         } else if (this->dataType == DATA_GGUF_FORMAT) {
             writer.WriteInt(this->ggmlType);
@@ -2818,6 +2853,13 @@ namespace fastllm {
                     // this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
                 }
                 reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == INT4_GROUP32) {
+                AssertInFastLLM(this->dims.size() == 2 && this->dims[1] % 32 == 0,
+                                "CreateFromFastllmFormat: invalid INT4_GROUP32 shape.\n");
+                this->perChannelAxis = 0;
+                this->groupCnt = 32;
+                this->group = this->dims[1] / 32;
+                reader.ReadBytes(this->cpuData, this->GetBytes());
             } else if (this->dataType == DATA_GGUF_FORMAT) {
                 reader.ReadBytes(this->cpuData, this->GetBytes());
             } else if (this->dataType == INT32 || this->dataType == INT32PARAM) {
@@ -2872,6 +2914,8 @@ namespace fastllm {
             return DataType::INF_INT8_PERCHANNEL;
         } else if (this->dataType == DataType::INT4_GROUP128) {
             return DataType::INF_INT8_GROUP128;
+        } else if (this->dataType == DataType::INT4_GROUP32) {
+            return DataType::INF_INT8_GROUP32;
         } else if (this->dataType == DataType::BFLOAT16 || 
                     this->dataType == DataType::FP8_E4M3 ||
                     this->dataType == DataType::FP8_E4M3_BLOCK_128 ||

@@ -913,6 +913,39 @@ namespace fastllm {
         }
     }
 
+    void Int4ToFastllmInt4Group32Compact(int rows, int columns,
+                                         const uint8_t *qweight,
+                                         const float *mins,
+                                         const float *scales,
+                                         std::vector<uint8_t> &packed) {
+        AssertInFastLLM(rows > 0 && columns > 0 && columns % 32 == 0,
+                        "INT4_GROUP32 compact pack requires columns divisible by 32.");
+        const int groups = columns / 32;
+        for (size_t i = 0; i < (size_t)rows * groups; i++) {
+            const float expectedMin = -8.0f * scales[i];
+            const float tolerance = std::max(1e-6f, std::fabs(expectedMin) * 1e-6f);
+            AssertInFastLLM(std::fabs(mins[i] - expectedMin) <= tolerance,
+                            "INT4_GROUP32 compact pack only supports symmetric weights with zero point 8.");
+        }
+        const size_t quantBytes = (size_t)columns / 2;
+        const size_t rowBytes = GetDataBytes(DataType::INT4_GROUP32, 1, columns);
+        packed.resize((size_t)rows * rowBytes);
+        for (int row = 0; row < rows; row++) {
+            uint8_t *dst = packed.data() + (size_t)row * rowBytes;
+            for (int group = 0; group < groups; group++) {
+                uint8_t *dstBlock = dst +
+                    GetInt4Group32DataOffset(group, groups);
+                memcpy(dstBlock,
+                       qweight + (size_t)row * quantBytes + (size_t)group * 16,
+                       16);
+                const uint16_t scale = Float32ToBFloat16RNEBits(
+                    scales[(size_t)row * groups + group]);
+                memcpy(dst + GetInt4Group32ScaleOffset(group, groups),
+                       &scale, sizeof(scale));
+            }
+        }
+    }
+
     void Int8ToFastllmInt8PerchannelPacked(int experts, int n, int m, uint8_t *qweight, int *zeros, float *scales, std::vector <uint8_t> &int8Packed) {
         int int8BytesPerRow = m;
         int rowSize = int8BytesPerRow + sizeof(float) * 2;  // m个uint8 + 1个min + 1个scale
@@ -1118,7 +1151,8 @@ namespace fastllm {
                     data->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                     data->dataType == DataType::FP8_E4M3_PERCHANNEL ||
                     data->dataType == DataType::NVFP4_BLOCK_16 ||
-                    data->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
+                    data->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                    data->dataType == DataType::INT4_GROUP32) {
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
                     uint8_t *srcData = data->cpuData;
                     std::vector<uint8_t> reordered;
@@ -1220,12 +1254,19 @@ namespace fastllm {
                         ErrorInFastLLM("RegisterNumas can't support data type int4g when m % groupCnt > 0.");
                     }
 
-                    int groups = m / data->groupCnt;
                     std::vector <uint8_t> int4Packed;
-                    Int4ToFastllmInt4PerchannelPacked(1, k * groups, data->groupCnt, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
-
-                    if (data->groupCnt == 128) {                    
+                    if (data->groupCnt == 128) {
+                        int groups = m / data->groupCnt;
+                        Int4ToFastllmInt4PerchannelPacked(
+                            1, k * groups, data->groupCnt, (uint8_t*)data->cpuData,
+                            data->mins.data(), data->scales.data(), int4Packed);
                         data->dataType = DataType::INT4_GROUP128;
+                    } else if (data->groupCnt == 32) {
+                        Int4ToFastllmInt4Group32Compact(
+                            k, m, (const uint8_t*)data->cpuData,
+                            data->mins.data(),
+                            data->scales.data(), int4Packed);
+                        data->dataType = DataType::INT4_GROUP32;
                     } else {
                         ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
                     }
@@ -1248,6 +1289,13 @@ namespace fastllm {
             data->isPinned = usePinned;
         }
 
+        if (data->dataType == DataType::INT4_GROUP32) {
+            std::vector<float>().swap(data->scales);
+            std::vector<float>().swap(data->mins);
+            std::vector<int>().swap(data->zeros);
+            std::vector<int>().swap(data->weightSum);
+        }
+
         delete[] data->cpuData;
         data->cpuData = nullptr;
     }
@@ -1262,9 +1310,16 @@ namespace fastllm {
              weight->dataType == DataType::INT4_NOZERO)) {
             return DataType::INF_INT8_PERCHANNEL;
         }
-        if (weight != nullptr && weight->dataType == DataType::INT4_GROUP &&
-            weight->groupCnt == 128) {
-            return DataType::INF_INT8_GROUP128;
+        if (weight != nullptr && weight->dataType == DataType::INT4_GROUP) {
+            if (weight->groupCnt == 128) {
+                return DataType::INF_INT8_GROUP128;
+            }
+            if (weight->groupCnt == 32) {
+                return DataType::INF_INT8_GROUP32;
+            }
+        }
+        if (weight != nullptr && weight->dataType == DataType::INT4_GROUP32) {
+            return DataType::INF_INT8_GROUP32;
         }
         if (weight != nullptr &&
             (weight->dataType == DataType::NVFP4 ||
@@ -1287,6 +1342,20 @@ namespace fastllm {
             // its concrete ggml subtype, while the CUDA path accepts the common
             // DATA_GGUF_FORMAT storage type.
             DataType weightType = weights[i]->dataType;
+            // Compact group-32 weights already have a bandwidth-efficient
+            // AVX512-VNNI path.  Streaming many small experts over PCIe and
+            // dequantizing them on every prefill is slower, and the dynamic
+            // curve calibration itself can take minutes.  This only disables
+            // NUMA-to-CUDA streaming; CUDA-resident INT4_GROUP32 weights still
+            // use the native CUDA kernels below the normal Linear/MergeMOE path.
+            if (weightType == DataType::INT4_GROUP32 &&
+                GetCPUInstructInfo()->hasAVX512VNNI) {
+                static std::once_flag compactWarningOnce;
+                std::call_once(compactWarningOnce, []() {
+                    printf("[Fastllm] NUMA GPU prefill keeps compact int4_group32 experts on NUMA: AVX512-VNNI is faster than sparse PCIe weight streaming.\n");
+                });
+                return false;
+            }
             if (!IsCudaLinearDataTypeSupported(inputType, weightType, DataType::FLOAT32)) {
                 static std::once_flag warningOnce;
                 std::call_once(warningOnce, [inputType, weightType]() {

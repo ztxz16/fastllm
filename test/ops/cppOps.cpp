@@ -1,5 +1,6 @@
 #include "fastllm.h"
 #include "executor.h"
+#include "utils/utils.h"
 
 #include <algorithm>
 #include <chrono>
@@ -186,6 +187,51 @@ namespace {
             weight.Resize({out, in});
             weight.CreateFromOriData(fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
                                      (uint8_t *) fp32Weight.cpuData, nullptr, nullptr, groupCnt);
+            return;
+        }
+        if (weightType == "int4group32") {
+            constexpr int groupCnt = 32;
+            if (in % groupCnt != 0) {
+                throw std::runtime_error("int4group32 input features must be divisible by 32");
+            }
+            weight.dataType = fastllm::DataType::INT4_GROUP32;
+            weight.Resize({out, in});
+            weight.Allocate(true);
+            const int groups = in / groupCnt;
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::INT4_GROUP32, 1, in);
+            const float *source = (const float*)fp32Weight.cpuData;
+            for (int row = 0; row < out; row++) {
+                uint8_t *rowData = weight.cpuData + (size_t)row * rowBytes;
+                for (int group = 0; group < groups; group++) {
+                    const float *sourceBlock = source +
+                        (size_t)row * in + group * groupCnt;
+                    float absMax = 0.0f;
+                    for (int column = 0; column < groupCnt; column++) {
+                        absMax = std::max(absMax, std::fabs(sourceBlock[column]));
+                    }
+                    uint8_t *block = rowData +
+                        fastllm::GetInt4Group32DataOffset(group, groups);
+                    const uint16_t scaleBits = fastllm::Float32ToBFloat16RNEBits(
+                        absMax == 0.0f ? 0.0f : absMax / 7.0f);
+                    std::memcpy(rowData +
+                                    fastllm::GetInt4Group32ScaleOffset(group, groups),
+                                &scaleBits, sizeof(scaleBits));
+                    const float scale = fastllm::BFloat16BitsToFloat32(scaleBits);
+                    for (int column = 0; column < groupCnt; column += 2) {
+                        auto quantize = [scale](float value) {
+                            if (scale == 0.0f) {
+                                return 8;
+                            }
+                            return std::max(0, std::min(15,
+                                (int)std::lround(value / scale) + 8));
+                        };
+                        const int high = quantize(sourceBlock[column]);
+                        const int low = quantize(sourceBlock[column + 1]);
+                        block[column / 2] = (uint8_t)((high << 4) | low);
+                    }
+                }
+            }
             return;
         }
         throw std::runtime_error("unsupported linear weight_type: " + weightType);
@@ -1133,7 +1179,7 @@ namespace {
                 params.Add("batch", "4", "batch size");
                 params.Add("in", "8", "input features");
                 params.Add("out", "6", "output features");
-                params.Add("weight_type", "float32", "weight datatype: float32 or int4group");
+                params.Add("weight_type", "float32", "weight datatype: float32, int4group, or int4group32");
                 params.Add("group_cnt", "128", "group size used by int4group quantization");
                 return params;
             },
@@ -1173,7 +1219,13 @@ namespace {
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
-                return FloatBytes({batch, in}) + FloatBytes({out, in}) + FloatBytes({out}) + FloatBytes({batch, out});
+                double weightBytes = FloatBytes({out, in});
+                if (params.GetString("weight_type") == "int4group32") {
+                    weightBytes = (double)fastllm::GetDataBytes(
+                        fastllm::DataType::INT4_GROUP32, out, in);
+                }
+                return FloatBytes({batch, in}) + weightBytes +
+                       FloatBytes({out}) + FloatBytes({batch, out});
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");

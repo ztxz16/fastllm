@@ -337,6 +337,78 @@ namespace fastllm {
         }
     }
 
+    extern bool LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Kernel(
+                        uint8_t *inputData, uint8_t *weightData,
+                        float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+
+    bool LinearINT8GROUP32_INT4GROUP32_Kernel(uint8_t *inputData, uint8_t *weightData,
+                        float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        if (m <= 0 || m % 32 != 0) {
+            return false;
+        }
+        if (GetCPUInstructInfo()->hasAVX512VNNI) {
+            return LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Kernel(
+                inputData, weightData, biasData, outputData,
+                n, m, k, st, end);
+        }
+        constexpr int groupCnt = 32;
+        const int groups = m / groupCnt;
+        const size_t lda = GetDataBytes(DataType::INF_INT8_GROUP32, 1, m);
+        const size_t ldb = GetDataBytes(DataType::INT4_GROUP32, 1, m);
+        const size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+        constexpr size_t astride = groupCnt + sizeof(float) + sizeof(int);
+
+#ifdef __AVX2__
+        const __m128i nibbleMask128 = _mm_set1_epi8(0x0f);
+        const __m256i ones = _mm256_set1_epi16(1);
+#endif
+        for (int i = 0; i < n; i++) {
+            float *floatC = (float*)((uint8_t*)outputData + (size_t)i * ldc);
+            for (int j = st; j < end; j++) {
+                float total = 0.0f;
+                for (int g = 0; g < groups; g++) {
+                    const uint8_t *inputGroup = inputData + (size_t)i * lda + (size_t)g * astride;
+                    const int8_t *quantizedInput = (const int8_t*)inputGroup;
+                    const float scaleA = *(const float*)(inputGroup + groupCnt);
+                    const int sumA = *(const int*)(inputGroup + groupCnt + sizeof(float));
+
+                    const uint8_t *weightRow = weightData + (size_t)j * ldb;
+                    const uint8_t *weightGroup = weightRow +
+                        GetInt4Group32DataOffset(g, groups);
+                    const uint16_t scaleBits = *(const uint16_t*)(weightRow +
+                        GetInt4Group32ScaleOffset(g, groups));
+                    const float scaleB = BFloat16BitsToFloat32(scaleBits);
+                    int sum = 0;
+#ifdef __AVX2__
+                    // Group-32 weights keep FastLLM's normal high/low nibble order.
+                    // Interleave the two nibble vectors back to q0..q31 before
+                    // using the unsigned-byte x signed-byte dot product.
+                    __m128i packed = _mm_loadu_si128((const __m128i*)weightGroup);
+                    __m128i low = _mm_and_si128(packed, nibbleMask128);
+                    __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), nibbleMask128);
+                    __m256i quantizedWeight = _mm256_set_m128i(
+                        _mm_unpackhi_epi8(high, low), _mm_unpacklo_epi8(high, low));
+                    __m256i input = _mm256_loadu_si256((const __m256i*)quantizedInput);
+                    __m256i products = _mm256_maddubs_epi16(quantizedWeight, input);
+                    sum = I32sum(_mm256_madd_epi16(products, ones));
+#else
+                    for (int l = 0; l < groupCnt; l += 2) {
+                        uint8_t packed = weightGroup[l / 2];
+                        sum += quantizedInput[l] * ((packed >> 4) & 0x0f) +
+                               quantizedInput[l + 1] * (packed & 0x0f);
+                    }
+#endif
+                    total += (sum - 8 * sumA) * scaleA * scaleB;
+                }
+                floatC[j] = total;
+            }
+        }
+        AddBias(outputData, biasData, n, k, st, end);
+        return true;
+    }
+
     void MultiThreadLinearFloat32Float32Op::Run() {
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {
@@ -2167,6 +2239,97 @@ namespace fastllm {
     struct FastllmQuantManager {
         std::vector <uint8_t> uinput;
     } fastllmQuantManager;
+
+    struct MultiThreadLinearInt4Group32Op : MultiThreadBaseOp {
+        uint8_t *inputData;
+        uint8_t *weightData;
+        float *biasData;
+        float *outputData;
+        int n, m, k, st, end;
+
+        MultiThreadLinearInt4Group32Op(
+                uint8_t *inputData, uint8_t *weightData, float *biasData,
+                float *outputData, int n, int m, int k, int st, int end) :
+            inputData(inputData), weightData(weightData), biasData(biasData),
+            outputData(outputData), n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run() override {
+            LinearINT8GROUP32_INT4GROUP32_Kernel(
+                inputData, weightData, biasData, outputData,
+                n, m, k, st, end);
+        }
+    };
+
+    struct MultiThreadQuantizeInt8Group32Op : MultiThreadBaseOp {
+        uint8_t *output;
+        const float *input;
+        int rows, columns;
+
+        MultiThreadQuantizeInt8Group32Op(uint8_t *output, const float *input,
+                                        int rows, int columns) :
+            output(output), input(input), rows(rows), columns(columns) {}
+
+        void Run() override {
+            ConvertFromFloat32(output, DataType::INF_INT8_GROUP32,
+                               input, rows, columns);
+        }
+    };
+
+    void RunLinearFloat32Int4Group32(
+            float *inputData, Data &weight, float *outputData, float *biasData,
+            int n, int m, int k,
+            AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector<uint8_t> &quantizedInput = fastllmQuantManager.uinput;
+        quantizedInput.resize(GetDataBytes(DataType::INF_INT8_GROUP32, n, m));
+        // Prefill can contain many rows. Quantizing all group-32 activation
+        // blocks on the caller thread becomes visible before the parallel
+        // GEMM, so split that conversion across the same active pool.
+        if ((size_t)n * m >= 10000 && n > 1 && threadNum > 1) {
+            const int quantThreads = std::min(n, threadNum);
+            const size_t rowBytes = GetDataBytes(
+                DataType::INF_INT8_GROUP32, 1, m);
+            std::vector<MultiThreadQuantizeInt8Group32Op*> quantOps;
+            quantOps.reserve(quantThreads);
+            int currentRow = 0;
+            for (int i = 0; i < quantThreads; i++) {
+                const int rows = n / quantThreads + (i < n % quantThreads);
+                quantOps.push_back(new MultiThreadQuantizeInt8Group32Op(
+                    quantizedInput.data() + (size_t)currentRow * rowBytes,
+                    inputData + (size_t)currentRow * m, rows, m));
+                currentRow += rows;
+            }
+            for (int i = 0; i < quantThreads; i++) {
+                pool->PushOp(startTid + i, quantOps[i]);
+            }
+            for (int i = 0; i < quantThreads; i++) {
+                pool->Wait(startTid + i);
+                delete quantOps[i];
+            }
+        } else {
+            ConvertFromFloat32(quantizedInput.data(), DataType::INF_INT8_GROUP32,
+                               inputData, n, m);
+        }
+
+        const int per = k / threadNum;
+        int current = 0;
+        std::vector<MultiThreadLinearInt4Group32Op*> ops;
+        ops.reserve(threadNum);
+        for (int i = 0; i < threadNum; i++) {
+            const int end = i == threadNum - 1 ? k :
+                current + per + (current + per * (threadNum - i) < k);
+            ops.push_back(new MultiThreadLinearInt4Group32Op(
+                quantizedInput.data(), (uint8_t*)weight.cpuData, biasData,
+                outputData, n, m, k, current, end));
+            current = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
 
     void RunLinearFloat32Int4Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, int group, int groupCnt,

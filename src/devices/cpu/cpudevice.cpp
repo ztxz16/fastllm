@@ -1586,6 +1586,12 @@ namespace fastllm {
                     finish = true;
         		}
         	}
+        } else if (AType == DataType::INF_INT8_GROUP32) {
+            if (CType == DataType::FLOAT32 && BType == DataType::INT4_GROUP32) {
+                LinearINT8GROUP32_INT4GROUP32_Kernel((uint8_t*)A, (uint8_t*)B, nullptr,
+                                                     (float*)C, n, m, ldc / sizeof(float), st, end);
+                finish = true;
+            }
         } else if (AType == DataType::FLOAT32) {
             if (CType == DataType::FLOAT32) {
                 if (BType == DataType::FLOAT32) {
@@ -2211,9 +2217,11 @@ namespace fastllm {
                     columns
                 );
             }
-        } else if (dstDataType == DataType::INF_INT8_GROUP128) {
-            rows *= (columns / 128);
-            columns = 128;
+        } else if (dstDataType == DataType::INF_INT8_GROUP128 ||
+                   dstDataType == DataType::INF_INT8_GROUP32) {
+            size_t groupCnt = dstDataType == DataType::INF_INT8_GROUP128 ? 128 : 32;
+            rows *= (columns / groupCnt);
+            columns = groupCnt;
             size_t rowCount = GetDataBytes(INF_INT8_PERCHANNEL, 1, columns);
             for (int i = 0; i < rows; i++) {
                 Float32ToInfInt8PerChannel (
@@ -5986,6 +5994,11 @@ ops += (long long)lines * inputDim * interDim * 2;
                 RunLinearFloat32Int4Group((float*)input.cpuData, weight, (float*)output.cpuData, 
                                         bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, group, groupCnt,
                                         GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                RunLinearFloat32Int4Group32(
+                    (float*)input.cpuData, weight, (float*)output.cpuData,
+                    bias.dims.size() > 0 ? (float*)bias.cpuData : nullptr,
+                    n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::INT2_GROUP) {
                 int group = weight.group, groupCnt = weight.groupCnt;
                 RunLinearFloat32Int2Group((float*)input.cpuData, weight, (float*)output.cpuData, 

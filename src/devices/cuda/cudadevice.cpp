@@ -3031,6 +3031,7 @@ namespace fastllm {
                    weightType == DataType::BFLOAT16 ||
                    weightType == DataType::INT8 ||
                    weightType == DataType::INT4_GROUP ||
+                   weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::INT4_GROUP128 ||
                    weightType == DataType::INT4_NOZERO ||
                    weightType == DataType::FP8_E4M3 ||
@@ -3049,6 +3050,7 @@ namespace fastllm {
                    weightType == DataType::INT4 ||
                    weightType == DataType::INT4_NOZERO ||
                    weightType == DataType::INT4_GROUP ||
+                   weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::FP8_E4M3 ||
                    weightType == DataType::FP8_E4M3_BLOCK_128 ||
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
@@ -3061,6 +3063,7 @@ namespace fastllm {
             return weightType == DataType::BFLOAT16 ||
                    weightType == DataType::FLOAT32 ||
                    weightType == DataType::FLOAT16 ||
+                   weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::FP8_E4M3 ||
                    weightType == DataType::FP8_E4M3_BLOCK_128 ||
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
@@ -3093,6 +3096,8 @@ namespace fastllm {
                 FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP) {
                 FastllmCudaHalfMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaHalfMatMulFloatInt4Group32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP128) {
                 FastllmCudaHalfMatMulFloatInt4Group128(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_NOZERO) {
@@ -3137,6 +3142,8 @@ namespace fastllm {
                 FastllmCudaMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP) {
                 FastllmCudaMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaMatMulFloatInt4Group32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 FastllmCudaMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
@@ -3161,6 +3168,8 @@ namespace fastllm {
                 FastllmCudaBFloat16MatMulFloat32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaBFloat16MatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaBFloat16MatMulInt4Group32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 if (!TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {

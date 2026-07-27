@@ -2,6 +2,7 @@
 #include "fastllm.h"
 #include "model.h"
 #include "models/basellm.h"
+#include "devices/cpu/computeutils.h"
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include <cuda_runtime_api.h>
@@ -99,6 +100,10 @@ namespace {
             throw std::runtime_error(message);
         }
     }
+
+    void ExpectFloatNear(const std::vector<float> &expected,
+                         const std::vector<float> &actual,
+                         float atol, float rtol, const std::string &name);
 
     void ExpectMinOutputLengthLogits(const float *logits, int batch, int stride,
                                      int eosTokenId, const std::vector<int> &resetLengths,
@@ -225,6 +230,158 @@ namespace {
                "Laguna auto dtype unexpectedly overrode the standard linear dtype.");
     }
 
+    void WriteLagunaPackedInt4Fixture(const std::filesystem::path &path) {
+        const std::string config = R"JSON({
+            "model_type": "laguna",
+            "architectures": ["LagunaForCausalLM"],
+            "eos_token_id": 2,
+            "torch_dtype": "bfloat16",
+            "quantization_config": {
+                "format": "pack-quantized",
+                "quant_method": "compressed-tensors",
+                "config_groups": {
+                    "group_0": {
+                        "format": "pack-quantized",
+                        "weights": {
+                            "group_size": 32,
+                            "num_bits": 4,
+                            "strategy": "group",
+                            "symmetric": true,
+                            "type": "int"
+                        }
+                    }
+                }
+            },
+            "num_hidden_layers": 1,
+            "hidden_size": 32,
+            "head_dim": 8,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "num_attention_heads_per_layer": [4],
+            "layer_types": ["full_attention"],
+            "intermediate_size": 32,
+            "moe_intermediate_size": 64,
+            "shared_expert_intermediate_size": 32,
+            "num_experts": 1,
+            "num_experts_per_tok": 1,
+            "max_position_embeddings": 32,
+            "sliding_window": 16
+        })JSON";
+        {
+            std::ofstream output(path / "config.json");
+            Expect(output.good(), "failed to create Laguna packed INT4 fixture config.");
+            output << config;
+        }
+
+        constexpr int rows = 32;
+        constexpr int columns = 64;
+        constexpr int groups = columns / 32;
+        constexpr int packedColumns = columns / 8;
+        const std::string packedName =
+            "model.layers.0.mlp.experts.0.down_proj.weight_packed";
+        const std::string scaleName =
+            "model.layers.0.mlp.experts.0.down_proj.weight_scale";
+        constexpr uint64_t lmHeadBytes = 2 * 32 * sizeof(uint16_t);
+        constexpr uint64_t packedBytes = rows * packedColumns * sizeof(uint32_t);
+        constexpr uint64_t scaleBytes = rows * groups * sizeof(uint16_t);
+        std::string header =
+            "{\"lm_head.weight\":{\"dtype\":\"BF16\",\"shape\":[2,32],\"data_offsets\":[0," +
+            std::to_string(lmHeadBytes) + "]},\"" + packedName +
+            "\":{\"dtype\":\"I32\",\"shape\":[32,8],\"data_offsets\":[" +
+            std::to_string(lmHeadBytes) + "," + std::to_string(lmHeadBytes + packedBytes) +
+            "]},\"" + scaleName +
+            "\":{\"dtype\":\"BF16\",\"shape\":[32,2],\"data_offsets\":[" +
+            std::to_string(lmHeadBytes + packedBytes) + "," +
+            std::to_string(lmHeadBytes + packedBytes + scaleBytes) + "]}}";
+        while (header.size() % 8 != 0) {
+            header.push_back(' ');
+        }
+
+        std::vector<uint16_t> lmHead(2 * 32, 0);
+        std::vector<uint32_t> packed(rows * packedColumns, 0);
+        for (int row = 0; row < rows; row++) {
+            for (int column = 0; column < columns; column++) {
+                int signedValue = (row * 3 + column) % 16 - 8;
+                uint32_t storedValue = (uint32_t)(signedValue + 8);
+                packed[row * packedColumns + column / 8] |=
+                    storedValue << ((column % 8) * 4);
+            }
+        }
+        std::vector<uint16_t> scales(rows * groups);
+        for (int row = 0; row < rows; row++) {
+            for (int group = 0; group < groups; group++) {
+                float value = 0.125f * (float)((row + group) % 7 + 1);
+                uint32_t bits;
+                memcpy(&bits, &value, sizeof(bits));
+                scales[row * groups + group] = (uint16_t)(bits >> 16);
+            }
+        }
+
+        std::ofstream output(path / "model.safetensors", std::ios::binary);
+        Expect(output.good(), "failed to create Laguna packed INT4 fixture weights.");
+        uint64_t headerSize = header.size();
+        output.write(reinterpret_cast<const char*>(&headerSize), sizeof(headerSize));
+        output.write(header.data(), header.size());
+        output.write(reinterpret_cast<const char*>(lmHead.data()), lmHeadBytes);
+        output.write(reinterpret_cast<const char*>(packed.data()), packedBytes);
+        output.write(reinterpret_cast<const char*>(scales.data()), scaleBytes);
+        Expect(output.good(), "failed to write Laguna packed INT4 fixture weights.");
+    }
+
+    void RunLagunaPackedInt4AutoDtypeRegression() {
+        ScopedTempDirectory temp("fastllm_laguna_packed_int4_auto_");
+        WriteLagunaPackedInt4Fixture(temp.Path());
+
+        auto model = fastllm::CreateLLMModelFromHF(
+            temp.Path().string(), fastllm::DataType::DATA_AUTO_SOURCE,
+            -1, true);
+        Expect(model != nullptr && model->model_type == "laguna",
+               "Laguna packed INT4 fixture did not create a Laguna model.");
+
+        const std::string weightName =
+            "model.layers.0.moe.experts.0.down_proj.weight";
+        auto packed = model->weight.weight.find(weightName);
+        Expect(packed != model->weight.weight.end(),
+               "packed Laguna INT4 expert weight was not loaded.");
+        const fastllm::Data &weight = packed->second;
+        Expect(weight.dataType == fastllm::DataType::INT4_GROUP32,
+               "Laguna auto dtype did not preserve compressed-tensors INT4 weight.");
+        Expect(weight.dims == std::vector<int>({32, 64}) &&
+                   weight.groupCnt == 32 && weight.group == 2,
+               "Laguna packed INT4 logical shape or group metadata is incorrect.");
+        Expect(weight.cpuData != nullptr && weight.GetBytes() == 32 * 36 &&
+                   weight.scales.empty() && weight.mins.empty() &&
+                   weight.zeros.empty() && weight.weightSum.empty(),
+               "Laguna packed INT4 data is not using compact inline scales.");
+
+        const uint8_t *data = (const uint8_t*)weight.cpuData;
+        for (int row = 0; row < 32; row++) {
+            const uint8_t *rowData = data + row * 36;
+            for (int group = 0; group < 2; group++) {
+                const uint8_t *block = rowData +
+                    fastllm::GetInt4Group32DataOffset(group, 2);
+                float expectedScale =
+                    0.125f * (float)((row + group) % 7 + 1);
+                uint16_t scaleBits;
+                memcpy(&scaleBits, rowData +
+                           fastllm::GetInt4Group32ScaleOffset(group, 2),
+                       sizeof(scaleBits));
+                Expect(std::fabs(fastllm::BFloat16BitsToFloat32(scaleBits) -
+                                 expectedScale) < 1e-6f,
+                       "Laguna packed INT4 inline BF16 scale is incorrect.");
+                for (int localColumn = 0; localColumn < 32; localColumn++) {
+                    const int column = group * 32 + localColumn;
+                    uint8_t byte = block[localColumn / 2];
+                    int storedValue = (localColumn & 1) ?
+                        (byte & 0xF) : (byte >> 4);
+                    int expectedValue = (row * 3 + column) % 16;
+                    Expect(storedValue == expectedValue,
+                           "Laguna packed INT4 nibble order is incorrect.");
+                }
+            }
+        }
+    }
+
     void RunPerRequestMinOutputLengthRegression() {
         MoeAtypeConfigTestModel model;
         model.block_cnt = 3;
@@ -293,6 +450,13 @@ namespace {
         Expect(IsCudaLinearDataTypeSupported(DataType::FLOAT16, DataType::INT4_GROUP128,
                                              DataType::FLOAT32),
                "FLOAT16 + INT4_GROUP128 should be supported by CUDA Linear.");
+        Expect(IsCudaLinearDataTypeSupported(DataType::FLOAT16, DataType::INT4_GROUP32,
+                                             DataType::FLOAT32) &&
+                   IsCudaLinearDataTypeSupported(DataType::BFLOAT16, DataType::INT4_GROUP32,
+                                                 DataType::FLOAT32) &&
+                   IsCudaLinearDataTypeSupported(DataType::FLOAT32, DataType::INT4_GROUP32,
+                                                 DataType::FLOAT32),
+               "compact INT4_GROUP32 should support FP16/BF16/FP32 CUDA Linear.");
         Expect(!IsCudaLinearDataTypeSupported(DataType::FLOAT32, DataType::INT4_GROUP128,
                                               DataType::FLOAT32),
                "FLOAT32 + INT4_GROUP128 should be rejected by CUDA Linear.");
@@ -334,6 +498,126 @@ namespace {
 
     fastllm::Data MakeFloatTensor(const std::vector<int> &dims, float seed = 0.0f) {
         return MakeTensor(fastllm::DataType::FLOAT32, dims, seed);
+    }
+
+    void RunCpuPackedInt4Group32KernelRegression() {
+        constexpr int n = 5;
+        constexpr int m = 96;
+        constexpr int k = 5;
+        constexpr int groupCnt = 32;
+        constexpr int groups = m / groupCnt;
+        const size_t inputRowBytes = fastllm::GetDataBytes(
+            fastllm::DataType::INF_INT8_GROUP32, 1, m);
+        const size_t weightRowBytes = fastllm::GetDataBytes(
+            fastllm::DataType::INT4_GROUP32, 1, m);
+        constexpr size_t inputGroupBytes = groupCnt + sizeof(float) + sizeof(int);
+
+        std::vector<uint8_t> input(n * inputRowBytes, 0);
+        std::vector<uint8_t> weight(k * weightRowBytes, 0);
+        std::vector<float> expected(n * k, 0.0f);
+        std::vector<float> actual(n * k, 0.0f);
+
+        for (int row = 0; row < n; row++) {
+            for (int group = 0; group < groups; group++) {
+                uint8_t *block = input.data() + row * inputRowBytes +
+                                 group * inputGroupBytes;
+                int8_t *values = (int8_t*)block;
+                int sum = 0;
+                for (int column = 0; column < groupCnt; column++) {
+                    values[column] = (int8_t)(((row * 29 + group * 17 + column * 7) % 255) - 127);
+                    sum += values[column];
+                }
+                float scale = 0.01f * (float)(row + group + 1);
+                memcpy(block + groupCnt, &scale, sizeof(scale));
+                memcpy(block + groupCnt + sizeof(float), &sum, sizeof(sum));
+            }
+        }
+        for (int row = 0; row < k; row++) {
+            for (int group = 0; group < groups; group++) {
+                uint8_t *rowData = weight.data() + row * weightRowBytes;
+                uint8_t *block = rowData +
+                    fastllm::GetInt4Group32DataOffset(group, groups);
+                for (int column = 0; column < groupCnt; column += 2) {
+                    int high = (row * 5 + group * 3 + column) % 16;
+                    int low = (row * 5 + group * 3 + column + 1) % 16;
+                    block[column / 2] = (uint8_t)((high << 4) | low);
+                }
+                float scale = 0.025f * (float)(row + group + 1);
+                uint16_t scaleBits = fastllm::Float32ToBFloat16RNEBits(scale);
+                memcpy(rowData +
+                           fastllm::GetInt4Group32ScaleOffset(group, groups),
+                       &scaleBits, sizeof(scaleBits));
+            }
+        }
+
+        for (int inputRow = 0; inputRow < n; inputRow++) {
+            for (int weightRow = 0; weightRow < k; weightRow++) {
+                float total = 0.0f;
+                for (int group = 0; group < groups; group++) {
+                    const uint8_t *inputBlock = input.data() + inputRow * inputRowBytes +
+                                                group * inputGroupBytes;
+                    const int8_t *inputValues = (const int8_t*)inputBlock;
+                    float inputScale;
+                    memcpy(&inputScale, inputBlock + groupCnt, sizeof(inputScale));
+                    const uint8_t *weightRowData = weight.data() + weightRow * weightRowBytes;
+                    const uint8_t *weightBlock = weightRowData +
+                        fastllm::GetInt4Group32DataOffset(group, groups);
+                    uint16_t weightScaleBits;
+                    memcpy(&weightScaleBits, weightRowData +
+                               fastllm::GetInt4Group32ScaleOffset(group, groups),
+                           sizeof(weightScaleBits));
+                    float weightScale = fastllm::BFloat16BitsToFloat32(weightScaleBits);
+                    int dot = 0;
+                    for (int column = 0; column < groupCnt; column++) {
+                        uint8_t packed = weightBlock[column / 2];
+                        int value = (column & 1) ? (packed & 0xF) : (packed >> 4);
+                        dot += inputValues[column] * (value - 8);
+                    }
+                    total += dot * inputScale * weightScale;
+                }
+                expected[inputRow * k + weightRow] = total;
+            }
+        }
+
+        Expect(fastllm::LinearINT8GROUP32_INT4GROUP32_Kernel(
+                   input.data(), weight.data(), nullptr, actual.data(),
+                   n, m, k, 0, k),
+               "packed INT4_GROUP(32) kernel rejected a valid shape.");
+        ExpectFloatNear(expected, actual, 1e-4f, 1e-5f,
+                        "packed INT4_GROUP(32) kernel");
+
+        // Cover the parallel FLOAT32 -> INF_INT8_GROUP32 conversion used by
+        // larger prefill batches before the compact kernel runs.
+        constexpr int parallelRows = 105;
+        std::vector<float> floatInput((size_t)parallelRows * m);
+        for (int row = 0; row < parallelRows; row++) {
+            for (int column = 0; column < m; column++) {
+                floatInput[(size_t)row * m + column] =
+                    (float)((row * 31 + column * 11) % 113 - 56) / 37.0f;
+            }
+        }
+        std::vector<uint8_t> referenceInput(
+            fastllm::GetDataBytes(fastllm::DataType::INF_INT8_GROUP32,
+                                  parallelRows, m));
+        fastllm::ConvertFromFloat32(
+            referenceInput.data(), fastllm::DataType::INF_INT8_GROUP32,
+            floatInput.data(), parallelRows, m);
+        std::vector<float> parallelExpected((size_t)parallelRows * k);
+        Expect(fastllm::LinearINT8GROUP32_INT4GROUP32_Kernel(
+                   referenceInput.data(), weight.data(), nullptr,
+                   parallelExpected.data(), parallelRows, m, k, 0, k),
+               "packed INT4_GROUP(32) reference kernel rejected a valid shape.");
+
+        fastllm::Data compactWeight(fastllm::DataType::INT4_GROUP32, {k, m});
+        compactWeight.Allocate();
+        memcpy(compactWeight.cpuData, weight.data(), weight.size());
+        std::vector<float> parallelActual((size_t)parallelRows * k);
+        fastllm::AliveThreadPool *pool = fastllm::GetAlivePool();
+        fastllm::RunLinearFloat32Int4Group32(
+            floatInput.data(), compactWeight, parallelActual.data(), nullptr,
+            parallelRows, m, k, pool, 0, (int)pool->threads.size());
+        ExpectFloatNear(parallelExpected, parallelActual, 1e-4f, 1e-5f,
+                        "parallel compact INT4_GROUP(32) linear");
     }
 
     fastllm::Data MakeIntTensor(const std::vector<int> &dims, const std::vector<int32_t> &values) {
@@ -2161,6 +2445,93 @@ namespace {
         }
     }
 
+    void RunCudaCompactInt4Group32LinearRegression() {
+        // Five groups exercise the non-padded final compact block as well as
+        // the less-aligned CUDA load path used when groups % 4 != 0.
+        constexpr int inputDim = 160;
+        constexpr int outputDim = 64;
+        constexpr int groups = inputDim / 32;
+        const size_t rowBytes = fastllm::GetDataBytes(
+            fastllm::DataType::INT4_GROUP32, 1, inputDim);
+
+        fastllm::Data compactWeight(fastllm::DataType::INT4_GROUP32,
+                                    {outputDim, inputDim});
+        compactWeight.name = "regression.cuda_compact_int4_group32.weight";
+        compactWeight.group = groups;
+        compactWeight.groupCnt = 32;
+        compactWeight.perChannelAxis = 0;
+        compactWeight.Allocate(true);
+        std::vector<float> floatWeightValues((size_t)outputDim * inputDim);
+        for (int row = 0; row < outputDim; row++) {
+            uint8_t *weightRow = compactWeight.cpuData + (size_t)row * rowBytes;
+            for (int group = 0; group < groups; group++) {
+                uint8_t *weightBlock = weightRow +
+                    fastllm::GetInt4Group32DataOffset(group, groups);
+                float sourceScale = 0.0025f * (float)(1 + ((row + group * 2) % 7));
+                uint16_t scaleBits = fastllm::Float32ToBFloat16RNEBits(sourceScale);
+                memcpy(weightRow +
+                           fastllm::GetInt4Group32ScaleOffset(group, groups),
+                       &scaleBits, sizeof(scaleBits));
+                float scale = fastllm::BFloat16BitsToFloat32(scaleBits);
+                for (int column = group * 32; column < (group + 1) * 32; column++) {
+                    int q = (row * 7 + column * 5 + group * 3) & 15;
+                    const int localColumn = column - group * 32;
+                    if ((column & 1) == 0) {
+                        weightBlock[localColumn / 2] |= (uint8_t)(q << 4);
+                    } else {
+                        weightBlock[localColumn / 2] |= (uint8_t)q;
+                    }
+                    floatWeightValues[(size_t)row * inputDim + column] =
+                        (float)(q - 8) * scale;
+                }
+            }
+        }
+        fastllm::Data floatWeight(fastllm::DataType::FLOAT32,
+                                  {outputDim, inputDim}, floatWeightValues);
+        compactWeight.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data emptyBias;
+
+        for (fastllm::DataType inputType : {fastllm::DataType::FLOAT16,
+                                            fastllm::DataType::BFLOAT16,
+                                            fastllm::DataType::FLOAT32}) {
+            for (int batch : {1, 2, 4, 8, 9, 16}) {
+                std::vector<float> values((size_t)batch * inputDim);
+                for (int b = 0; b < batch; b++) {
+                    for (int x = 0; x < inputDim; x++) {
+                        values[(size_t)b * inputDim + x] =
+                            (float)((x * (b + 5) + 13 * b) % 97 - 48) / 64.0f;
+                    }
+                }
+                fastllm::Data referenceInput(inputType, {batch, inputDim}, values);
+                fastllm::Data expected;
+                {
+                    ScopedFirstDevice guard("cpu");
+                    fastllm::Data referenceFloat;
+                    fastllm::ToDataType(referenceInput, referenceFloat,
+                                        fastllm::DataType::FLOAT32);
+                    fastllm::Linear(referenceFloat, floatWeight, emptyBias, expected);
+                }
+                fastllm::Data cudaInput(inputType, {batch, inputDim}, values);
+                cudaInput.ToDevice(fastllm::DataDevice::CUDA,
+                                   std::vector<int>{0}, true);
+                fastllm::Data actual;
+                {
+                    ScopedFirstDevice guard("cuda");
+                    fastllm::Linear(cudaInput, compactWeight, emptyBias, actual);
+                }
+                const bool directFloatPath =
+                    inputType == fastllm::DataType::FLOAT32 && batch <= 9;
+                ExpectFloatNear(
+                    ToFloatVector(expected), ToFloatVector(actual),
+                    directFloatPath ? 2e-4f : 5e-2f,
+                    directFloatPath ? 2e-4f : 2e-2f,
+                    "CUDA compact INT4_GROUP32 linear " +
+                        fastllm::GetDataTypeName(inputType) + " batch " +
+                        std::to_string(batch));
+            }
+        }
+    }
+
     void RunCudaInt4GroupHalfWeightRoundingRegression() {
         const int inputDim = 160;
         const int outputDim = 1;
@@ -2648,18 +3019,67 @@ namespace {
         return weights;
     }
 
-    fastllm::Data MakeInt4GroupWeight(int outputDim, int inputDim, float seed) {
-        fastllm::Data source = MakeFloatTensor({outputDim, inputDim}, seed);
-        fastllm::Data weight(fastllm::DataType::INT4_GROUP, {outputDim, inputDim});
-        weight.CreateFromOriData(fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
-                                 source.cpuData, nullptr, nullptr, 128);
+    fastllm::Data MakeCompactInt4Group32Weight(int outputDim, int inputDim,
+                                               float seed) {
+        constexpr int groupCnt = 32;
+        Expect(inputDim % groupCnt == 0,
+               "compact INT4_GROUP32 test weight has an invalid input dimension.");
+        fastllm::Data weight(fastllm::DataType::INT4_GROUP32,
+                             {outputDim, inputDim});
+        weight.Allocate(true);
+        const size_t rowBytes = fastllm::GetDataBytes(
+            fastllm::DataType::INT4_GROUP32, 1, inputDim);
+        const int groups = inputDim / groupCnt;
+        const int seedValue = (int)std::lround(seed * 100.0f);
+        for (int row = 0; row < outputDim; row++) {
+            uint8_t *rowData = weight.cpuData + (size_t)row * rowBytes;
+            for (int group = 0; group < groups; group++) {
+                uint8_t *block = rowData +
+                    fastllm::GetInt4Group32DataOffset(group, groups);
+                const float sourceScale =
+                    0.005f * (float)(1 + ((row + group + seedValue) % 11));
+                const uint16_t scale =
+                    fastllm::Float32ToBFloat16RNEBits(sourceScale);
+                memcpy(rowData +
+                           fastllm::GetInt4Group32ScaleOffset(group, groups),
+                       &scale, sizeof(scale));
+                for (int column = 0; column < groupCnt; column += 2) {
+                    const int high =
+                        (row * 7 + group * 5 + column * 3 + seedValue) & 15;
+                    const int low =
+                        (row * 7 + group * 5 + (column + 1) * 3 + seedValue) & 15;
+                    block[column / 2] = (uint8_t)((high << 4) | low);
+                }
+            }
+        }
         return weight;
     }
 
-    MoeWeights MakeInt4GroupMoeWeights(int inputDim, int interDim, int outputDim, float seed) {
+    fastllm::Data MakeInt4GroupWeight(int outputDim, int inputDim, float seed,
+                                      int groupCnt = 128) {
+        fastllm::Data source = MakeFloatTensor({outputDim, inputDim}, seed);
+        fastllm::Data weight(fastllm::DataType::INT4_GROUP, {outputDim, inputDim});
+        weight.CreateFromOriData(fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
+                                 source.cpuData, nullptr, nullptr, groupCnt);
+        return weight;
+    }
+
+    MoeWeights MakeCompactInt4Group32MoeWeights(
+            int inputDim, int interDim, int outputDim, float seed) {
         MoeWeights weights {
-            MakeInt4GroupWeight(interDim * 2, inputDim, seed),
-            MakeInt4GroupWeight(outputDim, interDim, seed + 1.0f)
+            MakeCompactInt4Group32Weight(interDim * 2, inputDim, seed),
+            MakeCompactInt4Group32Weight(outputDim, interDim, seed + 1.0f)
+        };
+        weights.routedGate.name = "test.int4g32_routed_gate";
+        weights.routedDown.name = "test.int4g32_routed_down";
+        return weights;
+    }
+
+    MoeWeights MakeInt4GroupMoeWeights(int inputDim, int interDim, int outputDim,
+                                       float seed, int groupCnt = 128) {
+        MoeWeights weights {
+            MakeInt4GroupWeight(interDim * 2, inputDim, seed, groupCnt),
+            MakeInt4GroupWeight(outputDim, interDim, seed + 1.0f, groupCnt)
         };
         weights.routedGate.name = "test.int4g_routed_gate";
         weights.routedDown.name = "test.int4g_routed_down";
@@ -2724,6 +3144,29 @@ namespace {
         Expect(numasWeights.routedDown.cpuData == nullptr, "routed down CPU buffer should be released after NUMA registration.");
     }
 
+    void RunNumasInt4Group32MergeMoeRegression() {
+        const int inputDim = 64;
+        const int interDim = 64;
+        const int outputDim = 64;
+
+        MoeWeights cpuWeights = MakeCompactInt4Group32MoeWeights(
+            inputDim, interDim, outputDim, 1.9f);
+        MoeWeights numasWeights = MakeCompactInt4Group32MoeWeights(
+            inputDim, interDim, outputDim, 1.9f);
+
+        std::vector<float> expected = RunMergeMoeOnDevice("cpu", cpuWeights, 8);
+        std::vector<float> actual = RunMergeMoeOnDevice("numa", numasWeights, 8);
+        ExpectFloatNear(expected, actual, 1e-4f, 1e-5f,
+                        "NUMA INT4_GROUP(32) MergeMOE output");
+        Expect(numasWeights.routedGate.dataType == fastllm::DataType::INT4_GROUP32,
+               "NUMA gate weight did not preserve INT4_GROUP32.");
+        Expect(numasWeights.routedDown.dataType == fastllm::DataType::INT4_GROUP32,
+               "NUMA down weight did not preserve INT4_GROUP32.");
+        Expect(numasWeights.routedGate.cpuData == nullptr &&
+                   numasWeights.routedDown.cpuData == nullptr,
+               "NUMA INT4_GROUP(32) source buffers were not released.");
+    }
+
 #ifdef USE_CUDA
     void RunNumasCudaPrefillFallbackRegression() {
         const int inputDim = 128;
@@ -2766,12 +3209,17 @@ int main() {
         RunLagunaNVFP4AutoDtypeRegression();
         std::cout << "Laguna NVFP4 auto dtype regression: PASS\n";
 
+        RunLagunaPackedInt4AutoDtypeRegression();
+        std::cout << "Laguna compressed-tensors INT4 auto dtype regression: PASS\n";
+
         RunPerRequestMinOutputLengthRegression();
         std::cout << "per-request minimum output length regression: PASS\n";
 
         if (fastllm::HasDeviceType("cpu")) {
             RunCpuInt4GroupAwqLinearRegression();
             std::cout << "cpu AWQ-style INT4_GROUP linear regression: PASS\n";
+            RunCpuPackedInt4Group32KernelRegression();
+            std::cout << "cpu packed INT4_GROUP(32) kernel regression: PASS\n";
             ranAny = true;
         }
 
@@ -2788,6 +3236,7 @@ int main() {
             RunCudaGraphMemoryPoolOwnershipRegression();
             RunCudaLinearDataTypeCapabilityRegression();
             RunCudaInt4Group32AwqLinearRegression();
+            RunCudaCompactInt4Group32LinearRegression();
             RunCudaInt4GroupHalfWeightRoundingRegression();
             RunCudaInt4GroupBatch1MoeRegression();
             RunCudaInt8Batch1MoeRegression();
@@ -2821,6 +3270,8 @@ int main() {
         if (fastllm::HasDeviceType("numa") && !fastllm::GetFastllmEnv().activateNuma) {
             RunNumasMergeMoeRegression();
             std::cout << "numa MergeMOE regression: PASS\n";
+            RunNumasInt4Group32MergeMoeRegression();
+            std::cout << "numa INT4_GROUP(32) MergeMOE regression: PASS\n";
 #ifdef USE_CUDA
             if (fastllm::HasDeviceType("cuda")) {
                 RunNumasCudaPrefillFallbackRegression();

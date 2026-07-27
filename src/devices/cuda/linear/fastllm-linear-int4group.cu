@@ -7,6 +7,8 @@
 #include "devices/cuda/fastllm-awq-sm70.cuh"
 
 #include <cmath>
+#include <cuda_bf16.h>
+#include <type_traits>
 #include <unordered_map>
 
 #if !defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
@@ -2190,4 +2192,440 @@ bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm:
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
+}
+
+// ==================== symmetric INT4_GROUP32 with inline BF16 scales ====================
+// Physical block: [up to four 16-byte packed groups] [their BF16 scales].
+// Full blocks are 72 bytes, so every 8-byte CUDA weight load stays aligned.
+// The final partial block has no padding.
+// q0 is stored in the high nibble and the implicit zero point is 8.
+
+template <typename T>
+__device__ __forceinline__ float FastllmInt4Group32ToFloat(T value);
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32ToFloat<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32ToFloat<half>(half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32ToFloat<__nv_bfloat16>(
+        __nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T FastllmInt4Group32FromFloat(float value);
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32FromFloat<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ half FastllmInt4Group32FromFloat<half>(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 FastllmInt4Group32FromFloat<__nv_bfloat16>(
+        float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <typename T>
+union __align__(16) FastllmInt4Group32Vector8 {
+    uint4 packed[sizeof(T) * 8 / sizeof(uint4)];
+    T values[8];
+};
+
+template <typename T, bool ALIGNED_ROWS>
+__global__ void FastllmCudaInt4Group32CompactDequantVectorKernel(
+        const uint8_t *weight, T *output, int rows, int columns) {
+    const int row = blockIdx.x;
+    const int groups = columns / 32;
+    const size_t rowBytes = (size_t)groups * 18;
+    const uint8_t *weightRow = weight + (size_t)row * rowBytes;
+    T *outputRow = output + (size_t)row * columns;
+    for (int column = threadIdx.x * 8; column < columns;
+         column += blockDim.x * 8) {
+        const int group = column / 32;
+        const int block = group / 4;
+        const int groupInBlock = group & 3;
+        const int blockGroups = ALIGNED_ROWS ? 4 :
+            min(4, groups - block * 4);
+        const uint8_t *blockData = weightRow + (size_t)block * 72;
+        const uint8_t *packedData = blockData +
+            (size_t)groupInBlock * 16 + (column & 31) / 2;
+        union_char4 packed;
+        if constexpr (ALIGNED_ROWS) {
+            packed.in = __ldg((const uint32_t*)packedData);
+        } else {
+            const uint16_t lo = __ldg((const uint16_t*)packedData);
+            const uint16_t hi = __ldg((const uint16_t*)(packedData + 2));
+            packed.in = (uint32_t)lo | ((uint32_t)hi << 16);
+        }
+        const __nv_bfloat16 *scaleData = (const __nv_bfloat16*)(
+            blockData + (size_t)blockGroups * 16 + groupInBlock * 2);
+        const float scale = __bfloat162float(__ldg(scaleData));
+        FastllmInt4Group32Vector8<T> result;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            result.values[i * 2] = FastllmInt4Group32FromFloat<T>(
+                (float)((int)(packed.out[i] >> 4) - 8) * scale);
+            result.values[i * 2 + 1] = FastllmInt4Group32FromFloat<T>(
+                (float)((int)(packed.out[i] & 0x0f) - 8) * scale);
+        }
+#pragma unroll
+        for (int i = 0; i < (int)(sizeof(T) * 8 / sizeof(uint4)); i++) {
+            reinterpret_cast<uint4*>(outputRow + column)[i] = result.packed[i];
+        }
+    }
+}
+
+template <typename T>
+static void LaunchFastllmCudaInt4Group32CompactDequantVector(
+        const uint8_t *weight, T *output, int rows, int columns) {
+    if (columns % 128 == 0) {
+        FastllmCudaInt4Group32CompactDequantVectorKernel<T, true>
+            <<<rows, 64, 0, cudaStreamPerThread>>>(
+                weight, output, rows, columns);
+    } else {
+        FastllmCudaInt4Group32CompactDequantVectorKernel<T, false>
+            <<<rows, 64, 0, cudaStreamPerThread>>>(
+                weight, output, rows, columns);
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ float FastllmInt4Group32Dot16(
+        const T *input, const float *weights) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        sum += FastllmInt4Group32ToFloat(input[i]) * weights[i];
+    }
+    return sum;
+}
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32Dot16<float>(
+        const float *input, const float *weights) {
+    const float4 a0 = *reinterpret_cast<const float4*>(input);
+    const float4 a1 = *reinterpret_cast<const float4*>(input + 4);
+    const float4 a2 = *reinterpret_cast<const float4*>(input + 8);
+    const float4 a3 = *reinterpret_cast<const float4*>(input + 12);
+    return
+        a0.x * weights[0]  + a0.y * weights[1]  +
+        a0.z * weights[2]  + a0.w * weights[3]  +
+        a1.x * weights[4]  + a1.y * weights[5]  +
+        a1.z * weights[6]  + a1.w * weights[7]  +
+        a2.x * weights[8]  + a2.y * weights[9]  +
+        a2.z * weights[10] + a2.w * weights[11] +
+        a3.x * weights[12] + a3.y * weights[13] +
+        a3.z * weights[14] + a3.w * weights[15];
+}
+
+template <typename T, int WARPS_PER_BLOCK, int PART, bool ALIGNED_BLOCKS>
+__global__ void FastllmGemvInt4Group32CompactKernel(
+        const T * __restrict__ input, const uint8_t * __restrict__ weight,
+        T * __restrict__ output, const float * __restrict__ bias,
+        int m, int k) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (out >= k) {
+        return;
+    }
+    const int groups = m / 32;
+    const size_t rowBytes = (size_t)groups * 18;
+    const uint8_t *weightRow = weight + (size_t)out * rowBytes;
+    float acc[PART];
+#pragma unroll
+    for (int part = 0; part < PART; part++) {
+        acc[part] = 0.0f;
+    }
+
+    const int units = m / 16;
+    for (int unit = lane; unit < units; unit += 32) {
+        const int start = unit * 16;
+        const int group = unit / 2;
+        const int block = group / 4;
+        const int groupInBlock = group & 3;
+        const int blockGroups = ALIGNED_BLOCKS ? 4 :
+            min(4, groups - block * 4);
+        const uint8_t *blockData = weightRow + (size_t)block * 72;
+        const uint8_t *weightBlock = blockData + (size_t)groupInBlock * 16;
+        const __nv_bfloat16 *scaleData = (const __nv_bfloat16*)(
+            blockData + (size_t)blockGroups * 16 + groupInBlock * 2);
+        const float scale = __bfloat162float(__ldg(scaleData));
+        union_char8 packed;
+        const uint8_t *packedData = weightBlock + (size_t)(unit & 1) * 8;
+        if constexpr (ALIGNED_BLOCKS) {
+            packed.in = __ldg(reinterpret_cast<const uint2*>(packedData));
+        } else {
+            // A partial final block makes following rows only 2-byte aligned.
+            const uint16_t packed0 = __ldg((const uint16_t*)(packedData));
+            const uint16_t packed1 = __ldg((const uint16_t*)(packedData + 2));
+            const uint16_t packed2 = __ldg((const uint16_t*)(packedData + 4));
+            const uint16_t packed3 = __ldg((const uint16_t*)(packedData + 6));
+            packed.in.x = (uint32_t)packed0 | ((uint32_t)packed1 << 16);
+            packed.in.y = (uint32_t)packed2 | ((uint32_t)packed3 << 16);
+        }
+        float unpacked[16];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const uint8_t q = packed.out[i];
+            unpacked[i * 2] = (float)((int)(q >> 4) - 8);
+            unpacked[i * 2 + 1] = (float)((int)(q & 0x0f) - 8);
+        }
+#pragma unroll
+        for (int part = 0; part < PART; part++) {
+            const T *inputPart = input + (size_t)part * m + start;
+            acc[part] += FastllmInt4Group32Dot16(inputPart, unpacked) * scale;
+        }
+    }
+
+#pragma unroll
+    for (int part = 0; part < PART; part++) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc[part] += __shfl_down_sync(0xffffffff, acc[part], offset);
+        }
+    }
+    if (lane == 0) {
+        const float biasValue = bias == nullptr ? 0.0f : __ldg(bias + out);
+#pragma unroll
+        for (int part = 0; part < PART; part++) {
+            output[(size_t)part * k + out] =
+                FastllmInt4Group32FromFloat<T>(acc[part] + biasValue);
+        }
+    }
+}
+
+template <typename T>
+__global__ void FastllmCudaInt4Group32CompactBiasKernel(
+        T *output, const float *bias, int total, int k) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < total) {
+        float value = FastllmInt4Group32ToFloat(output[index]) +
+                      __ldg(bias + index % k);
+        output[index] = FastllmInt4Group32FromFloat<T>(value);
+    }
+}
+
+template <typename T>
+static void LaunchFastllmGemmInt4Group32Compact(
+        const T *input, const uint8_t *weight, T *output, const float *bias,
+        int n, int m, int k) {
+    constexpr int warps = 8;
+    const int grid = (k + warps - 1) / warps;
+#define FASTLLM_LAUNCH_INT4G32(PART, OFFSET) \
+    if (m % 128 == 0) { \
+        FastllmGemvInt4Group32CompactKernel<T, warps, PART, true> \
+            <<<grid, warps * 32, 0, cudaStreamPerThread>>>( \
+                input + (size_t)(OFFSET) * m, weight, \
+                output + (size_t)(OFFSET) * k, bias, m, k); \
+    } else { \
+        FastllmGemvInt4Group32CompactKernel<T, warps, PART, false> \
+            <<<grid, warps * 32, 0, cudaStreamPerThread>>>( \
+                input + (size_t)(OFFSET) * m, weight, \
+                output + (size_t)(OFFSET) * k, bias, m, k); \
+    }
+    int offset = 0;
+    for (; offset + 7 < n; offset += 8) {
+        FASTLLM_LAUNCH_INT4G32(8, offset);
+    }
+    if (offset + 3 < n) {
+        FASTLLM_LAUNCH_INT4G32(4, offset);
+        offset += 4;
+    }
+    if (offset + 1 < n) {
+        FASTLLM_LAUNCH_INT4G32(2, offset);
+        offset += 2;
+    }
+    if (offset < n) {
+        FASTLLM_LAUNCH_INT4G32(1, offset);
+    }
+#undef FASTLLM_LAUNCH_INT4G32
+}
+
+template <typename T>
+static bool FastllmCudaMatMulInt4Group32CompactBase(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k, cudaDataType_t cudaType,
+        cudaDataType_t computeType) {
+    if (m <= 0 || m % 32 != 0 || weight.cudaData == nullptr) {
+        return false;
+    }
+    T *cudaInput = (T*)FastllmCudaPrepareInput(input);
+    T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
+    const float *cudaBias = bias.dims.empty() ? nullptr : (const float*)bias.cudaData;
+
+    // Small decode batches are bandwidth-bound and use the compact weights
+    // directly. Above nine rows, tensor-core GEMM amortizes one compact
+    // dequantization and is faster than launching repeated multi-row GEMVs.
+    // Keeping 1-9 rows direct also preserves FLOAT32 regression precision.
+    if (n <= 9) {
+        LaunchFastllmGemmInt4Group32Compact(
+            cudaInput, (const uint8_t*)weight.cudaData, cudaOutput, cudaBias,
+            n, m, k);
+    } else {
+        if constexpr (std::is_same<T, float>::value) {
+            half *halfInput = (half*)FastllmCudaMalloc(
+                (size_t)n * m * sizeof(half));
+#ifndef CUDA_NO_TENSOR_CORE
+            half *halfOutput = (half*)FastllmCudaMalloc(
+                (size_t)n * k * sizeof(half));
+#endif
+            const int inputTotal = n * m;
+            FastllmCudaFloat2HalfKernel
+                <<<(inputTotal + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                    cudaInput, halfInput, inputTotal);
+
+            size_t scratchBytes = 0;
+            bool ownScratch = false;
+            half *dequant = (half*)FastllmBorrowDequantScratch(
+                (size_t)k * m * sizeof(half), &scratchBytes, &ownScratch);
+            const size_t bytesPerRow = (size_t)m * sizeof(half);
+            const int rowsPerChunk = (int)std::min<size_t>(
+                (size_t)k, std::max<size_t>(1, scratchBytes / bytesPerRow));
+            const size_t compactRowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::INT4_GROUP32, 1, m);
+            auto handle = getFastllmCublasHandle();
+            cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+            for (int row = 0; row < k; row += rowsPerChunk) {
+                const int rows = std::min(rowsPerChunk, k - row);
+                LaunchFastllmCudaInt4Group32CompactDequantVector(
+                    (const uint8_t*)weight.cudaData +
+                        (size_t)row * compactRowBytes,
+                    dequant, rows, m);
+#ifdef CUDA_NO_TENSOR_CORE
+                float alpha = 1.0f, beta = 0.0f;
+                status = cublasGemmEx(
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
+                    &alpha, dequant, CUDA_R_16F, m,
+                    halfInput, CUDA_R_16F, m,
+                    &beta, cudaOutput + row, CUDA_R_32F, k, CUDA_R_32F,
+                    static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#else
+                half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+                status = cublasGemmEx(
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
+                    &alpha, dequant, CUDA_R_16F, m,
+                    halfInput, CUDA_R_16F, m,
+                    &beta, halfOutput + row, CUDA_R_16F, k, CUDA_R_16F,
+                    static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#endif
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    FastllmReleaseDequantScratch(dequant, ownScratch);
+                    FastllmCudaFree(halfInput);
+#ifndef CUDA_NO_TENSOR_CORE
+                    FastllmCudaFree(halfOutput);
+#endif
+                    printf("Error: INT4_GROUP32 compact FP16 cuBLAS error. status = %d\n",
+                           status);
+                    throw("int4_group32 compact fp16 cublas error");
+                }
+            }
+#ifndef CUDA_NO_TENSOR_CORE
+            const int outputTotal = n * k;
+            FastllmCudaHalf2FloatKernel
+                <<<(outputTotal + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                    halfOutput, cudaOutput, outputTotal);
+#endif
+            if (cudaBias != nullptr) {
+                const int outputTotal = n * k;
+                FastllmCudaInt4Group32CompactBiasKernel<float>
+                    <<<(outputTotal + 255) / 256, 256, 0,
+                       cudaStreamPerThread>>>(
+                        cudaOutput, cudaBias, outputTotal, k);
+            }
+            FastllmReleaseDequantScratch(dequant, ownScratch);
+            FastllmCudaFree(halfInput);
+#ifndef CUDA_NO_TENSOR_CORE
+            FastllmCudaFree(halfOutput);
+#endif
+        } else {
+            size_t scratchBytes = 0;
+            bool ownScratch = false;
+            T *dequant = (T*)FastllmBorrowDequantScratch(
+                (size_t)k * m * sizeof(T), &scratchBytes, &ownScratch);
+            const size_t bytesPerRow = (size_t)m * sizeof(T);
+            const int rowsPerChunk = (int)std::min<size_t>(
+                (size_t)k, std::max<size_t>(1, scratchBytes / bytesPerRow));
+            const size_t compactRowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::INT4_GROUP32, 1, m);
+            auto handle = getFastllmCublasHandle();
+            cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+            for (int row = 0; row < k; row += rowsPerChunk) {
+                const int rows = std::min(rowsPerChunk, k - row);
+                LaunchFastllmCudaInt4Group32CompactDequantVector(
+                    (const uint8_t*)weight.cudaData +
+                        (size_t)row * compactRowBytes,
+                    dequant, rows, m);
+                if constexpr (std::is_same<T, half>::value) {
+                    half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+                    status = cublasGemmEx(
+                        handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
+                        &alpha, dequant, cudaType, m, cudaInput, cudaType, m,
+                        &beta, cudaOutput + row, cudaType, k, computeType,
+                        static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                } else {
+                    float alpha = 1.0f, beta = 0.0f;
+                    status = cublasGemmEx(
+                        handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
+                        &alpha, dequant, cudaType, m, cudaInput, cudaType, m,
+                        &beta, cudaOutput + row, cudaType, k, computeType,
+                        static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                }
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    FastllmReleaseDequantScratch(dequant, ownScratch);
+                    printf("Error: INT4_GROUP32 compact cuBLAS error. status = %d\n",
+                           status);
+                    throw("int4_group32 compact cublas error");
+                }
+            }
+            if (cudaBias != nullptr) {
+                const int total = n * k;
+                FastllmCudaInt4Group32CompactBiasKernel<T>
+                    <<<(total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                        cudaOutput, cudaBias, total, k);
+            }
+            FastllmReleaseDequantScratch(dequant, ownScratch);
+        }
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaHalfMatMulFloatInt4Group32(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    return FastllmCudaMatMulInt4Group32CompactBase<half>(
+        input, weight, bias, output, n, m, k, CUDA_R_16F, CUDA_R_16F);
+}
+
+bool FastllmCudaBFloat16MatMulInt4Group32(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    return FastllmCudaMatMulInt4Group32CompactBase<__nv_bfloat16>(
+        input, weight, bias, output, n, m, k, CUDA_R_16BF, CUDA_R_32F);
+}
+
+bool FastllmCudaMatMulFloatInt4Group32(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    return FastllmCudaMatMulInt4Group32CompactBase<float>(
+        input, weight, bias, output, n, m, k, CUDA_R_32F, CUDA_R_32F);
 }

@@ -315,8 +315,13 @@ namespace fastllm {
         INT8_PERCHANNEL = 1005, // int8, per channel量化
         NVFP4_BLOCK_16 = 1006, // packed fp4 e2m1, blockM = 16, inline float scale per block
         NVFP4_BLOCK_16_E8M0 = 1007, // packed fp4 e2m1, blockM = 16, inline e8m0 scale per block
+        // Symmetric group-32 INT4. Four groups form one compact block:
+        // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
+        // The final partial block has no padding. The implicit zero point is 8.
+        INT4_GROUP32 = 1008,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
+        INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
         DATA_GGUF_FORMAT = 9999, DATA_GGUF_FORMAT_END = 19999, // [DATA_GGUF_FORMAT, DATA_GGUF_FORMAT_END]之间为GGUF格式的数据，ggml_type = type - DATA_FFUF_FORMAT
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV,
         DATA_AUTO_SOURCE // auto keeps scaled FP8 source weights, otherwise uses FLOAT16
@@ -325,6 +330,33 @@ namespace fastllm {
     std::string GetDataTypeName(DataType type);
 
     size_t GetDataBytes(DataType type, size_t rows, size_t columns);
+    constexpr size_t INT4_GROUP32_GROUP_SIZE = 32;
+    constexpr size_t INT4_GROUP32_PACKED_BYTES = 16;
+    constexpr size_t INT4_GROUP32_BLOCK_GROUPS = 4;
+
+    // INT4_GROUP32 keeps four packed groups together before their four scales.
+    // These helpers also handle the final 1-3 group block without padding.
+    inline size_t GetInt4Group32DataOffset(size_t group, size_t groups) {
+        (void)groups;
+        const size_t block = group / INT4_GROUP32_BLOCK_GROUPS;
+        const size_t inBlock = group % INT4_GROUP32_BLOCK_GROUPS;
+        return block * INT4_GROUP32_BLOCK_GROUPS *
+                   (INT4_GROUP32_PACKED_BYTES + sizeof(uint16_t)) +
+               inBlock * INT4_GROUP32_PACKED_BYTES;
+    }
+
+    inline size_t GetInt4Group32ScaleOffset(size_t group, size_t groups) {
+        const size_t block = group / INT4_GROUP32_BLOCK_GROUPS;
+        const size_t inBlock = group % INT4_GROUP32_BLOCK_GROUPS;
+        const size_t blockBegin = block * INT4_GROUP32_BLOCK_GROUPS;
+        const size_t blockGroups = std::min(
+            INT4_GROUP32_BLOCK_GROUPS, groups - blockBegin);
+        return block * INT4_GROUP32_BLOCK_GROUPS *
+                   (INT4_GROUP32_PACKED_BYTES + sizeof(uint16_t)) +
+               blockGroups * INT4_GROUP32_PACKED_BYTES +
+               inBlock * sizeof(uint16_t);
+    }
+
     size_t GetNVFP4WeightBytes(size_t rows, size_t columns);
     size_t GetNVFP4ScaleBytes(size_t rows, size_t columns, int blockK, int blockM);
     size_t GetNVFP4StorageBytes(size_t rows, size_t columns, int blockK, int blockM);
