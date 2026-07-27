@@ -350,6 +350,7 @@ namespace fastllm {
         if ((model->model_type != "qwen3_moe" &&
              model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
+             model->model_type != "laguna" &&
              model->model_type != "minimax_m2" &&
              model->model_type != "deepseek_v4" &&
              model->model_struct != "qwen3_5") ||

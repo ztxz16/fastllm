@@ -353,6 +353,14 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "kimi_k3",
     ] or text_model_type == "qwen3_5_moe_text")
 
+def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
+    return (architecture == "DeepseekV4ForCausalLM" or
+            model_type == "deepseek_v4")
+
+def _prefers_laguna_hybrid_tp(architecture: str, model_type: str = "") -> bool:
+    return (architecture == "LagunaForCausalLM" or
+            model_type == "laguna")
+
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
@@ -559,12 +567,16 @@ def make_normal_llm_model(args, startup_progress = None):
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
+    is_laguna_hybrid_tp_model = False
+    is_laguna_model = False
     if (os.path.exists(config_path)):
         try:
             with open(config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
             architecture = config["architectures"][0]
             model_type = config.get("model_type", "")
+            is_laguna_model = (architecture == 'LagunaForCausalLM' or
+                                model_type == 'laguna')
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
@@ -624,7 +636,9 @@ def make_normal_llm_model(args, startup_progress = None):
                 is_thread_tp_moe_model = True
             if (architecture == 'MiniMaxM2ForCausalLM' or model_type == 'minimax_m2'):
                 is_thread_tp_moe_model = True
-            if (architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4'):
+            if (_prefers_laguna_hybrid_tp(architecture, model_type)):
+                is_laguna_hybrid_tp_model = True
+            if (_prefers_multicuda_tp(architecture, model_type)):
                 is_multicuda_tp_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):
@@ -678,16 +692,22 @@ def make_normal_llm_model(args, startup_progress = None):
             args.device = target_spec
             if (not user_set_moe_device):
                 args.moe_device = target_spec
+        elif is_laguna_hybrid_tp_model:
+            multicuda_spec = "multicuda:" + cuda_spec.split(":", 1)[1]
+            if (not user_set_device):
+                args.device = tp_device
+            if (not user_set_moe_device):
+                args.moe_device = multicuda_spec
         else:
             if (not user_set_device):
                 args.device = tp_device
             if (not user_set_moe_device):
                 args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
-    if is_multicuda_tp_model and _uses_multicuda_device(args.moe_device):
-        # DeepSeek-V4 has tens of thousands of routed-expert tensors.  Splitting
-        # every one into a separate allocation can exhaust the CUDA driver's
-        # allocation-count limit long before device memory is full.  Keep the
-        # simple `--tp N` path usable by packing model weights into slabs.
+    if ((is_multicuda_tp_model or is_laguna_hybrid_tp_model) and
+            _uses_multicuda_device(args.moe_device)):
+        # Large MoE checkpoints have tens of thousands of routed-expert tensors.
+        # Pack their TP shards into slabs to avoid exhausting the CUDA driver's
+        # allocation-count limit before device memory is full.
         if args.cuda_slab <= 0:
             args.cuda_slab = 256
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
@@ -737,11 +757,13 @@ def make_normal_llm_model(args, startup_progress = None):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
             if (atype_was_auto):
-                args.atype = "float16"
+                args.atype = "bfloat16" if is_laguna_model else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
-        if (_uses_cuda_device(args.moe_device)):
+        if (is_laguna_model and _uses_thread_tp(tp_arg)):
+            args.moe_atype = "bfloat16"
+        elif (_uses_cuda_device(args.moe_device)):
             args.moe_atype = "float16"
         elif (_uses_thread_tp(tp_arg)):
             args.moe_atype = "bfloat16"

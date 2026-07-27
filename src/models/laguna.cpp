@@ -181,7 +181,12 @@ namespace fastllm {
                 }
                 const Data &gateup = gateupIt->second;
                 const Data &down = downIt->second;
-                if (gateup.isDiskWeight || down.isDiskWeight ||
+                // Tensor-parallel expert weights already own per-device shards.
+                // Rebuilding them as one fused 3D tensor would duplicate the
+                // complete expert layer on the root GPU and can exhaust its
+                // memory before the first request finishes.
+                if (gateup.multiDeviceData || down.multiDeviceData ||
+                    gateup.isDiskWeight || down.isDiskWeight ||
                     gateup.dims.size() != 2 || down.dims.size() != 2 ||
                     gateup.dims[0] <= 0 || (gateup.dims[0] & 1) != 0 ||
                     !LagunaMoeIsFusedFp8Type(gateup.dataType) ||
