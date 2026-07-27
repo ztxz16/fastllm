@@ -1981,6 +1981,45 @@ namespace fastllm {
             );
     }
 
+    static inline void CrossSwigluFloat32Chunk(
+            const float *input, int len, float *output) {
+        int i = 0;
+#ifdef __aarch64__
+        float32x4_t c1 = vdupq_n_f32(1.0f);
+        for (; i + 3 < len; i += 4) {
+            float32x4x2_t xy = vld2q_f32(input + i * 2);
+            float32x4_t vx = xy.val[0];
+            float32x4_t vy = xy.val[1];
+            vx = vdivq_f32(vx, vaddq_f32(c1, exp_ps(vnegq_f32(vx))));
+            vst1q_f32(output + i, vmulq_f32(vx, vy));
+        }
+#endif
+#ifdef __AVX2__
+        const __m256i deinterleaveIdx =
+            _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+        for (; i + 7 < len; i += 8) {
+            const __m256 lo = _mm256_loadu_ps(input + i * 2);
+            const __m256 hi = _mm256_loadu_ps(input + i * 2 + 8);
+            __m256 x = _mm256_shuffle_ps(lo, hi, 0x88);
+            __m256 y = _mm256_shuffle_ps(lo, hi, 0xDD);
+            x = _mm256_permutevar8x32_ps(x, deinterleaveIdx);
+            y = _mm256_permutevar8x32_ps(y, deinterleaveIdx);
+
+            const __m256 expNegX = exp256_ps(
+                _mm256_sub_ps(_mm256_setzero_ps(), x));
+            const __m256 silu = _mm256_div_ps(
+                x, _mm256_add_ps(_mm256_set1_ps(1.0f), expNegX));
+            _mm256_storeu_ps(output + i, _mm256_mul_ps(silu, y));
+        }
+#endif
+        for (; i < len; i++) {
+            const size_t inputOffset = (size_t)i * 2;
+            const float x = input[inputOffset];
+            output[i] = (x / (1.0f + expf(-x))) *
+                input[inputOffset + 1];
+        }
+    }
+
     void MultiThreadGemmAndCrossSwigluOp::Run() {
             // 1. 先执行 GEMM，结果写到 gateUpOutputData
             //    gateUpOutputData 已经偏移到了当前 NUMA 分片的起始列 (base)
@@ -2004,49 +2043,54 @@ namespace fastllm {
             int swigluCols = localCols / 2;   // 做完 swiglu 后的列数
             int globalSt = globalColOffset + st;
             int swigluColSt = globalSt / 2;   // swiglu 输出的列起始位置
-            long ldc = GetDataBytes(gateUpOutputDataType, 1, k);
+            const long ldc = GetDataBytes(gateUpOutputDataType, 1, k);
+
+            // Group-32 activation quantization needs a complete group to
+            // calculate its scale and sum. NUMA MergeMOE aligns these tasks
+            // to 64 gate/up columns, so compute each 32-value SwiGLU group in
+            // a small L1-resident buffer and quantize it immediately. This
+            // avoids both the large float intermediate write and a second
+            // thread-pool pass over all routed experts.
+            if (dstOutputData != nullptr &&
+                    dstOutputDataType == DataType::INF_INT8_GROUP32) {
+                constexpr int groupSize = 32;
+                AssertInFastLLM(
+                    globalSt % (groupSize * 2) == 0 &&
+                        localCols % (groupSize * 2) == 0 &&
+                        swigluColSt % groupSize == 0 &&
+                        swigluCols % groupSize == 0,
+                    "MultiThreadGemmAndCrossSwigluOp: INF_INT8_GROUP32 "
+                    "destination requires group-aligned columns.\n");
+                const size_t dstRowBytes = GetDataBytes(
+                    dstOutputDataType, 1, interDim);
+                const size_t dstGroupBytes = GetDataBytes(
+                    DataType::INF_INT8_PERCHANNEL, 1, groupSize);
+                for (int row = 0; row < n; row++) {
+                    const float *gateUpRow = (const float*)(
+                        gateUpOutputData + ldc * row);
+                    const float *cur = gateUpRow + st;
+                    uint8_t *dst = dstOutputData + dstRowBytes * row +
+                        (size_t)(swigluColSt / groupSize) * dstGroupBytes;
+                    for (int group = 0; group < swigluCols;
+                         group += groupSize) {
+                        alignas(32) float values[groupSize];
+                        CrossSwigluFloat32Chunk(
+                            cur + group * 2, groupSize, values);
+                        ConvertFromFloat32(
+                            dst, DataType::INF_INT8_GROUP32,
+                            values, 1, groupSize);
+                        dst += dstGroupBytes;
+                    }
+                }
+                return;
+            }
 
             for (int row = 0; row < n; row++) {
                 // gateUpOutputData 已经偏移了 base 列，所以这里从 st 开始读
                 float *gateUpRow = (float*)(gateUpOutputData + ldc * row);
                 float *cur = gateUpRow + st;  // 指向 GEMM 写出的 [st] 位置
                 float *out = swigluOutputData + (size_t)row * interDim + swigluColSt;
-
-                int i = 0;
-#ifdef __aarch64__
-                float32x4_t c1 = vdupq_n_f32(1.0f);
-                for (; i + 3 < swigluCols; i += 4) {
-                    float32x4x2_t xy = vld2q_f32(cur + i * 2);
-                    float32x4_t vx = xy.val[0]; // gate
-                    float32x4_t vy = xy.val[1]; // up
-                    vx = vdivq_f32(vx, vaddq_f32(c1, exp_ps(vnegq_f32(vx))));
-                    vy = vmulq_f32(vx, vy);
-                    vst1q_f32(out + i, vy);
-                }
-#endif
-#ifdef __AVX2__
-                __m256i deinterleave_idx = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
-                for (; i + 7 < swigluCols; i += 8) {
-                    __m256 lo = _mm256_loadu_ps(&cur[i * 2]);
-                    __m256 hi = _mm256_loadu_ps(&cur[i * 2 + 8]);
-                    __m256 x = _mm256_shuffle_ps(lo, hi, 0x88);
-                    __m256 y = _mm256_shuffle_ps(lo, hi, 0xDD);
-                    x = _mm256_permutevar8x32_ps(x, deinterleave_idx);
-                    y = _mm256_permutevar8x32_ps(y, deinterleave_idx);
-
-                    __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
-                    __m256 exp_neg_x = exp256_ps(neg_x);
-                    __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
-                    __m256 sigmoid = _mm256_div_ps(x, denom);
-
-                    __m256 result = _mm256_mul_ps(sigmoid, y);
-                    _mm256_storeu_ps(&out[i], result);
-                }
-#endif
-                for (; i < swigluCols; i++) {
-                    float x = cur[i * 2], y = cur[i * 2 + 1];
-                    out[i] = (x / (1.0f + expf(-x))) * y;
-                }
+                CrossSwigluFloat32Chunk(cur, swigluCols, out);
 
                 // 3. 如果指定了目标类型，立即将 swiglu 输出的列范围转换写入 dstOutputData
                 if (dstOutputData != nullptr) {

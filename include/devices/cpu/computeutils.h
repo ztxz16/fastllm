@@ -42,7 +42,7 @@ namespace fastllm {
         uint8_t *inputData;       // [n * m]
         uint8_t *weightData;      // [k * m], k = interDim * 2
         uint8_t *gateUpOutputData; // [n * k], 用于暂存 GEMM 结果
-        float *swigluOutputData;  // [n * interDim], Swiglu 中间结果（仅当 dstOutputData 非 nullptr 时用作临时缓冲）
+        float *swigluOutputData;  // [n * interDim], Swiglu 中间结果；直接 group32 量化时不写入
         uint8_t *dstOutputData;   // [n * interDim] 目标类型缓冲区，swiglu 后直接转换写出；nullptr 时行为同旧版
         DataType inputDataType, weightDataType, gateUpOutputDataType, dstOutputDataType;
         int n, m, k;              // k = interDim * 2

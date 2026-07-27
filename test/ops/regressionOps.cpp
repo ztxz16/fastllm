@@ -3215,6 +3215,14 @@ namespace {
         Expect(numasWeights.routedGate.cpuData == nullptr &&
                    numasWeights.routedDown.cpuData == nullptr,
                "NUMA INT4_GROUP(32) source buffers were not released.");
+
+        // Batch 32 takes the expert-batched NUMA path. It validates that the
+        // same fused SwiGLU -> group32 preparation works for multiple rows and
+        // that the paired VNNI row templates remain numerically equivalent.
+        expected = RunMergeMoeOnDevice("cpu", cpuWeights, 32);
+        actual = RunMergeMoeOnDevice("numa", numasWeights, 32);
+        ExpectFloatNear(expected, actual, 1e-4f, 1e-5f,
+                        "NUMA batched INT4_GROUP(32) MergeMOE output");
     }
 
 #ifdef USE_CUDA

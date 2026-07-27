@@ -2140,10 +2140,16 @@ namespace fastllm {
         int offset = 0;
         int stride = 64;
 
-        // 判断 downInputDataType 是否支持算子内直接转换
-        bool canFuseDstConvert = (downInputDataType == DataType::FLOAT32 ||
-                                  downInputDataType == DataType::FLOAT16 ||
-                                  downInputDataType == DataType::BFLOAT16);
+        const int gateCols = interDim * 2;
+        const int gateColsPerNuma = gateCols / numaConfig->numaCnt;
+        const bool canFuseGroup32 =
+            downInputDataType == DataType::INF_INT8_GROUP32 &&
+            interDim % 32 == 0 && gateColsPerNuma % 64 == 0;
+        const bool canFuseDstConvert =
+            downInputDataType == DataType::FLOAT32 ||
+            downInputDataType == DataType::FLOAT16 ||
+            downInputDataType == DataType::BFLOAT16 ||
+            canFuseGroup32;
 
         std::vector<std::vector <fastllm::MultiThreadBaseOp*> > ops;
         ops.resize(numaConfig->numaCnt);
@@ -2162,8 +2168,8 @@ namespace fastllm {
                 uint8_t* expertDstOutputPtr = canFuseDstConvert && !deepSeekV4Mode ?
                     (uint8_t*)downInput.data() + offset * GetDataBytes(downInputDataType, 1, interDim) : nullptr;
 
-                int k = interDim * 2;
-                int kPer = k / numaConfig->numaCnt;
+                int k = gateCols;
+                int kPer = gateColsPerNuma;
                     
                 for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
                     if ((int)weights[e * 2]->numasData.size() <= nid || weights[e * 2]->numasData[nid] == nullptr) {
@@ -2920,11 +2926,6 @@ namespace fastllm {
                     // 1. gateUp + swiglu
                     auto *numaConfig = GetNumaConfig();
 
-                    // 判断 downInputDataType 是否支持算子内直接转换
-                    bool canFuseDstConvert = (downInputDataType == DataType::FLOAT32 ||
-                                              downInputDataType == DataType::FLOAT16 ||
-                                              downInputDataType == DataType::BFLOAT16);
-
                     bool useDeepSeekV4MoeFast =
                         deepSeekV4Mode &&
                         GetCPUInstructInfo()->hasAVX512BF16 &&
@@ -2966,6 +2967,17 @@ namespace fastllm {
                     int totalExperts = v.size();
                     int k = interDim * 2;
                     int kPer = k / numaConfig->numaCnt;
+                    // Group-32 quantization can be fused only when every
+                    // NUMA shard begins and ends at a complete 32-value
+                    // SwiGLU group (64 interleaved gate/up columns).
+                    const bool canFuseGroup32 =
+                        downInputDataType == DataType::INF_INT8_GROUP32 &&
+                        interDim % 32 == 0 && kPer % 64 == 0;
+                    const bool canFuseDstConvert =
+                        downInputDataType == DataType::FLOAT32 ||
+                        downInputDataType == DataType::FLOAT16 ||
+                        downInputDataType == DataType::BFLOAT16 ||
+                        canFuseGroup32;
                     if (useDeepSeekV4MoeFast) {
                         std::vector<int> localExpertOrder;
                         auto &expertOrder = reuseMoeTaskStorage ?
@@ -3112,7 +3124,10 @@ namespace fastllm {
                             int threadNum =
                                 numaConfig->numaToCpuDict[nid].size();
                             int totalRows = kPer * totalExperts;
-                            int unitRows = 4;
+                            // A fused group-32 destination must never be
+                            // split between workers because its scale and sum
+                            // are shared by all 32 activation values.
+                            int unitRows = canFuseGroup32 ? 64 : 4;
                             int rowsPerThread =
                                 (totalRows / unitRows) / threadNum;
                             int remainingRows =
