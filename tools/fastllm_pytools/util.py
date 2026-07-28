@@ -29,7 +29,7 @@ def _normalize_mtp_arg(value) -> int:
         value = int(value)
     except Exception:
         value = 0
-    return max(0, value)
+    return min(9, max(0, value))
 
 def _total_memory_gib() -> float:
     try:
@@ -245,7 +245,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
-    parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大9")
     parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
