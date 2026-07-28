@@ -109,6 +109,108 @@ namespace fastllm {
                 }
             },
             {
+                "qwen3_5",
+                {
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.nextn\.eh_proj\.weight)"),
+                        "mtp.fc.weight"
+                    ), // MTP eh_proj (only present on the nextn block)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.nextn\.enorm\.weight)"),
+                        "mtp.pre_fc_norm_embedding.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.nextn\.hnorm\.weight)"),
+                        "mtp.pre_fc_norm_hidden.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.nextn\.shared_head_norm\.weight)"),
+                        "mtp.norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ssm_alpha\.weight)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_a.weight",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads
+                    ), // linear_attn in_proj_a (untile V-heads; must precede ssm_a)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ssm_beta\.weight)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_b.weight",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads
+                    ), // linear_attn in_proj_b
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ssm_a)"),
+                        "model.language_model.layers.$1.linear_attn.A_log",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads,
+                        true // untile V-heads then compose log(-x)
+                    ), // A_log (untile V-heads, then invert -exp(A_log) baked into GGUF ssm_a)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ssm_conv1d\.(weight|bias))"),
+                        "model.language_model.layers.$1.linear_attn.conv1d.$2",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads
+                    ), // conv1d (untile V channels)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ssm_dt\.bias)"),
+                        "model.language_model.layers.$1.linear_attn.dt_bias",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads
+                    ), // dt_bias (untile V-head scalars)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ssm_norm\.weight)"),
+                        "model.language_model.layers.$1.linear_attn.norm.weight"
+                    ), // linear_attn norm
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ssm_out\.weight)"),
+                        "model.language_model.layers.$1.linear_attn.out_proj.weight"
+                    ), // out_proj (stays Direct/tiled; runtime activation reorder before matmul)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_qkv\.weight)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_qkv.weight",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads
+                    ), // in_proj_qkv (untile V-segment rows only)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_gate\.weight)"),
+                        "model.language_model.layers.$1.linear_attn.in_proj_z.weight",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads
+                    ), // in_proj_z (gate; untile V rows)
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_(q|k|v)\.(weight|bias))"),
+                        "model.language_model.layers.$1.self_attn.$2_proj.$3"
+                    ), // full-attention qkv
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_(q|k)_norm\.weight)"),
+                        "model.language_model.layers.$1.self_attn.$2_norm.weight"
+                    ), // qk norm
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_output\.(weight|bias))"),
+                        "model.language_model.layers.$1.self_attn.o_proj.$2"
+                    ), // o
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_(gate|up|down)\.(weight|bias))"),
+                        "model.language_model.layers.$1.mlp.$2_proj.$3"
+                    ), // mlp
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_norm\.weight)"),
+                        "model.language_model.layers.$1.input_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.post_attention_norm\.weight)"),
+                        "model.language_model.layers.$1.post_attention_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(token_embd\.weight)"),
+                        "model.language_model.embed_tokens.weight",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(output\.weight)"),
+                        "lm_head.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(output_norm\.weight)"),
+                        "model.language_model.norm.weight"
+                    )
+                }
+            },
+            {
                 "deepseek_v2", 
                 {
                     GGUFWeightReplaceRule (

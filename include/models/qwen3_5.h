@@ -18,6 +18,38 @@
 #include <vector>
 
 namespace fastllm {
+    enum class Qwen35GdnProjectionLayout {
+        Missing,
+        Qkvzba,
+        QkvzBa,
+        QkvZBa
+    };
+
+    Qwen35GdnProjectionLayout ResolveQwen35GdnProjectionLayout(
+            const WeightMap &weight,
+            const std::string &layerPrefix);
+
+    enum class Qwen35AttentionProjectionLayout {
+        Missing,
+        MergedQkv,
+        SplitQkv
+    };
+
+    Qwen35AttentionProjectionLayout ResolveQwen35AttentionProjectionLayout(
+            const WeightMap &weight,
+            const std::string &layerPrefix);
+
+#ifdef USE_CUDA
+    using Qwen35DivisionScheme =
+        std::map<int, std::vector<std::pair<int, int> > >;
+    Qwen35DivisionScheme BuildQwen35LinearOutProjScheme(
+            const Qwen35DivisionScheme &keyHeadScheme,
+            int numKHeads,
+            int numVHeads,
+            int headVDim,
+            int quantBlock,
+            bool tiledColumns);
+#endif
     class Qwen3_5Model: public basellm {
     public:
     Qwen3_5Model (); // 构造函数
@@ -135,6 +167,7 @@ namespace fastllm {
     protected:
         bool IsThreadTensorParallelEnabled() const;
 
+
         std::vector <int> ForwardGPUWithHiddenStates(
                 int batch,
                 const Data &inputIds,
@@ -212,6 +245,8 @@ namespace fastllm {
         bool mergeSwiglu = false;
 
         bool initialized_add1 = false;
+        bool ggufNormsPreOffset = false;      // converter already +1'd norms
+        bool ggufOutProjColumnsTiled = false;  // out_proj columns stay tiled (runtime activation reorder)
 
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
         int mtp_num_hidden_layers = 0;
@@ -241,8 +276,8 @@ namespace fastllm {
         std::atomic<bool> mtpLogPrinted{false};
         std::atomic<bool> mtpSkipLogPrinted{false};
         std::atomic<long long> mtpValidationCount{0};
-        std::array<std::atomic<long long>, 8> mtpDraftPositionAttempts{};
-        std::array<std::atomic<long long>, 8> mtpDraftPositionAccepts{};
+        std::array<std::atomic<long long>, 9> mtpDraftPositionAttempts{};
+        std::array<std::atomic<long long>, 9> mtpDraftPositionAccepts{};
 
         Data inv_scale_data;
 

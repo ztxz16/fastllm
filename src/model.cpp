@@ -17,6 +17,7 @@
 #if defined(__linux__) && defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#include <exception>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -287,6 +288,16 @@ namespace fastllm {
     static bool IsDisabledTpSpec(const std::string &spec) {
         return spec.empty() || spec == "false" || spec == "off" ||
                spec == "none" || spec == "disable";
+    }
+
+    static bool Qwen35GGUFVHeadsTiledEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_GGUF_VHEAD_TILED");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        const std::string value = TrimAndLower(env);
+        return value != "0" && value != "false" && value != "off" &&
+               value != "no" && value != "disable";
     }
 
     static int ParseRoutedExpertIndex(const std::string &weightName) {
@@ -2362,6 +2373,7 @@ namespace fastllm {
         static std::map <std::string, std::string> ggufTypeToFastllmTypeDict = {
             {"qwen2", "qwen2"}, // llama
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
+            {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3_5 (Qwen3.6 GGUF reports as qwen35)
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2
@@ -2378,7 +2390,8 @@ namespace fastllm {
     static int GetGLMDSAGGUFMainLayerCount(const json11::Json &params,
                                            const std::string &arch,
                                            const basellm *model) {
-        if (model == nullptr || model->model_type != "glm_moe_dsa") {
+        if (model == nullptr ||
+            (model->model_type != "glm_moe_dsa" && model->model_type != "qwen3_5")) {
             return -1;
         }
 
@@ -2443,7 +2456,22 @@ namespace fastllm {
         json11::Json config;
         ReadGGUFMetaData(ggufFileNames[0], config);
         json11::Json params = config["params"];
-        std::string arch = params["general.architecture"].string_value();        
+        const std::string sourceArch = params["general.architecture"].string_value();
+        std::string arch = sourceArch;
+        const bool sourceQwen35GGUF = sourceArch == "qwen35" || sourceArch == "qwen3_5";
+        if (sourceArch == "qwen35moe" || sourceArch == "qwen3_5_moe") {
+            throw std::runtime_error("Unsupported Qwen3.5 MoE GGUF architecture: " + sourceArch + ".");
+        }
+        if (sourceQwen35GGUF) {
+            int nextnPredictLayers = params[sourceArch + ".nextn_predict_layers"].is_null() ?
+                                     0 : params[sourceArch + ".nextn_predict_layers"].int_value();
+            if (nextnPredictLayers > 1) {
+                throw std::runtime_error("Qwen3.5 GGUF supports at most one MTP layer, got " +
+                                         std::to_string(nextnPredictLayers) + ".");
+            }
+        }
+        const bool qwen35GGUFVHeadsTiled =
+            sourceQwen35GGUF && Qwen35GGUFVHeadsTiledEnabled();
 
         basellm *model = nullptr; 
         std::string path = originalPath;
@@ -2582,6 +2610,62 @@ namespace fastllm {
                     model->weight.AddDict("qk_nope_head_dim", std::to_string(qkMlaHeadDim - qkRopeHeadDim));
                 }
             }
+            if (sourceQwen35GGUF) {
+                int nextnPredictLayers = params[arch + ".nextn_predict_layers"].is_null() ?
+                                         0 : params[arch + ".nextn_predict_layers"].int_value();
+                if (nextnPredictLayers > 0 && model->block_cnt >= nextnPredictLayers) {
+                    model->block_cnt -= nextnPredictLayers;
+                    printf("Load qwen35 main block_cnt = %d (nextn = %d)\n",
+                           model->block_cnt, nextnPredictLayers);
+                }
+                model->weight.AddDict("model_type", "qwen3_5");
+                model->weight.AddDict("num_hidden_layers", std::to_string(model->block_cnt));
+                if (!params[arch + ".nextn_predict_layers"].is_null()) {
+                    model->weight.AddDict("mtp_num_hidden_layers",
+                                          std::to_string(params[arch + ".nextn_predict_layers"].int_value()));
+                }
+                auto q35Int = [&](const std::string &dictKey, const std::string &ggufKey) {
+                    if (!params[arch + "." + ggufKey].is_null()) {
+                        model->weight.AddDict(dictKey, std::to_string(params[arch + "." + ggufKey].int_value()));
+                    }
+                };
+                q35Int("hidden_size", "embedding_length");
+                q35Int("num_attention_heads", "attention.head_count");
+                q35Int("num_key_value_heads", "attention.head_count_kv");
+                q35Int("head_dim", "attention.key_length");
+                q35Int("max_position_embeddings", "context_length");
+                q35Int("intermediate_size", "feed_forward_length");
+                if (!params[arch + ".attention.layer_norm_rms_epsilon"].is_null()) {
+                    model->weight.AddDict("rms_norm_eps",
+                                          std::to_string(params[arch + ".attention.layer_norm_rms_epsilon"].number_value()));
+                }
+                // Qwen3.5 GDN linear-attention params: GGUF stores ssm.* which map
+                // to HF linear_attn dims as exposed by Qwen3_5Model::InitParams.
+                q35Int("linear_num_key_heads", "ssm.group_count");
+                // linear_num_value_heads = ssm.inner_size / ssm.state_size
+                // (time_step_rank happens to equal it for Qwen3.6 but is a
+                //  separate concept; derive from the value-head count instead).
+                if (!params[arch + ".ssm.inner_size"].is_null() &&
+                    !params[arch + ".ssm.state_size"].is_null() &&
+                    params[arch + ".ssm.state_size"].int_value() > 0) {
+                    int innerSize = params[arch + ".ssm.inner_size"].int_value();
+                    int stateSize = params[arch + ".ssm.state_size"].int_value();
+                    model->weight.AddDict("linear_num_value_heads",
+                                          std::to_string(innerSize / stateSize));
+                }
+                q35Int("linear_key_head_dim", "ssm.state_size");
+                q35Int("linear_value_head_dim", "ssm.state_size");
+                // Qwen3.5 GGUF converters pre-offset norms independently of
+                // their V-head layout. The layout can be overridden for old or
+                // nonstandard files without changing norm semantics.
+                model->weight.AddDict("ggufNormsPreOffset", "1");
+                model->weight.AddDict("ggufOutProjColumnsTiled",
+                                      qwen35GGUFVHeadsTiled ? "1" : "0");
+                if (!params[arch + ".rope.freq_base"].is_null()) {
+                    model->weight.AddDict("rope_theta",
+                                          std::to_string(params[arch + ".rope.freq_base"].number_value()));
+                }
+            }
 
             if (!params[arch + ".attention.head_count"].is_null()) {
                 model->num_attention_heads = params[arch + ".attention.head_count"].int_value();
@@ -2644,7 +2728,15 @@ namespace fastllm {
             // printf("config = %s\n", config.dump().c_str());
         }
 
-        arch = ConvertGGUFTypeToFastllmType(arch);
+        if (sourceQwen35GGUF) {
+            // Preserve GGUF properties when `originalPath` supplies the HF
+            // config/tokenizer (the branch above replaces `arch`).
+            model->weight.AddDict("ggufNormsPreOffset", "1");
+            model->weight.AddDict("ggufOutProjColumnsTiled",
+                                  qwen35GGUFVHeadsTiled ? "1" : "0");
+        }
+
+        arch = ConvertGGUFTypeToFastllmType(sourceArch);
         int ggufMainLayerCount = GetGLMDSAGGUFMainLayerCount(params, arch, model);
 
         // 3.0 更新模型信息
@@ -2658,6 +2750,58 @@ namespace fastllm {
         ReportModelLoadProgress("weights_prepare", 0, 1);
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
+        }
+        // Qwen3.5 GGUF: the nextn-specific tensors (eh_proj/enorm/hnorm/...)
+        // are renamed to mtp.* by the GGUF rules. The MTP block's attention/FFN
+        // weights were renamed by the trunk rules into
+        // model.language_model.layers.{block_count}.*; reroute them into
+        // mtp.layers.0.* so Qwen3_5Model's MTP draft head picks them up.
+        if (arch == "qwen3_5") {
+            std::string layerPrefix = "model.language_model.layers." +
+                                       std::to_string(model->block_cnt) + ".";
+            std::string mtpLayer = "mtp.layers.0.";
+            for (auto &task : readGGUFTasks) {
+                std::string &name = task.name;
+                if (name.compare(0, layerPrefix.size(), layerPrefix) == 0) {
+                    name = mtpLayer + name.substr(layerPrefix.size());
+                }
+            }
+        }
+        // Normalize converter-tiled V rows before any merge. An explicit
+        // override keeps old/nonstandard GGUFs in their native grouped layout;
+        // A_log still needs the independent -exp inverse in that mode.
+        if (arch == "qwen3_5") {
+            auto dictGet = [&](const std::string &key, const std::string &def) -> std::string {
+                auto it = model->weight.dicts.find(key);
+                return it != model->weight.dicts.end() ? it->second : def;
+            };
+            int numKHeads = atoi(dictGet("linear_num_key_heads", "0").c_str());
+            int numVHeads = atoi(dictGet("linear_num_value_heads", "0").c_str());
+            int headKDim = atoi(dictGet("linear_key_head_dim", "0").c_str());
+            if (qwen35GGUFVHeadsTiled) {
+                AssertInFastLLM(numKHeads > 0 && numVHeads >= numKHeads &&
+                                numVHeads % numKHeads == 0 && headKDim > 0,
+                                "Qwen3.5 GGUF V-head untile metadata is invalid.\n");
+            }
+            for (auto &task : readGGUFTasks) {
+                if (task.replaceType != GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads) {
+                    continue;
+                }
+                if (!qwen35GGUFVHeadsTiled) {
+                    task.replaceType = task.untileComposeNegLog
+                        ? GGUFWeightReplaceRule::GGUFWeightReplaceNegLogFP32
+                        : GGUFWeightReplaceRule::GGUFWeightReplaceDirect;
+                    continue;
+                }
+                task.untileNumKHeads = numKHeads;
+                task.untileNumVHeads = numVHeads;
+                const bool hasQkPrefix =
+                    task.name.find("in_proj_qkv.") != std::string::npos ||
+                    task.name.find("linear_attn.conv1d.") != std::string::npos;
+                task.untileVRowStart = hasQkPrefix
+                    ? 2 * numKHeads * headKDim
+                    : 0;
+            }
         }
         uint64_t totalLoadBytes = 0;
         for (int i = 0; i < readGGUFTasks.size(); i++) {
@@ -2683,6 +2827,7 @@ namespace fastllm {
         std::vector <std::thread*> threads;
         int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
         std::mutex locker;
+        std::vector<std::exception_ptr> threadErrors(threadNum);
         int cnt = 0;
         uint64_t completedLoadBytes = 0;
         ReportModelLoadProgress("weights_load", 0, std::max<size_t>(1, tensors.size()),
@@ -2717,9 +2862,11 @@ namespace fastllm {
         // Load 
         for (int i = 0; i < threadNum; i++) {
             threads.push_back(
-                new std::thread([&](int st, int end) {
-                    for (int i = st; i < end; i++) {
-                        auto &weightName = tensors[i];
+                new std::thread([&, i](int st, int end) {
+                    std::unique_lock<std::mutex> workerLock(locker, std::defer_lock);
+                    try {
+                        for (int tensorIndex = st; tensorIndex < end; tensorIndex++) {
+                            auto &weightName = tensors[tensorIndex];
                         uint64_t tensorBytes = 0;
                         if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
                             auto *task = readGGUFTaskDict[weightName];
@@ -2729,12 +2876,14 @@ namespace fastllm {
                                 SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
                             } else {
                                 WeightImportGGUFTensor(task->weight, &task->tensor, task->fileName,
-                                                       task->offset, task->replaceType);
+                                                       task->offset, task->replaceType,
+                                                       task->untileNumKHeads, task->untileNumVHeads,
+                                                       task->untileVRowStart, task->untileComposeNegLog);
                             }
                         } 
                         {
                             // try merge                                
-                            locker.lock();
+                            workerLock.lock();
                             allFinishNames.insert(weightName);
                             // 检查是否需要合并权重
                             bool needMerge = false;
@@ -2784,7 +2933,7 @@ namespace fastllm {
                                     continue;
                                 }
 
-                                locker.unlock();
+                                workerLock.unlock();
                                 for (auto &it : rule.rules) {
                                     if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
                                         continue;
@@ -2862,12 +3011,13 @@ namespace fastllm {
 #ifdef USE_TFACC
                                         try {
                                             if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "tfacc")) {
-                                                locker.lock();
+                                                workerLock.lock();
                                                 mergeData.weightSum.resize(1);
                                                 RegisterFastllmData(&mergeData, it.type);
-                                                locker.unlock();
+                                                workerLock.unlock();
                                             }
                                         } catch (...) {
+                                            if (workerLock.owns_lock()) workerLock.unlock();
                                         }
 #endif
 #if defined(USE_NUMAS)
@@ -2882,29 +3032,30 @@ namespace fastllm {
                                         model->MoveSpecialWeightToCudaIfNeeded(mergeName, mergeData);
                                     }
 
-                                    locker.lock();
+                                    workerLock.lock();
                                     allFinishNames.insert(mergedWeightName);
                                     model->OnWeightLoaded(mergedWeightName, allFinishNames);
-                                    locker.unlock();
+                                    workerLock.unlock();
                                     for (auto input : it.inputs) {
                                         model->weight.weight.erase(input);
                                     }
                                 }
-                                locker.lock();
+                                workerLock.lock();
                             }
-                            locker.unlock();
+                            workerLock.unlock();
 #ifdef USE_TFACC
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "tfacc")) {
                                     auto weightIt = model->weight.weight.find(weightName);
                                     if (weightIt != model->weight.weight.end()) {
-                                        locker.lock();
+                                        workerLock.lock();
                                         weightIt->second.weightSum.resize(1);
                                         RegisterFastllmData(&weightIt->second, model->specialWeights[weightName]);
-                                        locker.unlock();
+                                        workerLock.unlock();
                                     }
                                 }
                             } catch (...) {
+                                if (workerLock.owns_lock()) workerLock.unlock();
                             }
 #endif
 #if defined(USE_NUMAS)
@@ -2928,13 +3079,13 @@ namespace fastllm {
                         }
 
                         if (tensors.size() != 0) {
-                            locker.lock();
+                            workerLock.lock();
                             int current = ++cnt;
                             completedLoadBytes += tensorBytes;
                             uint64_t currentBytes = completedLoadBytes;
                             printf("Loading %d \r", current * 100 / (int)tensors.size());
                             fflush(stdout);
-                            locker.unlock();
+                            workerLock.unlock();
                             if (current == (int)tensors.size() ||
                                 current * 100 / (int)tensors.size() !=
                                     (current - 1) * 100 / (int)tensors.size()) {
@@ -2942,6 +3093,9 @@ namespace fastllm {
                                                         currentBytes, totalLoadBytes);
                             }
                         }
+                        }
+                    } catch (...) {
+                        threadErrors[i] = std::current_exception();
                     }
                 }, parts[i].first, parts[i].second)
             );
@@ -2949,6 +3103,11 @@ namespace fastllm {
         for (int i = 0; i < threads.size(); i++) {
             threads[i]->join();
             delete threads[i];
+        }
+        for (auto &error : threadErrors) {
+            if (error) {
+                std::rethrow_exception(error);
+            }
         }
         model->OnModelWeightsLoaded();
 
@@ -2959,6 +3118,9 @@ namespace fastllm {
     }
 
     std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
+        if (IsGGUFFile(fileName)) {
+            return CreateLLMModelFromGGUFFile(fileName, "");
+        }
         std::string modelType = GetModelTypeFromFile(fileName);
         basellm *model = CreateModelWithType(modelType);
         if(modelType == "bert"){

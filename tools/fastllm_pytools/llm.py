@@ -1190,6 +1190,10 @@ class model:
                 exit(0)
         if config_base_path is not None:
             self.model_path = config_base_path
+        config_path = os.path.join(config_base_path, "config.json") if config_base_path else ""
+        if config_path and os.path.isfile(config_path) and not hasattr(self, "config"):
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                self.config = json.load(config_file)
 
         architecture = ""
         model_type = ""
