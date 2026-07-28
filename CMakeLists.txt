@@ -321,8 +321,7 @@ if (USE_CUDA)
         endif()
     endforeach()
     set(FASTLLM_CUTLASS_W4A8_ENABLED OFF)
-    if (ENABLE_VLLM_KERNEL AND
-        NOT FASTLLM_CUTLASS_DIR STREQUAL "" AND
+    if (NOT FASTLLM_CUTLASS_DIR STREQUAL "" AND
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
         FASTLLM_CUTLASS_W4A8_ARCH_ENABLED AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
@@ -331,7 +330,7 @@ if (USE_CUDA)
         if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include")
             include_directories("${FASTLLM_CUTLASS_DIR}/tools/util/include")
         endif()
-        add_compile_definitions(FASTLLM_ENABLE_VLLM_CUTLASS_W4A8)
+        add_compile_definitions(FASTLLM_ENABLE_CUTLASS_W4A8)
         message(STATUS "CUTLASS W4A8 kernels: ON (${FASTLLM_CUTLASS_DIR})")
     else()
         message(STATUS "CUTLASS W4A8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
@@ -363,7 +362,7 @@ if (USE_CUDA)
     if(FASTLLM_CUTLASS_W4A8_ENABLED)
         list(APPEND FASTLLM_CUDA_SOURCES
             src/devices/cuda/linear/fastllm-linear-w4a8-cutlass.cu
-            src/libtorch_stable/quantization/cutlass_w4a8/w4a8_utils.cu
+            src/devices/cuda/linear/fastllm-w4a8-utils.cu
         )
     endif()
 

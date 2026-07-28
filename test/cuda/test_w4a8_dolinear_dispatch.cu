@@ -229,7 +229,7 @@ std::vector<float> DataToFloat(fastllm::Data &data) {
 
 bool RunFallbackCase(const W4A8DispatchCase &shape, uint32_t seedBase,
                      const std::string &name) {
-#ifndef FASTLLM_ENABLE_VLLM_CUTLASS_W4A8
+#ifndef FASTLLM_ENABLE_CUTLASS_W4A8
     (void)shape;
     (void)seedBase;
     std::printf("[W4A8 DoCudaLinear] %s compile macro disabled skip PASS\n", name.c_str());
@@ -271,7 +271,7 @@ bool RunFallbackCase(const W4A8DispatchCase &shape, uint32_t seedBase,
 }
 
 bool RunNoSwitchCase() {
-#ifndef FASTLLM_ENABLE_VLLM_CUTLASS_W4A8
+#ifndef FASTLLM_ENABLE_CUTLASS_W4A8
     std::printf("[W4A8 DoCudaLinear] no-switch compile macro disabled skip PASS\n");
     return true;
 #else
@@ -313,7 +313,7 @@ bool RunNoSwitchCase() {
 }
 
 bool RunW4A8EnterCase() {
-#ifndef FASTLLM_ENABLE_VLLM_CUTLASS_W4A8
+#ifndef FASTLLM_ENABLE_CUTLASS_W4A8
     std::printf("[W4A8 DoCudaLinear] compile macro disabled skip PASS\n");
     return true;
 #else

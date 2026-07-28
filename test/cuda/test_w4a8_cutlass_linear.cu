@@ -297,7 +297,7 @@ bool RunEntryBehaviorTests() {
     W4A8Case valid;
     bool ok = true;
 
-#ifndef FASTLLM_ENABLE_VLLM_CUTLASS_W4A8
+#ifndef FASTLLM_ENABLE_CUTLASS_W4A8
     ok = !TryCase(valid, fastllm::DataType::FLOAT16, fastllm::DataType::INT4_GROUP,
                   nullptr, 128, true) && ok;
     std::printf("[W4A8 CUTLASS] compile macro disabled skip PASS\n");
@@ -421,8 +421,8 @@ bool RunNumericalCase(const W4A8Case &shape, uint32_t seedBase, const std::strin
 }
 
 bool RunNumericalTests() {
-#ifndef FASTLLM_ENABLE_VLLM_CUTLASS_W4A8
-    std::printf("[W4A8 CUTLASS] numerical tests skipped: FASTLLM_ENABLE_VLLM_CUTLASS_W4A8 is off\n");
+#ifndef FASTLLM_ENABLE_CUTLASS_W4A8
+    std::printf("[W4A8 CUTLASS] numerical tests skipped: FASTLLM_ENABLE_CUTLASS_W4A8 is off\n");
     return true;
 #else
     if (!RuntimeSm90()) {

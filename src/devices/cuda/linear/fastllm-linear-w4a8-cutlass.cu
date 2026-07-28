@@ -1,5 +1,5 @@
 #include "fastllm-cuda.cuh"
-#include "libtorch_stable/quantization/cutlass_w4a8/w4a8_utils.cuh"
+#include "fastllm-w4a8-utils.cuh"
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -421,10 +421,10 @@ static bool FastllmCudaW4A8CanUseWeightSource(const fastllm::Data &weight,
     return true;
 }
 
-__global__ void FastllmCudaW4A8PackInt4GroupToVllmBKernel(const uint8_t *src,
-                                                          uint32_t *dst,
-                                                          int inChannels,
-                                                          int outChannels) {
+__global__ void FastllmCudaW4A8PackInt4GroupToCutlassBKernel(const uint8_t *src,
+                                                             uint32_t *dst,
+                                                             int inChannels,
+                                                             int outChannels) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = (size_t)(inChannels / 8) * outChannels;
     if (idx >= total) {
@@ -546,7 +546,7 @@ static bool FastllmCudaW4A8EncodeAndReorderInt4B(uint8_t *rawPackedWeight,
     auto packedPtr = reinterpret_cast<QuantType*>(cutlassPackedWeight);
     size_t numInt4Elems = (size_t)inChannels * outChannels;
 
-    if (!vllm::cutlass_w4a8_utils::unified_encode_int4b(rawPtr, packedPtr, numInt4Elems)) {
+    if (!fastllm::cuda::w4a8::EncodeInt4ForCutlass(rawPtr, packedPtr, numInt4Elems)) {
         return false;
     }
 
@@ -739,9 +739,8 @@ static bool FastllmCudaW4A8BuildScaleCaches(
                 channelAbsMax,
                 std::fabs(FastllmCudaW4A8SourceScaleAt(weight, rowOffset + group)));
         }
-        // This is equivalent to vLLM's per-channel FP8 quantization followed
-        // by fp8_scales /= 8 and channel_scales *= 8. The largest group scale
-        // maps to 56, preserving the same E4M3 dynamic-range usage.
+        // Per-channel FP8 quantization maps the largest group scale to 56,
+        // preserving E4M3 dynamic-range usage.
         float channelScale = std::max(channelAbsMax, 1.0e-10f) / 56.0f;
         hostChannelScales[out] = channelScale;
         for (int group = 0; group < weight.group; group++) {
@@ -953,7 +952,7 @@ static bool FastllmCudaW4A8EnsurePackedWeightCache(fastllm::Data &weight,
                 (const uint8_t*)weight.cudaData, rawPackedWeight, packedBytes);
     } else {
         size_t words = (size_t)(m / 8) * k;
-        FastllmCudaW4A8PackInt4GroupToVllmBKernel<<<
+        FastllmCudaW4A8PackInt4GroupToCutlassBKernel<<<
             (words + threads - 1) / threads, threads>>>(
                 (const uint8_t*)weight.cudaData, (uint32_t*)rawPackedWeight, m, k);
     }

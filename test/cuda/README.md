@@ -98,7 +98,6 @@ cmake --build build-fastllm --target test_w4a8_cutlass_linear -j$(nproc)
 ```text
 USE_CUDA=ON
 ENABLE_CUDA_TESTS=ON
-ENABLE_VLLM_KERNEL=ON
 CUTLASS include 可用
 CUDA_ARCH 包含 90 / 90a / 9.0a
 CUDA 编译器版本 >= 12.0
@@ -115,7 +114,7 @@ CUDA W4A8 CUTLASS test: OFF
 第一版测试先覆盖入口行为：
 
 ```text
-编译未开启 FASTLLM_ENABLE_VLLM_CUTLASS_W4A8 时返回 false
+编译未开启 FASTLLM_ENABLE_CUTLASS_W4A8 时返回 false
 非 SM90 时返回 false
 m/k 非 128 对齐时返回 false
 input/weight dtype 不满足时返回 false
