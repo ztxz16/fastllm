@@ -237,6 +237,221 @@ namespace {
         throw std::runtime_error("unsupported linear weight_type: " + weightType);
     }
 
+    static uint16_t FloatToBFloat16(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return uint16_t(bits >> 16);
+    }
+
+    static uint16_t FloatToBFloat16RoundToNearest(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        uint32_t roundingBias = 0x7fffU + ((bits >> 16) & 1U);
+        return uint16_t((bits + roundingBias) >> 16);
+    }
+
+    static float BFloat16ToFloat(uint16_t value) {
+        uint32_t bits = uint32_t(value) << 16;
+        float result;
+        std::memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+
+    static float RoundFp8E4M3(float value) {
+        if (!std::isfinite(value)) {
+            return std::copysign(448.0f, value);
+        }
+        bool negative = std::signbit(value);
+        float absolute = std::min(std::fabs(value), 448.0f);
+        float best = 0.0f;
+        float bestError = absolute;
+        int bestEncoding = 0;
+        for (int encoding = 1; encoding <= 0x7e; ++encoding) {
+            int exponent = encoding >> 3;
+            int mantissa = encoding & 7;
+            float candidate;
+            if (exponent == 0) {
+                candidate = std::ldexp(float(mantissa), -9);
+            } else {
+                candidate = std::ldexp(1.0f + float(mantissa) / 8.0f,
+                                       exponent - 7);
+            }
+            float error = std::fabs(candidate - absolute);
+            if (error < bestError ||
+                (error == bestError && (encoding & 1) == 0 &&
+                 (bestEncoding & 1) != 0)) {
+                best = candidate;
+                bestError = error;
+                bestEncoding = encoding;
+            }
+        }
+        return negative ? -best : best;
+    }
+
+    struct LinearW4A8Fixture {
+        int batch = 0;
+        int in = 0;
+        int out = 0;
+        int groups = 0;
+        std::vector<float> inputValues;
+        std::vector<uint8_t> packedWeights;
+        std::vector<uint16_t> bf16Scales;
+        std::vector<float> sourceScales;
+        std::vector<float> biasValues;
+
+        explicit LinearW4A8Fixture(const OpTestParams &params) {
+            batch = params.GetInt("batch");
+            in = params.GetInt("in");
+            out = params.GetInt("out");
+            if (batch <= 0 || in <= 0 || out <= 0 ||
+                in % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0 ||
+                out % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0) {
+                throw std::runtime_error(
+                    "linear weight_type=int4_w4a8 requires positive batch "
+                    "and 128-aligned in/out");
+            }
+
+            groups = in / fastllm::COMPRESSED_W4A8_GROUP_SIZE;
+            inputValues.resize((size_t)batch * in);
+            for (size_t i = 0; i < inputValues.size(); ++i) {
+                float value = 0.5f * std::sin(float(i + 1) * 0.013f) +
+                              0.25f * std::cos(float(i + 3) * 0.007f);
+                inputValues[i] = BFloat16ToFloat(FloatToBFloat16(value));
+            }
+
+            packedWeights.assign((size_t)out * in / 2, 0);
+            sourceScales.resize((size_t)out * groups);
+            bf16Scales.resize(sourceScales.size());
+            for (int row = 0; row < out; ++row) {
+                for (int group = 0; group < groups; ++group) {
+                    float scale =
+                        0.001f * float(1 + ((row * 7 + group * 3) % 19));
+                    size_t index = (size_t)row * groups + group;
+                    bf16Scales[index] = FloatToBFloat16(scale);
+                    sourceScales[index] =
+                        BFloat16ToFloat(bf16Scales[index]);
+                }
+                for (int col = 0; col < in; ++col) {
+                    int signedValue = ((row * 11 + col * 5 + 3) % 16) - 8;
+                    uint8_t nibble = uint8_t(signedValue + 8);
+                    size_t index = (size_t)row * (in / 2) + col / 2;
+                    if ((col & 1) == 0) {
+                        packedWeights[index] =
+                            (packedWeights[index] & 0xf0U) | nibble;
+                    } else {
+                        packedWeights[index] =
+                            (packedWeights[index] & 0x0fU) |
+                            uint8_t(nibble << 4);
+                    }
+                }
+            }
+
+            biasValues.resize(out);
+            for (int i = 0; i < out; ++i) {
+                biasValues[i] = float((i % 17) - 8) * 0.001f;
+            }
+        }
+
+        fastllm::Data CpuReference() const {
+            std::vector<float> quantizedInput(inputValues.size());
+            for (int token = 0; token < batch; ++token) {
+                size_t offset = (size_t)token * in;
+                float absoluteMax = 0.0f;
+                for (int col = 0; col < in; ++col) {
+                    absoluteMax = std::max(
+                        absoluteMax, std::fabs(inputValues[offset + col]));
+                }
+                float tokenScale =
+                    std::max(absoluteMax, 1.0e-10f) / 448.0f;
+                for (int col = 0; col < in; ++col) {
+                    float value = inputValues[offset + col] / tokenScale;
+                    value = std::max(-448.0f, std::min(448.0f, value));
+                    quantizedInput[offset + col] =
+                        RoundFp8E4M3(value) * tokenScale;
+                }
+            }
+
+            std::vector<float> decodedScales(sourceScales.size());
+            for (int row = 0; row < out; ++row) {
+                size_t offset = (size_t)row * groups;
+                float absoluteMax = 0.0f;
+                for (int group = 0; group < groups; ++group) {
+                    absoluteMax = std::max(
+                        absoluteMax,
+                        std::fabs(sourceScales[offset + group]));
+                }
+                float channelScale =
+                    std::max(absoluteMax, 1.0e-10f) / 56.0f;
+                for (int group = 0; group < groups; ++group) {
+                    decodedScales[offset + group] =
+                        RoundFp8E4M3(
+                            sourceScales[offset + group] / channelScale) *
+                        channelScale;
+                }
+            }
+
+            std::vector<float> expected((size_t)batch * out);
+            for (int token = 0; token < batch; ++token) {
+                for (int row = 0; row < out; ++row) {
+                    float value = 0.0f;
+                    for (int col = 0; col < in; ++col) {
+                        uint8_t packed =
+                            packedWeights[(size_t)row * (in / 2) + col / 2];
+                        int q =
+                            int((packed >> ((col & 1) * 4)) & 0xfU) - 8;
+                        value +=
+                            quantizedInput[(size_t)token * in + col] *
+                            float(q) *
+                            decodedScales[(size_t)row * groups +
+                                          col /
+                                              fastllm::COMPRESSED_W4A8_GROUP_SIZE];
+                    }
+                    value = BFloat16ToFloat(
+                        FloatToBFloat16RoundToNearest(value));
+                    expected[(size_t)token * out + row] =
+                        BFloat16ToFloat(FloatToBFloat16RoundToNearest(
+                            value + biasValues[row]));
+                }
+            }
+            return fastllm::Data(
+                fastllm::DataType::FLOAT32, {batch, out}, expected);
+        }
+
+        void InitDeviceData(fastllm::Data &input,
+                            fastllm::Data &weight,
+                            fastllm::Data &bias,
+                            fastllm::Data &output) const {
+            fastllm::Data inputSource(
+                fastllm::DataType::BFLOAT16, {batch, in}, inputValues);
+            input.CopyFrom(inputSource);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+
+            weight.dataType = fastllm::DataType::INT4_W4A8;
+            weight.UpdateUnitSize();
+            weight.Resize({out, in});
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.InitW4A8Weight(
+                fastllm::W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8);
+            weight.SetW4A8GroupScales(
+                bf16Scales.data(), bf16Scales.size());
+            weight.Allocate(false);
+            std::memcpy(
+                weight.cpuData, packedWeights.data(), packedWeights.size());
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data biasSource(
+                fastllm::DataType::FLOAT32, {out}, biasValues);
+            bias.CopyFrom(biasSource);
+            bias.ToDevice(fastllm::DataDevice::CUDA);
+
+            output.dataType = fastllm::DataType::BFLOAT16;
+            output.UpdateUnitSize();
+            output.Resize({batch, out});
+            output.Allocate(false);
+            output.ToDevice(fastllm::DataDevice::CUDA, false);
+        }
+    };
+
     static int CountElements(const std::vector<int> &dims) {
         int count = 1;
         for (int dim : dims) {
@@ -1179,11 +1394,35 @@ namespace {
                 params.Add("batch", "4", "batch size");
                 params.Add("in", "8", "input features");
                 params.Add("out", "6", "output features");
-                params.Add("weight_type", "float32", "weight datatype: float32, int4group, or int4group32");
+                params.Add("weight_type", "float32",
+                           "weight datatype: float32, int4group, int4group32 or int4_w4a8");
                 params.Add("group_cnt", "128", "group size used by int4group quantization");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
+                if (params.GetString("weight_type") == "int4_w4a8") {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                    int batch = params.GetInt("batch");
+                    int in = params.GetInt("in");
+                    int out = params.GetInt("out");
+                    if (batch <= 0 || in <= 0 || out <= 0 ||
+                        in % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0 ||
+                        out % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0) {
+                        throw std::runtime_error(
+                            "linear weight_type=int4_w4a8 requires positive "
+                            "batch and 128-aligned in/out");
+                    }
+                    if (device.rfind("cuda:", 0) != 0) {
+                        return false;
+                    }
+                    ScopedFirstDevice guard(device);
+                    return FastllmCudaRuntimeArch() == 90;
+#else
+                    (void)params;
+                    (void)device;
+                    return false;
+#endif
+                }
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 fastllm::Data input = MakeTensor({batch, in}, 0.2f);
                 fastllm::Data weight;
@@ -1194,6 +1433,22 @@ namespace {
                                       {}, {});
             },
             [](const OpTestParams &params, const std::string &device) {
+                if (params.GetString("weight_type") == "int4_w4a8") {
+                    LinearW4A8Fixture fixture(params);
+                    if (device == "cpu") {
+                        return fixture.CpuReference();
+                    }
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                    ScopedFirstDevice guard(device);
+                    fastllm::Data input, weight, bias, output;
+                    fixture.InitDeviceData(input, weight, bias, output);
+                    fastllm::Linear(input, weight, bias, output);
+                    return ConvertToFloat32Data(output);
+#else
+                    throw std::runtime_error(
+                        "int4_w4a8 linear requires CUDA SM90 CUTLASS build");
+#endif
+                }
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 fastllm::Data input = MakeTensor({batch, in}, 0.2f);
                 fastllm::Data weight;
@@ -1206,6 +1461,28 @@ namespace {
                 return output;
             },
             [](const OpTestParams &params, const std::string &device) {
+                if (params.GetString("weight_type") == "int4_w4a8") {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                    auto fixture =
+                        std::make_shared<LinearW4A8Fixture>(params);
+                    auto input = std::make_shared<fastllm::Data>();
+                    auto weight = std::make_shared<fastllm::Data>();
+                    auto bias = std::make_shared<fastllm::Data>();
+                    auto output = std::make_shared<fastllm::Data>();
+                    {
+                        ScopedFirstDevice guard(device);
+                        fixture->InitDeviceData(
+                            *input, *weight, *bias, *output);
+                    }
+                    return [device, input, weight, bias, output]() {
+                        ScopedFirstDevice guard(device);
+                        fastllm::Linear(*input, *weight, *bias, *output);
+                    };
+#else
+                    throw std::runtime_error(
+                        "int4_w4a8 linear requires CUDA SM90 CUTLASS build");
+#endif
+                }
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 auto input = std::make_shared<fastllm::Data>(MakeTensor({batch, in}, 0.2f));
                 auto weight = std::make_shared<fastllm::Data>();
@@ -1220,6 +1497,14 @@ namespace {
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 double weightBytes = FloatBytes({out, in});
+                if (params.GetString("weight_type") == "int4_w4a8") {
+                    int groups = in / fastllm::COMPRESSED_W4A8_GROUP_SIZE;
+                    return (double)batch * in * 2.0 +
+                           (double)out * in * 0.5 +
+                           (double)out * groups * 2.0 +
+                           (double)out * sizeof(float) +
+                           (double)batch * out * 2.0;
+                }
                 if (params.GetString("weight_type") == "int4group32") {
                     weightBytes = (double)fastllm::GetDataBytes(
                         fastllm::DataType::INT4_GROUP32, out, in);
