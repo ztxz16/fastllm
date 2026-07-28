@@ -164,6 +164,7 @@ struct APIConfig {
     int batch = 256; // batch数限制
     fastllm::DataType dtype = fastllm::DataType::FLOAT16;
     fastllm::DataType atype = fastllm::DataType::FLOAT32;
+    fastllm::DataType kvCacheDtype = fastllm::DataType::DATA_AUTO_NONE;
     int groupCnt = -1;
 
     std::map <std::string, int> devices;
@@ -620,6 +621,7 @@ void Usage() {
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<--atype> <args>:             设置推理使用的数据类型(float32/float16)" << std::endl;
+    std::cout << "<--kv_cache_dtype> <args>:    设置KV Cache数据类型(auto/float32/float16/bfloat16/fp8_e4m3)" << std::endl;
     std::cout << "<--batch> <args>:             最大batch数" << std::endl;
     std::cout << "<--tokens> <args>:            最大tokens容量" << std::endl;
     std::cout << "<--model_name> <args>:        模型名(openai api中使用)" << std::endl;
@@ -665,6 +667,12 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             fastllm::AssertInFastLLM(dataTypeDict.find(atypeStr) != dataTypeDict.end(),
                                     "Unsupport act type: " + atypeStr);
             config.atype = dataTypeDict[atypeStr];
+        } else if (sargv[i] == "--kv_cache_dtype") {
+            try {
+                config.kvCacheDtype = fastllm::ParseKVCacheDataType(sargv[++i]);
+            } catch (const std::invalid_argument &error) {
+                fastllm::AssertInFastLLM(false, error.what());
+            }
         } else if (sargv[i] == "--model_name") {
             config.modelName = sargv[++i];
         } else if (sargv[i] == "--device") {
@@ -696,8 +704,11 @@ int main(int argc, char** argv) {
     bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
     workQueue.model = isHFDir ? fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt)
         : fastllm::CreateLLMModelFromFile(config.path);
-    workQueue.model->tokensLimit = config.tokens;
+    workQueue.model->SetTokenLimit(config.tokens);
     workQueue.model->SetDataType(config.atype);
+    if (config.kvCacheDtype != fastllm::DataType::DATA_AUTO_NONE) {
+        workQueue.model->SetKVCacheDataType(config.kvCacheDtype);
+    }
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.Start();
 

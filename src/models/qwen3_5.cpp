@@ -78,6 +78,25 @@ namespace fastllm {
         return Qwen35AttentionProjectionLayout::Missing;
     }
 
+    int SelectQwen35DecodeTokensForPageBudget(
+            int requestedTokens,
+            const std::vector<std::pair<int, int> > &requestedNeedsAndFree,
+            const std::vector<std::pair<int, int> > &singleNeedsAndFree) {
+        auto fits = [](const std::vector<std::pair<int, int> > &needsAndFree) {
+            for (const auto &item : needsAndFree) {
+                if (item.first > item.second) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        requestedTokens = std::max(1, requestedTokens);
+        if (fits(requestedNeedsAndFree)) {
+            return requestedTokens;
+        }
+        return fits(singleNeedsAndFree) ? 1 : 0;
+    }
+
 #ifdef USE_CUDA
     Qwen35DivisionScheme BuildQwen35LinearOutProjScheme(
             const Qwen35DivisionScheme &keyHeadScheme,
@@ -14305,10 +14324,9 @@ namespace fastllm {
             return true;
         };
 
-        auto collectDecodePageNeeds = [&](ResponseContext *ctx) -> std::map<PagedCacheManager*, int> {
+        auto collectDecodePageNeeds = [&](ResponseContext *ctx, int decodeTokens) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
-            int decodeTokens = ctx == nullptr ? 1 :
-                std::max(1, scheduledDecodeTokens(ctx));
+            decodeTokens = std::max(1, decodeTokens);
             // Multi-token MTP validation runs against a paged-cache view. A
             // partial last page is cloned before appending so rejected draft
             // tokens cannot overwrite the real cache.
@@ -14383,6 +14401,19 @@ namespace fastllm {
                 }
             }
             return false;
+        };
+        auto pageNeedsAndFree = [](const std::map<PagedCacheManager*, int> &needs) {
+            std::vector<std::pair<int, int> > ret;
+            ret.reserve(needs.size());
+            for (const auto &it : needs) {
+                PagedCacheManager *manager = it.first;
+                if (manager == nullptr || it.second <= 0) {
+                    continue;
+                }
+                std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                ret.push_back({it.second, manager->FreePageCount()});
+            }
+            return ret;
         };
         auto accumulatePagedManagerNeeds = [](
                 std::map<PagedCacheManager*, int> &total,
@@ -14809,10 +14840,18 @@ namespace fastllm {
                     }
 
                     if (!isPrompt) {
-                        auto pageNeeds = collectDecodePageNeeds(ctx);
+                        auto pageNeeds = collectDecodePageNeeds(ctx, scheduledTokens);
                         if (!pageNeeds.empty() && hasPagedManagerShortage(pageNeeds)) {
-                            releaseAndReinitRequest(ctx);
-                            continue;
+                            auto singlePageNeeds = collectDecodePageNeeds(ctx, 1);
+                            int budgetedTokens = SelectQwen35DecodeTokensForPageBudget(
+                                scheduledTokens, pageNeedsAndFree(pageNeeds),
+                                pageNeedsAndFree(singlePageNeeds));
+                            if (budgetedTokens == 0) {
+                                releaseAndReinitRequest(ctx);
+                                continue;
+                            }
+                            scheduledTokens = budgetedTokens;
+                            pageNeeds.swap(singlePageNeeds);
                         }
                         if (!pageNeeds.empty()) {
                             auto combinedPageNeeds = selectedDecodePageNeeds;
@@ -14838,7 +14877,7 @@ namespace fastllm {
                     selectedMultimodal = isMultimodal;
 
                     if (!isPrompt && !selectedMultimodal && !ctx->currentTokens.empty()) {
-                        int seqLen = scheduledDecodeTokens(ctx);
+                        int seqLen = scheduledTokens;
                         if (seqLen == 1) {
                             ids.push_back((float)ctx->currentTokens[0]);
                             seqLens.push_back(1);

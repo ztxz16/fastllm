@@ -168,6 +168,8 @@ namespace fastllm {
         std::map<std::string, std::vector<Data*>> dataPtrVectorMap;
     };
 
+    DataType ParseKVCacheDataType(const std::string &value);
+
     class basellm {
     public:
         basellm() {};
@@ -410,6 +412,8 @@ namespace fastllm {
         // per-request chunks for recurrent-state snapshots while retaining a
         // larger aggregate batching limit.
         virtual int GetBatchedPrefillTokenLimit();
+
+        virtual void SetTokenLimit(int tokens);
 
         virtual void SetDataType(DataType dataType);
 

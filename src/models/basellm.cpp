@@ -3118,6 +3118,33 @@ namespace fastllm {
         return this->GetChunkedPrefillSize();
     }
 
+    DataType ParseKVCacheDataType(const std::string &value) {
+        if (value.empty() || value == "auto") {
+            return DataType::DATA_AUTO_NONE;
+        }
+        if (value == "float" || value == "float32") {
+            return DataType::FLOAT32;
+        }
+        if (value == "half" || value == "float16") {
+            return DataType::FLOAT16;
+        }
+        if (value == "bf16" || value == "bfloat16") {
+            return DataType::BFLOAT16;
+        }
+        if (value == "fp8" || value == "float8" || value == "fp8_e4m3") {
+            return DataType::FP8_E4M3;
+        }
+        throw std::invalid_argument(
+            "KV cache dtype should be auto, float32, float16, bfloat16 or fp8_e4m3.");
+    }
+
+    void basellm::SetTokenLimit(int tokens) {
+        this->tokensLimit = tokens;
+        if (tokens > 0) {
+            fastllm::SetMaxTokens(tokens);
+        }
+    }
+
     void basellm::SetDataType(DataType dataType) {
         if (dataType == DataType::FLOAT32) {
 

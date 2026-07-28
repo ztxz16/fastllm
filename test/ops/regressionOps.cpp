@@ -658,6 +658,70 @@ namespace {
                "qwen35 grouped out_proj TP scheme must stay contiguous.");
     }
 #endif
+    void RunModelTokenCapacityRegression() {
+        const int previousMaxTokens = fastllm::GetMaxTokens();
+        MoeAtypeConfigTestModel model;
+
+        model.SetTokenLimit(131072);
+        Expect(model.tokensLimit == 131072,
+               "model token limit did not preserve the configured capacity.");
+        Expect(fastllm::GetMaxTokens() == 131072,
+               "model token limit did not configure the paged-cache allocator capacity.");
+
+        fastllm::SetMaxTokens(previousMaxTokens);
+    }
+
+    void RunKVCacheDataTypeConfigRegression() {
+        Expect(fastllm::ParseKVCacheDataType("auto") == fastllm::DataType::DATA_AUTO_NONE,
+               "auto KV cache dtype did not preserve automatic selection.");
+        Expect(fastllm::ParseKVCacheDataType("float16") == fastllm::DataType::FLOAT16,
+               "float16 KV cache dtype was not parsed.");
+        Expect(fastllm::ParseKVCacheDataType("bfloat16") == fastllm::DataType::BFLOAT16,
+               "bfloat16 KV cache dtype was not parsed.");
+        Expect(fastllm::ParseKVCacheDataType("fp8_e4m3") == fastllm::DataType::FP8_E4M3,
+               "fp8_e4m3 KV cache dtype was not parsed.");
+
+        bool rejected = false;
+        try {
+            (void)fastllm::ParseKVCacheDataType("int4");
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        Expect(rejected, "unsupported KV cache dtype was not rejected.");
+
+        MoeAtypeConfigTestModel model;
+        model.kvCacheDataType = fastllm::DataType::FLOAT16;
+        model.SetKVCacheDataType(fastllm::ParseKVCacheDataType("fp8_e4m3"));
+        Expect(model.useCustomKVCacheDataType &&
+               model.kvCacheDataType == fastllm::DataType::FP8_E4M3,
+               "explicit FP8 KV cache dtype was not preserved after F16 activation setup.");
+    }
+
+    void RunQwen35DecodePageBudgetRegression() {
+        const std::vector<std::pair<int, int> > requestedFits = {
+            {2, 2}, {1, 4}
+        };
+        const std::vector<std::pair<int, int> > requestedShort = {
+            {2, 1}, {1, 4}
+        };
+        const std::vector<std::pair<int, int> > singleFits = {
+            {0, 1}, {1, 4}
+        };
+        const std::vector<std::pair<int, int> > singleShort = {
+            {1, 0}, {1, 4}
+        };
+
+        Expect(fastllm::SelectQwen35DecodeTokensForPageBudget(
+                   10, requestedFits, singleFits) == 10,
+               "qwen35 page budget rejected a valid MTP validation.");
+        Expect(fastllm::SelectQwen35DecodeTokensForPageBudget(
+                   10, requestedShort, singleFits) == 1,
+               "qwen35 page budget did not fall back to one target token.");
+        Expect(fastllm::SelectQwen35DecodeTokensForPageBudget(
+                   10, requestedShort, singleShort) == 0,
+               "qwen35 page budget hid a true single-token cache shortage.");
+    }
+
     void RunMoeAtypeConfigRegression() {
         MoeAtypeConfigTestModel model;
 
@@ -4767,6 +4831,12 @@ int main() {
         RunQwen35OutProjTpLayoutRegression();
 #endif
         std::cout << "qwen35 GGUF config, weight mapping, and embedding regression: PASS\n";
+        RunModelTokenCapacityRegression();
+        std::cout << "model and paged-cache token capacity regression: PASS\n";
+        RunKVCacheDataTypeConfigRegression();
+        std::cout << "KV cache dtype configuration regression: PASS\n";
+        RunQwen35DecodePageBudgetRegression();
+        std::cout << "qwen35 exact-window decode page budget regression: PASS\n";
         RunMoeAtypeConfigRegression();
         std::cout << "moe_atype auto/explicit configuration regression: PASS\n";
         ranAny = true;

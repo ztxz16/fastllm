@@ -39,6 +39,11 @@ namespace fastllm {
             const WeightMap &weight,
             const std::string &layerPrefix);
 
+    int SelectQwen35DecodeTokensForPageBudget(
+            int requestedTokens,
+            const std::vector<std::pair<int, int> > &requestedNeedsAndFree,
+            const std::vector<std::pair<int, int> > &singleNeedsAndFree);
+
 #ifdef USE_CUDA
     using Qwen35DivisionScheme =
         std::map<int, std::vector<std::pair<int, int> > >;
