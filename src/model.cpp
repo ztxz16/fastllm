@@ -268,9 +268,6 @@ namespace fastllm {
                deviceName[deviceType.size()] == ':';
     }
 
-#ifdef USE_CUDA
-    static std::mutex multiCudaTpLoadSplitLock;
-
     static std::string TrimAndLower(const std::string &s) {
         int l = 0, r = (int)s.size();
         while (l < r && std::isspace((unsigned char)s[l])) {
@@ -285,11 +282,6 @@ namespace fastllm {
         return ret;
     }
 
-    static bool IsDisabledTpSpec(const std::string &spec) {
-        return spec.empty() || spec == "false" || spec == "off" ||
-               spec == "none" || spec == "disable";
-    }
-
     static bool Qwen35GGUFVHeadsTiledEnabled() {
         const char *env = std::getenv("FASTLLM_QWEN35_GGUF_VHEAD_TILED");
         if (env == nullptr || env[0] == '\0') {
@@ -298,6 +290,14 @@ namespace fastllm {
         const std::string value = TrimAndLower(env);
         return value != "0" && value != "false" && value != "off" &&
                value != "no" && value != "disable";
+    }
+
+#ifdef USE_CUDA
+    static std::mutex multiCudaTpLoadSplitLock;
+
+    static bool IsDisabledTpSpec(const std::string &spec) {
+        return spec.empty() || spec == "false" || spec == "off" ||
+               spec == "none" || spec == "disable";
     }
 
     static int ParseRoutedExpertIndex(const std::string &weightName) {
