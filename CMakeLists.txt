@@ -360,6 +360,7 @@ if (USE_CUDA)
         src/devices/cuda/models/deepseekv4-kernels.cu)
 
     if(FASTLLM_CUTLASS_W4A8_ENABLED)
+        include_directories(src)
         list(APPEND FASTLLM_CUDA_SOURCES
             src/devices/cuda/linear/fastllm-linear-w4a8-cutlass.cu
             src/devices/cuda/linear/fastllm-w4a8-utils.cu
