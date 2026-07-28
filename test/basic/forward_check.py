@@ -36,7 +36,8 @@ if __name__ == "__main__":
     model_path = args.model
     logger.info("开始测试模型 " + model_path)    
     logger.info("正在用Transformer读取模型")
-    hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype = "auto")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype = "auto", attn_implementation = "eager")
     if not getattr(hf_model, "is_quantized", False):
         hf_model = hf_model.half()
     hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
