@@ -5,6 +5,27 @@
 - `prefill.py`：测长上下文 prefill 性能。
 - `decode.py`：测多 batch 并发请求下的 decode 性能。
 
+W4A8 模型不需要单独的 benchmark 实现。模型加载器识别
+`compressed-tensors` W4A8 权重后，`prefill.py` 和 `decode.py` 会直接走正式
+W4A8 Linear 分发。可使用以下示例配置：
+
+- `w4a8_prefill_config.example.json`：batch 1、不同输入长度的 prefill。
+- `w4a8_decode_config.example.json`：batch 1/4 的 decode。
+
+运行前只需把配置中的 `path` 改为 W4A8 模型目录：
+
+```bash
+python test/benchmark/prefill.py \
+  --config test/benchmark/w4a8_prefill_config.example.json
+
+python test/benchmark/decode.py \
+  --config test/benchmark/w4a8_decode_config.example.json
+```
+
+这两个配置固定 `dtype/atype=bfloat16`，与 SM90 CUTLASS W4A8 的正式入口一致。
+算子级 activation FP8 动态量化性能由 `optest` 中的
+`w4a8_activation_quant` 单独测量，整模 benchmark 不重复实现该 kernel。
+
 本文主要说明 `decode.py` 和 `decode_config.example.json` 的用法。
 
 ## 1. `decode.py` 是做什么的
