@@ -67,6 +67,41 @@ namespace {
     private:
         std::filesystem::path path;
     };
+    int SetRegressionEnv(const std::string &name, const char *value) {
+#ifdef _WIN32
+        return _putenv_s(name.c_str(), value == nullptr ? "" : value);
+#else
+        return value == nullptr ? unsetenv(name.c_str()) :
+            setenv(name.c_str(), value, 1);
+#endif
+    }
+
+    class ScopedEnvVar {
+    public:
+        ScopedEnvVar(const std::string &name, const char *value) : name(name) {
+            const char *current = std::getenv(name.c_str());
+            hadValue = current != nullptr;
+            if (hadValue) {
+                oldValue = current;
+            }
+            int rc = SetRegressionEnv(name, value);
+            if (rc != 0) {
+                throw std::runtime_error("failed to update regression environment variable: " + name);
+            }
+        }
+
+        ~ScopedEnvVar() {
+            SetRegressionEnv(name, hadValue ? oldValue.c_str() : nullptr);
+        }
+
+        ScopedEnvVar(const ScopedEnvVar &) = delete;
+        ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+
+    private:
+        std::string name;
+        std::string oldValue;
+        bool hadValue = false;
+    };
 
     class MoeAtypeConfigTestModel final : public fastllm::basellm {
     public:
@@ -200,7 +235,51 @@ namespace {
 
     std::string MakeTempGGUFPath(const std::string &name) {
         auto ticks = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        return "/tmp/" + name + "-" + std::to_string(ticks) + ".gguf";
+        return (std::filesystem::temp_directory_path() /
+                (name + "-" + std::to_string(ticks) + ".gguf")).string();
+    }
+
+    void RunRegressionFixtureScopeRegression() {
+        const std::string envName = "FASTLLM_REGRESSION_SCOPED_ENV_TEST";
+        const char *original = std::getenv(envName.c_str());
+        const bool hadOriginal = original != nullptr;
+        const std::string originalValue = hadOriginal ? original : "";
+
+        {
+            ScopedEnvVar outer(envName, "outer");
+            Expect(std::string(std::getenv(envName.c_str())) == "outer",
+                   "scoped environment fixture did not apply a value.");
+            {
+                ScopedEnvVar inner(envName, "inner");
+                Expect(std::string(std::getenv(envName.c_str())) == "inner",
+                       "nested environment fixture did not apply a value.");
+            }
+            Expect(std::string(std::getenv(envName.c_str())) == "outer",
+                   "nested environment fixture did not restore its parent value.");
+        }
+        const char *restored = std::getenv(envName.c_str());
+        Expect((hadOriginal && restored != nullptr && originalValue == restored) ||
+                   (!hadOriginal && restored == nullptr),
+               "environment fixture did not restore the original value.");
+
+        {
+            ScopedEnvVar unset(envName, nullptr);
+            Expect(std::getenv(envName.c_str()) == nullptr,
+                   "environment fixture did not apply an unset value.");
+            {
+                ScopedEnvVar inner(envName, "temporary");
+            }
+            Expect(std::getenv(envName.c_str()) == nullptr,
+                   "environment fixture did not restore an unset parent value.");
+        }
+        restored = std::getenv(envName.c_str());
+        Expect((hadOriginal && restored != nullptr && originalValue == restored) ||
+                   (!hadOriginal && restored == nullptr),
+               "unset environment fixture did not restore the original value.");
+
+        std::filesystem::path ggufPath = MakeTempGGUFPath("fastllm-fixture-scope");
+        Expect(ggufPath.parent_path() == std::filesystem::temp_directory_path(),
+               "synthetic GGUF fixture ignored the platform temporary directory.");
     }
 
     void WriteSyntheticQwen35GGUF(const std::string &path,
@@ -479,11 +558,9 @@ namespace {
     }
 
     void RunQwen35MixedQuantGGUFProjectionRegression() {
-        std::string path = MakeTempGGUFPath("fastllm-qwen35-mixed-quant");
-        const char *oldTiled = std::getenv("FASTLLM_QWEN35_GGUF_VHEAD_TILED");
-        const bool hadTiled = oldTiled != nullptr;
-        const std::string oldTiledValue = hadTiled ? oldTiled : "";
-        setenv("FASTLLM_QWEN35_GGUF_VHEAD_TILED", "0", 1);
+        ScopedTempDirectory tempDir("fastllm-qwen35-mixed-quant-");
+        std::string path = (tempDir.Path() / "model.gguf").string();
+        ScopedEnvVar tiledLayout("FASTLLM_QWEN35_GGUF_VHEAD_TILED", "0");
         WriteSyntheticQwen35GGUF(path, {
             MakeSyntheticQuantTensor("blk.0.attn_qkv.weight", {256, 256}, GGML_TYPE_Q5_K),
             MakeSyntheticQuantTensor("blk.0.attn_gate.weight", {256, 256}, GGML_TYPE_IQ4_XS),
@@ -494,12 +571,6 @@ namespace {
             MakeSyntheticQuantTensor("blk.3.attn_v.weight", {256, 256}, GGML_TYPE_Q5_K),
         });
         auto model = fastllm::CreateLLMModelFromGGUFFile(path, "");
-        if (hadTiled) {
-            setenv("FASTLLM_QWEN35_GGUF_VHEAD_TILED", oldTiledValue.c_str(), 1);
-        } else {
-            unsetenv("FASTLLM_QWEN35_GGUF_VHEAD_TILED");
-        }
-        std::remove(path.c_str());
 
         const std::string gdnPrefix = "model.language_model.layers.0.linear_attn.";
         RequireWeight(*model, gdnPrefix + "in_proj_qkv.weight");
@@ -573,22 +644,41 @@ namespace {
 
     void RunQwen35SplitGdnProjectionLayoutRegression() {
         const std::string prefix = "model.language_model.layers.0.";
-        fastllm::WeightMap weights;
-        weights.AddEmptyWeight(prefix + "linear_attn.in_proj_qkv.weight", {10, 4},
-                               fastllm::DataType::FLOAT32);
-        weights.AddEmptyWeight(prefix + "linear_attn.in_proj_z.weight", {6, 4},
-                               fastllm::DataType::FLOAT32);
-        weights.AddEmptyWeight(prefix + "linear_attn.in_proj_ba.weight", {4, 4},
-                               fastllm::DataType::FLOAT32);
+        auto add = [&](fastllm::WeightMap &weights, const std::string &suffix) {
+            weights.AddEmptyWeight(prefix + suffix, {4, 4},
+                                   fastllm::DataType::FLOAT32);
+        };
 
-        Expect(fastllm::ResolveQwen35GdnProjectionLayout(weights, prefix) ==
+        fastllm::WeightMap qkvZBa;
+        add(qkvZBa, "linear_attn.in_proj_qkv.weight");
+        add(qkvZBa, "linear_attn.in_proj_z.weight");
+        add(qkvZBa, "linear_attn.in_proj_ba.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvZBa, prefix) ==
                    fastllm::Qwen35GdnProjectionLayout::QkvZBa,
-               "qwen35 mixed-quant qkv/z plus ba should be a valid GDN projection layout.");
+               "qwen35 qkv/z plus ba should be a valid GDN projection layout.");
 
-        weights.weight.erase(prefix + "linear_attn.in_proj_z.weight");
-        Expect(fastllm::ResolveQwen35GdnProjectionLayout(weights, prefix) ==
+        qkvZBa.weight.erase(prefix + "linear_attn.in_proj_z.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvZBa, prefix) ==
                    fastllm::Qwen35GdnProjectionLayout::Missing,
                "qwen35 split GDN projection must require both qkv and z weights.");
+
+        fastllm::WeightMap qkvzBa;
+        add(qkvzBa, "linear_attn.in_proj_qkvz.weight");
+        add(qkvzBa, "linear_attn.in_proj_ba.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvzBa, prefix) ==
+                   fastllm::Qwen35GdnProjectionLayout::QkvzBa,
+               "qwen35 qkvz plus ba should be a valid GDN projection layout.");
+
+        fastllm::WeightMap qkvzba;
+        add(qkvzba, "linear_attn.in_proj_qkvzba.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvzba, prefix) ==
+                   fastllm::Qwen35GdnProjectionLayout::Qkvzba,
+               "qwen35 merged qkvzba should be a valid GDN projection layout.");
+        add(qkvzba, "linear_attn.in_proj_qkvz.weight");
+        add(qkvzba, "linear_attn.in_proj_ba.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvzba, prefix) ==
+                   fastllm::Qwen35GdnProjectionLayout::Qkvzba,
+               "qwen35 merged qkvzba must take precedence over split weights.");
     }
 
     void ExpectFloatNear(const std::vector<float> &expected,
@@ -690,11 +780,16 @@ namespace {
         Expect(rejected, "unsupported KV cache dtype was not rejected.");
 
         MoeAtypeConfigTestModel model;
-        model.kvCacheDataType = fastllm::DataType::FLOAT16;
+        model.SetKVCacheDataType(fastllm::DataType::FLOAT16);
+        Expect(model.useCustomKVCacheDataType &&
+               model.kvCacheDataType == fastllm::DataType::FLOAT16,
+               "explicit F16 KV cache dtype was not preserved.");
+#ifdef USE_CUDA
         model.SetKVCacheDataType(fastllm::ParseKVCacheDataType("fp8_e4m3"));
         Expect(model.useCustomKVCacheDataType &&
                model.kvCacheDataType == fastllm::DataType::FP8_E4M3,
-               "explicit FP8 KV cache dtype was not preserved after F16 activation setup.");
+               "explicit FP8 KV cache dtype was not preserved after F16 setup.");
+#endif
     }
 
     void RunQwen35DecodePageBudgetRegression() {
@@ -3514,25 +3609,15 @@ namespace {
                                 std::vector<int>{0}, false);
         std::vector<fastllm::Data*> biases(weights.size(), nullptr);
 
-        const char *oldSmallBatchEnv =
-            std::getenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH");
-        const bool hadSmallBatchEnv = oldSmallBatchEnv != nullptr;
-        const std::string oldSmallBatchEnvValue =
-            hadSmallBatchEnv ? oldSmallBatchEnv : "";
-        setenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH", "0", 1);
         {
+            ScopedEnvVar smallBatchRoute(
+                "FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH", "0");
             ScopedFirstDevice guard("cuda");
             fastllm::MergeMOE(
                 batchInput, fallbackIndex, fallbackScore, weights, biases,
                 fallbackW1, fallbackW2, fallbackW3,
                 fallbackInput, fallbackIntermediate,
                 0.0f, fallbackOutput);
-        }
-        if (hadSmallBatchEnv) {
-            setenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH",
-                   oldSmallBatchEnvValue.c_str(), 1);
-        } else {
-            unsetenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH");
         }
         // Different expert batching produces a different FP32 reduction tree.
         // Both paths already pass the dense reference checks above; constrain
@@ -4768,6 +4853,7 @@ int main() {
             throw std::runtime_error("gguf_dequant regression requires a CUDA build.");
 #endif
         }
+        RunRegressionFixtureScopeRegression();
         if (only != nullptr && std::string(only) == "qwen35_gguf") {
             RunQwen35GGUFConfigRegression();
             RunQwen35GGUFWeightMappingRegression();
@@ -4823,6 +4909,8 @@ int main() {
 #endif
         RunQwen35GGUFConfigRegression();
         RunQwen35GGUFWeightMappingRegression();
+        RunQwen35GGUFFailFastRegression();
+        RunQwen35GGUFWorkerExceptionRegression();
         RunQwen35MixedQuantGGUFProjectionRegression();
         RunCpuEmbeddingDirectInMemoryLowMemRegression();
         RunQwen35SplitGdnProjectionLayoutRegression();
@@ -4830,7 +4918,7 @@ int main() {
 #ifdef USE_CUDA
         RunQwen35OutProjTpLayoutRegression();
 #endif
-        std::cout << "qwen35 GGUF config, weight mapping, and embedding regression: PASS\n";
+        std::cout << "qwen35 GGUF config, fail-fast, mapping, layout, and embedding regression: PASS\n";
         RunModelTokenCapacityRegression();
         std::cout << "model and paged-cache token capacity regression: PASS\n";
         RunKVCacheDataTypeConfigRegression();
