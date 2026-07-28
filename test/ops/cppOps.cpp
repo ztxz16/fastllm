@@ -1460,7 +1460,8 @@ namespace {
                 output.ToDevice(fastllm::DataDevice::CPU);
                 return output;
             },
-            [](const OpTestParams &params, const std::string &device) {
+            [](const OpTestParams &params, const std::string &device)
+                -> std::function<void()> {
                 if (params.GetString("weight_type") == "int4_w4a8") {
 #if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
                     auto fixture =
