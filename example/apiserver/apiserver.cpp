@@ -342,15 +342,15 @@ struct WorkQueue {
 
             std::string output = "";
             bool rawPrompt = node->config["raw_prompt"].is_bool() && node->config["raw_prompt"].bool_value();
-            fastllm::Data inputs;
+            std::string prompt;
             if (rawPrompt) {
-                inputs = model->weight.tokenizer.Encode(node->config["prompt"].string_value());
+                prompt = node->config["prompt"].string_value();
             } else {
                 fastllm::ChatMessages messages;
                 messages.push_back({"user", node->config["prompt"].string_value()});
-                auto prompt = model->ApplyChatTemplate(messages);
-                inputs = model->weight.tokenizer.Encode(prompt);
+                prompt = model->ApplyChatTemplate(messages);
             }
+            fastllm::Data inputs = model->weight.tokenizer.Encode(prompt);
             std::vector<int> tokens;
             for (int i = 0; i < inputs.Count(0); i++) {
                 tokens.push_back(((float *) inputs.cpuData)[i]);
@@ -407,16 +407,15 @@ struct WorkQueue {
             }
 
             bool rawPrompt = node->config["raw_prompt"].is_bool() && node->config["raw_prompt"].bool_value();
-            fastllm::Data inputs;
+            std::string prompt;
             if (rawPrompt) {
                 if (!node->config["prompt"].is_string()) {
                     node->error = "raw_prompt requires a string prompt.\n";
                 } else {
-                    inputs = model->weight.tokenizer.Encode(node->config["prompt"].string_value());
+                    prompt = node->config["prompt"].string_value();
                 }
             } else {
-                auto prompt = model->ApplyChatTemplate(chatMessages);
-                inputs = model->weight.tokenizer.Encode(prompt);
+                prompt = model->ApplyChatTemplate(chatMessages);
             }
             if (node->error != "") {
                 message += node->error;
@@ -424,6 +423,7 @@ struct WorkQueue {
                 close(node->client);
                 return;
             }
+            fastllm::Data inputs = model->weight.tokenizer.Encode(prompt);
             std::vector<int> tokens;
             for (int i = 0; i < inputs.Count(0); i++) {
                 tokens.push_back(((float *) inputs.cpuData)[i]);
@@ -734,14 +734,23 @@ int main(int argc, char** argv) {
         }
 
         int size = 0;
-        while (true) {
-            int cur = read(client, buff + size, sizeof(buff) - size);
+        bool requestReady = false;
+        while (size < (int)sizeof(buff) - 1) {
+            int cur = read(client, buff + size, sizeof(buff) - 1 - size);
+            if (cur <= 0) {
+                break;
+            }
             size += cur;
+            buff[size] = 0;
             if (httpChecker.IsValid(buff, size)) {
+                requestReady = true;
                 break;
             }
         }
-        buff[size] = 0;
+        if (!requestReady) {
+            close(client);
+            continue;
+        }
 
         while (workQueue.q.size() > workQueue.maxActivateQueryNumber) {
             fastllm::MySleep(0);
