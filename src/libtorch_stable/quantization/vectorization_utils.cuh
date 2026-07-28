@@ -96,13 +96,16 @@ __device__ inline void vectorize_with_alignment(const InT *in, OutT *out, int le
     VecOp &&vec_op,      // vec_n_t<InT,16> -> vec_n_t<OutT,16>
     ScaOp &&scalar_op) { // InT -> OutT
     static_assert(VEC_SIZE > 0 && (VEC_SIZE & (VEC_SIZE - 1)) == 0, "VEC_SIZE must be a positive power-of-two");
-    constexpr int WIDTH = VEC_SIZE * sizeof(InT); // eg: 64 B
+    constexpr int WIDTH = VEC_SIZE * sizeof(InT);
+    constexpr int OUT_WIDTH = VEC_SIZE * sizeof(OutT);
     uintptr_t addr = reinterpret_cast<uintptr_t>(in);
+    uintptr_t out_addr = reinterpret_cast<uintptr_t>(out);
 
-    // fast path when the whole region is already aligned
-    // Note: currently the output is guaranteed to be same as the input, so we
-    // don't check it here, comments here just for future reference.
-    bool can_vec = ((addr & (WIDTH - 1)) == 0) && ((len & (VEC_SIZE - 1)) == 0);
+    // Input and output element sizes may differ, so each address must satisfy
+    // the alignment of its own vector type.
+    bool can_vec = ((addr & (WIDTH - 1)) == 0) &&
+                   ((out_addr & (OUT_WIDTH - 1)) == 0) &&
+                   ((len & (VEC_SIZE - 1)) == 0);
     if (can_vec) {
         int num_vec = len / VEC_SIZE;
 
@@ -127,7 +130,17 @@ __device__ inline void vectorize_with_alignment(const InT *in, OutT *out, int le
     prefix_elems /= sizeof(InT);
     prefix_elems = min(prefix_elems, len); // 0 ≤ prefix < 16
 
-    // 1. prefill the when it is unsafe to vectorize
+    // Aligning the input does not necessarily align an output whose element
+    // size differs. In that case keep the complete operation scalar.
+    if (((out_addr + prefix_elems * sizeof(OutT)) &
+         (OUT_WIDTH - 1)) != 0) {
+        for (int i = tid; i < len; i += stride) {
+            scalar_op(out[i], in[i]);
+        }
+        return;
+    }
+
+    // 1. handle the unaligned prefix
     for (int i = tid; i < prefix_elems; i += stride) {
         scalar_op(out[i], in[i]);
     }

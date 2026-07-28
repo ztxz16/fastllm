@@ -553,6 +553,12 @@ bool TryFastllmCudaAwqGemm(const fastllm::Data &input, fastllm::Data &weight,
 bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
                         const fastllm::Data &bias, fastllm::Data &output,
                         int n, int m, int k);
+bool FastllmCudaW4A8QuantizeActivationPerToken(
+    const fastllm::Data &input, int n, int m,
+    void *fp8Data, float *tokenScales);
+bool FastllmCudaInspectW4A8Activation(
+    const fastllm::Data &input, int n, int m,
+    std::vector<uint8_t> &fp8Bytes, std::vector<float> &tokenScales);
 void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight);
 #else
 inline bool TryCudaCutlassW4A8(const fastllm::Data &, fastllm::Data &,

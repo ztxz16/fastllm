@@ -288,6 +288,173 @@ namespace {
         return negative ? -best : best;
     }
 
+    static float DecodeFp8E4M3(uint8_t value) {
+        bool negative = (value & 0x80U) != 0;
+        int exponent = (value >> 3) & 0xf;
+        int mantissa = value & 7;
+        float decoded;
+        if (exponent == 0) {
+            decoded = std::ldexp(float(mantissa), -9);
+        } else {
+            decoded = std::ldexp(1.0f + float(mantissa) / 8.0f,
+                                 exponent - 7);
+        }
+        return negative ? -decoded : decoded;
+    }
+
+    static constexpr float W4A8Fp8Max = 448.0f;
+    static constexpr float W4A8Fp8MinScale =
+        1.0f / (W4A8Fp8Max * 512.0f);
+
+    struct W4A8ActivationQuantFixture {
+        int tokens = 0;
+        int hidden = 0;
+        fastllm::DataType inputType = fastllm::DataType::BFLOAT16;
+        std::vector<float> inputValues;
+
+        explicit W4A8ActivationQuantFixture(const OpTestParams &params) {
+            tokens = params.GetInt("tokens");
+            hidden = params.GetInt("hidden");
+            if (tokens <= 0 || hidden <= 0) {
+                throw std::runtime_error(
+                    "w4a8_activation_quant requires positive tokens and hidden");
+            }
+
+            std::string dtype = params.GetString("dtype");
+            if (dtype == "bfloat16") {
+                inputType = fastllm::DataType::BFLOAT16;
+            } else if (dtype == "float16") {
+                inputType = fastllm::DataType::FLOAT16;
+            } else {
+                throw std::runtime_error(
+                    "w4a8_activation_quant dtype must be bfloat16 or float16");
+            }
+
+            std::vector<float> source((size_t)tokens * hidden);
+            for (int token = 0; token < tokens; ++token) {
+                for (int col = 0; col < hidden; ++col) {
+                    float value = 0.0f;
+                    if (token != 0) {
+                        value =
+                            0.75f * std::sin(float(token * hidden + col + 1) * 0.013f) +
+                            0.25f * std::cos(float(col + 3) * 0.031f);
+                        if (token == 1) {
+                            value *= 1.0e-5f;
+                        }
+                    }
+                    source[(size_t)token * hidden + col] = value;
+                }
+            }
+
+            fastllm::Data typed(inputType, {tokens, hidden}, source);
+            fastllm::Data normalized;
+            fastllm::ToDataType(typed, normalized, fastllm::DataType::FLOAT32);
+            normalized.ToDevice(fastllm::DataDevice::CPU);
+            const float *ptr = (const float*)normalized.cpuData;
+            inputValues.assign(ptr, ptr + source.size());
+        }
+
+        fastllm::Data MakeInput() const {
+            return fastllm::Data(inputType, {tokens, hidden}, inputValues);
+        }
+
+        fastllm::Data CpuReference() const {
+            std::vector<float> result((size_t)tokens * (hidden + 1));
+            for (int token = 0; token < tokens; ++token) {
+                size_t inputOffset = (size_t)token * hidden;
+                size_t outputOffset = (size_t)token * (hidden + 1);
+                float absoluteMax = 0.0f;
+                for (int col = 0; col < hidden; ++col) {
+                    absoluteMax = std::max(
+                        absoluteMax, std::fabs(inputValues[inputOffset + col]));
+                }
+                float scale = std::max(
+                    absoluteMax / W4A8Fp8Max, W4A8Fp8MinScale);
+                result[outputOffset] = scale;
+                for (int col = 0; col < hidden; ++col) {
+                    float value = inputValues[inputOffset + col] / scale;
+                    value = std::max(
+                        -W4A8Fp8Max, std::min(W4A8Fp8Max, value));
+                    result[outputOffset + col + 1] =
+                        RoundFp8E4M3(value) * scale;
+                }
+            }
+            return fastllm::Data(
+                fastllm::DataType::FLOAT32, {tokens, hidden + 1}, result);
+        }
+
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+        fastllm::Data CudaResult() const {
+            fastllm::Data input = MakeInput();
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            std::vector<uint8_t> fp8Bytes;
+            std::vector<float> tokenScales;
+            if (!FastllmCudaInspectW4A8Activation(
+                    input, tokens, hidden, fp8Bytes, tokenScales)) {
+                throw std::runtime_error(
+                    "FastllmCudaInspectW4A8Activation failed");
+            }
+
+            std::vector<float> result((size_t)tokens * (hidden + 1));
+            for (int token = 0; token < tokens; ++token) {
+                size_t inputOffset = (size_t)token * hidden;
+                size_t outputOffset = (size_t)token * (hidden + 1);
+                float scale = tokenScales[token];
+                result[outputOffset] = scale;
+                for (int col = 0; col < hidden; ++col) {
+                    result[outputOffset + col + 1] =
+                        DecodeFp8E4M3(fp8Bytes[inputOffset + col]) * scale;
+                }
+            }
+            return fastllm::Data(
+                fastllm::DataType::FLOAT32, {tokens, hidden + 1}, result);
+        }
+#endif
+    };
+
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+    struct W4A8ActivationQuantBenchmarkState {
+        fastllm::Data input;
+        int tokens = 0;
+        int hidden = 0;
+        void *fp8 = nullptr;
+        float *scales = nullptr;
+
+        explicit W4A8ActivationQuantBenchmarkState(
+            const W4A8ActivationQuantFixture &fixture)
+            : input(fixture.MakeInput()),
+              tokens(fixture.tokens),
+              hidden(fixture.hidden) {
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            fp8 = FastllmCudaMalloc((size_t)tokens * hidden);
+            scales = (float*)FastllmCudaMalloc((size_t)tokens * sizeof(float));
+            if (fp8 == nullptr || scales == nullptr) {
+                if (fp8 != nullptr) {
+                    FastllmCudaFree(fp8);
+                }
+                if (scales != nullptr) {
+                    FastllmCudaFree(scales);
+                }
+                throw std::runtime_error(
+                    "failed to allocate W4A8 activation quant buffers");
+            }
+        }
+
+        ~W4A8ActivationQuantBenchmarkState() {
+            FastllmCudaFree(fp8);
+            FastllmCudaFree(scales);
+        }
+
+        void Run() {
+            if (!FastllmCudaW4A8QuantizeActivationPerToken(
+                    input, tokens, hidden, fp8, scales)) {
+                throw std::runtime_error(
+                    "W4A8 activation quantization launch failed");
+            }
+        }
+    };
+#endif
+
     struct LinearW4A8Fixture {
         int batch = 0;
         int in = 0;
@@ -361,8 +528,8 @@ namespace {
                     absoluteMax = std::max(
                         absoluteMax, std::fabs(inputValues[offset + col]));
                 }
-                float tokenScale =
-                    std::max(absoluteMax, 1.0e-10f) / 448.0f;
+                float tokenScale = std::max(
+                    absoluteMax / W4A8Fp8Max, W4A8Fp8MinScale);
                 for (int col = 0; col < in; ++col) {
                     float value = inputValues[offset + col] / tokenScale;
                     value = std::max(-448.0f, std::min(448.0f, value));
@@ -1516,6 +1683,76 @@ namespace {
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 return 2.0 * batch * in * out + (double) batch * out;
+            }
+        };
+    }
+
+    static OpCase MakeW4A8ActivationQuantCase() {
+        return {
+            "w4a8_activation_quant",
+            "dynamic per-token FP8 E4M3 activation quantization for W4A8",
+            []() {
+                OpTestParams params;
+                params.Add("tokens", "16", "number of flattened tokens");
+                params.Add("hidden", "4096", "hidden size per token");
+                params.Add("dtype", "bfloat16",
+                           "input datatype: bfloat16 or float16");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                W4A8ActivationQuantFixture fixture(params);
+                (void)fixture;
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                if (device.rfind("cuda:", 0) != 0) {
+                    return false;
+                }
+                ScopedFirstDevice guard(device);
+                return FastllmCudaRuntimeArch() == 90;
+#else
+                (void)device;
+                return false;
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                W4A8ActivationQuantFixture fixture(params);
+                if (device == "cpu") {
+                    return fixture.CpuReference();
+                }
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                ScopedFirstDevice guard(device);
+                return fixture.CudaResult();
+#else
+                throw std::runtime_error(
+                    "w4a8_activation_quant requires CUDA SM90 CUTLASS build");
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device)
+                -> std::function<void()> {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                ScopedFirstDevice guard(device);
+                W4A8ActivationQuantFixture fixture(params);
+                auto state =
+                    std::make_shared<W4A8ActivationQuantBenchmarkState>(fixture);
+                return [device, state]() {
+                    ScopedFirstDevice runGuard(device);
+                    state->Run();
+                };
+#else
+                (void)params;
+                (void)device;
+                throw std::runtime_error(
+                    "w4a8_activation_quant requires CUDA SM90 CUTLASS build");
+#endif
+            },
+            [](const OpTestParams &params) {
+                double tokens = params.GetInt("tokens");
+                double hidden = params.GetInt("hidden");
+                return tokens * hidden * 2.0 +
+                       tokens * hidden +
+                       tokens * sizeof(float);
+            },
+            [](const OpTestParams&) {
+                return 0.0;
             }
         };
     }
@@ -3094,6 +3331,7 @@ namespace {
             MakeMatMulCase(),
             MakeLayerNormCase(),
             MakeRmsNormCase(),
+            MakeW4A8ActivationQuantCase(),
             MakeLinearCase(),
             MakeSiluCase(),
             MakeSoftmaxCase(),

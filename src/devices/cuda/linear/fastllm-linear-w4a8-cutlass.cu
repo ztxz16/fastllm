@@ -1,5 +1,6 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm-w4a8-utils.cuh"
+#include "libtorch_stable/quantization/vectorization_utils.cuh"
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -16,6 +17,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
 
 #include <algorithm>
 #include <cmath>
@@ -33,6 +35,16 @@ namespace {
 static constexpr uint64_t W4A8_CACHE_MAGIC = 0x5734413843414348ULL; // "W4A8CACH"
 static constexpr int W4A8_GROUP_SIZE = 128;
 static constexpr int W4A8_SCALE_PACK_SIZE = 8;
+static constexpr int W4A8_FP8_QUANT_THREADS = 256;
+static constexpr float W4A8_FP8_MAX = 448.0f;
+static constexpr float W4A8_FP8_MIN_SCALE =
+    1.0f / (W4A8_FP8_MAX * 512.0f);
+
+struct W4A8MaxOp {
+    __device__ __forceinline__ float operator()(float lhs, float rhs) const {
+        return fmaxf(lhs, rhs);
+    }
+};
 
 struct W4A8ActivationScratch {
     cutlass::float_e4m3_t *fp8 = nullptr;
@@ -507,32 +519,62 @@ __global__ void FastllmCudaW4A8QuantizeActivationPerTokenKernel(
         return;
     }
 
-    __shared__ float reduce[256];
+    const int tid = threadIdx.x;
+    const T *tokenInput = input + (size_t)row * hidden;
+    cutlass::float_e4m3_t *tokenFp8 = fp8 + (size_t)row * hidden;
+
     float localMax = 0.0f;
-    size_t rowOffset = (size_t)row * hidden;
-    for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
-        float v = FastllmCudaW4A8ToFloat(input[rowOffset + col]);
-        localMax = fmaxf(localMax, fabsf(v));
+    fastllm::vectorize_read_with_alignment<16>(
+        tokenInput, hidden, tid, blockDim.x,
+        [&] __device__(T value) {
+            localMax = fmaxf(
+                localMax, fabsf(FastllmCudaW4A8ToFloat(value)));
+        });
+
+    using BlockReduce = cub::BlockReduce<float, W4A8_FP8_QUANT_THREADS>;
+    __shared__ typename BlockReduce::TempStorage reduceStorage;
+    float rowMax = BlockReduce(reduceStorage).Reduce(localMax, W4A8MaxOp{});
+
+    __shared__ float tokenScale;
+    if (threadIdx.x == 0) {
+        tokenScale = fmaxf(rowMax / W4A8_FP8_MAX, W4A8_FP8_MIN_SCALE);
+        tokenScales[row] = tokenScale;
     }
-    reduce[threadIdx.x] = localMax;
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
-        }
-        __syncthreads();
+    fastllm::vectorize_with_alignment<16>(
+        tokenInput, tokenFp8, hidden, tid, blockDim.x,
+        [=] __device__(cutlass::float_e4m3_t &dst, const T &src) {
+            float value = FastllmCudaW4A8ToFloat(src) / tokenScale;
+            value = fminf(
+                W4A8_FP8_MAX, fmaxf(-W4A8_FP8_MAX, value));
+            dst = cutlass::float_e4m3_t(value);
+        });
+}
+
+static bool FastllmCudaW4A8LaunchActivationQuant(
+    const fastllm::Data &input,
+    const void *inputData,
+    cutlass::float_e4m3_t *fp8,
+    float *tokenScales,
+    int n,
+    int m) {
+    if (!FastllmCudaW4A8CanQuantizeActivation(input, n, m) ||
+        inputData == nullptr || fp8 == nullptr || tokenScales == nullptr) {
+        return false;
     }
 
-    float scale = fmaxf(reduce[0], 1.0e-10f) * (1.0f / 448.0f);
-    for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
-        float v = FastllmCudaW4A8ToFloat(input[rowOffset + col]) / scale;
-        v = fminf(448.0f, fmaxf(-448.0f, v));
-        fp8[rowOffset + col] = cutlass::float_e4m3_t(v);
+    dim3 grid(n);
+    if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmCudaW4A8QuantizeActivationPerTokenKernel<<<
+            grid, W4A8_FP8_QUANT_THREADS>>>(
+                (const half*)inputData, fp8, tokenScales, n, m);
+    } else {
+        FastllmCudaW4A8QuantizeActivationPerTokenKernel<<<
+            grid, W4A8_FP8_QUANT_THREADS>>>(
+                (const __nv_bfloat16*)inputData, fp8, tokenScales, n, m);
     }
-    if (threadIdx.x == 0) {
-        tokenScales[row] = scale;
-    }
+    return cudaGetLastError() == cudaSuccess;
 }
 
 static bool FastllmCudaW4A8EncodeAndReorderInt4B(uint8_t *rawPackedWeight,
@@ -823,15 +865,8 @@ static bool FastllmCudaW4A8QuantizeActivation(const fastllm::Data &input,
         return false;
     }
 
-    dim3 grid(n);
-    if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmCudaW4A8QuantizeActivationPerTokenKernel<<<grid, 256>>>(
-            (const half*)inputData, scratch.fp8, scratch.tokenScales, n, m);
-    } else {
-        FastllmCudaW4A8QuantizeActivationPerTokenKernel<<<grid, 256>>>(
-            (const __nv_bfloat16*)inputData, scratch.fp8, scratch.tokenScales, n, m);
-    }
-    if (cudaGetLastError() != cudaSuccess) {
+    if (!FastllmCudaW4A8LaunchActivationQuant(
+            input, inputData, scratch.fp8, scratch.tokenScales, n, m)) {
         FastllmCudaW4A8ReleaseActivationScratch(scratch);
         return false;
     }
@@ -1009,6 +1044,51 @@ void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight) {
     weight.w4a8CudaCaches.clear();
 }
 
+bool FastllmCudaW4A8QuantizeActivationPerToken(
+    const fastllm::Data &input, int n, int m,
+    void *fp8Data, float *tokenScales) {
+    void *inputData = FastllmCudaPrepareInput(input);
+    if (inputData == nullptr) {
+        return false;
+    }
+    bool ready = FastllmCudaW4A8LaunchActivationQuant(
+        input, inputData, (cutlass::float_e4m3_t*)fp8Data,
+        tokenScales, n, m);
+    FastllmCudaFinishInput(input, inputData);
+    return ready;
+}
+
+bool FastllmCudaInspectW4A8Activation(
+    const fastllm::Data &input, int n, int m,
+    std::vector<uint8_t> &fp8Bytes, std::vector<float> &tokenScales) {
+    fp8Bytes.clear();
+    tokenScales.clear();
+    void *inputData = FastllmCudaPrepareInput(input);
+    if (inputData == nullptr) {
+        return false;
+    }
+
+    W4A8ActivationScratch scratch;
+    bool ready = FastllmCudaW4A8QuantizeActivation(input, inputData, n, m, scratch);
+    bool copied = false;
+    if (ready) {
+        fp8Bytes.resize(scratch.fp8Bytes);
+        tokenScales.resize(n);
+        cudaError_t fp8State = cudaMemcpy(
+            fp8Bytes.data(), scratch.fp8, scratch.fp8Bytes, cudaMemcpyDeviceToHost);
+        cudaError_t scaleState = cudaMemcpy(
+            tokenScales.data(), scratch.tokenScales, scratch.scaleBytes,
+            cudaMemcpyDeviceToHost);
+        copied = fp8State == cudaSuccess && scaleState == cudaSuccess;
+    }
+    FastllmCudaW4A8ReleaseActivationScratch(scratch);
+    FastllmCudaFinishInput(input, inputData);
+    if (!copied) {
+        fp8Bytes.clear();
+        tokenScales.clear();
+    }
+    return copied;
+}
 bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
                         const fastllm::Data &bias, fastllm::Data &output,
                         int n, int m, int k) {
