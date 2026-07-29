@@ -1036,6 +1036,13 @@ static bool FastllmCudaW4A8EnsurePackedWeightCache(fastllm::Data &weight,
 
 } // namespace
 
+bool FastllmCudaW4A8PrepareWeightCache(fastllm::Data &weight,
+                                       int inChannels,
+                                       int outChannels) {
+    return FastllmCudaW4A8EnsurePackedWeightCache(
+        weight, inChannels, outChannels);
+}
+
 void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight) {
     std::lock_guard<std::mutex> guard(g_w4a8WeightCacheMutex);
     for (auto &entry : weight.w4a8CudaCaches) {

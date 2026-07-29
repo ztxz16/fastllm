@@ -556,10 +556,19 @@ bool TryCudaCutlassW4A8(const fastllm::Data &input, fastllm::Data &weight,
 bool FastllmCudaW4A8QuantizeActivationPerToken(
     const fastllm::Data &input, int n, int m,
     void *fp8Data, float *tokenScales);
+bool FastllmCudaW4A8PrepareWeightCache(
+    fastllm::Data &weight, int inChannels, int outChannels);
 bool FastllmCudaInspectW4A8Activation(
     const fastllm::Data &input, int n, int m,
     std::vector<uint8_t> &fp8Bytes, std::vector<float> &tokenScales);
 void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight);
+bool FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
+    const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
+    fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+    const int *routeRows, const float *routeScales,
+    const int *routePositions, const int *expertStarts,
+    const int *expertCounts, int batch, int topk, int totalTasks,
+    int hidden, int inter);
 #else
 inline bool TryCudaCutlassW4A8(const fastllm::Data &, fastllm::Data &,
                                const fastllm::Data &, fastllm::Data &,
@@ -568,6 +577,12 @@ inline bool TryCudaCutlassW4A8(const fastllm::Data &, fastllm::Data &,
 }
 inline void FastllmCudaReleaseW4A8WeightCache(fastllm::Data &weight) {
     weight.w4a8CudaCaches.clear();
+}
+inline bool FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
+    const fastllm::Data &, fastllm::Data &, fastllm::Data &,
+    fastllm::Data &, fastllm::Data **, int, const int *, const float *,
+    const int *, const int *, const int *, int, int, int, int, int) {
+    return false;
 }
 #endif
 bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

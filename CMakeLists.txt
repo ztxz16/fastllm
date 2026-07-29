@@ -364,6 +364,7 @@ if (USE_CUDA)
         list(APPEND FASTLLM_CUDA_SOURCES
             src/devices/cuda/linear/fastllm-linear-w4a8-cutlass.cu
             src/devices/cuda/linear/fastllm-w4a8-utils.cu
+            src/devices/cuda/moe/fastllm-moe-w4a8-cutlass.cu
         )
     endif()
 
