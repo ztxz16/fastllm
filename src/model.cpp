@@ -837,10 +837,13 @@ namespace fastllm {
                     ErrorInFastLLM("CreateBufferWithScale error: packed FP4 cannot be loaded as FP8_E4M3.");
                 }
                 if (dstType == DataType::NVFP4 && !isPackedFp4) {
-                    ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8 can be loaded as NVFP4.");
+                    ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8/U8 can be loaded as NVFP4.");
                 }
-                if (dstType == DataType::NVFP4 && scale.dtype != "F8_E8M0") {
-                    ErrorInFastLLM("CreateBufferWithScale error: NVFP4 scale should be F8_E8M0.");
+                if (dstType == DataType::NVFP4 &&
+                    scale.dtype != "F8_E8M0" && scale.dtype != "U8") {
+                    ErrorInFastLLM(
+                        "CreateBufferWithScale error: NVFP4 scale should be "
+                        "F8_E8M0 or raw U8 E8M0.");
                 }
                 if ((dstType == DataType::NVFP4_BLOCK_16 || dstType == DataType::NVFP4_BLOCK_16_E8M0) && !isPackedFp4) {
                     ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8/U8 can be loaded as NVFP4_BLOCK_16.");
@@ -1187,10 +1190,16 @@ namespace fastllm {
                 if (dstType != DataType::FLOAT32) {
                     ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
                 }
-            } else if (this->dtype == "F8_E8M0") {
+            } else if (this->dtype == "F8_E8M0" ||
+                       (this->dtype == "U8" &&
+                        StringEndWith(this->tensorName, ".weight_scale"))) {
                 if (dstType != DataType::FLOAT32) {
-                    ErrorInFastLLM("SafeTensorItem.CreateBuffer: F8_E8M0 tensor " + this->tensorName + " should be loaded as float32.\n");
+                    ErrorInFastLLM("SafeTensorItem.CreateBuffer: E8M0 tensor " + this->tensorName + " should be loaded as float32.\n");
                 }
+                // compressed-tensors serializes MXFP4 E8M0 scales as plain U8.
+                // Restrict the U8 interpretation to compressed-tensors'
+                // weight_scale convention; unrelated U8 tensors remain plain
+                // integer data.
                 ClearBuffer();
                 buffer = new uint8_t[(size_t)len * sizeof(float)];
                 std::vector<uint8_t> ori(len);
@@ -1326,6 +1335,19 @@ namespace fastllm {
             return false;
         }
         if (scaleIt->second.dtype == "F8_E8M0") {
+            dataType = DataType::NVFP4;
+            return true;
+        }
+        // compressed-tensors' mxfp4-pack-quantized format stores the E8M0
+        // exponent byte in a plain torch.uint8 safetensors tensor.  Keep the
+        // check shape-specific so unrelated U8 scale tensors are not inferred
+        // as compact NVFP4 weights.
+        if (scaleIt->second.dtype == "U8" &&
+            it->second.shape.size() == 2 &&
+            scaleIt->second.shape.size() == 2 &&
+            it->second.shape[0] == scaleIt->second.shape[0] &&
+            scaleIt->second.shape[1] > 0 &&
+            it->second.shape[1] * 2 == scaleIt->second.shape[1] * 32) {
             dataType = DataType::NVFP4;
             return true;
         }
@@ -1689,7 +1711,8 @@ namespace fastllm {
             }
             weight.blockK = blockK;
             weight.blockM = blockM;
-            if (targetDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0") {
+            if (targetDataType == DataType::NVFP4 &&
+                (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) {
                 if (isScalarScale) {
                     ErrorInFastLLM("Disk MoE compact NVFP4 does not support scalar scale: " + weight.name + "\n");
                 }
@@ -2189,6 +2212,17 @@ namespace fastllm {
             for (int i = 0; i < lines.size(); i++) {
                 SplitString(lines[i], {' '}, line);
                 model->weight.AddTokenizerWord(Base64Decode(line[0]), atoi(line[1].c_str()), 1.0f);
+            }
+            std::map<std::string, int> addedTokens;
+            for (const auto &it : tokenizerConfig["added_tokens_decoder"].object_items()) {
+                const std::string content = it.second["content"].string_value();
+                if (!content.empty()) {
+                    addedTokens[content] = std::atoi(it.first.c_str());
+                }
+            }
+            if (!addedTokens.empty()) {
+                model->weight.tokenizer.SetSpecialTokens(addedTokens);
+                model->weight.AddDict("tokenizer_has_special_tokens", "1");
             }
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
             if (tokenizerClass == "QWenTokenizer") {
@@ -3125,6 +3159,13 @@ namespace fastllm {
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
+        tensors.erase(
+            std::remove_if(tensors.begin(), tensors.end(),
+                [&](const std::string &name) {
+                    auto it = tensorMap.find(name);
+                    return it == tensorMap.end() || it->second.empty();
+                }),
+            tensors.end());
 
         // 如果有需要，为moe设置特定的量化参数。AWQ 的专家权重使用
         // .qweight 保存，即使名称模式未把它识别成普通 LINEAR，也必须走
@@ -3511,9 +3552,11 @@ namespace fastllm {
                                         }
                                         scaleTensor = &safeTensors.itmeDict[scaleTensorName];
                                         AssertInFastLLM(scaleTensor->dtype == "F32" || scaleTensor->dtype == "BF16" ||
-                                                        scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "F8_E4M3",
-                                                        "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or F8_E4M3.");
-                                        if (!((diskDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0") ||
+                                                        scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "F8_E4M3" ||
+                                                        scaleTensor->dtype == "U8",
+                                                        "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0, F8_E4M3 or U8.");
+                                        if (!((diskDataType == DataType::NVFP4 &&
+                                               (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) ||
                                               (diskDataType == DataType::NVFP4_BLOCK_16 && scaleTensor->dtype == "F8_E4M3"))) {
                                             scaleTensor->CreateBuffer(DataType::FLOAT32);
                                         }
@@ -3529,9 +3572,11 @@ namespace fastllm {
                                 } else if(!isAwqModel) {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                     AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" ||
-                                                    scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "F8_E4M3"
-                                        , "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or F8_E4M3.");
-                                    bool keepScalePacked = (oriDataType == DataType::NVFP4 && scaleTensor.dtype == "F8_E8M0") ||
+                                                    scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "F8_E4M3" ||
+                                                    scaleTensor.dtype == "U8"
+                                        , "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0, F8_E4M3 or U8.");
+                                    bool keepScalePacked = (oriDataType == DataType::NVFP4 &&
+                                                            (scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8")) ||
                                                            (oriDataType == DataType::NVFP4_BLOCK_16 && scaleTensor.dtype == "F8_E4M3") ||
                                                            packedInt4DataType == DataType::INT4_GROUP32;
                                     if (!keepScalePacked) {
@@ -3964,7 +4009,8 @@ namespace fastllm {
         std::map <std::string, std::string> outputFileDict;
         std::string stIndexFile = path + "model.safetensors.index.json";
         std::string error;
-        if (!FileExists(stIndexFile)) {
+        bool hasSafeTensorIndex = FileExists(stIndexFile);
+        if (!hasSafeTensorIndex) {
             stFiles.insert(path + "model.safetensors");
             outputFileDict[path + "model.safetensors"] = outputPath + "model.safetensors";
         } else {
@@ -3996,6 +4042,13 @@ namespace fastllm {
         // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
         auto tensorMap = model->GetTensorMap(tensors);
+        tensors.erase(
+            std::remove_if(tensors.begin(), tensors.end(),
+                [&](const std::string &name) {
+                    auto it = tensorMap.find(name);
+                    return it == tensorMap.end() || it->second.empty();
+                }),
+            tensors.end());
 
         // 如果有需要，为moe设置特定的量化参数
         if (useMoeDataType && model->moeLinears.size() > 0) {
@@ -4035,7 +4088,10 @@ namespace fastllm {
             printf("Export weight model: %s\n", outputFileName.c_str());
             std::vector <SafeTensorItem*> items;
             for (auto &it : safeTensors.itmeDict) {
-                if (it.second.fileName == file) {
+                auto tensorMapIt = tensorMap.find(it.first);
+                if (it.second.fileName == file &&
+                    tensorMapIt != tensorMap.end() &&
+                    !tensorMapIt->second.empty()) {
                     items.push_back(&it.second);
                 }
             }
@@ -4177,11 +4233,13 @@ namespace fastllm {
                                 tensor.CreateBuffer(oriDataType);
                             } else {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
-                                    , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
+                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" ||
+                                                scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8"
+                                    , "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or U8.");
                                 if (packedInt4DataType == DataType::INT4_GROUP32) {
                                     scaleTensor.CreateBuffer(DataType::BFLOAT16);
-                                } else if (!(oriDataType == DataType::NVFP4 && scaleTensor.dtype == "F8_E8M0")) {
+                                } else if (!(oriDataType == DataType::NVFP4 &&
+                                             (scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8"))) {
                                     scaleTensor.CreateBuffer(DataType::FLOAT32);
                                 }
                                 if (isPackedInt4Group) {
@@ -4313,6 +4371,44 @@ namespace fastllm {
             fwrite(configString.data(), 1, configString.size(), outputFile);
             fwrite(bytes.data(), 1, bytes.size(), outputFile);
             fclose(outputFile);
+        }
+        if (hasSafeTensorIndex) {
+            json11::Json::object exportedWeightMap;
+            for (const auto &mapping : tensorMap) {
+                if (mapping.second.empty()) {
+                    continue;
+                }
+                auto tensor = safeTensors.itmeDict.find(mapping.first);
+                if (tensor == safeTensors.itmeDict.end()) {
+                    continue;
+                }
+                auto output = outputFileDict.find(tensor->second.fileName);
+                if (output == outputFileDict.end()) {
+                    continue;
+                }
+                exportedWeightMap[mapping.first] =
+                    fs::path(output->second).filename().string();
+            }
+            uint64_t totalSize = 0;
+            for (const auto &output : outputFileDict) {
+                if (fs::exists(output.second) && fs::is_regular_file(output.second)) {
+                    totalSize += fs::file_size(output.second);
+                }
+            }
+            json11::Json::object metadata = {
+                {"total_size", (double)totalSize},
+            };
+            json11::Json::object index = {
+                {"metadata", metadata},
+                {"weight_map", exportedWeightMap},
+            };
+            std::ofstream outputIndex(
+                outputPath + "model.safetensors.index.json",
+                std::ios::binary | std::ios::trunc);
+            AssertInFastLLM(
+                outputIndex.good(),
+                "Unable to write exported safetensors index.");
+            outputIndex << json11::Json(index).dump();
         }
         delete loraTensors;        
         return;
