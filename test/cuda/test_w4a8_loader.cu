@@ -108,7 +108,7 @@ std::vector<float> DataToFloat(fastllm::Data &data) {
 bool RunMissingCompanionTest() {
     std::string path = "/tmp/fastllm_w4a8_loader_" + std::to_string((long long)getpid());
     mkdir(path.c_str(), 0700);
-    std::string config = R"({"quantization_config":{"quant_method":"compressed-tensors","format":"pack-quantized","config_groups":{"group_0":{"format":"pack-quantized","targets":["Linear"],"weights":{"type":"int","num_bits":4,"strategy":"group","group_size":128,"symmetric":true,"dynamic":false,"actorder":null},"input_activations":{"type":"float","num_bits":8,"strategy":"token","symmetric":true,"dynamic":true,"actorder":null}}}}})";
+    std::string config = R"({"quantization_config":{"quant_method":"compressed-tensors","format":"pack-quantized","config_groups":{"group_0":{"targets":["Linear"],"weights":{"type":"int","num_bits":4,"strategy":"group","group_size":128,"symmetric":true,"dynamic":false,"actorder":"weight"},"input_activations":{"type":"float","num_bits":8,"strategy":"token","symmetric":true,"dynamic":true,"actorder":null}}}}})";
     std::ofstream(path + "/config.json") << config;
 
     std::string header = R"({"layer.weight_packed":{"dtype":"I32","shape":[128,16],"data_offsets":[0,8192]}})";

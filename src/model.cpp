@@ -1359,15 +1359,21 @@ namespace fastllm {
             }
             const auto &weight = group["weights"];
             const auto &input = group["input_activations"];
+            const std::string groupFormat = group["format"].string_value();
+            const std::string weightActorder =
+                weight["actorder"].string_value();
+            const bool weightPreordered =
+                weight["actorder"].is_null() ||
+                weightActorder == "weight" || weightActorder == "static";
             bool supported =
-                group["format"].string_value() == "pack-quantized" &&
+                (groupFormat.empty() || groupFormat == "pack-quantized") &&
                 weight["type"].string_value() == "int" &&
                 weight["num_bits"].int_value() == 4 &&
                 weight["strategy"].string_value() == "group" &&
                 weight["group_size"].int_value() == COMPRESSED_W4A8_GROUP_SIZE &&
                 weight["symmetric"].bool_value() &&
                 !weight["dynamic"].bool_value() &&
-                weight["actorder"].is_null() &&
+                weightPreordered &&
                 input["type"].string_value() == "float" &&
                 input["num_bits"].int_value() == 8 &&
                 input["strategy"].string_value() == "token" &&
