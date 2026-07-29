@@ -238,6 +238,18 @@ namespace fastllm {
                 for (auto &it: datas) {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
+                        // The disk Kimi operator materializes only the routed
+                        // experts selected by this invocation. Moving all 896
+                        // lazy entries here would defeat that bounded loading
+                        // policy and leaves no source buffer to copy anyway.
+                        if (opType == "KimiK3RoutedExperts" &&
+                            device->deviceType == "disk" && batch > 0 &&
+                            (it.first == "w1s" || it.first == "w2s" ||
+                             it.first == "w3s") &&
+                            ((Data**)it.second)[0] != nullptr &&
+                            ((Data**)it.second)[0]->isDiskWeight) {
+                            continue;
+                        }
 #ifdef USE_NUMAS
                         // Kimi-K3 registers all three routed-expert tables in
                         // NUMA arenas during model warmup.  Revalidating and

@@ -3,6 +3,7 @@
 
 #include "device.h"
 #include "devices/cpu/cpudevice.h"
+#include "devices/cpu/kimi_k3_ops.h"
 
 namespace fastllm {
     class DiskDevice : BaseDevice {
@@ -19,6 +20,16 @@ namespace fastllm {
     class DiskMergeMOE : CpuMergeMOE {
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class DiskKimiK3RoutedExpertsOp : public CpuKimiK3RoutedExpertsOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams,
+                    const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams,
+                 const IntDict &intParams) override;
     };
 
     class DiskLinearOp : public BaseOperator {

@@ -2994,6 +2994,123 @@ namespace {
                         0.0f, 0.0f, "disk row-wise BF16 embedding");
         Expect(diskEmbedding.cpuData == nullptr,
                "disk Embedding materialized the full resident weight.");
+
+        constexpr int kimiTokens = 2;
+        constexpr int kimiTopk = 2;
+        constexpr int kimiExperts = 3;
+        constexpr int kimiHidden = 256;
+        constexpr int kimiInter = 256;
+        constexpr float kimiBeta = 1.7f;
+        constexpr float kimiLinearBeta = 2.5f;
+        const std::filesystem::path kimiPath = temp.Path() / "kimi_q2k.bin";
+        std::ofstream kimiFile(kimiPath, std::ios::binary);
+        Expect(kimiFile.good(), "failed to create disk Kimi fixture.");
+        long long kimiFileOffset = 0;
+        std::vector<std::unique_ptr<fastllm::Data>> kimiResidentWeights;
+        std::vector<std::unique_ptr<fastllm::Data>> kimiDiskWeights;
+        std::vector<fastllm::Data*> residentW1s, residentW2s, residentW3s;
+        std::vector<fastllm::Data*> diskW1s, diskW2s, diskW3s;
+
+        auto makeKimiWeight = [&](const std::vector<int> &dims, float seed,
+                                  const std::string &name) {
+            fastllm::Data source = MakeFloatTensor(dims, seed);
+            auto resident = std::make_unique<fastllm::Data>(
+                fastllm::DataType::DATA_GGUF_FORMAT,
+                (int)GGML_TYPE_Q2_K, dims);
+            resident->name = name + ".resident";
+            resident->disableGGUFRepack = true;
+            resident->CreateFromOriData(
+                fastllm::WeightType::LINEAR,
+                fastllm::DataType::FLOAT32,
+                source.cpuData, nullptr, nullptr);
+            const uint64_t bytes = resident->GetBytes();
+            kimiFile.write(
+                reinterpret_cast<const char*>(resident->cpuData), bytes);
+            Expect(kimiFile.good(), "failed to write disk Kimi fixture.");
+
+            auto disk = std::make_unique<fastllm::Data>(
+                fastllm::DataType::DATA_GGUF_FORMAT,
+                (int)GGML_TYPE_Q2_K, dims);
+            disk->name = name + ".disk";
+            disk->weightType = fastllm::WeightType::LINEAR;
+            disk->isDiskWeight = true;
+            disk->disableGGUFRepack = true;
+            fastllm::DiskWeightPart part;
+            part.fileName = kimiPath.string();
+            part.fileOffset = kimiFileOffset;
+            part.bytes = bytes;
+            part.sourceDataType = fastllm::DataType::DATA_GGUF_FORMAT;
+            part.dims = dims;
+            disk->diskWeightParts.push_back(part);
+            kimiFileOffset += bytes;
+            return std::make_pair(std::move(resident), std::move(disk));
+        };
+
+        for (int expert = 0; expert < kimiExperts; expert++) {
+            auto w1 = makeKimiWeight(
+                {kimiInter, kimiHidden}, 1.0f + expert,
+                "regression.disk.kimi." + std::to_string(expert) + ".w1");
+            auto w2 = makeKimiWeight(
+                {kimiHidden, kimiInter}, 4.0f + expert,
+                "regression.disk.kimi." + std::to_string(expert) + ".w2");
+            auto w3 = makeKimiWeight(
+                {kimiInter, kimiHidden}, 7.0f + expert,
+                "regression.disk.kimi." + std::to_string(expert) + ".w3");
+            residentW1s.push_back(w1.first.get());
+            diskW1s.push_back(w1.second.get());
+            residentW2s.push_back(w2.first.get());
+            diskW2s.push_back(w2.second.get());
+            residentW3s.push_back(w3.first.get());
+            diskW3s.push_back(w3.second.get());
+            kimiResidentWeights.push_back(std::move(w1.first));
+            kimiDiskWeights.push_back(std::move(w1.second));
+            kimiResidentWeights.push_back(std::move(w2.first));
+            kimiDiskWeights.push_back(std::move(w2.second));
+            kimiResidentWeights.push_back(std::move(w3.first));
+            kimiDiskWeights.push_back(std::move(w3.second));
+        }
+        kimiFile.close();
+
+        // Expert 1 is never routed below. Point its lazy metadata at a file
+        // that does not exist so the regression also proves the disk operator
+        // materializes selected experts only.
+        const std::string unusedKimiPath =
+            (temp.Path() / "unused_kimi_expert.bin").string();
+        for (fastllm::Data *weight :
+             {diskW1s[1], diskW2s[1], diskW3s[1]}) {
+            weight->diskWeightParts[0].fileName = unusedKimiPath;
+        }
+
+        fastllm::Data kimiInput = MakeTensor(
+            fastllm::DataType::BFLOAT16,
+            {kimiTokens, kimiHidden}, 0.4f);
+        fastllm::Data kimiIndex = MakeIntTensor(
+            {kimiTokens, kimiTopk}, {0, 2, 2, 0});
+        fastllm::Data kimiScore(
+            fastllm::DataType::FLOAT32,
+            {kimiTokens, kimiTopk}, {0.65f, 0.35f, 0.4f, 0.6f});
+        fastllm::Data cpuKimiOutput, diskKimiOutput;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::KimiK3RoutedExperts(
+                kimiInput, kimiIndex, kimiScore,
+                residentW1s, residentW2s, residentW3s,
+                kimiBeta, kimiLinearBeta, cpuKimiOutput);
+        }
+        {
+            ScopedFirstDevice guard("disk");
+            fastllm::KimiK3RoutedExperts(
+                kimiInput, kimiIndex, kimiScore,
+                diskW1s, diskW2s, diskW3s,
+                kimiBeta, kimiLinearBeta, diskKimiOutput);
+        }
+        ExpectFloatNear(
+            ToFloatVector(cpuKimiOutput), ToFloatVector(diskKimiOutput),
+            0.0f, 0.0f, "disk Kimi Q2_K routed experts");
+        for (const auto &weight : kimiDiskWeights) {
+            Expect(weight->cpuData == nullptr,
+                   "disk Kimi retained a routed-expert weight.");
+        }
     }
 
     void RunCpuInt4GroupAwqLinearRegressionCase(int inputDim, int outputDim,
