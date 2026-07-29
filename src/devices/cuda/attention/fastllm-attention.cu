@@ -2602,6 +2602,14 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
 }
 
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph) {
+    if (FastllmCudaTrySm70PagedAttentionDecode(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType)) {
+        if (sync) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        return true;
+    }
 #ifndef FASTLLM_ENABLE_FLASHINFER
     bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);

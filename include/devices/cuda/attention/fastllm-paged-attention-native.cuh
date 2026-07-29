@@ -10,3 +10,11 @@ bool FastllmCudaHalfPagedAttentionBatchFastllmFallback(
     fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches,
     fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs,
     fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale);
+
+// V100 decode specialization for Qwen3.5's FP16 page128 Q24/KV4 D256 GQA6 layout.
+// Enabled by default for the exact shape; FASTLLM_CUDA_SM70_PAGED_XQA=0 disables it.
+bool FastllmCudaTrySm70PagedAttentionDecode(
+    fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches,
+    fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs,
+    fastllm::Data &lastPageLens, fastllm::Data &output,
+    int group, float scale, int attentionType);
