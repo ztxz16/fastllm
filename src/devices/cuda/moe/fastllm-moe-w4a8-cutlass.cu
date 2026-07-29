@@ -20,13 +20,12 @@
 #include <vector>
 
 // Native FastLLM adaptation of vLLM's SM90 grouped W4A8 CUTLASS entry.
-namespace {
+namespace fastllm_w4a8_moe_detail {
 
 using namespace cute;
 
 constexpr int W4A8_GROUP_SIZE = 128;
 constexpr int W4A8_SCALE_PACK_SIZE = 8;
-constexpr int W4A8_INT4_PACK_FACTOR = 8;
 
 using W4A8ProblemShape =
     cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
@@ -412,7 +411,9 @@ static bool FastllmW4A8CollectCaches(
     return !activeCounts.empty();
 }
 
-} // namespace
+} // namespace fastllm_w4a8_moe_detail
+
+using namespace fastllm_w4a8_moe_detail;
 
 bool FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
     const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &w2,
