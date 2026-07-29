@@ -886,6 +886,8 @@ namespace fastllm {
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);
+    bool CanRunMergeMOE(const Data &input, std::vector <Data*> &weights,
+                        std::vector <Data*> &biass);
     enum MoeGateType {
         MoeGateSwiglu = 0,
         MoeGateGeglu = 1

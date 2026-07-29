@@ -1240,7 +1240,7 @@ namespace fastllm {
         const bool useMergeMoe = layerId >= 0 &&
                                  layerId < (int) weights.size() &&
                                  !weights[layerId].empty() &&
-                                 CanRunMergeMOE(expertInputFlat, biass[layerId]);
+                                 CanRunMergeMOE(expertInputFlat, weights[layerId], biass[layerId]);
         if (useMergeMoe) {
             Data expertIndexData(DataType::INT32, {tokenCount, topK});
             expertIndexData.Allocate();

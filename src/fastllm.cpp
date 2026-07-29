@@ -3829,7 +3829,22 @@ namespace fastllm {
     }
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass) {
-        return curExecutor->CanRunOnFirstDevice("MergeMOE", {{"input", (Data*)&input}, {"biass", (Data*)biass.data()}}, {}, {});
+        return curExecutor->CanRunOnFirstDevice(
+            "MergeMOE",
+            {{"input", (Data*)&input}, {"biass", (Data*)biass.data()}},
+            {},
+            {{"biass___batch", (int)biass.size()}});
+    }
+
+    bool CanRunMergeMOE(const Data &input, std::vector <Data*> &weights,
+                        std::vector <Data*> &biass) {
+        return curExecutor->CanRunOnFirstDevice(
+            "MergeMOE",
+            {{"input", (Data*)&input}, {"weights", (Data*)weights.data()},
+             {"biass", (Data*)biass.data()}},
+            {},
+            {{"weights___batch", (int)weights.size()},
+             {"biass___batch", (int)biass.size()}});
     }
 
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 

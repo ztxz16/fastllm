@@ -4880,7 +4880,7 @@ namespace fastllm {
                 bool layerHasMergeMoe = !layerHasFusedMoe &&
                     i < (int)weights.size() && i < (int)biass.size() &&
                     weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() &&
-                    CanRunMergeMOE(attenInput, biass[i]);
+                    CanRunMergeMOE(attenInput, weights[i], biass[i]);
 
                 if (layerHasFusedMoe || layerHasMergeMoe) {
                     SelectExpert(routerLogitsTemp, expertIndex, expertScore, this->num_experts_per_tok, needNorm,

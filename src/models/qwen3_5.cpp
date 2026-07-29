@@ -18504,7 +18504,7 @@ namespace fastllm {
             }
 
             bool useMergeMoe = weight.weight.find(firstExpertGateupName) != weight.weight.end() &&
-                               !weights[i].empty() && CanRunMergeMOE(attenInput, biass[i]);
+                               !weights[i].empty() && CanRunMergeMOE(attenInput, weights[i], biass[i]);
             if (useMergeMoe) {
                 Data expertIndex, expertScore;
                 SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, this->norm_topk_prob,
@@ -19822,7 +19822,7 @@ namespace fastllm {
             }
 
             bool useMergeMoe = weight.weight.find(firstExpertGateupName) != weight.weight.end() &&
-                               !weights[i].empty() && CanRunMergeMOE(attenInput, biass[i]);
+                               !weights[i].empty() && CanRunMergeMOE(attenInput, weights[i], biass[i]);
             if (useMergeMoe) {
                 Data expertIndex, expertScore;
                 SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, this->norm_topk_prob,

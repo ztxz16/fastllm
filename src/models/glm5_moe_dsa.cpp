@@ -1218,14 +1218,14 @@ namespace fastllm {
 
                 Data expertIndex, expertScore;
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end()
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm,
                                 this->routed_scaling_factor, gateBias);
                 }
                 Glm5MoeDsaPrintExpertChoice(expertIndex, expertScore, i, "Glm5MoeDsa Forward ffn_moe_topk");
                 this->ApplyMoeDeviceMapForLayer(i);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end()
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
                         &weights[i], &biass[i],
                         &w1, &w2, &w3, &curInput, &curOutput,
@@ -1842,14 +1842,14 @@ namespace fastllm {
 
                 Data expertIndex, expertScore;
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end()
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm,
                                 this->routed_scaling_factor, gateBias);
                 }
                 Glm5MoeDsaPrintExpertChoice(expertIndex, expertScore, i, "Glm5MoeDsa ForwardBatch ffn_moe_topk");
                 this->ApplyMoeDeviceMapForLayer(i);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end()
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
                         &weights[i], &biass[i],
                         &w1, &w2, &w3, &curInput, &curOutput,
@@ -2494,14 +2494,14 @@ namespace fastllm {
 
                 Data expertIndex, expertScore;
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end()
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm,
                                 this->routed_scaling_factor, gateBias);
                 }
                 Glm5MoeDsaPrintExpertChoice(expertIndex, expertScore, i, "Glm5MoeDsa ForwardBatchBatch ffn_moe_topk");
                 this->ApplyMoeDeviceMapForLayer(i);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end()
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
                         &weights[i], &biass[i],
                         &w1, &w2, &w3, &curInput, &curOutput,

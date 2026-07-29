@@ -357,13 +357,13 @@ namespace fastllm {
 
                 Data expertIndex, expertScore;
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
                                 this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
                 }
                 this->ApplyMoeDeviceMapForLayer(i);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     MergeMOE (
                         attenInput, expertIndex, expertScore,
                         weights[i], biass[i],
@@ -750,13 +750,13 @@ namespace fastllm {
 
                 Data expertIndex, expertScore;
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
                                 this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
                 }
                 this->ApplyMoeDeviceMapForLayer(i);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
-                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    && CanRunMergeMOE(attenInput, weights[i], biass[i])) {
                     MergeMOE (
                         attenInput, expertIndex, expertScore,
                         weights[i], biass[i],
