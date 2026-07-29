@@ -60,6 +60,76 @@ namespace fastllm {
             Copy(combined, packed);
         }
 
+        std::vector<int> ParseIntegerList(const std::string &text) {
+            std::vector<int> values;
+            for (size_t position = 0; position < text.size();) {
+                if (!std::isdigit((unsigned char)text[position]) &&
+                    text[position] != '-') {
+                    position++;
+                    continue;
+                }
+                bool negative = text[position] == '-';
+                if (negative) {
+                    position++;
+                }
+                if (position >= text.size() ||
+                    !std::isdigit((unsigned char)text[position])) {
+                    continue;
+                }
+                int value = 0;
+                while (position < text.size() &&
+                       std::isdigit((unsigned char)text[position])) {
+                    value = value * 10 + (text[position] - '0');
+                    position++;
+                }
+                values.push_back(negative ? -value : value);
+            }
+            return values;
+        }
+
+        void AppendSequenceCache(Data &cache, const Data &current,
+                                 int allocationUnit = 64) {
+            AssertInFastLLM(current.dims.size() == 3,
+                            "Sequence cache input must be [heads, tokens, dim].");
+            if (cache.dims.empty() && cache.expansionDims.empty()) {
+                cache.dataType = current.dataType;
+                cache.UpdateUnitSize();
+                cache.dataDevice = current.dataDevice;
+                cache.dataDeviceIds = current.dataDeviceIds;
+            }
+            AssertInFastLLM(cache.dataType == current.dataType,
+                            "Sequence cache dtype mismatch.");
+            const int appendTokens = current.dims[1];
+            while ((cache.dims.empty() &&
+                    (cache.expansionDims.size() < 2 ||
+                     appendTokens > cache.expansionDims[1])) ||
+                   (!cache.dims.empty() &&
+                    (cache.expansionDims.size() < 2 ||
+                     cache.dims[1] + appendTokens >
+                         cache.expansionDims[1]))) {
+                std::vector<int> expanded = cache.dims.empty() ?
+                    std::vector<int>({
+                        current.dims[0],
+                        ((appendTokens - 1) / allocationUnit + 1) *
+                            allocationUnit,
+                        current.dims[2]}) : cache.expansionDims;
+                if (!cache.dims.empty()) {
+                    expanded[1] +=
+                        ((appendTokens - 1) / allocationUnit + 1) *
+                        allocationUnit;
+                }
+                cache.Expansion(expanded);
+            }
+            CatDirect(cache, current, 1);
+        }
+
+        void ResizeSequenceCache(Data &cache, int tokens) {
+            AssertInFastLLM(cache.dims.size() == 3 && tokens >= 0 &&
+                            tokens <= cache.dims[1],
+                            "Invalid sequence cache trim.");
+            cache.Resize({cache.dims[0], tokens, cache.dims[2]});
+        }
+
     }
 
     KimiK3Model::KimiK3Model() {
@@ -99,6 +169,10 @@ namespace fastllm {
         };
     }
 
+    KimiK3Model::~KimiK3Model() {
+        ShutdownRuntime();
+    }
+
     void KimiK3Model::InitParams() {
         FlattenTextConfig(weight.dicts);
         basellm::InitParams();
@@ -132,6 +206,7 @@ namespace fastllm {
         situBeta = optionalFloat("activation_situ_beta", 4.0f);
         situLinearBeta = optionalFloat("activation_situ_linear_beta", 25.0f);
         rms_norm_eps = optionalFloat("rms_norm_eps", 1e-5f);
+        max_positions = requiredInt("max_position_embeddings");
         head_dim = kdaHeadDim;
         kdaLayers.assign(block_cnt, false);
         auto kdaIt = weight.dicts.find("linear_attn_config.kda_layers");
@@ -181,6 +256,91 @@ namespace fastllm {
                         block_cnt == 93 && attnResBlockSize == 12,
                         "The Kimi-K3 implementation only supports the "
                         "published K3 text configuration.");
+
+        dsparkEnabled = weight.dicts.find("dspark.model_path") !=
+                        weight.dicts.end();
+        if (dsparkEnabled) {
+            auto dsparkRequiredInt = [&](const std::string &key) {
+                const std::string full = "dspark." + key;
+                auto it = weight.dicts.find(full);
+                AssertInFastLLM(it != weight.dicts.end(),
+                                "DSpark config is missing " + key);
+                return atoi(it->second.c_str());
+            };
+            auto dsparkOptionalFloat = [&](const std::string &key,
+                                           float fallback) {
+                auto it = weight.dicts.find("dspark." + key);
+                return it == weight.dicts.end() ? fallback :
+                       (float)atof(it->second.c_str());
+            };
+            dsparkBlockSize = dsparkRequiredInt("block_size");
+            dsparkLayers = dsparkRequiredInt("num_hidden_layers");
+            dsparkHeads = dsparkRequiredInt("num_attention_heads");
+            dsparkKvHeads = dsparkRequiredInt("num_key_value_heads");
+            dsparkHeadDim = dsparkRequiredInt("head_dim");
+            dsparkIntermediateSize =
+                dsparkRequiredInt("intermediate_size");
+            dsparkMaskTokenId =
+                dsparkRequiredInt("dflash_config.mask_token_id");
+            dsparkMarkovRank = dsparkRequiredInt("markov_rank");
+            dsparkRmsNormEps = dsparkOptionalFloat(
+                "rms_norm_eps", 1e-5f);
+            auto targetLayers = weight.dicts.find(
+                "dspark.dflash_config.target_layer_ids");
+            AssertInFastLLM(targetLayers != weight.dicts.end(),
+                            "DSpark config is missing target_layer_ids.");
+            dsparkTargetLayerIds = ParseIntegerList(targetLayers->second);
+
+            int targetVocab = requiredInt("vocab_size");
+            AssertInFastLLM(
+                dsparkBlockSize == 7 && dsparkLayers == 5 &&
+                dsparkHeads == 64 && dsparkKvHeads == 16 &&
+                dsparkHeadDim == 64 && dsparkIntermediateSize == 14336 &&
+                dsparkMarkovRank == 256 &&
+                dsparkRequiredInt("hidden_size") == embed_dim &&
+                dsparkRequiredInt("vocab_size") == targetVocab &&
+                dsparkRequiredInt("num_target_layers") == block_cnt &&
+                dsparkTargetLayerIds ==
+                    std::vector<int>({7, 23, 51, 67, 83}),
+                "The loaded DSpark checkpoint is incompatible with the "
+                "published Kimi-K3 DSpark architecture.");
+            const char *confidenceThresholdEnv = std::getenv(
+                "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD");
+            if (confidenceThresholdEnv != nullptr &&
+                confidenceThresholdEnv[0] != '\0') {
+                char *end = nullptr;
+                dsparkConfidenceThreshold = std::strtof(
+                    confidenceThresholdEnv, &end);
+                AssertInFastLLM(
+                    end != confidenceThresholdEnv && *end == '\0' &&
+                    std::isfinite(dsparkConfidenceThreshold) &&
+                    dsparkConfidenceThreshold >= 0.0f &&
+                    dsparkConfidenceThreshold <= 1.0f,
+                    "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD must be in [0, 1].");
+            }
+            weight.embeddingNames.insert(
+                "dspark.markov_head.markov_w1.weight");
+            for (const std::string &name : {
+                    "dspark.fc.weight",
+                    "dspark.markov_head.markov_w2.weight",
+                    "dspark.confidence_head.proj.weight"}) {
+                weight.linearNames.insert(name);
+            }
+            for (int layer = 0; layer < dsparkLayers; layer++) {
+                const std::string prefix = "dspark.layers." +
+                    std::to_string(layer) + ".";
+                for (const std::string &suffix : {
+                        "self_attn.q_proj.weight",
+                        "self_attn.k_proj.weight",
+                        "self_attn.v_proj.weight",
+                        "self_attn.o_proj.weight",
+                        "mlp.gate_proj.weight",
+                        "mlp.up_proj.weight",
+                        "mlp.down_proj.weight"}) {
+                    weight.linearNames.insert(prefix + suffix);
+                }
+            }
+        }
         // Export/load policy uses FastLLM's ordinary MoE registry.  Source
         // MXFP4 tensors map to these logical names, and dtype_config can then
         // convert them to GGML Q2_K without checkpoint-specific exporter code.
@@ -245,6 +405,62 @@ namespace fastllm {
             "block_sparse_moe.routed_expert_norm.weight",
         };
         for (const std::string &name : tensorNames) {
+            if (dsparkEnabled) {
+                const std::string target = "dspark." + name;
+                if (name == "fc.weight" ||
+                    name == "markov_head.markov_w1.weight" ||
+                    name == "markov_head.markov_w2.weight") {
+                    result[name].emplace_back(target, DataType::BFLOAT16);
+                    continue;
+                }
+                if (name == "hidden_norm.weight" ||
+                    name == "norm.weight" ||
+                    name == "confidence_head.proj.weight" ||
+                    name == "confidence_head.proj.bias") {
+                    result[name].emplace_back(target, DataType::FLOAT32);
+                    continue;
+                }
+                bool draftMatched = false;
+                for (int layerIndex = 0; layerIndex < dsparkLayers;
+                     layerIndex++) {
+                    const std::string layer = "layers." +
+                        std::to_string(layerIndex) + ".";
+                    if (name.rfind(layer, 0) != 0) {
+                        continue;
+                    }
+                    std::string suffix = name.substr(layer.size());
+                    static const std::set<std::string> draftLinearSuffixes = {
+                        "self_attn.q_proj.weight",
+                        "self_attn.k_proj.weight",
+                        "self_attn.v_proj.weight",
+                        "self_attn.o_proj.weight",
+                        "mlp.gate_proj.weight",
+                        "mlp.up_proj.weight",
+                        "mlp.down_proj.weight",
+                    };
+                    static const std::set<std::string> draftNormSuffixes = {
+                        "input_layernorm.weight",
+                        "post_attention_layernorm.weight",
+                        "self_attn.q_norm.weight",
+                        "self_attn.k_norm.weight",
+                    };
+                    if (draftLinearSuffixes.find(suffix) !=
+                        draftLinearSuffixes.end()) {
+                        result[name].emplace_back(
+                            target, DataType::BFLOAT16);
+                        draftMatched = true;
+                    } else if (draftNormSuffixes.find(suffix) !=
+                               draftNormSuffixes.end()) {
+                        result[name].emplace_back(
+                            target, DataType::FLOAT32);
+                        draftMatched = true;
+                    }
+                    break;
+                }
+                if (draftMatched) {
+                    continue;
+                }
+            }
             if (name == languagePrefix + "embed_tokens.weight") {
                 result[name].emplace_back(name, DataType::BFLOAT16);
                 continue;
@@ -410,6 +626,57 @@ namespace fastllm {
         require(languagePrefix + "output_attn_res_proj.weight");
         require(languagePrefix + "norm.weight");
         require("language_model.lm_head.weight");
+
+        if (dsparkEnabled) {
+            const int targetVocab = atoi(weight.dicts.at("vocab_size").c_str());
+            auto requireShape = [&](const std::string &name,
+                                    const std::vector<int> &shape) -> Data& {
+                Data &data = require("dspark." + name);
+                AssertInFastLLM(
+                    data.dims == shape,
+                    "DSpark weight has an invalid shape: " + name);
+                return data;
+            };
+            requireShape("fc.weight", {embed_dim, 5 * embed_dim});
+            requireShape("hidden_norm.weight", {embed_dim});
+            requireShape("norm.weight", {embed_dim});
+            requireShape("markov_head.markov_w1.weight",
+                         {targetVocab, dsparkMarkovRank});
+            requireShape("markov_head.markov_w2.weight",
+                         {targetVocab, dsparkMarkovRank});
+            requireShape("confidence_head.proj.weight",
+                         {1, embed_dim + dsparkMarkovRank});
+            requireShape("confidence_head.proj.bias", {1});
+            for (int layerIndex = 0; layerIndex < dsparkLayers;
+                 layerIndex++) {
+                const std::string layer = "layers." +
+                    std::to_string(layerIndex) + ".";
+                requireShape(layer + "input_layernorm.weight", {embed_dim});
+                requireShape(layer + "post_attention_layernorm.weight",
+                             {embed_dim});
+                requireShape(layer + "self_attn.q_norm.weight",
+                             {dsparkHeadDim});
+                requireShape(layer + "self_attn.k_norm.weight",
+                             {dsparkHeadDim});
+                requireShape(layer + "self_attn.q_proj.weight",
+                             {dsparkHeads * dsparkHeadDim, embed_dim});
+                requireShape(layer + "self_attn.k_proj.weight",
+                             {dsparkKvHeads * dsparkHeadDim, embed_dim});
+                requireShape(layer + "self_attn.v_proj.weight",
+                             {dsparkKvHeads * dsparkHeadDim, embed_dim});
+                requireShape(layer + "self_attn.o_proj.weight",
+                             {embed_dim, dsparkHeads * dsparkHeadDim});
+                requireShape(layer + "mlp.gate_proj.weight",
+                             {dsparkIntermediateSize, embed_dim});
+                requireShape(layer + "mlp.up_proj.weight",
+                             {dsparkIntermediateSize, embed_dim});
+                requireShape(layer + "mlp.down_proj.weight",
+                             {embed_dim, dsparkIntermediateSize});
+            }
+            std::cout << "[Kimi-K3] DSpark enabled: 5-layer BF16 draft, "
+                      << "block=" << dsparkBlockSize
+                      << ", target hidden layers=[7,23,51,67,83].\n";
+        }
     }
 
     void KimiK3Model::WarmUp() {
@@ -475,7 +742,8 @@ namespace fastllm {
 
     Data KimiK3Model::RunFirstLayerImpl(
             const std::vector<int> &tokenIds,
-            std::vector<std::pair<Data, Data>> *pastKeyValues) {
+            std::vector<std::pair<Data, Data>> *pastKeyValues,
+            TargetRunCapture *capture) {
         AssertInFastLLM(!tokenIds.empty(),
                         "Kimi-K3 requires at least one input token.");
         ApplyDeviceMap(deviceMap, 0, 1);
@@ -502,6 +770,11 @@ namespace fastllm {
                Data(), kProjected);
         Linear(normalized, weight[layer + "self_attn.v_proj.weight"],
                Data(), vProjected);
+        if (capture != nullptr && capture->captureKda) {
+            capture->kda[0].qProjected.CopyFrom(qProjected);
+            capture->kda[0].kProjected.CopyFrom(kProjected);
+            capture->kda[0].vProjected.CopyFrom(vProjected);
+        }
 
         Data qConv, kConv, vConv;
         Data qCache, kCache, vCache;
@@ -549,6 +822,12 @@ namespace fastllm {
         Linear(normalized, weight[layer + "self_attn.b_proj.weight"],
                Data(), rawBetaBf16);
         ToDataType(rawBetaBf16, rawBeta, DataType::FLOAT32);
+        if (capture != nullptr && capture->captureKda) {
+            capture->kda[0].k.CopyFrom(k);
+            capture->kda[0].v.CopyFrom(vConv);
+            capture->kda[0].rawGate.CopyFrom(rawGate);
+            capture->kda[0].rawBeta.CopyFrom(rawBeta);
+        }
 
         Data localKdaState, kdaOutput, kdaDecay, kdaBeta;
         Data &kdaState = pastKeyValues == nullptr ?
@@ -604,15 +883,20 @@ namespace fastllm {
 
     Data KimiK3Model::RunLayersImpl(
             const std::vector<int> &tokenIds, int layerCount,
-            std::vector<std::pair<Data, Data>> *pastKeyValues) {
+            std::vector<std::pair<Data, Data>> *pastKeyValues,
+            TargetRunCapture *capture) {
         AssertInFastLLM(layerCount >= 1 && layerCount <= block_cnt,
                         "Kimi-K3 requested layer count is out of range.");
         if (pastKeyValues != nullptr) {
             AssertInFastLLM((int)pastKeyValues->size() >= layerCount,
                             "Kimi-K3 cache table is shorter than the decoder.");
         }
+        if (capture != nullptr && capture->captureKda &&
+            (int)capture->kda.size() < layerCount) {
+            capture->kda.resize(layerCount);
+        }
         Data prefixSum = RunFirstLayerImpl(
-            tokenIds, pastKeyValues);
+            tokenIds, pastKeyValues, capture);
         if (layerCount == 1) {
             return prefixSum;
         }
@@ -629,6 +913,31 @@ namespace fastllm {
         ToDataType(blockResidual, DataType::BFLOAT16);
         blockResidual.Reshape({sequence, 1, embed_dim});
 
+        const bool cudaSharedExpert = GetCudaSharedExpert();
+        static const std::map<std::string, int> cpuMoeSupportDeviceMap = {
+            {"cpu", 1},
+        };
+        auto isCpuMoeLayer = [&](int layerIndex) {
+            const std::string selected = SelectMoeDeviceForLayer(layerIndex);
+            return selected == "cpu" || selected == "numa" ||
+                   selected.rfind("cpu:", 0) == 0 ||
+                   selected.rfind("numa:", 0) == 0;
+        };
+        auto applyRoutedProjectionDevice = [&](int layerIndex) {
+            if (!cudaSharedExpert && isCpuMoeLayer(layerIndex)) {
+                ApplyDeviceMap(cpuMoeSupportDeviceMap, 1, 1);
+            } else {
+                ApplyDeviceMap(deviceMap, layerIndex, layerCount);
+            }
+        };
+        auto applySharedExpertDevice = [&](int layerIndex) {
+            if (!cudaSharedExpert) {
+                ApplyDeviceMap(cpuMoeSupportDeviceMap, 1, 1);
+            } else {
+                ApplyDeviceMap(deviceMap, layerIndex, layerCount);
+            }
+        };
+
         auto runKdaAttention = [&](int layerIndex, Data &normalized,
                                    Data &attention) {
             const std::string layer = languagePrefix + "layers." +
@@ -640,6 +949,11 @@ namespace fastllm {
                    Data(), kProjected);
             Linear(normalized, weight[layer + "self_attn.v_proj.weight"],
                    Data(), vProjected);
+            if (capture != nullptr && capture->captureKda) {
+                capture->kda[layerIndex].qProjected.CopyFrom(qProjected);
+                capture->kda[layerIndex].kProjected.CopyFrom(kProjected);
+                capture->kda[layerIndex].vProjected.CopyFrom(vProjected);
+            }
 
             Data qConv, kConv, vConv;
             Data qCache, kCache, vCache;
@@ -688,6 +1002,12 @@ namespace fastllm {
             Linear(normalized, weight[layer + "self_attn.b_proj.weight"],
                    Data(), rawBetaBf16);
             ToDataType(rawBetaBf16, rawBeta, DataType::FLOAT32);
+            if (capture != nullptr && capture->captureKda) {
+                capture->kda[layerIndex].k.CopyFrom(k);
+                capture->kda[layerIndex].v.CopyFrom(vConv);
+                capture->kda[layerIndex].rawGate.CopyFrom(rawGate);
+                capture->kda[layerIndex].rawBeta.CopyFrom(rawBeta);
+            }
 
             Data localState, kdaOutput, decay, activatedBeta;
             Data &state = pastKeyValues == nullptr ?
@@ -861,6 +1181,7 @@ namespace fastllm {
             const std::string layer = languagePrefix + "layers." +
                 std::to_string(layerIndex) + ".";
             const std::string moe = layer + "block_sparse_moe.";
+            ApplyDeviceMap(deviceMap, layerIndex, layerCount);
             Data routerInput;
             ToDataType(input, routerInput, DataType::FLOAT32);
             Data routerScores;
@@ -873,17 +1194,21 @@ namespace fastllm {
                 expertsPerToken, true, 1.0f,
                 &weight[moe + "gate.e_score_correction_bias"]);
 
+            applyRoutedProjectionDevice(layerIndex);
             Data routedInput;
             Linear(input, weight[moe + "routed_expert_down_proj.weight"],
                    Data(), routedInput);
             routedInput.Reshape({sequence, routedExpertHiddenSize});
+
             Data routedLatent;
+            ApplyMoeDeviceMapForLayer(layerIndex);
             KimiK3RoutedExperts(
                 routedInput, expertIndex, expertScore,
                 expertW1s[layerIndex], expertW2s[layerIndex],
                 expertW3s[layerIndex], situBeta, situLinearBeta,
                 routedLatent);
             routedLatent.Reshape({1, sequence, routedExpertHiddenSize});
+            applyRoutedProjectionDevice(layerIndex);
             Data routedNormalized;
             KimiK3RMSNorm(
                 routedLatent, weight[moe + "routed_expert_norm.weight"],
@@ -893,7 +1218,15 @@ namespace fastllm {
                    weight[moe + "routed_expert_up_proj.weight"],
                    Data(), routedOutput);
 
+            // Match the cuda_shared_expert policy used by the other MoE
+            // models.  Keep the unfused shared branch on CPU when CUDA shared
+            // experts are disabled; with a CPU/NUMA MoE map, keep the adjacent
+            // latent projections there as well.  The router remains on the
+            // layer device to preserve its original numerical path.  Restore
+            // that device before combining both branches so the decoder state
+            // stays on its normal CUDA/pipeline device.
             Data sharedGate, sharedUp, sharedActivated, sharedOutput;
+            applySharedExpertDevice(layerIndex);
             Linear(input, weight[moe + "shared_experts.gate_proj.weight"],
                    Data(), sharedGate);
             Linear(input, weight[moe + "shared_experts.up_proj.weight"],
@@ -904,6 +1237,7 @@ namespace fastllm {
             Linear(sharedActivated,
                    weight[moe + "shared_experts.down_proj.weight"],
                    Data(), sharedOutput);
+            ApplyDeviceMap(deviceMap, layerIndex, layerCount);
             Copy(routedOutput, moeOutput);
             AddTo(moeOutput, sharedOutput);
         };
@@ -956,10 +1290,14 @@ namespace fastllm {
                 mlpInput, weight[layer + "post_attention_layernorm.weight"],
                 rms_norm_eps, mlpNormalized);
             Data moeOutput;
-            ApplyMoeDeviceMapForLayer(layerIndex);
             runSparseMoe(layerIndex, mlpNormalized, moeOutput);
-            ApplyDeviceMap(deviceMap, layerIndex, layerCount);
             AddTo(prefixSum, moeOutput);
+            if (capture != nullptr &&
+                std::find(dsparkTargetLayerIds.begin(),
+                          dsparkTargetLayerIds.end(), layerIndex) !=
+                    dsparkTargetLayerIds.end()) {
+                capture->targetHidden[layerIndex].CopyFrom(prefixSum);
+            }
         }
         if (layerCount == block_cnt) {
             Data outputResidual, finalOutput;
@@ -974,6 +1312,631 @@ namespace fastllm {
             return finalOutput;
         }
         return prefixSum;
+    }
+
+    void KimiK3Model::OnResponseContextCreated(ResponseContext *context) {
+        if (context == nullptr || !dsparkEnabled) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(dsparkContextMutex);
+        dsparkContexts.erase(&context->pastKeyValues);
+    }
+
+    void KimiK3Model::OnResponseContextRemoved(ResponseContext *context) {
+        if (context == nullptr || !dsparkEnabled) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(dsparkContextMutex);
+        dsparkContexts.erase(&context->pastKeyValues);
+    }
+
+    KimiK3Model::DsparkContext &KimiK3Model::GetDsparkContext(
+            std::vector<std::pair<Data, Data>> &pastKeyValues) {
+        std::lock_guard<std::mutex> guard(dsparkContextMutex);
+        auto *key = &pastKeyValues;
+        auto &entry = dsparkContexts[key];
+        if (entry == nullptr) {
+            entry.reset(new DsparkContext());
+            entry->adaptiveDraftLimit = dsparkBlockSize;
+            entry->draftKeyValues.resize(dsparkLayers);
+            entry->kdaSnapshots.resize(block_cnt);
+            entry->replay.resize(block_cnt);
+        }
+        return *entry;
+    }
+
+    void KimiK3Model::EnsureDsparkRotary(int positions) {
+        if (positions <= dsparkRotaryCapacity) {
+            return;
+        }
+        int capacity = std::max(4096, dsparkRotaryCapacity);
+        while (capacity < positions) {
+            capacity = std::min(max_positions,
+                                std::max(capacity + 1, capacity * 2));
+            AssertInFastLLM(capacity >= positions || capacity < max_positions,
+                            "DSpark position exceeds the target context window.");
+        }
+        std::vector<float> sinValues(
+            (size_t)capacity * dsparkHeadDim, 0.0f);
+        std::vector<float> cosValues(
+            (size_t)capacity * dsparkHeadDim, 0.0f);
+        std::vector<float> inverseFrequency;
+        inverseFrequency.reserve(dsparkHeadDim / 2);
+        for (int channel = 0; channel < dsparkHeadDim; channel += 2) {
+            inverseFrequency.push_back(
+                1.0f / std::pow(10000.0f,
+                                (float)channel / dsparkHeadDim));
+        }
+        for (int position = 0; position < capacity; position++) {
+            for (int channel = 0;
+                 channel < (int)inverseFrequency.size(); channel++) {
+                float angle = position * inverseFrequency[channel];
+                sinValues[(size_t)position * dsparkHeadDim + channel] =
+                    std::sin(angle);
+                cosValues[(size_t)position * dsparkHeadDim + channel] =
+                    std::cos(angle);
+            }
+        }
+        Data newSin(DataType::FLOAT32,
+                    {capacity, dsparkHeadDim}, sinValues);
+        Data newCos(DataType::FLOAT32,
+                    {capacity, dsparkHeadDim}, cosValues);
+        dsparkSinData.CopyFrom(newSin);
+        dsparkCosData.CopyFrom(newCos);
+        dsparkRotaryCapacity = capacity;
+    }
+
+    int KimiK3Model::SampleTargetHidden(
+            Data &hiddenStates,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits) {
+        AssertInFastLLM(hiddenStates.dims.size() == 3 &&
+                        hiddenStates.dims[0] == 1,
+                        "Kimi-K3 target hidden shape is invalid.");
+        int sequence = hiddenStates.dims[1];
+        Data lastHidden;
+        if (sequence > 1) {
+            Split(hiddenStates, 1, sequence - 1, sequence, lastHidden);
+        } else {
+            Copy(hiddenStates, lastHidden);
+        }
+        Data outputLogits;
+        Linear(lastHidden, weight["language_model.lm_head.weight"],
+               Data(), outputLogits);
+        ToDataType(outputLogits, DataType::FLOAT32);
+        outputLogits.ToDevice(DataDevice::CPU);
+        if (generationConfig.output_logits && logits != nullptr) {
+            int vocabulary = outputLogits.dims.back();
+            logits->resize(vocabulary);
+            std::memcpy(logits->data(), outputLogits.cpuData,
+                        (size_t)vocabulary * sizeof(float));
+        }
+        if (generationConfig.IsSimpleGreedy()) {
+            Data topk;
+            TopK(outputLogits, topk, 1);
+            topk.ToDevice(DataDevice::CPU);
+            return (int)(((float*)topk.cpuData)[0] + 1e-3f);
+        }
+        if (!lastTokens.units.empty()) {
+            return LLMSampling(outputLogits, 0, generationConfig,
+                               lastTokens.units[0]);
+        }
+        return LLMSamplingOnly(outputLogits, 0, generationConfig);
+    }
+
+    void KimiK3Model::AppendDsparkTargetHidden(
+            const TargetRunCapture &capture, int tokens,
+            DsparkContext &context) {
+        AssertInFastLLM(tokens > 0,
+                        "DSpark must append at least one target token.");
+        ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+        Data combined;
+        for (int feature = 0;
+             feature < (int)dsparkTargetLayerIds.size(); feature++) {
+            int layer = dsparkTargetLayerIds[feature];
+            auto it = capture.targetHidden.find(layer);
+            AssertInFastLLM(it != capture.targetHidden.end(),
+                            "DSpark target hidden capture is incomplete.");
+            Data selected;
+            AssertInFastLLM(it->second.dims.size() == 3 &&
+                            it->second.dims[1] >= tokens,
+                            "DSpark captured target hidden has an invalid shape.");
+            if (it->second.dims[1] == tokens) {
+                Copy(it->second, selected);
+            } else {
+                Split(it->second, 1, 0, tokens, selected);
+            }
+            if (feature == 0) {
+                Copy(selected, combined);
+            } else {
+                Data joined;
+                Cat(combined, selected, -1, joined);
+                Copy(joined, combined);
+            }
+        }
+
+        Data projected, contextHidden;
+        Linear(combined, weight["dspark.fc.weight"], Data(), projected);
+        RMSNorm(projected, weight["dspark.hidden_norm.weight"],
+                dsparkRmsNormEps, contextHidden);
+
+        const int startPosition = context.committedTokens;
+        EnsureDsparkRotary(startPosition + tokens);
+        std::vector<float> positionValues(tokens);
+        for (int token = 0; token < tokens; token++) {
+            positionValues[token] = (float)(startPosition + token);
+        }
+        Data positions(DataType::FLOAT32, {1, tokens}, positionValues);
+        for (int layerIndex = 0; layerIndex < dsparkLayers;
+             layerIndex++) {
+            ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+            const std::string layer = "dspark.layers." +
+                std::to_string(layerIndex) + ".";
+            Data key, value;
+            Linear(contextHidden, weight[layer + "self_attn.k_proj.weight"],
+                   Data(), key);
+            Linear(contextHidden, weight[layer + "self_attn.v_proj.weight"],
+                   Data(), value);
+            key.Reshape({1, tokens, dsparkKvHeads, dsparkHeadDim});
+            value.Reshape({1, tokens, dsparkKvHeads, dsparkHeadDim});
+            RMSNorm(key, weight[layer + "self_attn.k_norm.weight"],
+                    dsparkRmsNormEps, key);
+            LlamaRotatePosition2D(key, positions, dsparkSinData,
+                                  dsparkCosData, dsparkHeadDim);
+            PermuteSelf(key, {0, 2, 1, 3});
+            PermuteSelf(value, {0, 2, 1, 3});
+            key.Reshape({dsparkKvHeads, tokens, dsparkHeadDim});
+            value.Reshape({dsparkKvHeads, tokens, dsparkHeadDim});
+            // FastLLM's non-paged CUDA Attention kernel currently supports
+            // FP16/FP32, while the published DSpark checkpoint is BF16.
+            // Keep the transformer in BF16 and store only the draft attention
+            // K/V boundary in FP16. Draft logits are always verified by the
+            // BF16 target model, so this cannot alter the committed greedy
+            // token stream; it may only affect the speculative acceptance rate.
+            ToDataType(key, DataType::FLOAT16);
+            ToDataType(value, DataType::FLOAT16);
+            AppendSequenceCache(context.draftKeyValues[layerIndex].first,
+                                key);
+            AppendSequenceCache(context.draftKeyValues[layerIndex].second,
+                                value);
+        }
+        context.committedTokens += tokens;
+    }
+
+    KimiK3Model::DsparkDraftProposal KimiK3Model::RunDsparkDraft(
+            int anchorToken, DsparkContext &context) {
+        AssertInFastLLM(context.initialized &&
+                        (int)context.draftKeyValues.size() == dsparkLayers,
+                        "DSpark context is not initialized.");
+        ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+        EnsureDsparkRotary(context.committedTokens + dsparkBlockSize);
+
+        std::vector<float> tokenValues(dsparkBlockSize,
+                                       (float)dsparkMaskTokenId);
+        tokenValues[0] = (float)anchorToken;
+        Data inputIds(DataType::FLOAT32,
+                      {1, dsparkBlockSize}, tokenValues);
+        Data hiddenStates;
+        Embedding(inputIds,
+                  weight[languagePrefix + "embed_tokens.weight"],
+                  hiddenStates);
+        ToDataType(hiddenStates, DataType::BFLOAT16);
+
+        std::vector<float> positionValues(dsparkBlockSize);
+        for (int token = 0; token < dsparkBlockSize; token++) {
+            positionValues[token] =
+                (float)(context.committedTokens + token);
+        }
+        Data positions(DataType::FLOAT32,
+                       {1, dsparkBlockSize}, positionValues);
+
+        for (int layerIndex = 0; layerIndex < dsparkLayers;
+             layerIndex++) {
+            ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+            const std::string layer = "dspark.layers." +
+                std::to_string(layerIndex) + ".";
+            Data normalized;
+            RMSNorm(hiddenStates,
+                    weight[layer + "input_layernorm.weight"],
+                    dsparkRmsNormEps, normalized);
+
+            Data query, key, value;
+            Linear(normalized, weight[layer + "self_attn.q_proj.weight"],
+                   Data(), query);
+            Linear(normalized, weight[layer + "self_attn.k_proj.weight"],
+                   Data(), key);
+            Linear(normalized, weight[layer + "self_attn.v_proj.weight"],
+                   Data(), value);
+            query.Reshape(
+                {1, dsparkBlockSize, dsparkHeads, dsparkHeadDim});
+            key.Reshape(
+                {1, dsparkBlockSize, dsparkKvHeads, dsparkHeadDim});
+            value.Reshape(
+                {1, dsparkBlockSize, dsparkKvHeads, dsparkHeadDim});
+            RMSNorm(query, weight[layer + "self_attn.q_norm.weight"],
+                    dsparkRmsNormEps, query);
+            RMSNorm(key, weight[layer + "self_attn.k_norm.weight"],
+                    dsparkRmsNormEps, key);
+            LlamaRotatePosition2D(query, positions, dsparkSinData,
+                                  dsparkCosData, dsparkHeadDim);
+            LlamaRotatePosition2D(key, positions, dsparkSinData,
+                                  dsparkCosData, dsparkHeadDim);
+            PermuteSelf(query, {0, 2, 1, 3});
+            PermuteSelf(key, {0, 2, 1, 3});
+            PermuteSelf(value, {0, 2, 1, 3});
+            query.Reshape(
+                {dsparkHeads, dsparkBlockSize, dsparkHeadDim});
+            key.Reshape(
+                {dsparkKvHeads, dsparkBlockSize, dsparkHeadDim});
+            value.Reshape(
+                {dsparkKvHeads, dsparkBlockSize, dsparkHeadDim});
+            ToDataType(query, DataType::FLOAT16);
+            ToDataType(key, DataType::FLOAT16);
+            ToDataType(value, DataType::FLOAT16);
+
+            Data &keyCache = context.draftKeyValues[layerIndex].first;
+            Data &valueCache = context.draftKeyValues[layerIndex].second;
+            AssertInFastLLM(
+                keyCache.dims.size() == 3 &&
+                valueCache.dims.size() == 3 &&
+                keyCache.dims[1] == context.committedTokens &&
+                valueCache.dims[1] == context.committedTokens,
+                "DSpark draft KV cache is out of sync with the target.");
+            const int oldKeyTokens = keyCache.dims[1];
+            const int oldValueTokens = valueCache.dims[1];
+            AppendSequenceCache(keyCache, key);
+            AppendSequenceCache(valueCache, value);
+            Data attentionHeads;
+            Attention(query, keyCache, valueCache, *GetEmptyData(),
+                      attentionHeads, dsparkHeads / dsparkKvHeads,
+                      1.0f / std::sqrt((float)dsparkHeadDim), 2);
+            ResizeSequenceCache(keyCache, oldKeyTokens);
+            ResizeSequenceCache(valueCache, oldValueTokens);
+
+            PermuteSelf(attentionHeads, {1, 0, 2});
+            attentionHeads.Reshape(
+                {1, dsparkBlockSize, dsparkHeads * dsparkHeadDim});
+            ToDataType(attentionHeads, DataType::BFLOAT16);
+            Data attentionOutput;
+            Linear(attentionHeads,
+                   weight[layer + "self_attn.o_proj.weight"],
+                   Data(), attentionOutput);
+            AddTo(hiddenStates, attentionOutput);
+
+            RMSNorm(hiddenStates,
+                    weight[layer + "post_attention_layernorm.weight"],
+                    dsparkRmsNormEps, normalized);
+            Data gate, up;
+            Linear(normalized, weight[layer + "mlp.gate_proj.weight"],
+                   Data(), gate);
+            Linear(normalized, weight[layer + "mlp.up_proj.weight"],
+                   Data(), up);
+            // The generic CUDA SiLU/Mul kernels have the same FP16/FP32
+            // boundary as Attention. Keep the surrounding draft projections
+            // and residual stream in BF16.
+            ToDataType(gate, DataType::FLOAT16);
+            ToDataType(up, DataType::FLOAT16);
+            Silu(gate, gate);
+            MulTo(gate, up);
+            ToDataType(gate, DataType::BFLOAT16);
+            Data mlpOutput;
+            Linear(gate, weight[layer + "mlp.down_proj.weight"],
+                   Data(), mlpOutput);
+            AddTo(hiddenStates, mlpOutput);
+        }
+
+        Data normalizedDraft;
+        RMSNorm(hiddenStates, weight["dspark.norm.weight"],
+                dsparkRmsNormEps, normalizedDraft);
+        Data baseLogits;
+        Linear(normalizedDraft, weight["language_model.lm_head.weight"],
+               Data(), baseLogits);
+
+        DsparkDraftProposal proposal;
+        proposal.tokens.reserve(dsparkBlockSize);
+        std::vector<float> previousTokens;
+        previousTokens.reserve(dsparkBlockSize);
+        int previousToken = anchorToken;
+        for (int step = 0; step < dsparkBlockSize; step++) {
+            previousTokens.push_back((float)previousToken);
+            Data stepLogits;
+            Split(baseLogits, 1, step, step + 1, stepLogits);
+            Data previousIds(
+                DataType::FLOAT32, {1, 1}, {(float)previousToken});
+            Data markovLatent, markovBias;
+            Embedding(previousIds,
+                      weight["dspark.markov_head.markov_w1.weight"],
+                      markovLatent);
+            Linear(markovLatent,
+                   weight["dspark.markov_head.markov_w2.weight"],
+                   Data(), markovBias);
+            ToDataType(stepLogits, DataType::FLOAT32);
+            ToDataType(markovBias, DataType::FLOAT32);
+            AddTo(stepLogits, markovBias);
+            Data topk;
+            TopK(stepLogits, topk, 1);
+            topk.ToDevice(DataDevice::CPU);
+            previousToken =
+                (int)(((float*)topk.cpuData)[0] + 1e-3f);
+            proposal.tokens.push_back(previousToken);
+        }
+
+        if (dsparkConfidenceThreshold <= 0.0f) {
+            proposal.confidence.assign(dsparkBlockSize, 1.0f);
+            return proposal;
+        }
+
+        // The checkpoint predicts the conditional acceptance probability for
+        // every draft position from the normalized draft hidden state and the
+        // Markov embedding of [anchor, draft[:-1]].  Compute all seven values
+        // in one small linear call so adaptive scheduling adds only one device
+        // synchronization, rather than one synchronization per draft token.
+        Data previousIds(DataType::FLOAT32,
+                         {1, dsparkBlockSize}, previousTokens);
+        Data markovEmbeddings;
+        Embedding(previousIds,
+                  weight["dspark.markov_head.markov_w1.weight"],
+                  markovEmbeddings);
+        Data confidenceHidden, confidenceMarkov;
+        Copy(normalizedDraft, confidenceHidden);
+        Copy(markovEmbeddings, confidenceMarkov);
+        ToDataType(confidenceHidden, DataType::FLOAT32);
+        ToDataType(confidenceMarkov, DataType::FLOAT32);
+        Data confidenceFeatures;
+        Cat(confidenceHidden, confidenceMarkov, -1, confidenceFeatures);
+        Data confidenceLogits;
+        Linear(confidenceFeatures,
+               weight["dspark.confidence_head.proj.weight"],
+               weight["dspark.confidence_head.proj.bias"],
+               confidenceLogits);
+        ToDataType(confidenceLogits, DataType::FLOAT32);
+        confidenceLogits.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(
+            confidenceLogits.dims == std::vector<int>({1, dsparkBlockSize, 1}),
+            "DSpark confidence head output has an invalid shape.");
+        proposal.confidence.resize(dsparkBlockSize);
+        const float *confidenceData =
+            (const float*)confidenceLogits.cpuData;
+        for (int step = 0; step < dsparkBlockSize; step++) {
+            const float value = confidenceData[step];
+            const float probability = value >= 0.0f ?
+                1.0f / (1.0f + std::exp(-value)) :
+                std::exp(value) / (1.0f + std::exp(value));
+            AssertInFastLLM(std::isfinite(probability),
+                            "DSpark confidence head produced NaN or Inf.");
+            proposal.confidence[step] = probability;
+        }
+        return proposal;
+    }
+
+    int KimiK3Model::SelectDsparkVerifyDrafts(
+            const DsparkDraftProposal &proposal,
+            const DsparkContext &context) const {
+        AssertInFastLLM(
+            (int)proposal.tokens.size() == dsparkBlockSize &&
+            (int)proposal.confidence.size() == dsparkBlockSize,
+            "DSpark proposal has an invalid length.");
+        // A zero threshold is the explicit fixed-block fallback.  Besides
+        // making the policy configurable, this gives correctness/performance
+        // regressions a byte-for-byte equivalent of the original path.
+        if (dsparkConfidenceThreshold <= 0.0f) {
+            return dsparkBlockSize;
+        }
+
+        int confidenceLimit = 0;
+        while (confidenceLimit < dsparkBlockSize &&
+               proposal.confidence[confidenceLimit] >=
+                   dsparkConfidenceThreshold) {
+            confidenceLimit++;
+        }
+        const int rollingLimit = std::max(
+            1, std::min(dsparkBlockSize, context.adaptiveDraftLimit));
+        return std::min(confidenceLimit, rollingLimit);
+    }
+
+    void KimiK3Model::UpdateDsparkAdaptiveLimit(
+            int verifyDrafts, int acceptedDrafts,
+            DsparkContext &context) const {
+        if (dsparkConfidenceThreshold <= 0.0f || verifyDrafts == 0) {
+            return;
+        }
+        AssertInFastLLM(
+            acceptedDrafts >= 0 && acceptedDrafts <= verifyDrafts,
+            "DSpark accepted draft count is invalid.");
+        if (acceptedDrafts < verifyDrafts) {
+            // Keep one probe after the last known-good position.  This reacts
+            // immediately to task/domain shifts while retaining a path for the
+            // limit to grow again when later blocks improve.
+            context.adaptiveDraftLimit = std::max(1, acceptedDrafts + 1);
+        } else if (verifyDrafts >= context.adaptiveDraftLimit) {
+            context.adaptiveDraftLimit = std::min(
+                dsparkBlockSize, context.adaptiveDraftLimit + 1);
+        }
+    }
+
+    void KimiK3Model::SnapshotKdaCaches(
+            const std::vector<std::pair<Data, Data>> &pastKeyValues,
+            DsparkContext &context) {
+        AssertInFastLLM((int)pastKeyValues.size() >= block_cnt,
+                        "Kimi-K3 target cache table is incomplete.");
+        if ((int)context.kdaSnapshots.size() < block_cnt) {
+            context.kdaSnapshots.resize(block_cnt);
+        }
+        for (int layerIndex = 0; layerIndex < block_cnt; layerIndex++) {
+            if (!kdaLayers[layerIndex]) {
+                continue;
+            }
+            AssertInFastLLM(
+                !pastKeyValues[layerIndex].first.dims.empty() &&
+                !pastKeyValues[layerIndex].second.dims.empty(),
+                "DSpark requires initialized KDA caches before verification.");
+            context.kdaSnapshots[layerIndex].first.CopyFrom(
+                pastKeyValues[layerIndex].first);
+            context.kdaSnapshots[layerIndex].second.CopyFrom(
+                pastKeyValues[layerIndex].second);
+        }
+    }
+
+    void KimiK3Model::CommitTargetVerification(
+            int oldTokens, int commitTokens,
+            int verifyTokens,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            DsparkContext &context) {
+        AssertInFastLLM(commitTokens >= 1 &&
+                        commitTokens <= verifyTokens &&
+                        verifyTokens >= 1 &&
+                        verifyTokens <= dsparkBlockSize + 1,
+                        "DSpark target commit length is invalid.");
+        if (commitTokens < verifyTokens) {
+            AssertInFastLLM((int)context.replay.size() >= block_cnt,
+                            "DSpark KDA replay capture is incomplete.");
+            for (int layerIndex = 0; layerIndex < block_cnt;
+                 layerIndex++) {
+                if (!kdaLayers[layerIndex]) {
+                    continue;
+                }
+                ApplyDeviceMap(deviceMap, layerIndex, block_cnt);
+                pastKeyValues[layerIndex].first.CopyFrom(
+                    context.kdaSnapshots[layerIndex].first);
+                pastKeyValues[layerIndex].second.CopyFrom(
+                    context.kdaSnapshots[layerIndex].second);
+
+                KdaReplayCapture &replay = context.replay[layerIndex];
+                AssertInFastLLM(
+                    replay.qProjected.dims.size() >= 2 &&
+                    replay.qProjected.dims[1] == verifyTokens,
+                    "DSpark KDA projection replay data is incomplete.");
+                KimiK3UpdatePackedConvCache(
+                    replay.qProjected, replay.kProjected,
+                    replay.vProjected, shortConvKernel - 1,
+                    commitTokens, pastKeyValues[layerIndex].first);
+                const std::string layer = languagePrefix + "layers." +
+                    std::to_string(layerIndex) + ".";
+                KimiK3RecurrentKDAUpdateState(
+                    replay.k, replay.v,
+                    replay.rawGate, replay.rawBeta,
+                    weight[layer + "self_attn.A_log"],
+                    weight[layer + "self_attn.dt_bias"], gateLowerBound,
+                    commitTokens, pastKeyValues[layerIndex].second);
+            }
+        }
+
+        const int committedLength = oldTokens + commitTokens;
+        for (int layerIndex = 0; layerIndex < block_cnt; layerIndex++) {
+            if (kdaLayers[layerIndex]) {
+                continue;
+            }
+            Data &key = pastKeyValues[layerIndex].first;
+            Data &value = pastKeyValues[layerIndex].second;
+            AssertInFastLLM(
+                key.dims.size() == 3 && value.dims.size() == 3 &&
+                key.dims[1] == oldTokens + verifyTokens &&
+                value.dims[1] == oldTokens + verifyTokens,
+                "DSpark MLA verification cache length is invalid.");
+            if (commitTokens < verifyTokens) {
+                ResizeSequenceCache(key, committedLength);
+                ResizeSequenceCache(value, committedLength);
+            }
+        }
+        ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+    }
+
+    int KimiK3Model::ForwardDspark(
+            const std::vector<int> &tokenIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits) {
+        DsparkContext &context = GetDsparkContext(pastKeyValues);
+        if (!context.pending.empty()) {
+            AssertInFastLLM(
+                tokenIds.size() == 1 &&
+                tokenIds[0] == context.pending.front().expectedInput,
+                "DSpark pending token stream is out of sync with the scheduler.");
+            int output = context.pending.front().outputToken;
+            context.pending.pop_front();
+            return output;
+        }
+
+        if (!context.initialized || tokenIds.size() != 1) {
+            TargetRunCapture capture;
+            Data hiddenStates = RunLayersImpl(
+                tokenIds, block_cnt, &pastKeyValues, &capture);
+            AppendDsparkTargetHidden(
+                capture, (int)tokenIds.size(), context);
+            context.initialized = true;
+            return SampleTargetHidden(hiddenStates, generationConfig,
+                                      lastTokens, logits);
+        }
+
+        const int anchorToken = tokenIds[0];
+        const int oldTokens = context.committedTokens;
+        DsparkDraftProposal proposal = RunDsparkDraft(anchorToken, context);
+        const int verifyDrafts = SelectDsparkVerifyDrafts(proposal, context);
+        const int verifyTokens = verifyDrafts + 1;
+
+        if (verifyDrafts > 0) {
+            SnapshotKdaCaches(pastKeyValues, context);
+        }
+        std::vector<int> verifyIds;
+        verifyIds.reserve(verifyTokens);
+        verifyIds.push_back(anchorToken);
+        verifyIds.insert(verifyIds.end(), proposal.tokens.begin(),
+                         proposal.tokens.begin() + verifyDrafts);
+        TargetRunCapture capture;
+        capture.captureKda = verifyDrafts > 0;
+        if (capture.captureKda) {
+            capture.kda.swap(context.replay);
+        }
+        Data hiddenStates = RunLayersImpl(
+            verifyIds, block_cnt, &pastKeyValues, &capture);
+        if (capture.captureKda) {
+            capture.kda.swap(context.replay);
+        }
+
+        Data targetLogits;
+        Linear(hiddenStates, weight["language_model.lm_head.weight"],
+               Data(), targetLogits);
+        ToDataType(targetLogits, DataType::FLOAT32);
+        Data targetTopK;
+        TopK(targetLogits, targetTopK, 1);
+        targetTopK.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(
+            targetTopK.dims.size() == 3 &&
+            targetTopK.dims[1] == verifyTokens &&
+            targetTopK.dims.back() == 2,
+            "DSpark target verification TopK shape is invalid.");
+        std::vector<int> targetTokens(verifyTokens);
+        const float *topKData = (const float*)targetTopK.cpuData;
+        for (int token = 0; token < verifyTokens; token++) {
+            targetTokens[token] =
+                (int)(topKData[(size_t)token * 2] + 1e-3f);
+        }
+        int accepted = 0;
+        while (accepted < verifyDrafts &&
+               proposal.tokens[accepted] == targetTokens[accepted]) {
+            accepted++;
+        }
+        const int commitTokens = accepted + 1;
+        CommitTargetVerification(oldTokens, commitTokens, verifyTokens,
+                                 pastKeyValues, context);
+        AppendDsparkTargetHidden(capture, commitTokens, context);
+        UpdateDsparkAdaptiveLimit(verifyDrafts, accepted, context);
+
+        std::vector<int> outputs;
+        outputs.reserve(commitTokens);
+        outputs.insert(outputs.end(), proposal.tokens.begin(),
+                       proposal.tokens.begin() + accepted);
+        outputs.push_back(targetTokens[accepted]);
+        AssertInFastLLM((int)outputs.size() == commitTokens,
+                        "DSpark output/commit alignment failed.");
+        for (int index = 1; index < (int)outputs.size(); index++) {
+            context.pending.push_back(
+                {outputs[index - 1], outputs[index]});
+        }
+
+        return outputs[0];
     }
 
     int KimiK3Model::Forward(
@@ -1002,38 +1965,15 @@ namespace fastllm {
         for (uint64_t i = 0; i < currentIds.Count(0); i++) {
             tokenIds.push_back((int)(currentData[i] + 1e-3f));
         }
+        if (dsparkEnabled && generationConfig.IsSimpleGreedy() &&
+            !generationConfig.output_logits) {
+            return ForwardDspark(tokenIds, pastKeyValues, generationConfig,
+                                 lastTokens, logits);
+        }
         Data hiddenStates = RunLayersImpl(
             tokenIds, block_cnt, &pastKeyValues);
-        int sequence = hiddenStates.dims[1];
-        Data lastHidden;
-        if (sequence > 1) {
-            Split(hiddenStates, 1, sequence - 1, sequence, lastHidden);
-        } else {
-            Copy(hiddenStates, lastHidden);
-        }
-        Data outputLogits;
-        Linear(lastHidden, weight["language_model.lm_head.weight"],
-               Data(), outputLogits);
-        ToDataType(outputLogits, DataType::FLOAT32);
-        outputLogits.ToDevice(DataDevice::CPU);
-        if (generationConfig.output_logits && logits != nullptr) {
-            int vocabulary = outputLogits.dims.back();
-            logits->resize(vocabulary);
-            std::memcpy(logits->data(), outputLogits.cpuData,
-                        (size_t)vocabulary * sizeof(float));
-        }
-
-        if (generationConfig.IsSimpleGreedy()) {
-            Data topk;
-            TopK(outputLogits, topk, 1);
-            topk.ToDevice(DataDevice::CPU);
-            return (int)(((float*)topk.cpuData)[0] + 1e-3f);
-        }
-        if (!lastTokens.units.empty()) {
-            return LLMSampling(outputLogits, 0, generationConfig,
-                               lastTokens.units[0]);
-        }
-        return LLMSamplingOnly(outputLogits, 0, generationConfig);
+        return SampleTargetHidden(hiddenStates, generationConfig,
+                                  lastTokens, logits);
     }
 
     bool KimiK3Model::NeedAttentionMask(int qlen, int klen) {

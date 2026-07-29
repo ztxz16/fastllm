@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 import subprocess
@@ -246,6 +247,18 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
+                        dest = "speculative_algorithm", type = str, default = "",
+                        help = "投机解码算法；当前支持 dspark")
+    parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path", "--dspark_model",
+                        dest = "speculative_draft_model_path", type = str, default = "",
+                        help = "DSpark draft model 的 Hugging Face 目录")
+    parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
+                        dest = "speculative_dspark_block_size", type = int, default = -1,
+                        help = "DSpark block size；默认读取 draft config")
+    parser.add_argument("--speculative_dspark_confidence_threshold", "--speculative-dspark-confidence-threshold",
+                        dest = "speculative_dspark_confidence_threshold", type = float, default = 0.5,
+                        help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示固定验证完整 block")
     parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
@@ -304,7 +317,6 @@ def make_normal_llm_model(args, startup_progress = None):
         startup_progress.progress("initializing", 0, 1)
     if (args.model and args.model != ''):
         if (args.model.endswith(".json") and os.path.exists(args.model)):
-            import json
             with open(args.model, "r", encoding = "utf-8") as file:
                 args_config = json.load(file)
                 for it in args_config.keys():
@@ -316,6 +328,52 @@ def make_normal_llm_model(args, startup_progress = None):
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
     mtp = _normalize_mtp_arg(getattr(args, "mtp", 0))
     args.mtp = mtp
+    speculative_algorithm = str(
+        getattr(args, "speculative_algorithm", "") or "").strip().lower()
+    speculative_draft_path = str(
+        getattr(args, "speculative_draft_model_path", "") or "").strip()
+    if speculative_draft_path and not speculative_algorithm:
+        speculative_algorithm = "dspark"
+    if speculative_algorithm and speculative_algorithm != "dspark":
+        raise ValueError("--speculative_algorithm currently only supports dspark")
+    if speculative_algorithm == "dspark" and not speculative_draft_path:
+        raise ValueError("DSpark requires --speculative_draft_model_path")
+    if speculative_draft_path:
+        speculative_draft_path = os.path.abspath(
+            os.path.expanduser(speculative_draft_path))
+        draft_config_path = os.path.join(speculative_draft_path, "config.json")
+        if not os.path.isfile(draft_config_path):
+            raise ValueError(
+                "DSpark draft directory has no config.json: %s" %
+                speculative_draft_path)
+        with open(draft_config_path, "r", encoding = "utf-8") as file:
+            draft_config = json.load(file)
+        draft_architectures = draft_config.get("architectures", [])
+        if "DSparkDraftModel" not in draft_architectures:
+            raise ValueError(
+                "draft checkpoint is not DSparkDraftModel: %s" %
+                speculative_draft_path)
+        configured_block = int(draft_config.get("block_size", 0))
+        requested_block = int(
+            getattr(args, "speculative_dspark_block_size", -1))
+        if requested_block > 0 and requested_block != configured_block:
+            raise ValueError(
+                "FastLLM currently requires the DSpark runtime block size "
+                "to match the checkpoint (requested=%d, checkpoint=%d)" %
+                (requested_block, configured_block))
+        os.environ["FASTLLM_DSPARK_MODEL_PATH"] = speculative_draft_path
+        confidence_threshold = float(getattr(
+            args, "speculative_dspark_confidence_threshold", 0.5))
+        if not 0.0 <= confidence_threshold <= 1.0:
+            raise ValueError(
+                "--speculative_dspark_confidence_threshold must be in [0, 1]")
+        os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(
+            confidence_threshold)
+        args.speculative_draft_model_path = speculative_draft_path
+        args.speculative_algorithm = "dspark"
+    else:
+        os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
+        os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
 
     usenuma = False
     try:
@@ -356,7 +414,6 @@ def make_normal_llm_model(args, startup_progress = None):
     is_multicuda_tp_model = False
     if (os.path.exists(config_path)):
         try:
-            import json
             with open(config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
             architecture = config["architectures"][0]
@@ -364,6 +421,13 @@ def make_normal_llm_model(args, startup_progress = None):
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
+            if (speculative_algorithm == "dspark" and
+                    architecture != "KimiK3ForConditionalGeneration" and
+                    model_type != "kimi_k3"):
+                raise ValueError(
+                    "this DSpark integration currently targets Kimi-K3, got "
+                    "architecture=%s model_type=%s" %
+                    (architecture, model_type))
             is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)
 
             is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
@@ -441,6 +505,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 except:
                     pass
         except:
+            if speculative_algorithm:
+                raise
             pass
     raw_tp_arg = getattr(args, "tp", "")
     normalized_tp_arg = _normalize_thread_tp_arg(raw_tp_arg)
