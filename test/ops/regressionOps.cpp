@@ -1332,6 +1332,7 @@ namespace {
         Expect(count == (int) values.size(), "INT32 tensor element count mismatch.");
         fastllm::Data data(fastllm::DataType::INT32, dims);
         data.Allocate();
+        data.cpuIntDatas.assign(values.begin(), values.end());
         if (count > 0) {
             std::memcpy(data.cpuData, values.data(), (size_t) count * sizeof(int32_t));
         }
@@ -3170,6 +3171,389 @@ namespace {
                                 "SM70 paged XQA concurrent worker " +
                                     std::to_string(worker));
             }
+        }
+    }
+
+    void RunCudaSm70FlashAttentionPrefillRegression() {
+        if (getCudaInfos()->cudaArch != 700) {
+            std::cout << "SM70 FlashAttention prefill regression: SKIP (requires CC 7.0)\n";
+            return;
+        }
+        ScopedEnvVar enableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "1");
+
+        constexpr int batch = 1;
+        constexpr int qLen = 10;
+        constexpr int numKvHeads = 4;
+        constexpr int group = 6;
+        constexpr int numQHeads = numKvHeads * group;
+        constexpr int headDim = 256;
+        constexpr int pageLen = 128;
+        constexpr int maxPages = 4;
+        const float scale = 1.0f / std::sqrt((float)headDim);
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            MakeRegressionValues(numQHeads * qLen * headDim, 5.41f, 0.04f));
+        fastllm::Data cacheDesc = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3, {numKvHeads, 1, headDim},
+            std::vector<float>(numKvHeads * headDim, 0.0f));
+        fastllm::PagedCacheManager *pagedK = fastllm::AllocatePagedCacheManager(
+            61000, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            cacheDesc, pageLen, maxPages);
+        fastllm::PagedCacheManager *pagedV = fastllm::AllocatePagedCacheManager(
+            61001, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            cacheDesc, pageLen, maxPages);
+        fastllm::Data pagedKValues = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3,
+            {maxPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(maxPages * pageLen * numKvHeads * headDim,
+                                 0.83f, 0.03f));
+        fastllm::Data pagedVValues = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3,
+            {maxPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(maxPages * pageLen * numKvHeads * headDim,
+                                 1.27f, 0.05f));
+        FastllmCudaCopyFromDeviceToDevice(
+            pagedK->cudaData, pagedKValues.cudaData, pagedKValues.GetBytes());
+        FastllmCudaCopyFromDeviceToDevice(
+            pagedV->cudaData, pagedVValues.cudaData, pagedVValues.GetBytes());
+
+        fastllm::Data kCaches(fastllm::DataType::FP8_E4M3);
+        fastllm::Data vCaches(fastllm::DataType::FP8_E4M3);
+        kCaches.Resize({numKvHeads, qLen, headDim});
+        vCaches.Resize({numKvHeads, qLen, headDim});
+        kCaches.isKVCache = vCaches.isKVCache = true;
+        kCaches.isPagedKVCache = vCaches.isPagedKVCache = true;
+        kCaches.pageLen = vCaches.pageLen = pageLen;
+        kCaches.pagedKVCacheData = pagedK;
+        vCaches.pagedKVCacheData = pagedV;
+
+        fastllm::Data qSizes = MakeIntTensor({batch + 1}, {0, qLen});
+        fastllm::Data pageSizes = MakeIntTensor({batch + 1}, {0, 3});
+        fastllm::Data pageIndexs = MakeIntTensor({3}, {2, 0, 3});
+        fastllm::Data lastPageLens = MakeIntTensor({batch}, {17});
+        qSizes.ToDevice(fastllm::DataDevice::CUDA);
+        pageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        pageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        lastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+
+        fastllm::Data reference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                       lastPageLens, reference, group, scale, 1,
+                       false, true, false, -1),
+                   "native paged prefill rejected the SM70 qLen10 FP8 fixture.");
+        }
+
+        fastllm::Data actual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.0f));
+        Expect(FastllmCudaTrySm70FlashAttentionPrefill(
+                   q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                   lastPageLens, actual, group, scale, 1),
+               "SM70 FlashAttention route rejected qLen10 page128 FP8 fixture.");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                        3e-3f, 3e-3f,
+                        "SM70 FlashAttention qLen10 page128 FP8");
+
+        fastllm::Data untouched = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.25f));
+        const std::vector<float> untouchedReference = ToFloatVector(untouched);
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(!FastllmCudaTrySm70FlashAttentionPrefill(
+                       q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                       lastPageLens, untouched, group, scale, 1),
+                   "disabled SM70 FlashAttention route accepted fixture.");
+        }
+        ExpectFloatNear(untouchedReference, ToFloatVector(untouched),
+                        0.0f, 0.0f,
+                        "rejected SM70 FlashAttention route modified output");
+
+        fastllm::Data wrongShape = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, 1, headDim},
+            MakeRegressionValues(numQHeads * headDim, 2.19f, 0.02f));
+        fastllm::Data wrongShapeOutput = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, 1, headDim},
+            std::vector<float>(numQHeads * headDim, -0.375f));
+        const std::vector<float> wrongShapeReference =
+            ToFloatVector(wrongShapeOutput);
+        Expect(!FastllmCudaTrySm70FlashAttentionPrefill(
+                   wrongShape, kCaches, vCaches, qSizes, pageSizes,
+                   pageIndexs, lastPageLens, wrongShapeOutput, group, scale, 1),
+               "SM70 FlashAttention route accepted unsupported qLen1.");
+        ExpectFloatNear(wrongShapeReference, ToFloatVector(wrongShapeOutput),
+                        0.0f, 0.0f,
+                        "unsupported SM70 FlashAttention shape modified output");
+
+        constexpr int shortQLen = 2;
+        fastllm::Data shortQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, shortQLen, headDim},
+            MakeRegressionValues(numQHeads * shortQLen * headDim, 3.71f, 0.03f));
+        fastllm::Data shortQSizes = MakeIntTensor({2}, {0, shortQLen});
+        fastllm::Data fourPageSizes = MakeIntTensor({2}, {0, 4});
+        fastllm::Data fourPageIndexs = MakeIntTensor({4}, {2, 0, 3, 1});
+        fastllm::Data fullLastPage = MakeIntTensor({1}, {pageLen});
+        shortQSizes.ToDevice(fastllm::DataDevice::CUDA);
+        fourPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        fourPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        fullLastPage.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data shortReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, shortQLen, headDim},
+            std::vector<float>(numQHeads * shortQLen * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       shortQ, kCaches, vCaches, shortQSizes, fourPageSizes,
+                       fourPageIndexs, fullLastPage, shortReference, group,
+                       scale, 1, false, true, false, -1),
+                   "native prefill rejected qLen2 four-page FP8 fixture.");
+        }
+        fastllm::Data shortActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, shortQLen, headDim},
+            std::vector<float>(numQHeads * shortQLen * headDim, 0.0f));
+        Expect(FastllmCudaTrySm70FlashAttentionPrefill(
+                   shortQ, kCaches, vCaches, shortQSizes, fourPageSizes,
+                   fourPageIndexs, fullLastPage, shortActual, group, scale, 1),
+               "SM70 FlashAttention route rejected qLen2 four-page FP8 fixture.");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(shortReference), ToFloatVector(shortActual),
+                        3e-3f, 3e-3f,
+                        "SM70 FlashAttention qLen2 four-page FP8");
+
+        constexpr int raggedBatch = 5;
+        constexpr int raggedTokens = 30;
+        fastllm::Data raggedQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, raggedTokens, headDim},
+            MakeRegressionValues(numQHeads * raggedTokens * headDim,
+                                 4.63f, 0.025f));
+        fastllm::Data raggedQSizes =
+            MakeIntTensor({raggedBatch + 1}, {0, 2, 6, 12, 20, 30});
+        fastllm::Data raggedPageSizes =
+            MakeIntTensor({raggedBatch + 1}, {0, 1, 2, 3, 4, 5});
+        fastllm::Data raggedPageIndexs =
+            MakeIntTensor({raggedBatch}, {2, 0, 3, 1, 2});
+        fastllm::Data raggedLastPageLens =
+            MakeIntTensor({raggedBatch}, {17, 31, 49, 83, 127});
+        raggedQSizes.ToDevice(fastllm::DataDevice::CUDA);
+        raggedPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        raggedPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        raggedLastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data raggedReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {numQHeads, raggedTokens, headDim},
+            std::vector<float>(numQHeads * raggedTokens * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       raggedQ, kCaches, vCaches, raggedQSizes,
+                       raggedPageSizes, raggedPageIndexs, raggedLastPageLens,
+                       raggedReference, group, scale, 1,
+                       false, true, false, -1),
+                   "native prefill rejected ragged batch5 FP8 fixture.");
+        }
+        fastllm::Data raggedActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {numQHeads, raggedTokens, headDim},
+            std::vector<float>(numQHeads * raggedTokens * headDim, 0.0f));
+        Expect(FastllmCudaTrySm70FlashAttentionPrefill(
+                   raggedQ, kCaches, vCaches, raggedQSizes,
+                   raggedPageSizes, raggedPageIndexs, raggedLastPageLens,
+                   raggedActual, group, scale, 1),
+               "SM70 FlashAttention route rejected ragged batch5 FP8 fixture.");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(raggedReference),
+                        ToFloatVector(raggedActual), 3e-3f, 3e-3f,
+                        "SM70 FlashAttention ragged batch5 FP8");
+
+        constexpr int longPages = 64;
+        fastllm::PagedCacheManager *longPagedK =
+            fastllm::AllocatePagedCacheManager(
+                61002,
+                fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                cacheDesc, pageLen, longPages);
+        fastllm::PagedCacheManager *longPagedV =
+            fastllm::AllocatePagedCacheManager(
+                61003,
+                fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                cacheDesc, pageLen, longPages);
+        const int longCacheElements =
+            longPages * pageLen * numKvHeads * headDim;
+        fastllm::Data longKValues = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3,
+            {longPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(longCacheElements, 0.57f, 0.015f));
+        fastllm::Data longVValues = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3,
+            {longPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(longCacheElements, 1.11f, 0.02f));
+        FastllmCudaCopyFromDeviceToDevice(
+            longPagedK->cudaData, longKValues.cudaData, longKValues.GetBytes());
+        FastllmCudaCopyFromDeviceToDevice(
+            longPagedV->cudaData, longVValues.cudaData, longVValues.GetBytes());
+        fastllm::Data longKCaches(fastllm::DataType::FP8_E4M3);
+        fastllm::Data longVCaches(fastllm::DataType::FP8_E4M3);
+        longKCaches.Resize({numKvHeads, qLen, headDim});
+        longVCaches.Resize({numKvHeads, qLen, headDim});
+        longKCaches.isKVCache = longVCaches.isKVCache = true;
+        longKCaches.isPagedKVCache = longVCaches.isPagedKVCache = true;
+        longKCaches.pageLen = longVCaches.pageLen = pageLen;
+        longKCaches.pagedKVCacheData = longPagedK;
+        longVCaches.pagedKVCacheData = longPagedV;
+        std::vector<int32_t> longPhysicalPages(longPages);
+        for (int page = 0; page < longPages; ++page) {
+            longPhysicalPages[page] = (page * 17) % longPages;
+        }
+        fastllm::Data longPageSizes = MakeIntTensor({2}, {0, longPages});
+        fastllm::Data longPageIndexs =
+            MakeIntTensor({longPages}, longPhysicalPages);
+        fastllm::Data longLastPage = MakeIntTensor({1}, {pageLen});
+        longPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        longPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        longLastPage.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data longReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       q, longKCaches, longVCaches, qSizes, longPageSizes,
+                       longPageIndexs, longLastPage, longReference, group,
+                       scale, 1, false, true, false, -1),
+                   "native prefill rejected 8192-token FP8 fixture.");
+        }
+        ScopedEnvVar allowLongKv(
+            "FASTLLM_CUDA_SM70_FLASH_ATTN_MAX_KV", "8192");
+        fastllm::Data longActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.0f));
+        Expect(FastllmCudaTrySm70FlashAttentionPrefill(
+                   q, longKCaches, longVCaches, qSizes, longPageSizes,
+                   longPageIndexs, longLastPage, longActual, group, scale, 1),
+               "SM70 FlashAttention route rejected 8192-token FP8 fixture.");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(longReference), ToFloatVector(longActual),
+                        3e-3f, 3e-3f,
+                        "SM70 FlashAttention 8192-token FP8");
+
+        fastllm::Data longRejected = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.125f));
+        const std::vector<float> longRejectedReference =
+            ToFloatVector(longRejected);
+        {
+            ScopedEnvVar defaultKvLimit(
+                "FASTLLM_CUDA_SM70_FLASH_ATTN_MAX_KV", nullptr);
+            Expect(!FastllmCudaTrySm70FlashAttentionPrefill(
+                       q, longKCaches, longVCaches, qSizes, longPageSizes,
+                       longPageIndexs, longLastPage, longRejected,
+                       group, scale, 1),
+                   "SM70 FlashAttention route accepted KV8192 above default limit.");
+        }
+        ExpectFloatNear(longRejectedReference, ToFloatVector(longRejected),
+                        0.0f, 0.0f,
+                        "long-KV SM70 FlashAttention rejection modified output");
+
+        const char *bench = std::getenv("FASTLLM_SM70_FLASH_ATTN_BENCH");
+        if (bench != nullptr && std::string(bench) != "0") {
+            constexpr int warmup = 3;
+            constexpr int iterations = 20;
+            auto measure = [&](bool useRoute, fastllm::Data &benchQ,
+                               fastllm::Data &benchK, fastllm::Data &benchV,
+                               fastllm::Data &benchQSizes,
+                               fastllm::Data &benchPageSizes,
+                               fastllm::Data &benchPageIndexs,
+                               fastllm::Data &benchLastPageLens,
+                               fastllm::Data &benchOutput) {
+                ScopedEnvVar route("FASTLLM_CUDA_SM70_FLASH_ATTN",
+                                   useRoute ? "1" : "0");
+                auto launch = [&]() {
+                    if (useRoute) {
+                        return FastllmCudaTrySm70FlashAttentionPrefill(
+                            benchQ, benchK, benchV, benchQSizes,
+                            benchPageSizes, benchPageIndexs,
+                            benchLastPageLens, benchOutput, group, scale, 1);
+                    }
+                    return FastllmCudaHalfPagedAttentionBatch(
+                        benchQ, benchK, benchV, benchQSizes, benchPageSizes,
+                        benchPageIndexs, benchLastPageLens, benchOutput,
+                        group, scale, 1, false, false, false, -1);
+                };
+                for (int i = 0; i < warmup; ++i) {
+                    Expect(launch(), "SM70 prefill benchmark warmup failed.");
+                }
+                FastllmCudaSyncCurrentThreadStream();
+                void *start = FastllmCudaEventCreateTiming();
+                void *end = FastllmCudaEventCreateTiming();
+                FastllmCudaEventRecordCurrentThread(start);
+                for (int i = 0; i < iterations; ++i) {
+                    Expect(launch(), "SM70 prefill benchmark launch failed.");
+                }
+                FastllmCudaEventRecordCurrentThread(end);
+                FastllmCudaEventSynchronize(end);
+                const float averageMs =
+                    FastllmCudaEventElapsedTime(start, end) / iterations;
+                FastllmCudaEventDestroy(start);
+                FastllmCudaEventDestroy(end);
+                return averageMs;
+            };
+            std::cout << "shape,route,avg_ms,speedup_vs_native\n";
+            auto report = [&](const std::string &shape,
+                              fastllm::Data &benchQ,
+                              fastllm::Data &benchK,
+                              fastllm::Data &benchV,
+                              fastllm::Data &benchQSizes,
+                              fastllm::Data &benchPageSizes,
+                              fastllm::Data &benchPageIndexs,
+                              fastllm::Data &benchLastPageLens,
+                              fastllm::Data &nativeOutput,
+                              fastllm::Data &routeOutput) {
+                const float nativeMs = measure(
+                    false, benchQ, benchK, benchV, benchQSizes,
+                    benchPageSizes, benchPageIndexs, benchLastPageLens,
+                    nativeOutput);
+                const float routeMs = measure(
+                    true, benchQ, benchK, benchV, benchQSizes,
+                    benchPageSizes, benchPageIndexs, benchLastPageLens,
+                    routeOutput);
+                std::cout << shape << ",native," << nativeMs << ",1\n";
+                std::cout << shape << ",sm70_flash_attn," << routeMs << ','
+                          << nativeMs / routeMs << '\n';
+            };
+            report("b1_q10_kv273", q, kCaches, vCaches, qSizes, pageSizes,
+                   pageIndexs, lastPageLens, reference, actual);
+            report("b5_ragged_kv17_127", raggedQ, kCaches, vCaches,
+                   raggedQSizes, raggedPageSizes, raggedPageIndexs,
+                   raggedLastPageLens, raggedReference, raggedActual);
+            for (int kvTokens : {512, 1024, 2048, 4096}) {
+                const int pages = kvTokens / pageLen;
+                std::vector<int32_t> physicalPages(pages);
+                for (int page = 0; page < pages; ++page) {
+                    physicalPages[page] = (page * 17) % pages;
+                }
+                fastllm::Data crossPageSizes =
+                    MakeIntTensor({2}, {0, pages});
+                fastllm::Data crossPageIndexs =
+                    MakeIntTensor({pages}, physicalPages);
+                fastllm::Data crossLastPage =
+                    MakeIntTensor({1}, {pageLen});
+                crossPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+                crossPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+                crossLastPage.ToDevice(fastllm::DataDevice::CUDA);
+                report("b1_q10_kv" + std::to_string(kvTokens),
+                       q, longKCaches, longVCaches, qSizes,
+                       crossPageSizes, crossPageIndexs, crossLastPage,
+                       longReference, longActual);
+            }
+            report("b1_q10_kv8192", q, longKCaches, longVCaches, qSizes,
+                   longPageSizes, longPageIndexs, longLastPage,
+                   longReference, longActual);
         }
     }
 
@@ -5278,6 +5662,20 @@ int main() {
             throw std::runtime_error("sm70_paged_xqa_bench requires a CUDA build.");
 #endif
         }
+        if (only != nullptr && std::string(only) == "sm70_flash_attn_prefill_bench") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "sm70_flash_attn_prefill_bench requires CUDA.");
+            }
+            ScopedEnvVar bench("FASTLLM_SM70_FLASH_ATTN_BENCH", "1");
+            RunCudaSm70FlashAttentionPrefillRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "sm70_flash_attn_prefill_bench requires a CUDA build.");
+#endif
+        }
         if (only != nullptr && std::string(only) == "sm70_paged_xqa") {
 #ifdef USE_CUDA
             if (!fastllm::HasDeviceType("cuda")) {
@@ -5288,6 +5686,20 @@ int main() {
             return 0;
 #else
             throw std::runtime_error("sm70_paged_xqa regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr && std::string(only) == "sm70_flash_attn_prefill") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "sm70_flash_attn_prefill regression requires CUDA.");
+            }
+            RunCudaSm70FlashAttentionPrefillRegression();
+            std::cout << "SM70 FlashAttention prefill regression: PASS\n";
+            return 0;
+#else
+            throw std::runtime_error(
+                "sm70_flash_attn_prefill regression requires a CUDA build.");
 #endif
         }
         bool ranAny = false;

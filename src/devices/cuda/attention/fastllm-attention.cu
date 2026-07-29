@@ -2610,6 +2610,14 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         }
         return true;
     }
+    if (FastllmCudaTrySm70FlashAttentionPrefill(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType)) {
+        if (sync) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        return true;
+    }
 #ifndef FASTLLM_ENABLE_FLASHINFER
     bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);

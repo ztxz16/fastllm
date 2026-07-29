@@ -18,3 +18,10 @@ bool FastllmCudaTrySm70PagedAttentionDecode(
     fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs,
     fastllm::Data &lastPageLens, fastllm::Data &output,
     int group, float scale, int attentionType);
+
+// V100 causal prefill specialization transplanted from the SM70 Volta BM32 path.
+bool FastllmCudaTrySm70FlashAttentionPrefill(
+    fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches,
+    fastllm::Data &qSizes, fastllm::Data &pageSizes,
+    fastllm::Data &pageIndexs, fastllm::Data &lastPageLens,
+    fastllm::Data &output, int group, float scale, int attentionType);
