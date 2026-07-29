@@ -917,6 +917,9 @@ namespace fastllm {
         static const std::map<std::string, int> cpuMoeSupportDeviceMap = {
             {"cpu", 1},
         };
+        static const std::map<std::string, int> diskMoeSupportDeviceMap = {
+            {"disk", 1},
+        };
         auto isCpuMoeLayer = [&](int layerIndex) {
             const std::string selected = SelectMoeDeviceForLayer(layerIndex);
             return selected == "cpu" || selected == "numa" ||
@@ -932,7 +935,14 @@ namespace fastllm {
         };
         auto applySharedExpertDevice = [&](int layerIndex) {
             if (!cudaSharedExpert) {
-                ApplyDeviceMap(cpuMoeSupportDeviceMap, 1, 1);
+                const std::string selected =
+                    SelectMoeDeviceForLayer(layerIndex);
+                if (selected == "disk" ||
+                    selected.rfind("disk:", 0) == 0) {
+                    ApplyDeviceMap(diskMoeSupportDeviceMap, 1, 1);
+                } else {
+                    ApplyDeviceMap(cpuMoeSupportDeviceMap, 1, 1);
+                }
             } else {
                 ApplyDeviceMap(deviceMap, layerIndex, layerCount);
             }
