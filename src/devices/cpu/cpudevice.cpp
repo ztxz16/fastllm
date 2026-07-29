@@ -4263,7 +4263,14 @@ ops += (long long)lines * inputDim * interDim * 2;
                 expertTasks.resize(m + 1);
                 Data &tempInput = w2;
                 tempInput.ToDevice(input.dataDevice);
-                tempInput.dataType = input.dataType;
+                // w2 is a reusable scratch tensor and may still own storage
+                // allocated for a different dtype. expansionSize is measured
+                // in elements, so merely changing dataType can make Allocate
+                // incorrectly reuse a buffer with too few bytes.
+                if (tempInput.dataType != input.dataType) {
+                    tempInput.FreeSpace();
+                    tempInput.dataType = input.dataType;
+                }
                 tempInput.Resize(input.dims);
   // cnt["prepare 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 tempInput.Allocate();
@@ -4300,14 +4307,16 @@ ops += (long long)lines * inputDim * interDim * 2;
                                curWeight.dataType == DataType::NVFP4;
                     };
                     auto reshapeMoeLinear = [&](Data &curInput, Data &curWeight, Data &curOutput) {
-                        DoCpuLinearReshape(curInput, curWeight, curOutput);
-                        if (canForceFloatOutput(curInput, curWeight) &&
-                            curOutput.dataType != DataType::FLOAT32) {
-                            std::vector<int> dims = curInput.dims;
-                            dims.back() = curWeight.dims[0];
-                            curOutput.dataType = DataType::FLOAT32;
-                            curOutput.Resize(dims);
+                        curWeight.weightType = WeightType::LINEAR;
+                        DataType outputType = canForceFloatOutput(curInput, curWeight) ?
+                                              DataType::FLOAT32 : curInput.dataType;
+                        if (curOutput.dataType != outputType) {
+                            curOutput.FreeSpace();
+                            curOutput.dataType = outputType;
                         }
+                        std::vector<int> dims = curInput.dims;
+                        dims.back() = curWeight.dims[0];
+                        curOutput.Resize(dims);
                     };
 
                     tempInput.Resize({(int)task.size(), inputDim});
@@ -4323,7 +4332,10 @@ ops += (long long)lines * inputDim * interDim * 2;
                     DoCpuLinear(tempInput, *weights[e * 2], Data(), w3);
  // cnt["linear 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();                    
                     int mid = w3.dims[1] / 2;
-                    w1.dataType = w3.dataType;
+                    if (w1.dataType != w3.dataType) {
+                        w1.FreeSpace();
+                        w1.dataType = w3.dataType;
+                    }
                     w1.Resize({w3.dims[0], mid});
                     w1.Allocate();
 
