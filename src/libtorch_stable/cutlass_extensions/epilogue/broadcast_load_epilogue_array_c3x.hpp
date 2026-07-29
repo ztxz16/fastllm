@@ -75,12 +75,12 @@ struct Sm90RowOrScalarBroadcastArray {
   static_assert(is_static_v<decltype(take<0,2>(StrideMNL{}))>); // batch stride can be dynamic or static
   static_assert(take<0,2>(StrideMNL{}) == Stride<_0,_1>{});
 
-  struct SharedStorage { 
+  struct SharedStorage {
     array_aligned<Element, size<1>(CtaTileShapeMNK{})> smem;
   };
 
-  // This struct has been modified to have a bool indicating that ptr_row is a 
-  // scalar that must be broadcast, instead of containing a scalar that is 
+  // This struct has been modified to have a bool indicating that ptr_row is a
+  // scalar that must be broadcast, instead of containing a scalar that is
   // valid if ptr_row is null.
   struct Arguments {
     const Element* const* ptr_row_array = nullptr;
@@ -151,8 +151,8 @@ struct Sm90RowOrScalarBroadcastArray {
   struct ConsumerStoreCallbacks : EmptyConsumerStoreCallbacks {
     CUTLASS_DEVICE
     ConsumerStoreCallbacks(
-        GS_GTensor tGS_gRow_, GS_STensor tGS_sRow_, 
-        GS_CTensor tGS_cRow_, Tiled_G2S tiled_g2s_, 
+        GS_GTensor tGS_gRow_, GS_STensor tGS_sRow_,
+        GS_CTensor tGS_cRow_, Tiled_G2S tiled_g2s_,
         SR_STensor tSR_sRow_, SR_RTensor tSR_rRow_,
         CTensor tCcRow_, ThrResidue residue_tCcRow_, ThrNum thr_num_,
         int group, Params const& params_)
@@ -173,8 +173,8 @@ struct Sm90RowOrScalarBroadcastArray {
     Tiled_G2S tiled_G2S;
 
     SR_STensor tSR_sRow;                                                         // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
-    SR_RTensor tSR_rRow;                                                         // (CPY,CPY_M,CPY_N,EPI_M,EPI_N) 
-  
+    SR_RTensor tSR_rRow;                                                         // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
+
     CTensor tCcRow;                                                              // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
     ThrResidue residue_tCcRow;                                                   // (m, n)
     ThrNum thr_num;
@@ -195,7 +195,7 @@ struct Sm90RowOrScalarBroadcastArray {
 
       for (int i = 0; i < size(tGS_gRow_flt); ++i) {
         if (get<1>(tGS_cRow_flt(i)) >= size<1>(CtaTileShapeMNK{})) {
-          continue; // OOB of SMEM, 
+          continue; // OOB of SMEM,
         }
         if (elem_less(tGS_cRow_flt(i), make_coord(get<0>(residue_tCcRow), get<1>(residue_tCcRow)))) {
           tGS_sRow_flt(i) = tGS_gRow_flt(i);
@@ -210,7 +210,7 @@ struct Sm90RowOrScalarBroadcastArray {
     CUTLASS_DEVICE void
     begin_loop(int epi_m, int epi_n) {
       if (epi_m == 0) { // Assumes M-major subtile loop
-        if (!params.row_broadcast) return; // Do not issue LDS when row is scalar 
+        if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
         cute::Tensor tSR_sRow_flt = filter_zeros(tSR_sRow(_,_,_,epi_m,epi_n));
         cute::Tensor tSR_rRow_flt = filter_zeros(tSR_rRow);
         copy(tSR_sRow_flt, tSR_rRow_flt);
@@ -243,18 +243,18 @@ struct Sm90RowOrScalarBroadcastArray {
 
     cute::Tensor mRow = make_tensor(make_gmem_ptr(params.ptr_row_array[l]), make_shape(M,N,1), params.dRow);
     cute::Tensor gRow = local_tile(mRow(_,_,l), take<0,2>(args.tile_shape_mnk), make_coord(m, n));          // (CTA_M, CTA_N)
-    cute::Tensor sRow = make_tensor(make_smem_ptr(smem), 
+    cute::Tensor sRow = make_tensor(make_smem_ptr(smem),
         make_shape(size<0>(CtaTileShapeMNK{}), size<1>(CtaTileShapeMNK{})), make_shape(_0{}, _1{}));  // (CTA_M, CTA_N)
     //// G2S: Gmem to Smem
     auto tiled_g2s = make_tiled_copy(Copy_Atom<DefaultCopy, Element>{},
-                                     Layout< Shape<_1, ThreadCount>, 
-                                            Stride<_0,          _1>>{}, 
-                                     Layout<_1>{});   
+                                     Layout< Shape<_1, ThreadCount>,
+                                            Stride<_0,          _1>>{},
+                                     Layout<_1>{});
     auto thr_g2s = tiled_g2s.get_slice(args.thread_idx);
     cute::Tensor tGS_gRow = thr_g2s.partition_S(gRow);
     cute::Tensor tGS_sRow = thr_g2s.partition_D(sRow);
 
-    //// G2S: Coord 
+    //// G2S: Coord
     auto cRow = make_identity_tensor(make_shape(size<0>(CtaTileShapeMNK{}), size<1>(CtaTileShapeMNK{})));
     cute::Tensor tGS_cRow = thr_g2s.partition_S(cRow);
 
@@ -263,14 +263,14 @@ struct Sm90RowOrScalarBroadcastArray {
     cute::Tensor tSR_rRow = make_tensor_like(take<0,3>(tSR_sRow));                                           // (CPY,CPY_M,CPY_N)
 
     return ConsumerStoreCallbacks<decltype(tGS_gRow), decltype(tGS_sRow), decltype(tGS_cRow), decltype(tiled_g2s), decltype(tSR_sRow), decltype(tSR_rRow), decltype(args.tCcD), decltype(args.residue_cD), ThreadCount>(
-      tGS_gRow, 
-      tGS_sRow, 
-      tGS_cRow, tiled_g2s, 
-      tSR_sRow, 
-      tSR_rRow, 
-      args.tCcD, 
+      tGS_gRow,
+      tGS_sRow,
+      tGS_cRow, tiled_g2s,
+      tSR_sRow,
+      tSR_rRow,
+      args.tCcD,
       args.residue_cD,
-      ThreadCount{}, 
+      ThreadCount{},
       l,
       params);
   }
@@ -296,8 +296,8 @@ struct Sm90ColOrScalarBroadcastArray {
   // Accumulator distributes col elements evenly amongst threads so we can just directly load from gmem
   struct SharedStorage { };
 
-  // This struct has been modified to have a bool indicating that ptr_col is a 
-  // scalar that must be broadcast, instead of containing a scalar that is 
+  // This struct has been modified to have a bool indicating that ptr_col is a
+  // scalar that must be broadcast, instead of containing a scalar that is
   // valid if ptr_col is null.
   struct Arguments {
     const Element* const* ptr_col_array = nullptr;
@@ -372,7 +372,7 @@ struct Sm90ColOrScalarBroadcastArray {
       ProblemShape problem_shape,
       int group,
       Params const& params
-    ): 
+    ):
       tCgCol(cute::forward<GTensor>(tCgCol)),
       tCrCol(cute::forward<RTensor>(tCrCol)),
       tCcCol(cute::forward<CTensor>(tCcCol)),
@@ -444,7 +444,7 @@ struct Sm90ColOrScalarBroadcastArray {
       mCol, args.tile_shape_mnk, args.tile_coord_mnkl, args.epi_tile, args.tiled_copy, args.thread_idx);
     cute::Tensor tCrCol = make_tensor_like(tCgCol);                                          // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
 
-    // Generate an identity tensor matching the shape of the global tensor and 
+    // Generate an identity tensor matching the shape of the global tensor and
     //  partition the same way, this will be used to generate the predicate
     //  tensor for loading
     cute::Tensor cCol = make_identity_tensor(mCol.shape());
@@ -452,9 +452,9 @@ struct Sm90ColOrScalarBroadcastArray {
       cCol, args.tile_shape_mnk, args.tile_coord_mnkl, args.epi_tile, args.tiled_copy, args.thread_idx);
 
     return ConsumerStoreCallbacks(
-      cute::move(tCgCol), 
-      cute::move(tCrCol), 
-      cute::move(tCcCol), 
+      cute::move(tCgCol),
+      cute::move(tCrCol),
+      cute::move(tCcCol),
       args.problem_shape_mnkl,
       l,
       params

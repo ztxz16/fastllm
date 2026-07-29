@@ -67,7 +67,7 @@ template<
 >
 struct VisitorRowOrScalarBroadcast {
 
-  // This struct has been modified to have a bool indicating that ptr_row is a 
+  // This struct has been modified to have a bool indicating that ptr_row is a
   // scalar that must be broadcast.
   struct Arguments {
     Element const* ptr_row = nullptr;
@@ -424,7 +424,7 @@ struct VisitorColOrScalarBroadcast {
     int m;
 
     // This function is modified from VisitorColBroadcast
-    CUTLASS_DEVICE void 
+    CUTLASS_DEVICE void
     begin_epilogue() {
       clear(tC_rCol);
 
