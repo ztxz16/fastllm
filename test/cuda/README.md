@@ -1,0 +1,182 @@
+# CUDA Kernel Tests
+
+这个目录用于放独立 CUDA 算子正确性测试。
+
+测试目标是不依赖完整模型加载，直接比较：
+
+```text
+CPU reference vs GPU kernel output
+```
+
+每个测试建议输出：
+
+```text
+max_abs_error
+mean_abs_error
+max_rel_error
+PASS / FAIL
+```
+
+启用方式：
+
+```bash
+export CUDA_HOME=/usr/local/cuda
+export PATH=/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+cmake -S . -B build-fastllm \
+  -DUSE_CUDA=ON \
+  -DENABLE_CUDA_TESTS=ON \
+  -DUNIT_TEST=ON \
+  -DCUDA_ARCH=90a \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+
+cmake --build build-fastllm --target \
+  test_w4a8_cutlass_linear \
+  test_w4a8_dolinear_dispatch \
+  test_w4a8_loader \
+  optest -j$(nproc)
+
+./build-fastllm/test/cuda/test_w4a8_cutlass_linear
+./build-fastllm/test/cuda/test_w4a8_dolinear_dispatch
+```
+
+如果 CMake 找不到 `nvcc`，先确认：
+
+```bash
+which nvcc
+nvcc --version
+ls /usr/local/cuda/bin/nvcc
+```
+
+## W4A8 Cutlass Validation
+
+W4A8 迁移分阶段接入时，先用独立入口做合法性验证，再接数值和性能测试。
+
+阶段 6 可用下面的环境变量打开入口验证日志：
+
+```bash
+export FASTLLM_CUDA_W4A8_VALIDATE=1
+export FASTLLM_CUDA_W4A8_TRACE=1
+```
+
+只验证权重缓存、activation quant、output buffer 准备时，可分别打开：
+
+```bash
+export FASTLLM_CUDA_W4A8_PREPARE_CACHE=1
+export FASTLLM_CUDA_W4A8_PREPARE_ACTIVATION=1
+export FASTLLM_CUDA_W4A8_PREPARE_OUTPUT=1
+```
+
+正式的 `INT4_W4A8` 模型权重在满足 SM90、group=128、shape 和 dtype
+条件时会自动接管 `DoCudaLinear`，不需要运行时开关。下面的开关只用于让旧
+`INT4_GROUP` signed-int4 兼容格式进入 W4A8 GEMM：
+
+```bash
+export FASTLLM_CUDA_W4A8_ENABLE_GEMM=1
+```
+
+步骤 5 新增了最小独立测试：
+
+```bash
+cmake --build build-fastllm --target test_w4a8_cutlass_linear -j$(nproc)
+./build-fastllm/test/cuda/test_w4a8_cutlass_linear
+```
+
+这个 target 只会在 CMake 判定 `FASTLLM_CUTLASS_W4A8_ENABLED=ON` 时生成。
+也就是需要同时满足：
+
+```text
+USE_CUDA=ON
+ENABLE_CUDA_TESTS=ON
+CUTLASS include 可用
+CUDA_ARCH 包含 90 / 90a / 9.0a
+CUDA 编译器版本 >= 12.0
+```
+
+不满足时 CMake 会打印：
+
+```text
+CUDA W4A8 CUTLASS test: OFF
+```
+
+此时不会生成 `test_w4a8_cutlass_linear`，普通构建和其它 CUDA 测试不受影响。
+
+第一版测试先覆盖入口行为：
+
+```text
+编译未开启 FASTLLM_ENABLE_CUTLASS_W4A8 时返回 false
+非 SM90 时返回 false
+m/k 非 128 对齐时返回 false
+input/weight dtype 不满足时返回 false
+bias 不满足时返回 false
+groupCnt 不是 128 时返回 false
+```
+
+当编译开启 W4A8 且运行在 SM90 上时，测试使用正式 `INT4_W4A8` dtype，
+在不设置 `FASTLLM_CUDA_W4A8_ENABLE_GEMM` 的情况下跑最小数值比较：
+
+```text
+W4A8 output vs CPU baseline
+n = 1
+n = 4 / 8 / 16
+n = 64 / 128
+with bias / no bias
+FP16 input / BF16 input
+```
+
+合法性用例应覆盖：
+
+```text
+n = 1
+small batch: n = 4 / 8 / 16
+large batch: n = 64 / 128
+m/k: 128 对齐和非 128 对齐
+input dtype: FP16 / BF16 / 非 FP16/BF16
+weight dtype: INT4_GROUP / 非 INT4_GROUP
+bias: empty / FLOAT32[k] / 非 FLOAT32 / 长度不等于 k
+runtime arch: SM90 和非 SM90
+```
+
+期望行为：
+
+```text
+SM90 + dtype/shape/bias/weight 全满足时打印 validation ready
+非 SM90 打印 skip: runtime arch is not SM90
+m/k 非 128 对齐打印 skip: m/k is not 128-aligned
+dtype 不满足打印对应 dtype skip reason
+weight 不满足打印对应 INT4_GROUP / group / scale-min skip reason
+```
+
+产品分发策略：
+
+```text
+普通 INT4_GROUP：W4A8 入口拒绝后继续走原有 CUDA fallback
+专用 INT4_W4A8：非 SM90 明确报错，不隐式转换成 INT4_GROUP 或 BF16
+专用 INT4_W4A8：SM90 上构建或格式条件不满足时明确报错
+```
+
+后续如需为专用 checkpoint 增加跨 GPU fallback，应在模型加载后做一次性显式
+转换，不能在每次 Linear 调用时临时重新量化。
+
+### W4A8 加载器小范围测试
+
+`test_w4a8_loader` 不创建完整模型，只读取指定 Linear 的
+`weight_packed`、`weight_scale`、`weight_shape` 和 `lm_head` metadata：
+
+```bash
+cmake --build build-w4a8 --target test_w4a8_loader -j1
+
+FASTLLM_W4A8_TEST_MODEL=/path/to/Meta-Llama-3-8B-Instruct-W4AFP8-AWQ \
+./build-w4a8/test/cuda/test_w4a8_loader 2>&1 | tee w4a8-loader.log
+```
+
+可以用 `FASTLLM_W4A8_TEST_TENSOR` 指定其他 Linear 前缀，默认值为：
+
+```text
+model.layers.0.self_attn.q_proj
+```
+
+测试覆盖量化配置识别、三件套及 shape 校验、缺失 companion 报错、BF16
+scale 到 FP8 group/channel scale、packed nibble 解码和 CUTLASS reorder 后的
+端到端数值一致性，并确认 `lm_head` 仍为 BF16。

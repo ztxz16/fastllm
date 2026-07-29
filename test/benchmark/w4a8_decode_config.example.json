@@ -1,0 +1,29 @@
+{
+  "defaults": {
+    "path": "/path/to/compressed-tensors-w4a8-model",
+    "host": "127.0.0.1",
+    "port": 18080,
+    "api_key": "no-key",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "atype": "bfloat16",
+    "prefill_length": 128,
+    "max_tokens": 256,
+    "startup_timeout": 600,
+    "request_timeout": 3600,
+    "warmup_max_tokens": 8,
+    "skip_warmup": false
+  },
+  "cases": [
+    {
+      "name": "w4a8-decode-batch1",
+      "batch_size": 1,
+      "max_batch": 1
+    },
+    {
+      "name": "w4a8-decode-batch4",
+      "batch_size": 4,
+      "max_batch": 4
+    }
+  ]
+}

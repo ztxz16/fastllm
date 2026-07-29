@@ -1227,6 +1227,8 @@ namespace fastllm {
                 }
                 fclose(fi);
                 return;
+            } else if (this->dtype == "I32") {
+                srcType = DataType::INT32;
             } else {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
             }
@@ -1236,14 +1238,16 @@ namespace fastllm {
                 unitSize = 4;
             } else if (dstType == DataType::FLOAT16 || dstType == DataType::BFLOAT16) {
                 unitSize = 2;
-            } else if (dstType == DataType::INT32 || dstType == DataType::INT32PARAM) {
+            } else if (dstType == DataType::INT32 || dstType == DataType::INT32PARAM ||
+                       dstType == DataType::INT4_W4A8) {
                 unitSize = 4;
             } else {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport dst dtype " + std::to_string(dstType) + "\n");
             }
             ClearBuffer();
             buffer = new uint8_t[(size_t)len * unitSize];
-            if (dstType == srcType) {
+            if (dstType == srcType ||
+                (srcType == DataType::INT32 && dstType == DataType::INT4_W4A8)) {
                 ret = fread(buffer, 1, this->bytes, fi);
             } else {
                 uint8_t *ori = new uint8_t[this->bytes];
@@ -1321,6 +1325,238 @@ namespace fastllm {
             return ret;
         }
     };
+
+    struct CompressedTensorsW4A8Bundle {
+        std::string packedTensorName;
+        std::string scaleTensorName;
+        std::string shapeTensorName;
+        std::string weightName;
+        std::vector<int> logicalShape;
+    };
+
+    static bool HasJsonString(const json11::Json &values, const std::string &expected) {
+        for (const auto &value : values.array_items()) {
+            if (value.string_value() == expected) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool IsCompressedTensorsW4A8Config(const json11::Json &config) {
+        const auto &quant = config["quantization_config"];
+        if (quant.is_null() ||
+            quant["quant_method"].string_value() != "compressed-tensors" ||
+            quant["format"].string_value() != "pack-quantized") {
+            return false;
+        }
+
+        bool foundLinearW4A8 = false;
+        for (const auto &entry : quant["config_groups"].object_items()) {
+            const auto &group = entry.second;
+            if (!HasJsonString(group["targets"], "Linear")) {
+                continue;
+            }
+            const auto &weight = group["weights"];
+            const auto &input = group["input_activations"];
+            const std::string groupFormat = group["format"].string_value();
+            const std::string weightActorder =
+                weight["actorder"].string_value();
+            const bool weightPreordered =
+                weight["actorder"].is_null() ||
+                weightActorder == "weight" || weightActorder == "static";
+            bool supported =
+                (groupFormat.empty() || groupFormat == "pack-quantized") &&
+                weight["type"].string_value() == "int" &&
+                weight["num_bits"].int_value() == 4 &&
+                weight["strategy"].string_value() == "group" &&
+                weight["group_size"].int_value() == COMPRESSED_W4A8_GROUP_SIZE &&
+                weight["symmetric"].bool_value() &&
+                !weight["dynamic"].bool_value() &&
+                weightPreordered &&
+                input["type"].string_value() == "float" &&
+                input["num_bits"].int_value() == 8 &&
+                input["strategy"].string_value() == "token" &&
+                input["symmetric"].bool_value() &&
+                input["dynamic"].bool_value() &&
+                input["actorder"].is_null();
+            if (!supported) {
+                return false;
+            }
+            foundLinearW4A8 = true;
+        }
+        return foundLinearW4A8;
+    }
+
+    static bool DescribeCompressedTensorsW4A8Bundle(
+            SafeTensors &safeTensors, const std::string &packedName,
+            CompressedTensorsW4A8Bundle &bundle, std::string &error) {
+        auto fail = [&error](const std::string &message) {
+            error = message;
+            return false;
+        };
+        auto packedIt = safeTensors.itmeDict.find(packedName);
+        if (packedIt == safeTensors.itmeDict.end()) {
+            return fail("W4A8 tensor is missing packed weight: " + packedName);
+        }
+        if (!StringEndWith(packedName, ".weight_packed")) {
+            return fail("W4A8 packed tensor has an invalid name: " + packedName);
+        }
+
+        std::string prefix = packedName.substr(
+            0, packedName.size() - strlen(".weight_packed"));
+        std::string scaleName = prefix + ".weight_scale";
+        std::string shapeName = prefix + ".weight_shape";
+        auto scaleIt = safeTensors.itmeDict.find(scaleName);
+        auto shapeIt = safeTensors.itmeDict.find(shapeName);
+        if (scaleIt == safeTensors.itmeDict.end()) {
+            return fail("W4A8 tensor is missing companion scale: " + scaleName);
+        }
+        if (shapeIt == safeTensors.itmeDict.end()) {
+            return fail("W4A8 tensor is missing companion shape: " + shapeName);
+        }
+
+        SafeTensorItem &packed = packedIt->second;
+        SafeTensorItem &scale = scaleIt->second;
+        SafeTensorItem &shape = shapeIt->second;
+        if (packed.dtype != "I32" || packed.intShape.size() != 2) {
+            return fail("W4A8 weight_packed should be a 2D I32 tensor: " + packedName);
+        }
+        if (scale.dtype != "BF16" || scale.intShape.size() != 2) {
+            return fail("W4A8 weight_scale should be a 2D BF16 tensor: " + scaleName);
+        }
+        if (shape.dtype != "I64" || shape.len != 2) {
+            return fail("W4A8 weight_shape should be an I64 tensor with 2 values: " + shapeName);
+        }
+
+        shape.CreateBuffer(DataType::INT32PARAM);
+        const int32_t *logicalShape = reinterpret_cast<const int32_t*>(shape.buffer);
+        int outFeatures = logicalShape[0];
+        int inFeatures = logicalShape[1];
+        shape.ClearBuffer();
+        if (outFeatures <= 0 || inFeatures <= 0 ||
+            outFeatures % COMPRESSED_W4A8_GROUP_SIZE != 0 ||
+            inFeatures % COMPRESSED_W4A8_GROUP_SIZE != 0) {
+            return fail("W4A8 logical shape should be positive and 128-aligned: " + shapeName);
+        }
+        if (packed.intShape[0] != outFeatures || packed.intShape[1] * 8 != inFeatures) {
+            return fail("W4A8 weight_packed shape does not match weight_shape: " + packedName);
+        }
+        if (scale.intShape[0] != outFeatures ||
+            scale.intShape[1] * COMPRESSED_W4A8_GROUP_SIZE != inFeatures) {
+            return fail("W4A8 weight_scale shape does not match weight_shape: " + scaleName);
+        }
+        if (packed.bytes != (uint64_t)outFeatures * inFeatures / 2) {
+            return fail("W4A8 weight_packed byte size mismatch: " + packedName);
+        }
+        if (scale.bytes != (uint64_t)outFeatures *
+                           (inFeatures / COMPRESSED_W4A8_GROUP_SIZE) * sizeof(uint16_t)) {
+            return fail("W4A8 weight_scale byte size mismatch: " + scaleName);
+        }
+
+        bundle = CompressedTensorsW4A8Bundle{
+            packedName, scaleName, shapeName, prefix + ".weight",
+            {outFeatures, inFeatures}};
+        error.clear();
+        return true;
+    }
+
+    static std::map<std::string, CompressedTensorsW4A8Bundle>
+    BuildCompressedTensorsW4A8Bundles(SafeTensors &safeTensors, basellm *model) {
+        std::map<std::string, CompressedTensorsW4A8Bundle> bundles;
+        for (auto &entry : safeTensors.itmeDict) {
+            const std::string &packedName = entry.first;
+            if (!StringEndWith(packedName, ".weight_packed")) {
+                continue;
+            }
+
+            CompressedTensorsW4A8Bundle bundle;
+            std::string error;
+            bool validBundle = DescribeCompressedTensorsW4A8Bundle(
+                safeTensors, packedName, bundle, error);
+            AssertInFastLLM(validBundle, error + "\n");
+            AssertInFastLLM(model->weight.GetWeightType(bundle.weightName) == WeightType::LINEAR,
+                            "W4A8 tensor is not a known Linear weight: " + packedName + "\n");
+            bundles[packedName] = std::move(bundle);
+        }
+        AssertInFastLLM(!bundles.empty(),
+                        "Compressed-tensors W4A8 config found, but no weight_packed tensors were found.\n");
+        return bundles;
+    }
+
+    bool InspectCompressedW4A8Linear(const std::string &modelPath,
+                                     const std::string &tensorPrefix,
+                                     CompressedW4A8LinearProbe &probe,
+                                     std::string &error) {
+        auto fail = [&error](const std::string &message) {
+            error = message;
+            return false;
+        };
+        std::string path = modelPath;
+        if (path.empty()) {
+            return fail("W4A8 model path is empty");
+        }
+        if (path.back() != '/' && path.back() != '\\') {
+            path += "/";
+        }
+
+        std::string configError;
+        auto config = json11::Json::parse(ReadAllFile(path + "config.json"), configError);
+        if (!configError.empty()) {
+            return fail("Unable to parse W4A8 config.json: " + configError);
+        }
+        if (!IsCompressedTensorsW4A8Config(config)) {
+            return fail("Model quantization_config is not supported compressed-tensors W4A8");
+        }
+
+        std::set<std::string> stFiles;
+        std::string indexFile = path + "model.safetensors.index.json";
+        if (FileExists(indexFile)) {
+            auto index = json11::Json::parse(ReadAllFile(indexFile), configError);
+            if (!configError.empty()) {
+                return fail("Unable to parse model.safetensors.index.json: " + configError);
+            }
+            for (const auto &entry : index["weight_map"].object_items()) {
+                stFiles.insert(path + entry.second.string_value());
+            }
+        } else if (FileExists(path + "model.safetensors")) {
+            stFiles.insert(path + "model.safetensors");
+        } else {
+            return fail("Model has no safetensors weight file");
+        }
+
+        SafeTensors safeTensors(stFiles);
+        CompressedTensorsW4A8Bundle bundle;
+        if (!DescribeCompressedTensorsW4A8Bundle(
+                safeTensors, tensorPrefix + ".weight_packed", bundle, error)) {
+            return false;
+        }
+
+        SafeTensorItem &packed = safeTensors.itmeDict[bundle.packedTensorName];
+        SafeTensorItem &scale = safeTensors.itmeDict[bundle.scaleTensorName];
+        packed.CreateBuffer(DataType::INT4_W4A8);
+        scale.CreateBuffer(DataType::BFLOAT16);
+
+        probe = CompressedW4A8LinearProbe();
+        probe.tensorPrefix = tensorPrefix;
+        probe.logicalShape = bundle.logicalShape;
+        probe.packedShape = packed.intShape;
+        probe.scaleShape = scale.intShape;
+        probe.packedWeight.assign(packed.buffer, packed.buffer + packed.bytes);
+        const uint16_t *scaleData = reinterpret_cast<const uint16_t*>(scale.buffer);
+        probe.groupScales.assign(scaleData, scaleData + scale.len);
+        packed.ClearBuffer();
+        scale.ClearBuffer();
+
+        auto lmHead = safeTensors.itmeDict.find("lm_head.weight");
+        if (lmHead == safeTensors.itmeDict.end()) {
+            lmHead = safeTensors.itmeDict.find("model.lm_head.weight");
+        }
+        probe.lmHeadBfloat16 = lmHead != safeTensors.itmeDict.end() &&
+                               lmHead->second.dtype == "BF16";
+        error.clear();
+        return true;
+    }
 
     static bool IsPackedFP4StorageDType(const std::string &dtype) {
         return dtype == "I8" || dtype == "U8";
@@ -3121,6 +3357,7 @@ namespace fastllm {
         std::string configFile = path + "config.json";
         auto config = weightOnly ? json11::Json() : json11::Json::parse(ReadAllFile(configFile), error);
         bool isAwqModel = false;
+        bool isCompressedW4A8Model = false;
         int awqGroupCnt = 128;
         std::string modelType = "";
         if (weightOnly) {
@@ -3155,7 +3392,7 @@ namespace fastllm {
                 }
                 printf("[Fastllm] AWQ: keep unquantized floating-point tensors in source dtype.\n");
             }
-
+            isCompressedW4A8Model = IsCompressedTensorsW4A8Config(config);
         }
         basellm *model = CreateModelWithType(modelType);
         if (isJsonModel) {
@@ -3217,6 +3454,22 @@ namespace fastllm {
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
+        std::map<std::string, CompressedTensorsW4A8Bundle> w4a8Bundles;
+        std::set<std::string> w4a8CompanionTensorNames;
+        if (isCompressedW4A8Model) {
+            w4a8Bundles = BuildCompressedTensorsW4A8Bundles(safeTensors, model);
+            for (const auto &entry : w4a8Bundles) {
+                const auto &bundle = entry.second;
+                tensorMap[bundle.packedTensorName] = {
+                    {bundle.weightName, DataType::INT4_W4A8}};
+                tensorMap[bundle.scaleTensorName].clear();
+                tensorMap[bundle.shapeTensorName].clear();
+                w4a8CompanionTensorNames.insert(bundle.scaleTensorName);
+                w4a8CompanionTensorNames.insert(bundle.shapeTensorName);
+            }
+            printf("[Fastllm] compressed-tensors W4A8: grouped %d Linear weights.\n",
+                   (int)w4a8Bundles.size());
+        }
         tensors.erase(
             std::remove_if(tensors.begin(), tensors.end(),
                 [&](const std::string &name) {
@@ -3285,7 +3538,8 @@ namespace fastllm {
         ReportModelLoadProgress("weights_prepare", 0, prepareTotal);
         for (auto &tensorName : tensors) {
             auto &tensor = safeTensors.itmeDict[tensorName];
-            if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName)) {
+            if (w4a8CompanionTensorNames.find(tensorName) != w4a8CompanionTensorNames.end() ||
+                IsSafeTensorQuantScaleTensorName(safeTensors, tensorName)) {
                 int current = ++cur;
                 printf("Load %d \r", current * 100 / prepareTotal);
                 fflush(stdout);
@@ -3347,7 +3601,15 @@ namespace fastllm {
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
                 }
-                if (it.second == DATA_AUTO_CONV) {
+                auto w4a8BundleIt = w4a8Bundles.find(tensorName);
+                if (w4a8BundleIt != w4a8Bundles.end()) {
+                    model->weight.AddEmptyWeight(weightName,
+                                                 w4a8BundleIt->second.logicalShape,
+                                                 DataType::INT4_W4A8);
+                    Data &weight = model->weight[weightName];
+                    weight.InitW4A8Weight(
+                        W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8);
+                } else if (it.second == DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
                     model->weight.AddEmptyWeight(weightName, realShape, dataType);
@@ -3486,11 +3748,14 @@ namespace fastllm {
                     for (int i = st; i < end; i++) {
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
-                        if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName) ||
+                        if (w4a8CompanionTensorNames.find(tensorName) != w4a8CompanionTensorNames.end() ||
+                            IsSafeTensorQuantScaleTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             printLoadingProgress(tensor.bytes);
                             continue;
                         }
+                        auto w4a8BundleIt = w4a8Bundles.find(tensorName);
+                        bool isW4A8PackedTensor = w4a8BundleIt != w4a8Bundles.end();
                         std::string scaleTensorName = "";
                         std::string qzeroTensorName = "";
 
@@ -3508,6 +3773,11 @@ namespace fastllm {
                             int curGroupCnt = isMoeLinear
                                     ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
                                     : groupCnt;
+                            if (isW4A8PackedTensor) {
+                                dataType = DataType::INT4_W4A8;
+                                oriDataType = DataType::INT4_W4A8;
+                                curGroupCnt = 128;
+                            }
 
                             if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                                 ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
@@ -3669,6 +3939,19 @@ namespace fastllm {
                                     tensor.CreateBufferWithAWQ(oriDataType, scaleTensor, qzeroTensor);
                                 }
 
+                                if (isW4A8PackedTensor) {
+                                    AssertInFastLLM(loraDicts.find(weightName) == loraDicts.end(),
+                                                    "LoRA on compressed-tensors W4A8 weights is not supported yet: " + weightName + "\n");
+                                    auto &scaleTensor = safeTensors.itmeDict[w4a8BundleIt->second.scaleTensorName];
+                                    scaleTensor.CreateBuffer(DataType::BFLOAT16);
+                                    Data &weight = model->weight[weightName];
+                                    size_t scaleCount = (size_t)weight.dims[0] * weight.group;
+                                    weight.SetW4A8GroupScales(
+                                        reinterpret_cast<const uint16_t*>(scaleTensor.buffer),
+                                        scaleCount);
+                                    scaleTensor.ClearBuffer();
+                                }
+
                                 if (loraDicts.find(weightName) != loraDicts.end()) {
                                 std::string loraA = loraDicts[weightName].first;
                                 std::string loraB = loraDicts[weightName].second;
@@ -3736,6 +4019,13 @@ namespace fastllm {
                                     model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                             tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                             curGroupCnt, tensor.blockK, tensor.blockM);
+                                }
+                                if (isW4A8PackedTensor) {
+                                    std::string reason;
+                                    AssertInFastLLM(
+                                        model->weight[weightName].ValidateW4A8Weight(&reason),
+                                        "Invalid compressed-tensors W4A8 weight " +
+                                        weightName + ": " + reason + "\n");
                                 }
                                 if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
                                     model->weight[weightName].CalcWeightSum();
@@ -3838,9 +4128,25 @@ namespace fastllm {
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.isModelWeight = true;
-                                        mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
-                                        mergeData.group = model->weight[input0].group;
-                                        mergeData.groupCnt = model->weight[input0].groupCnt;
+                                        if (mergeData.dataType == DataType::INT4_W4A8) {
+                                            for (const auto &input : it.inputs) {
+                                                std::string reason;
+                                                AssertInFastLLM(
+                                                    model->weight[input].ValidateW4A8Weight(&reason),
+                                                    "Cannot merge invalid W4A8 weight " + input +
+                                                    ": " + reason + "\n");
+                                                AssertInFastLLM(
+                                                    model->weight[input].w4a8WeightEncoding ==
+                                                        model->weight[input0].w4a8WeightEncoding,
+                                                    "Cannot merge W4A8 weights with different source encodings.\n");
+                                            }
+                                            mergeData.InitW4A8Weight(
+                                                model->weight[input0].w4a8WeightEncoding);
+                                        } else {
+                                            mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
+                                            mergeData.group = model->weight[input0].group;
+                                            mergeData.groupCnt = model->weight[input0].groupCnt;
+                                        }
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
 
@@ -3857,12 +4163,23 @@ namespace fastllm {
                                                 mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
                                                 mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
                                                 mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                mergeData.w4a8GroupScales = AppendVector(
+                                                    mergeData.w4a8GroupScales,
+                                                    model->weight[input].w4a8GroupScales);
                                                 if (compactNVFP4) {
                                                     AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
                                                 } else {
                                                     memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
                                                     offset += model->weight[input].GetBytes();
                                                 }
+                                            }
+
+                                            if (mergeData.dataType == DataType::INT4_W4A8) {
+                                                std::string reason;
+                                                AssertInFastLLM(
+                                                    mergeData.ValidateW4A8Weight(&reason),
+                                                    "Invalid merged W4A8 weight " + mergeName +
+                                                    ": " + reason + "\n");
                                             }
 
                                             mergeData.CalcWeightSum();

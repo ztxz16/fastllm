@@ -23,6 +23,7 @@ option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 option(BUILD_CLI "build cli" OFF)
 
 option(UNIT_TEST "build unit tests" OFF)
+option(ENABLE_CUDA_TESTS "build standalone CUDA kernel tests" OFF)
 
 if(NOT DEFINED CUDA_ARCH)
     if(DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -311,6 +312,31 @@ if (USE_CUDA)
     else()
         message(STATUS "CUTLASS FP8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
     endif()
+
+    set(FASTLLM_CUTLASS_W4A8_ARCH_ENABLED OFF)
+    foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if (FASTLLM_CUDA_ARCH STREQUAL "90a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "90" OR
+            FASTLLM_CUDA_ARCH STREQUAL "9.0a")
+            set(FASTLLM_CUTLASS_W4A8_ARCH_ENABLED ON)
+        endif()
+    endforeach()
+    set(FASTLLM_CUTLASS_W4A8_ENABLED OFF)
+    if (NOT FASTLLM_CUTLASS_DIR STREQUAL "" AND
+        EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
+        FASTLLM_CUTLASS_W4A8_ARCH_ENABLED AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
+        set(FASTLLM_CUTLASS_W4A8_ENABLED ON)
+        include_directories("${FASTLLM_CUTLASS_DIR}/include")
+        if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include")
+            include_directories("${FASTLLM_CUTLASS_DIR}/tools/util/include")
+        endif()
+        add_compile_definitions(FASTLLM_ENABLE_CUTLASS_W4A8)
+        message(STATUS "CUTLASS W4A8 kernels: ON (${FASTLLM_CUTLASS_DIR})")
+    else()
+        message(STATUS "CUTLASS W4A8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
+    endif()
+
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
         src/devices/cuda/fastllm-cuda.cu 
@@ -333,6 +359,15 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/deepseekv4-kernels.cu)
+
+    if(FASTLLM_CUTLASS_W4A8_ENABLED)
+        include_directories(src)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/linear/fastllm-linear-w4a8-cutlass.cu
+            src/devices/cuda/linear/fastllm-w4a8-utils.cu
+            src/devices/cuda/moe/fastllm-moe-w4a8-cutlass.cu
+        )
+    endif()
 
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
     # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
@@ -531,6 +566,13 @@ if (UNIT_TEST)
     if (USE_CUDA AND NOT USE_ROCM)
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
+endif()
+
+if (ENABLE_CUDA_TESTS)
+    if (NOT USE_CUDA)
+        message(FATAL_ERROR "ENABLE_CUDA_TESTS requires USE_CUDA=ON")
+    endif()
+    add_subdirectory(test/cuda)
 endif()
 
 add_executable(webui example/webui/webui.cpp)

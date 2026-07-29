@@ -36,7 +36,10 @@ if __name__ == "__main__":
     model_path = args.model
     logger.info("开始测试模型 " + model_path)    
     logger.info("正在用Transformer读取模型")
-    hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype = "auto", device_map = "cpu").half()
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype = "auto", attn_implementation = "eager")
+    if not getattr(hf_model, "is_quantized", False):
+        hf_model = hf_model.half()
     hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
     logger.info("读取成功")
     logger.info("正在用Fastllm读取模型")
@@ -45,6 +48,9 @@ if __name__ == "__main__":
     fastllm_tokenizer = llm.tokenizer(model_path)
     logger.info("读取成功")
     logger.info("使用fastllm进行推理")
+    repeat_penalty = hf_model.generation_config.repetition_penalty
+    if repeat_penalty is None:
+        repeat_penalty = 1.0
 
     # fastllm模型推理
     fastllm_logits_list = []
@@ -53,7 +59,7 @@ if __name__ == "__main__":
         fastllm_text = fastllm_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
         fastllm_model.direct_query = True
         fastllm_logits = fastllm_model.response_logits(fastllm_text)
-        fastllm_response = fastllm_model.response(fastllm_text, max_length = args.tokens, top_k = 1, temperature = 0.01, repeat_penalty = hf_model.generation_config.repetition_penalty)
+        fastllm_response = fastllm_model.response(fastllm_text, max_length = args.tokens, top_k = 1, temperature = 0.01, repeat_penalty = repeat_penalty)
 
         fastllm_logits_list.append(fastllm_logits)
         fastllm_response_list.append(fastllm_response)

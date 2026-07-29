@@ -3327,6 +3327,7 @@ namespace fastllm {
                    weightType == DataType::FLOAT32 ||
                    weightType == DataType::FLOAT16 ||
                    weightType == DataType::INT4_GROUP32 ||
+                   weightType == DataType::INT4_W4A8 ||
                    weightType == DataType::FP8_E4M3 ||
                    weightType == DataType::FP8_E4M3_BLOCK_128 ||
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
@@ -3348,7 +3349,23 @@ namespace fastllm {
                                    ", bias.dataType = " + GetDataTypeName(bias.dataType) + ".";
         if (!IsCudaLinearDataTypeSupported(input.dataType, weight.dataType, bias.dataType)) {
             ErrorInFastLLM("Linear error: unsupported dataType combination." + dataTypeInfo);
-        } else if (input.dataType == DataType::FLOAT16) {
+        }
+        if (TryCudaCutlassW4A8(input, weight, bias, output, n, m, k)) {
+            return;
+        }
+        if (weight.dataType == DataType::INT4_W4A8) {
+            int runtimeArch = FastllmCudaRuntimeArch();
+            if (runtimeArch != 90) {
+                ErrorInFastLLM(
+                    "Linear error: compressed-tensors W4A8 checkpoints require an "
+                    "NVIDIA Hopper SM90 GPU; runtime SM=" + std::to_string(runtimeArch) + ".\n");
+            }
+            ErrorInFastLLM(
+                "Linear error: compressed-tensors W4A8 is unavailable. The CUDA build "
+                "must enable the SM90 CUTLASS W4A8 kernel, and the weight must use "
+                "symmetric INT4 group_size=128 without zero points or act-order.\n");
+        }
+        if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT32) {
                 FastllmCudaHalfMatMulFloat32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FLOAT16) {
@@ -6137,6 +6154,96 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         return ok;
     }
 
+    static bool TryCudaMergeMOEW4A8Grouped(
+        Data &input, Data &output, const int32_t *indexData,
+        const float *scoreData, int batch, int topk, Data &w1, Data &w2,
+        Data **weights, int weightsBatch, float sharedScale,
+        MoeGateType gateType) {
+#ifdef FASTLLM_ENABLE_CUTLASS_W4A8
+        if (FastllmCudaRuntimeArch() != 90 ||
+            input.dataType != DataType::BFLOAT16 ||
+            gateType != MoeGateSwiglu || batch <= 0 || topk <= 0 ||
+            weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
+            indexData == nullptr || scoreData == nullptr ||
+            (weights[0] != nullptr && sharedScale != 0.0f)) {
+            return false;
+        }
+
+        int experts = weightsBatch / 2 - 1;
+        Data *gateup = weights[2];
+        Data *down = weights[3];
+        if (experts <= 0 || gateup == nullptr || down == nullptr ||
+            gateup->dataType != DataType::INT4_W4A8 ||
+            down->dataType != DataType::INT4_W4A8 ||
+            gateup->dims.size() != 2 || down->dims.size() != 2) {
+            return false;
+        }
+        int hidden = input.dims.back();
+        int inter = down->dims[1];
+        if (gateup->dims[1] != hidden ||
+            gateup->dims[0] != inter * 2 ||
+            down->dims[0] != hidden) {
+            return false;
+        }
+
+        std::vector<int> expertCounts(experts, 0);
+        for (int token = 0; token < batch; ++token) {
+            for (int slot = 0; slot < topk; ++slot) {
+                int expert = indexData[token * topk + slot];
+                if (expert < 0 || expert >= experts) {
+                    return false;
+                }
+                expertCounts[expert]++;
+            }
+        }
+
+        std::vector<int> expertStarts(experts, 0);
+        int totalTasks = 0;
+        for (int expert = 0; expert < experts; ++expert) {
+            expertStarts[expert] = totalTasks;
+            totalTasks += expertCounts[expert];
+        }
+        if (totalTasks != batch * topk) {
+            return false;
+        }
+
+        std::vector<int> offsets = expertStarts;
+        std::vector<int> routeRows(totalTasks);
+        std::vector<float> routeScales(totalTasks);
+        std::vector<int> routePositions(totalTasks);
+        for (int token = 0; token < batch; ++token) {
+            for (int slot = 0; slot < topk; ++slot) {
+                int route = token * topk + slot;
+                int expert = indexData[route];
+                int position = offsets[expert]++;
+                routeRows[position] = token;
+                routeScales[position] = scoreData[route];
+                routePositions[route] = position;
+            }
+        }
+
+        return FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
+            input, w1, w2, output, weights, weightsBatch,
+            routeRows.data(), routeScales.data(), routePositions.data(),
+            expertStarts.data(), expertCounts.data(), batch, topk,
+            totalTasks, hidden, inter);
+#else
+        (void)input;
+        (void)output;
+        (void)indexData;
+        (void)scoreData;
+        (void)batch;
+        (void)topk;
+        (void)w1;
+        (void)w2;
+        (void)weights;
+        (void)weightsBatch;
+        (void)sharedScale;
+        (void)gateType;
+        return false;
+#endif
+    }
+
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
                         Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch) {
 // static std::map<std::string, float> mergeMoeTimeCnt;
@@ -6222,6 +6329,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             score.ToDevice(DataDevice::CPU);
             ToDataType(score, DataType::FLOAT32);
             float *scoreData = (float*)score.cpuData;
+
+            if (TryCudaMergeMOEW4A8Grouped(
+                    input, output, indexData, scoreData, batch, topk,
+                    w1, w2, weights, weightsBatch, sharedScale, gateType)) {
+                return;
+            }
 
             if (batch == 1) {
                 if (TryCudaMergeMOEBatch1Fp8(input, output, indexData, scoreData, false, topk, w1, weights, sharedScale, gateType)) {
