@@ -24,6 +24,16 @@ namespace fastllm {
                  const FloatDict &floatParams, const IntDict &intParams) override;
     };
 
+    class CpuKimiK3UpdatePackedConvCacheOp : public BaseOperator {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Reshape(const std::string &opType, const DataDict &datas,
+                     const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
     class CpuKimiK3L2NormOp : public BaseOperator {
     public:
         bool CanRun(const std::string &opType, const DataDict &datas,

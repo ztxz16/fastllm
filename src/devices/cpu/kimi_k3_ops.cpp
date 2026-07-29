@@ -287,6 +287,89 @@ namespace fastllm {
         }
     }
 
+    bool CpuKimiK3UpdatePackedConvCacheOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        auto q = datas.find("q");
+        return q != datas.end() && q->second != nullptr &&
+               q->second->dataType == DataType::BFLOAT16;
+    }
+
+    void CpuKimiK3UpdatePackedConvCacheOp::Reshape(
+            const std::string &, const DataDict &,
+            const FloatDict &, const IntDict &) {
+    }
+
+    void CpuKimiK3UpdatePackedConvCacheOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &intParams) {
+        Data &q = *datas.find("q")->second;
+        Data &k = *datas.find("k")->second;
+        Data &v = *datas.find("v")->second;
+        Data &cache = *datas.find("cache")->second;
+        const int history = intParams.find("history")->second;
+        const int tokens = intParams.find("tokens")->second;
+        KimiK3AssertBFloat16(q, "KimiK3UpdatePackedConvCache q");
+        KimiK3AssertBFloat16(k, "KimiK3UpdatePackedConvCache k");
+        KimiK3AssertBFloat16(v, "KimiK3UpdatePackedConvCache v");
+        KimiK3AssertBFloat16(cache, "KimiK3UpdatePackedConvCache cache");
+        AssertInFastLLM(
+            q.dims.size() == 3 && q.dims == k.dims && q.dims == v.dims &&
+            history > 0 && tokens > 0 && tokens <= q.dims[1],
+            "KimiK3UpdatePackedConvCache input shape mismatch.");
+        const int batch = q.dims[0];
+        const int sequence = q.dims[1];
+        const int channels = q.dims[2];
+        const bool legacyLayout =
+            batch == 1 && cache.dims ==
+                std::vector<int>({3, history, channels});
+        const bool batchedLayout =
+            cache.dims ==
+                std::vector<int>({3, batch, history, channels});
+        AssertInFastLLM(
+            legacyLayout || batchedLayout,
+            "KimiK3UpdatePackedConvCache cache shape mismatch.");
+        AssertInFastLLM(cache.cpuData != nullptr,
+                        "KimiK3UpdatePackedConvCache cache is uninitialized.");
+
+        const uint16_t *sources[3] = {
+            (const uint16_t*)q.cpuData,
+            (const uint16_t*)k.cpuData,
+            (const uint16_t*)v.cpuData,
+        };
+        uint16_t *cacheData = (uint16_t*)cache.cpuData;
+        KimiK3ParallelFor(3 * batch * channels,
+                          [&](int start, int end) {
+            for (int item = start; item < end; item++) {
+                const int stream = item / (batch * channels);
+                const int withinStream = item % (batch * channels);
+                const int batchIndex = withinStream / channels;
+                const int channel = withinStream % channels;
+                const uint16_t *source = sources[stream];
+                const uint64_t cacheBase =
+                    ((uint64_t)stream * batch + batchIndex) *
+                    history * channels;
+                for (int slot = 0; slot < history; slot++) {
+                    const int combined = tokens + slot;
+                    uint16_t value;
+                    if (combined < history) {
+                        value = cacheData[
+                            cacheBase + (uint64_t)combined * channels +
+                            channel];
+                    } else {
+                        const int inputToken = combined - history;
+                        value = source[
+                            ((uint64_t)batchIndex * sequence + inputToken) *
+                            channels + channel];
+                    }
+                    cacheData[
+                        cacheBase + (uint64_t)slot * channels + channel] =
+                        value;
+                }
+            }
+        });
+    }
+
     bool CpuKimiK3L2NormOp::CanRun(
             const std::string &, const DataDict &datas,
             const FloatDict &, const IntDict &) {
@@ -364,7 +447,7 @@ namespace fastllm {
 
     void CpuKimiK3RecurrentKDAOp::Run(
             const std::string &, const DataDict &datas,
-            const FloatDict &floatParams, const IntDict &) {
+            const FloatDict &floatParams, const IntDict &intParams) {
         Data &q = *datas.find("q")->second;
         Data &k = *datas.find("k")->second;
         Data &v = *datas.find("v")->second;
@@ -393,6 +476,18 @@ namespace fastllm {
         int sequence = q.dims[1];
         int heads = q.dims[2];
         int dimension = q.dims[3];
+        const bool stateOnly =
+            intParams.find("stateOnly") != intParams.end() &&
+            intParams.find("stateOnly")->second != 0;
+        const int requestedTokens =
+            intParams.find("tokenLimit") == intParams.end() ? -1 :
+            intParams.find("tokenLimit")->second;
+        const int tokenCount = requestedTokens < 0 ?
+            sequence : requestedTokens;
+        AssertInFastLLM(
+            tokenCount > 0 && tokenCount <= sequence &&
+            (stateOnly || tokenCount == sequence),
+            "KimiK3RecurrentKDA token limit is invalid.");
         AssertInFastLLM(rawBeta.dims == std::vector<int>({batch, sequence, heads}),
                         "KimiK3RecurrentKDA beta shape mismatch.");
         bool aLogPerHead = aLog.Count(0) == (uint64_t)heads;
@@ -401,16 +496,17 @@ namespace fastllm {
                         "KimiK3RecurrentKDA A_log must have num_heads or head_dim values.");
         AssertInFastLLM(dtBias.Count(0) == (uint64_t)heads * dimension,
                         "KimiK3RecurrentKDA dt_bias shape mismatch.");
-
         bool initializeState = state.cpuData == nullptr;
         state.Allocate(false);
         if (initializeState) {
             std::fill((float*)state.cpuData,
                       (float*)state.cpuData + state.Count(0), 0.0f);
         }
-        output.Allocate(false);
-        decay.Allocate(false);
-        activatedBeta.Allocate(false);
+        if (!stateOnly) {
+            output.Allocate(false);
+            decay.Allocate(false);
+            activatedBeta.Allocate(false);
+        }
 
         const uint16_t *qData = (const uint16_t*)q.cpuData;
         const uint16_t *kData = (const uint16_t*)k.cpuData;
@@ -420,9 +516,11 @@ namespace fastllm {
         const float *aLogData = (const float*)aLog.cpuData;
         const float *dtBiasData = (const float*)dtBias.cpuData;
         float *stateData = (float*)state.cpuData;
-        uint16_t *outputData = (uint16_t*)output.cpuData;
-        float *decayData = (float*)decay.cpuData;
-        float *activatedBetaData = (float*)activatedBeta.cpuData;
+        uint16_t *outputData = stateOnly ? nullptr :
+            (uint16_t*)output.cpuData;
+        float *decayData = stateOnly ? nullptr : (float*)decay.cpuData;
+        float *activatedBetaData = stateOnly ? nullptr :
+            (float*)activatedBeta.cpuData;
         float outputScale = 1.0f / std::sqrt((float)dimension);
 
         KimiK3ParallelFor(batch * heads, [&](int start, int end) {
@@ -434,23 +532,31 @@ namespace fastllm {
                 int head = item % heads;
                 float *headState = stateData +
                     ((uint64_t)batchIndex * heads + head) * dimension * dimension;
-                for (int token = 0; token < sequence; token++) {
+                for (int token = 0; token < tokenCount; token++) {
                     uint64_t vectorBase =
                         (((uint64_t)batchIndex * sequence + token) * heads + head) *
                         dimension;
                     uint64_t betaIndex =
                         ((uint64_t)batchIndex * sequence + token) * heads + head;
                     float beta = KimiK3Sigmoid(betaData[betaIndex]);
-                    activatedBetaData[betaIndex] = beta;
+                    if (!stateOnly) {
+                        activatedBetaData[betaIndex] = beta;
+                    }
                     for (int channel = 0; channel < dimension; channel++) {
                         key[channel] = BFloat16BitsToFloat32(kData[vectorBase + channel]);
-                        query[channel] = BFloat16BitsToFloat32(qData[vectorBase + channel]);
+                        if (!stateOnly) {
+                            query[channel] =
+                                BFloat16BitsToFloat32(
+                                    qData[vectorBase + channel]);
+                        }
                         float raw = BFloat16BitsToFloat32(gateData[vectorBase + channel]);
                         float a = aLogPerHead ? aLogData[head] : aLogData[channel];
                         float gate = lowerBound * KimiK3Sigmoid(
                             std::exp(a) *
                             (raw + dtBiasData[(uint64_t)head * dimension + channel]));
-                        decayData[vectorBase + channel] = gate;
+                        if (!stateOnly) {
+                            decayData[vectorBase + channel] = gate;
+                        }
                         float retention = std::exp(gate);
                         float *stateRow = headState + (uint64_t)channel * dimension;
                         for (int value = 0; value < dimension; value++) {
@@ -473,14 +579,19 @@ namespace fastllm {
                             stateRow[value] += key[channel] * delta[value];
                         }
                     }
-                    for (int value = 0; value < dimension; value++) {
-                        float result = 0.0f;
-                        for (int channel = 0; channel < dimension; channel++) {
-                            result += query[channel] *
-                                headState[(uint64_t)channel * dimension + value];
+                    if (!stateOnly) {
+                        for (int value = 0; value < dimension; value++) {
+                            float result = 0.0f;
+                            for (int channel = 0; channel < dimension;
+                                 channel++) {
+                                result += query[channel] *
+                                    headState[(uint64_t)channel * dimension +
+                                              value];
+                            }
+                            outputData[vectorBase + value] =
+                                Float32ToBFloat16RNEBits(
+                                    result * outputScale);
                         }
-                        outputData[vectorBase + value] =
-                            Float32ToBFloat16RNEBits(result * outputScale);
                     }
                 }
             }
