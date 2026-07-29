@@ -460,6 +460,7 @@ namespace {
         int in = 0;
         int out = 0;
         int groups = 0;
+        int seed = 0;
         std::vector<float> inputValues;
         std::vector<uint8_t> packedWeights;
         std::vector<uint16_t> bf16Scales;
@@ -470,6 +471,7 @@ namespace {
             batch = params.GetInt("batch");
             in = params.GetInt("in");
             out = params.GetInt("out");
+            seed = params.Has("seed") ? params.GetInt("seed") : 0;
             if (batch <= 0 || in <= 0 || out <= 0 ||
                 in % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0 ||
                 out % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0) {
@@ -492,14 +494,16 @@ namespace {
             for (int row = 0; row < out; ++row) {
                 for (int group = 0; group < groups; ++group) {
                     float scale =
-                        0.001f * float(1 + ((row * 7 + group * 3) % 19));
+                        0.001f * float(
+                            1 + ((row * 7 + group * 3 + seed * 5) % 19));
                     size_t index = (size_t)row * groups + group;
                     bf16Scales[index] = FloatToBFloat16(scale);
                     sourceScales[index] =
                         BFloat16ToFloat(bf16Scales[index]);
                 }
                 for (int col = 0; col < in; ++col) {
-                    int signedValue = ((row * 11 + col * 5 + 3) % 16) - 8;
+                    int signedValue =
+                        ((row * 11 + col * 5 + seed * 7 + 3) % 16) - 8;
                     uint8_t nibble = uint8_t(signedValue + 8);
                     size_t index = (size_t)row * (in / 2) + col / 2;
                     if ((col & 1) == 0) {
@@ -517,6 +521,78 @@ namespace {
             for (int i = 0; i < out; ++i) {
                 biasValues[i] = float((i % 17) - 8) * 0.001f;
             }
+        }
+
+        std::vector<float> ReferenceValues(
+                const std::vector<float> &values, int tokens,
+                bool addBias = false) const {
+            if (values.size() != (size_t)tokens * in) {
+                throw std::runtime_error("invalid W4A8 reference input size");
+            }
+            std::vector<float> quantizedInput(values.size());
+            for (int token = 0; token < tokens; ++token) {
+                size_t offset = (size_t)token * in;
+                float absoluteMax = 0.0f;
+                for (int col = 0; col < in; ++col) {
+                    absoluteMax = std::max(
+                        absoluteMax, std::fabs(values[offset + col]));
+                }
+                float tokenScale = std::max(
+                    absoluteMax / W4A8Fp8Max, W4A8Fp8MinScale);
+                for (int col = 0; col < in; ++col) {
+                    float value = values[offset + col] / tokenScale;
+                    value = std::max(-448.0f, std::min(448.0f, value));
+                    quantizedInput[offset + col] =
+                        RoundFp8E4M3(value) * tokenScale;
+                }
+            }
+
+            std::vector<float> decodedScales(sourceScales.size());
+            for (int row = 0; row < out; ++row) {
+                size_t offset = (size_t)row * groups;
+                float absoluteMax = 0.0f;
+                for (int group = 0; group < groups; ++group) {
+                    absoluteMax = std::max(
+                        absoluteMax,
+                        std::fabs(sourceScales[offset + group]));
+                }
+                float channelScale =
+                    std::max(absoluteMax, 1.0e-10f) / 56.0f;
+                for (int group = 0; group < groups; ++group) {
+                    decodedScales[offset + group] =
+                        RoundFp8E4M3(
+                            sourceScales[offset + group] / channelScale) *
+                        channelScale;
+                }
+            }
+
+            std::vector<float> result((size_t)tokens * out);
+            for (int token = 0; token < tokens; ++token) {
+                for (int row = 0; row < out; ++row) {
+                    float value = 0.0f;
+                    for (int col = 0; col < in; ++col) {
+                        uint8_t packed =
+                            packedWeights[(size_t)row * (in / 2) + col / 2];
+                        int q =
+                            int((packed >> ((col & 1) * 4)) & 0xfU) - 8;
+                        value +=
+                            quantizedInput[(size_t)token * in + col] *
+                            float(q) *
+                            decodedScales[(size_t)row * groups +
+                                          col /
+                                              fastllm::COMPRESSED_W4A8_GROUP_SIZE];
+                    }
+                    value = BFloat16ToFloat(
+                        FloatToBFloat16RoundToNearest(value));
+                    if (addBias) {
+                        value = BFloat16ToFloat(
+                            FloatToBFloat16RoundToNearest(
+                                value + biasValues[row]));
+                    }
+                    result[(size_t)token * out + row] = value;
+                }
+            }
+            return result;
         }
 
         fastllm::Data CpuReference() const {
@@ -618,6 +694,196 @@ namespace {
             output.ToDevice(fastllm::DataDevice::CUDA, false);
         }
     };
+
+    struct MergeMoeW4A8Fixture {
+        int batch = 0;
+        int hidden = 0;
+        int inter = 0;
+        int experts = 0;
+        int topk = 0;
+        std::vector<float> inputValues;
+        std::vector<int> routeRows;
+        std::vector<float> routeScales;
+        std::vector<int> routePositions;
+        std::vector<int> expertStarts;
+        std::vector<int> expertCounts;
+        std::vector<std::shared_ptr<LinearW4A8Fixture>> gateFixtures;
+        std::vector<std::shared_ptr<LinearW4A8Fixture>> downFixtures;
+
+        explicit MergeMoeW4A8Fixture(const OpTestParams &params) {
+            batch = params.GetInt("batch");
+            hidden = params.GetInt("hidden");
+            inter = params.GetInt("inter");
+            experts = params.GetInt("experts");
+            topk = params.GetInt("topk");
+            if (batch <= 0 || hidden <= 0 || inter <= 0 || experts <= 0 ||
+                topk <= 0 || topk > experts ||
+                hidden % 256 != 0 || inter % 256 != 0) {
+                throw std::runtime_error(
+                    "mergemoe_w4a8 requires positive batch/experts, "
+                    "topk <= experts and 256-aligned hidden/inter");
+            }
+
+            inputValues.resize((size_t)batch * hidden);
+            for (size_t i = 0; i < inputValues.size(); ++i) {
+                float value =
+                    0.35f * std::sin(float(i + 1) * 0.017f) +
+                    0.15f * std::cos(float(i + 5) * 0.011f);
+                inputValues[i] =
+                    BFloat16ToFloat(FloatToBFloat16RoundToNearest(value));
+            }
+
+            std::vector<int> routeExperts((size_t)batch * topk);
+            std::vector<float> originalScales((size_t)batch * topk);
+            expertCounts.assign(experts, 0);
+            for (int token = 0; token < batch; ++token) {
+                float denominator = float(topk * (topk + 1)) * 0.5f;
+                for (int slot = 0; slot < topk; ++slot) {
+                    int route = token * topk + slot;
+                    int expert = (token * 3 + slot) % experts;
+                    routeExperts[route] = expert;
+                    originalScales[route] = float(topk - slot) / denominator;
+                    expertCounts[expert]++;
+                }
+            }
+            expertStarts.resize(experts);
+            int totalTasks = 0;
+            for (int expert = 0; expert < experts; ++expert) {
+                expertStarts[expert] = totalTasks;
+                totalTasks += expertCounts[expert];
+            }
+            std::vector<int> offsets = expertStarts;
+            routeRows.resize(totalTasks);
+            routeScales.resize(totalTasks);
+            routePositions.resize(totalTasks);
+            for (int token = 0; token < batch; ++token) {
+                for (int slot = 0; slot < topk; ++slot) {
+                    int route = token * topk + slot;
+                    int position = offsets[routeExperts[route]]++;
+                    routeRows[position] = token;
+                    routeScales[position] = originalScales[route];
+                    routePositions[route] = position;
+                }
+            }
+
+            for (int expert = 0; expert < experts; ++expert) {
+                OpTestParams gateParams;
+                gateParams.Override("batch", std::to_string(batch * topk));
+                gateParams.Override("in", std::to_string(hidden));
+                gateParams.Override("out", std::to_string(inter * 2));
+                gateParams.Override("seed", std::to_string(expert * 2 + 1));
+                gateFixtures.push_back(
+                    std::make_shared<LinearW4A8Fixture>(gateParams));
+
+                OpTestParams downParams;
+                downParams.Override("batch", std::to_string(batch * topk));
+                downParams.Override("in", std::to_string(inter));
+                downParams.Override("out", std::to_string(hidden));
+                downParams.Override("seed", std::to_string(expert * 2 + 2));
+                downFixtures.push_back(
+                    std::make_shared<LinearW4A8Fixture>(downParams));
+            }
+        }
+
+        fastllm::Data CpuReference() const {
+            std::vector<float> result((size_t)batch * hidden, 0.0f);
+            for (int expert = 0; expert < experts; ++expert) {
+                int count = expertCounts[expert];
+                if (count == 0) {
+                    continue;
+                }
+                std::vector<float> expertInput((size_t)count * hidden);
+                for (int local = 0; local < count; ++local) {
+                    int route = expertStarts[expert] + local;
+                    int token = routeRows[route];
+                    std::copy_n(
+                        inputValues.data() + (size_t)token * hidden, hidden,
+                        expertInput.data() + (size_t)local * hidden);
+                }
+                std::vector<float> gate =
+                    gateFixtures[expert]->ReferenceValues(
+                        expertInput, count, false);
+                std::vector<float> activated((size_t)count * inter);
+                for (int row = 0; row < count; ++row) {
+                    for (int col = 0; col < inter; ++col) {
+                        float x = gate[(size_t)row * inter * 2 + col];
+                        float y =
+                            gate[(size_t)row * inter * 2 + inter + col];
+                        activated[(size_t)row * inter + col] =
+                            BFloat16ToFloat(FloatToBFloat16RoundToNearest(
+                                (x / (1.0f + std::exp(-x))) * y));
+                    }
+                }
+                std::vector<float> down =
+                    downFixtures[expert]->ReferenceValues(
+                        activated, count, false);
+                for (int local = 0; local < count; ++local) {
+                    int route = expertStarts[expert] + local;
+                    int token = routeRows[route];
+                    float scale = routeScales[route];
+                    for (int col = 0; col < hidden; ++col) {
+                        result[(size_t)token * hidden + col] +=
+                            down[(size_t)local * hidden + col] * scale;
+                    }
+                }
+            }
+            for (float &value : result) {
+                value = BFloat16ToFloat(
+                    FloatToBFloat16RoundToNearest(value));
+            }
+            return fastllm::Data(
+                fastllm::DataType::FLOAT32, {batch, hidden}, result);
+        }
+    };
+
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+    struct MergeMoeW4A8BenchmarkState {
+        std::shared_ptr<MergeMoeW4A8Fixture> fixture;
+        fastllm::Data input, w1, w2, output;
+        std::vector<std::shared_ptr<fastllm::Data>> ownedWeights;
+        std::vector<fastllm::Data*> weights;
+
+        explicit MergeMoeW4A8BenchmarkState(
+                std::shared_ptr<MergeMoeW4A8Fixture> fixture)
+            : fixture(std::move(fixture)) {
+            fastllm::Data inputSource(
+                fastllm::DataType::BFLOAT16,
+                {this->fixture->batch, this->fixture->hidden},
+                this->fixture->inputValues);
+            input.CopyFrom(inputSource);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+
+            weights.assign((size_t)(this->fixture->experts + 1) * 2, nullptr);
+            for (int expert = 0; expert < this->fixture->experts; ++expert) {
+                auto gateWeight = std::make_shared<fastllm::Data>();
+                auto downWeight = std::make_shared<fastllm::Data>();
+                fastllm::Data unusedInput, unusedBias, unusedOutput;
+                this->fixture->gateFixtures[expert]->InitDeviceData(
+                    unusedInput, *gateWeight, unusedBias, unusedOutput);
+                this->fixture->downFixtures[expert]->InitDeviceData(
+                    unusedInput, *downWeight, unusedBias, unusedOutput);
+                weights[(expert + 1) * 2] = gateWeight.get();
+                weights[(expert + 1) * 2 + 1] = downWeight.get();
+                ownedWeights.push_back(std::move(gateWeight));
+                ownedWeights.push_back(std::move(downWeight));
+            }
+        }
+
+        void Run() {
+            if (!FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
+                    input, w1, w2, output, weights.data(),
+                    static_cast<int>(weights.size()),
+                    fixture->routeRows.data(), fixture->routeScales.data(),
+                    fixture->routePositions.data(),
+                    fixture->expertStarts.data(),
+                    fixture->expertCounts.data(), fixture->batch,
+                    fixture->topk, fixture->batch * fixture->topk,
+                    fixture->hidden, fixture->inter)) {
+                throw std::runtime_error("W4A8 grouped MoE launch failed");
+            }
+        }
+    };
+#endif
 
     static int CountElements(const std::vector<int> &dims) {
         int count = 1;
@@ -1753,6 +2019,89 @@ namespace {
             },
             [](const OpTestParams&) {
                 return 0.0;
+            }
+        };
+    }
+
+    static OpCase MakeMergeMoeW4A8Case() {
+        return {
+            "mergemoe_w4a8",
+            "CUTLASS grouped W4A8 MoE with routed SwiGLU experts",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "16", "token batch size");
+                params.Add("hidden", "256", "model hidden size");
+                params.Add("inter", "256", "expert intermediate size");
+                params.Add("experts", "4", "number of routed experts");
+                params.Add("topk", "2", "experts selected per token");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                MergeMoeW4A8Fixture fixture(params);
+                (void)fixture;
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                if (device.rfind("cuda:", 0) != 0) {
+                    return false;
+                }
+                ScopedFirstDevice guard(device);
+                return FastllmCudaRuntimeArch() == 90;
+#else
+                (void)device;
+                return false;
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                auto fixture =
+                    std::make_shared<MergeMoeW4A8Fixture>(params);
+                if (device == "cpu") {
+                    return fixture->CpuReference();
+                }
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                ScopedFirstDevice guard(device);
+                MergeMoeW4A8BenchmarkState state(fixture);
+                state.Run();
+                return ConvertToFloat32Data(state.output);
+#else
+                throw std::runtime_error(
+                    "mergemoe_w4a8 requires CUDA SM90 CUTLASS build");
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device)
+                -> std::function<void()> {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                ScopedFirstDevice guard(device);
+                auto fixture =
+                    std::make_shared<MergeMoeW4A8Fixture>(params);
+                auto state =
+                    std::make_shared<MergeMoeW4A8BenchmarkState>(fixture);
+                return [device, state]() {
+                    ScopedFirstDevice runGuard(device);
+                    state->Run();
+                };
+#else
+                (void)params;
+                (void)device;
+                throw std::runtime_error(
+                    "mergemoe_w4a8 requires CUDA SM90 CUTLASS build");
+#endif
+            },
+            [](const OpTestParams &params) {
+                double batch = params.GetInt("batch");
+                double hidden = params.GetInt("hidden");
+                double inter = params.GetInt("inter");
+                double experts = params.GetInt("experts");
+                double topk = params.GetInt("topk");
+                return batch * hidden * 2.0 +
+                       experts * (2.0 * inter * hidden +
+                                  hidden * inter) * 0.5 +
+                       batch * topk * (2.0 * inter + hidden) * 2.0;
+            },
+            [](const OpTestParams &params) {
+                double batch = params.GetInt("batch");
+                double hidden = params.GetInt("hidden");
+                double inter = params.GetInt("inter");
+                double topk = params.GetInt("topk");
+                return batch * topk * 6.0 * hidden * inter;
             }
         };
     }
@@ -3333,6 +3682,7 @@ namespace {
             MakeRmsNormCase(),
             MakeW4A8ActivationQuantCase(),
             MakeLinearCase(),
+            MakeMergeMoeW4A8Case(),
             MakeSiluCase(),
             MakeSoftmaxCase(),
             MakeGeluNewCase(),
