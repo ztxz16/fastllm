@@ -44,6 +44,8 @@ namespace fastllm {
         LastTokensUnit tokens;
         ResponseContextError error = ResponseContextErrorNone;
         std::string toolCallConstraintGeneratedText;
+        std::vector<int> pendingStopTokens;
+        std::string pendingStopText;
 
         int preTokens = 0;
         int curTokens = 0;

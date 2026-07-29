@@ -532,6 +532,10 @@ if (UNIT_TEST)
     if (USE_CUDA AND NOT USE_ROCM)
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
+
+    add_executable(testApiServerSocket
+        test/apiserver/socketWriteTest.cpp
+        third_party/json11/json11.cpp)
 endif()
 
 add_executable(webui example/webui/webui.cpp)

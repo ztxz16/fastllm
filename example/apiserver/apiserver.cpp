@@ -120,6 +120,9 @@ using socket_t = int;
 #include <sys/stat.h>
 #include <thread>
 #include "model.h"
+#include "socket_writer.h"
+#include "stop_parser.h"
+#include "utils/stop_string_matcher.h"
 
 long long _GetCurrentTime() {
     auto now = std::chrono::high_resolution_clock::now();
@@ -445,6 +448,40 @@ struct WorkQueue {
                 config.top_k = node->config["top_k"].number_value();
             }
 
+            auto exactTokenLookup = [&](const std::string &stop,
+                                        int &tokenId) {
+                auto &tokenizer = model->weight.tokenizer;
+                auto it = tokenizer.stringToTokenDict.find(stop);
+                if (it == tokenizer.stringToTokenDict.end()) {
+                    return false;
+                }
+                tokenId = it->second;
+                return true;
+            };
+            auto fallbackEncode = [&](const std::string &stop) {
+                fastllm::Data stopTokens = model->weight.tokenizer.Encode(stop);
+                std::vector<int> tokenIds;
+                tokenIds.reserve(stopTokens.Count(0));
+                for (int i = 0; i < stopTokens.Count(0); i++) {
+                    tokenIds.push_back(
+                        static_cast<int>(((float *)stopTokens.cpuData)[i]));
+                }
+                return tokenIds;
+            };
+            auto encodeStop = [&](const std::string &stop) {
+                return EncodeOpenAIStop(stop, exactTokenLookup,
+                                        fallbackEncode);
+            };
+            if (!ParseOpenAIStop(node->config["stop"], encodeStop,
+                                 config.stop_token_ids,
+                                 config.stop_token_sequences,
+                                 config.stop_strings, node->error)) {
+                message += node->error + "\n";
+                WriteAllToSocket(node->client, message);
+                close(node->client);
+                return;
+            }
+
             std::string output = "";
             int handleId = model->LaunchResponseTokens(tokens, config);
             bool isStream = false;
@@ -458,12 +495,21 @@ struct WorkQueue {
             if (isStream) {
                 message = "";
                 message += "HTTP/1.1 200 OK\r\n";
-                message += "Content-Type:application/json\r\n";
+                message += "Content-Type:text/event-stream\r\n";
+                message += "Cache-Control:no-cache\r\n";
                 message += "server:fastllm api server\r\n";
                 message += "Transfer-Encoding: chunked\r\n";
                 message += "\r\n";
-                int ret = write(node->client, message.c_str(), message.length()); //返回初始信息
-            
+
+                auto abortDisconnectedStream = [&]() {
+                    model->AbortResponse(handleId);
+                    close(node->client);
+                };
+                if (!WriteAllToSocket(node->client, message)) {
+                    abortDisconnectedStream();
+                    return;
+                }
+
                 json11::Json startResult = json11::Json::object {
                     {"id", curId},
                     {"object", "chat.completion.chunk"},
@@ -481,19 +527,44 @@ struct WorkQueue {
                         }
                     }}
                 };
-                std::string cur = ("data: " + startResult.dump() + "\r\n");
-
-                char chunk_header[50];
-                sprintf(chunk_header, "%zx\r\n", cur.size());
-                ret = write(node->client, chunk_header, strlen(chunk_header));
-                ret = write(node->client, cur.data(), cur.size());
-                ret = write(node->client, "\r\n", 2);
+                if (!WriteHttpChunk(node->client,
+                                    FormatSseData(startResult.dump()))) {
+                    abortDisconnectedStream();
+                    return;
+                }
 
                 int outputTokens = 0;
                 std::vector<float> results;
+                std::string pendingStopText;
                 while (true) {
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
+                        std::string trailingText;
+                        FlushPendingStopText(pendingStopText, trailingText);
+                        if (!trailingText.empty()) {
+                            json11::Json trailingResult = json11::Json::object {
+                                {"id", curId},
+                                {"object", "chat.completion.chunk"},
+                                {"created", createTime},
+                                {"model", ::config.modelName},
+                                {"choices", json11::Json::array {
+                                    json11::Json::object {
+                                        {"index", 0},
+                                        {"delta", json11::Json::object {
+                                            {"content", trailingText}
+                                        }},
+                                        {"logprobs", nullptr},
+                                        {"finish_reason", nullptr},
+                                        {"stop_reason", nullptr}
+                                    }
+                                }}
+                            };
+                            if (!WriteHttpChunk(node->client,
+                                    FormatSseData(trailingResult.dump()))) {
+                                close(node->client);
+                                return;
+                            }
+                        }
                         json11::Json partResult = json11::Json::object {
                             {"id", curId},
                             {"object", "chat.completion.chunk"},
@@ -506,7 +577,7 @@ struct WorkQueue {
                                         {"content", ""}
                                     }},
                                     {"logprobs", nullptr},
-                                    {"finish_reason", nullptr},
+                                    {"finish_reason", "stop"},
                                     {"stop_reason", nullptr}
                                 }
                             }},
@@ -516,55 +587,67 @@ struct WorkQueue {
                                 {"completion_tokens", outputTokens}
                             }}
                         };
-
-                        std::string cur = ("data: " + partResult.dump() + "\r\n");
-                        sprintf(chunk_header, "%zx\r\n", cur.size());
-                        ret = write(node->client, chunk_header, strlen(chunk_header));
-                        ret = write(node->client, cur.data(), cur.size());
-                        ret = write(node->client, "\r\n", 2);
+                        if (!WriteHttpChunk(node->client,
+                                            FormatSseData(partResult.dump()))) {
+                            close(node->client);
+                            return;
+                        }
                         break;
-                    } else {
-                        outputTokens++;
-                        results.clear();
-                        results.push_back(result);
-                        std::string now = model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
-                        json11::Json partResult = json11::Json::object {
-                            {"id", curId},
-                            {"object", "chat.completion.chunk"},
-                            {"created", createTime},
-                            {"model", ::config.modelName},
-                            {"choices", json11::Json::array {
-                                json11::Json::object {
-                                    {"index", 0},
-                                    {"delta", json11::Json::object {
-                                        {"content", now}
-                                    }},
-                                    {"logprobs", nullptr},
-                                    {"finish_reason", nullptr},
-                                    {"stop_reason", nullptr}
-                                }
-                            }}
-                        };
+                    }
 
-                        std::string cur = ("data: " + partResult.dump() + "\r\n");
-                        sprintf(chunk_header, "%zx\r\n", cur.size());
-                        ret = write(node->client, chunk_header, strlen(chunk_header));
-                        ret = write(node->client, cur.data(), cur.size());
-                        ret = write(node->client, "\r\n", 2);
+                    outputTokens++;
+                    results.clear();
+                    results.push_back(result);
+                    std::string now = model->weight.tokenizer.Decode(
+                        fastllm::Data(fastllm::DataType::FLOAT32,
+                                      {(int)results.size()}, results));
+                    std::string filtered;
+                    bool matchedStop = PushStopText(
+                        config.stop_strings, pendingStopText, now, filtered);
+                    now = filtered;
+                    if (matchedStop) {
+                        model->AbortResponse(handleId);
+                    }
+                    if (now.empty()) {
+                        if (matchedStop) {
+                            continue;
+                        }
+                        continue;
+                    }
+                    json11::Json partResult = json11::Json::object {
+                        {"id", curId},
+                        {"object", "chat.completion.chunk"},
+                        {"created", createTime},
+                        {"model", ::config.modelName},
+                        {"choices", json11::Json::array {
+                            json11::Json::object {
+                                {"index", 0},
+                                {"delta", json11::Json::object {
+                                    {"content", now}
+                                }},
+                                {"logprobs", nullptr},
+                                {"finish_reason", nullptr},
+                                {"stop_reason", nullptr}
+                            }
+                        }}
+                    };
+                    if (!WriteHttpChunk(node->client,
+                                        FormatSseData(partResult.dump()))) {
+                        abortDisconnectedStream();
+                        return;
                     }
                 }
 
-                cur = ("data: [DONE]");
-                sprintf(chunk_header, "%zx\r\n", cur.size());
-                ret = write(node->client, chunk_header, strlen(chunk_header));
-                ret = write(node->client, cur.data(), cur.size());
-                ret = write(node->client, "\r\n", 2);
-
-                ret = write(node->client, "0\r\n\r\n", 5);
+                if (!WriteHttpChunk(node->client, FormatSseData("[DONE]"))
+                        || !WriteAllToSocket(node->client, "0\r\n\r\n", 5)) {
+                    close(node->client);
+                    return;
+                }
                 close(node->client);
             } else {
                 int outputTokens = 0;
                 std::vector<float> results;
+                std::string pendingStopText;
                 while (true) {
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
@@ -572,10 +655,22 @@ struct WorkQueue {
                     } else {
                         results.clear();
                         results.push_back(result);
-                        output += model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
+                        std::string now = model->weight.tokenizer.Decode(
+                            fastllm::Data(fastllm::DataType::FLOAT32,
+                                          {(int)results.size()}, results));
+                        std::string filtered;
+                        bool matchedStop = PushStopText(
+                            config.stop_strings, pendingStopText, now, filtered);
+                        output += filtered;
                         outputTokens++;
+                        if (matchedStop) {
+                            model->AbortResponse(handleId);
+                        }
                     }
                 }
+                std::string trailingText;
+                FlushPendingStopText(pendingStopText, trailingText);
+                output += trailingText;
 
                 json11::Json result = json11::Json::object {
                     {"id", curId},

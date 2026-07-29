@@ -450,6 +450,8 @@ namespace fastllm {
         }
         intParams.clear();
         toolCallConstraintGeneratedText.clear();
+        pendingStopTokens.clear();
+        pendingStopText.clear();
         currentTokens.clear();
         allTokens.clear();
         while (resultTokenQueue.size() > 0){

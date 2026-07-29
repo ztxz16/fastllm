@@ -8,6 +8,8 @@
 #include "blocks/baseblock.h"
 #include "executor.h"
 #include "gguf.h"
+#include "utils/stop_token_matcher.h"
+#include "utils/stop_string_matcher.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15357,8 +15359,16 @@ namespace fastllm {
                             acceptedTokenLists[i] : emptyAcceptedTokens;
                     for (int tokenIndex = 0; tokenIndex < (int)curAcceptedTokens.size(); tokenIndex++) {
                         int curRet = curAcceptedTokens[tokenIndex];
+                        auto flushPendingStopTokens = [&]() {
+                            FlushPendingStopTokensTo(
+                                ctx->pendingStopTokens,
+                                [&](int token) {
+                                    ctx->resultTokenQueue.push(token);
+                                });
+                        };
                         if (curRet == model->eos_token_id ||
                             model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
+                            flushPendingStopTokens();
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             eraseMtpCache(ctx);
@@ -15366,26 +15376,59 @@ namespace fastllm {
                         }
                         auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
                         if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                            flushPendingStopTokens();
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             eraseMtpCache(ctx);
                             break;
                         }
+                        std::string decodedToken =
+                            model->weight.tokenizer.DecodeTokens({curRet});
+                        std::string safeStopText;
+                        bool matchedStopText = PushStopText(
+                            ctx->generationConfig.stop_strings,
+                            ctx->pendingStopText, decodedToken,
+                            safeStopText);
 
-                        ctx->resultTokenQueue.push(curRet);
-                        if (tokenIndex == 0) {
-                            queueGeneratedResultLogits(ctx, logits, i);
+                        std::vector<int> readyTokens;
+                        int matchedStopLength = PushStopToken(
+                            ctx->generationConfig.stop_token_sequences,
+                            ctx->pendingStopTokens, curRet, readyTokens);
+                        for (int readyIndex = 0;
+                             readyIndex < (int)readyTokens.size();
+                             readyIndex++) {
+                            int readyToken = readyTokens[readyIndex];
+                            ctx->resultTokenQueue.push(readyToken);
+                            if (tokenIndex == 0 && readyIndex == 0) {
+                                queueGeneratedResultLogits(ctx, logits, i);
+                            }
                         }
+
                         ctx->allTokens.push_back(curRet);
                         if (Qwen35NeedRepeatPenalty(ctx->generationConfig)) {
                             ctx->tokens.Push(curRet);
                         }
                         ctx->curTokens++;
-                        if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
+
+                        if (matchedStopText || matchedStopLength > 0) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache(model);
+                            eraseMtpCache(ctx);
+                        } else if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
+                            FlushPendingStopTokens(ctx->pendingStopTokens,
+                                                   readyTokens);
+                            for (int readyToken : readyTokens) {
+                                ctx->resultTokenQueue.push(readyToken);
+                            }
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             eraseMtpCache(ctx);
                         } else if (ctx->allTokens.size() >= model->max_positions) {
+                            FlushPendingStopTokens(ctx->pendingStopTokens,
+                                                   readyTokens);
+                            for (int readyToken : readyTokens) {
+                                ctx->resultTokenQueue.push(readyToken);
+                            }
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             eraseMtpCache(ctx);
