@@ -3932,11 +3932,6 @@ namespace {
             return ran;
         }
 
-        fastllm::Data commonBaseline;
-        if (!opCase.runReference) {
-            commonBaseline = opCase.run(params, "cpu");
-            commonBaseline.ToDevice(fastllm::DataDevice::CPU);
-        }
         bool ok = true;
 
         for (const auto &device : devices) {
@@ -3950,7 +3945,7 @@ namespace {
 
             fastllm::Data baseline = opCase.runReference
                 ? opCase.runReference(params, device)
-                : fastllm::Data(commonBaseline);
+                : opCase.run(params, "cpu");
             baseline.ToDevice(fastllm::DataDevice::CPU);
             fastllm::Data output = opCase.run(params, device);
             output.ToDevice(fastllm::DataDevice::CPU);
