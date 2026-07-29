@@ -23,6 +23,7 @@ option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 option(BUILD_CLI "build cli" OFF)
 
 option(UNIT_TEST "build unit tests" OFF)
+option(ENABLE_CUDA_TESTS "build standalone CUDA kernel tests" OFF)
 
 if(NOT DEFINED CUDA_ARCH)
     if(DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -565,6 +566,13 @@ if (UNIT_TEST)
     if (USE_CUDA AND NOT USE_ROCM)
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
+endif()
+
+if (ENABLE_CUDA_TESTS)
+    if (NOT USE_CUDA)
+        message(FATAL_ERROR "ENABLE_CUDA_TESTS requires USE_CUDA=ON")
+    endif()
+    add_subdirectory(test/cuda)
 endif()
 
 add_executable(webui example/webui/webui.cpp)
