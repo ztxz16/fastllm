@@ -864,6 +864,268 @@ namespace {
         return values;
     }
 
+    void RunCudaKimiK3PackedConvCacheRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int sequence = 8;
+        constexpr int channels = 17;
+        constexpr int history = 3;
+        for (int batch : {1, 2}) {
+            const std::vector<int> inputDims = {batch, sequence, channels};
+            const std::vector<int> cacheDims = batch == 1 ?
+                std::vector<int>({3, history, channels}) :
+                std::vector<int>({3, batch, history, channels});
+            const int inputItems = batch * sequence * channels;
+            const int cacheItems = 3 * batch * history * channels;
+            const std::vector<float> qValues =
+                MakeRegressionValues(inputItems, 0.19f + batch, 0.7f);
+            const std::vector<float> kValues =
+                MakeRegressionValues(inputItems, 0.53f + batch, 0.6f);
+            const std::vector<float> vValues =
+                MakeRegressionValues(inputItems, 0.97f + batch, 0.5f);
+            const std::vector<float> initialValues =
+                MakeRegressionValues(cacheItems, 1.43f + batch, 0.4f);
+
+            fastllm::Data cpuQ(
+                fastllm::DataType::BFLOAT16, inputDims, qValues);
+            fastllm::Data cpuK(
+                fastllm::DataType::BFLOAT16, inputDims, kValues);
+            fastllm::Data cpuV(
+                fastllm::DataType::BFLOAT16, inputDims, vValues);
+            fastllm::Data initialCache(
+                fastllm::DataType::BFLOAT16, cacheDims, initialValues);
+            const std::vector<std::vector<float>> roundedInputs = {
+                ToFloatVector(cpuQ), ToFloatVector(cpuK),
+                ToFloatVector(cpuV)};
+            const std::vector<float> roundedInitial =
+                ToFloatVector(initialCache);
+            fastllm::Data cudaQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, inputDims, qValues);
+            fastllm::Data cudaK = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, inputDims, kValues);
+            fastllm::Data cudaV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, inputDims, vValues);
+
+            for (int tokens = 1; tokens <= sequence; tokens++) {
+                std::vector<float> expected = roundedInitial;
+                for (int stream = 0; stream < 3; stream++) {
+                    for (int batchIndex = 0; batchIndex < batch;
+                         batchIndex++) {
+                        for (int channel = 0; channel < channels;
+                             channel++) {
+                            const size_t cacheBase =
+                                ((size_t)stream * batch + batchIndex) *
+                                history * channels;
+                            for (int slot = 0; slot < history; slot++) {
+                                const int combined = tokens + slot;
+                                if (combined < history) {
+                                    expected[cacheBase +
+                                             (size_t)slot * channels +
+                                             channel] =
+                                        roundedInitial[
+                                            cacheBase +
+                                            (size_t)combined * channels +
+                                            channel];
+                                } else {
+                                    const int inputToken =
+                                        combined - history;
+                                    expected[cacheBase +
+                                             (size_t)slot * channels +
+                                             channel] =
+                                        roundedInputs[stream][
+                                            ((size_t)batchIndex * sequence +
+                                             inputToken) * channels +
+                                            channel];
+                                }
+                            }
+                        }
+                    }
+                }
+
+                fastllm::Data cpuCache(
+                    fastllm::DataType::BFLOAT16, cacheDims, initialValues);
+                {
+                    ScopedFirstDevice device("cpu");
+                    fastllm::KimiK3UpdatePackedConvCache(
+                        cpuQ, cpuK, cpuV, history, tokens, cpuCache);
+                }
+                fastllm::Data cudaCache = MakeCudaTensor(
+                    fastllm::DataType::BFLOAT16, cacheDims, initialValues);
+                {
+                    ScopedFirstDevice device("cuda:0");
+                    fastllm::KimiK3UpdatePackedConvCache(
+                        cudaQ, cudaK, cudaV, history, tokens, cudaCache);
+                }
+                FastllmCudaSyncCurrentThreadStream();
+                const std::string suffix =
+                    " batch=" + std::to_string(batch) +
+                    " tokens=" + std::to_string(tokens);
+                ExpectFloatNear(expected, ToFloatVector(cpuCache),
+                                0.0f, 0.0f,
+                                "CPU Kimi-K3 packed conv cache" + suffix);
+                ExpectFloatNear(expected, ToFloatVector(cudaCache),
+                                0.0f, 0.0f,
+                                "CUDA Kimi-K3 packed conv cache" + suffix);
+            }
+        }
+        std::cout << "CUDA Kimi-K3 packed conv cache regression: PASS\n";
+    }
+
+    void RunCudaKimiK3RecurrentKdaRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int batch = 1;
+        constexpr int sequence = 8;
+        constexpr int heads = 3;
+        constexpr int dimension = 128;
+        const std::vector<int> vectorDims = {
+            batch, sequence, heads, dimension};
+        const std::vector<int> betaDims = {batch, sequence, heads};
+        const std::vector<int> stateDims = {
+            batch, heads, dimension, dimension};
+
+        const std::vector<float> qValues = MakeRegressionValues(
+            batch * sequence * heads * dimension, 0.13f, 0.035f);
+        const std::vector<float> kValues = MakeRegressionValues(
+            batch * sequence * heads * dimension, 0.41f, 0.03f);
+        const std::vector<float> vValues = MakeRegressionValues(
+            batch * sequence * heads * dimension, 0.79f, 0.2f);
+        const std::vector<float> gateValues = MakeRegressionValues(
+            batch * sequence * heads * dimension, 1.17f, 0.25f);
+        const std::vector<float> rawBetaValues = MakeRegressionValues(
+            batch * sequence * heads, 1.61f, 0.4f);
+        const std::vector<float> aLogValues = {-0.7f, -0.45f, -0.2f};
+        const std::vector<float> dtBiasValues = MakeRegressionValues(
+            heads * dimension, 2.03f, 0.08f);
+        const std::vector<float> initialStateValues = MakeRegressionValues(
+            batch * heads * dimension * dimension, 2.47f, 0.015f);
+
+        fastllm::Data cpuQ(fastllm::DataType::BFLOAT16, vectorDims, qValues);
+        fastllm::Data cpuK(fastllm::DataType::BFLOAT16, vectorDims, kValues);
+        fastllm::Data cpuV(fastllm::DataType::BFLOAT16, vectorDims, vValues);
+        fastllm::Data cpuGate(
+            fastllm::DataType::BFLOAT16, vectorDims, gateValues);
+        fastllm::Data cpuRawBeta(
+            fastllm::DataType::FLOAT32, betaDims, rawBetaValues);
+        fastllm::Data cpuALog(
+            fastllm::DataType::FLOAT32, {heads}, aLogValues);
+        fastllm::Data cpuDtBias(
+            fastllm::DataType::FLOAT32, {heads, dimension}, dtBiasValues);
+        fastllm::Data cpuState(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        fastllm::Data cpuOutput, cpuDecay, cpuBeta;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::KimiK3RecurrentKDA(
+                cpuQ, cpuK, cpuV, cpuGate, cpuRawBeta, cpuALog, cpuDtBias,
+                -5.0f, cpuState, cpuOutput, cpuDecay, cpuBeta);
+        }
+
+        fastllm::Data cudaQ = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, vectorDims, qValues);
+        fastllm::Data cudaK = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, vectorDims, kValues);
+        fastllm::Data cudaV = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, vectorDims, vValues);
+        fastllm::Data cudaGate = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, vectorDims, gateValues);
+        fastllm::Data cudaRawBeta = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, betaDims, rawBetaValues);
+        fastllm::Data cudaALog = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {heads}, aLogValues);
+        fastllm::Data cudaDtBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {heads, dimension}, dtBiasValues);
+        fastllm::Data cudaState = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        fastllm::Data cudaOutput, cudaDecay, cudaBeta;
+        {
+            ScopedFirstDevice device("cuda:0");
+            fastllm::KimiK3RecurrentKDA(
+                cudaQ, cudaK, cudaV, cudaGate, cudaRawBeta, cudaALog,
+                cudaDtBias, -5.0f, cudaState, cudaOutput, cudaDecay,
+                cudaBeta);
+        }
+        FastllmCudaSyncCurrentThreadStream();
+
+        ExpectFloatNear(ToFloatVector(cpuOutput), ToFloatVector(cudaOutput),
+                        1.0f / 128.0f, 0.0f,
+                        "CUDA Kimi-K3 recurrent KDA output");
+        ExpectFloatNear(ToFloatVector(cpuDecay), ToFloatVector(cudaDecay),
+                        2e-6f, 2e-6f,
+                        "CUDA Kimi-K3 recurrent KDA decay");
+        ExpectFloatNear(ToFloatVector(cpuBeta), ToFloatVector(cudaBeta),
+                        2e-6f, 2e-6f,
+                        "CUDA Kimi-K3 recurrent KDA beta");
+        ExpectFloatNear(ToFloatVector(cpuState), ToFloatVector(cudaState),
+                        2e-5f, 2e-5f,
+                        "CUDA Kimi-K3 recurrent KDA state");
+
+        constexpr int replayTokens = 5;
+        const int replayVectorItems = replayTokens * heads * dimension;
+        const int replayBetaItems = replayTokens * heads;
+        const std::vector<int> replayVectorDims = {
+            batch, replayTokens, heads, dimension};
+        const std::vector<int> replayBetaDims = {
+            batch, replayTokens, heads};
+        fastllm::Data replayQ(
+            fastllm::DataType::BFLOAT16, replayVectorDims,
+            std::vector<float>(qValues.begin(),
+                               qValues.begin() + replayVectorItems));
+        fastllm::Data replayK(
+            fastllm::DataType::BFLOAT16, replayVectorDims,
+            std::vector<float>(kValues.begin(),
+                               kValues.begin() + replayVectorItems));
+        fastllm::Data replayV(
+            fastllm::DataType::BFLOAT16, replayVectorDims,
+            std::vector<float>(vValues.begin(),
+                               vValues.begin() + replayVectorItems));
+        fastllm::Data replayGate(
+            fastllm::DataType::BFLOAT16, replayVectorDims,
+            std::vector<float>(gateValues.begin(),
+                               gateValues.begin() + replayVectorItems));
+        fastllm::Data replayRawBeta(
+            fastllm::DataType::FLOAT32, replayBetaDims,
+            std::vector<float>(rawBetaValues.begin(),
+                               rawBetaValues.begin() + replayBetaItems));
+        fastllm::Data referenceReplayState(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        fastllm::Data replayOutput, replayDecay, replayBeta;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::KimiK3RecurrentKDA(
+                replayQ, replayK, replayV, replayGate, replayRawBeta,
+                cpuALog, cpuDtBias, -5.0f, referenceReplayState,
+                replayOutput, replayDecay, replayBeta);
+        }
+
+        fastllm::Data cpuReplayState(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::KimiK3RecurrentKDAUpdateState(
+                cpuK, cpuV, cpuGate, cpuRawBeta,
+                cpuALog, cpuDtBias, -5.0f, replayTokens,
+                cpuReplayState);
+        }
+        ExpectFloatNear(ToFloatVector(referenceReplayState),
+                        ToFloatVector(cpuReplayState), 0.0f, 0.0f,
+                        "CPU Kimi-K3 state-only KDA replay");
+
+        fastllm::Data cudaReplayState = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        {
+            ScopedFirstDevice device("cuda:0");
+            fastllm::KimiK3RecurrentKDAUpdateState(
+                cudaK, cudaV, cudaGate, cudaRawBeta,
+                cudaALog, cudaDtBias, -5.0f, replayTokens,
+                cudaReplayState);
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceReplayState),
+                        ToFloatVector(cudaReplayState), 2e-5f, 2e-5f,
+                        "CUDA Kimi-K3 state-only KDA replay");
+
+        std::cout << "CUDA Kimi-K3 recurrent KDA regression: PASS\n";
+    }
+
     void RunCudaTritonChunkGdnPrefillRegression() {
         bool tritonEnabled = fastllm::GetFastllmEnv().cudaTriton &&
             RegressionEnvFlagDefaultEnabled(
@@ -2805,6 +3067,90 @@ namespace {
     }
 
 #ifdef USE_CUDA
+    void RunCudaGgufMmvqBatch8Regression() {
+        constexpr int inputDim = QK_K;
+        constexpr int outputDim = 64;
+        constexpr int batch = 8;
+
+        std::vector<float> weightValues((size_t)outputDim * inputDim);
+        for (int row = 0; row < outputDim; row++) {
+            for (int column = 0; column < inputDim; column++) {
+                weightValues[(size_t)row * inputDim + column] =
+                    std::sin((float)(row * 17 + column * 5 + 3) * 0.03125f) *
+                    (0.25f + (float)((row + column) % 11) / 16.0f);
+            }
+        }
+
+        std::vector<float> inputValues((size_t)batch * inputDim);
+        for (int row = 0; row < batch; row++) {
+            for (int column = 0; column < inputDim; column++) {
+                inputValues[(size_t)row * inputDim + column] =
+                    std::cos((float)(row * 13 + column * 7 + 1) * 0.01953125f) *
+                    (0.5f + (float)((row * 3 + column) % 9) / 16.0f);
+            }
+        }
+
+        for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K}) {
+            fastllm::Data weight(
+                fastllm::DataType::DATA_GGUF_FORMAT, (int)type,
+                {outputDim, inputDim});
+            weight.name = "regression.cuda_gguf_mmvq_batch8." +
+                std::string(ggml_type_name(type));
+            weight.CreateFromOriData(
+                fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
+                (uint8_t*)weightValues.data(), nullptr, nullptr);
+            weight.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+
+            fastllm::Data emptyBias;
+            fastllm::Data input8(
+                fastllm::DataType::BFLOAT16,
+                {batch, inputDim}, inputValues);
+            input8.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data output8;
+            {
+                ScopedFirstDevice guard("cuda");
+                fastllm::Linear(input8, weight, emptyBias, output8);
+            }
+
+            std::vector<float> firstSevenValues(
+                inputValues.begin(),
+                inputValues.begin() + (batch - 1) * inputDim);
+            fastllm::Data input7(
+                fastllm::DataType::BFLOAT16,
+                {batch - 1, inputDim}, firstSevenValues);
+            input7.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data output7;
+            {
+                ScopedFirstDevice guard("cuda");
+                fastllm::Linear(input7, weight, emptyBias, output7);
+            }
+
+            std::vector<float> lastValue(
+                inputValues.begin() + (batch - 1) * inputDim,
+                inputValues.end());
+            fastllm::Data input1(
+                fastllm::DataType::BFLOAT16, {1, inputDim}, lastValue);
+            input1.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data output1;
+            {
+                ScopedFirstDevice guard("cuda");
+                fastllm::Linear(input1, weight, emptyBias, output1);
+            }
+
+            std::vector<float> expected = ToFloatVector(output7);
+            std::vector<float> lastOutput = ToFloatVector(output1);
+            expected.insert(expected.end(), lastOutput.begin(), lastOutput.end());
+            ExpectFloatNear(
+                expected, ToFloatVector(output8), 0.0f, 0.0f,
+                "CUDA GGUF MMVQ batch 8 " +
+                    std::string(ggml_type_name(type)));
+        }
+    }
+
     void RunCudaInt4Group32AwqLinearRegression() {
         const int inputDim = 128;
         const int outputDim = 64;
@@ -3955,6 +4301,9 @@ int main() {
             RunCudaDeepSeekV4FusedQKVRopeCacheRegression();
             RunCudaGraphMemoryPoolOwnershipRegression();
             RunCudaLinearDataTypeCapabilityRegression();
+            RunCudaGgufMmvqBatch8Regression();
+            RunCudaKimiK3PackedConvCacheRegression();
+            RunCudaKimiK3RecurrentKdaRegression();
             RunCudaInt4Group32AwqLinearRegression();
             RunCudaCompactInt4Group32LinearRegression();
             RunCudaInt4GroupHalfWeightRoundingRegression();
