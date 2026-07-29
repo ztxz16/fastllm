@@ -107,8 +107,10 @@ namespace {
     };
 
     struct ComparisonStats {
+        bool passed = true;
         float maxAbsDiff = 0.0f;
         float maxRelDiff = 0.0f;
+        float maxToleranceExcess = 0.0f;
         size_t mismatchIndex = 0;
         float expected = 0.0f;
         float actual = 0.0f;
@@ -660,15 +662,7 @@ namespace {
                 fastllm::DataType::FLOAT32, {batch, out}, expected);
         }
 
-        void InitDeviceData(fastllm::Data &input,
-                            fastllm::Data &weight,
-                            fastllm::Data &bias,
-                            fastllm::Data &output) const {
-            fastllm::Data inputSource(
-                fastllm::DataType::BFLOAT16, {batch, in}, inputValues);
-            input.CopyFrom(inputSource);
-            input.ToDevice(fastllm::DataDevice::CUDA);
-
+        void InitDeviceWeight(fastllm::Data &weight) const {
             weight.dataType = fastllm::DataType::INT4_W4A8;
             weight.UpdateUnitSize();
             weight.Resize({out, in});
@@ -681,6 +675,18 @@ namespace {
             std::memcpy(
                 weight.cpuData, packedWeights.data(), packedWeights.size());
             weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        void InitDeviceData(fastllm::Data &input,
+                            fastllm::Data &weight,
+                            fastllm::Data &bias,
+                            fastllm::Data &output) const {
+            fastllm::Data inputSource(
+                fastllm::DataType::BFLOAT16, {batch, in}, inputValues);
+            input.CopyFrom(inputSource);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+
+            InitDeviceWeight(weight);
 
             fastllm::Data biasSource(
                 fastllm::DataType::FLOAT32, {out}, biasValues);
@@ -948,6 +954,109 @@ namespace {
         return output;
     }
 
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+    static fastllm::Data MergeMoeW4A8DenseReference(
+            const MergeMoeW4A8Fixture &fixture) {
+        const int totalTasks = fixture.batch * fixture.topk;
+        std::vector<float> routedValues(
+            (size_t)totalTasks * fixture.hidden, 0.0f);
+        fastllm::Data emptyBias;
+
+        for (int expert = 0; expert < fixture.experts; ++expert) {
+            int count = fixture.expertCounts[expert];
+            if (count == 0) {
+                continue;
+            }
+
+            std::vector<float> expertValues((size_t)count * fixture.hidden);
+            for (int local = 0; local < count; ++local) {
+                int route = fixture.expertStarts[expert] + local;
+                int token = fixture.routeRows[route];
+                std::copy_n(
+                    fixture.inputValues.data() + (size_t)token * fixture.hidden,
+                    fixture.hidden,
+                    expertValues.data() + (size_t)local * fixture.hidden);
+            }
+
+            fastllm::Data expertSource(
+                fastllm::DataType::BFLOAT16, {count, fixture.hidden},
+                expertValues);
+            fastllm::Data expertInput;
+            expertInput.CopyFrom(expertSource);
+            expertInput.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data gateWeight, gateOutput, activated;
+            fixture.gateFixtures[expert]->InitDeviceWeight(gateWeight);
+            gateOutput.dataType = fastllm::DataType::BFLOAT16;
+            gateOutput.UpdateUnitSize();
+            gateOutput.Resize({count, fixture.inter * 2});
+            gateOutput.Allocate(false);
+            gateOutput.ToDevice(fastllm::DataDevice::CUDA, false);
+            if (!TryCudaCutlassW4A8(
+                    expertInput, gateWeight, emptyBias, gateOutput,
+                    count, fixture.hidden, fixture.inter * 2)) {
+                throw std::runtime_error(
+                    "W4A8 dense gate reference launch failed");
+            }
+
+            activated.dataType = fastllm::DataType::BFLOAT16;
+            activated.UpdateUnitSize();
+            activated.Resize({count, fixture.inter});
+            activated.Allocate(false);
+            activated.ToDevice(fastllm::DataDevice::CUDA, false);
+            if (!FastllmCudaSwiglu(gateOutput, activated)) {
+                throw std::runtime_error(
+                    "W4A8 dense reference SwiGLU launch failed");
+            }
+
+            fastllm::Data downWeight, routeOutput;
+            fixture.downFixtures[expert]->InitDeviceWeight(downWeight);
+            routeOutput.dataType = fastllm::DataType::BFLOAT16;
+            routeOutput.UpdateUnitSize();
+            routeOutput.Resize({count, fixture.hidden});
+            routeOutput.Allocate(false);
+            routeOutput.ToDevice(fastllm::DataDevice::CUDA, false);
+            if (!TryCudaCutlassW4A8(
+                    activated, downWeight, emptyBias, routeOutput,
+                    count, fixture.inter, fixture.hidden)) {
+                throw std::runtime_error(
+                    "W4A8 dense down reference launch failed");
+            }
+
+            std::vector<float> routeValues =
+                ToFloatVector(ConvertToFloat32Data(routeOutput));
+            for (int local = 0; local < count; ++local) {
+                int route = fixture.expertStarts[expert] + local;
+                std::copy_n(
+                    routeValues.data() + (size_t)local * fixture.hidden,
+                    fixture.hidden,
+                    routedValues.data() + (size_t)route * fixture.hidden);
+            }
+        }
+
+        std::vector<float> result(
+            (size_t)fixture.batch * fixture.hidden, 0.0f);
+        for (int token = 0; token < fixture.batch; ++token) {
+            for (int col = 0; col < fixture.hidden; ++col) {
+                float value = 0.0f;
+                for (int slot = 0; slot < fixture.topk; ++slot) {
+                    int route =
+                        fixture.routePositions[token * fixture.topk + slot];
+                    value +=
+                        routedValues[(size_t)route * fixture.hidden + col] *
+                        fixture.routeScales[route];
+                }
+                result[(size_t)token * fixture.hidden + col] =
+                    BFloat16ToFloat(
+                        FloatToBFloat16RoundToNearest(value));
+            }
+        }
+        return fastllm::Data(
+            fastllm::DataType::FLOAT32,
+            {fixture.batch, fixture.hidden}, result);
+    }
+#endif
+
     static ComparisonStats CompareData(const fastllm::Data &expectedData, const fastllm::Data &actualData,
                                        float atol, float rtol) {
         fastllm::Data expected(expectedData);
@@ -964,15 +1073,16 @@ namespace {
         for (size_t i = 0; i < expectedVec.size(); i++) {
             float absDiff = std::fabs(expectedVec[i] - actualVec[i]);
             float relDiff = absDiff / std::max(std::fabs(expectedVec[i]), 1e-6f);
-            if (absDiff > stats.maxAbsDiff) {
-                stats.maxAbsDiff = absDiff;
-                stats.maxRelDiff = relDiff;
+            stats.maxAbsDiff = std::max(stats.maxAbsDiff, absDiff);
+            stats.maxRelDiff = std::max(stats.maxRelDiff, relDiff);
+            float toleranceExcess =
+                absDiff - (atol + rtol * std::fabs(expectedVec[i]));
+            if (toleranceExcess > stats.maxToleranceExcess) {
+                stats.passed = false;
+                stats.maxToleranceExcess = toleranceExcess;
                 stats.mismatchIndex = i;
                 stats.expected = expectedVec[i];
                 stats.actual = actualVec[i];
-            }
-            if (absDiff > atol + rtol * std::fabs(expectedVec[i])) {
-                return stats;
             }
         }
         return stats;
@@ -1007,6 +1117,8 @@ namespace {
         std::function<BenchmarkResult(const OpTestParams&, const std::string&, int, int)> benchmarkOverride = nullptr;
         std::function<double(const OpTestParams&)> GetIOBytes = nullptr;
         std::function<double(const OpTestParams&)> GetComputeOps = nullptr;
+        std::function<fastllm::Data(
+            const OpTestParams&, const std::string&)> runReference = nullptr;
         bool benchmarkOnly = false;
 
         OpCase() = default;
@@ -2024,7 +2136,7 @@ namespace {
     }
 
     static OpCase MakeMergeMoeW4A8Case() {
-        return {
+        OpCase result = {
             "mergemoe_w4a8",
             "CUTLASS grouped W4A8 MoE with routed SwiGLU experts",
             []() {
@@ -2104,6 +2216,15 @@ namespace {
                 return batch * topk * 6.0 * hidden * inter;
             }
         };
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+        result.runReference = [](
+                const OpTestParams &params, const std::string &device) {
+            ScopedFirstDevice guard(device);
+            MergeMoeW4A8Fixture fixture(params);
+            return MergeMoeW4A8DenseReference(fixture);
+        };
+#endif
+        return result;
     }
 
     static OpCase MakeSiluCase() {
@@ -3811,8 +3932,11 @@ namespace {
             return ran;
         }
 
-        fastllm::Data baseline = opCase.run(params, "cpu");
-        baseline.ToDevice(fastllm::DataDevice::CPU);
+        fastllm::Data commonBaseline;
+        if (!opCase.runReference) {
+            commonBaseline = opCase.run(params, "cpu");
+            commonBaseline.ToDevice(fastllm::DataDevice::CPU);
+        }
         bool ok = true;
 
         for (const auto &device : devices) {
@@ -3824,10 +3948,14 @@ namespace {
                 continue;
             }
 
+            fastllm::Data baseline = opCase.runReference
+                ? opCase.runReference(params, device)
+                : fastllm::Data(commonBaseline);
+            baseline.ToDevice(fastllm::DataDevice::CPU);
             fastllm::Data output = opCase.run(params, device);
             output.ToDevice(fastllm::DataDevice::CPU);
             ComparisonStats stats = CompareData(baseline, output, config.atol, config.rtol);
-            bool pass = stats.maxAbsDiff <= config.atol + config.rtol * std::fabs(stats.expected);
+            bool pass = stats.passed;
             BenchmarkResult bench = Benchmark(opCase, params, device, config.warmup, config.iters);
 
             std::cout << "  [" << device << "] " << (pass ? "PASS" : "FAIL") << "\n";
