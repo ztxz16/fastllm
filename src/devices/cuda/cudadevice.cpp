@@ -2440,6 +2440,22 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["RMSNormPart"] = (BaseOperator*)(new CudaRMSNormPartOp());
+        this->ops["KimiK3RMSNorm"] =
+            (BaseOperator*)(new CudaKimiK3RMSNormOp());
+        this->ops["KimiK3CausalConv1D"] =
+            (BaseOperator*)(new CudaKimiK3CausalConv1DOp());
+        this->ops["KimiK3L2Norm"] =
+            (BaseOperator*)(new CudaKimiK3L2NormOp());
+        this->ops["KimiK3RecurrentKDA"] =
+            (BaseOperator*)(new CudaKimiK3RecurrentKDAOp());
+        this->ops["KimiK3RMSNormSigmoidGate"] =
+            (BaseOperator*)(new CudaKimiK3RMSNormSigmoidGateOp());
+        this->ops["KimiK3AttnRes"] =
+            (BaseOperator*)(new CudaKimiK3AttnResOp());
+        this->ops["KimiK3SiTUAndMul"] =
+            (BaseOperator*)(new CudaKimiK3SiTUAndMulOp());
+        this->ops["KimiK3CausalAttention"] =
+            (BaseOperator*)(new CudaKimiK3CausalAttentionOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
         this->ops["SwigluLinearAdd"] = (BaseOperator*)(new CudaSwigluLinearAddOp());
@@ -2882,6 +2898,253 @@ namespace fastllm {
         int start = intParams.find("start")->second;
         int end = intParams.find("end")->second;
         FastllmCudaRMSNormPart(input, weight, output, eps, start, end);
+    }
+
+    namespace {
+        bool CudaKimiK3HasType(const DataDict &datas, const char *name,
+                               DataType type) {
+            auto it = datas.find(name);
+            return it != datas.end() && it->second != nullptr &&
+                   it->second->dataType == type;
+        }
+    }
+
+    bool CudaKimiK3RMSNormOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "input", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "weight", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3RMSNormOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        float eps = floatParams.find("eps") == floatParams.end() ?
+                    1e-5f : floatParams.find("eps")->second;
+        AssertInFastLLM(!input.dims.empty() &&
+                        weight.Count(0) == (uint64_t)input.dims.back(),
+                        "CUDA KimiK3RMSNorm shape mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3RMSNorm(input, weight, output, eps),
+            "CUDA KimiK3RMSNorm launch failed.");
+    }
+
+    bool CudaKimiK3CausalConv1DOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "input", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "weight", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3CausalConv1DOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        auto cacheIt = datas.find("cache");
+        Data *cache = cacheIt == datas.end() ? nullptr : cacheIt->second;
+        int kernelSize = intParams.find("kernelSize")->second;
+        AssertInFastLLM(
+            input.dims.size() == 3 && weight.dims.size() == 3 &&
+            weight.dims[1] == 1 && weight.dims[2] == kernelSize &&
+            input.dims[2] == weight.dims[0] && kernelSize > 0,
+            "CUDA KimiK3CausalConv1D shape mismatch.");
+        bool initializeCache = cache != nullptr && cache->cudaData == nullptr;
+        if (cache != nullptr) {
+            cache->Allocate(false);
+        }
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3CausalConv1D(
+                input, weight, cache, output, kernelSize, initializeCache),
+            "CUDA KimiK3CausalConv1D launch failed.");
+    }
+
+    bool CudaKimiK3L2NormOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "input", DataType::BFLOAT16);
+    }
+
+    void CudaKimiK3L2NormOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &input = *datas.find("input")->second;
+        Data &output = *datas.find("output")->second;
+        float eps = floatParams.find("eps") == floatParams.end() ?
+                    1e-6f : floatParams.find("eps")->second;
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3L2Norm(input, output, eps),
+            "CUDA KimiK3L2Norm launch failed.");
+    }
+
+    bool CudaKimiK3RecurrentKDAOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "q", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "k", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "v", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "rawGate", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "rawBeta", DataType::FLOAT32) &&
+               CudaKimiK3HasType(datas, "aLog", DataType::FLOAT32) &&
+               CudaKimiK3HasType(datas, "dtBias", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3RecurrentKDAOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &q = *datas.find("q")->second;
+        Data &k = *datas.find("k")->second;
+        Data &v = *datas.find("v")->second;
+        Data &rawGate = *datas.find("rawGate")->second;
+        Data &rawBeta = *datas.find("rawBeta")->second;
+        Data &aLog = *datas.find("aLog")->second;
+        Data &dtBias = *datas.find("dtBias")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        Data &decay = *datas.find("decay")->second;
+        Data &beta = *datas.find("beta")->second;
+        float lowerBound =
+            floatParams.find("lowerBound") == floatParams.end() ?
+            -5.0f : floatParams.find("lowerBound")->second;
+        AssertInFastLLM(
+            q.dims.size() == 4 && q.dims == k.dims && q.dims == v.dims &&
+            q.dims == rawGate.dims,
+            "CUDA KimiK3RecurrentKDA q/k/v/g shape mismatch.");
+        bool initializeState = state.cudaData == nullptr;
+        state.Allocate(false);
+        output.Allocate(false);
+        decay.Allocate(false);
+        beta.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3RecurrentKDA(
+                q, k, v, rawGate, rawBeta, aLog, dtBias, state, output,
+                decay, beta, lowerBound, initializeState),
+            "CUDA KimiK3RecurrentKDA launch failed.");
+    }
+
+    bool CudaKimiK3RMSNormSigmoidGateOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "input", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "gate", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "weight", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3RMSNormSigmoidGateOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &input = *datas.find("input")->second;
+        Data &gate = *datas.find("gate")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        float eps = floatParams.find("eps") == floatParams.end() ?
+                    1e-5f : floatParams.find("eps")->second;
+        AssertInFastLLM(input.dims == gate.dims && !input.dims.empty() &&
+                        weight.Count(0) == (uint64_t)input.dims.back(),
+                        "CUDA KimiK3RMSNormSigmoidGate shape mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3RMSNormSigmoidGate(
+                input, gate, weight, output, eps),
+            "CUDA KimiK3RMSNormSigmoidGate launch failed.");
+    }
+
+    bool CudaKimiK3AttnResOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "prefixSum", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "blockResidual", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "projection", DataType::FLOAT32) &&
+               CudaKimiK3HasType(datas, "norm", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3AttnResOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &prefixSum = *datas.find("prefixSum")->second;
+        Data &blockResidual = *datas.find("blockResidual")->second;
+        Data &projection = *datas.find("projection")->second;
+        Data &norm = *datas.find("norm")->second;
+        Data &output = *datas.find("output")->second;
+        float eps = floatParams.find("eps") == floatParams.end() ?
+                    1e-5f : floatParams.find("eps")->second;
+        int dimension = prefixSum.dims.back();
+        int rows = (int)(prefixSum.Count(0) / dimension);
+        AssertInFastLLM(
+            blockResidual.dims.size() == 3 &&
+            blockResidual.dims[0] == rows &&
+            blockResidual.dims[2] == dimension &&
+            blockResidual.dims[1] > 0 &&
+            projection.Count(0) == (uint64_t)dimension &&
+            norm.Count(0) == (uint64_t)dimension,
+            "CUDA KimiK3AttnRes shape mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3AttnRes(
+                prefixSum, blockResidual, projection, norm, output, eps),
+            "CUDA KimiK3AttnRes launch failed.");
+    }
+
+    bool CudaKimiK3SiTUAndMulOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "gate", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "up", DataType::BFLOAT16);
+    }
+
+    void CudaKimiK3SiTUAndMulOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &gate = *datas.find("gate")->second;
+        Data &up = *datas.find("up")->second;
+        Data &output = *datas.find("output")->second;
+        float beta = floatParams.find("beta") == floatParams.end() ?
+                     1.0f : floatParams.find("beta")->second;
+        float linearBeta =
+            floatParams.find("linearBeta") == floatParams.end() ?
+            0.0f : floatParams.find("linearBeta")->second;
+        AssertInFastLLM(gate.dims == up.dims && beta > 0.0f,
+                        "CUDA KimiK3SiTUAndMul shape/parameter mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3SiTUAndMul(
+                gate, up, output, beta, linearBeta),
+            "CUDA KimiK3SiTUAndMul launch failed.");
+    }
+
+    bool CudaKimiK3CausalAttentionOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "q", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "k", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "v", DataType::BFLOAT16);
+    }
+
+    void CudaKimiK3CausalAttentionOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &q = *datas.find("q")->second;
+        Data &k = *datas.find("k")->second;
+        Data &v = *datas.find("v")->second;
+        Data &output = *datas.find("output")->second;
+        float scale = floatParams.find("scale") == floatParams.end() ?
+                      1.0f : floatParams.find("scale")->second;
+        bool standardCache = k.dims.size() == 3 && v.dims.size() == 3;
+        bool currentTensors = k.dims.size() == 4 && v.dims.size() == 4;
+        AssertInFastLLM(q.dims.size() == 4 &&
+                        (standardCache || currentTensors),
+                        "CUDA KimiK3CausalAttention q/k/v rank mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3CausalAttention(q, k, v, output, scale),
+            "CUDA KimiK3CausalAttention launch failed.");
     }
 
     bool CudaLayerNormOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
@@ -4255,8 +4518,9 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, 
-                        "Sigmoid error: Data's type should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Sigmoid error: Data's type should be float32, float16 or bfloat16.\n");
         FastllmCudaSigmoid(input, output);
     }
 
@@ -4360,9 +4624,12 @@ namespace fastllm {
         Data &input0 = *(datas.find("input0")->second);
         Data &input1 = *(datas.find("input1")->second);
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
-        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
-                        "MulTo error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(
+            input0.dataType == input1.dataType &&
+            (input0.dataType == DataType::FLOAT32 ||
+             input0.dataType == DataType::FLOAT16 ||
+             input0.dataType == DataType::BFLOAT16),
+            "MulTo error: inputs should have the same float32, float16 or bfloat16 type.\n");
         AssertInFastLLM(input0.dims == input1.dims || input1.Count(0) == 1
                         || input0.Count(0) % input1.Count(0) == 0, "MulTo error: input's shape should be same.\n");
         FastllmCudaMulTo(input0, input1, alpha);

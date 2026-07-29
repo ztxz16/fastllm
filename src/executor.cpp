@@ -34,6 +34,21 @@
 
 namespace fastllm {
 #ifdef USE_CUDA
+    static bool KeepKimiK3NumaTensorOnSource(
+            const std::string &opType, const std::string &name,
+            BaseDevice *device, const Data *data) {
+        if (opType != "KimiK3RoutedExperts" || device == nullptr ||
+            device->deviceType != "numa" || data == nullptr ||
+            data->dataDevice != DataDevice::CUDA ||
+            data->cudaData == nullptr || data->multiDeviceData) {
+            return false;
+        }
+        // NumasKimiK3RoutedExperts batches these three D2H copies into one
+        // pinned staging area and performs a single stream synchronization.
+        // Moving them here would issue three independent synchronous copies.
+        return name == "input" || name == "index" || name == "score";
+    }
+
     static bool KeepMultiCudaMergeMoeTensorOnSource(const std::string &opType,
                                                      const std::string &name,
                                                      BaseDevice *device,
@@ -223,6 +238,22 @@ namespace fastllm {
                 for (auto &it: datas) {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
+#ifdef USE_NUMAS
+                        // Kimi-K3 registers all three routed-expert tables in
+                        // NUMA arenas during model warmup.  Revalidating and
+                        // calling ToDevice() for 3 * 896 weights on every
+                        // decoded token only repeats an already established
+                        // placement decision.
+                        if (opType == "KimiK3RoutedExperts" &&
+                            device->deviceType == "numa" && batch > 0 &&
+                            (it.first == "w1s" || it.first == "w2s" ||
+                             it.first == "w3s") &&
+                            ((Data**)it.second)[0] != nullptr &&
+                            IsNumasLinearWeightRegistered(
+                                ((Data**)it.second)[0])) {
+                            continue;
+                        }
+#endif
                         if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
                             if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc" || device->deviceType == "disk") && 
                                 ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
@@ -249,8 +280,11 @@ namespace fastllm {
                                 copyData = false;
                             }
 #ifdef USE_CUDA
-                            if (!KeepMultiCudaMergeMoeTensorOnSource(
-                                    opType, it.first, device, it.second, intParams)) {
+                            if (!KeepKimiK3NumaTensorOnSource(
+                                    opType, it.first, device, it.second) &&
+                                !KeepMultiCudaMergeMoeTensorOnSource(
+                                    opType, it.first, device, it.second,
+                                    intParams)) {
                                 it.second->ToDevice((void *) device, copyData);
                             }
 #else
@@ -328,8 +362,11 @@ namespace fastllm {
                             copyData = false;
                         }
 #ifdef USE_CUDA
-                        if (!KeepMultiCudaMergeMoeTensorOnSource(
-                                opType, it.first, device, it.second, intParams)) {
+                        if (!KeepKimiK3NumaTensorOnSource(
+                                opType, it.first, device, it.second) &&
+                            !KeepMultiCudaMergeMoeTensorOnSource(
+                                opType, it.first, device, it.second,
+                                intParams)) {
                             it.second->ToDevice((void *) device, copyData);
                         }
 #else

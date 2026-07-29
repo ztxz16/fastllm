@@ -3,6 +3,11 @@
 #include "model.h"
 #include "models/basellm.h"
 #include "devices/cpu/computeutils.h"
+#include "gguf.h"
+
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include <cuda_runtime_api.h>
@@ -34,6 +39,8 @@
 #include <vector>
 
 namespace {
+    void Expect(bool condition, const std::string &message);
+
     class ScopedTempDirectory {
     public:
         explicit ScopedTempDirectory(const std::string &prefix) {
@@ -63,6 +70,61 @@ namespace {
     private:
         std::filesystem::path path;
     };
+
+    void RunBFloat16Q8KConversionRegression() {
+        constexpr size_t rows = 41;
+        constexpr size_t columns = QK_K * 3;
+        std::vector<uint16_t> input(rows * columns);
+        std::vector<float> referenceInput(rows * columns);
+        uint32_t state = 0x4b1d2a39u;
+        for (size_t index = 0; index < input.size(); index++) {
+            state = state * 1664525u + 1013904223u;
+            float value =
+                ((int32_t)(state % 400003u) - 200001) / 2048.0f;
+            if (index < QK_K) {
+                value = 0.0f;
+            } else if (index % 257 == 0) {
+                value = 0.0f;
+            } else if (index % 263 == 0) {
+                value = -0.0f;
+            } else if (index % 269 == 0) {
+                value = 1.0f / 65536.0f;
+            } else if (index % 271 == 0) {
+                value = -127.5f;
+            }
+            input[index] = fastllm::Float32ToBFloat16RNEBits(value);
+            referenceInput[index] =
+                fastllm::BFloat16BitsToFloat32(input[index]);
+        }
+
+        const std::vector<ggml_type> types = {
+            GGML_TYPE_Q8_K, GGML_TYPE_Q8_K32
+        };
+        for (ggml_type type : types) {
+            const fastllm::DataType dataType = (fastllm::DataType)(
+                (int)fastllm::DataType::DATA_GGUF_FORMAT + (int)type);
+            const size_t bytes =
+                fastllm::GetDataBytes(dataType, rows, columns);
+            std::vector<uint8_t> expected(bytes, 0xa5);
+            std::vector<uint8_t> actual(bytes, 0x5a);
+            std::vector<uint8_t> threaded(bytes, 0x3c);
+            fastllm::ConvertFromFloat32(
+                expected.data(), dataType, referenceInput.data(),
+                rows, columns);
+            fastllm::ConvertFromBFloat16(
+                actual.data(), dataType, input.data(), rows, columns);
+            fastllm::RunMultiThreadConvertFromBFloat16(
+                threaded.data(), dataType, input.data(), rows, columns,
+                fastllm::GetAlivePool());
+            const std::string typeName = ggml_type_name(type);
+            Expect(memcmp(expected.data(), actual.data(), bytes) == 0,
+                   "direct BF16 to " + typeName +
+                   " conversion differs from FLOAT32 reference");
+            Expect(memcmp(expected.data(), threaded.data(), bytes) == 0,
+                   "multi-thread BF16 to " + typeName +
+                   " conversion differs from FLOAT32 reference");
+        }
+    }
 
     class MoeAtypeConfigTestModel final : public fastllm::basellm {
     public:
@@ -717,6 +779,65 @@ namespace {
         fastllm::Data data(dataType, dims, values);
         data.ToDevice(fastllm::DataDevice::CUDA);
         return data;
+    }
+
+    void RunCudaBFloat16SigmoidMulToRegression() {
+        const std::vector<float> sigmoidValues = {
+            -9.0f, -2.5f, -0.1f, 0.0f, 0.1f, 2.5f, 9.0f
+        };
+        fastllm::Data cpuSigmoidInput(
+            fastllm::DataType::BFLOAT16, {(int)sigmoidValues.size()},
+            sigmoidValues);
+        fastllm::Data cpuSigmoidOutput;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::Sigmoid(cpuSigmoidInput, cpuSigmoidOutput);
+        }
+        fastllm::Data cudaSigmoidInput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {(int)sigmoidValues.size()},
+            sigmoidValues);
+        fastllm::Data cudaSigmoidOutput;
+        {
+            ScopedFirstDevice device("cuda:0");
+            fastllm::Sigmoid(cudaSigmoidInput, cudaSigmoidOutput);
+        }
+        ExpectFloatNear(ToFloatVector(cpuSigmoidOutput),
+                        ToFloatVector(cudaSigmoidOutput),
+                        1.0f / 256.0f, 0.0f,
+                        "CUDA BF16 Sigmoid output");
+
+        const std::vector<float> inputValues = {
+            -1.5f, -0.75f, -0.25f, 0.25f, 0.75f, 1.5f
+        };
+        const std::vector<std::pair<std::vector<int>, std::vector<float>>>
+            multipliers = {
+                {{6}, {0.5f, -0.25f, 1.25f, -1.0f, 0.75f, 2.0f}},
+                {{1}, {-0.625f}},
+                {{2}, {0.5f, -1.25f}},
+            };
+        for (const auto &multiplier : multipliers) {
+            fastllm::Data cpuInput(
+                fastllm::DataType::BFLOAT16, {2, 3}, inputValues);
+            fastllm::Data cpuMultiplier(
+                fastllm::DataType::BFLOAT16, multiplier.first,
+                multiplier.second);
+            {
+                ScopedFirstDevice device("cpu");
+                fastllm::MulTo(cpuInput, cpuMultiplier);
+            }
+
+            fastllm::Data cudaInput = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, {2, 3}, inputValues);
+            fastllm::Data cudaMultiplier = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, multiplier.first,
+                multiplier.second);
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::MulTo(cudaInput, cudaMultiplier);
+            }
+            ExpectFloatNear(ToFloatVector(cpuInput), ToFloatVector(cudaInput),
+                            0.0f, 0.0f, "CUDA BF16 MulTo output");
+        }
     }
 
     void ExpectCudaTensorMeta(const fastllm::Data &data, fastllm::DataType dataType,
@@ -3097,6 +3218,225 @@ namespace {
         return weights;
     }
 
+#ifdef USE_NUMAS
+    fastllm::DataType KimiNumaTestActType(const fastllm::Data &weight) {
+        if (weight.dataType == fastllm::DataType::FLOAT32) {
+            return fastllm::DataType::FLOAT32;
+        }
+        if (weight.dataType == fastllm::DataType::BFLOAT16) {
+            return fastllm::DataType::BFLOAT16;
+        }
+        if (weight.dataType == fastllm::DataType::INT4_GROUP32) {
+            return fastllm::DataType::INF_INT8_GROUP32;
+        }
+        throw std::runtime_error(
+            "unsupported Kimi NUMA regression weight type");
+    }
+
+    std::vector<float> RunKimiRoutedExpertsReference(
+            const fastllm::Data &input,
+            const std::vector<int32_t> &indices,
+            const std::vector<float> &scores,
+            int topk, std::vector<fastllm::Data> &w1s,
+            std::vector<fastllm::Data> &w2s,
+            std::vector<fastllm::Data> &w3s,
+            float beta, float linearBeta) {
+        const int tokens = input.dims[0];
+        const int inputDim = input.dims[1];
+        const int interDim = w1s[0].dims[0];
+        const int outputDim = w2s[0].dims[0];
+        const uint16_t *inputData = (const uint16_t*)input.cpuData;
+        std::vector<uint16_t> routed(
+            (size_t)tokens * topk * outputDim);
+
+        for (int token = 0; token < tokens; token++) {
+            std::vector<float> inputFloat(inputDim);
+            for (int channel = 0; channel < inputDim; channel++) {
+                inputFloat[channel] = fastllm::BFloat16BitsToFloat32(
+                    inputData[(size_t)token * inputDim + channel]);
+            }
+            for (int slot = 0; slot < topk; slot++) {
+                int expert = indices[(size_t)token * topk + slot];
+                fastllm::Data &w1 = w1s[expert];
+                fastllm::Data &w2 = w2s[expert];
+                fastllm::Data &w3 = w3s[expert];
+                fastllm::DataType gateType = KimiNumaTestActType(w1);
+                fastllm::DataType downType = KimiNumaTestActType(w2);
+                std::vector<uint8_t> gateInput(
+                    fastllm::GetDataBytes(gateType, 1, inputDim));
+                fastllm::ConvertFromFloat32(
+                    gateInput.data(), gateType, inputFloat.data(), 1,
+                    inputDim);
+                std::vector<float> gate(interDim), up(interDim);
+                fastllm::FastllmGemm(
+                    1, inputDim, interDim,
+                    gateInput.data(),
+                    fastllm::GetDataBytes(gateType, 1, inputDim),
+                    w1.cpuData,
+                    fastllm::GetDataBytes(w1.GetDataType(), 1, inputDim),
+                    gate.data(), sizeof(float) * interDim,
+                    0, interDim, gateType, w1.GetDataType(),
+                    fastllm::DataType::FLOAT32);
+                fastllm::FastllmGemm(
+                    1, inputDim, interDim,
+                    gateInput.data(),
+                    fastllm::GetDataBytes(gateType, 1, inputDim),
+                    w3.cpuData,
+                    fastllm::GetDataBytes(w3.GetDataType(), 1, inputDim),
+                    up.data(), sizeof(float) * interDim,
+                    0, interDim, gateType, w3.GetDataType(),
+                    fastllm::DataType::FLOAT32);
+
+                std::vector<float> activated(interDim);
+                for (int channel = 0; channel < interDim; channel++) {
+                    float gateValue =
+                        fastllm::RoundFloat32ToBFloat16RNE(gate[channel]);
+                    float upValue =
+                        fastllm::RoundFloat32ToBFloat16RNE(up[channel]);
+                    float sigmoid =
+                        1.0f / (1.0f + std::exp(-gateValue));
+                    float situ = beta * std::tanh(gateValue / beta) *
+                                 sigmoid;
+                    float boundedUp = linearBeta > 0.0f ?
+                        linearBeta * std::tanh(upValue / linearBeta) :
+                        upValue;
+                    uint16_t bits = fastllm::Float32ToBFloat16RNEBits(
+                        situ * boundedUp);
+                    activated[channel] =
+                        fastllm::BFloat16BitsToFloat32(bits);
+                }
+                std::vector<uint8_t> downInput(
+                    fastllm::GetDataBytes(downType, 1, interDim));
+                fastllm::ConvertFromFloat32(
+                    downInput.data(), downType, activated.data(), 1,
+                    interDim);
+                std::vector<float> down(outputDim);
+                fastllm::FastllmGemm(
+                    1, interDim, outputDim,
+                    downInput.data(),
+                    fastllm::GetDataBytes(downType, 1, interDim),
+                    w2.cpuData,
+                    fastllm::GetDataBytes(w2.GetDataType(), 1, interDim),
+                    down.data(), sizeof(float) * outputDim,
+                    0, outputDim, downType, w2.GetDataType(),
+                    fastllm::DataType::FLOAT32);
+                uint16_t *destination = routed.data() +
+                    ((size_t)token * topk + slot) * outputDim;
+                for (int channel = 0; channel < outputDim; channel++) {
+                    destination[channel] =
+                        fastllm::Float32ToBFloat16RNEBits(down[channel]);
+                }
+            }
+        }
+
+        std::vector<float> output((size_t)tokens * outputDim);
+        for (int token = 0; token < tokens; token++) {
+            for (int channel = 0; channel < outputDim; channel++) {
+                float sum = 0.0f;
+                for (int slot = 0; slot < topk; slot++) {
+                    sum += fastllm::BFloat16BitsToFloat32(
+                               routed[((size_t)token * topk + slot) *
+                                      outputDim + channel]) *
+                           scores[(size_t)token * topk + slot];
+                }
+                output[(size_t)token * outputDim + channel] =
+                    fastllm::RoundFloat32ToBFloat16RNE(sum);
+            }
+        }
+        return output;
+    }
+
+    fastllm::Data MakeKimiNumaTestWeight(
+            fastllm::DataType dataType, int outputDim, int inputDim,
+            float seed) {
+        if (dataType == fastllm::DataType::INT4_GROUP32) {
+            return MakeCompactInt4Group32Weight(
+                outputDim, inputDim, seed);
+        }
+        return MakeTensor(dataType, {outputDim, inputDim}, seed);
+    }
+
+    void RunNumasKimiRoutedExpertsFormatCase(
+            fastllm::DataType dataType, const std::string &formatName) {
+        constexpr int tokens = 2;
+        constexpr int topk = 2;
+        constexpr int expertCount = 3;
+        constexpr int inputDim = 64;
+        constexpr int interDim = 64;
+        constexpr int outputDim = 64;
+        constexpr float beta = 1.7f;
+        constexpr float linearBeta = 2.5f;
+        fastllm::Data input = MakeTensor(
+            fastllm::DataType::BFLOAT16, {tokens, inputDim}, 0.4f);
+        std::vector<int32_t> indices = {0, 1, 1, 2};
+        std::vector<float> scores = {0.65f, 0.35f, 0.4f, 0.6f};
+        fastllm::Data index = MakeIntTensor({tokens, topk}, indices);
+        fastllm::Data score(
+            fastllm::DataType::FLOAT32, {tokens, topk}, scores);
+
+        std::vector<fastllm::Data> w1s;
+        std::vector<fastllm::Data> w2s;
+        std::vector<fastllm::Data> w3s;
+        w1s.reserve(expertCount);
+        w2s.reserve(expertCount);
+        w3s.reserve(expertCount);
+        for (int expert = 0; expert < expertCount; expert++) {
+            w1s.push_back(MakeKimiNumaTestWeight(
+                dataType, interDim, inputDim, 1.0f + expert));
+            w2s.push_back(MakeKimiNumaTestWeight(
+                dataType, outputDim, interDim, 4.0f + expert));
+            w3s.push_back(MakeKimiNumaTestWeight(
+                dataType, interDim, inputDim, 7.0f + expert));
+        }
+        std::vector<float> expected = RunKimiRoutedExpertsReference(
+            input, indices, scores, topk, w1s, w2s, w3s,
+            beta, linearBeta);
+
+        std::vector<fastllm::Data*> w1Ptrs, w2Ptrs, w3Ptrs, allWeights;
+        for (int expert = 0; expert < expertCount; expert++) {
+            w1Ptrs.push_back(&w1s[expert]);
+            w2Ptrs.push_back(&w2s[expert]);
+            w3Ptrs.push_back(&w3s[expert]);
+            allWeights.push_back(&w1s[expert]);
+            allWeights.push_back(&w2s[expert]);
+            allWeights.push_back(&w3s[expert]);
+        }
+        fastllm::RegisterNumasLinearWeightBatch(allWeights);
+        for (fastllm::Data *weight : allWeights) {
+            Expect(fastllm::IsNumasLinearWeightRegistered(weight),
+                   formatName + " Kimi weight was not registered.");
+            Expect(weight->cpuData == nullptr,
+                   formatName + " Kimi source weight was not released.");
+        }
+
+        // Run twice so the second invocation exercises the persistent
+        // per-expert GEMM task plan, including refreshed input/output
+        // pointers and route counts.
+        for (int invocation = 0; invocation < 2; invocation++) {
+            fastllm::Data output;
+            {
+                ScopedFirstDevice guard("numa");
+                fastllm::KimiK3RoutedExperts(
+                    input, index, score, w1Ptrs, w2Ptrs, w3Ptrs,
+                    beta, linearBeta, output);
+            }
+            ExpectFloatNear(
+                expected, ToFloatVector(output), 0.0f, 0.0f,
+                "NUMA KimiK3RoutedExperts " + formatName +
+                    " invocation " + std::to_string(invocation));
+        }
+    }
+
+    void RunNumasKimiRoutedExpertsFormatRegression() {
+        RunNumasKimiRoutedExpertsFormatCase(
+            fastllm::DataType::FLOAT32, "FLOAT32");
+        RunNumasKimiRoutedExpertsFormatCase(
+            fastllm::DataType::BFLOAT16, "BFLOAT16");
+        RunNumasKimiRoutedExpertsFormatCase(
+            fastllm::DataType::INT4_GROUP32, "INT4_GROUP32");
+    }
+#endif
+
     std::vector<float> RunMergeMoeOnDevice(const std::string &device, MoeWeights &weights,
                                            int batch = 32, bool keepCudaInputMirror = false) {
         const int inputDim = weights.routedGate.dims[1];
@@ -3274,6 +3614,8 @@ int main() {
         std::cout << "per-request minimum output length regression: PASS\n";
 
         if (fastllm::HasDeviceType("cpu")) {
+            RunBFloat16Q8KConversionRegression();
+            std::cout << "BF16 to Q8_K/Q8_K32 bytewise regression: PASS\n";
             RunCpuInt4GroupAwqLinearRegression();
             std::cout << "cpu AWQ-style INT4_GROUP linear regression: PASS\n";
             RunCpuPackedInt4Group32KernelRegression();
@@ -3283,6 +3625,8 @@ int main() {
 
         if (fastllm::HasDeviceType("cuda")) {
 #ifdef USE_CUDA
+            RunCudaBFloat16SigmoidMulToRegression();
+            std::cout << "cuda BF16 Sigmoid/MulTo regression: PASS\n";
             Expect(FastllmCudaGraphQwen35MoeSelfTest(),
                    "Qwen3.5 CUDA graph shared/routed MoE parallelization/fallback self-test failed");
             RunCudaTritonChunkGdnPrefillRegression();
@@ -3332,6 +3676,10 @@ int main() {
             std::cout << "numa MergeMOE regression: PASS\n";
             RunNumasInt4Group32MergeMoeRegression();
             std::cout << "numa INT4_GROUP(32) MergeMOE regression: PASS\n";
+#ifdef USE_NUMAS
+            RunNumasKimiRoutedExpertsFormatRegression();
+            std::cout << "numa Kimi routed-expert multi-format regression: PASS\n";
+#endif
 #ifdef USE_CUDA
             if (fastllm::HasDeviceType("cuda")) {
                 RunNumasCudaPrefillFallbackRegression();

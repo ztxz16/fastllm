@@ -3928,6 +3928,108 @@ namespace fastllm {
         }, {{"eps", eps}}, {{"start", start}, {"end", end}});
     }
 
+    void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,
+                       Data &output) {
+        curExecutor->Run("KimiK3RMSNorm", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"output", &output}
+        }, {{"eps", eps}}, {});
+    }
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &output) {
+        curExecutor->Run("KimiK3CausalConv1D", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"output", &output}
+        }, {}, {{"kernelSize", kernelSize}});
+    }
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &cache, Data &output) {
+        curExecutor->Run("KimiK3CausalConv1D", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"cache", &cache}, {"output", &output}
+        }, {}, {{"kernelSize", kernelSize}});
+    }
+
+    void KimiK3L2Norm(const Data &input, float eps, Data &output) {
+        curExecutor->Run("KimiK3L2Norm", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {{"eps", eps}}, {});
+    }
+
+    void KimiK3RecurrentKDA(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output, Data &decay, Data &beta) {
+        curExecutor->Run("KimiK3RecurrentKDA", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"rawGate", (Data*)&rawGate}, {"rawBeta", (Data*)&rawBeta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output},
+                {"decay", &decay}, {"beta", &beta}
+        }, {{"lowerBound", lowerBound}}, {});
+    }
+
+    void KimiK3RMSNormSigmoidGate(
+            const Data &input, const Data &gate, const Data &weight,
+            float eps, Data &output) {
+        curExecutor->Run("KimiK3RMSNormSigmoidGate", {
+                {"input", (Data*)&input}, {"gate", (Data*)&gate},
+                {"weight", (Data*)&weight}, {"output", &output}
+        }, {{"eps", eps}}, {});
+    }
+
+    void KimiK3AttnRes(
+            const Data &prefixSum, const Data &blockResidual,
+            const Data &projection, const Data &norm, float eps,
+            Data &output) {
+        curExecutor->Run("KimiK3AttnRes", {
+                {"prefixSum", (Data*)&prefixSum},
+                {"blockResidual", (Data*)&blockResidual},
+                {"projection", (Data*)&projection},
+                {"norm", (Data*)&norm}, {"output", &output}
+        }, {{"eps", eps}}, {});
+    }
+
+    void KimiK3SiTUAndMul(
+            const Data &gate, const Data &up, float beta,
+            float linearBeta, Data &output) {
+        curExecutor->Run("KimiK3SiTUAndMul", {
+                {"gate", (Data*)&gate}, {"up", (Data*)&up},
+                {"output", &output}
+        }, {{"beta", beta}, {"linearBeta", linearBeta}}, {});
+    }
+
+    void KimiK3RoutedExperts(
+            const Data &input, const Data &index, const Data &score,
+            std::vector<Data*> &w1s, std::vector<Data*> &w2s,
+            std::vector<Data*> &w3s, float beta, float linearBeta,
+            Data &output) {
+        AssertInFastLLM(w1s.size() == w2s.size() && w1s.size() == w3s.size(),
+                        "KimiK3RoutedExperts weight table size mismatch.");
+        curExecutor->Run("KimiK3RoutedExperts", {
+                {"input", (Data*)&input}, {"index", (Data*)&index},
+                {"score", (Data*)&score}, {"w1s", (Data*)w1s.data()},
+                {"w2s", (Data*)w2s.data()}, {"w3s", (Data*)w3s.data()},
+                {"output", &output}
+        }, {{"beta", beta}, {"linearBeta", linearBeta}},
+           {{"experts___batch", (int)w1s.size()},
+            {"w1s___batch", (int)w1s.size()},
+            {"w2s___batch", (int)w2s.size()},
+            {"w3s___batch", (int)w3s.size()}});
+    }
+
+    void KimiK3CausalAttention(
+            const Data &q, const Data &k, const Data &v,
+            float scale, Data &output) {
+        curExecutor->Run("KimiK3CausalAttention", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"output", &output}
+        }, {{"scale", scale}}, {});
+    }
+
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output) {
         curExecutor->Run("LayerNorm", {
             {"input", &input}, {"gamma", &gamma}, {"beta", &beta}, {"output", &output}

@@ -1,0 +1,7 @@
+[
+    {
+        "key": "^language_model\\.model\\.layers\\.[0-9]+\\.block_sparse_moe\\.experts\\.[0-9]+\\.w[123]\\.weight_packed$",
+        "dtype": "ggml_q2_k",
+        "comment": "Quantize every Kimi-K3 routed expert w1/w2/w3 from source MXFP4 to GGML Q2_K; all non-MoE tensors retain their model-declared dtype."
+    }
+]

@@ -925,6 +925,48 @@ namespace fastllm {
 
     void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output);
 
+    // Kimi-K3 operators.  These are dispatched through the regular FastLLM
+    // executor; the CPU backend is the first implementation.
+    void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,
+                       Data &output);
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &output);
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &cache, Data &output);
+
+    void KimiK3L2Norm(const Data &input, float eps, Data &output);
+
+    void KimiK3RecurrentKDA(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output, Data &decay, Data &beta);
+
+    void KimiK3RMSNormSigmoidGate(
+            const Data &input, const Data &gate, const Data &weight,
+            float eps, Data &output);
+
+    void KimiK3AttnRes(
+            const Data &prefixSum, const Data &blockResidual,
+            const Data &projection, const Data &norm, float eps,
+            Data &output);
+
+    void KimiK3SiTUAndMul(
+            const Data &gate, const Data &up, float beta,
+            float linearBeta, Data &output);
+
+    void KimiK3RoutedExperts(
+            const Data &input, const Data &index, const Data &score,
+            std::vector<Data*> &w1s, std::vector<Data*> &w2s,
+            std::vector<Data*> &w3s, float beta, float linearBeta,
+            Data &output);
+
+    void KimiK3CausalAttention(
+            const Data &q, const Data &k, const Data &v,
+            float scale, Data &output);
+
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
     void Linear(Data &input, Data &weight, const Data &bias, Data &output, bool keepTpReplicated = false);

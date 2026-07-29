@@ -35,6 +35,26 @@ namespace fastllm {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
+
+    // Register a large set of ordinary row-major linear weights in a small
+    // number of per-node arenas.  GGUF weights are repacked in place; the
+    // other formats supported by MergeMOE reuse RegisterNumas' conversion
+    // path before their NUMA shards are consolidated into the arenas.  This
+    // is intended for checkpoints that keep every routed expert as an
+    // individual tensor: allocating one NUMA mmap per tensor would otherwise
+    // exhaust vm.max_map_count.
+    void RegisterNumasLinearWeightBatch(const std::vector<Data*> &weights);
+    bool IsNumasLinearWeightSupported(const Data *weight);
+    bool IsNumasLinearWeightRegistered(const Data *weight);
+
+    class NumasKimiK3RoutedExpertsOp : BaseOperator {
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams);
+        void Reshape(const std::string &opType, const DataDict &datas,
+                     const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams);
+    };
 }
 
 #endif

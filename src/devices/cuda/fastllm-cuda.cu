@@ -1418,6 +1418,15 @@ __global__ void FastllmSigmoidKernel(half* a, half *b, int len) {
     }
 }
 
+__global__ void FastllmSigmoidKernel(__nv_bfloat16* a,
+                                     __nv_bfloat16 *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __bfloat162float(a[idx]);
+        b[idx] = __float2bfloat16_rn(1.0f / (1.0f + expf(-x)));
+    }
+}
+
 __device__ float softplus(float x) {
     return  x > 20.0f ? x : log1p(expf(x));
 }
@@ -1699,6 +1708,16 @@ __global__ void FastllmMulToKernel(half* a, half *b, float alpha, int len) {
     }
 }
 
+__global__ void FastllmMulToKernel(__nv_bfloat16* a,
+                                   __nv_bfloat16 *b,
+                                   float alpha, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        a[idx] = __float2bfloat16_rn(
+            __bfloat162float(a[idx]) * __bfloat162float(b[idx]) * alpha);
+    }
+}
+
 __global__ void FastllmMulSingleToKernel(float* a, float *b, float alpha, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1717,6 +1736,16 @@ __global__ void FastllmMulSingleToKernel(half* a, half *b, float alpha, int len)
     }
 }
 
+__global__ void FastllmMulSingleToKernel(__nv_bfloat16* a,
+                                         __nv_bfloat16 *b,
+                                         float alpha, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        a[idx] = __float2bfloat16_rn(
+            __bfloat162float(a[idx]) * __bfloat162float(b[0]) * alpha);
+    }
+}
+
 __global__ void FastllmChannelMulToKernel(float* a, float *b, float alpha, int len, int channelLen) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1732,6 +1761,18 @@ __global__ void FastllmChannelMulToKernel(half* a, half *b, float alpha, int len
 #else
         a[idx] *= (half)((float)b[idx / channelLen] * alpha);
 #endif
+    }
+}
+
+__global__ void FastllmChannelMulToKernel(__nv_bfloat16* a,
+                                          __nv_bfloat16 *b,
+                                          float alpha, int len,
+                                          int channelLen) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        a[idx] = __float2bfloat16_rn(
+            __bfloat162float(a[idx]) *
+            __bfloat162float(b[idx / channelLen]) * alpha);
     }
 }
 
@@ -4025,6 +4066,15 @@ bool FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
                            cudaStreamPerThread) == cudaSuccess;
 }
 
+bool FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+        void *dst, const void *src, size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    return cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice,
+                           cudaStreamPerThread) == cudaSuccess;
+}
+
 bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
         void *dst, const void *src, size_t size) {
     if (size == 0 || dst == src) {
@@ -4398,6 +4448,8 @@ bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
         FastllmSigmoidKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmSigmoidKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmSigmoidKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len);
     }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -4602,21 +4654,27 @@ bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     if (input1.Count(0) == 1) {
         if (input0.dataType == fastllm::DataType::FLOAT32) {
             FastllmMulSingleToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
-        } else {
+        } else if (input0.dataType == fastllm::DataType::FLOAT16) {
             FastllmMulSingleToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len);
+        } else if (input0.dataType == fastllm::DataType::BFLOAT16) {
+            FastllmMulSingleToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaData, (__nv_bfloat16*)input1Data, alpha, len);
         }
     } else if (input0.dims == input1.dims) {
         if (input0.dataType == fastllm::DataType::FLOAT32) {
             FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
-        } else {
+        } else if (input0.dataType == fastllm::DataType::FLOAT16) {
             FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len);
+        } else if (input0.dataType == fastllm::DataType::BFLOAT16) {
+            FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaData, (__nv_bfloat16*)input1Data, alpha, len);
         }
     } else {
         int channelLen = input0.Count(0) / input1.Count(0);
         if (input0.dataType == fastllm::DataType::FLOAT32) {
             FastllmChannelMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len, channelLen);
-        } else {
+        } else if (input0.dataType == fastllm::DataType::FLOAT16) {
             FastllmChannelMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len, channelLen);
+        } else if (input0.dataType == fastllm::DataType::BFLOAT16) {
+            FastllmChannelMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaData, (__nv_bfloat16*)input1Data, alpha, len, channelLen);
         }
     }
     FastllmCudaFinishInput(input1, input1Data);
@@ -5147,6 +5205,776 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
+}
+
+namespace {
+    constexpr int KIMI_K3_CUDA_THREADS = 256;
+
+    template <int THREADS>
+    __device__ float KimiK3BlockReduceSum(float value, float *warpSums) {
+        constexpr int warpSize = 32;
+        constexpr int warps = (THREADS + warpSize - 1) / warpSize;
+        int lane = threadIdx.x & (warpSize - 1);
+        int warp = threadIdx.x / warpSize;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffff, value, offset);
+        }
+        if (lane == 0) {
+            warpSums[warp] = value;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            float total = lane < warps ? warpSums[lane] : 0.0f;
+            for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(0xffffffff, total, offset);
+            }
+            if (lane == 0) {
+                warpSums[0] = total;
+            }
+        }
+        __syncthreads();
+        return warpSums[0];
+    }
+
+    __device__ __forceinline__ float KimiK3CudaSigmoid(float value) {
+        return 1.0f / (1.0f + expf(-value));
+    }
+
+    __global__ void KimiK3RMSNormKernel(
+            const __nv_bfloat16 *input, const float *weight,
+            __nv_bfloat16 *output, int rows, int channels, float eps) {
+        int row = blockIdx.x;
+        if (row >= rows) {
+            return;
+        }
+        __shared__ float warpSums[KIMI_K3_CUDA_THREADS / 32];
+        const __nv_bfloat16 *source = input + (size_t)row * channels;
+        __nv_bfloat16 *destination = output + (size_t)row * channels;
+        float partial = 0.0f;
+        for (int channel = threadIdx.x; channel < channels;
+             channel += blockDim.x) {
+            float value = __bfloat162float(source[channel]);
+            partial += value * value;
+        }
+        float squareSum =
+            KimiK3BlockReduceSum<KIMI_K3_CUDA_THREADS>(partial, warpSums);
+        float scale = rsqrtf(squareSum / channels + eps);
+        for (int channel = threadIdx.x; channel < channels;
+             channel += blockDim.x) {
+            float value = __bfloat162float(source[channel]);
+            float normalized = __bfloat162float(
+                __float2bfloat16_rn(value * scale));
+            destination[channel] =
+                __float2bfloat16_rn(normalized * weight[channel]);
+        }
+    }
+
+    __global__ void KimiK3L2NormKernel(
+            const __nv_bfloat16 *input, __nv_bfloat16 *output,
+            int rows, int channels, float eps) {
+        int row = blockIdx.x;
+        if (row >= rows) {
+            return;
+        }
+        __shared__ float warpSums[KIMI_K3_CUDA_THREADS / 32];
+        const __nv_bfloat16 *source = input + (size_t)row * channels;
+        __nv_bfloat16 *destination = output + (size_t)row * channels;
+        float partial = 0.0f;
+        for (int channel = threadIdx.x; channel < channels;
+             channel += blockDim.x) {
+            float value = __bfloat162float(source[channel]);
+            partial += value * value;
+        }
+        float squareSum =
+            KimiK3BlockReduceSum<KIMI_K3_CUDA_THREADS>(partial, warpSums);
+        float scale = rsqrtf(squareSum + eps);
+        for (int channel = threadIdx.x; channel < channels;
+             channel += blockDim.x) {
+            destination[channel] = __float2bfloat16_rn(
+                __bfloat162float(source[channel]) * scale);
+        }
+    }
+
+    __global__ void KimiK3RMSNormSigmoidGateKernel(
+            const __nv_bfloat16 *input, const __nv_bfloat16 *gate,
+            const float *weight, __nv_bfloat16 *output,
+            int rows, int channels, float eps) {
+        int row = blockIdx.x;
+        if (row >= rows) {
+            return;
+        }
+        __shared__ float warpSums[KIMI_K3_CUDA_THREADS / 32];
+        size_t base = (size_t)row * channels;
+        float partial = 0.0f;
+        for (int channel = threadIdx.x; channel < channels;
+             channel += blockDim.x) {
+            float value = __bfloat162float(input[base + channel]);
+            partial += value * value;
+        }
+        float squareSum =
+            KimiK3BlockReduceSum<KIMI_K3_CUDA_THREADS>(partial, warpSums);
+        float scale = rsqrtf(squareSum / channels + eps);
+        for (int channel = threadIdx.x; channel < channels;
+             channel += blockDim.x) {
+            float value = __bfloat162float(input[base + channel]);
+            float gateValue = __bfloat162float(gate[base + channel]);
+            output[base + channel] = __float2bfloat16_rn(
+                value * scale * weight[channel] *
+                KimiK3CudaSigmoid(gateValue));
+        }
+    }
+
+    __global__ void KimiK3SiTUAndMulKernel(
+            const __nv_bfloat16 *gate, const __nv_bfloat16 *up,
+            __nv_bfloat16 *output, size_t count,
+            float beta, float linearBeta) {
+        size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (index >= count) {
+            return;
+        }
+        float gateValue = __bfloat162float(gate[index]);
+        float upValue = __bfloat162float(up[index]);
+        float situ = beta * tanhf(gateValue / beta) *
+                     KimiK3CudaSigmoid(gateValue);
+        float boundedUp = linearBeta > 0.0f ?
+            linearBeta * tanhf(upValue / linearBeta) : upValue;
+        output[index] = __float2bfloat16_rn(situ * boundedUp);
+    }
+
+    __global__ void KimiK3CausalConv1DKernel(
+            const __nv_bfloat16 *input, const float *weight,
+            const __nv_bfloat16 *cache, __nv_bfloat16 *output,
+            int batch, int sequence, int channels, int kernelSize) {
+        int item = blockIdx.x * blockDim.x + threadIdx.x;
+        if (item >= batch * channels) {
+            return;
+        }
+        int batchIndex = item / channels;
+        int channel = item % channels;
+        int history = kernelSize - 1;
+        for (int token = 0; token < sequence; token++) {
+            float value = 0.0f;
+            for (int kernel = 0; kernel < kernelSize; kernel++) {
+                int sourceToken = token - history + kernel;
+                float sourceValue = 0.0f;
+                if (sourceToken >= 0) {
+                    size_t sourceIndex =
+                        ((size_t)batchIndex * sequence + sourceToken) *
+                        channels + channel;
+                    sourceValue = __bfloat162float(input[sourceIndex]);
+                } else if (cache != nullptr) {
+                    int cacheToken = history + sourceToken;
+                    size_t cacheIndex =
+                        ((size_t)batchIndex * history + cacheToken) *
+                        channels + channel;
+                    sourceValue = __bfloat162float(cache[cacheIndex]);
+                }
+                value += sourceValue *
+                    weight[(size_t)channel * kernelSize + kernel];
+            }
+            size_t outputIndex =
+                ((size_t)batchIndex * sequence + token) * channels + channel;
+            output[outputIndex] = __float2bfloat16_rn(
+                value * KimiK3CudaSigmoid(value));
+        }
+    }
+
+    __global__ void KimiK3CausalConv1DUpdateCacheKernel(
+            const __nv_bfloat16 *input, __nv_bfloat16 *cache,
+            int batch, int sequence, int channels, int history) {
+        int item = blockIdx.x * blockDim.x + threadIdx.x;
+        if (item >= batch * channels || history <= 0) {
+            return;
+        }
+        int batchIndex = item / channels;
+        int channel = item % channels;
+        for (int token = 0; token < history; token++) {
+            int combined = sequence + token;
+            __nv_bfloat16 value;
+            if (combined < history) {
+                size_t sourceIndex =
+                    ((size_t)batchIndex * history + combined) * channels +
+                    channel;
+                value = cache[sourceIndex];
+            } else {
+                int inputToken = combined - history;
+                size_t sourceIndex =
+                    ((size_t)batchIndex * sequence + inputToken) * channels +
+                    channel;
+                value = input[sourceIndex];
+            }
+            size_t destinationIndex =
+                ((size_t)batchIndex * history + token) * channels + channel;
+            cache[destinationIndex] = value;
+        }
+    }
+
+    __global__ void KimiK3RecurrentKDAKernel(
+            const __nv_bfloat16 *q, const __nv_bfloat16 *k,
+            const __nv_bfloat16 *v, const __nv_bfloat16 *rawGate,
+            const float *rawBeta, const float *aLog, const float *dtBias,
+            float *state, __nv_bfloat16 *output, float *decay,
+            float *activatedBeta, int batch, int sequence, int heads,
+            int dimension, int aLogCount, float lowerBound) {
+        int item = blockIdx.x;
+        int batchIndex = item / heads;
+        int head = item % heads;
+        int channel = threadIdx.x;
+        if (batchIndex >= batch || channel >= dimension) {
+            return;
+        }
+        extern __shared__ float shared[];
+        float *key = shared;
+        float *query = key + dimension;
+        float *delta = query + dimension;
+        float *sharedBeta = delta + dimension;
+        float *headState = state +
+            ((size_t)batchIndex * heads + head) * dimension * dimension;
+        float outputScale = rsqrtf((float)dimension);
+
+        for (int token = 0; token < sequence; token++) {
+            size_t vectorBase =
+                (((size_t)batchIndex * sequence + token) * heads + head) *
+                dimension;
+            size_t betaIndex =
+                ((size_t)batchIndex * sequence + token) * heads + head;
+            if (channel == 0) {
+                sharedBeta[0] = KimiK3CudaSigmoid(rawBeta[betaIndex]);
+                activatedBeta[betaIndex] = sharedBeta[0];
+            }
+            key[channel] = __bfloat162float(k[vectorBase + channel]);
+            query[channel] = __bfloat162float(q[vectorBase + channel]);
+            float raw = __bfloat162float(rawGate[vectorBase + channel]);
+            float a = aLogCount == heads ? aLog[head] : aLog[channel];
+            float gate = lowerBound * KimiK3CudaSigmoid(
+                expf(a) * (raw + dtBias[(size_t)head * dimension + channel]));
+            decay[vectorBase + channel] = gate;
+            float retention = expf(gate);
+            float *stateRow = headState + (size_t)channel * dimension;
+            for (int value = 0; value < dimension; value++) {
+                stateRow[value] *= retention;
+            }
+            __syncthreads();
+
+            float prediction = 0.0f;
+            for (int sourceChannel = 0; sourceChannel < dimension;
+                 sourceChannel++) {
+                prediction += key[sourceChannel] *
+                    headState[(size_t)sourceChannel * dimension + channel];
+            }
+            delta[channel] =
+                (__bfloat162float(v[vectorBase + channel]) - prediction) *
+                sharedBeta[0];
+            __syncthreads();
+
+            for (int value = 0; value < dimension; value++) {
+                stateRow[value] += key[channel] * delta[value];
+            }
+            __syncthreads();
+
+            float result = 0.0f;
+            for (int sourceChannel = 0; sourceChannel < dimension;
+                 sourceChannel++) {
+                result += query[sourceChannel] *
+                    headState[(size_t)sourceChannel * dimension + channel];
+            }
+            output[vectorBase + channel] =
+                __float2bfloat16_rn(result * outputScale);
+            __syncthreads();
+        }
+    }
+
+    __global__ void KimiK3AttnResScoreKernel(
+            const __nv_bfloat16 *prefixSum,
+            const __nv_bfloat16 *blockResidual,
+            const float *projection, const float *norm, float *scores,
+            int rows, int blocks, int dimension, float eps) {
+        int vector = blockIdx.x;
+        int row = vector / (blocks + 1);
+        int block = vector % (blocks + 1);
+        if (row >= rows) {
+            return;
+        }
+        const __nv_bfloat16 *source = block == blocks ?
+            prefixSum + (size_t)row * dimension :
+            blockResidual + ((size_t)row * blocks + block) * dimension;
+        __shared__ float warpSums[KIMI_K3_CUDA_THREADS / 32];
+        float partialSquares = 0.0f;
+        for (int channel = threadIdx.x; channel < dimension;
+             channel += blockDim.x) {
+            float value = __bfloat162float(source[channel]);
+            partialSquares += value * value;
+        }
+        float squareSum = KimiK3BlockReduceSum<KIMI_K3_CUDA_THREADS>(
+            partialSquares, warpSums);
+        float scale = rsqrtf(squareSum / dimension + eps);
+        float partialScore = 0.0f;
+        for (int channel = threadIdx.x; channel < dimension;
+             channel += blockDim.x) {
+            float value = __bfloat162float(source[channel]);
+            partialScore += value * scale * norm[channel] * projection[channel];
+        }
+        float score = KimiK3BlockReduceSum<KIMI_K3_CUDA_THREADS>(
+            partialScore, warpSums);
+        if (threadIdx.x == 0) {
+            scores[(size_t)row * (blocks + 1) + block] = score;
+        }
+    }
+
+    __global__ void KimiK3AttnResMixKernel(
+            const __nv_bfloat16 *prefixSum,
+            const __nv_bfloat16 *blockResidual, float *scores,
+            __nv_bfloat16 *output, int rows, int blocks, int dimension) {
+        int row = blockIdx.x;
+        if (row >= rows) {
+            return;
+        }
+        float *probabilities = scores + (size_t)row * (blocks + 1);
+        if (threadIdx.x == 0) {
+            float maximum = probabilities[blocks];
+            for (int block = 0; block < blocks; block++) {
+                maximum = fmaxf(maximum, probabilities[block]);
+            }
+            if (blocks == 1) {
+                float prefixExp = expf(probabilities[1] - maximum);
+                float residualExp = expf(probabilities[0] - maximum);
+                probabilities[0] = residualExp / (prefixExp + residualExp);
+                probabilities[1] = 1.0f - probabilities[0];
+            } else {
+                float denominator = 0.0f;
+                for (int item = 0; item <= blocks; item++) {
+                    probabilities[item] = expf(probabilities[item] - maximum);
+                    denominator += probabilities[item];
+                }
+                for (int item = 0; item <= blocks; item++) {
+                    probabilities[item] /= denominator;
+                }
+            }
+        }
+        __syncthreads();
+        size_t prefixBase = (size_t)row * dimension;
+        for (int channel = threadIdx.x; channel < dimension;
+             channel += blockDim.x) {
+            float value = probabilities[blocks] *
+                __bfloat162float(prefixSum[prefixBase + channel]);
+            for (int block = 0; block < blocks; block++) {
+                size_t residualIndex =
+                    ((size_t)row * blocks + block) * dimension + channel;
+                value += probabilities[block] *
+                    __bfloat162float(blockResidual[residualIndex]);
+            }
+            output[prefixBase + channel] = __float2bfloat16_rn(value);
+        }
+    }
+
+    bool KimiK3CudaDataReady(const fastllm::Data &data,
+                             fastllm::DataType type) {
+        return data.dataDevice == fastllm::DataDevice::CUDA &&
+               data.dataType == type && data.cudaData != nullptr;
+    }
+
+    bool KimiK3CudaLastError(const char *message) {
+        cudaError_t status = cudaGetLastError();
+        showError(status, message, __FILE__, __LINE__);
+        return status == cudaSuccess;
+    }
+}
+
+bool FastllmCudaKimiK3RMSNorm(
+        const fastllm::Data &input, const fastllm::Data &weight,
+        fastllm::Data &output, float eps) {
+    if (!KimiK3CudaDataReady(input, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(weight, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+        input.dims.empty() || input.dims != output.dims ||
+        weight.Count(0) != (uint64_t)input.dims.back()) {
+        return false;
+    }
+    int channels = input.dims.back();
+    int rows = (int)(input.Count(0) / channels);
+    KimiK3RMSNormKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
+        (const __nv_bfloat16*)input.cudaData,
+        (const float*)weight.cudaData,
+        (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+    return KimiK3CudaLastError("KimiK3RMSNorm CUDA kernel failed.");
+}
+
+bool FastllmCudaKimiK3L2Norm(
+        const fastllm::Data &input, fastllm::Data &output, float eps) {
+    if (!KimiK3CudaDataReady(input, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+        input.dims.empty() || input.dims != output.dims) {
+        return false;
+    }
+    int channels = input.dims.back();
+    int rows = (int)(input.Count(0) / channels);
+    KimiK3L2NormKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
+        (const __nv_bfloat16*)input.cudaData,
+        (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+    return KimiK3CudaLastError("KimiK3L2Norm CUDA kernel failed.");
+}
+
+bool FastllmCudaKimiK3RMSNormSigmoidGate(
+        const fastllm::Data &input, const fastllm::Data &gate,
+        const fastllm::Data &weight, fastllm::Data &output, float eps) {
+    if (!KimiK3CudaDataReady(input, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(gate, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(weight, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+        input.dims.empty() || input.dims != gate.dims ||
+        input.dims != output.dims ||
+        weight.Count(0) != (uint64_t)input.dims.back()) {
+        return false;
+    }
+    int channels = input.dims.back();
+    int rows = (int)(input.Count(0) / channels);
+    KimiK3RMSNormSigmoidGateKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
+        (const __nv_bfloat16*)input.cudaData,
+        (const __nv_bfloat16*)gate.cudaData,
+        (const float*)weight.cudaData,
+        (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+    return KimiK3CudaLastError(
+        "KimiK3RMSNormSigmoidGate CUDA kernel failed.");
+}
+
+bool FastllmCudaKimiK3SiTUAndMul(
+        const fastllm::Data &gate, const fastllm::Data &up,
+        fastllm::Data &output, float beta, float linearBeta) {
+    if (!KimiK3CudaDataReady(gate, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(up, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+        gate.dims != up.dims || gate.dims != output.dims || beta <= 0.0f) {
+        return false;
+    }
+    size_t count = gate.Count(0);
+    int blocks = (int)((count + KIMI_K3_CUDA_THREADS - 1) /
+                       KIMI_K3_CUDA_THREADS);
+    KimiK3SiTUAndMulKernel<<<blocks, KIMI_K3_CUDA_THREADS>>>(
+        (const __nv_bfloat16*)gate.cudaData,
+        (const __nv_bfloat16*)up.cudaData,
+        (__nv_bfloat16*)output.cudaData, count, beta, linearBeta);
+    return KimiK3CudaLastError("KimiK3SiTUAndMul CUDA kernel failed.");
+}
+
+bool FastllmCudaKimiK3CausalConv1D(
+        const fastllm::Data &input, const fastllm::Data &weight,
+        fastllm::Data *cache, fastllm::Data &output, int kernelSize,
+        bool initializeCache) {
+    if (!KimiK3CudaDataReady(input, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(weight, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+        input.dims.size() != 3 || weight.dims.size() != 3 ||
+        output.dims != input.dims || weight.dims[1] != 1 ||
+        weight.dims[2] != kernelSize || weight.dims[0] != input.dims[2] ||
+        kernelSize <= 0 ||
+        (cache != nullptr &&
+         (!KimiK3CudaDataReady(*cache, fastllm::DataType::BFLOAT16) ||
+          cache->dims != std::vector<int>({input.dims[0], kernelSize - 1,
+                                           input.dims[2]})))) {
+        return false;
+    }
+    if (initializeCache && cache != nullptr) {
+        FastllmCudaMemset0(cache->cudaData, cache->GetBytes());
+    }
+    int batch = input.dims[0];
+    int sequence = input.dims[1];
+    int channels = input.dims[2];
+    int items = batch * channels;
+    int blocks = (items + KIMI_K3_CUDA_THREADS - 1) /
+                 KIMI_K3_CUDA_THREADS;
+    KimiK3CausalConv1DKernel<<<blocks, KIMI_K3_CUDA_THREADS>>>(
+        (const __nv_bfloat16*)input.cudaData,
+        (const float*)weight.cudaData,
+        cache == nullptr ? nullptr :
+            (const __nv_bfloat16*)cache->cudaData,
+        (__nv_bfloat16*)output.cudaData,
+        batch, sequence, channels, kernelSize);
+    if (cache != nullptr && kernelSize > 1) {
+        KimiK3CausalConv1DUpdateCacheKernel
+            <<<blocks, KIMI_K3_CUDA_THREADS>>>(
+                (const __nv_bfloat16*)input.cudaData,
+                (__nv_bfloat16*)cache->cudaData,
+                batch, sequence, channels, kernelSize - 1);
+    }
+    return KimiK3CudaLastError("KimiK3CausalConv1D CUDA kernel failed.");
+}
+
+bool FastllmCudaKimiK3RecurrentKDA(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &rawGate,
+        const fastllm::Data &rawBeta, const fastllm::Data &aLog,
+        const fastllm::Data &dtBias, fastllm::Data &state,
+        fastllm::Data &output, fastllm::Data &decay,
+        fastllm::Data &beta, float lowerBound, bool initializeState) {
+    if (!KimiK3CudaDataReady(q, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(k, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(v, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(rawGate, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(rawBeta, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(aLog, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(dtBias, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(state, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(decay, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(beta, fastllm::DataType::FLOAT32) ||
+        q.dims.size() != 4 || q.dims != k.dims || q.dims != v.dims ||
+        q.dims != rawGate.dims || output.dims != q.dims ||
+        q.dims[3] <= 0 || q.dims[3] > 256) {
+        return false;
+    }
+    int batch = q.dims[0];
+    int sequence = q.dims[1];
+    int heads = q.dims[2];
+    int dimension = q.dims[3];
+    if (rawBeta.dims != std::vector<int>({batch, sequence, heads}) ||
+        state.dims != std::vector<int>({batch, heads, dimension, dimension}) ||
+        decay.dims != q.dims ||
+        beta.dims != std::vector<int>({batch, sequence, heads}) ||
+        (aLog.Count(0) != (uint64_t)heads &&
+         aLog.Count(0) != (uint64_t)dimension) ||
+        dtBias.Count(0) != (uint64_t)heads * dimension) {
+        return false;
+    }
+    if (initializeState) {
+        FastllmCudaMemset0(state.cudaData, state.GetBytes());
+    }
+    // One thread owns one state column.  Launch exactly `dimension` threads:
+    // the kernel contains block-wide barriers, so inactive padding threads
+    // must not return before those barriers.
+    int threads = dimension;
+    size_t sharedBytes = ((size_t)dimension * 3 + 1) * sizeof(float);
+    KimiK3RecurrentKDAKernel<<<batch * heads, threads, sharedBytes>>>(
+        (const __nv_bfloat16*)q.cudaData,
+        (const __nv_bfloat16*)k.cudaData,
+        (const __nv_bfloat16*)v.cudaData,
+        (const __nv_bfloat16*)rawGate.cudaData,
+        (const float*)rawBeta.cudaData,
+        (const float*)aLog.cudaData,
+        (const float*)dtBias.cudaData,
+        (float*)state.cudaData,
+        (__nv_bfloat16*)output.cudaData,
+        (float*)decay.cudaData,
+        (float*)beta.cudaData,
+        batch, sequence, heads, dimension, (int)aLog.Count(0), lowerBound);
+    return KimiK3CudaLastError("KimiK3RecurrentKDA CUDA kernel failed.");
+}
+
+bool FastllmCudaKimiK3AttnRes(
+        const fastllm::Data &prefixSum,
+        const fastllm::Data &blockResidual,
+        const fastllm::Data &projection, const fastllm::Data &norm,
+        fastllm::Data &output, float eps) {
+    if (!KimiK3CudaDataReady(prefixSum, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(blockResidual, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(projection, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(norm, fastllm::DataType::FLOAT32) ||
+        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+        prefixSum.dims.empty() || prefixSum.dims != output.dims ||
+        blockResidual.dims.size() != 3) {
+        return false;
+    }
+    int dimension = prefixSum.dims.back();
+    int rows = (int)(prefixSum.Count(0) / dimension);
+    int blocks = blockResidual.dims[1];
+    if (blockResidual.dims[0] != rows ||
+        blockResidual.dims[2] != dimension || blocks <= 0 ||
+        projection.Count(0) != (uint64_t)dimension ||
+        norm.Count(0) != (uint64_t)dimension) {
+        return false;
+    }
+    size_t scratchBytes = (size_t)rows * (blocks + 1) * sizeof(float);
+    size_t borrowedBytes = 0;
+    bool own = false;
+    void *scratch = FastllmBorrowCudaTempBuffer(
+        scratchBytes, &borrowedBytes, &own);
+    if (scratch == nullptr || borrowedBytes < scratchBytes) {
+        FastllmReleaseCudaTempBuffer(scratch, own);
+        return false;
+    }
+    KimiK3AttnResScoreKernel
+        <<<rows * (blocks + 1), KIMI_K3_CUDA_THREADS>>>(
+            (const __nv_bfloat16*)prefixSum.cudaData,
+            (const __nv_bfloat16*)blockResidual.cudaData,
+            (const float*)projection.cudaData,
+            (const float*)norm.cudaData,
+            (float*)scratch, rows, blocks, dimension, eps);
+    KimiK3AttnResMixKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
+        (const __nv_bfloat16*)prefixSum.cudaData,
+        (const __nv_bfloat16*)blockResidual.cudaData,
+        (float*)scratch, (__nv_bfloat16*)output.cudaData,
+        rows, blocks, dimension);
+    FastllmReleaseCudaTempBuffer(scratch, own);
+    return KimiK3CudaLastError("KimiK3AttnRes CUDA kernel failed.");
+}
+
+namespace {
+    __global__ void KimiK3CausalAttentionKernel(
+            const __nv_bfloat16 *q, const __nv_bfloat16 *k,
+            const __nv_bfloat16 *v, float *scores,
+            __nv_bfloat16 *output,
+            int batch, int heads, int queryLength, int keyLength,
+            int queryDimension, int valueDimension, int standardCache,
+            uint64_t qStride0, uint64_t qStride1,
+            uint64_t qStride2, uint64_t qStride3,
+            uint64_t kStride0, uint64_t kStride1,
+            uint64_t kStride2, uint64_t kStride3,
+            uint64_t vStride0, uint64_t vStride1,
+            uint64_t vStride2, uint64_t vStride3,
+            uint64_t oStride0, uint64_t oStride1,
+            uint64_t oStride2, uint64_t oStride3,
+            float scale) {
+        int item = blockIdx.x;
+        int queryIndex = item % queryLength;
+        int headItem = item / queryLength;
+        int head = headItem % heads;
+        int batchIndex = headItem / heads;
+        if (batchIndex >= batch) {
+            return;
+        }
+        int lastKey = keyLength - queryLength + queryIndex;
+        size_t scoreBase = (size_t)item * keyLength;
+        uint64_t qBase = (uint64_t)batchIndex * qStride0 +
+                         (uint64_t)head * qStride1 +
+                         (uint64_t)queryIndex * qStride2;
+        for (int keyIndex = threadIdx.x; keyIndex <= lastKey;
+             keyIndex += blockDim.x) {
+            uint64_t kBase = standardCache ?
+                (uint64_t)head * kStride0 +
+                    (uint64_t)keyIndex * kStride1 :
+                (uint64_t)batchIndex * kStride0 +
+                    (uint64_t)head * kStride1 +
+                    (uint64_t)keyIndex * kStride2;
+            float dot = 0.0f;
+            for (int channel = 0; channel < queryDimension; channel++) {
+                dot += __bfloat162float(q[qBase +
+                    (uint64_t)channel * qStride3]) *
+                       __bfloat162float(k[kBase +
+                    (uint64_t)channel *
+                        (standardCache ? kStride2 : kStride3)]);
+            }
+            // Match eager_attention_forward: einsum output and its scaled
+            // score are BF16 before the FP32 softmax.
+            float roundedDot = __bfloat162float(__float2bfloat16_rn(dot));
+            scores[scoreBase + keyIndex] = __bfloat162float(
+                __float2bfloat16_rn(roundedDot * scale));
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float maximum = -3.402823466e+38F;
+            for (int keyIndex = 0; keyIndex <= lastKey; keyIndex++) {
+                maximum = fmaxf(maximum, scores[scoreBase + keyIndex]);
+            }
+            float denominator = 0.0f;
+            for (int keyIndex = 0; keyIndex <= lastKey; keyIndex++) {
+                float probability =
+                    expf(scores[scoreBase + keyIndex] - maximum);
+                scores[scoreBase + keyIndex] = probability;
+                denominator += probability;
+            }
+            for (int keyIndex = 0; keyIndex <= lastKey; keyIndex++) {
+                // Store the BF16 probability as a float so the following
+                // value reduction observes the same rounded operand as CPU.
+                scores[scoreBase + keyIndex] = __bfloat162float(
+                    __float2bfloat16_rn(
+                        scores[scoreBase + keyIndex] / denominator));
+            }
+        }
+        __syncthreads();
+
+        uint64_t outputBase = (uint64_t)batchIndex * oStride0 +
+                              (uint64_t)head * oStride1 +
+                              (uint64_t)queryIndex * oStride2;
+        for (int channel = threadIdx.x; channel < valueDimension;
+             channel += blockDim.x) {
+            float value = 0.0f;
+            for (int keyIndex = 0; keyIndex <= lastKey; keyIndex++) {
+                uint64_t vIndex = standardCache ?
+                    (uint64_t)head * vStride0 +
+                        (uint64_t)keyIndex * vStride1 +
+                        (uint64_t)channel * vStride2 :
+                    (uint64_t)batchIndex * vStride0 +
+                        (uint64_t)head * vStride1 +
+                        (uint64_t)keyIndex * vStride2 +
+                        (uint64_t)channel * vStride3;
+                value += scores[scoreBase + keyIndex] *
+                         __bfloat162float(v[vIndex]);
+            }
+            output[outputBase + (uint64_t)channel * oStride3] =
+                __float2bfloat16_rn(value);
+        }
+    }
+}
+
+bool FastllmCudaKimiK3CausalAttention(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, fastllm::Data &output, float scale) {
+    if (!KimiK3CudaDataReady(q, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(k, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(v, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+        q.dims.size() != 4 || output.dims.size() != 4) {
+        return false;
+    }
+    bool standardCache = k.dims.size() == 3 && v.dims.size() == 3;
+    bool currentTensors = k.dims.size() == 4 && v.dims.size() == 4;
+    if (!standardCache && !currentTensors) {
+        return false;
+    }
+    int batch = q.dims[0];
+    int heads = q.dims[1];
+    int queryLength = q.dims[2];
+    int queryDimension = q.dims[3];
+    int keyLength = standardCache ? k.dims[1] : k.dims[2];
+    int valueDimension = v.dims.back();
+    if (batch <= 0 || heads <= 0 || queryLength <= 0 ||
+        keyLength < queryLength || queryDimension <= 0 ||
+        valueDimension <= 0 ||
+        output.dims != std::vector<int>(
+            {batch, heads, queryLength, valueDimension})) {
+        return false;
+    }
+    if (standardCache) {
+        if (batch != 1 || k.dims[0] != heads || v.dims[0] != heads ||
+            k.dims[1] != v.dims[1] || k.dims[2] != queryDimension) {
+            return false;
+        }
+    } else if (q.dims[0] != k.dims[0] || q.dims[0] != v.dims[0] ||
+               q.dims[1] != k.dims[1] || q.dims[1] != v.dims[1] ||
+               k.dims[2] != v.dims[2] ||
+               k.dims[3] != queryDimension) {
+        return false;
+    }
+
+    size_t items = (size_t)batch * heads * queryLength;
+    if (items > SIZE_MAX / (size_t)keyLength / sizeof(float)) {
+        return false;
+    }
+    size_t scratchBytes = items * keyLength * sizeof(float);
+    size_t borrowedBytes = 0;
+    bool own = false;
+    void *scratch = FastllmBorrowCudaTempBuffer(
+        scratchBytes, &borrowedBytes, &own);
+    if (scratch == nullptr || borrowedBytes < scratchBytes) {
+        FastllmReleaseCudaTempBuffer(scratch, own);
+        return false;
+    }
+    uint64_t kStride3 = standardCache ? 0 : k.strides[3];
+    uint64_t vStride3 = standardCache ? 0 : v.strides[3];
+    KimiK3CausalAttentionKernel<<<(int)items, 128>>>(
+        (const __nv_bfloat16*)q.cudaData,
+        (const __nv_bfloat16*)k.cudaData,
+        (const __nv_bfloat16*)v.cudaData,
+        (float*)scratch, (__nv_bfloat16*)output.cudaData,
+        batch, heads, queryLength, keyLength,
+        queryDimension, valueDimension, standardCache ? 1 : 0,
+        q.strides[0], q.strides[1], q.strides[2], q.strides[3],
+        k.strides[0], k.strides[1], k.strides[2], kStride3,
+        v.strides[0], v.strides[1], v.strides[2], vStride3,
+        output.strides[0], output.strides[1],
+        output.strides[2], output.strides[3], scale);
+    FastllmReleaseCudaTempBuffer(scratch, own);
+    return KimiK3CudaLastError(
+        "KimiK3CausalAttention CUDA kernel failed.");
 }
 
 template <int THREAD_PER_BLOCK>

@@ -129,6 +129,36 @@ namespace fastllm {
                                                 const float *floatData, size_t rows, 
                                                 size_t columns, AliveThreadPool *pool);
 
+    // Convert BF16 activations without requiring a full-size FLOAT32 staging
+    // buffer. Q8_K/Q8_K32 use a direct vectorized path; other formats retain
+    // the exact ConvertFromFloat32 semantics through a row-local fallback.
+    void ConvertFromBFloat16(void *dstData, DataType dstDataType,
+                             const uint16_t *bfloat16Data, size_t rows,
+                             size_t columns);
+
+    struct MultiThreadConvertFromBFloat16Op : MultiThreadBaseOp {
+        void *dstData;
+        DataType dstDataType;
+        const uint16_t *bfloat16Data;
+        size_t columns;
+        size_t startRow, endRow;
+
+        MultiThreadConvertFromBFloat16Op(
+                void *dstData, DataType dstDataType,
+                const uint16_t *bfloat16Data, size_t columns,
+                size_t startRow, size_t endRow)
+            : dstData(dstData), dstDataType(dstDataType),
+              bfloat16Data(bfloat16Data), columns(columns),
+              startRow(startRow), endRow(endRow) {}
+
+        void Run() override;
+    };
+
+    void RunMultiThreadConvertFromBFloat16(
+        void *dstData, DataType dstDataType,
+        const uint16_t *bfloat16Data, size_t rows, size_t columns,
+        AliveThreadPool *pool);
+
     struct WorkStealingOp : MultiThreadBaseOp {
         struct alignas(64) TaskState {
             std::atomic<int> curr;

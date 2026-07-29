@@ -27,6 +27,7 @@
 #include "qwen3_moe.h"
 #include "hy_v3.h"
 #include "qwen3_next.h"
+#include "kimi_k3.h"
 #include "qwen3_5.h"
 #include "step3p5.h"
 #include "laguna.h"
@@ -630,6 +631,8 @@ namespace fastllm {
             model = (basellm*)(new MinimaxM2Model());
         } else if (modelType == "qwen3_next") {
             model = (basellm*)(new Qwen3NextModel());
+        } else if (modelType == "kimi_k3") {
+            model = (basellm*)(new KimiK3Model());
         } else if (modelType == "glm_moe_dsa") {
             model = (basellm*)(new Glm5MoeDsaModel());
             model->model_type = "glm_moe_dsa";

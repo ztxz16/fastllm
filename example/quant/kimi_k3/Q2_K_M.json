@@ -1,0 +1,17 @@
+[
+    {
+        "key": "^(language_model\\.lm_head|language_model\\.model\\.layers\\.[0-9]+\\..*)\\.weight$",
+        "dtype": "ggml_q4_k",
+        "comment": "Quantize every non-MoE Kimi-K3 text Linear, including lm_head, attention projections and the dense first-layer MLP, to GGML Q4_K. Non-Linear tensors retain their model-declared dtype."
+    },
+    {
+        "key": "^language_model\\.model\\.layers\\.[0-9]+\\.self_attn\\.f_b_proj\\.weight$",
+        "dtype": "bfloat16",
+        "comment": "Keep the 128-input KDA f_b projection in BF16 because GGML K-quants require complete 256-value blocks within every matrix row."
+    },
+    {
+        "key": "^language_model\\.model\\.layers\\.[0-9]+\\.block_sparse_moe\\.(gate\\.weight|routed_expert_(down|up)_proj\\.weight|shared_experts\\.(gate|up|down)_proj\\.weight|experts\\.[0-9]+\\.w[123]\\.weight_packed)$",
+        "dtype": "ggml_q2_k",
+        "comment": "Quantize all Kimi-K3 MoE Linear weights, including the router, latent projections, shared experts and routed experts, to GGML Q2_K."
+    }
+]

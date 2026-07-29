@@ -251,6 +251,8 @@ void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t siz
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size);
 bool FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
     void *dst, const void *src, size_t size);
+bool FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+    void *dst, const void *src, size_t size);
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size);
 bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
     void *dst, const void *src, size_t size);
@@ -330,6 +332,37 @@ bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::Data &g);
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
+bool FastllmCudaKimiK3RMSNorm(const fastllm::Data &input,
+                              const fastllm::Data &weight,
+                              fastllm::Data &output, float eps);
+bool FastllmCudaKimiK3CausalConv1D(const fastllm::Data &input,
+                                   const fastllm::Data &weight,
+                                   fastllm::Data *cache,
+                                   fastllm::Data &output, int kernelSize,
+                                   bool initializeCache);
+bool FastllmCudaKimiK3L2Norm(const fastllm::Data &input,
+                             fastllm::Data &output, float eps);
+bool FastllmCudaKimiK3RecurrentKDA(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &rawGate,
+        const fastllm::Data &rawBeta, const fastllm::Data &aLog,
+        const fastllm::Data &dtBias, fastllm::Data &state,
+        fastllm::Data &output, fastllm::Data &decay,
+        fastllm::Data &beta, float lowerBound, bool initializeState);
+bool FastllmCudaKimiK3RMSNormSigmoidGate(
+        const fastllm::Data &input, const fastllm::Data &gate,
+        const fastllm::Data &weight, fastllm::Data &output, float eps);
+bool FastllmCudaKimiK3AttnRes(
+        const fastllm::Data &prefixSum,
+        const fastllm::Data &blockResidual,
+        const fastllm::Data &projection, const fastllm::Data &norm,
+        fastllm::Data &output, float eps);
+bool FastllmCudaKimiK3SiTUAndMul(
+        const fastllm::Data &gate, const fastllm::Data &up,
+        fastllm::Data &output, float beta, float linearBeta);
+bool FastllmCudaKimiK3CausalAttention(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, fastllm::Data &output, float scale);
 // Benchmark/validation entry. threadCount == 0 selects the legacy launch;
 // threadCount == 32 selects the exact FP16 channel-128 specialization.
 bool FastllmCudaRMSNormFloat16WithThreadCount(const fastllm::Data &input, fastllm::Data &weight,

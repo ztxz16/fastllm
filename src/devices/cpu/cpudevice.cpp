@@ -5,6 +5,7 @@
 #define _USE_MATH_DEFINES
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/computeutils.h"
+#include "devices/cpu/kimi_k3_ops.h"
 
 #include <cstring>
 #include <thread>
@@ -294,6 +295,15 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
         this->ops["RMSNormPart"] = (BaseOperator*)(new CpuRMSNormPartOp());
+        this->ops["KimiK3RMSNorm"] = (BaseOperator*)(new CpuKimiK3RMSNormOp());
+        this->ops["KimiK3CausalConv1D"] = (BaseOperator*)(new CpuKimiK3CausalConv1DOp());
+        this->ops["KimiK3L2Norm"] = (BaseOperator*)(new CpuKimiK3L2NormOp());
+        this->ops["KimiK3RecurrentKDA"] = (BaseOperator*)(new CpuKimiK3RecurrentKDAOp());
+        this->ops["KimiK3RMSNormSigmoidGate"] = (BaseOperator*)(new CpuKimiK3RMSNormSigmoidGateOp());
+        this->ops["KimiK3AttnRes"] = (BaseOperator*)(new CpuKimiK3AttnResOp());
+        this->ops["KimiK3SiTUAndMul"] = (BaseOperator*)(new CpuKimiK3SiTUAndMulOp());
+        this->ops["KimiK3RoutedExperts"] = (BaseOperator*)(new CpuKimiK3RoutedExpertsOp());
+        this->ops["KimiK3CausalAttention"] = (BaseOperator*)(new CpuKimiK3CausalAttentionOp());
         this->ops["Linear"] = (BaseOperator*)(new CpuLinearOp());
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CpuConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CpuConv2DOp());
@@ -2285,6 +2295,247 @@ namespace fastllm {
             }
         } else {
             ErrorInFastLLM("ConvertFromFloat32 failed with type" + GetDataTypeName(dstDataType));
+        }
+    }
+
+#ifdef __AVX2__
+    namespace {
+        inline __m256 LoadBFloat16AsFloat32(const uint16_t *source) {
+            const __m128i packed =
+                _mm_loadu_si128((const __m128i*)source);
+            const __m256i expanded = _mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(packed), 16);
+            return _mm256_castsi256_ps(expanded);
+        }
+
+        inline int HorizontalSumInt32x8(const __m256i value) {
+            const __m128i sum128 = _mm_add_epi32(
+                _mm256_castsi256_si128(value),
+                _mm256_extractf128_si256(value, 1));
+            const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+            const __m128i sum64 = _mm_add_epi32(hi64, sum128);
+            const __m128i hi32 = _mm_shuffle_epi32(
+                sum64, _MM_SHUFFLE(2, 3, 0, 1));
+            return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+        }
+
+        inline float HorizontalMaxFloat32x8(__m256 value) {
+            __m128 max4 = _mm_max_ps(
+                _mm256_extractf128_ps(value, 1),
+                _mm256_castps256_ps128(value));
+            max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+            max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+            return _mm_cvtss_f32(max4);
+        }
+
+        template <bool q8K32>
+        void QuantizeBFloat16RowQ8K(
+                const uint16_t *source, block_q8_K *destination,
+                size_t columns) {
+            AssertInFastLLM(
+                columns % QK_K == 0,
+                "BF16 to Q8_K conversion requires a multiple of QK_K.");
+            const size_t blocks = columns / QK_K;
+            const __m256 signBit = _mm256_set1_ps(-0.0f);
+            const __m256i permutation =
+                _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+            for (size_t block = 0; block < blocks; block++) {
+                const uint16_t *blockSource = source + block * QK_K;
+                block_q8_K &output = destination[block];
+                __m256 maxAbs = _mm256_setzero_ps();
+                for (int offset = 0; offset < QK_K; offset += 8) {
+                    const __m256 value =
+                        LoadBFloat16AsFloat32(blockSource + offset);
+                    maxAbs = _mm256_max_ps(
+                        maxAbs, _mm256_andnot_ps(signBit, value));
+                }
+
+                const float maxScalar = HorizontalMaxFloat32x8(maxAbs);
+                const float scale = maxScalar / 127.0f;
+                const float inverseScale =
+                    maxScalar != 0.0f ? 127.0f / maxScalar : 0.0f;
+                output.d = scale;
+                const __m256 multiplier =
+                    _mm256_set1_ps(inverseScale);
+                int blockSumInt32 = 0;
+                float blockSumFloat32 = 0.0f;
+
+                for (int group = 0; group < QK_K / 32; group++) {
+                    const uint16_t *groupSource =
+                        blockSource + group * 32;
+                    __m256 value0 = _mm256_mul_ps(
+                        multiplier,
+                        LoadBFloat16AsFloat32(groupSource));
+                    __m256 value1 = _mm256_mul_ps(
+                        multiplier,
+                        LoadBFloat16AsFloat32(groupSource + 8));
+                    __m256 value2 = _mm256_mul_ps(
+                        multiplier,
+                        LoadBFloat16AsFloat32(groupSource + 16));
+                    __m256 value3 = _mm256_mul_ps(
+                        multiplier,
+                        LoadBFloat16AsFloat32(groupSource + 24));
+                    value0 = _mm256_round_ps(value0, _MM_ROUND_NEAREST);
+                    value1 = _mm256_round_ps(value1, _MM_ROUND_NEAREST);
+                    value2 = _mm256_round_ps(value2, _MM_ROUND_NEAREST);
+                    value3 = _mm256_round_ps(value3, _MM_ROUND_NEAREST);
+                    __m256i quant0 = _mm256_cvtps_epi32(value0);
+                    __m256i quant1 = _mm256_cvtps_epi32(value1);
+                    __m256i quant2 = _mm256_cvtps_epi32(value2);
+                    __m256i quant3 = _mm256_cvtps_epi32(value3);
+
+                    if constexpr (q8K32) {
+                        const int sum = HorizontalSumInt32x8(
+                            _mm256_add_epi32(
+                                _mm256_add_epi32(quant0, quant1),
+                                _mm256_add_epi32(quant2, quant3)));
+                        float *sums = (float*)output.bsums;
+                        sums[group] = scale * sum;
+                        blockSumFloat32 += sums[group];
+                    } else {
+                        output.bsums[group * 2] =
+                            HorizontalSumInt32x8(
+                                _mm256_add_epi32(quant0, quant1));
+                        output.bsums[group * 2 + 1] =
+                            HorizontalSumInt32x8(
+                                _mm256_add_epi32(quant2, quant3));
+                        blockSumInt32 += output.bsums[group * 2] +
+                                         output.bsums[group * 2 + 1];
+                    }
+
+                    quant0 = _mm256_packs_epi32(quant0, quant1);
+                    quant2 = _mm256_packs_epi32(quant2, quant3);
+                    quant0 = _mm256_packs_epi16(quant0, quant2);
+                    quant0 = _mm256_permutevar8x32_epi32(
+                        quant0, permutation);
+                    _mm256_storeu_si256(
+                        (__m256i*)(output.qs + group * 32), quant0);
+                }
+                output.sum = q8K32 ? blockSumFloat32 :
+                             scale * blockSumInt32;
+            }
+        }
+
+        bool TryConvertBFloat16ToQ8K(
+                void *dstData, DataType dstDataType,
+                const uint16_t *source, size_t rows, size_t columns) {
+            if (dstDataType < DataType::DATA_GGUF_FORMAT ||
+                dstDataType >= DataType::DATA_GGUF_FORMAT_END) {
+                return false;
+            }
+            const ggml_type type = (ggml_type)(
+                (int)dstDataType - (int)DataType::DATA_GGUF_FORMAT);
+            if (type != GGML_TYPE_Q8_K && type != GGML_TYPE_Q8_K32) {
+                return false;
+            }
+            const size_t rowBytes = GetDataBytes(
+                dstDataType, 1, columns);
+            for (size_t row = 0; row < rows; row++) {
+                block_q8_K *destination = (block_q8_K*)(
+                    (uint8_t*)dstData + row * rowBytes);
+                if (type == GGML_TYPE_Q8_K32) {
+                    QuantizeBFloat16RowQ8K<true>(
+                        source + row * columns, destination, columns);
+                } else {
+                    QuantizeBFloat16RowQ8K<false>(
+                        source + row * columns, destination, columns);
+                }
+            }
+            return true;
+        }
+    }
+#endif
+
+    void ConvertFromBFloat16(
+            void *dstData, DataType dstDataType,
+            const uint16_t *bfloat16Data, size_t rows, size_t columns) {
+        if (rows == 0 || columns == 0) {
+            return;
+        }
+        if (dstDataType == DataType::BFLOAT16) {
+            memcpy(dstData, bfloat16Data,
+                   rows * columns * sizeof(uint16_t));
+            return;
+        }
+        if (dstDataType == DataType::FLOAT32) {
+            float *destination = (float*)dstData;
+            for (size_t index = 0; index < rows * columns; index++) {
+                destination[index] =
+                    BFloat16BitsToFloat32(bfloat16Data[index]);
+            }
+            return;
+        }
+#ifdef __AVX2__
+        if (TryConvertBFloat16ToQ8K(
+                dstData, dstDataType, bfloat16Data, rows, columns)) {
+            return;
+        }
+#endif
+
+        // Preserve support for every existing activation format. This uses
+        // only one row of FLOAT32 scratch instead of materializing the full
+        // routed-expert activation table.
+        const size_t rowBytes = GetDataBytes(dstDataType, 1, columns);
+        std::vector<float, alignedAllocator<float, 64>> floatRow(columns);
+        for (size_t row = 0; row < rows; row++) {
+            const uint16_t *source = bfloat16Data + row * columns;
+            for (size_t column = 0; column < columns; column++) {
+                floatRow[column] = BFloat16BitsToFloat32(source[column]);
+            }
+            ConvertFromFloat32(
+                (uint8_t*)dstData + row * rowBytes, dstDataType,
+                floatRow.data(), 1, columns);
+        }
+    }
+
+    void MultiThreadConvertFromBFloat16Op::Run() {
+        const size_t rowBytes = GetDataBytes(dstDataType, 1, columns);
+        ConvertFromBFloat16(
+            (uint8_t*)dstData + startRow * rowBytes, dstDataType,
+            bfloat16Data + startRow * columns,
+            endRow - startRow, columns);
+    }
+
+    void RunMultiThreadConvertFromBFloat16(
+            void *dstData, DataType dstDataType,
+            const uint16_t *bfloat16Data, size_t rows, size_t columns,
+            AliveThreadPool *pool) {
+        if (rows * columns < 10000 || pool == nullptr) {
+            ConvertFromBFloat16(
+                dstData, dstDataType, bfloat16Data, rows, columns);
+            return;
+        }
+
+        const int firstThread =
+            pool->curActivateThreadInterval.first;
+        int threadCount = std::max(
+            1, pool->curActivateThreadInterval.second - firstThread);
+        threadCount = std::min(threadCount, (int)rows);
+        if (threadCount <= 1) {
+            ConvertFromBFloat16(
+                dstData, dstDataType, bfloat16Data, rows, columns);
+            return;
+        }
+
+        const size_t rowsPerThread = rows / threadCount;
+        size_t startRow = 0;
+        std::vector<MultiThreadConvertFromBFloat16Op*> operations;
+        operations.reserve(threadCount);
+        for (int thread = 0; thread < threadCount; thread++) {
+            const size_t endRow = thread == threadCount - 1 ? rows :
+                                  startRow + rowsPerThread;
+            operations.push_back(new MultiThreadConvertFromBFloat16Op(
+                dstData, dstDataType, bfloat16Data, columns,
+                startRow, endRow));
+            startRow = endRow;
+        }
+        for (int thread = 0; thread < threadCount; thread++) {
+            pool->PushOp(firstThread + thread, operations[thread]);
+        }
+        for (int thread = 0; thread < threadCount; thread++) {
+            pool->Wait(firstThread + thread);
+            delete operations[thread];
         }
     }
 
@@ -7360,8 +7611,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &output = *(datas.find("output")->second);
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, 
-                        "Sigmoid error: Data's type should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Sigmoid error: Data's type should be float32, float16 or bfloat16.\n");
 
         int len = input.Count(0);
         if (input.dataType == DataType::FLOAT16) {
@@ -7369,6 +7621,14 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint16_t *outputData = (uint16_t*)output.cpuData;
             for (int i = 0; i < len; i++) {
                 outputData[i] = fp16SigmoidManager.dict[inputData[i]];
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            uint16_t *inputData = (uint16_t*)input.cpuData;
+            uint16_t *outputData = (uint16_t*)output.cpuData;
+            for (int i = 0; i < len; i++) {
+                float value = BFloat16BitsToFloat32(inputData[i]);
+                outputData[i] = Float32ToBFloat16RNEBits(
+                    1.0f / (1.0f + std::exp(-value)));
             }
         } else {
             float *inputData = (float*)input.cpuData;
@@ -7831,6 +8091,11 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input1 = *(datas.find("input1")->second);
         int input0Len = input0.Count(0);
         int input1Len = input1.Count(0);
+        AssertInFastLLM(input0.dataType == input1.dataType &&
+                        (input0.dataType == DataType::FLOAT32 ||
+                         input0.dataType == DataType::FLOAT16 ||
+                         input0.dataType == DataType::BFLOAT16),
+                        "MulTo error: inputs should have the same float32, float16 or bfloat16 type.\n");
         AssertInFastLLM(input0.dims == input1.dims || input1Len == 1 || input0Len % input1Len == 0, "MulTo error: input's shape should be same.\n");
 
         int len = input0.Count(0);
@@ -7844,6 +8109,14 @@ ops += (long long)lines * inputDim * interDim * 2;
                 uint16_t *input1Data = (uint16_t*)input1.cpuData;
                 for (int i = 0; i < len; i++) {
                     input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[0]]);
+                }
+            } else if (input0.dataType == DataType::BFLOAT16) {
+                uint16_t *input0Data = (uint16_t*)input0.cpuData;
+                uint16_t *input1Data = (uint16_t*)input1.cpuData;
+                float scalar = BFloat16BitsToFloat32(input1Data[0]);
+                for (int i = 0; i < len; i++) {
+                    input0Data[i] = Float32ToBFloat16RNEBits(
+                        BFloat16BitsToFloat32(input0Data[i]) * scalar);
                 }
             } else {
                 float *input0Data = (float*)input0.cpuData;
@@ -7859,6 +8132,14 @@ ops += (long long)lines * inputDim * interDim * 2;
                 for (int i = 0; i < len; i++) {
                     input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[i]]);
                 }
+            } else if (input0.dataType == DataType::BFLOAT16) {
+                uint16_t *input0Data = (uint16_t*)input0.cpuData;
+                uint16_t *input1Data = (uint16_t*)input1.cpuData;
+                for (int i = 0; i < len; i++) {
+                    input0Data[i] = Float32ToBFloat16RNEBits(
+                        BFloat16BitsToFloat32(input0Data[i]) *
+                        BFloat16BitsToFloat32(input1Data[i]));
+                }
             } else {
                 float *input0Data = (float*)input0.cpuData;
                 float *input1Data = (float*)input1.cpuData;
@@ -7873,6 +8154,14 @@ ops += (long long)lines * inputDim * interDim * 2;
                 uint16_t *input1Data = (uint16_t*)input1.cpuData;
                 for (int i = 0; i < len; i++) {
                     input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[i / channelLen]]);
+                }
+            } else if (input0.dataType == DataType::BFLOAT16) {
+                uint16_t *input0Data = (uint16_t*)input0.cpuData;
+                uint16_t *input1Data = (uint16_t*)input1.cpuData;
+                for (int i = 0; i < len; i++) {
+                    input0Data[i] = Float32ToBFloat16RNEBits(
+                        BFloat16BitsToFloat32(input0Data[i]) *
+                        BFloat16BitsToFloat32(input1Data[i / channelLen]));
                 }
             } else {
                 float *input0Data = (float*)input0.cpuData;
@@ -7970,9 +8259,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint16_t *input1Data = (uint16_t *) input1.cpuData;
             for (int i = 0; i < len; i++) {
                 float val = bf16tofp32.dict[input0Data[i]] + bf16tofp32.dict[input1Data[i]] * alpha;
-                uint32_t tmp;
-                memcpy(&tmp, &val, sizeof(tmp));
-                input0Data[i] = (uint16_t)(tmp >> 16);
+                input0Data[i] = Float32ToBFloat16RNEBits(val);
             }
         }
     }
