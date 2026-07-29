@@ -156,7 +156,14 @@ namespace fastllm {
         numaConfigLocker.lock();
         auto *pool = GetAlivePool();
         if (fastllmNumaConfig == nullptr) {
-            fastllmNumaConfig = new NumaConfig(pool->threads.size(), pool, &machineNumaInfo);
+            // AliveThreadPool keeps previously-created worker objects when
+            // SetThreads() shrinks the active range.  Using vector::size()
+            // here silently ignored a later `-t N` and reactivated every
+            // old worker for NUMA.  NumaConfig uses worker ids from zero, so
+            // the active interval end is the requested pool size.
+            int activeThreads = pool->curActivateThreadInterval.second;
+            fastllmNumaConfig = new NumaConfig(
+                activeThreads, pool, &machineNumaInfo);
         }
         numaConfigLocker.unlock();
         
