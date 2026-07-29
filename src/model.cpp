@@ -1561,6 +1561,57 @@ namespace fastllm {
                DeviceNameMatchesType(GetMoeWeightSelectedDevice(model, weightName), "disk");
     }
 
+    static bool IsPureDiskDeviceMap(const std::map<std::string, int> &deviceMap) {
+        if (deviceMap.empty()) {
+            return false;
+        }
+        bool hasDisk = false;
+        for (const auto &it : deviceMap) {
+            if (it.second > 0) {
+                if (!DeviceNameMatchesType(it.first, "disk")) {
+                    return false;
+                }
+                hasDisk = true;
+            }
+        }
+        return hasDisk;
+    }
+
+    static uint64_t DiskEmbeddingMinBytes() {
+        static uint64_t bytes = []() {
+            const char *env = std::getenv("FASTLLM_DISK_EMBEDDING_MIN_MB");
+            unsigned long long mb = env == nullptr ? 64ULL : std::strtoull(env, nullptr, 10);
+            return mb * 1024ULL * 1024ULL;
+        }();
+        return bytes;
+    }
+
+    static WeightType GetDiskLazyWeightType(basellm *model,
+                                            const std::string &weightName,
+                                            uint64_t sourceBytes) {
+        if (model == nullptr) {
+            return WeightType::NONE;
+        }
+        if (IsDiskMoeWeight(model, weightName)) {
+            return WeightType::LINEAR;
+        }
+        if (!IsPureDiskDeviceMap(model->deviceMap)) {
+            return WeightType::NONE;
+        }
+        WeightType type = model->weight.GetWeightType(weightName);
+        if (type == WeightType::LINEAR) {
+            return type;
+        }
+        // Small positional embeddings are often consumed through direct CPU
+        // pointers by multimodal preprocessors. Keeping those resident costs
+        // little; token embeddings are large and benefit greatly from row-wise
+        // disk reads.
+        if (type == WeightType::EMBEDDING && sourceBytes >= DiskEmbeddingMinBytes()) {
+            return type;
+        }
+        return WeightType::NONE;
+    }
+
     static bool GetDiskSourceDataType(const std::string &dtype, DataType &dataType) {
         if (dtype == "F32") {
             dataType = DataType::FLOAT32;
@@ -1589,14 +1640,15 @@ namespace fastllm {
                dataType == DataType::NVFP4;
     }
 
-    static void ResetDiskWeightMeta(Data &weight, DataType dataType) {
+    static void ResetDiskWeightMeta(Data &weight, DataType dataType,
+                                    WeightType weightType = WeightType::LINEAR) {
         std::vector<int> dims = weight.dims;
         weight.dataType = dataType;
         weight.UpdateUnitSize();
         weight.Resize(dims);
         weight.isDiskWeight = true;
         weight.diskWeightParts.clear();
-        weight.weightType = WeightType::LINEAR;
+        weight.weightType = weightType;
         weight.expansionSize = 0;
         weight.expansionBytes = 0;
         weight.cpuData = nullptr;
@@ -1646,8 +1698,10 @@ namespace fastllm {
         return value;
     }
 
-    static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor, DataType targetDataType,
-                                  SafeTensorItem *scaleTensor = nullptr) {
+    static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor,
+                                  DataType targetDataType,
+                                  SafeTensorItem *scaleTensor = nullptr,
+                                  WeightType weightType = WeightType::LINEAR) {
         DataType sourceDataType;
         if (IsPackedFP4StorageDType(tensor.dtype) && targetDataType == DataType::NVFP4) {
             sourceDataType = DataType::NVFP4;
@@ -1662,7 +1716,7 @@ namespace fastllm {
               (sourceDataType == DataType::NVFP4 && targetDataType == DataType::NVFP4))) {
             ErrorInFastLLM("Disk MoE only supports scaled weights for FP8/NVFP4 expert tensors: " + weight.name + "\n");
         }
-        ResetDiskWeightMeta(weight, sourceDataType);
+        ResetDiskWeightMeta(weight, targetDataType, weightType);
 
         DiskWeightPart part;
         part.fileName = tensor.fileName;
@@ -1743,7 +1797,8 @@ namespace fastllm {
         }
     }
 
-    static void SetDiskFastllmWeightMeta(Data &weight, const SafeTensorItem &tensor) {
+    static void SetDiskFastllmWeightMeta(Data &weight, const SafeTensorItem &tensor,
+                                         WeightType weightType = WeightType::LINEAR) {
         std::vector<uint8_t> header(sizeof(int) * 5);
         ReadDiskTensorRange(tensor.fileName, (long long)tensor.data_offsets[0],
                             header.data(), header.size());
@@ -1765,7 +1820,7 @@ namespace fastllm {
             fastllmGgmlType = ReadDiskMetaInt(header, offset);
             weight.ggmlType = fastllmGgmlType;
         }
-        ResetDiskWeightMeta(weight, dataType);
+        ResetDiskWeightMeta(weight, dataType, weightType);
         uint64_t payloadOffset = sizeof(int) * 2;
         bool compactFastllmNVFP4 = false;
 
@@ -3535,13 +3590,16 @@ namespace fastllm {
                                 }
                             }
 
-                            bool diskLazyWeight = IsDiskMoeWeight(model, weightName);
+                            WeightType diskLazyWeightType = GetDiskLazyWeightType(
+                                model, weightName, tensor.bytes);
+                            bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
                             if (diskLazyWeight) {
                                 if (isAwqModel || loraDicts.find(weightName) != loraDicts.end()) {
-                                    ErrorInFastLLM("Disk MoE does not support AWQ/lora expert weight yet: " + weightName + "\n");
+                                    ErrorInFastLLM("Disk device does not support AWQ/lora lazy weight yet: " + weightName + "\n");
                                 }
                                 if (tensor.dtype == "fastllm") {
-                                    SetDiskFastllmWeightMeta(model->weight[weightName], tensor);
+                                    SetDiskFastllmWeightMeta(model->weight[weightName], tensor,
+                                                            diskLazyWeightType);
                                 } else {
                                     SafeTensorItem *scaleTensor = nullptr;
                                     DataType diskDataType = dataType;
@@ -3564,7 +3622,8 @@ namespace fastllm {
                                             scaleTensor->CreateBuffer(DataType::FLOAT32);
                                         }
                                     }
-                                    SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType, scaleTensor);
+                                    SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType,
+                                                      scaleTensor, diskLazyWeightType);
                                     if (scaleTensor != nullptr) {
                                         scaleTensor->ClearBuffer();
                                     }

@@ -2422,6 +2422,318 @@ namespace {
         fastllm::ClearAllPagedCacheManagers();
     }
 
+    float DecodeFP8E4M3(uint8_t value) {
+        const float sign = (value & 0x80) ? -1.0f : 1.0f;
+        const int exponent = (value >> 3) & 0x0f;
+        const int mantissa = value & 0x07;
+        if (exponent == 0) {
+            return sign * std::ldexp((float)mantissa, -9);
+        }
+        return sign * std::ldexp(1.0f + (float)mantissa / 8.0f, exponent - 7);
+    }
+
+    void RunDiskOperatorsRegression() {
+        // Exercise multiple decode chunks without creating a 64 MiB fixture.
+        setenv("FASTLLM_DISK_LINEAR_CHUNK_MB", "1", 1);
+        constexpr int inputDim = 256;
+        constexpr int outputDim = 8704;
+        constexpr int splitRows = 4352;
+        constexpr int blockK = 128;
+        constexpr int blockM = 128;
+        constexpr int batch = 2;
+        const int scaleColumns = (inputDim + blockM - 1) / blockM;
+
+        ScopedTempDirectory temp("fastllm_disk_linear_");
+        const std::filesystem::path weightPath = temp.Path() / "weights.bin";
+        std::vector<uint8_t> fp8Weights((size_t)outputDim * inputDim);
+        for (int row = 0; row < outputDim; row++) {
+            for (int column = 0; column < inputDim; column++) {
+                uint8_t magnitude = (uint8_t)((row * 17 + column * 29 + 3) % 127);
+                fp8Weights[(size_t)row * inputDim + column] =
+                    magnitude | (((row + column) & 1) ? 0x80 : 0x00);
+            }
+        }
+        std::vector<float> scales((size_t)((outputDim + blockK - 1) / blockK) *
+                                  scaleColumns);
+        for (size_t i = 0; i < scales.size(); i++) {
+            scales[i] = 0.0005f * (float)(1 + (i % 13));
+        }
+        std::vector<float> biasValues(outputDim);
+        for (int row = 0; row < outputDim; row++) {
+            biasValues[row] = (float)((row * 7) % 31 - 15) / 32.0f;
+        }
+
+        constexpr int vocabSize = 9;
+        constexpr int embeddingDim = 17;
+        std::vector<uint16_t> sourceEmbedding((size_t)vocabSize * embeddingDim);
+        std::vector<float> roundedEmbedding(sourceEmbedding.size());
+        for (size_t i = 0; i < sourceEmbedding.size(); i++) {
+            float value = (float)((int)(i * 11 % 101) - 50) / 19.0f;
+            sourceEmbedding[i] = fastllm::Float32ToBFloat16RNEBits(value);
+            roundedEmbedding[i] = fastllm::BFloat16BitsToFloat32(sourceEmbedding[i]);
+        }
+        const uint64_t embeddingOffset = fp8Weights.size();
+        {
+            std::ofstream output(weightPath, std::ios::binary);
+            Expect(output.good(), "failed to create disk operator fixture.");
+            output.write(reinterpret_cast<const char*>(fp8Weights.data()),
+                         fp8Weights.size());
+            output.write(reinterpret_cast<const char*>(sourceEmbedding.data()),
+                         sourceEmbedding.size() * sizeof(uint16_t));
+            Expect(output.good(), "failed to write disk operator fixture.");
+        }
+
+        fastllm::Data residentWeight(fastllm::DataType::FP8_E4M3,
+                                     {outputDim, inputDim});
+        residentWeight.blockK = blockK;
+        residentWeight.blockM = blockM;
+        residentWeight.scales = scales;
+        residentWeight.Allocate();
+        memcpy(residentWeight.cpuData, fp8Weights.data(), fp8Weights.size());
+
+        fastllm::Data diskWeight(fastllm::DataType::FP8_E4M3,
+                                 {outputDim, inputDim});
+        diskWeight.name = "regression.disk.fp8.weight";
+        diskWeight.blockK = blockK;
+        diskWeight.blockM = blockM;
+        diskWeight.scales = scales;
+        diskWeight.weightType = fastllm::WeightType::LINEAR;
+        diskWeight.isDiskWeight = true;
+        for (const auto &range : {std::pair<int, int>{0, splitRows},
+                                  std::pair<int, int>{splitRows, outputDim}}) {
+            fastllm::DiskWeightPart part;
+            part.fileName = weightPath.string();
+            part.fileOffset = (long long)range.first * inputDim;
+            part.bytes = (uint64_t)(range.second - range.first) * inputDim;
+            part.sourceDataType = fastllm::DataType::FP8_E4M3;
+            part.dims = {range.second - range.first, inputDim};
+            diskWeight.diskWeightParts.push_back(part);
+        }
+
+        std::vector<float> inputValues((size_t)batch * inputDim);
+        for (int b = 0; b < batch; b++) {
+            for (int column = 0; column < inputDim; column++) {
+                inputValues[(size_t)b * inputDim + column] =
+                    (float)((column * (b + 5) + 13 * b) % 97 - 48) / 37.0f;
+            }
+        }
+        fastllm::Data input(fastllm::DataType::FLOAT32,
+                            {batch, inputDim}, inputValues);
+        fastllm::Data bias(fastllm::DataType::FLOAT32, {outputDim}, biasValues);
+        fastllm::Data cpuOutput, diskOutput;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(input, residentWeight, bias, cpuOutput);
+        }
+        {
+            ScopedFirstDevice guard("disk");
+            fastllm::Linear(input, diskWeight, bias, diskOutput);
+        }
+        ExpectFloatNear(ToFloatVector(cpuOutput), ToFloatVector(diskOutput),
+                        2e-4f, 2e-4f, "disk transient-prefill FP8 linear batch 2");
+        Expect(diskWeight.cpuData == nullptr,
+               "disk prefill retained the Linear weight after the operator finished.");
+
+        std::vector<float> manual(outputDim);
+        for (int row = 0; row < outputDim; row++) {
+            float sum = biasValues[row];
+            for (int column = 0; column < inputDim; column++) {
+                float roundedInput = fastllm::BFloat16BitsToFloat32(
+                    fastllm::Float32ToBFloat16RNEBits(inputValues[column]));
+                float scale = scales[(size_t)(row / blockK) * scaleColumns +
+                                     column / blockM];
+                sum += roundedInput *
+                       DecodeFP8E4M3(fp8Weights[(size_t)row * inputDim + column]) *
+                       scale;
+            }
+            manual[row] = sum;
+        }
+        std::vector<float> cpuValues = ToFloatVector(cpuOutput);
+        cpuValues.resize(outputDim);
+        ExpectFloatNear(manual, cpuValues, 3e-3f, 3e-3f,
+                        "ARM/vector FP8 linear numerical reference");
+
+        fastllm::Data singleInput(fastllm::DataType::FLOAT32, {1, inputDim},
+                                  std::vector<float>(inputValues.begin(),
+                                                     inputValues.begin() + inputDim));
+        std::vector<fastllm::Data*> mergeWeights = {
+            nullptr, nullptr, &diskWeight, &diskWeight
+        };
+        std::vector<fastllm::Data*> mergeBiass(mergeWeights.size(), nullptr);
+        {
+            ScopedFirstDevice guard("disk");
+            Expect(fastllm::CanRunMergeMOE(singleInput, mergeWeights, mergeBiass),
+                   "disk MergeMOE capability probe did not receive disk weights.");
+        }
+
+        // A multi-token MergeMOE uses w2 as a gathered-input scratch buffer.
+        // Reproduce the model warmup case where that reusable tensor still has
+        // a BF16 allocation but the current MoE input is FLOAT32.
+        constexpr int moeHidden = 16;
+        constexpr int moeInter = 8;
+        constexpr int moeBatch = 32;
+        constexpr int moeBlock = 8;
+        const std::filesystem::path moePath = temp.Path() / "moe.bin";
+        std::vector<uint8_t> moeGateBytes((size_t)moeInter * 2 * moeHidden);
+        std::vector<uint8_t> moeDownBytes((size_t)moeHidden * moeInter);
+        for (size_t i = 0; i < moeGateBytes.size(); i++) {
+            moeGateBytes[i] = (uint8_t)(0x20 + i % 16) |
+                              ((i & 7) == 0 ? 0x80 : 0x00);
+        }
+        for (size_t i = 0; i < moeDownBytes.size(); i++) {
+            moeDownBytes[i] = (uint8_t)(0x18 + i % 16) |
+                              ((i & 5) == 0 ? 0x80 : 0x00);
+        }
+        {
+            std::ofstream output(moePath, std::ios::binary);
+            Expect(output.good(), "failed to create disk MergeMOE fixture.");
+            output.write(reinterpret_cast<const char*>(moeGateBytes.data()),
+                         moeGateBytes.size());
+            output.write(reinterpret_cast<const char*>(moeDownBytes.data()),
+                         moeDownBytes.size());
+            Expect(output.good(), "failed to write disk MergeMOE fixture.");
+        }
+
+        auto initMoeWeight = [&](fastllm::Data &weight,
+                                 const std::vector<int> &dims,
+                                 const std::vector<uint8_t> &bytes,
+                                 long long fileOffset, bool disk) {
+            weight.dataType = fastllm::DataType::FP8_E4M3;
+            weight.Resize(dims);
+            weight.blockK = moeBlock;
+            weight.blockM = moeBlock;
+            int scaleRows = (dims[0] + moeBlock - 1) / moeBlock;
+            int scaleColumns = (dims[1] + moeBlock - 1) / moeBlock;
+            weight.scales.resize((size_t)scaleRows * scaleColumns);
+            for (size_t i = 0; i < weight.scales.size(); i++) {
+                weight.scales[i] = 0.01f * (float)(i + 1);
+            }
+            weight.weightType = fastllm::WeightType::LINEAR;
+            if (disk) {
+                weight.isDiskWeight = true;
+                fastllm::DiskWeightPart part;
+                part.fileName = moePath.string();
+                part.fileOffset = fileOffset;
+                part.bytes = bytes.size();
+                part.sourceDataType = fastllm::DataType::FP8_E4M3;
+                part.dims = dims;
+                weight.diskWeightParts.push_back(part);
+            } else {
+                weight.Allocate(false);
+                memcpy(weight.cpuData, bytes.data(), bytes.size());
+            }
+        };
+        fastllm::Data residentMoeGate, residentMoeDown;
+        fastllm::Data diskMoeGate, diskMoeDown;
+        initMoeWeight(residentMoeGate, {moeInter * 2, moeHidden},
+                      moeGateBytes, 0, false);
+        initMoeWeight(residentMoeDown, {moeHidden, moeInter},
+                      moeDownBytes, moeGateBytes.size(), false);
+        initMoeWeight(diskMoeGate, {moeInter * 2, moeHidden},
+                      moeGateBytes, 0, true);
+        initMoeWeight(diskMoeDown, {moeHidden, moeInter},
+                      moeDownBytes, moeGateBytes.size(), true);
+
+        std::vector<float> moeInputValues((size_t)moeBatch * moeHidden);
+        for (size_t i = 0; i < moeInputValues.size(); i++) {
+            moeInputValues[i] = (float)((int)(i * 13 % 67) - 33) / 29.0f;
+        }
+        fastllm::Data moeInput(fastllm::DataType::FLOAT32,
+                               {moeBatch, moeHidden}, moeInputValues);
+        fastllm::Data moeIndex = MakeIntTensor(
+            {moeBatch, 1}, std::vector<int32_t>(moeBatch, 0));
+        fastllm::Data moeScore(fastllm::DataType::FLOAT32, {moeBatch, 1},
+                               std::vector<float>(moeBatch, 1.0f));
+        std::vector<fastllm::Data*> residentMoeWeights = {
+            nullptr, nullptr, &residentMoeGate, &residentMoeDown
+        };
+        std::vector<fastllm::Data*> diskMoeWeights = {
+            nullptr, nullptr, &diskMoeGate, &diskMoeDown
+        };
+        std::vector<fastllm::Data*> moeBiass(4, nullptr);
+        fastllm::Data cpuMoeW1, cpuMoeW2, cpuMoeW3;
+        fastllm::Data cpuMoeInput, cpuMoeIntermediate;
+        fastllm::Data cpuMoeOutput(fastllm::DataType::FLOAT32,
+                                   {moeBatch, moeHidden});
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::MergeMOE(
+                moeInput, moeIndex, moeScore, residentMoeWeights, moeBiass,
+                cpuMoeW1, cpuMoeW2, cpuMoeW3,
+                cpuMoeInput, cpuMoeIntermediate, 0.0f, cpuMoeOutput);
+        }
+
+        fastllm::Data diskMoeW1(fastllm::DataType::BFLOAT16,
+                                {moeBatch, moeInter});
+        diskMoeW1.Allocate(false);
+        fastllm::Data diskMoeW3(fastllm::DataType::BFLOAT16,
+                                {moeBatch, moeInter * 2});
+        diskMoeW3.Allocate(false);
+        fastllm::Data diskMoeW2(fastllm::DataType::BFLOAT16,
+                                {moeBatch, moeHidden});
+        diskMoeW2.Allocate(false);
+        fastllm::Data diskMoeInput, diskMoeIntermediate;
+        fastllm::Data diskMoeOutput(fastllm::DataType::FLOAT32,
+                                    {moeBatch, moeHidden});
+        {
+            ScopedFirstDevice guard("disk");
+            fastllm::MergeMOE(
+                moeInput, moeIndex, moeScore, diskMoeWeights, moeBiass,
+                diskMoeW1, diskMoeW2, diskMoeW3,
+                diskMoeInput, diskMoeIntermediate, 0.0f, diskMoeOutput);
+        }
+        ExpectFloatNear(ToFloatVector(cpuMoeOutput), ToFloatVector(diskMoeOutput),
+                        2e-4f, 2e-4f,
+                        "disk MergeMOE transient weights and scratch dtype reuse");
+        Expect(diskMoeGate.cpuData == nullptr && diskMoeDown.cpuData == nullptr,
+               "disk MergeMOE retained an expert weight after the operator finished.");
+
+        fastllm::Data singleCpuOutput, singleDiskOutput;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(singleInput, residentWeight, bias, singleCpuOutput);
+        }
+        {
+            ScopedFirstDevice guard("disk");
+            fastllm::Linear(singleInput, diskWeight, bias, singleDiskOutput);
+        }
+        ExpectFloatNear(ToFloatVector(singleCpuOutput), ToFloatVector(singleDiskOutput),
+                        2e-4f, 2e-4f, "disk chunked FP8 linear batch 1");
+        Expect(diskWeight.cpuData == nullptr,
+               "disk Linear materialized the full resident weight.");
+
+        fastllm::Data residentEmbedding(fastllm::DataType::FLOAT16,
+                                        {vocabSize, embeddingDim}, roundedEmbedding);
+        fastllm::Data diskEmbedding(fastllm::DataType::FLOAT16,
+                                    {vocabSize, embeddingDim});
+        diskEmbedding.name = "regression.disk.embedding.weight";
+        diskEmbedding.weightType = fastllm::WeightType::EMBEDDING;
+        diskEmbedding.isDiskWeight = true;
+        fastllm::DiskWeightPart embeddingPart;
+        embeddingPart.fileName = weightPath.string();
+        embeddingPart.fileOffset = embeddingOffset;
+        embeddingPart.bytes = sourceEmbedding.size() * sizeof(uint16_t);
+        embeddingPart.sourceDataType = fastllm::DataType::BFLOAT16;
+        embeddingPart.dims = {vocabSize, embeddingDim};
+        diskEmbedding.diskWeightParts.push_back(embeddingPart);
+
+        const std::vector<float> tokenValues = {5, 1, 5, 0, 8, 1};
+        fastllm::Data tokenIds(fastllm::DataType::FLOAT32, {2, 3}, tokenValues);
+        fastllm::Data cpuEmbedding, diskEmbeddingOutput;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Embedding(tokenIds, residentEmbedding, cpuEmbedding);
+        }
+        {
+            ScopedFirstDevice guard("disk");
+            fastllm::Embedding(tokenIds, diskEmbedding, diskEmbeddingOutput);
+        }
+        ExpectFloatNear(ToFloatVector(cpuEmbedding), ToFloatVector(diskEmbeddingOutput),
+                        0.0f, 0.0f, "disk row-wise BF16 embedding");
+        Expect(diskEmbedding.cpuData == nullptr,
+               "disk Embedding materialized the full resident weight.");
+    }
+
     void RunCpuInt4GroupAwqLinearRegressionCase(int inputDim, int outputDim,
                                                 int groupCnt,
                                                 const std::string &caseName) {
@@ -3620,6 +3932,12 @@ int main() {
             std::cout << "cpu AWQ-style INT4_GROUP linear regression: PASS\n";
             RunCpuPackedInt4Group32KernelRegression();
             std::cout << "cpu packed INT4_GROUP(32) kernel regression: PASS\n";
+            ranAny = true;
+        }
+
+        if (fastllm::HasDeviceType("disk")) {
+            RunDiskOperatorsRegression();
+            std::cout << "disk Linear, Embedding and MergeMOE regression: PASS\n";
             ranAny = true;
         }
 

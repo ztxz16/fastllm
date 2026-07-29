@@ -20,6 +20,31 @@ namespace fastllm {
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
+
+    class DiskLinearOp : public BaseOperator {
+    public:
+        void Reshape(const std::string &opType, const DataDict &datas,
+                     const FloatDict &floatParams, const IntDict &intParams) override;
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class DiskEmbeddingOp : public BaseOperator {
+    public:
+        explicit DiskEmbeddingOp(bool direct) : direct(direct) {}
+
+        void Reshape(const std::string &opType, const DataDict &datas,
+                     const FloatDict &floatParams, const IntDict &intParams) override;
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+
+    private:
+        bool direct;
+    };
 }
 
 #endif

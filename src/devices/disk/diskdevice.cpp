@@ -4,15 +4,26 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
+#include <future>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <set>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
+
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -29,6 +40,9 @@ namespace fastllm {
 
     DiskDevice::DiskDevice() {
         this->deviceType = "disk";
+        this->ops["Linear"] = (BaseOperator*)(new DiskLinearOp());
+        this->ops["Embedding"] = (BaseOperator*)(new DiskEmbeddingOp(false));
+        this->ops["EmbeddingDirect"] = (BaseOperator*)(new DiskEmbeddingOp(true));
         this->ops["MergeMOE"] = (BaseOperator*)(new DiskMergeMOE());
     }
 
@@ -64,21 +78,13 @@ namespace fastllm {
         return count;
     }
 
-    static int DiskMoeLoadThreads() {
-        static int threads = []() {
-            const char *env = std::getenv("FASTLLM_DISK_MOE_LOAD_THREADS");
-            int v = env == nullptr ? 4 : atoi(env);
-            return std::max(1, v);
-        }();
-        return threads;
-    }
-
     static bool ParseEnvFlag(const char *env, bool defaultValue) {
         if (env == nullptr) {
             return defaultValue;
         }
         std::string value(env);
-        std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
         if (value == "0" || value == "false" || value == "off") {
             return false;
         }
@@ -105,31 +111,65 @@ namespace fastllm {
         return minTokens;
     }
 
+    static bool DiskDirectIoEnabled() {
+        static bool enabled = []() {
+#ifndef O_DIRECT
+            return false;
+#else
+            bool ret = ParseEnvFlag(std::getenv("FASTLLM_DISK_DIRECT_IO"), false);
+            return ParseEnvFlag(std::getenv("FASTLLM_DISK_NO_CACHE"), ret);
+#endif
+        }();
+        return enabled;
+    }
+
+    static int DiskMoeLoadThreads() {
+        static int threads = []() {
+            const char *env = std::getenv("FASTLLM_DISK_MOE_LOAD_THREADS");
+            int v = env == nullptr ? (DiskDirectIoEnabled() ? 2 : 4) : atoi(env);
+            return std::max(1, v);
+        }();
+        return threads;
+    }
+
     class DiskFileCache {
     public:
         ~DiskFileCache() {
             for (auto &it : fds) {
                 close(it.second);
             }
+            for (auto &it : directFds) {
+                close(it.second);
+            }
         }
 
-        int Get(const std::string &fileName) {
+        int Get(const std::string &fileName, bool direct = false) {
             std::lock_guard<std::mutex> guard(locker);
-            auto it = fds.find(fileName);
-            if (it != fds.end()) {
+            int flags = O_RDONLY;
+#ifdef O_DIRECT
+            if (direct) {
+                flags |= O_DIRECT;
+            }
+#else
+            direct = false;
+#endif
+            auto &cache = direct ? directFds : fds;
+            auto it = cache.find(fileName);
+            if (it != cache.end()) {
                 return it->second;
             }
-            int fd = open(fileName.c_str(), O_RDONLY);
+            int fd = open(fileName.c_str(), flags);
             if (fd < 0) {
-                ErrorInFastLLM("Disk MoE can't open weight file: " + fileName + "\n");
+                ErrorInFastLLM("Disk device can't open weight file: " + fileName + "\n");
             }
-            fds[fileName] = fd;
+            cache[fileName] = fd;
             return fd;
         }
 
     private:
         std::mutex locker;
         std::unordered_map<std::string, int> fds;
+        std::unordered_map<std::string, int> directFds;
     };
 
     static DiskFileCache &GetDiskFileCache() {
@@ -137,28 +177,170 @@ namespace fastllm {
         return cache;
     }
 
-    static void ReadDiskPartBytes(const DiskWeightPart &part, uint8_t *dst) {
+    class DiskDirectScratch {
+    public:
+        ~DiskDirectScratch() {
+            free(buffer);
+        }
+
+        uint8_t *Acquire(size_t bytes) {
+            if (inUse || bytes > 4 * 1024 * 1024) {
+                return nullptr;
+            }
+            if (bytes > capacity) {
+                free(buffer);
+                buffer = nullptr;
+                capacity = 0;
+                void *ptr = nullptr;
+                if (posix_memalign(&ptr, 4096, bytes) != 0) {
+                    return nullptr;
+                }
+                buffer = (uint8_t*)ptr;
+                capacity = bytes;
+            }
+            inUse = true;
+            return buffer;
+        }
+
+        void Release() {
+            inUse = false;
+        }
+
+    private:
+        uint8_t *buffer = nullptr;
+        size_t capacity = 0;
+        bool inUse = false;
+    };
+
+    static thread_local DiskDirectScratch diskDirectScratch;
+
+    class DiskDirectRange {
+    public:
+        DiskDirectRange(const DiskWeightPart &part, uint64_t offset, uint64_t bytes,
+                        bool allowScratch = true) {
+            AssertInFastLLM(part.fileOffset >= 0 && offset <= part.bytes &&
+                            bytes <= part.bytes - offset && bytes > 0,
+                            "Disk direct read range is invalid: " + part.fileName + "\n");
+            const uint64_t alignment = 4096;
+            const uint64_t maxFileOffset = (uint64_t)std::numeric_limits<off_t>::max();
+            AssertInFastLLM((uint64_t)part.fileOffset <= maxFileOffset &&
+                            offset <= maxFileOffset - (uint64_t)part.fileOffset &&
+                            bytes <= maxFileOffset - ((uint64_t)part.fileOffset + offset),
+                            "Disk direct read file offset is too large: " + part.fileName + "\n");
+            uint64_t absoluteOffset = (uint64_t)part.fileOffset + offset;
+            uint64_t alignedOffset = absoluteOffset / alignment * alignment;
+            prefixBytes = (size_t)(absoluteOffset - alignedOffset);
+            AssertInFastLLM(bytes <= std::numeric_limits<size_t>::max() - prefixBytes,
+                            "Disk direct read range is too large.\n");
+            size_t requiredBytes = prefixBytes + (size_t)bytes;
+            AssertInFastLLM(requiredBytes <=
+                                std::numeric_limits<size_t>::max() - (alignment - 1),
+                            "Disk direct read aligned range is too large.\n");
+            bufferBytes = (requiredBytes + alignment - 1) / alignment * alignment;
+            buffer = allowScratch ? diskDirectScratch.Acquire(bufferBytes) : nullptr;
+            if (buffer != nullptr) {
+                usesScratch = true;
+            } else {
+                void *ptr = nullptr;
+                AssertInFastLLM(posix_memalign(&ptr, alignment, bufferBytes) == 0 && ptr != nullptr,
+                                "Disk direct read buffer allocation failed.\n");
+                buffer = (uint8_t*)ptr;
+            }
+
+            int fd = GetDiskFileCache().Get(part.fileName, true);
+            size_t done = 0;
+            while (done < requiredBytes) {
+                ssize_t ret = pread(fd, buffer + done, bufferBytes - done,
+                                    (off_t)(alignedOffset + done));
+                if (ret < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    ReleaseBuffer();
+                    ErrorInFastLLM("Disk direct read failed: " + part.fileName +
+                                   ", errno = " + std::to_string(errno) + "\n");
+                }
+                if (ret == 0) {
+                    ReleaseBuffer();
+                    ErrorInFastLLM("Disk direct read EOF: " + part.fileName + "\n");
+                }
+                done += (size_t)ret;
+            }
+        }
+
+        ~DiskDirectRange() {
+            ReleaseBuffer();
+        }
+
+        uint8_t *Get() const {
+            return buffer == nullptr ? nullptr : buffer + prefixBytes;
+        }
+
+    private:
+        void ReleaseBuffer() {
+            if (buffer == nullptr) {
+                return;
+            }
+            if (usesScratch) {
+                diskDirectScratch.Release();
+            } else {
+                free(buffer);
+            }
+            buffer = nullptr;
+        }
+
+        uint8_t *buffer = nullptr;
+        size_t bufferBytes = 0;
+        size_t prefixBytes = 0;
+        bool usesScratch = false;
+    };
+
+    static void ReadDiskPartRange(const DiskWeightPart &part, uint64_t offset,
+                                  uint64_t bytes, uint8_t *dst) {
+        AssertInFastLLM(offset <= part.bytes && bytes <= part.bytes - offset,
+                        "Disk weight read range is out of bounds: " + part.fileName + "\n");
+        if (bytes == 0) {
+            return;
+        }
+        if (DiskDirectIoEnabled()) {
+            DiskDirectRange direct(part, offset, bytes);
+            memcpy(dst, direct.Get(), bytes);
+            return;
+        }
         int fd = GetDiskFileCache().Get(part.fileName);
         uint64_t done = 0;
-        while (done < part.bytes) {
-            ssize_t ret = pread(fd, dst + done, part.bytes - done, part.fileOffset + done);
+        while (done < bytes) {
+            ssize_t ret = pread(fd, dst + done, bytes - done,
+                                part.fileOffset + offset + done);
             if (ret < 0) {
-                ErrorInFastLLM("Disk MoE read weight failed: " + part.fileName + "\n");
+                if (errno == EINTR) {
+                    continue;
+                }
+                ErrorInFastLLM("Disk device read weight failed: " + part.fileName +
+                               ", errno = " + std::to_string(errno) + "\n");
             }
             if (ret == 0) {
-                ErrorInFastLLM("Disk MoE read EOF: " + part.fileName + "\n");
+                ErrorInFastLLM("Disk device read EOF: " + part.fileName + "\n");
             }
             done += ret;
         }
     }
 
+    static void ReadDiskPartBytes(const DiskWeightPart &part, uint8_t *dst) {
+        ReadDiskPartRange(part, 0, part.bytes, dst);
+    }
+
     static float BF16ToFloat(uint16_t v) {
         uint32_t u = (uint32_t)v << 16;
-        return *(float*)&u;
+        float ret;
+        memcpy(&ret, &u, sizeof(ret));
+        return ret;
     }
 
     static uint16_t FloatToBF16(float v) {
-        return (uint16_t)(*(uint32_t*)&v >> 16);
+        uint32_t u;
+        memcpy(&u, &v, sizeof(u));
+        return (uint16_t)(u >> 16);
     }
 
     static void ConvertDiskPart(uint8_t *dst, DataType dstType,
@@ -204,7 +386,20 @@ namespace fastllm {
             }
             if (srcType == DataType::BFLOAT16) {
                 const uint16_t *in = (const uint16_t*)src;
-                for (size_t i = 0; i < count; i++) {
+                size_t i = 0;
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+                for (; i + 7 < count; i += 8) {
+                    uint16x8_t bf16 = vld1q_u16(in + i);
+                    float32x4_t low = vreinterpretq_f32_u32(
+                        vshll_n_u16(vget_low_u16(bf16), 16));
+                    float32x4_t high = vreinterpretq_f32_u32(
+                        vshll_n_u16(vget_high_u16(bf16), 16));
+                    float16x8_t fp16 = vcombine_f16(vcvt_f16_f32(low),
+                                                   vcvt_f16_f32(high));
+                    vst1q_u16(out + i, vreinterpretq_u16_f16(fp16));
+                }
+#endif
+                for (; i < count; i++) {
                     out[i] = float_to_half(BF16ToFloat(in[i]));
                 }
                 return;
@@ -230,9 +425,8 @@ namespace fastllm {
     }
 
     static Data *LoadDiskWeight(const Data *weight) {
-        if (weight == nullptr || !weight->isDiskWeight) {
-            return (Data*)weight;
-        }
+        AssertInFastLLM(weight != nullptr && weight->isDiskWeight,
+                        "LoadDiskWeight expects a lazy disk weight.\n");
         Data *loaded = new Data(weight->dataType);
         loaded->name = weight->name;
         loaded->isModelWeight = false;
@@ -283,7 +477,8 @@ namespace fastllm {
 
         uint64_t dstOffset = 0;
         std::vector<uint8_t> buffer;
-        for (auto &part : weight->diskWeightParts) {
+        for (size_t partIndex = 0; partIndex < weight->diskWeightParts.size(); partIndex++) {
+            const DiskWeightPart &part = weight->diskWeightParts[partIndex];
             if (part.isScalePart) {
                 AssertInFastLLM(weight->dataType == DataType::NVFP4 && weight->dims.size() == 2 &&
                                 weight->blockK > 0 && weight->blockM > 0,
@@ -305,7 +500,32 @@ namespace fastllm {
             Data partData(weight->dataType, part.dims);
             uint64_t dstBytes = partData.GetBytes();
             if (part.sourceDataType == weight->dataType && part.bytes == dstBytes) {
-                ReadDiskPartBytes(part, dst);
+                DiskWeightPart readPart = part;
+                if (DiskDirectIoEnabled() && readPart.fileOffset >= 0) {
+                    // Merged gate/up projections are consecutive both in the
+                    // destination tensor and in safetensors files. Reading the
+                    // run at once avoids a second unaligned O_DIRECT request.
+                    while (partIndex + 1 < weight->diskWeightParts.size()) {
+                        const DiskWeightPart &next = weight->diskWeightParts[partIndex + 1];
+                        if (next.isScalePart || next.fileName != readPart.fileName ||
+                            next.fileOffset < 0 ||
+                            (uint64_t)next.fileOffset !=
+                                (uint64_t)readPart.fileOffset + readPart.bytes ||
+                            next.sourceDataType != weight->dataType) {
+                            break;
+                        }
+                        Data nextData(weight->dataType, next.dims);
+                        uint64_t nextBytes = nextData.GetBytes();
+                        if (next.bytes != nextBytes ||
+                            nextBytes > std::numeric_limits<uint64_t>::max() - readPart.bytes) {
+                            break;
+                        }
+                        readPart.bytes += nextBytes;
+                        dstBytes += nextBytes;
+                        partIndex++;
+                    }
+                }
+                ReadDiskPartBytes(readPart, dst);
             } else {
                 buffer.resize(part.bytes);
                 ReadDiskPartBytes(part, buffer.data());
@@ -314,6 +534,628 @@ namespace fastllm {
             dstOffset += dstBytes;
         }
         return loaded;
+    }
+
+    static size_t DiskLinearChunkBytes() {
+        static size_t bytes = []() {
+            const char *env = std::getenv("FASTLLM_DISK_LINEAR_CHUNK_MB");
+            unsigned long long mb = env == nullptr ? 64ULL : std::strtoull(env, nullptr, 10);
+            mb = std::max(1ULL, std::min(1024ULL, mb));
+            return (size_t)mb * 1024 * 1024;
+        }();
+        return bytes;
+    }
+
+    class DiskMappedRange {
+    public:
+        DiskMappedRange(const DiskWeightPart &part, uint64_t offset, uint64_t bytes) {
+            long long fileOffset = part.fileOffset + offset;
+            AssertInFastLLM(offset <= part.bytes && bytes <= part.bytes - offset &&
+                            fileOffset >= 0 && bytes > 0,
+                            "Disk Linear mmap range is invalid: " + part.fileName + "\n");
+            int fd = GetDiskFileCache().Get(part.fileName);
+            long pageSizeValue = sysconf(_SC_PAGESIZE);
+            size_t pageSize = pageSizeValue > 0 ? (size_t)pageSizeValue : 4096;
+            uint64_t alignedOffset = (uint64_t)fileOffset / pageSize * pageSize;
+            size_t delta = (size_t)((uint64_t)fileOffset - alignedOffset);
+            AssertInFastLLM(bytes <= std::numeric_limits<size_t>::max() - delta,
+                            "Disk Linear mmap range is too large.\n");
+            mappedBytes = (size_t)bytes + delta;
+            mapped = mmap(nullptr, mappedBytes, PROT_READ, MAP_PRIVATE, fd, (off_t)alignedOffset);
+            if (mapped == MAP_FAILED) {
+                mapped = nullptr;
+                mappedBytes = 0;
+                return;
+            }
+            data = (uint8_t*)mapped + delta;
+#ifdef MADV_SEQUENTIAL
+            madvise(mapped, mappedBytes, MADV_SEQUENTIAL);
+#endif
+        }
+
+        ~DiskMappedRange() {
+            if (mapped == nullptr) {
+                return;
+            }
+            munmap(mapped, mappedBytes);
+        }
+
+        uint8_t *Get() const {
+            return data;
+        }
+
+    private:
+        void *mapped = nullptr;
+        size_t mappedBytes = 0;
+        uint8_t *data = nullptr;
+    };
+
+    static void PrefetchDiskPartRange(const DiskWeightPart &part, uint64_t offset, uint64_t bytes) {
+        if (DiskDirectIoEnabled() || bytes == 0 || offset > part.bytes || bytes > part.bytes - offset) {
+            return;
+        }
+        int fd = GetDiskFileCache().Get(part.fileName);
+        posix_fadvise(fd, (off_t)(part.fileOffset + offset), (off_t)bytes, POSIX_FADV_WILLNEED);
+    }
+
+    static size_t DiskPartRows(const DiskWeightPart &part) {
+        if (part.dims.size() < 2) {
+            return 0;
+        }
+        size_t rows = 1;
+        for (int i = 0; i + 1 < (int)part.dims.size(); i++) {
+            if (part.dims[i] <= 0 || rows > std::numeric_limits<size_t>::max() / part.dims[i]) {
+                return 0;
+            }
+            rows *= part.dims[i];
+        }
+        return rows;
+    }
+
+    static size_t DiskTypeRowBytes(DataType type, int columns, const Data &weight) {
+        if (type == DataType::DATA_GGUF_FORMAT) {
+            return GetDataBytes((DataType)((int)DataType::DATA_GGUF_FORMAT + weight.ggmlType),
+                                1, columns);
+        }
+        return GetDataBytes(type, 1, columns);
+    }
+
+    static bool IsDiskFloatStorageType(DataType type) {
+        return type == DataType::FLOAT32 || type == DataType::FLOAT16 ||
+               type == DataType::BFLOAT16;
+    }
+
+    static bool CanConvertDiskStorageType(DataType dst, DataType src) {
+        return dst == src || (IsDiskFloatStorageType(dst) && IsDiskFloatStorageType(src));
+    }
+
+    static bool CanStreamDiskLinear(const Data &weight) {
+        if (weight.dims.size() != 2 || weight.dims[0] <= 0 || weight.dims[1] <= 0 ||
+            weight.diskWeightParts.empty()) {
+            return false;
+        }
+        size_t rows = 0;
+        for (const auto &part : weight.diskWeightParts) {
+            if (part.isScalePart) {
+                continue;
+            }
+            size_t partRows = DiskPartRows(part);
+            if (partRows == 0 || part.dims.back() != weight.dims[1] ||
+                !CanConvertDiskStorageType(weight.dataType, part.sourceDataType)) {
+                return false;
+            }
+            size_t sourceRowBytes = DiskTypeRowBytes(part.sourceDataType, weight.dims[1], weight);
+            if (sourceRowBytes == 0 || partRows > std::numeric_limits<size_t>::max() / sourceRowBytes ||
+                part.bytes != partRows * sourceRowBytes) {
+                return false;
+            }
+            rows += partRows;
+        }
+        if (rows != (size_t)weight.dims[0]) {
+            return false;
+        }
+        if (weight.dataType == DataType::NVFP4 && weight.scales.empty()) {
+            if (weight.blockK <= 0 || weight.blockM <= 0) {
+                return false;
+            }
+            bool hasScalePart = false;
+            for (const auto &part : weight.diskWeightParts) {
+                hasScalePart |= part.isScalePart;
+            }
+            return hasScalePart;
+        }
+        return true;
+    }
+
+    template <class T>
+    static void SliceRowMetadata(const std::vector<T> &src, std::vector<T> &dst,
+                                 int totalRows, int rowStart, int rows) {
+        if (src.empty()) {
+            dst.clear();
+            return;
+        }
+        if (totalRows > 0 && src.size() % (size_t)totalRows == 0) {
+            size_t stride = src.size() / totalRows;
+            size_t begin = (size_t)rowStart * stride;
+            size_t end = (size_t)(rowStart + rows) * stride;
+            AssertInFastLLM(end <= src.size(), "Disk Linear row metadata is out of bounds.\n");
+            dst.assign(src.begin() + begin, src.begin() + end);
+        } else {
+            dst = src;
+        }
+    }
+
+    static void SliceDiskLinearMetadata(const Data &src, Data &dst,
+                                        int rowStart, int rows) {
+        dst.weightType = WeightType::LINEAR;
+        dst.tpLinearType = src.tpLinearType;
+        dst.tpPackType = src.tpPackType;
+        dst.perChannelAxis = src.perChannelAxis;
+        dst.group = src.group;
+        dst.groupCnt = src.groupCnt;
+        dst.blockK = src.blockK;
+        dst.blockM = src.blockM;
+        dst.isGGUFData = src.isGGUFData;
+        dst.ggmlType = src.ggmlType;
+        dst.IsRepacked = src.IsRepacked;
+        dst.disableGGUFRepack = src.disableGGUFRepack;
+        dst.forceGGUFFp32Dequant = src.forceGGUFFp32Dequant;
+
+        bool blockScales = (src.dataType == DataType::FP8_E4M3 ||
+                            src.dataType == DataType::NVFP4) &&
+                           !src.scales.empty() && src.blockK > 0 && src.blockM > 0;
+        if (blockScales) {
+            AssertInFastLLM(rowStart % src.blockK == 0,
+                            "Disk Linear chunk must be aligned to blockK.\n");
+            int ms = (src.dims[1] - 1) / src.blockM + 1;
+            size_t begin = (size_t)(rowStart / src.blockK) * ms;
+            size_t scaleRows = (rows - 1) / src.blockK + 1;
+            size_t end = begin + scaleRows * ms;
+            AssertInFastLLM(end <= src.scales.size(),
+                            "Disk Linear block scale metadata is out of bounds.\n");
+            dst.scales.assign(src.scales.begin() + begin, src.scales.begin() + end);
+        } else {
+            SliceRowMetadata(src.scales, dst.scales, src.dims[0], rowStart, rows);
+        }
+        SliceRowMetadata(src.mins, dst.mins, src.dims[0], rowStart, rows);
+        SliceRowMetadata(src.zeros, dst.zeros, src.dims[0], rowStart, rows);
+        SliceRowMetadata(src.halfScales, dst.halfScales, src.dims[0], rowStart, rows);
+        SliceRowMetadata(src.perChannelsConfigs, dst.perChannelsConfigs,
+                         src.dims[0], rowStart, rows);
+        SliceRowMetadata(src.weightSum, dst.weightSum, src.dims[0], rowStart, rows);
+    }
+
+    static const DiskWeightPart *FindCompactScalePart(const Data &weight, size_t weightPartIndex) {
+        for (size_t i = weightPartIndex + 1; i < weight.diskWeightParts.size(); i++) {
+            if (!weight.diskWeightParts[i].isScalePart) {
+                break;
+            }
+            return &weight.diskWeightParts[i];
+        }
+        return nullptr;
+    }
+
+    static void SetDiskGgmlChunkShape(ggml_tensor &tensor, int rows, int columns) {
+        tensor.dims = {rows, columns};
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            tensor.ne[i] = 1;
+        }
+        tensor.ne[0] = columns;
+        tensor.ne[1] = rows;
+        tensor.nb[0] = ggml_type_size(tensor.type);
+        tensor.nb[1] = tensor.nb[0] * (tensor.ne[0] / ggml_blck_size(tensor.type));
+        for (int i = 2; i < GGML_MAX_DIMS; i++) {
+            tensor.nb[i] = tensor.nb[i - 1] * tensor.ne[i - 1];
+        }
+    }
+
+    static void RunDiskLinearChunk(Data &input, const Data &weight, const Data &bias,
+                                   Data &output, uint8_t *weightData,
+                                   uint64_t weightStorageBytes, int rowStart, int rows) {
+        int columns = weight.dims[1];
+        ggml_tensor ggmlChunk;
+        Data chunkWeight(weight.dataType);
+        chunkWeight.isFake = true;
+        chunkWeight.name = weight.name;
+        SliceDiskLinearMetadata(weight, chunkWeight, rowStart, rows);
+        if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+            AssertInFastLLM(weight.ggmlTensor != nullptr,
+                            "Disk Linear GGUF metadata is missing.\n");
+            ggmlChunk = *(ggml_tensor*)weight.ggmlTensor;
+            SetDiskGgmlChunkShape(ggmlChunk, rows, columns);
+            chunkWeight.ggmlTensor = &ggmlChunk;
+            chunkWeight.disableGGUFRepack = true;
+            chunkWeight.IsRepacked = false;
+        }
+        chunkWeight.Resize({rows, columns});
+        chunkWeight.cpuData = weightData;
+        chunkWeight.dataDevice = DataDevice::CPU;
+        chunkWeight.expansionSize = chunkWeight.Count(0);
+        chunkWeight.expansionBytes = weightStorageBytes;
+
+        std::unique_ptr<Data> chunkBias;
+        const Data *runBias = &bias;
+        if (!bias.dims.empty()) {
+            AssertInFastLLM(bias.dataType == DataType::FLOAT32 && bias.cpuData != nullptr &&
+                            rowStart + rows <= bias.Count(0),
+                            "Disk Linear bias metadata is invalid.\n");
+            chunkBias.reset(new Data(DataType::FLOAT32, {rows}, DataDevice::CPU,
+                                     bias.cpuData + (size_t)rowStart * sizeof(float)));
+            runBias = chunkBias.get();
+        }
+
+        AssertInFastLLM(input.Count(0) == columns,
+                        "Disk Linear chunked path expects one input row.\n");
+        std::vector<int> chunkOutputDims = input.dims;
+        chunkOutputDims.back() = rows;
+        size_t outputOffset = GetDataBytes(output.dataType, 1, rowStart);
+        AssertInFastLLM(GetDataBytes(output.dataType, 1, rows) > 0,
+                        "Disk Linear output dtype is unsupported.\n");
+        Data chunkOutput(output.dataType, chunkOutputDims, DataDevice::CPU,
+                         output.cpuData + outputOffset);
+        DoCpuLinear(input, chunkWeight, *runBias, chunkOutput);
+    }
+
+    void DiskLinearOp::Reshape(const std::string &opType, const DataDict &datas,
+                               const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        AssertInFastLLM(weight.dims.size() == 2,
+                        "Disk Linear weight shape should be 2D.\n");
+        AssertInFastLLM(!input.dims.empty() && input.dims.back() == weight.dims[1],
+                        "Disk Linear weight shape mismatch.\n");
+        DoCpuLinearReshape(input, weight, output);
+    }
+
+    bool DiskLinearOp::CanRun(const std::string &opType, const DataDict &datas,
+                              const FloatDict &floatParams, const IntDict &intParams) {
+        if (intParams.find("exType") != intParams.end()) {
+            return false;
+        }
+        auto it = datas.find("weight");
+        return it != datas.end() && it->second != nullptr &&
+               it->second->isDiskWeight && !it->second->diskWeightParts.empty();
+    }
+
+    void DiskLinearOp::Run(const std::string &opType, const DataDict &datas,
+                           const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+        AssertInFastLLM(weight.isDiskWeight && weight.cpuData == nullptr,
+                        "Disk Linear expects a lazy disk weight.\n");
+        AssertInFastLLM(bias.dataType == DataType::FLOAT32,
+                        "Disk Linear bias should be float32.\n");
+
+        int columns = weight.dims[1];
+        int inputRows = input.Count(0) / columns;
+        if (inputRows > 1) {
+            // Prefill benefits from the regular full-matrix CPU kernel. The
+            // weight is materialized only for this call and released as soon
+            // as the Linear finishes. Decode continues through the bounded
+            // chunked path below.
+            std::unique_ptr<Data> loaded(LoadDiskWeight(&weight));
+            DoCpuLinear(input, *loaded, bias, output);
+            return;
+        }
+
+        if (!CanStreamDiskLinear(weight)) {
+            std::unique_ptr<Data> loaded(LoadDiskWeight(&weight));
+            DoCpuLinear(input, *loaded, bias, output);
+            return;
+        }
+
+        output.Allocate();
+        int rowStart = 0;
+        const size_t chunkBudget = DiskLinearChunkBytes();
+        for (size_t partIndex = 0; partIndex < weight.diskWeightParts.size(); partIndex++) {
+            const DiskWeightPart &part = weight.diskWeightParts[partIndex];
+            if (part.isScalePart) {
+                continue;
+            }
+            size_t partRows = DiskPartRows(part);
+            size_t sourceRowBytes = DiskTypeRowBytes(part.sourceDataType, columns, weight);
+            size_t targetRowBytes = DiskTypeRowBytes(weight.dataType, columns, weight);
+            size_t maxRowBytes = std::max(sourceRowBytes, targetRowBytes);
+            size_t rowsPerChunk = std::max((size_t)1, chunkBudget / std::max((size_t)1, maxRowBytes));
+            int rowAlignment = (weight.blockK > 0 &&
+                                (weight.dataType == DataType::FP8_E4M3 ||
+                                 weight.dataType == DataType::NVFP4)) ? weight.blockK : 1;
+            if (rowsPerChunk >= (size_t)rowAlignment) {
+                rowsPerChunk = rowsPerChunk / rowAlignment * rowAlignment;
+            }
+            rowsPerChunk = std::max(rowsPerChunk, (size_t)rowAlignment);
+
+            const DiskWeightPart *compactScalePart = nullptr;
+            bool compactNVFP4 = weight.dataType == DataType::NVFP4 && weight.scales.empty();
+            if (compactNVFP4) {
+                compactScalePart = FindCompactScalePart(weight, partIndex);
+                AssertInFastLLM(compactScalePart != nullptr,
+                                "Disk Linear compact NVFP4 scale part is missing.\n");
+            }
+
+            // The vocabulary projection is typically the largest decode
+            // matrix and may require dtype conversion. Overlap reading its
+            // next bounded chunk with conversion and matvec of the current
+            // chunk. Each chunk is still discarded immediately after use.
+            bool pipelineConvertedChunks = DiskDirectIoEnabled() &&
+                                           !compactNVFP4 &&
+                                           part.sourceDataType != weight.dataType &&
+                                           partRows > rowsPerChunk;
+            if (pipelineConvertedChunks) {
+                struct ConvertedChunk {
+                    std::vector<uint8_t> storage;
+                    std::vector<uint8_t> sourceStorage;
+                    std::unique_ptr<DiskDirectRange> directStorage;
+                    int rows = 0;
+                    size_t localRow = 0;
+                    uint64_t storageBytes = 0;
+
+                    uint8_t *Data() {
+                        return directStorage == nullptr ? storage.data() : directStorage->Get();
+                    }
+                };
+                auto loadChunk = [&](size_t localRow) {
+                    std::unique_ptr<ConvertedChunk> chunk(new ConvertedChunk());
+                    chunk->localRow = localRow;
+                    chunk->rows = (int)std::min(rowsPerChunk, partRows - localRow);
+                    uint64_t sourceOffset = localRow * sourceRowBytes;
+                    uint64_t sourceBytes = (uint64_t)chunk->rows * sourceRowBytes;
+                    uint64_t targetBytes = (uint64_t)chunk->rows * targetRowBytes;
+                    chunk->storageBytes = targetBytes;
+                    if (targetBytes <= sourceBytes) {
+                        chunk->directStorage.reset(new DiskDirectRange(
+                            part, sourceOffset, sourceBytes, false));
+                        ConvertDiskPart(chunk->directStorage->Get(), weight.dataType,
+                                        chunk->directStorage->Get(), part.sourceDataType,
+                                        (size_t)chunk->rows * columns);
+                    } else {
+                        chunk->storage.resize((size_t)targetBytes);
+                        chunk->sourceStorage.resize((size_t)sourceBytes);
+                        ReadDiskPartRange(part, sourceOffset, sourceBytes,
+                                          chunk->sourceStorage.data());
+                        ConvertDiskPart(chunk->storage.data(), weight.dataType,
+                                        chunk->sourceStorage.data(), part.sourceDataType,
+                                        (size_t)chunk->rows * columns);
+                    }
+                    return chunk;
+                };
+
+                std::unique_ptr<ConvertedChunk> current = loadChunk(0);
+                while (current != nullptr) {
+                    size_t nextRow = current->localRow + current->rows;
+                    std::future<std::unique_ptr<ConvertedChunk>> next;
+                    if (nextRow < partRows) {
+                        next = std::async(std::launch::async, loadChunk, nextRow);
+                    }
+                    RunDiskLinearChunk(input, weight, bias, output,
+                                       current->Data(), current->storageBytes,
+                                       rowStart + (int)current->localRow, current->rows);
+                    current.reset();
+                    if (!next.valid()) {
+                        break;
+                    }
+                    current = next.get();
+                }
+                rowStart += (int)partRows;
+                continue;
+            }
+
+            for (size_t localRow = 0; localRow < partRows; localRow += rowsPerChunk) {
+                int chunkRows = (int)std::min(rowsPerChunk, partRows - localRow);
+                uint64_t sourceOffset = localRow * sourceRowBytes;
+                uint64_t sourceBytes = (uint64_t)chunkRows * sourceRowBytes;
+                uint64_t targetBytes = (uint64_t)chunkRows * targetRowBytes;
+
+                size_t nextRow = localRow + chunkRows;
+                if (nextRow < partRows) {
+                    size_t nextRows = std::min(rowsPerChunk, partRows - nextRow);
+                    PrefetchDiskPartRange(part, nextRow * sourceRowBytes,
+                                          nextRows * sourceRowBytes);
+                }
+
+                std::unique_ptr<DiskMappedRange> mapped;
+                std::unique_ptr<DiskDirectRange> direct;
+                std::vector<uint8_t> storage;
+                std::vector<uint8_t> sourceStorage;
+                uint8_t *chunkData = nullptr;
+                uint64_t chunkStorageBytes = targetBytes;
+
+                bool canMap = !compactNVFP4 && part.sourceDataType == weight.dataType;
+                if (canMap) {
+                    if (DiskDirectIoEnabled()) {
+                        direct.reset(new DiskDirectRange(part, sourceOffset, sourceBytes));
+                        chunkData = direct->Get();
+                    } else {
+                        mapped.reset(new DiskMappedRange(part, sourceOffset, sourceBytes));
+                        chunkData = mapped->Get();
+                        if (chunkData == nullptr) {
+                            mapped.reset();
+                        }
+                    }
+                }
+                if (chunkData == nullptr && compactNVFP4) {
+                    int ms = (columns - 1) / weight.blockM + 1;
+                    AssertInFastLLM(localRow % weight.blockK == 0,
+                                    "Disk Linear compact NVFP4 chunk alignment mismatch.\n");
+                    size_t scaleRows = (chunkRows - 1) / weight.blockK + 1;
+                    size_t scaleBytes = scaleRows * ms;
+                    storage.resize((size_t)targetBytes + scaleBytes);
+                    ReadDiskPartRange(part, sourceOffset, sourceBytes, storage.data());
+                    ReadDiskPartRange(*compactScalePart,
+                                      (localRow / weight.blockK) * ms,
+                                      scaleBytes, storage.data() + targetBytes);
+                    chunkData = storage.data();
+                    chunkStorageBytes += scaleBytes;
+                } else if (chunkData == nullptr && part.sourceDataType == weight.dataType) {
+                    storage.resize((size_t)sourceBytes);
+                    ReadDiskPartRange(part, sourceOffset, sourceBytes, storage.data());
+                    chunkData = storage.data();
+                } else if (chunkData == nullptr) {
+                    bool canConvertInPlace = targetBytes <= sourceBytes;
+                    if (DiskDirectIoEnabled() && canConvertInPlace) {
+                        direct.reset(new DiskDirectRange(part, sourceOffset,
+                                                         sourceBytes, false));
+                        ConvertDiskPart(direct->Get(), weight.dataType, direct->Get(),
+                                        part.sourceDataType, (size_t)chunkRows * columns);
+                        chunkData = direct->Get();
+                    } else if (canConvertInPlace) {
+                        storage.resize((size_t)sourceBytes);
+                        ReadDiskPartRange(part, sourceOffset, sourceBytes, storage.data());
+                        ConvertDiskPart(storage.data(), weight.dataType, storage.data(),
+                                        part.sourceDataType, (size_t)chunkRows * columns);
+                    } else {
+                        storage.resize((size_t)targetBytes);
+                        sourceStorage.resize((size_t)sourceBytes);
+                        ReadDiskPartRange(part, sourceOffset, sourceBytes, sourceStorage.data());
+                        ConvertDiskPart(storage.data(), weight.dataType, sourceStorage.data(),
+                                        part.sourceDataType, (size_t)chunkRows * columns);
+                    }
+                    if (chunkData == nullptr) {
+                        chunkData = storage.data();
+                    }
+                }
+
+                RunDiskLinearChunk(input, weight, bias, output, chunkData,
+                                   chunkStorageBytes, rowStart + (int)localRow, chunkRows);
+            }
+            rowStart += (int)partRows;
+        }
+        AssertInFastLLM(rowStart == weight.dims[0],
+                        "Disk Linear row count mismatch.\n");
+    }
+
+    static float ReadDiskFloatValue(const uint8_t *data, DataType type, size_t index) {
+        if (type == DataType::FLOAT32) {
+            return ((const float*)data)[index];
+        }
+        if (type == DataType::FLOAT16) {
+            return half_to_float(((const uint16_t*)data)[index]);
+        }
+        if (type == DataType::BFLOAT16) {
+            return BF16ToFloat(((const uint16_t*)data)[index]);
+        }
+        ErrorInFastLLM("Disk Embedding unsupported dtype.\n");
+        return 0.0f;
+    }
+
+    static void WriteDiskFloatValue(uint8_t *data, DataType type, size_t index, float value) {
+        if (type == DataType::FLOAT32) {
+            ((float*)data)[index] = value;
+        } else if (type == DataType::FLOAT16) {
+            ((uint16_t*)data)[index] = float_to_half(value);
+        } else if (type == DataType::BFLOAT16) {
+            ((uint16_t*)data)[index] = FloatToBF16(value);
+        } else {
+            ErrorInFastLLM("Disk Embedding unsupported output dtype.\n");
+        }
+    }
+
+    static const DiskWeightPart *FindDiskRowPart(const Data &weight, int row,
+                                                  size_t &localRow) {
+        size_t start = 0;
+        for (const auto &part : weight.diskWeightParts) {
+            if (part.isScalePart) {
+                continue;
+            }
+            size_t rows = DiskPartRows(part);
+            if ((size_t)row < start + rows) {
+                localRow = row - start;
+                return &part;
+            }
+            start += rows;
+        }
+        return nullptr;
+    }
+
+    void DiskEmbeddingOp::Reshape(const std::string &opType, const DataDict &datas,
+                                  const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        AssertInFastLLM(weight.dims.size() == 2 && IsDiskFloatStorageType(weight.dataType),
+                        "Disk Embedding expects a 2D floating-point weight.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16,
+                        "Disk Embedding input should be float32 or float16.\n");
+        std::vector<int> dims = input.dims;
+        dims.push_back(weight.dims[1]);
+        output.dataType = direct ? weight.dataType : input.dataType;
+        if (!direct && weight.dataType == DataType::FLOAT16) {
+            output.dataType = DataType::FLOAT16;
+        }
+        output.Resize(dims);
+        weight.weightType = WeightType::EMBEDDING;
+    }
+
+    bool DiskEmbeddingOp::CanRun(const std::string &opType, const DataDict &datas,
+                                 const FloatDict &floatParams, const IntDict &intParams) {
+        auto it = datas.find("weight");
+        return it != datas.end() && it->second != nullptr &&
+               it->second->isDiskWeight && !it->second->diskWeightParts.empty() &&
+               IsDiskFloatStorageType(it->second->dataType);
+    }
+
+    void DiskEmbeddingOp::Run(const std::string &opType, const DataDict &datas,
+                              const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        output.Allocate();
+        int vocabSize = weight.dims[0];
+        int columns = weight.dims[1];
+        int inputLen = input.Count(0);
+        size_t targetRowBytes = DiskTypeRowBytes(weight.dataType, columns, weight);
+        size_t outputRowBytes = GetDataBytes(output.dataType, 1, columns);
+        std::vector<uint8_t> targetRow(targetRowBytes);
+        std::vector<uint8_t> sourceRow;
+        std::unordered_map<int, int> previousRows;
+
+        for (int i = 0; i < inputLen; i++) {
+            float rawToken = input.dataType == DataType::FLOAT32 ?
+                ((float*)input.cpuData)[i] : half_to_float(((uint16_t*)input.cpuData)[i]);
+            AssertInFastLLM(std::isfinite(rawToken),
+                            "Disk Embedding token is not finite.\n");
+            int token = (int)(rawToken + 1e-9f);
+            AssertInFastLLM(token >= 0 && token < vocabSize,
+                            "Disk Embedding token is out of range: " + std::to_string(token) + "\n");
+            auto previous = previousRows.find(token);
+            if (previous != previousRows.end()) {
+                memcpy(output.cpuData + (size_t)i * outputRowBytes,
+                       output.cpuData + (size_t)previous->second * outputRowBytes,
+                       outputRowBytes);
+                continue;
+            }
+
+            size_t localRow = 0;
+            const DiskWeightPart *part = FindDiskRowPart(weight, token, localRow);
+            AssertInFastLLM(part != nullptr,
+                            "Disk Embedding row metadata is incomplete.\n");
+            size_t sourceRowBytes = DiskTypeRowBytes(part->sourceDataType, columns, weight);
+            if (part->sourceDataType == weight.dataType) {
+                ReadDiskPartRange(*part, localRow * sourceRowBytes,
+                                  sourceRowBytes, targetRow.data());
+            } else {
+                sourceRow.resize(sourceRowBytes);
+                ReadDiskPartRange(*part, localRow * sourceRowBytes,
+                                  sourceRowBytes, sourceRow.data());
+                ConvertDiskPart(targetRow.data(), weight.dataType, sourceRow.data(),
+                                part->sourceDataType, columns);
+            }
+
+            uint8_t *dst = output.cpuData + (size_t)i * outputRowBytes;
+            if (output.dataType == weight.dataType) {
+                memcpy(dst, targetRow.data(), outputRowBytes);
+            } else {
+                for (int column = 0; column < columns; column++) {
+                    WriteDiskFloatValue(dst, output.dataType, column,
+                                        ReadDiskFloatValue(targetRow.data(), weight.dataType, column));
+                }
+            }
+            previousRows[token] = i;
+        }
     }
 
     static bool CudaSupportsDiskMoeWeight(DataType inputType, DataType weightType) {
@@ -594,14 +1436,18 @@ namespace fastllm {
         Data **weights;
         std::vector<Data*> *tempWeights;
         const std::vector<int> *indices;
-        int tid, threadCnt;
+        std::atomic<int> *nextIndex;
 
         LoadDiskWeightsOp(Data **weights, std::vector<Data*> *tempWeights,
-                          const std::vector<int> *indices, int tid, int threadCnt) :
-            weights(weights), tempWeights(tempWeights), indices(indices), tid(tid), threadCnt(threadCnt) {}
+                          const std::vector<int> *indices, std::atomic<int> *nextIndex) :
+            weights(weights), tempWeights(tempWeights), indices(indices), nextIndex(nextIndex) {}
 
         void Run() {
-            for (int i = tid; i < (int)indices->size(); i += threadCnt) {
+            while (true) {
+                int i = nextIndex->fetch_add(1, std::memory_order_relaxed);
+                if (i >= (int)indices->size()) {
+                    break;
+                }
                 int index = (*indices)[i];
                 (*tempWeights)[index] = LoadDiskWeight(weights[index]);
             }
@@ -660,6 +1506,10 @@ namespace fastllm {
         if (weightIt == datas.end()) {
             return false;
         }
+        auto weightsBatchIt = intParams.find("weights___batch");
+        if (weightsBatchIt == intParams.end() || weightsBatchIt->second <= 2) {
+            return false;
+        }
         Data **weights = (Data**)weightIt->second;
         if (weights == nullptr || weights[2] == nullptr) {
             return false;
@@ -667,7 +1517,10 @@ namespace fastllm {
         auto biasIt = datas.find("biass");
         if (biasIt != datas.end()) {
             Data **biass = (Data**)biasIt->second;
-            if (biass != nullptr && biass[0] != nullptr && biass[0]->dims.size() > 0) {
+            auto biassBatchIt = intParams.find("biass___batch");
+            int biassBatch = biassBatchIt == intParams.end() ? 0 : biassBatchIt->second;
+            if (biass != nullptr && biassBatch > 0 &&
+                biass[0] != nullptr && biass[0]->dims.size() > 0) {
                 return false;
             }
         }
@@ -723,6 +1576,31 @@ namespace fastllm {
                 loadIndices.push_back(down);
             }
         }
+        if (DiskDirectIoEnabled()) {
+            auto firstPayloadPart = [](const Data *weight) -> const DiskWeightPart* {
+                if (weight == nullptr) {
+                    return nullptr;
+                }
+                for (const auto &part : weight->diskWeightParts) {
+                    if (!part.isScalePart) {
+                        return &part;
+                    }
+                }
+                return nullptr;
+            };
+            std::stable_sort(loadIndices.begin(), loadIndices.end(),
+                             [&](int left, int right) {
+                const DiskWeightPart *a = firstPayloadPart(weights[left]);
+                const DiskWeightPart *b = firstPayloadPart(weights[right]);
+                if (a == nullptr || b == nullptr) {
+                    return a != nullptr;
+                }
+                if (a->fileName != b->fileName) {
+                    return a->fileName < b->fileName;
+                }
+                return a->fileOffset < b->fileOffset;
+            });
+        }
         if (loadIndices.size() > 0) {
             auto *pool = GetAlivePool();
             int threadCnt = std::min((int)loadIndices.size(), DiskMoeLoadThreads());
@@ -733,8 +1611,10 @@ namespace fastllm {
                 }
             } else {
                 std::vector<LoadDiskWeightsOp*> ops;
+                std::atomic<int> nextIndex(0);
                 for (int i = 0; i < threadCnt; i++) {
-                    ops.push_back(new LoadDiskWeightsOp(weights, &tempWeights, &loadIndices, i, threadCnt));
+                    ops.push_back(new LoadDiskWeightsOp(weights, &tempWeights,
+                                                        &loadIndices, &nextIndex));
                     pool->PushOp(i, ops.back());
                 }
                 for (int i = 0; i < threadCnt; i++) {

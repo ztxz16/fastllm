@@ -3548,6 +3548,28 @@ namespace fastllm {
 
         int pageLen = fastllm::GetPageLen();
         int len = this->GetChunkedPrefillSize();
+        int cacheSizingLen = len;
+        auto usesDiskDevice = [](const std::map<std::string, int> &deviceMap) {
+            for (const auto &it : deviceMap) {
+                if (it.second > 0 &&
+                    (it.first == "disk" ||
+                     (it.first.size() > 5 && it.first.compare(0, 5, "disk:") == 0))) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (usesDiskDevice(this->deviceMap) ||
+            usesDiskDevice(this->moeDeviceMap) ||
+            usesDiskDevice(this->layeredMoeDeviceMap)) {
+            // A long synthetic prefill touches nearly every MoE expert and
+            // defeats transient disk loading. One token is enough to establish
+            // cache shapes; real prefills still use their full request length.
+            if (len > 1 && this->verbose) {
+                printf("[Fastllm] AutoWarmup disk prefill length clamped from %d to 1.\n", len);
+            }
+            len = 1;
+        }
         bool autoCalcPages = (fastllm::GetMaxTokens() <= 0);
         if (!autoCalcPages && fastllm::GetMaxTokens() > 0 && pageLen > 0) {
             int maxWarmupLen = std::max(1, fastllm::GetMaxTokens() - pageLen);
@@ -3602,7 +3624,9 @@ namespace fastllm {
         };
 
         if (autoCalcPages) {
-            minPages = len / pageLen + 2;
+            // Disk mode may shorten only the synthetic forward. Preserve the
+            // normal KV-cache capacity derived from the configured chunk size.
+            minPages = cacheSizingLen / pageLen + 2;
             fastllm::SetMaxTokens(minPages * pageLen);
         }
 
@@ -3726,7 +3750,16 @@ namespace fastllm {
             auto &pastValue = pastKeyValuesStorage[i].second;
             if (pastKey.isLinearAttention || pastValue.isLinearAttention) {
                 linearLayerCount++;
-                linearFixedBytes += pastKey.GetBytes() + pastValue.GetBytes();
+                // Some hybrid linear-attention implementations only use one
+                // member of the key/value pair for their recurrent state.  The
+                // unused member is deliberately left with an empty shape, for
+                // which Data::GetBytes() is undefined.
+                if (!pastKey.dims.empty()) {
+                    linearFixedBytes += pastKey.GetBytes();
+                }
+                if (!pastValue.dims.empty()) {
+                    linearFixedBytes += pastValue.GetBytes();
+                }
 #ifdef USE_CUDA
                 accountCudaLinearFixedBytes(pastKey);
                 accountCudaLinearFixedBytes(pastValue);
