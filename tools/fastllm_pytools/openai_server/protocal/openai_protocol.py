@@ -106,8 +106,11 @@ class ChatCompletionRequest(BaseModel):
         Literal["auto"],
         Literal["required"],
         ChatCompletionNamedToolChoiceParam,
-    ]] = "none"
+    ]] = "auto"
     parallel_tool_calls: Optional[bool] = None
+    reasoning_effort: Optional[Literal[
+        "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    ]] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 

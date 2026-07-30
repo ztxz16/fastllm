@@ -17,17 +17,22 @@ from fastllm_pytools.util import add_server_args
 
 class _FakeModel:
     def __init__(self, model_context_window, kv_cache_token_limit,
-                 native_context_window = None, configured_limit = None):
+                 native_context_window = None, configured_limit = None,
+                 model_type = None):
         self._model_context_window = model_context_window
         self._kv_cache_token_limit = kv_cache_token_limit
         self.native_context_window = native_context_window
         self.configured_context_window_limit = configured_limit
+        self._model_type = model_type
 
     def get_max_input_len(self):
         return self._model_context_window
 
     def get_kv_cache_token_limit(self):
         return self._kv_cache_token_limit
+
+    def get_type(self):
+        return self._model_type
 
 
 class FastLLmModelContextMetadataTest(unittest.TestCase):
@@ -72,6 +77,20 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         metadata = FastLLmModel("unknown-model")
 
         self.assertEqual(metadata.context_window, 32768)
+
+    def test_kimi_k3_reasoning_efforts_are_discoverable(self):
+        metadata = FastLLmModel(
+            "kimi-k3",
+            _FakeModel(262144, 262144, model_type = "kimi_k3"),
+        )
+
+        model = metadata.response["data"][0]
+        self.assertEqual(
+            model["supported_reasoning_efforts"], ["low", "high", "max"])
+        self.assertEqual(model["supportedReasoningEfforts"],
+                         ["low", "high", "max"])
+        self.assertEqual(model["default_reasoning_effort"], "max")
+        self.assertEqual(model["defaultReasoningEffort"], "max")
 
 
 class ServerContextArgumentTest(unittest.TestCase):

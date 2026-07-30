@@ -2,6 +2,9 @@
 
 #include "utils.h"
 #include "gguf.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #endif
@@ -15,6 +18,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <set>
 
 namespace fastllm {
@@ -127,7 +131,117 @@ namespace fastllm {
             AssertInFastLLM(cache.dims.size() == 3 && tokens >= 0 &&
                             tokens <= cache.dims[1],
                             "Invalid sequence cache trim.");
+            if (cache.isPagedKVCache) {
+                AssertInFastLLM(
+                    cache.pagedKVCacheData != nullptr && cache.pageLen > 0,
+                    "Paged sequence cache is missing its manager.");
+                const int neededPages = tokens == 0 ? 0 :
+                    (tokens + cache.pageLen - 1) / cache.pageLen;
+                if (neededPages < (int)cache.pageIndex.size()) {
+                    std::vector<int> released(
+                        cache.pageIndex.begin() + neededPages,
+                        cache.pageIndex.end());
+                    cache.pagedKVCacheData->ReleasePageIndices(released);
+                    cache.pageIndex.resize(neededPages);
+                }
+                cache.lastPageLen = tokens == 0 ? 0 :
+                    (tokens - 1) % cache.pageLen + 1;
+            }
             cache.Resize({cache.dims[0], tokens, cache.dims[2]});
+        }
+
+        bool DeviceMapUsesCuda(const std::map<std::string, int> &deviceMap) {
+            for (const auto &item : deviceMap) {
+                if (item.second > 0 && item.first.rfind("cuda", 0) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void CreateKimiMlaAbsorbedWeights(
+                Data &source, int heads, int nopeDim, int valueDim,
+                int latentDim, Data &keyWeight, Data &valueWeight) {
+            AssertInFastLLM(
+                source.dataDevice == DataDevice::CPU &&
+                source.dims == std::vector<int>({
+                    heads * (nopeDim + valueDim), latentDim}),
+                "Kimi-K3 kv_b_proj has an invalid shape or device.");
+
+            auto initialize = [](Data &target, const std::vector<int> &dims,
+                                 const std::string &name) {
+                target.FreeSpace();
+                target.dataType = DataType::BFLOAT16;
+                target.UpdateUnitSize();
+                target.Resize(dims);
+                target.Allocate(false);
+                target.name = name;
+                target.isModelWeight = true;
+                target.weightType = WeightType::LINEAR;
+            };
+            initialize(keyWeight, {heads, nopeDim, latentDim},
+                       source.name + "__0");
+            initialize(valueWeight, {heads, valueDim, latentDim},
+                       source.name + "__1");
+
+            const int rowsPerHead = nopeDim + valueDim;
+            const int valuesPerHead = rowsPerHead * latentDim;
+            std::vector<float> floatRows(valuesPerHead);
+            uint16_t *keyData = (uint16_t*)keyWeight.cpuData;
+            uint16_t *valueData = (uint16_t*)valueWeight.cpuData;
+
+            auto copyHead = [&](int head, const float *rows) {
+                uint16_t *keyHead = keyData +
+                    (uint64_t)head * nopeDim * latentDim;
+                uint16_t *valueHead = valueData +
+                    (uint64_t)head * valueDim * latentDim;
+                for (int i = 0; i < nopeDim * latentDim; i++) {
+                    keyHead[i] = Float32ToBFloat16RNEBits(rows[i]);
+                }
+                for (int i = 0; i < valueDim * latentDim; i++) {
+                    valueHead[i] = Float32ToBFloat16RNEBits(
+                        rows[(uint64_t)nopeDim * latentDim + i]);
+                }
+            };
+
+            if (source.dataType == DataType::DATA_GGUF_FORMAT) {
+                const ggml_type type = (ggml_type)source.ggmlType;
+                auto toFloat = ggml_type_to_float(type);
+                AssertInFastLLM(
+                    toFloat != nullptr,
+                    "Kimi-K3 kv_b_proj GGUF type cannot be dequantized.");
+                const size_t rowBytes = ggml_row_size(type, latentDim);
+                for (int head = 0; head < heads; head++) {
+                    const uint8_t *headData = source.cpuData +
+                        (uint64_t)head * rowsPerHead * rowBytes;
+                    toFloat(headData, floatRows.data(), valuesPerHead);
+                    copyHead(head, floatRows.data());
+                }
+            } else {
+                AssertInFastLLM(
+                    source.dataType == DataType::FLOAT32 ||
+                    source.dataType == DataType::FLOAT16 ||
+                    source.dataType == DataType::BFLOAT16,
+                    "Kimi-K3 MLA absorption requires a float or GGUF "
+                    "kv_b_proj weight.");
+                for (int head = 0; head < heads; head++) {
+                    const uint64_t base =
+                        (uint64_t)head * valuesPerHead;
+                    for (int i = 0; i < valuesPerHead; i++) {
+                        if (source.dataType == DataType::FLOAT32) {
+                            floatRows[i] = ((float*)source.cpuData)[base + i];
+                        } else if (source.dataType == DataType::FLOAT16) {
+                            floatRows[i] = half_to_float(
+                                ((uint16_t*)source.cpuData)[base + i]);
+                        } else {
+                            uint32_t bits = (uint32_t)
+                                ((uint16_t*)source.cpuData)[base + i] << 16;
+                            std::memcpy(&floatRows[i], &bits, sizeof(bits));
+                        }
+                    }
+                    copyHead(head, floatRows.data());
+                }
+            }
         }
 
     }
@@ -137,6 +251,10 @@ namespace fastllm {
         model_struct = "kimi_k3";
         canDoBatchForward = false;
         dataType = DataType::BFLOAT16;
+        // Kimi-K3 attention kernels consume BF16 Q/K/V.  Leaving the generic
+        // default (FP32) here doubles every MLA cache and makes the automatic
+        // context-window calculation report half of the useful capacity.
+        kvCacheDataType = DataType::BFLOAT16;
         defaultChunkedPrefillSize = 2048;
 
         weight.embeddingNames.insert(languagePrefix + "embed_tokens.weight");
@@ -228,11 +346,9 @@ namespace fastllm {
                 kdaLayers[layerNumber - 1] = true;
             }
         }
-        // FastLLM's scheduler uses one ordinary attention cache to account
-        // for active sequence length and reserved KV capacity.  KDA caches
-        // contain fixed convolution/recurrent state, so point kvCacheId at
-        // the first MLA layer and expose every MLA cache in FastLLM's normal
-        // [heads, sequence, dim] Expansion/CatDirect layout.
+        // KDA caches contain fixed convolution/recurrent state. MLA stores
+        // one 512-d latent and one 64-d positional vector per token/layer;
+        // kvCacheId points at the first such paged cache for length tracking.
         kvCacheId = -1;
         elementsInKVCachePerToken = 0;
         for (int layerIndex = 0; layerIndex < block_cnt; layerIndex++) {
@@ -241,7 +357,7 @@ namespace fastllm {
                     kvCacheId = layerIndex;
                 }
                 elementsInKVCachePerToken +=
-                    kdaHeads * (qkNopeHeadDim + qkRopeHeadDim + vHeadDim);
+                    kvLoraRank + qkRopeHeadDim;
             }
         }
         AssertInFastLLM(kvCacheId >= 0,
@@ -340,6 +456,10 @@ namespace fastllm {
                     weight.linearNames.insert(prefix + suffix);
                 }
             }
+            // DSpark keeps five ordinary FP16 GQA K/V caches on the final
+            // pipeline device in addition to the target's compressed MLA.
+            elementsInKVCachePerToken +=
+                dsparkLayers * 2 * dsparkKvHeads * dsparkHeadDim;
         }
         // Export/load policy uses FastLLM's ordinary MoE registry.  Source
         // MXFP4 tensors map to these logical names, and dtype_config can then
@@ -514,6 +634,11 @@ namespace fastllm {
         expertW1s.assign(block_cnt, {});
         expertW2s.assign(block_cnt, {});
         expertW3s.assign(block_cnt, {});
+#ifdef USE_CUDA
+        const bool createCompressedMlaWeights = DeviceMapUsesCuda(deviceMap);
+#else
+        const bool createCompressedMlaWeights = false;
+#endif
 
         for (int layerIndex = 0; layerIndex < block_cnt; layerIndex++) {
             const std::string layer = languagePrefix + "layers." +
@@ -574,6 +699,15 @@ namespace fastllm {
                         "self_attn.g_proj.weight",
                         "self_attn.o_proj.weight"}) {
                     require(layer + suffix);
+                }
+                if (createCompressedMlaWeights) {
+                    const std::string kvWeightName =
+                        layer + "self_attn.kv_b_proj.weight";
+                    Data &combinedKvWeight = require(kvWeightName);
+                    CreateKimiMlaAbsorbedWeights(
+                        combinedKvWeight, kdaHeads, qkNopeHeadDim, vHeadDim,
+                        kvLoraRank, weight.weight[kvWeightName + "__0"],
+                        weight.weight[kvWeightName + "__1"]);
                 }
             }
 
@@ -676,6 +810,9 @@ namespace fastllm {
             std::cout << "[Kimi-K3] DSpark enabled: 5-layer BF16 draft, "
                       << "block=" << dsparkBlockSize
                       << ", target hidden layers=[7,23,51,67,83].\n";
+            std::cout << "[Kimi-K3] Reusable history cache is disabled: "
+                      << "the generic cache does not contain DSpark draft "
+                      << "KV/state.\n";
         }
     }
 
@@ -691,52 +828,179 @@ namespace fastllm {
                 totalWeights += expertW1s[layerIndex].size() * 3;
             }
         }
-        if (totalWeights == 0) {
+        if (totalWeights > 0) {
+            std::cout << "[Kimi-K3] NUMA warmup: converting and registering "
+                      << totalWeights << " routed-expert weights.\n";
+            auto start = std::chrono::steady_clock::now();
+            size_t completed = 0;
+            int lastProgress = -1;
+            for (int layerIndex = 1; layerIndex < block_cnt;
+                 layerIndex++) {
+                const std::string selectedDevice =
+                    SelectMoeDeviceForLayer(layerIndex);
+                if (selectedDevice != "numa" &&
+                    selectedDevice.rfind("numa:", 0) != 0) {
+                    continue;
+                }
+                std::vector<Data*> layerWeights;
+                layerWeights.reserve(expertW1s[layerIndex].size() * 3);
+                for (int expert = 0;
+                     expert < (int)expertW1s[layerIndex].size(); expert++) {
+                    layerWeights.push_back(expertW1s[layerIndex][expert]);
+                    layerWeights.push_back(expertW2s[layerIndex][expert]);
+                    layerWeights.push_back(expertW3s[layerIndex][expert]);
+                }
+                RegisterNumasLinearWeightBatch(layerWeights);
+                for (Data *weight : layerWeights) {
+                    AssertInFastLLM(
+                        weight != nullptr && weight->cpuData == nullptr &&
+                        IsNumasLinearWeightRegistered(weight),
+                        "Kimi-K3 NUMA warmup failed to register an expert "
+                        "weight through the Linear/MergeMOE format path.");
+                }
+                completed += layerWeights.size();
+                int progress = (int)(completed * 100 / totalWeights);
+                if (progress != lastProgress) {
+                    std::cout << "\r[Kimi-K3] NUMA warmup: " << progress << "%"
+                              << std::flush;
+                    lastProgress = progress;
+                }
+            }
+            double seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            std::cout << "\n[Kimi-K3] NUMA warmup complete: " << completed
+                      << " expert weights in " << std::fixed
+                      << std::setprecision(2) << seconds << " s.\n";
+        }
+#endif
+
+#ifdef USE_CUDA
+        if (!DeviceMapUsesCuda(deviceMap)) {
             return;
         }
+        AssertInFastLLM(
+            dataType == DataType::BFLOAT16,
+            "Kimi-K3 CUDA compressed MLA requires BF16 activations.");
 
-        std::cout << "[Kimi-K3] NUMA warmup: converting and registering "
-                  << totalWeights << " routed-expert weights.\n";
-        auto start = std::chrono::steady_clock::now();
-        size_t completed = 0;
-        int lastProgress = -1;
-        for (int layerIndex = 1; layerIndex < block_cnt;
-             layerIndex++) {
-            const std::string selectedDevice =
-                SelectMoeDeviceForLayer(layerIndex);
-            if (selectedDevice != "numa" &&
-                selectedDevice.rfind("numa:", 0) != 0) {
-                continue;
-            }
-            std::vector<Data*> layerWeights;
-            layerWeights.reserve(expertW1s[layerIndex].size() * 3);
-            for (int expert = 0;
-                 expert < (int)expertW1s[layerIndex].size(); expert++) {
-                layerWeights.push_back(expertW1s[layerIndex][expert]);
-                layerWeights.push_back(expertW2s[layerIndex][expert]);
-                layerWeights.push_back(expertW3s[layerIndex][expert]);
-            }
-            RegisterNumasLinearWeightBatch(layerWeights);
-            for (Data *weight : layerWeights) {
-                AssertInFastLLM(
-                    weight != nullptr && weight->cpuData == nullptr &&
-                    IsNumasLinearWeightRegistered(weight),
-                    "Kimi-K3 NUMA warmup failed to register an expert "
-                    "weight through the Linear/MergeMOE format path.");
-            }
-            completed += layerWeights.size();
-            int progress = (int)(completed * 100 / totalWeights);
-            if (progress != lastProgress) {
-                std::cout << "\r[Kimi-K3] NUMA warmup: " << progress << "%"
-                          << std::flush;
-                lastProgress = progress;
+        // The old scheduler sizes KV cache when the first request arrives.
+        // Kimi-K3 weights used to migrate lazily to CUDA during that request,
+        // so the scheduler mistook weight memory for free KV capacity and a
+        // long prefill later OOMed.  Exercise both target and DSpark paths now,
+        // then release their temporary caches before capacity is measured.
+        std::cout << "[Kimi-K3] CUDA weight warmup...\n";
+        std::vector<std::pair<Data, Data>> warmCaches;
+        warmCaches.reserve(block_cnt);
+        for (int layerIndex = 0; layerIndex < block_cnt; layerIndex++) {
+            warmCaches.emplace_back(
+                Data(kvCacheDataType), Data(kvCacheDataType));
+            warmCaches.back().first.SetKVCache();
+            warmCaches.back().second.SetKVCache();
+        }
+        GenerationConfig warmConfig;
+        LastTokensManager warmLastTokens;
+        Data warmInput(DataType::FLOAT32, {1, 1}, {1.0f});
+        cudaWeightWarmupRunning = true;
+        int nextToken = Forward(
+            warmInput, Data(), Data(), warmCaches,
+            warmConfig, warmLastTokens, nullptr);
+        if (dsparkEnabled) {
+            Data draftInput(
+                DataType::FLOAT32, {1, 1}, {(float)nextToken});
+            Forward(draftInput, Data(), Data(), warmCaches,
+                    warmConfig, warmLastTokens, nullptr);
+            std::lock_guard<std::mutex> guard(dsparkContextMutex);
+            dsparkContexts.erase(&warmCaches);
+        }
+        cudaWeightWarmupRunning = false;
+        warmCaches.clear();
+        ClearAllPagedCacheManagers();
+        FastllmCudaClearBigBuffer();
+
+        // Publish the usable capacity before the Python server builds
+        // /v1/models metadata.  The old scheduler otherwise performs this
+        // calculation lazily on the first request, so clients are briefly
+        // told that the full architectural context window is available.
+        const auto freeSizes = FastllmCudaGetFreeSizes();
+        std::set<int> deviceIds;
+        std::map<int, int> ratios;
+        for (const auto &item : deviceMap) {
+            if (StartWith(item.first, "cuda")) {
+                for (int deviceId :
+                     ParseDeviceIds(item.first, "cuda", ratios)) {
+                    deviceIds.insert(deviceId);
+                }
             }
         }
-        double seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - start).count();
-        std::cout << "\n[Kimi-K3] NUMA warmup complete: " << completed
-                  << " expert weights in " << std::fixed
-                  << std::setprecision(2) << seconds << " s.\n";
+        if (deviceIds.empty()) {
+            deviceIds.insert(0);
+        }
+        std::map<int, long long> cacheBytesPerToken;
+        auto addCacheBytes = [&](const std::string &device,
+                                 long long bytes) {
+            std::map<int, int> localRatios;
+            std::vector<int> ids = StartWith(device, "cuda") ?
+                ParseDeviceIds(device, "cuda", localRatios) :
+                std::vector<int>();
+            if (ids.empty()) {
+                ids.assign(deviceIds.begin(), deviceIds.end());
+            }
+            // A multi-CUDA layer shards its cache; pipeline CUDA entries have
+            // one id and therefore receive the complete per-layer charge.
+            const long long perDevice =
+                (bytes + (long long)ids.size() - 1) / ids.size();
+            for (int id : ids) {
+                cacheBytesPerToken[id] += perDevice;
+            }
+        };
+        const long long targetLayerBytes = GetDataBytes(
+            kvCacheDataType, 1, kvLoraRank + qkRopeHeadDim);
+        for (int layerIndex = 0; layerIndex < block_cnt; layerIndex++) {
+            if (!kdaLayers[layerIndex]) {
+                addCacheBytes(
+                    SelectDeviceFromMap(
+                        deviceMap, layerIndex, block_cnt),
+                    targetLayerBytes);
+            }
+        }
+        if (dsparkEnabled) {
+            const long long draftBytes = GetDataBytes(
+                DataType::FLOAT16, 1,
+                dsparkLayers * 2 * dsparkKvHeads * dsparkHeadDim);
+            addCacheBytes(
+                SelectDeviceFromMap(deviceMap, block_cnt, block_cnt),
+                draftBytes);
+        }
+
+        long long capacity = max_positions;
+        for (int deviceId : deviceIds) {
+            if (deviceId >= 0 && deviceId < (int)freeSizes.size()) {
+                const long long usable = std::max(
+                    freeSizes[deviceId] * 3 / 4,
+                    freeSizes[deviceId] - (2LL << 30));
+                auto bytes = cacheBytesPerToken.find(deviceId);
+                if (bytes != cacheBytesPerToken.end() && bytes->second > 0) {
+                    capacity = std::min(capacity, usable / bytes->second);
+                }
+            }
+        }
+        if (kvCacheLimit > 0) {
+            const long long totalBytesPerToken = GetDataBytes(
+                kvCacheDataType, 1, elementsInKVCachePerToken);
+            capacity = totalBytesPerToken > 0 ?
+                kvCacheLimit / totalBytesPerToken : 0;
+        }
+        if (GetMaxTokens() > 0) {
+            capacity = GetMaxTokens();
+        }
+        if (capacity > 0) {
+            tokensLimit = (int)std::min<long long>(
+                capacity, std::numeric_limits<int>::max());
+            promptLimit = tokensLimit * 3 / 4;
+            std::cout << "[Kimi-K3] KV cache capacity after CUDA warmup: "
+                      << tokensLimit << " tokens (prompt limit "
+                      << std::min(max_positions, promptLimit) << ").\n";
+        }
+        std::cout << "[Kimi-K3] CUDA weight warmup complete.\n";
 #endif
     }
 
@@ -1075,6 +1339,97 @@ namespace fastllm {
                 kvLatent,
                 weight[layer + "self_attn.kv_a_layernorm.weight"],
                 rms_norm_eps, kvLatentNorm);
+
+#ifdef USE_CUDA
+            const bool useCompressedMla =
+                pastKeyValues != nullptr && !GetKVCacheInCPU() &&
+                kvLatentNorm.dataDevice == DataDevice::CUDA;
+            if (useCompressedMla) {
+                const std::string kvWeightName =
+                    layer + "self_attn.kv_b_proj.weight";
+                Data &absorbedKeyWeight = weight[kvWeightName + "__0"];
+                Data &absorbedValueWeight = weight[kvWeightName + "__1"];
+                AssertInFastLLM(
+                    absorbedKeyWeight.dataType == DataType::BFLOAT16 &&
+                    absorbedValueWeight.dataType == DataType::BFLOAT16,
+                    "Kimi-K3 absorbed MLA weights must be BF16.");
+
+                // Store only the normalized 512-d latent and the model's
+                // 64-d positional partition. Kimi-K3 has mla_use_nope=true,
+                // so unlike DeepSeekV2 no rotary transform is applied here.
+                kvLatentNorm.Reshape({1, sequence, kvLoraRank});
+                kRot.Reshape({1, sequence, qkRopeHeadDim});
+                Data &keyCache = (*pastKeyValues)[layerIndex].first;
+                Data &valueCache = (*pastKeyValues)[layerIndex].second;
+                auto preparePagedDescriptor = [](Data &cache,
+                                                  const Data &current) {
+                    if (cache.dims.empty() && cache.pageIndex.empty()) {
+                        cache.dataType = current.dataType;
+                        cache.UpdateUnitSize();
+                        cache.dataDevice = current.dataDevice;
+                        cache.dataDeviceIds = current.dataDeviceIds;
+                    }
+                    cache.isKVCache = true;
+                    AssertInFastLLM(
+                        cache.dataType == current.dataType,
+                        "Kimi-K3 compressed MLA cache dtype mismatch.");
+                };
+                preparePagedDescriptor(keyCache, kRot);
+                preparePagedDescriptor(valueCache, kvLatentNorm);
+
+                const int pageLen = GetPageLen();
+                const int maxPages = cudaWeightWarmupRunning ? 1 :
+                    std::max(1, (tokensLimit + pageLen - 1) / pageLen);
+                PagedCacheManager *keyManager = AllocatePagedCacheManager(
+                    layerIndex * 2,
+                    PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+                    kRot, pageLen, maxPages);
+                PagedCacheManager *valueManager = AllocatePagedCacheManager(
+                    layerIndex * 2 + 1,
+                    PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+                    kvLatentNorm, pageLen, maxPages);
+                keyCache.ToDevice(
+                    kRot.dataDevice, kRot.dataDeviceIds, false);
+                valueCache.ToDevice(
+                    kvLatentNorm.dataDevice,
+                    kvLatentNorm.dataDeviceIds, false);
+                AppendPagedCache(*keyManager, keyCache, kRot);
+                AppendPagedCache(*valueManager, valueCache, kvLatentNorm);
+
+                PermuteSelf(qRot, {0, 2, 1, 3});
+                PermuteSelf(qNope, {0, 2, 1, 3});
+                const int batch = qNope.dims[0];
+                const int queryLength = qNope.dims[1];
+                const int heads = qNope.dims[2];
+                PermuteSelf(qNope, {2, 0, 1, 3});
+                qNope.Reshape({heads, batch * queryLength, qkNopeHeadDim});
+
+                Data absorbedQuery, latentAttention, attentionHeads;
+                MatMul(qNope, absorbedKeyWeight, absorbedQuery);
+                MergeMLAPaged(
+                    absorbedQuery, qRot, keyCache, valueCache,
+                    latentAttention,
+                    1.0f / std::sqrt((float)qHeadDimension));
+                MatMulTransB(
+                    latentAttention, absorbedValueWeight, attentionHeads);
+                attentionHeads.Reshape(
+                    {heads, batch, queryLength, vHeadDim});
+                PermuteSelf(attentionHeads, {1, 2, 0, 3});
+                attentionHeads.Reshape(
+                    {batch, queryLength, heads * vHeadDim});
+
+                Data outputGate;
+                Linear(normalized,
+                       weight[layer + "self_attn.g_proj.weight"],
+                       Data(), outputGate);
+                Sigmoid(outputGate, outputGate);
+                MulTo(attentionHeads, outputGate);
+                Linear(attentionHeads,
+                       weight[layer + "self_attn.o_proj.weight"],
+                       Data(), attention);
+                return;
+            }
+#endif
             Linear(kvLatentNorm, weight[layer + "self_attn.kv_b_proj.weight"],
                    Data(), kvStates);
             kvStates.Reshape(

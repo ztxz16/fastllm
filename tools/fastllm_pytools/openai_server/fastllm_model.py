@@ -12,6 +12,9 @@ class FastLLmModel:
         configured_context_window_limit = self._positive_int(
             getattr(model, "configured_context_window_limit", None)
         )
+        is_kimi_k3 = self._is_kimi_k3(model)
+        reasoning_efforts = ["low", "high", "max"] if is_kimi_k3 else []
+        default_reasoning_effort = "max" if is_kimi_k3 else None
 
         context_window_candidates = [
             value for value in (current_model_context_window, kv_cache_token_limit)
@@ -32,12 +35,12 @@ class FastLLmModel:
                 "description": "Local FastLLM model.",
                 "app_ids": [],
                 "hidden": False,
-                "default_reasoning_level": "low",
-                "supported_reasoning_levels": [],
-                "supported_reasoning_efforts": [],
-                "supportedReasoningEfforts": [],
-                "default_reasoning_effort": None,
-                "defaultReasoningEffort": None,
+                "default_reasoning_level": default_reasoning_effort or "low",
+                "supported_reasoning_levels": reasoning_efforts,
+                "supported_reasoning_efforts": reasoning_efforts,
+                "supportedReasoningEfforts": reasoning_efforts,
+                "default_reasoning_effort": default_reasoning_effort,
+                "defaultReasoningEffort": default_reasoning_effort,
                 "shell_type": "shell_command",
                 "visibility": "list",
                 "minimal_client_version": "0.0.0",
@@ -177,3 +180,19 @@ class FastLLmModel:
             return cls._positive_int(method())
         except Exception:
             return None
+
+    @staticmethod
+    def _is_kimi_k3(model):
+        detector = getattr(model, "_is_kimi_k3", None)
+        if callable(detector):
+            try:
+                return bool(detector())
+            except Exception:
+                pass
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                return get_type() == "kimi_k3"
+            except Exception:
+                pass
+        return False

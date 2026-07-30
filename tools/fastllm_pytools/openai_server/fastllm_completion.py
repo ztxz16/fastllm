@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import traceback
@@ -62,14 +63,33 @@ except ImportError:
 
 ConversationContent = Union[str, List[Dict[str, Any]]]
 
+_KIMI_K3_THINK_OPEN = "<|open|>think<|sep|>"
+_KIMI_K3_THINK_CLOSE = "<|close|>think<|sep|>"
+_KIMI_K3_RESPONSE_OPEN = "<|open|>response<|sep|>"
+_KIMI_K3_RESPONSE_CLOSE = "<|close|>response<|sep|>"
+_KIMI_K3_MESSAGE_CLOSE = "<|close|>message<|sep|>"
+
+_KIMI_K3_THINK_OPEN_RE = re.compile(
+    r"<\|open\|>\s*think\s*<\|sep\|>")
+_KIMI_K3_THINK_CLOSE_RE = re.compile(
+    r"<\|close\|>\s*think\s*<\|sep\|>")
+_KIMI_K3_RESPONSE_OPEN_RE = re.compile(
+    r"<\|open\|>\s*response\s*<\|sep\|>")
+_KIMI_K3_RESPONSE_CLOSE_RE = re.compile(
+    r"<\|close\|>\s*response\s*<\|sep\|>")
+_KIMI_K3_MESSAGE_CLOSE_RE = re.compile(
+    r"<\|close\|>\s*message\s*<\|sep\|>")
+
 
 class ConversationMessage:
-    def __init__(self, role:str, content:ConversationContent, tool_calls=None, tool_call_id=None, name=None):
+    def __init__(self, role:str, content:ConversationContent, tool_calls=None,
+                 tool_call_id=None, name=None, reasoning_content=None):
       self.role = role
       self.content = content
       self.tool_calls = tool_calls
       self.tool_call_id = tool_call_id
       self.name = name
+      self.reasoning_content = reasoning_content
 
 
 class LoadedMedia:
@@ -237,9 +257,47 @@ class FastLLmCompletion:
       except Exception:
           return False
 
+  def _is_kimi_k3_model(self) -> bool:
+      try:
+          return bool(self.model._is_kimi_k3())
+      except Exception:
+          pass
+      try:
+          return self.model.get_type() == "kimi_k3"
+      except Exception:
+          return False
+
+  def _is_kimi_k3_reasoning_response(self, enable_thinking: bool) -> bool:
+      return enable_thinking and self._is_kimi_k3_model()
+
   def _uses_tagged_reasoning_response(self, enable_thinking: bool) -> bool:
       return (self._is_deepseek_v4_reasoning_response(enable_thinking)
-              or self._is_poolside_reasoning_response(enable_thinking))
+              or self._is_poolside_reasoning_response(enable_thinking)
+              or self._is_kimi_k3_reasoning_response(enable_thinking))
+
+  def _resolve_kimi_k3_reasoning_effort(
+      self, request: ChatCompletionRequest
+  ) -> Optional[str]:
+      if not self._is_kimi_k3_model():
+          return None
+      effort = request.reasoning_effort
+      template_kwargs = request.chat_template_kwargs or {}
+      if effort is None:
+          effort = template_kwargs.get(
+              "thinking_effort", template_kwargs.get("reasoning_effort"))
+      if effort is None:
+          effort = "max"
+      if effort not in {"low", "high", "max"}:
+          raise ValueError(
+              "Kimi K3 reasoning_effort must be one of: low, high, max")
+      return effort
+
+  def _serialize_tool_choice(self, tool_choice: Any) -> Any:
+      if hasattr(tool_choice, "model_dump"):
+          return tool_choice.model_dump(exclude_none=True)
+      if hasattr(tool_choice, "dict"):
+          return tool_choice.dict(exclude_none=True)
+      return tool_choice
 
   def _normalize_model_delta(self, text: str) -> str:
       if text == "[unused16]":
@@ -314,6 +372,152 @@ class FastLLmCompletion:
       if reasoning_delta:
           return [DeltaMessage(reasoning_content=reasoning_delta)], ""
       return [], ""
+
+  def _strip_kimi_k3_response_wrapper(self, text: str) -> str:
+      response_open = _KIMI_K3_RESPONSE_OPEN_RE.search(text)
+      if response_open is not None:
+          response_close = _KIMI_K3_RESPONSE_CLOSE_RE.search(
+              text, response_open.end())
+          if response_close is not None:
+              text = text[response_open.end():response_close.start()]
+          else:
+              text = text[response_open.end():]
+      else:
+          response_close = _KIMI_K3_RESPONSE_CLOSE_RE.search(text)
+          if response_close is not None:
+              text = text[:response_close.start()]
+          text = _KIMI_K3_RESPONSE_OPEN_RE.sub("", text)
+          text = _KIMI_K3_RESPONSE_CLOSE_RE.sub("", text)
+      text = _KIMI_K3_MESSAGE_CLOSE_RE.sub("", text)
+      return text.replace("<|end_of_msg|>", "")
+
+  def _split_kimi_k3_reasoning(
+      self,
+      result: str,
+      emit_reasoning_content: bool,
+      preserve_xtml: bool,
+  ) -> Tuple[str, Optional[str]]:
+      if not emit_reasoning_content:
+          return result, None
+
+      think_open = _KIMI_K3_THINK_OPEN_RE.search(result)
+      reasoning_start = think_open.end() if think_open is not None else 0
+      think_close = _KIMI_K3_THINK_CLOSE_RE.search(
+          result, reasoning_start)
+      if think_close is None:
+          # The official K3 generation prompt ends inside the think channel,
+          # so an output truncated before think_close is reasoning-only.
+          return "", result[reasoning_start:] or None
+
+      reasoning_content = result[reasoning_start:think_close.start()]
+      content = result[think_close.end():]
+      if not preserve_xtml:
+          content = self._strip_kimi_k3_response_wrapper(content)
+      return content, reasoning_content or None
+
+  def _consume_kimi_k3_content_delta(
+      self,
+      delta_text: str,
+      state: Dict[str, Any],
+  ) -> str:
+      if state.get("content_done"):
+          return ""
+      state["content_buffer"] = (
+          state.get("content_buffer", "") + delta_text)
+      buffer = state["content_buffer"]
+
+      if not state.get("content_started"):
+          response_open = _KIMI_K3_RESPONSE_OPEN_RE.search(buffer)
+          if response_open is not None:
+              buffer = buffer[response_open.end():]
+              state["content_started"] = True
+          elif _KIMI_K3_RESPONSE_OPEN.startswith(buffer):
+              return ""
+          else:
+              # Support a serving path that consumed response_open as a
+              # generation prefix.  K3 normally emits the marker after think.
+              state["content_started"] = True
+
+      response_close = _KIMI_K3_RESPONSE_CLOSE_RE.search(buffer)
+      if response_close is not None:
+          content = buffer[:response_close.start()]
+          state["content_buffer"] = ""
+          state["content_done"] = True
+          return content
+
+      overlap = self._partial_tag_overlap(
+          buffer, _KIMI_K3_RESPONSE_CLOSE)
+      if overlap:
+          content = buffer[:-overlap]
+          state["content_buffer"] = buffer[-overlap:]
+      else:
+          content = buffer
+          state["content_buffer"] = ""
+      return content
+
+  def _consume_kimi_k3_reasoning_delta(
+      self,
+      delta_text: str,
+      state: Dict[str, Any],
+  ) -> Tuple[List[DeltaMessage], str]:
+      if state.get("phase") != "reasoning":
+          if state.get("preserve_xtml"):
+              return [], delta_text
+          return [], self._consume_kimi_k3_content_delta(
+              delta_text, state)
+
+      state["buffer"] = state.get("buffer", "") + delta_text
+      buffer = state["buffer"]
+
+      if not state.get("reasoning_started"):
+          think_open = _KIMI_K3_THINK_OPEN_RE.match(buffer)
+          if think_open is not None:
+              buffer = buffer[think_open.end():]
+              state["reasoning_started"] = True
+          elif _KIMI_K3_THINK_OPEN.startswith(buffer):
+              return [], ""
+          else:
+              # In the normal path think_open is part of the prompt.
+              state["reasoning_started"] = True
+
+      think_close = _KIMI_K3_THINK_CLOSE_RE.search(buffer)
+      if think_close is not None:
+          reasoning_delta = buffer[:think_close.start()]
+          trailing = buffer[think_close.end():]
+          state["buffer"] = ""
+          state["phase"] = "content"
+          state["active"] = False
+          messages = (
+              [DeltaMessage(reasoning_content=reasoning_delta)]
+              if reasoning_delta else [])
+          if state.get("preserve_xtml"):
+              return messages, trailing
+          return messages, self._consume_kimi_k3_content_delta(
+              trailing, state)
+
+      overlap = self._partial_tag_overlap(
+          buffer, _KIMI_K3_THINK_CLOSE)
+      if overlap:
+          reasoning_delta = buffer[:-overlap]
+          state["buffer"] = buffer[-overlap:]
+      else:
+          reasoning_delta = buffer
+          state["buffer"] = ""
+      if reasoning_delta:
+          return [DeltaMessage(
+              reasoning_content=reasoning_delta)], ""
+      return [], ""
+
+  def _consume_tagged_reasoning_delta(
+      self,
+      delta_text: str,
+      state: Dict[str, Any],
+  ) -> Tuple[List[DeltaMessage], str]:
+      if state.get("format") == "kimi_k3":
+          return self._consume_kimi_k3_reasoning_delta(
+              delta_text, state)
+      return self._consume_deepseek_v4_reasoning_delta(
+          delta_text, state)
 
   async def _check_model(self, request: ChatCompletionRequest):
     if request.model != self.model_name:
@@ -578,13 +782,40 @@ class FastLLmCompletion:
       images: Optional[List[Image.Image]],
       videos: Optional[List[Any]],
       tools: Optional[List[Dict[str, Any]]] = None,
+      thinking_effort: Optional[str] = None,
+      tool_choice: Any = None,
+      chat_template_kwargs: Optional[Dict[str, Any]] = None,
   ) -> int:
       token_len_messages = messages
       if tools and self._is_deepseek_v4_model():
           token_len_messages = self.model._inject_deepseek_v4_tools(messages, tools)
-      if not images and not videos:
+      def call_model_token_len(extra_kwargs: Optional[Dict[str, Any]] = None):
+          kwargs = {
+              "enable_thinking": enable_thinking,
+              "tools": tools,
+              "thinking_effort": thinking_effort,
+              "tool_choice": tool_choice,
+              "chat_template_kwargs": chat_template_kwargs,
+          }
+          if extra_kwargs:
+              kwargs.update(extra_kwargs)
+          try:
+              signature = inspect.signature(self.model.get_input_token_len)
+              accepts_kwargs = any(
+                  parameter.kind == inspect.Parameter.VAR_KEYWORD
+                  for parameter in signature.parameters.values())
+              if not accepts_kwargs:
+                  kwargs = {
+                      key: value for key, value in kwargs.items()
+                      if key in signature.parameters
+                  }
+          except (TypeError, ValueError):
+              pass
           return self.model.get_input_token_len(
-              token_len_messages, enable_thinking = enable_thinking)
+              token_len_messages, **kwargs)
+
+      if not images and not videos:
+          return call_model_token_len()
 
       try:
           signature = inspect.signature(self.model.get_input_token_len)
@@ -594,6 +825,14 @@ class FastLLmCompletion:
                   kwargs["images"] = images
               if "videos" in signature.parameters:
                   kwargs["videos"] = videos
+              if "tools" in signature.parameters:
+                  kwargs["tools"] = tools
+              if "thinking_effort" in signature.parameters:
+                  kwargs["thinking_effort"] = thinking_effort
+              if "tool_choice" in signature.parameters:
+                  kwargs["tool_choice"] = tool_choice
+              if "chat_template_kwargs" in signature.parameters:
+                  kwargs["chat_template_kwargs"] = chat_template_kwargs
               return self.model.get_input_token_len(token_len_messages, **kwargs)
       except (TypeError, ValueError):
           pass
@@ -657,8 +896,7 @@ class FastLLmCompletion:
           )
           return len(native_inputs["input_ids"])
 
-      return self.model.get_input_token_len(
-          token_len_messages, enable_thinking = enable_thinking)
+      return call_model_token_len()
 
   def _parse_chat_message_content(
       self,
@@ -668,6 +906,7 @@ class FastLLmCompletion:
       tool_calls=None,
       tool_call_id=None,
       name=None,
+      reasoning_content=None,
   ) -> Tuple[List[ConversationMessage], LoadedMedia]:
       empty_media = LoadedMedia()
       if content is None and tool_calls is None and tool_call_id is None:
@@ -676,13 +915,15 @@ class FastLLmCompletion:
           return [ConversationMessage(role=role, content=content or "",
                                       tool_calls=tool_calls,
                                       tool_call_id=tool_call_id,
-                                      name=name)], empty_media
+                                      name=name,
+                                      reasoning_content=reasoning_content)], empty_media
       if isinstance(content, list):
           parsed_content, media = self._parse_openai_content_parts(content)
           return [ConversationMessage(role=role, content=parsed_content,
                                       tool_calls=tool_calls,
                                       tool_call_id=tool_call_id,
-                                      name=name)], media
+                                      name=name,
+                                      reasoning_content=reasoning_content)], media
       raise NotImplementedError("Complex input not supported yet")
 
   def _stringify_anthropic_block_content(self, content: Any) -> str:
@@ -782,7 +1023,8 @@ class FastLLmCompletion:
       force_type = getattr(self.model, "tool_call_parser", "auto")
       allow_without_chat_template = (
           model_type == "deepseek_v4" or
-          force_type in ("deepseek_v4",)
+          model_type == "kimi_k3" or
+          force_type in ("deepseek_v4", "kimi_k3")
       )
       if tokenizer is None and allow_without_chat_template:
           tokenizer = _EmptyToolTokenizer()
@@ -1331,6 +1573,9 @@ class FastLLmCompletion:
       max_tokens = request.max_output_tokens
       if max_tokens is None:
           max_tokens = request.max_tokens
+      reasoning_effort = None
+      if isinstance(request.reasoning, dict):
+          reasoning_effort = request.reasoning.get("effort")
       return ChatCompletionRequest(
           model = request.model,
           messages = messages,
@@ -1342,6 +1587,7 @@ class FastLLmCompletion:
           stream = request.stream,
           tools = self._convert_responses_tools(request.tools),
           tool_choice = self._convert_responses_tool_choice(request.tool_choice),
+          reasoning_effort = reasoning_effort,
       )
 
   def _response_token_counts(
@@ -2143,7 +2389,9 @@ class FastLLmCompletion:
                   m["role"], m.get("content"),
                   tool_calls=m.get("tool_calls"),
                   tool_call_id=m.get("tool_call_id"),
-                  name=m.get("name"))
+                  name=m.get("name"),
+                  reasoning_content=m.get(
+                      "reasoning_content", m.get("reasoning")))
 
               conversation.extend(messages)
               media.extend(message_media)
@@ -2173,6 +2421,8 @@ class FastLLmCompletion:
                 msg_dict["tool_call_id"] = msg.tool_call_id
             if msg.name is not None:
                 msg_dict["name"] = msg.name
+            if msg.reasoning_content is not None:
+                msg_dict["reasoning_content"] = msg.reasoning_content
             messages.append(msg_dict)
 
       except Exception as e:
@@ -2200,6 +2450,12 @@ class FastLLmCompletion:
       enable_thinking = self.enable_thinking
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
+      try:
+          thinking_effort = self._resolve_kimi_k3_reasoning_effort(request)
+      except ValueError as error:
+          self._cleanup_temp_paths(media.temp_paths)
+          return self.create_error_response(str(error))
+      tool_choice = self._serialize_tool_choice(request.tool_choice)
 
       #logging.info(request)
       if (not(self.hide_input)):
@@ -2226,6 +2482,12 @@ class FastLLmCompletion:
           "videos": model_videos,
           "stop_token_ids": stop_token_ids,
       }
+      if self._is_kimi_k3_model():
+          launch_kwargs.update({
+              "thinking_effort": thinking_effort,
+              "tool_choice": tool_choice,
+              "chat_template_kwargs": request.chat_template_kwargs,
+          })
       self._attach_tool_call_constraint_if_supported(
           launch_kwargs, request)
 
@@ -2239,7 +2501,10 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
               images = model_images,
               videos = model_videos,
-              tools = tools)
+              tools = tools,
+              thinking_effort = thinking_effort,
+              tool_choice = tool_choice,
+              chat_template_kwargs = request.chat_template_kwargs)
           launched_handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
           return input_len, launched_handle
@@ -2320,8 +2585,19 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
-      result, reasoning_content = self._split_deepseek_v4_reasoning(
-          result, emit_reasoning_content)
+      if self._is_kimi_k3_model():
+          if emit_reasoning_content:
+              result, reasoning_content = self._split_kimi_k3_reasoning(
+                  result,
+                  emit_reasoning_content,
+                  preserve_xtml=bool(request.tools))
+          else:
+              reasoning_content = None
+              if not request.tools:
+                  result = self._strip_kimi_k3_response_wrapper(result)
+      else:
+          result, reasoning_content = self._split_deepseek_v4_reasoning(
+              result, emit_reasoning_content)
       result, stopped_by_stop_string = self._truncate_at_stop(
           result, self._normalize_stop_strings(request.stop))
       usage = self._chat_usage(
@@ -2461,10 +2737,18 @@ class FastLLmCompletion:
         current_token_ids = []
         previous_text = ""
         current_text = ""
+        reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
         reasoning_state = {
             "active": emit_reasoning_content,
             "buffer": "",
             "started": False,
+            "format": reasoning_format,
+            "phase": "reasoning" if emit_reasoning_content else "content",
+            "reasoning_started": False,
+            "preserve_xtml": bool(request.tools),
+            "content_buffer": "",
+            "content_started": False,
+            "content_done": False,
         }
 
         async for res in result_generator:
@@ -2472,7 +2756,7 @@ class FastLLmCompletion:
             completion_tokens += 1
             delta_text = res
 
-            reasoning_delta_messages, delta_text = self._consume_deepseek_v4_reasoning_delta(
+            reasoning_delta_messages, delta_text = self._consume_tagged_reasoning_delta(
                 delta_text, reasoning_state)
             for reasoning_delta_message in reasoning_delta_messages:
                 choice_data = ChatCompletionResponseStreamChoice(
@@ -2600,7 +2884,9 @@ class FastLLmCompletion:
                     data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
 
-        if (emit_reasoning_content and reasoning_state.get("active")
+        if (emit_reasoning_content
+                and reasoning_state.get("format") != "kimi_k3"
+                and reasoning_state.get("active")
                 and reasoning_state.get("buffer")):
             choice_data = ChatCompletionResponseStreamChoice(
                 index = 0,

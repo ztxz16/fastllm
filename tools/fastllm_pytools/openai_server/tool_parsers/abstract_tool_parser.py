@@ -268,6 +268,8 @@ class ToolParserManager:
             target = 'minimax_m2'
         elif model_type == 'kimi_k2':
             target = 'kimi_k2'
+        elif model_type == 'kimi_k3':
+            target = 'kimi_k3'
         elif model_type == 'hy_v3':
             target = 'hy_v3'
         elif model_type == 'deepseek_v4':
