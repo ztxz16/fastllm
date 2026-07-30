@@ -511,10 +511,13 @@ extern "C" {
 #ifdef USE_ROCM
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
-            if (model->model_type == "laguna") {
+            if (model->model_type == "laguna" ||
+                model->model_type == "kimi_k3") {
                 // Laguna's late-layer activations exceed the finite FP16
-                // range, so its automatic CUDA activation type must retain
-                // the checkpoint's BF16 exponent range.
+                // range, while Kimi-K3's dedicated CUDA kernels consume
+                // BF16.  Preserve BF16 for both models in auto mode; this
+                // also keeps Kimi-K3's KV capacity accounting consistent
+                // with the cache tensors created by its attention path.
                 model->SetDataType(fastllm::DataType::BFLOAT16);
             } else if (model->model_type == "glm_moe_dsa") {
                 model->SetDataType(fastllm::DataType::FLOAT32);

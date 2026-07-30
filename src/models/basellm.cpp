@@ -3153,6 +3153,7 @@ namespace fastllm {
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next" ||
+                            this->model_struct == "kimi_k3" ||
                             this->model_struct == "gemma4",
                             this->model_struct + " doesn't support bfloat16");
         } else {

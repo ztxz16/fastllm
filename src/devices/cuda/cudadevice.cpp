@@ -4293,8 +4293,9 @@ namespace fastllm {
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMul error: inputs should use same device.\n");
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
                         (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16) ||
                         (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16),
-                        "MatMul's input's type should be float32 or float16.\n");
+                        "MatMul's inputs should be matching float32, float16 or bfloat16.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
                         "MatMul's input's shape's size should be >= 2.\n");
         AssertInFastLLM(input0.dims.back() == input1.dims[input1.dims.size() - 2],
@@ -4349,8 +4350,9 @@ namespace fastllm {
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
                         (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16) ||
                         (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16),
-                        "MatMulTransB's input's type should be float32 or float16.\n");
+                        "MatMulTransB's inputs should be matching float32, float16 or bfloat16.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
                         "MatMulTransB's input's shape's size should be >= 2.\n");
         AssertInFastLLM(input0.dims.back() == input1.dims.back(),
@@ -5352,8 +5354,9 @@ namespace fastllm {
 
         AssertInFastLLM(kvCachePaged.isPagedKVCache && peCachePaged.isPagedKVCache,
             "CudaMergeMLAPaged: kvCachePaged and peCachePaged must be paged KV cache (isPagedKVCache=true).\n");
-        if (qNope.dataType != DataType::FLOAT16) {
-            printf("CudaMergeMLAPaged: qNope must be FLOAT16 to use FastllmCudaMLAPaged.\n");
+        if (qNope.dataType != DataType::FLOAT16 &&
+            qNope.dataType != DataType::BFLOAT16) {
+            printf("CudaMergeMLAPaged: qNope must be FLOAT16 or BFLOAT16.\n");
             return;
         }
 

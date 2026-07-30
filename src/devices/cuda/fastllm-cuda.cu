@@ -7779,6 +7779,15 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
                 (half*)cudaInput0, input0Stride, input0Spatial,
                 &h_beta,
                 (half*)cudaOutput, k, k * n, batch);
+    } else if (input0.dataType == fastllm::DataType::BFLOAT16 &&
+               input1.dataType == fastllm::DataType::BFLOAT16) {
+        status = cublasGemmStridedBatchedEx(
+                fastllmCublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+                k, n, m, &alpha,
+                cudaInput1, CUDA_R_16BF, input1Stride, input1Spatial,
+                cudaInput0, CUDA_R_16BF, input0Stride, input0Spatial,
+                &beta, cudaOutput, CUDA_R_16BF, k, k * n, batch,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
         auto runHalfGemm = [&]() {
             size_t tempInput0Bytes = input0.Count(0) * sizeof(half);
@@ -7888,6 +7897,15 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                         (half*)cudaInput0, input0Stride, input0Spatial,
                                         &h_beta,
                                         (half*)cudaOutput, k, k * n, batch);
+    } else if (input0.dataType == fastllm::DataType::BFLOAT16 &&
+               input1.dataType == fastllm::DataType::BFLOAT16) {
+        status = cublasGemmStridedBatchedEx(
+                fastllmCublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+                k, n, m, &alpha,
+                cudaInput1, CUDA_R_16BF, input1Stride, input1Spatial,
+                cudaInput0, CUDA_R_16BF, input0Stride, input0Spatial,
+                &beta, cudaOutput, CUDA_R_16BF, k, k * n, batch,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
         auto runHalfGemm = [&]() {
             size_t tempInput0Bytes = input0.Count(0) * sizeof(half);

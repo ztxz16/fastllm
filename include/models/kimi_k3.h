@@ -171,6 +171,7 @@ namespace fastllm {
         float gateLowerBound = -5.0f;
         float situBeta = 4.0f;
         float situLinearBeta = 25.0f;
+        bool cudaWeightWarmupRunning = false;
 
         bool dsparkEnabled = false;
         int dsparkBlockSize = 0;
