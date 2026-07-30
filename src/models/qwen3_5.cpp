@@ -1308,7 +1308,13 @@ namespace fastllm {
                 Data &hiddenStates,
                 const std::vector<int> &devices,
                 PersistentWorkerGroup &workerGroup) {
-            if (devices.empty()) {
+            AssertInFastLLM(!devices.empty(),
+                            "Qwen3.5 ForwardGPU CPU embedding got empty CUDA devices.\n");
+            hiddenStates.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(hiddenStates.cpuData != nullptr,
+                            "Qwen3.5 ForwardGPU CPU embedding has no CPU data.\n");
+            if (devices.size() == 1) {
+                hiddenStates.ToDevice(DataDevice::CUDA, {devices[0]}, true);
                 return;
             }
 
