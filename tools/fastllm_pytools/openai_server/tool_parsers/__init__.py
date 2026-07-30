@@ -14,6 +14,7 @@ from .hy_v3_tool_parser import HYV3ToolParser
 #from .internlm2_tool_parser import Internlm2ToolParser
 #from .jamba_tool_parser import JambaToolParser
 from .kimi_k2_tool_parser import KimiK2ToolParser
+from .kimi_k3_tool_parser import KimiK3ToolParser
 #from .llama4_pythonic_tool_parser import Llama4PythonicToolParser
 #from .llama_tool_parser import Llama3JsonToolParser
 #from .minimax_tool_parser import MinimaxToolParser
@@ -48,6 +49,7 @@ __all__ = [
     "MinimaxM2ToolParser",
     "PoolsideV1ToolParser",
     "KimiK2ToolParser",
+    "KimiK3ToolParser",
     #"HunyuanA13BToolParser",
     "Glm4MoeModelToolParser",
     "Qwen3CoderToolParser",

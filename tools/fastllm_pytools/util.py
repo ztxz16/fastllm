@@ -460,7 +460,9 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
                 architecture == 'Glm4MoeForCausalLM' or architecture == 'GlmMoeDsaForCausalLM' or
                 architecture == 'HYV3ForCausalLM' or model_type == 'glm_moe_dsa' or
-                model_type == 'hy_v3'):
+                model_type == 'hy_v3' or
+                architecture == 'KimiK3ForConditionalGeneration' or
+                model_type == 'kimi_k3'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
             if ((architecture == 'Qwen3_5ForConditionalGeneration' or
