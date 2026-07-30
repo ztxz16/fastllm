@@ -1058,6 +1058,62 @@ namespace {
                         2e-5f, 2e-5f,
                         "CUDA Kimi-K3 recurrent KDA state");
 
+        fastllm::Data cpuOutputOnlyState(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        fastllm::Data cpuOutputOnly;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::KimiK3RecurrentKDAOutputOnly(
+                cpuQ, cpuK, cpuV, cpuGate, cpuRawBeta, cpuALog, cpuDtBias,
+                -5.0f, cpuOutputOnlyState, cpuOutputOnly);
+        }
+        ExpectFloatNear(ToFloatVector(cpuOutput),
+                        ToFloatVector(cpuOutputOnly), 0.0f, 0.0f,
+                        "CPU Kimi-K3 output-only KDA output");
+        ExpectFloatNear(ToFloatVector(cpuState),
+                        ToFloatVector(cpuOutputOnlyState), 0.0f, 0.0f,
+                        "CPU Kimi-K3 output-only KDA state");
+
+        fastllm::Data cudaChunkedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        fastllm::Data cudaChunkedOutput;
+        {
+            ScopedFirstDevice device("cuda:0");
+            constexpr int recurrentChunkSize = 3;
+            for (int start = 0; start < sequence;
+                 start += recurrentChunkSize) {
+                const int end = std::min(
+                    sequence, start + recurrentChunkSize);
+                fastllm::Data qChunk, kChunk, vChunk, gateChunk;
+                fastllm::Data betaChunk, outputChunk;
+                fastllm::Split(cudaQ, 1, start, end, qChunk);
+                fastllm::Split(cudaK, 1, start, end, kChunk);
+                fastllm::Split(cudaV, 1, start, end, vChunk);
+                fastllm::Split(cudaGate, 1, start, end, gateChunk);
+                fastllm::Split(
+                    cudaRawBeta, 1, start, end, betaChunk);
+                fastllm::KimiK3RecurrentKDAOutputOnly(
+                    qChunk, kChunk, vChunk, gateChunk, betaChunk,
+                    cudaALog, cudaDtBias, -5.0f,
+                    cudaChunkedState, outputChunk);
+                if (start == 0) {
+                    fastllm::Copy(outputChunk, cudaChunkedOutput);
+                    cudaChunkedOutput.Expansion(vectorDims);
+                } else {
+                    fastllm::CatDirect(
+                        cudaChunkedOutput, outputChunk, 1);
+                }
+            }
+            cudaChunkedOutput.expansionDims.clear();
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(cudaOutput),
+                        ToFloatVector(cudaChunkedOutput), 0.0f, 0.0f,
+                        "CUDA Kimi-K3 chunked output-only KDA output");
+        ExpectFloatNear(ToFloatVector(cudaState),
+                        ToFloatVector(cudaChunkedState), 2e-5f, 2e-5f,
+                        "CUDA Kimi-K3 chunked output-only KDA state");
+
         constexpr int replayTokens = 5;
         const int replayVectorItems = replayTokens * heads * dimension;
         const int replayBetaItems = replayTokens * heads;

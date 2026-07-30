@@ -3042,6 +3042,9 @@ namespace fastllm {
         const bool stateOnly =
             intParams.find("stateOnly") != intParams.end() &&
             intParams.find("stateOnly")->second != 0;
+        const bool outputAux =
+            intParams.find("outputAux") == intParams.end() ||
+            intParams.find("outputAux")->second != 0;
         const int tokenLimit =
             intParams.find("tokenLimit") == intParams.end() ? -1 :
             intParams.find("tokenLimit")->second;
@@ -3053,14 +3056,16 @@ namespace fastllm {
         state.Allocate(false);
         if (!stateOnly) {
             output.Allocate(false);
-            decay.Allocate(false);
-            beta.Allocate(false);
+            if (outputAux) {
+                decay.Allocate(false);
+                beta.Allocate(false);
+            }
         }
         AssertInFastLLM(
             FastllmCudaKimiK3RecurrentKDA(
                 q, k, v, rawGate, rawBeta, aLog, dtBias, state, output,
                 decay, beta, lowerBound, initializeState,
-                tokenLimit, stateOnly),
+                tokenLimit, stateOnly, outputAux),
             "CUDA KimiK3RecurrentKDA launch failed.");
     }
 

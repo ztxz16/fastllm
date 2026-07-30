@@ -3994,7 +3994,24 @@ namespace fastllm {
                 {"state", &state}, {"output", &output},
                 {"decay", &decay}, {"beta", &beta}
         }, {{"lowerBound", lowerBound}},
-        {{"tokenLimit", -1}, {"stateOnly", 0}});
+        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 1}});
+    }
+
+    void KimiK3RecurrentKDAOutputOnly(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output) {
+        Data unusedDecay, unusedBeta;
+        curExecutor->Run("KimiK3RecurrentKDA", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"rawGate", (Data*)&rawGate},
+                {"rawBeta", (Data*)&rawBeta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output},
+                {"decay", &unusedDecay}, {"beta", &unusedBeta}
+        }, {{"lowerBound", lowerBound}},
+        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 0}});
     }
 
     void KimiK3RecurrentKDAUpdateState(
@@ -4014,7 +4031,7 @@ namespace fastllm {
                 {"state", &state}, {"output", &unusedOutput},
                 {"decay", &unusedDecay}, {"beta", &unusedBeta}
         }, {{"lowerBound", lowerBound}},
-        {{"tokenLimit", tokens}, {"stateOnly", 1}});
+        {{"tokenLimit", tokens}, {"stateOnly", 1}, {"outputAux", 0}});
     }
 
     void KimiK3RMSNormSigmoidGate(

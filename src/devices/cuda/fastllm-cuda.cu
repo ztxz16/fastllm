@@ -5803,7 +5803,7 @@ bool FastllmCudaKimiK3RecurrentKDA(
         const fastllm::Data &dtBias, fastllm::Data &state,
         fastllm::Data &output, fastllm::Data &decay,
         fastllm::Data &beta, float lowerBound, bool initializeState,
-        int tokenLimit, bool stateOnly) {
+        int tokenLimit, bool stateOnly, bool outputAux) {
     if (!KimiK3CudaDataReady(q, fastllm::DataType::BFLOAT16) ||
         !KimiK3CudaDataReady(k, fastllm::DataType::BFLOAT16) ||
         !KimiK3CudaDataReady(v, fastllm::DataType::BFLOAT16) ||
@@ -5831,13 +5831,18 @@ bool FastllmCudaKimiK3RecurrentKDA(
         dtBias.Count(0) != (uint64_t)heads * dimension) {
         return false;
     }
-    if (!stateOnly &&
-        (!KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
-         !KimiK3CudaDataReady(decay, fastllm::DataType::FLOAT32) ||
-         !KimiK3CudaDataReady(beta, fastllm::DataType::FLOAT32) ||
-         output.dims != q.dims || decay.dims != q.dims ||
-         beta.dims != std::vector<int>({batch, sequence, heads}))) {
-        return false;
+    if (!stateOnly) {
+        if (!KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+            output.dims != q.dims) {
+            return false;
+        }
+        if (outputAux &&
+            (!KimiK3CudaDataReady(decay, fastllm::DataType::FLOAT32) ||
+             !KimiK3CudaDataReady(beta, fastllm::DataType::FLOAT32) ||
+             decay.dims != q.dims ||
+             beta.dims != std::vector<int>({batch, sequence, heads}))) {
+            return false;
+        }
     }
     if (initializeState) {
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
@@ -5856,8 +5861,8 @@ bool FastllmCudaKimiK3RecurrentKDA(
         (const float*)dtBias.cudaData,
         (float*)state.cudaData,
         stateOnly ? nullptr : (__nv_bfloat16*)output.cudaData,
-        stateOnly ? nullptr : (float*)decay.cudaData,
-        stateOnly ? nullptr : (float*)beta.cudaData,
+        stateOnly || !outputAux ? nullptr : (float*)decay.cudaData,
+        stateOnly || !outputAux ? nullptr : (float*)beta.cudaData,
         batch, sequence, tokens, heads, dimension,
         (int)aLog.Count(0), lowerBound);
     return KimiK3CudaLastError("KimiK3RecurrentKDA CUDA kernel failed.");

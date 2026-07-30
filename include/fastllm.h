@@ -952,6 +952,15 @@ namespace fastllm {
             const Data &aLog, const Data &dtBias, float lowerBound,
             Data &state, Data &output, Data &decay, Data &beta);
 
+    // Inference only consumes the recurrent output and updated state.  Avoid
+    // materializing the full-sequence float32 decay/beta diagnostics on that
+    // path while retaining KimiK3RecurrentKDA for validation and tooling.
+    void KimiK3RecurrentKDAOutputOnly(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output);
+
     // Replays only the recurrent-state transition for the first `tokens`
     // rows of a captured verification batch.
     void KimiK3RecurrentKDAUpdateState(

@@ -102,6 +102,14 @@ namespace fastllm {
                 std::vector<std::pair<Data, Data>> *pastKeyValues,
                 TargetRunCapture *capture = nullptr);
 
+        void RunKdaAttentionImpl(
+                int layerIndex,
+                Data &normalized,
+                int sequence,
+                std::vector<std::pair<Data, Data>> *pastKeyValues,
+                TargetRunCapture *capture,
+                Data &attention);
+
         Data RunLayersImpl(
                 const std::vector<int> &tokenIds,
                 int layerCount,

@@ -1004,6 +1004,151 @@ namespace fastllm {
 #endif
     }
 
+    void KimiK3Model::RunKdaAttentionImpl(
+            int layerIndex, Data &normalized, int sequence,
+            std::vector<std::pair<Data, Data>> *pastKeyValues,
+            TargetRunCapture *capture, Data &attention) {
+        AssertInFastLLM(
+            normalized.dims.size() >= 2 &&
+            normalized.dims[normalized.dims.size() - 2] == sequence,
+            "Kimi-K3 KDA input has an invalid sequence dimension.");
+        const std::string layer = languagePrefix + "layers." +
+            std::to_string(layerIndex) + ".";
+
+        Data qCache, kCache, vCache;
+        if (pastKeyValues != nullptr) {
+            UnpackKdaConvCache(
+                (*pastKeyValues)[layerIndex].first,
+                shortConvKernel - 1, kdaHeads * kdaHeadDim,
+                qCache, kCache, vCache);
+        }
+        Data localState;
+        Data &state = pastKeyValues == nullptr ?
+            localState : (*pastKeyValues)[layerIndex].second;
+
+        auto runChunk = [&](Data &chunkInput, int chunkSequence,
+                            Data &chunkAttention) {
+            Data qProjected, kProjected, vProjected;
+            Linear(chunkInput, weight[layer + "self_attn.q_proj.weight"],
+                   Data(), qProjected);
+            Linear(chunkInput, weight[layer + "self_attn.k_proj.weight"],
+                   Data(), kProjected);
+            Linear(chunkInput, weight[layer + "self_attn.v_proj.weight"],
+                   Data(), vProjected);
+            if (capture != nullptr && capture->captureKda) {
+                capture->kda[layerIndex].qProjected.CopyFrom(qProjected);
+                capture->kda[layerIndex].kProjected.CopyFrom(kProjected);
+                capture->kda[layerIndex].vProjected.CopyFrom(vProjected);
+            }
+
+            Data qConv, kConv, vConv;
+            if (pastKeyValues != nullptr) {
+                KimiK3CausalConv1D(
+                    qProjected,
+                    weight[layer + "self_attn.q_conv1d.weight"],
+                    shortConvKernel, qCache, qConv);
+                KimiK3CausalConv1D(
+                    kProjected,
+                    weight[layer + "self_attn.k_conv1d.weight"],
+                    shortConvKernel, kCache, kConv);
+                KimiK3CausalConv1D(
+                    vProjected,
+                    weight[layer + "self_attn.v_conv1d.weight"],
+                    shortConvKernel, vCache, vConv);
+            } else {
+                KimiK3CausalConv1D(
+                    qProjected,
+                    weight[layer + "self_attn.q_conv1d.weight"],
+                    shortConvKernel, qConv);
+                KimiK3CausalConv1D(
+                    kProjected,
+                    weight[layer + "self_attn.k_conv1d.weight"],
+                    shortConvKernel, kConv);
+                KimiK3CausalConv1D(
+                    vProjected,
+                    weight[layer + "self_attn.v_conv1d.weight"],
+                    shortConvKernel, vConv);
+            }
+            qConv.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
+            kConv.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
+            vConv.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
+            Data q, k;
+            KimiK3L2Norm(qConv, 1e-6f, q);
+            KimiK3L2Norm(kConv, 1e-6f, k);
+
+            Data gateLowRank, rawGate;
+            Linear(chunkInput, weight[layer + "self_attn.f_a_proj.weight"],
+                   Data(), gateLowRank);
+            Linear(gateLowRank, weight[layer + "self_attn.f_b_proj.weight"],
+                   Data(), rawGate);
+            rawGate.Reshape(
+                {1, chunkSequence, kdaHeads, kdaHeadDim});
+            Data rawBetaBf16, rawBeta;
+            Linear(chunkInput, weight[layer + "self_attn.b_proj.weight"],
+                   Data(), rawBetaBf16);
+            ToDataType(rawBetaBf16, rawBeta, DataType::FLOAT32);
+            if (capture != nullptr && capture->captureKda) {
+                capture->kda[layerIndex].k.CopyFrom(k);
+                capture->kda[layerIndex].v.CopyFrom(vConv);
+                capture->kda[layerIndex].rawGate.CopyFrom(rawGate);
+                capture->kda[layerIndex].rawBeta.CopyFrom(rawBeta);
+            }
+
+            Data kdaOutput;
+            KimiK3RecurrentKDAOutputOnly(
+                q, k, vConv, rawGate, rawBeta,
+                weight[layer + "self_attn.A_log"],
+                weight[layer + "self_attn.dt_bias"], gateLowerBound,
+                state, kdaOutput);
+
+            Data outputGate;
+            Linear(chunkInput, weight[layer + "self_attn.g_proj.weight"],
+                   Data(), outputGate);
+            outputGate.Reshape(
+                {1, chunkSequence, kdaHeads, kdaHeadDim});
+            Data gatedAttention;
+            KimiK3RMSNormSigmoidGate(
+                kdaOutput, outputGate,
+                weight[layer + "self_attn.o_norm.weight"],
+                rms_norm_eps, gatedAttention);
+            gatedAttention.Reshape(
+                {1, chunkSequence, kdaHeads * kdaHeadDim});
+            Linear(gatedAttention, weight[layer + "self_attn.o_proj.weight"],
+                   Data(), chunkAttention);
+        };
+
+        const int sequenceAxis = (int)normalized.dims.size() - 2;
+        const int kdaChunkSize = 1024;
+        const bool chunkPrefill =
+            normalized.dataDevice == DataDevice::CUDA &&
+            pastKeyValues != nullptr &&
+            (capture == nullptr || !capture->captureKda) &&
+            sequence > kdaChunkSize;
+        if (!chunkPrefill) {
+            runChunk(normalized, sequence, attention);
+        } else {
+            for (int start = 0; start < sequence; start += kdaChunkSize) {
+                const int end = std::min(sequence, start + kdaChunkSize);
+                Data chunkInput, chunkAttention;
+                Split(normalized, sequenceAxis, start, end, chunkInput);
+                runChunk(chunkInput, end - start, chunkAttention);
+                if (start == 0) {
+                    Copy(chunkAttention, attention);
+                    attention.Expansion(normalized.dims);
+                } else {
+                    CatDirect(attention, chunkAttention, sequenceAxis);
+                }
+            }
+            attention.expansionDims.clear();
+        }
+
+        if (pastKeyValues != nullptr) {
+            PackKdaConvCache(
+                qCache, kCache, vCache,
+                (*pastKeyValues)[layerIndex].first);
+        }
+    }
+
     Data KimiK3Model::RunFirstLayerImpl(
             const std::vector<int> &tokenIds,
             std::vector<std::pair<Data, Data>> *pastKeyValues,
@@ -1027,94 +1172,9 @@ namespace fastllm {
             embedding, weight[layer + "input_layernorm.weight"],
             rms_norm_eps, normalized);
 
-        Data qProjected, kProjected, vProjected;
-        Linear(normalized, weight[layer + "self_attn.q_proj.weight"],
-               Data(), qProjected);
-        Linear(normalized, weight[layer + "self_attn.k_proj.weight"],
-               Data(), kProjected);
-        Linear(normalized, weight[layer + "self_attn.v_proj.weight"],
-               Data(), vProjected);
-        if (capture != nullptr && capture->captureKda) {
-            capture->kda[0].qProjected.CopyFrom(qProjected);
-            capture->kda[0].kProjected.CopyFrom(kProjected);
-            capture->kda[0].vProjected.CopyFrom(vProjected);
-        }
-
-        Data qConv, kConv, vConv;
-        Data qCache, kCache, vCache;
-        if (pastKeyValues != nullptr) {
-            UnpackKdaConvCache(
-                (*pastKeyValues)[0].first, shortConvKernel - 1,
-                kdaHeads * kdaHeadDim, qCache, kCache, vCache);
-            KimiK3CausalConv1D(
-                qProjected, weight[layer + "self_attn.q_conv1d.weight"],
-                shortConvKernel, qCache, qConv);
-            KimiK3CausalConv1D(
-                kProjected, weight[layer + "self_attn.k_conv1d.weight"],
-                shortConvKernel, kCache, kConv);
-            KimiK3CausalConv1D(
-                vProjected, weight[layer + "self_attn.v_conv1d.weight"],
-                shortConvKernel, vCache, vConv);
-            PackKdaConvCache(
-                qCache, kCache, vCache, (*pastKeyValues)[0].first);
-        } else {
-            KimiK3CausalConv1D(
-                qProjected, weight[layer + "self_attn.q_conv1d.weight"],
-                shortConvKernel, qConv);
-            KimiK3CausalConv1D(
-                kProjected, weight[layer + "self_attn.k_conv1d.weight"],
-                shortConvKernel, kConv);
-            KimiK3CausalConv1D(
-                vProjected, weight[layer + "self_attn.v_conv1d.weight"],
-                shortConvKernel, vConv);
-        }
-
-        qConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        kConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        vConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        Data q, k;
-        KimiK3L2Norm(qConv, 1e-6f, q);
-        KimiK3L2Norm(kConv, 1e-6f, k);
-
-        Data gateLowRank, rawGate;
-        Linear(normalized, weight[layer + "self_attn.f_a_proj.weight"],
-               Data(), gateLowRank);
-        Linear(gateLowRank, weight[layer + "self_attn.f_b_proj.weight"],
-               Data(), rawGate);
-        rawGate.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        Data rawBetaBf16, rawBeta;
-        Linear(normalized, weight[layer + "self_attn.b_proj.weight"],
-               Data(), rawBetaBf16);
-        ToDataType(rawBetaBf16, rawBeta, DataType::FLOAT32);
-        if (capture != nullptr && capture->captureKda) {
-            capture->kda[0].k.CopyFrom(k);
-            capture->kda[0].v.CopyFrom(vConv);
-            capture->kda[0].rawGate.CopyFrom(rawGate);
-            capture->kda[0].rawBeta.CopyFrom(rawBeta);
-        }
-
-        Data localKdaState, kdaOutput, kdaDecay, kdaBeta;
-        Data &kdaState = pastKeyValues == nullptr ?
-            localKdaState : (*pastKeyValues)[0].second;
-        KimiK3RecurrentKDA(
-            q, k, vConv, rawGate, rawBeta,
-            weight[layer + "self_attn.A_log"],
-            weight[layer + "self_attn.dt_bias"], gateLowerBound,
-            kdaState, kdaOutput, kdaDecay, kdaBeta);
-
-        Data outputGate;
-        Linear(normalized, weight[layer + "self_attn.g_proj.weight"],
-               Data(), outputGate);
-        outputGate.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        Data gatedAttention;
-        KimiK3RMSNormSigmoidGate(
-            kdaOutput, outputGate,
-            weight[layer + "self_attn.o_norm.weight"],
-            rms_norm_eps, gatedAttention);
-        gatedAttention.Reshape({1, sequence, kdaHeads * kdaHeadDim});
         Data attention;
-        Linear(gatedAttention, weight[layer + "self_attn.o_proj.weight"],
-               Data(), attention);
+        RunKdaAttentionImpl(
+            0, normalized, sequence, pastKeyValues, capture, attention);
 
         Data mlpInput;
         embedding.Reshape({sequence, 1, embed_dim});
@@ -1214,97 +1274,9 @@ namespace fastllm {
 
         auto runKdaAttention = [&](int layerIndex, Data &normalized,
                                    Data &attention) {
-            const std::string layer = languagePrefix + "layers." +
-                std::to_string(layerIndex) + ".";
-            Data qProjected, kProjected, vProjected;
-            Linear(normalized, weight[layer + "self_attn.q_proj.weight"],
-                   Data(), qProjected);
-            Linear(normalized, weight[layer + "self_attn.k_proj.weight"],
-                   Data(), kProjected);
-            Linear(normalized, weight[layer + "self_attn.v_proj.weight"],
-                   Data(), vProjected);
-            if (capture != nullptr && capture->captureKda) {
-                capture->kda[layerIndex].qProjected.CopyFrom(qProjected);
-                capture->kda[layerIndex].kProjected.CopyFrom(kProjected);
-                capture->kda[layerIndex].vProjected.CopyFrom(vProjected);
-            }
-
-            Data qConv, kConv, vConv;
-            Data qCache, kCache, vCache;
-            if (pastKeyValues != nullptr) {
-                UnpackKdaConvCache(
-                    (*pastKeyValues)[layerIndex].first,
-                    shortConvKernel - 1, kdaHeads * kdaHeadDim,
-                    qCache, kCache, vCache);
-                KimiK3CausalConv1D(
-                    qProjected, weight[layer + "self_attn.q_conv1d.weight"],
-                    shortConvKernel, qCache, qConv);
-                KimiK3CausalConv1D(
-                    kProjected, weight[layer + "self_attn.k_conv1d.weight"],
-                    shortConvKernel, kCache, kConv);
-                KimiK3CausalConv1D(
-                    vProjected, weight[layer + "self_attn.v_conv1d.weight"],
-                    shortConvKernel, vCache, vConv);
-                PackKdaConvCache(
-                    qCache, kCache, vCache,
-                    (*pastKeyValues)[layerIndex].first);
-            } else {
-                KimiK3CausalConv1D(
-                    qProjected, weight[layer + "self_attn.q_conv1d.weight"],
-                    shortConvKernel, qConv);
-                KimiK3CausalConv1D(
-                    kProjected, weight[layer + "self_attn.k_conv1d.weight"],
-                    shortConvKernel, kConv);
-                KimiK3CausalConv1D(
-                    vProjected, weight[layer + "self_attn.v_conv1d.weight"],
-                    shortConvKernel, vConv);
-            }
-            qConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            kConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            vConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            Data q, k;
-            KimiK3L2Norm(qConv, 1e-6f, q);
-            KimiK3L2Norm(kConv, 1e-6f, k);
-
-            Data gateLowRank, rawGate;
-            Linear(normalized, weight[layer + "self_attn.f_a_proj.weight"],
-                   Data(), gateLowRank);
-            Linear(gateLowRank, weight[layer + "self_attn.f_b_proj.weight"],
-                   Data(), rawGate);
-            rawGate.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            Data rawBetaBf16, rawBeta;
-            Linear(normalized, weight[layer + "self_attn.b_proj.weight"],
-                   Data(), rawBetaBf16);
-            ToDataType(rawBetaBf16, rawBeta, DataType::FLOAT32);
-            if (capture != nullptr && capture->captureKda) {
-                capture->kda[layerIndex].k.CopyFrom(k);
-                capture->kda[layerIndex].v.CopyFrom(vConv);
-                capture->kda[layerIndex].rawGate.CopyFrom(rawGate);
-                capture->kda[layerIndex].rawBeta.CopyFrom(rawBeta);
-            }
-
-            Data localState, kdaOutput, decay, activatedBeta;
-            Data &state = pastKeyValues == nullptr ?
-                localState : (*pastKeyValues)[layerIndex].second;
-            KimiK3RecurrentKDA(
-                q, k, vConv, rawGate, rawBeta,
-                weight[layer + "self_attn.A_log"],
-                weight[layer + "self_attn.dt_bias"], gateLowerBound,
-                state, kdaOutput, decay, activatedBeta);
-
-            Data outputGate;
-            Linear(normalized, weight[layer + "self_attn.g_proj.weight"],
-                   Data(), outputGate);
-            outputGate.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            Data gatedAttention;
-            KimiK3RMSNormSigmoidGate(
-                kdaOutput, outputGate,
-                weight[layer + "self_attn.o_norm.weight"],
-                rms_norm_eps, gatedAttention);
-            gatedAttention.Reshape(
-                {1, sequence, kdaHeads * kdaHeadDim});
-            Linear(gatedAttention, weight[layer + "self_attn.o_proj.weight"],
-                   Data(), attention);
+            RunKdaAttentionImpl(
+                layerIndex, normalized, sequence, pastKeyValues,
+                capture, attention);
         };
 
         auto runMlaAttention = [&](int layerIndex, Data &normalized,
