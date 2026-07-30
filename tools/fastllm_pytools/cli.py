@@ -87,6 +87,8 @@ def args_parser():
     export_parser_ = subparsers.add_parser('export', parents = [shared_parser], help = '创建配置文件')
     export_parser_.add_argument('-o', '--output', type = str, required = True, help = '导出路径')
 
+    subparsers.add_parser('collect-env', help = '收集运行环境信息')
+
     parser.add_argument('-v', '--version', action='store_true', help='输出版本号并退出')
 
     return parser
@@ -159,6 +161,9 @@ def main():
         if (args.path == '' or args.path is None):
             args.path = args.model
         llm.export_llm_model_fromhf(path = args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, lora = args.lora, output = args.output, dtype_config = args.dtype_config)
+    elif args.command == 'collect-env':
+        from ftllm.collect_env import main as collect_env_main
+        collect_env_main()
     else:
         print("Invalid command: ", args.command)
         exit(0)
