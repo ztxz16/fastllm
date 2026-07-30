@@ -5677,6 +5677,243 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 //printf("DoCudaMergeMOEFromCPU spend %f s.\n", GetSpan(xxx, std::chrono::system_clock::now()));
     }
 
+    void DoCudaKimiK3RoutedExpertsFromCPU(
+            Data &input, Data &output,
+            const int32_t *indexData, const float *scoreData, int topk,
+            Data **w1s, Data **w2s, Data **w3s, int expertCount,
+            float beta, float linearBeta, bool setZero,
+            const std::unordered_set<int> &experts) {
+        AssertInFastLLM(
+            input.dataType == DataType::BFLOAT16 &&
+            input.dataDevice == DataDevice::CUDA &&
+            input.cudaData != nullptr && input.dims.size() == 2 &&
+            output.dataType == DataType::BFLOAT16 &&
+            indexData != nullptr && scoreData != nullptr && topk > 0,
+            "CUDA KimiK3 routed-expert input is invalid.");
+
+        const int gpuId = FastllmCudaGetDevice();
+        output.ToDevice(DataDevice::CUDA, std::vector<int>{gpuId}, false);
+        output.Allocate(false);
+        if (setZero) {
+            FastllmCudaMemset0(output.cudaData, output.GetBytes());
+        }
+
+        const int tokens = input.dims[0];
+        std::vector<std::vector<std::pair<int, float>>> expertTasks(
+            expertCount);
+        for (int token = 0; token < tokens; token++) {
+            for (int slot = 0; slot < topk; slot++) {
+                const int expert = indexData[(size_t)token * topk + slot];
+                if (experts.find(expert) != experts.end()) {
+                    expertTasks[expert].emplace_back(
+                        token, scoreData[(size_t)token * topk + slot]);
+                }
+            }
+        }
+
+        std::vector<int> hostIndices;
+        std::vector<float> hostScales;
+        std::vector<int> expertOffsets(expertCount, -1);
+        int maxExpertRows = 0;
+        for (int expert = 0; expert < expertCount; expert++) {
+            if (expertTasks[expert].empty()) {
+                continue;
+            }
+            maxExpertRows = std::max(
+                maxExpertRows, (int)expertTasks[expert].size());
+            expertOffsets[expert] = (int)hostIndices.size();
+            for (const auto &task : expertTasks[expert]) {
+                hostIndices.push_back(task.first);
+                hostScales.push_back(task.second);
+            }
+        }
+        if (hostIndices.empty()) {
+            return;
+        }
+        constexpr int maxCudaExpertBatchRows = 1024;
+        const int cudaBufferRows = std::min(
+            maxExpertRows, maxCudaExpertBatchRows);
+
+        int *cudaIndices = (int*)FastllmCudaMalloc(
+            hostIndices.size() * sizeof(int));
+        float *cudaScales = (float*)FastllmCudaMalloc(
+            hostScales.size() * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(
+            cudaIndices, hostIndices.data(),
+            hostIndices.size() * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(
+            cudaScales, hostScales.data(),
+            hostScales.size() * sizeof(float));
+
+        const int inputDimension = input.dims[1];
+        const int intermediateDimension = w1s[0]->dims[0];
+        const int outputDimension = output.dims[1];
+        // These buffers are only live while routed experts are executing.
+        // Keeping them static pins roughly one micro-batch of input, three
+        // intermediate tensors and one output tensor across the rest of the
+        // decoder layer.  Large Kimi prefill chunks need that headroom for
+        // full hidden-state rows, and the allocator can reuse local buffers
+        // from its pool on the next routed-expert call.
+        Data tempInput, tempGate, tempUp, tempActivated, tempOutput;
+        auto prepareBuffer = [gpuId](
+                Data &buffer, DataType dataType,
+                const std::vector<int> &dims) {
+            buffer.dataType = dataType;
+            buffer.Resize(dims);
+            buffer.ToDevice(
+                DataDevice::CUDA, std::vector<int>{gpuId}, false);
+            buffer.Allocate(false);
+        };
+        prepareBuffer(
+            tempInput, input.dataType,
+            {cudaBufferRows, inputDimension});
+        prepareBuffer(
+            tempGate, input.dataType,
+            {cudaBufferRows, intermediateDimension});
+        prepareBuffer(
+            tempUp, input.dataType,
+            {cudaBufferRows, intermediateDimension});
+        prepareBuffer(
+            tempActivated, input.dataType,
+            {cudaBufferRows, intermediateDimension});
+        prepareBuffer(
+            tempOutput, input.dataType,
+            {cudaBufferRows, outputDimension});
+
+        auto isValidExpert = [&](int expert) {
+            return expert >= 0 && expert < expertCount &&
+                   !expertTasks[expert].empty() &&
+                   experts.find(expert) != experts.end() &&
+                   w1s[expert] != nullptr && w2s[expert] != nullptr &&
+                   w3s[expert] != nullptr;
+        };
+        auto findNextExpert = [&](int after) {
+            for (int expert = after + 1; expert < expertCount; expert++) {
+                if (isValidExpert(expert)) {
+                    return expert;
+                }
+            }
+            return -1;
+        };
+        auto loadExpert = [&](int expert, void *stream) {
+            w1s[expert]->ToCudaTemporary({}, true, stream);
+            w2s[expert]->ToCudaTemporary({}, true, stream);
+            w3s[expert]->ToCudaTemporary({}, true, stream);
+        };
+        auto freeExpert = [&](int expert) {
+            w1s[expert]->FreeCudaTemporary({}, false);
+            w2s[expert]->FreeCudaTemporary({}, false);
+            w3s[expert]->FreeCudaTemporary({}, false);
+        };
+
+        void *copyStream = FastllmCudaStreamCreate(true);
+        void *computeDoneEvent = FastllmCudaEventCreate();
+        int currentExpert = findNextExpert(-1);
+        if (currentExpert >= 0) {
+            loadExpert(currentExpert, nullptr);
+        }
+
+        int previousExpert = -1;
+        while (currentExpert >= 0) {
+            // The copy stream was synchronized at the end of the preceding
+            // iteration, after waiting for its compute-done event.  The
+            // previous expert is therefore no longer in use and can be
+            // released before prefetching another one.  This preserves the
+            // current-compute/next-copy overlap while reducing steady-state
+            // residency from three expert triplets to two.
+            if (previousExpert >= 0) {
+                freeExpert(previousExpert);
+                previousExpert = -1;
+            }
+            const int nextExpert = findNextExpert(currentExpert);
+            bool nextExpertPrefetched = false;
+            if (nextExpert >= 0) {
+                const long long nextWeightBytes =
+                    (long long)w1s[nextExpert]->GetBytes() +
+                    (long long)w2s[nextExpert]->GetBytes() +
+                    (long long)w3s[nextExpert]->GetBytes();
+                const long long freeBytes = FastllmCudaGetFreeSize();
+                // Keep asynchronous PCIe prefetch in the normal case, but
+                // do not let speculative residency consume the last memory
+                // needed by a full-chunk decoder activation.
+                if (freeBytes >= nextWeightBytes + (128LL << 20)) {
+                    loadExpert(nextExpert, copyStream);
+                    nextExpertPrefetched = true;
+                }
+            }
+
+            const int expertRows =
+                (int)expertTasks[currentExpert].size();
+            for (int rowStart = 0; rowStart < expertRows;
+                 rowStart += maxCudaExpertBatchRows) {
+                const int rows = std::min(
+                    maxCudaExpertBatchRows, expertRows - rowStart);
+                const int routeOffset =
+                    expertOffsets[currentExpert] + rowStart;
+                tempInput.Resize({rows, inputDimension});
+                FastllmCudaPickInput(
+                    (uint8_t*)input.cudaData,
+                    (uint8_t*)tempInput.cudaData,
+                    rows,
+                    GetDataBytes(
+                        input.dataType, 1, inputDimension),
+                    cudaIndices + routeOffset);
+
+                DoCudaLinearReshape(
+                    tempInput, *w1s[currentExpert], tempGate);
+                DoCudaLinear(
+                    tempInput, *w1s[currentExpert],
+                    *GetEmptyData(), tempGate);
+                DoCudaLinearReshape(
+                    tempInput, *w3s[currentExpert], tempUp);
+                DoCudaLinear(
+                    tempInput, *w3s[currentExpert],
+                    *GetEmptyData(), tempUp);
+                tempActivated.Resize(tempGate.dims);
+                AssertInFastLLM(
+                    FastllmCudaKimiK3SiTUAndMul(
+                        tempGate, tempUp, tempActivated,
+                        beta, linearBeta),
+                    "CUDA KimiK3 SiTU activation failed.");
+                DoCudaLinearReshape(
+                    tempActivated, *w2s[currentExpert], tempOutput);
+                DoCudaLinear(
+                    tempActivated, *w2s[currentExpert],
+                    *GetEmptyData(), tempOutput);
+                FastllmCudaPickOutput(
+                    (uint8_t*)tempOutput.cudaData,
+                    (uint8_t*)output.cudaData,
+                    rows, outputDimension,
+                    cudaIndices + routeOffset,
+                    cudaScales + routeOffset,
+                    tempOutput.dataType);
+            }
+
+            FastllmCudaEventRecord(computeDoneEvent);
+            if (nextExpertPrefetched) {
+                FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
+                FastllmCudaStreamSynchronize(copyStream);
+                previousExpert = currentExpert;
+            } else {
+                FastllmCudaEventSynchronize(computeDoneEvent);
+                freeExpert(currentExpert);
+                if (nextExpert >= 0) {
+                    loadExpert(nextExpert, nullptr);
+                }
+            }
+            currentExpert = nextExpert;
+        }
+
+        if (previousExpert >= 0) {
+            FastllmCudaEventSynchronize(computeDoneEvent);
+            freeExpert(previousExpert);
+        }
+        FastllmCudaEventDestroy(computeDoneEvent);
+        FastllmCudaStreamDestroy(copyStream);
+        FastllmCudaFree(cudaIndices);
+        FastllmCudaFree(cudaScales);
+    }
+
     static bool IsCudaMergeMoeFp8InputType(DataType dataType) {
         return dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16;
     }

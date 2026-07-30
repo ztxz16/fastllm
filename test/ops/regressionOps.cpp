@@ -4377,6 +4377,79 @@ namespace {
         RunNumasKimiRoutedExpertsFormatCase(
             fastllm::DataType::INT4_GROUP32, "INT4_GROUP32");
     }
+
+#ifdef USE_CUDA
+    void RunNumasKimiHybridPrefillRegression() {
+        constexpr int tokens = 1030;
+        constexpr int topk = 2;
+        constexpr int expertCount = 11;
+        constexpr int inputDim = 32;
+        constexpr int interDim = 32;
+        constexpr float beta = 1.7f;
+        constexpr float linearBeta = 2.5f;
+
+        fastllm::Data input = MakeTensor(
+            fastllm::DataType::BFLOAT16, {tokens, inputDim}, 0.4f);
+        std::vector<int32_t> indices((size_t)tokens * topk);
+        std::vector<float> scores((size_t)tokens * topk);
+        for (int token = 0; token < tokens; token++) {
+            indices[(size_t)token * topk] = 0;
+            indices[(size_t)token * topk + 1] =
+                1 + token % (expertCount - 1);
+            scores[(size_t)token * topk] = 0.6f;
+            scores[(size_t)token * topk + 1] = 0.4f;
+        }
+        fastllm::Data index = MakeIntTensor({tokens, topk}, indices);
+        fastllm::Data score(
+            fastllm::DataType::FLOAT32, {tokens, topk}, scores);
+
+        std::vector<fastllm::Data> w1s, w2s, w3s;
+        w1s.reserve(expertCount);
+        w2s.reserve(expertCount);
+        w3s.reserve(expertCount);
+        for (int expert = 0; expert < expertCount; expert++) {
+            w1s.push_back(MakeTensor(
+                fastllm::DataType::BFLOAT16,
+                {interDim, inputDim}, 1.0f + expert));
+            w2s.push_back(MakeTensor(
+                fastllm::DataType::BFLOAT16,
+                {inputDim, interDim}, 4.0f + expert));
+            w3s.push_back(MakeTensor(
+                fastllm::DataType::BFLOAT16,
+                {interDim, inputDim}, 7.0f + expert));
+        }
+        std::vector<float> expected = RunKimiRoutedExpertsReference(
+            input, indices, scores, topk, w1s, w2s, w3s,
+            beta, linearBeta);
+
+        std::vector<fastllm::Data*> w1Ptrs, w2Ptrs, w3Ptrs, allWeights;
+        for (int expert = 0; expert < expertCount; expert++) {
+            w1Ptrs.push_back(&w1s[expert]);
+            w2Ptrs.push_back(&w2s[expert]);
+            w3Ptrs.push_back(&w3s[expert]);
+            allWeights.push_back(&w1s[expert]);
+            allWeights.push_back(&w2s[expert]);
+            allWeights.push_back(&w3s[expert]);
+        }
+        fastllm::RegisterNumasLinearWeightBatch(allWeights);
+        input.ToDevice(fastllm::DataDevice::CUDA);
+        index.ToDevice(fastllm::DataDevice::CUDA);
+        score.ToDevice(fastllm::DataDevice::CUDA);
+
+        fastllm::Data output;
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::KimiK3RoutedExperts(
+                input, index, score, w1Ptrs, w2Ptrs, w3Ptrs,
+                beta, linearBeta, output);
+        }
+        Expect(output.dataDevice == fastllm::DataDevice::CUDA,
+               "NUMA Kimi hybrid prefill did not return a CUDA tensor.");
+        ExpectFloatNear(
+            expected, ToFloatVector(output), 0.25f, 0.03f,
+            "NUMA Kimi hybrid CUDA prefill output");
+    }
+#endif
 #endif
 
     std::vector<float> RunMergeMoeOnDevice(const std::string &device, MoeWeights &weights,
@@ -4631,6 +4704,10 @@ int main() {
 #ifdef USE_NUMAS
             RunNumasKimiRoutedExpertsFormatRegression();
             std::cout << "numa Kimi routed-expert multi-format regression: PASS\n";
+#ifdef USE_CUDA
+            RunNumasKimiHybridPrefillRegression();
+            std::cout << "numa Kimi hybrid CUDA-prefill regression: PASS\n";
+#endif
 #endif
 #ifdef USE_CUDA
             if (fastllm::HasDeviceType("cuda")) {

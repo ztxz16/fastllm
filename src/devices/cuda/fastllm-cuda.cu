@@ -371,6 +371,13 @@ std::vector <long long> FastllmCudaGetFreeSizes() {
     return ret;
 }
 
+long long FastllmCudaGetFreeSize() {
+    size_t freeBytes = 0;
+    size_t totalBytes = 0;
+    const cudaError_t error = cudaMemGetInfo(&freeBytes, &totalBytes);
+    return error == cudaSuccess ? (long long)freeBytes : 0;
+}
+
 std::vector <long long> FastllmCudaGetTotalSizes() {
     int deviceCount;
     auto error = cudaGetDeviceCount(&deviceCount);
@@ -4055,6 +4062,15 @@ void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
     cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
     checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
     //cudaDeviceSynchronize();
+}
+
+bool FastllmCudaCopyFromDeviceToPinnedHostAsync(
+        void *dst, const void *src, size_t size, void *stream) {
+    if (size == 0) {
+        return true;
+    }
+    return cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
+                           (cudaStream_t)stream) == cudaSuccess;
 }
 
 bool FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(

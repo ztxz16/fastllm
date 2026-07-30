@@ -65,6 +65,7 @@ typedef void* cublasHandle_t;
 #endif
 
 std::vector <long long> FastllmCudaGetFreeSizes();
+long long FastllmCudaGetFreeSize();
 std::vector <long long> FastllmCudaGetTotalSizes();
 
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
@@ -249,6 +250,8 @@ void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromHostToDeviceAsync(void *dst, void *src, size_t size, void *stream);
 void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t size, void *stream);
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size);
+bool FastllmCudaCopyFromDeviceToPinnedHostAsync(
+    void *dst, const void *src, size_t size, void *stream);
 bool FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
     void *dst, const void *src, size_t size);
 bool FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(

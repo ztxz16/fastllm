@@ -28,6 +28,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <numeric>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -2017,6 +2018,9 @@ namespace fastllm {
                     for (int slot = 0; slot < topk; slot++) {
                         const int line =
                             routedLineOffsets[routeBase + slot];
+                        if (line < 0) {
+                            continue;
+                        }
                         const float *source = downOutput +
                             (size_t)line * outputDimension + channel;
                         const __m256 rounded =
@@ -2035,6 +2039,9 @@ namespace fastllm {
                     for (int slot = 0; slot < topk; slot++) {
                         const int line =
                             routedLineOffsets[routeBase + slot];
+                        if (line < 0) {
+                            continue;
+                        }
                         sum = KimiK3MulAddPreserveOrder(
                             RoundFloat32ToBFloat16RNE(
                                 downOutput[(size_t)line *
@@ -2261,6 +2268,22 @@ namespace fastllm {
             std::unique_ptr<void, FastllmCudaHostFreeDeleter>
                 pinnedOutput {nullptr};
             size_t pinnedOutputBytes = 0;
+            std::unique_ptr<void, FastllmCudaFreeDeleter>
+                gpuOutputStaging {nullptr};
+            size_t gpuOutputStagingBytes = 0;
+            int gpuOutputStagingDevice = -1;
+            std::unique_ptr<void, FastllmCudaStreamDestroyDeleter>
+                inputCopyStream {
+                    nullptr, FastllmCudaStreamDestroyDeleter {}
+                };
+            std::unique_ptr<void, FastllmCudaStreamDestroyDeleter>
+                routeCopyStream {
+                    nullptr, FastllmCudaStreamDestroyDeleter {}
+                };
+            std::unique_ptr<void, FastllmCudaStreamDestroyDeleter>
+                outputCopyStream {
+                    nullptr, FastllmCudaStreamDestroyDeleter {}
+                };
 
             uint8_t *EnsurePinnedInput(size_t bytes) {
                 if (pinnedInput.get() == nullptr ||
@@ -2278,6 +2301,61 @@ namespace fastllm {
                     pinnedOutputBytes = bytes;
                 }
                 return (uint8_t*)pinnedOutput.get();
+            }
+
+            void *EnsureGpuOutputStaging(size_t bytes, int gpuId) {
+                if (gpuOutputStagingDevice != gpuId) {
+                    gpuOutputStaging.reset(nullptr);
+                    gpuOutputStagingBytes = 0;
+                    gpuOutputStagingDevice = gpuId;
+                }
+                if (gpuOutputStaging.get() == nullptr ||
+                    gpuOutputStagingBytes < bytes) {
+                    int originalDevice = FastllmCudaGetDevice();
+                    if (originalDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    gpuOutputStaging.reset(FastllmCudaMalloc(bytes));
+                    if (originalDevice != gpuId) {
+                        FastllmCudaSetDevice(originalDevice);
+                    }
+                    gpuOutputStagingBytes = bytes;
+                }
+                return gpuOutputStaging.get();
+            }
+
+            void *EnsureStream(
+                    std::unique_ptr<void,
+                        FastllmCudaStreamDestroyDeleter> &stream,
+                    int gpuId) {
+                if (stream.get() == nullptr ||
+                    stream.get_deleter().device != gpuId) {
+                    stream.reset(nullptr);
+                    int originalDevice = FastllmCudaGetDevice();
+                    if (originalDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    stream = std::unique_ptr<
+                        void, FastllmCudaStreamDestroyDeleter>(
+                            FastllmCudaStreamCreate(true),
+                            FastllmCudaStreamDestroyDeleter {gpuId});
+                    if (originalDevice != gpuId) {
+                        FastllmCudaSetDevice(originalDevice);
+                    }
+                }
+                return stream.get();
+            }
+
+            void *EnsureInputCopyStream(int gpuId) {
+                return EnsureStream(inputCopyStream, gpuId);
+            }
+
+            void *EnsureRouteCopyStream(int gpuId) {
+                return EnsureStream(routeCopyStream, gpuId);
+            }
+
+            void *EnsureOutputCopyStream(int gpuId) {
+                return EnsureStream(outputCopyStream, gpuId);
             }
 #endif
         };
@@ -2690,6 +2768,43 @@ namespace fastllm {
 
     }
 
+    extern void DoCudaKimiK3RoutedExpertsFromCPU(
+        Data &input, Data &output,
+        const int32_t *indexData, const float *scoreData, int topk,
+        Data **w1s, Data **w2s, Data **w3s, int expertCount,
+        float beta, float linearBeta, bool setZero,
+        const std::unordered_set<int> &experts);
+
+    static bool CanUseCudaKimiK3Prefill(
+            DataType inputType, const std::vector<int> &activeExperts,
+            Data **w1s, Data **w2s, Data **w3s) {
+#ifndef USE_CUDA
+        return false;
+#else
+        for (int expert : activeExperts) {
+            Data *weights[] = {w1s[expert], w2s[expert], w3s[expert]};
+            for (Data *weight : weights) {
+                if (weight == nullptr ||
+                    !IsCudaLinearDataTypeSupported(
+                        inputType, weight->dataType, DataType::FLOAT32)) {
+                    static std::once_flag warningOnce;
+                    std::call_once(warningOnce, [inputType, weight]() {
+                        const std::string weightType = weight == nullptr ?
+                            "null" : GetDataTypeName(weight->dataType);
+                        printf("[Fastllm] KimiK3 NUMA GPU prefill disabled: "
+                               "CUDA Linear does not support %s activations "
+                               "with %s expert weights.\n",
+                               GetDataTypeName(inputType).c_str(),
+                               weightType.c_str());
+                    });
+                    return false;
+                }
+            }
+        }
+        return true;
+#endif
+    }
+
     bool NumasKimiK3RoutedExpertsOp::CanRun(
             const std::string &, const DataDict &datas,
             const FloatDict &, const IntDict &intParams) {
@@ -2766,6 +2881,8 @@ namespace fastllm {
         bool returnOutputToCuda = false;
         int cudaDeviceId = -1;
 #ifdef USE_CUDA
+        void *inputCopyStream = nullptr;
+        bool inputCopyPending = false;
         const bool inputOnCuda =
             input.dataDevice == DataDevice::CUDA && input.cudaData != nullptr;
         const bool indexOnCuda =
@@ -2796,12 +2913,22 @@ namespace fastllm {
             uint8_t *inputHost = staging;
             uint8_t *indexHost = inputHost + inputBytes;
             uint8_t *scoreHost = indexHost + indexBytes;
+            inputCopyStream = workspace.EnsureInputCopyStream(cudaDeviceId);
+            void *routeCopyStream =
+                workspace.EnsureRouteCopyStream(cudaDeviceId);
+            void *sourceReadyEvent = FastllmCudaEventCreate();
+            FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
+            FastllmCudaStreamWaitEvent(
+                inputCopyStream, sourceReadyEvent);
+            FastllmCudaStreamWaitEvent(
+                routeCopyStream, sourceReadyEvent);
             auto stage = [](const Data &data, bool onCuda,
-                            uint8_t *destination, size_t bytes) {
+                            uint8_t *destination, size_t bytes,
+                            void *stream) {
                 if (onCuda) {
                     AssertInFastLLM(
-                        FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
-                            destination, data.cudaData, bytes),
+                        FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                            destination, data.cudaData, bytes, stream),
                         "KimiK3 NUMA failed to enqueue a CUDA D2H copy.");
                 } else {
                     AssertInFastLLM(
@@ -2810,10 +2937,17 @@ namespace fastllm {
                     memcpy(destination, data.cpuData, bytes);
                 }
             };
-            stage(input, inputOnCuda, inputHost, inputBytes);
-            stage(index, indexOnCuda, indexHost, indexBytes);
-            stage(score, scoreOnCuda, scoreHost, scoreBytes);
-            FastllmCudaSyncCurrentThreadStream();
+            stage(input, inputOnCuda, inputHost, inputBytes,
+                  inputCopyStream);
+            stage(index, indexOnCuda, indexHost, indexBytes,
+                  routeCopyStream);
+            stage(score, scoreOnCuda, scoreHost, scoreBytes,
+                  routeCopyStream);
+            FastllmCudaEventDestroy(sourceReadyEvent);
+            if (indexOnCuda || scoreOnCuda) {
+                FastllmCudaStreamSynchronize(routeCopyStream);
+            }
+            inputCopyPending = inputOnCuda;
             inputData = (const uint16_t*)inputHost;
             indexData = (const int32_t*)indexHost;
             scoreData = (const float*)scoreHost;
@@ -2847,23 +2981,92 @@ namespace fastllm {
                 workspace.routes[expert].emplace_back(token, slot);
             }
         }
-        workspace.activeExperts.clear();
+        std::vector<int> routedExperts;
         workspace.routeCounts.assign(expertCount, 0);
-        workspace.expertLineOffsets.assign(expertCount, -1);
-        int totalLines = 0;
         for (int expert = 0; expert < expertCount; expert++) {
             int routeCount = (int)workspace.routes[expert].size();
             workspace.routeCounts[expert] = routeCount;
             if (routeCount == 0) {
                 continue;
             }
-            workspace.activeExperts.push_back(expert);
-            workspace.expertLineOffsets[expert] = totalLines;
-            totalLines += routeCount;
+            routedExperts.push_back(expert);
         }
         AssertInFastLLM(
-            totalLines == tokens * topk,
+            std::accumulate(
+                workspace.routeCounts.begin(),
+                workspace.routeCounts.end(), 0) == tokens * topk,
             "KimiK3 NUMA routed-expert route table is incomplete.");
+
+        for (int expert : routedExperts) {
+            Data &w1 = *w1s[expert];
+            Data &w2 = *w2s[expert];
+            Data &w3 = *w3s[expert];
+            AssertInFastLLM(
+                IsKimiK3NumaWeight(&w1) &&
+                IsKimiK3NumaWeight(&w2) &&
+                IsKimiK3NumaWeight(&w3) &&
+                w1.dims == w1s[0]->dims &&
+                w2.dims == w2s[0]->dims &&
+                w3.dims == w3s[0]->dims,
+                "KimiK3 NUMA routed experts require registered weights with "
+                "uniform shapes.");
+        }
+
+        workspace.activeExperts = routedExperts;
+#ifdef USE_CUDA
+        std::unordered_set<int> gpuExperts;
+        std::thread gpuThread;
+        bool hybridGpuPrefill = false;
+        bool gpuPrefill = inputOnCuda &&
+            MoeEnvConfig::GetInstance().GetGpuPrefill() &&
+            CanUseCudaKimiK3Prefill(
+                input.dataType, routedExperts, w1s, w2s, w3s);
+        if (gpuPrefill) {
+            const int expertLimit =
+                MoeEnvConfig::GetInstance().GetExpertLimit();
+            workspace.activeExperts.clear();
+            for (int expert : routedExperts) {
+                if (workspace.routeCounts[expert] < expertLimit) {
+                    workspace.activeExperts.push_back(expert);
+                } else {
+                    gpuExperts.insert(expert);
+                }
+            }
+        }
+        if (!gpuExperts.empty() && workspace.activeExperts.empty()) {
+            DoCudaKimiK3RoutedExpertsFromCPU(
+                input, output, indexData, scoreData, topk,
+                w1s, w2s, w3s, expertCount, beta, linearBeta, true,
+                gpuExperts);
+            if (inputCopyPending) {
+                FastllmCudaStreamSynchronize(inputCopyStream);
+            }
+            output.dataDevice = DataDevice::CUDA;
+            output.dataDeviceIds = {cudaDeviceId};
+            return;
+        }
+        if (!gpuExperts.empty()) {
+            hybridGpuPrefill = true;
+            gpuThread = std::thread([
+                    &, cudaDeviceId, gpuExperts]() {
+                FastllmCudaSetDevice(cudaDeviceId);
+                DoCudaKimiK3RoutedExpertsFromCPU(
+                    input, output, indexData, scoreData, topk,
+                    w1s, w2s, w3s, expertCount, beta, linearBeta, true,
+                    gpuExperts);
+            });
+        }
+        if (inputCopyPending) {
+            FastllmCudaStreamSynchronize(inputCopyStream);
+        }
+#endif
+
+        workspace.expertLineOffsets.assign(expertCount, -1);
+        int totalLines = 0;
+        for (int expert : workspace.activeExperts) {
+            workspace.expertLineOffsets[expert] = totalLines;
+            totalLines += workspace.routeCounts[expert];
+        }
         workspace.routedLineOffsets.assign((size_t)tokens * topk, -1);
         workspace.expertLineTokens.assign(totalLines, -1);
         for (int expert : workspace.activeExperts) {
@@ -2878,9 +3081,6 @@ namespace fastllm {
             }
         }
         AssertInFastLLM(
-            std::find(workspace.routedLineOffsets.begin(),
-                workspace.routedLineOffsets.end(), -1) ==
-                workspace.routedLineOffsets.end() &&
             std::find(workspace.expertLineTokens.begin(),
                       workspace.expertLineTokens.end(), -1) ==
                 workspace.expertLineTokens.end(),
@@ -3010,14 +3210,37 @@ namespace fastllm {
             workspace);
 #ifdef USE_CUDA
         if (returnOutputToCuda) {
-            output.ToDevice(
-                DataDevice::CUDA, std::vector<int>{cudaDeviceId}, false);
-            output.Allocate(false);
-            AssertInFastLLM(
-                output.cudaData != nullptr &&
-                FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
-                    output.cudaData, outputData, output.GetBytes()),
-                "KimiK3 NUMA failed to enqueue a CUDA H2D copy.");
+            if (hybridGpuPrefill) {
+                FastllmCudaSetDevice(cudaDeviceId);
+                void *cpuOutputStaging =
+                    workspace.EnsureGpuOutputStaging(
+                        output.GetBytes(), cudaDeviceId);
+                void *outputCopyStream =
+                    workspace.EnsureOutputCopyStream(cudaDeviceId);
+                FastllmCudaCopyFromPinnedHostToDeviceAsync(
+                    cpuOutputStaging, outputData, output.GetBytes(),
+                    outputCopyStream);
+                gpuThread.join();
+                FastllmCudaStreamSynchronize(outputCopyStream);
+                Data gpuOutputAlias(
+                    output.dataType, output.dims, DataDevice::CUDA,
+                    output.cudaData);
+                Data cpuOutputAlias(
+                    output.dataType, output.dims, DataDevice::CUDA,
+                    cpuOutputStaging);
+                FastllmCudaAddTo(gpuOutputAlias, cpuOutputAlias, 1.0f);
+                output.dataDevice = DataDevice::CUDA;
+                output.dataDeviceIds = {cudaDeviceId};
+            } else {
+                output.ToDevice(
+                    DataDevice::CUDA, std::vector<int>{cudaDeviceId}, false);
+                output.Allocate(false);
+                AssertInFastLLM(
+                    output.cudaData != nullptr &&
+                    FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+                        output.cudaData, outputData, output.GetBytes()),
+                    "KimiK3 NUMA failed to enqueue a CUDA H2D copy.");
+            }
         }
 #endif
     }
