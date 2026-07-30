@@ -321,6 +321,8 @@ bool FastllmCudaGeglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
+                             const fastllm::Data &gate);
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale = 1.0f);

@@ -1346,6 +1346,41 @@ __global__ void FastllmCudaFloatEmbeddingKernel(float *input, T *weight, T *outp
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void FastllmCudaFloatEmbeddingVectorKernel(
+        const float *input, const uint4 *weight, uint4 *output,
+        int vectorsPerRow) {
+    int row = blockIdx.x;
+    int token = (int)(input[row] + 1e-5f);
+    const uint4 *src = weight + (int64_t)token * vectorsPerRow;
+    uint4 *dst = output + (int64_t)row * vectorsPerRow;
+    int vector = blockIdx.y * THREAD_PER_BLOCK + threadIdx.x;
+    int stride = gridDim.y * THREAD_PER_BLOCK;
+    for (; vector < vectorsPerRow; vector += stride) {
+        dst[vector] = src[vector];
+    }
+}
+
+template <typename T>
+static bool FastllmLaunchFloatEmbeddingVector(
+        const float *input, const T *weight, T *output,
+        uint64_t inputLen, int embSize) {
+    size_t rowBytes = (size_t)embSize * sizeof(T);
+    if (inputLen == 0 || rowBytes == 0 ||
+        rowBytes % sizeof(uint4) != 0 ||
+        ((uintptr_t)weight % alignof(uint4)) != 0 ||
+        ((uintptr_t)output % alignof(uint4)) != 0) {
+        return false;
+    }
+    int vectorsPerRow = (int)(rowBytes / sizeof(uint4));
+    int blocksPerRow = std::min(
+        8, (vectorsPerRow + 128 - 1) / 128);
+    dim3 grid((unsigned int)inputLen, (unsigned int)blocksPerRow);
+    FastllmCudaFloatEmbeddingVectorKernel<128><<<grid, 128>>>(
+        input, (const uint4*)weight, (uint4*)output, vectorsPerRow);
+    return true;
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmCudaBFloat16EmbeddingToFloatKernel(
         const float *input, const __nv_bfloat16 *weight, float *output,
         int embSize) {
@@ -1525,6 +1560,35 @@ __global__ void FastllmSigmoidKernel(__nv_bfloat16* a,
     if (idx < len) {
         float x = __bfloat162float(a[idx]);
         b[idx] = __float2bfloat16_rn(1.0f / (1.0f + expf(-x)));
+    }
+}
+
+__global__ void FastllmSigmoidMulToKernel(float *input, const float *gate,
+                                          int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        input[idx] *= 1.0f / (1.0f + expf(-gate[idx]));
+    }
+}
+
+__global__ void FastllmSigmoidMulToKernel(half *input, const half *gate,
+                                          int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __half2float(gate[idx]);
+        float value = __half2float(input[idx]);
+        input[idx] = __float2half_rn(value / (1.0f + expf(-x)));
+    }
+}
+
+__global__ void FastllmSigmoidMulToKernel(__nv_bfloat16 *input,
+                                          const __nv_bfloat16 *gate,
+                                          int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __bfloat162float(gate[idx]);
+        float value = __bfloat162float(input[idx]);
+        input[idx] = __float2bfloat16_rn(value / (1.0f + expf(-x)));
     }
 }
 
@@ -2643,6 +2707,76 @@ __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *out
         int last = channels - 1;
         output[last] = __float2half(__half2float(input[last]) * s * __ldg(&weight[last]));
     }
+}
+
+union FastllmRMSNormHalf8 {
+    uint4 packed;
+    half2 values[4];
+};
+
+__global__ __launch_bounds__(512)
+void FastllmRMSNormHalf4096Kernel(
+        const half *__restrict__ input, const float *__restrict__ weight,
+        half *__restrict__ output, float eps) {
+    constexpr int CHANNELS = 4096;
+    constexpr int VALUES_PER_THREAD = 8;
+    constexpr int WARP_COUNT = 16;
+    int tid = threadIdx.x;
+    int row = blockIdx.x;
+    int offset = tid * VALUES_PER_THREAD;
+    input += (int64_t)row * CHANNELS;
+    output += (int64_t)row * CHANNELS;
+
+    FastllmRMSNormHalf8 inputPack;
+    inputPack.packed = *(const uint4*)(input + offset);
+    float2 inputValues[4];
+    float sum2 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        inputValues[i] = __half22float2(inputPack.values[i]);
+        sum2 += inputValues[i].x * inputValues[i].x +
+                inputValues[i].y * inputValues[i].y;
+    }
+
+#pragma unroll
+    for (int shift = 16; shift > 0; shift >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, shift);
+    }
+    __shared__ float warpSums[WARP_COUNT];
+    __shared__ float scale;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        warpSums[warp] = sum2;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < WARP_COUNT ? warpSums[lane] : 0.0f;
+#pragma unroll
+        for (int shift = 16; shift > 0; shift >>= 1) {
+            value += __shfl_down_sync(0xffffffff, value, shift);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(value / (float)CHANNELS + eps);
+        }
+    }
+    __syncthreads();
+
+    const float4 *weight4 = (const float4*)(weight + offset);
+    float4 weightLo = weight4[0];
+    float4 weightHi = weight4[1];
+    float weights[8] = {
+        weightLo.x, weightLo.y, weightLo.z, weightLo.w,
+        weightHi.x, weightHi.y, weightHi.z, weightHi.w
+    };
+    FastllmRMSNormHalf8 outputPack;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        outputPack.values[i] = __floats2half2_rn(
+            inputValues[i].x * scale * weights[i * 2],
+            inputValues[i].y * scale * weights[i * 2 + 1]);
+    }
+    *(uint4*)(output + offset) = outputPack.packed;
 }
 
 // The legacy hidden=128 launch uses two warps.  One physical warp can evaluate
@@ -4839,6 +4973,37 @@ bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
+bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
+                             const fastllm::Data &gate) {
+    if (input.dataType != gate.dataType || input.dims != gate.dims ||
+        input.Count(0) <= 0) {
+        return false;
+    }
+    int len = input.Count(0);
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *gateData = FastllmCudaPrepareInput(gate);
+    int threads = std::min(256, len);
+    int blocks = (len + threads - 1) / threads;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            (float*)inputData, (const float*)gateData, len);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            (half*)inputData, (const half*)gateData, len);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            (__nv_bfloat16*)inputData,
+            (const __nv_bfloat16*)gateData, len);
+    } else {
+        FastllmCudaFinishInput(gate, gateData);
+        FastllmCudaFinishOutput(input, inputData);
+        return false;
+    }
+    FastllmCudaFinishInput(gate, gateData);
+    FastllmCudaFinishOutput(input, inputData);
+    return true;
+}
+
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale) {
     int dimsLen = input.dims.size();
     int outer = input.Count(0) / input.Count(dimsLen - 1);
@@ -5510,13 +5675,25 @@ static bool LaunchFastllmRMSNormFloat16(
     if (channels < 512) {
         FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
             (half*)input, (float*)weight, output, outer, channels, eps);
+        return true;
     } else if (channels < 4096) {
         FastllmRMSNormKernelInner1<512><<<outer, 512>>>(
             (half*)input, (float*)weight, output, outer, channels, eps);
-    } else {
-        FastllmRMSNormKernelInner1<1024><<<outer, 1024>>>(
-            (half*)input, (float*)weight, output, outer, channels, eps);
+        return true;
     }
+
+    // A 4096-wide decode row maps exactly one aligned 16-byte vector to each
+    // of 512 threads. Other shapes retain the generic launch.
+    if (channels == 4096 &&
+        ((uintptr_t)input % alignof(uint4)) == 0 &&
+        ((uintptr_t)output % alignof(uint4)) == 0 &&
+        ((uintptr_t)weight % alignof(float4)) == 0) {
+        FastllmRMSNormHalf4096Kernel<<<outer, 512>>>(
+            input, weight, output, eps);
+        return true;
+    }
+    FastllmRMSNormKernelInner1<1024><<<outer, 1024>>>(
+        (half*)input, (float*)weight, output, outer, channels, eps);
     return true;
 }
 
@@ -8527,11 +8704,19 @@ bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weigh
     if (weight.dataType == fastllm::DataType::FLOAT32) {
         float *outputData = (float *) dstOutputData;
         float *weightData = (float *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     } else if (weight.dataType == fastllm::DataType::FLOAT16) {
         half *outputData = (half *) dstOutputData;
         half *weightData = (half *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     } else if (weight.dataType == fastllm::DataType::BFLOAT16) {
         float *outputData = (float *) dstOutputData;
         __nv_bfloat16 *weightData = (__nv_bfloat16 *) weight.cudaData;
@@ -8554,15 +8739,27 @@ bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data 
     if (weight.dataType == fastllm::DataType::FLOAT32) {
         float *outputData = (float *) output.cudaData;
         float *weightData = (float *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     } else if (weight.dataType == fastllm::DataType::FLOAT16) {
         half *outputData = (half *) output.cudaData;
         half *weightData = (half *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     } else if (weight.dataType == fastllm::DataType::BFLOAT16) {
         __nv_bfloat16 *outputData = (__nv_bfloat16 *) output.cudaData;
         __nv_bfloat16 *weightData = (__nv_bfloat16 *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     }
 
     DeviceSync();

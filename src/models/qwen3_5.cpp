@@ -3952,11 +3952,18 @@ namespace fastllm {
                 }
             }
 
-            Qwen35CudaSigmoid(runner, *gate, *gate);
-            if (gate->dataType != attenOutput->dataType) {
-                Qwen3CudaToDataType(runner, *gate, attenOutput->dataType);
+            bool fusedAttentionGate =
+                gate->dataType == attenOutput->dataType &&
+                gate->dims == attenOutput->dims &&
+                FastllmCudaSigmoidMulTo(*attenOutput, *gate);
+            if (!fusedAttentionGate) {
+                Qwen35CudaSigmoid(runner, *gate, *gate);
+                if (gate->dataType != attenOutput->dataType) {
+                    Qwen3CudaToDataType(runner, *gate,
+                                        attenOutput->dataType);
+                }
+                Qwen35CudaMulTo(runner, *attenOutput, *gate);
             }
-            Qwen35CudaMulTo(runner, *attenOutput, *gate);
 
             if (!skipOutputProjection) {
                 Qwen3CudaLinearAddBlock(runner, attenOutput, oWeight, oBias,
@@ -4437,6 +4444,12 @@ namespace fastllm {
                         "Single-row last-dim view requires a contiguous one-row tensor.");
         AssertInFastLLM(start >= 0 && end >= start && end <= input.dims.back(),
                         "Single-row last-dim view range is out of bounds.");
+
+        // Graph buffers may have been materialized by an earlier failed capture.
+        // Release that storage before replacing the tensor with a non-owning view.
+        if (!output.isFake) {
+            output.FreeSpace();
+        }
 
         std::vector<int> dims = input.dims;
         dims.back() = end - start;
@@ -6631,12 +6644,32 @@ namespace fastllm {
                                                       qkvzWeightName + ".tp_bias"),
                                         buf.gdnMerged);
                     }
-                    Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0, localQkvDim, buf.qkvConvInput);
-                    Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim,
-                                   localQkvDim + localVd, buf.z);
-                    if (hasMergedGdnInLinear) {
-                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim + localVd,
-                                       localQkvDim + localVd + localValueHeads * 2, buf.ba);
+                    bool useSingleRowGdnViews =
+                        batch == 1 && CanUseSingleRowLastDimView(buf.gdnMerged);
+                    if (useSingleRowGdnViews) {
+                        MakeSingleRowLastDimView(
+                            buf.gdnMerged, 0, localQkvDim, buf.qkvConvInput);
+                        MakeSingleRowLastDimView(
+                            buf.gdnMerged, localQkvDim,
+                            localQkvDim + localVd, buf.z);
+                    } else {
+                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0,
+                                       localQkvDim, buf.qkvConvInput);
+                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1,
+                                       localQkvDim, localQkvDim + localVd,
+                                       buf.z);
+                    }
+                    if (hasMergedGdnInLinear && useSingleRowGdnViews) {
+                        MakeSingleRowLastDimView(
+                            buf.gdnMerged, localQkvDim + localVd,
+                            localQkvDim + localVd + localValueHeads * 2,
+                            buf.ba);
+                    } else if (hasMergedGdnInLinear) {
+                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1,
+                                       localQkvDim + localVd,
+                                       localQkvDim + localVd +
+                                           localValueHeads * 2,
+                                       buf.ba);
                     } else {
                         Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                         *requireLocal(weight[baWeightName], baWeightName),
