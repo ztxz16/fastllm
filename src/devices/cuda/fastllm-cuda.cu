@@ -10538,18 +10538,32 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
         nullptr, nullptr, nullptr, nullptr, 0, 0.09f, 0.3f);
 }
 
+struct FastllmGreedyPartial {
+    float value;
+    int id;
+};
+
+__device__ __forceinline__ bool FastllmGreedyIsBetter(
+        float value, int id, float bestValue, int bestId) {
+    return value > bestValue ||
+           (value == bestValue && id < bestId);
+}
+
 template <int THREAD_PER_BLOCK>
-__global__ void FastllmGreedySamplingKernel(float *logits, int *output, int vocabSize) {
+__global__ void FastllmGreedySamplingKernel(float *logits, int *output,
+                                            float *floatOutput, int vocabSize) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     float *row = logits + (long long)b * vocabSize;
 
     __shared__ float maxData[THREAD_PER_BLOCK];
     __shared__ int idData[THREAD_PER_BLOCK];
-    float localMax = -1.0e30f;
+    float localMax = -INFINITY;
     int localId = 0;
     for (int i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
         float v = row[i];
+        // Token IDs increase monotonically in this loop, so strict greater
+        // already preserves the smallest ID for equal values in one lane.
         if (v > localMax) {
             localMax = v;
             localId = i;
@@ -10560,7 +10574,9 @@ __global__ void FastllmGreedySamplingKernel(float *logits, int *output, int voca
     __syncthreads();
 
     for (int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s && maxData[tid] < maxData[tid + s]) {
+        if (tid < s && FastllmGreedyIsBetter(
+                maxData[tid + s], idData[tid + s],
+                maxData[tid], idData[tid])) {
             maxData[tid] = maxData[tid + s];
             idData[tid] = idData[tid + s];
         }
@@ -10569,7 +10585,119 @@ __global__ void FastllmGreedySamplingKernel(float *logits, int *output, int voca
 
     if (tid == 0) {
         output[b] = idData[0];
+        if (floatOutput != nullptr) {
+            floatOutput[b] = (float)idData[0];
+        }
     }
+}
+
+__device__ __forceinline__ void FastllmGreedyWarpReduce(
+        float &value, int &id) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float otherValue = __shfl_down_sync(0xffffffff, value, offset);
+        int otherId = __shfl_down_sync(0xffffffff, id, offset);
+        if (FastllmGreedyIsBetter(otherValue, otherId, value, id)) {
+            value = otherValue;
+            id = otherId;
+        }
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGreedySamplingPartialKernel(
+        const float *logits, FastllmGreedyPartial *partials,
+        int vocabSize, int partCount) {
+    int part = blockIdx.x;
+    int batch = blockIdx.y;
+    int chunk = (vocabSize + partCount - 1) / partCount;
+    int start = part * chunk;
+    int end = min(vocabSize, start + chunk);
+    const float *row = logits + (int64_t)batch * vocabSize;
+
+    float localMax = -INFINITY;
+    int localId = start;
+    for (int i = start + threadIdx.x; i < end;
+         i += THREAD_PER_BLOCK) {
+        float value = row[i];
+        if (value > localMax) {
+            localMax = value;
+            localId = i;
+        }
+    }
+    FastllmGreedyWarpReduce(localMax, localId);
+
+    constexpr int WARP_COUNT = THREAD_PER_BLOCK / 32;
+    __shared__ float warpMax[WARP_COUNT];
+    __shared__ int warpId[WARP_COUNT];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        warpMax[warp] = localMax;
+        warpId[warp] = localId;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        localMax = lane < WARP_COUNT ? warpMax[lane] : -INFINITY;
+        localId = lane < WARP_COUNT ? warpId[lane] : vocabSize;
+        FastllmGreedyWarpReduce(localMax, localId);
+        if (lane == 0) {
+            partials[(int64_t)batch * partCount + part] =
+                {localMax, localId};
+        }
+    }
+}
+
+__global__ void FastllmGreedySamplingFinalizeKernel(
+        const FastllmGreedyPartial *partials, int *output,
+        float *floatOutput, int partCount) {
+    int batch = blockIdx.x;
+    int lane = threadIdx.x;
+    float localMax = -INFINITY;
+    int localId = 0;
+    if (lane < partCount) {
+        FastllmGreedyPartial partial =
+            partials[(int64_t)batch * partCount + lane];
+        localMax = partial.value;
+        localId = partial.id;
+    }
+    FastllmGreedyWarpReduce(localMax, localId);
+    if (lane == 0) {
+        output[batch] = localId;
+        if (floatOutput != nullptr) {
+            floatOutput[batch] = (float)localId;
+        }
+    }
+}
+
+static bool FastllmLaunchGreedySampling(
+        float *logits, int *output, float *floatOutput,
+        int batch, int vocabSize) {
+    if (vocabSize >= 32768 && batch <= 8) {
+        int partCount = std::max(4, 32 / batch);
+        size_t scratchBytes = (size_t)batch * partCount *
+                              sizeof(FastllmGreedyPartial);
+        size_t scratchCapacity = 0;
+        bool scratchOwn = false;
+        void *scratch = FastllmBorrowCudaTempBuffer(
+            scratchBytes, &scratchCapacity, &scratchOwn);
+        if (scratch != nullptr && scratchCapacity >= scratchBytes) {
+            dim3 partialGrid((unsigned int)partCount,
+                             (unsigned int)batch);
+            FastllmGreedySamplingPartialKernel<256>
+                <<<partialGrid, 256>>>(
+                    logits, (FastllmGreedyPartial*)scratch,
+                    vocabSize, partCount);
+            FastllmGreedySamplingFinalizeKernel<<<batch, 32>>>(
+                (const FastllmGreedyPartial*)scratch, output,
+                floatOutput, partCount);
+            FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+            return true;
+        }
+        FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+    }
+    FastllmGreedySamplingKernel<256><<<batch, 256>>>(
+        logits, output, floatOutput, vocabSize);
+    return true;
 }
 
 bool FastllmCudaGreedySampling(float *logits, int *output,
@@ -10581,10 +10709,37 @@ bool FastllmCudaGreedySampling(float *logits, int *output,
         fastllm::ErrorInFastLLM("FastllmCudaGreedySampling: invalid input.\n");
         return false;
     }
-    FastllmGreedySamplingKernel<256><<<batch, 256>>>(logits, output, vocabSize);
+    // Keep the public host-output path independent from the shared temporary
+    // workspace.  The multi-CTA reduction below is reserved for the serialized
+    // GPU token-handoff path, where the next decode step consumes floatOutput.
+    FastllmGreedySamplingKernel<256><<<batch, 256>>>(
+        logits, output, nullptr, vocabSize);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         printf("FastllmCudaGreedySampling: kernel launch failed: %s\n",
+               cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
+                                              float *floatOutput,
+                                              int batch, int vocabSize) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (logits == nullptr || output == nullptr || floatOutput == nullptr ||
+        vocabSize <= 0) {
+        fastllm::ErrorInFastLLM(
+            "FastllmCudaGreedySamplingWithFloatOutput: invalid input.\n");
+        return false;
+    }
+    FastllmLaunchGreedySampling(logits, output, floatOutput,
+                                batch, vocabSize);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaGreedySamplingWithFloatOutput: kernel launch failed: %s\n",
                cudaGetErrorString(status));
         return false;
     }
@@ -10600,7 +10755,7 @@ __global__ void FastllmGreedySamplingWithScoresKernel(float *logits, int *output
 
     __shared__ float maxData[THREAD_PER_BLOCK];
     __shared__ int idData[THREAD_PER_BLOCK];
-    float localMax = -1.0e30f;
+    float localMax = -INFINITY;
     int localId = 0;
     for (int i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
         float v = row[i];
@@ -10617,8 +10772,8 @@ __global__ void FastllmGreedySamplingWithScoresKernel(float *logits, int *output
         if (tid < s) {
             float other = maxData[tid + s];
             int otherId = idData[tid + s];
-            if (maxData[tid] < other ||
-                (maxData[tid] == other && idData[tid] > otherId)) {
+            if (FastllmGreedyIsBetter(other, otherId,
+                                      maxData[tid], idData[tid])) {
                 maxData[tid] = other;
                 idData[tid] = otherId;
             }

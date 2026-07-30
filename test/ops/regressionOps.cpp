@@ -521,6 +521,69 @@ namespace {
     }
 
 #ifdef USE_CUDA
+    void RunCudaGreedyTieBreakRegression() {
+        constexpr int vocabSize = 32768;
+        const size_t logitsBytes = (size_t)vocabSize * sizeof(float);
+        FastllmCudaSetDevice(0);
+
+        float *cudaLogits = (float*)FastllmCudaMalloc(logitsBytes);
+        int *cudaOutput = (int*)FastllmCudaMalloc(sizeof(int));
+        float *cudaFloatOutput = (float*)FastllmCudaMalloc(sizeof(float));
+        Expect(cudaLogits != nullptr && cudaOutput != nullptr &&
+                   cudaFloatOutput != nullptr,
+               "failed to allocate CUDA greedy tie-break buffers");
+
+        auto runCase = [&](const std::string &name,
+                           const std::vector<int> &maxIds,
+                           int expectedId) {
+            std::vector<float> logits(vocabSize, -1000.0f);
+            for (int id : maxIds) {
+                Expect(id >= 0 && id < vocabSize,
+                       name + " has an invalid maximum token ID");
+                logits[id] = 10.0f;
+            }
+            FastllmCudaCopyFromHostToDevice(cudaLogits, logits.data(),
+                                            logitsBytes);
+
+            Expect(FastllmCudaGreedySampling(
+                       cudaLogits, cudaOutput, 1, vocabSize),
+                   name + " host-output greedy launch failed");
+            int hostOutput = -1;
+            FastllmCudaCopyFromDeviceToHost(&hostOutput, cudaOutput,
+                                            sizeof(hostOutput));
+            Expect(hostOutput == expectedId,
+                   name + " host-output greedy selected token " +
+                       std::to_string(hostOutput) + " instead of " +
+                       std::to_string(expectedId));
+
+            Expect(FastllmCudaGreedySamplingWithFloatOutput(
+                       cudaLogits, cudaOutput, cudaFloatOutput,
+                       1, vocabSize),
+                   name + " GPU-handoff greedy launch failed");
+            int handoffOutput = -1;
+            float handoffFloatOutput = -1.0f;
+            FastllmCudaCopyFromDeviceToHost(&handoffOutput, cudaOutput,
+                                            sizeof(handoffOutput));
+            FastllmCudaCopyFromDeviceToHost(
+                &handoffFloatOutput, cudaFloatOutput,
+                sizeof(handoffFloatOutput));
+            Expect(handoffOutput == expectedId,
+                   name + " GPU-handoff greedy selected token " +
+                       std::to_string(handoffOutput) + " instead of " +
+                       std::to_string(expectedId));
+            Expect(handoffFloatOutput == (float)expectedId,
+                   name + " GPU-handoff float token differs from int output");
+        };
+
+        runCase("unique maximum", {1234}, 1234);
+        runCase("same-CTA tied maximum", {1, 2}, 1);
+        runCase("cross-partition tied maximum", {100, 20000}, 100);
+
+        FastllmCudaFree(cudaFloatOutput);
+        FastllmCudaFree(cudaOutput);
+        FastllmCudaFree(cudaLogits);
+    }
+
     void RunCudaLinearDataTypeCapabilityRegression() {
         using fastllm::DataType;
         using fastllm::IsCudaLinearDataTypeSupported;
@@ -5722,6 +5785,8 @@ int main() {
         if (fastllm::HasDeviceType("cuda")) {
             RunCudaLocalExpertRangeMaskRegression();
             std::cout << "cuda local expert range mask regression: PASS\n";
+            RunCudaGreedyTieBreakRegression();
+            std::cout << "cuda greedy tie-break regression: PASS\n";
         }
 #endif
 

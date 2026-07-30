@@ -693,6 +693,9 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float typicalPosteriorAlpha);
 bool FastllmCudaGreedySampling(float *logits, int *output,
                                int batch, int vocabSize);
+bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
+                                              float *floatOutput,
+                                              int batch, int vocabSize);
 bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
                                          float *scores, int batch,
                                          int vocabSize);
