@@ -207,9 +207,8 @@ __global__ void Sm70FlashAttentionFp8PrefillKernel(
         const int row = i / kHeadDim;
         const int dim = i - row * kHeadDim;
         const float invSum = 1.0f / fmaxf(smem.rowSum[row], 1.0e-24f);
-        output[(int64_t)qHead * qStrideHead
-               + (int64_t)(qBegin + row) * qStrideToken + dim] =
-            __float2half_rn(smem.output[i] * invSum);
+        output[((int64_t)(qBegin + row) * kQHeads + qHead) * kHeadDim
+               + dim] = __float2half_rn(smem.output[i] * invSum);
     }
 #endif
 }
@@ -355,6 +354,7 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
     if (cudaGetLastError() != cudaSuccess) {
         return false;
     }
+    output.Resize({q.dims[1], kQHeads, kHeadDim});
     static thread_local bool logged = false;
     if (!logged) {
         std::printf("[FastLLM] SM70 FlashAttention FP8 paged prefill enabled "

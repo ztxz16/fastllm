@@ -3327,6 +3327,52 @@ namespace {
                         3e-3f, 3e-3f,
                         "SM70 FlashAttention qLen2 four-page FP8");
 
+        constexpr int mtpQLen = 3;
+        fastllm::Data mtpQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, mtpQLen, headDim},
+            MakeRegressionValues(numQHeads * mtpQLen * headDim, 2.73f, 0.035f));
+        fastllm::Data mtpQSizes = MakeIntTensor({2}, {0, mtpQLen});
+        fastllm::Data mtpPageSizes = MakeIntTensor({2}, {0, 1});
+        fastllm::Data mtpPageIndexs = MakeIntTensor({1}, {2});
+        fastllm::Data mtpLastPage = MakeIntTensor({1}, {17});
+        mtpQSizes.ToDevice(fastllm::DataDevice::CUDA);
+        mtpPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        mtpPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        mtpLastPage.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data mtpReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, mtpQLen, headDim},
+            std::vector<float>(numQHeads * mtpQLen * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       mtpQ, kCaches, vCaches, mtpQSizes, mtpPageSizes,
+                       mtpPageIndexs, mtpLastPage, mtpReference, group,
+                       scale, 1, false, true, false, -1),
+                   "native prefill rejected the MTP qLen3 FP8 fixture.");
+        }
+        fastllm::Data mtpActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, mtpQLen, headDim},
+            std::vector<float>(numQHeads * mtpQLen * headDim, 0.0f));
+        Expect(FastllmCudaHalfPagedAttentionBatch(
+                   mtpQ, kCaches, vCaches, mtpQSizes, mtpPageSizes,
+                   mtpPageIndexs, mtpLastPage, mtpActual, group,
+                   scale, 1, false, true, false, -1),
+               "SM70 FlashAttention public route rejected MTP qLen3 FP8.");
+        FastllmCudaSyncCurrentThreadStream();
+        const std::vector<int> expectedMtpOutputDims =
+            {mtpQLen, numQHeads, headDim};
+        const std::vector<uint64_t> expectedMtpOutputStrides =
+            {(uint64_t)numQHeads * headDim, (uint64_t)headDim, 1};
+        Expect(mtpReference.dims == expectedMtpOutputDims &&
+                   mtpReference.strides == expectedMtpOutputStrides,
+               "native MTP qLen3 output violated the token-major contract.");
+        Expect(mtpActual.dims == expectedMtpOutputDims &&
+                   mtpActual.strides == expectedMtpOutputStrides,
+               "SM70 MTP qLen3 output violated the token-major contract.");
+        ExpectFloatNear(ToFloatVector(mtpReference), ToFloatVector(mtpActual),
+                        3e-3f, 3e-3f,
+                        "SM70 FlashAttention MTP qLen3 token-major output");
+
         constexpr int raggedBatch = 5;
         constexpr int raggedTokens = 30;
         fastllm::Data raggedQ = MakeCudaTensor(
