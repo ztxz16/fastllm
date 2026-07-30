@@ -406,6 +406,34 @@ namespace fastllm {
         return model->SelectMoeDeviceForLayer(layerIt->second);
     }
 
+    static int GetMoeWeightLayerId(const std::string &weightName) {
+        // Auxiliary stacks such as mtp.layers use their own layer numbering.
+        // Only infer main-decoder paths when no explicit merge metadata exists.
+        size_t begin = std::string::npos;
+        const std::string modelMarker = "model.layers.";
+        size_t modelMarkerPos = weightName.find(modelMarker);
+        if (modelMarkerPos != std::string::npos &&
+            (modelMarkerPos == 0 || weightName[modelMarkerPos - 1] == '.')) {
+            begin = modelMarkerPos + modelMarker.size();
+        } else if (weightName.rfind("layers.", 0) == 0) {
+            begin = strlen("layers.");
+        }
+        if (begin == std::string::npos) {
+            return -1;
+        }
+
+        size_t end = begin;
+        while (end < weightName.size() &&
+               std::isdigit((unsigned char)weightName[end])) {
+            end++;
+        }
+        if (end == begin || end >= weightName.size() ||
+            weightName[end] != '.') {
+            return -1;
+        }
+        return std::atoi(weightName.substr(begin, end - begin).c_str());
+    }
+
     static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName) {
         if (model == nullptr) {
             return "";
@@ -426,6 +454,14 @@ namespace fastllm {
                 if (!selectedDevice.empty()) {
                     return selectedDevice;
                 }
+            }
+        }
+        if (!model->moeDeviceMap.empty() ||
+            (model->moeDeviceLayers >= 0 &&
+             !model->layeredMoeDeviceMap.empty())) {
+            int layerId = GetMoeWeightLayerId(weightName);
+            if (layerId >= 0) {
+                return model->SelectMoeDeviceForLayer(layerId);
             }
         }
         return "";
@@ -3339,6 +3375,15 @@ namespace fastllm {
             path += "/";
         }
 
+        std::string dsparkPath;
+        const char *dsparkPathEnv = std::getenv("FASTLLM_DSPARK_MODEL_PATH");
+        if (dsparkPathEnv != nullptr && dsparkPathEnv[0] != '\0') {
+            dsparkPath = dsparkPathEnv;
+            if (dsparkPath.back() != '/' && dsparkPath.back() != '\\') {
+                dsparkPath += "/";
+            }
+        }
+
         // 1. 检查是否有 model.safetensors.index.json,如果有就读取
         std::set <std::string> stFiles;
         std::string stIndexFile = path + "model.safetensors.index.json";
@@ -3349,6 +3394,27 @@ namespace fastllm {
             auto stIndex = json11::Json::parse(ReadAllFile(stIndexFile), error)["weight_map"];
             for (auto it : stIndex.object_items()) {
                 stFiles.insert(path + it.second.string_value());
+            }
+        }
+        if (!dsparkPath.empty()) {
+            std::string dsparkIndexFile =
+                dsparkPath + "model.safetensors.index.json";
+            if (!FileExists(dsparkIndexFile)) {
+                AssertInFastLLM(
+                    FileExists(dsparkPath + "model.safetensors"),
+                    "DSpark checkpoint has no model.safetensors: " +
+                    dsparkPath);
+                stFiles.insert(dsparkPath + "model.safetensors");
+            } else {
+                std::string dsparkIndexError;
+                auto dsparkIndex = json11::Json::parse(
+                    ReadAllFile(dsparkIndexFile),
+                    dsparkIndexError)["weight_map"];
+                AssertInFastLLM(dsparkIndexError.empty(),
+                                "Failed to parse DSpark safetensors index.");
+                for (auto it : dsparkIndex.object_items()) {
+                    stFiles.insert(dsparkPath + it.second.string_value());
+                }
             }
         }
         SafeTensors safeTensors(stFiles);
@@ -3399,6 +3465,27 @@ namespace fastllm {
             ((GraphLLMModel*)model)->graphLLMModelConfig->Init(modelConfig);
         }
         AddDictRecursion(model, "", config);
+        if (!dsparkPath.empty()) {
+            AssertInFastLLM(
+                model->model_type == "kimi_k3" || modelType == "kimi_k3",
+                "The current DSpark integration requires a Kimi-K3 target model.");
+            std::string dsparkConfigError;
+            auto dsparkConfig = json11::Json::parse(
+                ReadAllFile(dsparkPath + "config.json"),
+                dsparkConfigError);
+            AssertInFastLLM(dsparkConfigError.empty(),
+                            "Failed to parse DSpark config.json.");
+            bool dsparkArchitecture = false;
+            for (const auto &architecture :
+                 dsparkConfig["architectures"].array_items()) {
+                dsparkArchitecture |=
+                    architecture.string_value() == "DSparkDraftModel";
+            }
+            AssertInFastLLM(dsparkArchitecture,
+                            "The draft checkpoint is not DSparkDraftModel.");
+            AddDictRecursion(model, "dspark.", dsparkConfig);
+            model->weight.AddDict("dspark.model_path", dsparkPath);
+        }
         // 设置eos_token_id
         if (config["eos_token_id"].is_null()) {
             auto tokenizer = json11::Json::parse(ReadAllFile(path + "tokenizer.json"), error);

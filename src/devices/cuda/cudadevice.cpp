@@ -2444,6 +2444,8 @@ namespace fastllm {
             (BaseOperator*)(new CudaKimiK3RMSNormOp());
         this->ops["KimiK3CausalConv1D"] =
             (BaseOperator*)(new CudaKimiK3CausalConv1DOp());
+        this->ops["KimiK3UpdatePackedConvCache"] =
+            (BaseOperator*)(new CudaKimiK3UpdatePackedConvCacheOp());
         this->ops["KimiK3L2Norm"] =
             (BaseOperator*)(new CudaKimiK3L2NormOp());
         this->ops["KimiK3RecurrentKDA"] =
@@ -2965,6 +2967,30 @@ namespace fastllm {
             "CUDA KimiK3CausalConv1D launch failed.");
     }
 
+    bool CudaKimiK3UpdatePackedConvCacheOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "q", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "k", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "v", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "cache", DataType::BFLOAT16);
+    }
+
+    void CudaKimiK3UpdatePackedConvCacheOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &intParams) {
+        Data &q = *datas.find("q")->second;
+        Data &k = *datas.find("k")->second;
+        Data &v = *datas.find("v")->second;
+        Data &cache = *datas.find("cache")->second;
+        const int history = intParams.find("history")->second;
+        const int tokens = intParams.find("tokens")->second;
+        AssertInFastLLM(
+            FastllmCudaKimiK3UpdatePackedConvCache(
+                q, k, v, cache, history, tokens),
+            "CUDA KimiK3UpdatePackedConvCache launch failed.");
+    }
+
     bool CudaKimiK3L2NormOp::CanRun(
             const std::string &, const DataDict &datas,
             const FloatDict &, const IntDict &) {
@@ -2998,7 +3024,7 @@ namespace fastllm {
 
     void CudaKimiK3RecurrentKDAOp::Run(
             const std::string &, const DataDict &datas,
-            const FloatDict &floatParams, const IntDict &) {
+            const FloatDict &floatParams, const IntDict &intParams) {
         Data &q = *datas.find("q")->second;
         Data &k = *datas.find("k")->second;
         Data &v = *datas.find("v")->second;
@@ -3013,19 +3039,28 @@ namespace fastllm {
         float lowerBound =
             floatParams.find("lowerBound") == floatParams.end() ?
             -5.0f : floatParams.find("lowerBound")->second;
+        const bool stateOnly =
+            intParams.find("stateOnly") != intParams.end() &&
+            intParams.find("stateOnly")->second != 0;
+        const int tokenLimit =
+            intParams.find("tokenLimit") == intParams.end() ? -1 :
+            intParams.find("tokenLimit")->second;
         AssertInFastLLM(
             q.dims.size() == 4 && q.dims == k.dims && q.dims == v.dims &&
             q.dims == rawGate.dims,
             "CUDA KimiK3RecurrentKDA q/k/v/g shape mismatch.");
         bool initializeState = state.cudaData == nullptr;
         state.Allocate(false);
-        output.Allocate(false);
-        decay.Allocate(false);
-        beta.Allocate(false);
+        if (!stateOnly) {
+            output.Allocate(false);
+            decay.Allocate(false);
+            beta.Allocate(false);
+        }
         AssertInFastLLM(
             FastllmCudaKimiK3RecurrentKDA(
                 q, k, v, rawGate, rawBeta, aLog, dtBias, state, output,
-                decay, beta, lowerBound, initializeState),
+                decay, beta, lowerBound, initializeState,
+                tokenLimit, stateOnly),
             "CUDA KimiK3RecurrentKDA launch failed.");
     }
 

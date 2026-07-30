@@ -777,7 +777,10 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
 }
 
-#define MMVQ_MAX_BATCH_SIZE 7 // Max. batch size for which to use MMVQ kernels.
+// Keep speculative verification with one anchor plus seven draft tokens on the
+// quantized path.  Falling back at batch 8 dequantizes every GGUF linear weight
+// to BF16 before GEMM, which multiplies target-model memory traffic.
+#define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 #define WARP_SIZE 32
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1069,6 +1072,9 @@ static void mul_mat_vec_q_cuda_T(
             break;
         case 7:
             mul_mat_vec_q<type, 7, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
+        case 8:
+            mul_mat_vec_q<type, 8, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         default:
             printf("fatal error: ncols_y = %d exceeds MMVQ_MAX_BATCH_SIZE\n", ncols_y);

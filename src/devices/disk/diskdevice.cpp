@@ -44,6 +44,8 @@ namespace fastllm {
         this->ops["Embedding"] = (BaseOperator*)(new DiskEmbeddingOp(false));
         this->ops["EmbeddingDirect"] = (BaseOperator*)(new DiskEmbeddingOp(true));
         this->ops["MergeMOE"] = (BaseOperator*)(new DiskMergeMOE());
+        this->ops["KimiK3RoutedExperts"] =
+            (BaseOperator*)(new DiskKimiK3RoutedExpertsOp());
     }
 
     bool DiskDevice::Malloc(void **ret, size_t size) {
@@ -1454,6 +1456,170 @@ namespace fastllm {
         }
     };
 
+    static const DiskWeightPart *FirstDiskPayloadPart(const Data *weight) {
+        if (weight == nullptr) {
+            return nullptr;
+        }
+        for (const auto &part : weight->diskWeightParts) {
+            if (!part.isScalePart) {
+                return &part;
+            }
+        }
+        return nullptr;
+    }
+
+    static void LoadDiskWeightsInParallel(
+            Data **weights, std::vector<Data*> &loadedWeights,
+            std::vector<int> &loadIndices) {
+        if (loadIndices.empty()) {
+            return;
+        }
+        AssertInFastLLM(weights != nullptr &&
+                            loadedWeights.size() >
+                                (size_t)*std::max_element(
+                                    loadIndices.begin(), loadIndices.end()),
+                        "Disk weight load index is out of bounds.\n");
+        if (DiskDirectIoEnabled()) {
+            std::stable_sort(
+                loadIndices.begin(), loadIndices.end(),
+                [&](int left, int right) {
+                    const DiskWeightPart *a =
+                        FirstDiskPayloadPart(weights[left]);
+                    const DiskWeightPart *b =
+                        FirstDiskPayloadPart(weights[right]);
+                    if (a == nullptr || b == nullptr) {
+                        return a != nullptr;
+                    }
+                    if (a->fileName != b->fileName) {
+                        return a->fileName < b->fileName;
+                    }
+                    return a->fileOffset < b->fileOffset;
+                });
+        }
+
+        AliveThreadPool *pool = GetAlivePool();
+        int threadCount = std::min(
+            {(int)loadIndices.size(), DiskMoeLoadThreads(),
+             (int)pool->threads.size()});
+        if (threadCount <= 1) {
+            for (int index : loadIndices) {
+                loadedWeights[index] = LoadDiskWeight(weights[index]);
+            }
+            return;
+        }
+
+        std::vector<LoadDiskWeightsOp*> tasks;
+        tasks.reserve(threadCount);
+        std::atomic<int> nextIndex(0);
+        for (int thread = 0; thread < threadCount; thread++) {
+            tasks.push_back(new LoadDiskWeightsOp(
+                weights, &loadedWeights, &loadIndices, &nextIndex));
+            pool->PushOp(thread, tasks.back());
+        }
+        for (int thread = 0; thread < threadCount; thread++) {
+            pool->Wait(thread);
+            delete tasks[thread];
+        }
+    }
+
+    bool DiskKimiK3RoutedExpertsOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &intParams) {
+        auto inputIt = datas.find("input");
+        auto weightsIt = datas.find("w1s");
+        auto countIt = intParams.find("experts___batch");
+        if (inputIt == datas.end() || weightsIt == datas.end() ||
+            countIt == intParams.end() || countIt->second <= 0 ||
+            inputIt->second == nullptr ||
+            inputIt->second->dataType != DataType::BFLOAT16) {
+            return false;
+        }
+        Data **weights = (Data**)weightsIt->second;
+        return weights != nullptr && weights[0] != nullptr &&
+               weights[0]->isDiskWeight;
+    }
+
+    void DiskKimiK3RoutedExpertsOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &index = *datas.find("index")->second;
+        Data **w1s = (Data**)datas.find("w1s")->second;
+        Data **w2s = (Data**)datas.find("w2s")->second;
+        Data **w3s = (Data**)datas.find("w3s")->second;
+        int expertCount = intParams.find("experts___batch")->second;
+        AssertInFastLLM(
+            index.dataType == DataType::INT32 && index.dims.size() == 2 &&
+                index.cpuData != nullptr && expertCount > 0 &&
+                w1s != nullptr && w2s != nullptr && w3s != nullptr,
+            "KimiK3 disk routed-expert metadata is invalid.\n");
+
+        std::set<int> selectedExperts;
+        const int32_t *indexData = (const int32_t*)index.cpuData;
+        for (uint64_t i = 0; i < index.Count(0); i++) {
+            int expert = indexData[i];
+            AssertInFastLLM(
+                expert >= 0 && expert < expertCount,
+                "KimiK3 disk routed-expert index is out of range.\n");
+            selectedExperts.insert(expert);
+        }
+
+        std::vector<Data*> sourceWeights;
+        std::vector<int> sourceKinds;
+        std::vector<int> sourceExperts;
+        sourceWeights.reserve(selectedExperts.size() * 3);
+        sourceKinds.reserve(selectedExperts.size() * 3);
+        sourceExperts.reserve(selectedExperts.size() * 3);
+        for (int expert : selectedExperts) {
+            for (int kind = 0; kind < 3; kind++) {
+                Data *weight = kind == 0 ? w1s[expert] :
+                               (kind == 1 ? w2s[expert] : w3s[expert]);
+                AssertInFastLLM(
+                    weight != nullptr,
+                    "KimiK3 disk routed-expert weight is missing.\n");
+                if (weight->isDiskWeight) {
+                    sourceWeights.push_back(weight);
+                    sourceKinds.push_back(kind);
+                    sourceExperts.push_back(expert);
+                }
+            }
+        }
+
+        std::vector<Data*> loadedWeights(sourceWeights.size(), nullptr);
+        std::vector<int> loadIndices(sourceWeights.size());
+        for (int i = 0; i < (int)loadIndices.size(); i++) {
+            loadIndices[i] = i;
+        }
+        LoadDiskWeightsInParallel(
+            sourceWeights.data(), loadedWeights, loadIndices);
+
+        std::vector<std::unique_ptr<Data>> ownedWeights;
+        ownedWeights.reserve(loadedWeights.size());
+        std::vector<Data*> tempW1s(w1s, w1s + expertCount);
+        std::vector<Data*> tempW2s(w2s, w2s + expertCount);
+        std::vector<Data*> tempW3s(w3s, w3s + expertCount);
+        for (int i = 0; i < (int)loadedWeights.size(); i++) {
+            AssertInFastLLM(
+                loadedWeights[i] != nullptr,
+                "KimiK3 disk routed-expert weight load failed.\n");
+            Data *loaded = loadedWeights[i];
+            if (sourceKinds[i] == 0) {
+                tempW1s[sourceExperts[i]] = loaded;
+            } else if (sourceKinds[i] == 1) {
+                tempW2s[sourceExperts[i]] = loaded;
+            } else {
+                tempW3s[sourceExperts[i]] = loaded;
+            }
+            ownedWeights.emplace_back(loaded);
+        }
+
+        DataDict diskDatas = datas;
+        diskDatas["w1s"] = (Data*)tempW1s.data();
+        diskDatas["w2s"] = (Data*)tempW2s.data();
+        diskDatas["w3s"] = (Data*)tempW3s.data();
+        CpuKimiK3RoutedExpertsOp::Run(
+            opType, diskDatas, floatParams, intParams);
+    }
+
     static void ConvertInputToFloat32(const Data &input, Data &output) {
         output.dataType = DataType::FLOAT32;
         output.Resize(input.dims);
@@ -1576,52 +1742,8 @@ namespace fastllm {
                 loadIndices.push_back(down);
             }
         }
-        if (DiskDirectIoEnabled()) {
-            auto firstPayloadPart = [](const Data *weight) -> const DiskWeightPart* {
-                if (weight == nullptr) {
-                    return nullptr;
-                }
-                for (const auto &part : weight->diskWeightParts) {
-                    if (!part.isScalePart) {
-                        return &part;
-                    }
-                }
-                return nullptr;
-            };
-            std::stable_sort(loadIndices.begin(), loadIndices.end(),
-                             [&](int left, int right) {
-                const DiskWeightPart *a = firstPayloadPart(weights[left]);
-                const DiskWeightPart *b = firstPayloadPart(weights[right]);
-                if (a == nullptr || b == nullptr) {
-                    return a != nullptr;
-                }
-                if (a->fileName != b->fileName) {
-                    return a->fileName < b->fileName;
-                }
-                return a->fileOffset < b->fileOffset;
-            });
-        }
         if (loadIndices.size() > 0) {
-            auto *pool = GetAlivePool();
-            int threadCnt = std::min((int)loadIndices.size(), DiskMoeLoadThreads());
-            threadCnt = std::min(threadCnt, (int)pool->threads.size());
-            if (threadCnt <= 1) {
-                for (int index : loadIndices) {
-                    tempWeights[index] = LoadDiskWeight(weights[index]);
-                }
-            } else {
-                std::vector<LoadDiskWeightsOp*> ops;
-                std::atomic<int> nextIndex(0);
-                for (int i = 0; i < threadCnt; i++) {
-                    ops.push_back(new LoadDiskWeightsOp(weights, &tempWeights,
-                                                        &loadIndices, &nextIndex));
-                    pool->PushOp(i, ops.back());
-                }
-                for (int i = 0; i < threadCnt; i++) {
-                    pool->Wait(i);
-                    delete ops[i];
-                }
-            }
+            LoadDiskWeightsInParallel(weights, tempWeights, loadIndices);
             for (int index : loadIndices) {
                 ownedWeights.push_back(tempWeights[index]);
             }

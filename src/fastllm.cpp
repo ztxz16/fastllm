@@ -4103,6 +4103,15 @@ namespace fastllm {
         }, {}, {{"kernelSize", kernelSize}});
     }
 
+    void KimiK3UpdatePackedConvCache(
+            const Data &q, const Data &k, const Data &v,
+            int history, int tokens, Data &cache) {
+        curExecutor->Run("KimiK3UpdatePackedConvCache", {
+                {"q", (Data*)&q}, {"k", (Data*)&k},
+                {"v", (Data*)&v}, {"cache", &cache}
+        }, {}, {{"history", history}, {"tokens", tokens}});
+    }
+
     void KimiK3L2Norm(const Data &input, float eps, Data &output) {
         curExecutor->Run("KimiK3L2Norm", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -4120,7 +4129,28 @@ namespace fastllm {
                 {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
                 {"state", &state}, {"output", &output},
                 {"decay", &decay}, {"beta", &beta}
-        }, {{"lowerBound", lowerBound}}, {});
+        }, {{"lowerBound", lowerBound}},
+        {{"tokenLimit", -1}, {"stateOnly", 0}});
+    }
+
+    void KimiK3RecurrentKDAUpdateState(
+            const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            int tokens, Data &state) {
+        Data unusedOutput, unusedDecay, unusedBeta;
+        curExecutor->Run("KimiK3RecurrentKDA", {
+                // Query contributes only to the emitted attention output; the
+                // recurrent state transition depends on K/V/gate/beta.  Reuse
+                // K for the shape-only q slot in state-only mode.
+                {"q", (Data*)&k}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"rawGate", (Data*)&rawGate},
+                {"rawBeta", (Data*)&rawBeta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &unusedOutput},
+                {"decay", &unusedDecay}, {"beta", &unusedBeta}
+        }, {{"lowerBound", lowerBound}},
+        {{"tokenLimit", tokens}, {"stateOnly", 1}});
     }
 
     void KimiK3RMSNormSigmoidGate(

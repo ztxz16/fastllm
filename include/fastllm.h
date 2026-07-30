@@ -977,6 +977,12 @@ namespace fastllm {
     void KimiK3CausalConv1D(const Data &input, const Data &weight,
                            int kernelSize, Data &cache, Data &output);
 
+    // Updates the packed Q/K/V short-convolution cache from a prefix of the
+    // projected inputs without evaluating convolution outputs.
+    void KimiK3UpdatePackedConvCache(
+            const Data &q, const Data &k, const Data &v,
+            int history, int tokens, Data &cache);
+
     void KimiK3L2Norm(const Data &input, float eps, Data &output);
 
     void KimiK3RecurrentKDA(
@@ -984,6 +990,14 @@ namespace fastllm {
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
             Data &state, Data &output, Data &decay, Data &beta);
+
+    // Replays only the recurrent-state transition for the first `tokens`
+    // rows of a captured verification batch.
+    void KimiK3RecurrentKDAUpdateState(
+            const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            int tokens, Data &state);
 
     void KimiK3RMSNormSigmoidGate(
             const Data &input, const Data &gate, const Data &weight,

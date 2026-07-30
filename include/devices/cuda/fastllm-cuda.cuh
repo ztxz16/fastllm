@@ -340,6 +340,10 @@ bool FastllmCudaKimiK3CausalConv1D(const fastllm::Data &input,
                                    fastllm::Data *cache,
                                    fastllm::Data &output, int kernelSize,
                                    bool initializeCache);
+bool FastllmCudaKimiK3UpdatePackedConvCache(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, fastllm::Data &cache,
+        int history, int tokens);
 bool FastllmCudaKimiK3L2Norm(const fastllm::Data &input,
                              fastllm::Data &output, float eps);
 bool FastllmCudaKimiK3RecurrentKDA(
@@ -348,7 +352,8 @@ bool FastllmCudaKimiK3RecurrentKDA(
         const fastllm::Data &rawBeta, const fastllm::Data &aLog,
         const fastllm::Data &dtBias, fastllm::Data &state,
         fastllm::Data &output, fastllm::Data &decay,
-        fastllm::Data &beta, float lowerBound, bool initializeState);
+        fastllm::Data &beta, float lowerBound, bool initializeState,
+        int tokenLimit = -1, bool stateOnly = false);
 bool FastllmCudaKimiK3RMSNormSigmoidGate(
         const fastllm::Data &input, const fastllm::Data &gate,
         const fastllm::Data &weight, fastllm::Data &output, float eps);

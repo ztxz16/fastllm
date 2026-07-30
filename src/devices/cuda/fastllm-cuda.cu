@@ -5409,77 +5409,138 @@ namespace {
         }
     }
 
+    __global__ void KimiK3UpdatePackedConvCacheKernel(
+            const __nv_bfloat16 *q, const __nv_bfloat16 *k,
+            const __nv_bfloat16 *v, __nv_bfloat16 *cache,
+            int batch, int sequence, int channels, int history,
+            int tokens) {
+        int item = blockIdx.x * blockDim.x + threadIdx.x;
+        if (item >= 3 * batch * channels) {
+            return;
+        }
+        int stream = item / (batch * channels);
+        int withinStream = item % (batch * channels);
+        int batchIndex = withinStream / channels;
+        int channel = withinStream % channels;
+        const __nv_bfloat16 *source = stream == 0 ? q :
+            (stream == 1 ? k : v);
+        size_t cacheBase =
+            ((size_t)stream * batch + batchIndex) * history * channels;
+        // `tokens` is positive, so any retained cache slot is read from a
+        // strictly higher index.  Ascending writes are therefore safe in
+        // place and need no temporary history buffer.
+        for (int slot = 0; slot < history; slot++) {
+            int combined = tokens + slot;
+            __nv_bfloat16 value;
+            if (combined < history) {
+                value = cache[
+                    cacheBase + (size_t)combined * channels + channel];
+            } else {
+                int inputToken = combined - history;
+                value = source[
+                    ((size_t)batchIndex * sequence + inputToken) * channels +
+                    channel];
+            }
+            cache[cacheBase + (size_t)slot * channels + channel] = value;
+        }
+    }
+
     __global__ void KimiK3RecurrentKDAKernel(
             const __nv_bfloat16 *q, const __nv_bfloat16 *k,
             const __nv_bfloat16 *v, const __nv_bfloat16 *rawGate,
             const float *rawBeta, const float *aLog, const float *dtBias,
             float *state, __nv_bfloat16 *output, float *decay,
-            float *activatedBeta, int batch, int sequence, int heads,
-            int dimension, int aLogCount, float lowerBound) {
+            float *activatedBeta, int batch, int inputSequence, int tokens,
+            int heads, int dimension, int aLogCount, float lowerBound) {
         int item = blockIdx.x;
         int batchIndex = item / heads;
         int head = item % heads;
         int channel = threadIdx.x;
-        if (batchIndex >= batch || channel >= dimension) {
+        if (batchIndex >= batch) {
             return;
         }
         extern __shared__ float shared[];
         float *key = shared;
         float *query = key + dimension;
         float *delta = query + dimension;
-        float *sharedBeta = delta + dimension;
+        float *retention = delta + dimension;
+        float *sharedBeta = retention + dimension;
         float *headState = state +
             ((size_t)batchIndex * heads + head) * dimension * dimension;
         float outputScale = rsqrtf((float)dimension);
 
-        for (int token = 0; token < sequence; token++) {
+        for (int token = 0; token < tokens; token++) {
             size_t vectorBase =
-                (((size_t)batchIndex * sequence + token) * heads + head) *
+                (((size_t)batchIndex * inputSequence + token) * heads + head) *
                 dimension;
             size_t betaIndex =
-                ((size_t)batchIndex * sequence + token) * heads + head;
+                ((size_t)batchIndex * inputSequence + token) * heads + head;
             if (channel == 0) {
                 sharedBeta[0] = KimiK3CudaSigmoid(rawBeta[betaIndex]);
-                activatedBeta[betaIndex] = sharedBeta[0];
+                if (activatedBeta != nullptr) {
+                    activatedBeta[betaIndex] = sharedBeta[0];
+                }
             }
-            key[channel] = __bfloat162float(k[vectorBase + channel]);
-            query[channel] = __bfloat162float(q[vectorBase + channel]);
-            float raw = __bfloat162float(rawGate[vectorBase + channel]);
-            float a = aLogCount == heads ? aLog[head] : aLog[channel];
-            float gate = lowerBound * KimiK3CudaSigmoid(
-                expf(a) * (raw + dtBias[(size_t)head * dimension + channel]));
-            decay[vectorBase + channel] = gate;
-            float retention = expf(gate);
-            float *stateRow = headState + (size_t)channel * dimension;
-            for (int value = 0; value < dimension; value++) {
-                stateRow[value] *= retention;
-            }
-            __syncthreads();
-
-            float prediction = 0.0f;
-            for (int sourceChannel = 0; sourceChannel < dimension;
-                 sourceChannel++) {
-                prediction += key[sourceChannel] *
-                    headState[(size_t)sourceChannel * dimension + channel];
-            }
-            delta[channel] =
-                (__bfloat162float(v[vectorBase + channel]) - prediction) *
-                sharedBeta[0];
-            __syncthreads();
-
-            for (int value = 0; value < dimension; value++) {
-                stateRow[value] += key[channel] * delta[value];
+            if (channel < dimension) {
+                key[channel] = __bfloat162float(k[vectorBase + channel]);
+                if (output != nullptr) {
+                    query[channel] =
+                        __bfloat162float(q[vectorBase + channel]);
+                }
+                float raw = __bfloat162float(rawGate[vectorBase + channel]);
+                float a = aLogCount == heads ? aLog[head] : aLog[channel];
+                float gate = lowerBound * KimiK3CudaSigmoid(
+                    expf(a) *
+                    (raw + dtBias[(size_t)head * dimension + channel]));
+                if (decay != nullptr) {
+                    decay[vectorBase + channel] = gate;
+                }
+                retention[channel] = expf(gate);
             }
             __syncthreads();
 
-            float result = 0.0f;
-            for (int sourceChannel = 0; sourceChannel < dimension;
-                 sourceChannel++) {
-                result += query[sourceChannel] *
-                    headState[(size_t)sourceChannel * dimension + channel];
+            // Traverse the row-major state as a flat array.  Adjacent CUDA
+            // threads now touch adjacent values, instead of every thread
+            // walking a different row with a dimension-sized stride.
+            int matrixItems = dimension * dimension;
+            for (int index = channel; index < matrixItems;
+                index += blockDim.x) {
+                int row = index / dimension;
+                headState[index] *= retention[row];
             }
-            output[vectorBase + channel] =
-                __float2bfloat16_rn(result * outputScale);
+            __syncthreads();
+
+            if (channel < dimension) {
+                float prediction = 0.0f;
+                for (int sourceChannel = 0; sourceChannel < dimension;
+                     sourceChannel++) {
+                    prediction += key[sourceChannel] *
+                        headState[(size_t)sourceChannel * dimension + channel];
+                }
+                delta[channel] =
+                    (__bfloat162float(v[vectorBase + channel]) - prediction) *
+                    sharedBeta[0];
+            }
+            __syncthreads();
+
+            for (int index = channel; index < matrixItems;
+                 index += blockDim.x) {
+                int row = index / dimension;
+                int value = index - row * dimension;
+                headState[index] += key[row] * delta[value];
+            }
+            __syncthreads();
+
+            if (output != nullptr && channel < dimension) {
+                float result = 0.0f;
+                for (int sourceChannel = 0; sourceChannel < dimension;
+                     sourceChannel++) {
+                    result += query[sourceChannel] *
+                        headState[(size_t)sourceChannel * dimension + channel];
+                }
+                output[vectorBase + channel] =
+                    __float2bfloat16_rn(result * outputScale);
+            }
             __syncthreads();
         }
     }
@@ -5699,13 +5760,50 @@ bool FastllmCudaKimiK3CausalConv1D(
     return KimiK3CudaLastError("KimiK3CausalConv1D CUDA kernel failed.");
 }
 
+bool FastllmCudaKimiK3UpdatePackedConvCache(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, fastllm::Data &cache,
+        int history, int tokens) {
+    if (!KimiK3CudaDataReady(q, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(k, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(v, fastllm::DataType::BFLOAT16) ||
+        !KimiK3CudaDataReady(cache, fastllm::DataType::BFLOAT16) ||
+        q.dims.size() != 3 || q.dims != k.dims || q.dims != v.dims ||
+        history <= 0 || tokens <= 0 || tokens > q.dims[1]) {
+        return false;
+    }
+    int batch = q.dims[0];
+    int sequence = q.dims[1];
+    int channels = q.dims[2];
+    bool legacyLayout = batch == 1 &&
+        cache.dims == std::vector<int>({3, history, channels});
+    bool batchedLayout = cache.dims ==
+        std::vector<int>({3, batch, history, channels});
+    if (!legacyLayout && !batchedLayout) {
+        return false;
+    }
+    int items = 3 * batch * channels;
+    int blocks = (items + KIMI_K3_CUDA_THREADS - 1) /
+                 KIMI_K3_CUDA_THREADS;
+    KimiK3UpdatePackedConvCacheKernel
+        <<<blocks, KIMI_K3_CUDA_THREADS>>>(
+            (const __nv_bfloat16*)q.cudaData,
+            (const __nv_bfloat16*)k.cudaData,
+            (const __nv_bfloat16*)v.cudaData,
+            (__nv_bfloat16*)cache.cudaData,
+            batch, sequence, channels, history, tokens);
+    return KimiK3CudaLastError(
+        "KimiK3UpdatePackedConvCache CUDA kernel failed.");
+}
+
 bool FastllmCudaKimiK3RecurrentKDA(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &rawGate,
         const fastllm::Data &rawBeta, const fastllm::Data &aLog,
         const fastllm::Data &dtBias, fastllm::Data &state,
         fastllm::Data &output, fastllm::Data &decay,
-        fastllm::Data &beta, float lowerBound, bool initializeState) {
+        fastllm::Data &beta, float lowerBound, bool initializeState,
+        int tokenLimit, bool stateOnly) {
     if (!KimiK3CudaDataReady(q, fastllm::DataType::BFLOAT16) ||
         !KimiK3CudaDataReady(k, fastllm::DataType::BFLOAT16) ||
         !KimiK3CudaDataReady(v, fastllm::DataType::BFLOAT16) ||
@@ -5714,11 +5812,8 @@ bool FastllmCudaKimiK3RecurrentKDA(
         !KimiK3CudaDataReady(aLog, fastllm::DataType::FLOAT32) ||
         !KimiK3CudaDataReady(dtBias, fastllm::DataType::FLOAT32) ||
         !KimiK3CudaDataReady(state, fastllm::DataType::FLOAT32) ||
-        !KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
-        !KimiK3CudaDataReady(decay, fastllm::DataType::FLOAT32) ||
-        !KimiK3CudaDataReady(beta, fastllm::DataType::FLOAT32) ||
         q.dims.size() != 4 || q.dims != k.dims || q.dims != v.dims ||
-        q.dims != rawGate.dims || output.dims != q.dims ||
+        q.dims != rawGate.dims ||
         q.dims[3] <= 0 || q.dims[3] > 256) {
         return false;
     }
@@ -5726,23 +5821,31 @@ bool FastllmCudaKimiK3RecurrentKDA(
     int sequence = q.dims[1];
     int heads = q.dims[2];
     int dimension = q.dims[3];
+    int tokens = tokenLimit < 0 ? sequence : tokenLimit;
     if (rawBeta.dims != std::vector<int>({batch, sequence, heads}) ||
         state.dims != std::vector<int>({batch, heads, dimension, dimension}) ||
-        decay.dims != q.dims ||
-        beta.dims != std::vector<int>({batch, sequence, heads}) ||
+        tokens <= 0 || tokens > sequence ||
+        (!stateOnly && tokens != sequence) ||
         (aLog.Count(0) != (uint64_t)heads &&
          aLog.Count(0) != (uint64_t)dimension) ||
         dtBias.Count(0) != (uint64_t)heads * dimension) {
         return false;
     }
+    if (!stateOnly &&
+        (!KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+         !KimiK3CudaDataReady(decay, fastllm::DataType::FLOAT32) ||
+         !KimiK3CudaDataReady(beta, fastllm::DataType::FLOAT32) ||
+         output.dims != q.dims || decay.dims != q.dims ||
+         beta.dims != std::vector<int>({batch, sequence, heads}))) {
+        return false;
+    }
     if (initializeState) {
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
     }
-    // One thread owns one state column.  Launch exactly `dimension` threads:
-    // the kernel contains block-wide barriers, so inactive padding threads
-    // must not return before those barriers.
-    int threads = dimension;
-    size_t sharedBytes = ((size_t)dimension * 3 + 1) * sizeof(float);
+    // Vector reductions retain one owner per state column, while all threads
+    // cooperate on the row-major decay and rank-one update passes.
+    int threads = KIMI_K3_CUDA_THREADS;
+    size_t sharedBytes = ((size_t)dimension * 4 + 1) * sizeof(float);
     KimiK3RecurrentKDAKernel<<<batch * heads, threads, sharedBytes>>>(
         (const __nv_bfloat16*)q.cudaData,
         (const __nv_bfloat16*)k.cudaData,
@@ -5752,10 +5855,11 @@ bool FastllmCudaKimiK3RecurrentKDA(
         (const float*)aLog.cudaData,
         (const float*)dtBias.cudaData,
         (float*)state.cudaData,
-        (__nv_bfloat16*)output.cudaData,
-        (float*)decay.cudaData,
-        (float*)beta.cudaData,
-        batch, sequence, heads, dimension, (int)aLog.Count(0), lowerBound);
+        stateOnly ? nullptr : (__nv_bfloat16*)output.cudaData,
+        stateOnly ? nullptr : (float*)decay.cudaData,
+        stateOnly ? nullptr : (float*)beta.cudaData,
+        batch, sequence, tokens, heads, dimension,
+        (int)aLog.Count(0), lowerBound);
     return KimiK3CudaLastError("KimiK3RecurrentKDA CUDA kernel failed.");
 }
 

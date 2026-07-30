@@ -297,6 +297,8 @@ namespace fastllm {
         this->ops["RMSNormPart"] = (BaseOperator*)(new CpuRMSNormPartOp());
         this->ops["KimiK3RMSNorm"] = (BaseOperator*)(new CpuKimiK3RMSNormOp());
         this->ops["KimiK3CausalConv1D"] = (BaseOperator*)(new CpuKimiK3CausalConv1DOp());
+        this->ops["KimiK3UpdatePackedConvCache"] =
+            (BaseOperator*)(new CpuKimiK3UpdatePackedConvCacheOp());
         this->ops["KimiK3L2Norm"] = (BaseOperator*)(new CpuKimiK3L2NormOp());
         this->ops["KimiK3RecurrentKDA"] = (BaseOperator*)(new CpuKimiK3RecurrentKDAOp());
         this->ops["KimiK3RMSNormSigmoidGate"] = (BaseOperator*)(new CpuKimiK3RMSNormSigmoidGateOp());
