@@ -3636,9 +3636,12 @@ namespace fastllm {
                 }
                 continue;
             }
+            auto w4a8BundleIt = w4a8Bundles.find(tensorName);
+            bool isW4A8PackedTensor = w4a8BundleIt != w4a8Bundles.end();
             int packedInt4GroupCnt = -1;
-            bool isPackedInt4Group = TryGetPackedInt4GroupCnt(
-                safeTensors, tensorName, packedInt4GroupCnt);
+            bool isPackedInt4Group = !isW4A8PackedTensor &&
+                TryGetPackedInt4GroupCnt(
+                    safeTensors, tensorName, packedInt4GroupCnt);
             DataType packedInt4DataType = isPackedInt4Group ?
                 GetPackedInt4GroupDataType(safeTensors, tensorName, packedInt4GroupCnt) :
                 DataType::INT4_GROUP;
@@ -3688,7 +3691,6 @@ namespace fastllm {
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
                 }
-                auto w4a8BundleIt = w4a8Bundles.find(tensorName);
                 if (w4a8BundleIt != w4a8Bundles.end()) {
                     model->weight.AddEmptyWeight(weightName,
                                                  w4a8BundleIt->second.logicalShape,
@@ -3921,8 +3923,10 @@ namespace fastllm {
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
                             }
                             int packedInt4GroupCnt = -1;
-                            bool isPackedInt4Group = TryGetPackedInt4GroupCnt(
-                                safeTensors, tensorName, packedInt4GroupCnt);
+                            bool isPackedInt4Group = !isW4A8PackedTensor &&
+                                TryGetPackedInt4GroupCnt(
+                                    safeTensors, tensorName,
+                                    packedInt4GroupCnt);
                             DataType packedInt4DataType = isPackedInt4Group ?
                                 GetPackedInt4GroupDataType(safeTensors, tensorName,
                                                           packedInt4GroupCnt) :

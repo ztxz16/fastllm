@@ -2789,8 +2789,9 @@ namespace fastllm {
         AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
                         "Attention: q, k, v's datatype should be same.\n");
         AssertInFastLLM(q.dataType == DataType::FLOAT32 ||
-                        q.dataType == DataType::FLOAT16, 
-                        "Attention's input's type should be float32 or float16.\n");
+                        q.dataType == DataType::FLOAT16 ||
+                        q.dataType == DataType::BFLOAT16,
+                        "Attention's input's type should be float32, float16 or bfloat16.\n");
 
         DoCudaAttentionReshape(q, v, output);
     }
@@ -2805,7 +2806,11 @@ namespace fastllm {
             ToDataType(q, q32, DataType::FLOAT32);
             ToDataType(k, k32, DataType::FLOAT32);
             ToDataType(v, v32, DataType::FLOAT32);
-            ToDataType(output, output32, DataType::FLOAT32);
+            output32.dataType = DataType::FLOAT32;
+            output32.UpdateUnitSize();
+            output32.Resize(output.dims);
+            output32.ToDevice(output.dataDevice, false);
+            output32.Allocate();
             if (mask.dims.size() > 0)
                 ToDataType(mask, mask32, DataType::FLOAT32);
             FastllmCudaAttention(q32, k32, v32, mask32, output32, group, scale, maskType);
@@ -2813,6 +2818,18 @@ namespace fastllm {
 #else
             FastllmCudaHalfAttention(q, k, v, mask, output, group, scale, maskType);
 #endif
+        } else if (q.dataType == DataType::BFLOAT16) {
+            Data q32, k32, v32, mask32, output32;
+            ToDataType(q, q32, DataType::FLOAT32);
+            ToDataType(k, k32, DataType::FLOAT32);
+            ToDataType(v, v32, DataType::FLOAT32);
+            ToDataType(output, output32, DataType::FLOAT32);
+            if (!mask.dims.empty()) {
+                ToDataType(mask, mask32, DataType::FLOAT32);
+            }
+            FastllmCudaAttention(q32, k32, v32, mask32, output32,
+                                 group, scale, maskType);
+            ToDataType(output32, output, DataType::BFLOAT16);
         }
     }
 
