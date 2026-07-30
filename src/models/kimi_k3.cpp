@@ -921,6 +921,7 @@ namespace fastllm {
         // calculation lazily on the first request, so clients are briefly
         // told that the full architectural context window is available.
         const auto freeSizes = FastllmCudaGetFreeSizes();
+        const auto totalSizes = FastllmCudaGetTotalSizes();
         std::set<int> deviceIds;
         std::map<int, int> ratios;
         for (const auto &item : deviceMap) {
@@ -972,11 +973,53 @@ namespace fastllm {
         }
 
         long long capacity = max_positions;
+        const int prefillChunkSize = GetChunkedPrefillSize();
+        const int extraPrefillTokens = std::max(
+            0, prefillChunkSize - defaultChunkedPrefillSize);
+        const long long activationBytesPerExtraToken =
+            (long long)GetDataBytes(
+                dataType, 1, embed_dim) * 9;
+        const long long linearPrefillReserve =
+            (long long)extraPrefillTokens *
+            activationBytesPerExtraToken;
+        // Larger chunks also grow direct CUDA workspaces and leave a less
+        // reusable mix of pooled buffers.  That high-water mark is not fully
+        // described by the live hidden-state rows above: a 4096-token Kimi
+        // prefill still exhausted the generic allocator headroom late in a
+        // long request.  Keep one allocator-growth margin whenever the chunk
+        // exceeds the default; explicit context/KV limits remain untouched.
+        const long long allocatorGrowthMargin =
+            extraPrefillTokens > 0 ? (768LL << 20) : 0;
+        const long long prefillRuntimeReserve =
+            linearPrefillReserve + allocatorGrowthMargin;
+        if (prefillRuntimeReserve > 0 && kvCacheLimit <= 0 &&
+            GetMaxTokens() <= 0) {
+            std::cout << "[Kimi-K3] Auto context reserves "
+                      << std::fixed << std::setprecision(2)
+                      << (double)prefillRuntimeReserve /
+                             (1024.0 * 1024.0)
+                      << " MiB per GPU for chunked prefill "
+                      << prefillChunkSize << ".\n";
+        }
         for (int deviceId : deviceIds) {
             if (deviceId >= 0 && deviceId < (int)freeSizes.size()) {
-                const long long usable = std::max(
+                long long usable = std::max(
                     freeSizes[deviceId] * 3 / 4,
                     freeSizes[deviceId] - (2LL << 30));
+                if (kvCacheLimit <= 0 && GetMaxTokens() <= 0) {
+                    if (deviceId < (int)totalSizes.size()) {
+                        const long long ratioReserve = (long long)(
+                            totalSizes[deviceId] *
+                            (1.0 - GetGpuMemRatio()));
+                        usable = std::min(
+                            usable,
+                            std::max(
+                                0LL,
+                                freeSizes[deviceId] - ratioReserve));
+                    }
+                    usable = std::max(
+                        0LL, usable - prefillRuntimeReserve);
+                }
                 auto bytes = cacheBytesPerToken.find(deviceId);
                 if (bytes != cacheBytesPerToken.end() && bytes->second > 0) {
                     capacity = std::min(capacity, usable / bytes->second);
@@ -1373,22 +1416,69 @@ namespace fastllm {
                 const int batch = qNope.dims[0];
                 const int queryLength = qNope.dims[1];
                 const int heads = qNope.dims[2];
-                PermuteSelf(qNope, {2, 0, 1, 3});
-                qNope.Reshape({heads, batch * queryLength, qkNopeHeadDim});
+                const int cacheLength = keyCache.pageIndex.empty() ? 0 :
+                    ((int)keyCache.pageIndex.size() - 1) * pageLen +
+                    keyCache.lastPageLen;
+                const int historyLength = cacheLength - queryLength;
+                AssertInFastLLM(
+                    batch == 1 && historyLength >= 0,
+                    "Kimi-K3 compressed MLA expects one contiguous request.");
 
-                Data absorbedQuery, latentAttention, attentionHeads;
-                MatMul(qNope, absorbedKeyWeight, absorbedQuery);
-                MergeMLAPaged(
-                    absorbedQuery, qRot, keyCache, valueCache,
-                    latentAttention,
-                    1.0f / std::sqrt((float)qHeadDimension));
-                MatMulTransB(
-                    latentAttention, absorbedValueWeight, attentionHeads);
-                attentionHeads.Reshape(
-                    {heads, batch, queryLength, vHeadDim});
-                PermuteSelf(attentionHeads, {1, 2, 0, 3});
-                attentionHeads.Reshape(
-                    {batch, queryLength, heads * vHeadDim});
+                Data attentionHeads;
+                const int mlaQueryChunkSize = 1024;
+                auto runMlaChunk = [&](Data &qNopeChunk,
+                                       Data &qRotChunk,
+                                       int chunkLength, int kvLength,
+                                       Data &chunkAttentionHeads) {
+                    PermuteSelf(qNopeChunk, {2, 0, 1, 3});
+                    qNopeChunk.Reshape(
+                        {heads, batch * chunkLength, qkNopeHeadDim});
+
+                    Data absorbedQuery, latentAttention;
+                    MatMul(qNopeChunk, absorbedKeyWeight, absorbedQuery);
+                    MergeMLAPaged(
+                        absorbedQuery, qRotChunk,
+                        keyCache, valueCache, latentAttention,
+                        1.0f / std::sqrt((float)qHeadDimension),
+                        kvLength);
+                    MatMulTransB(
+                        latentAttention, absorbedValueWeight,
+                        chunkAttentionHeads);
+                    chunkAttentionHeads.Reshape(
+                        {heads, batch, chunkLength, vHeadDim});
+                    PermuteSelf(chunkAttentionHeads, {1, 2, 0, 3});
+                    chunkAttentionHeads.Reshape(
+                        {batch, chunkLength, heads * vHeadDim});
+                };
+                if (queryLength <= mlaQueryChunkSize) {
+                    runMlaChunk(
+                        qNope, qRot, queryLength,
+                        cacheLength, attentionHeads);
+                } else {
+                    for (int start = 0; start < queryLength;
+                         start += mlaQueryChunkSize) {
+                        const int end = std::min(
+                            queryLength, start + mlaQueryChunkSize);
+                        const int chunkLength = end - start;
+                        Data qNopeChunk, qRotChunk;
+                        Split(qNope, 1, start, end, qNopeChunk);
+                        Split(qRot, 1, start, end, qRotChunk);
+                        Data chunkAttentionHeads;
+                        runMlaChunk(
+                            qNopeChunk, qRotChunk, chunkLength,
+                            historyLength + end, chunkAttentionHeads);
+                        if (start == 0) {
+                            Copy(chunkAttentionHeads, attentionHeads);
+                            attentionHeads.Expansion(
+                                {batch, queryLength,
+                                 heads * vHeadDim});
+                        } else {
+                            CatDirect(
+                                attentionHeads, chunkAttentionHeads, 1);
+                        }
+                    }
+                    attentionHeads.expansionDims.clear();
+                }
 
                 Data outputGate;
                 Linear(normalized,

@@ -3881,11 +3881,13 @@ namespace fastllm {
         }, {{"softmaxScale", softmaxScale}}, {});
     }
 
-    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged, Data &peCachePaged, Data &output, float softmaxScale) {
+    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged,
+                       Data &peCachePaged, Data &output,
+                       float softmaxScale, int kvLen) {
         curExecutor->Run("MergeMLAPaged", {
             {"qNope", (Data*)&qNope}, {"qPe", (Data*)&qPe}, {"kvCachePaged", (Data*)&kvCachePaged}, {"peCachePaged", (Data*)&peCachePaged},
             {"output", (Data*)&output}
-        }, {{"softmaxScale", softmaxScale}}, {});
+        }, {{"softmaxScale", softmaxScale}}, {{"kvLen", kvLen}});
     }
 
     // attentionType

@@ -1182,6 +1182,117 @@ namespace {
         std::cout << "CUDA Kimi-K3 recurrent KDA regression: PASS\n";
     }
 
+    void RunCudaMergeMlaPagedChunkRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int pageLen = 4;
+        constexpr int kvLength = 11;
+        constexpr int queryLength = 6;
+        constexpr int historyLength = kvLength - queryLength;
+        constexpr int heads = 2;
+        constexpr int ckvDimension = 512;
+        constexpr int kpeDimension = 64;
+
+        fastllm::ClearAllPagedCacheManagers();
+        {
+        fastllm::Data kpe = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, kvLength, kpeDimension},
+            MakeRegressionValues(
+                kvLength * kpeDimension, 3.11f, 0.015f));
+        fastllm::Data ckv = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, kvLength, ckvDimension},
+            MakeRegressionValues(
+                kvLength * ckvDimension, 3.47f, 0.012f));
+        fastllm::Data qNope = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {heads, queryLength, ckvDimension},
+            MakeRegressionValues(
+                heads * queryLength * ckvDimension, 3.83f, 0.01f));
+        fastllm::Data qPe = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, queryLength, heads, kpeDimension},
+            MakeRegressionValues(
+                queryLength * heads * kpeDimension, 4.19f, 0.014f));
+
+        fastllm::Data kpeCache, ckvCache;
+        auto prepareDescriptor = [](fastllm::Data &cache,
+                                    const fastllm::Data &current) {
+            cache.dataType = current.dataType;
+            cache.UpdateUnitSize();
+            cache.dataDevice = current.dataDevice;
+            cache.dataDeviceIds = current.dataDeviceIds;
+            cache.isKVCache = true;
+        };
+        prepareDescriptor(kpeCache, kpe);
+        prepareDescriptor(ckvCache, ckv);
+        fastllm::PagedCacheManager *kpeManager =
+            fastllm::AllocatePagedCacheManager(
+                10000,
+                fastllm::PagedCacheManager::
+                    PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+                kpe, pageLen, 4);
+        fastllm::PagedCacheManager *ckvManager =
+            fastllm::AllocatePagedCacheManager(
+                10001,
+                fastllm::PagedCacheManager::
+                    PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+                ckv, pageLen, 4);
+        kpeCache.ToDevice(kpe.dataDevice, kpe.dataDeviceIds, false);
+        ckvCache.ToDevice(ckv.dataDevice, ckv.dataDeviceIds, false);
+
+        fastllm::Data fullOutput, explicitFullOutput, chunkedOutput;
+        {
+            ScopedFirstDevice device("cuda:0");
+            fastllm::AppendPagedCache(*kpeManager, kpeCache, kpe);
+            fastllm::AppendPagedCache(*ckvManager, ckvCache, ckv);
+            fastllm::MergeMLAPaged(
+                qNope, qPe, kpeCache, ckvCache,
+                fullOutput, 1.0f / std::sqrt(576.0f));
+            fastllm::MergeMLAPaged(
+                qNope, qPe, kpeCache, ckvCache,
+                explicitFullOutput, 1.0f / std::sqrt(576.0f),
+                kvLength);
+
+            constexpr int mlaChunkSize = 3;
+            for (int start = 0; start < queryLength;
+                 start += mlaChunkSize) {
+                const int end = std::min(
+                    queryLength, start + mlaChunkSize);
+                fastllm::Data qNopeChunk, qPeChunk, outputChunk;
+                fastllm::Split(
+                    qNope, 1, start, end, qNopeChunk);
+                fastllm::Split(qPe, 1, start, end, qPeChunk);
+                fastllm::MergeMLAPaged(
+                    qNopeChunk, qPeChunk,
+                    kpeCache, ckvCache, outputChunk,
+                    1.0f / std::sqrt(576.0f),
+                    historyLength + end);
+                if (start == 0) {
+                    fastllm::Copy(outputChunk, chunkedOutput);
+                    chunkedOutput.Expansion(
+                        {heads, queryLength, ckvDimension});
+                } else {
+                    fastllm::CatDirect(
+                        chunkedOutput, outputChunk, 1);
+                }
+            }
+            chunkedOutput.expansionDims.clear();
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(
+            ToFloatVector(fullOutput), ToFloatVector(explicitFullOutput),
+            0.0f, 0.0f,
+            "CUDA length-limited full paged MLA output");
+        ExpectFloatNear(
+            ToFloatVector(fullOutput), ToFloatVector(chunkedOutput),
+            0.0f, 0.0f,
+            "CUDA chunked paged MLA output");
+        }
+        fastllm::ClearAllPagedCacheManagers();
+        std::cout << "CUDA chunked paged MLA regression: PASS\n";
+    }
+
     void RunCudaTritonChunkGdnPrefillRegression() {
         bool tritonEnabled = fastllm::GetFastllmEnv().cudaTriton &&
             RegressionEnvFlagDefaultEnabled(
@@ -4477,6 +4588,7 @@ int main() {
             RunCudaGgufMmvqBatch8Regression();
             RunCudaKimiK3PackedConvCacheRegression();
             RunCudaKimiK3RecurrentKdaRegression();
+            RunCudaMergeMlaPagedChunkRegression();
             RunCudaInt4Group32AwqLinearRegression();
             RunCudaCompactInt4Group32LinearRegression();
             RunCudaInt4GroupHalfWeightRoundingRegression();

@@ -2932,7 +2932,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 }
 
 bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
-                         fastllm::Data &output, float softmaxScale) {
+                         fastllm::Data &output, float softmaxScale, int requestedKvLen) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     // FlashInfer 不可用（sm_70 以下），分页 MLA 暂无原生实现。
     return false;
@@ -2950,8 +2950,12 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     int b = qPe.dims[0], s = qPe.dims[1], h = qPe.dims[2], head_dim_ckv = (int)qNope.dims.back(), head_dim_kpe = (int)qPe.dims[3];
     int numPages = (int)kvCachePaged.pageIndex.size();
     int pageLen = kvCachePaged.pageLen;
-    int kvLen = (numPages > 0) ? (numPages - 1) * pageLen + kvCachePaged.lastPageLen : 0;
+    int fullKvLen = (numPages > 0) ?
+        (numPages - 1) * pageLen + kvCachePaged.lastPageLen : 0;
+    int kvLen = requestedKvLen > 0 ? requestedKvLen : fullKvLen;
     int qoLen = b * s;
+    if (kvLen <= 0 || kvLen > fullKvLen || kvLen < s) return false;
+    numPages = (kvLen + pageLen - 1) / pageLen;
 
     std::vector<int32_t> q_indptr_h = {0, qoLen};
     std::vector<int32_t> kv_indptr_h = {0, numPages};

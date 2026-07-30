@@ -4512,6 +4512,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &peCachePaged = *(datas.find("peCachePaged")->second);
         Data &output = *(datas.find("output")->second);
         float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;
+        int requestedKvLen = intParams.find("kvLen") != intParams.end() ?
+            intParams.find("kvLen")->second : -1;
 
         AssertInFastLLM(kvCachePaged.isPagedKVCache && peCachePaged.isPagedKVCache,
             "CpuMergeMLAPaged: kvCachePaged and peCachePaged must be paged KV cache (isPagedKVCache=true).\n");
@@ -4532,7 +4534,14 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
         int numPages = (int)kvCachePaged.pageIndex.size();
         int pageLen = kvCachePaged.pageLen;
-        int kvLen = (numPages > 0) ? (numPages - 1) * pageLen + kvCachePaged.lastPageLen : 0;
+        int fullKvLen = (numPages > 0) ?
+            (numPages - 1) * pageLen + kvCachePaged.lastPageLen : 0;
+        int kvLen = requestedKvLen > 0 ? requestedKvLen : fullKvLen;
+        AssertInFastLLM(
+            kvLen > 0 && kvLen <= fullKvLen && kvLen >= s,
+            "CpuMergeMLAPaged: requested KV length is invalid.\n");
+        numPages = (kvLen + pageLen - 1) / pageLen;
+        int lastPageLen = (kvLen - 1) % pageLen + 1;
 
         output.Allocate();
 
@@ -4559,7 +4568,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             int posInPage = kvPos % pageLen;
             if (pi >= numPages) return nullptr;
             int actualPage = peCachePaged.pageIndex[pi];
-            if (pi == numPages - 1 && posInPage >= peCachePaged.lastPageLen) return nullptr;
+            if (pi == numPages - 1 && posInPage >= lastPageLen) return nullptr;
             return ckvData + (size_t)actualPage * ckvPageStride + (size_t)posInPage * ckvPosStride;
         };
         auto getKpeAt = [&](int kvPos) -> const uint8_t* {
@@ -4568,7 +4577,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             int posInPage = kvPos % pageLen;
             if (pi >= numPages) return nullptr;
             int actualPage = kvCachePaged.pageIndex[pi];
-            if (pi == numPages - 1 && posInPage >= kvCachePaged.lastPageLen) return nullptr;
+            if (pi == numPages - 1 && posInPage >= lastPageLen) return nullptr;
             return kpeData + (size_t)actualPage * kpePageStride + (size_t)posInPage * kpePosStride;
         };
 

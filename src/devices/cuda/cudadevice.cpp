@@ -5356,6 +5356,8 @@ namespace fastllm {
         output.Allocate();
 
         float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;
+        int kvLen = intParams.find("kvLen") != intParams.end() ?
+            intParams.find("kvLen")->second : -1;
 
         AssertInFastLLM(kvCachePaged.isPagedKVCache && peCachePaged.isPagedKVCache,
             "CudaMergeMLAPaged: kvCachePaged and peCachePaged must be paged KV cache (isPagedKVCache=true).\n");
@@ -5365,7 +5367,9 @@ namespace fastllm {
             return;
         }
 
-        bool ok = FastllmCudaMLAPaged(qNope, qPe, kvCachePaged, peCachePaged, output, softmaxScale);
+        bool ok = FastllmCudaMLAPaged(
+            qNope, qPe, kvCachePaged, peCachePaged,
+            output, softmaxScale, kvLen);
         AssertInFastLLM(ok, "CudaMergeMLAPaged: FastllmCudaMLAPaged failed.\n");
     }
 
