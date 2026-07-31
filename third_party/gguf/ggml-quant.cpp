@@ -682,8 +682,9 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
             }
         }
         if (!amax) {
-            y[i].d = 0;
-            memset(y[i].qs, 0, QK_K);
+            // Q8_K consumers may read sum/bsums even when the scale is zero;
+            // initialize the complete intermediate block, not only its quants.
+            memset(&y[i], 0, sizeof(y[i]));
             x += QK_K;
             continue;
         }
@@ -851,8 +852,9 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
             }
         }
         if (!amax) {
-            y[i].d = 0;
-            memset(y[i].qs, 0, QK_K);
+            // Q8_K32 reuses bsums as float partial sums, so stale metadata is
+            // observable even though every quant in this block is zero.
+            memset(&y[i], 0, sizeof(y[i]));
             x += QK_K;
             continue;
         }
@@ -1825,8 +1827,9 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
             }
         }
         if (!amax) {
-            y[i].d = 0;
-            memset(y[i].qs, 0, QK_K);
+            // Q8_K consumers may read sum/bsums even when the scale is zero;
+            // initialize the complete intermediate block, not only its quants.
+            memset(&y[i], 0, sizeof(y[i]));
             x += QK_K;
             continue;
         }
@@ -2577,8 +2580,9 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
             }
         }
         if (!amax) {
-            y[i].d = 0;
-            memset(y[i].qs, 0, QK_K);
+            // Q8_K32 reuses bsums as float partial sums, so stale metadata is
+            // observable even though every quant in this block is zero.
+            memset(&y[i], 0, sizeof(y[i]));
             x += QK_K;
             continue;
         }
