@@ -8647,18 +8647,14 @@ namespace fastllm {
                         Qwen3CudaPermuteSelf(cudaRunner, coreAttnOut, {0, 2, 1, 3});
                     }
                     if (batchedPrefill) {
-                        bool recurrentStateTransposed = false;
-                        if (Qwen35TransposedBatchDecodeEnabled()) {
-                            recurrentStateTransposed =
-                                Qwen35EnsureCudaLinearAttnStateTransposed(
-                                    batchPrefillRecurrentState);
-                        }
+                        // Keep the recurrent state in the prefill [K, V]
+                        // layout across outer chunks. Decode converts it to
+                        // [V, K] once, on first use.
                         SplitBatchFirstDim(batchPrefillRecurrentState,
                                            batchPrefillRecurrentStates);
                         for (Data *state : batchPrefillRecurrentStates) {
                             Qwen35PrepareLinearAttentionCache(*state, computeType);
-                            state->isLinearAttentionTransposed =
-                                recurrentStateTransposed;
+                            state->isLinearAttentionTransposed = false;
                         }
                     }
                 };
