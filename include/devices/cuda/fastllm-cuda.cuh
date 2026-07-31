@@ -602,9 +602,25 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     const std::vector<fastllm::Data*> &caches, const fastllm::Data &newTokens,
     fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output,
     const std::vector<fastllm::Data*> &tokenCaches, int numTokenCaches);
+bool FastllmCudaShiftAppendConv1DPerChannelSiluRaggedPrefillFloat16BatchPointers(
+    const std::vector<fastllm::Data*> &caches, const fastllm::Data &newTokens,
+    const std::vector<int> &seqLens, fastllm::Data &weight,
+    fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(const std::vector<fastllm::Data*> &caches, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchDevicePointers(void *cudaCachePointers, int batch, const fastllm::Data &firstCache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchSlots(void *cudaCachePool, void *cudaSlotIds, int batch, const fastllm::Data &firstCache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
+
+bool FastllmCudaPackRaggedGdnPrefillFloat16(
+    const fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &b,
+    const fastllm::Data &g, const std::vector<int> &seqLens,
+    int paddedSeqLen, float qScale,
+    fastllm::Data &qPadded, fastllm::Data &kPadded,
+    fastllm::Data &vPadded, fastllm::Data &bPadded,
+    fastllm::Data &gPadded);
+bool FastllmCudaUnpackRaggedGdnPrefillFloat16(
+    const fastllm::Data &padded, const std::vector<int> &seqLens,
+    fastllm::Data &ragged);
 
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output);
 

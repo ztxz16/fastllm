@@ -2865,7 +2865,7 @@ namespace fastllm {
             return true;
         }
 
-        // Uniform batched prefill used to materialize one owned recurrent
+        // Batched prefill used to materialize one owned recurrent
         // state per request and layer, then copy those states into the
         // preallocated CUDA-graph slot pools before decode.  At batch 128 the
         // duplicate states consume several GiB and can exhaust memory even
@@ -2876,7 +2876,7 @@ namespace fastllm {
         // prefill code can then write directly into the borrowed slot views;
         // SplitBatchFirstDim reuses their expansion storage instead of
         // allocating a second persistent copy.
-        static bool Qwen35AttachFreshUniformPrefillLinearSlots(
+        static bool Qwen35AttachFreshBatchPrefillLinearSlots(
                 const Qwen3_5Model *model,
                 int gpuId,
                 int batch,
@@ -7549,24 +7549,22 @@ namespace fastllm {
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
         bool generatedAppendParams = false;
         bool generatedDecodeParams = false;
-        bool freshUniformPrefill =
+        bool freshBatchPrefill =
             isPrefill && batch > 1 && !all1 &&
             !speculativeCollectAllLogits &&
             (int)seqLens.size() == batch;
-        int freshUniformPrefillTokens = 0;
-        int freshUniformPrefillSeqLen =
-            freshUniformPrefill ? seqLens[0] : 0;
-        if (freshUniformPrefill) {
+        int freshBatchPrefillTokens = 0;
+        if (freshBatchPrefill) {
             for (int len : seqLens) {
-                freshUniformPrefill &=
-                    len == freshUniformPrefillSeqLen && len > 1 &&
+                freshBatchPrefill &=
+                    len > 1 &&
                     len <= QWEN35_BATCH_PREFILL_SEQ_MAX;
-                freshUniformPrefillTokens += len;
+                freshBatchPrefillTokens += len;
             }
-            freshUniformPrefill &=
-                freshUniformPrefillTokens == inputIds.Count(0);
+            freshBatchPrefill &=
+                freshBatchPrefillTokens == inputIds.Count(0);
         }
-        if (freshUniformPrefill) {
+        if (freshBatchPrefill) {
             std::vector<int> linearLayers;
             linearLayers.reserve(block_cnt);
             for (int layer = 0; layer < block_cnt; layer++) {
@@ -7578,7 +7576,7 @@ namespace fastllm {
                     linearLayers.push_back(layer);
                 }
             }
-            Qwen35AttachFreshUniformPrefillLinearSlots(
+            Qwen35AttachFreshBatchPrefillLinearSlots(
                 this, gpuId, batch, block_cnt,
                 linearLayers, pastKeyValues);
         }
@@ -7803,6 +7801,36 @@ namespace fastllm {
                     }
                     batchedUniformPrefill &= uniformPrefillTotalTokens == seqlen;
                 }
+                bool batchedRaggedPrefill =
+                    isPrefill && batch > 1 && !all1 &&
+                    !speculativeCollectAllLogits &&
+                    (int)seqLens.size() == batch && bsz == 1 &&
+                    !batchedUniformPrefill;
+                int raggedPrefillTotalTokens = 0;
+                int raggedPrefillMaxSeqLen = 0;
+                if (batchedRaggedPrefill) {
+                    for (int len : seqLens) {
+                        batchedRaggedPrefill &=
+                            len > 1 && len <= QWEN35_BATCH_PREFILL_SEQ_MAX;
+                        raggedPrefillMaxSeqLen =
+                            std::max(raggedPrefillMaxSeqLen, len);
+                        raggedPrefillTotalTokens += len;
+                    }
+                    batchedRaggedPrefill &=
+                        raggedPrefillTotalTokens == seqlen;
+                }
+                int raggedPrefillPaddedSeqLen = batchedRaggedPrefill ?
+                    ((raggedPrefillMaxSeqLen + 63) / 64) * 64 : 0;
+                // The native chunk kernel has a rectangular batch dimension.
+                // Avoid pathological memory growth for extremely skewed
+                // batches; the caller retains its request-local fallback.
+                if (batchedRaggedPrefill) {
+                    batchedRaggedPrefill &=
+                        (long long)batch * raggedPrefillPaddedSeqLen <=
+                        (long long)raggedPrefillTotalTokens * 2;
+                }
+                bool batchedPrefill =
+                    batchedUniformPrefill || batchedRaggedPrefill;
                 bool keepCombinedBaForBatchRecurrent = batch > 1 && all1;
                 bool keepCombinedBa =
                     keepCombinedBaForSmallDecode ||
@@ -7877,9 +7905,9 @@ namespace fastllm {
                          expectedCaptureSlots <= speculativeLinearStateCaptureSlots);
                 }
                 bool batchedConvSequence =
-                    batchedSpeculativeSequence || batchedUniformPrefill;
+                    batchedSpeculativeSequence || batchedPrefill;
                 bool tokenMajorBatchPrefill =
-                    batchedUniformPrefill && !batchedSpeculativeSequence;
+                    batchedPrefill && !batchedSpeculativeSequence;
                 if (batchedConvSequence) {
                     // Keep the flattened token-major projection. Each request
                     // is handled independently before its cache update.
@@ -7894,7 +7922,38 @@ namespace fastllm {
                 }
                 z.Reshape({bsz, seqlen, localValueHeads, head_v_dim});
 
-                if (batchedConvSequence) {
+                if (batchedRaggedPrefill) {
+                    std::vector<Data*> requestPastKeys(batch);
+                    for (int rb = 0; rb < batch; rb++) {
+                        Data *requestPastKey =
+                            pastKeyValues[rb * block_cnt + i].first;
+                        AssertInFastLLM(
+                            requestPastKey != nullptr,
+                            "Qwen3.5 ragged prefill missing linear conv cache.\n");
+                        Qwen35PrepareLinearAttentionCache(
+                            *requestPastKey, computeType);
+                        requestPastKey->dataDeviceIds = {gpuId};
+                        if (requestPastKey->dims.empty()) {
+                            requestPastKey->dataDevice = DataDevice::CUDA;
+                            requestPastKey->Resize({1, localQkvDim, 4});
+                            requestPastKey->Allocate(0.0f);
+                            requestPastKey->expansionDims =
+                                requestPastKey->dims;
+                        }
+                        requestPastKeys[rb] = requestPastKey;
+                    }
+                    bool fused =
+                        FastllmCudaShiftAppendConv1DPerChannelSiluRaggedPrefillFloat16BatchPointers(
+                            requestPastKeys, *qkvConvInputForConv, seqLens,
+                            *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                            convOutput);
+                    AssertInFastLLM(
+                        fused,
+                        "Qwen3.5 ragged prefill linear conv fast path is unavailable.\n");
+                    convOutput.Reshape(
+                        {1, seqlen, convOutput.dims.back()});
+                } else if (batchedConvSequence) {
                     int requestSeqLen = batchedUniformPrefill ?
                         uniformPrefillSeqLen : seqLens[0];
                     qkvConvInput.Reshape(
@@ -8302,11 +8361,13 @@ namespace fastllm {
                 Data batchPrefillRecurrentState;
                 std::vector<Data*> batchPrefillRecurrentStates;
                 Data *chunkPastValue = &pastValue;
-                if (batchedUniformPrefill) {
-                    convOutputForRecurrent->Reshape(
-                        {batch, uniformPrefillSeqLen,
-                         convOutputForRecurrent->dims.back()});
-                    batchPrefillRecurrentStates.resize(batch);
+                if (batchedPrefill) {
+                    if (batchedUniformPrefill) {
+                        convOutputForRecurrent->Reshape(
+                            {batch, uniformPrefillSeqLen,
+                             convOutputForRecurrent->dims.back()});
+                    }
+                    batchPrefillRecurrentStates.reserve(batch);
                     for (int rb = 0; rb < batch; rb++) {
                         Data *state = pastKeyValues[rb * block_cnt + i].second;
                         AssertInFastLLM(state != nullptr,
@@ -8324,7 +8385,7 @@ namespace fastllm {
                                 Qwen35EnsureCudaLinearAttnStateKVLayout(*state),
                                 "Qwen3.5 batched prefill cannot restore recurrent state layout.\n");
                         }
-                        batchPrefillRecurrentStates[rb] = state;
+                        batchPrefillRecurrentStates.push_back(state);
                     }
                     CatBatchFirstDim(batchPrefillRecurrentStates,
                                      batchPrefillRecurrentState);
@@ -8354,6 +8415,7 @@ namespace fastllm {
                     Data *pkk = nullptr, *pvv = nullptr;
                     Data *pbb = nullptr, *pgg = nullptr;
                     bool fusedPostConv = false;
+                    bool packedRagged = false;
                     bool normalizedBeforeRepeat = false;
 #ifdef USE_CUDA
                     if (batchedUniformPrefill) {
@@ -8381,6 +8443,44 @@ namespace fastllm {
                                 qq, kkPad, vvPad, ggPad, bbPad,
                                 kBeta, vBeta);
                     }
+                    if (batchedRaggedPrefill) {
+                        if (num_v_heads / num_k_heads > 1) {
+                            Qwen35CudaMul(cudaRunner, q, 1.0f, qRepeat);
+                            Qwen35CudaMul(cudaRunner, k, 1.0f, kRepeat);
+                            qRepeat.Resize({q.dims[0], q.dims[1],
+                                            q.dims[2], 1, q.dims[3]});
+                            kRepeat.Resize({k.dims[0], k.dims[1],
+                                            k.dims[2], 1, k.dims[3]});
+                            Qwen35CudaRepeat(cudaRunner, qRepeat, 3,
+                                            num_v_heads / num_k_heads, q);
+                            Qwen35CudaRepeat(cudaRunner, kRepeat, 3,
+                                            num_v_heads / num_k_heads, k);
+                            q.Reshape({q.dims[0], q.dims[1], -1,
+                                       q.dims.back()});
+                            k.Reshape({k.dims[0], k.dims[1], -1,
+                                       k.dims.back()});
+                        }
+                        Qwen3CudaRMSNorm(
+                            cudaRunner, q,
+                            *requireLocal(inv_scale_data,
+                                          "linear_attn.inv_scale"),
+                            rms_norm_eps, q);
+                        Qwen3CudaRMSNorm(
+                            cudaRunner, k,
+                            *requireLocal(inv_scale_data,
+                                          "linear_attn.inv_scale"),
+                            rms_norm_eps, k);
+                        normalizedBeforeRepeat = true;
+                        packedRagged =
+                            FastllmCudaPackRaggedGdnPrefillFloat16(
+                                q, k, v, b, g, seqLens,
+                                raggedPrefillPaddedSeqLen,
+                                1.0f / std::sqrt((float)head_k_dim),
+                                qq, kkPad, vvPad, bbPad, ggPad);
+                        AssertInFastLLM(
+                            packedRagged,
+                            "Qwen3.5 failed to pack ragged GDN prefill.\n");
+                    }
 #endif
                     if (fusedPostConv) {
                         keyBatchSize = batch;
@@ -8388,6 +8488,16 @@ namespace fastllm {
                         keyKHeadDim = head_k_dim;
                         seq = uniformPrefillSeqLen;
                         padSize = (chunkSize - seq % chunkSize) % chunkSize;
+                        pkk = &kkPad;
+                        pvv = &vvPad;
+                        pbb = &bbPad;
+                        pgg = &ggPad;
+                    } else if (packedRagged) {
+                        keyBatchSize = batch;
+                        keySequenceLength = localValueHeads;
+                        keyKHeadDim = head_k_dim;
+                        seq = raggedPrefillPaddedSeqLen;
+                        padSize = 0;
                         pkk = &kkPad;
                         pvv = &vvPad;
                         pbb = &bbPad;
@@ -8499,14 +8609,23 @@ namespace fastllm {
                                                          *chunkPastValue, coreAttnOut);
                     coreAttnOut.Reshape({coreAttnOut.dims[0], coreAttnOut.dims[1],
                                          -1, coreAttnOut.dims.back()});
-                    if (padSize > 0) {
+                    if (packedRagged) {
+                        bool unpacked =
+                            FastllmCudaUnpackRaggedGdnPrefillFloat16(
+                                coreAttnOut, seqLens, coreTemp);
+                        AssertInFastLLM(
+                            unpacked,
+                            "Qwen3.5 failed to unpack ragged GDN prefill.\n");
+                        Qwen35CudaMul(
+                            cudaRunner, coreTemp, 1.0f, coreAttnOut);
+                    } else if (padSize > 0) {
                         Qwen3CudaSplit(cudaRunner, coreAttnOut, 2, 0, seq, coreTemp);
                         Qwen3CudaPermuteSelf(cudaRunner, coreTemp, {0, 2, 1, 3});
                         Qwen35CudaMul(cudaRunner, coreTemp, 1.0f, coreAttnOut);
                     } else {
                         Qwen3CudaPermuteSelf(cudaRunner, coreAttnOut, {0, 2, 1, 3});
                     }
-                    if (batchedUniformPrefill) {
+                    if (batchedPrefill) {
                         bool recurrentStateTransposed = false;
                         if (Qwen35TransposedBatchDecodeEnabled()) {
                             recurrentStateTransposed =
@@ -9220,16 +9339,16 @@ namespace fastllm {
                 (int)pastKeyValues.size() < batch * block_cnt) {
                 return false;
             }
-            int commonSeqLen = seqLens[0];
-            if (commonSeqLen <= 1 ||
-                commonSeqLen > QWEN35_BATCH_PREFILL_SEQ_MAX) {
-                return false;
-            }
             int totalTokens = 0;
+            int maxSeqLen = 0;
+            bool uniform = true;
             for (int b = 0; b < batch; b++) {
-                if (seqLens[b] != commonSeqLen) {
+                if (seqLens[b] <= 1 ||
+                    seqLens[b] > QWEN35_BATCH_PREFILL_SEQ_MAX) {
                     return false;
                 }
+                maxSeqLen = std::max(maxSeqLen, seqLens[b]);
+                uniform &= seqLens[b] == seqLens[0];
                 totalTokens += seqLens[b];
                 for (int i = 0; i < block_cnt; i++) {
                     Data *pastKey = pastKeyValues[b * block_cnt + i].first;
@@ -9237,15 +9356,22 @@ namespace fastllm {
                     if (pastKey == nullptr || pastValue == nullptr) {
                         return false;
                     }
-                    // The conservative fast path handles initial prefill.  A
+                    bool isLinearLayer = linearAttentionLayers[i] != 0;
+                    // The conservative fast path handles initial prefill. A
                     // continued or chunked request keeps the established
                     // request-local path until its cache semantics are
                     // covered explicitly.
-                    bool isLinearLayer = linearAttentionLayers[i] != 0;
                     if (isLinearLayer &&
                         (!pastKey->dims.empty() || !pastValue->dims.empty())) {
                         return false;
                     }
+                }
+            }
+            int paddedSeqLen = ((maxSeqLen + 63) / 64) * 64;
+            if (!uniform) {
+                if ((long long)batch * paddedSeqLen >
+                    (long long)totalTokens * 2) {
+                    return false;
                 }
             }
             return inputIds.dims.size() == 2 && inputIds.dims[0] == 1 &&
