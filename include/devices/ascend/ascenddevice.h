@@ -33,18 +33,19 @@ namespace fastllm {
     public:
         BaseAscendOperator() {}
         BaseAscendOperator(std::string name) : name(name) {}
+        virtual ~BaseAscendOperator();
         // 是否可以运行某一个算子
         virtual bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         // 不编译，直接运行一个算子
         bool RunSingleOp(const std::string &opType, const OrderedData &inputData,
-                         const DataDict &outputData, const FloatDict &floatParams,
+                         const OrderedData &outputData, const FloatDict &floatParams,
                          const IntDict &intParams, const BoolDict &boolParams);
         // 动态shape编译，并运行一个算子
-        bool CompileAndRunSingleOp(const std::string &opType, const OrderedData &inputData, const fastllm::DataDict &outputData,
+        bool CompileAndRunSingleOp(const std::string &opType, const OrderedData &inputData, const OrderedData &outputData,
                                    const DynamicShapeDict &dynamicShapes, const FloatDict &floatParams,
                                    const IntDict &intParams, const BoolDict &boolParams);
     protected:
-        bool warmUpMode;
+        bool warmUpMode = false;
         bool deviceOk = true;
         std::string name;
     };

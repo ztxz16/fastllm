@@ -42,8 +42,10 @@ namespace fastllm {
         return result == 0;
     }
 
+    BaseAscendOperator::~BaseAscendOperator() {}
+
     bool BaseAscendOperator::RunSingleOp(const std::string &opType, const fastllm::OrderedData &inputData,
-                                         const fastllm::DataDict &outputData, const fastllm::FloatDict &floatParams,
+                                         const OrderedData &outputData, const fastllm::FloatDict &floatParams,
                                          const fastllm::IntDict &intParams, const std::map <std::string, bool> &boolParams) {
         std::vector<aclTensorDesc *> inputTensors;
         std::vector<aclDataBuffer *> inputBuffers;
@@ -61,7 +63,7 @@ namespace fastllm {
         return result;
     }
 
-    bool BaseAscendOperator::CompileAndRunSingleOp(const std::string &opType, const OrderedData &inputData, const fastllm::DataDict &outputData,
+    bool BaseAscendOperator::CompileAndRunSingleOp(const std::string &opType, const OrderedData &inputData, const OrderedData &outputData,
                                                    const DynamicShapeDict &dynamicShapes, const FloatDict &floatParams,
                                                    const IntDict &intParams, const BoolDict &boolParams) {
         std::vector<aclTensorDesc *> inputTensors;
@@ -187,10 +189,6 @@ namespace fastllm {
             orderedInputData.push_back(std::make_pair("bias", &bias));
         }
 
-        // 构建输出数据映射
-        fastllm::DataDict outputData;
-        outputData["y"] = &fakeReshapedOutput;
-
         // 构建动态形状信息（用于warmup模式）
         DynamicShapeDict dynamicShapes;
         if (warmUpMode) {
@@ -204,14 +202,14 @@ namespace fastllm {
         BoolDict boolParams = {{"adj_x1", false}, {"adj_x2", true}};
         if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT16) {
-                deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, outputData,
+                deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, {{"y", &fakeReshapedOutput}},
                                                 dynamicShapes, {}, {}, boolParams);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else if (input.dataType == DataType::FLOAT32) {
             if (weight.dataType == DataType::FLOAT32 || weight.dataType == DataType::FLOAT16) {
-                deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, outputData,
+                deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, {{"y", &fakeReshapedOutput}},
                                                 dynamicShapes, {}, {}, boolParams);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
