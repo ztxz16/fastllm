@@ -144,6 +144,12 @@ namespace fastllm {
         return env == nullptr || !Qwen35MoeIsTrueString(env);
     }
 
+    static bool Qwen35SinglePrefillFusedConvEnabled() {
+        const char *env =
+            std::getenv("FASTLLM_QWEN35_DISABLE_SINGLE_PREFILL_FUSED_CONV");
+        return env == nullptr || !Qwen35MoeIsTrueString(env);
+    }
+
     static bool Qwen35ShardedGreedyEnabled() {
         const char *env =
             std::getenv("FASTLLM_QWEN35_DISABLE_SHARDED_GREEDY");
@@ -7787,10 +7793,18 @@ namespace fastllm {
                     speculativeCollectAllLogits &&
                     speculativeCaptureFirstTokenLinearState &&
                     batch > 1 && !all1 && bsz == 1;
+                bool singleUniformPrefill =
+                    isPrefill && batch == 1 && !all1 &&
+                    !speculativeCollectAllLogits &&
+                    computeType == DataType::FLOAT16 &&
+                    (int)seqLens.size() == 1 && bsz == 1 &&
+                    seqLens[0] == seqlen && seqlen > 1 &&
+                    seqlen <= QWEN35_BATCH_PREFILL_SEQ_MAX;
                 bool batchedUniformPrefill =
                     batch > 1 && !all1 && !speculativeCollectAllLogits &&
                     (int)seqLens.size() == batch && bsz == 1;
-                int uniformPrefillSeqLen = batchedUniformPrefill ? seqLens[0] : 0;
+                int uniformPrefillSeqLen = singleUniformPrefill ?
+                    seqlen : (batchedUniformPrefill ? seqLens[0] : 0);
                 int uniformPrefillTotalTokens = 0;
                 if (batchedUniformPrefill) {
                     for (int len : seqLens) {
@@ -7831,6 +7845,8 @@ namespace fastllm {
                 }
                 bool batchedPrefill =
                     batchedUniformPrefill || batchedRaggedPrefill;
+                bool uniformPrefill =
+                    singleUniformPrefill || batchedUniformPrefill;
                 bool keepCombinedBaForBatchRecurrent = batch > 1 && all1;
                 bool keepCombinedBa =
                     keepCombinedBaForSmallDecode ||
@@ -7887,6 +7903,9 @@ namespace fastllm {
                 bool batchedSpeculativeSequence =
                     keepCombinedBaForBatchSpeculative &&
                     (int)seqLens.size() == batch;
+                bool singleFusedConvPrefill =
+                    singleUniformPrefill &&
+                    Qwen35SinglePrefillFusedConvEnabled();
                 int batchedSpeculativeTotalTokens = 0;
                 Data *qkvConvInputForConv = &qkvConvInput;
                 if (batchedSpeculativeSequence) {
@@ -7905,9 +7924,11 @@ namespace fastllm {
                          expectedCaptureSlots <= speculativeLinearStateCaptureSlots);
                 }
                 bool batchedConvSequence =
-                    batchedSpeculativeSequence || batchedPrefill;
+                    batchedSpeculativeSequence || batchedPrefill ||
+                    singleFusedConvPrefill;
                 bool tokenMajorBatchPrefill =
-                    batchedPrefill && !batchedSpeculativeSequence;
+                    (batchedPrefill || singleFusedConvPrefill) &&
+                    !batchedSpeculativeSequence;
                 if (batchedConvSequence) {
                     // Keep the flattened token-major projection. Each request
                     // is handled independently before its cache update.
@@ -8394,7 +8415,7 @@ namespace fastllm {
                 auto runChunkLinearAttention = [&]() {
                     ensureConvQkvSplit();
                     ensureBaSplit();
-                    if (batchedUniformPrefill) {
+                    if (uniformPrefill) {
                         b.Reshape({batch, uniformPrefillSeqLen, b.dims.back()});
                         a.Reshape({batch, uniformPrefillSeqLen, a.dims.back()});
                     }
@@ -8418,7 +8439,7 @@ namespace fastllm {
                     bool packedRagged = false;
                     bool normalizedBeforeRepeat = false;
 #ifdef USE_CUDA
-                    if (batchedUniformPrefill) {
+                    if (uniformPrefill) {
                         // RMSNorm is row-local. Normalize the key-head tensors
                         // before repeating them so the native fallback remains
                         // bit-stable while doing only one third of the work.

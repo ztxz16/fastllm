@@ -1892,9 +1892,9 @@ namespace fastllm {
             return false;
         }
         int minBatch = CudaEnvIntRange(
-            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MIN_BATCH", 8, 1, 4096);
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MIN_BATCH", 1, 1, 4096);
         int maxChunks = CudaEnvIntRange(
-            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MAX_CHUNKS", 8, 1, 256);
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MAX_CHUNKS", 64, 1, 256);
         if (batch < minBatch || chunks > maxChunks) {
             return false;
         }
@@ -1990,10 +1990,10 @@ namespace fastllm {
         }
         int minBatch = CudaEnvIntRange(
             "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV_MIN_BATCH",
-            8, 1, 4096);
+            1, 1, 4096);
         int maxChunks = CudaEnvIntRange(
             "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV_MAX_CHUNKS",
-            8, 1, 256);
+            64, 1, 256);
         if (batch < minBatch || chunks > maxChunks) {
             return false;
         }
