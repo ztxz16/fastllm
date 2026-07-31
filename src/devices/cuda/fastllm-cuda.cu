@@ -7802,7 +7802,10 @@ __global__ void FastllmCudaMaskAndRemapExpertsKernel(int32_t *index, float *scor
     if (expert >= expertStart && expert < expertEnd) {
         index[tid] = expert - expertStart;
     } else {
-        index[tid] = 0;
+        // All fused local-expert backends treat a negative id as an inactive
+        // route.  Keeping expert 0 here would still run its full gate/up and
+        // down projections before the zero score discarded the result.
+        index[tid] = -1;
         score[tid] = 0.0f;
     }
 }

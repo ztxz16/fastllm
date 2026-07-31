@@ -971,6 +971,34 @@ namespace {
         }
     }
 
+    void RunCudaLocalExpertRangeMaskRegression() {
+        const std::vector<int32_t> routeIndices = {
+            -1, 0, 31, 32, 47, 63, 64, 255
+        };
+        const std::vector<float> routeScores = {
+            0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.30f, 0.35f, 0.40f
+        };
+        fastllm::Data index = MakeIntTensor({1, (int)routeIndices.size()}, routeIndices);
+        fastllm::Data score(
+            fastllm::DataType::FLOAT32,
+            {1, (int)routeScores.size()}, routeScores);
+        index.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        score.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+
+        Expect(FastllmCudaMaskAndRemapExpertsForLocalRange(index, score, 32, 64),
+               "CUDA local expert range mask rejected valid inputs.");
+        const std::vector<int32_t> expectedIndices = {
+            -1, -1, -1, 0, 15, 31, -1, -1
+        };
+        const std::vector<float> expectedScores = {
+            0.0f, 0.0f, 0.0f, 0.20f, 0.25f, 0.30f, 0.0f, 0.0f
+        };
+        Expect(ToIntVector(index) == expectedIndices,
+               "CUDA local expert range mask produced incorrect local ids.");
+        ExpectFloatNear(expectedScores, ToFloatVector(score), 0.0f, 0.0f,
+                        "CUDA local expert range mask scores");
+    }
+
     void ExpectCudaTensorMeta(const fastllm::Data &data, fastllm::DataType dataType,
                               const std::vector<int> &dims, const std::string &name) {
         Expect(data.dataType == dataType, name + " dtype mismatch");
@@ -5637,6 +5665,13 @@ int main() {
 
         RunYarnRopeEncodingRegression();
         std::cout << "direct YaRN RoPE cached-reference regression: PASS\n";
+
+#ifdef USE_CUDA
+        if (fastllm::HasDeviceType("cuda")) {
+            RunCudaLocalExpertRangeMaskRegression();
+            std::cout << "cuda local expert range mask regression: PASS\n";
+        }
+#endif
 
         if (fastllm::HasDeviceType("cpu")) {
             RunBFloat16Q8KConversionRegression();

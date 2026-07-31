@@ -557,6 +557,8 @@ bool FastllmCudaFusedSoftmaxSelectExpert(const fastllm::Data &logits, const fast
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
 bool FastllmCudaFusedSigmoidSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias,
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
+// Remap global expert ids in [expertStart, expertEnd) to local ids. Remote slots
+// become index -1 with score 0 so fused MoE kernels can skip them entirely.
 bool FastllmCudaMaskAndRemapExpertsForLocalRange(fastllm::Data &index, fastllm::Data &score,
                                                  int expertStart, int expertEnd);
 bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis);

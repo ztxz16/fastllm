@@ -2121,7 +2121,9 @@ namespace fastllm {
                 if (expert >= expertStart && expert < expertEnd) {
                     indexData[i] = expert - expertStart;
                 } else {
-                    indexData[i] = 0;
+                    // The fused local-expert kernels use a negative index as
+                    // the inactive-route sentinel and skip its projections.
+                    indexData[i] = -1;
                     scoreData[i] = 0.0f;
                 }
             }
