@@ -26,6 +26,9 @@ from fastllm_pytools.openai_server.protocal.anthropic_protocol import (
 
 
 class FakeModel:
+    def __init__(self):
+        self.aborted_handles = []
+
     def get_response_statistics(self, handle):
         return {
             "cached_input_tokens": 8,
@@ -44,7 +47,7 @@ class FakeModel:
         return generator()
 
     def abort_handle(self, handle):
-        pass
+        self.aborted_handles.append(handle)
 
 
 class LegacyStreamModel(FakeModel):
@@ -103,6 +106,128 @@ def test_usage_protocol_mappings():
         "cache_read_input_tokens": 8,
         "output_tokens": 2,
     }
+
+
+def test_captured_terminal_usage_wins_over_reused_handle():
+    completion = make_completion()
+    terminal_statistics = {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 512,
+        "output_tokens": 128,
+    }
+
+    # FakeModel.get_response_statistics() represents a different request that
+    # has already reused the same integer handle.
+    usage = completion._chat_usage(1, terminal_statistics, 512, 128)
+    assert usage.prompt_tokens == 512
+    assert usage.completion_tokens == 128
+    assert usage.total_tokens == 640
+
+
+def test_stream_background_cleanup_does_not_abort_reused_handle():
+    async def run_test():
+        completion = make_completion()
+        raw_request = RawRequest()
+
+        # The old request completed and removed its request_id.  A new request
+        # now owns the same recycled integer handle.
+        completion.conversation_handles["new-request"] = 7
+        await completion.check_disconnect(raw_request, "old-request", 7)
+        assert completion.model.aborted_handles == []
+        assert completion.conversation_handles == {"new-request": 7}
+
+        # A disconnected request is still tracked and must be aborted exactly
+        # once, then removed from the active map.
+        completion.conversation_handles["active-request"] = 8
+        await completion.check_disconnect(raw_request, "active-request", 8)
+        assert completion.model.aborted_handles == [8]
+        assert "active-request" not in completion.conversation_handles
+
+    asyncio.run(run_test())
+
+
+def test_terminal_stream_event_releases_handle_before_yield():
+    async def run_test():
+        completion = make_completion()
+        raw_request = RawRequest()
+        stream_request = ChatCompletionRequest(
+            model="test-model", messages=[], stream=True, max_tokens=16)
+
+        completion.conversation_handles["old-request"] = 7
+        stream = completion.chat_completion_stream_generator(
+            stream_request, raw_request, model_deltas(),
+            "old-request", 12, False, handle=7,
+            response_statistics={})
+        async for event in stream:
+            if '"usage"' not in event:
+                continue
+            assert "old-request" not in completion.conversation_handles
+
+            # The terminal backend context has already released handle 7.  A
+            # new request may reuse it before the old client consumes [DONE].
+            completion.conversation_handles["new-request"] = 7
+            await completion.check_disconnect(
+                raw_request, "old-request", 7)
+            assert completion.model.aborted_handles == []
+            assert completion.conversation_handles == {"new-request": 7}
+            await stream.aclose()
+            break
+
+        anthropic_request = AnthropicMessageRequest(
+            model="test-model",
+            messages=[AnthropicInputMessage(role="user", content="hello")],
+            max_tokens=16,
+            stream=True,
+        )
+        completion.conversation_handles["old-anthropic"] = 8
+        anthropic_stream = completion.anthropic_message_stream_generator(
+            anthropic_request, raw_request, model_deltas(),
+            "old-anthropic", 12, None, handle=8,
+            response_statistics={})
+        async for event in anthropic_stream:
+            if '"type":"message_delta"' not in event:
+                continue
+            assert "old-anthropic" not in completion.conversation_handles
+            completion.conversation_handles["new-anthropic"] = 8
+            await completion.check_disconnect(
+                raw_request, "old-anthropic", 8)
+            assert completion.model.aborted_handles == []
+            assert completion.conversation_handles == {
+                "new-request": 7,
+                "new-anthropic": 8,
+            }
+            await anthropic_stream.aclose()
+            break
+
+    asyncio.run(run_test())
+
+
+def test_early_stream_stop_aborts_owned_handle_before_final_yield():
+    async def stopped_deltas():
+        yield "visible<stop>hidden"
+        yield "must not be consumed"
+
+    async def run_test():
+        completion = make_completion()
+        raw_request = RawRequest()
+        request = ChatCompletionRequest(
+            model="test-model", messages=[], stream=True, max_tokens=16,
+            stop="<stop>")
+        completion.conversation_handles["stopped-request"] = 9
+        stream = completion.chat_completion_stream_generator(
+            request, raw_request, stopped_deltas(),
+            "stopped-request", 12, False, handle=9,
+            response_statistics={})
+
+        async for event in stream:
+            if '"usage"' not in event:
+                continue
+            assert completion.model.aborted_handles == [9]
+            assert "stopped-request" not in completion.conversation_handles
+            await stream.aclose()
+            break
+
+    asyncio.run(run_test())
 
 
 def test_stream_adapter_supports_new_and_legacy_models():
@@ -227,6 +352,10 @@ def test_stream_and_nonstream_include_native_usage():
 
 if __name__ == "__main__":
     test_usage_protocol_mappings()
+    test_captured_terminal_usage_wins_over_reused_handle()
+    test_stream_background_cleanup_does_not_abort_reused_handle()
+    test_terminal_stream_event_releases_handle_before_yield()
+    test_early_stream_stop_aborts_owned_handle_before_final_yield()
     test_stream_adapter_supports_new_and_legacy_models()
     test_stream_and_nonstream_include_native_usage()
     print("usage accounting tests passed")

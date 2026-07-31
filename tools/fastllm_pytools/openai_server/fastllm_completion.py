@@ -1790,8 +1790,18 @@ class FastLLmCompletion:
       fallback_output_tokens: int,
   ) -> Tuple[int, int, int, int]:
       statistics = dict(response_statistics or {})
+      # FetchResponseTokens removes a finished context, and handle ids are
+      # reused immediately.  The streaming adapter captures the terminal
+      # counters before that removal, so a complete captured snapshot is more
+      # authoritative than a later lookup by handle.  Looking the handle up
+      # again can otherwise read counters from an unrelated, newly launched
+      # request (the classic handle ABA problem).
+      has_captured_statistics = all(
+          key in statistics for key in (
+              "cached_input_tokens", "missed_input_tokens", "output_tokens"))
       get_statistics = getattr(self.model, "get_response_statistics", None)
-      if handle is not None and callable(get_statistics):
+      if (not has_captured_statistics and handle is not None
+              and callable(get_statistics)):
           latest = get_statistics(handle)
           if latest is not None:
               statistics.update(latest)
@@ -2749,18 +2759,31 @@ class FastLLmCompletion:
           except ValueError as e:
               return self.create_error_response(str(e))
 
-  async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # 进入BackgroundTask之后，说明流式请求已经断开了，那么这里直接abort
+  def _release_conversation_handle(
+      self, request_id: str, handle: Optional[int]
+  ) -> bool:
+    if handle is None or self.conversation_handles.get(request_id) != handle:
+      return False
+    self.conversation_handles.pop(request_id, None)
+    return True
+
+  def _abort_conversation_handle(
+      self, request_id: str, handle: Optional[int]
+  ) -> bool:
+    if not self._release_conversation_handle(request_id, handle):
+      return False
     self.model.abort_handle(handle)
-    logging.info(f"Abort request: {request_id}")
-    return
-  
-    while True:
-      if await raw_request.is_disconnected():
-        self.model.abort_handle(handle)
-        logging.info(f"Abort request: {request_id}")
-        return
-      await asyncio.sleep(1)  # 检查间隔
+    return True
+
+  async def check_disconnect(self, raw_request: Request, request_id, handle: int):
+    # Starlette runs a StreamingResponse BackgroundTask after both a normal
+    # completion and a client disconnect.  A naturally exhausted generator
+    # releases ownership before its terminal SSE is yielded.  Only an
+    # interrupted generator remains active here, so abort it while the
+    # request_id still owns the integer handle.
+    if not self._abort_conversation_handle(request_id, handle):
+      return
+    logging.info(f"Abort disconnected request: {request_id}")
       
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
@@ -2952,6 +2975,7 @@ class FastLLmCompletion:
             "content_done": False,
         }
 
+        stream_exhausted = False
         async for res in result_generator:
             res = self._normalize_model_delta(res)
             completion_tokens += 1
@@ -3053,6 +3077,18 @@ class FastLLmCompletion:
             if stopped_by_stop_string:
                 break
             #await asyncio.sleep(0)
+        else:
+            stream_exhausted = True
+
+        # FetchResponseTokens removes a terminal backend context, so its
+        # integer handle can be reused immediately.  Drop request ownership in
+        # the same event-loop turn, before yielding any final content/usage
+        # event.  An early server-side stop has not exhausted the backend and
+        # must be aborted explicitly before ownership is released.
+        if stream_exhausted:
+            self._release_conversation_handle(request_id, handle)
+        elif self._abort_conversation_handle(request_id, handle):
+            logging.info(f"Abort early-terminated request: {request_id}")
 
         if (not request.tools) and not stopped_by_stop_string:
             delta_text = self._flush_stop_buffer(stop_strings, stop_filter_state)
@@ -3186,15 +3222,12 @@ class FastLLmCompletion:
                 yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
+        if self._abort_conversation_handle(request_id, handle):
+          logging.info(f"Abort failed streaming request: {request_id}")
         data = self.create_streaming_error_response(str(e))
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
-      
-      # After completion, remove the conversation from tracking dictionary
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
-          # logging.info(f"Removed completed stream conversation from tracking: {request_id}")
-      
+
       yield "data: [DONE]\n\n"
       await asyncio.sleep(0)
 
@@ -3391,6 +3424,11 @@ class FastLLmCompletion:
                                   partial_json = tool_delta.function.arguments),
                           ))
 
+          # Release the terminal handle before any closing SSE is yielded.  A
+          # client cancellation after message_delta/message_stop must not let
+          # the old BackgroundTask abort a newly recycled numeric handle.
+          self._release_conversation_handle(request_id, handle)
+
           if text_block_index is not None:
               yield self._create_anthropic_sse_event(
                   "content_block_stop",
@@ -3418,6 +3456,8 @@ class FastLLmCompletion:
               "message_stop",
               MessageStopEvent())
       except ValueError as e:
+          if self._abort_conversation_handle(request_id, handle):
+              logging.info(f"Abort failed Anthropic streaming request: {request_id}")
           error_data = json.dumps({
               "type": "error",
               "error": {
@@ -3427,9 +3467,6 @@ class FastLLmCompletion:
           })
           yield f"event: error\ndata: {error_data}\n\n"
           await asyncio.sleep(0)
-
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
 
       await asyncio.sleep(0)
       
