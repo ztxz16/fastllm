@@ -353,6 +353,12 @@ namespace fastllm {
             return -1;
         }
 
+        // Some direct GPU paths keep the page ids of logically bounded caches
+        // aligned with token-growing layers (for example during CUDA Graph
+        // replay).  Such caches must be charged as token-growing storage even
+        // though attention and the generic path still use a bounded tail.
+        virtual bool BoundedKVCacheUsesTokenGrowingStorage() const { return false; }
+
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
