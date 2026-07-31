@@ -3248,7 +3248,6 @@ namespace fastllm {
         std::vector<const Data*> currentPastKeyHosts(batch, nullptr);
         std::vector<char> needNewPage(batch, 0);
         bool anyNewPage = false;
-        int maxActualPagesPerRequest = 1;
 
         for (int b = 0; b < batch; b++) {
             Data *firstKey = pastKeyValues[b * block_cnt].first;
@@ -3355,7 +3354,6 @@ namespace fastllm {
             int requestPages = (int)firstKey->pageIndex.size();
             AssertInFastLLM(requestPages <= graphMaxPagesPerRequest,
                             "Step3p5 CUDA graph page metadata exceeds captured capacity.\n");
-            maxActualPagesPerRequest = std::max(maxActualPagesPerRequest, requestPages);
             pageSizesHost[b + 1] = pageSizesHost[b] + requestPages;
             pageIndexHost.insert(pageIndexHost.end(),
                                  firstKey->pageIndex.begin(), firstKey->pageIndex.end());
@@ -3372,13 +3370,13 @@ namespace fastllm {
                                 "Step3p5 CUDA graph requires aligned paged cache pages across layers.\n");
             }
         }
-        int graphPlanPagesPerRequest = 1;
-        while (graphPlanPagesPerRequest < maxActualPagesPerRequest &&
-               graphPlanPagesPerRequest < graphMaxPagesPerRequest) {
-            graphPlanPagesPerRequest <<= 1;
-        }
-        graphPlanPagesPerRequest = std::min(graphPlanPagesPerRequest, graphMaxPagesPerRequest);
-        int pageIndexCapacity = batch * graphPlanPagesPerRequest;
+        // Keep page-index storage fixed for the graph lifetime.  FlashInfer's
+        // dynamic decode plan reads the actual page indptr from pageSizes, so
+        // unused entries in the padded pageIndexs buffer are never consumed.
+        // Using the current request's page count here would change the graph
+        // signature at every power-of-two boundary and force recapture.
+        const int graphPlanPagesPerRequest = graphMaxPagesPerRequest;
+        const int pageIndexCapacity = batch * graphPlanPagesPerRequest;
 
         std::ostringstream signature;
         signature << "gpu=" << gpuId
@@ -3394,8 +3392,8 @@ namespace fastllm {
             signature << dim << ",";
         }
         // The FlashInfer tile schedule is rebuilt from the device page indptr
-        // by a kernel captured ahead of attention.  Exact page counts no longer
-        // affect graph topology; only page-index storage capacity does.
+        // by a kernel captured ahead of attention.  Exact page counts do not
+        // affect graph topology; the configured maximum fixes storage capacity.
         signature << ";pages=" << pageIndexCapacity
                   << ";inputType=" << (int)state.inputIds.dataType
                   << ";posType=" << (int)state.positionIds.dataType
