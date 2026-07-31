@@ -320,6 +320,7 @@ if (USE_CUDA)
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
         src/devices/cuda/attention/paged/fastllm-sm70-flash-attention.cu
+        src/devices/cuda/attention/paged/fastllm-turboquant-kv.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu

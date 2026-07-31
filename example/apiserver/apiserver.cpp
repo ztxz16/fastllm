@@ -790,7 +790,7 @@ void Usage() {
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<--atype> <args>:             设置推理使用的数据类型(float32/float16)" << std::endl;
-    std::cout << "<--kv_cache_dtype> <args>:    设置KV Cache数据类型(auto/float32/float16/bfloat16/fp8_e4m3)" << std::endl;
+    std::cout << "<--kv_cache_dtype> <args>:    设置KV Cache数据类型(auto/float32/float16/bfloat16/fp8_e4m3/turbo3; Qwen3.5/3.6 turbo3 uses q8_0 K + TurboQuant3 V)" << std::endl;
     std::cout << "<--batch> <args>:             最大batch数" << std::endl;
     std::cout << "<--tokens> <args>:            最大tokens容量" << std::endl;
     std::cout << "<--model_name> <args>:        模型名(openai api中使用)" << std::endl;

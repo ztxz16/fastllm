@@ -75,7 +75,7 @@ namespace fastllm {
 
         ~ResponseContext();
 
-        void Init(int blocks, DataType dataType, DataType kvCacheDataType);
+        void Init(basellm *model);
         void TryRecord(basellm *model);
         void TryRecordPagedCache(basellm *model);
     };
@@ -397,6 +397,10 @@ namespace fastllm {
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const;
+        virtual std::pair<DataType, DataType> GetKVCacheDataTypes(int layerIndex) const {
+            (void)layerIndex;
+            return {this->kvCacheDataType, this->kvCacheDataType};
+        }
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;

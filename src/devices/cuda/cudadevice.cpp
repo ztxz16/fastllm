@@ -6406,8 +6406,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
                         cache.dataType == DataType::FLOAT16 ||
                         cache.dataType == DataType::BFLOAT16 ||
-                        cache.dataType == DataType::FP8_E4M3,
-                        "CudaAppendPagedCacheOp's cache's type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+                        cache.dataType == DataType::FP8_E4M3 ||
+                        IsPackedKVCacheDataType(cache.dataType),
+                        "CudaAppendPagedCacheOp's cache type should be float32, float16, bfloat16, fp8_e4m3 or packed KV.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16 ||
                         input.dataType == DataType::BFLOAT16,
@@ -6573,8 +6574,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         AssertInFastLLM(((Data*)&manager)->dataType == DataType::FLOAT32 ||
                         ((Data*)&manager)->dataType == DataType::FLOAT16 ||
                         ((Data*)&manager)->dataType == DataType::BFLOAT16 ||
-                        ((Data*)&manager)->dataType == DataType::FP8_E4M3,
-                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+                        ((Data*)&manager)->dataType == DataType::FP8_E4M3 ||
+                        IsPackedKVCacheDataType(((Data*)&manager)->dataType),
+                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16, fp8_e4m3 or packed KV.\n");
         AssertInFastLLM(input.dims.size() == 3,
                         "CudaAppendPagedCacheBatchOp's input should have 3 dimensions [batch, numHeads, headDim].\n");
         AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == input.dims[0],

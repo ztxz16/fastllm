@@ -124,6 +124,14 @@ namespace {
         int NumKeyValueHeads() const {
             return num_key_value_heads;
         }
+
+        void ConfigureTurbo3Fixture() {
+            head_dim = 256;
+            block_cnt = 2;
+            weight.AddEmptyWeight(
+                language_prefix + "layers.0.self_attn.o_proj.weight",
+                {1, 1}, fastllm::DataType::FLOAT32);
+        }
     };
 
 
@@ -795,6 +803,22 @@ namespace {
                "bfloat16 KV cache dtype was not parsed.");
         Expect(fastllm::ParseKVCacheDataType("fp8_e4m3") == fastllm::DataType::FP8_E4M3,
                "fp8_e4m3 KV cache dtype was not parsed.");
+        Expect(fastllm::ParseKVCacheDataType("turbo3") == fastllm::DataType::TURBO3_KV,
+               "turbo3 KV cache dtype was not parsed.");
+        Expect(fastllm::ResolveQwen35CudaCacheType(
+                   fastllm::DataType::Q8_0_KV, fastllm::DataType::FLOAT16) ==
+                   fastllm::DataType::Q8_0_KV,
+               "Qwen3.5 CUDA cache resolver downgraded Q8 packed K to FP16.");
+        Expect(fastllm::ResolveQwen35CudaCacheType(
+                   fastllm::DataType::TURBO3_KV, fastllm::DataType::FLOAT16) ==
+                   fastllm::DataType::TURBO3_KV,
+               "Qwen3.5 CUDA cache resolver downgraded Turbo3 packed V to FP16.");
+        Expect(fastllm::Qwen35PagedCachePageBytes(
+                   fastllm::DataType::Q8_0_KV, 128, 4, 256) == 139264,
+               "Qwen3.5 Q8 paged cache page bytes regressed.");
+        Expect(fastllm::Qwen35PagedCachePageBytes(
+                   fastllm::DataType::TURBO3_KV, 128, 4, 256) == 51200,
+               "Qwen3.5 Turbo3 paged cache page bytes regressed.");
 
         bool rejected = false;
         try {
@@ -814,6 +838,29 @@ namespace {
         Expect(model.useCustomKVCacheDataType &&
                model.kvCacheDataType == fastllm::DataType::FP8_E4M3,
                "explicit FP8 KV cache dtype was not preserved after F16 setup.");
+#endif
+#ifdef USE_CUDA
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_TURBO3_KV", nullptr);
+            Expect(!fastllm::Qwen35Turbo3KvEnabled(),
+                   "Qwen3.5 Turbo3 KV gate should default off.");
+        }
+        {
+            ScopedEnvVar enabled("FASTLLM_QWEN35_TURBO3_KV", "1");
+            Expect(fastllm::Qwen35Turbo3KvEnabled(),
+                   "Qwen3.5 Turbo3 KV gate ignored an explicit enable.");
+            Qwen35ConfigTestModel qwen;
+            qwen.ConfigureTurbo3Fixture();
+            qwen.SetKVCacheDataType(fastllm::DataType::TURBO3_KV);
+            auto attentionTypes = qwen.GetKVCacheDataTypes(0);
+            auto linearTypes = qwen.GetKVCacheDataTypes(1);
+            Expect(attentionTypes.first == fastllm::DataType::Q8_0_KV &&
+                   attentionTypes.second == fastllm::DataType::TURBO3_KV,
+                   "Qwen3.5 Turbo3 full-attention layer did not use asymmetric K/V dtypes.");
+            Expect(linearTypes.first == linearTypes.second &&
+                   !fastllm::IsPackedKVCacheDataType(linearTypes.first),
+                   "Qwen3.5 linear-attention layer should use a non-packed compute cache dtype.");
+        }
 #endif
     }
 
@@ -1577,6 +1624,287 @@ namespace {
                                  0.5f * std::cos((i + 3) * 0.043f - seed));
         }
         return values;
+    }
+
+    void ExpectPackedKvQuality(const std::vector<float> &expected,
+                               const std::vector<float> &actual,
+                               fastllm::DataType type,
+                               const std::string &name) {
+        Expect(expected.size() == actual.size(), name + " size mismatch.");
+        double dot = 0.0, expectedSq = 0.0, actualSq = 0.0, errorSq = 0.0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            Expect(std::isfinite(expected[i]) && std::isfinite(actual[i]),
+                   name + " contains a non-finite value at index " + std::to_string(i));
+            double e = expected[i], a = actual[i], d = e - a;
+            dot += e * a;
+            expectedSq += e * e;
+            actualSq += a * a;
+            errorSq += d * d;
+        }
+        double cosine = dot / std::sqrt(std::max(1.0e-30, expectedSq * actualSq));
+        double relativeRmse = std::sqrt(errorSq / std::max(1.0e-30, expectedSq));
+        if (type == fastllm::DataType::Q8_0_KV) {
+            Expect(cosine > 0.999 && relativeRmse < 0.015,
+                   name + " Q8 quality regression: cosine=" + std::to_string(cosine) +
+                   ", relative_rmse=" + std::to_string(relativeRmse));
+        } else {
+            Expect(cosine > 0.90 && relativeRmse < 0.45,
+                   name + " Turbo3 quality regression: cosine=" + std::to_string(cosine) +
+                   ", relative_rmse=" + std::to_string(relativeRmse));
+        }
+    }
+
+    void RunCudaTurbo3KvRegression() {
+        using fastllm::DataType;
+        constexpr int pageLen = 3;
+        constexpr int maxPages = 3;
+        constexpr int numHeads = 2;
+        constexpr int headDim = 256;
+        constexpr int seqLen = 5;
+        FastllmCudaSetDevice(0);
+
+        Expect(fastllm::GetKVCacheRowBytes(DataType::Q8_0_KV, headDim) == 272,
+               "Q8 KV row bytes changed.");
+        Expect(fastllm::GetKVCacheRowBytes(DataType::TURBO3_KV, headDim) == 100,
+               "Turbo3 KV row bytes changed.");
+        Expect(fastllm::GetKVCacheRowBytes(DataType::Q8_0_KV, 257) == 306,
+               "Q8 KV partial row did not round up by 32 values.");
+        Expect(fastllm::GetKVCacheRowBytes(DataType::TURBO3_KV, 257) == 150,
+               "Turbo3 KV partial row did not round up by 128 values.");
+
+        std::vector<float> sourceValues = MakeRegressionValues(
+            numHeads * seqLen * headDim, 1.713f, 0.7f);
+        fastllm::Data source(DataType::FLOAT32,
+                             {numHeads, seqLen, headDim}, sourceValues);
+        fastllm::ToDataType(source, DataType::FLOAT16);
+        source.ToDevice(fastllm::DataDevice::CUDA);
+
+        int32_t hostPages[2] = {0, 1};
+        int32_t *cudaPages = (int32_t*)FastllmCudaMalloc(sizeof(hostPages));
+        FastllmCudaCopyFromHostToDevice(cudaPages, hostPages, sizeof(hostPages));
+
+        auto runType = [&](DataType type) {
+            size_t rowBytes = fastllm::GetKVCacheRowBytes(type, headDim);
+            size_t packedBytes = (size_t)maxPages * pageLen * numHeads * rowBytes;
+            uint8_t *packed = (uint8_t*)FastllmCudaMalloc(packedBytes);
+            Expect(packed != nullptr, "packed KV allocation failed.");
+            Expect(cudaMemset(packed, 0, packedBytes) == cudaSuccess,
+                   "packed KV memset failed.");
+
+            Expect(FastllmCudaPackedKVCacheCopy(
+                       packed, 0, pageLen, numHeads, headDim, type,
+                       (uint8_t*)source.cudaData, source.dataType,
+                       seqLen, 0, 3, 0),
+                   "packed KV first prefill page write failed.");
+            Expect(FastllmCudaPackedKVCacheCopy(
+                       packed, 1, pageLen, numHeads, headDim, type,
+                       (uint8_t*)source.cudaData, source.dataType,
+                       seqLen, 3, 2, 0),
+                   "packed KV second prefill page write failed.");
+
+            for (int head = 0; head < numHeads; head++) {
+                void *gatherHalf = FastllmCudaMalloc((size_t)seqLen * headDim * sizeof(uint16_t));
+                void *gatherFloat = FastllmCudaMalloc((size_t)seqLen * headDim * sizeof(float));
+                Expect(FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+                           packed, type, cudaPages, 0, seqLen,
+                           pageLen, numHeads, headDim, head, gatherHalf),
+                       "packed KV prefill gather failed.");
+                Expect(FastllmHalfToFloat(gatherHalf, gatherFloat, seqLen * headDim),
+                       "packed KV gathered half conversion failed.");
+                std::vector<float> actual((size_t)seqLen * headDim);
+                FastllmCudaCopyFromDeviceToHost(
+                    actual.data(), gatherFloat, actual.size() * sizeof(float));
+                std::vector<float> expected(actual.size());
+                for (int token = 0; token < seqLen; token++) {
+                    std::copy_n(sourceValues.begin() +
+                                    ((size_t)head * seqLen + token) * headDim,
+                                headDim, expected.begin() + (size_t)token * headDim);
+                }
+                ExpectPackedKvQuality(expected, actual, type,
+                                      "packed KV cross-page head " + std::to_string(head));
+                FastllmCudaFree(gatherFloat);
+                FastllmCudaFree(gatherHalf);
+            }
+
+            constexpr int decodeBatch = 2;
+            std::vector<float> decodeValues = MakeRegressionValues(
+                decodeBatch * numHeads * headDim, 2.419f, 0.6f);
+            fastllm::Data decode(DataType::FLOAT32,
+                                 {decodeBatch, numHeads, headDim}, decodeValues);
+            fastllm::ToDataType(decode, DataType::FLOAT16);
+            decode.ToDevice(fastllm::DataDevice::CUDA);
+            int32_t decodePageHost[decodeBatch] = {2, 0};
+            int32_t decodeOffsetHost[decodeBatch] = {1, 2};
+            int32_t *decodeMeta = (int32_t*)FastllmCudaMalloc(4 * sizeof(int32_t));
+            FastllmCudaCopyFromHostToDevice(decodeMeta, decodePageHost,
+                                            decodeBatch * sizeof(int32_t));
+            FastllmCudaCopyFromHostToDevice(decodeMeta + decodeBatch,
+                                            decodeOffsetHost,
+                                            decodeBatch * sizeof(int32_t));
+            Expect(FastllmCudaPackedKVCacheCopyBatch(
+                       packed, decodeMeta, decodeMeta + decodeBatch,
+                       pageLen, decodeBatch, numHeads, headDim, type,
+                       (uint8_t*)decode.cudaData, decode.dataType),
+                   "packed KV batch decode write failed.");
+            for (int b = 0; b < decodeBatch; b++) {
+                int32_t *onePage = decodeMeta + b;
+                for (int head = 0; head < numHeads; head++) {
+                    void *gatherHalf = FastllmCudaMalloc(headDim * sizeof(uint16_t));
+                    void *gatherFloat = FastllmCudaMalloc(headDim * sizeof(float));
+                    Expect(FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+                               packed, type, onePage, decodeOffsetHost[b], 1,
+                               pageLen, numHeads, headDim, head, gatherHalf),
+                           "packed KV batch decode gather failed.");
+                    Expect(FastllmHalfToFloat(gatherHalf, gatherFloat, headDim),
+                           "packed KV batch gathered half conversion failed.");
+                    std::vector<float> actual(headDim), expected(headDim);
+                    FastllmCudaCopyFromDeviceToHost(
+                        actual.data(), gatherFloat, actual.size() * sizeof(float));
+                    std::copy_n(decodeValues.begin() +
+                                    ((size_t)b * numHeads + head) * headDim,
+                                headDim, expected.begin());
+                    ExpectPackedKvQuality(expected, actual, type,
+                                          "packed KV batch request " + std::to_string(b) +
+                                          " head " + std::to_string(head));
+                    FastllmCudaFree(gatherFloat);
+                    FastllmCudaFree(gatherHalf);
+                }
+            }
+            FastllmCudaFree(decodeMeta);
+            FastllmCudaFree(packed);
+        };
+
+        runType(DataType::Q8_0_KV);
+        runType(DataType::TURBO3_KV);
+        fastllm::ClearAllPagedCacheManagers();
+        {
+            constexpr int attentionBatch = 2;
+            constexpr int group = 1;
+            const float attentionScale = 1.0f / std::sqrt((float)headDim);
+            std::vector<float> valueValues = MakeRegressionValues(
+                numHeads * seqLen * headDim, 3.117f, 0.55f);
+            fastllm::Data valueSource(DataType::FLOAT32,
+                                      {numHeads, seqLen, headDim}, valueValues);
+            fastllm::ToDataType(valueSource, DataType::FLOAT16);
+            valueSource.ToDevice(fastllm::DataDevice::CUDA);
+
+            auto allocateManager = [&](int id, DataType type) {
+                fastllm::Data desc(type);
+                desc.dims = {numHeads, 1, headDim};
+                desc.strides = {(uint64_t)headDim, (uint64_t)headDim, 1};
+                desc.dataDevice = fastllm::DataDevice::CUDA;
+                desc.dataDeviceIds = {0};
+                desc.UpdateUnitSize();
+                return fastllm::AllocatePagedCacheManager(
+                    id, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                    desc, pageLen, maxPages);
+            };
+            fastllm::PagedCacheManager *referenceKManager =
+                allocateManager(61000, DataType::FLOAT16);
+            fastllm::PagedCacheManager *referenceVManager =
+                allocateManager(61001, DataType::FLOAT16);
+            fastllm::PagedCacheManager *packedKManager =
+                allocateManager(61002, DataType::Q8_0_KV);
+            fastllm::PagedCacheManager *packedVManager =
+                allocateManager(61003, DataType::TURBO3_KV);
+
+            for (int page = 0; page < 2; page++) {
+                int inputOffset = page * pageLen;
+                int copyLen = std::min(pageLen, seqLen - inputOffset);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)referenceKManager->cudaData, page, pageLen,
+                    numHeads, headDim, DataType::FLOAT16,
+                    (uint8_t*)source.cudaData, source.dataType,
+                    seqLen, inputOffset, copyLen, 0);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)referenceVManager->cudaData, page, pageLen,
+                    numHeads, headDim, DataType::FLOAT16,
+                    (uint8_t*)valueSource.cudaData, valueSource.dataType,
+                    seqLen, inputOffset, copyLen, 0);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)packedKManager->cudaData, page, pageLen,
+                    numHeads, headDim, DataType::Q8_0_KV,
+                    (uint8_t*)source.cudaData, source.dataType,
+                    seqLen, inputOffset, copyLen, 0);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)packedVManager->cudaData, page, pageLen,
+                    numHeads, headDim, DataType::TURBO3_KV,
+                    (uint8_t*)valueSource.cudaData, valueSource.dataType,
+                    seqLen, inputOffset, copyLen, 0);
+            }
+
+            auto makeCache = [&](DataType type, fastllm::PagedCacheManager *manager) {
+                fastllm::Data cache(type);
+                cache.Resize({numHeads, seqLen, headDim});
+                cache.SetKVCache();
+                cache.isPagedKVCache = true;
+                cache.pageLen = pageLen;
+                cache.pageIndex = {0, 1};
+                cache.lastPageLen = seqLen - pageLen;
+                cache.pagedKVCacheData = manager;
+                return cache;
+            };
+            fastllm::Data referenceK = makeCache(DataType::FLOAT16, referenceKManager);
+            fastllm::Data referenceV = makeCache(DataType::FLOAT16, referenceVManager);
+            fastllm::Data packedK = makeCache(DataType::Q8_0_KV, packedKManager);
+            fastllm::Data packedV = makeCache(DataType::TURBO3_KV, packedVManager);
+            fastllm::Data query = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                MakeRegressionValues(numHeads * group * attentionBatch * headDim, 3.771f, 0.08f));
+            fastllm::Data qSizes = MakeIntTensor({3}, {0, 1, 2});
+            fastllm::Data pageSizes = MakeIntTensor({3}, {0, 1, 2});
+            fastllm::Data pageIndexs = MakeIntTensor({2}, {0, 1});
+            fastllm::Data lastPageLens = MakeIntTensor({2}, {pageLen, seqLen - pageLen});
+            qSizes.ToDevice(fastllm::DataDevice::CUDA);
+            pageSizes.ToDevice(fastllm::DataDevice::CUDA);
+            pageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+            lastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data referenceOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            fastllm::Data packedOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            {
+                ScopedEnvVar disableSm70("FASTLLM_CUDA_SM70_PAGED_XQA", "0");
+                ScopedEnvVar disableNativeGqa("FASTLLM_PAGED_GQA_DECODE", "0");
+                Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                           query, referenceK, referenceV,
+                           qSizes, pageSizes, pageIndexs, lastPageLens,
+                           referenceOutput, group, attentionScale),
+                       "FP16 paged attention reference failed.");
+                Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                           query, packedK, packedV,
+                           qSizes, pageSizes, pageIndexs, lastPageLens,
+                           packedOutput, group, attentionScale),
+                       "packed paged attention failed.");
+            }
+            ExpectPackedKvQuality(ToFloatVector(referenceOutput),
+                                  ToFloatVector(packedOutput),
+                                  DataType::TURBO3_KV,
+                                  "packed paged attention output");
+            fastllm::Data referenceSingleOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            fastllm::Data packedSingleOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            Expect(FastllmCudaHalfPagedAttentionFastllmFallback(
+                       query, referenceK, referenceV, referenceSingleOutput,
+                       group, attentionScale),
+                   "FP16 single paged attention reference failed.");
+            Expect(FastllmCudaHalfPagedAttentionFastllmFallback(
+                       query, packedK, packedV, packedSingleOutput,
+                       group, attentionScale),
+                   "packed single paged attention failed.");
+            ExpectPackedKvQuality(ToFloatVector(referenceSingleOutput),
+                                  ToFloatVector(packedSingleOutput),
+                                  DataType::TURBO3_KV,
+                                  "packed single paged attention output");
+        }
+        fastllm::ClearAllPagedCacheManagers();
+        FastllmCudaFree(cudaPages);
     }
 
     void RunCudaGreedyTieBreakRegression() {
@@ -5832,6 +6160,19 @@ int main() {
             RunQwen35LongPrefillStateRegression();
             std::cout << "qwen35 long prefill state regression: PASS\n";
             return 0;
+        }
+        if (only != nullptr && std::string(only) == "turbo3_kv") {
+            RunKVCacheDataTypeConfigRegression();
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error("turbo3_kv regression requires CUDA.");
+            }
+            RunCudaTurbo3KvRegression();
+            std::cout << "Qwen3.5 Turbo3 packed KV regression: PASS\n";
+            return 0;
+#else
+            throw std::runtime_error("turbo3_kv regression requires a CUDA build.");
+#endif
         }
         if (only != nullptr && std::string(only) == "iq4xs_mmq_bench") {
 #ifdef USE_CUDA

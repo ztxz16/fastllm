@@ -121,6 +121,34 @@ namespace fastllm {
         return lowered != "false" && lowered != "0" &&
                lowered != "no" && lowered != "off";
     }
+    bool Qwen35Turbo3KvEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_TURBO3_KV");
+        if (env == nullptr || env[0] == 0) {
+            return false;
+        }
+        std::string lowered(env);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered == "true" || lowered == "1" ||
+               lowered == "yes" || lowered == "on";
+    }
+    DataType ResolveQwen35CudaCacheType(DataType cacheType, DataType computeType) {
+        if (cacheType == DataType::FLOAT16 ||
+            cacheType == DataType::BFLOAT16 ||
+            cacheType == DataType::FP8_E4M3 ||
+            IsPackedKVCacheDataType(cacheType)) {
+            return cacheType;
+        }
+        return computeType;
+    }
+
+    size_t Qwen35PagedCachePageBytes(
+            DataType type, int pageLen, int numHeads, int headDim) {
+        AssertInFastLLM(pageLen > 0 && numHeads > 0 && headDim > 0,
+                        "Qwen3.5 paged cache page shape is invalid.\n");
+        return GetDataBytes(type, (size_t)pageLen * numHeads, headDim);
+    }
+
 
     Qwen35RequestPhase ClassifyQwen35RequestPhase(const ResponseContext &context) {
         if (context.longPrefill.inProgress &&
@@ -1434,14 +1462,6 @@ namespace fastllm {
             return DataType::FLOAT16;
         }
 
-        static DataType ResolveQwen35ThreadTpCacheType(DataType cacheType, DataType computeType) {
-            if (cacheType == DataType::FLOAT16 ||
-                cacheType == DataType::BFLOAT16 ||
-                cacheType == DataType::FP8_E4M3) {
-                return cacheType;
-            }
-            return computeType;
-        }
 
         static void PrepareQwen35EmbeddingWeightType(Data &embedWeight,
                                                      DataType outputType,
@@ -4288,33 +4308,79 @@ namespace fastllm {
                     *generatedAppendParams = true;
                 }
 
-                bool fillLastPageLensOnDevice = merged->dataDevice == DataDevice::CUDA &&
+                const bool packedKV =
+                    IsPackedKVCacheDataType(((Data*)pagedCacheKManager)->dataType) ||
+                    IsPackedKVCacheDataType(((Data*)pagedCacheVManager)->dataType);
+                bool fillLastPageLensOnDevice = !packedKV &&
+                                                 merged->dataDevice == DataDevice::CUDA &&
                                                  !merged->multiDeviceData &&
                                                  !externalDecodeMeta &&
                                                  !(*generatedDecodeParams);
-                Qwen35CudaQGateKVRMSNormRopeSplitAppendPagedCache(
-                    runner, *merged, *qNormWeight, *kNormWeight, *allPositionIds,
-                    *q, *gate,
-                    *(Data*)pagedCacheKManager, *(Data*)pagedCacheVManager,
-                    *insertIndexs, *insertPositions,
-                    numAttentionHeads, numKeyValueHeads, headDim,
-                    rotaryDim, mropeSections, rmsNormEps, ropeBase, ropeScale,
-                    kCaches.pageLen, batch, true,
-                    fillLastPageLensOnDevice ? lastPageLens : nullptr);
+                if (packedKV) {
+                    AssertInFastLLM(!externalDecodeMeta &&
+                                    ((Data*)pagedCacheKManager)->dataType == DataType::Q8_0_KV &&
+                                    ((Data*)pagedCacheVManager)->dataType == DataType::TURBO3_KV &&
+                                    headDim == 256,
+                                    "Qwen3.5 packed decode requires non-graph q8_0 K + turbo3 V with head_dim=256.\n");
+                    int qgateDim = numAttentionHeads * headDim * 2;
+                    int kvDim = numKeyValueHeads * headDim;
+                    Qwen3CudaSplit(runner, *merged, -1, 0, qgateDim, *qgate);
+                    Qwen3CudaSplit(runner, *merged, -1, qgateDim, qgateDim + kvDim, *k);
+                    Qwen3CudaSplit(runner, *merged, -1, qgateDim + kvDim,
+                                   qgateDim + kvDim * 2, *v);
 
-                if (!externalDecodeMeta) {
+                    qgate->Reshape({bsz, seqlen, numAttentionHeads, headDim * 2});
+                    Qwen3CudaSplit(runner, *qgate, -1, 0, headDim, *q);
+                    Qwen3CudaSplit(runner, *qgate, -1, headDim, headDim * 2, *gate);
+                    gate->Reshape({bsz, seqlen, numAttentionHeads * headDim});
+                    k->Reshape({bsz, seqlen, numKeyValueHeads, headDim});
+                    v->Reshape({bsz, seqlen, numKeyValueHeads, headDim});
+
+                    Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
+                    Qwen3CudaRMSNorm(runner, *k, *kNormWeight, rmsNormEps, *k);
+                    Qwen35CudaApplyRotary(runner, *q, *allPositionIds,
+                                          rotaryDim, mropeSections, ropeBase, ropeScale);
+                    Qwen35CudaApplyRotary(runner, *k, *allPositionIds,
+                                          rotaryDim, mropeSections, ropeBase, ropeScale);
+                    Qwen3CudaPermuteSelf(runner, *q, {0, 2, 1, 3});
+                    q->Reshape({-1, seqlen, headDim});
+                    k->Reshape({batch, numKeyValueHeads, headDim});
+                    v->Reshape({batch, numKeyValueHeads, headDim});
+                    Qwen3CudaAppendPagedCacheBatch(runner, *pagedCacheKManager,
+                                                   *batchPastKeys, *k,
+                                                   *insertIndexs, *insertPositions);
+                    Qwen3CudaAppendPagedCacheBatch(runner, *pagedCacheVManager,
+                                                   *batchPastValues, *v,
+                                                   *insertIndexs, *insertPositions);
                     for (int b = 0; b < batch; b++) {
-                        auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
-                            if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
-                                cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
-                                cache->lastPageLen = 1;
-                            } else {
-                                cache->lastPageLen++;
-                            }
-                            Qwen35AdvancePagedCacheLogicalTokens(*cache, 1);
-                        };
-                        updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
-                        updatePageMeta((*batchPastValues)[b], pagedCacheVManager);
+                        Qwen35AdvancePagedCacheLogicalTokens(*(*batchPastKeys)[b], 1);
+                        Qwen35AdvancePagedCacheLogicalTokens(*(*batchPastValues)[b], 1);
+                    }
+                } else {
+                    Qwen35CudaQGateKVRMSNormRopeSplitAppendPagedCache(
+                        runner, *merged, *qNormWeight, *kNormWeight, *allPositionIds,
+                        *q, *gate,
+                        *(Data*)pagedCacheKManager, *(Data*)pagedCacheVManager,
+                        *insertIndexs, *insertPositions,
+                        numAttentionHeads, numKeyValueHeads, headDim,
+                        rotaryDim, mropeSections, rmsNormEps, ropeBase, ropeScale,
+                        kCaches.pageLen, batch, true,
+                        fillLastPageLensOnDevice ? lastPageLens : nullptr);
+
+                    if (!externalDecodeMeta) {
+                        for (int b = 0; b < batch; b++) {
+                            auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
+                                if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
+                                    cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                                    cache->lastPageLen = 1;
+                                } else {
+                                    cache->lastPageLen++;
+                                }
+                                Qwen35AdvancePagedCacheLogicalTokens(*cache, 1);
+                            };
+                            updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
+                            updatePageMeta((*batchPastValues)[b], pagedCacheVManager);
+                        }
                     }
                 }
                 if (!externalDecodeMeta && !(*generatedDecodeParams)) {
@@ -5849,6 +5915,7 @@ namespace fastllm {
         int vocabSize = it->second.dims[0];
         FastllmCudaSetDevice(rootDevice);
 
+
         size_t logitsBytes = (size_t)batch * (size_t)vocabSize * sizeof(float);
         FastllmCudaMallocBigBuffer(logitsBytes);
         DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
@@ -5883,7 +5950,7 @@ namespace fastllm {
                 fflush(stdout);
             }
         }
-        if (GetFastllmEnv().cudaGraph) {
+        if (GetFastllmEnv().cudaGraph && this->kvCacheDataType != DataType::TURBO3_KV) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
@@ -5893,6 +5960,34 @@ namespace fastllm {
         }
         Qwen35ReleaseThreadLocalCudaSamplingBuffers();
 #endif
+    }
+
+    void Qwen3_5Model::SetKVCacheDataType(DataType dataType) {
+        if (dataType != DataType::TURBO3_KV) {
+            basellm::SetKVCacheDataType(dataType);
+            return;
+        }
+        AssertInFastLLM(Qwen35Turbo3KvEnabled(),
+                        "Qwen3.5 turbo3 KV cache requires FASTLLM_QWEN35_TURBO3_KV=1.\n");
+        AssertInFastLLM(this->head_dim == 256,
+                        "Qwen3.5 turbo3 KV cache currently requires head_dim=256.\n");
+#ifndef USE_CUDA
+        ErrorInFastLLM("Qwen3.5 turbo3 KV cache requires CUDA support.\n");
+#endif
+        this->kvCacheDataType = dataType;
+        this->useCustomKVCacheDataType = true;
+        printf("[Qwen3.5] Turbo3 paged KV enabled: K=q8_0, V=turbo3, head_dim=256.\n");
+        fflush(stdout);
+    }
+    std::pair<DataType, DataType> Qwen3_5Model::GetKVCacheDataTypes(int layerIndex) const {
+        if (layerIndex >= 0 && Qwen35LayerIsLinearAttention(this, layerIndex)) {
+            DataType cacheType = Qwen35LinearAttentionCacheDataType(this->dataType);
+            return {cacheType, cacheType};
+        }
+        if (this->kvCacheDataType == DataType::TURBO3_KV) {
+            return {DataType::Q8_0_KV, DataType::TURBO3_KV};
+        }
+        return basellm::GetKVCacheDataTypes(layerIndex);
     }
 
     PagedCacheManager* Qwen3_5Model::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
@@ -6356,15 +6451,16 @@ namespace fastllm {
             for (int b = 0; b < batch; b++) {
                 for (int i = 0; i < block_cnt; i++) {
                     bool isLinearLayer = Qwen35LayerIsLinearAttention(this, i);
-                    DataType cacheType = isLinearLayer ?
-                        Qwen35LinearAttentionCacheDataType(this->dataType) : this->kvCacheDataType;
-                    pastKeyValuesStorage.push_back(std::make_pair(Data(cacheType),
-                                                                  Data(cacheType)));
+                    auto types = this->GetKVCacheDataTypes(i);
+                    pastKeyValuesStorage.emplace_back(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(types.first),
+                        std::forward_as_tuple(types.second));
                     pastKeyValuesStorage.back().first.SetKVCache();
                     pastKeyValuesStorage.back().second.SetKVCache();
                     if (isLinearLayer) {
-                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().first, cacheType);
-                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().second, cacheType);
+                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().first, types.first);
+                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().second, types.second);
                     }
                     pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
                                                            &pastKeyValuesStorage.back().second));
@@ -6443,6 +6539,9 @@ namespace fastllm {
         return false;
 #else
         (void)ratios;
+        if (this->kvCacheDataType == DataType::TURBO3_KV) {
+            return false;
+        }
         const int maxCudaGraphDecodeBatch = Qwen35MaxCudaGraphDecodeBatch(this);
         if (!Qwen35CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
             !all1 || isPrefill || (int)seqLens.size() < batch ||
@@ -10226,9 +10325,9 @@ namespace fastllm {
                 } else {
                     pastKeyValues[idx].first->isLinearAttention = false;
                     pastKeyValues[idx].second->isLinearAttention = false;
-                    keyCacheType = ResolveQwen35ThreadTpCacheType(
+                    keyCacheType = ResolveQwen35CudaCacheType(
                         pastKeyValues[idx].first->dataType, computeType);
-                    valueCacheType = ResolveQwen35ThreadTpCacheType(
+                    valueCacheType = ResolveQwen35CudaCacheType(
                         pastKeyValues[idx].second->dataType, computeType);
                 }
                 for (int r = 0; r < (int)devices.size(); r++) {
@@ -10263,9 +10362,9 @@ namespace fastllm {
                 } else {
                     pastKeyValues[idx].first->isLinearAttention = false;
                     pastKeyValues[idx].second->isLinearAttention = false;
-                    keyCacheType = ResolveQwen35ThreadTpCacheType(
+                    keyCacheType = ResolveQwen35CudaCacheType(
                         pastKeyValues[idx].first->dataType, computeType);
-                    valueCacheType = ResolveQwen35ThreadTpCacheType(
+                    valueCacheType = ResolveQwen35CudaCacheType(
                         pastKeyValues[idx].second->dataType, computeType);
                 }
                 PrepareQwen35SingleCudaCache(*pastKeyValues[idx].first, device, keyCacheType);
@@ -11104,8 +11203,9 @@ namespace fastllm {
             PagedCacheManager *manager = cache.pagedKVCacheData;
             AssertInFastLLM(manager != nullptr && manager->dims.size() == 4,
                             "Qwen3.5 MTP validation paged cache manager is invalid.\n");
-            size_t pageBytes = (size_t)manager->pageLen * manager->dims[2] *
-                               manager->dims[3] * manager->unitSize / manager->unitSizeDiv;
+            size_t pageBytes = Qwen35PagedCachePageBytes(
+                manager->dataType, manager->pageLen,
+                manager->dims[2], manager->dims[3]);
             size_t srcOffset = (size_t)srcPage * pageBytes;
             size_t dstOffset = (size_t)dstPage * pageBytes;
             if (manager->dataDevice == DataDevice::CUDA) {
@@ -19176,10 +19276,26 @@ namespace fastllm {
                 v.Reshape(qkvSize);
                 PreparePagedAttentionInputs(q, k, v, this->dataType);
 
+                auto makeCacheDesc = [](const Data &src, DataType targetType) {
+                    Data desc(targetType);
+                    desc.dims = src.dims;
+                    desc.strides = src.strides;
+                    desc.dataDevice = src.dataDevice;
+                    desc.dataDeviceIds = src.dataDeviceIds;
+                    desc.multiDeviceData = src.multiDeviceData;
+                    desc.tpLayout = src.tpLayout;
+                    desc.tpAxis = src.tpAxis;
+                    desc.tpGlobalDims = src.tpGlobalDims;
+                    desc.tpRanges = src.tpRanges;
+                    desc.UpdateUnitSize();
+                    return desc;
+                };
+                Data kCacheDesc = makeCacheDesc(k, pastKey.dataType);
+                Data vCacheDesc = makeCacheDesc(v, pastValue.dataType);
                 PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                 AppendPagedCache(*pagedCacheKManager, pastKey, k);
                 AppendPagedCache(*pagedCacheVManager, pastValue, v);
                 AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);

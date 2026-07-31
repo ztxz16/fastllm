@@ -172,6 +172,12 @@ static bool FastllmCudaPagedCacheGatherHeadRangeToHalf(
     } else if (pagedKVCache->dataType == fastllm::DataType::FP8_E4M3) {
         FastllmPagedCacheGatherHeadRangeKernel<__nv_fp8_e4m3><<<numBlocks, THREAD_PER_BLOCK>>>(
             pagedBytes, pageIndicesGpu, kvStart, chunkLen, pageLen, numHeads, headDim, kvHead, outData);
+    } else if (fastllm::IsPackedKVCacheDataType(pagedKVCache->dataType)) {
+        if (!FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+                pagedBytes, pagedKVCache->dataType, pageIndicesGpu,
+                kvStart, chunkLen, pageLen, numHeads, headDim, kvHead, outData)) {
+            return false;
+        }
     } else {
         printf("FastllmCudaPagedCacheGatherHeadRangeToHalf: unsupported paged KV cache dataType=%d\n",
                (int)pagedKVCache->dataType);
@@ -642,18 +648,42 @@ bool FastllmCudaHalfPagedAttentionFastllmFallback(
     float scale) {
     if (!k.isPagedKVCache || !v.isPagedKVCache) {
         printf("FastllmCudaHalfPagedAttentionFastllmFallback: k/v must be paged KV cache.\n");
-        exit(0);
+        return false;
     }
     fastllm::Data *pagedKVCacheK = k.pagedKVCacheData;
     fastllm::Data *pagedKVCacheV = v.pagedKVCacheData;
     if (pagedKVCacheK == nullptr || pagedKVCacheV == nullptr) {
         printf("FastllmCudaHalfPagedAttentionFastllmFallback: pagedKVCacheData is nullptr.\n");
-        exit(0);
+        return false;
     }
     int numKvHeads = k.dims[0];
     int headDim = pagedKVCacheK->dims[3];
-    return FastllmCudaHalfPagedAttentionNative(q, k.pageIndex, k.lastPageLen, pagedKVCacheK, pagedKVCacheV,
-                                               k.pageLen, numKvHeads, headDim, output, group, scale);
+    bool packedKV = fastllm::IsPackedKVCacheDataType(pagedKVCacheK->dataType) ||
+                    fastllm::IsPackedKVCacheDataType(pagedKVCacheV->dataType);
+    if (!packedKV) {
+        return FastllmCudaHalfPagedAttentionNative(
+            q, k.pageIndex, k.lastPageLen, pagedKVCacheK, pagedKVCacheV,
+            k.pageLen, numKvHeads, headDim, output, group, scale);
+    }
+
+    if (q.dims.size() != 3 || output.dims.size() != 3 ||
+        q.dims[2] != headDim || output.dims[2] != headDim) {
+        return false;
+    }
+    int H = q.dims[0];
+    int qoLen = q.dims[1];
+    bool ok = FastllmCudaPagedAttentionNativeChunkedCublasRaw(
+        q.cudaData, q.dataType, H, qoLen, headDim,
+        q.strides[0], q.strides[1], k.pageIndex, nullptr, k.lastPageLen,
+        pagedKVCacheK, pagedKVCacheV, k.pageLen, numKvHeads, headDim,
+        output.cudaData, output.dataType,
+        output.strides[0], output.strides[1], group, scale);
+    if (ok) {
+        output.Resize({H, qoLen, headDim});
+        FastllmCudaPermute(output, {1, 0, 2});
+        DeviceSync();
+    }
+    return ok;
 }
 
 // CUDA-graph 可捕获的分页注意力 kernel（前缀填充 + 解码统一实现）。
@@ -2253,17 +2283,26 @@ bool FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         }
     }
     bool isDecode = (q.dims.size() >= 2 && (int)q.dims[1] == (int)batch_size);
-    if ((capturing || isDecode) &&
+    const bool packedKV = kCaches.pagedKVCacheData != nullptr &&
+                          vCaches.pagedKVCacheData != nullptr &&
+                          (fastllm::IsPackedKVCacheDataType(kCaches.pagedKVCacheData->dataType) ||
+                           fastllm::IsPackedKVCacheDataType(vCaches.pagedKVCacheData->dataType));
+    if (!packedKV && (capturing || isDecode) &&
         kCaches.pagedKVCacheData != nullptr && vCaches.pagedKVCacheData != nullptr &&
         (q.dataType == fastllm::DataType::FLOAT16 || q.dataType == fastllm::DataType::BFLOAT16)) {
         return FastllmCudaHalfPagedAttentionBatchCapturable(
             q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
     }
-    bool useChunkedCublasPrefill = !isDecode;
+    if (packedKV && capturing) {
+        return false;
+    }
+    // The first correctness path decompresses packed K/V in bounded chunks.
+    // Direct split-KV packed loads are added only after numerical validation.
+    bool useChunkedCublasPrefill = !isDecode || packedKV;
     if (useChunkedCublasPrefill) {
         static thread_local bool loggedChunkedCublasPrefill = false;
         if (!loggedChunkedCublasPrefill) {
-            printf("[Fastllm] Native paged prefill uses chunked cublas attention.\n");
+            printf("[Fastllm] Native paged attention uses chunked cublas attention.\n");
             loggedChunkedCublasPrefill = true;
         }
     }
@@ -2283,7 +2322,7 @@ bool FastllmCudaHalfPagedAttentionBatchFastllmFallback(
     fastllm::Data *pagedKVCacheV = vCaches.pagedKVCacheData;
     if (pagedKVCacheK == nullptr || pagedKVCacheV == nullptr) {
         printf("FastllmCudaHalfPagedAttentionBatchFastllmFallback: pagedKVCacheData is nullptr.\n");
-        exit(0);
+        return false;
     }
     int pageLen = kCaches.pageLen;
     int headDim = pagedKVCacheK->dims[3];
@@ -2345,23 +2384,21 @@ bool FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         }
 
         bool decodeLayout = (q.dims.size() >= 2 && q.dims[1] == 1);
-        if (useChunkedCublasPrefill && !decodeLayout) {
+        if (useChunkedCublasPrefill) {
             int qHeadStride = q.strides.size() >= 1 ? (int)q.strides[0] : totalTokens * q2;
             int qTokenStride = q.strides.size() >= 2 ? (int)q.strides[1] : q2;
             size_t qUnit = q.dataType == fastllm::DataType::BFLOAT16 ? sizeof(__nv_bfloat16) : sizeof(half);
             size_t outUnit = output.dataType == fastllm::DataType::BFLOAT16 ? sizeof(__nv_bfloat16) : sizeof(half);
-            void *qBatchBase = (uint8_t*)q.cudaData + (size_t)qo_start * qTokenStride * qUnit;
+            size_t qBatchOffset = decodeLayout ?
+                (size_t)b * H * q2 : (size_t)qo_start * qTokenStride;
+            void *qBatchBase = (uint8_t*)q.cudaData + qBatchOffset * qUnit;
             void *outBatchBase = (uint8_t*)output.cudaData + (size_t)qo_start * H * q2 * outUnit;
             bool okBatch = FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 qBatchBase, q.dataType, H, qo_len, q2, qHeadStride, qTokenStride,
                 pageIndices, pageIndicesGpu, lastPageLen,
                 pagedKVCacheK, pagedKVCacheV, pageLen, numKvHeads, headDim,
                 outBatchBase, output.dataType, q2, H * q2, group, scale);
-            if (okBatch) {
-                ok = okBatch && ok;
-                continue;
-            }
-            ok = false;
+            ok = okBatch && ok;
             continue;
         }
 

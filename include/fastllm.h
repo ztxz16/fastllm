@@ -308,6 +308,8 @@ namespace fastllm {
         BASE3_GROUP = 12, // 三元量化，-1 0 1
         INT32 = 13, // int32
         NVFP4 = 14, // packed fp4 e2m1 + compact e8m0 block scales
+        Q8_0_KV = 15, // KV cache: one fp16 scale + 32 int8 values per 32-value block
+        TURBO3_KV = 16, // TurboQuant KV: fp16 norm + packed 3-bit indices per 128-value block
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         FP8_E4M3_BLOCK_128 = 1000, // fp8e4m3, block = 128
         AWQ_4BIT_128 = 1001, // awq, bits = 4, group = 128
@@ -332,6 +334,8 @@ namespace fastllm {
     std::string GetDataTypeName(DataType type);
 
     size_t GetDataBytes(DataType type, size_t rows, size_t columns);
+    bool IsPackedKVCacheDataType(DataType type);
+    size_t GetKVCacheRowBytes(DataType type, size_t columns);
     constexpr size_t INT4_GROUP32_GROUP_SIZE = 32;
     constexpr size_t INT4_GROUP32_PACKED_BYTES = 16;
     constexpr size_t INT4_GROUP32_BLOCK_GROUPS = 4;

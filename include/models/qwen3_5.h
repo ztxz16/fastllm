@@ -68,6 +68,10 @@ namespace fastllm {
 
     bool Qwen35InterleaveLongPrefillEnabled();
     bool Qwen35BatchedMtpEnabled();
+    bool Qwen35Turbo3KvEnabled();
+    DataType ResolveQwen35CudaCacheType(DataType cacheType, DataType computeType);
+    size_t Qwen35PagedCachePageBytes(
+            DataType type, int pageLen, int numHeads, int headDim);
 
     Qwen35RequestPhase ClassifyQwen35RequestPhase(const ResponseContext &context);
 
@@ -188,6 +192,8 @@ namespace fastllm {
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
+        virtual std::pair<DataType, DataType> GetKVCacheDataTypes(int layerIndex) const override;
+        virtual void SetKVCacheDataType(DataType dataType) override;
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const override;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;

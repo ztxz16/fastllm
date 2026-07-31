@@ -518,7 +518,9 @@ namespace fastllm {
         {DataType::INT8, {"int8"}}, {DataType::INT4, {"int4o"}}, {DataType::INT2, {"int2"}}, {DataType::BIT, {"bit"}}, 
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
         {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
-        {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}}, {DataType::INT32PARAM, {"int32param"}},
+        {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}},
+        {DataType::Q8_0_KV, {"q8_0_kv"}}, {DataType::TURBO3_KV, {"turbo3", "turbo3_kv"}},
+        {DataType::INT32PARAM, {"int32param"}},
         {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
@@ -588,9 +590,34 @@ namespace fastllm {
         return data.cpuData + weightBytes;
     }
 
+    bool IsPackedKVCacheDataType(DataType type) {
+        return type == DataType::Q8_0_KV || type == DataType::TURBO3_KV;
+    }
+
+    size_t GetKVCacheRowBytes(DataType type, size_t columns) {
+        if (columns == 0) {
+            return 0;
+        }
+        if (type == DataType::Q8_0_KV) {
+            constexpr size_t blockValues = 32;
+            constexpr size_t blockBytes = sizeof(uint16_t) + blockValues;
+            return ((columns + blockValues - 1) / blockValues) * blockBytes;
+        }
+        if (type == DataType::TURBO3_KV) {
+            constexpr size_t blockValues = 128;
+            constexpr size_t blockBytes = sizeof(uint16_t) + blockValues / 4 + blockValues / 8;
+            static_assert(blockBytes == 50, "Turbo3 KV block must be 50 bytes per 128 values");
+            return ((columns + blockValues - 1) / blockValues) * blockBytes;
+        }
+        return GetDataBytes(type, 1, columns);
+    }
+
     size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
         if (rows == 0 || columns == 0) {
             return 0;
+        }
+        if (IsPackedKVCacheDataType(type)) {
+            return rows * GetKVCacheRowBytes(type, columns);
         }
         if (type == DataType::FLOAT32) {
             return rows * columns * sizeof(float);
@@ -1578,7 +1605,8 @@ namespace fastllm {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
-                   this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                   this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                   IsPackedKVCacheDataType(this->dataType)) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::NVFP4) {
@@ -1615,7 +1643,8 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
-             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -1839,7 +1868,8 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
-             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             return GetDataBytes(this->dataType, rows, columns);
@@ -1857,7 +1887,8 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
-             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);

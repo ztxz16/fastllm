@@ -283,6 +283,19 @@ void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, i
                                     int pageLen, int batch, int numHeads, int headDim,
                                     fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
                                     bool sync = true);
+bool FastllmCudaPackedKVCacheCopy(uint8_t *pagedData, int pageIdx, int pageLen,
+                                  int numHeads, int headDim, fastllm::DataType dstType,
+                                  uint8_t *inputData, fastllm::DataType srcType,
+                                  int seqLen, int inputOffset, int copyLen, int pageOffset);
+bool FastllmCudaPackedKVCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray,
+                                       int32_t *pageOffsetArray, int pageLen, int batch,
+                                       int numHeads, int headDim, fastllm::DataType dstType,
+                                       uint8_t *inputData, fastllm::DataType srcType,
+                                       bool sync = true);
+bool FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+        const uint8_t *pagedData, fastllm::DataType srcType,
+        const int32_t *pageIndices, int kvStart, int chunkLen,
+        int pageLen, int numHeads, int headDim, int head, void *output);
 
 bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);
