@@ -531,7 +531,8 @@ namespace fastllm {
             Data &input, Data &weight, Data &bias,
             Data &middle, Data &hiddenStates,
             bool tensorParallel, bool firstTensorParallelRank,
-            int gpuId, bool enableTP2P2PAllReduce = false) {
+            int gpuId, bool enableTP2P2PAllReduce = false,
+            bool forceNativeNccl = false) {
         DataType residualType = hiddenStates.dataType;
         bool canAddDirectly = input.dataType == residualType;
 
@@ -560,9 +561,15 @@ namespace fastllm {
                 Qwen3CudaLinear(runner, input, weight, bias, hiddenStates);
                 Qwen3CudaToDataType(runner, hiddenStates, residualType);
             }
-            FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
-                                 hiddenStates.Count(0), hiddenStates.dataType,
-                                 gpuId);
+            if (forceNativeNccl) {
+                FastllmNcclAllReduceNoCustom(
+                    hiddenStates.cudaData, hiddenStates.cudaData,
+                    hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+            } else {
+                FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
+                                     hiddenStates.Count(0), hiddenStates.dataType,
+                                     gpuId);
+            }
             return;
         }
 
@@ -738,7 +745,8 @@ namespace fastllm {
             int attentionType,
             bool inited,
             bool enableCudaGraph = false,
-            int flashInferCudaGraph = -1) {
+            int flashInferCudaGraph = -1,
+            int windowLeft = -1) {
         runner.Run("AttentionPagedBatch",
                    DataDict{{"q", &q}, {"kCaches", &kCaches}, {"vCaches", &vCaches},
                             {"output", &output}, {"qSizes", &qSizes}, {"pageSizes", &pageSizes},
@@ -746,7 +754,8 @@ namespace fastllm {
                    FloatDict{{"scale", scale}},
                    IntDict{{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited},
                            {"sync", 0}, {"enableCudaGraph", (int)enableCudaGraph},
-                           {"flashInferCudaGraph", flashInferCudaGraph}},
+                           {"flashInferCudaGraph", flashInferCudaGraph},
+                           {"windowLeft", windowLeft}},
                    {"output"});
     }
 

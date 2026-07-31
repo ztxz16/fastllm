@@ -272,6 +272,13 @@ def _thread_tp_cuda_device_spec(tp) -> str:
         return "cuda:0"
     return "cuda:" + spec
 
+def _thread_tp_cuda_device_count(tp) -> int:
+    spec = _thread_tp_cuda_device_spec(tp)
+    if spec == "":
+        return 0
+    payload = spec.split(":", 1)[1] if ":" in spec else spec
+    return len([item for item in payload.split(",") if item.strip() != ""])
+
 def _normalize_thread_tp_arg(tp) -> str:
     spec = str(tp or "").strip()
     lower = spec.lower()
@@ -709,7 +716,14 @@ def make_normal_llm_model(args, startup_progress = None):
         # Pack their TP shards into slabs to avoid exhausting the CUDA driver's
         # allocation-count limit before device memory is full.
         if args.cuda_slab <= 0:
-            args.cuda_slab = 256
+            # Laguna TP=4 owns 64 experts/rank.  Its merged gate-up and down
+            # sources are 6 MiB and 3 MiB, and one layer is exactly 576 MiB per
+            # rank.  A 96 MiB slab packs both shapes and the whole layer without
+            # tail waste, which is required to fit the FP8 checkpoint on 32 GB
+            # Blackwell cards.  Other layouts retain the established default.
+            args.cuda_slab = (96 if is_laguna_hybrid_tp_model and
+                              _thread_tp_cuda_device_count(args.tp) == 4
+                              else 256)
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"

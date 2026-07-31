@@ -297,12 +297,20 @@ namespace fastllm {
     }
 
     static int ParseRoutedExpertIndex(const std::string &weightName) {
-        const std::string marker = ".ffn.experts.";
-        size_t pos = weightName.find(marker);
-        if (pos == std::string::npos) {
+        const char *markers[] = {".ffn.experts.", ".moe.experts."};
+        size_t pos = std::string::npos;
+        size_t markerSize = 0;
+        for (const char *marker : markers) {
+            pos = weightName.find(marker);
+            if (pos != std::string::npos) {
+                markerSize = std::strlen(marker);
+                break;
+            }
+        }
+        if (pos == std::string::npos || markerSize == 0) {
             return -1;
         }
-        pos += marker.size();
+        pos += markerSize;
         size_t end = pos;
         while (end < weightName.size() && std::isdigit((unsigned char)weightName[end])) {
             end++;
@@ -386,6 +394,41 @@ namespace fastllm {
             }
         }
         int routedExpert = ParseRoutedExpertIndex(weightName);
+        if (model->model_type == "laguna" && routedExpert >= 0 &&
+            model->num_experts > 0) {
+            int totalRatio = 0;
+            for (int device : devices) {
+                auto ratioIt = ratios.find(device);
+                totalRatio += ratioIt == ratios.end()
+                    ? 1 : std::max(1, ratioIt->second);
+            }
+            int accumulatedRatio = 0;
+            int expertStart = 0;
+            for (int i = 0; i < (int)devices.size(); i++) {
+                auto ratioIt = ratios.find(devices[i]);
+                accumulatedRatio += ratioIt == ratios.end()
+                    ? 1 : std::max(1, ratioIt->second);
+                int expertEnd = i + 1 == (int)devices.size()
+                    ? model->num_experts
+                    : (int)((long long)model->num_experts *
+                            accumulatedRatio / totalRatio);
+                if (routedExpert >= expertStart && routedExpert < expertEnd) {
+                    // These source tensors are consumed layer-by-layer into a
+                    // local fused MoE tensor before the first ForwardGPU call.
+                    // On four Blackwell GPUs, keeping every 3 MiB down-proj in
+                    // an individual cudaMalloc rounds it to a 4 MiB allocation
+                    // and wastes about 3 GiB per rank across 47 x 64 experts.
+                    // Pack TP=4 sources into weight slabs; once a layer is
+                    // fused all of its source blocks retire together.  Keep the
+                    // established direct-allocation path for other TP sizes.
+                    data.directMemory = devices.size() != 4;
+                    return PlaceMultiCudaWeightOnDevice(
+                        data, devices, devices[i]);
+                }
+                expertStart = expertEnd;
+            }
+            return false;
+        }
         if (model->model_type == "deepseek_v4" && routedExpert >= 0) {
             constexpr int ownerOffset = 0;
             int ownerCount = (int)devices.size();
