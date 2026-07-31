@@ -1277,6 +1277,32 @@ namespace fastllm {
             prefillChunkSize, model->GetBatchedPrefillTokenLimit());
         const bool boundedCacheUsesTokenGrowingStorage =
             useGPUForward && model->BoundedKVCacheUsesTokenGrowingStorage();
+        // The first forward of an idle burst benefits from the model's full
+        // prefill batch: it keeps the ragged kernels efficient.  Once decode
+        // becomes active, however, repeatedly draining full prefill batches
+        // can starve existing requests long enough for newly admitted requests
+        // to form another large burst.  Use a smaller budget for those
+        // add-prefills and yield one scheduler iteration to decode after each
+        // such forward.  This is the non-mixed-forward equivalent of reserving
+        // decode tokens in a continuous-batching token budget.
+        int activePrefillTokenLimit = batchedPrefillTokenLimit;
+        bool interleaveActivePrefill = false;
+        if (useGPUForward && maxBatch > 1 && model->model_type == "qwen3_5") {
+            activePrefillTokenLimit = std::min(batchedPrefillTokenLimit, 8192);
+            interleaveActivePrefill = true;
+        }
+        if (const char *limitEnv =
+                std::getenv("FASTLLM_ACTIVE_PREFILL_TOKEN_LIMIT")) {
+            int configuredLimit = std::atoi(limitEnv);
+            if (configuredLimit <= 0) {
+                activePrefillTokenLimit = batchedPrefillTokenLimit;
+                interleaveActivePrefill = false;
+            } else {
+                activePrefillTokenLimit = std::min(
+                    batchedPrefillTokenLimit, configuredLimit);
+                interleaveActivePrefill = true;
+            }
+        }
 
         // 辅助lambda：释放一个请求占用的所有KV Cache分页，并以allTokens重新初始化为pending prefill状态
         auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
@@ -1583,6 +1609,13 @@ namespace fastllm {
         std::chrono::steady_clock::time_point idlePrefillBatchDeadline;
         std::chrono::steady_clock::time_point idlePrefillBatchHardDeadline;
         size_t idlePrefillBatchObservedSize = 0;
+        bool activePrefillNeedsDecode = false;
+        std::set<int> idleBurstPrefillHandles;
+        if (model->verbose && interleaveActivePrefill) {
+            printf("Fastllm Active AddPrefill token limit: %d "
+                   "(full idle burst, decode interleave enabled).\n",
+                   activePrefillTokenLimit);
+        }
         while (true) {
             if (model->isFree) {
                 break;
@@ -1604,6 +1637,8 @@ namespace fastllm {
             static const std::vector<int> decodeScalarDims = {1, 1};
             const int reserveBatch = std::max(1, maxBatch);
             bool selectedNeedLastTokens = false;
+            bool selectedHasPrompt = false;
+            bool selectedHasDecode = false;
             attentionMasks.reserve(reserveBatch);
             positionIds.reserve(reserveBatch);
             ownedAttentionMasks.reserve(reserveBatch);
@@ -1667,6 +1702,13 @@ namespace fastllm {
                 return a.handle < b.handle;
             });
 
+            if (currentActivate == 0) {
+                activePrefillNeedsDecode = false;
+                if (!hasPrefill) {
+                    idleBurstPrefillHandles.clear();
+                }
+            }
+
             // When the GPU is completely idle, the first HTTP request can wake
             // this loop and take dictLocker before the sibling requests in the
             // same burst have registered.  That turns one uniform batched
@@ -1701,6 +1743,32 @@ namespace fastllm {
             idlePrefillBatchDeadline = std::chrono::steady_clock::time_point();
             idlePrefillBatchHardDeadline = std::chrono::steady_clock::time_point();
             idlePrefillBatchObservedSize = 0;
+            // Keep the whole burst collected while idle on the efficient full
+            // prefill budget. Without remembering burst membership, the
+            // second through last groups of that burst are indistinguishable
+            // from latency-sensitive add-prefills once its first group starts
+            // decoding.
+            if (interleaveActivePrefill && currentActivate == 0 && hasPrefill) {
+                idleBurstPrefillHandles.clear();
+                for (auto &order : orders) {
+                    if (order.context->preTokens == 0) {
+                        idleBurstPrefillHandles.insert(order.handle);
+                    }
+                }
+            } else if (!idleBurstPrefillHandles.empty()) {
+                for (auto it = idleBurstPrefillHandles.begin();
+                     it != idleBurstPrefillHandles.end();) {
+                    auto contextIt = model->responseContextDict.dicts.find(*it);
+                    if (contextIt == model->responseContextDict.dicts.end() ||
+                        contextIt->second->isAbort ||
+                        contextIt->second->isEnding ||
+                        contextIt->second->preTokens != 0) {
+                        it = idleBurstPrefillHandles.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
 
             // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
             if (totalPages > 0) {
@@ -1717,8 +1785,21 @@ namespace fastllm {
 
             // 当busyPages未超过pagesLimit时可以开启新的Prefill；超过时只做Decode
             bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
+            int activeBeforeSelection = currentActivate;
+            bool isActiveAddPrefill = interleaveActivePrefill &&
+                hasPrefill &&
+                activeBeforeSelection > 0;
+            bool forceDecodeThisIteration = activeBeforeSelection > 0 &&
+                isActiveAddPrefill && activePrefillNeedsDecode;
+            bool hasIdleBurstPrefill = !idleBurstPrefillHandles.empty();
+            int currentPrefillTokenLimit =
+                isActiveAddPrefill && !hasIdleBurstPrefill ?
+                activePrefillTokenLimit : batchedPrefillTokenLimit;
 
             for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
+                if (isPrompt == 1 && forceDecodeThisIteration) {
+                    continue;
+                }
                 if (isPrompt == 0 && seqLens.size() > 0) {
                     continue;
                 }
@@ -1727,7 +1808,8 @@ namespace fastllm {
                     continue;
                 }
                 // 未超过阈值且有pending的prefill请求时，优先尝试prefill；但如果prefill阶段没收集到任何请求，回退做decode
-                if (isPrompt == 0 && hasPrefill && canAddPrefill && seqLens.size() > 0) {
+                if (isPrompt == 0 && hasPrefill && canAddPrefill &&
+                    seqLens.size() > 0) {
                     continue;
                 }
 
@@ -2126,7 +2208,7 @@ namespace fastllm {
                                 continue;
                             }
                         } else {
-                            if (prefillTokenCount + thisLen > batchedPrefillTokenLimit && seqLens.size() > 0) {
+                            if (prefillTokenCount + thisLen > currentPrefillTokenLimit && seqLens.size() > 0) {
                                 continue;
                             }
                         }
@@ -2150,6 +2232,8 @@ namespace fastllm {
 
                     tokenContexts.push_back(ctx);
                     handles.push_back(ii.handle);
+                    selectedHasPrompt |= isPrompt != 0;
+                    selectedHasDecode |= isPrompt == 0;
                     if (isMultimodal) {
                         selectedMultimodal = true;
                     }
@@ -2219,6 +2303,21 @@ namespace fastllm {
                 }
             }
 
+            if (!seqLens.empty()) {
+                if (selectedHasPrompt && interleaveActivePrefill) {
+                    // If an idle burst did not fit in its first full-sized
+                    // forward, let the newly active requests decode before
+                    // admitting the remainder.  Burst membership decides
+                    // whether that remainder retains the full prefill budget.
+                    activePrefillNeedsDecode =
+                        isActiveAddPrefill ||
+                        (activeBeforeSelection == 0 &&
+                         handles.size() < orders.size());
+                } else if (selectedHasDecode) {
+                    activePrefillNeedsDecode = false;
+                }
+            }
+
             if (selectedNeedLastTokens) {
                 tokensManager.units.reserve(tokenContexts.size());
                 for (auto *ctx : tokenContexts) {
@@ -2227,7 +2326,7 @@ namespace fastllm {
             }
 
             // Decode阶段：检查空闲分页是否足够，不够时释放资源
-            if (seqLens.size() > 0 && seqLens[0] == 1) {
+            if (seqLens.size() > 0 && selectedHasDecode) {
                 auto pageNeeds = collectDecodePageNeeds(tokenContexts);
                 if (!pageNeeds.empty()) {
                     while (hasPagedManagerShortage(pageNeeds)) {
