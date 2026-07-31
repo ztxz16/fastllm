@@ -7205,6 +7205,76 @@ __device__ __forceinline__ float FastllmRouterLogitToFloat(__nv_bfloat16 value) 
     return __bfloat162float(value);
 }
 
+#ifndef USE_ROCM
+template <typename T>
+__device__ __forceinline__ void FastllmRouterLoad8(
+        const T *source, float (&values)[8]) {
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        values[i] = FastllmRouterLogitToFloat(source[i]);
+    }
+}
+
+template <>
+__device__ __forceinline__ void FastllmRouterLoad8<float>(
+        const float *source, float (&values)[8]) {
+    float4 lo = reinterpret_cast<const float4*>(source)[0];
+    float4 hi = reinterpret_cast<const float4*>(source)[1];
+    values[0] = lo.x;
+    values[1] = lo.y;
+    values[2] = lo.z;
+    values[3] = lo.w;
+    values[4] = hi.x;
+    values[5] = hi.y;
+    values[6] = hi.z;
+    values[7] = hi.w;
+}
+
+template <>
+__device__ __forceinline__ void FastllmRouterLoad8<half>(
+        const half *source, float (&values)[8]) {
+    uint4 packed = *reinterpret_cast<const uint4*>(source);
+    half2 pair0 = *reinterpret_cast<half2*>(&packed.x);
+    half2 pair1 = *reinterpret_cast<half2*>(&packed.y);
+    half2 pair2 = *reinterpret_cast<half2*>(&packed.z);
+    half2 pair3 = *reinterpret_cast<half2*>(&packed.w);
+    float2 value0 = __half22float2(pair0);
+    float2 value1 = __half22float2(pair1);
+    float2 value2 = __half22float2(pair2);
+    float2 value3 = __half22float2(pair3);
+    values[0] = value0.x;
+    values[1] = value0.y;
+    values[2] = value1.x;
+    values[3] = value1.y;
+    values[4] = value2.x;
+    values[5] = value2.y;
+    values[6] = value3.x;
+    values[7] = value3.y;
+}
+
+template <>
+__device__ __forceinline__ void FastllmRouterLoad8<__nv_bfloat16>(
+        const __nv_bfloat16 *source, float (&values)[8]) {
+    uint4 packed = *reinterpret_cast<const uint4*>(source);
+    __nv_bfloat162 pair0 = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
+    __nv_bfloat162 pair1 = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
+    __nv_bfloat162 pair2 = *reinterpret_cast<__nv_bfloat162*>(&packed.z);
+    __nv_bfloat162 pair3 = *reinterpret_cast<__nv_bfloat162*>(&packed.w);
+    float2 value0 = __bfloat1622float2(pair0);
+    float2 value1 = __bfloat1622float2(pair1);
+    float2 value2 = __bfloat1622float2(pair2);
+    float2 value3 = __bfloat1622float2(pair3);
+    values[0] = value0.x;
+    values[1] = value0.y;
+    values[2] = value1.x;
+    values[3] = value1.y;
+    values[4] = value2.x;
+    values[5] = value2.y;
+    values[6] = value3.x;
+    values[7] = value3.y;
+}
+#endif
+
 __device__ __forceinline__ float FastllmRouterBiasToFloat(
         const void *bias, int biasType, int expert) {
     if (biasType == 1) {
@@ -7240,6 +7310,265 @@ __device__ __forceinline__ void FastllmRouterCandidateCompareSwap(
         b = temp;
     }
 }
+
+#ifndef USE_ROCM
+// Laguna's sigmoid router has a fixed 256-expert, top-10 shape. Keep the
+// transformed row and the TopK scan in one warp so the normal decode path does
+// not need shared-memory staging or block-wide synchronization. Exact ties are
+// uncommon for model logits; when they occur, reproduce the legacy 64-thread
+// merge order below so expert ordering remains compatible.
+template <typename T>
+__global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
+        const T *logits, const void *bias, int32_t *index, float *score,
+        int tokens, int hasBias, int biasType, int needNorm, float routeScale) {
+    constexpr int EXPERTS = 256;
+    constexpr int TOPK = 10;
+    constexpr int LEGACY_THREADS = 64;
+    constexpr float NEG_INF = -1.0e30f;
+    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+
+    __shared__ float selectedKeys[TOPK];
+    __shared__ int selectedIds[TOPK];
+    __shared__ float selectedProb[TOPK];
+    __shared__ float legacyKeys[LEGACY_THREADS][TOPK];
+    __shared__ float legacyIds[LEGACY_THREADS][TOPK];
+
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    int lane = threadIdx.x;
+    int firstExpert = lane * 8;
+    const T *tokenLogits = logits + (size_t)token * EXPERTS;
+
+    float rawLogits[8];
+    float probabilities[8];
+    float choiceKeys[8];
+    float correctionBias[8];
+    FastllmRouterLoad8(tokenLogits + firstExpert, rawLogits);
+    if (hasBias) {
+        if (biasType == 1) {
+            FastllmRouterLoad8((const half*)bias + firstExpert, correctionBias);
+        } else if (biasType == 2) {
+            FastllmRouterLoad8((const __nv_bfloat16*)bias + firstExpert, correctionBias);
+        } else {
+            FastllmRouterLoad8((const float*)bias + firstExpert, correctionBias);
+        }
+    } else {
+#pragma unroll
+        for (int part = 0; part < 8; part++) {
+            correctionBias[part] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (int part = 0; part < 8; part++) {
+        float probability = 1.0f / (1.0f + __expf(-rawLogits[part]));
+        probabilities[part] = probability;
+        choiceKeys[part] = probability + correctionBias[part];
+    }
+
+#pragma unroll
+    for (int rank = 0; rank < TOPK; rank++) {
+        FastllmRouterCandidate best = {choiceKeys[0], firstExpert};
+#pragma unroll
+        for (int part = 1; part < 8; part++) {
+            FastllmRouterCandidate candidate = {choiceKeys[part], firstExpert + part};
+            if (FastllmRouterCandidateBetter(candidate, best)) {
+                best = candidate;
+            }
+        }
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            FastllmRouterCandidate other;
+            other.key = __shfl_xor_sync(FULL_WARP_MASK, best.key, mask);
+            other.id = __shfl_xor_sync(FULL_WARP_MASK, best.id, mask);
+            if (FastllmRouterCandidateBetter(other, best)) {
+                best = other;
+            }
+        }
+
+        int owner = best.id >> 3;
+        int ownerPart = best.id & 7;
+        float probability = probabilities[ownerPart];
+        probability = __shfl_sync(FULL_WARP_MASK, probability, owner);
+        if (lane == 0) {
+            selectedKeys[rank] = best.key;
+            selectedIds[rank] = best.id;
+            selectedProb[rank] = probability;
+        }
+
+        if (lane == owner) {
+#pragma unroll
+            for (int part = 0; part < 8; part++) {
+                if (part == ownerPart) {
+                    choiceKeys[part] = NEG_INF;
+                }
+            }
+        }
+    }
+
+    __syncwarp(FULL_WARP_MASK);
+    float cutoff = lane == 0 ? selectedKeys[TOPK - 1] : 0.0f;
+    cutoff = __shfl_sync(FULL_WARP_MASK, cutoff, 0);
+    int useLegacyMerge = 0;
+#pragma unroll
+    for (int part = 0; part < 8; part++) {
+        useLegacyMerge |= choiceKeys[part] == cutoff;
+    }
+    useLegacyMerge = __any_sync(FULL_WARP_MASK, useLegacyMerge);
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 1; i < TOPK; i++) {
+            useLegacyMerge |= selectedKeys[i] == selectedKeys[i - 1];
+        }
+    }
+    useLegacyMerge = __shfl_sync(FULL_WARP_MASK, useLegacyMerge, 0);
+
+    if (!useLegacyMerge) {
+        if (lane == 0) {
+            float selectedSum = 1.0f;
+            if (needNorm) {
+                selectedSum = 0.0f;
+#pragma unroll
+                for (int rank = 0; rank < TOPK; rank++) {
+                    selectedSum += selectedProb[rank];
+                }
+            }
+            int32_t *tokenIndex = index + (size_t)token * TOPK;
+            float *tokenScore = score + (size_t)token * TOPK;
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                tokenIndex[rank] = selectedIds[rank];
+                tokenScore[rank] = selectedProb[rank] / selectedSum * routeScale;
+            }
+        }
+        return;
+    }
+
+    // The fast scan marks winners as consumed in choiceKeys. Restore those
+    // entries before constructing the exact legacy lists.
+#pragma unroll
+    for (int rank = 0; rank < TOPK; rank++) {
+        int expert = lane == 0 ? selectedIds[rank] : 0;
+        float key = lane == 0 ? selectedKeys[rank] : 0.0f;
+        expert = __shfl_sync(FULL_WARP_MASK, expert, 0);
+        key = __shfl_sync(FULL_WARP_MASK, key, 0);
+        int owner = expert >> 3;
+        int ownerPart = expert & 7;
+        if (lane == owner) {
+#pragma unroll
+            for (int part = 0; part < 8; part++) {
+                if (part == ownerPart) {
+                    choiceKeys[part] = key;
+                }
+            }
+        }
+    }
+
+    // Populate the same 64 virtual lists as FastllmSelectExpertKernel. One
+    // physical warp handles two virtual threads per lane; this path is only
+    // taken for exact ranking-key ties.
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+        int virtualTid = lane + half * 32;
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            legacyKeys[virtualTid][rank] = -1.0e100;
+            legacyIds[virtualTid][rank] = -1.0f;
+        }
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            int expert = virtualTid + part * LEGACY_THREADS;
+            int owner = expert >> 3;
+            int ownerPart = expert & 7;
+            float key = NEG_INF;
+#pragma unroll
+            for (int sourcePart = 0; sourcePart < 8; sourcePart++) {
+                float candidate = __shfl_sync(
+                    FULL_WARP_MASK, choiceKeys[sourcePart], owner);
+                if (sourcePart == ownerPart) {
+                    key = candidate;
+                }
+            }
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                if (key > legacyKeys[virtualTid][rank]) {
+#pragma unroll
+                    for (int shift = TOPK - 1; shift > rank; shift--) {
+                        legacyKeys[virtualTid][shift] = legacyKeys[virtualTid][shift - 1];
+                        legacyIds[virtualTid][shift] = legacyIds[virtualTid][shift - 1];
+                    }
+                    legacyKeys[virtualTid][rank] = key;
+                    legacyIds[virtualTid][rank] = (float)expert;
+                    break;
+                }
+            }
+        }
+    }
+    __syncwarp(FULL_WARP_MASK);
+
+    for (int stride = 32; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            int pos0 = 0;
+            int pos1 = 0;
+            while (pos0 + pos1 < TOPK) {
+                if (legacyKeys[lane][pos0] > legacyKeys[lane + stride][pos1]) {
+                    pos0++;
+                } else {
+                    pos1++;
+                }
+            }
+            pos0--;
+            pos1--;
+            for (int pos = TOPK - 1; pos >= 0; pos--) {
+                if (pos1 < 0 ||
+                    (pos0 >= 0 && legacyKeys[lane][pos0] < legacyKeys[lane + stride][pos1])) {
+                    legacyKeys[lane][pos] = legacyKeys[lane][pos0];
+                    legacyIds[lane][pos] = legacyIds[lane][pos0];
+                    pos0--;
+                } else {
+                    legacyKeys[lane][pos] = legacyKeys[lane + stride][pos1];
+                    legacyIds[lane][pos] = legacyIds[lane + stride][pos1];
+                    pos1--;
+                }
+            }
+        }
+        __syncwarp(FULL_WARP_MASK);
+    }
+
+#pragma unroll
+    for (int rank = 0; rank < TOPK; rank++) {
+        int expert = lane == 0 ? (int)legacyIds[0][rank] : 0;
+        expert = __shfl_sync(FULL_WARP_MASK, expert, 0);
+        int owner = expert >> 3;
+        int ownerPart = expert & 7;
+        float probability = probabilities[ownerPart];
+        probability = __shfl_sync(FULL_WARP_MASK, probability, owner);
+        if (lane == 0) {
+            selectedIds[rank] = expert;
+            selectedProb[rank] = probability;
+        }
+    }
+
+    if (lane == 0) {
+        float selectedSum = 1.0f;
+        if (needNorm) {
+            selectedSum = 0.0f;
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                selectedSum += selectedProb[rank];
+            }
+        }
+        int32_t *tokenIndex = index + (size_t)token * TOPK;
+        float *tokenScore = score + (size_t)token * TOPK;
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            tokenIndex[rank] = selectedIds[rank];
+            tokenScore[rank] = selectedProb[rank] / selectedSum * routeScale;
+        }
+    }
+}
+#endif
 
 // The 256-expert router keeps probabilities in shared memory, so the FP32
 // scoring intermediate never reaches global memory. Ranking deliberately uses
@@ -7560,18 +7889,37 @@ static bool FastllmCudaFusedSelectExpert256(
     int tokens = logits.Count(0) / 256;
     int biasType = !hasBias || gateBias->dataType == fastllm::DataType::FLOAT32 ? 0 :
                    (gateBias->dataType == fastllm::DataType::FLOAT16 ? 1 : 2);
-    if (logits.dataType == fastllm::DataType::FLOAT16) {
-        FastllmFusedSelectExpert256Kernel<half, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-            (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
-    } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmFusedSelectExpert256Kernel<__nv_bfloat16, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-            (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
-    } else {
-        FastllmFusedSelectExpert256Kernel<float, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-            (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+#ifndef USE_ROCM
+    if constexpr (ROUTER_SIGMOID) {
+        if (logits.dataType == fastllm::DataType::FLOAT16) {
+            FastllmFusedSigmoidSelectExpert256Top10Kernel<half><<<tokens, 32>>>(
+                (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
+            FastllmFusedSigmoidSelectExpert256Top10Kernel<__nv_bfloat16><<<tokens, 32>>>(
+                (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        } else {
+            FastllmFusedSigmoidSelectExpert256Top10Kernel<float><<<tokens, 32>>>(
+                (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        }
+    } else
+#endif
+    {
+        if (logits.dataType == fastllm::DataType::FLOAT16) {
+            FastllmFusedSelectExpert256Kernel<half, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
+            FastllmFusedSelectExpert256Kernel<__nv_bfloat16, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        } else {
+            FastllmFusedSelectExpert256Kernel<float, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        }
     }
 
     cudaError_t state = cudaGetLastError();
