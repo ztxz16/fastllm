@@ -3665,14 +3665,6 @@ namespace fastllm {
                                          prefix + "share_expert.down_proj.weight",
                                          Step3p5LayerLimit(swiglu_limits_shared, i),
                                          buf.ffMiddle, buf.ffAct, buf.ffUp, buf.shareOutput);
-                    if (buf.shareOutput.dataType != buf.hiddenStates.dataType) {
-                        Qwen3CudaToDataType(cudaRunner, buf.shareOutput, buf.hiddenStates.dataType);
-                    }
-                    if (tensorParallel) {
-                        FastllmNcclAllReduce(buf.shareOutput.cudaData, buf.shareOutput.cudaData,
-                                             buf.shareOutput.Count(0), buf.shareOutput.dataType, gpuId);
-                    }
-                    Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.shareOutput);
 
                     int flatBatch = buf.attenInput.dims[0];
                     int flatLen = buf.attenInput.dims[1];
@@ -3707,14 +3699,14 @@ namespace fastllm {
                                         *localFusedWeights[2], buf.w1, buf.moeFinal, i,
                                         Step3p5LayerLimit(swiglu_limits, i));
                     buf.moeFinal.Reshape(buf.hiddenStates.dims);
-                    if (buf.moeFinal.dataType != buf.hiddenStates.dataType) {
-                        Qwen3CudaToDataType(cudaRunner, buf.moeFinal, buf.hiddenStates.dataType);
+                    if (buf.shareOutput.dataType != buf.moeFinal.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, buf.shareOutput, buf.moeFinal.dataType);
                     }
-                    if (tensorParallel) {
-                        FastllmNcclAllReduce(buf.moeFinal.cudaData, buf.moeFinal.cudaData,
-                                             buf.moeFinal.Count(0), buf.moeFinal.dataType, gpuId);
-                    }
-                    Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.moeFinal);
+                    buf.shareOutput.Reshape(buf.moeFinal.dims);
+                    // Both tensors are rank-local partials. Merge them before
+                    // the collective so each MoE layer needs one all-reduce.
+                    Qwen3CudaAddTo(cudaRunner, buf.moeFinal, buf.shareOutput);
+                    addPartialToResidualReduce(buf.moeFinal);
                 }
             }
 
@@ -4198,21 +4190,6 @@ namespace fastllm {
                 runFeedForwardOutput(attenInput, sharedGateupName, sharedGateName, sharedUpName, sharedDownName,
                                      Step3p5LayerLimit(swiglu_limits_shared, i),
                                      ffMiddle, ffAct, ffUp, shareOutput);
-                if (shareOutput.dataType != hiddenStates.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, shareOutput, hiddenStates.dataType);
-                }
-                if (tensorParallel) {
-                    if (GPUForwardPreferNativeNccl(
-                            isPrefill, shareOutput.GetBytes(), (int)ratios.size())) {
-                        FastllmNcclAllReduceNoCustom(
-                            shareOutput.cudaData, shareOutput.cudaData,
-                            shareOutput.Count(0), shareOutput.dataType, gpuId);
-                    } else {
-                        FastllmNcclAllReduce(shareOutput.cudaData, shareOutput.cudaData,
-                                             shareOutput.Count(0), shareOutput.dataType, gpuId);
-                    }
-                }
-                Qwen3CudaAddTo(cudaRunner, hiddenStates, shareOutput);
 
                 int flatBatch = attenInput.dims[0];
                 int flatLen = attenInput.dims[1];
@@ -4290,21 +4267,14 @@ namespace fastllm {
                     }
                 }
                 moeFinal.Reshape(hiddenStates.dims);
-                if (moeFinal.dataType != hiddenStates.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, moeFinal, hiddenStates.dataType);
+                if (shareOutput.dataType != moeFinal.dataType) {
+                    Qwen3CudaToDataType(cudaRunner, shareOutput, moeFinal.dataType);
                 }
-                if (tensorParallel) {
-                    if (GPUForwardPreferNativeNccl(
-                            isPrefill, moeFinal.GetBytes(), (int)ratios.size())) {
-                        FastllmNcclAllReduceNoCustom(
-                            moeFinal.cudaData, moeFinal.cudaData,
-                            moeFinal.Count(0), moeFinal.dataType, gpuId);
-                    } else {
-                        FastllmNcclAllReduce(moeFinal.cudaData, moeFinal.cudaData,
-                                             moeFinal.Count(0), moeFinal.dataType, gpuId);
-                    }
-                }
-                Qwen3CudaAddTo(cudaRunner, hiddenStates, moeFinal);
+                shareOutput.Reshape(moeFinal.dims);
+                // Keep eager and graph execution on the same single-reduction
+                // dataflow as Qwen3.5's shared+routed expert implementation.
+                Qwen3CudaAddTo(cudaRunner, moeFinal, shareOutput);
+                addPartialToResidualReduce(moeFinal);
             }
         }
 
