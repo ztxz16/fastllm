@@ -171,6 +171,14 @@ namespace fastllm {
         std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
         std::vector <std::string> tool_call_parameter_name_prefixes;
         std::vector <int> tool_call_allowed_token_ids;
+        bool tool_call_content_sampling_enabled = false;
+        // Set on the per-step config after Kimi-K3 has drained DSpark's
+        // scheduler-ahead queue. DSpark then samples from its batched target
+        // verification logits while keeping target and draft caches aligned.
+        bool tool_call_content_sampling_active = false;
+        int tool_call_content_top_k = 1;
+        float tool_call_content_top_p = 1.0f;
+        float tool_call_content_temperature = 1.0f;
 
         bool IsSimpleGreedy() const {
             if (!tool_call_allowed_token_ids.empty()) {

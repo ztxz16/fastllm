@@ -251,6 +251,24 @@ extern "C" {
         if (!error.empty() || root.is_null()) {
             return false;
         }
+        json11::Json contentSampling = root["content_sampling"];
+        if (contentSampling.is_object() &&
+            contentSampling["type"].string_value() == "tool_content_sampling" &&
+            contentSampling["format"].string_value() == "kimi_k3_xtml") {
+            int topK = contentSampling["top_k"].int_value();
+            double topP = contentSampling["top_p"].number_value();
+            double temperature = contentSampling["temperature"].number_value();
+            if (topK <= 0 || topP <= 0.0 || topP > 1.0 ||
+                temperature <= 0.0) {
+                return false;
+            }
+            config.tool_call_content_sampling_enabled = true;
+            config.tool_call_content_top_k = topK;
+            config.tool_call_content_top_p = (float)topP;
+            config.tool_call_content_temperature = (float)temperature;
+            config.tool_call_allowed_token_ids.clear();
+            return true;
+        }
         json11::Json nameConstraint = root["name_constraint"];
         if (!nameConstraint.is_object()) {
             nameConstraint = root;
