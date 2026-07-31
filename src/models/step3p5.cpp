@@ -3672,16 +3672,23 @@ namespace fastllm {
                     Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                     *requireLocal(weight[prefix + "moe.gate.weight"], prefix + "moe.gate.weight"),
                                     *GetEmptyData(), buf.routerLogits, true);
-                    Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits, buf.routerProb, DataType::FLOAT32);
-                    Step3p5CudaSigmoid(cudaRunner, buf.routerProb, buf.routerProb);
                     Data *localGateBias = nullptr;
                     if (use_moe_router_bias &&
                         weight.weight.find(prefix + "moe.router_bias") != weight.weight.end()) {
                         localGateBias = requireLocal(weight[prefix + "moe.router_bias"], prefix + "moe.router_bias");
                     }
-                    Qwen3CudaSelectExpert(cudaRunner, buf.routerProb, buf.expertIndex, buf.expertScore,
-                                          num_experts_per_tok, norm_topk_prob,
-                                          routed_scaling_factor, localGateBias);
+                    if (!Qwen3CudaTryFusedSigmoidSelectExpert(
+                            cudaRunner, buf.routerLogits, buf.expertIndex, buf.expertScore,
+                            num_experts_per_tok, norm_topk_prob,
+                            routed_scaling_factor, localGateBias)) {
+                        Qwen3CudaConvertToDataType(
+                            cudaRunner, buf.routerLogits, buf.routerProb, DataType::FLOAT32);
+                        Step3p5CudaSigmoid(cudaRunner, buf.routerProb, buf.routerProb);
+                        Qwen3CudaSelectExpert(
+                            cudaRunner, buf.routerProb, buf.expertIndex, buf.expertScore,
+                            num_experts_per_tok, norm_topk_prob,
+                            routed_scaling_factor, localGateBias);
+                    }
 
                     auto &localFusedWeights = fusedMoeByDevice.at(gpuId)[i];
                     std::pair<int, int> expertRange = fusedMoeRangesByDevice.at(gpuId)[i];
@@ -4197,16 +4204,23 @@ namespace fastllm {
                 Qwen3CudaLinear(cudaRunner, attenInput,
                                 *requireLocal(weight[prefix + "moe.gate.weight"], prefix + "moe.gate.weight"),
                                 *GetEmptyData(), routerLogits, true);
-                Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerProb, DataType::FLOAT32);
-                Step3p5CudaSigmoid(cudaRunner, routerProb, routerProb);
                 Data *localGateBias = nullptr;
                 if (use_moe_router_bias &&
                     weight.weight.find(prefix + "moe.router_bias") != weight.weight.end()) {
                     localGateBias = requireLocal(weight[prefix + "moe.router_bias"], prefix + "moe.router_bias");
                 }
-                Qwen3CudaSelectExpert(cudaRunner, routerProb, expertIndex, expertScore,
-                                      num_experts_per_tok, norm_topk_prob,
-                                      routed_scaling_factor, localGateBias);
+                if (!Qwen3CudaTryFusedSigmoidSelectExpert(
+                        cudaRunner, routerLogits, expertIndex, expertScore,
+                        num_experts_per_tok, norm_topk_prob,
+                        routed_scaling_factor, localGateBias)) {
+                    Qwen3CudaConvertToDataType(
+                        cudaRunner, routerLogits, routerProb, DataType::FLOAT32);
+                    Step3p5CudaSigmoid(cudaRunner, routerProb, routerProb);
+                    Qwen3CudaSelectExpert(
+                        cudaRunner, routerProb, expertIndex, expertScore,
+                        num_experts_per_tok, norm_topk_prob,
+                        routed_scaling_factor, localGateBias);
+                }
 
                 bool ranFusedMoe = false;
                 auto fusedIt = fusedMoeByDevice.find(gpuId);

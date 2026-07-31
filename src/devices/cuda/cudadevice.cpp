@@ -2503,7 +2503,8 @@ namespace fastllm {
         this->ops["CumSumLastDim"] = (BaseOperator*)(new CudaCumSumLastDimOp());
         this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
         this->ops["SelectExpert"] = (BaseOperator*)(new CudaSelectExpertOp());
-        this->ops["FusedSoftmaxSelectExpert"] = (BaseOperator*)(new CudaFusedSoftmaxSelectExpertOp());
+        this->ops["FusedSoftmaxSelectExpert"] = (BaseOperator*)(new CudaFusedSelectExpertOp());
+        this->ops["FusedSigmoidSelectExpert"] = (BaseOperator*)(new CudaFusedSelectExpertOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CudaPermuteSelfOp());
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CudaNearlyRotatePosition2DOp());
@@ -4809,7 +4810,7 @@ namespace fastllm {
         }
     }
 
-    void CudaFusedSoftmaxSelectExpertOp::Reshape(
+    void CudaFusedSelectExpertOp::Reshape(
             const std::string &opType, const fastllm::DataDict &datas,
             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &logits = *(datas.find("logits")->second);
@@ -4818,7 +4819,7 @@ namespace fastllm {
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
 
         AssertInFastLLM(!logits.dims.empty(),
-                        "FusedSoftmaxSelectExpert requires non-empty logits.\n");
+                        "FusedSelectExpert requires non-empty logits.\n");
         int experts = logits.dims.back();
         int tokens = logits.Count(0) / experts;
         index.dataType = DataType::INT32;
@@ -4827,7 +4828,7 @@ namespace fastllm {
         score.Resize({tokens, topk});
     }
 
-    bool CudaFusedSoftmaxSelectExpertOp::CanRun(
+    bool CudaFusedSelectExpertOp::CanRun(
             const std::string &opType, const fastllm::DataDict &datas,
             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         auto logitsIt = datas.find("logits");
@@ -4840,7 +4841,10 @@ namespace fastllm {
         }
         const Data &logits = *logitsIt->second;
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
-        if (topk != 8 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
+        bool sigmoid = opType == "FusedSigmoidSelectExpert";
+        if ((!sigmoid && opType != "FusedSoftmaxSelectExpert") ||
+            topk != (sigmoid ? 10 : 8) ||
+            logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
             (logits.dataType != DataType::FLOAT16 &&
              logits.dataType != DataType::BFLOAT16 &&
              logits.dataType != DataType::FLOAT32)) {
@@ -4849,14 +4853,17 @@ namespace fastllm {
         auto biasIt = datas.find("gateBias");
         if (biasIt != datas.end() && biasIt->second != nullptr && !biasIt->second->dims.empty()) {
             const Data &bias = *biasIt->second;
-            if (bias.dataType != DataType::FLOAT32 || bias.Count(0) != 256) {
+            if ((bias.dataType != DataType::FLOAT32 &&
+                 bias.dataType != DataType::FLOAT16 &&
+                 bias.dataType != DataType::BFLOAT16) ||
+                bias.Count(0) != 256) {
                 return false;
             }
         }
         return true;
     }
 
-    void CudaFusedSoftmaxSelectExpertOp::Run(
+    void CudaFusedSelectExpertOp::Run(
             const std::string &opType, const fastllm::DataDict &datas,
             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &logits = *(datas.find("logits")->second);
@@ -4870,10 +4877,13 @@ namespace fastllm {
 
         index.Allocate(false);
         score.Allocate(false);
-        bool success = FastllmCudaFusedSoftmaxSelectExpert(
-            logits, gateBias, index, score, topk, needNorm, routeScale);
+        bool success = opType == "FusedSigmoidSelectExpert" ?
+            FastllmCudaFusedSigmoidSelectExpert(
+                logits, gateBias, index, score, topk, needNorm, routeScale) :
+            FastllmCudaFusedSoftmaxSelectExpert(
+                logits, gateBias, index, score, topk, needNorm, routeScale);
         AssertInFastLLM(success,
-                        "CudaFusedSoftmaxSelectExpert received an unsupported input.\n");
+                        "CudaFusedSelectExpert received an unsupported input.\n");
     }
 
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis) {
