@@ -23,6 +23,16 @@ class MoeArchitectureTest(unittest.TestCase):
             _is_moe_architecture("UnknownArchitecture", "laguna")
         )
 
+    def test_kimi_k3_architecture_is_moe(self):
+        self.assertTrue(
+            _is_moe_architecture("KimiK3ForConditionalGeneration")
+        )
+
+    def test_kimi_k3_model_type_is_moe(self):
+        self.assertTrue(
+            _is_moe_architecture("UnknownArchitecture", "kimi_k3")
+        )
+
     def test_dense_model_is_not_moe(self):
         self.assertFalse(
             _is_moe_architecture("LlamaForCausalLM", "llama")

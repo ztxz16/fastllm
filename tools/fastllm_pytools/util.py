@@ -204,7 +204,11 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "MiniMaxM2ForCausalLM",
         "HYV3ForCausalLM",
         "LagunaForCausalLM",
-    ] or model_type in ["deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna"] or text_model_type == "qwen3_5_moe_text")
+        "KimiK3ForConditionalGeneration",
+    ] or model_type in [
+        "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
+        "kimi_k3",
+    ] or text_model_type == "qwen3_5_moe_text")
 
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
