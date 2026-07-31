@@ -16,8 +16,100 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+#include <tuple>
+
 
 namespace fastllm {
+    enum class Qwen35GdnProjectionLayout {
+        Missing,
+        Qkvzba,
+        QkvzBa,
+        QkvZBa
+    };
+
+    Qwen35GdnProjectionLayout ResolveQwen35GdnProjectionLayout(
+            const WeightMap &weight,
+            const std::string &layerPrefix);
+
+    enum class Qwen35AttentionProjectionLayout {
+        Missing,
+        MergedQkv,
+        SplitQkv
+    };
+
+    Qwen35AttentionProjectionLayout ResolveQwen35AttentionProjectionLayout(
+            const WeightMap &weight,
+            const std::string &layerPrefix);
+
+    int SelectQwen35DecodeTokensForPageBudget(
+            int requestedTokens,
+            const std::vector<std::pair<int, int> > &requestedNeedsAndFree,
+            const std::vector<std::pair<int, int> > &singleNeedsAndFree);
+
+    enum class Qwen35RequestPhase {
+        NewPrefill,
+        ContinuedPrefill,
+        Decode
+    };
+
+    struct Qwen35LongPrefillQuantum {
+        int cursor = 0;
+        int length = 0;
+        int baseTokens = 0;
+        bool isLast = false;
+        bool producesOutput = false;
+    };
+
+    struct Qwen35PageReservationBudget {
+        int reserved = 0;
+        int needed = 0;
+        int free = 0;
+    };
+
+    bool Qwen35InterleaveLongPrefillEnabled();
+    bool Qwen35BatchedMtpEnabled();
+    bool Qwen35Turbo3KvEnabled();
+    DataType ResolveQwen35CudaCacheType(DataType cacheType, DataType computeType);
+    size_t Qwen35PagedCachePageBytes(
+            DataType type, int pageLen, int numHeads, int headDim);
+
+    Qwen35RequestPhase ClassifyQwen35RequestPhase(const ResponseContext &context);
+
+    bool BeginQwen35LongPrefill(
+            ResponseContext &context,
+            int total,
+            uint64_t ticket,
+            const std::map<PagedCacheManager*, int> &reservedPages = {});
+
+    Qwen35LongPrefillQuantum PlanQwen35LongPrefillQuantum(
+            const ResponseContext &context,
+            int chunkSize);
+
+    bool CommitQwen35LongPrefillQuantum(
+            ResponseContext &context,
+            const Qwen35LongPrefillQuantum &quantum,
+            bool mtpViable);
+
+    int SelectQwen35LongPrefillHandle(
+            const std::vector<std::tuple<int, uint64_t> > &candidates,
+            uint64_t lastTicket);
+
+    bool CanAdmitQwen35LongPrefill(int residentRequests, int schedulerLanes);
+
+    bool CanReserveQwen35LongPrefillPages(
+            const std::vector<Qwen35PageReservationBudget> &budgets);
+
+#ifdef USE_CUDA
+    using Qwen35DivisionScheme =
+        std::map<int, std::vector<std::pair<int, int> > >;
+    Qwen35DivisionScheme BuildQwen35LinearOutProjScheme(
+            const Qwen35DivisionScheme &keyHeadScheme,
+            int numKHeads,
+            int numVHeads,
+            int headVDim,
+            int quantBlock,
+            bool tiledColumns);
+#endif
     class Qwen3_5Model: public basellm {
     public:
     Qwen3_5Model (); // 构造函数
@@ -100,6 +192,8 @@ namespace fastllm {
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
+        virtual std::pair<DataType, DataType> GetKVCacheDataTypes(int layerIndex) const override;
+        virtual void SetKVCacheDataType(DataType dataType) override;
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const override;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
@@ -134,6 +228,7 @@ namespace fastllm {
 
     protected:
         bool IsThreadTensorParallelEnabled() const;
+
 
         std::vector <int> ForwardGPUWithHiddenStates(
                 int batch,
@@ -212,6 +307,8 @@ namespace fastllm {
         bool mergeSwiglu = false;
 
         bool initialized_add1 = false;
+        bool ggufNormsPreOffset = false;      // converter already +1'd norms
+        bool ggufOutProjColumnsTiled = false;  // out_proj columns stay tiled (runtime activation reorder)
 
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
         int mtp_num_hidden_layers = 0;
@@ -241,8 +338,8 @@ namespace fastllm {
         std::atomic<bool> mtpLogPrinted{false};
         std::atomic<bool> mtpSkipLogPrinted{false};
         std::atomic<long long> mtpValidationCount{0};
-        std::array<std::atomic<long long>, 8> mtpDraftPositionAttempts{};
-        std::array<std::atomic<long long>, 8> mtpDraftPositionAccepts{};
+        std::array<std::atomic<long long>, 9> mtpDraftPositionAttempts{};
+        std::array<std::atomic<long long>, 9> mtpDraftPositionAccepts{};
 
         Data inv_scale_data;
 

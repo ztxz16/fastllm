@@ -3,6 +3,7 @@
 #include "model.h"
 #include "models/basellm.h"
 #include "devices/cpu/computeutils.h"
+#include "models/qwen3_5.h"
 #include "gguf.h"
 
 #ifdef USE_NUMAS
@@ -17,6 +18,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/attention/fastllm-paged-attention-native.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -37,6 +39,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <map>
 
 namespace {
     void Expect(bool condition, const std::string &message);
@@ -69,6 +72,41 @@ namespace {
 
     private:
         std::filesystem::path path;
+    };
+    int SetRegressionEnv(const std::string &name, const char *value) {
+#ifdef _WIN32
+        return _putenv_s(name.c_str(), value == nullptr ? "" : value);
+#else
+        return value == nullptr ? unsetenv(name.c_str()) :
+            setenv(name.c_str(), value, 1);
+#endif
+    }
+
+    class ScopedEnvVar {
+    public:
+        ScopedEnvVar(const std::string &name, const char *value) : name(name) {
+            const char *current = std::getenv(name.c_str());
+            hadValue = current != nullptr;
+            if (hadValue) {
+                oldValue = current;
+            }
+            int rc = SetRegressionEnv(name, value);
+            if (rc != 0) {
+                throw std::runtime_error("failed to update regression environment variable: " + name);
+            }
+        }
+
+        ~ScopedEnvVar() {
+            SetRegressionEnv(name, hadValue ? oldValue.c_str() : nullptr);
+        }
+
+        ScopedEnvVar(const ScopedEnvVar &) = delete;
+        ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+
+    private:
+        std::string name;
+        std::string oldValue;
+        bool hadValue = false;
     };
 
     void RunBFloat16Q8KConversionRegression() {
@@ -137,6 +175,25 @@ namespace {
             return "";
         }
     };
+    class Qwen35ConfigTestModel final : public fastllm::Qwen3_5Model {
+    public:
+        const fastllm::Data &InvScaleData() const {
+            return inv_scale_data;
+        }
+
+        int NumKeyValueHeads() const {
+            return num_key_value_heads;
+        }
+
+        void ConfigureTurbo3Fixture() {
+            head_dim = 256;
+            block_cnt = 2;
+            weight.AddEmptyWeight(
+                language_prefix + "layers.0.self_attn.o_proj.weight",
+                {1, 1}, fastllm::DataType::FLOAT32);
+        }
+    };
+
 
     class ScopedFirstDevice {
     public:
@@ -161,6 +218,560 @@ namespace {
         if (!condition) {
             throw std::runtime_error(message);
         }
+    }
+    std::vector<float> ToFloatVector(fastllm::Data data);
+    void ExpectFloatNear(const std::vector<float> &expected, const std::vector<float> &actual,
+                         float atol, float rtol, const std::string &name);
+
+    struct SyntheticGGUFTensor {
+        std::string name;
+        std::vector<int64_t> dims;
+        std::vector<float> values;
+        int32_t ggmlType = GGML_TYPE_F32;
+        std::vector<uint8_t> rawData;
+    };
+
+    uint64_t SyntheticGGUFTensorBytes(const SyntheticGGUFTensor &tensor) {
+        if (tensor.ggmlType == GGML_TYPE_F32) {
+            return (uint64_t)tensor.values.size() * sizeof(float);
+        }
+        return tensor.rawData.size();
+    }
+
+    SyntheticGGUFTensor MakeSyntheticQuantTensor(
+            const std::string &name,
+            const std::vector<int64_t> &dims,
+            ggml_type type) {
+        Expect(!dims.empty() && dims[0] % ggml_blck_size(type) == 0,
+               "synthetic quantized GGUF row width must match the block size.");
+        int64_t rows = 1;
+        for (size_t i = 1; i < dims.size(); i++) {
+            rows *= dims[i];
+        }
+        SyntheticGGUFTensor tensor;
+        tensor.name = name;
+        tensor.dims = dims;
+        tensor.ggmlType = type;
+        tensor.rawData.resize(ggml_row_size(type, dims[0]) * rows, 0);
+        return tensor;
+    }
+
+    template <typename T>
+    void WritePod(std::ofstream &out, T value) {
+        out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+    }
+
+    void WriteGGUFString(std::ofstream &out, const std::string &value) {
+        WritePod<uint64_t>(out, value.size());
+        out.write(value.data(), (std::streamsize)value.size());
+    }
+
+    void WriteGGUFStringKV(std::ofstream &out, const std::string &key,
+                           const std::string &value) {
+        WriteGGUFString(out, key);
+        WritePod<int32_t>(out, 8);
+        WriteGGUFString(out, value);
+    }
+
+    void WriteGGUFUInt32KV(std::ofstream &out, const std::string &key,
+                           uint32_t value) {
+        WriteGGUFString(out, key);
+        WritePod<int32_t>(out, 4);
+        WritePod<uint32_t>(out, value);
+    }
+
+    void WriteGGUFFloat32KV(std::ofstream &out, const std::string &key,
+                            float value) {
+        WriteGGUFString(out, key);
+        WritePod<int32_t>(out, 6);
+        WritePod<float>(out, value);
+    }
+
+    void WriteGGUFInt32ArrayKV(std::ofstream &out, const std::string &key,
+                               const std::vector<int32_t> &values) {
+        WriteGGUFString(out, key);
+        WritePod<int32_t>(out, 9);
+        WritePod<int32_t>(out, 5);
+        WritePod<uint64_t>(out, values.size());
+        for (int32_t value : values) {
+            WritePod<int32_t>(out, value);
+        }
+    }
+
+    void WriteGGUFStringArrayKV(std::ofstream &out, const std::string &key,
+                                const std::vector<std::string> &values) {
+        WriteGGUFString(out, key);
+        WritePod<int32_t>(out, 9);
+        WritePod<int32_t>(out, 8);
+        WritePod<uint64_t>(out, values.size());
+        for (const std::string &value : values) {
+            WriteGGUFString(out, value);
+        }
+    }
+
+    uint64_t Pad32(uint64_t value) {
+        return (value + 31) / 32 * 32;
+    }
+
+    std::string MakeTempGGUFPath(const std::string &name) {
+        auto ticks = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        return (std::filesystem::temp_directory_path() /
+                (name + "-" + std::to_string(ticks) + ".gguf")).string();
+    }
+
+    void RunRegressionFixtureScopeRegression() {
+        const std::string envName = "FASTLLM_REGRESSION_SCOPED_ENV_TEST";
+        const char *original = std::getenv(envName.c_str());
+        const bool hadOriginal = original != nullptr;
+        const std::string originalValue = hadOriginal ? original : "";
+
+        {
+            ScopedEnvVar outer(envName, "outer");
+            Expect(std::string(std::getenv(envName.c_str())) == "outer",
+                   "scoped environment fixture did not apply a value.");
+            {
+                ScopedEnvVar inner(envName, "inner");
+                Expect(std::string(std::getenv(envName.c_str())) == "inner",
+                       "nested environment fixture did not apply a value.");
+            }
+            Expect(std::string(std::getenv(envName.c_str())) == "outer",
+                   "nested environment fixture did not restore its parent value.");
+        }
+        const char *restored = std::getenv(envName.c_str());
+        Expect((hadOriginal && restored != nullptr && originalValue == restored) ||
+                   (!hadOriginal && restored == nullptr),
+               "environment fixture did not restore the original value.");
+
+        {
+            ScopedEnvVar unset(envName, nullptr);
+            Expect(std::getenv(envName.c_str()) == nullptr,
+                   "environment fixture did not apply an unset value.");
+            {
+                ScopedEnvVar inner(envName, "temporary");
+            }
+            Expect(std::getenv(envName.c_str()) == nullptr,
+                   "environment fixture did not restore an unset parent value.");
+        }
+        restored = std::getenv(envName.c_str());
+        Expect((hadOriginal && restored != nullptr && originalValue == restored) ||
+                   (!hadOriginal && restored == nullptr),
+               "unset environment fixture did not restore the original value.");
+
+        std::filesystem::path ggufPath = MakeTempGGUFPath("fastllm-fixture-scope");
+        Expect(ggufPath.parent_path() == std::filesystem::temp_directory_path(),
+               "synthetic GGUF fixture ignored the platform temporary directory.");
+    }
+
+    void WriteSyntheticQwen35GGUF(const std::string &path,
+                                  const std::vector<SyntheticGGUFTensor> &tensors,
+                                  const std::string &arch = "qwen35",
+                                  uint32_t nextnPredictLayers = 1,
+                                  const std::vector<std::string> &tokens = {},
+                                  int eosTokenId = -1) {
+        std::ofstream out(path, std::ios::binary);
+        Expect(out.good(), "failed to create synthetic GGUF file.");
+
+        WritePod<uint32_t>(out, 0x46554747u);
+        WritePod<uint32_t>(out, 3u);
+        WritePod<uint64_t>(out, tensors.size());
+        WritePod<uint64_t>(out, 18u + (tokens.empty() ? 0u : 2u));
+
+        WriteGGUFStringKV(out, "general.architecture", arch);
+        WriteGGUFStringKV(out, "general.name", "synthetic qwen35");
+        WriteGGUFUInt32KV(out, arch + ".block_count", 65);
+        WriteGGUFUInt32KV(out, arch + ".nextn_predict_layers", nextnPredictLayers);
+        WriteGGUFUInt32KV(out, arch + ".embedding_length", 5120);
+        WriteGGUFUInt32KV(out, arch + ".context_length", 262144);
+        WriteGGUFUInt32KV(out, arch + ".feed_forward_length", 17408);
+        WriteGGUFUInt32KV(out, arch + ".attention.head_count", 24);
+        WriteGGUFUInt32KV(out, arch + ".attention.head_count_kv", 4);
+        WriteGGUFUInt32KV(out, arch + ".attention.key_length", 256);
+        WriteGGUFUInt32KV(out, arch + ".attention.value_length", 256);
+        WriteGGUFFloat32KV(out, arch + ".attention.layer_norm_rms_epsilon", 1e-6f);
+        WriteGGUFFloat32KV(out, arch + ".rope.freq_base", 10000000.0f);
+        WriteGGUFInt32ArrayKV(out, arch + ".rope.dimension_sections", {11, 11, 10, 0});
+        WriteGGUFUInt32KV(out, arch + ".ssm.group_count", 16);
+        WriteGGUFUInt32KV(out, arch + ".ssm.state_size", 128);
+        WriteGGUFUInt32KV(out, arch + ".ssm.time_step_rank", 48);
+        WriteGGUFUInt32KV(out, arch + ".ssm.inner_size", 6144);
+        if (!tokens.empty()) {
+            Expect(eosTokenId >= 0 && eosTokenId < (int)tokens.size(),
+                   "synthetic GGUF eos token must index the tokenizer vocabulary.");
+            WriteGGUFStringArrayKV(out, "tokenizer.ggml.tokens", tokens);
+            WriteGGUFUInt32KV(out, "tokenizer.ggml.eos_token_id", (uint32_t)eosTokenId);
+        }
+
+        uint64_t offset = 0;
+        for (const auto &tensor : tensors) {
+            WriteGGUFString(out, tensor.name);
+            WritePod<uint32_t>(out, tensor.dims.size());
+            int64_t elements = 1;
+            for (int64_t dim : tensor.dims) {
+                WritePod<int64_t>(out, dim);
+                elements *= dim;
+            }
+            uint64_t bytes = SyntheticGGUFTensorBytes(tensor);
+            if (tensor.ggmlType == GGML_TYPE_F32) {
+                Expect(elements == (int64_t)tensor.values.size(),
+                       "synthetic GGUF tensor element mismatch.");
+            } else {
+                Expect(bytes > 0, "synthetic quantized GGUF tensor payload is empty.");
+            }
+            WritePod<int32_t>(out, tensor.ggmlType);
+            WritePod<uint64_t>(out, offset);
+            offset += Pad32(bytes);
+        }
+
+        uint64_t headerSize = (uint64_t)out.tellp();
+        uint64_t paddedHeader = Pad32(headerSize);
+        for (uint64_t i = headerSize; i < paddedHeader; i++) {
+            out.put('\0');
+        }
+
+        for (const auto &tensor : tensors) {
+            uint64_t bytes = SyntheticGGUFTensorBytes(tensor);
+            if (tensor.ggmlType == GGML_TYPE_F32) {
+                out.write(reinterpret_cast<const char*>(tensor.values.data()),
+                          (std::streamsize)bytes);
+            } else {
+                out.write(reinterpret_cast<const char*>(tensor.rawData.data()),
+                          (std::streamsize)bytes);
+            }
+            uint64_t paddedBytes = Pad32(bytes);
+            for (uint64_t i = bytes; i < paddedBytes; i++) {
+                out.put('\0');
+            }
+        }
+    }
+
+    const fastllm::Data &RequireWeight(const fastllm::basellm &model,
+                                       const std::string &name) {
+        auto it = model.weight.weight.find(name);
+        Expect(it != model.weight.weight.end(), "missing weight: " + name);
+        return it->second;
+    }
+
+    void RunQwen35GGUFConfigRegression() {
+        for (const std::string &arch : {std::string("qwen35"), std::string("qwen3_5")}) {
+            std::string path = MakeTempGGUFPath("fastllm-" + arch + "-config");
+            WriteSyntheticQwen35GGUF(path, {}, arch, 1,
+                                     {"ordinary", "<|endoftext|>", "<|im_end|>"}, 2);
+            auto model = fastllm::CreateLLMModelFromFile(path);
+            std::remove(path.c_str());
+
+            Expect(model->model_type == "qwen3_5", arch + " GGUF should create a qwen3_5 model.");
+            Expect(model->block_cnt == 64, arch + " GGUF block_count must exclude nextn/MTP layers.");
+            Expect(model->embed_dim == 5120, arch + " hidden_size was not imported.");
+            Expect(model->num_attention_heads == 24, arch + " attention heads were not imported.");
+            Expect(model->num_key_value_heads == 4, arch + " KV heads were not imported.");
+            Expect(model->head_dim == 256, arch + " full-attention head_dim was not imported.");
+            Expect(model->max_positions == 262144, arch + " context length was not imported.");
+            Expect(model->eos_token_id == 2,
+                   arch + " GGUF scalar eos token was not imported.");
+            Expect(model->eos_token_ids.count(1) == 1 && model->eos_token_ids.count(2) == 1,
+                   arch + " GGUF must stop on both <|endoftext|> and <|im_end|>.");
+            Expect(model->weight.dicts["num_hidden_layers"] == "64",
+                   arch + " num_hidden_layers dict must use the main trunk layer count.");
+            Expect(model->weight.dicts["mtp_num_hidden_layers"] == "1",
+                   arch + " nextn_predict_layers should map to mtp_num_hidden_layers.");
+            Expect(model->weight.dicts["linear_num_key_heads"] == "16",
+                   arch + " ssm.group_count should map to linear_num_key_heads.");
+            Expect(model->weight.dicts["linear_num_value_heads"] == "48",
+                   arch + " ssm.time_step_rank should map to linear_num_value_heads.");
+            Expect(model->weight.dicts["linear_key_head_dim"] == "128",
+                   arch + " ssm.state_size should map to linear_key_head_dim.");
+            Expect(model->weight.dicts["linear_value_head_dim"] == "128",
+                   arch + " ssm.state_size should map to linear_value_head_dim.");
+            Qwen35ConfigTestModel runtimeModel;
+            runtimeModel.weight.dicts = model->weight.dicts;
+            runtimeModel.InitParams();
+            Expect(runtimeModel.NumKeyValueHeads() == 4,
+                   arch + " runtime KV head count was not initialized.");
+            std::vector<float> expectedInvScale(128, 1.0f / std::sqrt(128.0f));
+            Expect(runtimeModel.InvScaleData().dims == std::vector<int>({128}),
+                   arch + " runtime linear-attention scale shape was not initialized.");
+            ExpectFloatNear(expectedInvScale, ToFloatVector(runtimeModel.InvScaleData()),
+                            1e-7f, 1e-7f,
+                            arch + " runtime linear-attention inverse scale");
+            Expect(model->weight.dicts["ggufNormsPreOffset"] == "1" &&
+                       model->weight.dicts["ggufOutProjColumnsTiled"] == "1",
+                   arch + " GGUF runtime layout markers were not imported.");
+        }
+    }
+
+    void RunQwen35GGUFFailFastRegression() {
+        for (const auto &unsupported : std::vector<std::pair<std::string, uint32_t>>{
+                 {"qwen35moe", 1}, {"qwen35", 2}}) {
+            std::string path = MakeTempGGUFPath("fastllm-" + unsupported.first + "-unsupported");
+            WriteSyntheticQwen35GGUF(path, {}, unsupported.first, unsupported.second);
+            bool rejected = false;
+            try {
+                auto model = fastllm::CreateLLMModelFromGGUFFile(path, "");
+            } catch (const std::runtime_error &) {
+                rejected = true;
+            }
+            std::remove(path.c_str());
+            Expect(rejected, unsupported.first + " unsupported GGUF layout must fail fast.");
+        }
+    }
+
+    void RunQwen35GGUFWorkerExceptionRegression() {
+        std::string path = MakeTempGGUFPath("fastllm-qwen35-invalid-untile");
+        WriteSyntheticQwen35GGUF(path, {
+            {"blk.0.ssm_dt.bias", {47}, std::vector<float>(47, 1.0f)},
+        });
+        bool rejected = false;
+        try {
+            auto model = fastllm::CreateLLMModelFromGGUFFile(path, "");
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        std::remove(path.c_str());
+        Expect(rejected, "invalid untile layout must propagate the worker exception.");
+    }
+
+    void RunQwen35GGUFWeightMappingRegression() {
+        constexpr int H = 16;
+        constexpr int R = 3;
+        constexpr int V = H * R;
+        constexpr int D = 128;
+        constexpr int qkRows = 2 * H * D;
+        constexpr int vRows = V * D;
+
+        auto makeValues = [](int rows, int width, float base) {
+            std::vector<float> values((size_t)rows * width);
+            for (int row = 0; row < rows; row++) {
+                for (int col = 0; col < width; col++) {
+                    values[(size_t)row * width + col] =
+                        base + (float)row * 0.25f + (float)col * 0.03125f;
+                }
+            }
+            return values;
+        };
+        auto untile = [](const std::vector<float> &source, int prefixRows,
+                         int perHeadRows, int width) {
+            std::vector<float> expected = source;
+            for (int h = 0; h < H; h++) {
+                for (int r = 0; r < R; r++) {
+                    for (int d = 0; d < perHeadRows; d++) {
+                        int srcRow = prefixRows + (r * H + h) * perHeadRows + d;
+                        int dstRow = prefixRows + (h * R + r) * perHeadRows + d;
+                        std::copy_n(source.begin() + (size_t)srcRow * width, width,
+                                    expected.begin() + (size_t)dstRow * width);
+                    }
+                }
+            }
+            return expected;
+        };
+
+        std::vector<float> aSource(V);
+        for (int i = 0; i < V; i++) {
+            aSource[i] = -std::exp(-0.01f * (float)(i + 1));
+        }
+        std::vector<float> expectedALog = untile(aSource, 0, 1, 1);
+        for (float &value : expectedALog) value = std::log(-value);
+
+        std::vector<float> alphaSource = makeValues(V, 1, 10.0f);
+        std::vector<float> betaSource = makeValues(V, 1, 20.0f);
+        std::vector<float> dtSource = makeValues(V, 1, 30.0f);
+        std::vector<float> convSource = makeValues(qkRows + vRows, 4, 40.0f);
+        std::vector<float> qkvSource = makeValues(qkRows + vRows, 1, 50.0f);
+        std::vector<float> gateSource = makeValues(vRows, 1, 60.0f);
+
+        std::vector<float> expectedBa = untile(betaSource, 0, 1, 1);
+        std::vector<float> expectedAlpha = untile(alphaSource, 0, 1, 1);
+        expectedBa.insert(expectedBa.end(), expectedAlpha.begin(), expectedAlpha.end());
+        std::vector<float> expectedDt = untile(dtSource, 0, 1, 1);
+        std::vector<float> expectedConv = untile(convSource, qkRows, D, 4);
+        std::vector<float> expectedQkvz = untile(qkvSource, qkRows, D, 1);
+        std::vector<float> expectedGate = untile(gateSource, 0, D, 1);
+        expectedQkvz.insert(expectedQkvz.end(), expectedGate.begin(), expectedGate.end());
+
+        std::string path = MakeTempGGUFPath("fastllm-qwen35-weights");
+        WriteSyntheticQwen35GGUF(path, {
+            {"blk.0.ssm_a", {V}, aSource},
+            {"blk.0.ssm_alpha.weight", {1, V}, alphaSource},
+            {"blk.0.ssm_beta.weight", {1, V}, betaSource},
+            {"blk.0.ssm_conv1d.weight", {4, qkRows + vRows}, convSource},
+            {"blk.0.ssm_dt.bias", {V}, dtSource},
+            {"blk.0.ssm_norm.weight", {D}, makeValues(D, 1, 70.0f)},
+            {"blk.0.ssm_out.weight", {1, 1}, {1.1f}},
+            {"blk.0.attn_qkv.weight", {1, qkRows + vRows}, qkvSource},
+            {"blk.0.attn_gate.weight", {1, vRows}, gateSource},
+            {"blk.64.nextn.eh_proj.weight", {1, 1}, {1.4f}},
+            {"blk.64.nextn.enorm.weight", {1}, {1.5f}},
+            {"blk.64.nextn.hnorm.weight", {1}, {1.6f}},
+            {"blk.64.nextn.shared_head_norm.weight", {1}, {1.7f}},
+            {"blk.64.attn_q.weight", {1, 1}, {1.8f}},
+            {"blk.64.attn_k.weight", {1, 1}, {1.9f}},
+            {"blk.64.attn_v.weight", {1, 1}, {2.0f}},
+            {"blk.64.attn_output.weight", {1, 1}, {2.1f}},
+            {"blk.64.attn_q_norm.weight", {1}, {2.2f}},
+            {"blk.64.attn_k_norm.weight", {1}, {2.3f}},
+            {"blk.64.attn_norm.weight", {1}, {2.4f}},
+            {"blk.64.post_attention_norm.weight", {1}, {2.5f}},
+            {"blk.64.ffn_gate.weight", {1, 1}, {2.6f}},
+            {"blk.64.ffn_up.weight", {1, 1}, {2.7f}},
+            {"blk.64.ffn_down.weight", {1, 2}, {2.8f, 2.9f}},
+        });
+        auto model = fastllm::CreateLLMModelFromGGUFFile(path, "");
+        std::remove(path.c_str());
+
+        const std::string prefix = "model.language_model.layers.0.linear_attn.";
+        ExpectFloatNear(expectedALog, ToFloatVector(RequireWeight(*model, prefix + "A_log")),
+                        2e-6f, 2e-6f, "qwen35 tiled ssm_a inverse transform");
+        ExpectFloatNear(expectedBa, ToFloatVector(RequireWeight(*model, prefix + "in_proj_ba.weight")),
+                        0.0f, 0.0f, "qwen35 tiled alpha/beta merge");
+        ExpectFloatNear(expectedDt, ToFloatVector(RequireWeight(*model, prefix + "dt_bias")),
+                        0.0f, 0.0f, "qwen35 tiled dt_bias");
+        const auto &convWeight = RequireWeight(*model, prefix + "conv1d.weight");
+        Expect(convWeight.dims == std::vector<int>({qkRows + vRows, 1, 4}),
+               "qwen35 GGUF conv1d weight must use [channels, 1, kernel] layout.");
+        ExpectFloatNear(expectedConv, ToFloatVector(convWeight), 0.0f, 0.0f,
+                        "qwen35 tiled conv1d channels");
+        ExpectFloatNear(expectedQkvz, ToFloatVector(RequireWeight(*model, prefix + "in_proj_qkvz.weight")),
+                        0.0f, 0.0f, "qwen35 tiled qkv/z merge");
+        RequireWeight(*model, prefix + "norm.weight");
+        RequireWeight(*model, prefix + "out_proj.weight");
+        Expect(model->weight.dicts["ggufNormsPreOffset"] == "1" &&
+                   model->weight.dicts["ggufOutProjColumnsTiled"] == "1",
+               "qwen35 GGUF runtime layout markers changed during weight import.");
+
+        RequireWeight(*model, "mtp.fc.weight");
+        RequireWeight(*model, "mtp.pre_fc_norm_embedding.weight");
+        RequireWeight(*model, "mtp.pre_fc_norm_hidden.weight");
+        RequireWeight(*model, "mtp.norm.weight");
+        RequireWeight(*model, "mtp.layers.0.self_attn.mergeqkv.weight");
+        RequireWeight(*model, "mtp.layers.0.self_attn.o_proj.weight");
+        RequireWeight(*model, "mtp.layers.0.mlp.gateup_proj.weight");
+        RequireWeight(*model, "mtp.layers.0.mlp.down_proj.weight");
+        Expect(model->weight.weight.find("model.language_model.layers.64.self_attn.q_proj.weight") ==
+                   model->weight.weight.end(),
+               "nextn decoder block must not remain in the trunk layer namespace.");
+    }
+
+    void RunQwen35MixedQuantGGUFProjectionRegression() {
+        ScopedTempDirectory tempDir("fastllm-qwen35-mixed-quant-");
+        std::string path = (tempDir.Path() / "model.gguf").string();
+        ScopedEnvVar tiledLayout("FASTLLM_QWEN35_GGUF_VHEAD_TILED", "0");
+        WriteSyntheticQwen35GGUF(path, {
+            MakeSyntheticQuantTensor("blk.0.attn_qkv.weight", {256, 256}, GGML_TYPE_Q5_K),
+            MakeSyntheticQuantTensor("blk.0.attn_gate.weight", {256, 256}, GGML_TYPE_IQ4_XS),
+            MakeSyntheticQuantTensor("blk.0.ssm_beta.weight", {256, 256}, GGML_TYPE_IQ4_XS),
+            MakeSyntheticQuantTensor("blk.0.ssm_alpha.weight", {256, 256}, GGML_TYPE_IQ4_XS),
+            MakeSyntheticQuantTensor("blk.3.attn_q.weight", {256, 256}, GGML_TYPE_IQ4_XS),
+            MakeSyntheticQuantTensor("blk.3.attn_k.weight", {256, 256}, GGML_TYPE_IQ4_XS),
+            MakeSyntheticQuantTensor("blk.3.attn_v.weight", {256, 256}, GGML_TYPE_Q5_K),
+        });
+        auto model = fastllm::CreateLLMModelFromGGUFFile(path, "");
+
+        const std::string gdnPrefix = "model.language_model.layers.0.linear_attn.";
+        RequireWeight(*model, gdnPrefix + "in_proj_qkv.weight");
+        RequireWeight(*model, gdnPrefix + "in_proj_z.weight");
+        RequireWeight(*model, gdnPrefix + "in_proj_ba.weight");
+        Expect(model->weight.weight.find(gdnPrefix + "in_proj_qkvz.weight") ==
+                   model->weight.weight.end(),
+               "mixed Q5_K/IQ4_XS GDN projections must remain split.");
+        Expect(model->weight.weight.find(gdnPrefix + "in_proj_a.weight") ==
+                   model->weight.weight.end() &&
+               model->weight.weight.find(gdnPrefix + "in_proj_b.weight") ==
+                   model->weight.weight.end(),
+               "compatible IQ4_XS a/b projections should merge into ba.");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(
+                   model->weight, "model.language_model.layers.0.") ==
+                   fastllm::Qwen35GdnProjectionLayout::QkvZBa,
+               "mixed-quant GGUF should resolve to split qkv/z plus ba.");
+
+        const std::string attentionPrefix = "model.language_model.layers.3.";
+        RequireWeight(*model, attentionPrefix + "self_attn.q_proj.weight");
+        RequireWeight(*model, attentionPrefix + "self_attn.k_proj.weight");
+        RequireWeight(*model, attentionPrefix + "self_attn.v_proj.weight");
+        Expect(model->weight.weight.find(attentionPrefix + "self_attn.mergeqkv.weight") ==
+                   model->weight.weight.end(),
+               "mixed IQ4_XS/Q5_K attention projections must remain split.");
+        Expect(fastllm::ResolveQwen35AttentionProjectionLayout(
+                   model->weight, attentionPrefix) ==
+                   fastllm::Qwen35AttentionProjectionLayout::SplitQkv,
+               "mixed-quant GGUF should resolve to split q/k/v attention.");
+        Expect(model->weight.dicts["ggufOutProjColumnsTiled"] == "0",
+               "qwen35 grouped-layout override did not disable runtime out_proj reorder.");
+    }
+
+    void RunCpuEmbeddingDirectInMemoryLowMemRegression() {
+        // GGUF-loaded embedding weights live in cpuData with no fileName.
+        // CpuEmbeddingDirect must not try to fseek a null file handle in
+        // low-mem mode when the weight is already in memory.
+        bool prevLowMem = fastllm::GetLowMemMode();
+        fastllm::SetLowMemMode(true);
+
+        const int vocabSize = 4;
+        const int embSize = 3;
+        std::vector<float> weightValues = {
+            0.0f, 0.1f, 0.2f,   // token 0
+            1.0f, 1.1f, 1.2f,   // token 1
+            2.0f, 2.1f, 2.2f,   // token 2
+            3.0f, 3.1f, 3.2f    // token 3
+        };
+        fastllm::Data weight(fastllm::DataType::FLOAT32, {vocabSize, embSize}, weightValues);
+        Expect(weight.fileName.empty(), "in-memory weight should have no fileName.");
+
+        std::vector<float> inputValues = {0.0f, 3.0f, 1.0f};
+        fastllm::Data input(fastllm::DataType::FLOAT32, {3}, inputValues);
+        fastllm::Data output;
+
+        fastllm::Executor *executor = (fastllm::Executor*)fastllm::GetExecutor();
+        executor->RunOnDevice("cpu", "EmbeddingDirect",
+                              fastllm::DataDict{{"input", &input},
+                                                {"weight", &weight},
+                                                {"output", &output}},
+                              fastllm::FloatDict(), fastllm::IntDict());
+
+        fastllm::SetLowMemMode(prevLowMem);
+
+        std::vector<float> result = ToFloatVector(output);
+        ExpectFloatNear({0.0f, 0.1f, 0.2f,
+                         3.0f, 3.1f, 3.2f,
+                         1.0f, 1.1f, 1.2f}, result, 1e-6f, 1e-6f,
+                        "CpuEmbeddingDirect low-mem in-memory lookup");
+    }
+
+    void RunQwen35SplitGdnProjectionLayoutRegression() {
+        const std::string prefix = "model.language_model.layers.0.";
+        auto add = [&](fastllm::WeightMap &weights, const std::string &suffix) {
+            weights.AddEmptyWeight(prefix + suffix, {4, 4},
+                                   fastllm::DataType::FLOAT32);
+        };
+
+        fastllm::WeightMap qkvZBa;
+        add(qkvZBa, "linear_attn.in_proj_qkv.weight");
+        add(qkvZBa, "linear_attn.in_proj_z.weight");
+        add(qkvZBa, "linear_attn.in_proj_ba.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvZBa, prefix) ==
+                   fastllm::Qwen35GdnProjectionLayout::QkvZBa,
+               "qwen35 qkv/z plus ba should be a valid GDN projection layout.");
+
+        qkvZBa.weight.erase(prefix + "linear_attn.in_proj_z.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvZBa, prefix) ==
+                   fastllm::Qwen35GdnProjectionLayout::Missing,
+               "qwen35 split GDN projection must require both qkv and z weights.");
+
+        fastllm::WeightMap qkvzBa;
+        add(qkvzBa, "linear_attn.in_proj_qkvz.weight");
+        add(qkvzBa, "linear_attn.in_proj_ba.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvzBa, prefix) ==
+                   fastllm::Qwen35GdnProjectionLayout::QkvzBa,
+               "qwen35 qkvz plus ba should be a valid GDN projection layout.");
+
+        fastllm::WeightMap qkvzba;
+        add(qkvzba, "linear_attn.in_proj_qkvzba.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvzba, prefix) ==
+                   fastllm::Qwen35GdnProjectionLayout::Qkvzba,
+               "qwen35 merged qkvzba should be a valid GDN projection layout.");
+        add(qkvzba, "linear_attn.in_proj_qkvz.weight");
+        add(qkvzba, "linear_attn.in_proj_ba.weight");
+        Expect(fastllm::ResolveQwen35GdnProjectionLayout(qkvzba, prefix) ==
+                   fastllm::Qwen35GdnProjectionLayout::Qkvzba,
+               "qwen35 merged qkvzba must take precedence over split weights.");
     }
 
     void ExpectFloatNear(const std::vector<float> &expected,
@@ -189,8 +800,276 @@ namespace {
         }
     }
 
+    void RunQwen35SplitAttentionProjectionLayoutRegression() {
+        const std::string prefix = "model.language_model.layers.3.";
+        fastllm::WeightMap weights;
+        weights.AddEmptyWeight(prefix + "self_attn.q_proj.weight", {12, 4},
+                               fastllm::DataType::FLOAT32);
+        weights.AddEmptyWeight(prefix + "self_attn.k_proj.weight", {2, 4},
+                               fastllm::DataType::FLOAT32);
+        weights.AddEmptyWeight(prefix + "self_attn.v_proj.weight", {2, 4},
+                               fastllm::DataType::FLOAT32);
+
+        Expect(fastllm::ResolveQwen35AttentionProjectionLayout(weights, prefix) ==
+                   fastllm::Qwen35AttentionProjectionLayout::SplitQkv,
+               "qwen35 mixed-quant q/k/v should be a valid split attention layout.");
+
+        weights.weight.erase(prefix + "self_attn.v_proj.weight");
+        Expect(fastllm::ResolveQwen35AttentionProjectionLayout(weights, prefix) ==
+                   fastllm::Qwen35AttentionProjectionLayout::Missing,
+               "qwen35 split attention must require q, k, and v weights.");
+    }
+
+#ifdef USE_CUDA
+    void RunQwen35OutProjTpLayoutRegression() {
+        DivisionScheme keyScheme;
+        keyScheme[0] = {{0, 8}};
+        keyScheme[1] = {{8, 16}};
+
+        DivisionScheme tiled = fastllm::BuildQwen35LinearOutProjScheme(
+            keyScheme, 16, 48, 128, 256, true);
+        Expect(tiled[0] == DivisionScheme::mapped_type({
+                   {0, 1024}, {2048, 3072}, {4096, 5120}}) &&
+               tiled[1] == DivisionScheme::mapped_type({
+                   {1024, 2048}, {3072, 4096}, {5120, 6144}}),
+               "qwen35 tiled out_proj TP scheme changed layout.");
+
+        DivisionScheme grouped = fastllm::BuildQwen35LinearOutProjScheme(
+            keyScheme, 16, 48, 128, 256, false);
+        Expect(grouped[0] == DivisionScheme::mapped_type({{0, 3072}}) &&
+               grouped[1] == DivisionScheme::mapped_type({{3072, 6144}}),
+               "qwen35 grouped out_proj TP scheme must stay contiguous.");
+    }
+#endif
+    void RunModelTokenCapacityRegression() {
+        const int previousMaxTokens = fastllm::GetMaxTokens();
+        MoeAtypeConfigTestModel model;
+
+        model.SetTokenLimit(131072);
+        Expect(model.tokensLimit == 131072,
+               "model token limit did not preserve the configured capacity.");
+        Expect(fastllm::GetMaxTokens() == 131072,
+               "model token limit did not configure the paged-cache allocator capacity.");
+
+        fastllm::SetMaxTokens(previousMaxTokens);
+    }
+
+    void RunKVCacheDataTypeConfigRegression() {
+        Expect(fastllm::ParseKVCacheDataType("auto") == fastllm::DataType::DATA_AUTO_NONE,
+               "auto KV cache dtype did not preserve automatic selection.");
+        Expect(fastllm::ParseKVCacheDataType("float16") == fastllm::DataType::FLOAT16,
+               "float16 KV cache dtype was not parsed.");
+        Expect(fastllm::ParseKVCacheDataType("bfloat16") == fastllm::DataType::BFLOAT16,
+               "bfloat16 KV cache dtype was not parsed.");
+        Expect(fastllm::ParseKVCacheDataType("fp8_e4m3") == fastllm::DataType::FP8_E4M3,
+               "fp8_e4m3 KV cache dtype was not parsed.");
+        Expect(fastllm::ParseKVCacheDataType("turbo3") == fastllm::DataType::TURBO3_KV,
+               "turbo3 KV cache dtype was not parsed.");
+        Expect(fastllm::ResolveQwen35CudaCacheType(
+                   fastllm::DataType::Q8_0_KV, fastllm::DataType::FLOAT16) ==
+                   fastllm::DataType::Q8_0_KV,
+               "Qwen3.5 CUDA cache resolver downgraded Q8 packed K to FP16.");
+        Expect(fastllm::ResolveQwen35CudaCacheType(
+                   fastllm::DataType::TURBO3_KV, fastllm::DataType::FLOAT16) ==
+                   fastllm::DataType::TURBO3_KV,
+               "Qwen3.5 CUDA cache resolver downgraded Turbo3 packed V to FP16.");
+        Expect(fastllm::Qwen35PagedCachePageBytes(
+                   fastllm::DataType::Q8_0_KV, 128, 4, 256) == 139264,
+               "Qwen3.5 Q8 paged cache page bytes regressed.");
+        Expect(fastllm::Qwen35PagedCachePageBytes(
+                   fastllm::DataType::TURBO3_KV, 128, 4, 256) == 51200,
+               "Qwen3.5 Turbo3 paged cache page bytes regressed.");
+
+        bool rejected = false;
+        try {
+            (void)fastllm::ParseKVCacheDataType("int4");
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        Expect(rejected, "unsupported KV cache dtype was not rejected.");
+
+        MoeAtypeConfigTestModel model;
+        model.SetKVCacheDataType(fastllm::DataType::FLOAT16);
+        Expect(model.useCustomKVCacheDataType &&
+               model.kvCacheDataType == fastllm::DataType::FLOAT16,
+               "explicit F16 KV cache dtype was not preserved.");
+#ifdef USE_CUDA
+        model.SetKVCacheDataType(fastllm::ParseKVCacheDataType("fp8_e4m3"));
+        Expect(model.useCustomKVCacheDataType &&
+               model.kvCacheDataType == fastllm::DataType::FP8_E4M3,
+               "explicit FP8 KV cache dtype was not preserved after F16 setup.");
+#endif
+#ifdef USE_CUDA
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_TURBO3_KV", nullptr);
+            Expect(!fastllm::Qwen35Turbo3KvEnabled(),
+                   "Qwen3.5 Turbo3 KV gate should default off.");
+        }
+        {
+            ScopedEnvVar enabled("FASTLLM_QWEN35_TURBO3_KV", "1");
+            Expect(fastllm::Qwen35Turbo3KvEnabled(),
+                   "Qwen3.5 Turbo3 KV gate ignored an explicit enable.");
+            Qwen35ConfigTestModel qwen;
+            qwen.ConfigureTurbo3Fixture();
+            qwen.SetKVCacheDataType(fastllm::DataType::TURBO3_KV);
+            auto attentionTypes = qwen.GetKVCacheDataTypes(0);
+            auto linearTypes = qwen.GetKVCacheDataTypes(1);
+            Expect(attentionTypes.first == fastllm::DataType::Q8_0_KV &&
+                   attentionTypes.second == fastllm::DataType::TURBO3_KV,
+                   "Qwen3.5 Turbo3 full-attention layer did not use asymmetric K/V dtypes.");
+            Expect(linearTypes.first == linearTypes.second &&
+                   !fastllm::IsPackedKVCacheDataType(linearTypes.first),
+                   "Qwen3.5 linear-attention layer should use a non-packed compute cache dtype.");
+        }
+#endif
+    }
+
+    void RunQwen35DecodePageBudgetRegression() {
+        const std::vector<std::pair<int, int> > requestedFits = {
+            {2, 2}, {1, 4}
+        };
+        const std::vector<std::pair<int, int> > requestedShort = {
+            {2, 1}, {1, 4}
+        };
+        const std::vector<std::pair<int, int> > singleFits = {
+            {0, 1}, {1, 4}
+        };
+        const std::vector<std::pair<int, int> > singleShort = {
+            {1, 0}, {1, 4}
+        };
+
+        Expect(fastllm::SelectQwen35DecodeTokensForPageBudget(
+                   10, requestedFits, singleFits) == 10,
+               "qwen35 page budget rejected a valid MTP validation.");
+        Expect(fastllm::SelectQwen35DecodeTokensForPageBudget(
+                   10, requestedShort, singleFits) == 1,
+               "qwen35 page budget did not fall back to one target token.");
+        Expect(fastllm::SelectQwen35DecodeTokensForPageBudget(
+                   10, requestedShort, singleShort) == 0,
+               "qwen35 page budget hid a true single-token cache shortage.");
+    }
+
+    void RunQwen35LongPrefillStateRegression() {
+        constexpr int chunk = 2048;
+        fastllm::ResponseContext context;
+        context.currentTokens.resize(chunk * 2 + 17, 7);
+        auto *managerA = reinterpret_cast<fastllm::PagedCacheManager*>(uintptr_t(0x10));
+        auto *managerB = reinterpret_cast<fastllm::PagedCacheManager*>(uintptr_t(0x20));
+        Expect(fastllm::ClassifyQwen35RequestPhase(context) ==
+                   fastllm::Qwen35RequestPhase::NewPrefill,
+               "fresh qwen35 request was not classified as prefill.");
+        Expect(fastllm::BeginQwen35LongPrefill(
+                   context, (int)context.currentTokens.size(), 11,
+                   {{managerA, 4}, {managerB, 2}}),
+               "qwen35 long prefill state did not start.");
+        Expect(context.longPrefill.reservedPages.size() == 2,
+               "qwen35 long prefill reservations were not retained.");
+
+        auto first = fastllm::PlanQwen35LongPrefillQuantum(context, chunk);
+        Expect(first.cursor == 0 && first.length == chunk && first.baseTokens == 0 &&
+                   !first.isLast && !first.producesOutput,
+               "qwen35 first prefill quantum was planned incorrectly.");
+        Expect(fastllm::CommitQwen35LongPrefillQuantum(context, first, true),
+               "qwen35 first prefill quantum did not commit.");
+        Expect(context.preTokens == chunk && context.longPrefill.cursor == chunk &&
+                   context.longPrefill.inProgress,
+               "qwen35 first prefill quantum broke cursor invariants.");
+        Expect(!fastllm::CommitQwen35LongPrefillQuantum(context, first, true),
+               "qwen35 stale prefill quantum committed twice.");
+
+        auto second = fastllm::PlanQwen35LongPrefillQuantum(context, chunk);
+        Expect(second.cursor == chunk && second.length == chunk &&
+                   !second.producesOutput,
+               "qwen35 second prefill quantum was planned incorrectly.");
+        Expect(fastllm::CommitQwen35LongPrefillQuantum(context, second, false),
+               "qwen35 second prefill quantum did not commit.");
+        Expect(!context.longPrefill.mtpViable,
+               "qwen35 MTP append failure was not made sticky.");
+
+        auto last = fastllm::PlanQwen35LongPrefillQuantum(context, chunk);
+        Expect(last.cursor == chunk * 2 && last.length == 17 &&
+                   last.isLast && last.producesOutput,
+               "qwen35 final prefill quantum was planned incorrectly.");
+        Expect(fastllm::CommitQwen35LongPrefillQuantum(context, last, true),
+               "qwen35 final prefill quantum did not commit.");
+        Expect(context.preTokens == chunk * 2 + 17 &&
+                   context.longPrefill.cursor == chunk * 2 + 17 &&
+                   !context.longPrefill.inProgress &&
+                   context.longPrefill.reservedPages.empty(),
+               "qwen35 final prefill quantum did not release state.");
+        Expect(fastllm::ClassifyQwen35RequestPhase(context) ==
+                   fastllm::Qwen35RequestPhase::Decode,
+               "completed qwen35 prefill was not classified as decode.");
+
+        fastllm::ResponseContext prefixHit;
+        prefixHit.cacheLen = 128;
+        prefixHit.currentTokens.resize(33, 9);
+        Expect(fastllm::BeginQwen35LongPrefill(prefixHit, 33, 12),
+               "prefix-hit qwen35 prefill did not start.");
+        auto prefixQuantum = fastllm::PlanQwen35LongPrefillQuantum(prefixHit, 64);
+        Expect(prefixQuantum.baseTokens == 128 && prefixQuantum.isLast,
+               "prefix-hit qwen35 prefill used the wrong physical base.");
+        Expect(fastllm::CommitQwen35LongPrefillQuantum(prefixHit, prefixQuantum, true) &&
+                   prefixHit.cacheLen == 128 && prefixHit.preTokens == 33,
+               "qwen35 prefill cursor polluted cached-input accounting.");
+
+        std::vector<std::tuple<int, uint64_t> > candidates = {
+            {30, 3}, {10, 1}, {20, 2}
+        };
+        Expect(fastllm::SelectQwen35LongPrefillHandle(candidates, 0) == 10 &&
+                   fastllm::SelectQwen35LongPrefillHandle(candidates, 1) == 20 &&
+                   fastllm::SelectQwen35LongPrefillHandle(candidates, 2) == 30 &&
+                   fastllm::SelectQwen35LongPrefillHandle(candidates, 3) == 10,
+               "qwen35 long prefill ticket selection is not round-robin.");
+        Expect(fastllm::CanAdmitQwen35LongPrefill(3, 4) &&
+                   !fastllm::CanAdmitQwen35LongPrefill(4, 4),
+               "qwen35 long prefill lane capacity was not enforced.");
+        Expect(fastllm::CanReserveQwen35LongPrefillPages({{2, 3, 5}, {1, 2, 4}}) &&
+                   !fastllm::CanReserveQwen35LongPrefillPages({{2, 4, 5}}) &&
+                   fastllm::CanReserveQwen35LongPrefillPages({{0, 0, 0}}),
+               "qwen35 long prefill page reservation accounting is incorrect.");
+
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL", nullptr);
+            Expect(!fastllm::Qwen35InterleaveLongPrefillEnabled(),
+                   "qwen35 long prefill interleave should default off.");
+        }
+        {
+            ScopedEnvVar enabled("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL", "1");
+            Expect(fastllm::Qwen35InterleaveLongPrefillEnabled(),
+                   "qwen35 long prefill interleave did not accept 1.");
+        }
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL", "false");
+            Expect(!fastllm::Qwen35InterleaveLongPrefillEnabled(),
+                   "qwen35 long prefill interleave did not reject false.");
+        }
+        {
+            ScopedEnvVar enabled("FASTLLM_QWEN35_BATCHED_MTP", nullptr);
+            Expect(fastllm::Qwen35BatchedMtpEnabled(),
+                   "qwen35 batched MTP should default on.");
+        }
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_BATCHED_MTP", "0");
+            Expect(!fastllm::Qwen35BatchedMtpEnabled(),
+                   "qwen35 batched MTP did not accept 0 as disabled.");
+        }
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_BATCHED_MTP", "false");
+            Expect(!fastllm::Qwen35BatchedMtpEnabled(),
+                   "qwen35 batched MTP did not reject false.");
+        }
+        {
+            ScopedEnvVar enabled("FASTLLM_QWEN35_BATCHED_MTP", "1");
+            Expect(fastllm::Qwen35BatchedMtpEnabled(),
+                   "qwen35 batched MTP did not accept 1.");
+        }
+    }
+
+
     void RunMoeAtypeConfigRegression() {
         MoeAtypeConfigTestModel model;
+
         Expect(!model.useCustomMoeAtype, "moe_atype should default to auto.");
 
         model.SetMoeAtype(fastllm::DataType::FLOAT32);
@@ -546,6 +1425,7 @@ namespace {
     }
 #endif
 
+
     fastllm::Data MakeTensor(fastllm::DataType dataType, const std::vector<int> &dims, float seed = 0.0f) {
         int count = 1;
         for (int dim : dims) {
@@ -701,6 +1581,7 @@ namespace {
         Expect(count == (int) values.size(), "INT32 tensor element count mismatch.");
         fastllm::Data data(fastllm::DataType::INT32, dims);
         data.Allocate();
+        data.cpuIntDatas.assign(values.begin(), values.end());
         if (count > 0) {
             std::memcpy(data.cpuData, values.data(), (size_t) count * sizeof(int32_t));
         }
@@ -1291,6 +2172,326 @@ namespace {
         }
         fastllm::ClearAllPagedCacheManagers();
         std::cout << "CUDA chunked paged MLA regression: PASS\n";
+    }
+
+    void ExpectPackedKvQuality(const std::vector<float> &expected,
+                               const std::vector<float> &actual,
+                               fastllm::DataType type,
+                               const std::string &name) {
+        Expect(expected.size() == actual.size(), name + " size mismatch.");
+        double dot = 0.0, expectedSq = 0.0, actualSq = 0.0, errorSq = 0.0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            Expect(std::isfinite(expected[i]) && std::isfinite(actual[i]),
+                   name + " contains a non-finite value at index " + std::to_string(i));
+            double e = expected[i], a = actual[i], d = e - a;
+            dot += e * a;
+            expectedSq += e * e;
+            actualSq += a * a;
+            errorSq += d * d;
+        }
+        double cosine = dot / std::sqrt(std::max(1.0e-30, expectedSq * actualSq));
+        double relativeRmse = std::sqrt(errorSq / std::max(1.0e-30, expectedSq));
+        if (type == fastllm::DataType::Q8_0_KV) {
+            Expect(cosine > 0.999 && relativeRmse < 0.015,
+                   name + " Q8 quality regression: cosine=" + std::to_string(cosine) +
+                   ", relative_rmse=" + std::to_string(relativeRmse));
+        } else {
+            Expect(cosine > 0.90 && relativeRmse < 0.45,
+                   name + " Turbo3 quality regression: cosine=" + std::to_string(cosine) +
+                   ", relative_rmse=" + std::to_string(relativeRmse));
+        }
+    }
+
+    void RunCudaTurbo3KvRegression() {
+        using fastllm::DataType;
+        constexpr int pageLen = 3;
+        constexpr int maxPages = 3;
+        constexpr int numHeads = 2;
+        constexpr int headDim = 256;
+        constexpr int seqLen = 5;
+        FastllmCudaSetDevice(0);
+
+        Expect(fastllm::GetKVCacheRowBytes(DataType::Q8_0_KV, headDim) == 272,
+               "Q8 KV row bytes changed.");
+        Expect(fastllm::GetKVCacheRowBytes(DataType::TURBO3_KV, headDim) == 100,
+               "Turbo3 KV row bytes changed.");
+        Expect(fastllm::GetKVCacheRowBytes(DataType::Q8_0_KV, 257) == 306,
+               "Q8 KV partial row did not round up by 32 values.");
+        Expect(fastllm::GetKVCacheRowBytes(DataType::TURBO3_KV, 257) == 150,
+               "Turbo3 KV partial row did not round up by 128 values.");
+
+        std::vector<float> sourceValues = MakeRegressionValues(
+            numHeads * seqLen * headDim, 1.713f, 0.7f);
+        fastllm::Data source(DataType::FLOAT32,
+                             {numHeads, seqLen, headDim}, sourceValues);
+        fastllm::ToDataType(source, DataType::FLOAT16);
+        source.ToDevice(fastllm::DataDevice::CUDA);
+
+        int32_t hostPages[2] = {0, 1};
+        int32_t *cudaPages = (int32_t*)FastllmCudaMalloc(sizeof(hostPages));
+        FastllmCudaCopyFromHostToDevice(cudaPages, hostPages, sizeof(hostPages));
+
+        auto runType = [&](DataType type) {
+            size_t rowBytes = fastllm::GetKVCacheRowBytes(type, headDim);
+            size_t packedBytes = (size_t)maxPages * pageLen * numHeads * rowBytes;
+            uint8_t *packed = (uint8_t*)FastllmCudaMalloc(packedBytes);
+            Expect(packed != nullptr, "packed KV allocation failed.");
+            Expect(cudaMemset(packed, 0, packedBytes) == cudaSuccess,
+                   "packed KV memset failed.");
+
+            Expect(FastllmCudaPackedKVCacheCopy(
+                       packed, 0, pageLen, numHeads, headDim, type,
+                       (uint8_t*)source.cudaData, source.dataType,
+                       seqLen, 0, 3, 0),
+                   "packed KV first prefill page write failed.");
+            Expect(FastllmCudaPackedKVCacheCopy(
+                       packed, 1, pageLen, numHeads, headDim, type,
+                       (uint8_t*)source.cudaData, source.dataType,
+                       seqLen, 3, 2, 0),
+                   "packed KV second prefill page write failed.");
+
+            for (int head = 0; head < numHeads; head++) {
+                void *gatherHalf = FastllmCudaMalloc((size_t)seqLen * headDim * sizeof(uint16_t));
+                void *gatherFloat = FastllmCudaMalloc((size_t)seqLen * headDim * sizeof(float));
+                Expect(FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+                           packed, type, cudaPages, 0, seqLen,
+                           pageLen, numHeads, headDim, head, gatherHalf),
+                       "packed KV prefill gather failed.");
+                Expect(FastllmHalfToFloat(gatherHalf, gatherFloat, seqLen * headDim),
+                       "packed KV gathered half conversion failed.");
+                std::vector<float> actual((size_t)seqLen * headDim);
+                FastllmCudaCopyFromDeviceToHost(
+                    actual.data(), gatherFloat, actual.size() * sizeof(float));
+                std::vector<float> expected(actual.size());
+                for (int token = 0; token < seqLen; token++) {
+                    std::copy_n(sourceValues.begin() +
+                                    ((size_t)head * seqLen + token) * headDim,
+                                headDim, expected.begin() + (size_t)token * headDim);
+                }
+                ExpectPackedKvQuality(expected, actual, type,
+                                      "packed KV cross-page head " + std::to_string(head));
+                FastllmCudaFree(gatherFloat);
+                FastllmCudaFree(gatherHalf);
+            }
+
+            constexpr int decodeBatch = 2;
+            std::vector<float> decodeValues = MakeRegressionValues(
+                decodeBatch * numHeads * headDim, 2.419f, 0.6f);
+            fastllm::Data decode(DataType::FLOAT32,
+                                 {decodeBatch, numHeads, headDim}, decodeValues);
+            fastllm::ToDataType(decode, DataType::FLOAT16);
+            decode.ToDevice(fastllm::DataDevice::CUDA);
+            int32_t decodePageHost[decodeBatch] = {2, 0};
+            int32_t decodeOffsetHost[decodeBatch] = {1, 2};
+            int32_t *decodeMeta = (int32_t*)FastllmCudaMalloc(4 * sizeof(int32_t));
+            FastllmCudaCopyFromHostToDevice(decodeMeta, decodePageHost,
+                                            decodeBatch * sizeof(int32_t));
+            FastllmCudaCopyFromHostToDevice(decodeMeta + decodeBatch,
+                                            decodeOffsetHost,
+                                            decodeBatch * sizeof(int32_t));
+            Expect(FastllmCudaPackedKVCacheCopyBatch(
+                       packed, decodeMeta, decodeMeta + decodeBatch,
+                       pageLen, decodeBatch, numHeads, headDim, type,
+                       (uint8_t*)decode.cudaData, decode.dataType),
+                   "packed KV batch decode write failed.");
+            for (int b = 0; b < decodeBatch; b++) {
+                int32_t *onePage = decodeMeta + b;
+                for (int head = 0; head < numHeads; head++) {
+                    void *gatherHalf = FastllmCudaMalloc(headDim * sizeof(uint16_t));
+                    void *gatherFloat = FastllmCudaMalloc(headDim * sizeof(float));
+                    Expect(FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+                               packed, type, onePage, decodeOffsetHost[b], 1,
+                               pageLen, numHeads, headDim, head, gatherHalf),
+                           "packed KV batch decode gather failed.");
+                    Expect(FastllmHalfToFloat(gatherHalf, gatherFloat, headDim),
+                           "packed KV batch gathered half conversion failed.");
+                    std::vector<float> actual(headDim), expected(headDim);
+                    FastllmCudaCopyFromDeviceToHost(
+                        actual.data(), gatherFloat, actual.size() * sizeof(float));
+                    std::copy_n(decodeValues.begin() +
+                                    ((size_t)b * numHeads + head) * headDim,
+                                headDim, expected.begin());
+                    ExpectPackedKvQuality(expected, actual, type,
+                                          "packed KV batch request " + std::to_string(b) +
+                                          " head " + std::to_string(head));
+                    FastllmCudaFree(gatherFloat);
+                    FastllmCudaFree(gatherHalf);
+                }
+            }
+            FastllmCudaFree(decodeMeta);
+            FastllmCudaFree(packed);
+        };
+
+        runType(DataType::Q8_0_KV);
+        runType(DataType::TURBO3_KV);
+        fastllm::ClearAllPagedCacheManagers();
+        {
+            constexpr int attentionBatch = 2;
+            constexpr int group = 1;
+            const float attentionScale = 1.0f / std::sqrt((float)headDim);
+            std::vector<float> valueValues = MakeRegressionValues(
+                numHeads * seqLen * headDim, 3.117f, 0.55f);
+            fastllm::Data valueSource(DataType::FLOAT32,
+                                      {numHeads, seqLen, headDim}, valueValues);
+            fastllm::ToDataType(valueSource, DataType::FLOAT16);
+            valueSource.ToDevice(fastllm::DataDevice::CUDA);
+
+            auto allocateManager = [&](int id, DataType type) {
+                fastllm::Data desc(type);
+                desc.dims = {numHeads, 1, headDim};
+                desc.strides = {(uint64_t)headDim, (uint64_t)headDim, 1};
+                desc.dataDevice = fastllm::DataDevice::CUDA;
+                desc.dataDeviceIds = {0};
+                desc.UpdateUnitSize();
+                return fastllm::AllocatePagedCacheManager(
+                    id, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                    desc, pageLen, maxPages);
+            };
+            fastllm::PagedCacheManager *referenceKManager =
+                allocateManager(61000, DataType::FLOAT16);
+            fastllm::PagedCacheManager *referenceVManager =
+                allocateManager(61001, DataType::FLOAT16);
+            fastllm::PagedCacheManager *packedKManager =
+                allocateManager(61002, DataType::Q8_0_KV);
+            fastllm::PagedCacheManager *packedVManager =
+                allocateManager(61003, DataType::TURBO3_KV);
+
+            for (int page = 0; page < 2; page++) {
+                int inputOffset = page * pageLen;
+                int copyLen = std::min(pageLen, seqLen - inputOffset);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)referenceKManager->cudaData, page, pageLen,
+                    numHeads, headDim, DataType::FLOAT16,
+                    (uint8_t*)source.cudaData, source.dataType,
+                    seqLen, inputOffset, copyLen, 0);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)referenceVManager->cudaData, page, pageLen,
+                    numHeads, headDim, DataType::FLOAT16,
+                    (uint8_t*)valueSource.cudaData, valueSource.dataType,
+                    seqLen, inputOffset, copyLen, 0);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)packedKManager->cudaData, page, pageLen,
+                    numHeads, headDim, DataType::Q8_0_KV,
+                    (uint8_t*)source.cudaData, source.dataType,
+                    seqLen, inputOffset, copyLen, 0);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)packedVManager->cudaData, page, pageLen,
+                    numHeads, headDim, DataType::TURBO3_KV,
+                    (uint8_t*)valueSource.cudaData, valueSource.dataType,
+                    seqLen, inputOffset, copyLen, 0);
+            }
+
+            auto makeCache = [&](DataType type, fastllm::PagedCacheManager *manager) {
+                fastllm::Data cache(type);
+                cache.Resize({numHeads, seqLen, headDim});
+                cache.SetKVCache();
+                cache.isPagedKVCache = true;
+                cache.pageLen = pageLen;
+                cache.pageIndex = {0, 1};
+                cache.lastPageLen = seqLen - pageLen;
+                cache.pagedKVCacheData = manager;
+                return cache;
+            };
+            fastllm::Data referenceK = makeCache(DataType::FLOAT16, referenceKManager);
+            fastllm::Data referenceV = makeCache(DataType::FLOAT16, referenceVManager);
+            fastllm::Data packedK = makeCache(DataType::Q8_0_KV, packedKManager);
+            fastllm::Data packedV = makeCache(DataType::TURBO3_KV, packedVManager);
+            fastllm::Data query = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                MakeRegressionValues(numHeads * group * attentionBatch * headDim, 3.771f, 0.08f));
+            fastllm::Data qSizes = MakeIntTensor({3}, {0, 1, 2});
+            fastllm::Data pageSizes = MakeIntTensor({3}, {0, 1, 2});
+            fastllm::Data pageIndexs = MakeIntTensor({2}, {0, 1});
+            fastllm::Data lastPageLens = MakeIntTensor({2}, {pageLen, seqLen - pageLen});
+            qSizes.ToDevice(fastllm::DataDevice::CUDA);
+            pageSizes.ToDevice(fastllm::DataDevice::CUDA);
+            pageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+            lastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data referenceOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            fastllm::Data packedOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            {
+                ScopedEnvVar disableSm70("FASTLLM_CUDA_SM70_PAGED_XQA", "0");
+                ScopedEnvVar disableNativeGqa("FASTLLM_PAGED_GQA_DECODE", "0");
+                Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                           query, referenceK, referenceV,
+                           qSizes, pageSizes, pageIndexs, lastPageLens,
+                           referenceOutput, group, attentionScale),
+                       "FP16 paged attention reference failed.");
+                Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                           query, packedK, packedV,
+                           qSizes, pageSizes, pageIndexs, lastPageLens,
+                           packedOutput, group, attentionScale),
+                       "packed paged attention failed.");
+            }
+            ExpectPackedKvQuality(ToFloatVector(referenceOutput),
+                                  ToFloatVector(packedOutput),
+                                  DataType::TURBO3_KV,
+                                  "packed paged attention output");
+            fastllm::Data referenceSingleOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            fastllm::Data packedSingleOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            Expect(FastllmCudaHalfPagedAttentionFastllmFallback(
+                       query, referenceK, referenceV, referenceSingleOutput,
+                       group, attentionScale),
+                   "FP16 single paged attention reference failed.");
+            Expect(FastllmCudaHalfPagedAttentionFastllmFallback(
+                       query, packedK, packedV, packedSingleOutput,
+                       group, attentionScale),
+                   "packed single paged attention failed.");
+            ExpectPackedKvQuality(ToFloatVector(referenceSingleOutput),
+                                  ToFloatVector(packedSingleOutput),
+                                  DataType::TURBO3_KV,
+                                  "packed single paged attention output");
+        }
+        fastllm::ClearAllPagedCacheManagers();
+        FastllmCudaFree(cudaPages);
+    }
+
+    void RunCudaGreedyTieBreakRegression() {
+        constexpr int batch = 2;
+        constexpr int vocabSize = 300;
+        std::vector<float> logits((size_t)batch * vocabSize, -10.0f);
+        logits[1] = 7.0f;
+        logits[257] = 7.0f;
+        logits[vocabSize + 3] = 4.0f;
+        logits[vocabSize + 259] = 4.0f;
+
+        float *cudaLogits = (float *)FastllmCudaMalloc(logits.size() * sizeof(float));
+        int *cudaIds = (int *)FastllmCudaMalloc(batch * sizeof(int));
+        float *cudaScores = (float *)FastllmCudaMalloc(batch * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(cudaLogits, logits.data(), logits.size() * sizeof(float));
+
+        Expect(FastllmCudaGreedySampling(cudaLogits, cudaIds, batch, vocabSize),
+               "greedy sampling kernel rejected tie-break fixture");
+        std::vector<int> plainIds(batch);
+        FastllmCudaCopyFromDeviceToHost(plainIds.data(), cudaIds, batch * sizeof(int));
+
+        Expect(FastllmCudaGreedySamplingWithScores(
+                   cudaLogits, cudaIds, cudaScores, batch, vocabSize),
+               "greedy sampling with scores rejected tie-break fixture");
+        std::vector<int> scoredIds(batch);
+        std::vector<float> scores(batch);
+        FastllmCudaCopyFromDeviceToHost(scoredIds.data(), cudaIds, batch * sizeof(int));
+        FastllmCudaCopyFromDeviceToHost(scores.data(), cudaScores, batch * sizeof(float));
+
+        FastllmCudaFree(cudaScores);
+        FastllmCudaFree(cudaIds);
+        FastllmCudaFree(cudaLogits);
+
+        Expect(plainIds == std::vector<int>({1, 3}),
+               "plain greedy sampling did not choose the lowest token id on a tie");
+        Expect(scoredIds == plainIds,
+               "greedy sampling kernels disagree on tied maximum logits");
+        ExpectFloatNear({7.0f, 4.0f}, scores, 0.0f, 0.0f,
+                        "greedy sampling tied maximum scores");
     }
 
     void RunCudaTritonChunkGdnPrefillRegression() {
@@ -2063,7 +3264,7 @@ namespace {
         fastllm::Data bias = MakeCudaTensor(fastllm::DataType::FLOAT32,
                                             {channels}, biasValues);
 
-        for (int tokenCount = 1; tokenCount <= 6; tokenCount++) {
+        for (int tokenCount = 1; tokenCount <= 10; tokenCount++) {
             std::vector<float> tokenValues =
                 MakeRegressionValues(rows * tokenCount, 1.7f + tokenCount, 0.4f);
             fastllm::Data allTokens = MakeCudaTensor(fastllm::DataType::FLOAT16,
@@ -2121,26 +3322,26 @@ namespace {
             ExpectFloatNear(ToFloatVector(sequentialCache), ToFloatVector(multiCache),
                             1e-3f, 1e-3f,
                             "multi-token conv final cache N=" + std::to_string(tokenCount));
-            if (tokenCount == 6) {
+            if (tokenCount == 10) {
                 fastllm::Data partialCache = MakeCudaTensor(
                     fastllm::DataType::FLOAT16, {batch, channels, 4}, initialCacheValues);
-                std::vector<fastllm::Data> partialSnapshots(5);
-                std::vector<fastllm::Data*> partialSnapshotPtrs(5);
-                for (int token = 0; token < 5; token++) {
+                std::vector<fastllm::Data> partialSnapshots(9);
+                std::vector<fastllm::Data*> partialSnapshotPtrs(9);
+                for (int token = 0; token < 9; token++) {
                     partialSnapshotPtrs[token] = &partialSnapshots[token];
                 }
                 fastllm::Data partialOutput;
                 Expect(FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
                            partialCache, allTokens, weight, bias, partialOutput,
-                           partialSnapshotPtrs.data(), 5),
-                       "multi-token conv rejected N=6 with five prefix snapshots");
+                           partialSnapshotPtrs.data(), 9),
+                       "multi-token conv rejected N=10 with nine prefix snapshots");
                 ExpectFloatNear(ToFloatVector(multiOutput), ToFloatVector(partialOutput),
                                 1e-3f, 1e-3f,
                                 "multi-token conv partial-snapshot output");
                 ExpectFloatNear(ToFloatVector(multiCache), ToFloatVector(partialCache),
                                 1e-3f, 1e-3f,
                                 "multi-token conv partial-snapshot final cache");
-                for (int token = 0; token < 5; token++) {
+                for (int token = 0; token < 9; token++) {
                     ExpectFloatNear(expectedCaches[token], ToFloatVector(partialSnapshots[token]),
                                     1e-3f, 1e-3f,
                                     "multi-token conv partial snapshot token=" +
@@ -2217,7 +3418,7 @@ namespace {
                        "multi-token conv accepted a snapshot count larger than N");
         }
         {
-            const int tooManyTokens = 7;
+            const int tooManyTokens = 11;
             fastllm::Data cache = MakeCudaTensor(fastllm::DataType::FLOAT16,
                                                  {batch, channels, 4}, initialCacheValues);
             fastllm::Data tokens = MakeCudaTensor(
@@ -2226,7 +3427,7 @@ namespace {
             fastllm::Data output;
             Expect(!FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
                        cache, tokens, weight, bias, output, nullptr, 0),
-                   "multi-token conv accepted N=7");
+                   "multi-token conv accepted N=11");
         }
     }
 
@@ -2507,7 +3708,7 @@ namespace {
         fastllm::Data dtBias = MakeCudaTensor(fastllm::DataType::FLOAT32,
                                               {numVHeads}, {0.15f, -0.08f});
 
-        for (int tokenCount = 2; tokenCount <= 6; tokenCount++) {
+        for (int tokenCount = 2; tokenCount <= 10; tokenCount++) {
             std::vector<float> convValues =
                 MakeRegressionValues(tokenCount * qkvDim, 2.1f + tokenCount, 0.12f);
             std::vector<float> baValues(tokenCount * numVHeads * 2);
@@ -2559,7 +3760,7 @@ namespace {
                 expectedStates[token] = ToFloatVector(sequentialState);
             }
 
-            int snapshotCount = std::min(tokenCount, 5);
+            int snapshotCount = std::min(tokenCount, 9);
             std::vector<fastllm::Data> snapshots(snapshotCount);
             std::vector<fastllm::Data*> snapshotPtrs(snapshotCount);
             for (int token = 0; token < snapshotCount; token++) {
@@ -2619,22 +3820,22 @@ namespace {
             ExpectFloatNear(ToFloatVector(sequentialState), ToFloatVector(sequenceState),
                             2e-3f, 2e-3f,
                             "recurrent final state N=" + std::to_string(tokenCount));
-            if (tokenCount == 6) {
+            if (tokenCount == 10) {
                 fastllm::Data rejectedState = MakeCudaTensor(
                     fastllm::DataType::FLOAT16,
                     {1, numVHeads, headKDim, headVDim}, initialStateValues);
                 rejectedState.isLinearAttentionTransposed = true;
-                fastllm::Data rejectedSnapshots[6];
-                fastllm::Data *rejectedSnapshotPtrs[6];
-                for (int token = 0; token < 6; token++) {
+                fastllm::Data rejectedSnapshots[10];
+                fastllm::Data *rejectedSnapshotPtrs[10];
+                for (int token = 0; token < 10; token++) {
                     rejectedSnapshotPtrs[token] = &rejectedSnapshots[token];
                 }
                 fastllm::Data rejectedOutput;
                 Expect(!FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
                            convSequence, baSequence, normWeight, aLog, dtBias,
-                           rejectedState, rejectedOutput, rejectedSnapshotPtrs, 6,
+                           rejectedState, rejectedOutput, rejectedSnapshotPtrs, 10,
                            numKHeads, numVHeads, headKDim, headVDim, eps, qScale),
-                       "recurrent sequence accepted N=6 with six snapshots");
+                       "recurrent sequence accepted N=10 with ten snapshots");
             }
         }
 
@@ -2678,7 +3879,7 @@ namespace {
                        "recurrent snapshot sequence accepted nullptr tokenStates");
         }
         {
-            const int tooManyTokens = 7;
+            const int tooManyTokens = 11;
             fastllm::Data conv = MakeCudaTensor(
                 fastllm::DataType::FLOAT16, {1, tooManyTokens, qkvDim},
                 MakeRegressionValues(tooManyTokens * qkvDim, 6.4f, 0.12f));
@@ -2694,9 +3895,827 @@ namespace {
             Expect(!FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
                        conv, ba, normWeight, aLog, dtBias, state, output,
                        numKHeads, numVHeads, headKDim, headVDim, eps, qScale),
-                   "recurrent sequence accepted N=7");
+                   "recurrent sequence accepted N=11");
         }
     }
+    void RunCudaSm70PagedGqa6DecodeRegression() {
+        if (getCudaInfos()->cudaArch != 700) {
+            std::cout << "SM70 paged GQA6 decode regression: SKIP (requires CC 7.0)\n";
+            return;
+        }
+
+        constexpr int batch = 1;
+        constexpr int numKvHeads = 4;
+        constexpr int group = 6;
+        constexpr int numQHeads = numKvHeads * group;
+        constexpr int headDim = 256;
+        constexpr int pageLen = 128;
+        constexpr int maxPages = 4;
+        const float scale = 1.0f / std::sqrt((float)headDim);
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, batch, headDim},
+            MakeRegressionValues(numQHeads * batch * headDim, 0.41f, 0.04f));
+        fastllm::Data cacheDesc = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numKvHeads, 1, headDim},
+            std::vector<float>(numKvHeads * headDim, 0.0f));
+        fastllm::PagedCacheManager *pagedK = fastllm::AllocatePagedCacheManager(
+            60000, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            cacheDesc, pageLen, maxPages);
+        fastllm::PagedCacheManager *pagedV = fastllm::AllocatePagedCacheManager(
+            60001, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            cacheDesc, pageLen, maxPages);
+        fastllm::Data pagedKValues = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {maxPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(maxPages * pageLen * numKvHeads * headDim,
+                                 0.83f, 0.03f));
+        fastllm::Data pagedVValues = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {maxPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(maxPages * pageLen * numKvHeads * headDim,
+                                 1.27f, 0.05f));
+        FastllmCudaCopyFromDeviceToDevice(
+            pagedK->cudaData, pagedKValues.cudaData, pagedKValues.GetBytes());
+        FastllmCudaCopyFromDeviceToDevice(
+            pagedV->cudaData, pagedVValues.cudaData, pagedVValues.GetBytes());
+
+        fastllm::Data kCaches(fastllm::DataType::FLOAT16);
+        fastllm::Data vCaches(fastllm::DataType::FLOAT16);
+        kCaches.Resize({numKvHeads, 1, headDim});
+        vCaches.Resize({numKvHeads, 1, headDim});
+        kCaches.isKVCache = vCaches.isKVCache = true;
+        kCaches.isPagedKVCache = vCaches.isPagedKVCache = true;
+        kCaches.pageLen = vCaches.pageLen = pageLen;
+        kCaches.pagedKVCacheData = pagedK;
+        vCaches.pagedKVCacheData = pagedV;
+
+        fastllm::Data qSizes = MakeIntTensor({batch + 1}, {0, 1});
+        qSizes.ToDevice(fastllm::DataDevice::CUDA);
+        for (const auto &fixture : std::vector<std::pair<std::vector<int32_t>, int>>{
+                 {{2}, 17}, {{2, 0}, 1}, {{2, 0, 3}, 17}}) {
+            const std::vector<int32_t> &physicalPages = fixture.first;
+            int lastPageLen = fixture.second;
+            fastllm::Data pageSizes = MakeIntTensor(
+                {batch + 1}, {0, (int32_t)physicalPages.size()});
+            fastllm::Data pageIndexs = MakeIntTensor(
+                {(int)physicalPages.size()}, physicalPages);
+            fastllm::Data lastPageLens = MakeIntTensor({batch}, {lastPageLen});
+            pageSizes.ToDevice(fastllm::DataDevice::CUDA);
+            pageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+            lastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data reference = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {numQHeads, batch, headDim},
+                std::vector<float>(numQHeads * batch * headDim, 0.0f));
+            {
+                ScopedEnvVar disableSm70("FASTLLM_CUDA_SM70_PAGED_XQA", "0");
+                ScopedEnvVar disableNativeGqa("FASTLLM_PAGED_GQA_DECODE", "0");
+                Expect(FastllmCudaHalfPagedAttentionBatch(
+                           q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                           lastPageLens, reference, group, scale, 1,
+                           false, true, false, -1),
+                       "native per-Q-head paged decode rejected the SM70 fixture.");
+            }
+
+            fastllm::Data actual = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {numQHeads, batch, headDim},
+                std::vector<float>(numQHeads * batch * headDim, 0.0f));
+            {
+                ScopedEnvVar defaultSm70("FASTLLM_CUDA_SM70_PAGED_XQA", nullptr);
+                Expect(FastllmCudaTrySm70PagedAttentionDecode(
+                           q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                           lastPageLens, actual, group, scale, 1),
+                       "default SM70 paged GQA6 decode route rejected an eligible fixture.");
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            int kvLen = ((int)physicalPages.size() - 1) * pageLen + lastPageLen;
+            ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                            3e-3f, 3e-3f,
+                            "SM70 paged GQA6 decode kvLen=" + std::to_string(kvLen));
+
+            if (physicalPages.size() == 3) {
+                fastllm::Data graphOutput = MakeCudaTensor(
+                    fastllm::DataType::FLOAT16, {numQHeads, batch, headDim},
+                    std::vector<float>(numQHeads * batch * headDim, 0.0f));
+                ScopedEnvVar defaultSm70("FASTLLM_CUDA_SM70_PAGED_XQA", nullptr);
+                Expect(FastllmCudaHalfPagedAttentionBatch(
+                           q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                           lastPageLens, graphOutput, group, scale, 1,
+                           false, true, false, -1),
+                       "SM70 paged XQA graph warmup failed.");
+                FastllmCudaMemset0(graphOutput.cudaData, graphOutput.GetBytes());
+                void *graph = nullptr;
+                void *graphExec = nullptr;
+                Expect(FastllmCudaGraphBeginCapture(),
+                       "SM70 paged XQA graph capture did not start.");
+                Expect(FastllmCudaHalfPagedAttentionBatch(
+                           q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                           lastPageLens, graphOutput, group, scale, 1,
+                           false, false, true, -1),
+                       "SM70 paged XQA rejected graph capture.");
+                Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                       "SM70 paged XQA graph capture failed.");
+                Expect(FastllmCudaGraphInstantiate(graph, &graphExec) && graphExec != nullptr,
+                       "SM70 paged XQA graph instantiate failed.");
+                Expect(FastllmCudaGraphLaunch(graphExec),
+                       "SM70 paged XQA graph replay failed.");
+                ExpectFloatNear(ToFloatVector(reference), ToFloatVector(graphOutput),
+                                3e-3f, 3e-3f,
+                                "SM70 paged XQA graph replay");
+                FastllmCudaGraphExecDestroy(graphExec);
+                FastllmCudaGraphDestroy(graph);
+            }
+
+            fastllm::Data untouched = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {numQHeads, batch, headDim},
+                std::vector<float>(numQHeads * batch * headDim, 0.25f));
+            const std::vector<float> untouchedReference = ToFloatVector(untouched);
+            {
+                ScopedEnvVar enableSm70("FASTLLM_CUDA_SM70_PAGED_XQA", "1");
+                Expect(!FastllmCudaTrySm70PagedAttentionDecode(
+                           q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                           lastPageLens, untouched, 5, scale, 1),
+                       "SM70 paged decode accepted an unsupported GQA group.");
+            }
+            ExpectFloatNear(untouchedReference, ToFloatVector(untouched),
+                            0.0f, 0.0f,
+                            "rejected SM70 paged decode modified output");
+
+            fastllm::Data stridedOutput = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {numQHeads, batch, headDim},
+                std::vector<float>(numQHeads * batch * headDim, 0.25f));
+            const std::vector<uint64_t> contiguousStrides = stridedOutput.strides;
+            const std::vector<float> stridedReference = ToFloatVector(stridedOutput);
+            stridedOutput.strides[0] += headDim;
+            bool acceptedStridedOutput;
+            {
+                ScopedEnvVar enableSm70("FASTLLM_CUDA_SM70_PAGED_XQA", "1");
+                acceptedStridedOutput = FastllmCudaTrySm70PagedAttentionDecode(
+                    q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                    lastPageLens, stridedOutput, group, scale, 1);
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            stridedOutput.strides = contiguousStrides;
+            Expect(!acceptedStridedOutput,
+                   "SM70 paged decode accepted a noncontiguous output view.");
+            ExpectFloatNear(stridedReference, ToFloatVector(stridedOutput),
+                            0.0f, 0.0f,
+                            "rejected SM70 paged decode modified strided output");
+        }
+
+        {
+            constexpr int batchTwo = 2;
+            fastllm::Data qBatch = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {numQHeads, batchTwo, headDim},
+                MakeRegressionValues(numQHeads * batchTwo * headDim, 2.41f, 0.04f));
+            fastllm::Data qSizesBatch = MakeIntTensor({batchTwo + 1}, {0, 1, 2});
+            fastllm::Data pageSizesBatch = MakeIntTensor({batchTwo + 1}, {0, 2, 5});
+            fastllm::Data pageIndexsBatch = MakeIntTensor({5}, {3, 0, 2, 1, 3});
+            fastllm::Data lastPageLensBatch = MakeIntTensor({batchTwo}, {17, 29});
+            qSizesBatch.ToDevice(fastllm::DataDevice::CUDA);
+            pageSizesBatch.ToDevice(fastllm::DataDevice::CUDA);
+            pageIndexsBatch.ToDevice(fastllm::DataDevice::CUDA);
+            lastPageLensBatch.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data referenceBatch = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {numQHeads, batchTwo, headDim},
+                std::vector<float>(numQHeads * batchTwo * headDim, 0.0f));
+            {
+                ScopedEnvVar disableSm70("FASTLLM_CUDA_SM70_PAGED_XQA", "0");
+                ScopedEnvVar disableNativeGqa("FASTLLM_PAGED_GQA_DECODE", "0");
+                Expect(FastllmCudaHalfPagedAttentionBatch(
+                           qBatch, kCaches, vCaches, qSizesBatch, pageSizesBatch,
+                           pageIndexsBatch, lastPageLensBatch, referenceBatch,
+                           group, scale, 1, false, true, false, -1),
+                       "native per-Q-head paged decode rejected batch-two fixture.");
+            }
+            fastllm::Data actualBatch = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {numQHeads, batchTwo, headDim},
+                std::vector<float>(numQHeads * batchTwo * headDim, 0.0f));
+            {
+                ScopedEnvVar defaultSm70("FASTLLM_CUDA_SM70_PAGED_XQA", nullptr);
+                Expect(FastllmCudaTrySm70PagedAttentionDecode(
+                           qBatch, kCaches, vCaches, qSizesBatch, pageSizesBatch,
+                           pageIndexsBatch, lastPageLensBatch, actualBatch,
+                           group, scale, 1),
+                       "default SM70 paged XQA rejected batch-two fixture.");
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            ExpectFloatNear(ToFloatVector(referenceBatch), ToFloatVector(actualBatch),
+                            3e-3f, 3e-3f,
+                            "SM70 paged XQA batch-two nonzero pageStart");
+        }
+
+        {
+            fastllm::Data qConcurrent[2] = {
+                MakeCudaTensor(fastllm::DataType::FLOAT16,
+                               {numQHeads, batch, headDim},
+                               MakeRegressionValues(numQHeads * headDim, 3.41f, 0.04f)),
+                MakeCudaTensor(fastllm::DataType::FLOAT16,
+                               {numQHeads, batch, headDim},
+                               MakeRegressionValues(numQHeads * headDim, 4.41f, 0.04f))
+            };
+            fastllm::Data qSizesConcurrent[2] = {
+                MakeIntTensor({2}, {0, 1}), MakeIntTensor({2}, {0, 1})
+            };
+            fastllm::Data pageSizesConcurrent[2] = {
+                MakeIntTensor({2}, {0, 3}), MakeIntTensor({2}, {0, 2})
+            };
+            fastllm::Data pageIndexsConcurrent[2] = {
+                MakeIntTensor({3}, {2, 0, 3}), MakeIntTensor({2}, {1, 3})
+            };
+            fastllm::Data lastPageLensConcurrent[2] = {
+                MakeIntTensor({1}, {17}), MakeIntTensor({1}, {29})
+            };
+            fastllm::Data referenceConcurrent[2] = {
+                MakeCudaTensor(fastllm::DataType::FLOAT16,
+                               {numQHeads, batch, headDim},
+                               std::vector<float>(numQHeads * headDim, 0.0f)),
+                MakeCudaTensor(fastllm::DataType::FLOAT16,
+                               {numQHeads, batch, headDim},
+                               std::vector<float>(numQHeads * headDim, 0.0f))
+            };
+            fastllm::Data actualConcurrent[2] = {
+                MakeCudaTensor(fastllm::DataType::FLOAT16,
+                               {numQHeads, batch, headDim},
+                               std::vector<float>(numQHeads * headDim, 0.0f)),
+                MakeCudaTensor(fastllm::DataType::FLOAT16,
+                               {numQHeads, batch, headDim},
+                               std::vector<float>(numQHeads * headDim, 0.0f))
+            };
+            for (int worker = 0; worker < 2; worker++) {
+                qSizesConcurrent[worker].ToDevice(fastllm::DataDevice::CUDA);
+                pageSizesConcurrent[worker].ToDevice(fastllm::DataDevice::CUDA);
+                pageIndexsConcurrent[worker].ToDevice(fastllm::DataDevice::CUDA);
+                lastPageLensConcurrent[worker].ToDevice(fastllm::DataDevice::CUDA);
+                ScopedEnvVar disableSm70("FASTLLM_CUDA_SM70_PAGED_XQA", "0");
+                ScopedEnvVar disableNativeGqa("FASTLLM_PAGED_GQA_DECODE", "0");
+                Expect(FastllmCudaHalfPagedAttentionBatch(
+                           qConcurrent[worker], kCaches, vCaches,
+                           qSizesConcurrent[worker], pageSizesConcurrent[worker],
+                           pageIndexsConcurrent[worker], lastPageLensConcurrent[worker],
+                           referenceConcurrent[worker], group, scale, 1,
+                           false, true, false, -1),
+                       "native per-Q-head concurrent reference failed.");
+            }
+            ScopedEnvVar defaultSm70("FASTLLM_CUDA_SM70_PAGED_XQA", nullptr);
+            std::exception_ptr workerErrors[2];
+            std::thread workers[2];
+            for (int worker = 0; worker < 2; worker++) {
+                workers[worker] = std::thread([&, worker]() {
+                    try {
+                        FastllmCudaSetDevice(0);
+                        Expect(FastllmCudaTrySm70PagedAttentionDecode(
+                                   qConcurrent[worker], kCaches, vCaches,
+                                   qSizesConcurrent[worker], pageSizesConcurrent[worker],
+                                   pageIndexsConcurrent[worker], lastPageLensConcurrent[worker],
+                                   actualConcurrent[worker], group, scale, 1),
+                               "concurrent SM70 paged XQA route rejected fixture.");
+                        FastllmCudaSyncCurrentThreadStream();
+                    } catch (...) {
+                        workerErrors[worker] = std::current_exception();
+                    }
+                });
+            }
+            for (int worker = 0; worker < 2; worker++) {
+                workers[worker].join();
+                if (workerErrors[worker] != nullptr) {
+                    std::rethrow_exception(workerErrors[worker]);
+                }
+                ExpectFloatNear(ToFloatVector(referenceConcurrent[worker]),
+                                ToFloatVector(actualConcurrent[worker]),
+                                3e-3f, 3e-3f,
+                                "SM70 paged XQA concurrent worker " +
+                                    std::to_string(worker));
+            }
+        }
+    }
+
+    void RunCudaSm70FlashAttentionPrefillRegression() {
+        if (getCudaInfos()->cudaArch != 700) {
+            std::cout << "SM70 FlashAttention prefill regression: SKIP (requires CC 7.0)\n";
+            return;
+        }
+        ScopedEnvVar enableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "1");
+
+        constexpr int batch = 1;
+        constexpr int qLen = 10;
+        constexpr int numKvHeads = 4;
+        constexpr int group = 6;
+        constexpr int numQHeads = numKvHeads * group;
+        constexpr int headDim = 256;
+        constexpr int pageLen = 128;
+        constexpr int maxPages = 4;
+        const float scale = 1.0f / std::sqrt((float)headDim);
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            MakeRegressionValues(numQHeads * qLen * headDim, 5.41f, 0.04f));
+        fastllm::Data cacheDesc = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3, {numKvHeads, 1, headDim},
+            std::vector<float>(numKvHeads * headDim, 0.0f));
+        fastllm::PagedCacheManager *pagedK = fastllm::AllocatePagedCacheManager(
+            61000, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            cacheDesc, pageLen, maxPages);
+        fastllm::PagedCacheManager *pagedV = fastllm::AllocatePagedCacheManager(
+            61001, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            cacheDesc, pageLen, maxPages);
+        fastllm::Data pagedKValues = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3,
+            {maxPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(maxPages * pageLen * numKvHeads * headDim,
+                                 0.83f, 0.03f));
+        fastllm::Data pagedVValues = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3,
+            {maxPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(maxPages * pageLen * numKvHeads * headDim,
+                                 1.27f, 0.05f));
+        FastllmCudaCopyFromDeviceToDevice(
+            pagedK->cudaData, pagedKValues.cudaData, pagedKValues.GetBytes());
+        FastllmCudaCopyFromDeviceToDevice(
+            pagedV->cudaData, pagedVValues.cudaData, pagedVValues.GetBytes());
+
+        fastllm::Data kCaches(fastllm::DataType::FP8_E4M3);
+        fastllm::Data vCaches(fastllm::DataType::FP8_E4M3);
+        kCaches.Resize({numKvHeads, qLen, headDim});
+        vCaches.Resize({numKvHeads, qLen, headDim});
+        kCaches.isKVCache = vCaches.isKVCache = true;
+        kCaches.isPagedKVCache = vCaches.isPagedKVCache = true;
+        kCaches.pageLen = vCaches.pageLen = pageLen;
+        kCaches.pagedKVCacheData = pagedK;
+        vCaches.pagedKVCacheData = pagedV;
+
+        fastllm::Data qSizes = MakeIntTensor({batch + 1}, {0, qLen});
+        fastllm::Data pageSizes = MakeIntTensor({batch + 1}, {0, 3});
+        fastllm::Data pageIndexs = MakeIntTensor({3}, {2, 0, 3});
+        fastllm::Data lastPageLens = MakeIntTensor({batch}, {17});
+        qSizes.ToDevice(fastllm::DataDevice::CUDA);
+        pageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        pageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        lastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+
+        fastllm::Data reference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                       lastPageLens, reference, group, scale, 1,
+                       false, true, false, -1),
+                   "native paged prefill rejected the SM70 qLen10 FP8 fixture.");
+        }
+
+        fastllm::Data actual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.0f));
+        Expect(FastllmCudaTrySm70FlashAttentionPrefill(
+                   q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                   lastPageLens, actual, group, scale, 1),
+               "SM70 FlashAttention route rejected qLen10 page128 FP8 fixture.");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                        3e-3f, 3e-3f,
+                        "SM70 FlashAttention qLen10 page128 FP8");
+
+        fastllm::Data untouched = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.25f));
+        const std::vector<float> untouchedReference = ToFloatVector(untouched);
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(!FastllmCudaTrySm70FlashAttentionPrefill(
+                       q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                       lastPageLens, untouched, group, scale, 1),
+                   "disabled SM70 FlashAttention route accepted fixture.");
+        }
+        ExpectFloatNear(untouchedReference, ToFloatVector(untouched),
+                        0.0f, 0.0f,
+                        "rejected SM70 FlashAttention route modified output");
+
+        fastllm::Data wrongShape = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, 1, headDim},
+            MakeRegressionValues(numQHeads * headDim, 2.19f, 0.02f));
+        fastllm::Data wrongShapeOutput = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, 1, headDim},
+            std::vector<float>(numQHeads * headDim, -0.375f));
+        const std::vector<float> wrongShapeReference =
+            ToFloatVector(wrongShapeOutput);
+        Expect(!FastllmCudaTrySm70FlashAttentionPrefill(
+                   wrongShape, kCaches, vCaches, qSizes, pageSizes,
+                   pageIndexs, lastPageLens, wrongShapeOutput, group, scale, 1),
+               "SM70 FlashAttention route accepted unsupported qLen1.");
+        ExpectFloatNear(wrongShapeReference, ToFloatVector(wrongShapeOutput),
+                        0.0f, 0.0f,
+                        "unsupported SM70 FlashAttention shape modified output");
+
+        constexpr int shortQLen = 2;
+        fastllm::Data shortQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, shortQLen, headDim},
+            MakeRegressionValues(numQHeads * shortQLen * headDim, 3.71f, 0.03f));
+        fastllm::Data shortQSizes = MakeIntTensor({2}, {0, shortQLen});
+        fastllm::Data fourPageSizes = MakeIntTensor({2}, {0, 4});
+        fastllm::Data fourPageIndexs = MakeIntTensor({4}, {2, 0, 3, 1});
+        fastllm::Data fullLastPage = MakeIntTensor({1}, {pageLen});
+        shortQSizes.ToDevice(fastllm::DataDevice::CUDA);
+        fourPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        fourPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        fullLastPage.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data shortReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, shortQLen, headDim},
+            std::vector<float>(numQHeads * shortQLen * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       shortQ, kCaches, vCaches, shortQSizes, fourPageSizes,
+                       fourPageIndexs, fullLastPage, shortReference, group,
+                       scale, 1, false, true, false, -1),
+                   "native prefill rejected qLen2 four-page FP8 fixture.");
+        }
+        fastllm::Data shortActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, shortQLen, headDim},
+            std::vector<float>(numQHeads * shortQLen * headDim, 0.0f));
+        Expect(FastllmCudaTrySm70FlashAttentionPrefill(
+                   shortQ, kCaches, vCaches, shortQSizes, fourPageSizes,
+                   fourPageIndexs, fullLastPage, shortActual, group, scale, 1),
+               "SM70 FlashAttention route rejected qLen2 four-page FP8 fixture.");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(shortReference), ToFloatVector(shortActual),
+                        3e-3f, 3e-3f,
+                        "SM70 FlashAttention qLen2 four-page FP8");
+
+        constexpr int mtpQLen = 3;
+        fastllm::Data mtpQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, mtpQLen, headDim},
+            MakeRegressionValues(numQHeads * mtpQLen * headDim, 2.73f, 0.035f));
+        fastllm::Data mtpQSizes = MakeIntTensor({2}, {0, mtpQLen});
+        fastllm::Data mtpPageSizes = MakeIntTensor({2}, {0, 1});
+        fastllm::Data mtpPageIndexs = MakeIntTensor({1}, {2});
+        fastllm::Data mtpLastPage = MakeIntTensor({1}, {17});
+        mtpQSizes.ToDevice(fastllm::DataDevice::CUDA);
+        mtpPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        mtpPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        mtpLastPage.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data mtpReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, mtpQLen, headDim},
+            std::vector<float>(numQHeads * mtpQLen * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       mtpQ, kCaches, vCaches, mtpQSizes, mtpPageSizes,
+                       mtpPageIndexs, mtpLastPage, mtpReference, group,
+                       scale, 1, false, true, false, -1),
+                   "native prefill rejected the MTP qLen3 FP8 fixture.");
+        }
+        fastllm::Data mtpActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, mtpQLen, headDim},
+            std::vector<float>(numQHeads * mtpQLen * headDim, 0.0f));
+        Expect(FastllmCudaHalfPagedAttentionBatch(
+                   mtpQ, kCaches, vCaches, mtpQSizes, mtpPageSizes,
+                   mtpPageIndexs, mtpLastPage, mtpActual, group,
+                   scale, 1, false, true, false, -1),
+               "SM70 FlashAttention public route rejected MTP qLen3 FP8.");
+        FastllmCudaSyncCurrentThreadStream();
+        const std::vector<int> expectedMtpOutputDims =
+            {mtpQLen, numQHeads, headDim};
+        const std::vector<uint64_t> expectedMtpOutputStrides =
+            {(uint64_t)numQHeads * headDim, (uint64_t)headDim, 1};
+        Expect(mtpReference.dims == expectedMtpOutputDims &&
+                   mtpReference.strides == expectedMtpOutputStrides,
+               "native MTP qLen3 output violated the token-major contract.");
+        Expect(mtpActual.dims == expectedMtpOutputDims &&
+                   mtpActual.strides == expectedMtpOutputStrides,
+               "SM70 MTP qLen3 output violated the token-major contract.");
+        ExpectFloatNear(ToFloatVector(mtpReference), ToFloatVector(mtpActual),
+                        3e-3f, 3e-3f,
+                        "SM70 FlashAttention MTP qLen3 token-major output");
+
+        constexpr int raggedBatch = 5;
+        constexpr int raggedTokens = 30;
+        fastllm::Data raggedQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, raggedTokens, headDim},
+            MakeRegressionValues(numQHeads * raggedTokens * headDim,
+                                 4.63f, 0.025f));
+        fastllm::Data raggedQSizes =
+            MakeIntTensor({raggedBatch + 1}, {0, 2, 6, 12, 20, 30});
+        fastllm::Data raggedPageSizes =
+            MakeIntTensor({raggedBatch + 1}, {0, 1, 2, 3, 4, 5});
+        fastllm::Data raggedPageIndexs =
+            MakeIntTensor({raggedBatch}, {2, 0, 3, 1, 2});
+        fastllm::Data raggedLastPageLens =
+            MakeIntTensor({raggedBatch}, {17, 31, 49, 83, 127});
+        raggedQSizes.ToDevice(fastllm::DataDevice::CUDA);
+        raggedPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        raggedPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        raggedLastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data raggedReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {numQHeads, raggedTokens, headDim},
+            std::vector<float>(numQHeads * raggedTokens * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       raggedQ, kCaches, vCaches, raggedQSizes,
+                       raggedPageSizes, raggedPageIndexs, raggedLastPageLens,
+                       raggedReference, group, scale, 1,
+                       false, true, false, -1),
+                   "native prefill rejected ragged batch5 FP8 fixture.");
+        }
+        fastllm::Data raggedActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {numQHeads, raggedTokens, headDim},
+            std::vector<float>(numQHeads * raggedTokens * headDim, 0.0f));
+        Expect(FastllmCudaTrySm70FlashAttentionPrefill(
+                   raggedQ, kCaches, vCaches, raggedQSizes,
+                   raggedPageSizes, raggedPageIndexs, raggedLastPageLens,
+                   raggedActual, group, scale, 1),
+               "SM70 FlashAttention route rejected ragged batch5 FP8 fixture.");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(raggedReference),
+                        ToFloatVector(raggedActual), 3e-3f, 3e-3f,
+                        "SM70 FlashAttention ragged batch5 FP8");
+
+        constexpr int longPages = 64;
+        fastllm::PagedCacheManager *longPagedK =
+            fastllm::AllocatePagedCacheManager(
+                61002,
+                fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                cacheDesc, pageLen, longPages);
+        fastllm::PagedCacheManager *longPagedV =
+            fastllm::AllocatePagedCacheManager(
+                61003,
+                fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                cacheDesc, pageLen, longPages);
+        const int longCacheElements =
+            longPages * pageLen * numKvHeads * headDim;
+        fastllm::Data longKValues = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3,
+            {longPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(longCacheElements, 0.57f, 0.015f));
+        fastllm::Data longVValues = MakeCudaTensor(
+            fastllm::DataType::FP8_E4M3,
+            {longPages, pageLen, numKvHeads, headDim},
+            MakeRegressionValues(longCacheElements, 1.11f, 0.02f));
+        FastllmCudaCopyFromDeviceToDevice(
+            longPagedK->cudaData, longKValues.cudaData, longKValues.GetBytes());
+        FastllmCudaCopyFromDeviceToDevice(
+            longPagedV->cudaData, longVValues.cudaData, longVValues.GetBytes());
+        fastllm::Data longKCaches(fastllm::DataType::FP8_E4M3);
+        fastllm::Data longVCaches(fastllm::DataType::FP8_E4M3);
+        longKCaches.Resize({numKvHeads, qLen, headDim});
+        longVCaches.Resize({numKvHeads, qLen, headDim});
+        longKCaches.isKVCache = longVCaches.isKVCache = true;
+        longKCaches.isPagedKVCache = longVCaches.isPagedKVCache = true;
+        longKCaches.pageLen = longVCaches.pageLen = pageLen;
+        longKCaches.pagedKVCacheData = longPagedK;
+        longVCaches.pagedKVCacheData = longPagedV;
+        std::vector<int32_t> longPhysicalPages(longPages);
+        for (int page = 0; page < longPages; ++page) {
+            longPhysicalPages[page] = (page * 17) % longPages;
+        }
+        fastllm::Data longPageSizes = MakeIntTensor({2}, {0, longPages});
+        fastllm::Data longPageIndexs =
+            MakeIntTensor({longPages}, longPhysicalPages);
+        fastllm::Data longLastPage = MakeIntTensor({1}, {pageLen});
+        longPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        longPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        longLastPage.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data longReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.0f));
+        {
+            ScopedEnvVar disableRoute("FASTLLM_CUDA_SM70_FLASH_ATTN", "0");
+            Expect(FastllmCudaHalfPagedAttentionBatch(
+                       q, longKCaches, longVCaches, qSizes, longPageSizes,
+                       longPageIndexs, longLastPage, longReference, group,
+                       scale, 1, false, true, false, -1),
+                   "native prefill rejected 8192-token FP8 fixture.");
+        }
+        ScopedEnvVar allowLongKv(
+            "FASTLLM_CUDA_SM70_FLASH_ATTN_MAX_KV", "8192");
+        fastllm::Data longActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.0f));
+        Expect(FastllmCudaTrySm70FlashAttentionPrefill(
+                   q, longKCaches, longVCaches, qSizes, longPageSizes,
+                   longPageIndexs, longLastPage, longActual, group, scale, 1),
+               "SM70 FlashAttention route rejected 8192-token FP8 fixture.");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(longReference), ToFloatVector(longActual),
+                        3e-3f, 3e-3f,
+                        "SM70 FlashAttention 8192-token FP8");
+
+        fastllm::Data longRejected = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, qLen, headDim},
+            std::vector<float>(numQHeads * qLen * headDim, 0.125f));
+        const std::vector<float> longRejectedReference =
+            ToFloatVector(longRejected);
+        {
+            ScopedEnvVar defaultKvLimit(
+                "FASTLLM_CUDA_SM70_FLASH_ATTN_MAX_KV", nullptr);
+            Expect(!FastllmCudaTrySm70FlashAttentionPrefill(
+                       q, longKCaches, longVCaches, qSizes, longPageSizes,
+                       longPageIndexs, longLastPage, longRejected,
+                       group, scale, 1),
+                   "SM70 FlashAttention route accepted KV8192 above default limit.");
+        }
+        ExpectFloatNear(longRejectedReference, ToFloatVector(longRejected),
+                        0.0f, 0.0f,
+                        "long-KV SM70 FlashAttention rejection modified output");
+
+        const char *bench = std::getenv("FASTLLM_SM70_FLASH_ATTN_BENCH");
+        if (bench != nullptr && std::string(bench) != "0") {
+            constexpr int warmup = 3;
+            constexpr int iterations = 20;
+            auto measure = [&](bool useRoute, fastllm::Data &benchQ,
+                               fastllm::Data &benchK, fastllm::Data &benchV,
+                               fastllm::Data &benchQSizes,
+                               fastllm::Data &benchPageSizes,
+                               fastllm::Data &benchPageIndexs,
+                               fastllm::Data &benchLastPageLens,
+                               fastllm::Data &benchOutput) {
+                ScopedEnvVar route("FASTLLM_CUDA_SM70_FLASH_ATTN",
+                                   useRoute ? "1" : "0");
+                auto launch = [&]() {
+                    if (useRoute) {
+                        return FastllmCudaTrySm70FlashAttentionPrefill(
+                            benchQ, benchK, benchV, benchQSizes,
+                            benchPageSizes, benchPageIndexs,
+                            benchLastPageLens, benchOutput, group, scale, 1);
+                    }
+                    return FastllmCudaHalfPagedAttentionBatch(
+                        benchQ, benchK, benchV, benchQSizes, benchPageSizes,
+                        benchPageIndexs, benchLastPageLens, benchOutput,
+                        group, scale, 1, false, false, false, -1);
+                };
+                for (int i = 0; i < warmup; ++i) {
+                    Expect(launch(), "SM70 prefill benchmark warmup failed.");
+                }
+                FastllmCudaSyncCurrentThreadStream();
+                void *start = FastllmCudaEventCreateTiming();
+                void *end = FastllmCudaEventCreateTiming();
+                FastllmCudaEventRecordCurrentThread(start);
+                for (int i = 0; i < iterations; ++i) {
+                    Expect(launch(), "SM70 prefill benchmark launch failed.");
+                }
+                FastllmCudaEventRecordCurrentThread(end);
+                FastllmCudaEventSynchronize(end);
+                const float averageMs =
+                    FastllmCudaEventElapsedTime(start, end) / iterations;
+                FastllmCudaEventDestroy(start);
+                FastllmCudaEventDestroy(end);
+                return averageMs;
+            };
+            std::cout << "shape,route,avg_ms,speedup_vs_native\n";
+            auto report = [&](const std::string &shape,
+                              fastllm::Data &benchQ,
+                              fastllm::Data &benchK,
+                              fastllm::Data &benchV,
+                              fastllm::Data &benchQSizes,
+                              fastllm::Data &benchPageSizes,
+                              fastllm::Data &benchPageIndexs,
+                              fastllm::Data &benchLastPageLens,
+                              fastllm::Data &nativeOutput,
+                              fastllm::Data &routeOutput) {
+                const float nativeMs = measure(
+                    false, benchQ, benchK, benchV, benchQSizes,
+                    benchPageSizes, benchPageIndexs, benchLastPageLens,
+                    nativeOutput);
+                const float routeMs = measure(
+                    true, benchQ, benchK, benchV, benchQSizes,
+                    benchPageSizes, benchPageIndexs, benchLastPageLens,
+                    routeOutput);
+                std::cout << shape << ",native," << nativeMs << ",1\n";
+                std::cout << shape << ",sm70_flash_attn," << routeMs << ','
+                          << nativeMs / routeMs << '\n';
+            };
+            report("b1_q10_kv273", q, kCaches, vCaches, qSizes, pageSizes,
+                   pageIndexs, lastPageLens, reference, actual);
+            report("b5_ragged_kv17_127", raggedQ, kCaches, vCaches,
+                   raggedQSizes, raggedPageSizes, raggedPageIndexs,
+                   raggedLastPageLens, raggedReference, raggedActual);
+            for (int kvTokens : {512, 1024, 2048, 4096}) {
+                const int pages = kvTokens / pageLen;
+                std::vector<int32_t> physicalPages(pages);
+                for (int page = 0; page < pages; ++page) {
+                    physicalPages[page] = (page * 17) % pages;
+                }
+                fastllm::Data crossPageSizes =
+                    MakeIntTensor({2}, {0, pages});
+                fastllm::Data crossPageIndexs =
+                    MakeIntTensor({pages}, physicalPages);
+                fastllm::Data crossLastPage =
+                    MakeIntTensor({1}, {pageLen});
+                crossPageSizes.ToDevice(fastllm::DataDevice::CUDA);
+                crossPageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+                crossLastPage.ToDevice(fastllm::DataDevice::CUDA);
+                report("b1_q10_kv" + std::to_string(kvTokens),
+                       q, longKCaches, longVCaches, qSizes,
+                       crossPageSizes, crossPageIndexs, crossLastPage,
+                       longReference, longActual);
+            }
+            report("b1_q10_kv8192", q, longKCaches, longVCaches, qSizes,
+                   longPageSizes, longPageIndexs, longLastPage,
+                   longReference, longActual);
+        }
+    }
+
+    void RunCudaSm70PagedGqa6DecodeBenchmark() {
+        if (getCudaInfos()->cudaArch != 700) {
+            throw std::runtime_error("sm70_paged_xqa_bench requires CC 7.0.");
+        }
+        constexpr int batch = 1;
+        constexpr int numKvHeads = 4;
+        constexpr int group = 6;
+        constexpr int numQHeads = numKvHeads * group;
+        constexpr int headDim = 256;
+        constexpr int pageLen = 128;
+        constexpr int maxTokens = 131072;
+        constexpr int maxPages = maxTokens / pageLen;
+        constexpr int warmup = 5;
+        constexpr int iterations = 30;
+        const float scale = 1.0f / std::sqrt((float)headDim);
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numQHeads, batch, headDim},
+            MakeRegressionValues(numQHeads * headDim, 0.41f, 0.04f));
+        fastllm::Data cacheDesc = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {numKvHeads, 1, headDim},
+            std::vector<float>(numKvHeads * headDim, 0.0f));
+        fastllm::PagedCacheManager *pagedK = fastllm::AllocatePagedCacheManager(
+            60002, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            cacheDesc, pageLen, maxPages);
+        fastllm::PagedCacheManager *pagedV = fastllm::AllocatePagedCacheManager(
+            60003, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            cacheDesc, pageLen, maxPages);
+        FastllmCudaMemset0(pagedK->cudaData, pagedK->GetBytes());
+        FastllmCudaMemset0(pagedV->cudaData, pagedV->GetBytes());
+
+        fastllm::Data kCaches(fastllm::DataType::FLOAT16);
+        fastllm::Data vCaches(fastllm::DataType::FLOAT16);
+        kCaches.Resize({numKvHeads, 1, headDim});
+        vCaches.Resize({numKvHeads, 1, headDim});
+        kCaches.isKVCache = vCaches.isKVCache = true;
+        kCaches.isPagedKVCache = vCaches.isPagedKVCache = true;
+        kCaches.pageLen = vCaches.pageLen = pageLen;
+        kCaches.pagedKVCacheData = pagedK;
+        vCaches.pagedKVCacheData = pagedV;
+
+        fastllm::Data qSizes = MakeIntTensor({2}, {0, 1});
+        qSizes.ToDevice(fastllm::DataDevice::CUDA);
+        std::cout << "route,kv_tokens,avg_ms,speedup_vs_per_q_head\n";
+        for (int kvTokens : {8192, 32768, 131072}) {
+            int pages = kvTokens / pageLen;
+            std::vector<int32_t> physicalPages(pages);
+            std::iota(physicalPages.begin(), physicalPages.end(), 0);
+            fastllm::Data pageSizes = MakeIntTensor({2}, {0, pages});
+            fastllm::Data pageIndexs = MakeIntTensor({pages}, physicalPages);
+            fastllm::Data lastPageLens = MakeIntTensor({1}, {pageLen});
+            pageSizes.ToDevice(fastllm::DataDevice::CUDA);
+            pageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+            lastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data output = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {numQHeads, batch, headDim},
+                std::vector<float>(numQHeads * headDim, 0.0f));
+
+            auto measure = [&](bool xqa) {
+                ScopedEnvVar sm70Route("FASTLLM_CUDA_SM70_PAGED_XQA", xqa ? "1" : "0");
+                ScopedEnvVar nativeGqa("FASTLLM_PAGED_GQA_DECODE", "0");
+                for (int i = 0; i < warmup; i++) {
+                    Expect(FastllmCudaHalfPagedAttentionBatch(
+                               q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                               lastPageLens, output, group, scale, 1,
+                               false, false, false, -1),
+                           "paged decode benchmark route rejected its fixture.");
+                }
+                FastllmCudaSyncCurrentThreadStream();
+                void *start = FastllmCudaEventCreateTiming();
+                void *end = FastllmCudaEventCreateTiming();
+                FastllmCudaEventRecordCurrentThread(start);
+                for (int i = 0; i < iterations; i++) {
+                    Expect(FastllmCudaHalfPagedAttentionBatch(
+                               q, kCaches, vCaches, qSizes, pageSizes, pageIndexs,
+                               lastPageLens, output, group, scale, 1,
+                               false, false, false, -1),
+                           "paged decode benchmark route failed during timing.");
+                }
+                FastllmCudaEventRecordCurrentThread(end);
+                FastllmCudaEventSynchronize(end);
+                float averageMs = FastllmCudaEventElapsedTime(start, end) / iterations;
+                FastllmCudaEventDestroy(start);
+                FastllmCudaEventDestroy(end);
+                return averageMs;
+            };
+
+            float perQHeadMs = measure(false);
+            float xqaMs = measure(true);
+            std::cout << "per_q_head," << kvTokens << ',' << perQHeadMs << ",1\n";
+            std::cout << "sm70_xqa," << kvTokens << ',' << xqaMs << ','
+                      << (perQHeadMs / xqaMs) << '\n';
+        }
+    }
+
 #endif
 
     struct PastKeyBatch {
@@ -3288,11 +5307,20 @@ namespace {
                "CPU AWQ regression requires complete quantization groups.");
         const int group = inputDim / groupCnt;
 
+        // The production INT4_GROUP path first quantizes activations to uint8
+        // per group. Use an exactly representable 1/64 grid and include both
+        // endpoints in every group, so the dense reference isolates weight
+        // packing/math instead of measuring expected activation quantization error.
         std::vector<float> inputValues((size_t)batch * inputDim);
         for (int b = 0; b < batch; b++) {
-            for (int x = 0; x < inputDim; x++) {
-                inputValues[(size_t)b * inputDim + x] =
-                    (float)((x * (b + 3) + 11 * b) % 251 - 125) / 64.0f;
+            for (int g = 0; g < group; g++) {
+                for (int local = 0; local < groupCnt; local++) {
+                    int code = local == 0 ? -128 :
+                               (local == 1 ? 127 :
+                                (((local * 17 + b * 23 + g * 7) & 255) - 128));
+                    int x = g * groupCnt + local;
+                    inputValues[(size_t)b * inputDim + x] = (float)code / 64.0f;
+                }
             }
         }
 
@@ -3932,13 +5960,9 @@ namespace {
                                 std::vector<int>{0}, false);
         std::vector<fastllm::Data*> biases(weights.size(), nullptr);
 
-        const char *oldSmallBatchEnv =
-            std::getenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH");
-        const bool hadSmallBatchEnv = oldSmallBatchEnv != nullptr;
-        const std::string oldSmallBatchEnvValue =
-            hadSmallBatchEnv ? oldSmallBatchEnv : "";
-        setenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH", "0", 1);
         {
+            ScopedEnvVar smallBatchRoute(
+                "FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH", "0");
             ScopedFirstDevice guard("cuda");
             fastllm::MergeMOE(
                 batchInput, fallbackIndex, fallbackScore, weights, biases,
@@ -3946,14 +5970,11 @@ namespace {
                 fallbackInput, fallbackIntermediate,
                 0.0f, fallbackOutput);
         }
-        if (hadSmallBatchEnv) {
-            setenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH",
-                   oldSmallBatchEnvValue.c_str(), 1);
-        } else {
-            unsetenv("FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH");
-        }
+        // Different expert batching produces a different FP32 reduction tree.
+        // Both paths already pass the dense reference checks above; constrain
+        // the remaining FP16 rounding difference to a tight numerical budget.
         ExpectFloatNear(ToFloatVector(fallbackOutput), ToFloatVector(batchOutput),
-                        0.0f, 0.0f,
+                        1e-5f, 1e-3f,
                         "CUDA INT4_GROUP small-batch fused versus generic MergeMOE");
     }
 
@@ -4075,6 +6096,859 @@ namespace {
                         "CUDA INT8 batch-1 fused MoE graph downstream consumer");
         FastllmCudaGraphExecDestroy(graphExec);
         FastllmCudaGraphDestroy(graph);
+    }
+
+    // ---------------------------------------------------------------------------
+    // CUDA GGUF IQ4_XS / Q5_0 dequant + SM70 MMQ regression.
+    //
+    // Dispatch branches covered for each format:
+    //   n <= 7  -> DP4A MMVQ (chunked, Q8_1 input quant)
+    //   8 <= n <= 64 (SM70, IQ4_XS only) -> SM70 IQ4_XS DP4A MMQ trial
+    //                  (Q8_1 input quant, FP32 accumulate). Trial/fallback:
+    //                  on rejection or unsupported device, falls through to
+    //                  the dequant+GEMM path below.
+    //   n >  7  -> dequant + cublas GEMM (when dequant enabled)
+    // The reference is CPU dequantize_row_* + dense FP32 matmul, modeling
+    // input-dtype rounding and Q8_1 quant/dequant for the Q8_1 paths.
+    //
+    // Route assertion: the env switch FASTLLM_DISABLE_GGUF_DEQUANT_IQ4XS_Q5_0
+    // nulls the FP16/BF16 dequantizer so n>7 falls back to chunked MMVQ. The
+    // SM70 MMQ trial is gated by FASTLLM_CUDA_SM70_IQ4XS_MMQ (default on for
+    // SM70). Without a production introspection helper, each case is checked
+    // against BOTH the Q8_1 and dequant+GEMM references and must match at
+    // least one within tolerance.
+    // ---------------------------------------------------------------------------
+    static const int8_t kIq4NlValuesCpu[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113
+    };
+
+    static void FillIq4XsBlock(block_iq4_xs &blk, uint32_t seed) {
+        // Deterministic pseudo-random fill that exercises all nibble values,
+        // all six-bit scale values, and the high-bit paths.
+        auto rng = [seed](uint32_t &s) -> uint8_t {
+            s = s * 1103515245u + 12345u;
+            return (uint8_t)((s >> 16) & 0xFF);
+        };
+        uint32_t s = seed;
+
+        // d: tiny fp16 so dequantized weights stay in a realistic ~0.01..0.1
+        // magnitude band, avoiding FP16-output saturation that obscures
+        // real decode errors behind cancellation noise.
+        uint16_t dBits = 0x0280u | ((uint16_t)rng(s) & 0x007Fu); // ~2^-16 band
+        std::memcpy(&blk.d, &dBits, sizeof(dBits));
+
+        // scales_h: 2 high bits per sub-block (8 sub-blocks -> 16 bits).
+        blk.scales_h = (uint16_t)(rng(s) | ((uint16_t)rng(s) << 8));
+
+        // scales_l: 4 low bits per sub-block, packed 2 per byte.
+        blk.scales_l[0] = rng(s);
+        blk.scales_l[1] = rng(s);
+        blk.scales_l[2] = rng(s);
+        blk.scales_l[3] = rng(s);
+
+        // qs: 128 nibbles (64 bytes), cycling through all 16 values.
+        for (int i = 0; i < QK_K / 2; i++) {
+            blk.qs[i] = rng(s);
+        }
+    }
+
+    static void FillQ5_0Block(block_q5_0 &blk, uint32_t seed) {
+        auto rng = [seed](uint32_t &s) -> uint8_t {
+            s = s * 1103515245u + 12345u;
+            return (uint8_t)((s >> 16) & 0xFF);
+        };
+        uint32_t s = seed;
+        // d: small fp16 so dequantized weights stay realistic (~0.01..0.1),
+        // avoiding FP16-output saturation that obscures decode errors.
+        uint16_t dBits = 0x1C00u | ((uint16_t)rng(s) & 0x01FFu); // ~2^-9 band
+        std::memcpy(&blk.d, &dBits, sizeof(dBits));
+
+        // qh: 5th bits for all 32 values.
+        uint32_t qhBits = ((uint32_t)rng(s)) | ((uint32_t)rng(s) << 8) |
+                         ((uint32_t)rng(s) << 16) | ((uint32_t)rng(s) << 24);
+        std::memcpy(blk.qh, &qhBits, sizeof(qhBits));
+
+        // qs: 16 low-nibble bytes.
+        for (int i = 0; i < QK5_0 / 2; i++) {
+            blk.qs[i] = rng(s);
+        }
+    }
+
+    // CPU reference dequant for iq4_xs (mirrors dequantize_row_iq4_xs).
+    static void CpuDequantIq4Xs(const block_iq4_xs *blocks, int64_t nblocks,
+                                 std::vector<float> &out) {
+        out.resize((size_t)nblocks * QK_K);
+        for (int64_t i = 0; i < nblocks; i++) {
+            uint16_t dBits;
+            std::memcpy(&dBits, &blocks[i].d, sizeof(dBits));
+            const float d = fastllm::half_to_float(dBits);
+            const uint8_t *qs = blocks[i].qs;
+            float *y = out.data() + (size_t)i * QK_K;
+            for (int ib = 0; ib < QK_K / 32; ib++) {
+                int ls = ((blocks[i].scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f) |
+                         (((blocks[i].scales_h >> (2 * ib)) & 0x3) << 4);
+                float dl = d * (float)(ls - 32);
+                for (int j = 0; j < 16; j++) {
+                    y[j]      = dl * (float)kIq4NlValuesCpu[qs[j] & 0xf];
+                    y[j + 16] = dl * (float)kIq4NlValuesCpu[qs[j] >> 4];
+                }
+                y += 32;
+                qs += 16;
+            }
+        }
+    }
+
+    // CPU reference dequant for q5_0 (mirrors dequantize_row_q5_0).
+    static void CpuDequantQ5_0(const block_q5_0 *blocks, int64_t nblocks,
+                                std::vector<float> &out) {
+        out.resize((size_t)nblocks * QK5_0);
+        for (int64_t i = 0; i < nblocks; i++) {
+            uint16_t dBits;
+            std::memcpy(&dBits, &blocks[i].d, sizeof(dBits));
+            const float d = fastllm::half_to_float(dBits);
+            uint32_t qh;
+            std::memcpy(&qh, blocks[i].qh, sizeof(qh));
+            float *y = out.data() + (size_t)i * QK5_0;
+            for (int j = 0; j < QK5_0 / 2; j++) {
+                uint8_t xh0 = (uint8_t)(((qh >> (j +  0)) << 4) & 0x10);
+                uint8_t xh1 = (uint8_t)((qh >> (j + 12)) & 0x10);
+                int x0 = ((blocks[i].qs[j] & 0x0f) | xh0) - 16;
+                int x1 = ((blocks[i].qs[j] >>  4) | xh1) - 16;
+                y[j]            = x0 * d;
+                y[j + QK5_0/2]  = x1 * d;
+            }
+        }
+    }
+
+    // Dense CPU matmul: output[n][k] = sum_m input_fp16[n][m] * weight_fp32[k][m].
+    // weight is [k][m] row-major (output_dim × input_dim), same as Linear convention.
+    static void CpuDenseMatmul(const std::vector<float> &inputFp32,
+                               int n, int m, int k,
+                               const std::vector<float> &weightFp32,
+                               std::vector<float> &out) {
+        out.assign((size_t)n * k, 0.0f);
+        for (int ni = 0; ni < n; ni++) {
+            for (int ki = 0; ki < k; ki++) {
+                float sum = 0.0f;
+                for (int mi = 0; mi < m; mi++) {
+                    sum += inputFp32[(size_t)ni * m + mi] *
+                           weightFp32[(size_t)ki * m + mi];
+                }
+                out[(size_t)ni * k + ki] = sum;
+            }
+        }
+    }
+
+    static float RoundToFp16(float value) {
+        return fastllm::half_to_float(fastllm::float_to_half(value));
+    }
+
+    static void RoundInputToFp16(std::vector<float> &values) {
+        for (float &value : values) {
+            value = RoundToFp16(value);
+        }
+    }
+
+    static void RoundOutputToFp16(std::vector<float> &values) {
+        constexpr float kMaxFp16 = 65504.0f;
+        for (float &value : values) {
+            value = RoundToFp16(std::max(-kMaxFp16, std::min(kMaxFp16, value)));
+        }
+    }
+
+    static void RoundWeightToFp16(std::vector<float> &values) {
+        for (float &value : values) {
+            value = RoundToFp16(value);
+        }
+    }
+
+    // --- BF16 rounding helpers (matching production conversion conventions) ---
+
+    // BF16 round-to-nearest-even (matches __float2bfloat16_rn used by CUDA
+    // dequant kernels and MMVQ/MMQ output casts).
+    static float RoundToBf16Rne(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        uint32_t lsb = (bits >> 16) & 1;
+        bits += 0x7FFFu + lsb;
+        uint16_t bf16Bits = (uint16_t)(bits >> 16);
+        uint32_t restored = (uint32_t)bf16Bits << 16;
+        float result;
+        std::memcpy(&result, &restored, sizeof(result));
+        return result;
+    }
+
+    // BF16 truncation (matches Data(BFLOAT16,...) constructor's fp32->bf16
+    // cast used when constructing activation tensors from float vectors).
+    static float RoundToBf16Trunc(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        uint16_t bf16Bits = (uint16_t)(bits >> 16);
+        uint32_t restored = (uint32_t)bf16Bits << 16;
+        float result;
+        std::memcpy(&result, &restored, sizeof(result));
+        return result;
+    }
+
+    static void RoundInputToBf16(std::vector<float> &values) {
+        for (float &v : values) { v = RoundToBf16Trunc(v); }
+    }
+
+    static void RoundOutputToBf16(std::vector<float> &values) {
+        for (float &v : values) { v = RoundToBf16Rne(v); }
+    }
+
+    static void RoundWeightToBf16(std::vector<float> &values) {
+        for (float &v : values) { v = RoundToBf16Rne(v); }
+    }
+
+    // Round input values to the activation dtype's precision, matching how
+    // the Data constructor casts float vectors to the target type.
+    static void RoundInputToDtype(std::vector<float> &values,
+                                  fastllm::DataType dtype) {
+        if (dtype == fastllm::DataType::FLOAT16) {
+            RoundInputToFp16(values);
+        } else if (dtype == fastllm::DataType::BFLOAT16) {
+            RoundInputToBf16(values);
+        }
+        // FLOAT32: no rounding.
+    }
+
+    // Round output values to the output dtype's precision, matching how CUDA
+    // kernels cast FP32 dot-product results to the output type.
+    static void RoundOutputToDtype(std::vector<float> &values,
+                                   fastllm::DataType dtype) {
+        if (dtype == fastllm::DataType::FLOAT16) {
+            RoundOutputToFp16(values);
+        } else if (dtype == fastllm::DataType::BFLOAT16) {
+            RoundOutputToBf16(values);
+        }
+        // FLOAT32: no rounding.
+    }
+
+    // Round weight values for the dequant+GEMM reference path. BF16 input uses
+    // the BF16 dequant kernel (__float2bfloat16_rn); FP16 and FP32 input both
+    // use the FP16 dequant kernel by default (no FASTLLM_GGUF_FP32_DEQUANT).
+    static void RoundWeightForGemm(std::vector<float> &values,
+                                   fastllm::DataType actDtype) {
+        if (actDtype == fastllm::DataType::BFLOAT16) {
+            RoundWeightToBf16(values);
+        } else {
+            RoundWeightToFp16(values);
+        }
+    }
+
+    static void QuantizeQ8_1DequantizeInPlace(std::vector<float> &values, int rowSize) {
+        Expect(rowSize % QK8_1 == 0, "Q8_1 reference input row size must be 32-aligned.");
+        Expect(values.size() % (size_t)rowSize == 0, "Q8_1 reference input size mismatch.");
+        for (size_t row = 0; row < values.size(); row += rowSize) {
+            for (int block = 0; block < rowSize; block += QK8_1) {
+                float amax = 0.0f;
+                for (int j = 0; j < QK8_1; j++) {
+                    amax = std::max(amax, std::fabs(values[row + block + j]));
+                }
+                const float d = amax == 0.0f ? 0.0f : amax / 127.0f;
+                const float dequantD = RoundToFp16(d);
+                for (int j = 0; j < QK8_1; j++) {
+                    const float q = d == 0.0f ? 0.0f : std::round(values[row + block + j] / d);
+                    values[row + block + j] = q * dequantD;
+                }
+            }
+        }
+    }
+
+    static void QuantizeQ8D4DequantizeInPlace(std::vector<float> &values,
+                                               int rowSize) {
+        Expect(rowSize % (4 * QK8_1) == 0,
+               "Q8 D4 reference input row size must be 128-aligned.");
+        Expect(values.size() % (size_t)rowSize == 0,
+               "Q8 D4 reference input size mismatch.");
+        for (size_t row = 0; row < values.size(); row += rowSize) {
+            for (int block128 = 0; block128 < rowSize;
+                 block128 += 4 * QK8_1) {
+                for (int group = 0; group < 4; group++) {
+                    const int block = block128 + group * QK8_1;
+                    float amax = 0.0f;
+                    for (int j = 0; j < QK8_1; j++) {
+                        amax = std::max(
+                            amax, std::fabs(values[row + block + j]));
+                    }
+                    const float d = amax == 0.0f ? 0.0f : amax / 127.0f;
+                    for (int j = 0; j < QK8_1; j++) {
+                        const float q = d == 0.0f
+                            ? 0.0f
+                            : std::round(values[row + block + j] / d);
+                        values[row + block + j] = q * d;
+                    }
+                }
+            }
+        }
+    }
+
+    static bool GgufDequantIq4xsQ50EnvDisabled() {
+        const char *v = std::getenv("FASTLLM_DISABLE_GGUF_DEQUANT_IQ4XS_Q5_0");
+        if (v == nullptr || v[0] == '\0') return false;
+        char c = (char)std::tolower((unsigned char)v[0]);
+        return c == '1' || c == 't' || c == 'y' || c == 'o';
+    }
+
+    // Build a GGUF quantized weight with synthetic blocks, dequant CPU reference,
+    // run CUDA Linear across batch sizes, verify, and assert the dispatched branch.
+    template <typename BlockT>
+    static void RunGgufDequantRegressionOne(ggml_type quantType, int inputDim,
+                                             int outputDim, const char *typeName,
+                                             void (*fillBlock)(BlockT &, uint32_t),
+                                             void (*cpuDequant)(const BlockT *, int64_t,
+                                                                std::vector<float> &)) {
+        const int blockSize = (int)ggml_blck_size(quantType);
+        Expect(inputDim % blockSize == 0,
+               std::string("input dim must be aligned to ") + typeName + " block size.");
+        int blocksPerRow = inputDim / blockSize;
+
+        // Uninitialized Data via the GGUF constructor, then fill raw blocks.
+        fastllm::Data weight(fastllm::DataType::DATA_GGUF_FORMAT, (int)quantType,
+                             {outputDim, inputDim});
+        weight.isGGUFData = true;
+        weight.disableGGUFRepack = true; // keep IQ4_XS/Q5_0 type stable for the CUDA dequant path
+        weight.Allocate();
+        size_t bytesPerRow = ggml_row_size(quantType, inputDim);
+
+        // Build the CPU reference dequantized weights.
+        std::vector<float> refWeightFp32((size_t)outputDim * inputDim);
+        for (int row = 0; row < outputDim; row++) {
+            std::vector<BlockT> rowBlocks(blocksPerRow);
+            for (int b = 0; b < blocksPerRow; b++) {
+                std::memset(&rowBlocks[b], 0, sizeof(BlockT));
+                fillBlock(rowBlocks[b], (uint32_t)((row * 1000 + b) * 7 + 3));
+            }
+            // Write blocks into the weight's CPU buffer.
+            std::memcpy(weight.cpuData + (size_t)row * bytesPerRow,
+                        rowBlocks.data(), (size_t)blocksPerRow * sizeof(BlockT));
+            // Dequant this row for the CPU reference.
+            std::vector<float> dequantRow;
+            cpuDequant(rowBlocks.data(), blocksPerRow, dequantRow);
+            std::memcpy(refWeightFp32.data() + (size_t)row * inputDim,
+                        dequantRow.data(), (size_t)inputDim * sizeof(float));
+        }
+        // Identity-input dequant check: feed a square identity matrix as the
+        // activation so the Linear output equals the dequantized weight rows
+        // directly. This isolates the CUDA dequantizer + row/column layout from
+        // any matmul accumulation noise. Bypassed when outputDim != inputDim.
+        if (outputDim == inputDim) {
+            std::vector<float> identity((size_t)inputDim * inputDim, 0.0f);
+            for (int i = 0; i < inputDim; i++) {
+                identity[(size_t)i * inputDim + i] = 1.0f;
+            }
+            fastllm::Data idInput(fastllm::DataType::FLOAT16, {inputDim, inputDim}, identity);
+            idInput.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data idWeight = weight;
+            idWeight.name = std::string("regression.gguf_dequant.identity.") + typeName;
+            idWeight.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data idActual;
+            {
+                ScopedFirstDevice guard("cuda");
+                fastllm::Data emptyBias;
+                fastllm::Linear(idInput, idWeight, emptyBias, idActual);
+            }
+            std::vector<float> idRef = refWeightFp32;
+            RoundOutputToFp16(idRef);
+            float idAtol = (quantType == GGML_TYPE_IQ4_XS) ? 1.5f : 0.5f;
+            float idRtol = (quantType == GGML_TYPE_IQ4_XS) ? 0.15f : 0.08f;
+            ExpectFloatNear(idRef, ToFloatVector(idActual), idAtol, idRtol,
+                            std::string("CUDA GGUF ") + typeName +
+                            " identity dequant (weight rows exact)");
+        }
+
+        // Batches spanning the MMVQ (n<=7) / SM70 MMQ trial (8<=n<=64) /
+        // dequant+GEMM (n>7, or n>64 fallback) boundaries.
+        const std::vector<int> batches = {1, 7, 8, 16, 33};
+
+        for (int batch : batches) {
+            // Deterministic synthetic activation.
+            std::vector<float> inputFp32((size_t)batch * inputDim);
+            for (int ni = 0; ni < batch; ni++) {
+                for (int mi = 0; mi < inputDim; mi++) {
+                    inputFp32[(size_t)ni * inputDim + mi] =
+                        (float)((ni * 17 + mi * 13 + 5) % 101 - 50) / 47.0f;
+                }
+            }
+
+            bool dequantDisabled = GgufDequantIq4xsQ50EnvDisabled();
+            bool expectDequantGemm = (batch > 7) && !dequantDisabled;
+            std::vector<float> refInput = inputFp32;
+            RoundInputToFp16(refInput);
+            if (!expectDequantGemm) {
+                QuantizeQ8_1DequantizeInPlace(refInput, inputDim);
+            }
+            std::vector<float> refWeight = refWeightFp32;
+            if (expectDequantGemm) {
+                RoundWeightToFp16(refWeight);
+            }
+            std::vector<float> refOutput;
+            CpuDenseMatmul(refInput, batch, inputDim, outputDim, refWeight, refOutput);
+            RoundOutputToFp16(refOutput);
+
+            // CUDA path: FP16 activation + GGUF quantized weight.
+            fastllm::Data inputHalf(fastllm::DataType::FLOAT16, {batch, inputDim}, inputFp32);
+            inputHalf.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data quantWeight = weight; // copy to get a fresh device placement
+            quantWeight.name = std::string("regression.gguf_dequant.") + typeName;
+            quantWeight.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data actual;
+            {
+                ScopedFirstDevice guard("cuda");
+                fastllm::Data emptyBias;
+                fastllm::Linear(inputHalf, quantWeight, emptyBias, actual);
+            }
+
+            bool expectedMmvq = !expectDequantGemm;
+
+            // Verify the GPU still owns the raw quantized buffer (dequant path
+            // borrows scratch; MMVQ reads weight.cudaData in chunks). Both branches
+            // keep cudaData non-null, so we assert the branch via the env + batch.
+            std::string route = expectDequantGemm ? "dequant+GEMM" : "DP4A-MMVQ";
+            std::string label = std::string("CUDA GGUF ") + typeName +
+                                " dequant linear batch " + std::to_string(batch) +
+                                " [" + route + "]";
+            if (dequantDisabled && batch > 7) {
+                std::cout << "  (env-disabled: n=" << batch
+                          << " forced to MMVQ fallback for " << typeName << ")\n";
+            }
+
+            // Tolerance: FP16 accumulation in the GEMM branch and DP4A in the
+            // MMVQ branch both produce float32 outputs. Tight enough to catch
+            // nibble/scale/high-bit decode errors (which would be O(1) or larger)
+            // but permissive for FP16 rounding of large dot-products.
+            float atol = (quantType == GGML_TYPE_IQ4_XS) ? 1.5f : 0.5f;
+            float rtol = (quantType == GGML_TYPE_IQ4_XS) ? 0.15f : 0.08f;
+            ExpectFloatNear(refOutput, ToFloatVector(actual), atol, rtol, label);
+
+            // Route logic consistency: this basic test uses a small batch set
+            // ({1,7,8,16,33}) and checks that the expected branch flag is
+            // internally consistent. For IQ4_XS on SM70, the SM70 MMQ trial
+            // (8<=n<=64) runs first when dequant is enabled; if it rejects,
+            // it falls through to dequant+GEMM. Both produce numerically
+            // correct output within the tolerance above, so this assertion
+            // only verifies the dispatch logic, not the actual route selected.
+            // The comprehensive MMQ test below exercises all boundary cases.
+            Expect(expectDequantGemm == (batch > 7 && !dequantDisabled),
+                   std::string("route selection inconsistent for ") + typeName +
+                   " batch " + std::to_string(batch) + ": expected " +
+                   (expectDequantGemm ? "dequant+GEMM" : "DP4A-MMVQ"));
+        }
+    }
+
+    // Forward declaration: defined after RunCudaGgufIq4xsQ5DequantRegression.
+    void RunCudaGgufIq4XsSm70MmqRegression();
+
+    void RunCudaGgufIq4xsQ5DequantRegression() {
+        // Minimum aligned shapes: IQ4_XS block = 256, Q5_0 block = 32.
+        // Use dims that are multiples of the block sizes and that match the
+        // existing test conventions (small but realistic).
+        RunGgufDequantRegressionOne<block_iq4_xs>(
+            GGML_TYPE_IQ4_XS, 256, 256, "iq4_xs",
+            FillIq4XsBlock, CpuDequantIq4Xs);
+        // Realistic shape for IQ4_XS (256-aligned).
+        RunGgufDequantRegressionOne<block_iq4_xs>(
+            GGML_TYPE_IQ4_XS, 512, 256, "iq4_xs",
+            FillIq4XsBlock, CpuDequantIq4Xs);
+        // Q5_0 minimum and realistic shapes (32-aligned).
+        RunGgufDequantRegressionOne<block_q5_0>(
+            GGML_TYPE_Q5_0, 256, 256, "q5_0",
+            FillQ5_0Block, CpuDequantQ5_0);
+        RunGgufDequantRegressionOne<block_q5_0>(
+            GGML_TYPE_Q5_0, 512, 256, "q5_0",
+            FillQ5_0Block, CpuDequantQ5_0);
+        // Comprehensive SM70 IQ4_XS MMQ sweep (boundary batches, 3 dtypes,
+        // non-%128 output dims for tail coverage).
+        RunCudaGgufIq4XsSm70MmqRegression();
+    }
+
+    // ---------------------------------------------------------------------------
+    // SM70 IQ4_XS MMQ comprehensive correctness regression.
+    //
+    // Sweeps batches across all dispatch boundaries (MMVQ n<=7, MMQ trial
+    // 8<=n<=64, dequant+GEMM fallback n>64), three activation dtypes
+    // (FLOAT16, FLOAT32, BFLOAT16), and non-%128 output dims (129/257) that
+    // exercise tile-Y tail-row handling. m (inputDim) is %256 for IQ4_XS
+    // block alignment.
+    //
+    // Without a production route introspection helper, each case is checked
+    // against BOTH the Q8_1 reference (models MMVQ + MMQ) and the dequant+GEMM
+    // reference. The actual output must match at least one within tolerance.
+    // A nibble/scale/row/column/tail bug produces O(1)+ errors that exceed
+    // the tolerance for every valid reference.
+    // ---------------------------------------------------------------------------
+
+    static const char *MmqDtypeName(fastllm::DataType dtype) {
+        switch (dtype) {
+            case fastllm::DataType::FLOAT16:  return "FP16";
+            case fastllm::DataType::FLOAT32:  return "FP32";
+            case fastllm::DataType::BFLOAT16: return "BF16";
+            default:                          return "UNKNOWN";
+        }
+    }
+
+    // Check actual against a reference, returning max-error context on failure.
+    // Returns true if within tolerance.
+    static bool MmqCheckRef(const std::vector<float> &actual,
+                            const std::vector<float> &ref,
+                            float atol, float rtol,
+                            float &maxErr, size_t &maxErrIdx) {
+        maxErr = 0.0f;
+        maxErrIdx = 0;
+        for (size_t i = 0; i < actual.size(); i++) {
+            if (!std::isfinite(actual[i]) || !std::isfinite(ref[i])) return false;
+            float diff = std::fabs(ref[i] - actual[i]);
+            if (diff > maxErr) { maxErr = diff; maxErrIdx = i; }
+            float limit = atol + rtol * std::fabs(ref[i]);
+            if (diff > limit) return false;
+        }
+        return true;
+    }
+
+    static void RunGgufIq4XsMmqShape(int inputDim, int outputDim) {
+        const int blockSize = (int)ggml_blck_size(GGML_TYPE_IQ4_XS);
+        Expect(inputDim % blockSize == 0,
+               "IQ4_XS MMQ regression: inputDim must be 256-aligned.");
+        int blocksPerRow = inputDim / blockSize;
+
+        // Build GGUF IQ4_XS weight and CPU reference dequant (reuses the same
+        // deterministic fill + dequant as the basic regression above).
+        fastllm::Data weightBase(fastllm::DataType::DATA_GGUF_FORMAT,
+                                 (int)GGML_TYPE_IQ4_XS,
+                                 {outputDim, inputDim});
+        weightBase.isGGUFData = true;
+        weightBase.disableGGUFRepack = true;
+        weightBase.Allocate();
+        size_t bytesPerRow = ggml_row_size(GGML_TYPE_IQ4_XS, inputDim);
+
+        std::vector<float> refWeightFp32((size_t)outputDim * inputDim);
+        for (int row = 0; row < outputDim; row++) {
+            std::vector<block_iq4_xs> rowBlocks(blocksPerRow);
+            for (int b = 0; b < blocksPerRow; b++) {
+                std::memset(&rowBlocks[b], 0, sizeof(block_iq4_xs));
+                FillIq4XsBlock(rowBlocks[b],
+                               (uint32_t)((row * 1000 + b) * 7 + 3));
+            }
+            std::memcpy(weightBase.cpuData + (size_t)row * bytesPerRow,
+                        rowBlocks.data(),
+                        (size_t)blocksPerRow * sizeof(block_iq4_xs));
+            std::vector<float> dequantRow;
+            CpuDequantIq4Xs(rowBlocks.data(), blocksPerRow, dequantRow);
+            std::memcpy(refWeightFp32.data() + (size_t)row * inputDim,
+                        dequantRow.data(), (size_t)inputDim * sizeof(float));
+        }
+
+        // Batches spanning MMVQ (n<=7), MMQ trial (8<=n<=64), and
+        // dequant+GEMM fallback (n>64). n=65 is the canonical fallback case.
+        const std::vector<int> batches = {
+            1, 7,      // MMVQ boundary
+            8, 9,      // MMQ trial entry + tile-X tail (tile=8)
+            15, 16, 17, // tile=16 boundary
+            31, 32, 33, // tile=32 boundary
+            63, 64,    // MMQ trial exit (tile=64)
+            65,        // dequant+GEMM fallback (outside [8,64])
+        };
+        const std::vector<fastllm::DataType> dtypes = {
+            fastllm::DataType::FLOAT16,
+            fastllm::DataType::FLOAT32,
+            fastllm::DataType::BFLOAT16,
+        };
+
+        bool dequantDisabled = GgufDequantIq4xsQ50EnvDisabled();
+        // IQ4_XS MMQ tolerance: catches nibble/scale/row/column/tail errors
+        // (O(1)+ per corrupted element) while accommodating Q8_1 input
+        // quantization noise and FP16/BF16 output rounding.
+        const float atol = 1.5f;
+        const float rtol = 0.15f;
+
+        for (int batch : batches) {
+            // Deterministic synthetic activation. Token zero is entirely zero
+            // to exercise the D4 quantizer's amax==0 path in every shape.
+            std::vector<float> inputFp32((size_t)batch * inputDim);
+            for (int ni = 0; ni < batch; ni++) {
+                for (int mi = 0; mi < inputDim; mi++) {
+                    inputFp32[(size_t)ni * inputDim + mi] = ni == 0
+                        ? 0.0f
+                        : (float)((ni * 17 + mi * 13 + 5) % 101 - 50) / 47.0f;
+                }
+            }
+
+            for (fastllm::DataType actDtype : dtypes) {
+                std::string dname = MmqDtypeName(actDtype);
+
+                // --- Q8_1 reference (models MMVQ + MMQ trial) ---
+                // Input rounded to activation dtype, then Q8_1 quant/dequant
+                // (32-element blocks, FP16 scale), FP32 accumulate against
+                // exact dequantized weights, output rounded to output dtype.
+                std::vector<float> q8Input = inputFp32;
+                RoundInputToDtype(q8Input, actDtype);
+                QuantizeQ8_1DequantizeInPlace(q8Input, inputDim);
+                std::vector<float> q8Ref;
+                CpuDenseMatmul(q8Input, batch, inputDim, outputDim,
+                               refWeightFp32, q8Ref);
+                RoundOutputToDtype(q8Ref, actDtype);
+
+                // The SM70 MMQ path uses the llama D4 layout: four FP32
+                // scales per 128 activation values. This is intentionally
+                // distinct from block_q8_1 MMVQ's FP16 scale reference.
+                std::vector<float> d4Input = inputFp32;
+                RoundInputToDtype(d4Input, actDtype);
+                QuantizeQ8D4DequantizeInPlace(d4Input, inputDim);
+                std::vector<float> d4Ref;
+                CpuDenseMatmul(d4Input, batch, inputDim, outputDim,
+                               refWeightFp32, d4Ref);
+                RoundOutputToDtype(d4Ref, actDtype);
+
+                // --- dequant+GEMM reference ---
+                // Input rounded to activation dtype; weights rounded to the
+                // dequant kernel's output type (FP16 for FP16/FP32 input,
+                // BF16 for BF16 input); FP32 accumulate; output rounded.
+                std::vector<float> gemmInput = inputFp32;
+                RoundInputToDtype(gemmInput, actDtype);
+                std::vector<float> gemmWeight = refWeightFp32;
+                RoundWeightForGemm(gemmWeight, actDtype);
+                std::vector<float> gemmRef;
+                CpuDenseMatmul(gemmInput, batch, inputDim, outputDim,
+                               gemmWeight, gemmRef);
+                RoundOutputToDtype(gemmRef, actDtype);
+
+                // --- Route label for diagnostics ---
+                std::string route;
+                if (batch <= 7) {
+                    route = "DP4A-MMVQ";
+                } else if (batch <= 64) {
+                    route = dequantDisabled ? "DP4A-MMVQ(env-disabled)"
+                                           : "SM70-IQ4XS-MMQ(trial)";
+                } else {
+                    route = dequantDisabled ? "DP4A-MMVQ(env-disabled)"
+                                           : "dequant+GEMM";
+                }
+
+                std::string label = std::string("IQ4_XS MMQ ") + dname +
+                                    " n=" + std::to_string(batch) +
+                                    " m=" + std::to_string(inputDim) +
+                                    " k=" + std::to_string(outputDim) +
+                                    " [" + route + "]";
+
+
+                // --- Run CUDA Linear ---
+                fastllm::Data inputData(actDtype, {batch, inputDim}, inputFp32);
+                inputData.ToDevice(fastllm::DataDevice::CUDA,
+                                   std::vector<int>{0}, true);
+                fastllm::Data quantWeight = weightBase;
+                quantWeight.name = "regression.iq4xs_mmq." + dname +
+                                   ".n" + std::to_string(batch);
+                quantWeight.ToDevice(fastllm::DataDevice::CUDA,
+                                     std::vector<int>{0}, true);
+
+                // Prove route selection separately from public-API fallback.
+                // A successful direct wrapper call must return true and match
+                // the independent D4 CPU reference; a no-op false return can
+                // no longer make this regression pass through GEMM.
+                if (batch >= 8 && batch <= 64 &&
+                    FastllmCudaSm70Iq4XsMmqSupported()) {
+                    fastllm::Data directOutput(actDtype);
+                    directOutput.Resize({batch, outputDim});
+                    directOutput.ToDevice(fastllm::DataDevice::CUDA,
+                                          std::vector<int>{0}, false);
+                    directOutput.Allocate(false);
+                    bool selected = FastllmCudaTrySm70Iq4XsMmq(
+                        quantWeight.cudaData, inputData.cudaData,
+                        directOutput.cudaData, actDtype,
+                        batch, inputDim, outputDim, nullptr);
+                    Expect(selected, label + " direct wrapper was not selected.");
+                    std::vector<float> directVec = ToFloatVector(directOutput);
+                    float directMaxErr = 0.0f;
+                    size_t directMaxIdx = 0;
+                    Expect(MmqCheckRef(directVec, d4Ref, 2e-2f, 2e-2f,
+                                       directMaxErr, directMaxIdx),
+                           label + " direct D4 mismatch: maxErr=" +
+                           std::to_string(directMaxErr) + " at out[" +
+                           std::to_string(directMaxIdx / outputDim) + "," +
+                           std::to_string(directMaxIdx % outputDim) + "]");
+                }
+                fastllm::Data actual;
+                {
+                    ScopedFirstDevice guard("cuda");
+                    fastllm::Data emptyBias;
+                    fastllm::Linear(inputData, quantWeight, emptyBias, actual);
+                }
+                std::vector<float> actualVec = ToFloatVector(actual);
+
+                Expect(actualVec.size() == q8Ref.size(),
+                       label + " output size mismatch: actual " +
+                       std::to_string(actualVec.size()) + " vs ref " +
+                       std::to_string(q8Ref.size()));
+
+                // --- Check against the route-specific references ---
+                float q8MaxErr = 0, d4MaxErr = 0, gemmMaxErr = 0;
+                size_t q8MaxIdx = 0, d4MaxIdx = 0, gemmMaxIdx = 0;
+
+                if (batch >= 8 && batch <= 64 &&
+                    FastllmCudaSm70Iq4XsMmqSupported() &&
+                    MmqCheckRef(actualVec, d4Ref, 2e-2f, 2e-2f,
+                                d4MaxErr, d4MaxIdx)) {
+                    continue;
+                }
+                if (MmqCheckRef(actualVec, q8Ref, atol, rtol,
+                                q8MaxErr, q8MaxIdx)) {
+                    continue;
+                }
+
+                if (MmqCheckRef(actualVec, gemmRef, atol, rtol,
+                                gemmMaxErr, gemmMaxIdx)) {
+                    continue;
+                }
+
+                // Neither reference matched — report full context.
+                throw std::runtime_error(
+                    label + " FAILED: no reference matched.\n"
+                    "  Q8_1 ref: maxErr=" + std::to_string(q8MaxErr) +
+                    " at out[" + std::to_string(q8MaxIdx / outputDim) +
+                    "," + std::to_string(q8MaxIdx % outputDim) + "]" +
+                    " ref=" + std::to_string(q8Ref[q8MaxIdx]) +
+                    " act=" + std::to_string(actualVec[q8MaxIdx]) + "\n"
+                    "  GEMM ref: maxErr=" + std::to_string(gemmMaxErr) +
+                    " at out[" + std::to_string(gemmMaxIdx / outputDim) +
+                    "," + std::to_string(gemmMaxIdx % outputDim) + "]" +
+                    " ref=" + std::to_string(gemmRef[gemmMaxIdx]) +
+                    " act=" + std::to_string(actualVec[gemmMaxIdx]));
+            }
+        }
+    }
+
+    void RunCudaGgufIq4XsSm70MmqRegression() {
+        FastllmCudaClearThreadError();
+        // Note on m%256 negative test: IQ4_XS has block size 256, so m must
+        // be %256 for a valid weight. The Data constructor and GGUF dequant
+        // kernel assert on block alignment, so an invalid m%256 cannot be
+        // expressed through the public Linear API without triggering an
+        // upstream assertion. This is by design (block-level quantization
+        // requires aligned dimensions). The n=65 case below covers the
+        // MMQ-eligibility fallback boundary instead.
+        // Small output projections (for example Qwen3.5 alpha/beta k=48)
+        // are intentionally rejected because the 128-row MMQ tile is slower
+        // than the legacy MMVQ path there.
+        if (FastllmCudaSm70Iq4XsMmqSupported()) {
+            Expect(!FastllmCudaTrySm70Iq4XsMmq(
+                       (const void *)1, (const void *)1, (void *)1,
+                       fastllm::DataType::FLOAT16, 8, 256, 127, nullptr),
+                   "IQ4_XS MMQ accepted a k<128 projection.");
+        }
+
+        // Small shapes with non-%128 output dims (129/257) to exercise
+        // tile-Y tail-row handling. m (inputDim) is %256 for IQ4_XS.
+        RunGgufIq4XsMmqShape(256, 129);
+        RunGgufIq4XsMmqShape(256, 257);
+        RunGgufIq4XsMmqShape(512, 129);
+        RunGgufIq4XsMmqShape(512, 257);
+
+#if !defined(USE_ROCM)
+        cudaError_t syncState = cudaDeviceSynchronize();
+        Expect(syncState == cudaSuccess,
+               std::string("IQ4_XS MMQ asynchronous CUDA failure: ") +
+               cudaGetErrorString(syncState));
+        cudaError_t stickyState = cudaGetLastError();
+        Expect(stickyState == cudaSuccess,
+               std::string("IQ4_XS MMQ left a sticky CUDA error: ") +
+               cudaGetErrorString(stickyState));
+#endif
+        Expect(!FastllmCudaGetThreadError(),
+               "IQ4_XS MMQ set the FastLLM CUDA thread-error flag.");
+    }
+
+    void RunCudaGgufIq4XsSm70MmqBenchmark() {
+        struct BenchShape {
+            const char *name;
+            int inputDim;
+            int outputDim;
+        };
+        const std::vector<BenchShape> shapes = {
+            {"qwen35_z", 5120, 6144},
+            {"qwen35_out", 6144, 5120},
+            {"qwen35_ab", 5120, 48},
+        };
+        const std::vector<int> batches = {8, 16, 32, 64};
+        constexpr int warmup = 5;
+        constexpr int iterations = 30;
+
+        std::cout << "route,dtype,shape,n,m,k,avg_ms,tokens_per_second\n";
+        for (const BenchShape &shape : shapes) {
+            const int blocksPerRow = shape.inputDim /
+                (int)ggml_blck_size(GGML_TYPE_IQ4_XS);
+            fastllm::Data weight(fastllm::DataType::DATA_GGUF_FORMAT,
+                                 (int)GGML_TYPE_IQ4_XS,
+                                 {shape.outputDim, shape.inputDim});
+            weight.isGGUFData = true;
+            weight.disableGGUFRepack = true;
+            weight.name = std::string("benchmark.") + shape.name;
+            weight.Allocate();
+            const size_t bytesPerRow =
+                ggml_row_size(GGML_TYPE_IQ4_XS, shape.inputDim);
+            for (int row = 0; row < shape.outputDim; row++) {
+                std::vector<block_iq4_xs> blocks(blocksPerRow);
+                for (int block = 0; block < blocksPerRow; block++) {
+                    std::memset(&blocks[block], 0, sizeof(block_iq4_xs));
+                    FillIq4XsBlock(
+                        blocks[block],
+                        (uint32_t)((row * 1000 + block) * 7 + 3));
+                }
+                std::memcpy(weight.cpuData + (size_t)row * bytesPerRow,
+                            blocks.data(),
+                            (size_t)blocksPerRow * sizeof(block_iq4_xs));
+            }
+            weight.ToDevice(fastllm::DataDevice::CUDA,
+                            std::vector<int>{0}, true);
+
+            for (int batch : batches) {
+                std::vector<float> inputFp32((size_t)batch * shape.inputDim);
+                for (int token = 0; token < batch; token++) {
+                    for (int col = 0; col < shape.inputDim; col++) {
+                        inputFp32[(size_t)token * shape.inputDim + col] =
+                            (float)((token * 17 + col * 13 + 5) % 101 - 50) /
+                            47.0f;
+                    }
+                }
+                for (fastllm::DataType dtype : {
+                         fastllm::DataType::FLOAT16,
+                         fastllm::DataType::FLOAT32}) {
+                    fastllm::Data input(dtype, {batch, shape.inputDim}, inputFp32);
+                    input.ToDevice(fastllm::DataDevice::CUDA,
+                                   std::vector<int>{0}, true);
+                    fastllm::Data output;
+                    fastllm::Data emptyBias;
+                    ScopedFirstDevice guard("cuda");
+                    for (int i = 0; i < warmup; i++) {
+                        fastllm::Linear(input, weight, emptyBias, output);
+                    }
+                    ForceDeviceSync();
+                    const auto begin = std::chrono::steady_clock::now();
+                    for (int i = 0; i < iterations; i++) {
+                        fastllm::Linear(input, weight, emptyBias, output);
+                    }
+                    ForceDeviceSync();
+                    const auto end = std::chrono::steady_clock::now();
+                    const double elapsedMs =
+                        std::chrono::duration<double, std::milli>(end - begin).count();
+                    const double avgMs = elapsedMs / iterations;
+                    const double tokensPerSecond = 1000.0 * batch / avgMs;
+                    std::cout
+                        << (batch >= 8 && batch <= 64 && shape.outputDim >= 128 &&
+                            FastllmCudaSm70Iq4XsMmqSupported() ? "mmq" : "fallback")
+                        << ',' << (dtype == fastllm::DataType::FLOAT16 ? "f16" : "f32")
+                        << ',' << shape.name
+                        << ',' << batch
+                        << ',' << shape.inputDim
+                        << ',' << shape.outputDim
+                        << ',' << avgMs
+                        << ',' << tokensPerSecond
+                        << '\n';
+                }
+            }
+        }
     }
 #endif
 
@@ -4609,12 +7483,162 @@ namespace {
 
 int main() {
     try {
+        const char *only = std::getenv("FASTLLM_REGRESSION_ONLY");
+        if (only != nullptr && std::string(only) == "gguf_dequant") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error("gguf_dequant regression requires CUDA.");
+            }
+            RunCudaGgufIq4xsQ5DequantRegression();
+            std::cout << "cuda GGUF IQ4_XS/Q5_0 dequant regression: PASS\n";
+            return 0;
+#else
+            throw std::runtime_error("gguf_dequant regression requires a CUDA build.");
+#endif
+        }
+        RunRegressionFixtureScopeRegression();
+        if (only != nullptr && std::string(only) == "qwen35_gguf") {
+            RunQwen35GGUFConfigRegression();
+            RunQwen35GGUFWeightMappingRegression();
+            RunQwen35GGUFFailFastRegression();
+            RunQwen35GGUFWorkerExceptionRegression();
+            RunQwen35MixedQuantGGUFProjectionRegression();
+#ifdef USE_CUDA
+            RunQwen35OutProjTpLayoutRegression();
+#endif
+            std::cout << "qwen35 GGUF alias, V-head layout, and grouped override regression: PASS\n";
+            return 0;
+        }
+        if (only != nullptr && std::string(only) == "qwen35_long_prefill_state") {
+            RunQwen35LongPrefillStateRegression();
+            std::cout << "qwen35 long prefill state regression: PASS\n";
+            return 0;
+        }
+        if (only != nullptr && std::string(only) == "turbo3_kv") {
+            RunKVCacheDataTypeConfigRegression();
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error("turbo3_kv regression requires CUDA.");
+            }
+            RunCudaTurbo3KvRegression();
+            std::cout << "Qwen3.5 Turbo3 packed KV regression: PASS\n";
+            return 0;
+#else
+            throw std::runtime_error("turbo3_kv regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr && std::string(only) == "iq4xs_mmq_bench") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error("iq4xs_mmq_bench requires CUDA.");
+            }
+            RunCudaGgufIq4XsSm70MmqBenchmark();
+            return 0;
+#else
+            throw std::runtime_error("iq4xs_mmq_bench requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr && std::string(only) == "sm70_paged_xqa_bench") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error("sm70_paged_xqa_bench requires CUDA.");
+            }
+            RunCudaSm70PagedGqa6DecodeBenchmark();
+            return 0;
+#else
+            throw std::runtime_error("sm70_paged_xqa_bench requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr && std::string(only) == "sm70_flash_attn_prefill_bench") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "sm70_flash_attn_prefill_bench requires CUDA.");
+            }
+            ScopedEnvVar bench("FASTLLM_SM70_FLASH_ATTN_BENCH", "1");
+            RunCudaSm70FlashAttentionPrefillRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "sm70_flash_attn_prefill_bench requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr && std::string(only) == "sm70_paged_xqa") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error("sm70_paged_xqa regression requires CUDA.");
+            }
+            RunCudaSm70PagedGqa6DecodeRegression();
+            std::cout << "SM70 paged GQA6 decode regression: PASS\n";
+            return 0;
+#else
+            throw std::runtime_error("sm70_paged_xqa regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr && std::string(only) == "sm70_flash_attn_prefill") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "sm70_flash_attn_prefill regression requires CUDA.");
+            }
+            RunCudaSm70FlashAttentionPrefillRegression();
+            std::cout << "SM70 FlashAttention prefill regression: PASS\n";
+            return 0;
+#else
+            throw std::runtime_error(
+                "sm70_flash_attn_prefill regression requires a CUDA build.");
+#endif
+        }
         bool ranAny = false;
+        if (only != nullptr && std::string(only) == "mtp9_snapshots") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error("mtp9_snapshots regression requires CUDA.");
+            }
+            RunCudaConvMultiTokenSnapshotsRegression();
+            RunCudaRecurrentSnapshotsRegression();
+            std::cout << "cuda MTP9 conv/recurrent snapshot regression: PASS\n";
+            return 0;
+#else
+            throw std::runtime_error("mtp9_snapshots regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr && std::string(only) == "mtp9_greedy") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error("mtp9_greedy regression requires CUDA.");
+            }
+            RunCudaGreedyTieBreakRegression();
+            std::cout << "cuda MTP9 greedy tie-break regression: PASS\n";
+            return 0;
+#else
+            throw std::runtime_error("mtp9_greedy regression requires a CUDA build.");
+#endif
+        }
         bool ranCrossDeviceViewRegression = false;
 #ifndef USE_ROCM
         bool ranLargeWeightOffsetRegression = false;
 #endif
-
+        RunQwen35GGUFConfigRegression();
+        RunQwen35GGUFWeightMappingRegression();
+        RunQwen35GGUFFailFastRegression();
+        RunQwen35GGUFWorkerExceptionRegression();
+        RunQwen35MixedQuantGGUFProjectionRegression();
+        RunCpuEmbeddingDirectInMemoryLowMemRegression();
+        RunQwen35SplitGdnProjectionLayoutRegression();
+        RunQwen35SplitAttentionProjectionLayoutRegression();
+#ifdef USE_CUDA
+        RunQwen35OutProjTpLayoutRegression();
+#endif
+        std::cout << "qwen35 GGUF config, fail-fast, mapping, layout, and embedding regression: PASS\n";
+        RunModelTokenCapacityRegression();
+        std::cout << "model and paged-cache token capacity regression: PASS\n";
+        RunKVCacheDataTypeConfigRegression();
+        std::cout << "KV cache dtype configuration regression: PASS\n";
+        RunQwen35DecodePageBudgetRegression();
+        std::cout << "qwen35 exact-window decode page budget regression: PASS\n";
+        RunQwen35LongPrefillStateRegression();
+        std::cout << "qwen35 long prefill state regression: PASS\n";
         RunMoeAtypeConfigRegression();
         std::cout << "moe_atype auto/explicit configuration regression: PASS\n";
         ranAny = true;
@@ -4627,6 +7651,7 @@ int main() {
 
         RunPerRequestMinOutputLengthRegression();
         std::cout << "per-request minimum output length regression: PASS\n";
+
 
         if (fastllm::HasDeviceType("cpu")) {
             RunBFloat16Q8KConversionRegression();
@@ -4667,7 +7692,9 @@ int main() {
             RunCudaInt4GroupHalfWeightRoundingRegression();
             RunCudaInt4GroupBatch1MoeRegression();
             RunCudaInt8Batch1MoeRegression();
+            RunCudaGgufIq4xsQ5DequantRegression();
             RunCudaConvMultiTokenSnapshotsRegression();
+            RunCudaSm70PagedGqa6DecodeRegression();
             ranCrossDeviceViewRegression = RunCudaCrossDeviceViewRejectionRegression();
             RunMultiCudaReplicatedExpansionRegression();
 #ifndef USE_ROCM

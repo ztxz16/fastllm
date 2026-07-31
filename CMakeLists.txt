@@ -316,8 +316,11 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-cuda.cu 
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
+        src/devices/cuda/fastllm-iq4xs-sm70.cu
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
+        src/devices/cuda/attention/paged/fastllm-sm70-flash-attention.cu
+        src/devices/cuda/attention/paged/fastllm-turboquant-kv.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
@@ -531,6 +534,10 @@ if (UNIT_TEST)
     if (USE_CUDA AND NOT USE_ROCM)
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
+
+    add_executable(testApiServerSocket
+        test/apiserver/socketWriteTest.cpp
+        third_party/json11/json11.cpp)
 endif()
 
 add_executable(webui example/webui/webui.cpp)

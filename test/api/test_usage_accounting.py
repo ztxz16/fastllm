@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import sys
 
 
@@ -65,6 +67,7 @@ async def model_deltas():
 def make_completion():
     completion = object.__new__(FastLLmCompletion)
     completion.model = FakeModel()
+    completion._ensure_handle_tracking()
     completion.model_name = "test-model"
     completion.conversation_handles = {}
     return completion
@@ -225,8 +228,72 @@ def test_stream_and_nonstream_include_native_usage():
     asyncio.run(run_test())
 
 
+def test_owned_handle_launches_remain_concurrent():
+    completion = make_completion()
+    launch_barrier = threading.Barrier(2)
+
+    def launch(handle):
+        launch_barrier.wait(timeout=2)
+        return handle
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            completion._launch_owned_handle, "request-a", lambda: launch(1))
+        second = executor.submit(
+            completion._launch_owned_handle, "request-b", lambda: launch(2))
+        assert first.result(timeout=3) == 1
+        assert second.result(timeout=3) == 2
+
+    assert completion.conversation_handles == {
+        "request-a": 1,
+        "request-b": 2,
+    }
+
+
+def test_stale_disconnect_cannot_abort_reused_handle():
+    class TrackingModel(FakeModel):
+        def __init__(self):
+            self.aborted_handles = []
+
+        def abort_handle(self, handle):
+            self.aborted_handles.append(handle)
+
+    completion = make_completion()
+    completion.model = TrackingModel()
+    completion._launch_owned_handle("request-a", lambda: 1)
+
+    launch_entered = threading.Event()
+    release_launch = threading.Event()
+
+    def launch_reused_handle():
+        launch_entered.set()
+        assert release_launch.wait(timeout=2)
+        return 1
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        launch_b = executor.submit(
+            completion._launch_owned_handle,
+            "request-b",
+            launch_reused_handle,
+        )
+        assert launch_entered.wait(timeout=2)
+        stale_cleanup = executor.submit(
+            lambda: asyncio.run(completion.check_disconnect(
+                RawRequest(), "request-a", 1)))
+        release_launch.set()
+
+        assert launch_b.result(timeout=3) == 1
+        assert stale_cleanup.result(timeout=3) is None
+
+    assert completion.model.aborted_handles == []
+    assert completion.conversation_handles == {"request-b": 1}
+    assert completion._handle_owners == {1: "request-b"}
+
+
 if __name__ == "__main__":
     test_usage_protocol_mappings()
     test_stream_adapter_supports_new_and_legacy_models()
     test_stream_and_nonstream_include_native_usage()
+    test_owned_handle_launches_remain_concurrent()
+    test_stale_disconnect_cannot_abort_reused_handle()
     print("usage accounting tests passed")

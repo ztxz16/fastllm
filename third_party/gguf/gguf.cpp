@@ -1,4 +1,5 @@
 #include <map>
+#include <stdexcept>
 
 #include <assert.h>
 #include "gguf.h"
@@ -205,7 +206,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
         {GGML_TYPE_IQ4_XS, {/* type_name */"iq4_xs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq4_xs),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq4_xs,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq4_xs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_xs_ref,
         }},
         {GGML_TYPE_Q8_K, {/* type_name */"q8_K", /* blck_size */QK_K,
@@ -545,7 +546,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq4_xs),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq4_xs,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq4_xs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_xs_ref,
         }},
         {GGML_TYPE_Q8_K, {
@@ -711,8 +712,10 @@ namespace fastllm {
 
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
 
-    void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
-                                GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
+    void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset,
+                                GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType,
+                                int untileNumKHeads, int untileNumVHeads,
+                                int untileVRowStart, bool untileComposeNegLog) {
         if (tensor->type == ggml_type::GGML_TYPE_F32) {
             weight->dataType = DataType::FLOAT32;    
         } else if (tensor->type == ggml_type::GGML_TYPE_F16) {
@@ -810,6 +813,154 @@ namespace fastllm {
                 ggml_type_name(tensor->type) + ") can't convert to fp32.");
             toFloat(oriData.data(), floatData.data(), weight->Count(0));
             Float32ToFloat16(floatData.data(), (uint16_t*)weight->cpuData, weight->Count(0));
+        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceNegLogFP32) {
+            weight->dataType = DataType::FLOAT32;
+            weight->Resize(tensor->dims);
+            weight->Allocate();
+
+            auto len = ggml_nbytes(tensor);
+            std::vector <uint8_t> oriData;
+            oriData.resize(len);
+
+            FILE *fi = fopen(fileName.c_str(), "rb");
+#if defined(_WIN32) || defined(_WIN64)
+            _fseeki64(fi, offset, 0);
+#else
+            fseek(fi, offset, 0);
+#endif
+            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
+            fclose(fi);
+
+            if (tensor->type == ggml_type::GGML_TYPE_F32) {
+                memcpy((float*)weight->cpuData, oriData.data(), ggml_nbytes(tensor));
+            } else {
+                auto toFloat = ggml_type_to_float(tensor->type);
+                AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " +
+                    ggml_type_name(tensor->type) + ") can't convert to fp32.");
+                toFloat(oriData.data(), (float*)weight->cpuData, weight->Count(0));
+            }
+            // GGUF stores ssm_a as -exp(A_log); FastLLM's GDN kernel applies -exp(A_log) again,
+            // so invert to recover raw A_log = log(-ssm_a).
+            float *data = (float*)weight->cpuData;
+            for (size_t i = 0; i < (size_t)weight->Count(0); i++) {
+                AssertInFastLLM(data[i] < 0.0f, "WeightImportGGUFTensor: ssm_a value >= 0, cannot take log(-x).");
+                data[i] = logf(-data[i]);
+            }
+        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads) {
+            // Qwen3.5/3.6 GGUF converter tiles V-heads at export:
+            //   T[((r*H+h)*W)+d] = G[((h*R+r)*W)+d]
+            // Inverse (load-time, tiled→grouped) so all internal tensors use
+            // grouped layout. Quantized rows are moved byte-exactly.
+            auto requireLayout = [&](bool condition, const std::string &message) {
+                if (!condition) {
+                    throw std::runtime_error("WeightImportGGUFTensor: " + message +
+                                             " for " + tensor->name + ".");
+                }
+            };
+            requireLayout(untileNumKHeads > 0 &&
+                          untileNumVHeads >= untileNumKHeads &&
+                          untileNumVHeads % untileNumKHeads == 0,
+                          "invalid V-head counts");
+            requireLayout(tensor->dims.size() == 1 || tensor->dims.size() == 2,
+                          "V-head untile expects a 1D or 2D tensor");
+            const int H = untileNumKHeads;
+            const int R = untileNumVHeads / H;
+            const bool isMultiDim = tensor->dims.size() == 2;
+            const int totalUnits = isMultiDim
+                ? (int)tensor->ne[1]
+                : (int)tensor->ne[0];
+            requireLayout(untileVRowStart >= 0 && untileVRowStart < totalUnits,
+                          "invalid V-row start");
+            const int vRowCount = totalUnits - untileVRowStart;
+            requireLayout(vRowCount > 0 &&
+                          vRowCount % untileNumVHeads == 0,
+                          "V rows do not divide into heads");
+            const int D = vRowCount / untileNumVHeads;
+
+            auto untileBytes = [&](uint8_t *storage, size_t storageBytes,
+                                   size_t unitStride) {
+                const size_t baseOffset =
+                    (size_t)untileVRowStart * unitStride;
+                const size_t groupStride = (size_t)D * unitStride;
+                const size_t totalVBytes = (size_t)vRowCount * unitStride;
+                requireLayout(unitStride > 0 &&
+                              baseOffset + totalVBytes <= storageBytes,
+                              "V-head byte range exceeds tensor storage");
+                uint8_t *vSeg = storage + baseOffset;
+                std::vector<uint8_t> temp(totalVBytes);
+                for (int h = 0; h < H; h++) {
+                    for (int r = 0; r < R; r++) {
+                        memcpy(temp.data() + (size_t)(h * R + r) * groupStride,
+                               vSeg + (size_t)(r * H + h) * groupStride,
+                               groupStride);
+                    }
+                }
+                memcpy(vSeg, temp.data(), totalVBytes);
+            };
+
+            if (untileComposeNegLog) {
+                weight->dataType = DataType::FLOAT32;
+                weight->Resize(tensor->dims);
+                weight->Allocate();
+                const size_t len = ggml_nbytes(tensor);
+                std::vector<uint8_t> oriData(len);
+                FILE *fi = fopen(fileName.c_str(), "rb");
+        #if defined(_WIN32) || defined(_WIN64)
+                _fseeki64(fi, offset, 0);
+        #else
+                fseek(fi, offset, 0);
+        #endif
+                const size_t ret = fread(oriData.data(), 1, len, fi);
+                fclose(fi);
+                requireLayout(ret == len, "short read");
+                if (tensor->type == ggml_type::GGML_TYPE_F32) {
+                    memcpy(weight->cpuData, oriData.data(), len);
+                } else {
+                    auto toFloat = ggml_type_to_float(tensor->type);
+                    requireLayout(toFloat != nullptr,
+                                  "type " + std::string(ggml_type_name(tensor->type)) +
+                                  " cannot convert to fp32");
+                    toFloat(oriData.data(), (float*)weight->cpuData,
+                            weight->Count(0));
+                }
+                const size_t unitStride = isMultiDim
+                    ? (size_t)tensor->ne[0] * sizeof(float)
+                    : sizeof(float);
+                untileBytes((uint8_t*)weight->cpuData, weight->GetBytes(),
+                            unitStride);
+                float *data = (float*)weight->cpuData;
+                for (size_t i = 0; i < (size_t)weight->Count(0); i++) {
+                    requireLayout(data[i] < 0.0f,
+                                  "ssm_a value is outside the log(-x) domain");
+                    data[i] = logf(-data[i]);
+                }
+            } else {
+                if (weight->dataType != DataType::DATA_GGUF_FORMAT) {
+                    weight->Resize(tensor->dims);
+                    weight->Allocate();
+                } else {
+                    weight->dims = tensor->dims;
+                    weight->ggmlTensor = (void*)(new ggml_tensor());
+                    weight->ggmlType = tensor->type;
+                    weight->expansionBytes = ggml_nbytes(tensor);
+                    weight->cpuData = new uint8_t[weight->expansionBytes];
+                    (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
+                }
+                const size_t len = ggml_nbytes(tensor);
+                FILE *fi = fopen(fileName.c_str(), "rb");
+        #if defined(_WIN32) || defined(_WIN64)
+                _fseeki64(fi, offset, 0);
+        #else
+                fseek(fi, offset, 0);
+        #endif
+                const size_t ret = fread(weight->cpuData, 1, len, fi);
+                fclose(fi);
+                requireLayout(ret == len, "short read");
+                const size_t unitStride = isMultiDim
+                    ? (size_t)tensor->nb[1]
+                    : (size_t)tensor->nb[0];
+                untileBytes((uint8_t*)weight->cpuData, len, unitStride);
+            }
         } else {
             ErrorInFastLLM("WeightImportGGUFTensor: Unsupport replace type.");
         }
@@ -1000,7 +1151,9 @@ namespace fastllm {
                                 )
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
-                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceNegLogFP32 ||
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads) {
                         name = std::regex_replace(name, it.pattern, it.names[0]);
                         if (name == "ignore") {
                             break;
@@ -1011,6 +1164,7 @@ namespace fastllm {
                                 it.type
                             )
                         );
+                        tasks.back().untileComposeNegLog = it.untileComposeNegLog;
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplacePacked) {
                         std::string prefix = std::regex_replace(name, it.pattern, it.names[0]);
                         std::string suffix = std::regex_replace(name, it.pattern, it.names[1]);
@@ -1193,7 +1347,10 @@ namespace fastllm {
                             );
                             // printf("replace %s\n", name.c_str());
                         }
-                    } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32) {
+                    } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
+                               it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16 ||
+                               it.type == GGUFWeightReplaceRule::GGUFWeightReplaceNegLogFP32 ||
+                               it.type == GGUFWeightReplaceRule::GGUFWeightReplaceUntileVHeads) {
                         name = std::regex_replace(name, it.pattern, it.names[0]);
                         if (model->weight.weight.find(name) != model->weight.weight.end()) {
                             tasks.push_back (
@@ -1202,6 +1359,7 @@ namespace fastllm {
                                     it.type
                                 )
                             );
+                            tasks.back().untileComposeNegLog = it.untileComposeNegLog;
                             // printf("replace %s\n", name.c_str());
                         }
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplacePacked) {

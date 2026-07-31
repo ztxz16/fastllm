@@ -7,6 +7,9 @@
 #include "qwen3_5.h"
 #include "blocks/baseblock.h"
 #include "executor.h"
+#include "gguf.h"
+#include "utils/stop_token_matcher.h"
+#include "utils/stop_string_matcher.h"
 
 #include <algorithm>
 #include <atomic>
@@ -37,6 +40,287 @@
 namespace fastllm {
 #ifdef USE_NUMAS
     extern void RegisterNumas(fastllm::Data *data, std::string weightType);
+#endif
+
+    Qwen35GdnProjectionLayout ResolveQwen35GdnProjectionLayout(
+            const WeightMap &weight,
+            const std::string &layerPrefix) {
+        auto has = [&](const char *suffix) {
+            return weight.weight.find(layerPrefix + suffix) != weight.weight.end();
+        };
+        if (has("linear_attn.in_proj_qkvzba.weight")) {
+            return Qwen35GdnProjectionLayout::Qkvzba;
+        }
+        if (has("linear_attn.in_proj_qkvz.weight") &&
+            has("linear_attn.in_proj_ba.weight")) {
+            return Qwen35GdnProjectionLayout::QkvzBa;
+        }
+        if (has("linear_attn.in_proj_qkv.weight") &&
+            has("linear_attn.in_proj_z.weight") &&
+            has("linear_attn.in_proj_ba.weight")) {
+            return Qwen35GdnProjectionLayout::QkvZBa;
+        }
+        return Qwen35GdnProjectionLayout::Missing;
+    }
+
+    Qwen35AttentionProjectionLayout ResolveQwen35AttentionProjectionLayout(
+            const WeightMap &weight,
+            const std::string &layerPrefix) {
+        auto has = [&](const char *suffix) {
+            return weight.weight.find(layerPrefix + suffix) != weight.weight.end();
+        };
+        if (has("self_attn.mergeqkv.weight")) {
+            return Qwen35AttentionProjectionLayout::MergedQkv;
+        }
+        if (has("self_attn.q_proj.weight") &&
+            has("self_attn.k_proj.weight") &&
+            has("self_attn.v_proj.weight")) {
+            return Qwen35AttentionProjectionLayout::SplitQkv;
+        }
+        return Qwen35AttentionProjectionLayout::Missing;
+    }
+
+    int SelectQwen35DecodeTokensForPageBudget(
+            int requestedTokens,
+            const std::vector<std::pair<int, int> > &requestedNeedsAndFree,
+            const std::vector<std::pair<int, int> > &singleNeedsAndFree) {
+        auto fits = [](const std::vector<std::pair<int, int> > &needsAndFree) {
+            for (const auto &item : needsAndFree) {
+                if (item.first > item.second) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        requestedTokens = std::max(1, requestedTokens);
+        if (fits(requestedNeedsAndFree)) {
+            return requestedTokens;
+        }
+        return fits(singleNeedsAndFree) ? 1 : 0;
+    }
+
+    bool Qwen35InterleaveLongPrefillEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL");
+        if (env == nullptr || env[0] == 0) {
+            return false;
+        }
+        std::string lowered(env);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered == "true" || lowered == "1" ||
+               lowered == "yes" || lowered == "on";
+    }
+    bool Qwen35BatchedMtpEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_BATCHED_MTP");
+        if (env == nullptr || env[0] == 0) {
+            return true;
+        }
+        std::string lowered(env);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered != "false" && lowered != "0" &&
+               lowered != "no" && lowered != "off";
+    }
+    bool Qwen35Turbo3KvEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_TURBO3_KV");
+        if (env == nullptr || env[0] == 0) {
+            return false;
+        }
+        std::string lowered(env);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered == "true" || lowered == "1" ||
+               lowered == "yes" || lowered == "on";
+    }
+    DataType ResolveQwen35CudaCacheType(DataType cacheType, DataType computeType) {
+        if (cacheType == DataType::FLOAT16 ||
+            cacheType == DataType::BFLOAT16 ||
+            cacheType == DataType::FP8_E4M3 ||
+            IsPackedKVCacheDataType(cacheType)) {
+            return cacheType;
+        }
+        return computeType;
+    }
+
+    size_t Qwen35PagedCachePageBytes(
+            DataType type, int pageLen, int numHeads, int headDim) {
+        AssertInFastLLM(pageLen > 0 && numHeads > 0 && headDim > 0,
+                        "Qwen3.5 paged cache page shape is invalid.\n");
+        return GetDataBytes(type, (size_t)pageLen * numHeads, headDim);
+    }
+
+
+    Qwen35RequestPhase ClassifyQwen35RequestPhase(const ResponseContext &context) {
+        if (context.longPrefill.inProgress &&
+            context.longPrefill.cursor < context.longPrefill.total) {
+            return Qwen35RequestPhase::ContinuedPrefill;
+        }
+        return context.preTokens == 0 ?
+            Qwen35RequestPhase::NewPrefill : Qwen35RequestPhase::Decode;
+    }
+
+    bool BeginQwen35LongPrefill(
+            ResponseContext &context,
+            int total,
+            uint64_t ticket,
+            const std::map<PagedCacheManager*, int> &reservedPages) {
+        if (context.longPrefill.inProgress || context.preTokens != 0 ||
+            total <= 0 || total != (int)context.currentTokens.size()) {
+            return false;
+        }
+        for (const auto &item : reservedPages) {
+            if (item.first == nullptr || item.second < 0) {
+                return false;
+            }
+        }
+        context.longPrefill.inProgress = true;
+        context.longPrefill.total = total;
+        context.longPrefill.cursor = 0;
+        context.longPrefill.mtpViable = true;
+        context.longPrefill.ticket = ticket;
+        context.longPrefill.reservedPages = reservedPages;
+        return true;
+    }
+
+    Qwen35LongPrefillQuantum PlanQwen35LongPrefillQuantum(
+            const ResponseContext &context,
+            int chunkSize) {
+        Qwen35LongPrefillQuantum quantum;
+        const Qwen35LongPrefillProgress &progress = context.longPrefill;
+        if (!progress.inProgress || chunkSize <= 0 || progress.total <= 0 ||
+            progress.cursor < 0 || progress.cursor >= progress.total ||
+            context.preTokens != progress.cursor) {
+            return quantum;
+        }
+        quantum.cursor = progress.cursor;
+        quantum.length = std::min(chunkSize, progress.total - progress.cursor);
+        quantum.baseTokens = context.cacheLen + progress.cursor;
+        quantum.isLast = progress.cursor + quantum.length == progress.total;
+        quantum.producesOutput = quantum.isLast;
+        return quantum;
+    }
+
+    bool CommitQwen35LongPrefillQuantum(
+            ResponseContext &context,
+            const Qwen35LongPrefillQuantum &quantum,
+            bool mtpViable) {
+        Qwen35LongPrefillProgress &progress = context.longPrefill;
+        if (!progress.inProgress || quantum.length <= 0 ||
+            quantum.cursor != progress.cursor ||
+            context.preTokens != progress.cursor ||
+            quantum.baseTokens != context.cacheLen + progress.cursor ||
+            quantum.cursor + quantum.length > progress.total) {
+            return false;
+        }
+        bool isLast = quantum.cursor + quantum.length == progress.total;
+        if (quantum.isLast != isLast || quantum.producesOutput != isLast) {
+            return false;
+        }
+        progress.cursor += quantum.length;
+        context.preTokens += quantum.length;
+        progress.mtpViable = progress.mtpViable && mtpViable;
+        if (isLast) {
+            progress.inProgress = false;
+            progress.reservedPages.clear();
+        }
+        return true;
+    }
+
+    int SelectQwen35LongPrefillHandle(
+            const std::vector<std::tuple<int, uint64_t> > &candidates,
+            uint64_t lastTicket) {
+        int afterHandle = -1;
+        uint64_t afterTicket = UINT64_MAX;
+        int firstHandle = -1;
+        uint64_t firstTicket = UINT64_MAX;
+        for (const auto &candidate : candidates) {
+            int handle = std::get<0>(candidate);
+            uint64_t ticket = std::get<1>(candidate);
+            if (handle < 0) {
+                continue;
+            }
+            if (ticket < firstTicket ||
+                (ticket == firstTicket && (firstHandle < 0 || handle < firstHandle))) {
+                firstTicket = ticket;
+                firstHandle = handle;
+            }
+            if (ticket > lastTicket &&
+                (ticket < afterTicket ||
+                 (ticket == afterTicket && (afterHandle < 0 || handle < afterHandle)))) {
+                afterTicket = ticket;
+                afterHandle = handle;
+            }
+        }
+        return afterHandle >= 0 ? afterHandle : firstHandle;
+    }
+
+    bool CanAdmitQwen35LongPrefill(int residentRequests, int schedulerLanes) {
+        return residentRequests >= 0 && schedulerLanes > 0 &&
+               residentRequests < schedulerLanes;
+    }
+
+    bool CanReserveQwen35LongPrefillPages(
+            const std::vector<Qwen35PageReservationBudget> &budgets) {
+        for (const auto &budget : budgets) {
+            if (budget.reserved < 0 || budget.needed < 0 || budget.free < 0 ||
+                (long long)budget.reserved + budget.needed > budget.free) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+#ifdef USE_CUDA
+    Qwen35DivisionScheme BuildQwen35LinearOutProjScheme(
+            const Qwen35DivisionScheme &keyHeadScheme,
+            int numKHeads,
+            int numVHeads,
+            int headVDim,
+            int quantBlock,
+            bool tiledColumns) {
+        if (!(numKHeads > 0 && numVHeads >= numKHeads &&
+              numVHeads % numKHeads == 0 && headVDim > 0)) {
+            throw std::runtime_error(
+                "Qwen3.5 out_proj TP split got invalid head metadata.");
+        }
+        quantBlock = std::max(1, quantBlock);
+        const int valueHeadsPerKey = numVHeads / numKHeads;
+        Qwen35DivisionScheme ret;
+        for (auto &it : keyHeadScheme) {
+            ret[it.first];
+            if (it.second.size() > 1) {
+                throw std::runtime_error(
+                    "Qwen3.5 out_proj TP split requires one contiguous key-head range per device.");
+            }
+            for (auto &range : it.second) {
+                if (!(range.first >= 0 && range.second > range.first &&
+                      range.second <= numKHeads)) {
+                    throw std::runtime_error(
+                        "Qwen3.5 out_proj TP split got an invalid key-head range.");
+                }
+                if (tiledColumns) {
+                    for (int r = 0; r < valueHeadsPerKey; r++) {
+                        const int start = (r * numKHeads + range.first) * headVDim;
+                        const int end = (r * numKHeads + range.second) * headVDim;
+                        if (!(start % quantBlock == 0 && end % quantBlock == 0)) {
+                            throw std::runtime_error(
+                                "Qwen3.5 tiled out_proj TP split is not quant-block aligned.");
+                        }
+                        ret[it.first].push_back({start, end});
+                    }
+                } else {
+                    const int start = range.first * valueHeadsPerKey * headVDim;
+                    const int end = range.second * valueHeadsPerKey * headVDim;
+                    if (!(start % quantBlock == 0 && end % quantBlock == 0)) {
+                        throw std::runtime_error(
+                            "Qwen3.5 grouped out_proj TP split is not quant-block aligned.");
+                    }
+                    ret[it.first].push_back({start, end});
+                }
+            }
+        }
+        return ret;
+    }
 #endif
 
     static std::string Qwen35MoeExpertPrefix(int layer, int expert) {
@@ -124,8 +408,8 @@ namespace fastllm {
     }
 
     static constexpr int QWEN35_MTP_LOG_INTERVAL = 64;
-    static constexpr int QWEN35_MTP_MAX_DRAFTS = 8;
-    static constexpr int QWEN35_MTP_FAST_SEQ_MAX = 6;
+    static constexpr int QWEN35_MTP_MAX_DRAFTS = 9;
+    static constexpr int QWEN35_MTP_FAST_SEQ_MAX = QWEN35_MTP_MAX_DRAFTS + 1;
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_MAX =
@@ -155,6 +439,87 @@ namespace fastllm {
         explicit Qwen35MtpBatchFastPathUnavailable(const std::string &message)
             : std::runtime_error(message) {}
     };
+    struct Qwen35GdnDryRunResult {
+        bool eligible = false;
+        std::string reason;
+    };
+
+    static void Qwen35LogGdnDecisionOnce(const std::string &key,
+                                         const std::string &message) {
+        static std::mutex logMutex;
+        static std::set<std::string> logged;
+        std::lock_guard<std::mutex> guard(logMutex);
+        if (logged.insert(key).second) {
+            printf("[Fastllm] Qwen3.5 GDN %s\n", message.c_str());
+            fflush(stdout);
+        }
+    }
+
+    static Qwen35GdnDryRunResult Qwen35DryRunSingleDecodeRecurrent(
+            const Data &q, const Data &k, const Data &v,
+            const Data &gateA, const Data &gateB,
+            const Data &normWeight, const Data *aLog, const Data *dtBias,
+            const Data &lastRecurrentState, bool tiledQKHeadOrder) {
+        auto reject = [](const std::string &reason) {
+            return Qwen35GdnDryRunResult{false, reason};
+        };
+        if (q.dataDevice != DataDevice::CUDA ||
+            k.dataDevice != DataDevice::CUDA ||
+            v.dataDevice != DataDevice::CUDA ||
+            gateA.dataDevice != DataDevice::CUDA ||
+            gateB.dataDevice != DataDevice::CUDA) {
+            return reject("input_not_cuda");
+        }
+        if (q.dataType != DataType::FLOAT16 ||
+            k.dataType != DataType::FLOAT16 ||
+            v.dataType != DataType::FLOAT16 ||
+            gateA.dataType != DataType::FLOAT16 ||
+            gateB.dataType != DataType::FLOAT16) {
+            return reject("input_dtype_requires_fp16");
+        }
+        if (q.dims.size() != 4 || k.dims.size() != 4 ||
+            v.dims.size() != 4 || gateA.dims.size() != 3 ||
+            gateB.dims.size() != 3) {
+            return reject("input_rank_mismatch");
+        }
+        if (q.dims[0] != 1 || k.dims[0] != 1 || v.dims[0] != 1 ||
+            q.dims[1] != 1 || k.dims[1] != 1 || v.dims[1] != 1 ||
+            gateA.dims[0] != 1 || gateB.dims[0] != 1 ||
+            gateA.dims[1] != 1 || gateB.dims[1] != 1) {
+            return reject("single_token_shape_required");
+        }
+        if (q.dims[3] != 128 || k.dims[3] != 128 ||
+            q.dims[2] <= 0 || q.dims[2] != k.dims[2]) {
+            return reject("qk_head_shape_mismatch");
+        }
+        if (v.dims[2] <= 0 || gateA.dims[2] != v.dims[2] ||
+            gateB.dims[2] != v.dims[2] || v.dims[2] % q.dims[2] != 0) {
+            return reject("value_head_shape_mismatch");
+        }
+        if (normWeight.dataType != DataType::FLOAT32 ||
+            normWeight.dims.size() != 1 || normWeight.dims[0] != q.dims[3]) {
+            return reject("norm_weight_contract_mismatch");
+        }
+        if (aLog != nullptr || dtBias != nullptr) {
+            if (aLog == nullptr || dtBias == nullptr ||
+                aLog->dataType != DataType::FLOAT32 ||
+                dtBias->dataType != DataType::FLOAT32 ||
+                aLog->dims != std::vector<int>({v.dims[2]}) ||
+                dtBias->dims != std::vector<int>({v.dims[2]})) {
+                return reject("decay_weight_contract_mismatch");
+            }
+        }
+        if (lastRecurrentState.dataDevice != DataDevice::CUDA ||
+            lastRecurrentState.dataType != DataType::FLOAT16 ||
+            lastRecurrentState.dims !=
+                std::vector<int>({1, v.dims[2], q.dims[3], v.dims[3]})) {
+            return reject("recurrent_state_contract_mismatch");
+        }
+        if (tiledQKHeadOrder && v.dims[2] <= q.dims[2]) {
+            return reject("tiled_qk_order_requires_more_value_heads");
+        }
+        return {true, "eligible"};
+    }
 
     enum Qwen35MtpProfilePath {
         QWEN35_MTP_PROFILE_SEED = 0,
@@ -1097,14 +1462,6 @@ namespace fastllm {
             return DataType::FLOAT16;
         }
 
-        static DataType ResolveQwen35ThreadTpCacheType(DataType cacheType, DataType computeType) {
-            if (cacheType == DataType::FLOAT16 ||
-                cacheType == DataType::BFLOAT16 ||
-                cacheType == DataType::FP8_E4M3) {
-                return cacheType;
-            }
-            return computeType;
-        }
 
         static void PrepareQwen35EmbeddingWeightType(Data &embedWeight,
                                                      DataType outputType,
@@ -1778,6 +2135,19 @@ namespace fastllm {
             return ret;
         }
 
+        static DivisionScheme ExtractQwen35RangeScheme(
+                const DivisionScheme &scheme, int rangeIndex, int base) {
+            DivisionScheme ret;
+            for (auto &it : scheme) {
+                ret[it.first];
+                if (rangeIndex < (int)it.second.size()) {
+                    ret[it.first].push_back({it.second[rangeIndex].first - base,
+                                            it.second[rangeIndex].second - base});
+                }
+            }
+            return ret;
+        }
+
         static DivisionScheme BuildQwen35LinearKeyHeadScheme(
                 std::vector<int> devices,
                 std::map<int, int> ratios,
@@ -1870,6 +2240,44 @@ namespace fastllm {
             return ret;
         }
 
+        static DivisionScheme BuildQwen35LinearQkvScheme(
+                const DivisionScheme &keyHeadScheme,
+                int numKHeads,
+                int numVHeads,
+                int headKDim,
+                int headVDim) {
+            DivisionScheme ret;
+            int valueHeadsPerKey = numVHeads / numKHeads;
+            int kd = numKHeads * headKDim;
+            int vd = numVHeads * headVDim;
+            for (auto &it : keyHeadScheme) {
+                ret[it.first];
+                for (auto &kr : it.second) {
+                    int vs = kr.first * valueHeadsPerKey;
+                    int ve = kr.second * valueHeadsPerKey;
+                    ret[it.first].push_back({kr.first * headKDim, kr.second * headKDim});
+                    ret[it.first].push_back({kd + kr.first * headKDim, kd + kr.second * headKDim});
+                    ret[it.first].push_back({kd * 2 + vs * headVDim,
+                                            kd * 2 + ve * headVDim});
+                }
+            }
+            return ret;
+        }
+
+        static DivisionScheme BuildQwen35LinearZScheme(
+                const DivisionScheme &valueHeadScheme,
+                int headVDim) {
+            DivisionScheme ret;
+            for (auto &it : valueHeadScheme) {
+                ret[it.first];
+                for (auto &range : it.second) {
+                    ret[it.first].push_back({range.first * headVDim,
+                                            range.second * headVDim});
+                }
+            }
+            return ret;
+        }
+
         static DivisionScheme BuildQwen35LinearBaScheme(
                 const DivisionScheme &valueHeadScheme,
                 int numVHeads) {
@@ -1908,18 +2316,6 @@ namespace fastllm {
             return ret;
         }
 
-        static DivisionScheme BuildQwen35LinearOutProjScheme(
-                const DivisionScheme &valueHeadScheme,
-                int headVDim) {
-            DivisionScheme ret;
-            for (auto &it : valueHeadScheme) {
-                ret[it.first];
-                for (auto &range : it.second) {
-                    ret[it.first].push_back({range.first * headVDim, range.second * headVDim});
-                }
-            }
-            return ret;
-        }
 
         static int Qwen35RangeTotal(const DivisionScheme &scheme, int device) {
             int total = 0;
@@ -2914,7 +3310,7 @@ namespace fastllm {
         }
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
-            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
+            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 64);
             pages = std::max(1, pages);
             return pages * fastllm::GetPageLen();
         }
@@ -3711,6 +4107,9 @@ namespace fastllm {
                 Qwen3CudaDirectRunner &runner,
                 Data *attenInput,
                 Data *mergeQkvWeight, Data *mergeQkvBias,
+                Data *qWeight, Data *qBias,
+                Data *kWeight, Data *kBias,
+                Data *vWeight, Data *vBias,
                 Data *qNormWeight, Data *kNormWeight,
                 Data *oWeight, Data *oBias,
                 Data *allPositionIds,
@@ -3741,7 +4140,10 @@ namespace fastllm {
                 int flashInferCudaGraph = -1) {
             using namespace qwen3cuda;
             AssertInFastLLM(attenInput != nullptr && mergeQkvWeight != nullptr &&
-                            mergeQkvBias != nullptr && qNormWeight != nullptr &&
+                            mergeQkvBias != nullptr && qWeight != nullptr && qBias != nullptr &&
+                            kWeight != nullptr && kBias != nullptr &&
+                            vWeight != nullptr && vBias != nullptr &&
+                            qNormWeight != nullptr &&
                             kNormWeight != nullptr && allPositionIds != nullptr &&
                             pastKeyValues != nullptr && batchPastKeys != nullptr &&
                             batchPastValues != nullptr && merged != nullptr &&
@@ -3756,8 +4158,16 @@ namespace fastllm {
             AssertInFastLLM(numAttentionHeads > 0 && numKeyValueHeads > 0 &&
                             headDim > 0 && numAttentionHeads % numKeyValueHeads == 0,
                             "Qwen3.5 gated paged attention block got invalid head metadata.\n");
-
-            Qwen3CudaLinear(runner, *attenInput, *mergeQkvWeight, *mergeQkvBias, *merged);
+            if (!mergeQkvWeight->dims.empty()) {
+                Qwen3CudaLinear(runner, *attenInput, *mergeQkvWeight, *mergeQkvBias, *merged);
+            } else {
+                Data qResult, kResult, vResult, qkResult;
+                Qwen3CudaLinear(runner, *attenInput, *qWeight, *qBias, qResult);
+                Qwen3CudaLinear(runner, *attenInput, *kWeight, *kBias, kResult);
+                Qwen3CudaLinear(runner, *attenInput, *vWeight, *vBias, vResult);
+                Qwen3CudaCat(runner, qResult, kResult, -1, qkResult);
+                Qwen3CudaCat(runner, qkResult, vResult, -1, *merged);
+            }
 
             int bsz = attenInput->dims[0];
             int seqlen = attenInput->dims[1];
@@ -3898,33 +4308,79 @@ namespace fastllm {
                     *generatedAppendParams = true;
                 }
 
-                bool fillLastPageLensOnDevice = merged->dataDevice == DataDevice::CUDA &&
+                const bool packedKV =
+                    IsPackedKVCacheDataType(((Data*)pagedCacheKManager)->dataType) ||
+                    IsPackedKVCacheDataType(((Data*)pagedCacheVManager)->dataType);
+                bool fillLastPageLensOnDevice = !packedKV &&
+                                                 merged->dataDevice == DataDevice::CUDA &&
                                                  !merged->multiDeviceData &&
                                                  !externalDecodeMeta &&
                                                  !(*generatedDecodeParams);
-                Qwen35CudaQGateKVRMSNormRopeSplitAppendPagedCache(
-                    runner, *merged, *qNormWeight, *kNormWeight, *allPositionIds,
-                    *q, *gate,
-                    *(Data*)pagedCacheKManager, *(Data*)pagedCacheVManager,
-                    *insertIndexs, *insertPositions,
-                    numAttentionHeads, numKeyValueHeads, headDim,
-                    rotaryDim, mropeSections, rmsNormEps, ropeBase, ropeScale,
-                    kCaches.pageLen, batch, true,
-                    fillLastPageLensOnDevice ? lastPageLens : nullptr);
+                if (packedKV) {
+                    AssertInFastLLM(!externalDecodeMeta &&
+                                    ((Data*)pagedCacheKManager)->dataType == DataType::Q8_0_KV &&
+                                    ((Data*)pagedCacheVManager)->dataType == DataType::TURBO3_KV &&
+                                    headDim == 256,
+                                    "Qwen3.5 packed decode requires non-graph q8_0 K + turbo3 V with head_dim=256.\n");
+                    int qgateDim = numAttentionHeads * headDim * 2;
+                    int kvDim = numKeyValueHeads * headDim;
+                    Qwen3CudaSplit(runner, *merged, -1, 0, qgateDim, *qgate);
+                    Qwen3CudaSplit(runner, *merged, -1, qgateDim, qgateDim + kvDim, *k);
+                    Qwen3CudaSplit(runner, *merged, -1, qgateDim + kvDim,
+                                   qgateDim + kvDim * 2, *v);
 
-                if (!externalDecodeMeta) {
+                    qgate->Reshape({bsz, seqlen, numAttentionHeads, headDim * 2});
+                    Qwen3CudaSplit(runner, *qgate, -1, 0, headDim, *q);
+                    Qwen3CudaSplit(runner, *qgate, -1, headDim, headDim * 2, *gate);
+                    gate->Reshape({bsz, seqlen, numAttentionHeads * headDim});
+                    k->Reshape({bsz, seqlen, numKeyValueHeads, headDim});
+                    v->Reshape({bsz, seqlen, numKeyValueHeads, headDim});
+
+                    Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
+                    Qwen3CudaRMSNorm(runner, *k, *kNormWeight, rmsNormEps, *k);
+                    Qwen35CudaApplyRotary(runner, *q, *allPositionIds,
+                                          rotaryDim, mropeSections, ropeBase, ropeScale);
+                    Qwen35CudaApplyRotary(runner, *k, *allPositionIds,
+                                          rotaryDim, mropeSections, ropeBase, ropeScale);
+                    Qwen3CudaPermuteSelf(runner, *q, {0, 2, 1, 3});
+                    q->Reshape({-1, seqlen, headDim});
+                    k->Reshape({batch, numKeyValueHeads, headDim});
+                    v->Reshape({batch, numKeyValueHeads, headDim});
+                    Qwen3CudaAppendPagedCacheBatch(runner, *pagedCacheKManager,
+                                                   *batchPastKeys, *k,
+                                                   *insertIndexs, *insertPositions);
+                    Qwen3CudaAppendPagedCacheBatch(runner, *pagedCacheVManager,
+                                                   *batchPastValues, *v,
+                                                   *insertIndexs, *insertPositions);
                     for (int b = 0; b < batch; b++) {
-                        auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
-                            if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
-                                cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
-                                cache->lastPageLen = 1;
-                            } else {
-                                cache->lastPageLen++;
-                            }
-                            Qwen35AdvancePagedCacheLogicalTokens(*cache, 1);
-                        };
-                        updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
-                        updatePageMeta((*batchPastValues)[b], pagedCacheVManager);
+                        Qwen35AdvancePagedCacheLogicalTokens(*(*batchPastKeys)[b], 1);
+                        Qwen35AdvancePagedCacheLogicalTokens(*(*batchPastValues)[b], 1);
+                    }
+                } else {
+                    Qwen35CudaQGateKVRMSNormRopeSplitAppendPagedCache(
+                        runner, *merged, *qNormWeight, *kNormWeight, *allPositionIds,
+                        *q, *gate,
+                        *(Data*)pagedCacheKManager, *(Data*)pagedCacheVManager,
+                        *insertIndexs, *insertPositions,
+                        numAttentionHeads, numKeyValueHeads, headDim,
+                        rotaryDim, mropeSections, rmsNormEps, ropeBase, ropeScale,
+                        kCaches.pageLen, batch, true,
+                        fillLastPageLensOnDevice ? lastPageLens : nullptr);
+
+                    if (!externalDecodeMeta) {
+                        for (int b = 0; b < batch; b++) {
+                            auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
+                                if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
+                                    cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                                    cache->lastPageLen = 1;
+                                } else {
+                                    cache->lastPageLen++;
+                                }
+                                Qwen35AdvancePagedCacheLogicalTokens(*cache, 1);
+                            };
+                            updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
+                            updatePageMeta((*batchPastValues)[b], pagedCacheVManager);
+                        }
                     }
                 }
                 if (!externalDecodeMeta && !(*generatedDecodeParams)) {
@@ -4403,6 +4859,45 @@ namespace fastllm {
         }
     }
 
+    // Materialize grouped V-head activations in the GGUF tiled column order
+    // immediately before quantized out_proj.
+    static void Qwen35ReorderGroupedToTiled(Data &act, int localKeyHeads,
+                                             int localValueHeads, int headVDim) {
+        if (!(localKeyHeads > 0 && localValueHeads >= localKeyHeads &&
+              localValueHeads % localKeyHeads == 0 && headVDim > 0 &&
+              !act.dims.empty() &&
+              act.dims.back() == localValueHeads * headVDim)) {
+            throw std::runtime_error(
+                "Qwen3.5 grouped-to-tiled activation reorder got invalid dimensions.");
+        }
+        if (localValueHeads == localKeyHeads) return;
+        const int Rloc = localValueHeads / localKeyHeads;
+        std::vector<int> origShape = act.dims;
+        act.Reshape({-1, localKeyHeads, Rloc, headVDim});
+        PermuteSelf(act, {0, 2, 1, 3});
+        act.Reshape(origShape);
+    }
+
+#ifdef USE_CUDA
+    static void Qwen35CudaReorderGroupedToTiled(
+            Qwen3CudaDirectRunner &runner, Data &act,
+            int localKeyHeads, int localValueHeads, int headVDim) {
+        if (!(localKeyHeads > 0 && localValueHeads >= localKeyHeads &&
+              localValueHeads % localKeyHeads == 0 && headVDim > 0 &&
+              !act.dims.empty() &&
+              act.dims.back() == localValueHeads * headVDim)) {
+            throw std::runtime_error(
+                "Qwen3.5 CUDA grouped-to-tiled reorder got invalid dimensions.");
+        }
+        if (localValueHeads == localKeyHeads) return;
+        const int Rloc = localValueHeads / localKeyHeads;
+        std::vector<int> origShape = act.dims;
+        act.Reshape({-1, localKeyHeads, Rloc, headVDim});
+        qwen3cuda::Qwen3CudaPermuteSelf(runner, act, {0, 2, 1, 3});
+        act.Reshape(origShape);
+    }
+#endif
+
     static void Add1(Data &input) {
         if (input.dims.size() == 0) {
             return;
@@ -4618,7 +5113,29 @@ namespace fastllm {
 
     static bool Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
             Data &q, Data &k, Data &v, Data &g, Data &b,
-            Data &normWeight, float eps, Data &lastRecurrentState, Data &coreAttnOut) {
+            Data &normWeight, float eps, Data &lastRecurrentState, Data &coreAttnOut,
+            bool tiledQKHeadOrder = false) {
+        Qwen35GdnDryRunResult dryRun = Qwen35DryRunSingleDecodeRecurrent(
+            q, k, v, g, b, normWeight, nullptr, nullptr,
+            lastRecurrentState, tiledQKHeadOrder);
+        std::string dryRunKey = std::string("single_norm_") +
+            (tiledQKHeadOrder ? "gguf_tiled" : "grouped");
+        if (!dryRun.eligible) {
+            Qwen35LogGdnDecisionOnce(
+                dryRunKey + "_reject_" + dryRun.reason,
+                "single-norm dry-run=reject reason=" + dryRun.reason +
+                (tiledQKHeadOrder ? " action=fail-fast" :
+                                    " fallback=generic-recurrent"));
+            AssertInFastLLM(!tiledQKHeadOrder,
+                            "Qwen3.5 GGUF tiled single-norm GDN dry-run rejected: " +
+                            dryRun.reason + "\n");
+            return false;
+        }
+        Qwen35LogGdnDecisionOnce(
+            dryRunKey + "_eligible",
+            "single-norm dry-run=eligible selected=cuda-transposed-recurrent head-map=" +
+            std::string(tiledQKHeadOrder ? "modulo" : "grouped"));
+
         if (q.dataDevice != DataDevice::CUDA ||
             k.dataDevice != DataDevice::CUDA ||
             v.dataDevice != DataDevice::CUDA ||
@@ -4673,12 +5190,21 @@ namespace fastllm {
         bool stateLayoutReady = Qwen35EnsureCudaLinearAttnStateTransposed(lastRecurrentState);
         bool fused = stateLayoutReady &&
             FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(
-                q, k, v, g, b, normWeight, lastRecurrentState, coreAttnOut, eps, recurrentQScale
+                q, k, v, g, b, normWeight, lastRecurrentState, coreAttnOut,
+                eps, recurrentQScale, tiledQKHeadOrder
             );
         if (fused) {
             SwapSingleTokenSeqHeadByReshape(coreAttnOut);
             return true;
         }
+        Qwen35LogGdnDecisionOnce(
+            dryRunKey + "_runtime_reject",
+            "single-norm runtime-reject selected=cuda-transposed-recurrent" +
+            std::string(tiledQKHeadOrder ? " action=fail-fast" :
+                                            " fallback=generic-recurrent"));
+        AssertInFastLLM(!tiledQKHeadOrder,
+                        "Qwen3.5 GGUF tiled single-norm GDN runtime rejection.\n");
+
         if (stateLayoutReady) {
             Qwen35EnsureCudaLinearAttnStateKVLayout(lastRecurrentState);
         }
@@ -4694,7 +5220,29 @@ namespace fastllm {
     static bool Qwen35TryCudaLinearAttnSingleDecodeNormBaRecurrent(
             Data &q, Data &k, Data &v, Data &a, Data &b,
             Data &normWeight, Data &aLog, Data &dtBias,
-            float eps, Data &lastRecurrentState, Data &coreAttnOut) {
+            float eps, Data &lastRecurrentState, Data &coreAttnOut,
+            bool tiledQKHeadOrder = false) {
+        Qwen35GdnDryRunResult dryRun = Qwen35DryRunSingleDecodeRecurrent(
+            q, k, v, a, b, normWeight, &aLog, &dtBias,
+            lastRecurrentState, tiledQKHeadOrder);
+        std::string dryRunKey = std::string("single_norm_ba_") +
+            (tiledQKHeadOrder ? "gguf_tiled" : "grouped");
+        if (!dryRun.eligible) {
+            Qwen35LogGdnDecisionOnce(
+                dryRunKey + "_reject_" + dryRun.reason,
+                "single-norm-ba dry-run=reject reason=" + dryRun.reason +
+                (tiledQKHeadOrder ? " action=fail-fast" :
+                                    " fallback=single-norm"));
+            AssertInFastLLM(!tiledQKHeadOrder,
+                            "Qwen3.5 GGUF tiled single-norm-ba GDN dry-run rejected: " +
+                            dryRun.reason + "\n");
+            return false;
+        }
+        Qwen35LogGdnDecisionOnce(
+            dryRunKey + "_eligible",
+            "single-norm-ba dry-run=eligible selected=cuda-transposed-recurrent head-map=" +
+            std::string(tiledQKHeadOrder ? "modulo" : "grouped"));
+
         if (q.dataDevice != DataDevice::CUDA ||
             k.dataDevice != DataDevice::CUDA ||
             v.dataDevice != DataDevice::CUDA ||
@@ -4763,12 +5311,19 @@ namespace fastllm {
         bool fused = stateLayoutReady &&
             FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(
                 q, k, v, a, b, normWeight, aLog, dtBias, lastRecurrentState,
-                coreAttnOut, eps, recurrentQScale
+                coreAttnOut, eps, recurrentQScale, tiledQKHeadOrder
             );
         if (fused) {
             SwapSingleTokenSeqHeadByReshape(coreAttnOut);
             return true;
         }
+        Qwen35LogGdnDecisionOnce(
+            dryRunKey + "_runtime_reject",
+            "single-norm-ba runtime-reject selected=cuda-transposed-recurrent" +
+            std::string(tiledQKHeadOrder ? " action=fail-fast" :
+                                            " fallback=single-norm"));
+        AssertInFastLLM(!tiledQKHeadOrder,
+                        "Qwen3.5 GGUF tiled single-norm-ba GDN runtime rejection.\n");
         if (stateLayoutReady) {
             Qwen35EnsureCudaLinearAttnStateKVLayout(lastRecurrentState);
         }
@@ -5275,6 +5830,8 @@ namespace fastllm {
                     this->weight.weight.find(prefix + "linear_attn.in_proj_qkvz.weight") !=
                         this->weight.weight.end() ||
                     this->weight.weight.find(prefix + "linear_attn.in_proj_qkvzba.weight") !=
+                        this->weight.weight.end() ||
+                    this->weight.weight.find(prefix + "linear_attn.in_proj_qkv.weight") !=
                         this->weight.weight.end();
                 if (!isLinearAttentionLayer) {
                     continue;
@@ -5288,11 +5845,15 @@ namespace fastllm {
                         prefix + "linear_attn.in_proj_qkvz.weight";
                     std::string qkvzbaWeightName =
                         prefix + "linear_attn.in_proj_qkvzba.weight";
+                    std::string qkvWeightName =
+                        prefix + "linear_attn.in_proj_qkv.weight";
+                    std::string balanceWeightName =
+                        this->weight.weight.find(qkvzbaWeightName) != this->weight.weight.end() ?
+                            qkvzbaWeightName :
+                            (this->weight.weight.find(qkvzWeightName) != this->weight.weight.end() ?
+                                 qkvzWeightName : qkvWeightName);
                     BalanceMultiCudaDivisionSchemeByLayer(
-                        this->weight.weight.find(qkvzbaWeightName) !=
-                                this->weight.weight.end() ?
-                            qkvzbaWeightName : qkvzWeightName,
-                        devices, keyScheme);
+                        balanceWeightName, devices, keyScheme);
                     DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
                         keyScheme, num_v_heads / num_k_heads);
                     localKeyHeads = Qwen35LocalHeads(keyScheme, deviceId);
@@ -5354,6 +5915,7 @@ namespace fastllm {
         int vocabSize = it->second.dims[0];
         FastllmCudaSetDevice(rootDevice);
 
+
         size_t logitsBytes = (size_t)batch * (size_t)vocabSize * sizeof(float);
         FastllmCudaMallocBigBuffer(logitsBytes);
         DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
@@ -5388,7 +5950,7 @@ namespace fastllm {
                 fflush(stdout);
             }
         }
-        if (GetFastllmEnv().cudaGraph) {
+        if (GetFastllmEnv().cudaGraph && this->kvCacheDataType != DataType::TURBO3_KV) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
@@ -5398,6 +5960,34 @@ namespace fastllm {
         }
         Qwen35ReleaseThreadLocalCudaSamplingBuffers();
 #endif
+    }
+
+    void Qwen3_5Model::SetKVCacheDataType(DataType dataType) {
+        if (dataType != DataType::TURBO3_KV) {
+            basellm::SetKVCacheDataType(dataType);
+            return;
+        }
+        AssertInFastLLM(Qwen35Turbo3KvEnabled(),
+                        "Qwen3.5 turbo3 KV cache requires FASTLLM_QWEN35_TURBO3_KV=1.\n");
+        AssertInFastLLM(this->head_dim == 256,
+                        "Qwen3.5 turbo3 KV cache currently requires head_dim=256.\n");
+#ifndef USE_CUDA
+        ErrorInFastLLM("Qwen3.5 turbo3 KV cache requires CUDA support.\n");
+#endif
+        this->kvCacheDataType = dataType;
+        this->useCustomKVCacheDataType = true;
+        printf("[Qwen3.5] Turbo3 paged KV enabled: K=q8_0, V=turbo3, head_dim=256.\n");
+        fflush(stdout);
+    }
+    std::pair<DataType, DataType> Qwen3_5Model::GetKVCacheDataTypes(int layerIndex) const {
+        if (layerIndex >= 0 && Qwen35LayerIsLinearAttention(this, layerIndex)) {
+            DataType cacheType = Qwen35LinearAttentionCacheDataType(this->dataType);
+            return {cacheType, cacheType};
+        }
+        if (this->kvCacheDataType == DataType::TURBO3_KV) {
+            return {DataType::Q8_0_KV, DataType::TURBO3_KV};
+        }
+        return basellm::GetKVCacheDataTypes(layerIndex);
     }
 
     PagedCacheManager* Qwen3_5Model::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
@@ -5763,8 +6353,16 @@ namespace fastllm {
                 if (tensorParallel) {
                     DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
                         devices, ratios, num_k_heads);
+                    std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
+                    std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
+                    std::string qkvWeightName = prefix + "linear_attn.in_proj_qkv.weight";
+                    std::string balanceWeightName =
+                        weight.weight.find(qkvzbaWeightName) != weight.weight.end() ?
+                            qkvzbaWeightName :
+                            (weight.weight.find(qkvzWeightName) != weight.weight.end() ?
+                                 qkvzWeightName : qkvWeightName);
                     BalanceMultiCudaDivisionSchemeByLayer(
-                        prefix + "linear_attn.in_proj_qkvz.weight", devices, keyScheme);
+                        balanceWeightName, devices, keyScheme);
                     DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
                         keyScheme, num_v_heads / num_k_heads);
                     localKeyHeads = Qwen35LocalHeads(keyScheme, gpuId);
@@ -5853,15 +6451,16 @@ namespace fastllm {
             for (int b = 0; b < batch; b++) {
                 for (int i = 0; i < block_cnt; i++) {
                     bool isLinearLayer = Qwen35LayerIsLinearAttention(this, i);
-                    DataType cacheType = isLinearLayer ?
-                        Qwen35LinearAttentionCacheDataType(this->dataType) : this->kvCacheDataType;
-                    pastKeyValuesStorage.push_back(std::make_pair(Data(cacheType),
-                                                                  Data(cacheType)));
+                    auto types = this->GetKVCacheDataTypes(i);
+                    pastKeyValuesStorage.emplace_back(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(types.first),
+                        std::forward_as_tuple(types.second));
                     pastKeyValuesStorage.back().first.SetKVCache();
                     pastKeyValuesStorage.back().second.SetKVCache();
                     if (isLinearLayer) {
-                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().first, cacheType);
-                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().second, cacheType);
+                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().first, types.first);
+                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().second, types.second);
                     }
                     pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
                                                            &pastKeyValuesStorage.back().second));
@@ -5940,6 +6539,9 @@ namespace fastllm {
         return false;
 #else
         (void)ratios;
+        if (this->kvCacheDataType == DataType::TURBO3_KV) {
+            return false;
+        }
         const int maxCudaGraphDecodeBatch = Qwen35MaxCudaGraphDecodeBatch(this);
         if (!Qwen35CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
             !all1 || isPrefill || (int)seqLens.size() < batch ||
@@ -6536,6 +7138,36 @@ namespace fastllm {
                     std::string qNormName = prefix + "self_attn.q_norm.weight";
                     std::string kNormName = prefix + "self_attn.k_norm.weight";
                     std::string oWeightName = prefix + "self_attn.o_proj.weight";
+                    std::string qWeightName = prefix + "self_attn.q_proj.weight";
+                    std::string qBiasName = prefix + "self_attn.q_proj.bias";
+                    std::string kWeightName = prefix + "self_attn.k_proj.weight";
+                    std::string kBiasName = prefix + "self_attn.k_proj.bias";
+                    std::string vWeightName = prefix + "self_attn.v_proj.weight";
+                    std::string vBiasName = prefix + "self_attn.v_proj.bias";
+                    Qwen35AttentionProjectionLayout attentionLayout =
+                        ResolveQwen35AttentionProjectionLayout(weight, prefix);
+                    AssertInFastLLM(attentionLayout != Qwen35AttentionProjectionLayout::Missing,
+                                    "Qwen3.5 CUDA graph requires complete attention projection weights.\n");
+                    Data *localMergeWeight = GetEmptyData();
+                    Data *localMergeBias = GetEmptyData();
+                    Data *localQWeight = GetEmptyData();
+                    Data *localQBias = GetEmptyData();
+                    Data *localKWeight = GetEmptyData();
+                    Data *localKBias = GetEmptyData();
+                    Data *localVWeight = GetEmptyData();
+                    Data *localVBias = GetEmptyData();
+                    if (attentionLayout == Qwen35AttentionProjectionLayout::MergedQkv) {
+                        localMergeWeight = requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName);
+                        localMergeBias = requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName),
+                                                      mergeQkvBiasName);
+                    } else {
+                        localQWeight = requireLocal(weight[qWeightName], qWeightName);
+                        localQBias = requireLocal(GetThreadTensorParallelBias(qBiasName), qBiasName);
+                        localKWeight = requireLocal(weight[kWeightName], kWeightName);
+                        localKBias = requireLocal(GetThreadTensorParallelBias(kBiasName), kBiasName);
+                        localVWeight = requireLocal(weight[vWeightName], vWeightName);
+                        localVBias = requireLocal(GetThreadTensorParallelBias(vBiasName), vBiasName);
+                    }
                     std::string oBiasName = prefix + "self_attn.o_proj.bias";
 
                     int localKVHeads = num_key_value_heads;
@@ -6550,8 +7182,10 @@ namespace fastllm {
                         Qwen35CudaAttentionPagedBlock(
                             cudaRunner,
                             &buf.attenInput,
-                            requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                            requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                            localMergeWeight, localMergeBias,
+                            localQWeight, localQBias,
+                            localKWeight, localKBias,
+                            localVWeight, localVBias,
                             requireLocal(weight[qNormName], qNormName),
                             requireLocal(weight[kNormName], kNormName),
                             requireLocal(weight[oWeightName], oWeightName),
@@ -6590,6 +7224,8 @@ namespace fastllm {
                     std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
                     std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                     std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
+                    std::string qkvWeightName = prefix + "linear_attn.in_proj_qkv.weight";
+                    std::string zWeightName = prefix + "linear_attn.in_proj_z.weight";
                     std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
                     std::string conv1dBiasName = prefix + "linear_attn.conv1d.bias";
                     std::string aLogName = prefix + "linear_attn.A_log";
@@ -6613,27 +7249,42 @@ namespace fastllm {
                     int localVd = localValueHeads * head_v_dim;
                     int localQkvDim = localKd * 2 + localVd;
 
+                    Qwen35GdnProjectionLayout gdnLayout =
+                        ResolveQwen35GdnProjectionLayout(weight, prefix);
                     bool hasMergedGdnInLinear =
-                        weight.weight.find(qkvzbaWeightName) != weight.weight.end();
+                        gdnLayout == Qwen35GdnProjectionLayout::Qkvzba;
+                    AssertInFastLLM(gdnLayout != Qwen35GdnProjectionLayout::Missing,
+                                    "Qwen3.5 CUDA graph requires complete linear attention projection weights.\n");
                     if (hasMergedGdnInLinear) {
                         Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                         *requireLocal(weight[qkvzbaWeightName], qkvzbaWeightName),
                                         *requireLocal(GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias"),
                                                       qkvzbaWeightName + ".tp_bias"),
                                         buf.gdnMerged);
-                    } else {
-                        AssertInFastLLM(weight.weight.find(qkvzWeightName) != weight.weight.end() &&
-                                        weight.weight.find(baWeightName) != weight.weight.end(),
-                                        "Qwen3.5 CUDA graph requires linear attention qkvz/ba weights.\n");
+                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0, localQkvDim, buf.qkvConvInput);
+                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim,
+                                       localQkvDim + localVd, buf.z);
+                    } else if (gdnLayout == Qwen35GdnProjectionLayout::QkvzBa) {
                         Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                         *requireLocal(weight[qkvzWeightName], qkvzWeightName),
                                         *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"),
                                                       qkvzWeightName + ".tp_bias"),
                                         buf.gdnMerged);
+                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0, localQkvDim, buf.qkvConvInput);
+                        Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim,
+                                       localQkvDim + localVd, buf.z);
+                    } else {
+                        Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                        *requireLocal(weight[qkvWeightName], qkvWeightName),
+                                        *requireLocal(GetThreadTensorParallelBias(qkvWeightName + ".tp_bias"),
+                                                      qkvWeightName + ".tp_bias"),
+                                        buf.qkvConvInput);
+                        Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                        *requireLocal(weight[zWeightName], zWeightName),
+                                        *requireLocal(GetThreadTensorParallelBias(zWeightName + ".tp_bias"),
+                                                      zWeightName + ".tp_bias"),
+                                        buf.z);
                     }
-                    Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0, localQkvDim, buf.qkvConvInput);
-                    Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim,
-                                   localQkvDim + localVd, buf.z);
                     if (hasMergedGdnInLinear) {
                         Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, localQkvDim + localVd,
                                        localQkvDim + localVd + localValueHeads * 2, buf.ba);
@@ -6730,7 +7381,7 @@ namespace fastllm {
                                 linearStatePool->cudaData, state.linearSlotIds.cudaData, batch,
                                 buf.coreAttnOut,
                                 localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
-                                rms_norm_eps, recurrentQScale);
+                                rms_norm_eps, recurrentQScale, false);
                     }
                     if (fusedBatchRecurrentFromConvBa) {
                         for (int rb = 0; rb < batch; rb++) {
@@ -6802,6 +7453,10 @@ namespace fastllm {
                         Qwen35CudaMulTo(cudaRunner, buf.coreAttnOut, buf.z);
                     }
                     buf.coreAttnOut.Reshape({zShape[0], zShape[1], localVd});
+                    if (ggufOutProjColumnsTiled) {
+                        Qwen35CudaReorderGroupedToTiled(cudaRunner, buf.coreAttnOut,
+                                                         localKeyHeads, localValueHeads, head_v_dim);
+                    }
                     Qwen3CudaLinearResidualReduce(
                         cudaRunner, buf.coreAttnOut,
                         *requireLocal(weight[outProjWeightName], outProjWeightName),
@@ -7357,6 +8012,36 @@ namespace fastllm {
                 std::string kNormName = prefix + "self_attn.k_norm.weight";
                 std::string oWeightName = prefix + "self_attn.o_proj.weight";
                 std::string oBiasName = prefix + "self_attn.o_proj.bias";
+                std::string qWeightName = prefix + "self_attn.q_proj.weight";
+                std::string qBiasName = prefix + "self_attn.q_proj.bias";
+                std::string kWeightName = prefix + "self_attn.k_proj.weight";
+                std::string kBiasName = prefix + "self_attn.k_proj.bias";
+                std::string vWeightName = prefix + "self_attn.v_proj.weight";
+                std::string vBiasName = prefix + "self_attn.v_proj.bias";
+                Qwen35AttentionProjectionLayout attentionLayout =
+                    ResolveQwen35AttentionProjectionLayout(weight, prefix);
+                AssertInFastLLM(attentionLayout != Qwen35AttentionProjectionLayout::Missing,
+                                "Qwen3.5 ForwardSingleGPU requires complete attention projection weights.\n");
+                Data *localMergeWeight = GetEmptyData();
+                Data *localMergeBias = GetEmptyData();
+                Data *localQWeight = GetEmptyData();
+                Data *localQBias = GetEmptyData();
+                Data *localKWeight = GetEmptyData();
+                Data *localKBias = GetEmptyData();
+                Data *localVWeight = GetEmptyData();
+                Data *localVBias = GetEmptyData();
+                if (attentionLayout == Qwen35AttentionProjectionLayout::MergedQkv) {
+                    localMergeWeight = requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName);
+                    localMergeBias = requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName),
+                                                  mergeQkvBiasName);
+                } else {
+                    localQWeight = requireLocal(weight[qWeightName], qWeightName);
+                    localQBias = requireLocal(GetThreadTensorParallelBias(qBiasName), qBiasName);
+                    localKWeight = requireLocal(weight[kWeightName], kWeightName);
+                    localKBias = requireLocal(GetThreadTensorParallelBias(kBiasName), kBiasName);
+                    localVWeight = requireLocal(weight[vWeightName], vWeightName);
+                    localVBias = requireLocal(GetThreadTensorParallelBias(vBiasName), vBiasName);
+                }
 
                 int localKVHeads = num_key_value_heads;
                 if (tensorParallel) {
@@ -7370,8 +8055,10 @@ namespace fastllm {
                     Qwen35CudaAttentionPagedBlock(
                         cudaRunner,
                         &attenInput,
-                        requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                        requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                        localMergeWeight, localMergeBias,
+                        localQWeight, localQBias,
+                        localKWeight, localKBias,
+                        localVWeight, localVBias,
                         requireLocal(weight[qNormName], qNormName),
                         requireLocal(weight[kNormName], kNormName),
                         requireLocal(weight[oWeightName], oWeightName),
@@ -7409,6 +8096,8 @@ namespace fastllm {
                 std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
                 std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                 std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
+                std::string qkvWeightName = prefix + "linear_attn.in_proj_qkv.weight";
+                std::string zWeightName = prefix + "linear_attn.in_proj_z.weight";
                 std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
                 std::string conv1dBiasName = prefix + "linear_attn.conv1d.bias";
                 std::string aLogName = prefix + "linear_attn.A_log";
@@ -7431,26 +8120,40 @@ namespace fastllm {
                 int localKd = localKeyHeads * head_k_dim;
                 int localVd = localValueHeads * head_v_dim;
                 int localQkvDim = localKd * 2 + localVd;
+                Qwen35GdnProjectionLayout gdnLayout =
+                    ResolveQwen35GdnProjectionLayout(weight, prefix);
                 bool hasMergedGdnInLinear =
-                    weight.weight.find(qkvzbaWeightName) != weight.weight.end();
+                    gdnLayout == Qwen35GdnProjectionLayout::Qkvzba;
+                AssertInFastLLM(gdnLayout != Qwen35GdnProjectionLayout::Missing,
+                                "Qwen3.5 ForwardSingleGPU requires complete linear attention projection weights.\n");
                 if (hasMergedGdnInLinear) {
                     Qwen3CudaLinear(cudaRunner, attenInput,
                                     *requireLocal(weight[qkvzbaWeightName], qkvzbaWeightName),
                                     *requireLocal(GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias"),
                                                   qkvzbaWeightName + ".tp_bias"),
                                     gdnMerged);
-                } else {
-                    AssertInFastLLM(weight.weight.find(qkvzWeightName) != weight.weight.end() &&
-                                    weight.weight.find(baWeightName) != weight.weight.end(),
-                                    "Qwen3.5 ForwardSingleGPU requires linear attention qkvz/ba weights.\n");
+                    Qwen3CudaSplit(cudaRunner, gdnMerged, -1, 0, localQkvDim, qkvConvInput);
+                    Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim, localQkvDim + localVd, z);
+                } else if (gdnLayout == Qwen35GdnProjectionLayout::QkvzBa) {
                     Qwen3CudaLinear(cudaRunner, attenInput,
                                     *requireLocal(weight[qkvzWeightName], qkvzWeightName),
                                     *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"),
                                                   qkvzWeightName + ".tp_bias"),
                                     gdnMerged);
+                    Qwen3CudaSplit(cudaRunner, gdnMerged, -1, 0, localQkvDim, qkvConvInput);
+                    Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim, localQkvDim + localVd, z);
+                } else {
+                    Qwen3CudaLinear(cudaRunner, attenInput,
+                                    *requireLocal(weight[qkvWeightName], qkvWeightName),
+                                    *requireLocal(GetThreadTensorParallelBias(qkvWeightName + ".tp_bias"),
+                                                  qkvWeightName + ".tp_bias"),
+                                    qkvConvInput);
+                    Qwen3CudaLinear(cudaRunner, attenInput,
+                                    *requireLocal(weight[zWeightName], zWeightName),
+                                    *requireLocal(GetThreadTensorParallelBias(zWeightName + ".tp_bias"),
+                                                  zWeightName + ".tp_bias"),
+                                    z);
                 }
-                Qwen3CudaSplit(cudaRunner, gdnMerged, -1, 0, localQkvDim, qkvConvInput);
-                Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim, localQkvDim + localVd, z);
                 bool captureLinearState =
                     speculativeCaptureFirstTokenLinearState;
                 int linearStateCaptureSlots =
@@ -7902,7 +8605,7 @@ namespace fastllm {
                             tokenValueStates, captureTokens,
                             localKeyHeads, localValueHeads,
                             head_k_dim, head_v_dim, rms_norm_eps,
-                            1.0f / std::sqrt((float)head_k_dim));
+                            1.0f / std::sqrt((float)head_k_dim), false);
                     if (!fused) {
                         throw Qwen35MtpBatchFastPathUnavailable(
                             "Qwen3.5 batched MTP recurrent fast path is unavailable.");
@@ -7999,13 +8702,13 @@ namespace fastllm {
                                 *convOutputForRecurrent, baMerged, *linearNormWeight, *aLog, *dtBias,
                                 fusedRecurrentStates, coreAttnOut,
                                 localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
-                                rms_norm_eps, recurrentQScale);
+                                rms_norm_eps, recurrentQScale, false);
                         } else {
                             FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
                                 *convOutputForRecurrent, baMerged, *linearNormWeight, *aLog, *dtBias,
                                 fusedRecurrentStates, coreAttnOut,
                                 localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
-                                rms_norm_eps, recurrentQScale);
+                                rms_norm_eps, recurrentQScale, false);
                         }
                         fusedBatchRecurrentFromConvBa = true;
                         for (int rb = 0; rb < batch; rb++) {
@@ -8125,14 +8828,18 @@ namespace fastllm {
                         if (num_v_heads / num_k_heads > 1) {
                             Qwen35CudaMul(cudaRunner, q, 1.0f, qRepeat);
                             Qwen35CudaMul(cudaRunner, k, 1.0f, kRepeat);
-                            qRepeat.Resize({q.dims[0], q.dims[1], q.dims[2],
-                                            1, q.dims[3]});
-                            kRepeat.Resize({k.dims[0], k.dims[1], k.dims[2],
-                                            1, k.dims[3]});
-                            Qwen35CudaRepeat(cudaRunner, qRepeat, 3,
-                                            num_v_heads / num_k_heads, q);
-                            Qwen35CudaRepeat(cudaRunner, kRepeat, 3,
-                                            num_v_heads / num_k_heads, k);
+                            // All V-heads are now grouped (load-time untile).
+                            // Repeat each K head in place along axis 3.
+                            {
+                                qRepeat.Resize({q.dims[0], q.dims[1], q.dims[2],
+                                                1, q.dims[3]});
+                                kRepeat.Resize({k.dims[0], k.dims[1], k.dims[2],
+                                                1, k.dims[3]});
+                                Qwen35CudaRepeat(cudaRunner, qRepeat, 3,
+                                                num_v_heads / num_k_heads, q);
+                                Qwen35CudaRepeat(cudaRunner, kRepeat, 3,
+                                                num_v_heads / num_k_heads, k);
+                            }
                             q.Reshape({q.dims[0], q.dims[1], -1,
                                        q.dims.back()});
                             k.Reshape({k.dims[0], k.dims[1], -1,
@@ -8264,7 +8971,7 @@ namespace fastllm {
                         *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                         *requireLocal(weight[aLogName], aLogName),
                         *requireLocal(weight[dtBiasName], dtBiasName),
-                        rms_norm_eps, pastValue, coreAttnOut
+                        rms_norm_eps, pastValue, coreAttnOut, false
                     );
                     if (!fusedSingleDecode) {
                         Qwen35CudaSigmoidMambaSoftplus(cudaRunner, b, a,
@@ -8274,7 +8981,7 @@ namespace fastllm {
                         fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
                             q, k, v, g, b,
                             *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
-                            rms_norm_eps, pastValue, coreAttnOut
+                            rms_norm_eps, pastValue, coreAttnOut, false
                         );
                     }
                     if (!fusedSingleDecode) {
@@ -8315,7 +9022,8 @@ namespace fastllm {
                                         *requireLocal(weight[dtBiasName], dtBiasName),
                                         pastValue, coreAttnOut,
                                         localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
-                                        rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
+                                        rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim),
+                                        false);
                             } else {
                                 // 融合序列 kernel 内部在处理完第 t 个 token 后直接把递归状态
                                 // 写入快照 slot, 替代逐行前向 + 全量 CopyFrom 的慢速路径。
@@ -8335,7 +9043,8 @@ namespace fastllm {
                                         pastValue, coreAttnOut,
                                         tokenValueStates, valueCaptureTokens,
                                         localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
-                                        rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
+                                        rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim),
+                                        false);
                                 if (fusedSmallDecode) {
                                     for (int tokenIndex = 0; tokenIndex < valueCaptureTokens; tokenIndex++) {
                                         if (tokenValueStates[tokenIndex] != nullptr) {
@@ -8363,7 +9072,8 @@ namespace fastllm {
                                         *requireLocal(weight[dtBiasName], dtBiasName),
                                         pastValue, rowOut,
                                         localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
-                                        rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
+                                        rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim),
+                                        false);
                                 if (!rowOk) {
                                     if (row == 0) {
                                         fusedSmallDecode = false;
@@ -8418,7 +9128,8 @@ namespace fastllm {
                                 *requireLocal(weight[dtBiasName], dtBiasName),
                                 pastValue, coreAttnOut0,
                                 localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
-                                rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
+                                rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim),
+                                false);
                         if (fusedFirstToken) {
                             Data *firstTokenValueState =
                                 getFirstTokenLinearCaptureSlot(false);
@@ -8438,7 +9149,8 @@ namespace fastllm {
                                     *requireLocal(weight[dtBiasName], dtBiasName),
                                     pastValue, coreAttnOut1,
                                     localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
-                                    rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim));
+                                    rms_norm_eps, 1.0f / std::sqrt((float)head_k_dim),
+                                    false);
                             AssertInFastLLM(fusedSecondToken,
                                             "Qwen3.5 two-token conv+ba linear decode fused first token but failed second token.\n");
                             SwapSingleTokenSeqHeadByReshape(coreAttnOut1);
@@ -8460,7 +9172,7 @@ namespace fastllm {
                             *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                             *requireLocal(weight[aLogName], aLogName),
                             *requireLocal(weight[dtBiasName], dtBiasName),
-                            rms_norm_eps, pastValue, coreAttnOut0
+                            rms_norm_eps, pastValue, coreAttnOut0, false
                         );
                     }
                     if (fusedTwoTokenDecode && !fusedConvBaTwoTokenDecode) {
@@ -8480,7 +9192,7 @@ namespace fastllm {
                             *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                             *requireLocal(weight[aLogName], aLogName),
                             *requireLocal(weight[dtBiasName], dtBiasName),
-                            rms_norm_eps, pastValue, coreAttnOut1
+                            rms_norm_eps, pastValue, coreAttnOut1, false
                         );
                         AssertInFastLLM(fusedSecondToken,
                                         "Qwen3.5 two-token linear decode fused first token but failed second token.\n");
@@ -8541,6 +9253,10 @@ namespace fastllm {
                     Qwen35CudaMulTo(cudaRunner, coreAttnOut, z);
                 }
                 coreAttnOut.Reshape({zShape[0], zShape[1], localVd});
+                if (ggufOutProjColumnsTiled) {
+                    Qwen35CudaReorderGroupedToTiled(cudaRunner, coreAttnOut,
+                                                     localKeyHeads, localValueHeads, head_v_dim);
+                }
                 Qwen3CudaLinearResidualReduce(
                     cudaRunner, coreAttnOut,
                     *requireLocal(weight[outProjWeightName], outProjWeightName),
@@ -9129,14 +9845,16 @@ namespace fastllm {
             if (initialized_add1) {
                 return;
             }
-            for (int i = 0; i < block_cnt; i++) {
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
+            if (!ggufNormsPreOffset) {
+                for (int i = 0; i < block_cnt; i++) {
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
+                }
+                Add1(this->weight[language_prefix + "norm.weight"]);
+                AddMtpRmsNormOffset();
             }
-            Add1(this->weight[language_prefix + "norm.weight"]);
-            AddMtpRmsNormOffset();
             initialized_add1 = true;
         };
 
@@ -9199,19 +9917,51 @@ namespace fastllm {
                             std::string kNormName = prefix + "self_attn.k_norm.weight";
                             std::string oWeightName = prefix + "self_attn.o_proj.weight";
                             std::string oBiasName = prefix + "self_attn.o_proj.bias";
-                            AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
-                                            "Qwen3.5 ForwardGPU requires merged qgate/k/v weight.\n");
+                            std::string qWeightName = prefix + "self_attn.q_proj.weight";
+                            std::string qBiasName = prefix + "self_attn.q_proj.bias";
+                            std::string kWeightName = prefix + "self_attn.k_proj.weight";
+                            std::string kBiasName = prefix + "self_attn.k_proj.bias";
+                            std::string vWeightName = prefix + "self_attn.v_proj.weight";
+                            std::string vBiasName = prefix + "self_attn.v_proj.bias";
+                            Qwen35AttentionProjectionLayout attentionLayout =
+                                ResolveQwen35AttentionProjectionLayout(weight, prefix);
+                            AssertInFastLLM(attentionLayout != Qwen35AttentionProjectionLayout::Missing,
+                                            "Qwen3.5 ForwardGPU requires complete attention projection weights.\n");
                             prepareReplicated(qNormName);
                             prepareReplicated(kNormName);
 
-                            Data &mergeW = weight[mergeQkvWeightName];
-                            Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
-                            mergeW.tpPackType = TP_PACK_NONE;
                             DivisionScheme qkvScheme = BuildQwen35GatedAttentionQkvScheme(
                                 devices, ratios, num_attention_heads, num_key_value_heads, head_dim);
                             std::vector<int> devCopy = devices;
-                            AssertInFastLLM(SplitMultiCudaWeight(mergeW, mergeB, devCopy, qkvScheme, 0),
-                                            "Qwen3.5 ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
+                            if (attentionLayout == Qwen35AttentionProjectionLayout::MergedQkv) {
+                                Data &mergeW = weight[mergeQkvWeightName];
+                                Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
+                                mergeW.tpPackType = TP_PACK_NONE;
+                                AssertInFastLLM(SplitMultiCudaWeight(mergeW, mergeB, devCopy,
+                                                                     qkvScheme, 0),
+                                                "Qwen3.5 ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
+                            } else {
+                                int qGateWidth = num_attention_heads * head_dim * 2;
+                                int kvWidth = num_key_value_heads * head_dim;
+                                DivisionScheme qScheme = ExtractQwen35RangeScheme(qkvScheme, 0, 0);
+                                DivisionScheme kScheme = ExtractQwen35RangeScheme(qkvScheme, 1, qGateWidth);
+                                DivisionScheme vScheme = ExtractQwen35RangeScheme(qkvScheme, 2,
+                                                                                  qGateWidth + kvWidth);
+                                Data &qBias = GetThreadTensorParallelBias(qBiasName);
+                                Data &kBias = GetThreadTensorParallelBias(kBiasName);
+                                Data &vBias = GetThreadTensorParallelBias(vBiasName);
+                                AssertInFastLLM(SplitMultiCudaWeight(weight[qWeightName], qBias,
+                                                                     devCopy, qScheme, 0),
+                                                "Qwen3.5 ForwardGPU failed to split " + qWeightName + ".\n");
+                                devCopy = devices;
+                                AssertInFastLLM(SplitMultiCudaWeight(weight[kWeightName], kBias,
+                                                                     devCopy, kScheme, 0),
+                                                "Qwen3.5 ForwardGPU failed to split " + kWeightName + ".\n");
+                                devCopy = devices;
+                                AssertInFastLLM(SplitMultiCudaWeight(weight[vWeightName], vBias,
+                                                                     devCopy, vScheme, 0),
+                                                "Qwen3.5 ForwardGPU failed to split " + vWeightName + ".\n");
+                            }
                             int qGateWidth = num_attention_heads * head_dim * 2;
                             threadTpAttentionKVHeadSchemes[i] =
                                 ExtractQwen35AttentionKVHeadScheme(qkvScheme, qGateWidth, head_dim);
@@ -9224,25 +9974,30 @@ namespace fastllm {
                             std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
                             std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                             std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
+                            std::string qkvWeightName = prefix + "linear_attn.in_proj_qkv.weight";
+                            std::string zWeightName = prefix + "linear_attn.in_proj_z.weight";
                             std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
                             std::string conv1dBiasName = prefix + "linear_attn.conv1d.bias";
                             std::string aLogName = prefix + "linear_attn.A_log";
                             std::string dtBiasName = prefix + "linear_attn.dt_bias";
                             std::string outNormWeightName = prefix + "linear_attn.norm.weight";
                             std::string outProjWeightName = prefix + "linear_attn.out_proj.weight";
+                            Qwen35GdnProjectionLayout gdnLayout =
+                                ResolveQwen35GdnProjectionLayout(weight, prefix);
                             bool hasMergedGdnInLinear =
-                                weight.weight.find(qkvzbaWeightName) != weight.weight.end();
-                            AssertInFastLLM(hasMergedGdnInLinear ||
-                                            (weight.weight.find(qkvzWeightName) != weight.weight.end() &&
-                                             weight.weight.find(baWeightName) != weight.weight.end()),
-                                            "Qwen3.5 ForwardGPU requires linear attention qkvzba or qkvz/ba weights.\n");
+                                gdnLayout == Qwen35GdnProjectionLayout::Qkvzba;
+                            AssertInFastLLM(gdnLayout != Qwen35GdnProjectionLayout::Missing,
+                                            "Qwen3.5 ForwardGPU requires complete linear attention projection weights.\n");
                             prepareReplicated(outNormWeightName);
 
                             DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
                                 devices, ratios, num_k_heads);
+                            std::string balanceWeightName = hasMergedGdnInLinear ?
+                                qkvzbaWeightName :
+                                (gdnLayout == Qwen35GdnProjectionLayout::QkvzBa ?
+                                     qkvzWeightName : qkvWeightName);
                             BalanceMultiCudaDivisionSchemeByLayer(
-                                hasMergedGdnInLinear ? qkvzbaWeightName : qkvzWeightName,
-                                devices, keyScheme);
+                                balanceWeightName, devices, keyScheme);
                             DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
                                 keyScheme, num_v_heads / num_k_heads);
                             threadTpLinearKeyHeadSchemes[i] = keyScheme;
@@ -9256,13 +10011,29 @@ namespace fastllm {
                                 AssertInFastLLM(SplitMultiCudaWeight(weight[qkvzbaWeightName], qkvzbaBias,
                                                                      devCopy, qkvzbaScheme, 0, true),
                                                 "Qwen3.5 ForwardGPU failed to split " + qkvzbaWeightName + ".\n");
-                            } else {
+                            } else if (gdnLayout == Qwen35GdnProjectionLayout::QkvzBa) {
                                 DivisionScheme qkvzScheme = BuildQwen35LinearQkvzScheme(
                                     keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
                                 Data &qkvzBias = GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias");
                                 AssertInFastLLM(SplitMultiCudaWeight(weight[qkvzWeightName], qkvzBias,
                                                                      devCopy, qkvzScheme, 0, true),
                                                 "Qwen3.5 ForwardGPU failed to split " + qkvzWeightName + ".\n");
+                            } else {
+                                DivisionScheme qkvScheme = BuildQwen35LinearQkvScheme(
+                                    keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
+                                DivisionScheme zScheme = BuildQwen35LinearZScheme(
+                                    valueScheme, head_v_dim);
+                                Data &qkvBias = GetThreadTensorParallelBias(qkvWeightName + ".tp_bias");
+                                Data &zBias = GetThreadTensorParallelBias(zWeightName + ".tp_bias");
+                                AssertInFastLLM(SplitMultiCudaWeight(weight[qkvWeightName], qkvBias,
+                                                                     devCopy, qkvScheme, 0, true),
+                                                "Qwen3.5 ForwardGPU failed to split " + qkvWeightName + ".\n");
+                                devCopy = devices;
+                                AssertInFastLLM(SplitMultiCudaWeight(weight[zWeightName], zBias,
+                                                                     devCopy, zScheme, 0, true),
+                                                "Qwen3.5 ForwardGPU failed to split " + zWeightName + ".\n");
+                            }
+                            if (!hasMergedGdnInLinear) {
                                 DivisionScheme baScheme = BuildQwen35LinearBaScheme(
                                     valueScheme, num_v_heads);
                                 Data &baBias = GetThreadTensorParallelBias(baWeightName + ".tp_bias");
@@ -9285,7 +10056,13 @@ namespace fastllm {
                             AssertInFastLLM(SplitQwen35VectorWeight(weight[dtBiasName], devices, valueScheme),
                                             "Qwen3.5 ForwardGPU failed to split " + dtBiasName + ".\n");
 
-                            DivisionScheme outScheme = BuildQwen35LinearOutProjScheme(valueScheme, head_v_dim);
+                            const int outProjQuantBlock =
+                                weight[outProjWeightName].dataType == DataType::DATA_GGUF_FORMAT
+                                    ? (int)ggml_blck_size((ggml_type)weight[outProjWeightName].ggmlType)
+                                    : 1;
+                            DivisionScheme outScheme = BuildQwen35LinearOutProjScheme(
+                                keyScheme, num_k_heads, num_v_heads, head_v_dim,
+                                outProjQuantBlock, ggufOutProjColumnsTiled);
                             Data &outBias = GetThreadTensorParallelBias(outProjWeightName + ".tp_bias");
                             devCopy = devices;
                             AssertInFastLLM(SplitMultiCudaWeight(weight[outProjWeightName], outBias,
@@ -9548,9 +10325,9 @@ namespace fastllm {
                 } else {
                     pastKeyValues[idx].first->isLinearAttention = false;
                     pastKeyValues[idx].second->isLinearAttention = false;
-                    keyCacheType = ResolveQwen35ThreadTpCacheType(
+                    keyCacheType = ResolveQwen35CudaCacheType(
                         pastKeyValues[idx].first->dataType, computeType);
-                    valueCacheType = ResolveQwen35ThreadTpCacheType(
+                    valueCacheType = ResolveQwen35CudaCacheType(
                         pastKeyValues[idx].second->dataType, computeType);
                 }
                 for (int r = 0; r < (int)devices.size(); r++) {
@@ -9585,9 +10362,9 @@ namespace fastllm {
                 } else {
                     pastKeyValues[idx].first->isLinearAttention = false;
                     pastKeyValues[idx].second->isLinearAttention = false;
-                    keyCacheType = ResolveQwen35ThreadTpCacheType(
+                    keyCacheType = ResolveQwen35CudaCacheType(
                         pastKeyValues[idx].first->dataType, computeType);
-                    valueCacheType = ResolveQwen35ThreadTpCacheType(
+                    valueCacheType = ResolveQwen35CudaCacheType(
                         pastKeyValues[idx].second->dataType, computeType);
                 }
                 PrepareQwen35SingleCudaCache(*pastKeyValues[idx].first, device, keyCacheType);
@@ -10426,8 +11203,9 @@ namespace fastllm {
             PagedCacheManager *manager = cache.pagedKVCacheData;
             AssertInFastLLM(manager != nullptr && manager->dims.size() == 4,
                             "Qwen3.5 MTP validation paged cache manager is invalid.\n");
-            size_t pageBytes = (size_t)manager->pageLen * manager->dims[2] *
-                               manager->dims[3] * manager->unitSize / manager->unitSizeDiv;
+            size_t pageBytes = Qwen35PagedCachePageBytes(
+                manager->dataType, manager->pageLen,
+                manager->dims[2], manager->dims[3]);
             size_t srcOffset = (size_t)srcPage * pageBytes;
             size_t dstOffset = (size_t)dstPage * pageBytes;
             if (manager->dataDevice == DataDevice::CUDA) {
@@ -13551,6 +14329,15 @@ namespace fastllm {
         const int mtpBatchDecodeTokens = std::min(
             mtpDraftsPerStep + 1, QWEN35_MTP_FAST_SEQ_MAX);
         int prefillChunkSize = model->GetChunkedPrefillSize();
+        const bool interleaveLongPrefill = Qwen35InterleaveLongPrefillEnabled();
+        const int longPrefillResidentLanes = interleaveLongPrefill ?
+            std::max(mtpSchedulerLanes,
+                     std::min(configuredMtpSchedulerLanes,
+                              QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX)) :
+            mtpSchedulerLanes;
+        uint64_t nextLongPrefillTicket = 0;
+        uint64_t lastLongPrefillTicket = 0;
+        bool lastQuantumWasLongPrefill = false;
 
         auto releasePagedCachePages = [](Data &cache, bool clearDims = false) {
             std::set<std::pair<PagedCacheManager*, int> > releasedPages;
@@ -13609,6 +14396,7 @@ namespace fastllm {
             ctx->preTokens = 0;
             ctx->cacheLen = 0;
             ctx->intParams.clear();
+            ctx->longPrefill.Reset();
         };
 
         auto scheduledDecodeTokens = [&](const ResponseContext *ctx) {
@@ -13791,10 +14579,9 @@ namespace fastllm {
             return true;
         };
 
-        auto collectDecodePageNeeds = [&](ResponseContext *ctx) -> std::map<PagedCacheManager*, int> {
+        auto collectDecodePageNeeds = [&](ResponseContext *ctx, int decodeTokens) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
-            int decodeTokens = ctx == nullptr ? 1 :
-                std::max(1, scheduledDecodeTokens(ctx));
+            decodeTokens = std::max(1, decodeTokens);
             // Multi-token MTP validation runs against a paged-cache view. A
             // partial last page is cloned before appending so rejected draft
             // tokens cannot overwrite the real cache.
@@ -13853,6 +14640,105 @@ namespace fastllm {
             return needs;
         };
 
+        struct Qwen35PrefillPageNeed {
+            std::map<PagedCacheManager*, int> needs;
+            bool impossible = false;
+        };
+        auto collectPrefillPageNeeds = [&](ResponseContext *ctx, int appendTokens) {
+            Qwen35PrefillPageNeed state;
+            if (ctx == nullptr || appendTokens <= 0) {
+                return state;
+            }
+            auto addManagerNeed = [&](PagedCacheManager *manager,
+                                      int currentTokens,
+                                      int currentPages) {
+                if (manager == nullptr || manager->pageLen <= 0 ||
+                    manager->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                    return;
+                }
+                long long totalTokens = (long long)std::max(0, currentTokens) + appendTokens;
+                long long totalManagerPages =
+                    (totalTokens + manager->pageLen - 1) / manager->pageLen;
+                if (totalManagerPages > manager->maxPages) {
+                    state.impossible = true;
+                    return;
+                }
+                int newPages = (int)totalManagerPages - std::max(0, currentPages);
+                if (newPages > 0) {
+                    int &need = state.needs[manager];
+                    need = need >= INT_MAX - newPages ? INT_MAX : need + newPages;
+                }
+            };
+            std::function<bool(Data&)> addExistingCache = [&](Data &cache) {
+                if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                    bool usedLocal = false;
+                    for (auto &item : cache.multiDeviceDatas) {
+                        if (item.second != nullptr) {
+                            usedLocal = addExistingCache(*item.second) || usedLocal;
+                        }
+                    }
+                    if (usedLocal) {
+                        return true;
+                    }
+                }
+                if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+                    return false;
+                }
+                int currentPages = (int)cache.pageIndex.size();
+                int cachePageLen = cache.pageLen > 0 ?
+                    cache.pageLen : cache.pagedKVCacheData->pageLen;
+                int currentTokens = currentPages > 0 ?
+                    (currentPages - 1) * cachePageLen + cache.lastPageLen : 0;
+                addManagerNeed(cache.pagedKVCacheData, currentTokens, currentPages);
+                return true;
+            };
+            for (int layer = 0;
+                 layer < model->block_cnt && layer < (int)ctx->pastKeyValues.size();
+                 layer++) {
+                for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                    bool isKey = keyFlag == 0;
+                    Data &cache = isKey ? ctx->pastKeyValues[layer].first :
+                                          ctx->pastKeyValues[layer].second;
+                    if (addExistingCache(cache)) {
+                        continue;
+                    }
+                    for (auto &ref : model->GetPagedKVCacheManagers(layer, isKey)) {
+                        addManagerNeed(ref.second, 0, 0);
+                    }
+                }
+            }
+            return state;
+        };
+
+        auto pageNeedsFitWithReservations = [](
+                const std::map<PagedCacheManager*, int> &needs,
+                const std::map<PagedCacheManager*, int> &reserved) {
+            std::set<PagedCacheManager*> managers;
+            for (const auto &item : needs) managers.insert(item.first);
+            for (const auto &item : reserved) managers.insert(item.first);
+            for (PagedCacheManager *manager : managers) {
+                if (manager == nullptr) {
+                    continue;
+                }
+                int need = 0;
+                int reservation = 0;
+                auto needIt = needs.find(manager);
+                if (needIt != needs.end()) need = needIt->second;
+                auto reservationIt = reserved.find(manager);
+                if (reservationIt != reserved.end()) reservation = reservationIt->second;
+                int freePages = 0;
+                {
+                    std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                    freePages = manager->FreePageCount();
+                }
+                if (need < 0 || reservation < 0 ||
+                    (long long)need + reservation > freePages) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
         auto hasPagedManagerShortage = [](const std::map<PagedCacheManager*, int> &needs) -> bool {
             for (auto &it : needs) {
                 PagedCacheManager *manager = it.first;
@@ -13869,6 +14755,19 @@ namespace fastllm {
                 }
             }
             return false;
+        };
+        auto pageNeedsAndFree = [](const std::map<PagedCacheManager*, int> &needs) {
+            std::vector<std::pair<int, int> > ret;
+            ret.reserve(needs.size());
+            for (const auto &it : needs) {
+                PagedCacheManager *manager = it.first;
+                if (manager == nullptr || it.second <= 0) {
+                    continue;
+                }
+                std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                ret.push_back({it.second, manager->FreePageCount()});
+            }
+            return ret;
         };
         auto accumulatePagedManagerNeeds = [](
                 std::map<PagedCacheManager*, int> &total,
@@ -14128,6 +15027,11 @@ namespace fastllm {
         } else if (model->verbose) {
             printf("Fastllm Scheduler: Qwen3.5 MTP (lane=%d).\n", mtpSchedulerLanes);
         }
+        if (interleaveLongPrefill) {
+            printf("[Qwen3.5 MTP] interleaved long prefill enabled: chunk=%d, decode_lanes=%d, resident_lanes=%d.\n",
+                   prefillChunkSize, mtpSchedulerLanes, longPrefillResidentLanes);
+            fflush(stdout);
+        }
         if (model->verbose && useMtpBatchScheduling &&
             mtpDraftsPerStep + 1 > QWEN35_MTP_FAST_SEQ_MAX) {
             printf("[Qwen3.5 MTP] batched validation uses %d of %d configured drafts per step.\n",
@@ -14161,6 +15065,8 @@ namespace fastllm {
             bool selectedIsPrompt = false;
             bool selectedMultimodal = false;
             std::map<PagedCacheManager*, int> selectedDecodePageNeeds;
+            bool selectedLongPrefill = false;
+            Qwen35LongPrefillQuantum selectedLongPrefillQuantum;
 
             attentionMasks.reserve(mtpSchedulerLanes);
             positionIds.reserve(mtpSchedulerLanes);
@@ -14183,6 +15089,10 @@ namespace fastllm {
             int busyPages = 0;
             int currentActivate = 0;
             bool hasPrefill = false;
+            bool hasDecode = false;
+            bool hasContinuedPrefill = false;
+            std::vector<std::tuple<int, uint64_t> > continuedPrefillCandidates;
+            std::map<PagedCacheManager*, int> outstandingPrefillReservations;
             struct DecodeOrder {
                 int sortKey;
                 int handle;
@@ -14209,11 +15119,30 @@ namespace fastllm {
                     eraseMtpCache(ctx);
                     continue;
                 }
-                if (ctx->preTokens > 0) {
-                    currentActivate++;
-                }
-                if (ctx->preTokens == 0) {
-                    hasPrefill = true;
+                if (interleaveLongPrefill) {
+                    Qwen35RequestPhase phase = ClassifyQwen35RequestPhase(*ctx);
+                    if (phase == Qwen35RequestPhase::ContinuedPrefill) {
+                        currentActivate++;
+                        hasPrefill = true;
+                        hasContinuedPrefill = true;
+                        continuedPrefillCandidates.push_back(
+                            {it.first, ctx->longPrefill.ticket});
+                        accumulatePagedManagerNeeds(
+                            outstandingPrefillReservations,
+                            ctx->longPrefill.reservedPages);
+                    } else if (phase == Qwen35RequestPhase::NewPrefill) {
+                        hasPrefill = true;
+                    } else {
+                        currentActivate++;
+                        hasDecode = true;
+                    }
+                } else {
+                    if (ctx->preTokens > 0) {
+                        currentActivate++;
+                    }
+                    if (ctx->preTokens == 0) {
+                        hasPrefill = true;
+                    }
                 }
                 orders.push_back({-scheduledDecodeTokens(ctx), it.first, ctx});
             }
@@ -14238,21 +15167,47 @@ namespace fastllm {
                     pagesLimit = totalPages * 4 / 5;
                 }
             }
-            // A prefetched request owns its hybrid linear-attention state and
-            // MTP rollback snapshots even while it is not selected for the
-            // current decode forward.  Limiting only seqLens below therefore
-            // limits per-step compute, not resident per-request CUDA memory.
-            // Keep excess requests pending before prefill so the number of
-            // resident request states cannot exceed the startup-validated MTP
-            // scheduler capacity.
-            bool canAddPrefill = currentActivate < mtpSchedulerLanes &&
+            // Long-prefill requests own per-context KV, hybrid-state, and MTP
+            // snapshots, while each quantum still runs as a single forward.
+            // Keep decode batching on the startup-validated fast-path width,
+            // but let explicitly enabled interleave admit independently
+            // reserved prefill contexts up to the single-GPU snapshot cap.
+            bool canAddPrefill = CanAdmitQwen35LongPrefill(
+                    currentActivate, longPrefillResidentLanes) &&
                 ((pagesLimit > 0) ? (busyPages < pagesLimit) : true);
+            bool forceDecode = interleaveLongPrefill &&
+                lastQuantumWasLongPrefill && hasDecode;
+            int continuedPrefillHandle = interleaveLongPrefill &&
+                !continuedPrefillCandidates.empty() ?
+                SelectQwen35LongPrefillHandle(
+                    continuedPrefillCandidates, lastLongPrefillTicket) : -1;
+            int newPrefillHandle = -1;
+            int newPrefillTokens = INT_MAX;
+            if (interleaveLongPrefill && canAddPrefill) {
+                for (const auto &item : orders) {
+                    if (item.context == nullptr ||
+                        ClassifyQwen35RequestPhase(*item.context) !=
+                            Qwen35RequestPhase::NewPrefill) {
+                        continue;
+                    }
+                    int promptTokens = (int)item.context->currentTokens.size();
+                    if (promptTokens < newPrefillTokens ||
+                        (promptTokens == newPrefillTokens &&
+                         (newPrefillHandle < 0 || item.handle < newPrefillHandle))) {
+                        newPrefillTokens = promptTokens;
+                        newPrefillHandle = item.handle;
+                    }
+                }
+            }
+            bool canRunPrefill = interleaveLongPrefill ?
+                (!forceDecode && (hasContinuedPrefill || canAddPrefill)) :
+                canAddPrefill;
 
             for (int isPrompt = 1; isPrompt >= 0 && seqLens.empty(); isPrompt--) {
-                if (isPrompt == 1 && !canAddPrefill) {
+                if (isPrompt == 1 && !canRunPrefill) {
                     continue;
                 }
-                if (isPrompt == 0 && hasPrefill && canAddPrefill) {
+                if (isPrompt == 0 && hasPrefill && canRunPrefill) {
                     continue;
                 }
 
@@ -14261,13 +15216,26 @@ namespace fastllm {
                     if (ctx == nullptr || ctx->isEnding) {
                         continue;
                     }
-                    if (isPrompt && ctx->preTokens != 0) {
+                    Qwen35RequestPhase requestPhase = interleaveLongPrefill ?
+                        ClassifyQwen35RequestPhase(*ctx) :
+                        (ctx->preTokens == 0 ? Qwen35RequestPhase::NewPrefill :
+                                               Qwen35RequestPhase::Decode);
+                    bool continuedLongPrefill = interleaveLongPrefill &&
+                        requestPhase == Qwen35RequestPhase::ContinuedPrefill;
+                    if (interleaveLongPrefill && isPrompt) {
+                        int selectedPrefillHandle = newPrefillHandle >= 0 ?
+                            newPrefillHandle : continuedPrefillHandle;
+                        if (selectedPrefillHandle >= 0 && ii.handle != selectedPrefillHandle) {
+                            continue;
+                        }
+                    }
+                    if (isPrompt && requestPhase == Qwen35RequestPhase::Decode) {
                         continue;
                     }
-                    if (!isPrompt && ctx->preTokens == 0) {
+                    if (!isPrompt && requestPhase != Qwen35RequestPhase::Decode) {
                         continue;
                     }
-                    if (isPrompt && ctx->cacheLen == 0 &&
+                    if (isPrompt && !continuedLongPrefill && ctx->cacheLen == 0 &&
                         tryRestorePrefixCache(ctx) < 0) {
                         releaseAndReinitRequest(ctx);
                     }
@@ -14295,14 +15263,42 @@ namespace fastllm {
                     }
 
                     if (!isPrompt) {
-                        auto pageNeeds = collectDecodePageNeeds(ctx);
+                        auto pageNeeds = collectDecodePageNeeds(ctx, scheduledTokens);
+                        if (interleaveLongPrefill &&
+                            !pageNeedsFitWithReservations(
+                                pageNeeds, outstandingPrefillReservations)) {
+                            auto singlePageNeeds = collectDecodePageNeeds(ctx, 1);
+                            if (!pageNeedsFitWithReservations(
+                                    singlePageNeeds, outstandingPrefillReservations)) {
+                                continue;
+                            }
+                            scheduledTokens = 1;
+                            pageNeeds.swap(singlePageNeeds);
+                        }
                         if (!pageNeeds.empty() && hasPagedManagerShortage(pageNeeds)) {
-                            releaseAndReinitRequest(ctx);
-                            continue;
+                            auto singlePageNeeds = collectDecodePageNeeds(ctx, 1);
+                            int budgetedTokens = SelectQwen35DecodeTokensForPageBudget(
+                                scheduledTokens, pageNeedsAndFree(pageNeeds),
+                                pageNeedsAndFree(singlePageNeeds));
+                            if (budgetedTokens == 0) {
+                                releaseAndReinitRequest(ctx);
+                                continue;
+                            }
+                            scheduledTokens = budgetedTokens;
+                            pageNeeds.swap(singlePageNeeds);
                         }
                         if (!pageNeeds.empty()) {
                             auto combinedPageNeeds = selectedDecodePageNeeds;
                             accumulatePagedManagerNeeds(combinedPageNeeds, pageNeeds);
+                            if (interleaveLongPrefill) {
+                                auto reservedCombined = combinedPageNeeds;
+                                accumulatePagedManagerNeeds(
+                                    reservedCombined,
+                                    outstandingPrefillReservations);
+                                if (hasPagedManagerShortage(reservedCombined)) {
+                                    continue;
+                                }
+                            }
                             if (hasPagedManagerShortage(combinedPageNeeds)) {
                                 // This request fits by itself, but not together
                                 // with the requests already selected for this
@@ -14311,6 +15307,70 @@ namespace fastllm {
                                 continue;
                             }
                             selectedDecodePageNeeds.swap(combinedPageNeeds);
+                        }
+                    }
+
+                    if (interleaveLongPrefill && isPrompt &&
+                        ctx->multimodalInput.empty()) {
+                        if (!continuedLongPrefill &&
+                            (int)ctx->currentTokens.size() > prefillChunkSize) {
+                            Qwen35PrefillPageNeed wholeNeed = collectPrefillPageNeeds(
+                                ctx, (int)ctx->currentTokens.size());
+                            if (wholeNeed.impossible ||
+                                !pageNeedsFitWithReservations(
+                                    wholeNeed.needs,
+                                    outstandingPrefillReservations) ||
+                                !BeginQwen35LongPrefill(
+                                    *ctx, (int)ctx->currentTokens.size(),
+                                    ++nextLongPrefillTicket, wholeNeed.needs)) {
+                                continue;
+                            }
+                            continuedLongPrefill = true;
+                        }
+                        if (continuedLongPrefill) {
+                            selectedLongPrefillQuantum =
+                                PlanQwen35LongPrefillQuantum(*ctx, prefillChunkSize);
+                            if (selectedLongPrefillQuantum.length <= 0) {
+                                releaseAndReinitRequest(ctx);
+                                continue;
+                            }
+                            std::map<PagedCacheManager*, int> otherReservations =
+                                outstandingPrefillReservations;
+                            for (const auto &reservation : ctx->longPrefill.reservedPages) {
+                                auto reservationIt = otherReservations.find(reservation.first);
+                                if (reservationIt != otherReservations.end()) {
+                                    reservationIt->second = std::max(
+                                        0, reservationIt->second - reservation.second);
+                                }
+                            }
+                            Qwen35PrefillPageNeed chunkNeed = collectPrefillPageNeeds(
+                                ctx, selectedLongPrefillQuantum.length);
+                            if (chunkNeed.impossible ||
+                                !pageNeedsFitWithReservations(
+                                    chunkNeed.needs, otherReservations)) {
+                                continue;
+                            }
+                            selectedLongPrefill = true;
+                            scheduledTokens = selectedLongPrefillQuantum.length;
+                        } else {
+                            Qwen35PrefillPageNeed shortNeed =
+                                collectPrefillPageNeeds(ctx, scheduledTokens);
+                            if (shortNeed.impossible ||
+                                !pageNeedsFitWithReservations(
+                                    shortNeed.needs,
+                                    outstandingPrefillReservations)) {
+                                continue;
+                            }
+                        }
+                    }
+                    if (interleaveLongPrefill && isPrompt && isMultimodal) {
+                        Qwen35PrefillPageNeed multimodalNeed =
+                            collectPrefillPageNeeds(ctx, scheduledTokens);
+                        if (multimodalNeed.impossible ||
+                            !pageNeedsFitWithReservations(
+                                multimodalNeed.needs,
+                                outstandingPrefillReservations)) {
+                            continue;
                         }
                     }
 
@@ -14324,7 +15384,7 @@ namespace fastllm {
                     selectedMultimodal = isMultimodal;
 
                     if (!isPrompt && !selectedMultimodal && !ctx->currentTokens.empty()) {
-                        int seqLen = scheduledDecodeTokens(ctx);
+                        int seqLen = scheduledTokens;
                         if (seqLen == 1) {
                             ids.push_back((float)ctx->currentTokens[0]);
                             seqLens.push_back(1);
@@ -14372,7 +15432,13 @@ namespace fastllm {
                             ctx->preTokens += seqLen;
                         }
                     } else {
-                        if (ctx->preTokens == 0) {
+                        if (selectedLongPrefill) {
+                            ctx->intParams["add_special_tokens"] =
+                                ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
+                            ctx->intParams["promptLen"] =
+                                ctx->cacheLen + ctx->longPrefill.total;
+                            ctx->intParams["index"] = 0;
+                        } else if (ctx->preTokens == 0) {
                             ctx->intParams["add_special_tokens"] =
                                 ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
                             ctx->intParams["promptLen"] =
@@ -14381,36 +15447,82 @@ namespace fastllm {
                         } else {
                             ctx->intParams["index"]++;
                         }
-                        Data inputIds, attentionMask, curPositionIds;
+                        Data fullInputIds, attentionMask, fullPositionIds;
                         std::vector<std::vector<float> > tokens(1);
                         tokens[0].reserve(ctx->currentTokens.size());
                         for (int token : ctx->currentTokens) {
                             tokens[0].push_back((float)token);
                         }
                         model->FillLLMInputs(tokens, ctx->intParams,
-                                             inputIds, attentionMask, curPositionIds);
+                                             fullInputIds, attentionMask, fullPositionIds);
                         ToDataType(attentionMask, model->dataType);
 
-                        seqLens.push_back(inputIds.Count(0));
-                        for (int i = 0; i < inputIds.Count(0); i++) {
-                            ids.push_back(((float*)inputIds.cpuData)[i]);
-                        }
-                        if (attentionMask.dims.empty()) {
+                        if (selectedLongPrefill) {
+                            int inputStart = selectedLongPrefillQuantum.cursor;
+                            int chunkLen = selectedLongPrefillQuantum.length;
+                            int inputEnd = inputStart + chunkLen;
+                            AssertInFastLLM(fullInputIds.cpuData != nullptr &&
+                                            inputStart >= 0 &&
+                                            inputEnd <= fullInputIds.Count(0),
+                                            "Qwen3.5 interleaved prefill got an invalid input slice.\n");
+                            seqLens.push_back(chunkLen);
+                            const float *fullIds = (const float*)fullInputIds.cpuData;
+                            for (int i = inputStart; i < inputEnd; i++) {
+                                ids.push_back(fullIds[i]);
+                            }
                             attentionMasks.push_back(nullptr);
+                            if (fullPositionIds.dims.empty() ||
+                                fullPositionIds.cpuData == nullptr) {
+                                positionIds.push_back(nullptr);
+                            } else {
+                                int lastDim = fullPositionIds.dims.back();
+                                int outer = fullPositionIds.Count(0) / lastDim;
+                                AssertInFastLLM(inputStart >= 0 &&
+                                                inputEnd <= lastDim,
+                                                "Qwen3.5 interleaved prefill got an invalid position slice.\n");
+                                std::vector<int> outDims = fullPositionIds.dims;
+                                outDims.back() = chunkLen;
+                                positionIds.push_back(new Data());
+                                ownedPositionIds.push_back(positionIds.back());
+                                positionIds.back()->dataType = fullPositionIds.dataType;
+                                positionIds.back()->Resize(outDims);
+                                positionIds.back()->Allocate();
+                                int unitSize = positionIds.back()->unitSize;
+                                int rowBytes = chunkLen * unitSize;
+                                int srcRowBytes = lastDim * unitSize;
+                                const uint8_t *srcPos =
+                                    (const uint8_t*)fullPositionIds.cpuData;
+                                uint8_t *dstPos =
+                                    (uint8_t*)positionIds.back()->cpuData;
+                                for (int row = 0; row < outer; row++) {
+                                    memcpy(dstPos + (size_t)row * rowBytes,
+                                           srcPos + (size_t)row * srcRowBytes +
+                                               (size_t)inputStart * unitSize,
+                                           rowBytes);
+                                }
+                            }
                         } else {
-                            attentionMasks.push_back(new Data());
-                            ownedAttentionMasks.push_back(attentionMasks.back());
-                            attentionMask.ToDevice(DataDevice::CPU);
-                            attentionMasks.back()->CopyFrom(attentionMask);
+                            seqLens.push_back(fullInputIds.Count(0));
+                            for (int i = 0; i < fullInputIds.Count(0); i++) {
+                                ids.push_back(((float*)fullInputIds.cpuData)[i]);
+                            }
+                            if (attentionMask.dims.empty()) {
+                                attentionMasks.push_back(nullptr);
+                            } else {
+                                attentionMasks.push_back(new Data());
+                                ownedAttentionMasks.push_back(attentionMasks.back());
+                                attentionMask.ToDevice(DataDevice::CPU);
+                                attentionMasks.back()->CopyFrom(attentionMask);
+                            }
+                            if (fullPositionIds.dims.empty()) {
+                                positionIds.push_back(nullptr);
+                            } else {
+                                positionIds.push_back(new Data());
+                                ownedPositionIds.push_back(positionIds.back());
+                                positionIds.back()->CopyFrom(fullPositionIds);
+                            }
+                            ctx->preTokens += seqLens.back();
                         }
-                        if (curPositionIds.dims.empty()) {
-                            positionIds.push_back(nullptr);
-                        } else {
-                            positionIds.push_back(new Data());
-                            ownedPositionIds.push_back(positionIds.back());
-                            positionIds.back()->CopyFrom(curPositionIds);
-                        }
-                        ctx->preTokens += seqLens.back();
                     }
 
                     for (int i = 0; i < model->block_cnt; i++) {
@@ -14442,7 +15554,150 @@ namespace fastllm {
                 std::vector<std::vector<int> > nextInputTokenLists;
                 std::vector<int> keptInputLens;
                 bool usedMtpForward = false;
+                bool completedLongPrefillIntermediate = false;
+                bool longPrefillMtpViable = true;
 
+                if (selectedLongPrefill && singleContext != nullptr) {
+                    std::vector<int> mtpDevices;
+                    std::map<int, int> mtpRatios;
+                    bool seedMtp = singleContext->longPrefill.mtpViable &&
+                        !Qwen35MtpDisabledByEnv() &&
+                        Qwen35MtpDraftsPerStep() > 0 &&
+                        model->HasMtpWeights() &&
+                        generationConfigs.size() == 1 &&
+                        Qwen35MtpSupportsGenerationConfig(generationConfigs[0]) &&
+                        !positionIds.empty() && positionIds[0] != nullptr &&
+                        GetQwen35GPUForwardDevices(
+                            model->deviceMap, mtpDevices, mtpRatios) &&
+                        !mtpDevices.empty();
+                    int expectedTokens = selectedLongPrefillQuantum.baseTokens;
+                    if (seedMtp) {
+                        std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                        if (expectedTokens == 0) {
+                            model->mtpCaches.erase(singleContext);
+                        } else {
+                            auto mtpIt = model->mtpCaches.find(singleContext);
+                            seedMtp = mtpIt != model->mtpCaches.end() &&
+                                mtpIt->second.tokens == expectedTokens &&
+                                mtpIt->second.key.dims.size() >= 2 &&
+                                mtpIt->second.value.dims.size() >= 2 &&
+                                mtpIt->second.key.dims[1] == expectedTokens &&
+                                mtpIt->second.value.dims[1] == expectedTokens;
+                        }
+                    }
+
+                    bool oldCaptureAllHiddenStates =
+                        model->speculativeCaptureAllHiddenStates;
+                    model->speculativeCaptureAllHiddenStates = seedMtp;
+                    if (seedMtp) {
+                        model->speculativeHiddenStates.FreeSpace();
+                        model->speculativeHiddenStates.dims.clear();
+                        model->speculativeHiddenStates.strides.clear();
+                        model->speculativeHiddenStates.expansionDims.clear();
+                    }
+                    if (!seedMtp) {
+                        eraseMtpCache(singleContext);
+                    }
+                    try {
+                        ret = model->ForwardGPU(1, inputIds, attentionMasks,
+                                                positionIds, seqLens,
+                                                pastKeyValues, generationConfigs,
+                                                tokensManager, &logits);
+                    } catch (...) {
+                        model->speculativeCaptureAllHiddenStates =
+                            oldCaptureAllHiddenStates;
+                        if (seedMtp) {
+                            eraseMtpCache(singleContext);
+                        }
+                        throw;
+                    }
+                    model->speculativeCaptureAllHiddenStates =
+                        oldCaptureAllHiddenStates;
+                    AssertInFastLLM(!ret.empty(),
+                                    "Qwen3.5 interleaved target prefill returned no token.\n");
+
+                    int firstDraft = -1;
+                    bool mtpSeeded = false;
+                    if (seedMtp) {
+                        AssertInFastLLM(!ret.empty(),
+                                        "Qwen3.5 interleaved prefill returned no token.\n");
+                        std::vector<int> mtpInputTokens(
+                            selectedLongPrefillQuantum.length);
+                        for (int i = 0; i < selectedLongPrefillQuantum.length; i++) {
+                            int globalIndex = selectedLongPrefillQuantum.cursor + i;
+                            int nextIndex = globalIndex + 1;
+                            mtpInputTokens[i] = nextIndex < singleContext->longPrefill.total ?
+                                singleContext->currentTokens[nextIndex] : ret.back();
+                        }
+                        std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                        auto cacheIt = model->mtpCaches.find(singleContext);
+                        if (cacheIt == model->mtpCaches.end()) {
+                            if (expectedTokens == 0) {
+                                cacheIt = model->mtpCaches.emplace(
+                                    singleContext, MtpKvCache()).first;
+                            } else {
+                                seedMtp = false;
+                            }
+                        }
+                        if (seedMtp && cacheIt->second.tokens == expectedTokens) {
+                            try {
+                                firstDraft = model->RunMtpGreedyDraft(
+                                    mtpDevices[0], mtpDevices, cacheIt->second,
+                                    model->speculativeHiddenStates,
+                                    mtpInputTokens, *positionIds[0],
+                                    (int)mtpInputTokens.size() - 1,
+                                    nullptr,
+                                    !selectedLongPrefillQuantum.isLast);
+                            } catch (...) {
+                                model->mtpCaches.erase(singleContext);
+                                throw;
+                            }
+                            int newTokens = expectedTokens +
+                                selectedLongPrefillQuantum.length;
+                            mtpSeeded = cacheIt->second.tokens == newTokens &&
+                                cacheIt->second.key.dims.size() >= 2 &&
+                                cacheIt->second.value.dims.size() >= 2 &&
+                                cacheIt->second.key.dims[1] == newTokens &&
+                                cacheIt->second.value.dims[1] == newTokens;
+                        }
+                        if (!mtpSeeded) {
+                            model->mtpCaches.erase(singleContext);
+                        }
+                    }
+                    longPrefillMtpViable = seedMtp && mtpSeeded;
+                    int physicalTokens = expectedTokens +
+                        selectedLongPrefillQuantum.length;
+                    if (physicalTokens % pageLen == 0) {
+                        singleContext->TryRecordPagedCache(model);
+                    }
+                    if (selectedLongPrefillQuantum.isLast) {
+                        if (longPrefillMtpViable && firstDraft >= 0) {
+                            int nextToken = ret.back();
+                            usedMtpForward = true;
+                            acceptedTokenLists = {{nextToken}};
+                            nextInputTokenLists = {{nextToken, firstDraft}};
+                            keptInputLens = {selectedLongPrefillQuantum.length};
+                        }
+                    } else {
+                        usedMtpForward = true;
+                        completedLongPrefillIntermediate = true;
+                    }
+                    if (model->verbose) {
+                        int doneTokens = selectedLongPrefillQuantum.cursor +
+                            selectedLongPrefillQuantum.length;
+                        printf("[Prompt] Interleaved Long Prefill handle=%d (%d/%d, %d%%).\n",
+                               handles.empty() ? -1 : handles[0],
+                               doneTokens, singleContext->longPrefill.total,
+                               doneTokens * 100 / singleContext->longPrefill.total);
+                        if (selectedLongPrefillQuantum.isLast &&
+                            longPrefillMtpViable && firstDraft >= 0) {
+                            printf("[Qwen3.5 MTP] long prefill cache seeded: tokens=%d.\n",
+                                   selectedLongPrefillQuantum.baseTokens +
+                                   selectedLongPrefillQuantum.length);
+                        }
+                        fflush(stdout);
+                    }
+                } else
                 if (selectedMultimodal && singleContext != nullptr) {
                     ret = model->ForwardMultimodal(
                         inputIds,
@@ -14662,10 +15917,12 @@ namespace fastllm {
                 } else {
                     auto batchStartTime = std::chrono::system_clock::now();
                     if (seqLens.size() > 1) {
-                        usedMtpForward = model->Qwen35MTPBatchForward(
-                            true, tokenContexts, inputIds, attentionMasks, positionIds,
-                            seqLens, pastKeyValues, generationConfigs,
-                            acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                        if (Qwen35BatchedMtpEnabled()) {
+                            usedMtpForward = model->Qwen35MTPBatchForward(
+                                true, tokenContexts, inputIds, attentionMasks, positionIds,
+                                seqLens, pastKeyValues, generationConfigs,
+                                acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                        }
                     } else {
                         usedMtpForward = model->Qwen35MTPForward(
                             true, singleContext, inputIds, attentionMasks, positionIds,
@@ -14756,6 +16013,46 @@ namespace fastllm {
 
                 forwardLocker.unlock();
                 dictLocker.lock();
+                if (selectedLongPrefill && !handles.empty()) {
+                    auto contextIt = model->responseContextDict.dicts.find(handles[0]);
+                    ResponseContext *commitContext =
+                        contextIt == model->responseContextDict.dicts.end() ?
+                        nullptr : contextIt->second;
+                    if (commitContext != singleContext ||
+                        !CommitQwen35LongPrefillQuantum(
+                            *commitContext, selectedLongPrefillQuantum,
+                            longPrefillMtpViable)) {
+                        if (commitContext == singleContext) {
+                            releaseAndReinitRequest(commitContext);
+                        }
+                        completedLongPrefillIntermediate = true;
+                    } else {
+                        lastLongPrefillTicket = commitContext->longPrefill.ticket;
+                        lastQuantumWasLongPrefill = true;
+                        if (commitContext->longPrefill.inProgress) {
+                            int remaining = commitContext->longPrefill.total -
+                                commitContext->longPrefill.cursor;
+                            Qwen35PrefillPageNeed remainingNeed =
+                                collectPrefillPageNeeds(commitContext, remaining);
+                            if (remainingNeed.impossible) {
+                                releaseAndReinitRequest(commitContext);
+                            } else {
+                                commitContext->longPrefill.reservedPages =
+                                    remainingNeed.needs;
+                            }
+                        }
+                    }
+                    if (completedLongPrefillIntermediate) {
+                        acceptedTokenLists.clear();
+                        nextInputTokenLists.clear();
+                        keptInputLens.clear();
+                        handles.clear();
+                        tokenContexts.clear();
+                        selectedIsPrompt = false;
+                    }
+                } else {
+                    lastQuantumWasLongPrefill = false;
+                }
 
                 if (selectedIsPrompt) {
                     for (int i = 0; i < (int)handles.size(); i++) {
@@ -14804,8 +16101,16 @@ namespace fastllm {
                             acceptedTokenLists[i] : emptyAcceptedTokens;
                     for (int tokenIndex = 0; tokenIndex < (int)curAcceptedTokens.size(); tokenIndex++) {
                         int curRet = curAcceptedTokens[tokenIndex];
+                        auto flushPendingStopTokens = [&]() {
+                            FlushPendingStopTokensTo(
+                                ctx->pendingStopTokens,
+                                [&](int token) {
+                                    ctx->resultTokenQueue.push(token);
+                                });
+                        };
                         if (curRet == model->eos_token_id ||
                             model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
+                            flushPendingStopTokens();
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             eraseMtpCache(ctx);
@@ -14813,26 +16118,59 @@ namespace fastllm {
                         }
                         auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
                         if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                            flushPendingStopTokens();
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             eraseMtpCache(ctx);
                             break;
                         }
+                        std::string decodedToken =
+                            model->weight.tokenizer.DecodeTokens({curRet});
+                        std::string safeStopText;
+                        bool matchedStopText = PushStopText(
+                            ctx->generationConfig.stop_strings,
+                            ctx->pendingStopText, decodedToken,
+                            safeStopText);
 
-                        ctx->resultTokenQueue.push(curRet);
-                        if (tokenIndex == 0) {
-                            queueGeneratedResultLogits(ctx, logits, i);
+                        std::vector<int> readyTokens;
+                        int matchedStopLength = PushStopToken(
+                            ctx->generationConfig.stop_token_sequences,
+                            ctx->pendingStopTokens, curRet, readyTokens);
+                        for (int readyIndex = 0;
+                             readyIndex < (int)readyTokens.size();
+                             readyIndex++) {
+                            int readyToken = readyTokens[readyIndex];
+                            ctx->resultTokenQueue.push(readyToken);
+                            if (tokenIndex == 0 && readyIndex == 0) {
+                                queueGeneratedResultLogits(ctx, logits, i);
+                            }
                         }
+
                         ctx->allTokens.push_back(curRet);
                         if (Qwen35NeedRepeatPenalty(ctx->generationConfig)) {
                             ctx->tokens.Push(curRet);
                         }
                         ctx->curTokens++;
-                        if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
+
+                        if (matchedStopText || matchedStopLength > 0) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache(model);
+                            eraseMtpCache(ctx);
+                        } else if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
+                            FlushPendingStopTokens(ctx->pendingStopTokens,
+                                                   readyTokens);
+                            for (int readyToken : readyTokens) {
+                                ctx->resultTokenQueue.push(readyToken);
+                            }
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             eraseMtpCache(ctx);
                         } else if (ctx->allTokens.size() >= model->max_positions) {
+                            FlushPendingStopTokens(ctx->pendingStopTokens,
+                                                   readyTokens);
+                            for (int readyToken : readyTokens) {
+                                ctx->resultTokenQueue.push(readyToken);
+                            }
                             ctx->isEnding = true;
                             ctx->TryRecordPagedCache(model);
                             eraseMtpCache(ctx);
@@ -14910,22 +16248,19 @@ namespace fastllm {
             }
         }
         basellm::InitParams();
-        num_key_value_heads = num_attention_heads;
         if (this->weight.dicts.find("num_key_value_heads") != this->weight.dicts.end()) {
             num_key_value_heads = atoi(this->weight.dicts["num_key_value_heads"].c_str());
         }
-        if (this->weight.dicts.find("linear_num_key_heads") != this->weight.dicts.end()) {
-            num_k_heads = atoi(this->weight.dicts["linear_num_key_heads"].c_str());
-        }
-        if (this->weight.dicts.find("linear_num_value_heads") != this->weight.dicts.end()) {
-            num_v_heads = atoi(this->weight.dicts["linear_num_value_heads"].c_str());
-        }
-        if (this->weight.dicts.find("linear_key_head_dim") != this->weight.dicts.end()) {
-            head_k_dim = atoi(this->weight.dicts["linear_key_head_dim"].c_str());
-        }
-        if (this->weight.dicts.find("linear_value_head_dim") != this->weight.dicts.end()) {
-            head_v_dim = atoi(this->weight.dicts["linear_value_head_dim"].c_str());
-        }
+        ggufNormsPreOffset = getDictValue("ggufNormsPreOffset", "0") == "1";
+        ggufOutProjColumnsTiled = getDictValue("ggufOutProjColumnsTiled", "0") == "1";
+        num_k_heads = atoi(getDictValue("linear_num_key_heads", "0").c_str());
+        num_v_heads = atoi(getDictValue("linear_num_value_heads", "0").c_str());
+        head_k_dim = atoi(getDictValue("linear_key_head_dim", "0").c_str());
+        head_v_dim = atoi(getDictValue("linear_value_head_dim", "0").c_str());
+        AssertInFastLLM(num_k_heads > 0 && num_v_heads > 0 &&
+                        head_k_dim > 0 && head_v_dim > 0 &&
+                        num_v_heads % num_k_heads == 0,
+                        "Qwen3.5 requires valid linear attention head metadata.\n");
         head_dim = embed_dim / num_attention_heads;
         if (this->weight.dicts.find("head_dim") != this->weight.dicts.end()) {
             head_dim = atoi(this->weight.dicts["head_dim"].c_str());
@@ -15896,6 +17231,17 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnModelWeightsLoaded() {
+        for (int i = 0; i < block_cnt; i++) {
+            std::string convWeightName = language_prefix + "layers." +
+                                         std::to_string(i) +
+                                         ".linear_attn.conv1d.weight";
+            auto convIt = weight.weight.find(convWeightName);
+            if (convIt != weight.weight.end() && convIt->second.dims.size() == 2) {
+                const int channels = convIt->second.dims[0];
+                const int kernel = convIt->second.dims[1];
+                convIt->second.Reshape({channels, 1, kernel});
+            }
+        }
         if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
             return;
         }
@@ -17853,14 +19199,16 @@ namespace fastllm {
         PrepareGdnWeights();
 
         if (!initialized_add1) {
-            for (int i = 0; i < block_cnt; i++) {
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
+            if (!ggufNormsPreOffset) {
+                for (int i = 0; i < block_cnt; i++) {
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
+                }
+                Add1(this->weight[language_prefix + "norm.weight"]);
+                AddMtpRmsNormOffset();
             }
-            Add1(this->weight[language_prefix + "norm.weight"]);
-            AddMtpRmsNormOffset();
             initialized_add1 = true;
         }
 
@@ -17928,10 +19276,26 @@ namespace fastllm {
                 v.Reshape(qkvSize);
                 PreparePagedAttentionInputs(q, k, v, this->dataType);
 
+                auto makeCacheDesc = [](const Data &src, DataType targetType) {
+                    Data desc(targetType);
+                    desc.dims = src.dims;
+                    desc.strides = src.strides;
+                    desc.dataDevice = src.dataDevice;
+                    desc.dataDeviceIds = src.dataDeviceIds;
+                    desc.multiDeviceData = src.multiDeviceData;
+                    desc.tpLayout = src.tpLayout;
+                    desc.tpAxis = src.tpAxis;
+                    desc.tpGlobalDims = src.tpGlobalDims;
+                    desc.tpRanges = src.tpRanges;
+                    desc.UpdateUnitSize();
+                    return desc;
+                };
+                Data kCacheDesc = makeCacheDesc(k, pastKey.dataType);
+                Data vCacheDesc = makeCacheDesc(v, pastValue.dataType);
                 PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                 AppendPagedCache(*pagedCacheKManager, pastKey, k);
                 AppendPagedCache(*pagedCacheVManager, pastValue, v);
                 AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
@@ -17958,6 +19322,8 @@ namespace fastllm {
                 std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
                 std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
                 std::string qkvzbaWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvzba.weight";
+                std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
+                std::string zWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_z.weight";
                 std::string conv1dWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight";
                 std::string conv1dBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.bias";
                 std::string aLogName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.A_log";
@@ -17967,9 +19333,17 @@ namespace fastllm {
                 Qwen35PrepareLinearAttentionCache(pastValue, linearCacheType);
 
                 int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
-                int mixedQkvzDim = this->weight[qkvzWeightName].dims[0];
-                int baMergedDim = this->weight[baWeightName].dims[0];
-                bool hasMergedGdnInLinear = this->weight.weight.find(qkvzbaWeightName) != this->weight.weight.end();
+                int mixedQkvzDim = kd * 2 + vd * 2;
+                int baMergedDim = num_v_heads * 2;
+                std::string layerPrefix = language_prefix + "layers." + std::to_string(i) + ".";
+                Qwen35GdnProjectionLayout gdnLayout =
+                    ResolveQwen35GdnProjectionLayout(weight, layerPrefix);
+                AssertInFastLLM(gdnLayout != Qwen35GdnProjectionLayout::Missing,
+                                "Qwen3.5 generic forward requires complete linear attention projection weights.\n");
+                bool hasMergedGdnInLinear =
+                    gdnLayout == Qwen35GdnProjectionLayout::Qkvzba;
+                bool hasSplitQkvZ =
+                    gdnLayout == Qwen35GdnProjectionLayout::QkvZBa;
                 if (hasMergedGdnInLinear && !isSingleTokenDecode &&
                     attenInput.dataDevice == DataDevice::CUDA &&
                     this->weight[qkvzbaWeightName].dataDevice != DataDevice::CUDA) {
@@ -17991,18 +19365,24 @@ namespace fastllm {
                         Split(gdn_in_merged, -1, 0, mixedQkvzDim, mixed_qkvz);
                         Split(gdn_in_merged, -1, mixedQkvzDim, mixedQkvzDim + baMergedDim, ba_merged);
                     }
+                } else if (hasSplitQkvZ) {
+                    Linear(attenInput, weight[qkvWeightName], Data(), qkvConvInput);
+                    Linear(attenInput, weight[zWeightName], Data(), z);
+                    Linear(attenInput, weight[baWeightName], Data(), ba_merged);
                 } else {
                     Linear(attenInput, weight[qkvzWeightName], Data(), mixed_qkvz);
                     Linear(attenInput, weight[baWeightName], Data(), ba_merged);
                 }
 
                 int qkvzDim = kd * 2 + vd;
-                if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
-                    MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
-                    MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
-                } else {
-                    Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
-                    Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                if (!hasSplitQkvZ) {
+                    if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
+                        MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
+                        MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
+                    } else {
+                        Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
+                        Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                    }
                 }
 
                 if (isSingleTokenDecode && CanUseSingleRowLastDimView(ba_merged)) {
@@ -18156,7 +19536,8 @@ namespace fastllm {
                     bool fusedSingleDecode = false;
 #ifdef USE_CUDA
                     fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
-                        q, k, v, g, b, inv_scale_data, rms_norm_eps, last_recurrent_state, core_attn_out
+                        q, k, v, g, b, inv_scale_data, rms_norm_eps,
+                        last_recurrent_state, core_attn_out, false
                     );
 #endif
                     if (!fusedSingleDecode) {
@@ -18185,13 +19566,11 @@ namespace fastllm {
                         Data qrepeat, krepeat;
                         Mul(q, 1.0f, qrepeat);
                         Mul(k, 1.0f, krepeat);
-
+                        // All V-heads are now grouped (load-time untile).
                         qrepeat.Resize({q.dims[0], q.dims[1], q.dims[2], 1, q.dims[3]});
                         krepeat.Resize({k.dims[0], k.dims[1], k.dims[2], 1, k.dims[3]});
-
                         Repeat(qrepeat, 3, num_v_heads / num_k_heads, q);
                         Repeat(krepeat, 3, num_v_heads / num_k_heads, k);
-
                         q.Reshape({q.dims[0], q.dims[1], -1, q.dims.back()});
                         k.Reshape({k.dims[0], k.dims[1], -1, k.dims.back()});
                     }
@@ -18412,6 +19791,10 @@ namespace fastllm {
                 }
 
                 core_attn_out.Reshape({zShape[0], zShape[1], -1});
+                if (ggufOutProjColumnsTiled) {
+                    Qwen35ReorderGroupedToTiled(core_attn_out,
+                                                 num_k_heads, num_v_heads, head_v_dim);
+                }
                 if (isSingleTokenDecode &&
                     core_attn_out.dataDevice == DataDevice::CUDA &&
                     core_attn_out.dataType == DataType::FLOAT16 &&
@@ -18971,14 +20354,16 @@ namespace fastllm {
         PrepareGdnWeights();
 
         if (!initialized_add1) {
-            for (int i = 0; i < block_cnt; i++) {
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
-                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
+            if (!ggufNormsPreOffset) {
+                for (int i = 0; i < block_cnt; i++) {
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
+                    Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
+                }
+                Add1(this->weight[language_prefix + "norm.weight"]);
+                AddMtpRmsNormOffset();
             }
-            Add1(this->weight[language_prefix + "norm.weight"]);
-            AddMtpRmsNormOffset();
             initialized_add1 = true;
         }
 
@@ -19140,15 +20525,25 @@ namespace fastllm {
                 std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
                 std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
                 std::string qkvzbaWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvzba.weight";
+                std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
+                std::string zWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_z.weight";
                 std::string conv1dWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight";
                 std::string conv1dBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.bias";
                 std::string aLogName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.A_log";
                 std::string dtBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.dt_bias";
 
                 int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
-                int mixedQkvzDim = this->weight[qkvzWeightName].dims[0];
-                int baMergedDim = this->weight[baWeightName].dims[0];
-                bool hasMergedGdnInLinear = this->weight.weight.find(qkvzbaWeightName) != this->weight.weight.end();
+                int mixedQkvzDim = kd * 2 + vd * 2;
+                int baMergedDim = num_v_heads * 2;
+                std::string layerPrefix = language_prefix + "layers." + std::to_string(i) + ".";
+                Qwen35GdnProjectionLayout gdnLayout =
+                    ResolveQwen35GdnProjectionLayout(weight, layerPrefix);
+                AssertInFastLLM(gdnLayout != Qwen35GdnProjectionLayout::Missing,
+                                "Qwen3.5 ForwardV2 requires complete linear attention projection weights.\n");
+                bool hasMergedGdnInLinear =
+                    gdnLayout == Qwen35GdnProjectionLayout::Qkvzba;
+                bool hasSplitQkvZ =
+                    gdnLayout == Qwen35GdnProjectionLayout::QkvZBa;
                 if (hasMergedGdnInLinear && !isSingleTokenDecode &&
                     attenInput.dataDevice == DataDevice::CUDA &&
                     this->weight[qkvzbaWeightName].dataDevice != DataDevice::CUDA) {
@@ -19170,19 +20565,25 @@ namespace fastllm {
                         Split(gdn_in_merged, -1, 0, mixedQkvzDim, mixed_qkvz);
                         Split(gdn_in_merged, -1, mixedQkvzDim, mixedQkvzDim + baMergedDim, ba_merged);
                     }
+                } else if (hasSplitQkvZ) {
+                    Linear(attenInput, weight[qkvWeightName], Data(), qkvConvInput);
+                    Linear(attenInput, weight[zWeightName], Data(), z);
+                    Linear(attenInput, weight[baWeightName], Data(), ba_merged);
                 } else {
                     Linear(attenInput, weight[qkvzWeightName], Data(), mixed_qkvz);
                     Linear(attenInput, weight[baWeightName], Data(), ba_merged);
                 }
 
-                // Split qkvz -> mixed_qkv + z
+                // Split qkvz -> mixed_qkv + z when qkvz was loaded as one tensor.
                 int qkvzDim = kd * 2 + vd;
-                if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
-                    MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
-                    MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
-                } else {
-                    Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
-                    Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                if (!hasSplitQkvZ) {
+                    if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
+                        MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
+                        MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
+                    } else {
+                        Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
+                        Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                    }
                 }
 
                 // Split ba -> b + a (note: b and a have dim num_v_heads, not vd).
@@ -19360,7 +20761,7 @@ namespace fastllm {
                             convOutput, ba_merged, inv_scale_data, weight[aLogName], weight[dtBiasName],
                             recurrentStates, core_attn_out,
                             num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-                            rms_norm_eps, recurrentQScale
+                            rms_norm_eps, recurrentQScale, false
                         );
                         for (int rb = 0; rb < batch; rb++) {
                             Qwen35PrepareLinearAttentionCache(*recurrentStates[rb], linearCacheType);
@@ -19415,7 +20816,8 @@ namespace fastllm {
                     bool fusedSingleDecode = false;
 #ifdef USE_CUDA
                     fusedSingleDecode = Qwen35TryCudaLinearAttnSingleDecodeNormRecurrent(
-                        q, k, v, g, b, inv_scale_data, rms_norm_eps, last_recurrent_state, core_attn_out
+                        q, k, v, g, b, inv_scale_data, rms_norm_eps,
+                        last_recurrent_state, core_attn_out, false
                     );
 #endif
                     if (!fusedSingleDecode) {
@@ -19500,13 +20902,11 @@ namespace fastllm {
                         Data qrepeat, krepeat;
                         Mul(q, 1.0f, qrepeat);
                         Mul(k, 1.0f, krepeat);
-
+                        // All V-heads are now grouped (load-time untile).
                         qrepeat.Resize({q.dims[0], q.dims[1], q.dims[2], 1, q.dims[3]});
                         krepeat.Resize({k.dims[0], k.dims[1], k.dims[2], 1, k.dims[3]});
-
                         Repeat(qrepeat, 3, num_v_heads / num_k_heads, q);
                         Repeat(krepeat, 3, num_v_heads / num_k_heads, k);
-
                         q.Reshape({q.dims[0], q.dims[1], -1, q.dims.back()});
                         k.Reshape({k.dims[0], k.dims[1], -1, k.dims.back()});
                     }
@@ -19729,6 +21129,10 @@ namespace fastllm {
                     }
 
                     core_attn_out.Reshape({zShape[0], zShape[1], -1});
+                    if (ggufOutProjColumnsTiled) {
+                        Qwen35ReorderGroupedToTiled(core_attn_out,
+                                                     num_k_heads, num_v_heads, head_v_dim);
+                    }
                     if (isSingleTokenDecode &&
                         core_attn_out.dataDevice == DataDevice::CUDA &&
                         core_attn_out.dataType == DataType::FLOAT16 &&

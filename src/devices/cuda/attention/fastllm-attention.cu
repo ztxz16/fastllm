@@ -1882,6 +1882,14 @@ void FastllmCudaPagedCacheCopy(
     int inputOffset,
     int copyLen,
     int pageOffset) {
+    if (fastllm::IsPackedKVCacheDataType(dstType)) {
+        if (!FastllmCudaPackedKVCacheCopy(
+                pagedData, pageIdx, pageLen, numHeads, headDim, dstType,
+                inputData, srcType, seqLen, inputOffset, copyLen, pageOffset)) {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: packed KV cache copy failed.\n");
+        }
+        return;
+    }
     if (srcType == fastllm::DataType::FLOAT32) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyTyped<float, float>(pagedData, pageIdx, pageLen, numHeads, headDim,
@@ -2024,6 +2032,14 @@ void FastllmCudaPagedCacheCopyBatch(
     uint8_t *inputData,
     fastllm::DataType srcType,
     bool sync) {
+    if (fastllm::IsPackedKVCacheDataType(dstType)) {
+        if (!FastllmCudaPackedKVCacheCopyBatch(
+                pagedData, pageIdxArray, pageOffsetArray, pageLen, batch,
+                numHeads, headDim, dstType, inputData, srcType, sync)) {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: packed KV cache copy failed.\n");
+        }
+        return;
+    }
     if (srcType == fastllm::DataType::FLOAT32) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<float, float>(pagedData, pageIdxArray, pageOffsetArray,
@@ -2371,6 +2387,11 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         printf("DoCudaAttentionPaged: pagedKVCacheData is nullptr\n");
         exit(0);
     }
+    if (fastllm::IsPackedKVCacheDataType(pagedKVCacheK->dataType) ||
+        fastllm::IsPackedKVCacheDataType(pagedKVCacheV->dataType)) {
+        return FastllmCudaHalfPagedAttentionFastllmFallback(
+            q, k, v, output, group, scale);
+    }
     
     int pageLen = k.pageLen;
     int numHeads = pagedKVCacheK->dims[2];  // [maxPages, pageLen, numHeads, headDim]
@@ -2602,6 +2623,22 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
 }
 
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph) {
+    if (FastllmCudaTrySm70PagedAttentionDecode(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType)) {
+        if (sync) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        return true;
+    }
+    if (FastllmCudaTrySm70FlashAttentionPrefill(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType)) {
+        if (sync) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        return true;
+    }
 #ifndef FASTLLM_ENABLE_FLASHINFER
     bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);

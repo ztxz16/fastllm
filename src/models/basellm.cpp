@@ -432,32 +432,36 @@ namespace fastllm {
         }
     }
 
-    void ResponseContext::Init(int blocks, DataType, DataType kvCacheDataType) {
+    void ResponseContext::Init(basellm *model) {
+        AssertInFastLLM(model != nullptr, "ResponseContext::Init requires a model.\n");
         pastKeyValues.clear();
-        // A request owns two cache descriptors per transformer block.  Without
+        // A request owns two cache descriptors per transformer block. Without
         // reserving here, vector growth repeatedly copy-constructs every Data
-        // descriptor already inserted.  Qwen3.5 has enough blocks for that
-        // O(blocks^2) setup work to serialize a burst of HTTP requests and
-        // split one batch into multiple prefills before any GPU work starts.
-        pastKeyValues.reserve(blocks);
-        for (int i = 0; i < blocks; i++) {
+        // descriptor already inserted.
+        pastKeyValues.reserve(model->block_cnt);
+        for (int i = 0; i < model->block_cnt; i++) {
+            auto types = model->GetKVCacheDataTypes(i);
             pastKeyValues.emplace_back(
                 std::piecewise_construct,
-                std::forward_as_tuple(kvCacheDataType),
-                std::forward_as_tuple(kvCacheDataType));
+                std::forward_as_tuple(types.first),
+                std::forward_as_tuple(types.second));
             pastKeyValues.back().first.SetKVCache();
             pastKeyValues.back().second.SetKVCache();
         }
         intParams.clear();
         toolCallConstraintGeneratedText.clear();
+        pendingStopTokens.clear();
+        pendingStopText.clear();
         currentTokens.clear();
         allTokens.clear();
-        while (resultTokenQueue.size() > 0){
+        while (resultTokenQueue.size() > 0) {
             resultTokenQueue.pop();
         }
         isEnding = false;
-        preTokens = 0;
+        isAbort = false;
+        longPrefill.Reset();
     }
+
 
     void ResponseContext::TryRecord(basellm *model) {
         model->TryRecordResponseContext(this);
@@ -2791,7 +2795,7 @@ namespace fastllm {
         dictLocker.lock();
         int handleId = responseContextDict.CreateHandle();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
-        context->Init(this->block_cnt, this->dataType, this->kvCacheDataType);
+        context->Init(this);
         context->inputTokens = (int)inputTokens.size();
         context->currentTokens = inputTokens;
         context->allTokens = inputTokens;
@@ -3116,6 +3120,36 @@ namespace fastllm {
 
     int basellm::GetBatchedPrefillTokenLimit() {
         return this->GetChunkedPrefillSize();
+    }
+
+    DataType ParseKVCacheDataType(const std::string &value) {
+        if (value.empty() || value == "auto") {
+            return DataType::DATA_AUTO_NONE;
+        }
+        if (value == "float" || value == "float32") {
+            return DataType::FLOAT32;
+        }
+        if (value == "half" || value == "float16") {
+            return DataType::FLOAT16;
+        }
+        if (value == "bf16" || value == "bfloat16") {
+            return DataType::BFLOAT16;
+        }
+        if (value == "fp8" || value == "float8" || value == "fp8_e4m3") {
+            return DataType::FP8_E4M3;
+        }
+        if (value == "turbo3" || value == "turbo3_kv") {
+            return DataType::TURBO3_KV;
+        }
+        throw std::invalid_argument(
+            "KV cache dtype should be auto, float32, float16, bfloat16, fp8_e4m3 or turbo3.");
+    }
+
+    void basellm::SetTokenLimit(int tokens) {
+        this->tokensLimit = tokens;
+        if (tokens > 0) {
+            fastllm::SetMaxTokens(tokens);
+        }
     }
 
     void basellm::SetDataType(DataType dataType) {
@@ -3654,7 +3688,11 @@ namespace fastllm {
             std::vector <std::pair <Data, Data> > weightWarmupPastKeyValuesStorage;
             std::vector <std::pair <Data*, Data*> > weightWarmupPastKeyValues;
             for (int i = 0; i < block_cnt; i++) {
-                weightWarmupPastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+                auto types = this->GetKVCacheDataTypes(i);
+                weightWarmupPastKeyValuesStorage.emplace_back(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(types.first),
+                    std::forward_as_tuple(types.second));
                 weightWarmupPastKeyValuesStorage.back().first.SetKVCache();
                 weightWarmupPastKeyValuesStorage.back().second.SetKVCache();
             }
@@ -3698,7 +3736,11 @@ namespace fastllm {
         std::vector <std::pair <Data, Data> > pastKeyValuesStorage;
         std::vector <std::pair <Data*, Data*> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+            auto types = this->GetKVCacheDataTypes(i);
+            pastKeyValuesStorage.emplace_back(
+                std::piecewise_construct,
+                std::forward_as_tuple(types.first),
+                std::forward_as_tuple(types.second));
             pastKeyValuesStorage.back().first.SetKVCache();
             pastKeyValuesStorage.back().second.SetKVCache();
         }
@@ -3720,7 +3762,7 @@ namespace fastllm {
         elementsInKVCachePerToken = 0;
         bool foundTokenGrowingCache = false;
         bool hasCudaTokenGrowingCache = false;
-        std::vector <long long> layerElementsPerToken(block_cnt, 0);
+        std::vector <long long> layerKeyElementsPerToken(block_cnt, 0), layerValueElementsPerToken(block_cnt, 0);
         int tokenGrowingLayerCount = 0, linearLayerCount = 0;
         int boundedLayerCount = 0;
         long long linearFixedBytes = 0;
@@ -3843,15 +3885,23 @@ namespace fastllm {
                 foundTokenGrowingCache = true;
             }
 
-            layerElementsPerToken[i] =
-                (long long)pastKey.dims[0] * pastKey.dims[2] +
+            layerKeyElementsPerToken[i] =
+                (long long)pastKey.dims[0] * pastKey.dims[2];
+            layerValueElementsPerToken[i] =
                 (long long)pastValue.dims[0] * pastValue.dims[2];
-            elementsInKVCachePerToken += layerElementsPerToken[i];
+            elementsInKVCachePerToken +=
+                layerKeyElementsPerToken[i] + layerValueElementsPerToken[i];
         }
 
         long long bytesPerToken = 0;
-        if (elementsInKVCachePerToken > 0) {
-            bytesPerToken = GetDataBytes(this->kvCacheDataType, 1, elementsInKVCachePerToken);
+        for (int i = 0; i < block_cnt; i++) {
+            if (layerKeyElementsPerToken[i] <= 0 || layerValueElementsPerToken[i] <= 0) {
+                continue;
+            }
+            bytesPerToken += GetDataBytes(pastKeyValuesStorage[i].first.dataType, 1,
+                                          layerKeyElementsPerToken[i]);
+            bytesPerToken += GetDataBytes(pastKeyValuesStorage[i].second.dataType, 1,
+                                          layerValueElementsPerToken[i]);
         }
         if (autoCalcPages) {
             printf("[Fastllm] AutoWarmup stats: tokenGrowingLayers=%d, boundedLayers=%d, linearLayers=%d, fixedCachePerRequest=%.2f MB, kvBytesPerToken=%.2f KB, firstKVLayer=%d.\n",
@@ -3897,7 +3947,11 @@ namespace fastllm {
             pastKeyValues.reserve((size_t)batch * block_cnt);
             for (int b = 0; b < batch; b++) {
                 for (int i = 0; i < block_cnt; i++) {
-                    pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+                    auto types = this->GetKVCacheDataTypes(i);
+                    pastKeyValuesStorage.emplace_back(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(types.first),
+                        std::forward_as_tuple(types.second));
                     pastKeyValuesStorage.back().first.SetKVCache();
                     pastKeyValuesStorage.back().second.SetKVCache();
                     pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
@@ -3994,25 +4048,29 @@ namespace fastllm {
             std::map <int, long long> deviceDelayedCacheBytesPerPage;
             std::map <int, int> deviceLayerCount;
             auto updateDelayedCacheReserve = [&](int id,
+                                                 DataType keyType,
                                                  long long keyElementsPerToken,
+                                                 DataType valueType,
                                                  long long valueElementsPerToken) {
                 if (id < 0 || keyElementsPerToken <= 0 || valueElementsPerToken <= 0) {
                     return;
                 }
-                long long keyBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, keyElementsPerToken);
-                long long valueBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, valueElementsPerToken);
+                long long keyBytesPerPage = GetDataBytes(keyType, pageLen, keyElementsPerToken);
+                long long valueBytesPerPage = GetDataBytes(valueType, pageLen, valueElementsPerToken);
                 long long layerPairBytesPerPage = keyBytesPerPage + valueBytesPerPage;
                 deviceDelayedCacheBytesPerPage[id] =
                     std::max(deviceDelayedCacheBytesPerPage[id], layerPairBytesPerPage);
             };
             for (int i = 0; i < block_cnt; i++) {
-                if (layerElementsPerToken[i] <= 0) {
+                if (layerKeyElementsPerToken[i] <= 0 || layerValueElementsPerToken[i] <= 0) {
                     continue;
                 }
                 auto &pastKey = pastKeyValuesStorage[i].first;
                 auto &pastValue = pastKeyValuesStorage[i].second;
                 bool accountedByLocalShard = false;
-                long long layerBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, layerElementsPerToken[i]);
+                long long layerBytesPerPage =
+                    GetDataBytes(pastKey.dataType, pageLen, layerKeyElementsPerToken[i]) +
+                    GetDataBytes(pastValue.dataType, pageLen, layerValueElementsPerToken[i]);
 
                 if (pastKey.multiDeviceData && pastValue.multiDeviceData &&
                     !pastKey.multiDeviceDatas.empty() && !pastValue.multiDeviceDatas.empty()) {
@@ -4034,12 +4092,13 @@ namespace fastllm {
                             (long long)localKey->dims[0] * localKey->dims[2];
                         long long localValueElementsPerToken =
                             (long long)localValue->dims[0] * localValue->dims[2];
-                        long long localElementsPerToken =
-                            localKeyElementsPerToken + localValueElementsPerToken;
-                        long long localBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, localElementsPerToken);
+                        long long localBytesPerPage =
+                            GetDataBytes(localKey->dataType, pageLen, localKeyElementsPerToken) +
+                            GetDataBytes(localValue->dataType, pageLen, localValueElementsPerToken);
                         deviceIds.insert(id);
                         deviceBytesPerPage[id] += localBytesPerPage;
-                        updateDelayedCacheReserve(id, localKeyElementsPerToken, localValueElementsPerToken);
+                        updateDelayedCacheReserve(id, localKey->dataType, localKeyElementsPerToken,
+                                                  localValue->dataType, localValueElementsPerToken);
                         deviceLayerCount[id]++;
                         accountedByLocalShard = true;
                     }
@@ -4057,7 +4116,8 @@ namespace fastllm {
                         deviceBytesPerPage[id] += layerBytesPerPage;
                         long long keyElementsPerToken = (long long)pastKey.dims[0] * pastKey.dims[2];
                         long long valueElementsPerToken = (long long)pastValue.dims[0] * pastValue.dims[2];
-                        updateDelayedCacheReserve(id, keyElementsPerToken, valueElementsPerToken);
+                        updateDelayedCacheReserve(id, pastKey.dataType, keyElementsPerToken,
+                                                  pastValue.dataType, valueElementsPerToken);
                         deviceLayerCount[id]++;
                     }
                 }
