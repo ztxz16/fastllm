@@ -62,6 +62,7 @@ class KimiK3ToolParser(ToolParser):
 
         self.tools_open = "<|open|>tools<|sep|>"
         self.tools_close = "<|close|>tools<|sep|>"
+        self.call_open = "<|open|>call"
         self.response_open = "<|open|>response<|sep|>"
         self.response_close = "<|close|>response<|sep|>"
         self.tool_call_start_token = self.tools_open
@@ -70,6 +71,8 @@ class KimiK3ToolParser(ToolParser):
             _OPEN + r"\s*tools\s*" + _SEP)
         self._tools_close_re = re.compile(
             _CLOSE + r"\s*tools\s*" + _SEP)
+        self._call_open_re = re.compile(
+            _OPEN + r"\s*call(?:\s|" + _SEP + r")")
         self._response_open_re = re.compile(
             _OPEN + r"\s*response\s*" + _SEP)
         self._response_close_re = re.compile(
@@ -135,16 +138,17 @@ class KimiK3ToolParser(ToolParser):
                 "constructor during construction.")
 
     def has_tool_call(self, text: str) -> bool:
-        return self._tools_open_re.search(text) is not None
+        return (
+            self._tools_open_re.search(text) is not None
+            or self._call_open_re.search(text) is not None
+        )
 
     def get_token_ids(self, text: str) -> list[int]:
-        try:
-            return self.model_tokenizer.encode(
-                text, add_special_tokens=False)
-        except Exception:
-            # FunctionCallParser only uses these ids for parsers whose state is
-            # token-count based.  K3's parser is accumulated-text based.
-            return [1]
+        # K3 parses accumulated XTML text and never inspects token ids.  Avoid
+        # re-tokenizing every streamed fragment: the custom Kimi tokenizer
+        # deliberately warns whenever Hugging Face's add_special_tokens
+        # argument sends encode() through its generic compatibility path.
+        return [1]
 
     def _attributes(self, text: str) -> dict[str, str]:
         return {
@@ -231,12 +235,13 @@ class KimiK3ToolParser(ToolParser):
         response_open = self._response_open_re.search(current_text)
         body_start = response_open.end() if response_open is not None else 0
         tools_open = self._tools_open_re.search(current_text, body_start)
+        call_open = self._call_open_re.search(current_text, body_start)
         response_close = self._response_close_re.search(
             current_text, body_start)
 
         terminal_positions = [
             match.start()
-            for match in (tools_open, response_close)
+            for match in (tools_open, call_open, response_close)
             if match is not None
         ]
         if terminal_positions:
@@ -246,6 +251,7 @@ class KimiK3ToolParser(ToolParser):
                 _partial_marker_overlap(current_text, self.response_open),
                 _partial_marker_overlap(current_text, self.response_close),
                 _partial_marker_overlap(current_text, self.tools_open),
+                _partial_marker_overlap(current_text, self.call_open),
             )
             sendable_index = len(current_text) - overlap
 
@@ -267,7 +273,8 @@ class KimiK3ToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
         tools_open = self._tools_open_re.search(model_output)
-        if tools_open is None:
+        call_open = self._call_open_re.search(model_output)
+        if tools_open is None and call_open is None:
             return ExtractedToolCallInformation(
                 tools_called=False,
                 tool_calls=[],
@@ -275,8 +282,12 @@ class KimiK3ToolParser(ToolParser):
             )
 
         try:
-            before_tools = model_output[:tools_open.start()]
-            section_start = tools_open.end()
+            wrapper = tools_open if tools_open is not None else call_open
+            before_tools = model_output[:wrapper.start()]
+            section_start = (
+                tools_open.end() if tools_open is not None
+                else call_open.start()
+            )
             tools_close = self._tools_close_re.search(
                 model_output, section_start)
             section = (
@@ -317,10 +328,15 @@ class KimiK3ToolParser(ToolParser):
         # safe, including chunks that end halfway through a control marker.
         content = self._extract_stream_content(current_text)
         tools_open = self._tools_open_re.search(current_text)
-        if tools_open is None:
+        call_open = self._call_open_re.search(current_text)
+        if tools_open is None and call_open is None:
             return DeltaMessage(content=content) if content else None
 
-        section = current_text[tools_open.end():]
+        section_start = (
+            tools_open.end() if tools_open is not None
+            else call_open.start()
+        )
+        section = current_text[section_start:]
         calls = [
             tool_call
             for match in self._call_re.finditer(section)
