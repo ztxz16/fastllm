@@ -2915,12 +2915,15 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
 }
 
 // 功能：将所有卡上的 data 数据进行 Sum 求和，结果保存在 dest 中 (支持 in-place，即 data == dest)
-void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {
+static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
+                                    int dataType, int deviceId,
+                                    bool allowCustomAllReduce) {
     if (data == nullptr || dest == nullptr || count <= 0) {
         return;
     }
 
-    if (FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId)) {
+    if (allowCustomAllReduce &&
+        FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId)) {
         return;
     }
 
@@ -2981,6 +2984,15 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
         cudaError_t syncState = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL allreduce!", syncState);
     }
+}
+
+void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {
+    FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, true);
+}
+
+void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
+                                  int dataType, int deviceId) {
+    FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
 }
 
 // Sums all ranks but materializes the result only on root.  This is preferable

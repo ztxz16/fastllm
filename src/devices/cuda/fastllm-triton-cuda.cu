@@ -1553,6 +1553,7 @@ static bool LaunchTritonMergeMOEFP8E4M3Table(
     int32_t interArg = inter;
     CUdeviceptr globalScratch = 0;
     CUdeviceptr profileScratch = 0;
+    CUstream stream = reinterpret_cast<CUstream>(cudaStreamPerThread);
     auto launchTriton = [&](int kernelId, unsigned int gridX, unsigned int gridY, unsigned int gridZ,
                             void **args) -> CUresult {
         return LaunchTritonKernel(
@@ -1560,7 +1561,7 @@ static bool LaunchTritonMergeMOEFP8E4M3Table(
             gridX, gridY, gridZ,
             (unsigned int)(numWarps[kernelId] * 32),
             (unsigned int)shared[kernelId],
-            args);
+            args, stream);
     };
 
     CUresult result = CUDA_SUCCESS;

@@ -1508,7 +1508,7 @@ namespace fastllm {
 
     static bool RunCudaTritonLinearFp8Block128(
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
-        if (!GetFastllmEnv().cudaTriton ||
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
             !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8", true)) {
             return false;
         }
@@ -1711,7 +1711,7 @@ namespace fastllm {
 
     static bool TryCudaTritonLinearFp8Block128(
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
-        if (!GetFastllmEnv().cudaTriton ||
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
             !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8", true)) {
             return false;
         }
@@ -1840,7 +1840,7 @@ namespace fastllm {
     static bool TryCudaTritonChunkGdnPrefill(
         Data &q, Data &k, Data &v, Data &g, Data &attn,
         Data &kCumdecay, Data &lastRecurrentState, Data &coreAttnOut) {
-        if (!GetFastllmEnv().cudaTriton ||
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
             !CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL", true)) {
             return false;
@@ -1943,7 +1943,7 @@ namespace fastllm {
         int kDim, int vDim, float qScale,
         Data &q, Data &k, Data &v, Data &g, Data &beta,
         Data &kBeta, Data &vBeta) {
-        if (!GetFastllmEnv().cudaTriton ||
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
             !CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV", true)) {
             return false;
@@ -2032,7 +2032,7 @@ namespace fastllm {
 
     bool FastllmCudaTryTritonDeepSeekV4WoA(
         const Data &input, Data &weight, int groups, int oRank, Data &output) {
-        if (!GetFastllmEnv().cudaTriton ||
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
             !CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_FP8_WOA", true)) {
             return false;
@@ -2096,7 +2096,7 @@ namespace fastllm {
         const Data &q, const Data &windowKV, const Data &compressedKV,
         const Data &attnSink, int windowSize, int compressRatio,
         const int32_t *decodeMeta, float softmaxScale, float *output) {
-        if (!GetFastllmEnv().cudaTriton ||
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
             !CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_SPARSE_DECODE", true)) {
             return false;
@@ -2169,7 +2169,7 @@ namespace fastllm {
     static bool TryCudaTritonMergeMOEFp8Indexed(
         Data &input, Data &output, Data &index, Data &score, int batch, int topk,
         Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
-        if (!GetFastllmEnv().cudaTriton) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) {
             return false;
         }
         const char *moeEnv = std::getenv("FASTLLM_CUDA_TRITON_MERGE_MOE");
@@ -2282,7 +2282,7 @@ namespace fastllm {
         Data &gate, Data &up, Data &down, Data &w1,
         int batch, int topk, int hidden, int inter, int experts,
         MoeGateType gateType, float swigluLimit) {
-        if (!GetFastllmEnv().cudaTriton) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) {
             return false;
         }
         const char *moeEnv = std::getenv("FASTLLM_CUDA_TRITON_MERGE_MOE");
@@ -4579,7 +4579,9 @@ namespace fastllm {
         AssertInFastLLM(aLogData.dataType == DataType::FLOAT32 && dtBiasData.dataType == DataType::FLOAT32,
                         "CudaMambaSoftplusOp error: alog's type and dtbias's type should be float32.\n");
         
-        FastllmCudaMambaSoftplus(input, output, aLogData, dtBiasData);
+        float outputScale = floatParams.find("outputScale") != floatParams.end() ?
+            floatParams.find("outputScale")->second : 1.0f;
+        FastllmCudaMambaSoftplus(input, output, aLogData, dtBiasData, outputScale);
     }
 
     void CudaSigmoidMambaSoftplusOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -5066,6 +5068,15 @@ namespace fastllm {
             floatParams.find("llama3LowFreqFactor")->second : 1.0f;
         float llama3HighFreqFactor = floatParams.find("llama3HighFreqFactor") != floatParams.end() ?
             floatParams.find("llama3HighFreqFactor")->second : 32.0f;
+        int useYarn = intParams.find("useYarn") != intParams.end() ? intParams.find("useYarn")->second : 0;
+        float yarnFactor = floatParams.find("yarnFactor") != floatParams.end() ?
+            floatParams.find("yarnFactor")->second : 1.0f;
+        float yarnAttentionFactor = floatParams.find("yarnAttentionFactor") != floatParams.end() ?
+            floatParams.find("yarnAttentionFactor")->second : 1.0f;
+        float yarnCorrectionLow = floatParams.find("yarnCorrectionLow") != floatParams.end() ?
+            floatParams.find("yarnCorrectionLow")->second : 0.0f;
+        float yarnCorrectionHigh = floatParams.find("yarnCorrectionHigh") != floatParams.end() ?
+            floatParams.find("yarnCorrectionHigh")->second : 1.0f;
 
         AssertInFastLLM(batch > 0 && pageLen > 0,
                         "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: batch and pageLen must be positive.\n");
@@ -5124,7 +5135,9 @@ namespace fastllm {
             q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
             pageLen, maxPages, pagedKCacheData.dataType, batch, doQKNorm,
             useLlama3, llama3Factor, llama3OriginalMaxPosition,
-            llama3LowFreqFactor, llama3HighFreqFactor),
+            llama3LowFreqFactor, llama3HighFreqFactor,
+            useYarn, yarnFactor, yarnAttentionFactor,
+            yarnCorrectionLow, yarnCorrectionHigh),
             "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: CUDA fused append failed.\n");
     }
 
@@ -6739,7 +6752,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 
     void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
                         Data &gate, Data &up, Data &down, Data &w1,
-                        MoeGateType gateType, float swigluLimit) {
+                        MoeGateType gateType, float swigluLimit,
+                        bool allowTriton) {
         if (gateType != MoeGateSwiglu) {
             ErrorInFastLLM("CudaFusedMOE only supports swiglu gate type.\n");
         }
@@ -6800,7 +6814,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         clearIfOnOtherDevice(w1);
         clearIfOnOtherDevice(output);
 
-        if (isFp8 &&
+        if (allowTriton && isFp8 &&
             TryCudaTritonFusedMOEFp8(input, output, index, score, gate, up, down, w1,
                                      batch, topk, hidden, inter, experts, gateType, swigluLimit)) {
             return;
@@ -6854,7 +6868,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
         float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
             floatParams.find("swigluLimit")->second : 0.0f;
-        DoCudaFusedMOE(input, output, index, score, gate, up, down, w1, gateType, swigluLimit);
+        bool allowTriton = intParams.find("allowTriton") == intParams.end() ||
+                           intParams.find("allowTriton")->second != 0;
+        DoCudaFusedMOE(input, output, index, score, gate, up, down, w1,
+                       gateType, swigluLimit, allowTriton);
     }
 
     void CudaMergeAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -7294,8 +7311,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         FastllmCudaCopyFromHostToDevice(insertPositions.cudaData, (void*)posDataHost.data(), batch * sizeof(int32_t));
     }
 
-    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1) {
-        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph);
+    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1) {
+        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph, windowLeft);
     }
 
     void CudaAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -7315,8 +7332,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         bool sync = intParams.find("sync") != intParams.end() ? (intParams.find("sync")->second != 0) : true;
         bool enableCudaGraph = intParams.find("enableCudaGraph") != intParams.end() ? (intParams.find("enableCudaGraph")->second != 0) : false;
         int flashInferCudaGraph = intParams.find("flashInferCudaGraph") != intParams.end() ? intParams.find("flashInferCudaGraph")->second : -1;
+        int windowLeft = intParams.find("windowLeft") != intParams.end() ? intParams.find("windowLeft")->second : -1;
         output.Allocate(false);
-        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph);
+        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph, windowLeft);
     }
 
     void CudaGeneratePagedBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,

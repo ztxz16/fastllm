@@ -88,6 +88,9 @@ CudaInfos *getCudaInfos();
 
 // FlashInfer attention requires compute capability >= 7.5 (Turing+).
 bool FastllmCudaFlashInferSupported();
+// BF16 FlashInfer kernels additionally require SM80; FP16 remains available
+// from SM75. Other compute types are rejected.
+bool FastllmCudaFlashInferDataTypeSupported(fastllm::DataType dataType);
 
 void *FastllmCudaPrepareInput(const fastllm::Data &input);
 void *FastllmCudaPrepareOutput(fastllm::Data &output);
@@ -157,6 +160,10 @@ bool FastllmCudaGraphMemoryPoolBegin();
 bool FastllmCudaGraphMemoryPoolEnd(std::vector<void*> &reservedPointers);
 void FastllmCudaGraphMemoryPoolAbort();
 void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointers);
+// Returns a valid device address only after an allocation failure in a managed
+// whole-step capture. Kernels may retain this address while the failed capture
+// is completed and discarded, but it must never be launched or freed by Data.
+bool FastllmCudaGraphGetAllocationFailurePlaceholder(void **ptr);
 
 // 线程级 CUDA 错误标志：showError 报错时置位；graph 捕获路径用于错误熔断。
 void FastllmCudaClearThreadError();
@@ -183,7 +190,7 @@ void FastllmCudaSetNcclForceSync(bool value);
 bool FastllmCudaGetNcclForceSync();
 void FastllmCudaSetWeightSlabBytes(size_t bytes);
 size_t FastllmCudaGetWeightSlabBytes();
-void *FastllmCudaMallocModelWeight(size_t size);
+void *FastllmCudaMallocModelWeight(size_t size, const std::string &name);
 void FastllmCudaMemPoolStats();
 void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
@@ -316,7 +323,7 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
-bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData);
+bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale = 1.0f);
 bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput, fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData);
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output);
@@ -640,7 +647,11 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int useLlama3 = 0, float llama3Factor = 1.0f,
     float llama3OriginalMaxPosition = 131072.0f,
     float llama3LowFreqFactor = 1.0f,
-    float llama3HighFreqFactor = 32.0f);
+    float llama3HighFreqFactor = 32.0f,
+    int useYarn = 0, float yarnFactor = 1.0f,
+    float yarnAttentionFactor = 1.0f,
+    float yarnCorrectionLow = 0.0f,
+    float yarnCorrectionHigh = 1.0f);
 bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
     fastllm::Data &qgatekv, fastllm::Data &qNormWeight, fastllm::Data &kNormWeight,
     const fastllm::Data &positionIds,
@@ -699,7 +710,7 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
 bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType);
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1);
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
 bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo, bool allowRouterSpecialization);
 bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k);

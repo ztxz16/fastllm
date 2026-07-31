@@ -38,6 +38,10 @@ bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId);
 void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, int root, int deviceId);
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
+// Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
+// prefill tensors can be bandwidth-bound on the direct-peer implementation
+// even though it is faster for decode tensors.
+void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.
 // Callers use this preflight to preserve their existing NCCL fallback without
 // first changing the reduction's compute or accumulation order.

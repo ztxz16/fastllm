@@ -44,6 +44,43 @@ static thread_local bool fastllmCudaThreadErrorFlag = false;
 // NCCL, or custom kernels, so retain a capture-epoch aggregate as well.
 static std::atomic<bool> fastllmCudaGraphErrorFlag(false);
 
+namespace {
+    // A pool miss must not unwind one tensor-parallel rank while its peers are
+    // still recording NCCL collectives. CUDA capture records kernel arguments
+    // without executing them, so a small, process-lifetime address can carry the
+    // failed rank to the common post-body abort barrier. Managed whole-step
+    // callers check the graph error flag before instantiation, guaranteeing
+    // that a graph containing this address is never launched.
+    static std::mutex fastllmCudaGraphAllocationFailurePlaceholderMutex;
+    static std::map<int, void*>
+        fastllmCudaGraphAllocationFailurePlaceholders;
+
+    static cudaError_t FastllmCudaGraphPrepareAllocationFailurePlaceholder() {
+        int device = -1;
+        cudaError_t state = cudaGetDevice(&device);
+        if (state != cudaSuccess) {
+            return state;
+        }
+        std::lock_guard<std::mutex> guard(
+            fastllmCudaGraphAllocationFailurePlaceholderMutex);
+        if (fastllmCudaGraphAllocationFailurePlaceholders.find(device) !=
+                fastllmCudaGraphAllocationFailurePlaceholders.end()) {
+            return cudaSuccess;
+        }
+        // Keep one tiny process-lifetime allocation per device. It is resolved
+        // before stream capture and intentionally stays outside FastLLM's
+        // reusable pool, so a failed Data owner can mark it borrowed without
+        // affecting allocator ownership. This also works on the ROCm build,
+        // where runtime symbol-address lookup is unavailable.
+        void *ptr = nullptr;
+        state = FastllmCudaCheckedMalloc(&ptr, 256, __FILE__, __LINE__);
+        if (state == cudaSuccess && ptr != nullptr) {
+            fastllmCudaGraphAllocationFailurePlaceholders[device] = ptr;
+        }
+        return state;
+    }
+}
+
 void FastllmCudaClearThreadError() {
     fastllmCudaThreadErrorFlag = false;
 }
@@ -489,6 +526,26 @@ bool FastllmCudaFlashInferSupported() {
     return supported;
 }
 
+bool FastllmCudaFlashInferDataTypeSupported(fastllm::DataType dataType) {
+    if (!FastllmCudaFlashInferSupported()) {
+        return false;
+    }
+    if (dataType == fastllm::DataType::FLOAT16) {
+        return true;
+    }
+    if (dataType != fastllm::DataType::BFLOAT16) {
+        return false;
+    }
+
+    int dev = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        return false;
+    }
+    return major * 10 + minor >= 80;
+}
+
 void DeviceSync() {
     if (fastllm::GetFastllmEnv().cudaSync) {
         cudaDeviceSynchronize();
@@ -587,7 +644,18 @@ static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
 }
 
 bool FastllmCudaGraphBeginCapture() {
-    cudaError_t state = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+    cudaError_t state = cudaSuccess;
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
+        // Allocate the process-lifetime failure address before capture; even a
+        // tiny cudaMalloc is forbidden once stream capture has begun.
+        state = FastllmCudaGraphPrepareAllocationFailurePlaceholder();
+        if (state != cudaSuccess) {
+            return FastllmCudaGraphSetError(
+                "prepare allocation-failure placeholder", state);
+        }
+    }
+    state = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
     bool ok = FastllmCudaGraphSetError("cudaStreamBeginCapture", state);
     if (ok && fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
                   FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
@@ -617,6 +685,31 @@ bool FastllmCudaGraphIsCapturing() {
         return false;
     }
     return captureStatus != cudaStreamCaptureStatusNone;
+}
+
+bool FastllmCudaGraphGetAllocationFailurePlaceholder(void **ptr) {
+    if (ptr == nullptr) {
+        return false;
+    }
+    *ptr = nullptr;
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) !=
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING ||
+        !FastllmCudaGetThreadError() || !FastllmCudaGraphIsCapturing()) {
+        return false;
+    }
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(
+        fastllmCudaGraphAllocationFailurePlaceholderMutex);
+    auto it = fastllmCudaGraphAllocationFailurePlaceholders.find(device);
+    if (it == fastllmCudaGraphAllocationFailurePlaceholders.end()) {
+        return false;
+    }
+    *ptr = it->second;
+    return *ptr != nullptr;
 }
 
 namespace {
@@ -1449,17 +1542,17 @@ __device__ __forceinline__ float softplus_fast(float x) {
     return __logf(1.0f + __expf(x));
 }
 
-__global__ void FastllmMambaSoftplusKernel(float* inputData, float *outputData, float *aLog, float *dtBias, int channels) {
+__global__ void FastllmMambaSoftplusKernel(float* inputData, float *outputData, float *aLog, float *dtBias, int channels, float outputScale) {
     int o = blockIdx.x;
     for (int i = threadIdx.x; i < channels; i += blockDim.x) {
-        outputData[o * channels + i] = -expf((double)aLog[i]) * softplus(inputData[o * channels + i] + dtBias[i]);
+        outputData[o * channels + i] = outputScale * -expf((double)aLog[i]) * softplus(inputData[o * channels + i] + dtBias[i]);
     }
 }
 
-__global__ void FastllmMambaSoftplusKernel(half* inputData, half *outputData, float *aLog, float *dtBias, int channels) {
+__global__ void FastllmMambaSoftplusKernel(half* inputData, half *outputData, float *aLog, float *dtBias, int channels, float outputScale) {
     int o = blockIdx.x;
     for (int i = threadIdx.x; i < channels; i += blockDim.x) {
-        outputData[o * channels + i] = __float2half(-exp((double)aLog[i]) * softplus(__half2float(inputData[o * channels + i]) + dtBias[i]));
+        outputData[o * channels + i] = __float2half(outputScale * -exp((double)aLog[i]) * softplus(__half2float(inputData[o * channels + i]) + dtBias[i]));
     }
 }
 
@@ -3070,6 +3163,7 @@ struct FastllmCudaWeightSlab {
     size_t size = 0;
     size_t used = 0;
     int activeBlocks = 0;
+    std::string group;
 };
 
 struct FastllmCudaWeightSlabPtr {
@@ -3095,7 +3189,20 @@ static size_t FastllmCudaAlignBytes(size_t size, size_t align) {
     return ((size + align - 1) / align) * align;
 }
 
-void *FastllmCudaMallocModelWeight(size_t size) {
+static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
+    // Expert-parallel source tensors are consolidated and released one layer
+    // at a time during the first ForwardGPU call.  Do not mix different layers
+    // in the same slab, otherwise one live tensor from a later layer pins all
+    // already-consumed blocks and makes the repack peak grow every layer.
+    const std::string marker = ".moe.experts.";
+    size_t pos = name.find(marker);
+    if (pos == std::string::npos) {
+        return "";
+    }
+    return name.substr(0, pos + marker.size());
+}
+
+void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
     size_t slabBytes = FastllmCudaGetWeightSlabBytes();
     if (slabBytes == 0 || size == 0 || size > slabBytes / 2) {
         return FastllmCudaMalloc(size);
@@ -3107,12 +3214,14 @@ void *FastllmCudaMallocModelWeight(size_t size) {
 
     const size_t align = 256;
     size_t aligned = FastllmCudaAlignBytes(size, align);
+    std::string group = FastllmCudaWeightSlabGroup(name);
     std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
 
     auto &slabs = fastllmCudaWeightSlabs[id];
     int slabId = -1;
     for (int i = 0; i < slabs.size(); i++) {
-        if (slabs[i].size >= slabs[i].used && slabs[i].size - slabs[i].used >= aligned) {
+        if (slabs[i].group == group && slabs[i].size >= slabs[i].used &&
+            slabs[i].size - slabs[i].used >= aligned) {
             slabId = i;
             break;
         }
@@ -3120,7 +3229,18 @@ void *FastllmCudaMallocModelWeight(size_t size) {
 
     if (slabId < 0) {
         void *base = nullptr;
-        state = FastllmCudaCheckedMalloc(&base, slabBytes, __FILE__, __LINE__);
+        // Weight preparation can run after temporary CUDA buffers have already
+        // warmed the regular allocator pool.  Near the capacity limit (for
+        // example, Laguna FP8 on four 32 GB GPUs), those idle buffers can make
+        // a new weight slab fail even though they are immediately reclaimable.
+        // Match the retry policy used by ordinary and direct CUDA allocations
+        // before reporting a real model-weight OOM.
+        FastllmCudaMemPoolView poolView = FastllmGetCudaMemPoolView(id);
+        {
+            std::lock_guard<std::mutex> poolLock(*poolView.lock);
+            state = FastllmCudaCheckedMallocWithIdlePoolRetry(
+                &base, slabBytes, id, poolView, __FILE__, __LINE__);
+        }
         if (cudaSuccess != state) {
             printf("Error: CUDA error when allocating model weight slab %lu MB memory! maybe there's no enough memory left on device.",
                    slabBytes >> 20);
@@ -3132,6 +3252,7 @@ void *FastllmCudaMallocModelWeight(size_t size) {
         slab.size = slabBytes;
         slab.used = 0;
         slab.activeBlocks = 0;
+        slab.group = group;
         slabs.push_back(slab);
         slabId = (int)slabs.size() - 1;
     }
@@ -3388,6 +3509,10 @@ static void CudaMemDebugRemove(void *ptr) {
 #endif // CUDA_MEM_DEBUG
 
 void * FastllmCudaDirectMalloc(size_t size) {
+    if (FastllmCudaGraphIsCapturing()) {
+        FastllmCudaSetThreadError();
+        return nullptr;
+    }
     void * ret = nullptr;
     int id = -1;
     cudaError_t state = cudaGetDevice(&id);
@@ -3554,6 +3679,13 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
 }
 
 static bool FastllmCudaRetryMallocAfterReleasingIdle(size_t size, void **ret, int id, const char *file, int line) {
+    // cudaFree is forbidden while a stream is being captured. A capture-time
+    // pool miss must be reported to the graph path instead of trying the
+    // ordinary OOM recovery, which would invalidate every participating rank.
+    if (FastllmCudaGraphIsCapturing()) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
     cudaGetLastError();
     FastllmCudaReleaseIdleCachedBuffersForDevice(id);
     cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
@@ -3704,6 +3836,10 @@ void * FastllmCudaMalloc(size_t size) {
     FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
+    const bool capturePoolOnly = captureIdentity.valid ||
+        FastllmCudaGraphIsCapturing();
+    const bool useAnyFittingPooledBuffer = capturePoolOnly ||
+        fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(*view.lock);
     if (size > 1024 * 1024) {
         auto &bigBuffers = *view.bigBuffers;
@@ -3727,7 +3863,7 @@ void * FastllmCudaMalloc(size_t size) {
 #endif
             return bigBuffers[selId].data;
         }
-        if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        if (useAnyFittingPooledBuffer) {
             for (int i = 0; i < bigBuffers.size(); i++) {
                 if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
                     bigBuffers[i].size >= size &&
@@ -3750,8 +3886,12 @@ void * FastllmCudaMalloc(size_t size) {
         }
 
         void * ret = nullptr;
-        if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        if (useAnyFittingPooledBuffer) {
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
+        }
+        if (capturePoolOnly) {
+            FastllmCudaSetThreadError();
+            return nullptr;
         }
         state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
         if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
@@ -3795,7 +3935,7 @@ void * FastllmCudaMalloc(size_t size) {
             return cudaBuffers[i].data;
         }
     }
-    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (useAnyFittingPooledBuffer) {
         auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
@@ -3819,8 +3959,12 @@ void * FastllmCudaMalloc(size_t size) {
         }
     }
     void * ret = nullptr;
-    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (useAnyFittingPooledBuffer) {
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
+    }
+    if (capturePoolOnly) {
+        FastllmCudaSetThreadError();
+        return nullptr;
     }
     state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
@@ -4594,7 +4738,7 @@ bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
-bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData) {
+bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale) {
     int dimsLen = input.dims.size();
     int outer = input.Count(0) / input.Count(dimsLen - 1);
     int channels = input.dims[dimsLen - 1];
@@ -4606,9 +4750,9 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
 
     int threadPerBlock = std::min(64, channels);
     if (input.dataType == fastllm::DataType::FLOAT32) {
-        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> (cudaInput, cudaOutput, aLog, dtBias, channels);
+        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> (cudaInput, cudaOutput, aLog, dtBias, channels, outputScale);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> ((half*)cudaInput, (half*)cudaOutput, aLog, dtBias, channels);
+        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> ((half*)cudaInput, (half*)cudaOutput, aLog, dtBias, channels, outputScale);
     }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishInput(aLogData, aLog);
@@ -8694,7 +8838,12 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     float llama3Factor,
     float llama3OriginalMaxPosition,
     float llama3LowFreqFactor,
-    float llama3HighFreqFactor
+    float llama3HighFreqFactor,
+    int useYarn,
+    float yarnFactor,
+    float yarnAttentionFactor,
+    float yarnCorrectionLow,
+    float yarnCorrectionHigh
 ) {
     int total_heads = q_heads + k_heads + v_heads;
     int block_id = blockIdx.x;
@@ -8794,7 +8943,13 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
             float rawPosition = positionIds[positionOffset];
             float invFreq = 1.0f / powf(ropeTheta, (float)(2 * j) / rotateDim);
             float freq;
-            if (useLlama3) {
+            if (useYarn) {
+                invFreq = FastllmYarnInvFreq(j, rotateDim, ropeTheta,
+                                              yarnFactor,
+                                              yarnCorrectionLow,
+                                              yarnCorrectionHigh);
+                freq = (float)((int)rawPosition) * invFreq;
+            } else if (useLlama3) {
                 invFreq = FastllmLlama3InvFreq(invFreq, llama3Factor,
                                                 llama3OriginalMaxPosition,
                                                 llama3LowFreqFactor,
@@ -8806,6 +8961,10 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
             }
             float curSin = sinf(freq);
             float curCos = cosf(freq);
+            if (useYarn) {
+                curSin *= yarnAttentionFactor;
+                curCos *= yarnAttentionFactor;
+            }
 
             float va = (float)base[j];
             float vb = (float)base[j + half_rotate];
@@ -8872,7 +9031,11 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int useLlama3, float llama3Factor,
     float llama3OriginalMaxPosition,
     float llama3LowFreqFactor,
-    float llama3HighFreqFactor
+    float llama3HighFreqFactor,
+    int useYarn, float yarnFactor,
+    float yarnAttentionFactor,
+    float yarnCorrectionLow,
+    float yarnCorrectionHigh
 ) {
     float *cudaQKV = (float *) FastllmCudaPrepareInput(qkv);
     float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
@@ -8899,7 +9062,9 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
             outer, total_dim, q_heads, k_heads, v_heads, head_dim,
             bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, maxPages, batch, doQKNorm,
             useLlama3, llama3Factor, llama3OriginalMaxPosition,
-            llama3LowFreqFactor, llama3HighFreqFactor);
+            llama3LowFreqFactor, llama3HighFreqFactor,
+            useYarn, yarnFactor, yarnAttentionFactor,
+            yarnCorrectionLow, yarnCorrectionHigh);
     };
 
     auto launchByPagedType = [&](auto TPB, auto *qkvPtr, auto *qOutputPtr) {

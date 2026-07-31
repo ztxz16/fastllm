@@ -106,14 +106,20 @@ namespace fastllm {
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
             if (data.isModelWeight && !data.directMemory) {
-                return FastllmCudaMallocModelWeight(bytes);
+                return FastllmCudaMallocModelWeight(bytes, data.name);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
 
-        static void CheckCudaMallocForData(const Data &data, void *ptr, uint64_t bytes, const char *context) {
+        static bool CheckCudaMallocForData(const Data &data, void *&ptr,
+                                           uint64_t bytes, const char *context,
+                                           bool allowGraphCapturePlaceholder = false) {
             if (ptr != nullptr) {
-                return;
+                return true;
+            }
+            if (allowGraphCapturePlaceholder &&
+                FastllmCudaGraphGetAllocationFailurePlaceholder(&ptr)) {
+                return false;
             }
             std::string msg = "Error: cuda malloc failed in " + std::string(context) +
                               ". requestBytes = " + std::to_string(bytes) +
@@ -127,6 +133,7 @@ namespace fastllm {
             }
             msg += ".\n";
             ErrorInFastLLM(msg);
+            return false;
         }
 
         static void CudaFreeForData(const Data &data, void *ptr) {
@@ -1878,7 +1885,18 @@ namespace fastllm {
 #ifdef USE_CUDA
             this->cudaData = CudaMallocForData(*this, this->expansionBytes);
             this->cudaDataBorrowed = false;
-            CheckCudaMallocForData(*this, this->cudaData, this->expansionBytes, "Data::MallocSpace");
+            bool allocated = CheckCudaMallocForData(
+                *this, this->cudaData, this->expansionBytes,
+                "Data::MallocSpace", true);
+            if (!allocated) {
+                // The placeholder keeps host-side operator setup and TP/NCCL
+                // sequencing intact until every rank reaches the common graph
+                // abort barrier. Mark it borrowed and force the next eager
+                // Allocate() to replace it with real storage.
+                this->cudaDataBorrowed = true;
+                this->expansionSize = 0;
+                return;
+            }
             if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
                 for (auto it : this->multiDeviceDatas) {
                     delete it.second;

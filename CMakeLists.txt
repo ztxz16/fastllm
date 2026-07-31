@@ -531,6 +531,12 @@ if (UNIT_TEST)
     if (USE_CUDA AND NOT USE_ROCM)
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
+
+    if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
+        target_link_libraries(cudaGraphPoolMissRegression fastllm)
+        target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    endif()
 endif()
 
 add_executable(webui example/webui/webui.cpp)
