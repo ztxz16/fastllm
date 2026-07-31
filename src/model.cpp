@@ -2734,6 +2734,13 @@ namespace fastllm {
             model->weight.AddDict("ggufNormsPreOffset", "1");
             model->weight.AddDict("ggufOutProjColumnsTiled",
                                   qwen35GGUFVHeadsTiled ? "1" : "0");
+            for (const std::string &token : {std::string("<|endoftext|>"),
+                                             std::string("<|im_end|>")}) {
+                auto it = model->weight.tokenizer.stringToTokenDict.find(token);
+                if (it != model->weight.tokenizer.stringToTokenDict.end()) {
+                    model->eos_token_ids.insert(it->second);
+                }
+            }
         }
 
         arch = ConvertGGUFTypeToFastllmType(sourceArch);

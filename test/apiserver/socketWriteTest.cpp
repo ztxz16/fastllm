@@ -10,6 +10,8 @@
 #endif
 
 #include "../../example/apiserver/socket_writer.h"
+#include "../../example/apiserver/http_request_reader.h"
+#include "../../example/apiserver/openai_output_parser.h"
 #include "../../example/apiserver/stop_parser.h"
 #include "../../include/utils/stop_token_matcher.h"
 #include "../../include/utils/stop_string_matcher.h"
@@ -28,6 +30,26 @@ int main() {
     CHECK(FormatSseData("[DONE]") == "data: [DONE]\r\n\r\n");
     CHECK(FormatSseData("{\n\t\"ok\": true\n}") ==
           "data: {\r\ndata: \t\"ok\": true\r\ndata: }\r\n\r\n");
+
+    CHECK(ResolveOpenAIFinishReason(false, false, 42, 256) == "stop");
+    CHECK(ResolveOpenAIFinishReason(false, false, 256, 256) == "length");
+    CHECK(ResolveOpenAIFinishReason(false, true, 256, 256) == "stop");
+    CHECK(ResolveOpenAIFinishReason(true, false, 256, 256) == "tool_calls");
+
+    const std::string getRequest =
+        "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    CHECK(IsHttpRequestComplete(getRequest.data(), getRequest.size()));
+    const std::string emptyPost =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: localhost\r\nContent-Length: 0\r\n\r\n";
+    CHECK(IsHttpRequestComplete(emptyPost.data(), emptyPost.size()));
+    const std::string partialPost =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Content-Length: 5\r\n\r\nabc";
+    CHECK(!IsHttpRequestComplete(partialPost.data(), partialPost.size()));
+    const std::string completePost = partialPost + "de";
+    CHECK(IsHttpRequestComplete(completePost.data(), completePost.size()));
+    CHECK(!IsHttpRequestComplete("GET /health HTTP/1.1\r\n", 22));
 
     auto encodeStop = [](const std::string &stop) {
         OpenAIStopEncoding encoding;
@@ -199,6 +221,109 @@ int main() {
                         readyText));
     CHECK(readyText == "plain text");
     CHECK(pendingStopText.empty());
+
+    CHECK(OpenAIReasoningParser::PromptEndsInReasoning(
+        "<|im_start|>assistant\n<think>\n"));
+    CHECK(!OpenAIReasoningParser::PromptEndsInReasoning(
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    CHECK(OpenAIReasoningParser::PromptEndsInReasoning(
+        "<think>old</think><think>new"));
+
+    OpenAIReasoningParser reasoningParser(true);
+    std::string reasoningText;
+    std::string answerText;
+    for (const std::string &fragment :
+         std::vector<std::string>{"work", "\n", "</", "think", ">",
+                                  "\n", "OK"}) {
+        OpenAIReasoningDelta delta = reasoningParser.Push(fragment);
+        reasoningText += delta.reasoningContent;
+        answerText += delta.content;
+    }
+    CHECK(reasoningText == "work\n");
+    CHECK(answerText == "\nOK");
+    CHECK(reasoningParser.Flush().Empty());
+
+    OpenAIReasoningParser longMarkerParser(true);
+    OpenAIReasoningDelta longMarkerDelta =
+        longMarkerParser.Push("analysis</thinking>answer");
+    CHECK(longMarkerDelta.reasoningContent == "analysis");
+    CHECK(longMarkerDelta.content == "answer");
+
+    OpenAIReasoningParser disabledReasoningParser(false);
+    OpenAIReasoningDelta disabledDelta =
+        disabledReasoningParser.Push("plain answer");
+    CHECK(disabledDelta.reasoningContent.empty());
+    CHECK(disabledDelta.content == "plain answer");
+
+    OpenAIReasoningParser unclosedReasoningParser(true);
+    OpenAIReasoningDelta unclosedDelta =
+        unclosedReasoningParser.Push("unfinished </thi");
+    OpenAIReasoningDelta unclosedTrailing = unclosedReasoningParser.Flush();
+    CHECK(unclosedDelta.reasoningContent +
+          unclosedTrailing.reasoningContent == "unfinished </thi");
+    CHECK(unclosedDelta.content.empty());
+    CHECK(unclosedTrailing.content.empty());
+
+    OpenAIToolCallParser toolParser(true);
+    std::string toolText;
+    std::vector<OpenAIParsedToolCall> parsedToolCalls;
+    for (const std::string &fragment : std::vector<std::string>{
+             "\n<tool", "_call>\n<function=builtin_", "web_search>\n",
+             "</function>\n</tool_call>"}) {
+        OpenAIToolCallDelta delta = toolParser.Push(fragment);
+        toolText += delta.content;
+        parsedToolCalls.insert(parsedToolCalls.end(), delta.toolCalls.begin(),
+                               delta.toolCalls.end());
+    }
+    CHECK(toolText == "\n");
+    CHECK(parsedToolCalls.size() == 1);
+    CHECK(parsedToolCalls[0].name == "builtin_web_search");
+    CHECK(parsedToolCalls[0].arguments == "{}");
+    CHECK(toolParser.Flush().Empty());
+
+    OpenAIToolCallParser typoToolParser(true);
+    OpenAIToolCallDelta typoToolDelta = typoToolParser.Push(
+        "<tool_call>\n<fuction=builtin_web_search>\n"
+        "<parameter=query>\n原神 最新消息 2024\n</parameter>\n"
+        "</function>\n</tool_call>");
+    CHECK(typoToolDelta.content.empty());
+    CHECK(typoToolDelta.toolCalls.size() == 1);
+    CHECK(typoToolDelta.toolCalls[0].name == "builtin_web_search");
+    CHECK(typoToolDelta.toolCalls[0].arguments ==
+          "{\"query\":\"原神 最新消息 2024\"}");
+
+    OpenAIToolCallParser parameterToolParser(true);
+    OpenAIToolCallDelta parameterDelta = parameterToolParser.Push(
+        "<tool_call>\n<function=search>\n"
+        "<parameter=query>\n原神 latest\n</parameter>\n"
+        "<parameter=limit>\n3\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=lookup>\n"
+        "<parameter=filters>\n{\"lang\":\"zh\"}\n</parameter>\n"
+        "</function>\n</tool_call>");
+    CHECK(parameterDelta.toolCalls.size() == 2);
+    CHECK(parameterDelta.toolCalls[0].name == "search");
+    CHECK(parameterDelta.toolCalls[0].arguments ==
+          "{\"limit\":3,\"query\":\"原神 latest\"}");
+    CHECK(parameterDelta.toolCalls[1].name == "lookup");
+    CHECK(parameterDelta.toolCalls[1].arguments ==
+          "{\"filters\":{\"lang\":\"zh\"}}");
+
+    OpenAIToolCallParser disabledToolParser(false);
+    OpenAIToolCallDelta disabledToolDelta = disabledToolParser.Push(
+        "literal <tool_call><function=demo></function></tool_call>");
+    CHECK(disabledToolDelta.content ==
+          "literal <tool_call><function=demo></function></tool_call>");
+    CHECK(disabledToolDelta.toolCalls.empty());
+
+    OpenAIToolCallParser unfinishedToolParser(true);
+    OpenAIToolCallDelta unfinishedToolDelta = unfinishedToolParser.Push(
+        "before<tool_call><function=demo>");
+    OpenAIToolCallDelta unfinishedToolTrailing = unfinishedToolParser.Flush();
+    CHECK(unfinishedToolDelta.content + unfinishedToolTrailing.content ==
+          "before<tool_call><function=demo>");
+    CHECK(unfinishedToolDelta.toolCalls.empty());
+    CHECK(unfinishedToolTrailing.toolCalls.empty());
 
 #ifndef _WIN32
     int sockets[2];

@@ -99,6 +99,149 @@ namespace fastllm {
         return fits(singleNeedsAndFree) ? 1 : 0;
     }
 
+    bool Qwen35InterleaveLongPrefillEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL");
+        if (env == nullptr || env[0] == 0) {
+            return false;
+        }
+        std::string lowered(env);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered == "true" || lowered == "1" ||
+               lowered == "yes" || lowered == "on";
+    }
+    bool Qwen35BatchedMtpEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_BATCHED_MTP");
+        if (env == nullptr || env[0] == 0) {
+            return true;
+        }
+        std::string lowered(env);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered != "false" && lowered != "0" &&
+               lowered != "no" && lowered != "off";
+    }
+
+    Qwen35RequestPhase ClassifyQwen35RequestPhase(const ResponseContext &context) {
+        if (context.longPrefill.inProgress &&
+            context.longPrefill.cursor < context.longPrefill.total) {
+            return Qwen35RequestPhase::ContinuedPrefill;
+        }
+        return context.preTokens == 0 ?
+            Qwen35RequestPhase::NewPrefill : Qwen35RequestPhase::Decode;
+    }
+
+    bool BeginQwen35LongPrefill(
+            ResponseContext &context,
+            int total,
+            uint64_t ticket,
+            const std::map<PagedCacheManager*, int> &reservedPages) {
+        if (context.longPrefill.inProgress || context.preTokens != 0 ||
+            total <= 0 || total != (int)context.currentTokens.size()) {
+            return false;
+        }
+        for (const auto &item : reservedPages) {
+            if (item.first == nullptr || item.second < 0) {
+                return false;
+            }
+        }
+        context.longPrefill.inProgress = true;
+        context.longPrefill.total = total;
+        context.longPrefill.cursor = 0;
+        context.longPrefill.mtpViable = true;
+        context.longPrefill.ticket = ticket;
+        context.longPrefill.reservedPages = reservedPages;
+        return true;
+    }
+
+    Qwen35LongPrefillQuantum PlanQwen35LongPrefillQuantum(
+            const ResponseContext &context,
+            int chunkSize) {
+        Qwen35LongPrefillQuantum quantum;
+        const Qwen35LongPrefillProgress &progress = context.longPrefill;
+        if (!progress.inProgress || chunkSize <= 0 || progress.total <= 0 ||
+            progress.cursor < 0 || progress.cursor >= progress.total ||
+            context.preTokens != progress.cursor) {
+            return quantum;
+        }
+        quantum.cursor = progress.cursor;
+        quantum.length = std::min(chunkSize, progress.total - progress.cursor);
+        quantum.baseTokens = context.cacheLen + progress.cursor;
+        quantum.isLast = progress.cursor + quantum.length == progress.total;
+        quantum.producesOutput = quantum.isLast;
+        return quantum;
+    }
+
+    bool CommitQwen35LongPrefillQuantum(
+            ResponseContext &context,
+            const Qwen35LongPrefillQuantum &quantum,
+            bool mtpViable) {
+        Qwen35LongPrefillProgress &progress = context.longPrefill;
+        if (!progress.inProgress || quantum.length <= 0 ||
+            quantum.cursor != progress.cursor ||
+            context.preTokens != progress.cursor ||
+            quantum.baseTokens != context.cacheLen + progress.cursor ||
+            quantum.cursor + quantum.length > progress.total) {
+            return false;
+        }
+        bool isLast = quantum.cursor + quantum.length == progress.total;
+        if (quantum.isLast != isLast || quantum.producesOutput != isLast) {
+            return false;
+        }
+        progress.cursor += quantum.length;
+        context.preTokens += quantum.length;
+        progress.mtpViable = progress.mtpViable && mtpViable;
+        if (isLast) {
+            progress.inProgress = false;
+            progress.reservedPages.clear();
+        }
+        return true;
+    }
+
+    int SelectQwen35LongPrefillHandle(
+            const std::vector<std::tuple<int, uint64_t> > &candidates,
+            uint64_t lastTicket) {
+        int afterHandle = -1;
+        uint64_t afterTicket = UINT64_MAX;
+        int firstHandle = -1;
+        uint64_t firstTicket = UINT64_MAX;
+        for (const auto &candidate : candidates) {
+            int handle = std::get<0>(candidate);
+            uint64_t ticket = std::get<1>(candidate);
+            if (handle < 0) {
+                continue;
+            }
+            if (ticket < firstTicket ||
+                (ticket == firstTicket && (firstHandle < 0 || handle < firstHandle))) {
+                firstTicket = ticket;
+                firstHandle = handle;
+            }
+            if (ticket > lastTicket &&
+                (ticket < afterTicket ||
+                 (ticket == afterTicket && (afterHandle < 0 || handle < afterHandle)))) {
+                afterTicket = ticket;
+                afterHandle = handle;
+            }
+        }
+        return afterHandle >= 0 ? afterHandle : firstHandle;
+    }
+
+    bool CanAdmitQwen35LongPrefill(int residentRequests, int schedulerLanes) {
+        return residentRequests >= 0 && schedulerLanes > 0 &&
+               residentRequests < schedulerLanes;
+    }
+
+    bool CanReserveQwen35LongPrefillPages(
+            const std::vector<Qwen35PageReservationBudget> &budgets) {
+        for (const auto &budget : budgets) {
+            if (budget.reserved < 0 || budget.needed < 0 || budget.free < 0 ||
+                (long long)budget.reserved + budget.needed > budget.free) {
+                return false;
+            }
+        }
+        return true;
+    }
+
 #ifdef USE_CUDA
     Qwen35DivisionScheme BuildQwen35LinearOutProjScheme(
             const Qwen35DivisionScheme &keyHeadScheme,
@@ -3147,7 +3290,7 @@ namespace fastllm {
         }
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
-            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
+            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 64);
             pages = std::max(1, pages);
             return pages * fastllm::GetPageLen();
         }
@@ -14086,6 +14229,15 @@ namespace fastllm {
         const int mtpBatchDecodeTokens = std::min(
             mtpDraftsPerStep + 1, QWEN35_MTP_FAST_SEQ_MAX);
         int prefillChunkSize = model->GetChunkedPrefillSize();
+        const bool interleaveLongPrefill = Qwen35InterleaveLongPrefillEnabled();
+        const int longPrefillResidentLanes = interleaveLongPrefill ?
+            std::max(mtpSchedulerLanes,
+                     std::min(configuredMtpSchedulerLanes,
+                              QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX)) :
+            mtpSchedulerLanes;
+        uint64_t nextLongPrefillTicket = 0;
+        uint64_t lastLongPrefillTicket = 0;
+        bool lastQuantumWasLongPrefill = false;
 
         auto releasePagedCachePages = [](Data &cache, bool clearDims = false) {
             std::set<std::pair<PagedCacheManager*, int> > releasedPages;
@@ -14144,6 +14296,7 @@ namespace fastllm {
             ctx->preTokens = 0;
             ctx->cacheLen = 0;
             ctx->intParams.clear();
+            ctx->longPrefill.Reset();
         };
 
         auto scheduledDecodeTokens = [&](const ResponseContext *ctx) {
@@ -14385,6 +14538,105 @@ namespace fastllm {
                 }
             }
             return needs;
+        };
+
+        struct Qwen35PrefillPageNeed {
+            std::map<PagedCacheManager*, int> needs;
+            bool impossible = false;
+        };
+        auto collectPrefillPageNeeds = [&](ResponseContext *ctx, int appendTokens) {
+            Qwen35PrefillPageNeed state;
+            if (ctx == nullptr || appendTokens <= 0) {
+                return state;
+            }
+            auto addManagerNeed = [&](PagedCacheManager *manager,
+                                      int currentTokens,
+                                      int currentPages) {
+                if (manager == nullptr || manager->pageLen <= 0 ||
+                    manager->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                    return;
+                }
+                long long totalTokens = (long long)std::max(0, currentTokens) + appendTokens;
+                long long totalManagerPages =
+                    (totalTokens + manager->pageLen - 1) / manager->pageLen;
+                if (totalManagerPages > manager->maxPages) {
+                    state.impossible = true;
+                    return;
+                }
+                int newPages = (int)totalManagerPages - std::max(0, currentPages);
+                if (newPages > 0) {
+                    int &need = state.needs[manager];
+                    need = need >= INT_MAX - newPages ? INT_MAX : need + newPages;
+                }
+            };
+            std::function<bool(Data&)> addExistingCache = [&](Data &cache) {
+                if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                    bool usedLocal = false;
+                    for (auto &item : cache.multiDeviceDatas) {
+                        if (item.second != nullptr) {
+                            usedLocal = addExistingCache(*item.second) || usedLocal;
+                        }
+                    }
+                    if (usedLocal) {
+                        return true;
+                    }
+                }
+                if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+                    return false;
+                }
+                int currentPages = (int)cache.pageIndex.size();
+                int cachePageLen = cache.pageLen > 0 ?
+                    cache.pageLen : cache.pagedKVCacheData->pageLen;
+                int currentTokens = currentPages > 0 ?
+                    (currentPages - 1) * cachePageLen + cache.lastPageLen : 0;
+                addManagerNeed(cache.pagedKVCacheData, currentTokens, currentPages);
+                return true;
+            };
+            for (int layer = 0;
+                 layer < model->block_cnt && layer < (int)ctx->pastKeyValues.size();
+                 layer++) {
+                for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                    bool isKey = keyFlag == 0;
+                    Data &cache = isKey ? ctx->pastKeyValues[layer].first :
+                                          ctx->pastKeyValues[layer].second;
+                    if (addExistingCache(cache)) {
+                        continue;
+                    }
+                    for (auto &ref : model->GetPagedKVCacheManagers(layer, isKey)) {
+                        addManagerNeed(ref.second, 0, 0);
+                    }
+                }
+            }
+            return state;
+        };
+
+        auto pageNeedsFitWithReservations = [](
+                const std::map<PagedCacheManager*, int> &needs,
+                const std::map<PagedCacheManager*, int> &reserved) {
+            std::set<PagedCacheManager*> managers;
+            for (const auto &item : needs) managers.insert(item.first);
+            for (const auto &item : reserved) managers.insert(item.first);
+            for (PagedCacheManager *manager : managers) {
+                if (manager == nullptr) {
+                    continue;
+                }
+                int need = 0;
+                int reservation = 0;
+                auto needIt = needs.find(manager);
+                if (needIt != needs.end()) need = needIt->second;
+                auto reservationIt = reserved.find(manager);
+                if (reservationIt != reserved.end()) reservation = reservationIt->second;
+                int freePages = 0;
+                {
+                    std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                    freePages = manager->FreePageCount();
+                }
+                if (need < 0 || reservation < 0 ||
+                    (long long)need + reservation > freePages) {
+                    return false;
+                }
+            }
+            return true;
         };
 
         auto hasPagedManagerShortage = [](const std::map<PagedCacheManager*, int> &needs) -> bool {
@@ -14675,6 +14927,11 @@ namespace fastllm {
         } else if (model->verbose) {
             printf("Fastllm Scheduler: Qwen3.5 MTP (lane=%d).\n", mtpSchedulerLanes);
         }
+        if (interleaveLongPrefill) {
+            printf("[Qwen3.5 MTP] interleaved long prefill enabled: chunk=%d, decode_lanes=%d, resident_lanes=%d.\n",
+                   prefillChunkSize, mtpSchedulerLanes, longPrefillResidentLanes);
+            fflush(stdout);
+        }
         if (model->verbose && useMtpBatchScheduling &&
             mtpDraftsPerStep + 1 > QWEN35_MTP_FAST_SEQ_MAX) {
             printf("[Qwen3.5 MTP] batched validation uses %d of %d configured drafts per step.\n",
@@ -14708,6 +14965,8 @@ namespace fastllm {
             bool selectedIsPrompt = false;
             bool selectedMultimodal = false;
             std::map<PagedCacheManager*, int> selectedDecodePageNeeds;
+            bool selectedLongPrefill = false;
+            Qwen35LongPrefillQuantum selectedLongPrefillQuantum;
 
             attentionMasks.reserve(mtpSchedulerLanes);
             positionIds.reserve(mtpSchedulerLanes);
@@ -14730,6 +14989,10 @@ namespace fastllm {
             int busyPages = 0;
             int currentActivate = 0;
             bool hasPrefill = false;
+            bool hasDecode = false;
+            bool hasContinuedPrefill = false;
+            std::vector<std::tuple<int, uint64_t> > continuedPrefillCandidates;
+            std::map<PagedCacheManager*, int> outstandingPrefillReservations;
             struct DecodeOrder {
                 int sortKey;
                 int handle;
@@ -14756,11 +15019,30 @@ namespace fastllm {
                     eraseMtpCache(ctx);
                     continue;
                 }
-                if (ctx->preTokens > 0) {
-                    currentActivate++;
-                }
-                if (ctx->preTokens == 0) {
-                    hasPrefill = true;
+                if (interleaveLongPrefill) {
+                    Qwen35RequestPhase phase = ClassifyQwen35RequestPhase(*ctx);
+                    if (phase == Qwen35RequestPhase::ContinuedPrefill) {
+                        currentActivate++;
+                        hasPrefill = true;
+                        hasContinuedPrefill = true;
+                        continuedPrefillCandidates.push_back(
+                            {it.first, ctx->longPrefill.ticket});
+                        accumulatePagedManagerNeeds(
+                            outstandingPrefillReservations,
+                            ctx->longPrefill.reservedPages);
+                    } else if (phase == Qwen35RequestPhase::NewPrefill) {
+                        hasPrefill = true;
+                    } else {
+                        currentActivate++;
+                        hasDecode = true;
+                    }
+                } else {
+                    if (ctx->preTokens > 0) {
+                        currentActivate++;
+                    }
+                    if (ctx->preTokens == 0) {
+                        hasPrefill = true;
+                    }
                 }
                 orders.push_back({-scheduledDecodeTokens(ctx), it.first, ctx});
             }
@@ -14785,21 +15067,47 @@ namespace fastllm {
                     pagesLimit = totalPages * 4 / 5;
                 }
             }
-            // A prefetched request owns its hybrid linear-attention state and
-            // MTP rollback snapshots even while it is not selected for the
-            // current decode forward.  Limiting only seqLens below therefore
-            // limits per-step compute, not resident per-request CUDA memory.
-            // Keep excess requests pending before prefill so the number of
-            // resident request states cannot exceed the startup-validated MTP
-            // scheduler capacity.
-            bool canAddPrefill = currentActivate < mtpSchedulerLanes &&
+            // Long-prefill requests own per-context KV, hybrid-state, and MTP
+            // snapshots, while each quantum still runs as a single forward.
+            // Keep decode batching on the startup-validated fast-path width,
+            // but let explicitly enabled interleave admit independently
+            // reserved prefill contexts up to the single-GPU snapshot cap.
+            bool canAddPrefill = CanAdmitQwen35LongPrefill(
+                    currentActivate, longPrefillResidentLanes) &&
                 ((pagesLimit > 0) ? (busyPages < pagesLimit) : true);
+            bool forceDecode = interleaveLongPrefill &&
+                lastQuantumWasLongPrefill && hasDecode;
+            int continuedPrefillHandle = interleaveLongPrefill &&
+                !continuedPrefillCandidates.empty() ?
+                SelectQwen35LongPrefillHandle(
+                    continuedPrefillCandidates, lastLongPrefillTicket) : -1;
+            int newPrefillHandle = -1;
+            int newPrefillTokens = INT_MAX;
+            if (interleaveLongPrefill && canAddPrefill) {
+                for (const auto &item : orders) {
+                    if (item.context == nullptr ||
+                        ClassifyQwen35RequestPhase(*item.context) !=
+                            Qwen35RequestPhase::NewPrefill) {
+                        continue;
+                    }
+                    int promptTokens = (int)item.context->currentTokens.size();
+                    if (promptTokens < newPrefillTokens ||
+                        (promptTokens == newPrefillTokens &&
+                         (newPrefillHandle < 0 || item.handle < newPrefillHandle))) {
+                        newPrefillTokens = promptTokens;
+                        newPrefillHandle = item.handle;
+                    }
+                }
+            }
+            bool canRunPrefill = interleaveLongPrefill ?
+                (!forceDecode && (hasContinuedPrefill || canAddPrefill)) :
+                canAddPrefill;
 
             for (int isPrompt = 1; isPrompt >= 0 && seqLens.empty(); isPrompt--) {
-                if (isPrompt == 1 && !canAddPrefill) {
+                if (isPrompt == 1 && !canRunPrefill) {
                     continue;
                 }
-                if (isPrompt == 0 && hasPrefill && canAddPrefill) {
+                if (isPrompt == 0 && hasPrefill && canRunPrefill) {
                     continue;
                 }
 
@@ -14808,13 +15116,26 @@ namespace fastllm {
                     if (ctx == nullptr || ctx->isEnding) {
                         continue;
                     }
-                    if (isPrompt && ctx->preTokens != 0) {
+                    Qwen35RequestPhase requestPhase = interleaveLongPrefill ?
+                        ClassifyQwen35RequestPhase(*ctx) :
+                        (ctx->preTokens == 0 ? Qwen35RequestPhase::NewPrefill :
+                                               Qwen35RequestPhase::Decode);
+                    bool continuedLongPrefill = interleaveLongPrefill &&
+                        requestPhase == Qwen35RequestPhase::ContinuedPrefill;
+                    if (interleaveLongPrefill && isPrompt) {
+                        int selectedPrefillHandle = newPrefillHandle >= 0 ?
+                            newPrefillHandle : continuedPrefillHandle;
+                        if (selectedPrefillHandle >= 0 && ii.handle != selectedPrefillHandle) {
+                            continue;
+                        }
+                    }
+                    if (isPrompt && requestPhase == Qwen35RequestPhase::Decode) {
                         continue;
                     }
-                    if (!isPrompt && ctx->preTokens == 0) {
+                    if (!isPrompt && requestPhase != Qwen35RequestPhase::Decode) {
                         continue;
                     }
-                    if (isPrompt && ctx->cacheLen == 0 &&
+                    if (isPrompt && !continuedLongPrefill && ctx->cacheLen == 0 &&
                         tryRestorePrefixCache(ctx) < 0) {
                         releaseAndReinitRequest(ctx);
                     }
@@ -14843,6 +15164,17 @@ namespace fastllm {
 
                     if (!isPrompt) {
                         auto pageNeeds = collectDecodePageNeeds(ctx, scheduledTokens);
+                        if (interleaveLongPrefill &&
+                            !pageNeedsFitWithReservations(
+                                pageNeeds, outstandingPrefillReservations)) {
+                            auto singlePageNeeds = collectDecodePageNeeds(ctx, 1);
+                            if (!pageNeedsFitWithReservations(
+                                    singlePageNeeds, outstandingPrefillReservations)) {
+                                continue;
+                            }
+                            scheduledTokens = 1;
+                            pageNeeds.swap(singlePageNeeds);
+                        }
                         if (!pageNeeds.empty() && hasPagedManagerShortage(pageNeeds)) {
                             auto singlePageNeeds = collectDecodePageNeeds(ctx, 1);
                             int budgetedTokens = SelectQwen35DecodeTokensForPageBudget(
@@ -14858,6 +15190,15 @@ namespace fastllm {
                         if (!pageNeeds.empty()) {
                             auto combinedPageNeeds = selectedDecodePageNeeds;
                             accumulatePagedManagerNeeds(combinedPageNeeds, pageNeeds);
+                            if (interleaveLongPrefill) {
+                                auto reservedCombined = combinedPageNeeds;
+                                accumulatePagedManagerNeeds(
+                                    reservedCombined,
+                                    outstandingPrefillReservations);
+                                if (hasPagedManagerShortage(reservedCombined)) {
+                                    continue;
+                                }
+                            }
                             if (hasPagedManagerShortage(combinedPageNeeds)) {
                                 // This request fits by itself, but not together
                                 // with the requests already selected for this
@@ -14866,6 +15207,70 @@ namespace fastllm {
                                 continue;
                             }
                             selectedDecodePageNeeds.swap(combinedPageNeeds);
+                        }
+                    }
+
+                    if (interleaveLongPrefill && isPrompt &&
+                        ctx->multimodalInput.empty()) {
+                        if (!continuedLongPrefill &&
+                            (int)ctx->currentTokens.size() > prefillChunkSize) {
+                            Qwen35PrefillPageNeed wholeNeed = collectPrefillPageNeeds(
+                                ctx, (int)ctx->currentTokens.size());
+                            if (wholeNeed.impossible ||
+                                !pageNeedsFitWithReservations(
+                                    wholeNeed.needs,
+                                    outstandingPrefillReservations) ||
+                                !BeginQwen35LongPrefill(
+                                    *ctx, (int)ctx->currentTokens.size(),
+                                    ++nextLongPrefillTicket, wholeNeed.needs)) {
+                                continue;
+                            }
+                            continuedLongPrefill = true;
+                        }
+                        if (continuedLongPrefill) {
+                            selectedLongPrefillQuantum =
+                                PlanQwen35LongPrefillQuantum(*ctx, prefillChunkSize);
+                            if (selectedLongPrefillQuantum.length <= 0) {
+                                releaseAndReinitRequest(ctx);
+                                continue;
+                            }
+                            std::map<PagedCacheManager*, int> otherReservations =
+                                outstandingPrefillReservations;
+                            for (const auto &reservation : ctx->longPrefill.reservedPages) {
+                                auto reservationIt = otherReservations.find(reservation.first);
+                                if (reservationIt != otherReservations.end()) {
+                                    reservationIt->second = std::max(
+                                        0, reservationIt->second - reservation.second);
+                                }
+                            }
+                            Qwen35PrefillPageNeed chunkNeed = collectPrefillPageNeeds(
+                                ctx, selectedLongPrefillQuantum.length);
+                            if (chunkNeed.impossible ||
+                                !pageNeedsFitWithReservations(
+                                    chunkNeed.needs, otherReservations)) {
+                                continue;
+                            }
+                            selectedLongPrefill = true;
+                            scheduledTokens = selectedLongPrefillQuantum.length;
+                        } else {
+                            Qwen35PrefillPageNeed shortNeed =
+                                collectPrefillPageNeeds(ctx, scheduledTokens);
+                            if (shortNeed.impossible ||
+                                !pageNeedsFitWithReservations(
+                                    shortNeed.needs,
+                                    outstandingPrefillReservations)) {
+                                continue;
+                            }
+                        }
+                    }
+                    if (interleaveLongPrefill && isPrompt && isMultimodal) {
+                        Qwen35PrefillPageNeed multimodalNeed =
+                            collectPrefillPageNeeds(ctx, scheduledTokens);
+                        if (multimodalNeed.impossible ||
+                            !pageNeedsFitWithReservations(
+                                multimodalNeed.needs,
+                                outstandingPrefillReservations)) {
+                            continue;
                         }
                     }
 
@@ -14927,7 +15332,13 @@ namespace fastllm {
                             ctx->preTokens += seqLen;
                         }
                     } else {
-                        if (ctx->preTokens == 0) {
+                        if (selectedLongPrefill) {
+                            ctx->intParams["add_special_tokens"] =
+                                ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
+                            ctx->intParams["promptLen"] =
+                                ctx->cacheLen + ctx->longPrefill.total;
+                            ctx->intParams["index"] = 0;
+                        } else if (ctx->preTokens == 0) {
                             ctx->intParams["add_special_tokens"] =
                                 ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
                             ctx->intParams["promptLen"] =
@@ -14936,36 +15347,82 @@ namespace fastllm {
                         } else {
                             ctx->intParams["index"]++;
                         }
-                        Data inputIds, attentionMask, curPositionIds;
+                        Data fullInputIds, attentionMask, fullPositionIds;
                         std::vector<std::vector<float> > tokens(1);
                         tokens[0].reserve(ctx->currentTokens.size());
                         for (int token : ctx->currentTokens) {
                             tokens[0].push_back((float)token);
                         }
                         model->FillLLMInputs(tokens, ctx->intParams,
-                                             inputIds, attentionMask, curPositionIds);
+                                             fullInputIds, attentionMask, fullPositionIds);
                         ToDataType(attentionMask, model->dataType);
 
-                        seqLens.push_back(inputIds.Count(0));
-                        for (int i = 0; i < inputIds.Count(0); i++) {
-                            ids.push_back(((float*)inputIds.cpuData)[i]);
-                        }
-                        if (attentionMask.dims.empty()) {
+                        if (selectedLongPrefill) {
+                            int inputStart = selectedLongPrefillQuantum.cursor;
+                            int chunkLen = selectedLongPrefillQuantum.length;
+                            int inputEnd = inputStart + chunkLen;
+                            AssertInFastLLM(fullInputIds.cpuData != nullptr &&
+                                            inputStart >= 0 &&
+                                            inputEnd <= fullInputIds.Count(0),
+                                            "Qwen3.5 interleaved prefill got an invalid input slice.\n");
+                            seqLens.push_back(chunkLen);
+                            const float *fullIds = (const float*)fullInputIds.cpuData;
+                            for (int i = inputStart; i < inputEnd; i++) {
+                                ids.push_back(fullIds[i]);
+                            }
                             attentionMasks.push_back(nullptr);
+                            if (fullPositionIds.dims.empty() ||
+                                fullPositionIds.cpuData == nullptr) {
+                                positionIds.push_back(nullptr);
+                            } else {
+                                int lastDim = fullPositionIds.dims.back();
+                                int outer = fullPositionIds.Count(0) / lastDim;
+                                AssertInFastLLM(inputStart >= 0 &&
+                                                inputEnd <= lastDim,
+                                                "Qwen3.5 interleaved prefill got an invalid position slice.\n");
+                                std::vector<int> outDims = fullPositionIds.dims;
+                                outDims.back() = chunkLen;
+                                positionIds.push_back(new Data());
+                                ownedPositionIds.push_back(positionIds.back());
+                                positionIds.back()->dataType = fullPositionIds.dataType;
+                                positionIds.back()->Resize(outDims);
+                                positionIds.back()->Allocate();
+                                int unitSize = positionIds.back()->unitSize;
+                                int rowBytes = chunkLen * unitSize;
+                                int srcRowBytes = lastDim * unitSize;
+                                const uint8_t *srcPos =
+                                    (const uint8_t*)fullPositionIds.cpuData;
+                                uint8_t *dstPos =
+                                    (uint8_t*)positionIds.back()->cpuData;
+                                for (int row = 0; row < outer; row++) {
+                                    memcpy(dstPos + (size_t)row * rowBytes,
+                                           srcPos + (size_t)row * srcRowBytes +
+                                               (size_t)inputStart * unitSize,
+                                           rowBytes);
+                                }
+                            }
                         } else {
-                            attentionMasks.push_back(new Data());
-                            ownedAttentionMasks.push_back(attentionMasks.back());
-                            attentionMask.ToDevice(DataDevice::CPU);
-                            attentionMasks.back()->CopyFrom(attentionMask);
+                            seqLens.push_back(fullInputIds.Count(0));
+                            for (int i = 0; i < fullInputIds.Count(0); i++) {
+                                ids.push_back(((float*)fullInputIds.cpuData)[i]);
+                            }
+                            if (attentionMask.dims.empty()) {
+                                attentionMasks.push_back(nullptr);
+                            } else {
+                                attentionMasks.push_back(new Data());
+                                ownedAttentionMasks.push_back(attentionMasks.back());
+                                attentionMask.ToDevice(DataDevice::CPU);
+                                attentionMasks.back()->CopyFrom(attentionMask);
+                            }
+                            if (fullPositionIds.dims.empty()) {
+                                positionIds.push_back(nullptr);
+                            } else {
+                                positionIds.push_back(new Data());
+                                ownedPositionIds.push_back(positionIds.back());
+                                positionIds.back()->CopyFrom(fullPositionIds);
+                            }
+                            ctx->preTokens += seqLens.back();
                         }
-                        if (curPositionIds.dims.empty()) {
-                            positionIds.push_back(nullptr);
-                        } else {
-                            positionIds.push_back(new Data());
-                            ownedPositionIds.push_back(positionIds.back());
-                            positionIds.back()->CopyFrom(curPositionIds);
-                        }
-                        ctx->preTokens += seqLens.back();
                     }
 
                     for (int i = 0; i < model->block_cnt; i++) {
@@ -14997,7 +15454,150 @@ namespace fastllm {
                 std::vector<std::vector<int> > nextInputTokenLists;
                 std::vector<int> keptInputLens;
                 bool usedMtpForward = false;
+                bool completedLongPrefillIntermediate = false;
+                bool longPrefillMtpViable = true;
 
+                if (selectedLongPrefill && singleContext != nullptr) {
+                    std::vector<int> mtpDevices;
+                    std::map<int, int> mtpRatios;
+                    bool seedMtp = singleContext->longPrefill.mtpViable &&
+                        !Qwen35MtpDisabledByEnv() &&
+                        Qwen35MtpDraftsPerStep() > 0 &&
+                        model->HasMtpWeights() &&
+                        generationConfigs.size() == 1 &&
+                        Qwen35MtpSupportsGenerationConfig(generationConfigs[0]) &&
+                        !positionIds.empty() && positionIds[0] != nullptr &&
+                        GetQwen35GPUForwardDevices(
+                            model->deviceMap, mtpDevices, mtpRatios) &&
+                        !mtpDevices.empty();
+                    int expectedTokens = selectedLongPrefillQuantum.baseTokens;
+                    if (seedMtp) {
+                        std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                        if (expectedTokens == 0) {
+                            model->mtpCaches.erase(singleContext);
+                        } else {
+                            auto mtpIt = model->mtpCaches.find(singleContext);
+                            seedMtp = mtpIt != model->mtpCaches.end() &&
+                                mtpIt->second.tokens == expectedTokens &&
+                                mtpIt->second.key.dims.size() >= 2 &&
+                                mtpIt->second.value.dims.size() >= 2 &&
+                                mtpIt->second.key.dims[1] == expectedTokens &&
+                                mtpIt->second.value.dims[1] == expectedTokens;
+                        }
+                    }
+
+                    bool oldCaptureAllHiddenStates =
+                        model->speculativeCaptureAllHiddenStates;
+                    model->speculativeCaptureAllHiddenStates = seedMtp;
+                    if (seedMtp) {
+                        model->speculativeHiddenStates.FreeSpace();
+                        model->speculativeHiddenStates.dims.clear();
+                        model->speculativeHiddenStates.strides.clear();
+                        model->speculativeHiddenStates.expansionDims.clear();
+                    }
+                    if (!seedMtp) {
+                        eraseMtpCache(singleContext);
+                    }
+                    try {
+                        ret = model->ForwardGPU(1, inputIds, attentionMasks,
+                                                positionIds, seqLens,
+                                                pastKeyValues, generationConfigs,
+                                                tokensManager, &logits);
+                    } catch (...) {
+                        model->speculativeCaptureAllHiddenStates =
+                            oldCaptureAllHiddenStates;
+                        if (seedMtp) {
+                            eraseMtpCache(singleContext);
+                        }
+                        throw;
+                    }
+                    model->speculativeCaptureAllHiddenStates =
+                        oldCaptureAllHiddenStates;
+                    AssertInFastLLM(!ret.empty(),
+                                    "Qwen3.5 interleaved target prefill returned no token.\n");
+
+                    int firstDraft = -1;
+                    bool mtpSeeded = false;
+                    if (seedMtp) {
+                        AssertInFastLLM(!ret.empty(),
+                                        "Qwen3.5 interleaved prefill returned no token.\n");
+                        std::vector<int> mtpInputTokens(
+                            selectedLongPrefillQuantum.length);
+                        for (int i = 0; i < selectedLongPrefillQuantum.length; i++) {
+                            int globalIndex = selectedLongPrefillQuantum.cursor + i;
+                            int nextIndex = globalIndex + 1;
+                            mtpInputTokens[i] = nextIndex < singleContext->longPrefill.total ?
+                                singleContext->currentTokens[nextIndex] : ret.back();
+                        }
+                        std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                        auto cacheIt = model->mtpCaches.find(singleContext);
+                        if (cacheIt == model->mtpCaches.end()) {
+                            if (expectedTokens == 0) {
+                                cacheIt = model->mtpCaches.emplace(
+                                    singleContext, MtpKvCache()).first;
+                            } else {
+                                seedMtp = false;
+                            }
+                        }
+                        if (seedMtp && cacheIt->second.tokens == expectedTokens) {
+                            try {
+                                firstDraft = model->RunMtpGreedyDraft(
+                                    mtpDevices[0], mtpDevices, cacheIt->second,
+                                    model->speculativeHiddenStates,
+                                    mtpInputTokens, *positionIds[0],
+                                    (int)mtpInputTokens.size() - 1,
+                                    nullptr,
+                                    !selectedLongPrefillQuantum.isLast);
+                            } catch (...) {
+                                model->mtpCaches.erase(singleContext);
+                                throw;
+                            }
+                            int newTokens = expectedTokens +
+                                selectedLongPrefillQuantum.length;
+                            mtpSeeded = cacheIt->second.tokens == newTokens &&
+                                cacheIt->second.key.dims.size() >= 2 &&
+                                cacheIt->second.value.dims.size() >= 2 &&
+                                cacheIt->second.key.dims[1] == newTokens &&
+                                cacheIt->second.value.dims[1] == newTokens;
+                        }
+                        if (!mtpSeeded) {
+                            model->mtpCaches.erase(singleContext);
+                        }
+                    }
+                    longPrefillMtpViable = seedMtp && mtpSeeded;
+                    int physicalTokens = expectedTokens +
+                        selectedLongPrefillQuantum.length;
+                    if (physicalTokens % pageLen == 0) {
+                        singleContext->TryRecordPagedCache(model);
+                    }
+                    if (selectedLongPrefillQuantum.isLast) {
+                        if (longPrefillMtpViable && firstDraft >= 0) {
+                            int nextToken = ret.back();
+                            usedMtpForward = true;
+                            acceptedTokenLists = {{nextToken}};
+                            nextInputTokenLists = {{nextToken, firstDraft}};
+                            keptInputLens = {selectedLongPrefillQuantum.length};
+                        }
+                    } else {
+                        usedMtpForward = true;
+                        completedLongPrefillIntermediate = true;
+                    }
+                    if (model->verbose) {
+                        int doneTokens = selectedLongPrefillQuantum.cursor +
+                            selectedLongPrefillQuantum.length;
+                        printf("[Prompt] Interleaved Long Prefill handle=%d (%d/%d, %d%%).\n",
+                               handles.empty() ? -1 : handles[0],
+                               doneTokens, singleContext->longPrefill.total,
+                               doneTokens * 100 / singleContext->longPrefill.total);
+                        if (selectedLongPrefillQuantum.isLast &&
+                            longPrefillMtpViable && firstDraft >= 0) {
+                            printf("[Qwen3.5 MTP] long prefill cache seeded: tokens=%d.\n",
+                                   selectedLongPrefillQuantum.baseTokens +
+                                   selectedLongPrefillQuantum.length);
+                        }
+                        fflush(stdout);
+                    }
+                } else
                 if (selectedMultimodal && singleContext != nullptr) {
                     ret = model->ForwardMultimodal(
                         inputIds,
@@ -15217,10 +15817,12 @@ namespace fastllm {
                 } else {
                     auto batchStartTime = std::chrono::system_clock::now();
                     if (seqLens.size() > 1) {
-                        usedMtpForward = model->Qwen35MTPBatchForward(
-                            true, tokenContexts, inputIds, attentionMasks, positionIds,
-                            seqLens, pastKeyValues, generationConfigs,
-                            acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                        if (Qwen35BatchedMtpEnabled()) {
+                            usedMtpForward = model->Qwen35MTPBatchForward(
+                                true, tokenContexts, inputIds, attentionMasks, positionIds,
+                                seqLens, pastKeyValues, generationConfigs,
+                                acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                        }
                     } else {
                         usedMtpForward = model->Qwen35MTPForward(
                             true, singleContext, inputIds, attentionMasks, positionIds,
@@ -15311,6 +15913,46 @@ namespace fastllm {
 
                 forwardLocker.unlock();
                 dictLocker.lock();
+                if (selectedLongPrefill && !handles.empty()) {
+                    auto contextIt = model->responseContextDict.dicts.find(handles[0]);
+                    ResponseContext *commitContext =
+                        contextIt == model->responseContextDict.dicts.end() ?
+                        nullptr : contextIt->second;
+                    if (commitContext != singleContext ||
+                        !CommitQwen35LongPrefillQuantum(
+                            *commitContext, selectedLongPrefillQuantum,
+                            longPrefillMtpViable)) {
+                        if (commitContext == singleContext) {
+                            releaseAndReinitRequest(commitContext);
+                        }
+                        completedLongPrefillIntermediate = true;
+                    } else {
+                        lastLongPrefillTicket = commitContext->longPrefill.ticket;
+                        lastQuantumWasLongPrefill = true;
+                        if (commitContext->longPrefill.inProgress) {
+                            int remaining = commitContext->longPrefill.total -
+                                commitContext->longPrefill.cursor;
+                            Qwen35PrefillPageNeed remainingNeed =
+                                collectPrefillPageNeeds(commitContext, remaining);
+                            if (remainingNeed.impossible) {
+                                releaseAndReinitRequest(commitContext);
+                            } else {
+                                commitContext->longPrefill.reservedPages =
+                                    remainingNeed.needs;
+                            }
+                        }
+                    }
+                    if (completedLongPrefillIntermediate) {
+                        acceptedTokenLists.clear();
+                        nextInputTokenLists.clear();
+                        keptInputLens.clear();
+                        handles.clear();
+                        tokenContexts.clear();
+                        selectedIsPrompt = false;
+                    }
+                } else {
+                    lastQuantumWasLongPrefill = false;
+                }
 
                 if (selectedIsPrompt) {
                     for (int i = 0; i < (int)handles.size(); i++) {

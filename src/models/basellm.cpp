@@ -459,6 +459,7 @@ namespace fastllm {
         }
         isEnding = false;
         preTokens = 0;
+        longPrefill.Reset();
     }
 
     void ResponseContext::TryRecord(basellm *model) {

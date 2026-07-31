@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -115,7 +116,82 @@ class FastLLmCompletion:
     self.hide_input = hide_input
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
+    self._conversation_lock = threading.Lock()
+    self._handle_condition = threading.Condition(self._conversation_lock)
+    self._active_handle_launches = 0
+    self._handle_owners = {}
     
+  def _ensure_handle_tracking(self):
+    if not hasattr(self, "_conversation_lock"):
+      self._conversation_lock = threading.Lock()
+    if not hasattr(self, "_handle_condition"):
+      self._handle_condition = threading.Condition(self._conversation_lock)
+    if not hasattr(self, "_active_handle_launches"):
+      self._active_handle_launches = 0
+    if not hasattr(self, "_handle_owners"):
+      self._handle_owners = {}
+
+  def _launch_owned_handle(self, request_id: str, launch):
+    self._ensure_handle_tracking()
+    with self._handle_condition:
+      self._active_handle_launches += 1
+    try:
+      handle = launch()
+    except BaseException:
+      with self._handle_condition:
+        self._active_handle_launches -= 1
+        self._handle_condition.notify_all()
+      raise
+    with self._handle_condition:
+      try:
+        previous_request = self._handle_owners.get(handle)
+        if (previous_request is not None and
+                self.conversation_handles.get(previous_request) == handle):
+          del self.conversation_handles[previous_request]
+        previous_handle = self.conversation_handles.get(request_id)
+        if (previous_handle is not None and
+                self._handle_owners.get(previous_handle) == request_id):
+          del self._handle_owners[previous_handle]
+        self.conversation_handles[request_id] = handle
+        self._handle_owners[handle] = request_id
+      finally:
+        self._active_handle_launches -= 1
+        self._handle_condition.notify_all()
+    return handle
+
+  def _release_owned_handle(self, request_id: str,
+                            expected_handle: Optional[int] = None) -> bool:
+    self._ensure_handle_tracking()
+    with self._conversation_lock:
+      handle = self.conversation_handles.get(request_id)
+      if handle is None or (expected_handle is not None and
+                            handle != expected_handle):
+        return False
+      if self._handle_owners.get(handle) != request_id:
+        del self.conversation_handles[request_id]
+        return False
+      del self.conversation_handles[request_id]
+      del self._handle_owners[handle]
+      return True
+
+  def _abort_owned_handle(self, request_id: str,
+                          expected_handle: Optional[int] = None) -> bool:
+    self._ensure_handle_tracking()
+    with self._handle_condition:
+      while self._active_handle_launches:
+        self._handle_condition.wait()
+      handle = self.conversation_handles.get(request_id)
+      if handle is None or (expected_handle is not None and
+                            handle != expected_handle):
+        return False
+      if self._handle_owners.get(handle) != request_id:
+        del self.conversation_handles[request_id]
+        return False
+      self.model.abort_handle(handle)
+      del self.conversation_handles[request_id]
+      del self._handle_owners[handle]
+      return True
+
   def init_fast_llm_model(self):
     pass
   
@@ -2089,11 +2165,12 @@ class FastLLmCompletion:
           if parser_request is not None:
               self._attach_tool_call_constraint_if_supported(
                   launch_kwargs, parser_request)
-          handle = self.model.launch_stream_response(
-              messages, **launch_kwargs)
+          handle = self._launch_owned_handle(
+              request_id,
+              lambda: self.model.launch_stream_response(
+                  messages, **launch_kwargs))
       finally:
           self._cleanup_temp_paths(media.temp_paths)
-      self.conversation_handles[request_id] = handle
       response_statistics: Dict[str, int] = {}
       result_generator = self._stream_response_handle_with_statistics(
           handle, response_statistics)
@@ -2111,6 +2188,7 @@ class FastLLmCompletion:
                   input_token_len, parser_request,
                   response_statistics = response_statistics)
           except ValueError as e:
+              self._release_owned_handle(request_id, handle)
               return self.create_error_response(str(e))
 
   async def create_chat_completion(
@@ -2240,8 +2318,10 @@ class FastLLmCompletion:
               images = model_images,
               videos = model_videos,
               tools = tools)
-          launched_handle = self.model.launch_stream_response(
-              messages, **launch_kwargs)
+          launched_handle = self._launch_owned_handle(
+              request_id,
+              lambda: self.model.launch_stream_response(
+                  messages, **launch_kwargs))
           return input_len, launched_handle
 
       try:
@@ -2256,7 +2336,6 @@ class FastLLmCompletion:
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
-      self.conversation_handles[request_id] = handle
       # logging.info(f"Created conversation: {request_id}, handle: {handle}")
       response_statistics: Dict[str, int] = {}
       result_generator = self._stream_response_handle_with_statistics(
@@ -2281,20 +2360,15 @@ class FastLLmCompletion:
                   emit_reasoning_content = emit_reasoning_content,
                   response_statistics = response_statistics)
           except ValueError as e:
+              self._release_owned_handle(request_id, handle)
               return self.create_error_response(str(e))
 
   async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # 进入BackgroundTask之后，说明流式请求已经断开了，那么这里直接abort
-    self.model.abort_handle(handle)
-    logging.info(f"Abort request: {request_id}")
-    return
-  
-    while True:
-      if await raw_request.is_disconnected():
-        self.model.abort_handle(handle)
-        logging.info(f"Abort request: {request_id}")
-        return
-      await asyncio.sleep(1)  # 检查间隔
+    # Starlette runs this task after a stream disconnects or completes. The
+    # integer handle may already have been recycled for another request, so
+    # abort only while this request still owns that exact handle.
+    if self._abort_owned_handle(request_id, handle):
+      logging.info(f"Abort request: {request_id}")
       
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
@@ -2316,7 +2390,7 @@ class FastLLmCompletion:
         completion_tokens += 1
         if await raw_request.is_disconnected():
            print("is_disconnected!!!")
-           self.model.abort_handle(handle)
+           self._abort_owned_handle(request_id, handle)
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
@@ -2330,8 +2404,7 @@ class FastLLmCompletion:
 
       tool_call_info = self._parse_non_stream_tool_calls(result, request)
       if isinstance(tool_call_info, ErrorResponse):
-          if request_id in self.conversation_handles:
-              del self.conversation_handles[request_id]
+          self._release_owned_handle(request_id, handle)
           return tool_call_info
 
       if tool_call_info.tools_called:
@@ -2368,9 +2441,7 @@ class FastLLmCompletion:
           usage = usage,
       )
 
-      # After completion, remove the conversation from tracking dictionary
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
+      self._release_owned_handle(request_id, handle)
           # logging.info(f"Removed completed conversation from tracking: {request_id}")
 
       return response
@@ -2694,9 +2765,7 @@ class FastLLmCompletion:
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
       
-      # After completion, remove the conversation from tracking dictionary
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
+      self._release_owned_handle(request_id, handle)
           # logging.info(f"Removed completed stream conversation from tracking: {request_id}")
       
       yield "data: [DONE]\n\n"
@@ -2723,7 +2792,7 @@ class FastLLmCompletion:
         completion_tokens += 1
         if await raw_request.is_disconnected():
            print("is_disconnected!!!")
-           self.model.abort_handle(handle)
+           self._abort_owned_handle(request_id, handle)
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
@@ -2747,8 +2816,7 @@ class FastLLmCompletion:
           usage = usage,
       )
 
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
+      self._release_owned_handle(request_id, handle)
 
       return response
 
@@ -2932,8 +3000,7 @@ class FastLLmCompletion:
           yield f"event: error\ndata: {error_data}\n\n"
           await asyncio.sleep(0)
 
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
+      self._release_owned_handle(request_id, handle)
 
       await asyncio.sleep(0)
       
@@ -2951,26 +3018,26 @@ class FastLLmCompletion:
       return json_str
 
   def abort_conversation(self, conversation_id: str) -> bool:
-    if conversation_id in self.conversation_handles:
-      handle = self.conversation_handles[conversation_id]
-      try:
-        self.model.abort_handle(handle)
-        logging.info(f"Aborted conversation: {conversation_id}, handle: {handle}")
-        # Remove the conversation from the mapping
-        del self.conversation_handles[conversation_id]
-        return True
-      except Exception as e:
-        logging.error(f"Error aborting conversation {conversation_id}: {e}")
-        return False
-    else:
+    self._ensure_handle_tracking()
+    handle = self.conversation_handles.get(conversation_id)
+    if handle is None:
       logging.warning(f"Conversation ID not found: {conversation_id}")
+      return False
+    try:
+      if not self._abort_owned_handle(conversation_id, handle):
+        logging.warning(f"Conversation no longer owns handle: {conversation_id}")
+        return False
+      logging.info(f"Aborted conversation: {conversation_id}, handle: {handle}")
+      return True
+    except Exception as e:
+      logging.error(f"Error aborting conversation {conversation_id}: {e}")
       return False
       
   def get_active_conversations(self) -> List[Dict[str, Any]]:
-    result = []
-    for conversation_id, handle in self.conversation_handles.items():
-      result.append({
-        "conversation_id": conversation_id,
-        "handle": handle
-      })
-    return result
+    self._ensure_handle_tracking()
+    with self._conversation_lock:
+      conversations = list(self.conversation_handles.items())
+    return [
+        {"conversation_id": conversation_id, "handle": handle}
+        for conversation_id, handle in conversations
+    ]

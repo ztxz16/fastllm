@@ -16,6 +16,8 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+#include <tuple>
+
 
 namespace fastllm {
     enum class Qwen35GdnProjectionLayout {
@@ -43,6 +45,55 @@ namespace fastllm {
             int requestedTokens,
             const std::vector<std::pair<int, int> > &requestedNeedsAndFree,
             const std::vector<std::pair<int, int> > &singleNeedsAndFree);
+
+    enum class Qwen35RequestPhase {
+        NewPrefill,
+        ContinuedPrefill,
+        Decode
+    };
+
+    struct Qwen35LongPrefillQuantum {
+        int cursor = 0;
+        int length = 0;
+        int baseTokens = 0;
+        bool isLast = false;
+        bool producesOutput = false;
+    };
+
+    struct Qwen35PageReservationBudget {
+        int reserved = 0;
+        int needed = 0;
+        int free = 0;
+    };
+
+    bool Qwen35InterleaveLongPrefillEnabled();
+    bool Qwen35BatchedMtpEnabled();
+
+    Qwen35RequestPhase ClassifyQwen35RequestPhase(const ResponseContext &context);
+
+    bool BeginQwen35LongPrefill(
+            ResponseContext &context,
+            int total,
+            uint64_t ticket,
+            const std::map<PagedCacheManager*, int> &reservedPages = {});
+
+    Qwen35LongPrefillQuantum PlanQwen35LongPrefillQuantum(
+            const ResponseContext &context,
+            int chunkSize);
+
+    bool CommitQwen35LongPrefillQuantum(
+            ResponseContext &context,
+            const Qwen35LongPrefillQuantum &quantum,
+            bool mtpViable);
+
+    int SelectQwen35LongPrefillHandle(
+            const std::vector<std::tuple<int, uint64_t> > &candidates,
+            uint64_t lastTicket);
+
+    bool CanAdmitQwen35LongPrefill(int residentRequests, int schedulerLanes);
+
+    bool CanReserveQwen35LongPrefillPages(
+            const std::vector<Qwen35PageReservationBudget> &budgets);
 
 #ifdef USE_CUDA
     using Qwen35DivisionScheme =

@@ -120,7 +120,9 @@ using socket_t = int;
 #include <sys/stat.h>
 #include <thread>
 #include "model.h"
+#include "http_request_reader.h"
 #include "socket_writer.h"
+#include "openai_output_parser.h"
 #include "stop_parser.h"
 #include "utils/stop_string_matcher.h"
 
@@ -310,13 +312,16 @@ struct WorkQueue {
                     printf("totalQueryNumber = %d\n", ts->totalQueryNumber);
 //printf("activate = %d, q.size() = %d\n", ts->activateQueryNumber, (int) ts->q.size());
 
-                    std::thread *t = new std::thread([](WorkQueue *ts, WorkNode *now) {
+                    std::thread([ts](WorkNode *now) {
                         ts->Deal(now);
                         printf("Response client %d finish\n", now->client);
-                        ts->locker.lock();
-                        ts->activateQueryNumber--;
-                        ts->locker.unlock();
-                    }, ts, now);
+                        delete now;
+                        {
+                            std::lock_guard<std::mutex> lock(ts->locker);
+                            ts->activateQueryNumber--;
+                        }
+                        ts->cv.notify_all();
+                    }, now).detach();
                 }
             }
         }, this);
@@ -482,24 +487,67 @@ struct WorkQueue {
                 return;
             }
 
-            std::string output = "";
-            int handleId = model->LaunchResponseTokens(tokens, config);
-            bool isStream = false;
-            if (node->config["stream"].is_bool() && node->config["stream"].bool_value()) {
-                isStream = true;
+            bool toolsEnabled = node->config["tools"].is_array();
+            if (node->config["tool_choice"].is_string() &&
+                node->config["tool_choice"].string_value() == "none") {
+                toolsEnabled = false;
+            }
+            std::string selectedToolName;
+            if (node->config["tool_choice"].is_object()) {
+                selectedToolName =
+                    node->config["tool_choice"]["function"]["name"].string_value();
+            }
+            if (toolsEnabled) {
+                for (const auto &tool : node->config["tools"].array_items()) {
+                    const std::string name = tool["function"]["name"].string_value();
+                    if (!name.empty() &&
+                        (selectedToolName.empty() || name == selectedToolName)) {
+                        config.tool_call_allowed_names.push_back(name);
+                    }
+                }
+                toolsEnabled = !config.tool_call_allowed_names.empty();
+            }
+            if (toolsEnabled) {
+                config.tool_call_name_constraint_enabled = true;
+                config.tool_call_invoke_name_prefixes = {
+                    "<function=", "<fuction="
+                };
+                config.tool_call_name_terminator = ">";
             }
 
-            std::string curId = "fastllm-" + GenerateRandomID();
-            auto createTime = _GetCurrentTime();
+            int handleId = model->LaunchResponseTokens(tokens, config);
+            const bool isStream = node->config["stream"].is_bool() &&
+                                  node->config["stream"].bool_value();
+            const std::string curId = "fastllm-" + GenerateRandomID();
+            const auto createTime = _GetCurrentTime();
+            OpenAIOutputParser outputParser(
+                OpenAIReasoningParser::PromptEndsInReasoning(prompt),
+                toolsEnabled);
+
+            auto serializeToolCall = [&](const OpenAIParsedToolCall &call,
+                                         const std::string &id,
+                                         int index,
+                                         bool includeIndex) {
+                json11::Json::object toolCall = {
+                    {"id", id},
+                    {"type", "function"},
+                    {"function", json11::Json::object {
+                        {"name", call.name},
+                        {"arguments", call.arguments}
+                    }}
+                };
+                if (includeIndex) {
+                    toolCall["index"] = index;
+                }
+                return json11::Json(toolCall);
+            };
 
             if (isStream) {
-                message = "";
-                message += "HTTP/1.1 200 OK\r\n";
+                message = "HTTP/1.1 200 OK\r\n";
                 message += "Content-Type:text/event-stream\r\n";
                 message += "Cache-Control:no-cache\r\n";
                 message += "server:fastllm api server\r\n";
-                message += "Transfer-Encoding: chunked\r\n";
-                message += "\r\n";
+                message += "Transfer-Encoding: chunked\r\n\r\n";
 
                 auto abortDisconnectedStream = [&]() {
                     model->AbortResponse(handleId);
@@ -534,38 +582,62 @@ struct WorkQueue {
                 }
 
                 int outputTokens = 0;
+                int toolCallIndex = 0;
+                bool hasToolCalls = false;
                 std::vector<float> results;
                 std::string pendingStopText;
+                bool matchedStopString = false;
+                auto sendParsedDelta = [&](const OpenAIOutputDelta &parsed) {
+                    if (parsed.Empty()) {
+                        return true;
+                    }
+                    json11::Json::object delta;
+                    if (!parsed.reasoningContent.empty()) {
+                        delta["reasoning_content"] = parsed.reasoningContent;
+                    }
+                    if (!parsed.content.empty()) {
+                        delta["content"] = parsed.content;
+                    }
+                    if (!parsed.toolCalls.empty()) {
+                        json11::Json::array toolCalls;
+                        for (const auto &call : parsed.toolCalls) {
+                            toolCalls.push_back(serializeToolCall(
+                                call, "call_" + GenerateRandomID(),
+                                toolCallIndex++, true));
+                        }
+                        delta["tool_calls"] = toolCalls;
+                        hasToolCalls = true;
+                    }
+                    json11::Json partResult = json11::Json::object {
+                        {"id", curId},
+                        {"object", "chat.completion.chunk"},
+                        {"created", createTime},
+                        {"model", ::config.modelName},
+                        {"choices", json11::Json::array {
+                            json11::Json::object {
+                                {"index", 0},
+                                {"delta", delta},
+                                {"logprobs", nullptr},
+                                {"finish_reason", nullptr},
+                                {"stop_reason", nullptr}
+                            }
+                        }}
+                    };
+                    return WriteHttpChunk(
+                        node->client, FormatSseData(partResult.dump()));
+                };
+
                 while (true) {
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
                         std::string trailingText;
                         FlushPendingStopText(pendingStopText, trailingText);
-                        if (!trailingText.empty()) {
-                            json11::Json trailingResult = json11::Json::object {
-                                {"id", curId},
-                                {"object", "chat.completion.chunk"},
-                                {"created", createTime},
-                                {"model", ::config.modelName},
-                                {"choices", json11::Json::array {
-                                    json11::Json::object {
-                                        {"index", 0},
-                                        {"delta", json11::Json::object {
-                                            {"content", trailingText}
-                                        }},
-                                        {"logprobs", nullptr},
-                                        {"finish_reason", nullptr},
-                                        {"stop_reason", nullptr}
-                                    }
-                                }}
-                            };
-                            if (!WriteHttpChunk(node->client,
-                                    FormatSseData(trailingResult.dump()))) {
-                                close(node->client);
-                                return;
-                            }
+                        if (!sendParsedDelta(outputParser.Push(trailingText)) ||
+                            !sendParsedDelta(outputParser.Flush())) {
+                            close(node->client);
+                            return;
                         }
-                        json11::Json partResult = json11::Json::object {
+                        json11::Json finishResult = json11::Json::object {
                             {"id", curId},
                             {"object", "chat.completion.chunk"},
                             {"created", createTime},
@@ -577,7 +649,10 @@ struct WorkQueue {
                                         {"content", ""}
                                     }},
                                     {"logprobs", nullptr},
-                                    {"finish_reason", "stop"},
+                                    {"finish_reason", ResolveOpenAIFinishReason(
+                                        hasToolCalls, matchedStopString,
+                                        outputTokens,
+                                        config.output_token_limit)},
                                     {"stop_reason", nullptr}
                                 }
                             }},
@@ -588,7 +663,7 @@ struct WorkQueue {
                             }}
                         };
                         if (!WriteHttpChunk(node->client,
-                                            FormatSseData(partResult.dump()))) {
+                                FormatSseData(finishResult.dump()))) {
                             close(node->client);
                             return;
                         }
@@ -596,50 +671,25 @@ struct WorkQueue {
                     }
 
                     outputTokens++;
-                    results.clear();
-                    results.push_back(result);
+                    results.assign(1, static_cast<float>(result));
                     std::string now = model->weight.tokenizer.Decode(
                         fastllm::Data(fastllm::DataType::FLOAT32,
                                       {(int)results.size()}, results));
                     std::string filtered;
                     bool matchedStop = PushStopText(
                         config.stop_strings, pendingStopText, now, filtered);
-                    now = filtered;
+                    matchedStopString = matchedStopString || matchedStop;
                     if (matchedStop) {
                         model->AbortResponse(handleId);
                     }
-                    if (now.empty()) {
-                        if (matchedStop) {
-                            continue;
-                        }
-                        continue;
-                    }
-                    json11::Json partResult = json11::Json::object {
-                        {"id", curId},
-                        {"object", "chat.completion.chunk"},
-                        {"created", createTime},
-                        {"model", ::config.modelName},
-                        {"choices", json11::Json::array {
-                            json11::Json::object {
-                                {"index", 0},
-                                {"delta", json11::Json::object {
-                                    {"content", now}
-                                }},
-                                {"logprobs", nullptr},
-                                {"finish_reason", nullptr},
-                                {"stop_reason", nullptr}
-                            }
-                        }}
-                    };
-                    if (!WriteHttpChunk(node->client,
-                                        FormatSseData(partResult.dump()))) {
+                    if (!sendParsedDelta(outputParser.Push(filtered))) {
                         abortDisconnectedStream();
                         return;
                     }
                 }
 
-                if (!WriteHttpChunk(node->client, FormatSseData("[DONE]"))
-                        || !WriteAllToSocket(node->client, "0\r\n\r\n", 5)) {
+                if (!WriteHttpChunk(node->client, FormatSseData("[DONE]")) ||
+                    !WriteAllToSocket(node->client, "0\r\n\r\n", 5)) {
                     close(node->client);
                     return;
                 }
@@ -648,31 +698,57 @@ struct WorkQueue {
                 int outputTokens = 0;
                 std::vector<float> results;
                 std::string pendingStopText;
+                bool matchedStopString = false;
+                std::string reasoningOutput;
+                std::string output;
+                std::vector<OpenAIParsedToolCall> parsedToolCalls;
+                auto appendParsedDelta = [&](const OpenAIOutputDelta &parsed) {
+                    reasoningOutput += parsed.reasoningContent;
+                    output += parsed.content;
+                    parsedToolCalls.insert(parsedToolCalls.end(),
+                                           parsed.toolCalls.begin(),
+                                           parsed.toolCalls.end());
+                };
                 while (true) {
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
                         break;
-                    } else {
-                        results.clear();
-                        results.push_back(result);
-                        std::string now = model->weight.tokenizer.Decode(
-                            fastllm::Data(fastllm::DataType::FLOAT32,
-                                          {(int)results.size()}, results));
-                        std::string filtered;
-                        bool matchedStop = PushStopText(
-                            config.stop_strings, pendingStopText, now, filtered);
-                        output += filtered;
-                        outputTokens++;
-                        if (matchedStop) {
-                            model->AbortResponse(handleId);
-                        }
+                    }
+                    outputTokens++;
+                    results.assign(1, static_cast<float>(result));
+                    std::string now = model->weight.tokenizer.Decode(
+                        fastllm::Data(fastllm::DataType::FLOAT32,
+                                      {(int)results.size()}, results));
+                    std::string filtered;
+                    bool matchedStop = PushStopText(
+                        config.stop_strings, pendingStopText, now, filtered);
+                    matchedStopString = matchedStopString || matchedStop;
+                    appendParsedDelta(outputParser.Push(filtered));
+                    if (matchedStop) {
+                        model->AbortResponse(handleId);
                     }
                 }
                 std::string trailingText;
                 FlushPendingStopText(pendingStopText, trailingText);
-                output += trailingText;
+                appendParsedDelta(outputParser.Push(trailingText));
+                appendParsedDelta(outputParser.Flush());
 
-                json11::Json result = json11::Json::object {
+                json11::Json::object responseMessage = {
+                    {"role", "assistant"},
+                    {"content", output}
+                };
+                if (!reasoningOutput.empty()) {
+                    responseMessage["reasoning_content"] = reasoningOutput;
+                }
+                if (!parsedToolCalls.empty()) {
+                    json11::Json::array toolCalls;
+                    for (const auto &call : parsedToolCalls) {
+                        toolCalls.push_back(serializeToolCall(
+                            call, "call_" + GenerateRandomID(), 0, false));
+                    }
+                    responseMessage["tool_calls"] = toolCalls;
+                }
+                json11::Json response = json11::Json::object {
                     {"id", curId},
                     {"object", "chat.completion"},
                     {"created", createTime},
@@ -680,12 +756,11 @@ struct WorkQueue {
                     {"choices", json11::Json::array {
                         json11::Json::object {
                             {"index", 0},
-                            {"message", json11::Json::object {
-                                {"role", "assistant"},
-                                {"content", output}
-                            }},
+                            {"message", responseMessage},
                             {"logprobs", nullptr},
-                            {"finish_reason", nullptr},
+                            {"finish_reason", ResolveOpenAIFinishReason(
+                                !parsedToolCalls.empty(), matchedStopString,
+                                outputTokens, config.output_token_limit)},
                             {"stop_reason", nullptr}
                         }
                     }},
@@ -695,9 +770,8 @@ struct WorkQueue {
                         {"completion_tokens", outputTokens}
                     }}
                 };
-
-                message += result.dump();
-                int ret = write(node->client, message.c_str(), message.length()); //返回message
+                message += response.dump();
+                WriteAllToSocket(node->client, message);
                 close(node->client);
             }
             return;
@@ -805,6 +879,7 @@ int main(int argc, char** argv) {
         workQueue.model->SetKVCacheDataType(config.kvCacheDtype);
     }
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
+    workQueue.model->maxBatch = workQueue.maxActivateQueryNumber;
     workQueue.Start();
 
     int local_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -839,6 +914,17 @@ int main(int argc, char** argv) {
             exit(-1);
         }
 
+#ifdef _WIN32
+        DWORD receiveTimeoutMs = 15000;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char *>(&receiveTimeoutMs),
+                   sizeof(receiveTimeoutMs));
+#else
+        struct timeval receiveTimeout = {15, 0};
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                   &receiveTimeout, sizeof(receiveTimeout));
+#endif
+
         int size = 0;
         bool requestReady = false;
         while (size < (int)sizeof(buff) - 1) {
@@ -848,7 +934,7 @@ int main(int argc, char** argv) {
             }
             size += cur;
             buff[size] = 0;
-            if (httpChecker.IsValid(buff, size)) {
+            if (IsHttpRequestComplete(buff, static_cast<size_t>(size))) {
                 requestReady = true;
                 break;
             }
@@ -858,9 +944,6 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        while (workQueue.q.size() > workQueue.maxActivateQueryNumber) {
-            fastllm::MySleep(0);
-        }
         workQueue.Push(buff, client);
     }
 

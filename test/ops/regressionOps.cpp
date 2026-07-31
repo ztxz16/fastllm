@@ -230,6 +230,17 @@ namespace {
         }
     }
 
+    void WriteGGUFStringArrayKV(std::ofstream &out, const std::string &key,
+                                const std::vector<std::string> &values) {
+        WriteGGUFString(out, key);
+        WritePod<int32_t>(out, 9);
+        WritePod<int32_t>(out, 8);
+        WritePod<uint64_t>(out, values.size());
+        for (const std::string &value : values) {
+            WriteGGUFString(out, value);
+        }
+    }
+
     uint64_t Pad32(uint64_t value) {
         return (value + 31) / 32 * 32;
     }
@@ -286,14 +297,16 @@ namespace {
     void WriteSyntheticQwen35GGUF(const std::string &path,
                                   const std::vector<SyntheticGGUFTensor> &tensors,
                                   const std::string &arch = "qwen35",
-                                  uint32_t nextnPredictLayers = 1) {
+                                  uint32_t nextnPredictLayers = 1,
+                                  const std::vector<std::string> &tokens = {},
+                                  int eosTokenId = -1) {
         std::ofstream out(path, std::ios::binary);
         Expect(out.good(), "failed to create synthetic GGUF file.");
 
         WritePod<uint32_t>(out, 0x46554747u);
         WritePod<uint32_t>(out, 3u);
         WritePod<uint64_t>(out, tensors.size());
-        WritePod<uint64_t>(out, 18u);
+        WritePod<uint64_t>(out, 18u + (tokens.empty() ? 0u : 2u));
 
         WriteGGUFStringKV(out, "general.architecture", arch);
         WriteGGUFStringKV(out, "general.name", "synthetic qwen35");
@@ -313,6 +326,12 @@ namespace {
         WriteGGUFUInt32KV(out, arch + ".ssm.state_size", 128);
         WriteGGUFUInt32KV(out, arch + ".ssm.time_step_rank", 48);
         WriteGGUFUInt32KV(out, arch + ".ssm.inner_size", 6144);
+        if (!tokens.empty()) {
+            Expect(eosTokenId >= 0 && eosTokenId < (int)tokens.size(),
+                   "synthetic GGUF eos token must index the tokenizer vocabulary.");
+            WriteGGUFStringArrayKV(out, "tokenizer.ggml.tokens", tokens);
+            WriteGGUFUInt32KV(out, "tokenizer.ggml.eos_token_id", (uint32_t)eosTokenId);
+        }
 
         uint64_t offset = 0;
         for (const auto &tensor : tensors) {
@@ -367,7 +386,8 @@ namespace {
     void RunQwen35GGUFConfigRegression() {
         for (const std::string &arch : {std::string("qwen35"), std::string("qwen3_5")}) {
             std::string path = MakeTempGGUFPath("fastllm-" + arch + "-config");
-            WriteSyntheticQwen35GGUF(path, {}, arch);
+            WriteSyntheticQwen35GGUF(path, {}, arch, 1,
+                                     {"ordinary", "<|endoftext|>", "<|im_end|>"}, 2);
             auto model = fastllm::CreateLLMModelFromFile(path);
             std::remove(path.c_str());
 
@@ -378,6 +398,10 @@ namespace {
             Expect(model->num_key_value_heads == 4, arch + " KV heads were not imported.");
             Expect(model->head_dim == 256, arch + " full-attention head_dim was not imported.");
             Expect(model->max_positions == 262144, arch + " context length was not imported.");
+            Expect(model->eos_token_id == 2,
+                   arch + " GGUF scalar eos token was not imported.");
+            Expect(model->eos_token_ids.count(1) == 1 && model->eos_token_ids.count(2) == 1,
+                   arch + " GGUF must stop on both <|endoftext|> and <|im_end|>.");
             Expect(model->weight.dicts["num_hidden_layers"] == "64",
                    arch + " num_hidden_layers dict must use the main trunk layer count.");
             Expect(model->weight.dicts["mtp_num_hidden_layers"] == "1",
@@ -817,6 +841,124 @@ namespace {
                    10, requestedShort, singleShort) == 0,
                "qwen35 page budget hid a true single-token cache shortage.");
     }
+
+    void RunQwen35LongPrefillStateRegression() {
+        constexpr int chunk = 2048;
+        fastllm::ResponseContext context;
+        context.currentTokens.resize(chunk * 2 + 17, 7);
+        auto *managerA = reinterpret_cast<fastllm::PagedCacheManager*>(uintptr_t(0x10));
+        auto *managerB = reinterpret_cast<fastllm::PagedCacheManager*>(uintptr_t(0x20));
+        Expect(fastllm::ClassifyQwen35RequestPhase(context) ==
+                   fastllm::Qwen35RequestPhase::NewPrefill,
+               "fresh qwen35 request was not classified as prefill.");
+        Expect(fastllm::BeginQwen35LongPrefill(
+                   context, (int)context.currentTokens.size(), 11,
+                   {{managerA, 4}, {managerB, 2}}),
+               "qwen35 long prefill state did not start.");
+        Expect(context.longPrefill.reservedPages.size() == 2,
+               "qwen35 long prefill reservations were not retained.");
+
+        auto first = fastllm::PlanQwen35LongPrefillQuantum(context, chunk);
+        Expect(first.cursor == 0 && first.length == chunk && first.baseTokens == 0 &&
+                   !first.isLast && !first.producesOutput,
+               "qwen35 first prefill quantum was planned incorrectly.");
+        Expect(fastllm::CommitQwen35LongPrefillQuantum(context, first, true),
+               "qwen35 first prefill quantum did not commit.");
+        Expect(context.preTokens == chunk && context.longPrefill.cursor == chunk &&
+                   context.longPrefill.inProgress,
+               "qwen35 first prefill quantum broke cursor invariants.");
+        Expect(!fastllm::CommitQwen35LongPrefillQuantum(context, first, true),
+               "qwen35 stale prefill quantum committed twice.");
+
+        auto second = fastllm::PlanQwen35LongPrefillQuantum(context, chunk);
+        Expect(second.cursor == chunk && second.length == chunk &&
+                   !second.producesOutput,
+               "qwen35 second prefill quantum was planned incorrectly.");
+        Expect(fastllm::CommitQwen35LongPrefillQuantum(context, second, false),
+               "qwen35 second prefill quantum did not commit.");
+        Expect(!context.longPrefill.mtpViable,
+               "qwen35 MTP append failure was not made sticky.");
+
+        auto last = fastllm::PlanQwen35LongPrefillQuantum(context, chunk);
+        Expect(last.cursor == chunk * 2 && last.length == 17 &&
+                   last.isLast && last.producesOutput,
+               "qwen35 final prefill quantum was planned incorrectly.");
+        Expect(fastllm::CommitQwen35LongPrefillQuantum(context, last, true),
+               "qwen35 final prefill quantum did not commit.");
+        Expect(context.preTokens == chunk * 2 + 17 &&
+                   context.longPrefill.cursor == chunk * 2 + 17 &&
+                   !context.longPrefill.inProgress &&
+                   context.longPrefill.reservedPages.empty(),
+               "qwen35 final prefill quantum did not release state.");
+        Expect(fastllm::ClassifyQwen35RequestPhase(context) ==
+                   fastllm::Qwen35RequestPhase::Decode,
+               "completed qwen35 prefill was not classified as decode.");
+
+        fastllm::ResponseContext prefixHit;
+        prefixHit.cacheLen = 128;
+        prefixHit.currentTokens.resize(33, 9);
+        Expect(fastllm::BeginQwen35LongPrefill(prefixHit, 33, 12),
+               "prefix-hit qwen35 prefill did not start.");
+        auto prefixQuantum = fastllm::PlanQwen35LongPrefillQuantum(prefixHit, 64);
+        Expect(prefixQuantum.baseTokens == 128 && prefixQuantum.isLast,
+               "prefix-hit qwen35 prefill used the wrong physical base.");
+        Expect(fastllm::CommitQwen35LongPrefillQuantum(prefixHit, prefixQuantum, true) &&
+                   prefixHit.cacheLen == 128 && prefixHit.preTokens == 33,
+               "qwen35 prefill cursor polluted cached-input accounting.");
+
+        std::vector<std::tuple<int, uint64_t> > candidates = {
+            {30, 3}, {10, 1}, {20, 2}
+        };
+        Expect(fastllm::SelectQwen35LongPrefillHandle(candidates, 0) == 10 &&
+                   fastllm::SelectQwen35LongPrefillHandle(candidates, 1) == 20 &&
+                   fastllm::SelectQwen35LongPrefillHandle(candidates, 2) == 30 &&
+                   fastllm::SelectQwen35LongPrefillHandle(candidates, 3) == 10,
+               "qwen35 long prefill ticket selection is not round-robin.");
+        Expect(fastllm::CanAdmitQwen35LongPrefill(3, 4) &&
+                   !fastllm::CanAdmitQwen35LongPrefill(4, 4),
+               "qwen35 long prefill lane capacity was not enforced.");
+        Expect(fastllm::CanReserveQwen35LongPrefillPages({{2, 3, 5}, {1, 2, 4}}) &&
+                   !fastllm::CanReserveQwen35LongPrefillPages({{2, 4, 5}}) &&
+                   fastllm::CanReserveQwen35LongPrefillPages({{0, 0, 0}}),
+               "qwen35 long prefill page reservation accounting is incorrect.");
+
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL", nullptr);
+            Expect(!fastllm::Qwen35InterleaveLongPrefillEnabled(),
+                   "qwen35 long prefill interleave should default off.");
+        }
+        {
+            ScopedEnvVar enabled("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL", "1");
+            Expect(fastllm::Qwen35InterleaveLongPrefillEnabled(),
+                   "qwen35 long prefill interleave did not accept 1.");
+        }
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL", "false");
+            Expect(!fastllm::Qwen35InterleaveLongPrefillEnabled(),
+                   "qwen35 long prefill interleave did not reject false.");
+        }
+        {
+            ScopedEnvVar enabled("FASTLLM_QWEN35_BATCHED_MTP", nullptr);
+            Expect(fastllm::Qwen35BatchedMtpEnabled(),
+                   "qwen35 batched MTP should default on.");
+        }
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_BATCHED_MTP", "0");
+            Expect(!fastllm::Qwen35BatchedMtpEnabled(),
+                   "qwen35 batched MTP did not accept 0 as disabled.");
+        }
+        {
+            ScopedEnvVar disabled("FASTLLM_QWEN35_BATCHED_MTP", "false");
+            Expect(!fastllm::Qwen35BatchedMtpEnabled(),
+                   "qwen35 batched MTP did not reject false.");
+        }
+        {
+            ScopedEnvVar enabled("FASTLLM_QWEN35_BATCHED_MTP", "1");
+            Expect(fastllm::Qwen35BatchedMtpEnabled(),
+                   "qwen35 batched MTP did not accept 1.");
+        }
+    }
+
 
     void RunMoeAtypeConfigRegression() {
         MoeAtypeConfigTestModel model;
@@ -5686,6 +5828,11 @@ int main() {
             std::cout << "qwen35 GGUF alias, V-head layout, and grouped override regression: PASS\n";
             return 0;
         }
+        if (only != nullptr && std::string(only) == "qwen35_long_prefill_state") {
+            RunQwen35LongPrefillStateRegression();
+            std::cout << "qwen35 long prefill state regression: PASS\n";
+            return 0;
+        }
         if (only != nullptr && std::string(only) == "iq4xs_mmq_bench") {
 #ifdef USE_CUDA
             if (!fastllm::HasDeviceType("cuda")) {
@@ -5796,6 +5943,8 @@ int main() {
         std::cout << "KV cache dtype configuration regression: PASS\n";
         RunQwen35DecodePageBudgetRegression();
         std::cout << "qwen35 exact-window decode page budget regression: PASS\n";
+        RunQwen35LongPrefillStateRegression();
+        std::cout << "qwen35 long prefill state regression: PASS\n";
         RunMoeAtypeConfigRegression();
         std::cout << "moe_atype auto/explicit configuration regression: PASS\n";
         ranAny = true;
