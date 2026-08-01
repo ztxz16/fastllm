@@ -5538,7 +5538,7 @@ extern "C" bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, 
 extern "C" bool FastllmCudaDeepSeekV4SqrtSoftplusRouter(
         const fastllm::Data &logits, const fastllm::Data &gateBias,
         float routeScale, fastllm::Data &expertIndex,
-        fastllm::Data &expertScore) {
+        fastllm::Data &expertScore, bool allowTriton) {
     constexpr int experts = 256;
     constexpr int topk = 6;
     if (logits.dataDevice != fastllm::DataDevice::CUDA ||
@@ -5559,6 +5559,15 @@ extern "C" bool FastllmCudaDeepSeekV4SqrtSoftplusRouter(
             expertScore, fastllm::DataType::FLOAT32, {tokens, topk})) {
         return false;
     }
+#ifndef USE_ROCM
+    if (allowTriton &&
+        fastllm::FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+            logits, gateBias, routeScale, expertIndex, expertScore)) {
+        return true;
+    }
+#else
+    (void)allowTriton;
+#endif
     DeepSeekV4SqrtSoftplusTop6GenericKernel<<<tokens, experts>>>(
         (const float *)logits.cudaData,
         (const float *)gateBias.cudaData,

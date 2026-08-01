@@ -2203,6 +2203,223 @@ namespace {
         std::cout << "DeepSeek-V4 hash route cache regression: PASS\n";
     }
 
+    void RunCudaDeepSeekV4FusedRouterRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int experts = 256;
+        constexpr int topk = 6;
+        constexpr float routeScale = 1.5f;
+
+        std::vector<float> biasValues(experts);
+        for (int expert = 0; expert < experts; expert++) {
+            biasValues[expert] =
+                ((expert * 11) % 17 - 8) * 4.0e-4f + expert * 1.0e-7f;
+        }
+        fastllm::Data gateBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {experts}, biasValues);
+
+        bool tritonGate = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_ROUTER", true) &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DSV4_ROUTER_SM120", true);
+        int major = 0, minor = 0;
+#ifndef USE_ROCM
+        int device = 0;
+        bool haveArch = cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(
+                &major, cudaDevAttrComputeCapabilityMajor, device) ==
+                cudaSuccess &&
+            cudaDeviceGetAttribute(
+                &minor, cudaDevAttrComputeCapabilityMinor, device) ==
+                cudaSuccess;
+#else
+        bool haveArch = false;
+#endif
+        bool expectSm120Triton = tritonGate && haveArch &&
+            (major * 10 + minor == 120 || major * 10 + minor == 121);
+
+        for (int tokens : {1, 7, 127}) {
+            std::vector<float> logitsValues((size_t)tokens * experts);
+            for (int token = 0; token < tokens; token++) {
+                for (int expert = 0; expert < experts; expert++) {
+                    int permuted = (expert * 37 + token * 17) % 257;
+                    logitsValues[(size_t)token * experts + expert] =
+                        (permuted - 128) / 24.0f + expert * 1.0e-5f;
+                }
+                logitsValues[(size_t)token * experts] = -25.0f - token;
+                logitsValues[(size_t)token * experts + 1] = 25.0f + token;
+            }
+
+            fastllm::Data referenceLogits = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, experts}, logitsValues);
+            fastllm::Data fusedLogits = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, experts}, logitsValues);
+            fastllm::Data referenceIndex = MakeIntTensor(
+                {tokens, topk}, std::vector<int32_t>(tokens * topk, -1));
+            referenceIndex.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data referenceScore = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, topk},
+                std::vector<float>(tokens * topk, 0.0f));
+            Expect(FastllmCudaDeepSeekV4RouteScoreTransform(
+                       referenceLogits, 2),
+                   "DeepSeek-V4 legacy sqrt-softplus transform failed");
+            Expect(FastllmCudaSelectExpert(
+                       referenceLogits, &gateBias,
+                       referenceIndex, referenceScore,
+                       topk, true, routeScale),
+                   "DeepSeek-V4 legacy top-6 reference failed");
+            FastllmCudaSyncCurrentThreadStream();
+            const std::vector<int32_t> expectedIndex =
+                ToIntVector(referenceIndex);
+            const std::vector<float> expectedScore =
+                ToFloatVector(referenceScore);
+
+            fastllm::Data genericIndex, genericScore;
+            Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                       fusedLogits, gateBias, routeScale,
+                       genericIndex, genericScore, false),
+                   "generic DeepSeek-V4 fused router rejected a valid input");
+            ExpectIntEqual(expectedIndex, ToIntVector(genericIndex),
+                           "generic DeepSeek-V4 fused router indices");
+            ExpectFloatNear(expectedScore, ToFloatVector(genericScore),
+                            2.0e-6f, 2.0e-6f,
+                            "generic DeepSeek-V4 fused router scores");
+            ExpectFloatNear(logitsValues, ToFloatVector(fusedLogits),
+                            0.0f, 0.0f,
+                            "generic DeepSeek-V4 fused router input");
+
+            for (int token = 0; token < tokens; token++) {
+                float sum = std::accumulate(
+                    expectedScore.begin() + token * topk,
+                    expectedScore.begin() + (token + 1) * topk, 0.0f);
+                Expect(std::fabs(sum - routeScale) < 2.0e-5f,
+                       "DeepSeek-V4 fused router score sum mismatch");
+            }
+
+            fastllm::Data tritonIndex = MakeIntTensor(
+                {tokens, topk}, std::vector<int32_t>(tokens * topk, -1));
+            tritonIndex.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data tritonScore = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, topk},
+                std::vector<float>(tokens * topk, 0.0f));
+            bool usedTriton =
+                fastllm::FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+                    fusedLogits, gateBias, routeScale,
+                    tritonIndex, tritonScore);
+            if (expectSm120Triton) {
+                Expect(usedTriton,
+                       "SM120 DeepSeek-V4 fused router was not selected");
+                FastllmCudaSyncCurrentThreadStream();
+                ExpectIntEqual(expectedIndex, ToIntVector(tritonIndex),
+                               "SM120 DeepSeek-V4 fused router indices");
+                ExpectFloatNear(expectedScore, ToFloatVector(tritonScore),
+                                2.0e-5f, 2.0e-5f,
+                                "SM120 DeepSeek-V4 fused router scores");
+            } else {
+                Expect(!usedTriton,
+                       "DeepSeek-V4 SM120 router ignored its architecture/gate");
+            }
+
+            if (tokens == 1) {
+                void *graph = nullptr;
+                void *graphExec = nullptr;
+                Expect(FastllmCudaGraphBeginCapture(),
+                       "generic DeepSeek-V4 router graph capture did not start");
+                Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                           fusedLogits, gateBias, routeScale,
+                           genericIndex, genericScore, false),
+                       "generic DeepSeek-V4 router failed during graph capture");
+                Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                       "generic DeepSeek-V4 router graph capture failed");
+                Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                           graphExec != nullptr,
+                       "generic DeepSeek-V4 router graph instantiate failed");
+                Expect(FastllmCudaGraphLaunch(graphExec),
+                       "generic DeepSeek-V4 router graph replay failed");
+                FastllmCudaSyncCurrentThreadStream();
+                ExpectIntEqual(expectedIndex, ToIntVector(genericIndex),
+                               "generic DeepSeek-V4 router graph indices");
+                ExpectFloatNear(expectedScore, ToFloatVector(genericScore),
+                                2.0e-6f, 2.0e-6f,
+                                "generic DeepSeek-V4 router graph scores");
+                FastllmCudaGraphExecDestroy(graphExec);
+                FastllmCudaGraphDestroy(graph);
+
+                if (expectSm120Triton) {
+                    graph = nullptr;
+                    graphExec = nullptr;
+                    Expect(FastllmCudaGraphBeginCapture(),
+                           "SM120 DeepSeek-V4 router graph capture did not start");
+                    Expect(fastllm::
+                               FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+                                   fusedLogits, gateBias, routeScale,
+                                   tritonIndex, tritonScore),
+                           "SM120 DeepSeek-V4 router failed during graph capture");
+                    Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                           "SM120 DeepSeek-V4 router graph capture failed");
+                    Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                               graphExec != nullptr,
+                           "SM120 DeepSeek-V4 router graph instantiate failed");
+                    Expect(FastllmCudaGraphLaunch(graphExec),
+                           "SM120 DeepSeek-V4 router graph replay failed");
+                    FastllmCudaSyncCurrentThreadStream();
+                    ExpectIntEqual(expectedIndex, ToIntVector(tritonIndex),
+                                   "SM120 DeepSeek-V4 router graph indices");
+                    ExpectFloatNear(expectedScore, ToFloatVector(tritonScore),
+                                    2.0e-5f, 2.0e-5f,
+                                    "SM120 DeepSeek-V4 router graph scores");
+                    FastllmCudaGraphExecDestroy(graphExec);
+                    FastllmCudaGraphDestroy(graph);
+                }
+            }
+        }
+
+        std::vector<float> nonFiniteValues(
+            2 * experts, std::numeric_limits<float>::quiet_NaN());
+        fastllm::Data nonFiniteLogits = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {2, experts}, nonFiniteValues);
+        fastllm::Data nonFiniteIndex, nonFiniteScore;
+        Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                   nonFiniteLogits, gateBias, routeScale,
+                   nonFiniteIndex, nonFiniteScore, false),
+               "generic DeepSeek-V4 router rejected non-finite input");
+        for (int expert : ToIntVector(nonFiniteIndex)) {
+            Expect(expert >= 0 && expert < experts,
+                   "generic DeepSeek-V4 router returned an invalid expert");
+        }
+        for (float score : ToFloatVector(nonFiniteScore)) {
+            Expect(std::isfinite(score) && score == 0.0f,
+                   "generic DeepSeek-V4 router returned a non-finite score");
+        }
+        if (expectSm120Triton) {
+            fastllm::Data tritonIndex = MakeIntTensor(
+                {2, topk}, std::vector<int32_t>(2 * topk, -1));
+            tritonIndex.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data tritonScore = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {2, topk},
+                std::vector<float>(2 * topk, -1.0f));
+            Expect(fastllm::
+                       FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+                           nonFiniteLogits, gateBias, routeScale,
+                           tritonIndex, tritonScore),
+                   "SM120 DeepSeek-V4 router rejected non-finite input");
+            FastllmCudaSyncCurrentThreadStream();
+            for (int expert : ToIntVector(tritonIndex)) {
+                Expect(expert >= 0 && expert < experts,
+                       "SM120 DeepSeek-V4 router returned an invalid expert");
+            }
+            for (float score : ToFloatVector(tritonScore)) {
+                Expect(std::isfinite(score) && score == 0.0f,
+                       "SM120 DeepSeek-V4 router returned a non-finite score");
+            }
+        }
+
+        std::cout << "DeepSeek-V4 fused sqrt-softplus router regression: PASS ("
+                  << (expectSm120Triton ? "generic + SM120 Triton" :
+                                         "generic fallback")
+                  << ")\n";
+    }
+
     void RunCudaDeepSeekV4FusedHcPreNormRegression() {
         FastllmCudaSetDevice(0);
         constexpr int hcMult = 4;
@@ -6931,6 +7148,7 @@ int main() {
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
             RunMultiCudaDeepSeekV4SparsePrefillRegression();
             RunCudaDeepSeekV4HashRouteCacheRegression();
+            RunCudaDeepSeekV4FusedRouterRegression();
             RunCudaDeepSeekV4FusedHcPreNormRegression();
             RunMultiCudaDeepSeekV4HcPrePrefillRegression();
             RunMultiCudaDeepSeekV4RouterLinearResizeRegression();

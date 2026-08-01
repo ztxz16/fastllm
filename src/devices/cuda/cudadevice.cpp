@@ -241,6 +241,13 @@ namespace fastllm {
         std::string variant = "generic";
     };
 
+    struct CudaTritonDeepSeekV4RouterMeta {
+        CudaTritonKernelMeta kernel;
+        int numExperts = 256;
+        int topk = 6;
+        int blockN = 256;
+    };
+
     struct CudaTritonMergeMoeFp8Meta {
         CudaTritonKernelMeta kernels[kCudaTritonMergeMoeFp8KernelCount];
         int routeBlockT = 1024;
@@ -426,6 +433,17 @@ namespace fastllm {
            << "_bs" << blockSplits
            << "_snw" << splitNumWarps << "_mnw" << mergeNumWarps
            << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonDeepSeekV4RouterBaseName(
+        int arch, int numExperts, int topk, int blockN,
+        int numWarps, int numStages) {
+        std::ostringstream os;
+        os << "deepseek_v4_sqrtsoftplus_router_v1_sm" << arch
+           << "_e" << numExperts << "_k" << topk
+           << "_bn" << blockN
+           << "_nw" << numWarps << "_ns" << numStages;
         return os.str();
     }
 
@@ -712,6 +730,35 @@ namespace fastllm {
                  meta.numHeads <= 16)) &&
                (meta.mergeBlockD == 16 || meta.mergeBlockD == 32 ||
                 meta.mergeBlockD == 64 || meta.mergeBlockD == 128);
+    }
+
+    static bool CudaTritonReadDeepSeekV4RouterMeta(
+        const std::string &path, CudaTritonDeepSeekV4RouterMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() !=
+                "deepseek_v4_sqrtsoftplus_router" ||
+            json["version"].int_value() != 1 ||
+            json["variant"].string_value() != "sm120") {
+            return false;
+        }
+        meta.kernel.cubinPath = json["cubin"].string_value();
+        meta.kernel.kernelName = json["kernel"].string_value();
+        meta.kernel.shared = json["shared"].int_value();
+        meta.kernel.numWarps = json["num_warps"].int_value();
+        meta.numExperts = json["num_experts"].int_value();
+        meta.topk = json["topk"].int_value();
+        meta.blockN = json["block_n"].int_value();
+        return !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.kernel.numWarps == 1 && meta.numExperts == 256 &&
+               meta.topk == 6 && meta.blockN == 256;
     }
 
     static bool CudaTritonReadMergeMoeFp8Meta(const std::string &path, CudaTritonMergeMoeFp8Meta &meta) {
@@ -1637,6 +1684,100 @@ namespace fastllm {
             return false;
         }
 
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestDeepSeekV4RouterKernel(
+        const std::string &cacheDir, int arch, int numExperts, int topk,
+        int blockN, int numWarps, int numStages,
+        CudaTritonDeepSeekV4RouterMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "deepseek_v4_sqrtsoftplus_router"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"num_experts", numExperts},
+            {"topk", topk},
+            {"block_n", blockN},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: DeepSeek-V4 router compile failed; "
+                       "falling back to generic CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.kernel.cubinPath = response["cubin"].string_value();
+        meta.kernel.kernelName = response["kernel"].string_value();
+        meta.kernel.shared = response["shared"].int_value();
+        meta.kernel.numWarps = response["num_warps"].int_value();
+        meta.numExperts = response["num_experts"].int_value();
+        meta.topk = response["topk"].int_value();
+        meta.blockN = response["block_n"].int_value();
+        return response["version"].int_value() == 1 &&
+               response["variant"].string_value() == "sm120" &&
+               meta.kernel.numWarps == numWarps &&
+               meta.numExperts == numExperts && meta.topk == topk &&
+               meta.blockN == blockN &&
+               !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               CudaTritonFileExists(meta.kernel.cubinPath);
+    }
+
+    static bool CudaTritonGetDeepSeekV4RouterMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, int numExperts, int topk, int blockN,
+        int numWarps, int numStages,
+        const CudaTritonDeepSeekV4RouterMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonDeepSeekV4RouterMeta>
+            cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonDeepSeekV4RouterMeta loaded;
+        if (!CudaTritonReadDeepSeekV4RouterMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestDeepSeekV4RouterKernel(
+                    cacheDir, arch, numExperts, topk, blockN,
+                    numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.numExperts != numExperts || loaded.topk != topk ||
+            loaded.blockN != blockN ||
+            loaded.kernel.numWarps != numWarps) {
+            return false;
+        }
         std::lock_guard<std::mutex> guard(mutex);
         auto it = cachedMeta.find(metaPath);
         if (it == cachedMeta.end()) {
@@ -2761,6 +2902,64 @@ namespace fastllm {
             decodeMeta, softmaxScale, output);
     }
 
+    bool FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+        const Data &logits, const Data &gateBias, float routeScale,
+        Data &expertIndex, Data &expertScore) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_ROUTER", true) ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DSV4_ROUTER_SM120", true)) {
+            return false;
+        }
+        constexpr int numExperts = 256;
+        constexpr int topk = 6;
+        constexpr int blockN = 256;
+        constexpr int numWarps = 1;
+        constexpr int numStages = 1;
+        if (logits.dataDevice != DataDevice::CUDA ||
+            logits.dataType != DataType::FLOAT32 ||
+            logits.cudaData == nullptr || logits.dims.empty() ||
+            logits.dims.back() != numExperts ||
+            logits.Count(0) == 0 || logits.Count(0) % numExperts != 0 ||
+            gateBias.dataDevice != DataDevice::CUDA ||
+            gateBias.dataType != DataType::FLOAT32 ||
+            gateBias.cudaData == nullptr ||
+            gateBias.Count(0) != numExperts ||
+            expertIndex.dataDevice != DataDevice::CUDA ||
+            expertIndex.dataType != DataType::INT32 ||
+            expertIndex.cudaData == nullptr ||
+            expertScore.dataDevice != DataDevice::CUDA ||
+            expertScore.dataType != DataType::FLOAT32 ||
+            expertScore.cudaData == nullptr || !std::isfinite(routeScale)) {
+            return false;
+        }
+        int tokens = (int)(logits.Count(0) / numExperts);
+        if (expertIndex.Count(0) != (uint64_t)tokens * topk ||
+            expertScore.Count(0) != (uint64_t)tokens * topk) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch != 120 && arch != 121) {
+            return false;
+        }
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonDeepSeekV4RouterBaseName(
+            arch, numExperts, topk, blockN, numWarps, numStages);
+        const CudaTritonDeepSeekV4RouterMeta *meta = nullptr;
+        if (!CudaTritonGetDeepSeekV4RouterMeta(
+                cacheDir, base, arch, numExperts, topk, blockN,
+                numWarps, numStages, meta) || meta == nullptr) {
+            return false;
+        }
+        return FastllmCudaTritonDeepSeekV4SqrtSoftplusRouter(
+            meta->kernel.cubinPath.c_str(),
+            meta->kernel.kernelName.c_str(),
+            meta->kernel.numWarps, meta->kernel.shared,
+            meta->numExperts, meta->topk, meta->blockN,
+            logits, gateBias, routeScale, expertIndex, expertScore);
+    }
+
     static bool TryCudaTritonMergeMOEFp8Indexed(
         Data &input, Data &output, Data &index, Data &score, int batch, int topk,
         Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
@@ -2970,6 +3169,11 @@ namespace fastllm {
     bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
         const Data &, const Data &, const Data &, const Data &, int, int,
         const int32_t *, float, float *) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+        const Data &, const Data &, float, Data &, Data &) {
         return false;
     }
 

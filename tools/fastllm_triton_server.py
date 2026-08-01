@@ -989,6 +989,97 @@ if triton is not None:
 
 
     @triton.jit
+    def fastllm_deepseek_v4_sqrtsoftplus_router_sm120_kernel(
+        logits_ptr,
+        bias_ptr,
+        index_ptr,
+        score_ptr,
+        route_scale,
+        NUM_EXPERTS: tl.constexpr,
+        TOPK: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Single-warp DeepSeek-V4 sqrt-softplus top-k router for SM120."""
+        row = tl.program_id(0)
+        expert_offsets = tl.arange(0, BLOCK_N)
+        expert_mask = expert_offsets < NUM_EXPERTS
+        raw = tl.load(
+            logits_ptr + row * NUM_EXPERTS + expert_offsets,
+            mask=expert_mask,
+            other=0.0,
+        ).to(tl.float32)
+        bias = tl.load(
+            bias_ptr + expert_offsets,
+            mask=expert_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        # Match DeepSeekV4Softplus's stable branches. The selected score uses
+        # the unbiased transformed weight; correction bias only affects rank.
+        softplus = tl.where(
+            raw > 20.0,
+            raw,
+            tl.where(
+                raw < -20.0,
+                tl.exp(raw),
+                tl.log(1.0 + tl.exp(raw)),
+            ),
+        )
+        weights = tl.sqrt(softplus)
+        weight_finite = (
+            (weights == weights)
+            & (weights < float("inf"))
+            & (weights > -float("inf"))
+        )
+        score_weights = tl.where(weight_finite, weights, 0.0)
+        current = weights + bias
+        finite = (
+            (current == current)
+            & (current < float("inf"))
+            & (current > -float("inf"))
+        )
+        current = tl.where(expert_mask & finite, current, -float("inf"))
+
+        output_offsets = tl.arange(0, 8)
+        selected_weights = tl.zeros((8,), dtype=tl.float32)
+        selected_ids = tl.zeros((8,), dtype=tl.int32)
+        for slot in tl.static_range(0, TOPK):
+            max_value = tl.max(current, axis=0)
+            candidate = tl.where(
+                current == max_value, expert_offsets, NUM_EXPERTS
+            )
+            expert_id = tl.min(candidate, axis=0).to(tl.int32)
+            selected_weight = tl.sum(
+                tl.where(
+                    expert_offsets == expert_id, score_weights, 0.0
+                ),
+                axis=0,
+            )
+            is_slot = output_offsets == slot
+            selected_weights = tl.where(
+                is_slot, selected_weight, selected_weights
+            )
+            selected_ids = tl.where(is_slot, expert_id, selected_ids)
+            current = tl.where(
+                expert_offsets == expert_id, -float("inf"), current
+            )
+
+        weight_sum = tl.sum(selected_weights, axis=0)
+        valid_sum = (
+            (weight_sum == weight_sum)
+            & (weight_sum < float("inf"))
+            & (weight_sum > -float("inf"))
+            & (tl.abs(weight_sum) >= 1.0e-20)
+        )
+        denominator = tl.where(valid_sum, weight_sum, 1.0)
+        selected_weights *= route_scale / denominator
+        output_mask = output_offsets < TOPK
+        row_offsets = row * TOPK + output_offsets
+        tl.store(index_ptr + row_offsets, selected_ids, mask=output_mask)
+        tl.store(score_ptr + row_offsets, selected_weights, mask=output_mask)
+
+
+    @triton.jit
     def fastllm_deepseek_v4_sparse_decode_kernel(
         q_ptr,
         window_kv_ptr,
@@ -2076,6 +2167,22 @@ def deepseek_v4_fp8_woa_cache_paths(payload):
     return cache_dir / f"{name}.cubin", cache_dir / f"{name}.json"
 
 
+def deepseek_v4_sqrtsoftplus_router_cache_paths(payload):
+    arch = require_int(payload, "arch")
+    num_experts = require_int(payload, "num_experts", 256)
+    topk = require_int(payload, "topk", 6)
+    block_n = require_int(payload, "block_n", 256)
+    num_warps = require_int(payload, "num_warps", 1)
+    num_stages = require_int(payload, "num_stages", 1)
+    cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
+    name = (
+        f"deepseek_v4_sqrtsoftplus_router_v1_sm{arch}"
+        f"_e{num_experts}_k{topk}_bn{block_n}"
+        f"_nw{num_warps}_ns{num_stages}"
+    )
+    return cache_dir / f"{name}.cubin", cache_dir / f"{name}.json"
+
+
 DEEPSEEK_V4_SPARSE_DECODE_KERNEL_ORDER = ("split", "merge")
 
 
@@ -3020,6 +3127,75 @@ def compile_deepseek_v4_sparse_decode(payload):
     return meta
 
 
+def compile_deepseek_v4_sqrtsoftplus_router(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+
+    arch = require_int(payload, "arch")
+    num_experts = require_int(payload, "num_experts", 256)
+    topk = require_int(payload, "topk", 6)
+    block_n = require_int(payload, "block_n", 256)
+    num_warps = require_int(payload, "num_warps", 1)
+    num_stages = require_int(payload, "num_stages", 1)
+    if arch not in {120, 121}:
+        raise ValueError("DeepSeek-V4 high-efficiency router requires SM12x")
+    if num_experts != 256 or topk != 6 or block_n != 256:
+        raise ValueError(
+            "DeepSeek-V4 high-efficiency router requires 256 experts and top-6"
+        )
+    if num_warps != 1 or num_stages != 1:
+        raise ValueError(
+            "DeepSeek-V4 high-efficiency router requires one warp and one stage"
+        )
+
+    cubin_path, meta_path = deepseek_v4_sqrtsoftplus_router_cache_paths(payload)
+    if cubin_path.exists() and meta_path.exists():
+        return json.loads(meta_path.read_text())
+
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    signature = {
+        "logits_ptr": "*fp32",
+        "bias_ptr": "*fp32",
+        "index_ptr": "*i32",
+        "score_ptr": "*fp32",
+        "route_scale": "fp32",
+        "NUM_EXPERTS": "constexpr",
+        "TOPK": "constexpr",
+        "BLOCK_N": "constexpr",
+    }
+    constexprs = {
+        "NUM_EXPERTS": num_experts,
+        "TOPK": topk,
+        "BLOCK_N": block_n,
+    }
+    ccinfo = _compile_cubin(
+        fastllm_deepseek_v4_sqrtsoftplus_router_sm120_kernel,
+        signature,
+        constexprs,
+        arch,
+        num_warps,
+        num_stages,
+        cubin_path,
+    )
+    meta = {
+        "ok": True,
+        "op": "deepseek_v4_sqrtsoftplus_router",
+        "version": 1,
+        "variant": "sm120",
+        "cubin": str(cubin_path),
+        "kernel": ccinfo.metadata.name,
+        "shared": int(ccinfo.metadata.shared),
+        "num_warps": int(ccinfo.metadata.num_warps),
+        "num_stages": int(ccinfo.metadata.num_stages),
+        "arch": arch,
+        "num_experts": num_experts,
+        "topk": topk,
+        "block_n": block_n,
+    }
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
 def compile_merge_moe_fp8(payload):
     if triton is None:
         raise RuntimeError(f"failed to import triton: {_triton_error}")
@@ -3557,6 +3733,8 @@ def handle_compile(payload):
             return compile_deepseek_v4_fp8_woa(payload)
         if op == "deepseek_v4_sparse_decode":
             return compile_deepseek_v4_sparse_decode(payload)
+        if op == "deepseek_v4_sqrtsoftplus_router":
+            return compile_deepseek_v4_sqrtsoftplus_router(payload)
         if op == "merge_moe_fp8":
             return compile_merge_moe_fp8(payload)
         raise ValueError(f"unsupported op: {op}")

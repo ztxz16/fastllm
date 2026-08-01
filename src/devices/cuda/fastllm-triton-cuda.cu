@@ -1540,6 +1540,82 @@ extern "C" bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
         mergeResult, "cuLaunchKernel deepseek_v4_sparse_decode_merge");
 }
 
+extern "C" bool FastllmCudaTritonDeepSeekV4SqrtSoftplusRouter(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared, int numExperts, int topk, int blockN,
+    const fastllm::Data &logits, const fastllm::Data &gateBias,
+    float routeScale, fastllm::Data &expertIndex,
+    fastllm::Data &expertScore) {
+    if (cubinPath == nullptr || kernelName == nullptr ||
+        numWarps != 1 || numExperts != 256 || topk != 6 || blockN != 256 ||
+        logits.dataDevice != fastllm::DataDevice::CUDA ||
+        logits.dataType != fastllm::DataType::FLOAT32 ||
+        logits.cudaData == nullptr || logits.dims.empty() ||
+        logits.dims.back() != numExperts || logits.Count(0) == 0 ||
+        logits.Count(0) % numExperts != 0 ||
+        gateBias.dataDevice != fastllm::DataDevice::CUDA ||
+        gateBias.dataType != fastllm::DataType::FLOAT32 ||
+        gateBias.cudaData == nullptr || gateBias.Count(0) != numExperts ||
+        expertIndex.dataDevice != fastllm::DataDevice::CUDA ||
+        expertIndex.dataType != fastllm::DataType::INT32 ||
+        expertIndex.cudaData == nullptr ||
+        expertScore.dataDevice != fastllm::DataDevice::CUDA ||
+        expertScore.dataType != fastllm::DataType::FLOAT32 ||
+        expertScore.cudaData == nullptr || !isfinite(routeScale)) {
+        return false;
+    }
+    int tokens = (int)(logits.Count(0) / numExperts);
+    if (expertIndex.Count(0) != (uint64_t)tokens * topk ||
+        expertScore.Count(0) != (uint64_t)tokens * topk) {
+        return false;
+    }
+    LoadedTritonKernel *kernel =
+        LoadTritonKernel(cubinPath, kernelName, shared);
+    if (kernel == nullptr) {
+        return false;
+    }
+
+    void *logitsData = FastllmCudaPrepareInput(logits);
+    void *biasData = FastllmCudaPrepareInput(gateBias);
+    void *indexData = FastllmCudaPrepareOutput(expertIndex);
+    void *scoreData = FastllmCudaPrepareOutput(expertScore);
+    if (logitsData == nullptr || biasData == nullptr ||
+        indexData == nullptr || scoreData == nullptr) {
+        FastllmCudaFinishInput(logits, logitsData);
+        FastllmCudaFinishInput(gateBias, biasData);
+        FastllmCudaFinishOutput(expertIndex, indexData);
+        FastllmCudaFinishOutput(expertScore, scoreData);
+        return false;
+    }
+
+    CUdeviceptr logitsPtr = (CUdeviceptr)logitsData;
+    CUdeviceptr biasPtr = (CUdeviceptr)biasData;
+    CUdeviceptr indexPtr = (CUdeviceptr)indexData;
+    CUdeviceptr scorePtr = (CUdeviceptr)scoreData;
+    float routeScaleArg = routeScale;
+    CUdeviceptr globalScratch = 0;
+    CUdeviceptr profileScratch = 0;
+    void *args[] = {
+        &logitsPtr,
+        &biasPtr,
+        &indexPtr,
+        &scorePtr,
+        &routeScaleArg,
+        &globalScratch,
+        &profileScratch,
+    };
+    CUresult result = LaunchTritonKernel(
+        kernel, (unsigned int)tokens, 1, 1,
+        (unsigned int)(numWarps * 32), (unsigned int)shared, args);
+
+    FastllmCudaFinishInput(logits, logitsData);
+    FastllmCudaFinishInput(gateBias, biasData);
+    FastllmCudaFinishOutput(expertIndex, indexData);
+    FastllmCudaFinishOutput(expertScore, scoreData);
+    return CheckCu(
+        result, "cuLaunchKernel deepseek_v4_sqrtsoftplus_router_sm120");
+}
+
 static bool LaunchTritonMergeMOEFP8E4M3Table(
     const char *const *cubinPaths, const char *const *kernelNames,
     const int *numWarps, const int *shared,

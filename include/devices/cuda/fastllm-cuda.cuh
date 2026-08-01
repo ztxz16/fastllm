@@ -475,13 +475,15 @@ bool FastllmCudaDeepSeekV4FusedQKVRopeCacheGraph(
                                             int quantDim, int quantBlockSize,
                                             int windowSize, fastllm::Data &windowKV);
 bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, int scoreFuncMode);
-// Architecture-generic fused DeepSeek-V4 sqrt-softplus router for the
-// production 256-expert, top-6 shape.
+// Fused DeepSeek-V4 sqrt-softplus router for the production 256-expert,
+// top-6 shape. The built-in CUDA kernel is architecture-generic; when
+// allowTriton is true an eligible SM120 device may use the faster Triton path.
 bool FastllmCudaDeepSeekV4SqrtSoftplusRouter(const fastllm::Data &logits,
                                              const fastllm::Data &gateBias,
                                              float routeScale,
                                              fastllm::Data &expertIndex,
-                                             fastllm::Data &expertScore);
+                                             fastllm::Data &expertScore,
+                                             bool allowTriton = true);
 bool FastllmCudaDeepSeekV4HashRouteScore(const fastllm::Data &logits, fastllm::Data &tid2eid,
                                          const int *inputIds, int tokens, int topk,
                                          int scoreFuncMode, float routeScale,
@@ -627,6 +629,9 @@ bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
         const Data &q, const Data &windowKV, const Data &compressedKV,
         const Data &attnSink, int windowSize, int compressRatio,
         const int32_t *decodeMeta, float softmaxScale, float *output);
+bool FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+        const Data &logits, const Data &gateBias,
+        float routeScale, Data &expertIndex, Data &expertScore);
 }
 bool FastllmCudaDeepSeekV4HcPost(const fastllm::Data &x, const fastllm::Data &residual, const float *post,
                                  const float *comb, int bsz, int seqlen, int hcMult, int dim,
@@ -1087,6 +1092,13 @@ bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
     const fastllm::Data &windowKV, const fastllm::Data &compressedKV,
     const fastllm::Data &attnSink, int windowSize, int compressRatio,
     const int32_t *decodeMeta, float softmaxScale, float *output);
+
+bool FastllmCudaTritonDeepSeekV4SqrtSoftplusRouter(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared, int numExperts, int topk, int blockN,
+    const fastllm::Data &logits, const fastllm::Data &gateBias,
+    float routeScale, fastllm::Data &expertIndex,
+    fastllm::Data &expertScore);
 
 bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     const char *hCubinPath, const char *hKernelName, int hNumWarps, int hShared,

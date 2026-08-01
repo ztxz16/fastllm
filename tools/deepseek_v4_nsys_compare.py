@@ -52,11 +52,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def fast_family(name: str) -> str:
+    lower_name = name.lower()
     if "fastllm_deepseek_v4_sparse_decode" in name:
         return "sparse_attention_core"
     if "CustomAllReduce" in name or "ncclDevKernel" in name:
         return "communication"
-    if "SelectExpert" in name or "RouteScoreTransform" in name or "HashRouteScore" in name:
+    if (
+        "SelectExpert" in name
+        or "RouteScoreTransform" in name
+        or "HashRouteScore" in name
+        or "SqrtSoftplusTop6" in name
+        or "sqrtsoftplus_router" in lower_name
+    ):
         return "moe_router"
     if "marlin_moe_wna16::Marlin" in name:
         return "expert_gemm"
