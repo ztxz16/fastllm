@@ -9876,7 +9876,12 @@ int main() {
             RunCudaGgufMmvqBatch8Regression();
             RunCudaKimiK3PackedConvCacheRegression();
             RunCudaKimiK3RecurrentKdaRegression();
+#ifdef FASTLLM_ENABLE_FLASHINFER
             RunCudaMergeMlaPagedChunkRegression();
+#else
+            std::cout << "CUDA MergeMLAPaged regression: SKIP "
+                         "(FlashInfer unavailable)\n";
+#endif
             RunCudaInt4Group32AwqLinearRegression();
             RunCudaCompactInt4Group32LinearRegression();
             RunCudaInt4GroupHalfWeightRoundingRegression();
