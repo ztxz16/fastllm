@@ -359,6 +359,19 @@ bool FastllmCudaMulCausalMask(const fastllm::Data &input0,
                               const fastllm::Data &input1,
                               fastllm::Data &output,
                               float alpha, int base, float maskValue);
+// Merge the routed and shared Qwen3.5 MoE branches into destination. When
+// sharedGate is non-null it contains the per-token gate. It is pre-sigmoid
+// unless sharedGateAlreadySigmoid is true. Setting addResidual preserves
+// destination and adds the merged local result to it; otherwise destination
+// is overwritten. The FLOAT16 path deliberately keeps the same intermediate
+// FP16 rounding as Sigmoid + MulTo + AddTo (+ AddTo).
+bool FastllmCudaQwen35FusedMoeJoin(
+        fastllm::Data &destination,
+        const fastllm::Data &routedOutput,
+        const fastllm::Data &sharedOutput,
+        const fastllm::Data *sharedGate,
+        bool addResidual,
+        bool sharedGateAlreadySigmoid = false);
 bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaTransferAttn(fastllm::Data &input);
@@ -829,6 +842,9 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
 bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo, bool allowRouterSpecialization);
+// Fuses the Qwen3.5 FP16 router and shared-gate projections for one to seven
+// flattened decode rows. Larger batches keep the cuBLAS GEMM path.
+bool FastllmCudaQwen35RouterSharedGateFloat16(const fastllm::Data &input, fastllm::Data &routerWeight, fastllm::Data &sharedGateWeight, fastllm::Data &routerOutput, fastllm::Data &sharedGateOutput, bool sigmoidSharedGate = false);
 bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

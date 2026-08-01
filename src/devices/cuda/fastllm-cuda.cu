@@ -1938,6 +1938,124 @@ __global__ void FastllmMulSingleToKernel(__nv_bfloat16* a,
     }
 }
 
+template <bool HAS_GATE, bool ADD_RESIDUAL>
+__global__ void FastllmCudaQwen35FusedMoeJoinHalfKernel(
+        half *destination,
+        const half *routedOutput,
+        const half *sharedOutput,
+        const half *sharedGate,
+        int rows, int hidden, bool broadcastGate,
+        bool sharedGateAlreadySigmoid) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    __shared__ half computedGateValue;
+    half gateValue;
+    if (HAS_GATE) {
+        if (sharedGateAlreadySigmoid) {
+            // The fused router/shared-gate GEMV has already rounded the
+            // linear result to FP16 and applied the exact legacy sigmoid.
+            // A uniform cached load is cheaper here than a block barrier.
+            gateValue = sharedGate[broadcastGate ? 0 : row];
+        } else {
+            if (threadIdx.x == 0) {
+                const half inputGate =
+                    sharedGate[broadcastGate ? 0 : row];
+#ifdef CUDA_NO_TENSOR_CORE
+                computedGateValue = __float2half(
+                    1.0f / (1.0f + expf(-__half2float(inputGate))));
+#else
+                // Match FastllmSigmoidKernel(half) exactly. In particular,
+                // keep the sigmoid result in FP16 before multiplying
+                // sharedOutput.
+                computedGateValue = __hdiv(
+                    1.0, __hadd(__float2half(1.0), hexp(-inputGate)));
+#endif
+            }
+            __syncthreads();
+            gateValue = computedGateValue;
+        }
+    }
+
+    const int base = row * hidden;
+    const half one = __float2half_rn(1.0f);
+#ifndef CUDA_NO_TENSOR_CORE
+    const uintptr_t pointerBits =
+        (uintptr_t)destination | (uintptr_t)routedOutput |
+        (uintptr_t)sharedOutput;
+    if ((hidden & 1) == 0 &&
+        (pointerBits & (alignof(half2) - 1)) == 0) {
+        const int packedHidden = hidden / 2;
+        const int packedBase = row * packedHidden;
+        half2 *destination2 = reinterpret_cast<half2*>(destination);
+        const half2 *routed2 =
+            reinterpret_cast<const half2*>(routedOutput);
+        const half2 *shared2 =
+            reinterpret_cast<const half2*>(sharedOutput);
+        const half2 one2 = __half2half2(one);
+        half2 gate2;
+        if (HAS_GATE) {
+            gate2 = __half2half2(
+                (half)((float)gateValue * 1.0f));
+        }
+        for (int column = threadIdx.x;
+             column < packedHidden; column += blockDim.x) {
+            const int index = packedBase + column;
+            half2 shared = shared2[index];
+            if (HAS_GATE) {
+                shared = __hmul2_rn(shared, gate2);
+            }
+            half2 merged = __hadd2_rn(
+                routed2[index], __hmul2_rn(shared, one2));
+            if (ADD_RESIDUAL) {
+                merged = __hadd2_rn(
+                    destination2[index], __hmul2_rn(merged, one2));
+            }
+            destination2[index] = merged;
+        }
+        return;
+    }
+#endif
+    for (int column = threadIdx.x; column < hidden; column += blockDim.x) {
+        const int index = base + column;
+        half shared = sharedOutput[index];
+        if (HAS_GATE) {
+#ifdef CUDA_NO_TENSOR_CORE
+            shared = __float2half(
+                __half2float(gateValue) * __half2float(shared));
+#else
+            // Match FastllmMulSingleToKernel(half), including its FP16
+            // conversion of the scalar multiplier. The _rn intrinsic is
+            // important here: without it nvcc may contract this multiply with
+            // the following add, removing the legacy kernel boundary's FP16
+            // rounding point.
+            shared = __hmul_rn(
+                shared, (half)((float)gateValue * 1.0f));
+#endif
+        }
+#ifdef CUDA_NO_TENSOR_CORE
+        half merged = __float2half(
+            __half2float(routedOutput[index]) + __half2float(shared));
+        if (ADD_RESIDUAL) {
+            merged = __float2half(
+                __half2float(destination[index]) + __half2float(merged));
+        }
+#else
+        // Preserve both AddTo rounding points even though the operations now
+        // execute in one kernel.
+        half merged = __hadd_rn(
+            routedOutput[index], __hmul_rn(shared, one));
+        if (ADD_RESIDUAL) {
+            merged = __hadd_rn(
+                destination[index], __hmul_rn(merged, one));
+        }
+#endif
+        destination[index] = merged;
+    }
+}
+
 __global__ void FastllmChannelMulToKernel(float* a, float *b, float alpha, int len, int channelLen) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -5808,6 +5926,78 @@ bool FastllmCudaMulCausalMask(
     return true;
 }
 
+bool FastllmCudaQwen35FusedMoeJoin(
+        fastllm::Data &destination,
+        const fastllm::Data &routedOutput,
+        const fastllm::Data &sharedOutput,
+        const fastllm::Data *sharedGate,
+        bool addResidual,
+        bool sharedGateAlreadySigmoid) {
+    const int len = destination.Count(0);
+    if (len <= 0 ||
+        destination.dataDevice != fastllm::DataDevice::CUDA ||
+        routedOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        sharedOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        destination.cudaData == nullptr ||
+        routedOutput.cudaData == nullptr ||
+        sharedOutput.cudaData == nullptr ||
+        destination.dataType != fastllm::DataType::FLOAT16 ||
+        routedOutput.dataType != destination.dataType ||
+        sharedOutput.dataType != destination.dataType ||
+        routedOutput.Count(0) != len ||
+        sharedOutput.Count(0) != len ||
+        sharedOutput.dims.empty()) {
+        return false;
+    }
+
+    const int hidden = sharedOutput.dims.back();
+    if (hidden <= 0 || len % hidden != 0) {
+        return false;
+    }
+    const int rows = len / hidden;
+    bool broadcastGate = false;
+    const half *gateData = nullptr;
+    if (sharedGate != nullptr) {
+        if (sharedGate->dataDevice != fastllm::DataDevice::CUDA ||
+            sharedGate->cudaData == nullptr ||
+            sharedGate->dataType != destination.dataType ||
+            (sharedGate->Count(0) != rows && sharedGate->Count(0) != 1)) {
+            return false;
+        }
+        broadcastGate = sharedGate->Count(0) == 1;
+        gateData = (const half*)sharedGate->cudaData;
+    }
+
+    const int threads = std::min(1024, hidden);
+    half *destinationData = (half*)destination.cudaData;
+    const half *routedData = (const half*)routedOutput.cudaData;
+    const half *sharedData = (const half*)sharedOutput.cudaData;
+    if (gateData != nullptr) {
+        if (addResidual) {
+            FastllmCudaQwen35FusedMoeJoinHalfKernel<true, true>
+                <<<rows, threads>>>(destinationData, routedData, sharedData,
+                                    gateData, rows, hidden, broadcastGate,
+                                    sharedGateAlreadySigmoid);
+        } else {
+            FastllmCudaQwen35FusedMoeJoinHalfKernel<true, false>
+                <<<rows, threads>>>(destinationData, routedData, sharedData,
+                                    gateData, rows, hidden, broadcastGate,
+                                    sharedGateAlreadySigmoid);
+        }
+    } else if (addResidual) {
+        FastllmCudaQwen35FusedMoeJoinHalfKernel<false, true>
+            <<<rows, threads>>>(destinationData, routedData, sharedData,
+                                nullptr, rows, hidden, false, false);
+    } else {
+        FastllmCudaQwen35FusedMoeJoinHalfKernel<false, false>
+            <<<rows, threads>>>(destinationData, routedData, sharedData,
+                                nullptr, rows, hidden, false, false);
+    }
+    checkCudaErrors("Error: CUDA error in FastllmCudaQwen35FusedMoeJoin.",
+                    cudaGetLastError());
+    return true;
+}
+
 bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue) {
     int n = input.dims[0], m = input.dims[1];
     int spn = input.dims[2], spm = input.dims[3];
@@ -9146,10 +9336,531 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
 }
 #endif
 
-// The 256-expert router keeps probabilities in shared memory, so the FP32
-// scoring intermediate never reaches global memory. Ranking deliberately uses
-// probability + correction bias while output scores use the unbiased
-// probabilities, matching SelectExpert's existing semantics.
+__device__ __forceinline__ void FastllmWriteNormalizedLogitsTop8(
+        float key, int expert, int lane,
+        int32_t *tokenIndex, float *tokenScore, float routeScale) {
+    constexpr int TOPK = 8;
+    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+    float maxKey = __shfl_sync(FULL_WARP_MASK, key, 0);
+    float selected = lane < TOPK ? expf(key - maxKey) : 0.0f;
+    float selectedSum = selected;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        selectedSum +=
+            __shfl_down_sync(FULL_WARP_MASK, selectedSum, offset);
+    }
+    selectedSum =
+        __shfl_sync(FULL_WARP_MASK, selectedSum, 0);
+    if (lane < TOPK) {
+        tokenIndex[lane] = expert;
+        tokenScore[lane] = selected / selectedSum * routeScale;
+    }
+}
+
+// Reproduce the original 64-thread SelectExpert merge tree with one physical
+// warp.  This is only needed when equal routing keys make a fixed total-order
+// comparator insufficient: the legacy tie order depends on how candidates are
+// distributed across the merge tree.
+template <typename T>
+__device__ __forceinline__ void FastllmWriteLegacyNormalizedLogitsTop8(
+        const T *tokenLogits, int lane,
+        float *legacyKeys, int *legacyIds,
+        int32_t *tokenIndex, float *tokenScore, float routeScale) {
+    constexpr int THREADS = 64;
+    constexpr int TOPK = 8;
+    constexpr float NEG_INF = -1.0e30f;
+    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+
+    // Each physical lane initializes the two logical selector threads that
+    // occupied the same lane in the original two-warp implementation.
+#pragma unroll
+    for (int logicalThread = lane; logicalThread < THREADS;
+         logicalThread += 32) {
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            legacyKeys[logicalThread * TOPK + rank] = -1.0e100;
+            legacyIds[logicalThread * TOPK + rank] = -1;
+        }
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            int expert = logicalThread + part * THREADS;
+            float key = FastllmRouterLogitToFloat(tokenLogits[expert]);
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                int offset = logicalThread * TOPK + rank;
+                if (key > legacyKeys[offset]) {
+#pragma unroll
+                    for (int shift = TOPK - 1; shift > rank; shift--) {
+                        int dst = logicalThread * TOPK + shift;
+                        legacyKeys[dst] = legacyKeys[dst - 1];
+                        legacyIds[dst] = legacyIds[dst - 1];
+                    }
+                    legacyKeys[offset] = key;
+                    legacyIds[offset] = expert;
+                    break;
+                }
+            }
+        }
+    }
+    __syncwarp(FULL_WARP_MASK);
+
+    int row0 = lane * TOPK;
+    int row1 = (lane + 32) * TOPK;
+    int pos0 = 0;
+    int pos1 = 0;
+    while (pos0 + pos1 < TOPK) {
+        if (legacyKeys[row0 + pos0] > legacyKeys[row1 + pos1]) {
+            pos0++;
+        } else {
+            pos1++;
+        }
+    }
+    pos0--;
+    pos1--;
+    for (int pos = TOPK - 1; pos >= 0; pos--) {
+        if (pos1 < 0 ||
+            (pos0 >= 0 && legacyKeys[row0 + pos0] < legacyKeys[row1 + pos1])) {
+            legacyKeys[row0 + pos] = legacyKeys[row0 + pos0];
+            legacyIds[row0 + pos] = legacyIds[row0 + pos0];
+            pos0--;
+        } else {
+            legacyKeys[row0 + pos] = legacyKeys[row1 + pos1];
+            legacyIds[row0 + pos] = legacyIds[row1 + pos1];
+            pos1--;
+        }
+    }
+    __syncwarp(FULL_WARP_MASK);
+
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            row0 = lane * TOPK;
+            row1 = (lane + stride) * TOPK;
+            pos0 = 0;
+            pos1 = 0;
+            while (pos0 + pos1 < TOPK) {
+                if (legacyKeys[row0 + pos0] > legacyKeys[row1 + pos1]) {
+                    pos0++;
+                } else {
+                    pos1++;
+                }
+            }
+            pos0--;
+            pos1--;
+            for (int pos = TOPK - 1; pos >= 0; pos--) {
+                if (pos1 < 0 ||
+                    (pos0 >= 0 &&
+                     legacyKeys[row0 + pos0] < legacyKeys[row1 + pos1])) {
+                    legacyKeys[row0 + pos] = legacyKeys[row0 + pos0];
+                    legacyIds[row0 + pos] = legacyIds[row0 + pos0];
+                    pos0--;
+                } else {
+                    legacyKeys[row0 + pos] = legacyKeys[row1 + pos1];
+                    legacyIds[row0 + pos] = legacyIds[row1 + pos1];
+                    pos1--;
+                }
+            }
+        }
+        __syncwarp(FULL_WARP_MASK);
+    }
+
+    int expert = lane < TOPK ? legacyIds[lane] : -1;
+    float key = lane < TOPK ?
+        FastllmRouterLogitToFloat(tokenLogits[expert]) : NEG_INF;
+    FastllmWriteNormalizedLogitsTop8(
+        key, expert, lane, tokenIndex, tokenScore, routeScale);
+}
+
+// Pack a finite FP16 logit and a deterministic equal-key priority into one
+// sortable integer. Ambiguous top-k ties are detected and sent through the
+// exact legacy merge path below.
+__device__ __forceinline__ uint32_t FastllmPackFp16RouterCandidate(
+        half key, int expert) {
+    uint32_t bits = __half_as_ushort(key);
+    // The float comparator treats +0 and -0 as equal.
+    if ((bits & 0x7fffu) == 0) {
+        bits = 0;
+    }
+    uint32_t ordered =
+        (bits & 0x8000u) ? (~bits & 0xffffu) : (bits ^ 0x8000u);
+    int selectorThread = expert & 63;
+    int reversedThread =
+        __brev((unsigned int)selectorThread) >> 26;
+    int selectorPart = expert >> 6;
+    uint32_t tiePriority =
+        (uint32_t)((reversedThread << 2) | (3 - selectorPart));
+    return (ordered << 16) | (tiePriority << 8) |
+           (uint32_t)expert;
+}
+
+__device__ __forceinline__ void FastllmPackedRouterCompareSwap(
+        uint32_t &a, uint32_t &b) {
+    if (b > a) {
+        uint32_t temp = a;
+        a = b;
+        b = temp;
+    }
+}
+
+// FP16 no-bias Qwen3.5 router specialization.  One warp owns one token and
+// ranks all 256 logits in registers.  Distinct top-k values avoid the generic
+// two-warp merge; ambiguous ties use the exact legacy merge in the same block.
+// The kernel has no cross-CTA state, so it remains safe under CUDA Graph replay
+// and concurrent tokens.
+__global__ __launch_bounds__(32)
+void FastllmFusedSoftmaxSelectExpertFp16Packed256Top8Kernel(
+        const half *logits, int32_t *index, float *score,
+        int tokens, float routeScale) {
+    constexpr int EXPERTS = 256;
+    constexpr int TOPK = 8;
+    constexpr float NEG_INF = -1.0e30f;
+    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+
+    __shared__ float legacyKeys[64][TOPK];
+    __shared__ int legacyIds[64][TOPK];
+
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    int lane = threadIdx.x;
+    const half *tokenLogits = logits + (size_t)token * EXPERTS;
+
+    uint32_t local[8];
+#pragma unroll
+    for (int part = 0; part < 8; part++) {
+        int expert = lane + part * 32;
+        local[part] =
+            FastllmPackFp16RouterCandidate(tokenLogits[expert], expert);
+    }
+
+    // Sort each lane's eight candidates in descending order.
+    FastllmPackedRouterCompareSwap(local[0], local[1]);
+    FastllmPackedRouterCompareSwap(local[2], local[3]);
+    FastllmPackedRouterCompareSwap(local[4], local[5]);
+    FastllmPackedRouterCompareSwap(local[6], local[7]);
+    FastllmPackedRouterCompareSwap(local[0], local[2]);
+    FastllmPackedRouterCompareSwap(local[1], local[3]);
+    FastllmPackedRouterCompareSwap(local[4], local[6]);
+    FastllmPackedRouterCompareSwap(local[5], local[7]);
+    FastllmPackedRouterCompareSwap(local[1], local[2]);
+    FastllmPackedRouterCompareSwap(local[5], local[6]);
+    FastllmPackedRouterCompareSwap(local[0], local[4]);
+    FastllmPackedRouterCompareSwap(local[3], local[7]);
+    FastllmPackedRouterCompareSwap(local[1], local[5]);
+    FastllmPackedRouterCompareSwap(local[2], local[6]);
+    FastllmPackedRouterCompareSwap(local[1], local[4]);
+    FastllmPackedRouterCompareSwap(local[3], local[6]);
+    FastllmPackedRouterCompareSwap(local[2], local[4]);
+    FastllmPackedRouterCompareSwap(local[3], local[5]);
+    FastllmPackedRouterCompareSwap(local[3], local[4]);
+
+    int selectedExpert = -1;
+    float selectedKey = NEG_INF;
+#pragma unroll
+    for (int rank = 0; rank < TOPK + 1; rank++) {
+        uint32_t best = local[0];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            uint32_t other =
+                __shfl_down_sync(FULL_WARP_MASK, best, offset);
+            if (lane + offset < 32 && other > best) {
+                best = other;
+            }
+        }
+        uint32_t winner =
+            __shfl_sync(FULL_WARP_MASK, best, 0);
+        int winnerExpert = (int)(winner & 0xffu);
+        if (lane == rank) {
+            selectedExpert = winnerExpert;
+            selectedKey =
+                FastllmRouterLogitToFloat(tokenLogits[winnerExpert]);
+        }
+        if (local[0] == winner) {
+#pragma unroll
+            for (int part = 0; part < 7; part++) {
+                local[part] = local[part + 1];
+            }
+            local[7] = 0;
+        }
+    }
+
+    bool ambiguous = false;
+#pragma unroll
+    for (int i = 1; i < TOPK; i++) {
+        float keyI = __shfl_sync(FULL_WARP_MASK, selectedKey, i);
+#pragma unroll
+        for (int j = 0; j < i; j++) {
+            float keyJ = __shfl_sync(FULL_WARP_MASK, selectedKey, j);
+            ambiguous |= keyI == keyJ;
+        }
+    }
+    ambiguous |=
+        __shfl_sync(FULL_WARP_MASK, selectedKey, TOPK) ==
+        __shfl_sync(FULL_WARP_MASK, selectedKey, TOPK - 1);
+
+    int32_t *tokenIndex = index + (size_t)token * TOPK;
+    float *tokenScore = score + (size_t)token * TOPK;
+    if (ambiguous) {
+        FastllmWriteLegacyNormalizedLogitsTop8(
+            tokenLogits, lane, &legacyKeys[0][0], &legacyIds[0][0],
+            tokenIndex, tokenScore, routeScale);
+    } else {
+        FastllmWriteNormalizedLogitsTop8(
+            selectedKey, selectedExpert, lane,
+            tokenIndex, tokenScore, routeScale);
+    }
+}
+
+// Qwen3.5 batch-1 decode specialization for 256 experts and top-8.  The
+// correction-bias path retains the full shared-memory softmax.  Without a bias,
+// ranking can use logits directly; when selected scores are normalized, the
+// global softmax denominator cancels, so only the winning eight need expf.
+// Equal-key ordering follows the original 64-thread SelectExpert merge tree.
+template <typename T, int BLOCK_THREADS, bool NORMALIZE_SELECTED_LOGITS>
+__global__ __launch_bounds__(BLOCK_THREADS)
+void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
+        const T *logits, const float *bias, int32_t *index, float *score,
+        int tokens, int hasBias, int needNorm, float routeScale) {
+    constexpr int THREADS = 64;
+    constexpr int EXPERTS = 256;
+    constexpr int TOPK = 8;
+    constexpr int CANDIDATES = TOPK + 1;
+    constexpr float NEG_INF = -1.0e30f;
+    static_assert(BLOCK_THREADS >= THREADS &&
+                      BLOCK_THREADS <= EXPERTS &&
+                      EXPERTS % BLOCK_THREADS == 0,
+                  "router block width must divide 256 and cover 64 selectors");
+
+    __shared__ float reduceData[THREADS];
+    __shared__ float probabilities[EXPERTS];
+    __shared__ float maxValue;
+    __shared__ float sumValue;
+    __shared__ float warpTopKeys[2][CANDIDATES];
+    __shared__ int warpTopIds[2][CANDIDATES];
+    __shared__ float standardTopKeys[CANDIDATES];
+    __shared__ int standardTopIds[CANDIDATES];
+    __shared__ float legacyKeys[THREADS][TOPK];
+    __shared__ int legacyIds[THREADS][TOPK];
+    __shared__ int useLegacyMerge;
+
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    const T *tokenLogits = logits + (size_t)token * EXPERTS;
+
+    // Use all 256 threads for the expensive exponential while preserving the
+    // old 64-thread softmax reduction tree exactly.  Each of the first 64
+    // threads still combines experts tid + {0, 64, 128, 192} in the original
+    // order, so scores and close correction-bias boundaries remain unchanged.
+#pragma unroll
+    for (int expert = tid; expert < EXPERTS; expert += BLOCK_THREADS) {
+        probabilities[expert] =
+            FastllmRouterLogitToFloat(tokenLogits[expert]);
+    }
+    __syncthreads();
+
+    float localMax = NEG_INF;
+    if constexpr (!NORMALIZE_SELECTED_LOGITS) {
+        if (tid < THREADS) {
+#pragma unroll
+            for (int part = 0; part < 4; part++) {
+                int expert = tid + part * THREADS;
+                localMax = fmaxf(localMax, probabilities[expert]);
+            }
+            reduceData[tid] = localMax;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            float reducedMax = fmaxf(localMax, reduceData[lane + 32]);
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float other =
+                    __shfl_down_sync(0xffffffffu, reducedMax, offset);
+                if (lane < offset) {
+                    reducedMax = fmaxf(reducedMax, other);
+                }
+            }
+            if (lane == 0) {
+                maxValue = reducedMax;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int expert = tid; expert < EXPERTS;
+             expert += BLOCK_THREADS) {
+            probabilities[expert] =
+                expf(probabilities[expert] - maxValue);
+        }
+        __syncthreads();
+
+        float localSum = 0.0f;
+        if (tid < THREADS) {
+#pragma unroll
+            for (int part = 0; part < 4; part++) {
+                localSum += probabilities[tid + part * THREADS];
+            }
+            reduceData[tid] = localSum;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            float reducedSum = localSum + reduceData[lane + 32];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float other =
+                    __shfl_down_sync(0xffffffffu, reducedSum, offset);
+                if (lane < offset) {
+                    reducedSum += other;
+                }
+            }
+            if (lane == 0) {
+                sumValue =
+                    fabsf(reducedSum) < 1.0e-6f ? 1.0e-4f : reducedSum;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int expert = tid; expert < EXPERTS;
+             expert += BLOCK_THREADS) {
+            probabilities[expert] /= sumValue;
+        }
+        __syncthreads();
+    }
+
+    FastllmRouterCandidate local[4];
+    if (tid < THREADS) {
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            int expert = tid + part * THREADS;
+            if constexpr (NORMALIZE_SELECTED_LOGITS) {
+                local[part].key = probabilities[expert];
+            } else {
+                local[part].key =
+                    probabilities[expert] +
+                    (hasBias ? bias[expert] : 0.0f);
+            }
+            local[part].id = expert;
+        }
+
+        FastllmRouterCandidateCompareSwap(local[0], local[1]);
+        FastllmRouterCandidateCompareSwap(local[2], local[3]);
+        FastllmRouterCandidateCompareSwap(local[0], local[2]);
+        FastllmRouterCandidateCompareSwap(local[1], local[3]);
+        FastllmRouterCandidateCompareSwap(local[1], local[2]);
+
+        unsigned int warpMask = 0xffffffffu;
+        int cursor = 0;
+#pragma unroll
+        for (int rank = 0; rank < CANDIDATES; rank++) {
+            FastllmRouterCandidate best = cursor < 4 ?
+                local[cursor] :
+                FastllmRouterCandidate{NEG_INF, -1};
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                FastllmRouterCandidate other;
+                other.key =
+                    __shfl_down_sync(warpMask, best.key, offset);
+                other.id =
+                    __shfl_down_sync(warpMask, best.id, offset);
+                if (lane + offset < 32 &&
+                    FastllmRouterCandidateBetter(other, best)) {
+                    best = other;
+                }
+            }
+            int winner = __shfl_sync(warpMask, best.id, 0);
+            if (lane == 0) {
+                warpTopKeys[warp][rank] = best.key;
+                warpTopIds[warp][rank] = best.id;
+            }
+            if (cursor < 4 && local[cursor].id == winner) {
+                cursor++;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int positions[2] = {0, 0};
+#pragma unroll
+        for (int rank = 0; rank < CANDIDATES; rank++) {
+            FastllmRouterCandidate first = positions[0] < CANDIDATES ?
+                FastllmRouterCandidate{warpTopKeys[0][positions[0]], warpTopIds[0][positions[0]]} :
+                FastllmRouterCandidate{NEG_INF, -1};
+            FastllmRouterCandidate second = positions[1] < CANDIDATES ?
+                FastllmRouterCandidate{warpTopKeys[1][positions[1]], warpTopIds[1][positions[1]]} :
+                FastllmRouterCandidate{NEG_INF, -1};
+            bool takeFirst = FastllmRouterCandidateBetter(first, second);
+            FastllmRouterCandidate chosen = takeFirst ? first : second;
+            positions[takeFirst ? 0 : 1]++;
+            standardTopKeys[rank] = chosen.key;
+            standardTopIds[rank] = chosen.id;
+        }
+        if constexpr (NORMALIZE_SELECTED_LOGITS) {
+            bool ambiguous = false;
+#pragma unroll
+            for (int i = 1; i < TOPK; i++) {
+#pragma unroll
+                for (int j = 0; j < i; j++) {
+                    ambiguous |= standardTopKeys[i] == standardTopKeys[j];
+                }
+            }
+            useLegacyMerge = ambiguous ||
+                standardTopKeys[TOPK] == standardTopKeys[TOPK - 1];
+        } else {
+            useLegacyMerge = 0;
+        }
+    }
+    __syncthreads();
+
+    if constexpr (NORMALIZE_SELECTED_LOGITS) {
+        if (useLegacyMerge) {
+            if (warp == 0) {
+                FastllmWriteLegacyNormalizedLogitsTop8(
+                    tokenLogits, lane,
+                    &legacyKeys[0][0], &legacyIds[0][0],
+                    index + (size_t)token * TOPK,
+                    score + (size_t)token * TOPK,
+                    routeScale);
+            }
+        } else if (warp == 0) {
+            float key =
+                lane < TOPK ? standardTopKeys[lane] : NEG_INF;
+            int expert =
+                lane < TOPK ? standardTopIds[lane] : -1;
+            FastllmWriteNormalizedLogitsTop8(
+                key, expert, lane,
+                index + (size_t)token * TOPK,
+                score + (size_t)token * TOPK,
+                routeScale);
+        }
+    } else if (tid == 0) {
+        float selectedSum = 1.0f;
+        if (needNorm) {
+            selectedSum = 0.0f;
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                selectedSum += probabilities[standardTopIds[rank]];
+            }
+        }
+        int32_t *tokenIndex = index + (size_t)token * TOPK;
+        float *tokenScore = score + (size_t)token * TOPK;
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            int expert = standardTopIds[rank];
+            tokenIndex[rank] = expert;
+            tokenScore[rank] = probabilities[expert] / selectedSum * routeScale;
+        }
+    }
+}
+
+// General 256-expert router used by both the softmax/top-8 and
+// sigmoid/top-10 entry points.  Keep this path feature-complete for Laguna and
+// for bias types that the Qwen3.5 no-bias specializations do not handle.
 template <typename T, int ROUTER_TOPK, bool ROUTER_SIGMOID>
 __global__ void FastllmFusedSelectExpert256Kernel(
         const T *logits, const void *bias, int32_t *index, float *score,
@@ -9470,32 +10181,65 @@ static bool FastllmCudaFusedSelectExpert256(
         if (logits.dataType == fastllm::DataType::FLOAT16) {
             FastllmFusedSigmoidSelectExpert256Top10Kernel<half><<<tokens, 32>>>(
                 (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+                tokens, hasBias ? 1 : 0, biasType,
+                needNorm ? 1 : 0, routeScale);
         } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
-            FastllmFusedSigmoidSelectExpert256Top10Kernel<__nv_bfloat16><<<tokens, 32>>>(
-                (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+            FastllmFusedSigmoidSelectExpert256Top10Kernel<__nv_bfloat16>
+                <<<tokens, 32>>>(
+                    (const __nv_bfloat16*)cudaLogits, cudaBias,
+                    cudaIndex, cudaScore, tokens, hasBias ? 1 : 0,
+                    biasType, needNorm ? 1 : 0, routeScale);
         } else {
             FastllmFusedSigmoidSelectExpert256Top10Kernel<float><<<tokens, 32>>>(
                 (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+                tokens, hasBias ? 1 : 0, biasType,
+                needNorm ? 1 : 0, routeScale);
         }
     } else
 #endif
     {
-        if (logits.dataType == fastllm::DataType::FLOAT16) {
-            FastllmFusedSelectExpert256Kernel<half, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-                (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
-        } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
-            FastllmFusedSelectExpert256Kernel<__nv_bfloat16, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-                (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+    bool useSelectedLogitFastPath =
+        !ROUTER_SIGMOID && ROUTER_TOPK == 8 && !hasBias && needNorm;
+    if (logits.dataType == fastllm::DataType::FLOAT16) {
+        if (useSelectedLogitFastPath) {
+            FastllmFusedSoftmaxSelectExpertFp16Packed256Top8Kernel
+                <<<tokens, 32>>>(
+                    (const half*)cudaLogits, cudaIndex, cudaScore,
+                    tokens, routeScale);
         } else {
-            FastllmFusedSelectExpert256Kernel<float, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-                (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-                tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+            FastllmFusedSelectExpert256Kernel<
+                half, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                    (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                    tokens, hasBias ? 1 : 0, biasType,
+                    needNorm ? 1 : 0, routeScale);
         }
+    } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
+        if (useSelectedLogitFastPath) {
+            FastllmFusedSoftmaxSelectExpert256Top8Kernel<
+                __nv_bfloat16, 64, true><<<tokens, 64>>>(
+                    (const __nv_bfloat16*)cudaLogits, nullptr,
+                    cudaIndex, cudaScore, tokens, 0, 1, routeScale);
+        } else {
+            FastllmFusedSelectExpert256Kernel<
+                __nv_bfloat16, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                    (const __nv_bfloat16*)cudaLogits, cudaBias,
+                    cudaIndex, cudaScore, tokens, hasBias ? 1 : 0, biasType,
+                    needNorm ? 1 : 0, routeScale);
+        }
+    } else {
+        if (useSelectedLogitFastPath) {
+            FastllmFusedSoftmaxSelectExpert256Top8Kernel<float, 64, true>
+                <<<tokens, 64>>>(
+                    (const float*)cudaLogits, nullptr,
+                    cudaIndex, cudaScore, tokens, 0, 1, routeScale);
+        } else {
+            FastllmFusedSelectExpert256Kernel<
+                float, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                    (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                    tokens, hasBias ? 1 : 0, biasType,
+                    needNorm ? 1 : 0, routeScale);
+        }
+    }
     }
 
     cudaError_t state = cudaGetLastError();

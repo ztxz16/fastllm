@@ -3620,6 +3620,124 @@ namespace fastllm {
                        FloatDict{{"alpha", alpha}}, IntDict());
         }
 
+        static bool Qwen35CudaCanFuseRouterSharedGate(
+                const Data &input,
+                const Data &routerWeight,
+                const Data &sharedGateWeight) {
+            constexpr int HIDDEN = 2048;
+            constexpr int EXPERTS = 256;
+            constexpr int MAX_GEMV_ROWS = 7;
+            const int inputCount = input.Count(0);
+            const int rows = inputCount > 0 ? inputCount / HIDDEN : 0;
+            return input.dataType == DataType::FLOAT16 &&
+                   routerWeight.dataType == DataType::FLOAT16 &&
+                   sharedGateWeight.dataType == DataType::FLOAT16 &&
+                   !input.dims.empty() &&
+                   inputCount > 0 &&
+                   inputCount % HIDDEN == 0 &&
+                   rows <= MAX_GEMV_ROWS &&
+                   input.dims.back() == HIDDEN &&
+                   routerWeight.dims.size() == 2 &&
+                   routerWeight.dims[0] == EXPERTS &&
+                   routerWeight.dims[1] == HIDDEN &&
+                   sharedGateWeight.dims.size() == 2 &&
+                   sharedGateWeight.dims[0] == 1 &&
+                   sharedGateWeight.dims[1] == HIDDEN;
+        }
+
+        static bool Qwen35CudaTryFusedRouterSharedGate(
+                Qwen3CudaDirectRunner &runner,
+                Data &input,
+                Data &routerWeight,
+                Data &sharedGateWeight,
+                Data &routerOutput,
+                Data &sharedGateOutput) {
+            constexpr int EXPERTS = 256;
+            if (!Qwen35CudaCanFuseRouterSharedGate(
+                    input, routerWeight, sharedGateWeight)) {
+                return false;
+            }
+
+            Qwen3CudaPrepareLocalOutput(routerOutput, runner.DeviceId());
+            Qwen3CudaPrepareLocalOutput(
+                sharedGateOutput, runner.DeviceId());
+            routerWeight.weightType = WeightType::LINEAR;
+            sharedGateWeight.weightType = WeightType::LINEAR;
+            routerOutput.dataType = input.dataType;
+            sharedGateOutput.dataType = input.dataType;
+            std::vector<int> routerDims = input.dims;
+            std::vector<int> sharedGateDims = input.dims;
+            routerDims.back() = EXPERTS;
+            sharedGateDims.back() = 1;
+            routerOutput.Resize(routerDims);
+            sharedGateOutput.Resize(sharedGateDims);
+            routerOutput.Allocate(false);
+            sharedGateOutput.Allocate(false);
+
+            FastllmCudaSetDevice(runner.DeviceId());
+            return FastllmCudaQwen35RouterSharedGateFloat16(
+                input, routerWeight, sharedGateWeight,
+                routerOutput, sharedGateOutput, true);
+        }
+
+        static bool Qwen35CudaTryFusedMoeJoinReduce(
+                Qwen3CudaDirectRunner &runner,
+                Data &hiddenStates,
+                Data &routedOutput,
+                const Data &sharedOutput,
+                const Data *rawSharedGate,
+                bool sharedGateAlreadySigmoid,
+                bool tensorParallel,
+                bool firstTensorParallelRank,
+                int gpuId) {
+            const int count = hiddenStates.Count(0);
+            if (tensorParallel &&
+                FastllmCanUseTP2P2PAllReduceAdd(
+                    count, (int)hiddenStates.dataType, gpuId)) {
+                if (!FastllmCudaQwen35FusedMoeJoin(
+                        routedOutput, routedOutput, sharedOutput,
+                        rawSharedGate, false,
+                        sharedGateAlreadySigmoid)) {
+                    return false;
+                }
+                if (qwen3cuda::Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                        routedOutput, hiddenStates, gpuId)) {
+                    return true;
+                }
+
+                // A custom all-reduce can become unavailable after its cheap
+                // capability check (for example, pointer registration can
+                // fail). The local routed/shared merge is already complete,
+                // so finish with the ordinary NCCL fallback.
+                if (firstTensorParallelRank) {
+                    qwen3cuda::Qwen3CudaAddTo(
+                        runner, hiddenStates, routedOutput);
+                } else {
+                    Qwen35CudaCopyTensor(
+                        runner, routedOutput, hiddenStates);
+                }
+                FastllmNcclAllReduce(
+                    hiddenStates.cudaData, hiddenStates.cudaData,
+                    count, hiddenStates.dataType, gpuId);
+                return true;
+            }
+
+            const bool addResidual =
+                !tensorParallel || firstTensorParallelRank;
+            if (!FastllmCudaQwen35FusedMoeJoin(
+                    hiddenStates, routedOutput, sharedOutput,
+                    rawSharedGate, addResidual,
+                    sharedGateAlreadySigmoid)) {
+                return false;
+            }
+            if (tensorParallel) {
+                FastllmNcclAllReduce(
+                    hiddenStates.cudaData, hiddenStates.cudaData,
+                    count, hiddenStates.dataType, gpuId);
+            }
+            return true;
+        }
+
         static void Qwen35CudaRepeat(Qwen3CudaDirectRunner &runner,
                                      const Data &input, int axis, int repeatTimes,
                                      Data &output) {
@@ -7366,6 +7484,10 @@ namespace fastllm {
                                 "Qwen3.5 CUDA graph doesn't support non-CUDA moe_device layers.\n");
 
                 bool sharedExpertPending = false;
+                bool sharedGatePending = false;
+                bool sharedGateLinearPending = false;
+                bool sharedGateAlreadySigmoid = false;
+                Data *sharedGateWeight = nullptr;
                 if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
                     AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
                                     "Qwen3.5 CUDA graph requires merged shared expert gateup weight.\n");
@@ -7381,14 +7503,31 @@ namespace fastllm {
                                                   sharedDownWeightName + ".tp_bias"),
                                     buf.sharedOutput);
                     if (weight.weight.find(sharedExpertGateWeightName) != weight.weight.end()) {
-                        Qwen3CudaLinear(cudaRunner, buf.attenInput,
-                                        *requireLocal(weight[sharedExpertGateWeightName], sharedExpertGateWeightName),
-                                        *GetEmptyData(), buf.sharedGate);
-                        Qwen35CudaSigmoid(cudaRunner, buf.sharedGate, buf.sharedGate);
-                        if (buf.sharedGate.dataType != buf.sharedOutput.dataType) {
-                            Qwen3CudaToDataType(cudaRunner, buf.sharedGate, buf.sharedOutput.dataType);
+                        sharedGateWeight = requireLocal(
+                            weight[sharedExpertGateWeightName],
+                            sharedExpertGateWeightName);
+                        if (Qwen35CudaCanFuseRouterSharedGate(
+                                buf.attenInput,
+                                *requireLocal(
+                                    weight[gateWeightName],
+                                    gateWeightName),
+                                *sharedGateWeight)) {
+                            // Both projections consume the same small-batch
+                            // decode input. Defer the per-token gate projection
+                            // so router CTA 256 can compute it in the same grid.
+                            sharedGateLinearPending = true;
+                            sharedGatePending = true;
+                        } else {
+                            Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                            *sharedGateWeight,
+                                            *GetEmptyData(), buf.sharedGate);
                         }
-                        Qwen35CudaMulTo(cudaRunner, buf.sharedOutput, buf.sharedGate);
+                        if (!sharedGateLinearPending) {
+                            // Keep the raw scalar gate until the shared/routed
+                            // join so sigmoid, scaling and both local adds can
+                            // execute in one kernel.
+                            sharedGatePending = true;
+                        }
                     }
                     // 共享专家输出不单独归约：延后与路由专家输出本地相加后一次 allReduce，
                     // 每个 MoE 层省一次集合通信（小 hidden 下 allReduce 为纯延迟型，TP 解码收益明显）。
@@ -7402,12 +7541,29 @@ namespace fastllm {
                 int localBatch = buf.attenInput.dims[0];
                 int localLen = buf.attenInput.dims[1];
                 buf.attenInput.Reshape({localBatch * localLen, buf.attenInput.dims[2]});
-                Qwen3CudaLinear(cudaRunner, buf.attenInput,
-                                *requireLocal(weight[gateWeightName], gateWeightName),
-                                *GetEmptyData(), buf.routerLogits, true);
+                Data &routerWeight =
+                    *requireLocal(weight[gateWeightName], gateWeightName);
+                bool fusedRouterSharedGate =
+                    sharedGateLinearPending &&
+                    Qwen35CudaTryFusedRouterSharedGate(
+                        cudaRunner, buf.attenInput, routerWeight,
+                        *sharedGateWeight, buf.routerLogits,
+                        buf.sharedGate);
+                sharedGateAlreadySigmoid = fusedRouterSharedGate;
+                if (!fusedRouterSharedGate) {
+                    if (sharedGateLinearPending) {
+                        Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                        *sharedGateWeight,
+                                        *GetEmptyData(), buf.sharedGate);
+                    }
+                    Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                    routerWeight, *GetEmptyData(),
+                                    buf.routerLogits, true);
+                }
                 Data *localGateBias = nullptr;
                 if (weight.weight.find(gateBiasName) != weight.weight.end()) {
-                    localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
+                    localGateBias =
+                        requireLocal(weight[gateBiasName], gateBiasName);
                 }
                 if (!Qwen3CudaTryFusedSoftmaxSelectExpert(
                         cudaRunner, buf.routerLogits, buf.expertIndex, buf.expertScore,
@@ -7453,10 +7609,29 @@ namespace fastllm {
                 buf.moeFinal.Reshape(buf.hiddenStates.dims);
                 if (sharedExpertPending) {
                     FastllmCudaGraphMarkQwen35MoeJoin(i);
+                    buf.sharedOutput.Reshape(buf.moeFinal.dims);
+                    if (Qwen35CudaTryFusedMoeJoinReduce(
+                            cudaRunner, buf.hiddenStates, buf.moeFinal,
+                            buf.sharedOutput,
+                            sharedGatePending ? &buf.sharedGate : nullptr,
+                            sharedGateAlreadySigmoid,
+                            tensorParallel, firstTensorParallelRank, gpuId)) {
+                        continue;
+                    }
+                    if (sharedGatePending) {
+                        if (!sharedGateAlreadySigmoid) {
+                            Qwen35CudaSigmoid(
+                                cudaRunner, buf.sharedGate, buf.sharedGate);
+                        }
+                        if (buf.sharedGate.dataType != buf.sharedOutput.dataType) {
+                            Qwen3CudaToDataType(cudaRunner, buf.sharedGate,
+                                               buf.sharedOutput.dataType);
+                        }
+                        Qwen35CudaMulTo(cudaRunner, buf.sharedOutput, buf.sharedGate);
+                    }
                     if (buf.sharedOutput.dataType != buf.moeFinal.dataType) {
                         Qwen3CudaToDataType(cudaRunner, buf.sharedOutput, buf.moeFinal.dataType);
                     }
-                    buf.sharedOutput.Reshape(buf.moeFinal.dims);
                     Qwen3CudaAddTo(cudaRunner, buf.moeFinal, buf.sharedOutput);
                 }
                 addPartialToResidualReduce(buf.moeFinal);
@@ -9596,6 +9771,10 @@ namespace fastllm {
                             "Qwen3.5 ForwardGPU layer has neither dense MLP nor router gate weight.\n");
 
             bool sharedExpertPending = false;
+            bool sharedGatePending = false;
+            bool sharedGateLinearPending = false;
+            bool sharedGateAlreadySigmoid = false;
+            Data *sharedGateWeight = nullptr;
             if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
                 AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
                                 "Qwen3.5 ForwardGPU requires merged shared expert gateup weight.\n");
@@ -9610,14 +9789,26 @@ namespace fastllm {
                                               sharedDownWeightName + ".tp_bias"),
                                 sharedOutput);
                 if (weight.weight.find(sharedExpertGateWeightName) != weight.weight.end()) {
-                    Qwen3CudaLinear(cudaRunner, attenInput,
-                                    *requireLocal(weight[sharedExpertGateWeightName], sharedExpertGateWeightName),
-                                    *GetEmptyData(), sharedGate);
-                    Qwen35CudaSigmoid(cudaRunner, sharedGate, sharedGate);
-                    if (sharedGate.dataType != sharedOutput.dataType) {
-                        Qwen3CudaToDataType(cudaRunner, sharedGate, sharedOutput.dataType);
+                    sharedGateWeight = requireLocal(
+                        weight[sharedExpertGateWeightName],
+                        sharedExpertGateWeightName);
+                    if (all1 &&
+                        Qwen35CudaCanFuseRouterSharedGate(
+                            attenInput,
+                            *requireLocal(
+                                weight[gateWeightName],
+                                gateWeightName),
+                            *sharedGateWeight)) {
+                        sharedGateLinearPending = true;
+                        sharedGatePending = true;
+                    } else {
+                        Qwen3CudaLinear(cudaRunner, attenInput,
+                                        *sharedGateWeight,
+                                        *GetEmptyData(), sharedGate);
                     }
-                    Qwen35CudaMulTo(cudaRunner, sharedOutput, sharedGate);
+                    if (!sharedGateLinearPending) {
+                        sharedGatePending = true;
+                    }
                 }
                 // 共享专家输出延后与路由专家输出本地相加后一次 allReduce，每层省一次集合通信。
                 sharedExpertPending = true;
@@ -9626,12 +9817,28 @@ namespace fastllm {
             int localBatch = attenInput.dims[0];
             int localLen = attenInput.dims[1];
             attenInput.Reshape({localBatch * localLen, attenInput.dims[2]});
-            Qwen3CudaLinear(cudaRunner, attenInput,
-                            *requireLocal(weight[gateWeightName], gateWeightName),
-                            *GetEmptyData(), routerLogits, true);
+            Data &routerWeight =
+                *requireLocal(weight[gateWeightName], gateWeightName);
+            bool fusedRouterSharedGate =
+                sharedGateLinearPending &&
+                Qwen35CudaTryFusedRouterSharedGate(
+                    cudaRunner, attenInput, routerWeight,
+                    *sharedGateWeight, routerLogits, sharedGate);
+            sharedGateAlreadySigmoid = fusedRouterSharedGate;
+            if (!fusedRouterSharedGate) {
+                if (sharedGateLinearPending) {
+                    Qwen3CudaLinear(cudaRunner, attenInput,
+                                    *sharedGateWeight,
+                                    *GetEmptyData(), sharedGate);
+                }
+                Qwen3CudaLinear(cudaRunner, attenInput,
+                                routerWeight, *GetEmptyData(),
+                                routerLogits, true);
+            }
             Data *localGateBias = nullptr;
             if (weight.weight.find(gateBiasName) != weight.weight.end()) {
-                localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
+                localGateBias =
+                    requireLocal(weight[gateBiasName], gateBiasName);
             }
             if (!Qwen3CudaTryFusedSoftmaxSelectExpert(
                     cudaRunner, routerLogits, expertIndex, expertScore,
@@ -9694,10 +9901,28 @@ namespace fastllm {
             }
             moeFinal.Reshape(hiddenStates.dims);
             if (sharedExpertPending) {
+                sharedOutput.Reshape(moeFinal.dims);
+                if (Qwen35CudaTryFusedMoeJoinReduce(
+                        cudaRunner, hiddenStates, moeFinal, sharedOutput,
+                        sharedGatePending ? &sharedGate : nullptr,
+                        sharedGateAlreadySigmoid,
+                        tensorParallel, firstTensorParallelRank, gpuId)) {
+                    continue;
+                }
+                if (sharedGatePending) {
+                    if (!sharedGateAlreadySigmoid) {
+                        Qwen35CudaSigmoid(
+                            cudaRunner, sharedGate, sharedGate);
+                    }
+                    if (sharedGate.dataType != sharedOutput.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, sharedGate,
+                                           sharedOutput.dataType);
+                    }
+                    Qwen35CudaMulTo(cudaRunner, sharedOutput, sharedGate);
+                }
                 if (sharedOutput.dataType != moeFinal.dataType) {
                     Qwen3CudaToDataType(cudaRunner, sharedOutput, moeFinal.dataType);
                 }
-                sharedOutput.Reshape(moeFinal.dims);
                 Qwen3CudaAddTo(cudaRunner, moeFinal, sharedOutput);
             }
             addPartialToResidualReduce(moeFinal);

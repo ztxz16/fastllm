@@ -83,8 +83,10 @@ __global__ void FastllmGemvBf16Fp16Kernel2MultiRow(__nv_bfloat16 *A, half *B, __
     }
 }
 
-template <int THREAD_PER_BLOCK, int PART>
-__global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, half *bias, int m, int k, bool addTo) {
+template <int THREAD_PER_BLOCK, int PART, bool WITH_SHARED_GATE>
+__global__ void FastllmGemvFp16Fp16Kernel2MultiRow(
+        half *A, half *B, half *C, half *bias, int m, int k, bool addTo,
+        half *sharedGateB, half *sharedGateC, bool sigmoidSharedGate) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
     const half zero = __float2half_rn(0.0);
@@ -93,11 +95,12 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
 
     // 1. 计算
     int st = blockIdx.x;
-    int p = st;
+    const bool isSharedGate = WITH_SHARED_GATE && st == k;
+    int p = isSharedGate ? 0 : st;
 #pragma unroll
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
         
-    const half *baseB = B + p * m;
+    const half *baseB = isSharedGate ? sharedGateB : B + p * m;
 
     if (m % 8 == 0) {
 #pragma unroll
@@ -150,7 +153,22 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
     }
 
     if (tid == 0) {
-        if (bias != nullptr) {
+        if (isSharedGate) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                half outputValue = (half)sdata[x][0];
+                if (sigmoidSharedGate) {
+#ifdef CUDA_NO_TENSOR_CORE
+                    outputValue = __float2half(
+                        1.0f / (1.0f + expf(-__half2float(outputValue))));
+#else
+                    outputValue = __hdiv(
+                        1.0, __hadd(__float2half(1.0), hexp(-outputValue)));
+#endif
+                }
+                sharedGateC[x] = outputValue;
+            }
+        } else if (bias != nullptr) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 float val = sdata[x][0] + (float)(__ldg(bias + p));
@@ -167,19 +185,112 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
     __syncthreads();
 }
 
-// Qwen3.5 batch-1 router specialization (1x2048 @ 256x2048).  One 64-thread
-// CTA computes one expert logit.  Each thread reproduces four lanes of the
+// Batch-1 projection specialization for the two input widths used by Qwen3.5
+// decode.  The legacy GEMV assigns one 256-thread CTA to every output row even
+// though a 2048-wide row gives each thread only eight values (and a 256-wide
+// row leaves seven warps idle).  Here one warp owns a row and a CTA computes
+// eight adjacent rows.  For INPUT_SIZE=2048 every lane explicitly reproduces
+// eight legacy lanes before continuing the same binary reduction tree with
+// warp shuffles, so the final FP16 result keeps the legacy accumulation order.
+template <int INPUT_SIZE, int WARPS_PER_BLOCK = 8>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32)
+void FastllmGemvFp16Fp16WarpRowsKernel(
+        const half *A, const half *B, half *C, const half *bias,
+        int k, bool addTo) {
+    static_assert(INPUT_SIZE == 256 || INPUT_SIZE == 2048,
+                  "warp-row GEMV only supports tuned decode input widths");
+    constexpr int WARP_SIZE = 32;
+    constexpr int VALUES_PER_LOAD = 8;
+    constexpr int LEGACY_LANES_PER_WARP =
+        INPUT_SIZE / (WARP_SIZE * VALUES_PER_LOAD);
+
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int warp = threadIdx.x / WARP_SIZE;
+    int row = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (row >= k) {
+        return;
+    }
+
+    const half *baseB = B + (size_t)row * INPUT_SIZE;
+    float values[LEGACY_LANES_PER_WARP];
+    float diffs[LEGACY_LANES_PER_WARP];
+
+#pragma unroll
+    for (int virtualLane = 0; virtualLane < LEGACY_LANES_PER_WARP;
+         virtualLane++) {
+        int i = (lane + virtualLane * WARP_SIZE) * VALUES_PER_LOAD;
+        union_half8 regA;
+        union_half8 regB;
+        regA.in = *reinterpret_cast<const uint4 *>(A + i);
+        regB.in = *reinterpret_cast<const uint4 *>(baseB + i);
+        float sum = 0.0f;
+        sum += __low2float(regA.out2[0]) * __low2float(regB.out2[0]);
+        sum += __high2float(regA.out2[0]) * __high2float(regB.out2[0]);
+        sum += __low2float(regA.out2[1]) * __low2float(regB.out2[1]);
+        sum += __high2float(regA.out2[1]) * __high2float(regB.out2[1]);
+        sum += __low2float(regA.out2[2]) * __low2float(regB.out2[2]);
+        sum += __high2float(regA.out2[2]) * __high2float(regB.out2[2]);
+        sum += __low2float(regA.out2[3]) * __low2float(regB.out2[3]);
+        sum += __high2float(regA.out2[3]) * __high2float(regB.out2[3]);
+        values[virtualLane] = sum;
+        diffs[virtualLane] = 0.0f;
+    }
+
+    // Reproduce the legacy 256 -> 128 -> 64 -> 32 lane stages locally.
+#pragma unroll
+    for (int stride = LEGACY_LANES_PER_WARP / 2; stride > 0; stride >>= 1) {
+#pragma unroll
+        for (int virtualLane = 0; virtualLane < stride; virtualLane++) {
+            float other =
+                values[virtualLane + stride] - diffs[virtualLane];
+            float sum = values[virtualLane] + other;
+            diffs[virtualLane] =
+                (sum - values[virtualLane]) - other;
+            values[virtualLane] = sum;
+        }
+    }
+
+    float value = values[0];
+    float diff = diffs[0];
+    unsigned int mask = __activemask();
+#pragma unroll
+    for (int stride = WARP_SIZE / 2; stride > 0; stride >>= 1) {
+        float rhs = __shfl_down_sync(mask, value, stride);
+        if (lane < stride) {
+            float other = rhs - diff;
+            float sum = value + other;
+            diff = (sum - value) - other;
+            value = sum;
+        }
+    }
+
+    if (lane == 0) {
+        if (bias != nullptr) {
+            value += (float)__ldg(bias + row);
+        }
+        C[row] = addTo ? (half)(value + (float)C[row]) : (half)value;
+    }
+}
+
+// Qwen3.5 single-row router specialization (1x2048 @ 256x2048). One 64-thread
+// CTA computes one expert logit. Each thread reproduces four lanes of the
 // legacy 256-thread kernel, including its compensated reduction order, then
 // replaces only the final five block barriers with the equivalent warp tree.
-// This keeps the FP16 router logits bit-identical while reducing synchronization
-// and scheduled-warps overhead on latency-bound GEMV shapes.
+// Small batched decode uses FastllmGemvFp16Fp16Kernel2MultiRow above so it can
+// preserve the legacy multi-row accumulation order.
+template <bool WITH_SHARED_GATE>
 __global__ __launch_bounds__(64) void FastllmGemvFp16Fp16Router2048x256Kernel(
-        const half *A, const half *B, half *C, const half *bias, bool addTo) {
+        const half *A, const half *B, half *C, const half *bias, bool addTo,
+        const half *sharedGateB = nullptr, half *sharedGateC = nullptr,
+        bool sigmoidSharedGate = false) {
     constexpr int THREADS = 64;
     constexpr int HIDDEN = 2048;
     int tid = threadIdx.x;
-    int row = blockIdx.x;
-    const half *baseB = B + (size_t)row * HIDDEN;
+    const bool isSharedGate = WITH_SHARED_GATE && blockIdx.x == 256;
+    int row = isSharedGate ? 0 : blockIdx.x;
+    const half *baseB = isSharedGate
+        ? sharedGateB
+        : B + (size_t)row * HIDDEN;
 
     int offset0 = tid * 8;
     int offset1 = (tid + THREADS) * 8;
@@ -239,10 +350,23 @@ __global__ __launch_bounds__(64) void FastllmGemvFp16Fp16Router2048x256Kernel(
             }
         }
         if (tid == 0) {
-            if (bias != nullptr) {
+            if (!isSharedGate && bias != nullptr) {
                 value += (float)__ldg(bias + row);
             }
-            C[row] = addTo ? (half)(value + (float)C[row]) : (half)value;
+            half *output = isSharedGate ? sharedGateC : C + row;
+            half outputValue = (!isSharedGate && addTo)
+                ? (half)(value + (float)*output)
+                : (half)value;
+            if (isSharedGate && sigmoidSharedGate) {
+#ifdef CUDA_NO_TENSOR_CORE
+                outputValue = __float2half(
+                    1.0f / (1.0f + expf(-__half2float(outputValue))));
+#else
+                outputValue = __hdiv(
+                    1.0, __hadd(__float2half(1.0), hexp(-outputValue)));
+#endif
+            }
+            *output = outputValue;
         }
     }
 }
@@ -541,22 +665,46 @@ void LaunchFastllmGemmFp16Fp16(half *input, half *weight, half *output, half *bi
                                bool allowRouterSpecialization) {
     if (allowRouterSpecialization && n == 1 && m == 2048 && k == 256 &&
         bias == nullptr && !addTo) {
-        FastllmGemvFp16Fp16Router2048x256Kernel<<<k, 64>>>(
+        FastllmGemvFp16Fp16Router2048x256Kernel<false><<<k, 64>>>(
             input, weight, output, bias, addTo);
+    } else if (allowRouterSpecialization && n == 1 &&
+               m == 2048 && k == 2048) {
+        FastllmGemvFp16Fp16WarpRowsKernel<2048, 4>
+            <<< (k + 3) / 4, 128 >>>(
+                input, weight, output, bias, k, addTo);
+    } else if (allowRouterSpecialization && n == 1 &&
+               m == 256 && k == 2048) {
+        FastllmGemvFp16Fp16WarpRowsKernel<256, 4>
+            <<< (k + 3) / 4, 128 >>>(
+                input, weight, output, bias, k, addTo);
     } else if (n == 1) {
-        FastllmGemvFp16Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 1, false>
+            <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
+                         nullptr, nullptr, false);
     } else if (n == 2) {
-        FastllmGemvFp16Fp16Kernel2MultiRow<256, 2> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 2, false>
+            <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
+                         nullptr, nullptr, false);
     } else if (n == 3) {
-        FastllmGemvFp16Fp16Kernel2MultiRow<256, 3> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 3, false>
+            <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
+                         nullptr, nullptr, false);
     } else if (n == 4) {
-        FastllmGemvFp16Fp16Kernel2MultiRow<256, 4> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 4, false>
+            <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
+                         nullptr, nullptr, false);
     } else if (n == 5) {
-        FastllmGemvFp16Fp16Kernel2MultiRow<256, 5> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 5, false>
+            <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
+                         nullptr, nullptr, false);
     } else if (n == 6) {
-        FastllmGemvFp16Fp16Kernel2MultiRow<256, 6> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 6, false>
+            <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
+                         nullptr, nullptr, false);
     } else if (n == 7) {
-        FastllmGemvFp16Fp16Kernel2MultiRow<256, 7> <<< k, 256 >>>(input, weight, output, bias, m, k, addTo);
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 7, false>
+            <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
+                         nullptr, nullptr, false);
     } else {
         printf("Error: LaunchFastllmGemmFp16Fp16: n > 7.\n");
         exit(0);
@@ -660,6 +808,103 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
                                  int n, int m, int k, bool addTo) {
     return FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
         input, weight, bias, output, n, m, k, addTo, true);
+}
+
+bool FastllmCudaQwen35RouterSharedGateFloat16(
+        const fastllm::Data &input,
+        fastllm::Data &routerWeight,
+        fastllm::Data &sharedGateWeight,
+        fastllm::Data &routerOutput,
+        fastllm::Data &sharedGateOutput,
+        bool sigmoidSharedGate) {
+    constexpr int HIDDEN = 2048;
+    constexpr int EXPERTS = 256;
+    constexpr int MAX_GEMV_ROWS = 7;
+    const int inputCount = input.Count(0);
+    const int rows = inputCount > 0 ? inputCount / HIDDEN : 0;
+    if (input.dataType != fastllm::DataType::FLOAT16 ||
+        routerWeight.dataType != fastllm::DataType::FLOAT16 ||
+        sharedGateWeight.dataType != fastllm::DataType::FLOAT16 ||
+        routerOutput.dataType != fastllm::DataType::FLOAT16 ||
+        sharedGateOutput.dataType != fastllm::DataType::FLOAT16 ||
+        input.dims.empty() ||
+        inputCount <= 0 ||
+        inputCount % HIDDEN != 0 ||
+        rows > MAX_GEMV_ROWS ||
+        input.dims.back() != HIDDEN ||
+        routerWeight.dims.size() != 2 ||
+        routerWeight.dims[0] != EXPERTS ||
+        routerWeight.dims[1] != HIDDEN ||
+        sharedGateWeight.dims.size() != 2 ||
+        sharedGateWeight.dims[0] != 1 ||
+        sharedGateWeight.dims[1] != HIDDEN ||
+        routerOutput.Count(0) != rows * EXPERTS ||
+        sharedGateOutput.Count(0) != rows ||
+        routerWeight.cudaData == nullptr ||
+        sharedGateWeight.cudaData == nullptr) {
+        return false;
+    }
+
+    half *cudaInput = (half*)FastllmCudaPrepareInput(input);
+    half *cudaRouterOutput = (half*)FastllmCudaPrepareOutput(routerOutput);
+    half *cudaSharedGateOutput =
+        (half*)FastllmCudaPrepareOutput(sharedGateOutput);
+    if (rows == 1) {
+        FastllmGemvFp16Fp16Router2048x256Kernel<true>
+            <<<EXPERTS + 1, 64>>>(
+                cudaInput, (half*)routerWeight.cudaData, cudaRouterOutput,
+                nullptr, false, (half*)sharedGateWeight.cudaData,
+                cudaSharedGateOutput, sigmoidSharedGate);
+    } else if (rows == 2) {
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 2, true>
+            <<<EXPERTS + 1, 256>>>(
+                cudaInput, (half*)routerWeight.cudaData, cudaRouterOutput,
+                nullptr, HIDDEN, EXPERTS, false,
+                (half*)sharedGateWeight.cudaData,
+                cudaSharedGateOutput, sigmoidSharedGate);
+    } else if (rows == 3) {
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 3, true>
+            <<<EXPERTS + 1, 256>>>(
+                cudaInput, (half*)routerWeight.cudaData, cudaRouterOutput,
+                nullptr, HIDDEN, EXPERTS, false,
+                (half*)sharedGateWeight.cudaData,
+                cudaSharedGateOutput, sigmoidSharedGate);
+    } else if (rows == 4) {
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 4, true>
+            <<<EXPERTS + 1, 256>>>(
+                cudaInput, (half*)routerWeight.cudaData, cudaRouterOutput,
+                nullptr, HIDDEN, EXPERTS, false,
+                (half*)sharedGateWeight.cudaData,
+                cudaSharedGateOutput, sigmoidSharedGate);
+    } else if (rows == 5) {
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 5, true>
+            <<<EXPERTS + 1, 256>>>(
+                cudaInput, (half*)routerWeight.cudaData, cudaRouterOutput,
+                nullptr, HIDDEN, EXPERTS, false,
+                (half*)sharedGateWeight.cudaData,
+                cudaSharedGateOutput, sigmoidSharedGate);
+    } else if (rows == 6) {
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 6, true>
+            <<<EXPERTS + 1, 256>>>(
+                cudaInput, (half*)routerWeight.cudaData, cudaRouterOutput,
+                nullptr, HIDDEN, EXPERTS, false,
+                (half*)sharedGateWeight.cudaData,
+                cudaSharedGateOutput, sigmoidSharedGate);
+    } else {
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 7, true>
+            <<<EXPERTS + 1, 256>>>(
+                cudaInput, (half*)routerWeight.cudaData, cudaRouterOutput,
+                nullptr, HIDDEN, EXPERTS, false,
+                (half*)sharedGateWeight.cudaData,
+                cudaSharedGateOutput, sigmoidSharedGate);
+    }
+    checkCudaErrors(
+        "Error: CUDA error in FastllmCudaQwen35RouterSharedGateFloat16.",
+        cudaGetLastError());
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(routerOutput, cudaRouterOutput);
+    FastllmCudaFinishOutput(sharedGateOutput, cudaSharedGateOutput);
+    return true;
 }
 
 bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k) {
