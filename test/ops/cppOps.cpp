@@ -838,22 +838,25 @@ namespace {
         };
     }
 
-    struct RmsNormFp16BenchState {
+    struct RmsNormSpecializedBenchState {
         std::string kind;
         std::string path;
+        fastllm::DataType dataType = fastllm::DataType::FLOAT16;
         int threads = 0;
         float eps = 1.0e-6f;
         fastllm::Data input, weight, gate;
         fastllm::Data legacyOutput, fastOutput;
 
-        static void PrepareFp16Tensor(fastllm::Data &data, const std::vector<int> &dims, float seed) {
+        static void PrepareTensor(fastllm::Data &data, const std::vector<int> &dims,
+                                  float seed, fastllm::DataType dataType) {
             data.CopyFrom(MakeTensor(dims, seed, 0.25f));
-            fastllm::ToDataType(data, fastllm::DataType::FLOAT16);
+            fastllm::ToDataType(data, dataType);
             data.ToDevice(fastllm::DataDevice::CUDA);
         }
 
-        static void PrepareOutput(fastllm::Data &data, const std::vector<int> &dims) {
-            data.dataType = fastllm::DataType::FLOAT16;
+        static void PrepareOutput(fastllm::Data &data, const std::vector<int> &dims,
+                                  fastllm::DataType dataType) {
+            data.dataType = dataType;
             data.UpdateUnitSize();
             data.Resize(dims);
             data.Allocate(false);
@@ -862,17 +865,22 @@ namespace {
 
         void RunOne(const fastllm::Data &source, fastllm::Data &output, int threadCount) {
             bool ok = false;
-            if (kind == "rmsnorm") {
+            if (dataType == fastllm::DataType::BFLOAT16 && kind == "rmsnorm") {
+                ok = FastllmCudaRMSNormBFloat16WithThreadCount(
+                    source, weight, output, eps, threadCount);
+            } else if (dataType == fastllm::DataType::FLOAT16 && kind == "rmsnorm") {
                 ok = FastllmCudaRMSNormFloat16WithThreadCount(
                     source, weight, output, eps, threadCount);
-            } else if (kind == "rmsnorm_silu_mul") {
+            } else if (dataType == fastllm::DataType::FLOAT16 &&
+                       kind == "rmsnorm_silu_mul") {
                 ok = FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
                     source, weight, gate, output, eps, threadCount);
             } else {
-                throw std::runtime_error("kind must be rmsnorm or rmsnorm_silu_mul");
+                throw std::runtime_error(
+                    "BF16 supports rmsnorm; FP16 supports rmsnorm and rmsnorm_silu_mul");
             }
             if (!ok) {
-                throw std::runtime_error("FP16 RMSNorm specialized launch failed");
+                throw std::runtime_error("RMSNorm specialized launch failed");
             }
         }
 
@@ -899,15 +907,15 @@ namespace {
             RunOne(input, legacyOutput, 0);
             RunOne(input, fastOutput, threads);
             ForceDeviceSync();
-            ExpectExact(legacyOutput, fastOutput, "out-of-place FP16 RMSNorm");
+            ExpectExact(legacyOutput, fastOutput, "out-of-place RMSNorm");
 
             fastllm::Data legacyInplace, fastInplace;
-            PrepareFp16Tensor(legacyInplace, dims, 0.413f);
-            PrepareFp16Tensor(fastInplace, dims, 0.413f);
+            PrepareTensor(legacyInplace, dims, 0.413f, dataType);
+            PrepareTensor(fastInplace, dims, 0.413f, dataType);
             RunOne(legacyInplace, legacyInplace, 0);
             RunOne(fastInplace, fastInplace, threads);
             ForceDeviceSync();
-            ExpectExact(legacyInplace, fastInplace, "in-place FP16 RMSNorm");
+            ExpectExact(legacyInplace, fastInplace, "in-place RMSNorm");
         }
 
         void Init(const OpTestParams &params) {
@@ -915,21 +923,29 @@ namespace {
             FastllmCudaSetDevice(0);
             kind = params.GetString("kind");
             path = params.GetString("path");
+            std::string dtype = params.GetString("dtype");
+            if (dtype == "fp16") {
+                dataType = fastllm::DataType::FLOAT16;
+            } else if (dtype == "bf16") {
+                dataType = fastllm::DataType::BFLOAT16;
+            } else {
+                throw std::runtime_error("dtype must be fp16 or bf16");
+            }
             threads = params.GetInt("threads");
             eps = params.GetFloat("eps");
             int outer = params.GetInt("outer");
             int hidden = params.GetInt("hidden");
             std::vector<int> dims = {outer, hidden};
-            PrepareFp16Tensor(input, dims, 0.413f);
-            PrepareFp16Tensor(gate, dims, 0.927f);
+            PrepareTensor(input, dims, 0.413f, dataType);
+            PrepareTensor(gate, dims, 0.927f, dataType);
             weight.CopyFrom(MakeRampTensor({hidden}, 0.731f));
             weight.ToDevice(fastllm::DataDevice::CUDA);
-            PrepareOutput(legacyOutput, dims);
-            PrepareOutput(fastOutput, dims);
+            PrepareOutput(legacyOutput, dims, dataType);
+            PrepareOutput(fastOutput, dims, dataType);
             Check(dims);
 #else
             (void)params;
-            throw std::runtime_error("rmsnorm_fp16_specialized benchmark requires USE_CUDA");
+            throw std::runtime_error("RMSNorm specialized benchmark requires USE_CUDA");
 #endif
         }
 
@@ -944,11 +960,11 @@ namespace {
         }
     };
 
-    static BenchmarkResult BenchmarkRmsNormFp16Cuda(
+    static BenchmarkResult BenchmarkRmsNormSpecializedCuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {
 #ifdef USE_CUDA
         ScopedFirstDevice guard(device);
-        auto state = std::make_shared<RmsNormFp16BenchState>();
+        auto state = std::make_shared<RmsNormSpecializedBenchState>();
         state->Init(params);
         for (int i = 0; i < warmup; i++) {
             state->Run();
@@ -969,18 +985,19 @@ namespace {
         (void)device;
         (void)warmup;
         (void)iters;
-        throw std::runtime_error("rmsnorm_fp16_specialized benchmark requires USE_CUDA");
+        throw std::runtime_error("RMSNorm specialized benchmark requires USE_CUDA");
 #endif
     }
 
-    static OpCase MakeRmsNormFp16SpecializedCase() {
+    static OpCase MakeRmsNormSpecializedCase() {
         return {
             "rmsnorm_fp16_specialized",
-            "benchmark exact FP16 RMSNorm and RMSNorm+SiLU+mul specializations",
+            "benchmark exact FP16/BF16 RMSNorm and FP16 RMSNorm+SiLU+mul specializations",
             []() {
                 OpTestParams params;
                 params.Add("kind", "rmsnorm", "rmsnorm or rmsnorm_silu_mul");
                 params.Add("path", "fast", "legacy or fast");
+                params.Add("dtype", "fp16", "fp16 or bf16");
                 params.Add("outer", "16", "number of rows");
                 params.Add("hidden", "128", "channels per row");
                 params.Add("threads", "32", "fast thread count");
@@ -995,7 +1012,7 @@ namespace {
                 marker.Allocate(0.0f);
                 return marker;
             },
-            BenchmarkRmsNormFp16Cuda,
+            BenchmarkRmsNormSpecializedCuda,
             [](const OpTestParams &params) {
                 int outer = params.GetInt("outer"), hidden = params.GetInt("hidden");
                 return (double)(outer * hidden * 2 * 2 + hidden * 4);
@@ -1054,9 +1071,9 @@ namespace {
             RunOne(legacyState, legacyOutput, 8, false);
             RunOne(candidateState, candidateOutput, tileV, exactNorm);
             ForceDeviceSync();
-            RmsNormFp16BenchState::ExpectExact(
+            RmsNormSpecializedBenchState::ExpectExact(
                 legacyOutput, candidateOutput, "recurrent output");
-            RmsNormFp16BenchState::ExpectExact(
+            RmsNormSpecializedBenchState::ExpectExact(
                 legacyState, candidateState, "recurrent state");
         }
 
@@ -2814,7 +2831,7 @@ namespace {
             MakeGeluNewCase(),
             MakeSwigluCase(),
             MakeAttentionCase(),
-            MakeRmsNormFp16SpecializedCase(),
+            MakeRmsNormSpecializedCase(),
             MakeRecurrentFromConvFp16Case(),
             MakeLinearFp8Block128Case(),
             MakeMergeMoeFp8Case(),

@@ -2755,6 +2755,107 @@ __global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, 
     }
 }
 
+#ifndef USE_ROCM
+// hidden=3072 uses three bfloat162 values per thread in the legacy 512-thread
+// kernel.  A physical thread evaluates two independent legacy thread lanes and
+// keeps all six packed values in registers until the scale is available.  The
+// two warp reductions are stored in the same 16 slots and combined in the same
+// order as the legacy kernel, so this removes the second input read without
+// changing the reduction tree.
+__global__ __launch_bounds__(256) void FastllmRMSNormBFloat16Hidden3072ExactKernel(
+        const __nv_bfloat16 *input, const float *weight,
+        __nv_bfloat16 *output, float eps) {
+    constexpr int CHANNELS = 3072;
+    constexpr int BF16_PAIRS = CHANNELS / 2;
+    constexpr int LEGACY_THREADS = 512;
+    constexpr int PHYSICAL_THREADS = 256;
+    constexpr int PHYSICAL_WARPS = PHYSICAL_THREADS / 32;
+    constexpr int LEGACY_WARPS = LEGACY_THREADS / 32;
+    constexpr int PAIRS_PER_LEGACY_THREAD = BF16_PAIRS / LEGACY_THREADS;
+    static_assert(LEGACY_THREADS == PHYSICAL_THREADS * 2,
+                  "each physical thread must emulate two legacy threads");
+    static_assert(BF16_PAIRS % LEGACY_THREADS == 0,
+                  "BF16 pairs must divide evenly across legacy threads");
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    input += (size_t)row * CHANNELS;
+    output += (size_t)row * CHANNELS;
+
+    const __nv_bfloat162 *input2 =
+        reinterpret_cast<const __nv_bfloat162 *>(input);
+    __nv_bfloat162 values0[PAIRS_PER_LEGACY_THREAD];
+    __nv_bfloat162 values1[PAIRS_PER_LEGACY_THREAD];
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < PAIRS_PER_LEGACY_THREAD; i++) {
+        int pair0 = tid + i * LEGACY_THREADS;
+        int pair1 = pair0 + PHYSICAL_THREADS;
+        values0[i] = input2[pair0];
+        values1[i] = input2[pair1];
+        float lo0 = __bfloat162float(values0[i].x);
+        float hi0 = __bfloat162float(values0[i].y);
+        float lo1 = __bfloat162float(values1[i].x);
+        float hi1 = __bfloat162float(values1[i].y);
+        sum0 += lo0 * lo0 + hi0 * hi0;
+        sum1 += lo1 * lo1 + hi1 * hi1;
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+
+    __shared__ float warpSums[LEGACY_WARPS];
+    __shared__ float scale;
+    if (lane == 0) {
+        warpSums[warp] = sum0;
+        warpSums[warp + PHYSICAL_WARPS] = sum1;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float total = lane < LEGACY_WARPS ? warpSums[lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(total / CHANNELS + eps);
+        }
+    }
+    __syncthreads();
+
+    __nv_bfloat162 *output2 = reinterpret_cast<__nv_bfloat162 *>(output);
+    float rowScale = scale;
+#pragma unroll
+    for (int i = 0; i < PAIRS_PER_LEGACY_THREAD; i++) {
+        int pair0 = tid + i * LEGACY_THREADS;
+        int pair1 = pair0 + PHYSICAL_THREADS;
+        float lo0 = __bfloat162float(values0[i].x);
+        float hi0 = __bfloat162float(values0[i].y);
+        float lo1 = __bfloat162float(values1[i].x);
+        float hi1 = __bfloat162float(values1[i].y);
+        __nv_bfloat162 normalized0;
+        __nv_bfloat162 normalized1;
+        normalized0.x = __float2bfloat16_rn(
+            lo0 * rowScale * __ldg(weight + pair0 * 2));
+        normalized0.y = __float2bfloat16_rn(
+            hi0 * rowScale * __ldg(weight + pair0 * 2 + 1));
+        normalized1.x = __float2bfloat16_rn(
+            lo1 * rowScale * __ldg(weight + pair1 * 2));
+        normalized1.y = __float2bfloat16_rn(
+            hi1 * rowScale * __ldg(weight + pair1 * 2 + 1));
+        output2[pair0] = normalized0;
+        output2[pair1] = normalized1;
+    }
+}
+#endif
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *beta, float *output, int outer, int channels) {
     int o = blockIdx.x;
@@ -5419,6 +5520,32 @@ static bool LaunchFastllmRMSNormFloat16(
     return true;
 }
 
+static bool LaunchFastllmRMSNormBFloat16(
+        __nv_bfloat16 *input, float *weight, __nv_bfloat16 *output,
+        int outer, int channels, float eps, int threadCount) {
+#ifndef USE_ROCM
+    if (channels == 3072 && threadCount == 256) {
+        FastllmRMSNormBFloat16Hidden3072ExactKernel<<<outer, 256>>>(
+            input, weight, output, eps);
+        return true;
+    }
+#endif
+    if (threadCount != 0) {
+        return false;
+    }
+    if (channels < 512) {
+        FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
+            input, weight, output, outer, channels, eps);
+    } else if (channels < 4096) {
+        FastllmRMSNormKernelInner1<512><<<outer, 512>>>(
+            input, weight, output, outer, channels, eps);
+    } else {
+        FastllmRMSNormKernelInner1<1024><<<outer, 1024>>>(
+            input, weight, output, outer, channels, eps);
+    }
+    return true;
+}
+
 bool FastllmCudaRMSNormFloat16WithThreadCount(
         const fastllm::Data &input, fastllm::Data &weight,
         fastllm::Data &output, float eps, int threadCount) {
@@ -5442,6 +5569,31 @@ bool FastllmCudaRMSNormFloat16WithThreadCount(
     return LaunchFastllmRMSNormFloat16(
         (const half*)input.cudaData, (const float*)weight.cudaData,
         (half*)output.cudaData, outer, channels, eps, threadCount);
+}
+
+bool FastllmCudaRMSNormBFloat16WithThreadCount(
+        const fastllm::Data &input, fastllm::Data &weight,
+        fastllm::Data &output, float eps, int threadCount) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::BFLOAT16 ||
+        output.dataType != fastllm::DataType::BFLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        input.dims.empty() || input.dims != output.dims ||
+        input.strides.empty() || output.strides.empty() ||
+        input.strides.back() != 1 || output.strides.back() != 1 ||
+        weight.dims.size() != 1 || weight.dims[0] != input.dims.back() ||
+        input.cudaData == nullptr || output.cudaData == nullptr ||
+        weight.cudaData == nullptr) {
+        return false;
+    }
+    int axis = (int)input.dims.size() - 1;
+    int outer = input.Count(0) / input.Count(axis);
+    int channels = input.dims[axis];
+    return LaunchFastllmRMSNormBFloat16(
+        (__nv_bfloat16*)input.cudaData, (float*)weight.cudaData,
+        (__nv_bfloat16*)output.cudaData, outer, channels, eps, threadCount);
 }
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
@@ -5472,16 +5624,13 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
             (half*)cudaInput, (float*)weight.cudaData, (half*)cudaOutput,
             outer, channels, eps, channels == 128 ? 32 : 0);
     } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-        if (channels < 512) {
-            FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
-                                                              channels, eps);
-        } else if (channels < 4096) {
-            FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
-                                                                channels, eps);
-        } else {
-            FastllmRMSNormKernelInner1<1024> <<< outer, 1024 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
-                                                                  channels, eps);
-        }
+        int threadCount = 0;
+#ifndef USE_ROCM
+        threadCount = channels == 3072 ? 256 : 0;
+#endif
+        LaunchFastllmRMSNormBFloat16(
+            (__nv_bfloat16*)cudaInput, (float*)weight.cudaData,
+            (__nv_bfloat16*)cudaOutput, outer, channels, eps, threadCount);
     }
 
     FastllmCudaFinishInput(input, cudaInput);

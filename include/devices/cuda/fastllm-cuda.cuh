@@ -383,6 +383,10 @@ bool FastllmCudaKimiK3CausalAttention(
 // threadCount == 32 selects the exact FP16 channel-128 specialization.
 bool FastllmCudaRMSNormFloat16WithThreadCount(const fastllm::Data &input, fastllm::Data &weight,
                                               fastllm::Data &output, float eps, int threadCount);
+// Benchmark/validation entry. threadCount == 0 selects the legacy launch;
+// threadCount == 256 selects the exact BF16 channel-3072 specialization.
+bool FastllmCudaRMSNormBFloat16WithThreadCount(const fastllm::Data &input, fastllm::Data &weight,
+                                               fastllm::Data &output, float eps, int threadCount);
 bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
                                        int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,

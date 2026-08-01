@@ -912,6 +912,58 @@ namespace {
         return data;
     }
 
+    std::vector<float> MakeRegressionValues(int count, float seed, float scale);
+
+#ifndef USE_ROCM
+    void RunCudaBFloat16Hidden3072RMSNormRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int outer = 7;
+        constexpr int hidden = 3072;
+        constexpr float eps = 1.0e-6f;
+        const std::vector<int> dims = {outer, hidden};
+        std::vector<float> inputValues =
+            MakeRegressionValues(outer * hidden, 0.413f, 0.19f);
+        std::vector<float> weightValues(hidden);
+        for (int i = 0; i < hidden; i++) {
+            weightValues[i] = 0.85f + 0.2f * std::sin((i + 1) * 0.017f);
+        }
+        fastllm::Data weight = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {hidden}, weightValues);
+
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, dims, inputValues);
+        fastllm::Data legacyOutput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, dims,
+            std::vector<float>(outer * hidden, 0.0f));
+        fastllm::Data specializedOutput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, dims,
+            std::vector<float>(outer * hidden, 0.0f));
+        Expect(FastllmCudaRMSNormBFloat16WithThreadCount(
+                   input, weight, legacyOutput, eps, 0),
+               "legacy BF16 hidden-3072 RMSNorm launch failed");
+        Expect(FastllmCudaRMSNormBFloat16WithThreadCount(
+                   input, weight, specializedOutput, eps, 256),
+               "specialized BF16 hidden-3072 RMSNorm launch failed");
+        ExpectFloatNear(ToFloatVector(legacyOutput),
+                        ToFloatVector(specializedOutput), 0.0f, 0.0f,
+                        "out-of-place BF16 hidden-3072 RMSNorm");
+
+        fastllm::Data legacyInplace = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, dims, inputValues);
+        fastllm::Data specializedInplace = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, dims, inputValues);
+        Expect(FastllmCudaRMSNormBFloat16WithThreadCount(
+                   legacyInplace, weight, legacyInplace, eps, 0),
+               "legacy in-place BF16 hidden-3072 RMSNorm launch failed");
+        Expect(FastllmCudaRMSNormBFloat16WithThreadCount(
+                   specializedInplace, weight, specializedInplace, eps, 256),
+               "specialized in-place BF16 hidden-3072 RMSNorm launch failed");
+        ExpectFloatNear(ToFloatVector(legacyInplace),
+                        ToFloatVector(specializedInplace), 0.0f, 0.0f,
+                        "in-place BF16 hidden-3072 RMSNorm");
+    }
+#endif
+
     void RunCudaBFloat16SigmoidMulToRegression() {
         const std::vector<float> sigmoidValues = {
             -9.0f, -2.5f, -0.1f, 0.0f, 0.1f, 2.5f, 9.0f
@@ -5691,6 +5743,10 @@ int main() {
 
         if (fastllm::HasDeviceType("cuda")) {
 #ifdef USE_CUDA
+#ifndef USE_ROCM
+            RunCudaBFloat16Hidden3072RMSNormRegression();
+            std::cout << "cuda BF16 hidden-3072 RMSNorm regression: PASS\n";
+#endif
             RunCudaBFloat16SigmoidMulToRegression();
             std::cout << "cuda BF16 Sigmoid/MulTo regression: PASS\n";
             Expect(FastllmCudaGraphQwen35MoeSelfTest(),
