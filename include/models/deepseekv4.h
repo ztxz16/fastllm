@@ -36,6 +36,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace fastllm {
     struct DeepSeekV4DecodeLayerCache {
@@ -124,6 +126,61 @@ namespace fastllm {
         std::vector<int> historyTokens;
         std::shared_ptr<void> cudaGraphState;
     };
+
+    struct DeepSeekV4ExpertAllowList {
+        bool configured = false;
+        std::vector<int> experts;
+        std::vector<uint8_t> mask;
+
+        bool Allows(int expert) const {
+            return expert >= 0 && expert < (int)mask.size() && mask[expert] != 0;
+        }
+    };
+
+    struct DeepSeekV4HashRemapResult {
+        std::vector<int> routes;
+        uint64_t entries = 0;
+        uint64_t remapped = 0;
+    };
+
+    DeepSeekV4ExpertAllowList ParseDeepSeekV4ExpertAllowList(
+            const std::string &spec, int expertCount, int topk,
+            const std::string &scope);
+
+    std::string DeepSeekV4ExpertAllowListJson(
+            const DeepSeekV4ExpertAllowList &policy);
+
+    DeepSeekV4HashRemapResult RemapDeepSeekV4HashRoutes(
+            const std::vector<float> &routerRows,
+            const std::vector<int> &routes,
+            int expertCount, int rowWidth, int topk,
+            const DeepSeekV4ExpertAllowList &policy);
+
+    void SelectDeepSeekV4AllowedExperts(
+            const std::vector<float> &rawScores,
+            int tokens, int expertCount, int topk,
+            const std::string &scoreFunc, float routeScale,
+            const std::vector<float> *gateBias,
+            const DeepSeekV4ExpertAllowList *policy,
+            std::vector<int> &indices,
+            std::vector<float> &scores);
+
+    void ValidateDeepSeekV4AllowedExpertIndices(
+            const std::vector<int> &indices,
+            const DeepSeekV4ExpertAllowList *policy);
+
+    // Test-only seam over the file-local MoE routing builder in
+    // deepseekv4.cpp. Lets unit tests drive learned/hash CPU and CUDA expert
+    // routing with tiny in-memory weights instead of a checkpoint. Not used by
+    // production inference paths.
+    void DeepSeekV4BuildMoERoutingDataForTesting(
+            WeightMap &weight, const std::string &prefix, const Data &x,
+            const std::vector<int> &inputIds, int nRoutedExperts, int topk,
+            const std::string &scoreFunc, float routeScale,
+            Data &expertIndex, Data &expertScore,
+            const Data *decodeMeta,
+            const DeepSeekV4ExpertAllowList *expertPolicy,
+            Data *hashRouteTable);
 
     class DeepSeekV4Model : public basellm {
     public:
@@ -248,6 +305,21 @@ namespace fastllm {
         std::string topk_method = "noaux_tc";
         float swiglu_limit = 0.f;           // SwiGLU 截断
         bool mergeSwiglu = false;
+
+        DeepSeekV4ExpertAllowList backboneExpertAllowList;
+        DeepSeekV4ExpertAllowList mtpExpertAllowList;
+        Data backboneExpertAllowMaskData;
+        Data mtpExpertAllowMaskData;
+        std::map<std::string, std::shared_ptr<Data> > remappedHashRouteTables;
+        std::map<std::string, std::pair<uint64_t, uint64_t> > hashRemapCoverage;
+        std::mutex expertAllowListMutex;
+
+        const DeepSeekV4ExpertAllowList &GetExpertAllowListForPrefix(
+                const std::string &prefix) const;
+        Data *GetExpertAllowMaskDataForPrefix(const std::string &prefix);
+        Data *GetEffectiveHashRouteTable(const std::string &prefix);
+        void PrepareExpertAllowListRouting();
+        void UpdateExpertAllowListMetadata();
 
         // -------- Hyper-Connections --------
         int hc_mult = 4;

@@ -284,6 +284,10 @@ def add_server_args(parser):
     parser.add_argument("--max_context_length", "--max-context-length", dest = "max_context_length",
                         type = _positive_int, default = -1,
                         help = "限制单会话输入和输出合计的最大token数；默认取模型上限和KV Cache总容量的较小值")
+    parser.add_argument("--default_max_tokens", "--default-max-tokens",
+                        dest = "default_max_tokens", type = _positive_int,
+                        default = 16384,
+                        help = "请求省略max_tokens时的默认输出token上限（默认16384）")
     parser.add_argument("--temperature", type = float, default = None, help = "覆盖服务端默认 temperature，未指定则使用模型默认值")
     parser.add_argument("--top_p", type = float, default = None, help = "覆盖服务端默认 top_p，未指定则使用模型默认值")
     parser.add_argument("--top_k", type = int, default = None, help = "覆盖服务端默认 top_k，未指定则使用模型默认值")

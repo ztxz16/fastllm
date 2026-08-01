@@ -1489,6 +1489,13 @@ typedef struct {
 } block_q8_K;
 static_assert(sizeof(block_q8_K) == 2*sizeof(float) + QK_K + QK_K/16*sizeof(int16_t), "wrong q8_K block size/padding");
 
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e; // E8M0 scale
+    uint8_t qs[QK_MXFP4/2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
 // (Almost) "true" 2-bit quantization.
 // Due to the need to use blocks as per ggml design, it ends up using
 // 2.0625 bpw because of the 16-bit scale for each block of 256.
@@ -1787,6 +1794,10 @@ enum ggml_type {
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
+        GGML_TYPE_MXFP4   = 39,
+        // GGML_TYPE_NVFP4 = 40,
+        // GGML_TYPE_Q1_0  = 41,
+        // GGML_TYPE_Q2_0  = 42,
         //
         // So we are able to consume MS BitNet I2_S quants
         //
@@ -1962,6 +1973,7 @@ GGML_API void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GG
 GGML_API void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 //GGML_API void dequantize_row_q8_1(const block_q8_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 GGML_API void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
@@ -2124,6 +2136,8 @@ namespace fastllm {
         bool ReadBool();
 
         void ReadBytes(uint8_t *buffer, uint64_t bytes);
+
+        void SkipBytes(uint64_t bytes);
 
         ~GGUFBuffer();
     };

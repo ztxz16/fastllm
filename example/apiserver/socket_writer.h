@@ -8,6 +8,7 @@
 #include <winsock2.h>
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #endif
 
 inline bool WriteAllToSocket(int socket, const char *data, size_t size) {
@@ -42,6 +43,31 @@ inline bool WriteAllToSocket(int socket, const char *data, size_t size) {
 
 inline bool WriteAllToSocket(int socket, const std::string &data) {
     return WriteAllToSocket(socket, data.data(), data.size());
+}
+
+inline bool SocketPeerDisconnected(int socket) {
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(socket, &readSet);
+    timeval timeout = {0, 0};
+    int ready = select(socket + 1, &readSet, nullptr, nullptr, &timeout);
+    if (ready <= 0 || !FD_ISSET(socket, &readSet)) {
+        return false;
+    }
+    char byte = 0;
+#ifdef _WIN32
+    int ret = recv(socket, &byte, 1, MSG_PEEK);
+    if (ret == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+        return error != WSAEWOULDBLOCK && error != WSAEINTR;
+    }
+#else
+    ssize_t ret = recv(socket, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (ret < 0) {
+        return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+    }
+#endif
+    return ret == 0;
 }
 
 

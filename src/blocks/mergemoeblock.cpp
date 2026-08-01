@@ -36,21 +36,22 @@ namespace fastllm {
         DataType dataType, DataType moeAtype,
         Data *moeInputTemp, Data *moeOutputTemp,
         MoeGateType gateType, bool expertParallel,
-        float swigluLimit, bool deepSeekV4Mode
+        float swigluLimit, bool deepSeekV4Mode,
+        const Data *allowedExpertMask
     ) {
         if (dataType == moeAtype) {
             MergeMOE(*input, *expertIndex, *expertScore,
                      *weights, *biass,
                      *w1, *w2, *w3, *tempInput, *tempOutput,
                      sharedScale, *output, layer, gateType, expertParallel,
-                     swigluLimit, deepSeekV4Mode);
+                     swigluLimit, deepSeekV4Mode, allowedExpertMask);
         } else {
             ToDataType(*input, *moeInputTemp, moeAtype);
             MergeMOE(*moeInputTemp, *expertIndex, *expertScore,
                      *weights, *biass,
                      *w1, *w2, *w3, *tempInput, *tempOutput,
                      sharedScale, *moeOutputTemp, layer, gateType, expertParallel,
-                     swigluLimit, deepSeekV4Mode);
+                     swigluLimit, deepSeekV4Mode, allowedExpertMask);
             ToDataType(*moeOutputTemp, *output, dataType);
         }
         ClearStaleReplicatedView(output);

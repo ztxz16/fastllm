@@ -15,6 +15,7 @@ option(USE_TFACC "use tfacc" OFF)
 option(PY_API "python api" OFF)
 
 option(USE_MMAP "use mmap" OFF)
+option(USE_ZSTD "Enable optional zstd compression for cold CPU request snapshots" ON)
 
 option(USE_SENTENCEPIECE "use sentencepiece" OFF)
 
@@ -449,6 +450,19 @@ if(USE_ROCM)
     endif()
 endif()
 
+if (USE_ZSTD)
+    find_path(FASTLLM_ZSTD_INCLUDE_DIR zstd.h)
+    find_library(FASTLLM_ZSTD_LIBRARY NAMES zstd)
+    if (FASTLLM_ZSTD_INCLUDE_DIR AND FASTLLM_ZSTD_LIBRARY)
+        include_directories(${FASTLLM_ZSTD_INCLUDE_DIR})
+        list(APPEND FASTLLM_LINKED_LIBS ${FASTLLM_ZSTD_LIBRARY})
+        add_compile_definitions(FASTLLM_USE_ZSTD)
+        message(STATUS "Cold CPU request snapshot zstd support enabled")
+    else()
+        message(WARNING "libzstd was not found; cold CPU snapshots remain raw")
+    endif()
+endif()
+
 if (USE_IVCOREX)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cudart)
     set(CMAKE_CUDA_ARCHITECTURES ${IVCOREX_ARCH})
@@ -538,6 +552,44 @@ if (UNIT_TEST)
     add_executable(testApiServerSocket
         test/apiserver/socketWriteTest.cpp
         third_party/json11/json11.cpp)
+
+    add_executable(testDeepSeekV4GGUFAdapter
+        test/gguf/deepseek4AdapterTest.cpp)
+    target_link_libraries(testDeepSeekV4GGUFAdapter fastllm)
+
+    add_executable(testDeepSeekV4ExpertAllowList
+        test/models/deepseek4ExpertAllowListTest.cpp)
+    target_link_libraries(testDeepSeekV4ExpertAllowList fastllm)
+
+    add_executable(testDeepSeekV4QuantizedDiskMoe
+        test/gguf/deepseek4QuantizedDiskMoeTest.cpp)
+    target_link_libraries(testDeepSeekV4QuantizedDiskMoe fastllm)
+
+    add_executable(testDeepSeekV4DiskExpertCache
+        test/gguf/deepseek4DiskExpertCacheTest.cpp)
+    target_link_libraries(testDeepSeekV4DiskExpertCache fastllm)
+
+    add_executable(testDeepSeekV4RouteSeam
+        test/models/deepseek4RouteSeamTest.cpp)
+    target_link_libraries(testDeepSeekV4RouteSeam fastllm)
+
+    # These tests use assert(), so keep assertions enabled even when the
+    # surrounding build adds -DNDEBUG for optimized binaries.
+    if (MSVC)
+        target_compile_options(testApiServerSocket PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4ExpertAllowList PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4RouteSeam PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(testApiServerSocket PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4ExpertAllowList PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4RouteSeam PRIVATE -UNDEBUG)
+    endif()
 endif()
 
 add_executable(webui example/webui/webui.cpp)

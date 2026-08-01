@@ -2505,13 +2505,111 @@ namespace fastllm {
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2
-            {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
+            {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"}, {"deepseek_v3", "deepseek_v2"}, // deepseek_v2
+            {"deepseek4", "deepseek_v4"}, {"deepseek_v4", "deepseek_v4"} // deepseek_v4
         };
         if (ggufTypeToFastllmTypeDict.find(type) != ggufTypeToFastllmTypeDict.end()) {
             return ggufTypeToFastllmTypeDict[type];
         } else {
             printf("Warning: Can't convert type \"%s\", try use original type.\n", type.c_str());
             return type;
+        }
+    }
+
+    void ApplyDeepSeekV4GGUFMetadata(basellm *model, const json11::Json &params,
+                                     const std::string &arch) {
+        AssertInFastLLM(model != nullptr, "DeepSeek V4 GGUF metadata requires a model.\n");
+        AssertInFastLLM(arch == "deepseek4" || arch == "deepseek_v4",
+                        "Invalid DeepSeek V4 GGUF architecture: " + arch + ".\n");
+
+        auto addInt = [&](const std::string &dictKey, const std::string &ggufKey) {
+            const auto &value = params[arch + "." + ggufKey];
+            if (!value.is_null()) {
+                model->weight.AddDict(dictKey, std::to_string(value.int_value()));
+            }
+        };
+        auto addFloat = [&](const std::string &dictKey, const std::string &ggufKey) {
+            const auto &value = params[arch + "." + ggufKey];
+            if (!value.is_null()) {
+                model->weight.AddDict(dictKey, std::to_string(value.number_value()));
+            }
+        };
+        auto addString = [&](const std::string &dictKey, const std::string &ggufKey) {
+            const auto &value = params[arch + "." + ggufKey];
+            if (!value.is_null()) {
+                model->weight.AddDict(dictKey, value.string_value());
+            }
+        };
+
+        model->weight.AddDict("model_type", "deepseek_v4");
+        addInt("num_hidden_layers", "block_count");
+        addInt("hidden_size", "embedding_length");
+        addInt("num_attention_heads", "attention.head_count");
+        addInt("num_key_value_heads", "attention.head_count_kv");
+        addInt("head_dim", "attention.key_length");
+        addInt("qk_rope_head_dim", "rope.dimension_count");
+        addInt("q_lora_rank", "attention.q_lora_rank");
+        addInt("o_lora_rank", "attention.output_lora_rank");
+        addInt("o_groups", "attention.output_group_count");
+        addInt("sliding_window", "attention.sliding_window");
+        addInt("max_position_embeddings", "context_length");
+        addFloat("rms_norm_eps", "attention.layer_norm_rms_epsilon");
+
+        addInt("n_routed_experts", "expert_count");
+        addInt("num_experts_per_tok", "expert_used_count");
+        addInt("n_shared_experts", "expert_shared_count");
+        addInt("moe_intermediate_size", "expert_feed_forward_length");
+        addFloat("routed_scaling_factor", "expert_weights_scale");
+        const auto &normalizeExperts = params[arch + ".expert_weights_norm"];
+        if (!normalizeExperts.is_null()) {
+            model->weight.AddDict("norm_topk_prob",
+                                  normalizeExperts.bool_value() ? "true" : "false");
+        }
+        int gatingFunc = params[arch + ".expert_gating_func"].is_null()
+                             ? 4
+                             : params[arch + ".expert_gating_func"].int_value();
+        model->weight.AddDict("scoring_func",
+                              gatingFunc == 4 ? "sqrtsoftplus" :
+                              (gatingFunc == 2 ? "sigmoid" : "softmax"));
+        model->weight.AddDict("topk_method", "noaux_tc");
+
+        const auto &swigluClamp = params[arch + ".swiglu_clamp_exp"];
+        if (swigluClamp.is_array() && !swigluClamp.array_items().empty()) {
+            model->weight.AddDict("swiglu_limit",
+                                  std::to_string(swigluClamp.array_items()[0].number_value()));
+        } else if (swigluClamp.is_number()) {
+            model->weight.AddDict("swiglu_limit", std::to_string(swigluClamp.number_value()));
+        }
+
+        addInt("index_n_heads", "attention.indexer.head_count");
+        addInt("index_head_dim", "attention.indexer.key_length");
+        addInt("index_topk", "attention.indexer.top_k");
+        const auto &compressRatios = params[arch + ".attention.compress_ratios"];
+        if (compressRatios.is_array()) {
+            model->weight.AddDict("compress_ratios", compressRatios.dump());
+        }
+        addFloat("compress_rope_theta", "attention.compress_rope_freq_base");
+
+        addInt("hc_mult", "hyper_connection.count");
+        addInt("hc_sinkhorn_iters", "hyper_connection.sinkhorn_iterations");
+        addFloat("hc_eps", "hyper_connection.epsilon");
+        addInt("num_hash_layers", "hash_layer_count");
+
+        addFloat("rope_theta", "rope.freq_base");
+        addString("rope_scaling.type", "rope.scaling.type");
+        addFloat("rope_scaling.factor", "rope.scaling.factor");
+        addInt("rope_scaling.original_max_position_embeddings",
+               "rope.scaling.original_context_length");
+        addFloat("rope_scaling.beta_fast", "rope.scaling.yarn_beta_fast");
+        addFloat("rope_scaling.beta_slow", "rope.scaling.yarn_beta_slow");
+
+        // The selected GGUF contains the 43-layer target backbone only. DSpark
+        // is loaded separately from the official mtp.* safetensors shards.
+        model->weight.AddDict("num_nextn_predict_layers", "0");
+
+        const auto &blockCount = params[arch + ".block_count"];
+        if (!blockCount.is_null()) {
+            model->block_cnt = blockCount.int_value();
         }
     }
 
@@ -2587,6 +2685,7 @@ namespace fastllm {
         const std::string sourceArch = params["general.architecture"].string_value();
         std::string arch = sourceArch;
         const bool sourceQwen35GGUF = sourceArch == "qwen35" || sourceArch == "qwen3_5";
+        const bool sourceDeepSeek4GGUF = sourceArch == "deepseek4" || sourceArch == "deepseek_v4";
         if (sourceArch == "qwen35moe" || sourceArch == "qwen3_5_moe") {
             throw std::runtime_error("Unsupported Qwen3.5 MoE GGUF architecture: " + sourceArch + ".");
         }
@@ -2793,6 +2892,9 @@ namespace fastllm {
                     model->weight.AddDict("rope_theta",
                                           std::to_string(params[arch + ".rope.freq_base"].number_value()));
                 }
+            }
+            if (sourceDeepSeek4GGUF) {
+                ApplyDeepSeekV4GGUFMetadata(model, params, sourceArch);
             }
 
             if (!params[arch + ".attention.head_count"].is_null()) {

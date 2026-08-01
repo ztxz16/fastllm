@@ -7,6 +7,7 @@
 
 #include "basellm.h"
 #include "bert.h"
+#include "json11.hpp"
 #include "xlmroberta.h"
 
 namespace fastllm {
@@ -15,6 +16,11 @@ namespace fastllm {
     std::unique_ptr<basellm> CreateLLMModelFromGGUF(const std::string &modelPath);
 
     std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath);
+
+    std::string ConvertGGUFTypeToFastllmType(const std::string &type);
+
+    void ApplyDeepSeekV4GGUFMetadata(basellm *model, const json11::Json &params,
+                                     const std::string &arch);
 
     std::unique_ptr<basellm> CreateLLMModelFromFile(const std::string &fileName);
 

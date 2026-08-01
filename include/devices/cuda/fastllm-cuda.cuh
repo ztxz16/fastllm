@@ -342,6 +342,13 @@ bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float 
 bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaTransferAttn(fastllm::Data &input);
+bool FastllmCudaGatedDeltaRulePrepareAttn(
+    const fastllm::Data &at, const fastllm::Data &decayMask,
+    fastllm::Data &attn);
+bool FastllmCudaGatedDeltaRuleBuildDecay(
+    fastllm::Data &g, fastllm::Data &decayMask);
+bool FastllmCudaGatedDeltaRuleApplyDecayMask(
+    fastllm::Data &attn, const fastllm::Data &decayMask, int causalBase);
 bool FastllmCudaCumSumLastDim(fastllm::Data &input);
 bool FastllmCudaCausalMask(fastllm::Data &input, int base, float maskValue);
 bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output);

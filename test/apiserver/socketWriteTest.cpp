@@ -11,7 +11,9 @@
 
 #include "../../example/apiserver/socket_writer.h"
 #include "../../example/apiserver/http_request_reader.h"
+#include "../../example/apiserver/http_response.h"
 #include "../../example/apiserver/openai_output_parser.h"
+#include "../../example/apiserver/output_token_limit.h"
 #include "../../example/apiserver/stop_parser.h"
 #include "../../include/utils/stop_token_matcher.h"
 #include "../../include/utils/stop_string_matcher.h"
@@ -35,6 +37,69 @@ int main() {
     CHECK(ResolveOpenAIFinishReason(false, false, 256, 256) == "length");
     CHECK(ResolveOpenAIFinishReason(false, true, 256, 256) == "stop");
     CHECK(ResolveOpenAIFinishReason(true, false, 256, 256) == "tool_calls");
+
+    int selectedOutputLimit = 0;
+    std::string outputLimitError;
+    CHECK(ResolveOutputTokenLimit(json11::Json(), 16384,
+                                  selectedOutputLimit, outputLimitError));
+    CHECK(selectedOutputLimit == 16384);
+    CHECK(outputLimitError.empty());
+    CHECK(ResolveOutputTokenLimit(json11::Json(4096), 16384,
+                                  selectedOutputLimit, outputLimitError));
+    CHECK(selectedOutputLimit == 4096);
+    CHECK(!ResolveOutputTokenLimit(json11::Json(0), 16384,
+                                   selectedOutputLimit, outputLimitError));
+    CHECK(!ResolveOutputTokenLimit(json11::Json(-1), 16384,
+                                   selectedOutputLimit, outputLimitError));
+    CHECK(!ResolveOutputTokenLimit(json11::Json(1.5), 16384,
+                                   selectedOutputLimit, outputLimitError));
+    CHECK(!ResolveOutputTokenLimit(json11::Json("4096"), 16384,
+                                   selectedOutputLimit, outputLimitError));
+    CHECK(!ResolveOutputTokenLimit(json11::Json(true), 16384,
+                                   selectedOutputLimit, outputLimitError));
+    CHECK(!ResolveOutputTokenLimit(json11::Json(), 0,
+                                   selectedOutputLimit, outputLimitError));
+    int parsedPositiveInt = 0;
+    CHECK(ParsePositiveInt("16384", parsedPositiveInt, outputLimitError));
+    CHECK(parsedPositiveInt == 16384);
+    CHECK(!ParsePositiveInt("0", parsedPositiveInt, outputLimitError));
+    CHECK(!ParsePositiveInt("-1", parsedPositiveInt, outputLimitError));
+    CHECK(!ParsePositiveInt("1.5", parsedPositiveInt, outputLimitError));
+    CHECK(!ParsePositiveInt("abc", parsedPositiveInt, outputLimitError));
+
+    const json11::Json okBody = json11::Json::object {
+        {"ready", true}, {"status", "ok"}
+    };
+    const std::string okResponse = BuildFixedHttpResponse(
+        200, okBody.dump());
+    CHECK(okResponse.find("HTTP/1.1 200 OK\r\n") == 0);
+    CHECK(okResponse.find("Content-Type: application/json; charset=utf-8\r\n") !=
+          std::string::npos);
+    CHECK(okResponse.find("Content-Length: " +
+                          std::to_string(okBody.dump().size()) + "\r\n") !=
+          std::string::npos);
+    CHECK(okResponse.find("Connection: close\r\n") != std::string::npos);
+    CHECK(okResponse.substr(okResponse.find("\r\n\r\n") + 4) ==
+          okBody.dump());
+
+    const json11::Json notFoundBody = OpenAIHttpError(
+        "Route /missing was not found.",
+        "invalid_request_error", "not_found");
+    const std::string notFoundResponse = BuildFixedHttpResponse(
+        404, notFoundBody.dump());
+    CHECK(notFoundResponse.find("HTTP/1.1 404 Not Found\r\n") == 0);
+    CHECK(notFoundResponse.substr(
+              notFoundResponse.find("\r\n\r\n") + 4) ==
+          notFoundBody.dump());
+
+    const json11::Json methodBody = OpenAIHttpError(
+        "Method POST is not allowed for /health.",
+        "invalid_request_error", "method_not_allowed");
+    const std::string methodResponse = BuildFixedHttpResponse(
+        405, methodBody.dump(), "application/json; charset=utf-8",
+        {{"Allow", "GET"}});
+    CHECK(methodResponse.find("HTTP/1.1 405 Method Not Allowed\r\n") == 0);
+    CHECK(methodResponse.find("Allow: GET\r\n") != std::string::npos);
 
     const std::string getRequest =
         "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -328,6 +393,7 @@ int main() {
 #ifndef _WIN32
     int sockets[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    CHECK(!SocketPeerDisconnected(sockets[0]));
 
     const char payload[] = "ready";
     CHECK(WriteAllToSocket(sockets[0], payload, sizeof(payload) - 1));
@@ -337,6 +403,7 @@ int main() {
     CHECK(std::memcmp(payload, received, sizeof(payload) - 1) == 0);
 
     close(sockets[1]);
+    CHECK(SocketPeerDisconnected(sockets[0]));
     CHECK(!WriteAllToSocket(sockets[0], payload, sizeof(payload) - 1));
     close(sockets[0]);
 #endif

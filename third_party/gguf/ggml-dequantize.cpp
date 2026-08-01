@@ -142,6 +142,33 @@ void dequantize_row_q8_0(const block_q8_0 * restrict x, float * restrict y, int6
     }
 }
 
+void dequantize_row_mxfp4(const block_mxfp4 * restrict x, float * restrict y, int64_t k) {
+    static const int8_t values[16] = {
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    assert(k % QK_MXFP4 == 0);
+    const int64_t nb = k / QK_MXFP4;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        uint32_t scaleBits;
+        if (x[i].e < 2) {
+            scaleBits = 0x00200000u << x[i].e;
+        } else {
+            scaleBits = (uint32_t)(x[i].e - 1) << 23;
+        }
+        float scale;
+        memcpy(&scale, &scaleBits, sizeof(scale));
+
+        for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+            const uint8_t packed = x[i].qs[j];
+            y[i * QK_MXFP4 + j] = values[packed & 0x0f] * scale;
+            y[i * QK_MXFP4 + j + QK_MXFP4 / 2] =
+                values[packed >> 4] * scale;
+        }
+    }
+}
+
 void dequantize_row_q2_K(const block_q2_K * restrict x, float * restrict y, int64_t k) {
     assert(k % QK_K == 0);
     const int nb = k / QK_K;

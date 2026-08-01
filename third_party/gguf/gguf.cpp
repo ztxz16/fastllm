@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <limits>
 #include <map>
 #include <stdexcept>
 
@@ -85,6 +89,12 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             /* type_size */ sizeof(block_q8_1),/* is_quantized */  true,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q8_1_ref,
         }},
+        {GGML_TYPE_MXFP4, ggml_type_traits{/* type_name */"mxfp4", /* blck_size */QK_MXFP4,
+            /* type_size */ sizeof(block_mxfp4),/* is_quantized */  true,
+            /* vec_dot */ nullptr,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
+            /* to_float */ (ggml_to_float_t) dequantize_row_mxfp4,
+        }},
         {GGML_TYPE_Q2_K, ggml_type_traits{/* type_name */"q2_K", /* blck_size */QK_K,
             /* type_size */ sizeof(block_q2_K),/* is_quantized */  true,
             /* vec_dot */ ggml_vec_dot_q2_K_q8_K,
@@ -169,14 +179,18 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
-        {GGML_TYPE_IQ2_XS, {/* type_name */"iq2_xs", /* blck_size */QK_K,
+        {GGML_TYPE_IQ2_XS, ggml_type_traits{/* type_name */"iq2_xs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq2_xs),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
+            /* vec_dot */ nullptr,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq2_xs,
             // .from_float_ref           = nullptr,
         }},
-        {GGML_TYPE_IQ3_XXS, {/* type_name */"iq3_xxs", /* blck_size */QK_K,
+        {GGML_TYPE_IQ3_XXS, ggml_type_traits{/* type_name */"iq3_xxs", /* blck_size */QK_K,
             /* type_size */ sizeof(block_iq3_xxs),/* is_quantized */  true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
+            /* vec_dot */ nullptr,
+            /* vec_dot_type */ GGML_TYPE_Q8_K,
+            /* to_float */ (ggml_to_float_t) dequantize_row_iq3_xxs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_xxs_ref,
         }},
         {GGML_TYPE_IQ3_S, {/* type_name */"iq3_s", /* blck_size */QK_K,
@@ -327,6 +341,13 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .is_quantized             = true,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q8_1_ref,
         }},
+        {GGML_TYPE_MXFP4, {
+            .type_name                = "mxfp4",
+            .blck_size                = QK_MXFP4,
+            .type_size                = sizeof(block_mxfp4),
+            .is_quantized             = true,
+            .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
+        }},
         {GGML_TYPE_Q2_K, ggml_type_traits{
             .type_name                = "q2_K",
             .blck_size                = QK_K,
@@ -452,7 +473,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq2_xs),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xs,
             // .from_float_ref           = nullptr,
         }},
         {GGML_TYPE_IQ2_XS_R4, {
@@ -470,7 +491,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq3_xxs),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq3_xxs,
             // .from_float_ref           = (ggml_from_float_t)quantize_row_iq3_xxs_ref,
         }},
         {GGML_TYPE_IQ3_XXS_R4, {
@@ -588,83 +609,177 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
 };
 #endif
 
+namespace {
+    const ggml_type_traits *FindGGMLTypeTraits(enum ggml_type type) {
+        const auto it = type_traits.find(type);
+        if (it == type_traits.end() || it->second.blck_size <= 0 ||
+            it->second.type_size == 0) {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    std::string SanitizeGGUFTensorName(const std::string &name) {
+        std::string result;
+        result.reserve(std::min<size_t>(name.size(), 160));
+        for (unsigned char c : name) {
+            if (result.size() == 160) {
+                result += "...";
+                break;
+            }
+            result += std::isalnum(c) || c == '.' || c == '_' || c == '-'
+                ? (char)c
+                : '?';
+        }
+        return result.empty() ? "<unnamed>" : result;
+    }
+
+    size_t CheckedSizeAdd(size_t left, size_t right,
+                          const std::string &context) {
+        if (right > std::numeric_limits<size_t>::max() - left) {
+            throw std::runtime_error(context + " size addition overflow.");
+        }
+        return left + right;
+    }
+
+    size_t CheckedSizeMultiply(size_t left, size_t right,
+                               const std::string &context) {
+        if (left != 0 && right > std::numeric_limits<size_t>::max() / left) {
+            throw std::runtime_error(context + " size multiplication overflow.");
+        }
+        return left * right;
+    }
+
+    size_t CheckedSizePad(size_t value, size_t alignment,
+                          const std::string &context) {
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+            throw std::runtime_error(context + " has invalid alignment " +
+                                     std::to_string(alignment) + ".");
+        }
+        return CheckedSizeAdd(value, alignment - 1, context) & ~(alignment - 1);
+    }
+
+    size_t CheckedUint64ToSize(uint64_t value,
+                               const std::string &context) {
+        if (value > std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error(context + " exceeds host size_t.");
+        }
+        return (size_t)value;
+    }
+}
+
 int64_t ggml_blck_size(enum ggml_type type) {
-    return type_traits[type].blck_size;
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits == nullptr ? 0 : traits->blck_size;
 }
 
 size_t ggml_type_size(enum ggml_type type) {
-    return type_traits[type].type_size;
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits == nullptr ? 0 : traits->type_size;
 }
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne) {
-    assert(ne % ggml_blck_size(type) == 0);
-    return ggml_type_size(type)*ne/ggml_blck_size(type);
+    const int64_t blockSize = ggml_blck_size(type);
+    const size_t typeSize = ggml_type_size(type);
+    if (blockSize <= 0 || typeSize == 0) {
+        throw std::runtime_error("Unsupported GGML type " +
+                                 std::to_string((int)type) + ".");
+    }
+    if (ne < 0 || ne % blockSize != 0) {
+        throw std::runtime_error("GGML row length is not divisible by block size.");
+    }
+    return typeSize * ne / blockSize;
 }
 
 double ggml_type_sizef(enum ggml_type type) {
-    return ((double)(type_traits[type].type_size))/type_traits[type].blck_size;
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits == nullptr
+        ? 0.0
+        : (double)traits->type_size / traits->blck_size;
 }
 
 const char * ggml_type_name(enum ggml_type type) {
-    return type < GGML_TYPE_COUNT ? type_traits[type].type_name : "NONE";
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits == nullptr ? "UNSUPPORTED" : traits->type_name;
 }
 
 ggml_from_float_t ggml_type_from_float_ref(enum ggml_type type) {
-    return type < GGML_TYPE_COUNT ? type_traits[type].from_float_ref : nullptr;
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits == nullptr ? nullptr : traits->from_float_ref;
 }
 
 ggml_to_float_t ggml_type_to_float(enum ggml_type type) {
-    return type < GGML_TYPE_COUNT ? type_traits[type].to_float : nullptr;
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits == nullptr ? nullptr : traits->to_float;
 }
 
 ggml_vec_dot_t ggml_type_vec_dot(enum ggml_type type) {
-    return type < GGML_TYPE_COUNT ? type_traits[type].vec_dot : nullptr;
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits == nullptr ? nullptr : traits->vec_dot;
 }
 
 ggml_type ggml_type_vec_dot_type(enum ggml_type type) {
-    return type < GGML_TYPE_COUNT ? type_traits[type].vec_dot_type : GGML_TYPE_Q8_K;
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits == nullptr ? GGML_TYPE_Q8_K : traits->vec_dot_type;
 }
 
 bool ggml_is_quantized(enum ggml_type type) {
-    return type_traits[type].is_quantized;
+    const auto *traits = FindGGMLTypeTraits(type);
+    return traits != nullptr && traits->is_quantized;
 }
 
 size_t ggml_nbytes(const struct ggml_tensor * tensor) {
+    const std::string context =
+        "GGUF tensor '" + SanitizeGGUFTensorName(tensor->name) + "'";
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         if (tensor->ne[i] <= 0) {
-            return 0;
+            throw std::runtime_error(context + " has a non-positive dimension.");
         }
-    }
-    size_t nbytes;
-    const size_t blck_size = ggml_blck_size(tensor->type);
-    if (blck_size == 1) {
-        nbytes = ggml_type_size(tensor->type);
-        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-            nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
-        }
-    }
-    else {
-        nbytes = tensor->ne[0]*tensor->nb[0]/blck_size;
-        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-            nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
+        if ((uint64_t)tensor->ne[i] > std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error(context + " dimension exceeds host size_t.");
         }
     }
 
+    const size_t blck_size = ggml_blck_size(tensor->type);
+    const size_t type_size = ggml_type_size(tensor->type);
+    if (blck_size == 0 || type_size == 0) {
+        throw std::runtime_error(
+            context + " uses unsupported GGML type " +
+            std::to_string((int)tensor->type) + ".");
+    }
+    if ((size_t)tensor->ne[0] % blck_size != 0) {
+        throw std::runtime_error(context +
+                                 " row length is not divisible by block size.");
+    }
+
+    size_t nbytes = CheckedSizeMultiply(
+        (size_t)tensor->ne[0] / blck_size, type_size, context);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        const size_t span = CheckedSizeMultiply(
+            (size_t)(tensor->ne[i] - 1), tensor->nb[i], context);
+        nbytes = CheckedSizeAdd(nbytes, span, context);
+    }
     return nbytes;
 }
 
 size_t ggml_nbytes_pad(const struct ggml_tensor * tensor) {
-    return GGML_PAD(ggml_nbytes(tensor), GGML_MEM_ALIGN);
+    return CheckedSizePad(ggml_nbytes(tensor), GGML_MEM_ALIGN,
+                          "GGUF padded tensor size");
 }
 
 namespace fastllm {
     GGUFBuffer::GGUFBuffer (const std::string &fileName) {
         this->fileName = fileName;
         this->f = fopen(fileName.c_str(), "rb");
+        if (this->f == nullptr) {
+            ErrorInFastLLM("Unable to open GGUF file.\n");
+        }
     }
 
     GGUFBuffer::~GGUFBuffer () {
-        fclose(this->f);
+        if (this->f != nullptr) {
+            fclose(this->f);
+        }
     }
 
     template <typename T>
@@ -677,19 +792,17 @@ namespace fastllm {
     }
 
     bool GGUFBuffer::ReadBool() {
-        int8_t v;
-        int ret = fread(&v, 1, 1, f);
-        return (v != 0);
+        return Read<uint8_t>() != 0;
     }
 
     std::string GGUFBuffer::ReadString() {
-        uint64_t len = Read <uint64_t> ();
-        std::vector <char> v;
-        v.resize(len + 5);
-        int ret = fread(v.data(), 1, len, f);
-        std::string s;
-        for (int i = 0; i < len; i++) {
-            s += v[i];
+        uint64_t len = Read<uint64_t>();
+        if (len > std::numeric_limits<size_t>::max()) {
+            ErrorInFastLLM("GGUFBuffer.ReadString length overflow.\n");
+        }
+        std::string s((size_t)len, '\0');
+        if (len > 0) {
+            ReadBytes(reinterpret_cast<uint8_t*>(&s[0]), len);
         }
         return s;
     }
@@ -697,6 +810,17 @@ namespace fastllm {
     void GGUFBuffer::ReadBytes(uint8_t *buffer, uint64_t bytes) {
         if (fread(buffer, 1, bytes, f) != bytes) {
             ErrorInFastLLM("GGUFBuffer.ReadBytes error.\n");
+        }
+    }
+
+    void GGUFBuffer::SkipBytes(uint64_t bytes) {
+        std::array<uint8_t, 8192> scratch;
+        while (bytes > 0) {
+            const size_t chunk = (size_t)std::min<uint64_t>(bytes, scratch.size());
+            if (fread(scratch.data(), 1, chunk, f) != chunk) {
+                ErrorInFastLLM("GGUFBuffer.SkipBytes error.\n");
+            }
+            bytes -= chunk;
         }
     }
 
@@ -709,6 +833,178 @@ namespace fastllm {
     template int32_t GGUFBuffer::Read<int32_t>();
     template int64_t GGUFBuffer::Read<int64_t>();
     template float GGUFBuffer::Read<float>();
+    template double GGUFBuffer::Read<double>();
+
+    namespace {
+        json11::Json ReadGGUFValue(GGUFBuffer &buffer, gguf_type type) {
+            switch (type) {
+                case GGUF_TYPE_UINT8:
+                    return (int)buffer.Read<uint8_t>();
+                case GGUF_TYPE_INT8:
+                    return (int)buffer.Read<int8_t>();
+                case GGUF_TYPE_UINT16:
+                    return (int)buffer.Read<uint16_t>();
+                case GGUF_TYPE_INT16:
+                    return (int)buffer.Read<int16_t>();
+                case GGUF_TYPE_UINT32:
+                    return (double)buffer.Read<uint32_t>();
+                case GGUF_TYPE_INT32:
+                    return (int)buffer.Read<int32_t>();
+                case GGUF_TYPE_FLOAT32:
+                    return (double)buffer.Read<float>();
+                case GGUF_TYPE_BOOL:
+                    return buffer.ReadBool();
+                case GGUF_TYPE_STRING:
+                    return buffer.ReadString();
+                case GGUF_TYPE_ARRAY: {
+                    const uint32_t elementTypeValue = buffer.Read<uint32_t>();
+                    if (elementTypeValue >= GGUF_TYPE_COUNT ||
+                        elementTypeValue == GGUF_TYPE_ARRAY) {
+                        ErrorInFastLLM("GGUF array has invalid or nested element type " +
+                                       std::to_string(elementTypeValue) + ".\n");
+                    }
+                    const uint64_t count = buffer.Read<uint64_t>();
+                    if (count > std::numeric_limits<size_t>::max()) {
+                        ErrorInFastLLM("GGUF array length overflow.\n");
+                    }
+                    json11::Json::array values;
+                    values.reserve((size_t)count);
+                    for (uint64_t i = 0; i < count; ++i) {
+                        values.push_back(ReadGGUFValue(
+                            buffer, (gguf_type)elementTypeValue));
+                    }
+                    return values;
+                }
+                case GGUF_TYPE_UINT64:
+                    return (double)buffer.Read<uint64_t>();
+                case GGUF_TYPE_INT64:
+                    return (double)buffer.Read<int64_t>();
+                case GGUF_TYPE_FLOAT64:
+                    return buffer.Read<double>();
+                default:
+                    ErrorInFastLLM("Unsupported GGUF metadata type " +
+                                   std::to_string((int)type) + ".\n");
+            }
+            return json11::Json();
+        }
+
+        void SkipGGUFValue(GGUFBuffer &buffer, gguf_type type) {
+            switch (type) {
+                case GGUF_TYPE_UINT8:
+                case GGUF_TYPE_INT8:
+                case GGUF_TYPE_BOOL:
+                    buffer.SkipBytes(1);
+                    return;
+                case GGUF_TYPE_UINT16:
+                case GGUF_TYPE_INT16:
+                    buffer.SkipBytes(2);
+                    return;
+                case GGUF_TYPE_UINT32:
+                case GGUF_TYPE_INT32:
+                case GGUF_TYPE_FLOAT32:
+                    buffer.SkipBytes(4);
+                    return;
+                case GGUF_TYPE_UINT64:
+                case GGUF_TYPE_INT64:
+                case GGUF_TYPE_FLOAT64:
+                    buffer.SkipBytes(8);
+                    return;
+                case GGUF_TYPE_STRING:
+                    buffer.SkipBytes(buffer.Read<uint64_t>());
+                    return;
+                case GGUF_TYPE_ARRAY: {
+                    const uint32_t elementTypeValue = buffer.Read<uint32_t>();
+                    if (elementTypeValue >= GGUF_TYPE_COUNT ||
+                        elementTypeValue == GGUF_TYPE_ARRAY) {
+                        ErrorInFastLLM("GGUF array has invalid or nested element type " +
+                                       std::to_string(elementTypeValue) + ".\n");
+                    }
+                    const uint64_t count = buffer.Read<uint64_t>();
+                    uint64_t fixedSize = 0;
+                    switch ((gguf_type)elementTypeValue) {
+                        case GGUF_TYPE_UINT8:
+                        case GGUF_TYPE_INT8:
+                        case GGUF_TYPE_BOOL:
+                            fixedSize = 1;
+                            break;
+                        case GGUF_TYPE_UINT16:
+                        case GGUF_TYPE_INT16:
+                            fixedSize = 2;
+                            break;
+                        case GGUF_TYPE_UINT32:
+                        case GGUF_TYPE_INT32:
+                        case GGUF_TYPE_FLOAT32:
+                            fixedSize = 4;
+                            break;
+                        case GGUF_TYPE_UINT64:
+                        case GGUF_TYPE_INT64:
+                        case GGUF_TYPE_FLOAT64:
+                            fixedSize = 8;
+                            break;
+                        default:
+                            break;
+                    }
+                    if (fixedSize != 0) {
+                        if (count > std::numeric_limits<uint64_t>::max() / fixedSize) {
+                            ErrorInFastLLM("GGUF array byte size overflow.\n");
+                        }
+                        buffer.SkipBytes(count * fixedSize);
+                    } else {
+                        for (uint64_t i = 0; i < count; ++i) {
+                            SkipGGUFValue(buffer, (gguf_type)elementTypeValue);
+                        }
+                    }
+                    return;
+                }
+                default:
+                    ErrorInFastLLM("Unsupported GGUF metadata type " +
+                                   std::to_string((int)type) + ".\n");
+            }
+        }
+
+        void ReadGGUFPayload(const std::string &fileName, uint64_t offset,
+                             uint8_t *buffer, size_t bytes,
+                             const std::string &tensorName) {
+            const std::string safeName = SanitizeGGUFTensorName(tensorName);
+            FILE *file = fopen(fileName.c_str(), "rb");
+            if (file == nullptr) {
+                ErrorInFastLLM("Unable to open payload for GGUF tensor '" +
+                               safeName + "'.\n");
+            }
+
+        #if defined(_WIN32) || defined(_WIN64)
+            const bool offsetFits =
+                offset <= (uint64_t)std::numeric_limits<int64_t>::max();
+            const int seekResult = offsetFits
+                ? _fseeki64(file, (int64_t)offset, SEEK_SET)
+                : -1;
+        #else
+            const bool offsetFits =
+                offset <= (uint64_t)std::numeric_limits<long>::max();
+            const int seekResult = offsetFits
+                ? fseek(file, (long)offset, SEEK_SET)
+                : -1;
+        #endif
+            if (seekResult != 0) {
+                fclose(file);
+                ErrorInFastLLM("Unable to seek payload for GGUF tensor '" +
+                               safeName + "'.\n");
+            }
+
+            const size_t readBytes = fread(buffer, 1, bytes, file);
+            const int closeResult = fclose(file);
+            if (readBytes != bytes) {
+                ErrorInFastLLM("Short payload read for GGUF tensor '" +
+                               safeName + "': expected " +
+                               std::to_string(bytes) + " bytes, got " +
+                               std::to_string(readBytes) + ".\n");
+            }
+            if (closeResult != 0) {
+                ErrorInFastLLM("Unable to close payload for GGUF tensor '" +
+                               safeName + "'.\n");
+            }
+        }
+    }
 
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
 
@@ -717,9 +1013,11 @@ namespace fastllm {
                                 int untileNumKHeads, int untileNumVHeads,
                                 int untileVRowStart, bool untileComposeNegLog) {
         if (tensor->type == ggml_type::GGML_TYPE_F32) {
-            weight->dataType = DataType::FLOAT32;    
+            weight->dataType = DataType::FLOAT32;
         } else if (tensor->type == ggml_type::GGML_TYPE_F16) {
-            weight->dataType = DataType::FLOAT16;    
+            weight->dataType = DataType::FLOAT16;
+        } else if (tensor->type == ggml_type::GGML_TYPE_I32) {
+            weight->dataType = DataType::INT32;
         } else {
             weight->dataType = DataType::DATA_GGUF_FORMAT;
         }
@@ -738,14 +1036,9 @@ namespace fastllm {
                 (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
             }
 
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(weight->cpuData, 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
+            const size_t payloadBytes = ggml_nbytes(tensor);
+            ReadGGUFPayload(fileName, offset, (uint8_t*)weight->cpuData,
+                            payloadBytes, tensor->name);
 /*
             auto repack = get_repack_info(tensor->type);
             if (repack != nullptr && regex_search(tensor->name, std::regex(R"(blk.(\d+).ffn_(gate|up|down)_exps.weight)"))) {
@@ -775,14 +1068,8 @@ namespace fastllm {
             std::vector <uint8_t> oriData;
             oriData.resize(len);
 
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
+            ReadGGUFPayload(fileName, offset, oriData.data(), len,
+                            tensor->name);
 
             auto toFloat = ggml_type_to_float(tensor->type);
             AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
@@ -799,14 +1086,8 @@ namespace fastllm {
             oriData.resize(len);
             floatData.resize(weight->Count(0));
 
-            FILE *fi = fopen(fileName.c_str(), "rb");
-    #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-    #else
-            fseek(fi, offset, 0);
-    #endif
-            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
+            ReadGGUFPayload(fileName, offset, oriData.data(), len,
+                            tensor->name);
 
             auto toFloat = ggml_type_to_float(tensor->type);
             AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
@@ -822,14 +1103,8 @@ namespace fastllm {
             std::vector <uint8_t> oriData;
             oriData.resize(len);
 
-            FILE *fi = fopen(fileName.c_str(), "rb");
-#if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, offset, 0);
-#else
-            fseek(fi, offset, 0);
-#endif
-            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
-            fclose(fi);
+            ReadGGUFPayload(fileName, offset, oriData.data(), len,
+                            tensor->name);
 
             if (tensor->type == ggml_type::GGML_TYPE_F32) {
                 memcpy((float*)weight->cpuData, oriData.data(), ggml_nbytes(tensor));
@@ -904,15 +1179,8 @@ namespace fastllm {
                 weight->Allocate();
                 const size_t len = ggml_nbytes(tensor);
                 std::vector<uint8_t> oriData(len);
-                FILE *fi = fopen(fileName.c_str(), "rb");
-        #if defined(_WIN32) || defined(_WIN64)
-                _fseeki64(fi, offset, 0);
-        #else
-                fseek(fi, offset, 0);
-        #endif
-                const size_t ret = fread(oriData.data(), 1, len, fi);
-                fclose(fi);
-                requireLayout(ret == len, "short read");
+                ReadGGUFPayload(fileName, offset, oriData.data(), len,
+                                tensor->name);
                 if (tensor->type == ggml_type::GGML_TYPE_F32) {
                     memcpy(weight->cpuData, oriData.data(), len);
                 } else {
@@ -947,15 +1215,9 @@ namespace fastllm {
                     (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
                 }
                 const size_t len = ggml_nbytes(tensor);
-                FILE *fi = fopen(fileName.c_str(), "rb");
-        #if defined(_WIN32) || defined(_WIN64)
-                _fseeki64(fi, offset, 0);
-        #else
-                fseek(fi, offset, 0);
-        #endif
-                const size_t ret = fread(weight->cpuData, 1, len, fi);
-                fclose(fi);
-                requireLayout(ret == len, "short read");
+                ReadGGUFPayload(fileName, offset,
+                                (uint8_t*)weight->cpuData, len,
+                                tensor->name);
                 const size_t unitStride = isMultiDim
                     ? (size_t)tensor->nb[1]
                     : (size_t)tensor->nb[0];
@@ -967,7 +1229,7 @@ namespace fastllm {
     }
 
     void ReadGGUFMetaData(const std::string &fileName, json11::Json &config) {
-        int ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
+        size_t ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
         GGUFBuffer ggufBuffer = GGUFBuffer(fileName);
         int magic = ggufBuffer.Read<int> ();
         int version = ggufBuffer.Read<int> ();
@@ -977,57 +1239,20 @@ namespace fastllm {
         json11::Json::object jsonConfig;
         jsonConfig["magic"] = magic;
         jsonConfig["version"] = version;
-        jsonConfig["tensorCount"] = (int)tensorCount;
-        jsonConfig["metaDataCount"] = (int)metaDataCount;
+        jsonConfig["tensorCount"] = (double)tensorCount;
+        jsonConfig["metaDataCount"] = (double)metaDataCount;
 
         json11::Json::object paramsConfig;
 
-        for (int i = 0; i < metaDataCount; i++) {
+        for (uint64_t i = 0; i < metaDataCount; i++) {
             std::string key = ggufBuffer.ReadString();
             // printf("key = %s\n", key.c_str());
-            int type = ggufBuffer.Read <int> ();            
-            if (type == GGUF_TYPE_STRING) {
-                std::string value = ggufBuffer.ReadString();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_UINT8) {
-                int8_t value = ggufBuffer.Read <int8_t> ();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_UINT16) {
-                uint16_t value = ggufBuffer.Read <uint16_t> ();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_UINT32) {
-                uint32_t value = ggufBuffer.Read <uint32_t> ();
-                paramsConfig[key] = (int)value;
-            } else if (type == GGUF_TYPE_FLOAT32) {
-                float value = ggufBuffer.Read <float> ();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_INT32) {
-                int value = ggufBuffer.Read <int> ();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_BOOL) {
-                bool value = ggufBuffer.ReadBool();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
-                uint64_t n = ggufBuffer.Read <uint64_t> ();
-                if (type == GGUF_TYPE_STRING) {
-                    std::vector <std::string> value;
-                    for (int i = 0; i < n; i++) {
-                        value.push_back(ggufBuffer.ReadString());
-                    }
-                    paramsConfig[key] = value; // std::vector <std::string> ({value[0], value[1]});
-                } else if (type == GGUF_TYPE_INT32) {
-                    std::vector <int> value;
-                    for (int i = 0; i < n; i++) {
-                        value.push_back(ggufBuffer.Read <int> ());
-                    }
-                    paramsConfig[key] = value; // std::vector <int> ({value[0], value[1]});
-                } else {
-                    ErrorInFastLLM("Read GGUF_TYPE_ARRAY type " + std::to_string(type) + " error.\n");
-                }
-            } else {
-                ErrorInFastLLM("Read GGUF_TYPE type " + std::to_string(type) + " error.\n");
+            const uint32_t type = ggufBuffer.Read<uint32_t>();
+            if (type >= GGUF_TYPE_COUNT) {
+                ErrorInFastLLM("GGUF metadata key " + key + " has invalid type " +
+                               std::to_string(type) + ".\n");
             }
+            paramsConfig[key] = ReadGGUFValue(ggufBuffer, (gguf_type)type);
         }
 
         jsonConfig["params"] = paramsConfig;
@@ -1035,59 +1260,61 @@ namespace fastllm {
     }
 
     void AppendGGUFTasks(std::string arch, const std::string &fileName, std::vector <ReadGGUFTask> &tasks) {
-        int ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
+        size_t ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
         GGUFBuffer ggufBuffer = GGUFBuffer(fileName);
         int magic = ggufBuffer.Read<int> ();
         int version = ggufBuffer.Read<int> ();
         uint64_t tensorCount = ggufBuffer.Read <uint64_t> ();
         uint64_t metaDataCount = ggufBuffer.Read <uint64_t> ();
 
-        for (int i = 0; i < metaDataCount; i++) {
-            std::string key = ggufBuffer.ReadString();
-            int type = ggufBuffer.Read <int> ();            
-            if (type == GGUF_TYPE_STRING) {
-                std::string value = ggufBuffer.ReadString();
-            } else if (type == GGUF_TYPE_UINT8) {
-                int8_t value = ggufBuffer.Read <int8_t> ();
-            } else if (type == GGUF_TYPE_UINT16) {
-                uint16_t value = ggufBuffer.Read <uint16_t> ();
-            } else if (type == GGUF_TYPE_UINT32) {
-                uint32_t value = ggufBuffer.Read <uint32_t> ();
-            } else if (type == GGUF_TYPE_FLOAT32) {
-                float value = ggufBuffer.Read <float> ();
-            } else if (type == GGUF_TYPE_INT32) {
-                int value = ggufBuffer.Read <int> ();
-            } else if (type == GGUF_TYPE_BOOL) {
-                bool value = ggufBuffer.ReadBool();
-            } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
-                uint64_t n = ggufBuffer.Read <uint64_t> ();
-                for (int i = 0; i < n; i++) {
-                    if (type == GGUF_TYPE_STRING) {
-                        std::string value = ggufBuffer.ReadString();
-                    } else if (type == GGUF_TYPE_INT32) {
-                        int a = ggufBuffer.Read <int> ();
-                    }
+        for (uint64_t i = 0; i < metaDataCount; i++) {
+            const std::string key = ggufBuffer.ReadString();
+            const uint32_t type = ggufBuffer.Read<uint32_t>();
+            if (type >= GGUF_TYPE_COUNT) {
+                ErrorInFastLLM("GGUF metadata key " + key + " has invalid type " +
+                               std::to_string(type) + ".\n");
+            }
+            if (key == GGUF_KEY_GENERAL_ALIGNMENT) {
+                if (type != GGUF_TYPE_UINT32) {
+                    ErrorInFastLLM("GGUF general.alignment must be UINT32.\n");
                 }
+                const uint32_t alignment = ggufBuffer.Read<uint32_t>();
+                if (alignment == 0 ||
+                    (alignment & (alignment - 1)) != 0) {
+                    ErrorInFastLLM("GGUF general.alignment must be a nonzero power of two.\n");
+                }
+                ggufAlignment = alignment;
             } else {
-                printf("AppendGGUFTasks error, type = %d\n", type);
-                exit(0);
+                SkipGGUFValue(ggufBuffer, (gguf_type)type);
             }
         }
 
         std::vector <std::pair <ggml_tensor, uint64_t> > tensors; // <tensors, offset>
-        tensors.resize(tensorCount);
+        tensors.resize(CheckedUint64ToSize(tensorCount, "GGUF tensor count"));
 
-        for (int i = 0; i < tensorCount; i++) {
+        for (uint64_t i = 0; i < tensorCount; i++) {
             std::string tensorName = ggufBuffer.ReadString();
-            uint32_t ndims = ggufBuffer.Read <uint32_t> ();
-        
-            for (int j = 0; j < ndims; j++) {
-                int64_t dim = ggufBuffer.Read <int64_t> ();
-                tensors[i].first.dims.push_back(dim);
+            uint32_t ndims = ggufBuffer.Read<uint32_t>();
+            if (ndims == 0 || ndims > GGML_MAX_DIMS) {
+                ErrorInFastLLM(
+                    "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) +
+                    "' has invalid dimension count " +
+                    std::to_string(ndims) + ".\n");
             }
 
-            for (int j = 0; j < GGML_MAX_DIMS; j++) {
+            for (uint32_t j = 0; j < ndims; j++) {
+                const int64_t dim = ggufBuffer.Read<int64_t>();
+                if (dim <= 0 ||
+                    dim > std::numeric_limits<int>::max()) {
+                    ErrorInFastLLM(
+                        "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) +
+                        "' has unsupported dimension " +
+                        std::to_string(dim) + ".\n");
+                }
+                tensors[i].first.dims.push_back((int)dim);
+            }
+
+            for (uint32_t j = 0; j < GGML_MAX_DIMS; j++) {
                 tensors[i].first.ne[j] = 1;
                 if (j < ndims) {
                     tensors[i].first.ne[j] = tensors[i].first.dims[j];
@@ -1100,45 +1327,87 @@ namespace fastllm {
             uint64_t offset = ggufBuffer.Read <uint64_t> ();
 
             {
+                tensors[i].first.name = tensorName;
                 tensors[i].first.type = (ggml_type)type;
-                const size_t  type_size = ggml_type_size(tensors[i].first.type);
-                const int64_t blck_size = ggml_blck_size(tensors[i].first.type);
+                const auto *traits = FindGGMLTypeTraits(tensors[i].first.type);
+                if (traits == nullptr) {
+                    ErrorInFastLLM(
+                        "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) +
+                        "' uses unsupported GGML type " + std::to_string(type) +
+                        "; implement its block layout before loading.\n");
+                }
+                const size_t type_size = traits->type_size;
+                const int64_t blck_size = traits->blck_size;
+                if (tensors[i].first.ne[0] <= 0 ||
+                    tensors[i].first.ne[0] % blck_size != 0) {
+                    ErrorInFastLLM(
+                        "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) +
+                        "' row length " + std::to_string(tensors[i].first.ne[0]) +
+                        " is not divisible by block size " +
+                        std::to_string(blck_size) + " for GGML type " +
+                        std::to_string(type) + ".\n");
+                }
 
                 // calculate byte offsets given the tensor shape and type
+                const std::string sizeContext =
+                    "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) + "'";
                 tensors[i].first.nb[0] = type_size;
-                tensors[i].first.nb[1] = tensors[i].first.nb[0] * (tensors[i].first.ne[0] / blck_size);
+                tensors[i].first.nb[1] = CheckedSizeMultiply(
+                    tensors[i].first.nb[0],
+                    (size_t)(tensors[i].first.ne[0] / blck_size),
+                    sizeContext);
                 for (int j = 2; j < GGML_MAX_DIMS; ++j) {
-                    tensors[i].first.nb[j] = tensors[i].first.nb[j - 1] * tensors[i].first.ne[j - 1];
+                    tensors[i].first.nb[j] = CheckedSizeMultiply(
+                        tensors[i].first.nb[j - 1],
+                        (size_t)tensors[i].first.ne[j - 1],
+                        sizeContext);
                 }
             }
 
-            tensors[i].first.name = tensorName;
             tensors[i].second = offset;
         }
 
         // we require the data section to be aligned, so take into account any padding
-        if (fseek(ggufBuffer.f, GGML_PAD(ftell(ggufBuffer.f), ggufAlignment), SEEK_SET) != 0) {
-            printf("alignment error\n");
-            exit(0);
+        const long descriptorEnd = ftell(ggufBuffer.f);
+        if (descriptorEnd < 0) {
+            ErrorInFastLLM("Unable to determine GGUF descriptor position.\n");
+        }
+        const size_t alignedDescriptorEnd = CheckedSizePad(
+            (size_t)descriptorEnd, ggufAlignment, "GGUF data section");
+        if (alignedDescriptorEnd > (size_t)std::numeric_limits<long>::max() ||
+            fseek(ggufBuffer.f, (long)alignedDescriptorEnd, SEEK_SET) != 0) {
+            ErrorInFastLLM("Unable to seek to aligned GGUF data section.\n");
         }
 
-        uint64_t baseOffset = ftell(ggufBuffer.f);
-        uint64_t curPos = baseOffset;
+        const long basePosition = ftell(ggufBuffer.f);
+        if (basePosition < 0) {
+            ErrorInFastLLM("Unable to determine GGUF data position.\n");
+        }
+        const size_t baseOffset = (size_t)basePosition;
+        size_t curPos = baseOffset;
 
         std::vector <GGUFWeightReplaceRule> weightNameConverterRules = GetGGUFWeightReplaceRules(arch);
 
-        for (int i = 0; i < tensorCount; i++) {
-            if (curPos != baseOffset + tensors[i].second) {
-                ErrorInFastLLM("read weight " + tensors[i].first.name + " error.\n");
-                exit(0);
-            } 
+        for (uint64_t i = 0; i < tensorCount; i++) {
+            const size_t tensorOffset = CheckedSizeAdd(
+                baseOffset,
+                CheckedUint64ToSize(tensors[i].second,
+                                    "GGUF tensor relative offset"),
+                "GGUF tensor absolute offset");
+            if (curPos != tensorOffset) {
+                ErrorInFastLLM("GGUF tensor '" +
+                               SanitizeGGUFTensorName(tensors[i].first.name) +
+                               "' has a non-contiguous or overflowed offset.\n");
+            }
 
             std::string name = tensors[i].first.name;
             bool matched = false;
+            int matchedCount = 0;
 
             for (auto &it : weightNameConverterRules) {
                 if (std::regex_search(name, it.pattern)) {
                     matched = true;
+                    matchedCount++;
 
                     if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                         name = std::regex_replace(name, it.pattern, it.names[0]);
@@ -1147,7 +1416,8 @@ namespace fastllm {
                         }
                         tasks.push_back (
                                 ReadGGUFTask (
-                                    name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second
+                                    name, nullptr, tensors[i].first,
+                                    ggufBuffer.fileName, tensorOffset
                                 )
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
@@ -1160,8 +1430,8 @@ namespace fastllm {
                         }
                         tasks.push_back (
                             ReadGGUFTask (
-                                name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second, 
-                                it.type
+                                name, nullptr, tensors[i].first,
+                                ggufBuffer.fileName, tensorOffset, it.type
                             )
                         );
                         tasks.back().untileComposeNegLog = it.untileComposeNegLog;
@@ -1175,12 +1445,18 @@ namespace fastllm {
                         singleTensor.ne[2] = 1;
                         singleTensor.nb[2] = singleTensor.nb[3] = singleTensor.nb[1];
 
+                        const size_t expertBytes = ggml_nbytes(&singleTensor);
                         for (int idx = 0; idx < packedBatch; idx++) {
                             std::string modelName = prefix + std::to_string(idx) + suffix;
+                            const size_t expertOffset = CheckedSizeAdd(
+                                tensorOffset,
+                                CheckedSizeMultiply((size_t)idx, expertBytes,
+                                                    "GGUF packed expert offset"),
+                                "GGUF packed expert offset");
                             tasks.push_back (
                                 ReadGGUFTask (
-                                    modelName, nullptr, singleTensor, 
-                                    ggufBuffer.fileName, baseOffset + tensors[i].second + idx * ggml_nbytes(&singleTensor)
+                                    modelName, nullptr, singleTensor,
+                                    ggufBuffer.fileName, expertOffset
                                 )
                             );
                         }
@@ -1188,6 +1464,10 @@ namespace fastllm {
                 }
             } 
 
+            if ((arch == "deepseek4" || arch == "deepseek_v4") && matchedCount != 1) {
+                ErrorInFastLLM("DeepSeek V4 GGUF tensor " + name + " matched " +
+                               std::to_string(matchedCount) + " adapter rules; expected exactly one.\n");
+            }
             if (!matched) {
                 printf("unmatched weight %s (", name.c_str());
                 for (auto it : tensors[i].first.dims) {
@@ -1196,13 +1476,18 @@ namespace fastllm {
                 printf(") type = %s\n", ggml_type_name(tensors[i].first.type));
             }
 
-            curPos += GGML_PAD(ggml_nbytes(&tensors[i].first), ggufAlignment);
+            curPos = CheckedSizeAdd(
+                (size_t)curPos,
+                CheckedSizePad(ggml_nbytes(&tensors[i].first),
+                               (size_t)ggufAlignment,
+                               "GGUF tensor padding"),
+                "GGUF tensor progression");
         }
     }
 
     void ReadGGUF(basellm *model, const std::string &fileName, std::vector <ReadGGUFTask> &tasks) {
         // 仅做测试用
-        int ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
+        size_t ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
         GGUFBuffer ggufBuffer = GGUFBuffer(fileName);
         int magic = ggufBuffer.Read<int> ();
         int version = ggufBuffer.Read<int> ();
@@ -1214,61 +1499,55 @@ namespace fastllm {
         printf("tensorCount = %d\n", (int)tensorCount);
         printf("metaDataCount = %d\n", (int)metaDataCount);
 
-        for (int i = 0; i < metaDataCount; i++) {
-            std::string key = ggufBuffer.ReadString();
-            printf("key = %s\n", key.c_str());
-            int type = ggufBuffer.Read <int> ();            
-            if (type == GGUF_TYPE_STRING) {
-                std::string value = ggufBuffer.ReadString();
-                printf("value = %s\n", value.c_str());
-            } else if (type == GGUF_TYPE_UINT8) {
-                int8_t value = ggufBuffer.Read <int8_t> ();
-                printf("value = %d\n", value);
-            } else if (type == GGUF_TYPE_UINT16) {
-                uint16_t value = ggufBuffer.Read <uint16_t> ();
-                printf("value = %d\n", value);
-            } else if (type == GGUF_TYPE_UINT32) {
-                uint32_t value = ggufBuffer.Read <uint32_t> ();
-                printf("value = %u\n", value);
-            } else if (type == GGUF_TYPE_FLOAT32) {
-                float value = ggufBuffer.Read <float> ();
-                printf("value = %f\n", value);
-            } else if (type == GGUF_TYPE_INT32) {
-                int value = ggufBuffer.Read <int> ();
-                printf("value = %d\n", value);
-            } else if (type == GGUF_TYPE_BOOL) {
-                bool value = ggufBuffer.ReadBool();
-                printf("value = %d\n", value);
-            } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
-                uint64_t n = ggufBuffer.Read <uint64_t> ();
-                printf("type = %d\n", type);
-                for (int i = 0; i < n; i++) {
-                    if (type == GGUF_TYPE_STRING) {
-                        std::string value = ggufBuffer.ReadString();
-                    } else if (type == GGUF_TYPE_INT32) {
-                        int a = ggufBuffer.Read <int> ();
-                    }
-                }
-            } else {
-                printf("type = %d\n", type);
-                exit(0);
+        for (uint64_t i = 0; i < metaDataCount; i++) {
+            const std::string key = ggufBuffer.ReadString();
+            const uint32_t type = ggufBuffer.Read<uint32_t>();
+            if (type >= GGUF_TYPE_COUNT) {
+                ErrorInFastLLM("GGUF metadata key " + key + " has invalid type " +
+                               std::to_string(type) + ".\n");
             }
+            const json11::Json value =
+                ReadGGUFValue(ggufBuffer, (gguf_type)type);
+            if (key == GGUF_KEY_GENERAL_ALIGNMENT) {
+                if (type != GGUF_TYPE_UINT32) {
+                    ErrorInFastLLM("GGUF general.alignment must be UINT32.\n");
+                }
+                const uint32_t alignment = (uint32_t)value.number_value();
+                if (alignment == 0 ||
+                    (alignment & (alignment - 1)) != 0) {
+                    ErrorInFastLLM("GGUF general.alignment must be a nonzero power of two.\n");
+                }
+                ggufAlignment = alignment;
+            }
+            printf("key = %s\nvalue = %s\n", key.c_str(), value.dump().c_str());
         }
 
         std::vector <std::pair <ggml_tensor, uint64_t> > tensors; // <tensors, offset>
-        tensors.resize(tensorCount);
+        tensors.resize(CheckedUint64ToSize(tensorCount, "GGUF tensor count"));
 
-        for (int i = 0; i < tensorCount; i++) {
+        for (uint64_t i = 0; i < tensorCount; i++) {
             std::string tensorName = ggufBuffer.ReadString();
-            uint32_t ndims = ggufBuffer.Read <uint32_t> ();
-        
-            for (int j = 0; j < ndims; j++) {
-                int64_t dim = ggufBuffer.Read <int64_t> ();
-                tensors[i].first.dims.push_back(dim);
+            uint32_t ndims = ggufBuffer.Read<uint32_t>();
+            if (ndims == 0 || ndims > GGML_MAX_DIMS) {
+                ErrorInFastLLM(
+                    "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) +
+                    "' has invalid dimension count " +
+                    std::to_string(ndims) + ".\n");
             }
 
-            for (int j = 0; j < GGML_MAX_DIMS; j++) {
+            for (uint32_t j = 0; j < ndims; j++) {
+                const int64_t dim = ggufBuffer.Read<int64_t>();
+                if (dim <= 0 ||
+                    dim > std::numeric_limits<int>::max()) {
+                    ErrorInFastLLM(
+                        "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) +
+                        "' has unsupported dimension " +
+                        std::to_string(dim) + ".\n");
+                }
+                tensors[i].first.dims.push_back((int)dim);
+            }
+
+            for (uint32_t j = 0; j < GGML_MAX_DIMS; j++) {
                 tensors[i].first.ne[j] = 1;
                 if (j < ndims) {
                     tensors[i].first.ne[j] = tensors[i].first.dims[j];
@@ -1281,68 +1560,95 @@ namespace fastllm {
             uint64_t offset = ggufBuffer.Read <uint64_t> ();
 
             {
+                tensors[i].first.name = tensorName;
                 tensors[i].first.type = (ggml_type)type;
-                // check that tensor type is within defined range
-                /* if (tensors[i].first.type < 0 || tensors[i].first.type >= GGML_TYPE_COUNT) {
-                    GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d (%s)\n",
-                        __func__, tensors[i].first.name, tensors[i].first.type, ggml_type_name(tensors[i].first.type));
-                    ok = false;
-                    break;
-                }*/ 
-                const size_t  type_size = ggml_type_size(tensors[i].first.type);
-                const int64_t blck_size = ggml_blck_size(tensors[i].first.type);
-
-                // check that row size is divisible by block size
-                /*if (blck_size == 0 || tensors[i].first.ne[0] % blck_size != 0) {
-                    GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
-                        "not a multiple of block size (%" PRId64 ")\n",
-                        __func__, tensors[i].first.name, (int) tensors[i].first.type, ggml_type_name(tensors[i].first.type), tensors[i].first.ne[0], blck_size);
-                    ok = false;
-                    break;
-                }*/
+                const auto *traits = FindGGMLTypeTraits(tensors[i].first.type);
+                if (traits == nullptr) {
+                    ErrorInFastLLM(
+                        "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) +
+                        "' uses unsupported GGML type " + std::to_string(type) +
+                        "; implement its block layout before loading.\n");
+                }
+                const size_t type_size = traits->type_size;
+                const int64_t blck_size = traits->blck_size;
+                if (tensors[i].first.ne[0] <= 0 ||
+                    tensors[i].first.ne[0] % blck_size != 0) {
+                    ErrorInFastLLM(
+                        "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) +
+                        "' row length " + std::to_string(tensors[i].first.ne[0]) +
+                        " is not divisible by block size " +
+                        std::to_string(blck_size) + " for GGML type " +
+                        std::to_string(type) + ".\n");
+                }
 
                 // calculate byte offsets given the tensor shape and type
+                const std::string sizeContext =
+                    "GGUF tensor '" + SanitizeGGUFTensorName(tensorName) + "'";
                 tensors[i].first.nb[0] = type_size;
-                tensors[i].first.nb[1] = tensors[i].first.nb[0] * (tensors[i].first.ne[0] / blck_size);
+                tensors[i].first.nb[1] = CheckedSizeMultiply(
+                    tensors[i].first.nb[0],
+                    (size_t)(tensors[i].first.ne[0] / blck_size),
+                    sizeContext);
                 for (int j = 2; j < GGML_MAX_DIMS; ++j) {
-                    tensors[i].first.nb[j] = tensors[i].first.nb[j - 1] * tensors[i].first.ne[j - 1];
+                    tensors[i].first.nb[j] = CheckedSizeMultiply(
+                        tensors[i].first.nb[j - 1],
+                        (size_t)tensors[i].first.ne[j - 1],
+                        sizeContext);
                 }
             }
 
-            tensors[i].first.name = tensorName;
             tensors[i].second = offset;
         }
 
         // we require the data section to be aligned, so take into account any padding
-        if (fseek(ggufBuffer.f, GGML_PAD(ftell(ggufBuffer.f), ggufAlignment), SEEK_SET) != 0) {
-            printf("alignment error\n");
-            exit(0);
+        const long descriptorEnd = ftell(ggufBuffer.f);
+        if (descriptorEnd < 0) {
+            ErrorInFastLLM("Unable to determine GGUF descriptor position.\n");
+        }
+        const size_t alignedDescriptorEnd = CheckedSizePad(
+            (size_t)descriptorEnd, ggufAlignment, "GGUF data section");
+        if (alignedDescriptorEnd > (size_t)std::numeric_limits<long>::max() ||
+            fseek(ggufBuffer.f, (long)alignedDescriptorEnd, SEEK_SET) != 0) {
+            ErrorInFastLLM("Unable to seek to aligned GGUF data section.\n");
         }
 
-        uint64_t baseOffset = ftell(ggufBuffer.f);
-
-        uint64_t curPos = baseOffset;
+        const long basePosition = ftell(ggufBuffer.f);
+        if (basePosition < 0) {
+            ErrorInFastLLM("Unable to determine GGUF data position.\n");
+        }
+        const size_t baseOffset = (size_t)basePosition;
+        size_t curPos = baseOffset;
 
         std::vector <GGUFWeightReplaceRule> weightNameConverterRules = GetGGUFWeightReplaceRules(model->model_type);
-        for (int i = 0; i < tensorCount; i++) {
-            if (curPos != baseOffset + tensors[i].second) {
-                ErrorInFastLLM("read weight " + tensors[i].first.name + " error.\n");
-                exit(0);
-            } 
+        for (uint64_t i = 0; i < tensorCount; i++) {
+            const size_t tensorOffset = CheckedSizeAdd(
+                baseOffset,
+                CheckedUint64ToSize(tensors[i].second,
+                                    "GGUF tensor relative offset"),
+                "GGUF tensor absolute offset");
+            if (curPos != tensorOffset) {
+                ErrorInFastLLM("GGUF tensor '" +
+                               SanitizeGGUFTensorName(tensors[i].first.name) +
+                               "' has a non-contiguous or overflowed offset.\n");
+            }
 
             std::string name = tensors[i].first.name;
             bool matched = false;
+            int matchedCount = 0;
 
             for (auto &it : weightNameConverterRules) {
                 if (std::regex_search(name, it.pattern)) {
                     matched = true;
+                    matchedCount++;
 
                     if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                         name = std::regex_replace(name, it.pattern, it.names[0]);
                         if (model->weight.weight.find(name) != model->weight.weight.end()) {
                             tasks.push_back (
                                 ReadGGUFTask (
-                                    name, &model->weight.weight[name], tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second
+                                    name, &model->weight.weight[name],
+                                    tensors[i].first, ggufBuffer.fileName,
+                                    tensorOffset
                                 )
                             );
                             // printf("replace %s\n", name.c_str());
@@ -1355,8 +1661,9 @@ namespace fastllm {
                         if (model->weight.weight.find(name) != model->weight.weight.end()) {
                             tasks.push_back (
                                 ReadGGUFTask (
-                                    name, &model->weight.weight[name], tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second, 
-                                    it.type
+                                    name, &model->weight.weight[name],
+                                    tensors[i].first, ggufBuffer.fileName,
+                                    tensorOffset, it.type
                                 )
                             );
                             tasks.back().untileComposeNegLog = it.untileComposeNegLog;
@@ -1372,13 +1679,19 @@ namespace fastllm {
                         singleTensor.ne[2] = 1;
                         singleTensor.nb[2] = singleTensor.nb[3] = singleTensor.nb[1];
 
+                        const size_t expertBytes = ggml_nbytes(&singleTensor);
                         for (int idx = 0; idx < packedBatch; idx++) {
                             std::string modelName = prefix + std::to_string(idx) + suffix;
                             if (model->weight.weight.find(modelName) != model->weight.weight.end()) {
+                                const size_t expertOffset = CheckedSizeAdd(
+                                    tensorOffset,
+                                    CheckedSizeMultiply((size_t)idx, expertBytes,
+                                                        "GGUF packed expert offset"),
+                                    "GGUF packed expert offset");
                                 tasks.push_back (
                                     ReadGGUFTask (
-                                        modelName, &model->weight.weight[modelName], singleTensor, 
-                                        ggufBuffer.fileName, baseOffset + tensors[i].second + idx * ggml_nbytes(&singleTensor)
+                                        modelName, &model->weight.weight[modelName], singleTensor,
+                                        ggufBuffer.fileName, expertOffset
                                     )
                                 );
                             }
@@ -1397,6 +1710,13 @@ namespace fastllm {
                 }
             } 
 
+            if ((model->model_type == "deepseek4" ||
+                 model->model_type == "deepseek_v4") &&
+                matchedCount != 1) {
+                ErrorInFastLLM("DeepSeek V4 GGUF tensor " + name + " matched " +
+                               std::to_string(matchedCount) +
+                               " adapter rules; expected exactly one.\n");
+            }
             if (!matched) {
                 printf("unmatched weight %s (", name.c_str());
                 for (auto it : tensors[i].first.dims) {
@@ -1405,9 +1725,12 @@ namespace fastllm {
                 printf(") type = %s\n", ggml_type_name(tensors[i].first.type));
             }
 
-            curPos += GGML_PAD(ggml_nbytes(&tensors[i].first), ggufAlignment);
+            curPos = CheckedSizeAdd(
+                curPos,
+                CheckedSizePad(ggml_nbytes(&tensors[i].first),
+                               ggufAlignment,
+                               "GGUF tensor padding"),
+                "GGUF tensor progression");
         }
-        
-        // exit(0);
     }
 }

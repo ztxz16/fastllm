@@ -4832,6 +4832,177 @@ __global__ void TransferAttnKernelFused(T *data, int n, int m, int outer) {
     }
 }
 
+__global__ void FastllmGatedDeltaRulePrepareAttnHalfKernel(
+        const half *at, const half *decayMask, half *attn,
+        int dim, int outer) {
+    extern __shared__ float shared[];
+    int o = blockIdx.x;
+    if (o >= outer) {
+        return;
+    }
+
+    const half *atBatch = at + (size_t)o * dim * dim;
+    const half *decayBatch = decayMask + (size_t)o * dim * dim;
+    half *attnBatch = attn + (size_t)o * dim * dim;
+    float *matrix = shared;
+    float *row = shared + dim * dim;
+    const half minusOne = __float2half_rn(-1.0f);
+
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        half value = __hmul(atBatch[idx], minusOne);
+        value = __hmul(value, decayBatch[idx]);
+        matrix[idx] = j < i ? __half2float(value) : 0.0f;
+    }
+    __syncthreads();
+
+    for (int i = 1; i < dim; i++) {
+        for (int j = threadIdx.x; j < i; j += blockDim.x) {
+            row[j] = matrix[i * dim + j];
+        }
+        __syncthreads();
+        for (int j = threadIdx.x; j < i; j += blockDim.x) {
+            float sum = row[j];
+            for (int k = 0; k < i; k++) {
+                sum += row[k] * matrix[k * dim + j];
+            }
+            matrix[i * dim + j] = sum;
+        }
+        __syncthreads();
+    }
+
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        float value = matrix[idx] + (i == j ? 1.0f : 0.0f);
+        attnBatch[idx] = __float2half(value);
+    }
+}
+
+bool FastllmCudaGatedDeltaRulePrepareAttn(
+        const fastllm::Data &at, const fastllm::Data &decayMask,
+        fastllm::Data &attn) {
+    if (!FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_SM70_GDN_PRECORE") ||
+        FastllmCudaRuntimeArch() != 70 ||
+        at.dataDevice != fastllm::DataDevice::CUDA ||
+        decayMask.dataDevice != fastllm::DataDevice::CUDA ||
+        attn.dataDevice != fastllm::DataDevice::CUDA ||
+        at.dataType != fastllm::DataType::FLOAT16 ||
+        decayMask.dataType != fastllm::DataType::FLOAT16 ||
+        attn.dataType != fastllm::DataType::FLOAT16 ||
+        at.dims != decayMask.dims || at.dims != attn.dims ||
+        at.dims.size() < 2 || at.dims.back() != 64 ||
+        at.dims[at.dims.size() - 2] != 64 ||
+        at.Count(0) <= 0) {
+        return false;
+    }
+
+    const half *atData = (const half*)FastllmCudaPrepareInput(at);
+    const half *decayData =
+        (const half*)FastllmCudaPrepareInput(decayMask);
+    half *attnData = (half*)FastllmCudaPrepareOutput(attn);
+    int outer = at.Count(0) / (64 * 64);
+    size_t sharedBytes = (64 * 64 + 64) * sizeof(float);
+    FastllmGatedDeltaRulePrepareAttnHalfKernel<<<outer, 64, sharedBytes>>>(
+        atData, decayData, attnData, 64, outer);
+    FastllmCudaFinishInput(at, (void*)atData);
+    FastllmCudaFinishInput(decayMask, (void*)decayData);
+    FastllmCudaFinishOutput(attn, attnData);
+    return true;
+}
+
+__global__ void FastllmGatedDeltaRuleBuildDecayHalfKernel(
+        half *g, half *decayMask, int dim, int outer) {
+    int o = blockIdx.x;
+    if (o >= outer) {
+        return;
+    }
+    half *row = g + (size_t)o * dim;
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < dim; j++) {
+            row[j] = __float2half(
+                __half2float(row[j]) + __half2float(row[j - 1]));
+        }
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        decayMask[(size_t)o * dim * dim + idx] = j <= i
+            ? __float2half(expf(
+                __half2float(row[i]) - __half2float(row[j])))
+            : __float2half(0.0f);
+    }
+}
+
+bool FastllmCudaGatedDeltaRuleBuildDecay(
+        fastllm::Data &g, fastllm::Data &decayMask) {
+    if (!FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_SM70_GDN_PRECORE") ||
+        FastllmCudaRuntimeArch() != 70 ||
+        g.dataDevice != fastllm::DataDevice::CUDA ||
+        decayMask.dataDevice != fastllm::DataDevice::CUDA ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        decayMask.dataType != fastllm::DataType::FLOAT16 ||
+        g.dims.empty() || g.dims.back() != 64 ||
+        decayMask.dims.size() != g.dims.size() + 1 ||
+        decayMask.dims.back() != 64 ||
+        decayMask.Count(0) != g.Count(0) * 64 || g.Count(0) <= 0) {
+        return false;
+    }
+    half *gData = (half*)FastllmCudaPrepareInput(g);
+    half *decayData = (half*)FastllmCudaPrepareOutput(decayMask);
+    int outer = g.Count(0) / 64;
+    FastllmGatedDeltaRuleBuildDecayHalfKernel<<<outer, 64>>>(
+        gData, decayData, 64, outer);
+    FastllmCudaFinishOutput(g, gData);
+    FastllmCudaFinishOutput(decayMask, decayData);
+    return true;
+}
+
+__global__ void FastllmGatedDeltaRuleApplyDecayMaskHalfKernel(
+        half *attn, const half *decayMask, int dim,
+        int outer, int causalBase) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outer * dim * dim;
+    if (idx >= total) {
+        return;
+    }
+    int matrixIdx = idx % (dim * dim);
+    int i = matrixIdx / dim;
+    int j = matrixIdx % dim;
+    half value = __hmul(attn[idx], decayMask[idx]);
+    attn[idx] = j >= i + causalBase ? __float2half(0.0f) : value;
+}
+
+bool FastllmCudaGatedDeltaRuleApplyDecayMask(
+        fastllm::Data &attn, const fastllm::Data &decayMask,
+        int causalBase) {
+    if (!FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_SM70_GDN_PRECORE") ||
+        FastllmCudaRuntimeArch() != 70 ||
+        attn.dataDevice != fastllm::DataDevice::CUDA ||
+        decayMask.dataDevice != fastllm::DataDevice::CUDA ||
+        attn.dataType != fastllm::DataType::FLOAT16 ||
+        decayMask.dataType != fastllm::DataType::FLOAT16 ||
+        attn.dims != decayMask.dims || attn.dims.size() < 2 ||
+        attn.dims.back() != 64 ||
+        attn.dims[attn.dims.size() - 2] != 64 ||
+        (causalBase != 0 && causalBase != 1) || attn.Count(0) <= 0) {
+        return false;
+    }
+    half *attnData = (half*)FastllmCudaPrepareInput(attn);
+    const half *decayData =
+        (const half*)FastllmCudaPrepareInput(decayMask);
+    int total = attn.Count(0);
+    int outer = total / (64 * 64);
+    FastllmGatedDeltaRuleApplyDecayMaskHalfKernel<<<
+        (total + 255) / 256, 256>>>(
+        attnData, decayData, 64, outer, causalBase);
+    FastllmCudaFinishInput(decayMask, (void*)decayData);
+    FastllmCudaFinishOutput(attn, attnData);
+    return true;
+}
+
 template<typename T>
 __global__ void TransferAttnKernelRow(T *data, int n, int m, int outer, int row_idx) {
     extern __shared__ float shared[];
@@ -13523,6 +13694,38 @@ __global__ void FastllmChunkGatedDeltaRuleBuildKScaledTransKernel(
     }
 }
 
+template <typename T>
+__global__ void FastllmChunkGatedDeltaRuleFusedStateKPreprocessKernel(
+    const T *k, const T *g, T *state, T *kScaledTrans,
+    int chunks, int ci, int chunkSize, int kdim, int stateSize) {
+    extern __shared__ float scales[];
+    int bh = blockIdx.x;
+    int base = (bh * chunks + ci) * chunkSize;
+    float last = FastllmCudaValueToFloat(g[base + chunkSize - 1]);
+    for (int t = threadIdx.x; t < chunkSize; t += blockDim.x) {
+        scales[t] = expf(last - FastllmCudaValueToFloat(g[base + t]));
+    }
+    if (threadIdx.x == 0) {
+        scales[chunkSize] = expf(last);
+    }
+    __syncthreads();
+
+    size_t stateBase = (size_t)bh * stateSize;
+    for (int i = threadIdx.x; i < stateSize; i += blockDim.x) {
+        state[stateBase + i] = FastllmCudaFloatToValue<T>(
+            FastllmCudaValueToFloat(state[stateBase + i]) * scales[chunkSize]);
+    }
+    int kElements = kdim * chunkSize;
+    size_t kOutBase = (size_t)bh * kElements;
+    for (int i = threadIdx.x; i < kElements; i += blockDim.x) {
+        int kd = i / chunkSize;
+        int t = i % chunkSize;
+        size_t src = ((size_t)base + t) * kdim + kd;
+        kScaledTrans[kOutBase + i] = FastllmCudaFloatToValue<T>(
+            FastllmCudaValueToFloat(k[src]) * scales[t]);
+    }
+}
+
 static void FastllmChunkGatedDeltaRuleBatchedMatMul(
     const void *input0, const void *input1, void *output,
     fastllm::DataType dataType,
@@ -13790,6 +13993,57 @@ __global__ void FastllmChunkGatedDeltaRulePrefillOKernel(
     }
 }
 
+static bool FastllmCudaSm70FusedChunkGdnPrefillEnabled(
+        fastllm::DataType dataType, int chunks, int chunkSize,
+        int kDim, int vDim) {
+    if (!FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL") ||
+        dataType != fastllm::DataType::FLOAT16 || chunks <= 0 ||
+        chunkSize != 64 || kDim != 128 || vDim != 128) {
+        return false;
+    }
+    int device = -1, major = 0, minor = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                               device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                               device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    bool supported = major == 7 && minor == 0;
+    if (supported) {
+        static thread_local std::set<int> loggedDevices;
+        if (loggedDevices.insert(device).second) {
+            printf("[FastLLM] SM70 fused chunk GDN prefill enabled on CUDA device %d.\n",
+                   device);
+        }
+    }
+    return supported;
+}
+
+namespace {
+struct FastllmChunkGdnPersistentScratch {
+    void *data = nullptr;
+    size_t bytes = 0;
+};
+
+static void *FastllmBorrowChunkGdnPersistentScratch(size_t bytes) {
+    thread_local static std::map<int, FastllmChunkGdnPersistentScratch> scratches;
+    int device = FastllmCudaGetDevice();
+    FastllmChunkGdnPersistentScratch &scratch = scratches[device];
+    if (scratch.bytes < bytes) {
+        if (scratch.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(scratch.data);
+        }
+        scratch.data = FastllmCudaMalloc(bytes);
+        scratch.bytes = scratch.data == nullptr ? 0 : bytes;
+    }
+    return scratch.data;
+}
+}
+
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out) {
@@ -13812,14 +14066,49 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     long long qChunkStride = (long long)chunk_size * kdim;
     long long vChunkStride = (long long)chunk_size * vdim;
     long long attnChunkStride = (long long)chunk_size * chunk_size;
-    bool useBatchedGemm = q.dataType == fastllm::DataType::FLOAT32 ||
-                          q.dataType == fastllm::DataType::FLOAT16;
+    bool useSm70Fused = FastllmCudaSm70FusedChunkGdnPrefillEnabled(
+        q.dataType, chunks, chunk_size, kdim, vdim);
+    bool useBatchedGemm = !useSm70Fused &&
+                          (q.dataType == fastllm::DataType::FLOAT32 ||
+                           q.dataType == fastllm::DataType::FLOAT16);
+    bool useAsyncGather = useBatchedGemm && FastllmCudaEnvFlagEnabled(
+        "FASTLLM_CUDA_CHUNK_GDN_ASYNC_GATHER");
+    bool useFusedPreprocess = useBatchedGemm && chunk_size == 64 &&
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_CHUNK_GDN_FUSED_PREPROCESS");
+    bool usePersistentScratch = FastllmCudaEnvFlagEnabled(
+        "FASTLLM_CUDA_CHUNK_GDN_PERSISTENT_SCRATCH");
 
     size_t hElems = (size_t)batch * heads * chunks * kdim * vdim;
     size_t vNewElems = useBatchedGemm ? (size_t)bhCount * vChunkStride
                                       : (size_t)batch * heads * chunks * chunk_size * vdim;
-    void *hData = useBatchedGemm ? nullptr : FastllmCudaMalloc(hElems * unitBytes);
-    void *vNewData = FastllmCudaMalloc(vNewElems * unitBytes);
+    size_t hBytes = useBatchedGemm ? 0 :
+        FastllmCudaAlignBytes(hElems * unitBytes, 256);
+    size_t vNewBytes = FastllmCudaAlignBytes(vNewElems * unitBytes, 256);
+    size_t qScaledBytes = useBatchedGemm ? FastllmCudaAlignBytes(
+        (size_t)bhCount * qChunkStride * unitBytes, 256) : 0;
+    size_t kScaledTransBytes = useBatchedGemm ? FastllmCudaAlignBytes(
+        (size_t)bhCount * kdim * chunk_size * unitBytes, 256) : 0;
+    size_t gScaleBytes = useBatchedGemm && !useFusedPreprocess ?
+        FastllmCudaAlignBytes((size_t)bhCount * chunk_size * sizeof(float), 256) : 0;
+    size_t gLastExpBytes = useBatchedGemm && !useFusedPreprocess ?
+        FastllmCudaAlignBytes((size_t)bhCount * sizeof(float), 256) : 0;
+    size_t scratchBytes = hBytes + vNewBytes + qScaledBytes +
+        kScaledTransBytes + gScaleBytes + gLastExpBytes;
+    uint8_t *persistentScratch = usePersistentScratch ?
+        (uint8_t*)FastllmBorrowChunkGdnPersistentScratch(scratchBytes) : nullptr;
+    usePersistentScratch = persistentScratch != nullptr;
+    size_t scratchOffset = 0;
+    auto borrowScratch = [&](size_t bytes) -> void* {
+        if (!usePersistentScratch) {
+            return FastllmCudaMalloc(bytes);
+        }
+        void *result = persistentScratch + scratchOffset;
+        scratchOffset += bytes;
+        return result;
+    };
+    void *hData = useBatchedGemm ? nullptr : borrowScratch(hBytes);
+    void *vNewData = borrowScratch(vNewBytes);
 
     void *qData = FastllmCudaPrepareInput(q);
     void *kData = FastllmCudaPrepareInput(k);
@@ -13838,10 +14127,12 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         size_t qScaledElems = (size_t)bhCount * qChunkStride;
         size_t stateElems = (size_t)bhCount * stateStride;
         size_t kScaledTransElems = (size_t)bhCount * kdim * chunk_size;
-        qScaledData = FastllmCudaMalloc(qScaledElems * unitBytes);
-        kScaledTransData = FastllmCudaMalloc(kScaledTransElems * unitBytes);
-        gScaleData = (float*)FastllmCudaMalloc((size_t)bhCount * chunk_size * sizeof(float));
-        gLastExpData = (float*)FastllmCudaMalloc((size_t)bhCount * sizeof(float));
+        qScaledData = borrowScratch(qScaledBytes);
+        kScaledTransData = borrowScratch(kScaledTransBytes);
+        if (!useFusedPreprocess) {
+            gScaleData = (float*)borrowScratch(gScaleBytes);
+            gLastExpData = (float*)borrowScratch(gLastExpBytes);
+        }
 
         const int threads = 256;
         int qScaleBlocks = (int)((qScaledElems + threads - 1) / threads);
@@ -13865,10 +14156,12 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                     chunks, ci, chunk_size, kdim, qScaledElems);
             }
 
-            cudaError_t cudaState = cudaMemcpy2DAsync(vNewData, (size_t)vChunkStride * unitBytes,
-                                                      vSlice, (size_t)chunks * vChunkStride * unitBytes,
-                                                      (size_t)vChunkStride * unitBytes, bhCount,
-                                                      cudaMemcpyDeviceToDevice, 0);
+            cudaError_t cudaState = cudaMemcpy2DAsync(
+                vNewData, (size_t)vChunkStride * unitBytes,
+                vSlice, (size_t)chunks * vChunkStride * unitBytes,
+                (size_t)vChunkStride * unitBytes, bhCount,
+                cudaMemcpyDeviceToDevice,
+                useAsyncGather ? cudaStreamPerThread : (cudaStream_t)0);
             checkCudaErrors("Error: CUDA error when gathering chunk v data!", cudaState);
 
             FastllmChunkGatedDeltaRuleBatchedMatMul(
@@ -13888,8 +14181,22 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                 (int)bhCount, chunk_size, chunk_size, vdim,
                 (long long)chunks * attnChunkStride, vChunkStride, outStride,
                 1.0f, 1.0f);
-
-            if (q.dataType == fastllm::DataType::FLOAT32) {
+            if (useFusedPreprocess) {
+                size_t sharedBytes = (size_t)(chunk_size + 1) * sizeof(float);
+                if (q.dataType == fastllm::DataType::FLOAT32) {
+                    FastllmChunkGatedDeltaRuleFusedStateKPreprocessKernel<float><<<
+                        (int)bhCount, threads, sharedBytes>>>(
+                        (float*)kData, (float*)gData, (float*)stateData,
+                        (float*)kScaledTransData, chunks, ci, chunk_size,
+                        kdim, (int)stateStride);
+                } else {
+                    FastllmChunkGatedDeltaRuleFusedStateKPreprocessKernel<half><<<
+                        (int)bhCount, threads, sharedBytes>>>(
+                        (half*)kData, (half*)gData, (half*)stateData,
+                        (half*)kScaledTransData, chunks, ci, chunk_size,
+                        kdim, (int)stateStride);
+                }
+            } else if (q.dataType == fastllm::DataType::FLOAT32) {
                 FastllmChunkGatedDeltaRuleBuildChunkScaleKernel<float><<<chunkScaleBlocks, threads>>>(
                     (float*)gData, gScaleData, gLastExpData, (int)bhCount, chunks, chunk_size, ci);
                 FastllmChunkGatedDeltaRuleScaleStateKernel<float><<<stateScaleBlocks, threads>>>(
@@ -13932,7 +14239,31 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         size_t sharedMemSizeH = useLargeBKH ? sharedMemSizeHLargeBK : sharedMemSizeHSmallBK;
         size_t sharedMemSizeO = (size_t)(kdim * BVO + chunk_size * BVO) * sizeof(float);
 
-        if (useSmallBVH) {
+        if (q.dataType == fastllm::DataType::FLOAT16) {
+            if (useSmallBVH) {
+                if (useLargeBKH) {
+                    FastllmChunkGatedDeltaRulePrefillHKernel<half, BVHSmall, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                        (half*)kData, (half*)vData, (half*)gData, (half*)kCumData,
+                        (half*)hData, (half*)vNewData, (half*)stateData,
+                        batch, heads, chunks, chunk_size, kdim, vdim);
+                } else {
+                    FastllmChunkGatedDeltaRulePrefillHKernel<half, BVHSmall, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                        (half*)kData, (half*)vData, (half*)gData, (half*)kCumData,
+                        (half*)hData, (half*)vNewData, (half*)stateData,
+                        batch, heads, chunks, chunk_size, kdim, vdim);
+                }
+            } else if (useLargeBKH) {
+                FastllmChunkGatedDeltaRulePrefillHKernel<half, BVHLarge, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                    (half*)kData, (half*)vData, (half*)gData, (half*)kCumData,
+                    (half*)hData, (half*)vNewData, (half*)stateData,
+                    batch, heads, chunks, chunk_size, kdim, vdim);
+            } else {
+                FastllmChunkGatedDeltaRulePrefillHKernel<half, BVHLarge, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                    (half*)kData, (half*)vData, (half*)gData, (half*)kCumData,
+                    (half*)hData, (half*)vNewData, (half*)stateData,
+                    batch, heads, chunks, chunk_size, kdim, vdim);
+            }
+        } else if (useSmallBVH) {
             if (useLargeBKH) {
                 FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHSmall, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
                     (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
@@ -13944,25 +14275,32 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                     (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
                     batch, heads, chunks, chunk_size, kdim, vdim);
             }
+        } else if (useLargeBKH) {
+            FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
+                (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
+                batch, heads, chunks, chunk_size, kdim, vdim);
         } else {
-            if (useLargeBKH) {
-                FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
-                    (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
-                    (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
-                    batch, heads, chunks, chunk_size, kdim, vdim);
-            } else {
-                FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
-                    (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
-                    (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
-                    batch, heads, chunks, chunk_size, kdim, vdim);
-            }
+            FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
+                (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
+                batch, heads, chunks, chunk_size, kdim, vdim);
         }
-        FastllmChunkGatedDeltaRulePrefillOKernel<__nv_bfloat16, BVO><<<gridO, threadsPerBlockO, sharedMemSizeO>>>(
-            (__nv_bfloat16*)qData, (__nv_bfloat16*)gData, (__nv_bfloat16*)attnData,
-            (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)outData,
-            batch, heads, chunks, chunk_size, kdim, vdim);
+        if (q.dataType == fastllm::DataType::FLOAT16) {
+            FastllmChunkGatedDeltaRulePrefillOKernel<half, BVO><<<gridO, threadsPerBlockO, sharedMemSizeO>>>(
+                (half*)qData, (half*)gData, (half*)attnData,
+                (half*)hData, (half*)vNewData, (half*)outData,
+                batch, heads, chunks, chunk_size, kdim, vdim);
+        } else {
+            FastllmChunkGatedDeltaRulePrefillOKernel<__nv_bfloat16, BVO><<<gridO, threadsPerBlockO, sharedMemSizeO>>>(
+                (__nv_bfloat16*)qData, (__nv_bfloat16*)gData, (__nv_bfloat16*)attnData,
+                (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)outData,
+                batch, heads, chunks, chunk_size, kdim, vdim);
+        }
     }
 
+    checkCudaErrors("Error: CUDA error in FastllmChunkGatedDeltaRulePrefill.",
+                    cudaGetLastError());
     FastllmCudaFinishInput(q, qData);
     FastllmCudaFinishInput(k, kData);
     FastllmCudaFinishInput(v, vData);
@@ -13971,12 +14309,14 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     FastllmCudaFinishInput(k_cumdecay, kCumData);
     FastllmCudaFinishInput(last_recurrent_state, stateData);
     FastllmCudaFinishOutput(core_attn_out, outData);
-    if (qScaledData != nullptr) FastllmCudaFree(qScaledData);
-    if (kScaledTransData != nullptr) FastllmCudaFree(kScaledTransData);
-    if (gScaleData != nullptr) FastllmCudaFree(gScaleData);
-    if (gLastExpData != nullptr) FastllmCudaFree(gLastExpData);
-    if (hData != nullptr) FastllmCudaFree(hData);
-    if (vNewData != nullptr) FastllmCudaFree(vNewData);
+    if (!usePersistentScratch) {
+        if (qScaledData != nullptr) FastllmCudaFree(qScaledData);
+        if (kScaledTransData != nullptr) FastllmCudaFree(kScaledTransData);
+        if (gScaleData != nullptr) FastllmCudaFree(gScaleData);
+        if (gLastExpData != nullptr) FastllmCudaFree(gLastExpData);
+        if (hData != nullptr) FastllmCudaFree(hData);
+        if (vNewData != nullptr) FastllmCudaFree(vNewData);
+    }
 }
 
 void FastllmPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex) {

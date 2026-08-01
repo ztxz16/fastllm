@@ -121,8 +121,10 @@ using socket_t = int;
 #include <thread>
 #include "model.h"
 #include "http_request_reader.h"
+#include "http_response.h"
 #include "socket_writer.h"
 #include "openai_output_parser.h"
+#include "output_token_limit.h"
 #include "stop_parser.h"
 #include "utils/stop_string_matcher.h"
 
@@ -167,6 +169,7 @@ struct APIConfig {
     int port = 8080; // 端口号
     int tokens = -1; // token容量限制
     int batch = 256; // batch数限制
+    int defaultMaxTokens = kDefaultOutputTokenLimit; // 请求省略max_tokens时的输出上限
     fastllm::DataType dtype = fastllm::DataType::FLOAT16;
     fastllm::DataType atype = fastllm::DataType::FLOAT32;
     fastllm::DataType kvCacheDtype = fastllm::DataType::DATA_AUTO_NONE;
@@ -329,12 +332,180 @@ struct WorkQueue {
 
     void Deal(WorkNode *node) {
         auto *req = &node->request;
-        if ((req->route == "/generate" || req->route == "/generate/") && req->method == "POST") {
-            std::string message = "";
-            message += "HTTP/1.1 200 OK\r\n";
-            message += "Content-Type:application/json\r\n";
-            message += "server:fastllm api server\r\n";
-            message += "\r\n";
+        std::string route = req->route;
+        if (route.size() > 1 && route.back() == '/') {
+            route.pop_back();
+        }
+        auto writeJsonAndClose = [&](int status, const json11::Json &body,
+                                     const std::vector<std::pair<std::string, std::string>> &headers = {}) {
+            WriteFixedJsonResponse(node->client, status, body, headers);
+            close(node->client);
+        };
+        auto writeMethodNotAllowed = [&](const std::string &allowed) {
+            writeJsonAndClose(
+                405,
+                OpenAIHttpError("Method " + req->method + " is not allowed for " + route + ".",
+                                "invalid_request_error", "method_not_allowed"),
+                {{"Allow", allowed}});
+        };
+
+        if (route == "/health" || route == "/version" || route == "/props") {
+            if (req->method != "GET") {
+                writeMethodNotAllowed("GET");
+                return;
+            }
+            if (route == "/health") {
+                int activeRequests = 0;
+                int queuedRequests = 0;
+                {
+                    std::lock_guard<std::mutex> lock(locker);
+                    activeRequests = std::max(0, activateQueryNumber - 1);
+                    queuedRequests = static_cast<int>(q.size());
+                }
+                writeJsonAndClose(200, json11::Json::object {
+                    {"status", "ok"},
+                    {"ready", true},
+                    {"accepting", activeRequests < maxActivateQueryNumber},
+                    {"active_requests", activeRequests},
+                    {"queued_requests", queuedRequests},
+                    {"model", ::config.modelName}
+                });
+                return;
+            }
+            if (route == "/version") {
+                writeJsonAndClose(200, json11::Json::object {
+                    {"name", "fastllm"},
+                    {"version", "unknown"},
+                    {"build", "unknown"}
+                });
+                return;
+            }
+            const std::string kvCacheDtype =
+                ::config.kvCacheDtype == fastllm::DataType::DATA_AUTO_NONE
+                    ? "auto"
+                    : fastllm::GetDataTypeName(::config.kvCacheDtype);
+            const auto zstdMetrics =
+                fastllm::GetPagedCacheCpuSnapshotZstdMetrics();
+            writeJsonAndClose(200, json11::Json::object {
+                {"model", ::config.modelName},
+                {"max_batch", ::config.batch},
+                {"token_pool", ::config.tokens},
+                {"kv_cache_dtype", kvCacheDtype},
+                {"activation_dtype", fastllm::GetDataTypeName(::config.atype)},
+                {"default_max_tokens", ::config.defaultMaxTokens},
+                {"cpu_request_swap_enabled",
+                    model->IsCpuRequestSwapEnabled()},
+                {"cpu_request_swap_zstd_enabled",
+                    model->IsCpuRequestSwapZstdEnabled()},
+                {"cpu_request_swap_disk_enabled",
+                    model->IsCpuRequestSwapDiskEnabled()},
+                {"cpu_request_swap_suspended",
+                    (int)model->GetSuspendedResponseContextCount()},
+                {"cpu_request_swap_disk_spills",
+                    (double)model->GetCpuRequestSwapDiskSpillCount()},
+                {"cpu_request_swap_disk_restores",
+                    (double)model->GetCpuRequestSwapDiskRestoreCount()},
+                {"cpu_request_swap_disk_write_bytes",
+                    (double)model->GetCpuRequestSwapDiskWriteBytes()},
+                {"cpu_request_swap_disk_read_bytes",
+                    (double)model->GetCpuRequestSwapDiskReadBytes()},
+                {"cpu_request_swap_disk_read_mib_per_second",
+                    model->
+                        GetCpuRequestSwapDiskReadMegabytesPerSecond()},
+                {"paged_cache_snapshot_zstd_compress_calls",
+                    (double)zstdMetrics.compressCalls},
+                {"paged_cache_snapshot_zstd_compress_input_bytes",
+                    (double)zstdMetrics.compressInputBytes},
+                {"paged_cache_snapshot_zstd_compress_output_bytes",
+                    (double)zstdMetrics.compressOutputBytes},
+                {"paged_cache_snapshot_zstd_compress_seconds",
+                    (double)zstdMetrics.compressNanoseconds / 1.0e9},
+                {"paged_cache_snapshot_zstd_decompress_calls",
+                    (double)zstdMetrics.decompressCalls},
+                {"paged_cache_snapshot_zstd_decompress_input_bytes",
+                    (double)zstdMetrics.decompressInputBytes},
+                {"paged_cache_snapshot_zstd_decompress_output_bytes",
+                    (double)zstdMetrics.decompressOutputBytes},
+                {"paged_cache_snapshot_zstd_decompress_seconds",
+                    (double)zstdMetrics.decompressNanoseconds / 1.0e9},
+                {"prefix_cache_cpu_tier_enabled",
+                    fastllm::PagedPrefixCacheCpuTierEnabled()},
+                {"prefix_cache_disk_tier_enabled",
+                    fastllm::PagedPrefixCacheDiskTierEnabled()},
+                {"prefix_cache_gpu_hit_pages",
+                    (double)fastllm::
+                        GetPagedPrefixCacheGpuHitPages()},
+                {"prefix_cache_cpu_hit_pages",
+                    (double)fastllm::
+                        GetPagedPrefixCacheCpuHitPages()},
+                {"prefix_cache_cpu_tier_bytes",
+                    (double)fastllm::
+                        GetPagedPrefixCacheCpuTierBytes()},
+                {"prefix_cache_disk_write_bytes",
+                    (double)fastllm::
+                        GetPagedPrefixCacheDiskWriteBytes()},
+                {"prefix_cache_disk_live_bytes",
+                    (double)fastllm::
+                        GetPagedPrefixCacheDiskLiveBytes()},
+                {"prefix_cache_disk_read_bytes",
+                    (double)fastllm::
+                        GetPagedPrefixCacheDiskReadBytes()},
+                {"prefix_cache_disk_hits",
+                    (double)fastllm::
+                        GetPagedPrefixCacheDiskHitCount()},
+                {"prefix_cache_disk_read_mib_per_second",
+                    fastllm::
+                        GetPagedPrefixCacheDiskReadMegabytesPerSecond()},
+                {"prefix_cache_recompute_tokens_per_second",
+                    fastllm::
+                        GetPagedPrefixCacheRecomputeTokensPerSecond()},
+                {"prefix_cache_zstd_decompress_mib_per_second",
+                    fastllm::
+                        GetPagedPrefixCacheZstdDecompressMegabytesPerSecond()},
+                {"prefix_cache_zstd_compress_calls",
+                    (double)fastllm::
+                        GetPagedPrefixCacheZstdCompressCalls()},
+                {"prefix_cache_zstd_compress_input_bytes",
+                    (double)fastllm::
+                        GetPagedPrefixCacheZstdCompressInputBytes()},
+                {"prefix_cache_zstd_compress_output_bytes",
+                    (double)fastllm::
+                        GetPagedPrefixCacheZstdCompressOutputBytes()},
+                {"prefix_cache_zstd_compress_seconds",
+                    fastllm::
+                        GetPagedPrefixCacheZstdCompressSeconds()},
+                {"prefix_cache_zstd_decompress_calls",
+                    (double)fastllm::
+                        GetPagedPrefixCacheZstdDecompressCalls()},
+                {"prefix_cache_zstd_decompress_input_bytes",
+                    (double)fastllm::
+                        GetPagedPrefixCacheZstdDecompressInputBytes()},
+                {"prefix_cache_zstd_decompress_output_bytes",
+                    (double)fastllm::
+                        GetPagedPrefixCacheZstdDecompressOutputBytes()},
+                {"prefix_cache_zstd_decompress_seconds",
+                    fastllm::
+                        GetPagedPrefixCacheZstdDecompressSeconds()},
+                {"backend", "fastllm"}
+            });
+            return;
+        }
+
+        const bool generateRoute = route == "/generate";
+        const bool chatRoute = route == "/v1/chat/completions";
+        if ((generateRoute || chatRoute) && req->method != "POST") {
+            writeMethodNotAllowed("POST");
+            return;
+        }
+        if (!generateRoute && !chatRoute) {
+            writeJsonAndClose(
+                404,
+                OpenAIHttpError("Route " + route + " was not found.",
+                                "invalid_request_error", "not_found"));
+            return;
+        }
+        if (generateRoute) {
+            std::string message;
 
             if (node->error == "") {
                 if (node->config["prompt"].is_null()) {
@@ -342,10 +513,14 @@ struct WorkQueue {
                 }
             }
             if (node->error != "") {
-                printf("error body = %s, prompt = %s, error = %s\n", node->request.body.c_str(), node->config["prompt"].string_value().c_str(), node->error.c_str());
-                message += node->error;
-                int ret = write(node->client, message.c_str(), message.length()); //返回error
-                close(node->client);
+                printf("error body = %s, prompt = %s, error = %s\n",
+                       node->request.body.c_str(),
+                       node->config["prompt"].string_value().c_str(),
+                       node->error.c_str());
+                writeJsonAndClose(
+                    400, OpenAIHttpError(node->error,
+                                         "invalid_request_error",
+                                         "invalid_request"));
                 return;
             }
 
@@ -365,7 +540,16 @@ struct WorkQueue {
                 tokens.push_back(((float *) inputs.cpuData)[i]);
             }
             fastllm::GenerationConfig config;
-            config.output_token_limit = node->config["max_tokens"].is_null() ? 200 : node->config["max_tokens"].int_value();
+            if (!ResolveOutputTokenLimit(node->config["max_tokens"],
+                                         ::config.defaultMaxTokens,
+                                         config.output_token_limit,
+                                         node->error)) {
+                writeJsonAndClose(
+                    400, OpenAIHttpError(node->error,
+                                         "invalid_request_error",
+                                         "invalid_max_tokens"));
+                return;
+            }
             int handleId = model->LaunchResponseTokens(tokens, config);
             std::vector<float> results;
             while (true) {
@@ -377,21 +561,16 @@ struct WorkQueue {
                     results.push_back(result);
                     output += model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
 
-                    std::string cur = (message + output);
-                    int ret = write(node->client, cur.c_str(), cur.length()); //返回message
                 }
             }
 
-            message += output;
-            int ret = write(node->client, message.c_str(), message.length()); //返回message
-
+            WriteAllToSocket(
+                node->client,
+                BuildFixedHttpResponse(
+                    200, output, "text/plain; charset=utf-8"));
             close(node->client);
-        } else if ((req->route == "/v1/chat/completions" || req->route == "/v1/chat/completions/") && req->method == "POST") {
-            std::string message = "";
-            message += "HTTP/1.1 200 OK\r\n";
-            message += "Content-Type:application/json\r\n";
-            message += "server:fastllm api server\r\n";
-            message += "\r\n";
+        } else if (chatRoute) {
+            std::string message;
 
             fastllm::ChatMessages chatMessages;
             if (node->config["messages"].is_array()) {
@@ -404,14 +583,18 @@ struct WorkQueue {
                 node->error = "no input.\n";
             }
 
-            if (node->config["model"].string_value() != ::config.modelName) {
-                node->error = "The model `" + node->config["model"].string_value() + "` does not exist.";
+            if (node->error != "") {
+                writeJsonAndClose(
+                    400, OpenAIHttpError(node->error,
+                                         "invalid_request_error",
+                                         "invalid_request"));
+                return;
             }
-
-            if (node->error != "") {                
-                message += node->error;
-                int ret = write(node->client, message.c_str(), message.length()); //返回error
-                close(node->client);
+            if (node->config["model"].string_value() != ::config.modelName) {
+                writeJsonAndClose(
+                    404, OpenAIHttpError(
+                        "The model `" + node->config["model"].string_value() + "` does not exist.",
+                        "invalid_request_error", "model_not_found"));
                 return;
             }
 
@@ -427,9 +610,10 @@ struct WorkQueue {
                 prompt = model->ApplyChatTemplate(chatMessages);
             }
             if (node->error != "") {
-                message += node->error;
-                int ret = write(node->client, message.c_str(), message.length());
-                close(node->client);
+                writeJsonAndClose(
+                    400, OpenAIHttpError(node->error,
+                                         "invalid_request_error",
+                                         "invalid_raw_prompt"));
                 return;
             }
             fastllm::Data inputs = model->weight.tokenizer.Encode(prompt);
@@ -439,7 +623,16 @@ struct WorkQueue {
             }
 
             fastllm::GenerationConfig config;
-            config.output_token_limit = !node->config["max_tokens"].is_number() ? 256 : node->config["max_tokens"].int_value();
+            if (!ResolveOutputTokenLimit(node->config["max_tokens"],
+                                         ::config.defaultMaxTokens,
+                                         config.output_token_limit,
+                                         node->error)) {
+                writeJsonAndClose(
+                    400, OpenAIHttpError(node->error,
+                                         "invalid_request_error",
+                                         "invalid_max_tokens"));
+                return;
+            }
             if (node->config["frequency_penalty"].is_number()) {
                 config.repeat_penalty = node->config["frequency_penalty"].number_value();
             }
@@ -481,12 +674,12 @@ struct WorkQueue {
                                  config.stop_token_ids,
                                  config.stop_token_sequences,
                                  config.stop_strings, node->error)) {
-                message += node->error + "\n";
-                WriteAllToSocket(node->client, message);
-                close(node->client);
+                writeJsonAndClose(
+                    400, OpenAIHttpError(node->error,
+                                         "invalid_request_error",
+                                         "invalid_stop"));
                 return;
             }
-
             bool toolsEnabled = node->config["tools"].is_array();
             if (node->config["tool_choice"].is_string() &&
                 node->config["tool_choice"].string_value() == "none") {
@@ -628,6 +821,13 @@ struct WorkQueue {
                 };
 
                 while (true) {
+                    while (!model->CanFetchResponse(handleId)) {
+                        if (SocketPeerDisconnected(node->client)) {
+                            abortDisconnectedStream();
+                            return;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
                         std::string trailingText;
@@ -770,9 +970,7 @@ struct WorkQueue {
                         {"completion_tokens", outputTokens}
                     }}
                 };
-                message += response.dump();
-                WriteAllToSocket(node->client, message);
-                close(node->client);
+                writeJsonAndClose(200, response);
             }
             return;
         } else {
@@ -793,6 +991,7 @@ void Usage() {
     std::cout << "<--kv_cache_dtype> <args>:    设置KV Cache数据类型(auto/float32/float16/bfloat16/fp8_e4m3/turbo3; Qwen3.5/3.6 turbo3 uses q8_0 K + TurboQuant3 V)" << std::endl;
     std::cout << "<--batch> <args>:             最大batch数" << std::endl;
     std::cout << "<--tokens> <args>:            最大tokens容量" << std::endl;
+    std::cout << "<--default_max_tokens> <args>: 请求省略max_tokens时的默认输出上限（默认16384）" << std::endl;
     std::cout << "<--model_name> <args>:        模型名(openai api中使用)" << std::endl;
     std::cout << "<--port> <args>:              网页端口号" << std::endl;
     std::cout << "<--cuda_embedding>:           使用cuda来执行embedding" << std::endl;
@@ -829,6 +1028,13 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             config.dtype = dataTypeDict[dtypeStr];
         } else if (sargv[i] == "--tokens") {
             config.tokens = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--default_max_tokens" || sargv[i] == "--default-max-tokens") {
+            fastllm::AssertInFastLLM(i + 1 < argc,
+                                    "--default_max_tokens requires a value");
+            std::string error;
+            fastllm::AssertInFastLLM(
+                ParsePositiveInt(sargv[++i], config.defaultMaxTokens, error),
+                "Invalid --default_max_tokens: " + error);
         } else if (sargv[i] == "--batch") {
             config.batch = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "--atype") {

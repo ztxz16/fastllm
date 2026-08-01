@@ -67,6 +67,7 @@ namespace fastllm {
     };
 
     bool Qwen35InterleaveLongPrefillEnabled();
+    bool Qwen35ResidentPlainBatchEnabled();
     bool Qwen35BatchedMtpEnabled();
     bool Qwen35Turbo3KvEnabled();
     DataType ResolveQwen35CudaCacheType(DataType cacheType, DataType computeType);
@@ -98,6 +99,23 @@ namespace fastllm {
 
     bool CanReserveQwen35LongPrefillPages(
             const std::vector<Qwen35PageReservationBudget> &budgets);
+
+    int SelectQwen35SchedulerLanes(
+            int configuredLanes,
+            bool canUseMtpBatchForward,
+            bool batchedMtpEnabled,
+            int mtpSnapshotBatchLimit);
+
+    int SelectQwen35ResidentRequestLimit(
+            int configuredLanes,
+            int schedulerLanes,
+            bool interleaveLongPrefill);
+
+    bool Qwen35UsePlainResidentDecodeBatch(
+            bool plainBatchEnabled,
+            bool batchedMtpEnabled,
+            int schedulerLanes,
+            int residentDecodeRequests);
 
 #ifdef USE_CUDA
     using Qwen35DivisionScheme =
@@ -212,6 +230,20 @@ namespace fastllm {
         virtual void OnResponseContextCreated(ResponseContext *context) override;
 
         virtual void OnResponseContextRemoved(ResponseContext *context) override;
+        virtual bool CanSuspendResponseContextToCpu(
+            const ResponseContext *context,
+            std::string *error) const override;
+        virtual bool CaptureResponseContextExtraCpuState(
+            ResponseContext *context,
+            std::unique_ptr<ModelResponseContextCpuState> &state,
+            size_t &hostBytes,
+            std::string *error) override;
+        virtual bool RestoreResponseContextExtraCpuState(
+            ResponseContext *context,
+            const ModelResponseContextCpuState *state,
+            std::string *error) override;
+        virtual void ClearResponseContextExtraDeviceState(
+            ResponseContext *context) noexcept override;
 
         virtual bool UseModelSpecificScheduler() const override;
 
@@ -220,7 +252,6 @@ namespace fastllm {
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
-
         std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
 
         static const std::string language_prefix;

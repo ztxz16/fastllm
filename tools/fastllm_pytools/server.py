@@ -10,6 +10,8 @@ import time
 import uvicorn
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.exception_handlers import http_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .openai_server.protocal.openai_protocol import *
@@ -29,6 +31,7 @@ global fastllm_model
 global dev_mode_enabled
 global api_thread_pool_workers
 global request_executor
+global runtime_server_info
 
 # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L630
 def set_ulimit(target_soft_limit: int = 65535):
@@ -82,6 +85,95 @@ fastllm_model:FastLLmModel
 dev_mode_enabled:bool = False
 api_thread_pool_workers:int = 32
 request_executor = None
+runtime_server_info = {
+    "ready": False,
+    "model": "",
+    "max_batch": 0,
+    "token_pool": -1,
+    "kv_cache_dtype": "auto",
+    "activation_dtype": "auto",
+    "default_max_tokens": 16384,
+}
+
+def _openai_http_error(message: str, code: str):
+    return {
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": None,
+            "code": code,
+        }
+    }
+
+def _active_request_count() -> int:
+    try:
+        return len(fastllm_completion.get_active_conversations())
+    except Exception:
+        return 0
+
+def _queued_request_count() -> int:
+    queue = getattr(request_executor, "_work_queue", None)
+    qsize = getattr(queue, "qsize", None)
+    if not callable(qsize):
+        return 0
+    try:
+        return max(0, int(qsize()))
+    except Exception:
+        return 0
+
+def build_health_payload():
+    active = _active_request_count()
+    max_batch = max(1, int(runtime_server_info.get("max_batch") or 1))
+    ready = bool(runtime_server_info.get("ready"))
+    return {
+        "status": "ok" if ready else "loading",
+        "ready": ready,
+        "accepting": ready and active < max_batch,
+        "active_requests": active,
+        "queued_requests": _queued_request_count(),
+        "model": runtime_server_info.get("model", ""),
+    }
+
+def build_version_payload():
+    return {"name": "fastllm", "version": "unknown", "build": "unknown"}
+
+def build_props_payload():
+    return {
+        "model": runtime_server_info.get("model", ""),
+        "max_batch": runtime_server_info.get("max_batch", 0),
+        "token_pool": runtime_server_info.get("token_pool", -1),
+        "kv_cache_dtype": runtime_server_info.get("kv_cache_dtype", "auto"),
+        "activation_dtype": runtime_server_info.get("activation_dtype", "auto"),
+        "default_max_tokens": runtime_server_info.get(
+            "default_max_tokens", 16384),
+        "backend": "fastllm",
+    }
+
+@app.exception_handler(StarletteHTTPException)
+async def normalized_http_error(request: Request, exc: StarletteHTTPException):
+    if exc.status_code not in (404, 405):
+        return await http_exception_handler(request, exc)
+    code = "not_found" if exc.status_code == 404 else "method_not_allowed"
+    message = (f"Route {request.url.path} was not found."
+               if exc.status_code == 404 else
+               f"Method {request.method} is not allowed for {request.url.path}.")
+    return JSONResponse(
+        content = _openai_http_error(message, code),
+        status_code = exc.status_code,
+        headers = dict(exc.headers or {}))
+
+@app.get("/health")
+async def health():
+    return JSONResponse(content = build_health_payload())
+
+@app.get("/version")
+async def version():
+    return JSONResponse(content = build_version_payload())
+
+@app.get("/props")
+async def props():
+    return JSONResponse(content = build_props_payload())
+
 
 def _prewarm_request_executor(executor, workers: int) -> int:
     started = 0
@@ -128,8 +220,15 @@ class FastLLMUvicornServer(uvicorn.Server):
                 api_thread_pool_workers, started)
         await super().startup(sockets)
         if self.started and not self.should_exit:
-            from .llm import disable_cuda_malloc
-            disable_cuda_malloc()
+            # The native C++ apiserver reference never freezes the CUDA allocator.
+            # Freezing here (after a main-thread warmup, before the lazily-spawned
+            # scheduler thread runs its first forward) starves that thread's
+            # thread-local CUDA scratch and segfaults the first request. Keep the
+            # freeze strictly opt-in for leak checking under FASTLLM_CUDA_MEM_CHECK.
+            freeze_env = os.getenv("FASTLLM_FREEZE_CUDA_MALLOC_AFTER_WARMUP", "")
+            if freeze_env.lower() in ("1", "true", "yes", "on"):
+                from .llm import disable_cuda_malloc
+                disable_cuda_malloc()
             if self.startup_progress is not None:
                 self.startup_progress.ready()
 
@@ -294,6 +393,7 @@ def _fastllm_server(args, startup_progress):
     global fastllm_model
     global dev_mode_enabled
     global api_thread_pool_workers
+    global runtime_server_info
     
     # Set development mode from args
     dev_mode_enabled = args.dev_mode
@@ -311,13 +411,24 @@ def _fastllm_server(args, startup_progress):
         args.model_name = args.path
         if (args.model_name is None or args.model_name == ''):
             args.model_name = args.model
-    fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model,
-                                           think = (args.think.lower() != "false"),
-                                           enable_thinking = getattr(model, "enable_thinking", True),
-                                           hide_input = args.hide_input)
+    fastllm_completion = FastLLmCompletion(
+        model_name = args.model_name, model = model,
+        think = (args.think.lower() != "false"),
+        enable_thinking = getattr(model, "enable_thinking", True),
+        hide_input = args.hide_input,
+        default_max_tokens = args.default_max_tokens)
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     fastllm_model = FastLLmModel(model_name = args.model_name, model = model)
+    runtime_server_info.update({
+        "ready": True,
+        "model": args.model_name,
+        "max_batch": args.max_batch,
+        "token_pool": args.tokens,
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "activation_dtype": args.atype,
+        "default_max_tokens": args.default_max_tokens,
+    })
     logging.info(
         "Model context window: %d tokens per session "
         "(model=%s, shared KV cache=%s, configured limit=%s)",
@@ -326,6 +437,7 @@ def _fastllm_server(args, startup_progress):
         fastllm_model.kv_cache_token_limit,
         fastllm_model.configured_context_window_limit,
     )
+    logging.info("Default output token limit: %d", args.default_max_tokens)
     default_workers = args.max_batch if args.max_batch > 0 else 64
     default_workers = max(32, min(128, default_workers))
     workers_env = os.getenv("FASTLLM_API_THREADPOOL_WORKERS", "")

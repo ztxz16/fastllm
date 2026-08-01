@@ -204,6 +204,13 @@ MOE_ATYPE_CHOICES: Sequence[Choice] = (
     ("bfloat16", "bfloat16"),
 )
 
+ACTIVATION_DTYPE_CHOICES: Sequence[Choice] = (
+    ("auto", "自动"),
+    ("float16", "float16"),
+    ("float32", "float32"),
+    ("bfloat16", "bfloat16"),
+)
+
 ENABLE_THINKING_CHOICES: Sequence[Choice] = (
     ("auto", "自动"),
     ("true", "开启"),
@@ -312,6 +319,11 @@ FIELDS: Sequence[FormField] = (
         "分块 prefill 的切片大小；调小可以减少显存占用，auto 表示不指定。",
     ),
     FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型；turbo3 仅用于 Qwen3.5/3.6，且需 FASTLLM_QWEN35_TURBO3_KV=1。", KV_CACHE_DTYPE_CHOICES),
+    FormField("activation_dtype", "激活类型", "choice", "主干推理激活类型。", ACTIVATION_DTYPE_CHOICES),
+    FormField("low_memory", "低内存模式", "bool", "启用 -l，减少模型加载阶段内存占用。"),
+    FormField("cuda_embedding", "CUDA Embedding", "bool", "把 embedding 放到 CUDA；容量 profile 通常关闭。"),
+    FormField("prefix_cache", "前缀缓存", "bool", "显式开启或关闭 FASTLLM_PREFIX_CACHE。"),
+    FormField("prefix_snapshot_interval_pages", "前缀快照间隔页数", "text", "auto 使用默认值；容量 profile 常用 16，速度 profile 常用 64。"),
     FormField("mtp", "MTP", "text", "Qwen3.5 MTP 每步生成的 draft token 数；0 表示关闭，1-9 开启，auto 表示不指定。"),
     FormField("max_batch", "最大Batch", "text", "每次最多同时推理的询问数量；auto 表示不指定。"),
     FormField(
@@ -321,6 +333,8 @@ FIELDS: Sequence[FormField] = (
         "限制单会话输入和输出合计的最大 token 数；auto 表示取模型与 KV Cache 上限的较小值。",
         visible=lambda c: c.command == "server",
     ),
+    FormField("default_max_tokens", "默认输出上限", "text", "请求省略 max_tokens 时使用的严格正整数上限。", visible=lambda c: c.command == "server"),
+    FormField("startup_timeout", "启动超时", "text", "profile readiness 等待秒数，必须是正整数。", visible=lambda c: c.command == "server"),
     FormField("moe_atype", "MOE激活类型", "choice", "MOE层激活类型，可使用 auto、float32、float16 或 bfloat16。", MOE_ATYPE_CHOICES),
     FormField("enable_thinking", "思考开关", "choice", "是否开启硬思考开关，需要模型支持。", ENABLE_THINKING_CHOICES),
     FormField("tokens", "tokens数量", "text", "设置总 token 数量；auto 表示不指定。"),
@@ -1134,6 +1148,21 @@ def validate_config(config: DeployConfig) -> List[str]:
         except ValueError as exc:
             errors.append(str(exc))
     return errors
+
+# Keep the UI form helpers local, but use one deployment schema and runtime
+# contract for TUI and `ftllm profile`.
+from . import deploy as _deploy
+DeployConfig = _deploy.DeployConfig
+build_fastllm_env = _deploy.build_fastllm_env
+effective_model_name = _deploy.effective_model_name
+get_saved_commands_path = _deploy.get_saved_commands_path
+clone_config = _deploy.clone_config
+config_from_dict = _deploy.config_from_dict
+load_saved_configs = _deploy.load_saved_configs
+save_saved_configs = _deploy.save_saved_configs
+build_fastllm_argv = _deploy.build_fastllm_argv
+build_fastllm_command = _deploy.build_fastllm_command
+validate_config = _deploy.validate_config
 
 
 def _tui_escdelay_ms() -> int:

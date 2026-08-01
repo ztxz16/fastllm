@@ -1982,34 +1982,87 @@ static void dequantize_row_q6_K_r4_cuda(const void * vx, dst_t * y, const int64_
 //   y[j+16] = dl * kvalues_iq4nl[qs[j] >>  4]
 // One CUDA block per iq4_xs block, 256 threads (one output element each).
 template<typename dst_t>
-static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const block_iq4_xs * x = (const block_iq4_xs *) vx;
-
-    const int64_t i  = blockIdx.x;
-    const int     tid = threadIdx.x;        // 0 .. 255 -> output element within block
-
+static __device__ __forceinline__ void dequantize_iq4_xs_block(
+        const block_iq4_xs * __restrict__ x,
+        dst_t * __restrict__ yy, int64_t i, int tid) {
     const float d = __half2float(x[i].d);
-
-    const int ib = tid >> 5;                 // sub-block index 0 .. 7
-    const int p  = tid & 31;                 // position within sub-block 0 .. 31
-    const int j  = p & 15;                   // qs byte index within sub-block 0 .. 15
-
+    const int ib = tid >> 5;
+    const int p = tid & 31;
+    const int j = p & 15;
     const uint8_t qbyte = x[i].qs[ib * 16 + j];
-    const uint8_t nibble = (p < 16) ? (uint8_t)(qbyte & 0x0f) : (uint8_t)(qbyte >> 4);
-
-    // six-bit scale: 4 low bits from scales_l, 2 high bits from scales_h
-    const int ls = ((x[i].scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0f)
-                 | (((x[i].scales_h >> (2 * ib)) & 0x3) << 4);
+    const uint8_t nibble =
+        (p < 16) ? (uint8_t)(qbyte & 0x0f) : (uint8_t)(qbyte >> 4);
+    const int ls =
+        ((x[i].scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0f) |
+        (((x[i].scales_h >> (2 * ib)) & 0x3) << 4);
     const float dl = d * (float)(ls - 32);
-
-    yy[i * QK_K + tid] = DequantizeCast<dst_t>::cast(dl * (float)kvalues_iq4nl[nibble]);
+    yy[i * QK_K + tid] =
+        DequantizeCast<dst_t>::cast(
+            dl * (float)kvalues_iq4nl[nibble]);
 }
 
 template<typename dst_t>
-static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
-    const int64_t k = nrows * n_per_row;
-    const int64_t nb = k / QK_K;
-    dequantize_block_iq4_xs<<<nb, QK_K, 0, stream>>>(vx, y);
+static __global__ void dequantize_block_iq4_xs(
+        const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    dequantize_iq4_xs_block(
+        (const block_iq4_xs *)vx, yy,
+        (int64_t)blockIdx.x, threadIdx.x);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq4_xs_grid(
+        const void * __restrict__ vx, dst_t * __restrict__ yy,
+        int64_t nblocks) {
+    const block_iq4_xs *x = (const block_iq4_xs *)vx;
+    for (int64_t i = blockIdx.x; i < nblocks; i += gridDim.x) {
+        dequantize_iq4_xs_block(x, yy, i, threadIdx.x);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_iq4_xs_cuda(
+        const void *vx, dst_t *y, const int64_t nrows,
+        const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t nblocks = nrows * n_per_row / QK_K;
+    const char *env = std::getenv("FASTLLM_CUDA_IQ4XS_GRID_DEQUANT");
+    bool useGrid = env != nullptr && env[0] != '\0' &&
+                   !(env[0] == '0' && env[1] == '\0');
+    int blocksPerSm = 8;
+    if (useGrid) {
+        char *end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= 2 && parsed <= 32) {
+            blocksPerSm = (int)parsed;
+        }
+    }
+    if (useGrid) {
+        int device = -1, smCount = 0;
+        cudaError_t deviceState = cudaGetDevice(&device);
+        cudaError_t attrState = deviceState == cudaSuccess
+            ? cudaDeviceGetAttribute(
+                  &smCount, cudaDevAttrMultiProcessorCount, device)
+            : deviceState;
+        if (attrState == cudaSuccess && smCount > 0) {
+            int grid = (int)std::min<int64_t>(
+                nblocks, (int64_t)smCount * blocksPerSm);
+            dequantize_block_iq4_xs_grid<<<grid, QK_K, 0, stream>>>(
+                vx, y, nblocks);
+            cudaError_t launchState = cudaPeekAtLastError();
+            if (launchState == cudaSuccess) {
+                static thread_local bool logged = false;
+                if (!logged) {
+                    printf("[FastLLM] IQ4_XS grid-stride dequant enabled: grid=%d, blocks_per_sm=%d.\n",
+                           grid, blocksPerSm);
+                    logged = true;
+                }
+                return;
+            }
+            cudaGetLastError();
+        } else {
+            cudaGetLastError();
+        }
+    }
+    dequantize_block_iq4_xs<<<nblocks, QK_K, 0, stream>>>(vx, y);
 }
 
 // ---------------------------------------------------------------------------
@@ -2223,6 +2276,33 @@ static bool FastllmGGUFDequantIq4xsQ50Disabled() {
         return c == '1' || c == 't' || c == 'y' || c == 'o';
     }();
     return disabled;
+}
+
+// Optional SM70 IQ4_XS prefill experiment for wide-to-narrow projections.
+// A single dequantized weight is reused across several token/N tiles.  This
+// avoids the slow full-N cuBLAS algorithm selected by some V100 shapes while
+// preserving the original full-N GEMM as the failure fallback.
+static int FastllmGGUFSm70Iq4XsWideNTile(ggml_type type,
+                                         int n, int m, int k) {
+    const char *env = std::getenv(
+        "FASTLLM_CUDA_SM70_IQ4XS_WIDE_N_TILE");
+    if (env == nullptr || env[0] == '\0' || type != GGML_TYPE_IQ4_XS ||
+        n <= 0 || m < 2 * k || FastllmCudaRuntimeArch() != 70) {
+        return 0;
+    }
+    char *end = nullptr;
+    long tile = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || tile < 256 || tile >= n ||
+        tile > INT_MAX || (tile & 127) != 0) {
+        return 0;
+    }
+    static thread_local bool logged = false;
+    if (!logged) {
+        printf("[FastLLM] SM70 IQ4_XS wide-N tiling enabled: tile=%ld.\n",
+               tile);
+        logged = true;
+    }
+    return (int)tile;
 }
 
 static size_t FastllmGGUFAlignBytes(size_t bytes) {
@@ -2747,18 +2827,36 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
-        cublasStatus_t status;
+        cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
         dequant((const char *)weight.cudaData, cudaFp16Weight, k, m, stream);
 
-        status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                k, n, m,
-                                &h_alpha, cudaFp16Weight, AType,
-                                m, cudaInput, BType,
-                                m, &h_beta,
-                                cudaOutput, CType,
-                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        auto runGemm = [&](int nOffset, int nCount) {
+            return cublasGemmEx(
+                fastllmCublasHandle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                k, nCount, m,
+                &h_alpha, cudaFp16Weight, AType,
+                m, cudaInput + (size_t)nOffset * m, BType,
+                m, &h_beta,
+                cudaOutput + (size_t)nOffset * k, CType,
+                k, ComputeType,
+                static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        };
+        int nTile = FastllmGGUFSm70Iq4XsWideNTile(ggufType, n, m, k);
+        if (nTile > 0) {
+            for (int nOffset = 0; nOffset < n; nOffset += nTile) {
+                status = runGemm(nOffset, std::min(nTile, n - nOffset));
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    break;
+                }
+            }
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                status = runGemm(0, n);
+            }
+        } else {
+            status = runGemm(0, n);
+        }
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("Error: cublas error.\n");
             throw("cublas error");

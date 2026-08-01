@@ -230,6 +230,16 @@ __global__ void FastllmPagedCublasInitBlockAtten(float *sum0, float *max0, float
     }
 }
 
+__global__ void FastllmPagedCublasCommitBlockState(
+    float *lastMax, float *lastSum,
+    const float *currentMax, const float *currentSum, int len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < len) {
+        lastMax[i] = currentMax[i];
+        lastSum[i] = currentSum[i];
+    }
+}
+
 __global__ void FastllmPagedCublasAttnBlockUpdateFloat(float *data, int m, int stride,
                                                        float *lastMax, float *lastSum,
                                                        float *curMax, float *curSum) {
@@ -331,6 +341,25 @@ __global__ void FastllmPagedCublasSoftmaxWithCausalMask(half *input, half *outpu
         maxp + o, sump + o);
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmPagedCublasSoftmaxWithCausalMaskBatchGqa(
+    half *input, half *output, int outer, int qoLen, int channels, int base,
+    float *maxp, float *sump) {
+    int o = blockIdx.x;
+    int token = o % qoLen;
+    int visible = token + base + 1;
+    if (visible < 0) {
+        visible = 0;
+    }
+    if (visible > channels) {
+        visible = channels;
+    }
+    FastllmPagedCublasSoftmaxCausalFunc<THREAD_PER_BLOCK>(
+        input + (size_t)o * channels,
+        output + (size_t)o * channels,
+        visible, channels, maxp + o, sump + o);
+}
+
 static size_t FastllmPagedAlignWorkspaceOffset(size_t offset) {
     const size_t align = 256;
     return ((offset + align - 1) / align) * align;
@@ -346,6 +375,17 @@ static int FastllmPagedCublasChunkSizeFromEnv(int fallback) {
         return fallback;
     }
     return value;
+}
+
+static bool FastllmPagedCublasFusedStateCommitEnabled() {
+    const char *env = std::getenv(
+        "FASTLLM_CUDA_PAGED_CUBLAS_FUSED_STATE_COMMIT");
+    return env != nullptr && env[0] == '1';
+}
+
+static bool FastllmPagedCublasBatchGqaEnabled() {
+    const char *env = std::getenv("FASTLLM_CUDA_PAGED_CUBLAS_BATCH_GQA");
+    return env != nullptr && env[0] == '1';
 }
 
 static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
@@ -392,6 +432,8 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         outHeadStride < headDim || outTokenStride < headDim) {
         return false;
     }
+    bool batchGqa = qIsHalf && outIsHalf && group > 1 &&
+        FastllmPagedCublasBatchGqaEnabled();
 
     bool ownPageIndices = false;
     int32_t *pageIndicesGpu = (int32_t*)pageIndicesGpuIn;
@@ -411,9 +453,13 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         FastllmPagedAlignWorkspaceOffset((size_t)group * qoLen * headDim * sizeof(float));
     auto chunkWorkspaceBytes = [&](int chunk) -> size_t {
         size_t bytes = 0;
-        bytes += FastllmPagedAlignWorkspaceOffset((size_t)chunk * headDim * sizeof(half));
-        bytes += FastllmPagedAlignWorkspaceOffset((size_t)chunk * headDim * sizeof(half));
-        bytes += FastllmPagedAlignWorkspaceOffset((size_t)qoLen * chunk * sizeof(half));
+        bytes += FastllmPagedAlignWorkspaceOffset(
+            (size_t)chunk * headDim * sizeof(half));
+        bytes += FastllmPagedAlignWorkspaceOffset(
+            (size_t)chunk * headDim * sizeof(half));
+        size_t qkGroups = batchGqa ? (size_t)group : 1;
+        bytes += FastllmPagedAlignWorkspaceOffset(
+            qkGroups * qoLen * chunk * sizeof(half));
         return bytes;
     };
     size_t fixedBytes = stateBytes * 4 + qScratchBytes + outFloatScratchBytes;
@@ -451,7 +497,8 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     half *vChunk = (half*)(workspace + offset);
     offset += FastllmPagedAlignWorkspaceOffset((size_t)maxChunk * headDim * sizeof(half));
     half *qk = (half*)(workspace + offset);
-    offset += FastllmPagedAlignWorkspaceOffset((size_t)qoLen * maxChunk * sizeof(half));
+    offset += FastllmPagedAlignWorkspaceOffset(
+        (size_t)(batchGqa ? group : 1) * qoLen * maxChunk * sizeof(half));
     float *lastSum = (float*)(workspace + offset);
     offset += stateBytes;
     float *lastMax = (float*)(workspace + offset);
@@ -484,6 +531,67 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 pagedKVCacheV, pageIndicesGpu, kvStart, chunkLen, pageLen, numKvHeads, headDim, kvh, vChunk);
             if (!ok) {
                 break;
+            }
+
+            if (batchGqa) {
+                int firstHead = kvh * group;
+                half *qHead = (half*)qData + (size_t)firstHead * qHeadStride;
+                cublasStatus_t status = cublasHgemmStridedBatched(
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    chunkLen, qoLen, headDim, &hscale,
+                    kChunk, headDim, 0,
+                    qHead, qTokenStride, qHeadStride,
+                    &beta, qk, chunkLen,
+                    (long long)qoLen * chunkLen, group);
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("FastllmCudaPagedAttentionNativeChunkedCublas: batched GQA qk failed, status=%d\n",
+                           (int)status);
+                    ok = false;
+                    break;
+                }
+
+                int stateLen = group * qoLen;
+                FastllmPagedCublasSoftmaxWithCausalMaskBatchGqa<256><<<
+                    stateLen, 256>>>(qk, qk, stateLen, qoLen, chunkLen,
+                                     kvLen - qoLen - kvStart,
+                                     currentMax, currentSum);
+                if (kvStart > 0) {
+                    FastllmPagedCublasAttnBlockUpdateFloat<<<stateLen, 128>>>(
+                        outFloatScratch, headDim, headDim,
+                        lastMax, lastSum, currentMax, currentSum);
+                } else if (FastllmPagedCublasFusedStateCommitEnabled()) {
+                    const int commitThreads = 256;
+                    FastllmPagedCublasCommitBlockState<<<
+                        (stateLen + commitThreads - 1) / commitThreads,
+                        commitThreads>>>(lastMax, lastSum,
+                                         currentMax, currentSum, stateLen);
+                } else {
+                    cudaMemcpy(lastMax, currentMax,
+                               (size_t)stateLen * sizeof(float),
+                               cudaMemcpyDeviceToDevice);
+                    cudaMemcpy(lastSum, currentSum,
+                               (size_t)stateLen * sizeof(float),
+                               cudaMemcpyDeviceToDevice);
+                }
+
+                float currentScale = kvStart > 0 ? 1.0f : 0.0f;
+                status = cublasGemmStridedBatchedEx(
+                    handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    headDim, qoLen, chunkLen, &oneFloat,
+                    vChunk, CUDA_R_16F, headDim, 0,
+                    qk, CUDA_R_16F, chunkLen,
+                    (long long)qoLen * chunkLen,
+                    &currentScale,
+                    outFloatScratch, CUDA_R_32F, headDim,
+                    (long long)qoLen * headDim, group,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("FastllmCudaPagedAttentionNativeChunkedCublas: batched GQA pv failed, status=%d\n",
+                           (int)status);
+                    ok = false;
+                    break;
+                }
+                continue;
             }
 
             for (int g = 0; g < group; g++) {
@@ -528,10 +636,20 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
 
                 if (kvStart > 0) {
                     FastllmPagedCublasAttnBlockUpdateFloat<<<qoLen, 128>>>(
-                        outH, headDim, outStrideForCublas, lastMaxH, lastSumH, currentMaxH, currentSumH);
+                        outH, headDim, outStrideForCublas, lastMaxH, lastSumH,
+                        currentMaxH, currentSumH);
+                } else if (FastllmPagedCublasFusedStateCommitEnabled()) {
+                    const int commitThreads = 256;
+                    FastllmPagedCublasCommitBlockState<<<
+                        (qoLen + commitThreads - 1) / commitThreads, commitThreads>>>(
+                        lastMaxH, lastSumH, currentMaxH, currentSumH, qoLen);
                 } else {
-                    cudaMemcpy(lastMaxH, currentMaxH, (size_t)qoLen * sizeof(float), cudaMemcpyDeviceToDevice);
-                    cudaMemcpy(lastSumH, currentSumH, (size_t)qoLen * sizeof(float), cudaMemcpyDeviceToDevice);
+                    cudaMemcpy(lastMaxH, currentMaxH,
+                               (size_t)qoLen * sizeof(float),
+                               cudaMemcpyDeviceToDevice);
+                    cudaMemcpy(lastSumH, currentSumH,
+                               (size_t)qoLen * sizeof(float),
+                               cudaMemcpyDeviceToDevice);
                 }
 
                 float currentScale = kvStart > 0 ? 1.0f : 0.0f;

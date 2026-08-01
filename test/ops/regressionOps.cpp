@@ -11,6 +11,7 @@
 #endif
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #endif
 
@@ -40,6 +41,24 @@
 #include <utility>
 #include <vector>
 #include <map>
+
+namespace fastllm {
+    ResponseContext *SelectCpuRequestSwapVictim(
+        const std::vector<std::pair<int, ResponseContext*> > &candidates,
+        const ResponseContext *excluded);
+    bool CpuRequestSwapQuantumExpired(
+        int resumedGeneratedTokens,
+        int currentGeneratedTokens,
+        int quantumTokens,
+        size_t suspendedRequests);
+    bool CpuRequestSwapShouldSpillToDisk(
+        size_t tokens,
+        size_t storedBytes,
+        size_t minTokens,
+        size_t minBytes,
+        double diskReadMegabytesPerSecond,
+        double recomputeTokensPerSecond);
+}
 
 namespace {
     void Expect(bool condition, const std::string &message);
@@ -175,6 +194,40 @@ namespace {
             return "";
         }
     };
+
+    class CpuRequestSwapTestModel final : public fastllm::basellm {
+    public:
+        CpuRequestSwapTestModel() {
+            block_cnt = 2;
+        }
+
+        bool restoreObservedOwnedSnapshot = false;
+
+        std::string MakeInput(
+                const std::string &, int,
+                const std::string &) override {
+            return "";
+        }
+
+        std::string MakeHistory(
+                const std::string &, int,
+                const std::string &,
+                const std::string &) override {
+            return "";
+        }
+
+        bool RestoreResponseContextExtraCpuState(
+                fastllm::ResponseContext *context,
+                const fastllm::ModelResponseContextCpuState *,
+                std::string *) override {
+            auto it = responseContextCpuSnapshots.find(context);
+            restoreObservedOwnedSnapshot =
+                it != responseContextCpuSnapshots.end() &&
+                it->second != nullptr &&
+                it->second.use_count() > 1;
+            return true;
+        }
+    };
     class Qwen35ConfigTestModel final : public fastllm::Qwen3_5Model {
     public:
         const fastllm::Data &InvScaleData() const {
@@ -192,6 +245,37 @@ namespace {
                 language_prefix + "layers.0.self_attn.o_proj.weight",
                 {1, 1}, fastllm::DataType::FLOAT32);
         }
+
+        void ConfigureMtpFixture() {
+            mtp_num_hidden_layers = 1;
+            const std::vector<std::string> names = {
+                "mtp.fc.weight",
+                "mtp.norm.weight",
+                "mtp.pre_fc_norm_embedding.weight",
+                "mtp.pre_fc_norm_hidden.weight",
+                "mtp.layers.0.self_attn.mergeqkv.weight",
+                "mtp.layers.0.self_attn.o_proj.weight",
+                "mtp.layers.0.mlp.gateup_proj.weight",
+                "mtp.layers.0.mlp.down_proj.weight"
+            };
+            for (const std::string &name : names) {
+                weight.AddEmptyWeight(
+                    name, {1, 1}, fastllm::DataType::FLOAT32);
+            }
+        }
+
+        void InstallMtpCacheFixture(
+                fastllm::ResponseContext *context,
+                int tokens) {
+            std::vector<float> values((size_t)tokens, 1.0f);
+            fastllm::Data tensor(
+                fastllm::DataType::FLOAT32,
+                {1, tokens, 1}, values);
+            MtpKvCache &cache = mtpCaches[context];
+            cache.key.CopyFrom(tensor);
+            cache.value.CopyFrom(tensor);
+            cache.tokens = tokens;
+        }
     };
 
 
@@ -199,6 +283,7 @@ namespace {
     public:
         explicit ScopedFirstDevice(const std::string &device) {
             executor = (fastllm::Executor*) fastllm::GetExecutor();
+
             previous = executor->firstDevice;
             executor->SetFirstDevice(device);
         }
@@ -218,6 +303,572 @@ namespace {
         if (!condition) {
             throw std::runtime_error(message);
         }
+    }
+    void RunCpuRequestSwapPolicyRegression() {
+        fastllm::ResponseContext shortDecode;
+        shortDecode.preTokens = 32;
+        shortDecode.allTokens.resize(128);
+        fastllm::ResponseContext longDecode;
+        longDecode.preTokens = 32;
+        longDecode.allTokens.resize(4096);
+        fastllm::ResponseContext pendingPrompt;
+        pendingPrompt.preTokens = 0;
+        pendingPrompt.allTokens.resize(8192);
+        fastllm::ResponseContext activeLongPrefill;
+        activeLongPrefill.preTokens = 32;
+        activeLongPrefill.allTokens.resize(16384);
+        activeLongPrefill.longPrefill.inProgress = true;
+
+        std::vector<std::pair<int, fastllm::ResponseContext*> >
+            candidates = {
+                {9, &shortDecode},
+                {7, &longDecode},
+                {5, &pendingPrompt},
+                {3, &activeLongPrefill}
+            };
+        Expect(
+            fastllm::SelectCpuRequestSwapVictim(
+                candidates, nullptr) == &activeLongPrefill,
+            "CPU swap policy skipped the largest resumable boundary.");
+        Expect(
+            fastllm::SelectCpuRequestSwapVictim(
+                candidates, &activeLongPrefill) == &longDecode,
+            "CPU swap policy did not honor the excluded request.");
+        activeLongPrefill.isEnding = true;
+        longDecode.isEnding = true;
+        Expect(
+            fastllm::SelectCpuRequestSwapVictim(
+                candidates, nullptr) == &shortDecode,
+            "CPU swap policy selected a terminal request.");
+        ScopedEnvVar mtpEnabled(
+            "FASTLLM_QWEN35_ENABLE_MTP", "2");
+        Qwen35ConfigTestModel qwenModel;
+        qwenModel.ConfigureMtpFixture();
+        fastllm::ResponseContext qwenLongPrefill;
+        qwenLongPrefill.Init(&qwenModel);
+        qwenLongPrefill.preTokens = 32;
+        qwenLongPrefill.longPrefill.inProgress = true;
+        qwenLongPrefill.longPrefill.total = 128;
+        qwenLongPrefill.longPrefill.cursor = 32;
+        std::string snapshotError;
+        Expect(
+            !qwenModel.CanSuspendResponseContextToCpu(
+                &qwenLongPrefill, &snapshotError),
+            "Qwen3.5 allowed a viable long prefill to suspend "
+            "without its MTP cache.");
+        qwenModel.InstallMtpCacheFixture(
+            &qwenLongPrefill,
+            qwenLongPrefill.longPrefill.cursor);
+        snapshotError.clear();
+        Expect(
+            qwenModel.CanSuspendResponseContextToCpu(
+                &qwenLongPrefill, &snapshotError),
+            "Qwen3.5 rejected a seeded long-prefill quantum boundary: " +
+                snapshotError);
+        std::unique_ptr<fastllm::ModelResponseContextCpuState>
+            extraState;
+        size_t extraHostBytes = 0;
+        const bool capturedMtpState =
+            qwenModel.CaptureResponseContextExtraCpuState(
+                &qwenLongPrefill, extraState,
+                extraHostBytes, &snapshotError);
+#ifdef USE_CUDA
+        Expect(
+            capturedMtpState &&
+                extraState != nullptr &&
+                extraHostBytes ==
+                    (size_t)qwenLongPrefill.longPrefill.cursor *
+                    sizeof(float) * 2,
+            "Qwen3.5 did not preserve a viable long-prefill MTP cache: " +
+                snapshotError);
+#else
+        Expect(
+            capturedMtpState &&
+                extraState == nullptr && extraHostBytes == 0,
+            "CPU-only Qwen3.5 invented CUDA MTP snapshot state.");
+#endif
+        Expect(
+            fastllm::CpuRequestSwapShouldSpillToDisk(
+                65536, 1ULL << 30, 65536, 1ULL << 30, 1000.0, 800.0),
+            "CPU swap L3 cost gate rejected beneficial disk restore.");
+        Expect(
+            !fastllm::CpuRequestSwapShouldSpillToDisk(
+                65535, 1ULL << 30, 65536, 1, 1000.0, 800.0) &&
+            !fastllm::CpuRequestSwapShouldSpillToDisk(
+                65536, (1ULL << 30) - 1, 1, 1ULL << 30, 1000.0, 800.0) &&
+            !fastllm::CpuRequestSwapShouldSpillToDisk(
+                1024, 1ULL << 30, 1, 1, 1.0, 100000.0),
+            "CPU swap L3 cost gate ignored a threshold or slower restore.");
+        Expect(
+            std::fabs(fastllm::UpdateCpuRequestSwapDiskReadRate(
+                0.0, 100ULL << 20, 1.0) - 100.0) < 1e-6 &&
+            std::fabs(fastllm::UpdateCpuRequestSwapDiskReadRate(
+                100.0, 200ULL << 20, 1.0) - 120.0) < 1e-6 &&
+            fastllm::UpdateCpuRequestSwapDiskReadRate(
+                120.0, 0, 1.0) == 120.0,
+            "CPU swap L3 measured read-rate EWMA is incorrect.");
+
+
+        CpuRequestSwapTestModel coldModel;
+        fastllm::ResponseContext oldestColdContext;
+        fastllm::ResponseContext newerColdContext;
+        auto installColdSnapshot = [&](
+                fastllm::ResponseContext *context,
+                uint64_t ticket) {
+            std::shared_ptr<fastllm::ResponseContextCpuSnapshot> snapshot(
+                new fastllm::ResponseContextCpuSnapshot());
+            snapshot->ticket = ticket;
+            snapshot->suspendedAtMilliseconds = 0;
+            snapshot->contextTokens = 65536;
+            snapshot->caches.resize(1);
+            fastllm::CacheCpuSnapshot &cache =
+                snapshot->caches[0].first;
+            cache.valid = true;
+            cache.paged = true;
+            cache.pagedData.valid = true;
+            cache.pagedData.single.valid = true;
+            cache.pagedData.single.pageCount = 1;
+            cache.pagedData.single.pageBytes = 1 << 20;
+            cache.pagedData.single.uncompressedBytes = 1 << 20;
+            cache.pagedData.single.bytes.assign(1 << 20, 0x5a);
+            snapshot->hostBytes =
+                cache.pagedData.single.bytes.size();
+            coldModel.responseContextCpuSnapshots[context] =
+                std::move(snapshot);
+        };
+        installColdSnapshot(&oldestColdContext, 1);
+        installColdSnapshot(&newerColdContext, 2);
+        {
+            ScopedEnvVar enabled(
+                "FASTLLM_CPU_REQUEST_SWAP_ZSTD", "1");
+            ScopedEnvVar immediatelyCold(
+                "FASTLLM_CPU_REQUEST_SWAP_ZSTD_COLD_MS", "0");
+            const size_t compressedSnapshots =
+                coldModel.CompressColdResponseContextCpuSnapshots();
+            if (fastllm::PagedCacheCpuSnapshotZstdAvailable()) {
+                Expect(
+                    compressedSnapshots == 1 &&
+                    !coldModel.responseContextCpuSnapshots[
+                        &oldestColdContext]->
+                            caches[0].first.pagedData.single.
+                                zstdCompressed &&
+                    coldModel.responseContextCpuSnapshots[
+                        &newerColdContext]->
+                            caches[0].first.pagedData.single.
+                                zstdCompressed,
+                    "cold CPU tier did not preserve the next raw snapshot.");
+            } else {
+                Expect(
+                    compressedSnapshots == 0,
+                    "cold CPU tier compressed without zstd support.");
+            }
+        }
+        ScopedTempDirectory diskDirectory("fastllm-request-swap-l3-");
+        const std::filesystem::path staleDiskSession =
+            diskDirectory.Path() / "fastllm-swap-stale";
+        std::filesystem::create_directory(staleDiskSession);
+        {
+            std::ofstream orphan(
+                staleDiskSession / "orphan.bin",
+                std::ios::binary | std::ios::trunc);
+            orphan << "stale";
+        }
+        std::string spilledPath;
+        {
+            ScopedEnvVar enabled(
+                "FASTLLM_CPU_REQUEST_SWAP_DISK_DIR",
+                diskDirectory.Path().string().c_str());
+            ScopedEnvVar immediatelyCold(
+                "FASTLLM_CPU_REQUEST_SWAP_DISK_COLD_MS", "0");
+            ScopedEnvVar minTokens(
+                "FASTLLM_CPU_REQUEST_SWAP_DISK_MIN_TOKENS", "1");
+            ScopedEnvVar minBytes(
+                "FASTLLM_CPU_REQUEST_SWAP_DISK_MIN_BYTES", "1");
+            ScopedEnvVar diskReadRate(
+                "FASTLLM_CPU_REQUEST_SWAP_DISK_READ_MBPS", "1000");
+            ScopedEnvVar recomputeRate(
+                "FASTLLM_CPU_REQUEST_SWAP_RECOMPUTE_TPS", "800");
+            ScopedEnvVar maxDiskBytes(
+                "FASTLLM_CPU_REQUEST_SWAP_DISK_MAX_BYTES", "67108864");
+            const size_t spilledSnapshots =
+                coldModel.SpillColdResponseContextCpuSnapshotsToDisk();
+            Expect(
+                !std::filesystem::exists(staleDiskSession),
+                "CPU swap L3 did not reclaim a stale session.");
+            const auto &oldestSnapshot =
+                coldModel.responseContextCpuSnapshots[
+                    &oldestColdContext];
+            const auto &newerSnapshot =
+                coldModel.responseContextCpuSnapshots[
+                    &newerColdContext];
+            const auto &oldestPart =
+                oldestSnapshot->caches[0].first.pagedData.single;
+            const auto &newerPart =
+                newerSnapshot->caches[0].first.pagedData.single;
+            Expect(
+                spilledSnapshots == 1 &&
+                oldestPart.diskFile == nullptr &&
+                newerPart.diskFile != nullptr &&
+                newerPart.bytes.empty() &&
+                newerPart.compressedBytes.empty() &&
+                newerSnapshot->hostBytes == 0,
+                "CPU swap L3 did not spill only the colder non-next snapshot.");
+            spilledPath = newerPart.diskFile->path;
+            Expect(
+                std::filesystem::is_regular_file(spilledPath),
+                "CPU swap L3 did not publish its snapshot file.");
+        }
+        coldModel.EraseResponseContextCpuSnapshot(
+            &newerColdContext);
+        Expect(
+            !std::filesystem::exists(spilledPath),
+            "CPU swap L3 file outlived its snapshot owner.");
+
+        coldModel.EraseResponseContextCpuSnapshot(
+            &oldestColdContext);
+
+        Expect(
+            !fastllm::CpuRequestSwapQuantumExpired(
+                100, 227, 128, 1),
+            "CPU swap quantum expired one token too early.");
+        Expect(
+            fastllm::CpuRequestSwapQuantumExpired(
+                100, 228, 128, 1),
+            "CPU swap quantum did not expire at its boundary.");
+        Expect(
+            !fastllm::CpuRequestSwapQuantumExpired(
+                100, 1000, 128, 0),
+            "CPU swap quantum rotated without a suspended peer.");
+        Expect(
+            !fastllm::CpuRequestSwapQuantumExpired(
+                228, 100, 128, 1),
+            "CPU swap quantum accepted a negative token delta.");
+        std::cout << "CPU request swap policy regression: PASS\n";
+    }
+    void RunPagedPrefixCachePolicyRegression() {
+        {
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 2;
+            manager.SetMaxPages(3);
+            std::vector<int> pages;
+            for (int i = 0; i < 3; i++) {
+                pages.push_back(manager.GetUnusedPageIndex(true));
+            }
+            manager.Record(
+                {1, 2, 3, 4, 5, 6},
+                pages);
+            manager.ReleasePageIndices(pages);
+
+            const uint64_t gpuHitsBefore =
+                fastllm::GetPagedPrefixCacheGpuHitPages();
+            std::vector<int> hit;
+            manager.Query({1, 2, 3, 4, 9, 9}, hit);
+            Expect(
+                hit == std::vector<int>({pages[0], pages[1]}),
+                "paged prefix cache did not return the longest exact "
+                "page-aligned prefix.");
+            Expect(
+                fastllm::GetPagedPrefixCacheGpuHitPages() ==
+                    gpuHitsBefore + 2,
+                "paged prefix cache did not count resident page hits.");
+        }
+        {
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 2;
+            manager.SetMaxPages(2);
+            const int page = manager.GetUnusedPageIndex(true);
+            manager.Record({1, 1000000007}, {page});
+            manager.ReleasePageIndex(page);
+
+            std::vector<int> collision;
+            manager.Query({2, 0}, collision);
+            Expect(
+                collision.empty(),
+                "paged prefix cache accepted a token-page hash "
+                "collision.");
+        }
+        {
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 2;
+            manager.SetMaxPages(3);
+            const int coldA = manager.GetUnusedPageIndex(true);
+            const int coldB = manager.GetUnusedPageIndex(true);
+            const int hot = manager.GetUnusedPageIndex(true);
+            manager.Record({10, 10}, {coldA});
+            manager.Record({20, 20}, {coldB});
+            manager.Record({30, 30}, {hot});
+            manager.ReleasePageIndex(coldA);
+            manager.ReleasePageIndex(coldB);
+            manager.ReleasePageIndex(hot);
+
+            for (int i = 0; i < 8; i++) {
+                std::vector<int> hit;
+                manager.Query({30, 30}, hit);
+                Expect(
+                    hit == std::vector<int>({hot}),
+                    "paged prefix cache lost a hot page before "
+                    "eviction pressure.");
+            }
+            (void)manager.GetUnusedPageIndex(true);
+            std::vector<int> retained;
+            manager.Query({30, 30}, retained);
+            Expect(
+                retained == std::vector<int>({hot}),
+                "paged prefix cache evicted the highest-frequency page.");
+        }
+        {
+            ScopedEnvVar tierEnabled(
+                "FASTLLM_PREFIX_CACHE_CPU_TIER", "1");
+            ScopedEnvVar minHits(
+                "FASTLLM_PREFIX_CACHE_MIN_HITS", "2");
+            ScopedEnvVar minTokens(
+                "FASTLLM_PREFIX_CACHE_MIN_TOKENS", "4");
+            ScopedEnvVar zstd(
+                "FASTLLM_PREFIX_CACHE_ZSTD", "0");
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 2;
+            manager.dataType = fastllm::DataType::INT8;
+            manager.dataDevice = fastllm::DataDevice::CPU;
+            manager.UpdateUnitSize();
+            manager.Resize({2, 2, 1, 1});
+            manager.Allocate();
+            manager.SetMaxPages(2);
+            const int first = manager.GetUnusedPageIndex(true);
+            const int second = manager.GetUnusedPageIndex(true);
+            manager.Record({1, 2, 3, 4}, {first, second});
+            auto rootIt = manager.trieRoot->children.find(
+                fastllm::PagedCacheManager::HashTokenPage(
+                    std::vector<int>({1, 2}).data(), 2));
+            Expect(
+                rootIt != manager.trieRoot->children.end() &&
+                    manager.PageOutTrieNode(rootIt->second),
+                "paged prefix CPU tier did not preserve the leading "
+                "page of an eligible long prefix.");
+        }
+        {
+            ScopedEnvVar tierEnabled(
+                "FASTLLM_PREFIX_CACHE_CPU_TIER", "1");
+            ScopedEnvVar minHits(
+                "FASTLLM_PREFIX_CACHE_MIN_HITS", "0");
+            ScopedEnvVar minTokens(
+                "FASTLLM_PREFIX_CACHE_MIN_TOKENS", "0");
+            ScopedEnvVar zstd(
+                "FASTLLM_PREFIX_CACHE_ZSTD", "0");
+            ScopedEnvVar cpuLimit(
+                "FASTLLM_PREFIX_CACHE_CPU_MAX_BYTES", "1048576");
+            const uint64_t bytesBefore =
+                fastllm::GetPagedPrefixCacheCpuTierBytes();
+            {
+                fastllm::PagedCacheManager manager;
+                manager.pageLen = 2;
+                manager.dataType = fastllm::DataType::INT8;
+                manager.dataDevice = fastllm::DataDevice::CPU;
+                manager.UpdateUnitSize();
+                manager.Resize({1, 2, 1, 1});
+                manager.Allocate();
+                manager.SetMaxPages(1);
+                const int first =
+                    manager.GetUnusedPageIndex(true);
+                manager.cpuData[0] = 11;
+                manager.cpuData[1] = 12;
+                manager.Record({41, 42}, {first});
+                manager.ReleasePageIndex(first);
+
+                const int reused =
+                    manager.GetUnusedPageIndex(true);
+                Expect(
+                    reused == first,
+                    "paged prefix CPU tier did not release the "
+                    "physical page.");
+                manager.cpuData[0] = 21;
+                manager.cpuData[1] = 22;
+                manager.Record({51, 52}, {reused});
+                manager.ReleasePageIndex(reused);
+
+                const uint64_t cpuHitsBefore =
+                    fastllm::GetPagedPrefixCacheCpuHitPages();
+                std::vector<int> restored;
+                manager.Query({41, 42}, restored);
+                Expect(
+                    restored == std::vector<int>({first}) &&
+                    manager.cpuData[0] == 11 &&
+                    manager.cpuData[1] == 12,
+                    "paged prefix CPU tier did not restore exact "
+                    "physical bytes.");
+                Expect(
+                    fastllm::GetPagedPrefixCacheCpuHitPages() ==
+                        cpuHitsBefore + 1,
+                    "paged prefix CPU tier did not count restored pages.");
+            }
+            Expect(
+                fastllm::GetPagedPrefixCacheCpuTierBytes() ==
+                    bytesBefore,
+                "paged prefix CPU tier leaked accounted bytes.");
+        }
+        {
+            ScopedEnvVar tierEnabled(
+                "FASTLLM_PREFIX_CACHE_CPU_TIER", "1");
+            ScopedEnvVar minHits(
+                "FASTLLM_PREFIX_CACHE_MIN_HITS", "0");
+            ScopedEnvVar minTokens(
+                "FASTLLM_PREFIX_CACHE_MIN_TOKENS", "0");
+            ScopedEnvVar zstd(
+                "FASTLLM_PREFIX_CACHE_ZSTD", "0");
+            ScopedEnvVar cpuReadRate(
+                "FASTLLM_PREFIX_CACHE_CPU_READ_MBPS", "0.000001");
+            ScopedEnvVar recomputeRate(
+                "FASTLLM_PREFIX_CACHE_RECOMPUTE_TPS", "1000000000");
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 2;
+            manager.dataType = fastllm::DataType::INT8;
+            manager.dataDevice = fastllm::DataDevice::CPU;
+            manager.UpdateUnitSize();
+            manager.Resize({1, 2, 1, 1});
+            manager.Allocate();
+            manager.SetMaxPages(1);
+            const int first = manager.GetUnusedPageIndex(true);
+            manager.cpuData[0] = 81;
+            manager.cpuData[1] = 82;
+            manager.Record({81, 82}, {first});
+            manager.ReleasePageIndex(first);
+            (void)manager.GetUnusedPageIndex(true);
+            std::vector<int> rejected;
+            manager.Query({81, 82}, rejected);
+            Expect(
+                rejected.empty(),
+                "paged prefix CPU tier ignored a slower-than-recompute "
+                "restore estimate.");
+        }
+#ifndef _WIN32
+        {
+            ScopedTempDirectory diskDirectory(
+                "fastllm-prefix-cache-tier-");
+            const std::string diskPath =
+                diskDirectory.Path().string();
+            ScopedEnvVar tierEnabled(
+                "FASTLLM_PREFIX_CACHE_CPU_TIER", "1");
+            ScopedEnvVar diskTier(
+                "FASTLLM_PREFIX_CACHE_DISK_DIR",
+                diskPath.c_str());
+            ScopedEnvVar minHits(
+                "FASTLLM_PREFIX_CACHE_MIN_HITS", "0");
+            ScopedEnvVar minTokens(
+                "FASTLLM_PREFIX_CACHE_MIN_TOKENS", "0");
+            ScopedEnvVar diskMinHits(
+                "FASTLLM_PREFIX_CACHE_DISK_MIN_HITS", "0");
+            ScopedEnvVar diskMinTokens(
+                "FASTLLM_PREFIX_CACHE_DISK_MIN_TOKENS", "0");
+            ScopedEnvVar diskFree(
+                "FASTLLM_PREFIX_CACHE_DISK_MIN_FREE_BYTES", "0");
+            ScopedEnvVar diskLimit(
+                "FASTLLM_PREFIX_CACHE_DISK_MAX_BYTES", "1048576");
+            ScopedEnvVar diskRate(
+                "FASTLLM_PREFIX_CACHE_DISK_READ_MBPS", "300");
+            ScopedEnvVar recomputeRate(
+                "FASTLLM_PREFIX_CACHE_RECOMPUTE_TPS", "800");
+            ScopedEnvVar zstd(
+                "FASTLLM_PREFIX_CACHE_ZSTD", "1");
+            const uint64_t writesBefore =
+                fastllm::GetPagedPrefixCacheDiskWriteBytes();
+            const uint64_t readsBefore =
+                fastllm::GetPagedPrefixCacheDiskReadBytes();
+            const uint64_t hitsBefore =
+                fastllm::GetPagedPrefixCacheDiskHitCount();
+            const uint64_t liveBytesBefore =
+                fastllm::GetPagedPrefixCacheDiskLiveBytes();
+            const uint64_t zstdCompressCallsBefore =
+                fastllm::GetPagedPrefixCacheZstdCompressCalls();
+            const uint64_t zstdCompressInputBefore =
+                fastllm::GetPagedPrefixCacheZstdCompressInputBytes();
+            const uint64_t zstdCompressOutputBefore =
+                fastllm::GetPagedPrefixCacheZstdCompressOutputBytes();
+            const double zstdCompressSecondsBefore =
+                fastllm::GetPagedPrefixCacheZstdCompressSeconds();
+            const uint64_t zstdDecompressCallsBefore =
+                fastllm::GetPagedPrefixCacheZstdDecompressCalls();
+            const uint64_t zstdDecompressInputBefore =
+                fastllm::GetPagedPrefixCacheZstdDecompressInputBytes();
+            const uint64_t zstdDecompressOutputBefore =
+                fastllm::GetPagedPrefixCacheZstdDecompressOutputBytes();
+            const double zstdDecompressSecondsBefore =
+                fastllm::GetPagedPrefixCacheZstdDecompressSeconds();
+            {
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 1024;
+            manager.dataType = fastllm::DataType::INT8;
+            manager.dataDevice = fastllm::DataDevice::CPU;
+            manager.UpdateUnitSize();
+            manager.Resize({1, 1024, 1, 1});
+            manager.Allocate();
+            manager.SetMaxPages(1);
+            const std::vector<int> originalTokens(1024, 61);
+            const std::vector<int> replacementTokens(1024, 71);
+            const int first =
+                manager.GetUnusedPageIndex(true);
+            std::memset(manager.cpuData, 31, 1024);
+            manager.Record(originalTokens, {first});
+            manager.ReleasePageIndex(first);
+            const int reused =
+                manager.GetUnusedPageIndex(true);
+            std::memset(manager.cpuData, 41, 1024);
+            manager.Record(replacementTokens, {reused});
+            manager.ReleasePageIndex(reused);
+            Expect(
+                fastllm::GetPagedPrefixCacheDiskWriteBytes() >
+                    writesBefore,
+                "paged prefix disk tier did not page out bytes.");
+
+            std::vector<int> restored;
+            manager.Query(originalTokens, restored);
+            Expect(
+                restored == std::vector<int>({first}) &&
+                manager.cpuData[0] == 31 &&
+                manager.cpuData[1023] == 31,
+                "paged prefix disk tier did not restore exact bytes.");
+            Expect(
+                fastllm::GetPagedPrefixCacheDiskReadBytes() >
+                    readsBefore &&
+                fastllm::GetPagedPrefixCacheDiskHitCount() >
+                    hitsBefore,
+                "paged prefix disk tier did not record a restore hit.");
+            if (fastllm::PagedCacheCpuSnapshotZstdAvailable()) {
+                Expect(
+                    fastllm::GetPagedPrefixCacheZstdCompressCalls() >
+                        zstdCompressCallsBefore &&
+                    fastllm::GetPagedPrefixCacheZstdCompressInputBytes() >
+                        zstdCompressInputBefore &&
+                    fastllm::GetPagedPrefixCacheZstdCompressOutputBytes() >
+                        zstdCompressOutputBefore &&
+                    fastllm::GetPagedPrefixCacheZstdCompressSeconds() >
+                        zstdCompressSecondsBefore,
+                    "paged prefix disk tier did not publish zstd "
+                    "compression metrics.");
+                Expect(
+                    fastllm::GetPagedPrefixCacheZstdDecompressCalls() >
+                        zstdDecompressCallsBefore &&
+                    fastllm::GetPagedPrefixCacheZstdDecompressInputBytes() >
+                        zstdDecompressInputBefore &&
+                    fastllm::GetPagedPrefixCacheZstdDecompressOutputBytes() >
+                        zstdDecompressOutputBefore &&
+                    fastllm::GetPagedPrefixCacheZstdDecompressSeconds() >
+                        zstdDecompressSecondsBefore,
+                    "paged prefix disk tier did not publish zstd "
+                    "decompression metrics.");
+            }
+            }
+            Expect(
+                fastllm::GetPagedPrefixCacheDiskLiveBytes() ==
+                    liveBytesBefore,
+                "paged prefix disk tier did not release dead extents.");
+        }
+#endif
+        fastllm::ObservePagedPrefixCacheRecompute(1600, 2.0);
+        Expect(
+            std::fabs(
+                fastllm::GetPagedPrefixCacheRecomputeTokensPerSecond() -
+                800.0) < 1e-6,
+            "paged prefix cache did not publish measured prefill cost.");
+        std::cout << "paged prefix cache policy regression: PASS\n";
     }
     std::vector<float> ToFloatVector(fastllm::Data data);
     void ExpectFloatNear(const std::vector<float> &expected, const std::vector<float> &actual,
@@ -1028,6 +1679,45 @@ namespace {
                    !fastllm::CanReserveQwen35LongPrefillPages({{2, 4, 5}}) &&
                    fastllm::CanReserveQwen35LongPrefillPages({{0, 0, 0}}),
                "qwen35 long prefill page reservation accounting is incorrect.");
+        Expect(fastllm::SelectQwen35SchedulerLanes(5, true, true, 4) == 4 &&
+                   fastllm::SelectQwen35SchedulerLanes(5, true, false, 4) == 5 &&
+                   fastllm::SelectQwen35SchedulerLanes(5, false, false, 4) == 1 &&
+                   fastllm::SelectQwen35SchedulerLanes(0, true, false, 4) == 1,
+               "qwen35 scheduler did not separate plain and MTP batch lanes.");
+        Expect(fastllm::SelectQwen35ResidentRequestLimit(5, 4, true) == 5 &&
+                   fastllm::SelectQwen35ResidentRequestLimit(5, 4, false) == 4 &&
+                   fastllm::SelectQwen35ResidentRequestLimit(0, 0, true) == 1,
+               "qwen35 resident request limit was not capacity-lane aware.");
+        Expect(
+            fastllm::Qwen35UsePlainResidentDecodeBatch(
+                    true, false, 5, 2) &&
+                !fastllm::Qwen35UsePlainResidentDecodeBatch(
+                    false, false, 5, 2) &&
+                !fastllm::Qwen35UsePlainResidentDecodeBatch(
+                    true, true, 5, 2) &&
+                !fastllm::Qwen35UsePlainResidentDecodeBatch(
+                    true, false, 1, 2) &&
+                !fastllm::Qwen35UsePlainResidentDecodeBatch(
+                    true, false, 5, 1),
+            "qwen35 resident decode policy did not prefer gated plain CUDA batching.");
+        {
+            ScopedEnvVar unset(
+                "FASTLLM_QWEN35_RESIDENT_PLAIN_BATCH", nullptr);
+            Expect(!fastllm::Qwen35ResidentPlainBatchEnabled(),
+                   "qwen35 resident plain batch should default off.");
+        }
+        {
+            ScopedEnvVar enabled(
+                "FASTLLM_QWEN35_RESIDENT_PLAIN_BATCH", "1");
+            Expect(fastllm::Qwen35ResidentPlainBatchEnabled(),
+                   "qwen35 resident plain batch did not accept 1.");
+        }
+        {
+            ScopedEnvVar disabled(
+                "FASTLLM_QWEN35_RESIDENT_PLAIN_BATCH", "0");
+            Expect(!fastllm::Qwen35ResidentPlainBatchEnabled(),
+                   "qwen35 resident plain batch did not reject 0.");
+        }
 
         {
             ScopedEnvVar disabled("FASTLLM_QWEN35_INTERLEAVE_LONG_PREFILL", nullptr);
@@ -1065,6 +1755,507 @@ namespace {
                    "qwen35 batched MTP did not accept 1.");
         }
     }
+#ifdef USE_CUDA
+    void RunCudaPagedCacheCpuSnapshotRegression() {
+        constexpr int pageLen = 2;
+        constexpr int maxPages = 4;
+        constexpr int heads = 1;
+        constexpr int headDim = 256;
+        constexpr int logicalPages = 3;
+        FastllmCudaSetDevice(0);
+
+        fastllm::Data descriptor(fastllm::DataType::TURBO3_KV);
+        descriptor.dims = {heads, 1, headDim};
+        descriptor.strides = {(uint64_t)headDim, (uint64_t)headDim, 1};
+        descriptor.dataDevice = fastllm::DataDevice::CUDA;
+        descriptor.dataDeviceIds = {0};
+        descriptor.UpdateUnitSize();
+        fastllm::PagedCacheManager *manager =
+            fastllm::AllocatePagedCacheManager(
+                62050,
+                fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                descriptor, pageLen, maxPages);
+        const size_t pageBytes = manager->GetBytes() / maxPages;
+        Expect(pageBytes > 0 && manager->GetBytes() % maxPages == 0,
+               "paged CPU snapshot fixture has invalid physical page bytes.");
+
+        std::vector<uint8_t> physical(manager->GetBytes(), 0);
+        for (size_t i = 0; i < physical.size(); i++) {
+            physical[i] = (uint8_t)((i * 29 + 17) & 0xff);
+        }
+        FastllmCudaCopyFromHostToDevice(
+            manager->cudaData, physical.data(), physical.size());
+
+        fastllm::Data cache(fastllm::DataType::TURBO3_KV);
+        cache.dataDevice = fastllm::DataDevice::CUDA;
+        cache.dataDeviceIds = {0};
+        cache.Resize({heads, logicalPages * pageLen - 1, headDim});
+        cache.SetKVCache();
+        cache.isPagedKVCache = true;
+        cache.pageLen = pageLen;
+        cache.lastPageLen = pageLen - 1;
+        cache.pagedKVCacheData = manager;
+        for (int i = 0; i < logicalPages; i++) {
+            cache.pageIndex.push_back(manager->GetUnusedPageIndex(true));
+        }
+
+        const auto zstdMetricsBefore =
+            fastllm::GetPagedCacheCpuSnapshotZstdMetrics();
+        fastllm::PagedCacheCpuSnapshot snapshot;
+        std::string error;
+        Expect(fastllm::SnapshotPagedCacheToCpu(cache, snapshot, &error),
+               "paged CPU snapshot failed: " + error);
+        Expect(snapshot.valid && !snapshot.multiDeviceData &&
+                   snapshot.single.pageCount == logicalPages &&
+                   snapshot.single.pageBytes == pageBytes &&
+                   snapshot.single.bytes.size() == logicalPages * pageBytes,
+               "paged CPU snapshot metadata is incorrect.");
+        const std::vector<uint8_t> expectedSnapshotBytes =
+            snapshot.single.bytes;
+        fastllm::PagedCacheCpuSnapshot incompressible = snapshot;
+        uint32_t randomState = 0x6d2b79f5U;
+        for (uint8_t &value : incompressible.single.bytes) {
+            randomState =
+                randomState * 1664525U + 1013904223U;
+            value = (uint8_t)(randomState >> 24);
+        }
+        const std::vector<uint8_t> incompressibleBytes =
+            incompressible.single.bytes;
+        const bool incompressibleCompressed =
+            fastllm::TryCompressPagedCacheCpuSnapshot(
+                incompressible, 1, &error);
+        Expect(
+            !incompressibleCompressed &&
+            !incompressible.single.zstdCompressed &&
+            incompressible.single.bytes == incompressibleBytes,
+            "incompressible paged CPU snapshot did not stay raw.");
+        const bool zstdCompressed =
+            fastllm::TryCompressPagedCacheCpuSnapshot(
+                snapshot, 1, &error);
+        if (fastllm::PagedCacheCpuSnapshotZstdAvailable()) {
+            Expect(
+                zstdCompressed &&
+                snapshot.single.zstdCompressed &&
+                snapshot.single.zstdContentChecksum &&
+                snapshot.single.bytes.empty() &&
+                snapshot.single.compressedBytes.size() <
+                    expectedSnapshotBytes.size(),
+                "paged CPU snapshot zstd compression was ineffective.");
+        } else {
+            Expect(
+                !zstdCompressed &&
+                !snapshot.single.zstdCompressed &&
+                snapshot.single.bytes == expectedSnapshotBytes,
+                "paged CPU snapshot changed without zstd support.");
+        }
+
+        fastllm::PagedCacheCpuSnapshot corruptedZstd;
+        if (zstdCompressed) {
+            corruptedZstd = snapshot;
+            corruptedZstd.single.compressedBytes.back() ^= 1;
+        }
+
+        ScopedTempDirectory diskDirectory("fastllm-cpu-snapshot-disk-");
+        fastllm::PagedCacheCpuSnapshot corruptedDisk = snapshot;
+        const std::vector<uint8_t> expectedStoredBytes =
+            snapshot.single.zstdCompressed
+                ? snapshot.single.compressedBytes
+                : snapshot.single.bytes;
+        Expect(
+            fastllm::SpillPagedCacheCpuSnapshotPartToDisk(
+                snapshot.single,
+                (diskDirectory.Path() / "snapshot.bin").string(),
+                &error),
+            "paged CPU snapshot disk spill failed: " + error);
+        Expect(
+            snapshot.single.bytes.empty() &&
+            snapshot.single.compressedBytes.empty() &&
+            snapshot.single.diskFile != nullptr &&
+            snapshot.single.diskFile->bytes == expectedStoredBytes.size(),
+            "paged CPU snapshot disk spill retained resident bytes.");
+        std::vector<uint8_t> loadedStoredBytes;
+        Expect(
+            fastllm::LoadPagedCacheCpuSnapshotPartFromDisk(
+                snapshot.single, loadedStoredBytes, &error) &&
+            loadedStoredBytes == expectedStoredBytes,
+            "paged CPU snapshot disk load changed stored bytes: " + error);
+        Expect(
+            fastllm::SpillPagedCacheCpuSnapshotPartToDisk(
+                corruptedDisk.single,
+                (diskDirectory.Path() / "corrupted.bin").string(),
+                &error),
+            "paged CPU snapshot corruption fixture spill failed: " + error);
+        {
+            std::fstream stream(
+                corruptedDisk.single.diskFile->path,
+                std::ios::in | std::ios::out | std::ios::binary);
+            const std::streamoff offset =
+                (std::streamoff)(corruptedDisk.single.diskFile->bytes / 2);
+            char value = 0;
+            stream.seekg(offset);
+            stream.read(&value, 1);
+            value ^= 1;
+            stream.seekp(offset);
+            stream.write(&value, 1);
+            stream.flush();
+            Expect(stream.good(),
+                   "paged CPU snapshot disk corruption fixture failed.");
+        }
+
+        const int freeBeforeRelease = manager->FreePageCount();
+        fastllm::ReleasePagedCacheStorage(cache);
+        Expect(!cache.isPagedKVCache && cache.pageIndex.empty() &&
+                   manager->FreePageCount() == freeBeforeRelease + logicalPages,
+               "paged CPU snapshot release did not return physical pages.");
+        FastllmCudaMemset0(manager->cudaData, manager->GetBytes());
+        if (zstdCompressed) {
+            fastllm::Data corruptDestination;
+            const int freeBeforeCorruptRestore =
+                manager->FreePageCount();
+            Expect(
+                !fastllm::RestorePagedCacheFromCpu(
+                    corruptedZstd, corruptDestination, &error) &&
+                manager->FreePageCount() ==
+                    freeBeforeCorruptRestore &&
+                corruptDestination.dims.empty(),
+                "corrupted zstd paged snapshot was restored.");
+        }
+        {
+            fastllm::Data corruptDestination;
+            const int freeBeforeCorruptRestore =
+                manager->FreePageCount();
+            Expect(
+                !fastllm::RestorePagedCacheFromCpu(
+                    corruptedDisk, corruptDestination, &error) &&
+                manager->FreePageCount() ==
+                    freeBeforeCorruptRestore &&
+                corruptDestination.dims.empty(),
+                "corrupted disk paged snapshot was restored.");
+        }
+
+        Expect(fastllm::RestorePagedCacheFromCpu(snapshot, cache, &error),
+               "paged CPU snapshot restore failed: " + error);
+        Expect(cache.isPagedKVCache && cache.pagedKVCacheData == manager &&
+                   (int)cache.pageIndex.size() == logicalPages &&
+                   cache.lastPageLen == pageLen - 1 &&
+                   cache.dims == std::vector<int>({heads, logicalPages * pageLen - 1, headDim}),
+               "paged CPU snapshot restore metadata is incorrect.");
+
+        fastllm::PagedCacheCpuSnapshot roundTrip;
+        Expect(fastllm::SnapshotPagedCacheToCpu(cache, roundTrip, &error),
+               "restored paged CPU snapshot could not be read: " + error);
+        Expect(roundTrip.single.bytes == expectedSnapshotBytes,
+               "paged CPU snapshot changed physical packed bytes.");
+        fastllm::ReleasePagedCacheStorage(cache);
+        if (fastllm::PagedCacheCpuSnapshotZstdAvailable()) {
+            const auto zstdMetricsAfter =
+                fastllm::GetPagedCacheCpuSnapshotZstdMetrics();
+            Expect(
+                zstdMetricsAfter.compressCalls >=
+                    zstdMetricsBefore.compressCalls + 2 &&
+                zstdMetricsAfter.compressInputBytes >=
+                    zstdMetricsBefore.compressInputBytes +
+                        2 * expectedSnapshotBytes.size() &&
+                zstdMetricsAfter.compressOutputBytes >
+                    zstdMetricsBefore.compressOutputBytes &&
+                zstdMetricsAfter.compressNanoseconds >
+                    zstdMetricsBefore.compressNanoseconds,
+                "paged CPU snapshot zstd compression metrics were not recorded.");
+            Expect(
+                zstdMetricsAfter.decompressCalls >=
+                    zstdMetricsBefore.decompressCalls + 2 &&
+                zstdMetricsAfter.decompressInputBytes >
+                    zstdMetricsBefore.decompressInputBytes &&
+                zstdMetricsAfter.decompressOutputBytes >=
+                    zstdMetricsBefore.decompressOutputBytes +
+                        expectedSnapshotBytes.size() &&
+                zstdMetricsAfter.decompressNanoseconds >
+                    zstdMetricsBefore.decompressNanoseconds,
+                "paged CPU snapshot zstd decompression metrics were not recorded.");
+        }
+        std::cout << "paged cache CPU snapshot regression: PASS\n";
+    }
+
+    void RunCudaResponseContextCpuSwapRegression() {
+        FastllmCudaSetDevice(0);
+        CpuRequestSwapTestModel model;
+        fastllm::ResponseContext context;
+        context.Init(&model);
+        context.allTokens = {7, 11, 13, 17, 19};
+        context.currentTokens = {19};
+        context.curTokens = 3;
+
+        auto makeManager = [](
+                int id,
+                fastllm::PagedCacheManager::PagedCacheManagerType type,
+                int width,
+                int pageLen,
+                int maxPages) {
+            fastllm::Data descriptor(fastllm::DataType::FLOAT16);
+            descriptor.dims = {1, 1, width};
+            descriptor.strides = {
+                (uint64_t)width, (uint64_t)width, 1};
+            descriptor.dataDevice = fastllm::DataDevice::CUDA;
+            descriptor.dataDeviceIds = {0};
+            descriptor.UpdateUnitSize();
+            return fastllm::AllocatePagedCacheManager(
+                id, type, descriptor, pageLen, maxPages);
+        };
+        fastllm::PagedCacheManager *attentionKey = makeManager(
+            62060,
+            fastllm::PagedCacheManager::
+                PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            8, 2, 4);
+        fastllm::PagedCacheManager *attentionValue = makeManager(
+            62061,
+            fastllm::PagedCacheManager::
+                PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            8, 2, 4);
+        fastllm::PagedCacheManager *linearConv = makeManager(
+            62062,
+            fastllm::PagedCacheManager::
+                PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+            8, 1, 3);
+        fastllm::PagedCacheManager *linearState = makeManager(
+            62063,
+            fastllm::PagedCacheManager::
+                PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+            16, 1, 3);
+        std::vector<fastllm::PagedCacheManager*> managers = {
+            attentionKey, attentionValue, linearConv, linearState};
+        for (size_t managerIndex = 0;
+             managerIndex < managers.size(); managerIndex++) {
+            std::vector<uint8_t> bytes(
+                (size_t)managers[managerIndex]->GetBytes());
+            for (size_t byteIndex = 0;
+                 byteIndex < bytes.size(); byteIndex++) {
+                bytes[byteIndex] = (uint8_t)(
+                    (byteIndex * 31 + managerIndex * 47 + 3) & 0xff);
+            }
+            FastllmCudaCopyFromHostToDevice(
+                managers[managerIndex]->cudaData,
+                bytes.data(), bytes.size());
+        }
+
+        auto attach = [](
+                fastllm::Data &cache,
+                fastllm::PagedCacheManager *manager,
+                const std::vector<int> &dims,
+                int logicalPages,
+                bool linear) {
+            cache.dataDevice = fastllm::DataDevice::CUDA;
+            cache.dataDeviceIds = {0};
+            cache.Resize(dims);
+            cache.SetKVCache();
+            cache.isLinearAttention = linear;
+            cache.dataType = manager->dataType;
+            cache.UpdateUnitSize();
+            cache.isPagedKVCache = true;
+            cache.pageLen = manager->pageLen;
+            cache.lastPageLen = linear ?
+                1 : dims[dims.size() - 2] % manager->pageLen;
+            if (cache.lastPageLen == 0) {
+                cache.lastPageLen = manager->pageLen;
+            }
+            cache.pagedKVCacheData = manager;
+            for (int i = 0; i < logicalPages; i++) {
+                cache.pageIndex.push_back(
+                    manager->GetUnusedPageIndex(true));
+            }
+            if (linear) {
+                const size_t pageBytes =
+                    (size_t)manager->GetBytes() /
+                    (size_t)manager->maxPages;
+                cache.cudaData =
+                    (uint8_t*)manager->cudaData +
+                    (size_t)cache.pageIndex[0] * pageBytes;
+                cache.cudaDataBorrowed = true;
+            }
+        };
+        attach(
+            context.pastKeyValues[0].first,
+            attentionKey, {1, 3, 8}, 2, false);
+        attach(
+            context.pastKeyValues[0].second,
+            attentionValue, {1, 3, 8}, 2, false);
+        attach(
+            context.pastKeyValues[1].first,
+            linearConv, {1, 1, 8}, 1, true);
+        attach(
+            context.pastKeyValues[1].second,
+            linearState, {1, 1, 16}, 1, true);
+
+        std::vector<fastllm::PagedCacheCpuSnapshot> expected(4);
+        std::vector<int> freeBeforeSuspend;
+        std::string error;
+        for (int i = 0; i < 4; i++) {
+            fastllm::Data &cache =
+                i == 0 ? context.pastKeyValues[0].first :
+                i == 1 ? context.pastKeyValues[0].second :
+                i == 2 ? context.pastKeyValues[1].first :
+                         context.pastKeyValues[1].second;
+            Expect(fastllm::SnapshotPagedCacheToCpu(
+                       cache, expected[i], &error),
+                   "request swap fixture snapshot failed: " + error);
+            freeBeforeSuspend.push_back(
+                managers[i]->FreePageCount());
+        }
+
+        Expect(model.SuspendResponseContextToCpu(
+                   &context, &error),
+               "request CPU suspend failed: " + error);
+        Expect(model.IsResponseContextSuspended(&context) &&
+                   model.GetSuspendedResponseContextCount() == 1 &&
+                   model.GetOldestSuspendedResponseContext() == &context,
+               "request CPU suspend was not registered.");
+        for (int i = 0; i < 4; i++) {
+            fastllm::Data &cache =
+                i == 0 ? context.pastKeyValues[0].first :
+                i == 1 ? context.pastKeyValues[0].second :
+                i == 2 ? context.pastKeyValues[1].first :
+                         context.pastKeyValues[1].second;
+            Expect(!cache.isPagedKVCache &&
+                       cache.pageIndex.empty() &&
+                       cache.cudaData == nullptr,
+                   "request CPU suspend retained device cache storage.");
+            Expect(managers[i]->FreePageCount() >
+                       freeBeforeSuspend[i],
+                   "request CPU suspend did not release cache pages.");
+        }
+
+        ScopedTempDirectory requestDiskDirectory(
+            "fastllm-response-swap-l3-");
+        size_t requestDiskBytes = 0;
+        std::vector<std::string> requestDiskPaths;
+        {
+            fastllm::ResponseContextCpuSnapshot *requestSnapshot =
+                model.responseContextCpuSnapshots[&context].get();
+            Expect(requestSnapshot != nullptr,
+                   "request CPU snapshot disappeared before disk spill.");
+            for (size_t layer = 0;
+                 layer < requestSnapshot->caches.size(); layer++) {
+                auto spill = [&](fastllm::CacheCpuSnapshot &cache,
+                                 char side) {
+                    if (!cache.valid || !cache.paged) {
+                        return;
+                    }
+                    const std::filesystem::path path =
+                        requestDiskDirectory.Path() /
+                        (std::to_string(layer) + "-" + side + ".bin");
+                    Expect(
+                        fastllm::SpillPagedCacheCpuSnapshotPartToDisk(
+                            cache.pagedData.single,
+                            path.string(), &error),
+                        "request CPU snapshot disk spill failed: " + error);
+                    requestDiskBytes +=
+                        cache.pagedData.single.diskFile->bytes;
+                    requestDiskPaths.push_back(
+                        cache.pagedData.single.diskFile->path);
+                };
+                spill(requestSnapshot->caches[layer].first, 'k');
+                spill(requestSnapshot->caches[layer].second, 'v');
+            }
+            requestSnapshot->hostBytes = 0;
+        }
+        Expect(requestDiskBytes > 0,
+               "request CPU snapshot disk fixture wrote no bytes.");
+
+        FastllmCudaMemset0(
+            attentionKey->cudaData, attentionKey->GetBytes());
+        FastllmCudaMemset0(
+            attentionValue->cudaData, attentionValue->GetBytes());
+        FastllmCudaMemset0(
+            linearConv->cudaData, linearConv->GetBytes());
+        FastllmCudaMemset0(
+            linearState->cudaData, linearState->GetBytes());
+        Expect(model.RestoreResponseContextFromCpu(
+                   &context, &error),
+               "request CPU restore failed: " + error);
+        Expect(!model.IsResponseContextSuspended(&context) &&
+                   model.GetSuspendedResponseContextCount() == 0,
+               "request CPU restore retained the snapshot.");
+        Expect(
+            model.restoreObservedOwnedSnapshot,
+            "request CPU restore did not retain snapshot ownership "
+            "outside the snapshot map.");
+        Expect(
+            model.GetCpuRequestSwapDiskRestoreCount() == 1 &&
+            model.GetCpuRequestSwapDiskReadBytes() == requestDiskBytes,
+            "request CPU disk restore metrics were not updated.");
+        for (const std::string &path : requestDiskPaths) {
+            Expect(
+                !std::filesystem::exists(path),
+                "restored request retained an L3 snapshot file.");
+        }
+
+        for (int i = 0; i < 4; i++) {
+            fastllm::Data &cache =
+                i == 0 ? context.pastKeyValues[0].first :
+                i == 1 ? context.pastKeyValues[0].second :
+                i == 2 ? context.pastKeyValues[1].first :
+                         context.pastKeyValues[1].second;
+            fastllm::PagedCacheCpuSnapshot actual;
+            Expect(fastllm::SnapshotPagedCacheToCpu(
+                       cache, actual, &error),
+                   "restored request cache could not be read: " + error);
+            Expect(actual.single.bytes ==
+                       expected[i].single.bytes,
+                   "request CPU swap changed cache bytes.");
+            if (i >= 2) {
+                Expect(cache.isLinearAttention &&
+                           cache.cudaData != nullptr &&
+                           cache.cudaDataBorrowed,
+                       "linear-state restore did not rebuild its slot view.");
+            }
+            fastllm::ReleasePagedCacheStorage(cache);
+        }
+
+        fastllm::ResponseContext tensorContext;
+        tensorContext.Init(&model);
+        tensorContext.allTokens = {23, 29, 31};
+        tensorContext.currentTokens = {31};
+        tensorContext.curTokens = 2;
+        const std::vector<float> tensorValues = {
+            1.25f, -2.5f, 3.75f, -4.0f
+        };
+        fastllm::Data tensorSource(
+            fastllm::DataType::FLOAT32, {1, 4}, tensorValues);
+        fastllm::Data &tensorCache =
+            tensorContext.pastKeyValues[0].first;
+        tensorCache.CopyFrom(tensorSource);
+        tensorCache.ToDevice(fastllm::DataDevice::CUDA);
+        Expect(model.SuspendResponseContextToCpu(
+                   &tensorContext, &error),
+               "tensor-cache CPU suspend failed: " + error);
+        Expect(tensorCache.dims.empty() &&
+                   tensorCache.cudaData == nullptr,
+               "tensor-cache CPU suspend retained device storage.");
+        Expect(model.RestoreResponseContextFromCpu(
+                   &tensorContext, &error),
+               "tensor-cache CPU restore failed: " + error);
+        ExpectFloatNear(
+            tensorValues, ToFloatVector(tensorCache),
+            0.0f, 0.0f,
+            "tensor-cache CPU swap");
+
+        {
+            ScopedEnvVar disabled(
+                "FASTLLM_CPU_REQUEST_SWAP", "0");
+            Expect(!model.IsCpuRequestSwapEnabled(),
+                   "generic CPU request swap ignored disabled gate.");
+        }
+        {
+            ScopedEnvVar enabled(
+                "FASTLLM_CPU_REQUEST_SWAP", "1");
+            ScopedEnvVar quantum(
+                "FASTLLM_CPU_REQUEST_SWAP_QUANTUM_TOKENS", "257");
+            Expect(model.IsCpuRequestSwapEnabled() &&
+                       model.GetCpuRequestSwapQuantumTokens() == 257,
+                   "generic CPU request swap gate was not parsed.");
+        }
+        std::cout << "response context CPU swap regression: PASS\n";
+    }
+#endif
 
 
     void RunMoeAtypeConfigRegression() {
@@ -2327,7 +3518,7 @@ namespace {
         fastllm::ClearAllPagedCacheManagers();
         {
             constexpr int attentionBatch = 2;
-            constexpr int group = 1;
+            constexpr int group = 6;
             const float attentionScale = 1.0f / std::sqrt((float)headDim);
             std::vector<float> valueValues = MakeRegressionValues(
                 numHeads * seqLen * headDim, 3.117f, 0.55f);
@@ -2414,6 +3605,12 @@ namespace {
             fastllm::Data packedOutput = MakeCudaTensor(
                 DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
                 std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            fastllm::Data packedFusedStateOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
+            fastllm::Data packedBatchedGqaOutput = MakeCudaTensor(
+                DataType::FLOAT16, {numHeads * group, attentionBatch, headDim},
+                std::vector<float>(numHeads * group * attentionBatch * headDim, 0.0f));
             {
                 ScopedEnvVar disableSm70("FASTLLM_CUDA_SM70_PAGED_XQA", "0");
                 ScopedEnvVar disableNativeGqa("FASTLLM_PAGED_GQA_DECODE", "0");
@@ -2422,12 +3619,44 @@ namespace {
                            qSizes, pageSizes, pageIndexs, lastPageLens,
                            referenceOutput, group, attentionScale),
                        "FP16 paged attention reference failed.");
+                ScopedEnvVar legacyStateCommit(
+                    "FASTLLM_CUDA_PAGED_CUBLAS_FUSED_STATE_COMMIT", "0");
+                ScopedEnvVar serialGqa(
+                    "FASTLLM_CUDA_PAGED_CUBLAS_BATCH_GQA", "0");
                 Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
                            query, packedK, packedV,
                            qSizes, pageSizes, pageIndexs, lastPageLens,
                            packedOutput, group, attentionScale),
                        "packed paged attention failed.");
             }
+            {
+                ScopedEnvVar fusedStateCommit(
+                    "FASTLLM_CUDA_PAGED_CUBLAS_FUSED_STATE_COMMIT", "1");
+                Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                           query, packedK, packedV,
+                           qSizes, pageSizes, pageIndexs, lastPageLens,
+                           packedFusedStateOutput, group, attentionScale),
+                       "packed paged attention fused state commit failed.");
+            }
+            ExpectFloatNear(ToFloatVector(packedOutput),
+                            ToFloatVector(packedFusedStateOutput),
+                            0.0f, 0.0f,
+                            "packed paged attention fused state commit");
+            {
+                ScopedEnvVar batchedGqa(
+                    "FASTLLM_CUDA_PAGED_CUBLAS_BATCH_GQA", "1");
+                ScopedEnvVar fusedStateCommit(
+                    "FASTLLM_CUDA_PAGED_CUBLAS_FUSED_STATE_COMMIT", "0");
+                Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                           query, packedK, packedV,
+                           qSizes, pageSizes, pageIndexs, lastPageLens,
+                           packedBatchedGqaOutput, group, attentionScale),
+                       "packed paged attention batched GQA failed.");
+            }
+            ExpectFloatNear(ToFloatVector(packedOutput),
+                            ToFloatVector(packedBatchedGqaOutput),
+                            2e-3f, 2e-3f,
+                            "packed paged attention batched GQA");
             ExpectPackedKvQuality(ToFloatVector(referenceOutput),
                                   ToFloatVector(packedOutput),
                                   DataType::TURBO3_KV,
@@ -2492,6 +3721,401 @@ namespace {
                "greedy sampling kernels disagree on tied maximum logits");
         ExpectFloatNear({7.0f, 4.0f}, scores, 0.0f, 0.0f,
                         "greedy sampling tied maximum scores");
+    }
+
+    void RunCudaSm70GdnPrepareAttnRegression() {
+        FastllmCudaSetDevice(0);
+        int arch = FastllmCudaRuntimeArch();
+        if (arch != 70) {
+            std::cout << "SM70 GDN prepare-attn regression: SKIP\n";
+            return;
+        }
+
+        constexpr int heads = 48;
+        constexpr int chunks = 32;
+        constexpr int dim = 64;
+        const std::vector<int> dims = {1, heads, chunks, dim, dim};
+        const int elements = heads * chunks * dim * dim;
+        fastllm::Data at = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, dims,
+            MakeRegressionValues(elements, 0.19f, 0.002f));
+        fastllm::Data decayMask = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, dims,
+            MakeRegressionValues(elements, 0.71f, 0.001f));
+        fastllm::Data reference, fused;
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar disabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "0");
+            fastllm::GatedDeltaRulePrepareAttn(at, decayMask, reference);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar enabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "1");
+            fastllm::GatedDeltaRulePrepareAttn(at, decayMask, fused);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(fused),
+                        0.0f, 0.0f,
+                        "SM70 GDN prepare-attn output");
+
+        const std::vector<int> gDims = {1, heads, chunks, dim};
+        const int gElements = heads * chunks * dim;
+        const std::vector<float> gValues =
+            MakeRegressionValues(gElements, 0.047f, 0.0002f);
+        fastllm::Data referenceG = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims, gValues);
+        fastllm::Data fusedG = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims, gValues);
+        fastllm::Data referenceBuiltDecay, fusedBuiltDecay;
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar disabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "0");
+            fastllm::GatedDeltaRuleBuildDecay(
+                referenceG, referenceBuiltDecay);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar enabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "1");
+            fastllm::GatedDeltaRuleBuildDecay(fusedG, fusedBuiltDecay);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        ExpectFloatNear(ToFloatVector(referenceG), ToFloatVector(fusedG),
+                        0.0f, 0.0f,
+                        "SM70 GDN cumulative decay");
+        ExpectFloatNear(ToFloatVector(referenceBuiltDecay),
+                        ToFloatVector(fusedBuiltDecay),
+                        0.0f, 0.0f,
+                        "SM70 GDN decay mask");
+
+        const std::vector<float> applyValues =
+            MakeRegressionValues(elements, 1.17f, 0.0015f);
+        fastllm::Data referenceApply = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, dims, applyValues);
+        fastllm::Data fusedApply = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, dims, applyValues);
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar disabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "0");
+            fastllm::GatedDeltaRuleApplyDecayMask(
+                referenceApply, referenceBuiltDecay, 1);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar enabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "1");
+            fastllm::GatedDeltaRuleApplyDecayMask(
+                fusedApply, fusedBuiltDecay, 1);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        ExpectFloatNear(ToFloatVector(referenceApply),
+                        ToFloatVector(fusedApply),
+                        0.0f, 0.0f,
+                        "SM70 GDN apply decay mask");
+
+        const std::vector<int> fallbackDims = {2, 3, 32, 32};
+        const int fallbackElements = 2 * 3 * 32 * 32;
+        fastllm::Data fallbackAt = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, fallbackDims,
+            MakeRegressionValues(fallbackElements, 0.37f, 0.003f));
+        fastllm::Data fallbackDecay = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, fallbackDims,
+            MakeRegressionValues(fallbackElements, 0.83f, 0.002f));
+        fastllm::Data fallbackReference, fallbackActual;
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar disabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "0");
+            fastllm::GatedDeltaRulePrepareAttn(
+                fallbackAt, fallbackDecay, fallbackReference);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar enabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "1");
+            fastllm::GatedDeltaRulePrepareAttn(
+                fallbackAt, fallbackDecay, fallbackActual);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        ExpectFloatNear(ToFloatVector(fallbackReference),
+                        ToFloatVector(fallbackActual),
+                        0.0f, 0.0f,
+                        "GDN prepare-attn unsupported-shape fallback");
+        fastllm::Data fallbackApplyReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, fallbackDims,
+            MakeRegressionValues(fallbackElements, 1.43f, 0.002f));
+        fastllm::Data fallbackApplyActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, fallbackDims,
+            MakeRegressionValues(fallbackElements, 1.43f, 0.002f));
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar disabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "0");
+            fastllm::GatedDeltaRuleApplyDecayMask(
+                fallbackApplyReference, fallbackDecay, 1);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar enabled(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", "1");
+            fastllm::GatedDeltaRuleApplyDecayMask(
+                fallbackApplyActual, fallbackDecay, 1);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        ExpectFloatNear(ToFloatVector(fallbackApplyReference),
+                        ToFloatVector(fallbackApplyActual),
+                        0.0f, 0.0f,
+                        "GDN apply-mask unsupported-shape fallback");
+
+        auto benchmark = [&](const char *gate, fastllm::Data &output) {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar scopedGate(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", gate);
+            fastllm::GatedDeltaRulePrepareAttn(at, decayMask, output);
+            FastllmCudaSyncCurrentThreadStream();
+            constexpr int iterations = 10;
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                fastllm::GatedDeltaRulePrepareAttn(at, decayMask, output);
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(end - begin).count() /
+                   iterations;
+        };
+        double baselineMs = benchmark("0", reference);
+        double fusedMs = benchmark("1", fused);
+        double baselineRepeatMs = benchmark("0", reference);
+        double fusedRepeatMs = benchmark("1", fused);
+        std::cout << "SM70 GDN prepare-attn h48_c32_d64: baseline="
+                  << baselineMs << "/" << baselineRepeatMs
+                  << " ms fused=" << fusedMs << "/" << fusedRepeatMs
+                  << " ms speedup="
+                  << ((baselineMs + baselineRepeatMs) /
+                      (fusedMs + fusedRepeatMs))
+                  << "x\n";
+        fastllm::Data benchmarkG = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims,
+            std::vector<float>(gElements, 0.0f));
+        fastllm::Data benchmarkDecay, benchmarkPrepared;
+        fastllm::Data benchmarkPost = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, dims, applyValues);
+        auto benchmarkPrecore = [&](const char *gate) {
+            ScopedFirstDevice device("cuda:0");
+            ScopedEnvVar scopedGate(
+                "FASTLLM_CUDA_SM70_GDN_PRECORE", gate);
+            auto run = [&]() {
+                fastllm::GatedDeltaRuleBuildDecay(
+                    benchmarkG, benchmarkDecay);
+                fastllm::GatedDeltaRulePrepareAttn(
+                    at, benchmarkDecay, benchmarkPrepared);
+                fastllm::GatedDeltaRuleApplyDecayMask(
+                    benchmarkPost, benchmarkDecay, 1);
+            };
+            run();
+            FastllmCudaSyncCurrentThreadStream();
+            constexpr int iterations = 10;
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                run();
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(end - begin).count() /
+                   iterations;
+        };
+        double precoreBaselineMs = benchmarkPrecore("0");
+        double precoreFusedMs = benchmarkPrecore("1");
+        double precoreBaselineRepeatMs = benchmarkPrecore("0");
+        double precoreFusedRepeatMs = benchmarkPrecore("1");
+        std::cout << "SM70 GDN full pre-core h48_c32_d64: baseline="
+                  << precoreBaselineMs << "/" << precoreBaselineRepeatMs
+                  << " ms fused=" << precoreFusedMs << "/"
+                  << precoreFusedRepeatMs << " ms speedup="
+                  << ((precoreBaselineMs + precoreBaselineRepeatMs) /
+                      (precoreFusedMs + precoreFusedRepeatMs))
+                  << "x\n";
+        std::cout << "SM70 GDN pre-core regression: PASS\n";
+    }
+
+    void RunCudaSm70FusedChunkGdnPrefillRegression() {
+        FastllmCudaSetDevice(0);
+        int arch = FastllmCudaRuntimeArch();
+        if (arch != 70) {
+            std::cout << "SM70 fused chunk GDN prefill regression: SKIP\n";
+            return;
+        }
+
+        constexpr int batch = 1;
+        constexpr int heads = 48;
+        constexpr int chunks = 32;
+        constexpr int chunkSize = 64;
+        constexpr int kDim = 128;
+        constexpr int vDim = 128;
+        const std::vector<int> qDims = {batch, heads, chunks, chunkSize, kDim};
+        const std::vector<int> vDims = {batch, heads, chunks, chunkSize, vDim};
+        const std::vector<int> gDims = {batch, heads, chunks, chunkSize};
+        const std::vector<int> attnDims = {
+            batch, heads, chunks, chunkSize, chunkSize};
+        const std::vector<int> stateDims = {batch, heads, kDim, vDim};
+
+        std::vector<float> gValues = MakeRegressionValues(
+            batch * heads * chunks * chunkSize, 0.83f, 0.01f);
+        for (float &value : gValues) {
+            value -= 0.08f;
+        }
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * kDim, 0.11f, 0.01f));
+        fastllm::Data k = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * kDim, 0.37f, 0.01f));
+        fastllm::Data v = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, vDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * vDim, 0.59f, 0.01f));
+        fastllm::Data g = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims, gValues);
+        fastllm::Data attn = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, attnDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * chunkSize,
+                1.07f, 0.002f));
+        fastllm::Data kCumdecay = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims,
+            MakeRegressionValues(
+                batch * heads * chunks * chunkSize * kDim, 1.31f, 0.004f));
+        const std::vector<float> initialState = MakeRegressionValues(
+            batch * heads * kDim * vDim, 1.73f, 0.01f);
+        fastllm::Data gemmState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data fusedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data gemmOutput, fusedOutput;
+        fastllm::Data optimizedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data optimizedOutput;
+        fastllm::Data arenaState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data arenaOutput;
+
+        {
+            ScopedEnvVar disabled(
+                "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL", "0");
+            ScopedEnvVar legacyGather(
+                "FASTLLM_CUDA_CHUNK_GDN_ASYNC_GATHER", "0");
+            ScopedEnvVar legacyPreprocess(
+                "FASTLLM_CUDA_CHUNK_GDN_FUSED_PREPROCESS", "0");
+            ScopedEnvVar legacyScratch(
+                "FASTLLM_CUDA_CHUNK_GDN_PERSISTENT_SCRATCH", "0");
+            FastllmChunkGatedDeltaRulePrefill(
+                q, k, v, g, attn, kCumdecay, gemmState, gemmOutput);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedEnvVar enabled(
+                "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL", "1");
+            FastllmChunkGatedDeltaRulePrefill(
+                q, k, v, g, attn, kCumdecay, fusedState, fusedOutput);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedEnvVar fusedDisabled(
+                "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL", "0");
+            ScopedEnvVar asyncGather(
+                "FASTLLM_CUDA_CHUNK_GDN_ASYNC_GATHER", "1");
+            ScopedEnvVar fusedPreprocess(
+                "FASTLLM_CUDA_CHUNK_GDN_FUSED_PREPROCESS", "1");
+            FastllmChunkGatedDeltaRulePrefill(
+                q, k, v, g, attn, kCumdecay, optimizedState, optimizedOutput);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedEnvVar fusedDisabled(
+                "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL", "0");
+            ScopedEnvVar legacyGather(
+                "FASTLLM_CUDA_CHUNK_GDN_ASYNC_GATHER", "0");
+            ScopedEnvVar legacyPreprocess(
+                "FASTLLM_CUDA_CHUNK_GDN_FUSED_PREPROCESS", "0");
+            ScopedEnvVar persistentScratch(
+                "FASTLLM_CUDA_CHUNK_GDN_PERSISTENT_SCRATCH", "1");
+            FastllmChunkGatedDeltaRulePrefill(
+                q, k, v, g, attn, kCumdecay, arenaState, arenaOutput);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+
+        ExpectFloatNear(ToFloatVector(gemmState), ToFloatVector(fusedState),
+                        2e-3f, 2e-3f,
+                        "SM70 fused chunk GDN recurrent state");
+        ExpectFloatNear(ToFloatVector(gemmOutput), ToFloatVector(fusedOutput),
+                        2e-3f, 2e-3f,
+                        "SM70 fused chunk GDN output");
+        ExpectFloatNear(ToFloatVector(gemmState), ToFloatVector(optimizedState),
+                        0.0f, 0.0f,
+                        "optimized chunk GDN recurrent state");
+        ExpectFloatNear(ToFloatVector(gemmOutput), ToFloatVector(optimizedOutput),
+                        0.0f, 0.0f,
+                        "optimized chunk GDN output");
+        ExpectFloatNear(ToFloatVector(gemmState), ToFloatVector(arenaState),
+                        0.0f, 0.0f,
+                        "persistent scratch chunk GDN recurrent state");
+        ExpectFloatNear(ToFloatVector(gemmOutput), ToFloatVector(arenaOutput),
+                        0.0f, 0.0f,
+                        "persistent scratch chunk GDN output");
+        auto benchmark = [&](const char *fused, const char *asyncGather,
+                             const char *fusedPreprocess,
+                             const char *persistentScratch,
+                             fastllm::Data &state,
+                             fastllm::Data &output) {
+            ScopedEnvVar fusedGate(
+                "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL", fused);
+            ScopedEnvVar gatherGate(
+                "FASTLLM_CUDA_CHUNK_GDN_ASYNC_GATHER", asyncGather);
+            ScopedEnvVar preprocessGate(
+                "FASTLLM_CUDA_CHUNK_GDN_FUSED_PREPROCESS", fusedPreprocess);
+            ScopedEnvVar scratchGate(
+                "FASTLLM_CUDA_CHUNK_GDN_PERSISTENT_SCRATCH", persistentScratch);
+            FastllmChunkGatedDeltaRulePrefill(
+                q, k, v, g, attn, kCumdecay, state, output);
+            FastllmCudaSyncCurrentThreadStream();
+            constexpr int iterations = 5;
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                FastllmChunkGatedDeltaRulePrefill(
+                    q, k, v, g, attn, kCumdecay, state, output);
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(end - begin).count() /
+                   iterations;
+        };
+        double gemmMs = benchmark("0", "0", "0", "0", gemmState, gemmOutput);
+        double arenaMs = benchmark("0", "0", "0", "1", arenaState, arenaOutput);
+        double asyncGatherMs = benchmark("0", "1", "0", "0", optimizedState,
+                                         optimizedOutput);
+        double fusedPreprocessMs = benchmark("0", "0", "1", "0", optimizedState,
+                                             optimizedOutput);
+        double combinedMs = benchmark("0", "1", "1", "0", optimizedState,
+                                      optimizedOutput);
+        double fusedMs = benchmark("1", "0", "0", "0", fusedState, fusedOutput);
+        std::cout << "SM70 chunk GDN prefill 2K microbenchmark: baseline="
+                  << gemmMs << " ms persistent_scratch=" << arenaMs
+                  << " ms async_gather=" << asyncGatherMs
+                  << " ms fused_preprocess=" << fusedPreprocessMs
+                  << " ms combined=" << combinedMs << " ms fused_h_o="
+                  << fusedMs << " ms\n";
+        std::cout << "SM70 fused chunk GDN prefill regression: PASS\n";
     }
 
     void RunCudaTritonChunkGdnPrefillRegression() {
@@ -4619,6 +6243,115 @@ namespace {
                    longPageSizes, longPageIndexs, longLastPage,
                    longReference, longActual);
         }
+    }
+
+    void RunCudaTurbo3PagedPrefillBenchmark() {
+        using fastllm::DataType;
+        constexpr int numKvHeads = 4;
+        constexpr int group = 6;
+        constexpr int numQHeads = numKvHeads * group;
+        constexpr int headDim = 256;
+        constexpr int pageLen = 128;
+        constexpr int queryTokens = 2048;
+        constexpr int kvTokens = 32768;
+        constexpr int pages = kvTokens / pageLen;
+        constexpr int warmup = 2;
+        constexpr int iterations = 5;
+        const float scale = 1.0f / std::sqrt((float)headDim);
+        FastllmCudaSetDevice(0);
+
+        fastllm::Data q = MakeCudaTensor(
+            DataType::FLOAT16, {numQHeads, queryTokens, headDim},
+            MakeRegressionValues(
+                numQHeads * queryTokens * headDim, 0.47f, 0.01f));
+        auto allocateManager = [&](int id, DataType type) {
+            fastllm::Data desc(type);
+            desc.dims = {numKvHeads, 1, headDim};
+            desc.strides = {(uint64_t)headDim, (uint64_t)headDim, 1};
+            desc.dataDevice = fastllm::DataDevice::CUDA;
+            desc.dataDeviceIds = {0};
+            desc.UpdateUnitSize();
+            fastllm::PagedCacheManager *manager = fastllm::AllocatePagedCacheManager(
+                id, fastllm::PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                desc, pageLen, pages);
+            FastllmCudaMemset0(manager->cudaData, manager->GetBytes());
+            return manager;
+        };
+        fastllm::PagedCacheManager *pagedK =
+            allocateManager(61010, DataType::Q8_0_KV);
+        fastllm::PagedCacheManager *pagedV =
+            allocateManager(61011, DataType::TURBO3_KV);
+
+        auto makeCache = [&](DataType type, fastllm::PagedCacheManager *manager) {
+            fastllm::Data cache(type);
+            cache.Resize({numKvHeads, kvTokens, headDim});
+            cache.SetKVCache();
+            cache.isPagedKVCache = true;
+            cache.pageLen = pageLen;
+            cache.lastPageLen = pageLen;
+            cache.pageIndex.resize(pages);
+            std::iota(cache.pageIndex.begin(), cache.pageIndex.end(), 0);
+            cache.pagedKVCacheData = manager;
+            return cache;
+        };
+        fastllm::Data k = makeCache(DataType::Q8_0_KV, pagedK);
+        fastllm::Data v = makeCache(DataType::TURBO3_KV, pagedV);
+        fastllm::Data qSizes = MakeIntTensor({2}, {0, queryTokens});
+        fastllm::Data pageSizes = MakeIntTensor({2}, {0, pages});
+        std::vector<int32_t> physicalPages(pages);
+        std::iota(physicalPages.begin(), physicalPages.end(), 0);
+        fastllm::Data pageIndexs = MakeIntTensor({pages}, physicalPages);
+        fastllm::Data lastPageLens = MakeIntTensor({1}, {pageLen});
+        qSizes.ToDevice(fastllm::DataDevice::CUDA);
+        pageSizes.ToDevice(fastllm::DataDevice::CUDA);
+        pageIndexs.ToDevice(fastllm::DataDevice::CUDA);
+        lastPageLens.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data output = MakeCudaTensor(
+            DataType::FLOAT16, {numQHeads, queryTokens, headDim},
+            std::vector<float>(numQHeads * queryTokens * headDim, 0.0f));
+
+        auto measure = [&](const char *batchGqa, const char *fusedStateCommit) {
+            ScopedEnvVar batchGate(
+                "FASTLLM_CUDA_PAGED_CUBLAS_BATCH_GQA", batchGqa);
+            ScopedEnvVar gate(
+                "FASTLLM_CUDA_PAGED_CUBLAS_FUSED_STATE_COMMIT",
+                fusedStateCommit);
+            for (int i = 0; i < warmup; i++) {
+                Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                           q, k, v, qSizes, pageSizes, pageIndexs,
+                           lastPageLens, output, group, scale),
+                       "Turbo3 paged prefill benchmark warmup failed.");
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                Expect(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                           q, k, v, qSizes, pageSizes, pageIndexs,
+                           lastPageLens, output, group, scale),
+                       "Turbo3 paged prefill benchmark failed.");
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(end - begin).count() /
+                   iterations;
+        };
+        double baselineMs = measure("0", "0");
+        double fusedMs = measure("0", "1");
+        double batchedGqaMs = measure("1", "0");
+        std::vector<float> outputValues = ToFloatVector(output);
+        Expect(std::all_of(outputValues.begin(), outputValues.end(),
+                           [](float value) { return value == 0.0f; }),
+               "zero packed KV benchmark produced non-zero output.");
+        std::cout << "Turbo3 paged prefill b1_q2048_kv32768: baseline="
+                  << baselineMs << " ms fused_state_commit=" << fusedMs
+                  << " ms batched_gqa=" << batchedGqaMs
+                  << " ms batched_gqa_speedup=" << baselineMs / batchedGqaMs
+                  << "x" << std::endl;
+        k.pageIndex.clear();
+        v.pageIndex.clear();
+        k.pagedKVCacheData = nullptr;
+        v.pagedKVCacheData = nullptr;
+        fastllm::ClearAllPagedCacheManagers();
     }
 
     void RunCudaSm70PagedGqa6DecodeBenchmark() {
@@ -6950,6 +8683,342 @@ namespace {
             }
         }
     }
+
+    void RunCudaGgufIq4XsPrefillBenchmark() {
+        struct BenchShape {
+            const char *name;
+            int inputDim;
+            int outputDim;
+        };
+        const std::vector<BenchShape> shapes = {
+            {"qwen35_mlp_gateup", 5120, 34816},
+            {"qwen35_mlp_down", 17408, 5120},
+        };
+        // Descending order lets FastLLM's CUDA allocator reuse the largest
+        // activation/output buffers for the smaller measurements.
+        const std::vector<int> batches = {8192, 4096, 2048};
+        constexpr int warmup = 2;
+        constexpr int iterations = 5;
+        constexpr int promptTokens = 32768;
+
+        std::cout
+            << "shape,n,m,k,avg_ms,tokens_per_second,projected_32k_ms\n";
+        for (const BenchShape &shape : shapes) {
+            const int blocksPerRow = shape.inputDim /
+                (int)ggml_blck_size(GGML_TYPE_IQ4_XS);
+            fastllm::Data weight(fastllm::DataType::DATA_GGUF_FORMAT,
+                                 (int)GGML_TYPE_IQ4_XS,
+                                 {shape.outputDim, shape.inputDim});
+            weight.isGGUFData = true;
+            weight.disableGGUFRepack = true;
+            weight.name = std::string("benchmark.prefill.") + shape.name;
+            weight.Allocate();
+            const size_t bytesPerRow =
+                ggml_row_size(GGML_TYPE_IQ4_XS, shape.inputDim);
+            for (int row = 0; row < shape.outputDim; row++) {
+                auto *blocks = reinterpret_cast<block_iq4_xs*>(
+                    weight.cpuData + (size_t)row * bytesPerRow);
+                for (int block = 0; block < blocksPerRow; block++) {
+                    std::memset(&blocks[block], 0, sizeof(block_iq4_xs));
+                    FillIq4XsBlock(
+                        blocks[block],
+                        (uint32_t)((row * 1000 + block) * 7 + 3));
+                }
+            }
+            weight.ToDevice(fastllm::DataDevice::CUDA,
+                            std::vector<int>{0}, true);
+
+            std::vector<std::pair<int, double>> measurements;
+            for (int batch : batches) {
+                fastllm::Data input(fastllm::DataType::FLOAT16);
+                input.Resize({batch, shape.inputDim});
+                input.ToDevice(fastllm::DataDevice::CUDA,
+                               std::vector<int>{0}, false);
+                input.Allocate(false);
+                FastllmCudaMemset0(input.cudaData, input.GetBytes());
+
+                fastllm::Data output;
+                fastllm::Data emptyBias;
+                ScopedFirstDevice guard("cuda");
+                for (int i = 0; i < warmup; i++) {
+                    fastllm::Linear(input, weight, emptyBias, output);
+                }
+                ForceDeviceSync();
+                const auto begin = std::chrono::steady_clock::now();
+                for (int i = 0; i < iterations; i++) {
+                    fastllm::Linear(input, weight, emptyBias, output);
+                }
+                ForceDeviceSync();
+                const auto end = std::chrono::steady_clock::now();
+                const double elapsedMs =
+                    std::chrono::duration<double, std::milli>(
+                        end - begin).count();
+                const double avgMs = elapsedMs / iterations;
+                const double tokensPerSecond = 1000.0 * batch / avgMs;
+                const double projected32kMs =
+                    avgMs * ((promptTokens + batch - 1) / batch);
+                measurements.emplace_back(batch, avgMs);
+                std::cout << shape.name << ',' << batch << ','
+                          << shape.inputDim << ',' << shape.outputDim << ','
+                          << avgMs << ',' << tokensPerSecond << ','
+                          << projected32kMs << '\n';
+            }
+
+            double sumX = 0.0, sumY = 0.0, sumXX = 0.0, sumXY = 0.0;
+            for (const auto &measurement : measurements) {
+                const double x = measurement.first;
+                const double y = measurement.second;
+                sumX += x;
+                sumY += y;
+                sumXX += x * x;
+                sumXY += x * y;
+            }
+            const double count = (double)measurements.size();
+            const double denominator = count * sumXX - sumX * sumX;
+            const double slopeMsPerToken =
+                denominator == 0.0 ? 0.0 :
+                (count * sumXY - sumX * sumY) / denominator;
+            const double fixedMs =
+                (sumY - slopeMsPerToken * sumX) / count;
+            const double projected2kMs =
+                16.0 * (fixedMs + slopeMsPerToken * 2048.0);
+            const double projected8kMs =
+                4.0 * (fixedMs + slopeMsPerToken * 8192.0);
+            std::cout << "fit," << shape.name
+                      << ",fixed_ms=" << fixedMs
+                      << ",slope_ms_per_token=" << slopeMsPerToken
+                      << ",projected_32k_at_2k_ms=" << projected2kMs
+                      << ",projected_32k_at_8k_ms=" << projected8kMs
+                      << ",speedup=" << projected2kMs / projected8kMs
+                      << '\n';
+        }
+    }
+
+    void RunCudaGgufIq4XsWideNTileRegression() {
+        constexpr int batch = 2048;
+        constexpr int inputDim = 17408;
+        constexpr int outputDim = 5120;
+        constexpr const char *tile = "1024";
+        constexpr int warmup = 3;
+        constexpr int iterations = 3;
+        constexpr int rounds = 4;
+
+        const int blocksPerRow = inputDim /
+            (int)ggml_blck_size(GGML_TYPE_IQ4_XS);
+        fastllm::Data weight(fastllm::DataType::DATA_GGUF_FORMAT,
+                             (int)GGML_TYPE_IQ4_XS,
+                             {outputDim, inputDim});
+        weight.isGGUFData = true;
+        weight.disableGGUFRepack = true;
+        weight.name = "regression.iq4xs_wide_n_tile";
+        weight.Allocate();
+        const size_t bytesPerRow =
+            ggml_row_size(GGML_TYPE_IQ4_XS, inputDim);
+        for (int row = 0; row < outputDim; row++) {
+            auto *blocks = reinterpret_cast<block_iq4_xs*>(
+                weight.cpuData + (size_t)row * bytesPerRow);
+            for (int block = 0; block < blocksPerRow; block++) {
+                std::memset(&blocks[block], 0, sizeof(block_iq4_xs));
+                FillIq4XsBlock(
+                    blocks[block],
+                    (uint32_t)((row * 1000 + block) * 7 + 3));
+            }
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA,
+                        std::vector<int>{0}, true);
+
+        fastllm::Data input(fastllm::DataType::FLOAT16);
+        input.Resize({batch, inputDim});
+        input.ToDevice(fastllm::DataDevice::CUDA,
+                       std::vector<int>{0}, false);
+        input.Allocate(false);
+        cudaError_t fillState = cudaMemset(
+            input.cudaData, 0x3c, input.GetBytes());
+        Expect(fillState == cudaSuccess,
+               std::string("IQ4_XS wide-N input fill failed: ") +
+               cudaGetErrorString(fillState));
+
+        fastllm::Data directOutput, tiledOutput, emptyBias;
+        ScopedFirstDevice guard("cuda");
+        auto run = [&](const char *gate, fastllm::Data &output,
+                       int count) -> double {
+            ScopedEnvVar scoped(
+                "FASTLLM_CUDA_SM70_IQ4XS_WIDE_N_TILE", gate);
+            ForceDeviceSync();
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < count; i++) {
+                fastllm::Linear(input, weight, emptyBias, output);
+            }
+            ForceDeviceSync();
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(
+                end - begin).count();
+        };
+        run("0", directOutput, warmup);
+        run(tile, tiledOutput, warmup);
+
+        double directMs = 0.0, tiledMs = 0.0;
+        for (int round = 0; round < rounds; round++) {
+            if ((round & 1) == 0) {
+                directMs += run("0", directOutput, iterations);
+                tiledMs += run(tile, tiledOutput, iterations);
+            } else {
+                tiledMs += run(tile, tiledOutput, iterations);
+                directMs += run("0", directOutput, iterations);
+            }
+        }
+        directMs /= rounds * iterations;
+        tiledMs /= rounds * iterations;
+
+        auto sampleEdgeRows = [&](const fastllm::Data &output) {
+            std::vector<__half> host((size_t)outputDim * 2);
+            cudaError_t firstState = cudaMemcpy(
+                host.data(), output.cudaData,
+                (size_t)outputDim * sizeof(__half),
+                cudaMemcpyDeviceToHost);
+            cudaError_t lastState = cudaMemcpy(
+                host.data() + outputDim,
+                (const __half*)output.cudaData +
+                    (size_t)(batch - 1) * outputDim,
+                (size_t)outputDim * sizeof(__half),
+                cudaMemcpyDeviceToHost);
+            Expect(firstState == cudaSuccess && lastState == cudaSuccess,
+                   "IQ4_XS wide-N output sample copy failed.");
+            std::vector<float> result(host.size());
+            for (size_t i = 0; i < host.size(); i++) {
+                result[i] = __half2float(host[i]);
+            }
+            return result;
+        };
+        ExpectFloatNear(sampleEdgeRows(directOutput),
+                        sampleEdgeRows(tiledOutput),
+                        1.5f, 0.15f,
+                        "IQ4_XS wide-N tiled output");
+        std::cout << "SM70 IQ4_XS wide-N tile n2048_m17408_k5120:"
+                  << " direct=" << directMs
+                  << " ms tiled=" << tiledMs
+                  << " ms speedup=" << directMs / tiledMs << "x\n";
+        Expect(tiledMs < directMs * 0.90,
+               "SM70 IQ4_XS wide-N tile did not improve latency by 10%.");
+        std::cout << "SM70 IQ4_XS wide-N tile regression: PASS\n";
+    }
+
+    void RunCudaGgufIq4XsGridDequantRegression() {
+        constexpr int batch = 128;
+        constexpr int inputDim = 17408;
+        constexpr int outputDim = 5120;
+        constexpr int warmup = 3;
+        constexpr int iterations = 3;
+        constexpr int rounds = 4;
+
+        const int blocksPerRow = inputDim /
+            (int)ggml_blck_size(GGML_TYPE_IQ4_XS);
+        fastllm::Data weight(fastllm::DataType::DATA_GGUF_FORMAT,
+                             (int)GGML_TYPE_IQ4_XS,
+                             {outputDim, inputDim});
+        weight.isGGUFData = true;
+        weight.disableGGUFRepack = true;
+        weight.name = "regression.iq4xs_grid_dequant";
+        weight.Allocate();
+        const size_t bytesPerRow =
+            ggml_row_size(GGML_TYPE_IQ4_XS, inputDim);
+        for (int row = 0; row < outputDim; row++) {
+            auto *blocks = reinterpret_cast<block_iq4_xs*>(
+                weight.cpuData + (size_t)row * bytesPerRow);
+            for (int block = 0; block < blocksPerRow; block++) {
+                std::memset(&blocks[block], 0, sizeof(block_iq4_xs));
+                FillIq4XsBlock(
+                    blocks[block],
+                    (uint32_t)((row * 1000 + block) * 7 + 3));
+            }
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA,
+                        std::vector<int>{0}, true);
+
+        fastllm::Data input(fastllm::DataType::FLOAT16);
+        input.Resize({batch, inputDim});
+        input.ToDevice(fastllm::DataDevice::CUDA,
+                       std::vector<int>{0}, false);
+        input.Allocate(false);
+        cudaError_t fillState = cudaMemset(
+            input.cudaData, 0x3c, input.GetBytes());
+        Expect(fillState == cudaSuccess,
+               std::string("IQ4_XS grid-dequant input fill failed: ") +
+               cudaGetErrorString(fillState));
+
+        fastllm::Data directOutput, gridOutput, emptyBias;
+        ScopedFirstDevice guard("cuda");
+        auto run = [&](const char *gate, fastllm::Data &output,
+                       int count) -> double {
+            ScopedEnvVar scoped(
+                "FASTLLM_CUDA_IQ4XS_GRID_DEQUANT", gate);
+            ForceDeviceSync();
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < count; i++) {
+                fastllm::Linear(input, weight, emptyBias, output);
+            }
+            ForceDeviceSync();
+            const auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(
+                end - begin).count();
+        };
+        const std::vector<const char*> gates = {"1", "2", "4", "8", "16"};
+        run("0", directOutput, warmup);
+        for (const char *gate : gates) {
+            run(gate, gridOutput, warmup);
+        }
+
+        const int timedCalls = rounds * iterations;
+        double directMs = run("0", directOutput, timedCalls);
+        double gridMs = std::numeric_limits<double>::infinity();
+        const char *bestGate = nullptr;
+        for (const char *gate : gates) {
+            double candidateMs =
+                run(gate, gridOutput, timedCalls) / timedCalls;
+            std::cout << "IQ4_XS grid candidate blocks_per_sm=" << gate
+                      << " avg_ms=" << candidateMs << '\n';
+            if (candidateMs < gridMs) {
+                gridMs = candidateMs;
+                bestGate = gate;
+            }
+        }
+        directMs += run("0", directOutput, timedCalls);
+        directMs /= 2 * timedCalls;
+        run(bestGate, gridOutput, 1);
+
+        auto sampleEdgeRows = [&](const fastllm::Data &output) {
+            std::vector<__half> host((size_t)outputDim * 2);
+            cudaError_t firstState = cudaMemcpy(
+                host.data(), output.cudaData,
+                (size_t)outputDim * sizeof(__half),
+                cudaMemcpyDeviceToHost);
+            cudaError_t lastState = cudaMemcpy(
+                host.data() + outputDim,
+                (const __half*)output.cudaData +
+                    (size_t)(batch - 1) * outputDim,
+                (size_t)outputDim * sizeof(__half),
+                cudaMemcpyDeviceToHost);
+            Expect(firstState == cudaSuccess && lastState == cudaSuccess,
+                   "IQ4_XS grid-dequant output sample copy failed.");
+            std::vector<float> result(host.size());
+            for (size_t i = 0; i < host.size(); i++) {
+                result[i] = __half2float(host[i]);
+            }
+            return result;
+        };
+        ExpectFloatNear(sampleEdgeRows(directOutput),
+                        sampleEdgeRows(gridOutput),
+                        0.0f, 0.0f,
+                        "IQ4_XS grid-dequant output");
+        std::cout << "IQ4_XS grid dequant n128_m17408_k5120:"
+                  << " best_blocks_per_sm=" << bestGate
+                  << " legacy=" << directMs
+                  << " ms grid=" << gridMs
+                  << " ms speedup=" << directMs / gridMs << "x\n";
+        Expect(gridMs < directMs * 0.97,
+               "IQ4_XS grid dequant did not improve latency by 3%.");
+        std::cout << "IQ4_XS grid dequant regression: PASS\n";
+    }
 #endif
 
     struct MoeWeights {
@@ -7496,6 +9565,16 @@ int main() {
             throw std::runtime_error("gguf_dequant regression requires a CUDA build.");
 #endif
         }
+        if (only != nullptr &&
+            std::string(only) == "cpu_swap_policy") {
+            RunCpuRequestSwapPolicyRegression();
+            return 0;
+        }
+        if (only != nullptr &&
+            std::string(only) == "paged_prefix_cache_policy") {
+            RunPagedPrefixCachePolicyRegression();
+            return 0;
+        }
         RunRegressionFixtureScopeRegression();
         if (only != nullptr && std::string(only) == "qwen35_gguf") {
             RunQwen35GGUFConfigRegression();
@@ -7536,6 +9615,62 @@ int main() {
             return 0;
 #else
             throw std::runtime_error("iq4xs_mmq_bench requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr &&
+            std::string(only) == "iq4xs_prefill_bench") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "iq4xs_prefill_bench requires CUDA.");
+            }
+            RunCudaGgufIq4XsPrefillBenchmark();
+            return 0;
+#else
+            throw std::runtime_error(
+                "iq4xs_prefill_bench requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr &&
+            std::string(only) == "sm70_iq4xs_wide_n_tile") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "sm70_iq4xs_wide_n_tile requires CUDA.");
+            }
+            RunCudaGgufIq4XsWideNTileRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "sm70_iq4xs_wide_n_tile requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr &&
+            std::string(only) == "iq4xs_grid_dequant") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "iq4xs_grid_dequant requires CUDA.");
+            }
+            RunCudaGgufIq4XsGridDequantRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "iq4xs_grid_dequant requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr &&
+            std::string(only) == "turbo3_paged_prefill_bench") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "turbo3_paged_prefill_bench requires CUDA.");
+            }
+            RunCudaTurbo3PagedPrefillBenchmark();
+            return 0;
+#else
+            throw std::runtime_error(
+                "turbo3_paged_prefill_bench requires a CUDA build.");
 #endif
         }
         if (only != nullptr && std::string(only) == "sm70_paged_xqa_bench") {
@@ -7587,6 +9722,61 @@ int main() {
 #else
             throw std::runtime_error(
                 "sm70_flash_attn_prefill regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr && std::string(only) == "sm70_fused_chunk_gdn") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "sm70_fused_chunk_gdn regression requires CUDA.");
+            }
+            RunCudaSm70FusedChunkGdnPrefillRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "sm70_fused_chunk_gdn regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr &&
+            std::string(only) == "sm70_gdn_prepare_attn") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "sm70_gdn_prepare_attn regression requires CUDA.");
+            }
+            RunCudaSm70GdnPrepareAttnRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "sm70_gdn_prepare_attn regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr &&
+            std::string(only) == "paged_cache_cpu_snapshot") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "paged_cache_cpu_snapshot regression requires CUDA.");
+            }
+            RunCudaPagedCacheCpuSnapshotRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "paged_cache_cpu_snapshot regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr &&
+            std::string(only) == "response_context_cpu_swap") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "response_context_cpu_swap regression requires CUDA.");
+            }
+            RunCudaResponseContextCpuSwapRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "response_context_cpu_swap regression requires a CUDA build.");
 #endif
         }
         bool ranAny = false;

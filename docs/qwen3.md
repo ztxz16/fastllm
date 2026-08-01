@@ -2,6 +2,8 @@
 
 Qwen3是阿里巴巴出品的系列模型
 
+Qwen3.5/3.6 GGUF 在 V100/SM70 上的 Turbo3 KV、MTP、命名 profile、前缀缓存与切换回滚组合方式，见 [单卡分层本地部署](qwen35_v100_local_stack.md)。
+
 ### 安装Fastllm
 
 - PIP安装

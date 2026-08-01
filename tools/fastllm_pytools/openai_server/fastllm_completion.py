@@ -81,6 +81,8 @@ _KIMI_K3_RESPONSE_CLOSE_RE = re.compile(
 _KIMI_K3_MESSAGE_CLOSE_RE = re.compile(
     r"<\|close\|>\s*message\s*<\|sep\|>")
 
+DEFAULT_MAX_OUTPUT_TOKENS = 16384
+
 
 class ConversationMessage:
     def __init__(self, role:str, content:ConversationContent, tool_calls=None,
@@ -125,7 +127,8 @@ class FastLLmCompletion:
                model,
                think,
                hide_input,
-               enable_thinking = None):
+               enable_thinking = None,
+               default_max_tokens = DEFAULT_MAX_OUTPUT_TOKENS):
     self.model_name = model_name
     self.model = model
     self.init_fast_llm_model()
@@ -134,6 +137,11 @@ class FastLLmCompletion:
         enable_thinking = getattr(model, "enable_thinking", True)
     self.enable_thinking = enable_thinking
     self.hide_input = hide_input
+    if (isinstance(default_max_tokens, bool) or
+            not isinstance(default_max_tokens, int) or
+            default_max_tokens <= 0):
+      raise ValueError("default_max_tokens must be a positive integer")
+    self.default_max_tokens = default_max_tokens
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
     self._conversation_lock = threading.Lock()
@@ -303,6 +311,23 @@ class FastLLmCompletion:
       buffer = state.get("buffer", "")
       state["buffer"] = ""
       return buffer
+
+  def _effective_max_tokens(self, requested: Optional[int]) -> int:
+      if requested is None:
+          requested = getattr(
+              self, "default_max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
+      if (isinstance(requested, bool) or not isinstance(requested, int)
+              or requested <= 0):
+          raise ValueError("max_tokens must be a positive integer")
+      return requested
+
+  def _with_effective_max_tokens(
+      self, request: ChatCompletionRequest, max_tokens: int
+  ) -> ChatCompletionRequest:
+      model_copy = getattr(request, "model_copy", None)
+      if callable(model_copy):
+          return model_copy(update={"max_tokens": max_tokens})
+      return request.copy(update={"max_tokens": max_tokens})
 
   def _chat_finish_reason(
       self,
@@ -767,6 +792,31 @@ class FastLLmCompletion:
               delta_text, state)
       return self._consume_deepseek_v4_reasoning_delta(
           delta_text, state)
+
+  def _raw_prompt_text(self, request: ChatCompletionRequest) -> str:
+      if not request.raw_prompt:
+          raise ValueError("raw_prompt mode is not enabled")
+      if not isinstance(request.prompt, str) or request.prompt == "":
+          raise ValueError("raw_prompt requires a non-empty string prompt")
+      if request.messages not in (None, [], ""):
+          raise ValueError("raw_prompt cannot be combined with messages")
+      return request.prompt
+
+  def _raw_prompt_token_ids(self, prompt: str) -> List[int]:
+      token_ids = self.model.encode(prompt)
+      if not isinstance(token_ids, list):
+          token_ids = list(token_ids)
+      return token_ids
+
+  def _launch_raw_prompt(self, request_id: str, prompt: str,
+                         launch_kwargs: Dict[str, Any]) -> Tuple[int, int]:
+      raw_tokens = self._raw_prompt_token_ids(prompt)
+      handle = self._launch_owned_handle(
+          request_id,
+          lambda: self.model.launch_stream_response(
+              prompt, raw_prompt = True,
+              raw_prompt_tokens = raw_tokens, **launch_kwargs))
+      return len(raw_tokens), handle
 
   async def _check_model(self, request: ChatCompletionRequest):
     if request.model != self.model_name:
@@ -2569,7 +2619,7 @@ class FastLLmCompletion:
       temperature = request.temperature if request.temperature is not None else default_gen['temperature']
       do_sample, top_p, top_k, temperature = self._normalize_sampling_args(top_p, top_k, temperature)
       frequency_penalty = default_gen['repetition_penalty']
-      max_length = request.max_tokens if request.max_tokens else 32768
+      max_length = self._effective_max_tokens(request.max_tokens)
 
       if request.stop_sequences:
           logging.warning("Anthropic stop_sequences are not supported yet and will be ignored.")
@@ -2647,59 +2697,66 @@ class FastLLmCompletion:
       if error_check_ret is not None:
           return error_check_ret
       
-      query:str = ""
-      if request.prompt:
-         request.messages.append({"role": "user", "content": request.prompt})
-      try:
-          # print("request", str(request))
-          conversation: List[ConversationMessage] = []
+      raw_prompt_text = None
+      if request.raw_prompt:
+          try:
+              raw_prompt_text = self._raw_prompt_text(request)
+          except ValueError as error:
+              return self.create_error_response(str(error))
+      elif request.prompt:
+          request.messages.append({"role": "user", "content": request.prompt})
+      if raw_prompt_text is not None:
+          messages = raw_prompt_text
           media = LoadedMedia()
-          for m in request.messages:
-              messages, message_media = self._parse_chat_message_content(
-                  m["role"], m.get("content"),
-                  tool_calls=m.get("tool_calls"),
-                  tool_call_id=m.get("tool_call_id"),
-                  name=m.get("name"),
-                  reasoning_content=m.get(
-                      "reasoning_content", m.get("reasoning")))
+      else:
+          try:
+              conversation: List[ConversationMessage] = []
+              media = LoadedMedia()
+              for m in request.messages:
+                  parsed_messages, message_media = self._parse_chat_message_content(
+                      m["role"], m.get("content"),
+                      tool_calls=m.get("tool_calls"),
+                      tool_call_id=m.get("tool_call_id"),
+                      name=m.get("name"),
+                      reasoning_content=m.get(
+                          "reasoning_content", m.get("reasoning")))
+                  conversation.extend(parsed_messages)
+                  media.extend(message_media)
 
-              conversation.extend(messages)
-              media.extend(message_media)
-
-          if len(conversation) == 0:
-            raise Exception("Empty msg")
-          messages = []
-          for msg in conversation:
-            msg_dict = {"role": msg.role, "content": msg.content}
-            if msg.tool_calls is not None:
-                parsed_tool_calls = []
-                for tc in msg.tool_calls:
-                    tc_copy = dict(tc) if isinstance(tc, dict) else tc
-                    if isinstance(tc_copy, dict) and "function" in tc_copy:
-                        func = tc_copy["function"]
-                        if isinstance(func, dict) and isinstance(func.get("arguments"), str):
-                            func = dict(func)
-                            try:
-                                func["arguments"] = json.loads(func["arguments"])
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-                            tc_copy = dict(tc_copy)
-                            tc_copy["function"] = func
-                    parsed_tool_calls.append(tc_copy)
-                msg_dict["tool_calls"] = parsed_tool_calls
-            if msg.tool_call_id is not None:
-                msg_dict["tool_call_id"] = msg.tool_call_id
-            if msg.name is not None:
-                msg_dict["name"] = msg.name
-            if msg.reasoning_content is not None:
-                msg_dict["reasoning_content"] = msg.reasoning_content
-            messages.append(msg_dict)
-
-      except Exception as e:
-          logging.error("Error in applying chat template from request: %s", e)
-          traceback.print_exc()
-          self._cleanup_temp_paths(media.temp_paths if "media" in locals() else [])
-          return self.create_error_response(str(e))
+              if len(conversation) == 0:
+                raise Exception("Empty msg")
+              messages = []
+              for msg in conversation:
+                msg_dict = {"role": msg.role, "content": msg.content}
+                if msg.tool_calls is not None:
+                    parsed_tool_calls = []
+                    for tc in msg.tool_calls:
+                        tc_copy = dict(tc) if isinstance(tc, dict) else tc
+                        if isinstance(tc_copy, dict) and "function" in tc_copy:
+                            func = tc_copy["function"]
+                            if isinstance(func, dict) and isinstance(func.get("arguments"), str):
+                                func = dict(func)
+                                try:
+                                    func["arguments"] = json.loads(func["arguments"])
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+                                tc_copy = dict(tc_copy)
+                                tc_copy["function"] = func
+                        parsed_tool_calls.append(tc_copy)
+                    msg_dict["tool_calls"] = parsed_tool_calls
+                if msg.tool_call_id is not None:
+                    msg_dict["tool_call_id"] = msg.tool_call_id
+                if msg.name is not None:
+                    msg_dict["name"] = msg.name
+                if msg.reasoning_content is not None:
+                    msg_dict["reasoning_content"] = msg.reasoning_content
+                messages.append(msg_dict)
+          except Exception as e:
+              logging.error("Error in applying chat template from request: %s", e)
+              traceback.print_exc()
+              self._cleanup_temp_paths(
+                  media.temp_paths if "media" in locals() else [])
+              return self.create_error_response(str(e))
 
       request_id = f"fastllm-{self.model_name}-{random_uuid()}"
       
@@ -2712,8 +2769,8 @@ class FastLLmCompletion:
       if request.frequency_penalty and request.frequency_penalty != 0.0:
         frequency_penalty = request.frequency_penalty
 
-      max_length = request.max_tokens if request.max_tokens else 32768
-      min_length = request.min_tokens if request.min_tokens else 0
+      max_length = self._effective_max_tokens(request.max_tokens)
+      min_length = request.min_tokens if request.min_tokens is not None else 0
       stop_strings = self._normalize_stop_strings(request.stop)
       stop_token_ids = self._stop_token_ids_from_strings(stop_strings)
 
@@ -2736,14 +2793,15 @@ class FastLLmCompletion:
       model_videos = media.videos if media.videos else None
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
-      messages = self._apply_kimi_k3_auto_tool_guidance(
-          messages, tools, tool_choice)
-      tool_choice = self._resolve_kimi_k3_auto_tool_choice(
-          messages, tools, tool_choice)
-      messages = self._apply_kimi_k3_required_tool_guidance(
-          messages, tools, tool_choice)
-      effective_request = self._with_effective_tool_choice(
-          request, tool_choice)
+      if raw_prompt_text is None:
+          messages = self._apply_kimi_k3_auto_tool_guidance(
+              messages, tools, tool_choice)
+          tool_choice = self._resolve_kimi_k3_auto_tool_choice(
+              messages, tools, tool_choice)
+          messages = self._apply_kimi_k3_required_tool_guidance(
+              messages, tools, tool_choice)
+      effective_request = self._with_effective_max_tokens(
+          self._with_effective_tool_choice(request, tool_choice), max_length)
 
       launch_kwargs = {
           "max_length": max_length,
@@ -2770,10 +2828,11 @@ class FastLLmCompletion:
           launch_kwargs, effective_request)
 
       def prepare_and_launch_text_request():
-          # Token counting and launch both apply the chat template.  Keep them
-          # on one worker thread so llm.py can reuse the one-shot tokenization,
-          # while independent HTTP requests prepare concurrently instead of
-          # serializing the FastAPI event loop.
+          if raw_prompt_text is not None:
+              return self._launch_raw_prompt(
+                  request_id, raw_prompt_text, launch_kwargs)
+          # Token counting and launch both apply the chat template. Keep them
+          # on one worker thread so llm.py can reuse one-shot tokenization.
           input_len = self._compute_multimodal_input_token_len(
               messages,
               enable_thinking = enable_thinking,
@@ -2906,7 +2965,7 @@ class FastLLmCompletion:
               ),
               logprobs=None,
               finish_reason=self._chat_finish_reason(
-                  output_tokens, request.max_tokens or 32768,
+                  output_tokens, request.max_tokens,
                   stopped_by_stop_string),
           )
 
@@ -3179,7 +3238,7 @@ class FastLLmCompletion:
         usage = self._chat_usage(
             handle, response_statistics, input_token_len, completion_tokens)
         finish_reason = self._chat_finish_reason(
-            usage.completion_tokens or 0, request.max_tokens or 32768,
+            usage.completion_tokens or 0, request.max_tokens,
             stopped_by_stop_string)
         final_stream_error_data = None
         if request.tools and tool_call_parser:

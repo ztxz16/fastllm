@@ -760,6 +760,25 @@ extern "C" {
         return model->LaunchResponseTokens(input, config);
     }
 
+    DLL_EXPORT int launch_raw_prompt_llm_model(int modelId, int len, int *values,
+                                  int max_length, int min_length, bool do_sample, float top_p, int top_k,
+                                  float temperature, float repeat_penalty, bool output_logits,
+                                  int stop_token_len, int * stop_token_ids) {
+        std::vector <int> input;
+        for (int i = 0; i < len; i++) {
+            input.push_back(values[i]);
+        }
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k,
+                                  temperature, repeat_penalty, output_logits, true);
+        apply_pending_tool_call_constraint(config);
+        for (int i = 0; i < stop_token_len; i++) {
+            config.stop_token_ids.insert(stop_token_ids[i]);
+        }
+        config.input_token_length = input.size();
+        auto model = models.GetModel(modelId);
+        return model->LaunchResponseTokens(input, config);
+    }
+
     DLL_EXPORT int launch_response_llm_model_multimodal(int modelId, int len, int *values, 
                                   char *multimodal_json, uint8_t *multimodal_data,
                                   int max_length, int min_length, bool do_sample, float top_p, int top_k,
