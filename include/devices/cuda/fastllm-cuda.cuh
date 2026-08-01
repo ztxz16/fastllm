@@ -922,7 +922,27 @@ bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fast
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128Add(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNorm(const fastllm::Data &input, fastllm::Data &normWeight, float eps, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNormMaterialize(
+        const fastllm::Data &input, fastllm::Data &normWeight, float eps,
+        fastllm::Data &normOutput,
+        fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGate(
+        const fastllm::Data &headMajorInput, fastllm::Data &normWeight,
+        const fastllm::Data &combinedGateInput,
+        int batch, int seqLen, int gateOffset, int gateHeads, float eps,
+        fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGateAdd(
+        const fastllm::Data &headMajorInput, fastllm::Data &normWeight,
+        const fastllm::Data &combinedGateInput,
+        int batch, int seqLen, int gateOffset, int gateHeads, float eps,
+        fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAdd(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

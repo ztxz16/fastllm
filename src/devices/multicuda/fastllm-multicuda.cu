@@ -2469,10 +2469,10 @@ __global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceAddDirectKernel(
         Packed residualValue = packedResidual[index];
 #pragma unroll
         for (int i = 0; i < valuesPerPack; i++) {
-            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
-                                                 rank1.values[i]);
-            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
-                                                 residualValue.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(
+                residualValue.values[i], rank0.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(
+                rank0.values[i], rank1.values[i]);
         }
         packedDst[index] = rank0;
     }
@@ -2532,10 +2532,10 @@ __global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceAddKnownPeerKernel(
         Packed residualValue = packedResidual[index];
 #pragma unroll
         for (int i = 0; i < valuesPerPack; i++) {
-            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
-                                                 rank1.values[i]);
-            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
-                                                 residualValue.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(
+                residualValue.values[i], rank0.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(
+                rank0.values[i], rank1.values[i]);
         }
         packedDst[index] = rank0;
     }
