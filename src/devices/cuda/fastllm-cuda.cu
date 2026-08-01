@@ -665,6 +665,12 @@ bool FastllmCudaGraphBeginCapture() {
     return ok;
 }
 
+bool FastllmCudaGraphPrepareCaptureDevice() {
+    return FastllmCudaGraphSetError(
+        "prepare allocation-failure placeholder",
+        FastllmCudaGraphPrepareAllocationFailurePlaceholder());
+}
+
 // 检查当前线程的捕获是否已被 invalidate（捕获体内任何算子报错都会导致失效）。
 // 不通过 showError 上报的错误路径（如 FlashInfer、独立 kernel 封装内的 printf）
 // 也会 invalidate 捕获，因此该检查是错误标志之外的兜底。

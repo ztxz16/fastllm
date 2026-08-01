@@ -121,6 +121,10 @@ void FastllmCudaStreamWaitEvent(void *stream, void *event);
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event);
 
 bool FastllmCudaGraphBeginCapture();
+// Resolve per-device process-lifetime graph sentinels before any stream in a
+// multi-GPU capture has begun. Calling cudaMalloc after the first rank starts
+// capture invalidates that rank even when the allocation targets another GPU.
+bool FastllmCudaGraphPrepareCaptureDevice();
 bool FastllmCudaGraphEndCapture(void **graph);
 bool FastllmCudaGraphInstantiate(void *graph, void **exec);
 bool FastllmCudaTensorParallelGreedyGatherGraphCreate(

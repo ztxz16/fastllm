@@ -3648,8 +3648,13 @@ namespace fastllm {
 
         int wideDim = (compressRatio == 4 ? 2 : 1) * cache.headDim;
         int rawCapacity = compressRatio == 4 ? 2 * compressRatio : compressRatio;
+        // ComputeCompressorRaw explicitly promotes both projections to FP32.
+        // A ratio-128 prefill can consume the complete raw tail, leaving no
+        // compressorKVRaw tensor from which to infer the graph ring type.  The
+        // old BF16 default then made every ratio-128 decode reject the fixed
+        // ring even though the live compressor output is FP32.
         DataType ringType = HasTensorData(cache.compressorKVRaw) ?
-                            cache.compressorKVRaw.dataType : DataType::BFLOAT16;
+                            cache.compressorKVRaw.dataType : DataType::FLOAT32;
         bool ringStale = !cache.cudaGraphCacheReady ||
                          cache.cudaGraphRawCapacity != rawCapacity ||
                          !DeepSeekV4GraphTensorMatches(
@@ -5779,14 +5784,13 @@ namespace fastllm {
                 embeddingInputIds = &graphState->graphInputIds;
             }
 #endif
-            Embedding(*embeddingInputIds, weight["embed.weight"],
-                      hiddenStatesBeforeHcExpand);
-            // The official ParallelEmbedding output follows the checkpoint's
-            // BF16 dtype.  The generic CPU Embedding operator returns FLOAT32,
-            // which would otherwise skip the first hc_pre BF16 boundary.
-            if (hiddenStatesBeforeHcExpand.dataType != DataType::BFLOAT16) {
-                ToDataType(hiddenStatesBeforeHcExpand, DataType::BFLOAT16);
-            }
+            // ParallelEmbedding returns the checkpoint dtype.  EmbeddingDirect
+            // preserves the BF16 payload instead of materializing FP32 and
+            // converting it back in-place.  Besides avoiding that round trip,
+            // the fixed dtype keeps the persistent decode workspace allocation
+            // stable across CUDA-graph warmup and capture.
+            EmbeddingDirect(*embeddingInputIds, weight["embed.weight"],
+                            hiddenStatesBeforeHcExpand);
             hiddenStatesBeforeHcExpand.Reshape({bsz, seqlen, 1, dim});
             bool repeatedToTpReplicas = false;
 #ifdef USE_CUDA
@@ -6636,8 +6640,24 @@ namespace fastllm {
                 }
             } else {
                 syncGraphDevices();
-                bool captureOk = FastllmCudaGraphMemoryPoolBegin();
-                const char *failureStage = captureOk ? nullptr : "workspace reservation";
+                // The graph allocation-failure sentinel is one real cudaMalloc
+                // per device. Resolve all of them before starting rank 0's
+                // stream capture; lazily allocating rank 1's sentinel while
+                // rank 0 is already capturing invalidates rank 0's graph.
+                bool captureOk = true;
+                const char *failureStage = nullptr;
+                for (auto &deviceState : graphState->devices) {
+                    FastllmCudaSetDevice(deviceState->device);
+                    if (!FastllmCudaGraphPrepareCaptureDevice()) {
+                        captureOk = false;
+                        failureStage = "prepare capture devices";
+                        break;
+                    }
+                }
+                if (captureOk && !FastllmCudaGraphMemoryPoolBegin()) {
+                    captureOk = false;
+                    failureStage = "workspace reservation";
+                }
                 int begunCaptures = 0;
                 if (captureOk) {
                     for (auto &deviceState : graphState->devices) {
