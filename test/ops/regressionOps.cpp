@@ -1960,6 +1960,50 @@ namespace {
                             "DeepSeek-V4 Triton sparse decode output ratio=" +
                                 std::to_string(compressRatio));
         }
+
+        // Exercise the production SM12x tile: TP8 has eight local heads and
+        // DSV4 uses a 512-wide latent.  Other architectures transparently run
+        // the generic Triton variant with the same inputs.
+        constexpr int smHeads = 8;
+        constexpr int smHeadDim = 512;
+        constexpr int smWindowSize = 128;
+        constexpr int smCompressedCapacity = 64;
+        constexpr int smStartPos = 127;
+        fastllm::Data smQ = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, smHeads, smHeadDim},
+            MakeRegressionValues(smHeads * smHeadDim, 0.19f, 0.11f));
+        fastllm::Data smWindowKV = MakeCudaTensor(
+            fastllm::DataType::FLOAT32,
+            {1, smWindowSize, smHeadDim},
+            MakeRegressionValues(smWindowSize * smHeadDim, 0.47f, 0.09f));
+        fastllm::Data smCompressedKV = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, smCompressedCapacity, smHeadDim},
+            MakeRegressionValues(
+                smCompressedCapacity * smHeadDim, 0.83f, 0.08f));
+        fastllm::Data smSink = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {smHeads},
+            MakeRegressionValues(smHeads, 1.29f, 0.07f));
+        fastllm::Data smDecodeMeta =
+            MakeIntTensor({2}, {smStartPos, 456});
+        smDecodeMeta.ToDevice(fastllm::DataDevice::CUDA);
+        const int32_t *smDecodeMetaPtr =
+            reinterpret_cast<const int32_t*>(smDecodeMeta.cudaData);
+        float smSoftmaxScale = 1.0f / std::sqrt((float)smHeadDim);
+        fastllm::Data smReference, smActual;
+        Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
+                   smQ, smWindowKV, smCompressedKV, smSink, smWindowSize, 4,
+                   smDecodeMetaPtr, 64, 10000.0f, 4096, 8.0f, 32, 1,
+                   smSoftmaxScale, smReference, false),
+               "built-in DeepSeek-V4 sparse decode rejected SM120 shape");
+        Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
+                   smQ, smWindowKV, smCompressedKV, smSink, smWindowSize, 4,
+                   smDecodeMetaPtr, 64, 10000.0f, 4096, 8.0f, 32, 1,
+                   smSoftmaxScale, smActual),
+               "DeepSeek-V4 Triton sparse decode rejected SM120 shape");
+        ExpectFloatNear(ToFloatVector(smReference), ToFloatVector(smActual),
+                        5e-2f, 5e-3f,
+                        "DeepSeek-V4 Triton sparse decode SM120 tile output");
         std::cout << "DeepSeek-V4 Triton sparse decode regression: PASS ("
                   << (tritonEnabled ? "Triton" : "disabled-gate fallback")
                   << ")\n";

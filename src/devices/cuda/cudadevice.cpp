@@ -140,6 +140,13 @@ namespace fastllm {
         "recompute_precomputed_scale_internal_exp",
     };
 
+    static const int kCudaTritonDeepSeekV4SparseDecodeKernelCount = 2;
+    static const char *kCudaTritonDeepSeekV4SparseDecodeKernelKeys[
+        kCudaTritonDeepSeekV4SparseDecodeKernelCount] = {
+        "split",
+        "merge",
+    };
+
     static const int kCudaTritonMergeMoeFp8KernelCount = 12;
     static const char *kCudaTritonMergeMoeFp8KernelKeys[kCudaTritonMergeMoeFp8KernelCount] = {
         "init_count",
@@ -218,14 +225,20 @@ namespace fastllm {
     };
 
     struct CudaTritonDeepSeekV4SparseDecodeMeta {
-        CudaTritonKernelMeta kernel;
+        CudaTritonKernelMeta kernels[kCudaTritonDeepSeekV4SparseDecodeKernelCount];
         int batch = 1;
         int numHeads = 64;
         int headDim = 512;
         int windowSize = 128;
         int compressRatio = 0;
-        int headBlock = 1;
+        int compressedCapacity = 1;
+        int numSplits = 1;
+        int blockSplits = 1;
+        int splitSize = 8;
         int blockD = 512;
+        int mergeBlockD = 32;
+        int splitHeadBlock = 1;
+        std::string variant = "generic";
     };
 
     struct CudaTritonMergeMoeFp8Meta {
@@ -397,14 +410,22 @@ namespace fastllm {
 
     static std::string CudaTritonDeepSeekV4SparseDecodeBaseName(
         int arch, int batch, int numHeads, int headDim, int windowSize,
-        int compressRatio, int headBlock, int blockD,
-        int numWarps, int numStages) {
+        int compressRatio, int compressedCapacity, int splitSize, int blockD,
+        int mergeBlockD, int blockSplits, int splitNumWarps,
+        int mergeNumWarps, int numStages, const std::string &variant) {
         std::ostringstream os;
-        os << "deepseek_v4_sparse_decode_v1_sm" << arch
+        os << "deepseek_v4_sparse_decode_v3";
+        if (variant != "generic") {
+            os << "_" << variant;
+        }
+        os << "_sm" << arch
            << "_b" << batch << "_h" << numHeads << "_d" << headDim
            << "_w" << windowSize << "_cr" << compressRatio
-           << "_hb" << headBlock << "_bd" << blockD
-           << "_nw" << numWarps << "_ns" << numStages;
+           << "_cc" << compressedCapacity << "_ss" << splitSize
+           << "_bd" << blockD << "_mbd" << mergeBlockD
+           << "_bs" << blockSplits
+           << "_snw" << splitNumWarps << "_mnw" << mergeNumWarps
+           << "_ns" << numStages;
         return os.str();
     }
 
@@ -639,26 +660,58 @@ namespace fastllm {
         std::string err;
         json11::Json json = json11::Json::parse(text, err);
         if (!err.empty() || !json["ok"].bool_value() ||
-            json["op"].string_value() != "deepseek_v4_sparse_decode") {
+            json["op"].string_value() != "deepseek_v4_sparse_decode" ||
+            json["version"].int_value() != 3) {
             return false;
         }
-        meta.kernel.cubinPath = json["cubin"].string_value();
-        meta.kernel.kernelName = json["kernel"].string_value();
-        meta.kernel.shared = json["shared"].int_value();
-        meta.kernel.numWarps = json["num_warps"].int_value();
+        json11::Json kernels = json["kernels"];
+        for (int i = 0; i < kCudaTritonDeepSeekV4SparseDecodeKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonDeepSeekV4SparseDecodeKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
         meta.batch = json["batch"].int_value();
         meta.numHeads = json["num_heads"].int_value();
         meta.headDim = json["head_dim"].int_value();
         meta.windowSize = json["window_size"].int_value();
         meta.compressRatio = json["compress_ratio"].int_value();
-        meta.headBlock = json["head_block"].int_value();
+        meta.compressedCapacity = json["compressed_capacity"].int_value();
+        meta.numSplits = json["num_splits"].int_value();
+        meta.blockSplits = json["block_splits"].int_value();
+        meta.splitSize = json["split_size"].int_value();
         meta.blockD = json["block_d"].int_value();
-        return !meta.kernel.cubinPath.empty() && !meta.kernel.kernelName.empty() &&
-               meta.kernel.numWarps > 0 && CudaTritonFileExists(meta.kernel.cubinPath) &&
-               meta.batch == 1 && meta.numHeads > 0 && meta.headDim > 0 &&
+        meta.mergeBlockD = json["merge_block_d"].int_value();
+        meta.variant = json["variant"].string_value();
+        if (meta.variant.empty()) {
+            meta.variant = "generic";
+        }
+        meta.splitHeadBlock = json["split_head_block"].int_value();
+        if (meta.splitHeadBlock <= 0) {
+            meta.splitHeadBlock = 1;
+        }
+        return meta.batch == 1 && meta.numHeads > 0 && meta.headDim > 0 &&
                meta.windowSize > 0 && meta.compressRatio >= 0 &&
-               (meta.headBlock == 1 || meta.headBlock == 2 || meta.headBlock == 4) &&
-               meta.blockD >= meta.headDim && meta.blockD <= 1024;
+               meta.compressedCapacity > 0 && meta.numSplits > 0 &&
+               meta.numSplits <= 256 && meta.blockSplits >= meta.numSplits &&
+               (meta.blockSplits & (meta.blockSplits - 1)) == 0 &&
+               (meta.splitSize == 8 || meta.splitSize == 16 ||
+                meta.splitSize == 32 || meta.splitSize == 64) &&
+               meta.blockD >= meta.headDim && meta.blockD <= 1024 &&
+               ((meta.variant == "generic" && meta.splitHeadBlock == 1) ||
+                (meta.variant == "sm120_tensorcore" &&
+                 meta.splitHeadBlock == 16 && meta.headDim == 512 &&
+                 meta.numHeads <= 16)) &&
+               (meta.mergeBlockD == 16 || meta.mergeBlockD == 32 ||
+                meta.mergeBlockD == 64 || meta.mergeBlockD == 128);
     }
 
     static bool CudaTritonReadMergeMoeFp8Meta(const std::string &path, CudaTritonMergeMoeFp8Meta &meta) {
@@ -1454,14 +1507,17 @@ namespace fastllm {
 
     static bool CudaTritonRequestDeepSeekV4SparseDecodeKernel(
         const std::string &cacheDir, int arch, int batch, int numHeads,
-        int headDim, int windowSize, int compressRatio, int headBlock,
-        int blockD, int numWarps, int numStages,
+        int headDim, int windowSize, int compressRatio,
+        int compressedCapacity, int splitSize, int blockD, int mergeBlockD,
+        int splitNumWarps, int mergeNumWarps, int numStages,
+        const std::string &variant,
         CudaTritonDeepSeekV4SparseDecodeMeta &meta) {
         if (!CudaTritonEnsureServer()) {
             return false;
         }
         json11::Json request = json11::Json::object {
             {"op", "deepseek_v4_sparse_decode"},
+            {"variant", variant},
             {"cache_dir", cacheDir},
             {"arch", arch},
             {"batch", batch},
@@ -1469,9 +1525,12 @@ namespace fastllm {
             {"head_dim", headDim},
             {"window_size", windowSize},
             {"compress_ratio", compressRatio},
-            {"head_block", headBlock},
+            {"compressed_capacity", compressedCapacity},
+            {"split_size", splitSize},
             {"block_d", blockD},
-            {"num_warps", numWarps},
+            {"merge_block_d", mergeBlockD},
+            {"split_num_warps", splitNumWarps},
+            {"merge_num_warps", mergeNumWarps},
             {"num_stages", numStages},
         };
         int status = 0;
@@ -1491,29 +1550,59 @@ namespace fastllm {
             }
             return false;
         }
-        meta.kernel.cubinPath = response["cubin"].string_value();
-        meta.kernel.kernelName = response["kernel"].string_value();
-        meta.kernel.shared = response["shared"].int_value();
-        meta.kernel.numWarps = response["num_warps"].int_value();
+        if (response["version"].int_value() != 3) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0; i < kCudaTritonDeepSeekV4SparseDecodeKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonDeepSeekV4SparseDecodeKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
         meta.batch = response["batch"].int_value();
         meta.numHeads = response["num_heads"].int_value();
         meta.headDim = response["head_dim"].int_value();
         meta.windowSize = response["window_size"].int_value();
         meta.compressRatio = response["compress_ratio"].int_value();
-        meta.headBlock = response["head_block"].int_value();
+        meta.compressedCapacity = response["compressed_capacity"].int_value();
+        meta.numSplits = response["num_splits"].int_value();
+        meta.blockSplits = response["block_splits"].int_value();
+        meta.splitSize = response["split_size"].int_value();
         meta.blockD = response["block_d"].int_value();
-        return !meta.kernel.cubinPath.empty() && !meta.kernel.kernelName.empty() &&
-               meta.kernel.numWarps > 0 && CudaTritonFileExists(meta.kernel.cubinPath) &&
-               meta.batch == batch && meta.numHeads == numHeads &&
+        meta.mergeBlockD = response["merge_block_d"].int_value();
+        meta.variant = response["variant"].string_value();
+        if (meta.variant.empty()) {
+            meta.variant = "generic";
+        }
+        meta.splitHeadBlock = response["split_head_block"].int_value();
+        if (meta.splitHeadBlock <= 0) {
+            meta.splitHeadBlock = 1;
+        }
+        return meta.batch == batch && meta.numHeads == numHeads &&
                meta.headDim == headDim && meta.windowSize == windowSize &&
-               meta.compressRatio == compressRatio && meta.headBlock == headBlock &&
-               meta.blockD == blockD;
+               meta.compressRatio == compressRatio &&
+               meta.compressedCapacity == compressedCapacity &&
+               meta.splitSize == splitSize && meta.blockD == blockD &&
+               meta.mergeBlockD == mergeBlockD && meta.variant == variant &&
+               meta.numSplits > 0 &&
+               meta.numSplits <= 256 && meta.blockSplits >= meta.numSplits;
     }
 
     static bool CudaTritonGetDeepSeekV4SparseDecodeMeta(
         const std::string &cacheDir, const std::string &base, int arch,
         int batch, int numHeads, int headDim, int windowSize, int compressRatio,
-        int headBlock, int blockD, int numWarps, int numStages,
+        int compressedCapacity, int splitSize, int blockD, int mergeBlockD,
+        int splitNumWarps, int mergeNumWarps, int numStages,
+        const std::string &variant,
         const CudaTritonDeepSeekV4SparseDecodeMeta *&meta) {
         static std::mutex mutex;
         static std::map<std::string, CudaTritonDeepSeekV4SparseDecodeMeta> cachedMeta;
@@ -1532,14 +1621,19 @@ namespace fastllm {
         if (!CudaTritonReadDeepSeekV4SparseDecodeMeta(metaPath, loaded)) {
             if (!CudaTritonRequestDeepSeekV4SparseDecodeKernel(
                     cacheDir, arch, batch, numHeads, headDim, windowSize,
-                    compressRatio, headBlock, blockD, numWarps, numStages, loaded)) {
+                    compressRatio, compressedCapacity, splitSize, blockD,
+                    mergeBlockD, splitNumWarps, mergeNumWarps, numStages,
+                    variant,
+                    loaded)) {
                 return false;
             }
         }
         if (loaded.batch != batch || loaded.numHeads != numHeads ||
             loaded.headDim != headDim || loaded.windowSize != windowSize ||
-            loaded.compressRatio != compressRatio || loaded.headBlock != headBlock ||
-            loaded.blockD != blockD) {
+            loaded.compressRatio != compressRatio ||
+            loaded.compressedCapacity != compressedCapacity ||
+            loaded.splitSize != splitSize || loaded.blockD != blockD ||
+            loaded.mergeBlockD != mergeBlockD || loaded.variant != variant) {
             return false;
         }
 
@@ -2566,32 +2660,96 @@ namespace fastllm {
         while (blockD < headDim) {
             blockD <<= 1;
         }
-        constexpr int headBlock = 1;
-        constexpr int numWarps = 4;
+        int compressedCapacity = compressedKV.dims[1];
+        if (compressedKV.expansionDims.size() >= 3) {
+            compressedCapacity = std::max(
+                compressedCapacity, compressedKV.expansionDims[1]);
+        }
+        int mergeBlockD = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_MERGE_BLOCK_D", 32, 16, 128);
+        if (mergeBlockD != 16 && mergeBlockD != 32 &&
+            mergeBlockD != 64 && mergeBlockD != 128) {
+            mergeBlockD = 32;
+        }
+        int mergeNumWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_MERGE_WARPS", 4, 1, 8);
         constexpr int numStages = 2;
+        if (compressedCapacity <= 0) {
+            return false;
+        }
         int arch = CudaTritonRuntimeArch();
         if (arch != 89 && arch != 120 && arch != 121) {
             return false;
         }
 
         std::string cacheDir = CudaTritonCacheDir();
-        std::string base = CudaTritonDeepSeekV4SparseDecodeBaseName(
-            arch, 1, numHeads, headDim, windowSize, compressRatio,
-            headBlock, blockD, numWarps, numStages);
-        const CudaTritonDeepSeekV4SparseDecodeMeta *meta = nullptr;
-        if (!CudaTritonGetDeepSeekV4SparseDecodeMeta(
-                cacheDir, base, arch, 1, numHeads, headDim, windowSize,
-                compressRatio, headBlock, blockD, numWarps, numStages, meta) ||
-            meta == nullptr) {
-            return false;
+        auto tryVariant = [&](const std::string &variant, int splitSize,
+                              int splitNumWarps) -> bool {
+            int numSplits =
+                (windowSize + compressedCapacity + splitSize - 1) / splitSize;
+            if (numSplits <= 0 || numSplits > 256) {
+                return false;
+            }
+            int blockSplits = 1;
+            while (blockSplits < numSplits) {
+                blockSplits <<= 1;
+            }
+            std::string base = CudaTritonDeepSeekV4SparseDecodeBaseName(
+                arch, 1, numHeads, headDim, windowSize, compressRatio,
+                compressedCapacity, splitSize, blockD, mergeBlockD,
+                blockSplits, splitNumWarps, mergeNumWarps, numStages,
+                variant);
+            const CudaTritonDeepSeekV4SparseDecodeMeta *meta = nullptr;
+            if (!CudaTritonGetDeepSeekV4SparseDecodeMeta(
+                    cacheDir, base, arch, 1, numHeads, headDim, windowSize,
+                    compressRatio, compressedCapacity, splitSize, blockD,
+                    mergeBlockD, splitNumWarps, mergeNumWarps, numStages,
+                    variant, meta) || meta == nullptr) {
+                return false;
+            }
+            return FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
+                meta->kernels[0].cubinPath.c_str(),
+                meta->kernels[0].kernelName.c_str(),
+                meta->kernels[0].numWarps, meta->kernels[0].shared,
+                meta->kernels[1].cubinPath.c_str(),
+                meta->kernels[1].kernelName.c_str(),
+                meta->kernels[1].numWarps, meta->kernels[1].shared,
+                meta->compressedCapacity, meta->numSplits, meta->splitSize,
+                meta->splitHeadBlock, meta->blockD, meta->mergeBlockD,
+                q, windowKV, compressedKV, attnSink, windowSize,
+                compressRatio, decodeMeta, softmaxScale, output);
+        };
+
+        bool trySm120 = (arch == 120 || arch == 121) && numHeads <= 16 &&
+                        headDim == 512 &&
+                        CudaEnvFlagDefaultEnabled(
+                            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SM120", true);
+        if (trySm120) {
+            int sm120SplitSize = CudaEnvIntRange(
+                "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SM120_SPLIT_SIZE",
+                16, 16, 64);
+            if (sm120SplitSize != 16 && sm120SplitSize != 32 &&
+                sm120SplitSize != 64) {
+                sm120SplitSize = 16;
+            }
+            int sm120SplitWarps = CudaEnvIntRange(
+                "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SM120_SPLIT_WARPS",
+                8, 4, 8);
+            if (tryVariant("sm120_tensorcore", sm120SplitSize,
+                           sm120SplitWarps)) {
+                return true;
+            }
         }
-        bool ok = FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
-            meta->kernel.cubinPath.c_str(), meta->kernel.kernelName.c_str(),
-            meta->kernel.numWarps, meta->kernel.shared,
-            meta->headBlock, meta->blockD, q, windowKV, compressedKV,
-            attnSink, windowSize, compressRatio, decodeMeta,
-            softmaxScale, output);
-        return ok;
+
+        int splitSize = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SPLIT_SIZE", 8, 8, 64);
+        if (splitSize != 8 && splitSize != 16 &&
+            splitSize != 32 && splitSize != 64) {
+            splitSize = 8;
+        }
+        int splitNumWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SPLIT_WARPS", 4, 1, 8);
+        return tryVariant("generic", splitSize, splitNumWarps);
     }
 
     bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(

@@ -1107,6 +1107,337 @@ if triton is not None:
 
 
     @triton.jit
+    def fastllm_deepseek_v4_sparse_decode_split_kernel(
+        q_ptr,
+        window_kv_ptr,
+        compressed_kv_ptr,
+        decode_meta_ptr,
+        partial_output_ptr,
+        partial_max_ptr,
+        partial_denom_ptr,
+        softmax_scale,
+        BATCH: tl.constexpr,
+        NUM_HEADS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        WINDOW_SIZE: tl.constexpr,
+        COMPRESS_RATIO: tl.constexpr,
+        COMPRESSED_CAPACITY: tl.constexpr,
+        NUM_SPLITS: tl.constexpr,
+        SPLIT_SIZE: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Build one online-softmax partial for a candidate-key split.
+
+        Unlike the original graph-safe kernel, the candidate dimension is
+        represented in the launch grid.  Each program still uses FastLLM's
+        general FP32-window/BF16-compressed cache ABI, but only scans a small
+        fixed-size split.  The second kernel combines these partials exactly in
+        FP32, so unsupported shapes can continue to fall back to the original
+        CUDA implementation without changing cache ownership or layout.
+        """
+        batch_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        split_idx = tl.program_id(2)
+        dim_offsets = tl.arange(0, BLOCK_D)
+        dim_mask = dim_offsets < HEAD_DIM
+
+        start_pos = tl.load(decode_meta_ptr)
+        live_window = tl.minimum(start_pos + 1, WINDOW_SIZE)
+        if COMPRESS_RATIO > 0:
+            compressed_count = tl.minimum(
+                (start_pos + 1) // COMPRESS_RATIO, COMPRESSED_CAPACITY
+            )
+        else:
+            compressed_count = 0
+        total_count = live_window + compressed_count
+        candidate_base = split_idx * SPLIT_SIZE
+        # The launch grid covers graph capacity, while the live candidate
+        # count grows with decode_meta.  Empty capacity splits are excluded by
+        # the merge kernel, so they can return without loading Q/KV or writing
+        # the large FP32 partial buffer.
+        if candidate_base >= total_count:
+            return
+
+        q = tl.load(
+            q_ptr
+            + (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM
+            + dim_offsets,
+            mask=dim_mask,
+            other=0.0,
+        ).to(tl.float32)
+        running_max = tl.full((), -float("inf"), tl.float32)
+        running_denom = tl.zeros((), tl.float32)
+        running_acc = tl.zeros((BLOCK_D,), tl.float32)
+
+        for split_offset in range(0, SPLIT_SIZE):
+            candidate_idx = candidate_base + split_offset
+            valid = candidate_idx < total_count
+            use_window = valid & (candidate_idx < live_window)
+
+            ring_pos = start_pos % WINDOW_SIZE
+            ring_full = start_pos >= WINDOW_SIZE - 1
+            window_idx = tl.where(
+                ring_full,
+                (ring_pos + 1 + candidate_idx) % WINDOW_SIZE,
+                candidate_idx,
+            )
+            window_kv = tl.load(
+                window_kv_ptr
+                + (batch_idx * WINDOW_SIZE + window_idx) * HEAD_DIM
+                + dim_offsets,
+                mask=use_window & dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+
+            compressed_idx = candidate_idx - live_window
+            use_compressed = valid & ~use_window
+            compressed_kv = tl.load(
+                compressed_kv_ptr
+                + (batch_idx * COMPRESSED_CAPACITY + compressed_idx) * HEAD_DIM
+                + dim_offsets,
+                mask=use_compressed & dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            kv = tl.where(use_window, window_kv, compressed_kv)
+            score = tl.sum(q * kv, axis=0) * softmax_scale
+
+            # Empty graph-capacity splits are common early in decode.  Keep
+            # every exponent finite even when both maxima are -inf so those
+            # splits deterministically write a zero partial.
+            had_previous = running_denom > 0.0
+            next_max = tl.where(
+                valid,
+                tl.where(had_previous, tl.maximum(running_max, score), score),
+                running_max,
+            )
+            has_any = had_previous | valid
+            safe_next_max = tl.where(has_any, next_max, 0.0)
+            previous_weight = tl.where(
+                had_previous, tl.exp(running_max - safe_next_max), 0.0
+            )
+            candidate_weight = tl.where(
+                valid, tl.exp(score - safe_next_max), 0.0
+            )
+            running_acc = (
+                running_acc * previous_weight + kv * candidate_weight
+            )
+            running_denom = (
+                running_denom * previous_weight + candidate_weight
+            )
+            running_max = next_max
+
+        partial_row = (
+            (batch_idx * NUM_HEADS + head_idx) * NUM_SPLITS + split_idx
+        )
+        tl.store(
+            partial_output_ptr + partial_row * HEAD_DIM + dim_offsets,
+            running_acc,
+            mask=dim_mask,
+        )
+        tl.store(partial_max_ptr + partial_row, running_max)
+        tl.store(partial_denom_ptr + partial_row, running_denom)
+
+
+    @triton.jit
+    def fastllm_deepseek_v4_sparse_decode_sm120_split_kernel(
+        q_ptr,
+        window_kv_ptr,
+        compressed_kv_ptr,
+        decode_meta_ptr,
+        partial_output_ptr,
+        partial_max_ptr,
+        partial_denom_ptr,
+        softmax_scale,
+        BATCH: tl.constexpr,
+        NUM_HEADS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        WINDOW_SIZE: tl.constexpr,
+        COMPRESS_RATIO: tl.constexpr,
+        COMPRESSED_CAPACITY: tl.constexpr,
+        NUM_SPLITS: tl.constexpr,
+        SPLIT_SIZE: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HEAD_BLOCK: tl.constexpr,
+    ):
+        """SM12x tensor-core sparse decode split.
+
+        A program owns a 16-head x candidate tile, matching FlashInfer's
+        head-padded sparse-MLA schedule.  QK and PV use BF16 tensor-core dot
+        products while the graph-capacity ABI and FP32 split/merge state stay
+        identical to the generic kernel.  The generic scalar-FP32 path remains
+        available for other architectures, dtypes, dimensions, and strict
+        compatibility runs.
+        """
+        batch_idx = tl.program_id(0)
+        head_block_idx = tl.program_id(1)
+        split_idx = tl.program_id(2)
+        head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+        candidate_offsets = tl.arange(0, SPLIT_SIZE)
+        dim_offsets = tl.arange(0, BLOCK_D)
+        head_mask = head_offsets < NUM_HEADS
+        dim_mask = dim_offsets < HEAD_DIM
+
+        start_pos = tl.load(decode_meta_ptr)
+        live_window = tl.minimum(start_pos + 1, WINDOW_SIZE)
+        if COMPRESS_RATIO > 0:
+            compressed_count = tl.minimum(
+                (start_pos + 1) // COMPRESS_RATIO, COMPRESSED_CAPACITY
+            )
+        else:
+            compressed_count = 0
+        total_count = live_window + compressed_count
+        candidate_indices = split_idx * SPLIT_SIZE + candidate_offsets
+        candidate_mask = candidate_indices < total_count
+        if split_idx * SPLIT_SIZE >= total_count:
+            return
+
+        ring_pos = start_pos % WINDOW_SIZE
+        ring_full = start_pos >= WINDOW_SIZE - 1
+        use_window = candidate_mask & (candidate_indices < live_window)
+        window_indices = tl.where(
+            ring_full,
+            (ring_pos + 1 + candidate_indices) % WINDOW_SIZE,
+            candidate_indices,
+        )
+        window_kv = tl.load(
+            window_kv_ptr
+            + (batch_idx * WINDOW_SIZE + window_indices[:, None]) * HEAD_DIM
+            + dim_offsets[None, :],
+            mask=use_window[:, None] & dim_mask[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+        compressed_indices = candidate_indices - live_window
+        use_compressed = candidate_mask & ~use_window
+        compressed_kv = tl.load(
+            compressed_kv_ptr
+            + (batch_idx * COMPRESSED_CAPACITY + compressed_indices[:, None])
+            * HEAD_DIM
+            + dim_offsets[None, :],
+            mask=use_compressed[:, None] & dim_mask[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+        kv = tl.where(use_window[:, None], window_kv, compressed_kv)
+        q = tl.load(
+            q_ptr
+            + (batch_idx * NUM_HEADS + head_offsets[:, None]) * HEAD_DIM
+            + dim_offsets[None, :],
+            mask=head_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        ).to(tl.bfloat16)
+
+        scores = tl.dot(q, tl.trans(kv), out_dtype=tl.float32)
+        scores *= softmax_scale
+        score_mask = head_mask[:, None] & candidate_mask[None, :]
+        scores = tl.where(score_mask, scores, -float("inf"))
+        partial_max = tl.max(scores, axis=1)
+        safe_max = tl.where(head_mask, partial_max, 0.0)
+        weights = tl.where(
+            score_mask,
+            tl.exp(scores - safe_max[:, None]),
+            0.0,
+        )
+        partial_denom = tl.sum(weights, axis=1)
+        partial_output = tl.dot(
+            weights.to(tl.bfloat16), kv, out_dtype=tl.float32
+        )
+
+        partial_rows = (
+            (batch_idx * NUM_HEADS + head_offsets) * NUM_SPLITS + split_idx
+        )
+        tl.store(
+            partial_output_ptr
+            + partial_rows[:, None] * HEAD_DIM
+            + dim_offsets[None, :],
+            partial_output,
+            mask=head_mask[:, None] & dim_mask[None, :],
+        )
+        tl.store(partial_max_ptr + partial_rows, partial_max, mask=head_mask)
+        tl.store(
+            partial_denom_ptr + partial_rows, partial_denom, mask=head_mask
+        )
+
+
+    @triton.jit
+    def fastllm_deepseek_v4_sparse_decode_merge_kernel(
+        partial_output_ptr,
+        partial_max_ptr,
+        partial_denom_ptr,
+        sink_ptr,
+        decode_meta_ptr,
+        output_ptr,
+        BATCH: tl.constexpr,
+        NUM_HEADS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        WINDOW_SIZE: tl.constexpr,
+        COMPRESS_RATIO: tl.constexpr,
+        COMPRESSED_CAPACITY: tl.constexpr,
+        NUM_SPLITS: tl.constexpr,
+        SPLIT_SIZE: tl.constexpr,
+        BLOCK_SPLITS: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Merge split online-softmax states and the learned attention sink."""
+        batch_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        dim_block = tl.program_id(2)
+        split_offsets = tl.arange(0, BLOCK_SPLITS)
+        dim_offsets = dim_block * BLOCK_D + tl.arange(0, BLOCK_D)
+        start_pos = tl.load(decode_meta_ptr)
+        live_window = tl.minimum(start_pos + 1, WINDOW_SIZE)
+        if COMPRESS_RATIO > 0:
+            compressed_count = tl.minimum(
+                (start_pos + 1) // COMPRESS_RATIO, COMPRESSED_CAPACITY
+            )
+        else:
+            compressed_count = 0
+        live_splits = tl.cdiv(live_window + compressed_count, SPLIT_SIZE)
+        split_mask = (split_offsets < NUM_SPLITS) & (split_offsets < live_splits)
+        dim_mask = dim_offsets < HEAD_DIM
+        partial_base = (batch_idx * NUM_HEADS + head_idx) * NUM_SPLITS
+
+        partial_max = tl.load(
+            partial_max_ptr + partial_base + split_offsets,
+            mask=split_mask,
+            other=-float("inf"),
+        )
+        partial_denom = tl.load(
+            partial_denom_ptr + partial_base + split_offsets,
+            mask=split_mask,
+            other=0.0,
+        )
+        sink = tl.load(sink_ptr + head_idx)
+        token_max = tl.max(partial_max, axis=0)
+        merge_max = tl.maximum(token_max, sink)
+        has_tokens = tl.sum(partial_denom, axis=0) > 0.0
+        has_sink = sink > -float("inf")
+        has_any = has_tokens | has_sink
+        safe_merge_max = tl.where(has_any, merge_max, 0.0)
+        partial_scale = tl.where(
+            partial_denom > 0.0,
+            tl.exp(partial_max - safe_merge_max),
+            0.0,
+        )
+        sink_weight = tl.where(
+            has_sink, tl.exp(sink - safe_merge_max), 0.0
+        )
+        total_denom = (
+            tl.sum(partial_denom * partial_scale, axis=0) + sink_weight
+        )
+
+        partial = tl.load(
+            partial_output_ptr
+            + (partial_base + split_offsets[:, None]) * HEAD_DIM
+            + dim_offsets[None, :],
+            mask=split_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+        numerator = tl.sum(partial * partial_scale[:, None], axis=0)
+        result = tl.where(total_denom > 0.0, numerator / total_denom, 0.0)
+        output_row = (batch_idx * NUM_HEADS + head_idx) * HEAD_DIM
+        tl.store(output_ptr + output_row + dim_offsets, result, mask=dim_mask)
+
+
+    @triton.jit
     def fastllm_merge_moe_fp8_swiglu_quant_kernel(
         gateup_ptr,
         c_ptr,
@@ -1745,6 +2076,9 @@ def deepseek_v4_fp8_woa_cache_paths(payload):
     return cache_dir / f"{name}.cubin", cache_dir / f"{name}.json"
 
 
+DEEPSEEK_V4_SPARSE_DECODE_KERNEL_ORDER = ("split", "merge")
+
+
 def deepseek_v4_sparse_decode_cache_paths(payload):
     arch = require_int(payload, "arch")
     batch = require_int(payload, "batch", 1)
@@ -1752,17 +2086,34 @@ def deepseek_v4_sparse_decode_cache_paths(payload):
     head_dim = require_int(payload, "head_dim", 512)
     window_size = require_int(payload, "window_size", 128)
     compress_ratio = require_nonnegative_int(payload, "compress_ratio", 0)
-    head_block = require_int(payload, "head_block", 1)
+    compressed_capacity = require_int(payload, "compressed_capacity", 1)
+    split_size = require_int(payload, "split_size", 16)
     block_d = require_int(payload, "block_d", 512)
-    num_warps = require_int(payload, "num_warps", 4)
+    merge_block_d = require_int(payload, "merge_block_d", 32)
+    split_num_warps = require_int(payload, "split_num_warps", 4)
+    merge_num_warps = require_int(payload, "merge_num_warps", 4)
     num_stages = require_int(payload, "num_stages", 2)
+    variant = str(payload.get("variant") or "generic").strip().lower()
+    if variant not in {"generic", "sm120_tensorcore"}:
+        raise ValueError(
+            "DeepSeek-V4 sparse decode variant must be generic or sm120_tensorcore"
+        )
+    num_splits = (window_size + compressed_capacity + split_size - 1) // split_size
+    block_splits = 1 << (num_splits - 1).bit_length()
     cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
+    variant_tag = "" if variant == "generic" else f"_{variant}"
     name = (
-        f"deepseek_v4_sparse_decode_v1_sm{arch}"
+        f"deepseek_v4_sparse_decode_v3{variant_tag}_sm{arch}"
         f"_b{batch}_h{num_heads}_d{head_dim}_w{window_size}_cr{compress_ratio}"
-        f"_hb{head_block}_bd{block_d}_nw{num_warps}_ns{num_stages}"
+        f"_cc{compressed_capacity}_ss{split_size}_bd{block_d}"
+        f"_mbd{merge_block_d}_bs{block_splits}"
+        f"_snw{split_num_warps}_mnw{merge_num_warps}_ns{num_stages}"
     )
-    return cache_dir / f"{name}.cubin", cache_dir / f"{name}.json"
+    cubins = {
+        key: cache_dir / f"{name}_{key}.cubin"
+        for key in DEEPSEEK_V4_SPARSE_DECODE_KERNEL_ORDER
+    }
+    return cubins, cache_dir / f"{name}.json"
 
 
 def merge_moe_fp8_cache_paths(payload):
@@ -2499,64 +2850,158 @@ def compile_deepseek_v4_sparse_decode(payload):
     head_dim = require_int(payload, "head_dim", 512)
     window_size = require_int(payload, "window_size", 128)
     compress_ratio = require_nonnegative_int(payload, "compress_ratio", 0)
-    head_block = require_int(payload, "head_block", 1)
+    compressed_capacity = require_int(payload, "compressed_capacity", 1)
+    split_size = require_int(payload, "split_size", 16)
     block_d = require_int(payload, "block_d", 512)
-    num_warps = require_int(payload, "num_warps", 4)
+    merge_block_d = require_int(payload, "merge_block_d", 32)
+    split_num_warps = require_int(payload, "split_num_warps", 4)
+    merge_num_warps = require_int(payload, "merge_num_warps", 4)
     num_stages = require_int(payload, "num_stages", 2)
+    variant = str(payload.get("variant") or "generic").strip().lower()
+    if variant not in {"generic", "sm120_tensorcore"}:
+        raise ValueError(
+            "DeepSeek-V4 sparse decode variant must be generic or sm120_tensorcore"
+        )
     if batch != 1:
         raise ValueError("DeepSeek-V4 sparse decode currently requires batch=1")
-    if head_block not in {1, 2, 4}:
-        raise ValueError("DeepSeek-V4 sparse decode head_block must be 1, 2, or 4")
+    if split_size not in {8, 16, 32, 64}:
+        raise ValueError("DeepSeek-V4 sparse decode split_size must be 8, 16, 32, or 64")
     if block_d < head_dim or block_d > 1024 or (block_d & (block_d - 1)) != 0:
         raise ValueError("DeepSeek-V4 sparse decode block_d must be a power of two covering head_dim")
+    if merge_block_d not in {16, 32, 64, 128}:
+        raise ValueError("DeepSeek-V4 sparse decode merge_block_d must be 16, 32, 64, or 128")
     if num_heads <= 0 or head_dim <= 0 or window_size <= 0:
         raise ValueError("DeepSeek-V4 sparse decode dimensions must be positive")
-    cubin_path, meta_path = deepseek_v4_sparse_decode_cache_paths(payload)
-    if cubin_path.exists() and meta_path.exists():
+    if variant == "sm120_tensorcore":
+        if arch not in {120, 121}:
+            raise ValueError("SM120 tensor-core sparse decode requires SM12x")
+        if head_dim != 512 or block_d != 512 or num_heads > 16:
+            raise ValueError(
+                "SM120 tensor-core sparse decode requires head_dim=block_d=512 "
+                "and at most 16 local heads"
+            )
+        if split_size not in {16, 32, 64}:
+            raise ValueError(
+                "SM120 tensor-core sparse decode requires split_size 16, 32, or 64"
+            )
+    num_splits = (window_size + compressed_capacity + split_size - 1) // split_size
+    block_splits = 1 << (num_splits - 1).bit_length()
+    if num_splits > 256:
+        raise ValueError(
+            "DeepSeek-V4 sparse decode optimized path supports at most 256 splits"
+        )
+
+    cubin_paths, meta_path = deepseek_v4_sparse_decode_cache_paths(payload)
+    if all(path.exists() for path in cubin_paths.values()) and meta_path.exists():
         return json.loads(meta_path.read_text())
 
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    signature = {
+    split_signature = {
         "q_ptr": "*bf16",
         "window_kv_ptr": "*fp32",
         "compressed_kv_ptr": "*bf16",
-        "sink_ptr": "*fp32",
         "decode_meta_ptr": "*i32",
-        "output_ptr": "*fp32",
+        "partial_output_ptr": "*fp32",
+        "partial_max_ptr": "*fp32",
+        "partial_denom_ptr": "*fp32",
         "softmax_scale": "fp32",
         "BATCH": "constexpr",
         "NUM_HEADS": "constexpr",
         "HEAD_DIM": "constexpr",
         "WINDOW_SIZE": "constexpr",
         "COMPRESS_RATIO": "constexpr",
-        "HEAD_BLOCK": "constexpr",
+        "COMPRESSED_CAPACITY": "constexpr",
+        "NUM_SPLITS": "constexpr",
+        "SPLIT_SIZE": "constexpr",
         "BLOCK_D": "constexpr",
     }
-    constexprs = {
+    split_constexprs = {
         "BATCH": batch,
         "NUM_HEADS": num_heads,
         "HEAD_DIM": head_dim,
         "WINDOW_SIZE": window_size,
         "COMPRESS_RATIO": compress_ratio,
-        "HEAD_BLOCK": head_block,
+        "COMPRESSED_CAPACITY": compressed_capacity,
+        "NUM_SPLITS": num_splits,
+        "SPLIT_SIZE": split_size,
         "BLOCK_D": block_d,
     }
-    ccinfo = _compile_cubin(
-        fastllm_deepseek_v4_sparse_decode_kernel,
-        signature,
-        constexprs,
+    split_kernel = fastllm_deepseek_v4_sparse_decode_split_kernel
+    split_head_block = 1
+    if variant == "sm120_tensorcore":
+        split_signature["HEAD_BLOCK"] = "constexpr"
+        split_constexprs["HEAD_BLOCK"] = 16
+        split_kernel = fastllm_deepseek_v4_sparse_decode_sm120_split_kernel
+        split_head_block = 16
+    split_ccinfo = _compile_cubin(
+        split_kernel,
+        split_signature,
+        split_constexprs,
         arch,
-        num_warps,
+        split_num_warps,
         num_stages,
-        cubin_path,
+        cubin_paths["split"],
     )
+
+    merge_signature = {
+        "partial_output_ptr": "*fp32",
+        "partial_max_ptr": "*fp32",
+        "partial_denom_ptr": "*fp32",
+        "sink_ptr": "*fp32",
+        "decode_meta_ptr": "*i32",
+        "output_ptr": "*fp32",
+        "BATCH": "constexpr",
+        "NUM_HEADS": "constexpr",
+        "HEAD_DIM": "constexpr",
+        "WINDOW_SIZE": "constexpr",
+        "COMPRESS_RATIO": "constexpr",
+        "COMPRESSED_CAPACITY": "constexpr",
+        "NUM_SPLITS": "constexpr",
+        "SPLIT_SIZE": "constexpr",
+        "BLOCK_SPLITS": "constexpr",
+        "BLOCK_D": "constexpr",
+    }
+    merge_constexprs = {
+        "BATCH": batch,
+        "NUM_HEADS": num_heads,
+        "HEAD_DIM": head_dim,
+        "WINDOW_SIZE": window_size,
+        "COMPRESS_RATIO": compress_ratio,
+        "COMPRESSED_CAPACITY": compressed_capacity,
+        "NUM_SPLITS": num_splits,
+        "SPLIT_SIZE": split_size,
+        "BLOCK_SPLITS": block_splits,
+        "BLOCK_D": merge_block_d,
+    }
+    merge_ccinfo = _compile_cubin(
+        fastllm_deepseek_v4_sparse_decode_merge_kernel,
+        merge_signature,
+        merge_constexprs,
+        arch,
+        merge_num_warps,
+        num_stages,
+        cubin_paths["merge"],
+    )
+
+    kernel_infos = {
+        "split": split_ccinfo,
+        "merge": merge_ccinfo,
+    }
     meta = {
         "ok": True,
         "op": "deepseek_v4_sparse_decode",
-        "cubin": str(cubin_path),
-        "kernel": ccinfo.metadata.name,
-        "shared": int(ccinfo.metadata.shared),
-        "num_warps": int(ccinfo.metadata.num_warps),
+        "version": 3,
+        "variant": variant,
+        "split_head_block": split_head_block,
+        "kernels": {
+            key: {
+                "cubin": str(cubin_paths[key]),
+                "kernel": kernel_infos[key].metadata.name,
+                "shared": int(kernel_infos[key].metadata.shared),
+                "num_warps": int(kernel_infos[key].metadata.num_warps),
+            }
+            for key in DEEPSEEK_V4_SPARSE_DECODE_KERNEL_ORDER
+        },
         "num_stages": num_stages,
         "arch": arch,
         "batch": batch,
@@ -2564,8 +3009,12 @@ def compile_deepseek_v4_sparse_decode(payload):
         "head_dim": head_dim,
         "window_size": window_size,
         "compress_ratio": compress_ratio,
-        "head_block": head_block,
+        "compressed_capacity": compressed_capacity,
+        "num_splits": num_splits,
+        "block_splits": block_splits,
+        "split_size": split_size,
         "block_d": block_d,
+        "merge_block_d": merge_block_d,
     }
     meta_path.write_text(json.dumps(meta, sort_keys=True))
     return meta

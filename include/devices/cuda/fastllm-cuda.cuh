@@ -1071,8 +1071,12 @@ bool FastllmCudaTritonDeepSeekV4WoA(
     int numTokens, int groups, int outRank, int hiddenSize);
 
 bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
-    const char *cubinPath, const char *kernelName, int numWarps, int shared,
-    int headBlock, int blockD, const fastllm::Data &q,
+    const char *splitCubinPath, const char *splitKernelName,
+    int splitNumWarps, int splitShared,
+    const char *mergeCubinPath, const char *mergeKernelName,
+    int mergeNumWarps, int mergeShared,
+    int compressedCapacity, int numSplits, int splitSize,
+    int splitHeadBlock, int blockD, int mergeBlockD, const fastllm::Data &q,
     const fastllm::Data &windowKV, const fastllm::Data &compressedKV,
     const fastllm::Data &attnSink, int windowSize, int compressRatio,
     const int32_t *decodeMeta, float softmaxScale, float *output);
