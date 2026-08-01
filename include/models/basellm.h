@@ -550,6 +550,10 @@ namespace fastllm {
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
 
+        // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
+        // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。
+        bool isIntermediateChunkedPrefill = false;
+
         int defaultChunkedPrefillSize = 8192;
 
         // 新推理引擎的主循环

@@ -156,6 +156,13 @@ namespace fastllm {
         return env == nullptr || !Qwen35MoeIsTrueString(env);
     }
 
+    static bool Qwen35SkipIntermediateChunkHeadEnabled() {
+        const char *env = std::getenv(
+            "FASTLLM_QWEN35_SKIP_INTERMEDIATE_CHUNK_HEAD");
+        return env == nullptr || env[0] == '\0' ||
+               Qwen35MoeIsTrueString(env);
+    }
+
     class Qwen35MtpBatchFastPathUnavailable final : public std::runtime_error {
     public:
         explicit Qwen35MtpBatchFastPathUnavailable(const std::string &message)
@@ -9099,7 +9106,11 @@ namespace fastllm {
             addPartialToResidualReduce(moeFinal);
         }
         mtpWorkerProfileSyncMark(mtpWorkerProfileLayersUs);
-        if (speculativeCacheOnlyForward) {
+        if (speculativeCacheOnlyForward ||
+            (isIntermediateChunkedPrefill &&
+             !speculativeCaptureAllHiddenStates &&
+             !speculativeCollectAllLogits &&
+             Qwen35SkipIntermediateChunkHeadEnabled())) {
             logits.FreeSpace();
             logits.dims.clear();
             logits.strides.clear();
@@ -10119,7 +10130,11 @@ namespace fastllm {
         }
         mtpTargetProfileMark(mtpTargetProfileMetaSyncUs);
 
-        if (speculativeCacheOnlyForward) {
+        if (speculativeCacheOnlyForward ||
+            (isIntermediateChunkedPrefill &&
+             !speculativeCaptureAllHiddenStates &&
+             !speculativeCollectAllLogits &&
+             Qwen35SkipIntermediateChunkHeadEnabled())) {
             return {};
         }
 
@@ -15239,6 +15254,7 @@ namespace fastllm {
                         auto prefillStartTime = std::chrono::system_clock::now();
                         for (int st = 0; st < len; ) {
                             int curLen = std::min(prefillChunkSize, len - st);
+                            bool isLastChunk = st + curLen == len;
                             auto chunkStartTime = std::chrono::system_clock::now();
                             Data curInput, curPositionIds;
                             Split(inputIds, 1, st, st + curLen, curInput);
@@ -15265,7 +15281,16 @@ namespace fastllm {
                             }
                             bool oldCaptureAllHiddenStates =
                                 model->speculativeCaptureAllHiddenStates;
+                            bool oldCacheOnlyForward =
+                                model->speculativeCacheOnlyForward;
+                            bool skipIntermediateHead =
+                                !isLastChunk && !seedLongPrefillMtp &&
+                                generationConfigs.size() == 1 &&
+                                generationConfigs[0].IsSimpleGreedy() &&
+                                Qwen35SkipIntermediateChunkHeadEnabled();
                             model->speculativeCaptureAllHiddenStates = seedLongPrefillMtp;
+                            model->speculativeCacheOnlyForward =
+                                oldCacheOnlyForward || skipIntermediateHead;
                             if (seedLongPrefillMtp) {
                                 model->speculativeHiddenStates.FreeSpace();
                                 model->speculativeHiddenStates.dims.clear();
@@ -15280,6 +15305,8 @@ namespace fastllm {
                             } catch (...) {
                                 model->speculativeCaptureAllHiddenStates =
                                     oldCaptureAllHiddenStates;
+                                model->speculativeCacheOnlyForward =
+                                    oldCacheOnlyForward;
                                 if (seedLongPrefillMtp) {
                                     eraseLongPrefillMtpCache();
                                 }
@@ -15287,8 +15314,9 @@ namespace fastllm {
                             }
                             model->speculativeCaptureAllHiddenStates =
                                 oldCaptureAllHiddenStates;
+                            model->speculativeCacheOnlyForward =
+                                oldCacheOnlyForward;
 
-                            bool isLastChunk = st + curLen == len;
                             if (seedLongPrefillMtp) {
                                 AssertInFastLLM(!ret.empty(),
                                                 "Qwen3.5 long prefill returned no token.\n");

@@ -2493,15 +2493,33 @@ namespace fastllm {
                             curPastKeyValues.push_back(std::make_pair(&(*pastKeyValue1)[i].first,
                                                                       &(*pastKeyValue1)[i].second));
                         }
-                        if (useGPUForward) {
-                            ret = model->ForwardGPU(1, curInput, curAttentionMasks,
-                                                     curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
-                                                     tokensManager, &logits);
-                        } else {
-                            ret = model->ForwardV2(1, curInput, curAttentionMasks,
-                                                   curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
-                                                   tokensManager, &logits);
+                        bool oldIntermediateChunkedPrefill =
+                            model->isIntermediateChunkedPrefill;
+                        model->isIntermediateChunkedPrefill =
+                            st + curLen < len &&
+                            generationConfigs.size() == 1 &&
+                            generationConfigs[0].IsSimpleGreedy();
+                        try {
+                            if (useGPUForward) {
+                                ret = model->ForwardGPU(
+                                    1, curInput, curAttentionMasks,
+                                    curPositionIdsVec, curSeqLens,
+                                    curPastKeyValues, generationConfigs,
+                                    tokensManager, &logits);
+                            } else {
+                                ret = model->ForwardV2(
+                                    1, curInput, curAttentionMasks,
+                                    curPositionIdsVec, curSeqLens,
+                                    curPastKeyValues, generationConfigs,
+                                    tokensManager, &logits);
+                            }
+                        } catch (...) {
+                            model->isIntermediateChunkedPrefill =
+                                oldIntermediateChunkedPrefill;
+                            throw;
                         }
+                        model->isIntermediateChunkedPrefill =
+                            oldIntermediateChunkedPrefill;
                         st += curLen;
                         if (st < len) {
                             dictLocker.lock();
