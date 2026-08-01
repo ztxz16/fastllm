@@ -1849,6 +1849,88 @@ namespace {
         }
     }
 
+    static void CheckLinearFp8LayoutSafetyCuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "separate" ||
+            params.GetString("input_type") != "fp16") {
+            throw std::runtime_error(
+                "FP8 layout safety check requires weight_layout=separate and input_type=fp16");
+        }
+        int arch = FastllmCudaRuntimeArch();
+        if (arch != 120 && arch != 121) {
+            throw std::runtime_error("FP8 layout safety check targets SM120/SM121");
+        }
+        const char *marlinEnv = std::getenv("FASTLLM_CUDA_FP8_MARLIN");
+        if (marlinEnv != nullptr && marlinEnv[0] != '\0') {
+            throw std::runtime_error(
+                "FP8 layout safety check requires FASTLLM_CUDA_FP8_MARLIN to be unset");
+        }
+
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+
+        struct ScopedNcclForceSync {
+            bool previous = FastllmCudaGetNcclForceSync();
+            ScopedNcclForceSync() {
+                FastllmCudaSetNcclForceSync(true);
+            }
+            ~ScopedNcclForceSync() {
+                FastllmCudaSetNcclForceSync(previous);
+            }
+        } forceSync;
+
+        fastllm::Data warmup = MakeCudaOutputLike(
+            state->input.dataType, 2, state->out);
+        bool ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, warmup,
+            2, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("FP8 layout safety warmup failed");
+        }
+        ForceDeviceSync();
+        if (FastllmCudaHasFp8MarlinLayout(state->weight)) {
+            throw std::runtime_error(
+                "SM120/SM121 warmup must preserve row-major FP8 weights");
+        }
+
+        // Also verify the defensive CUTLASS check independently of the SM120
+        // default policy. The fake non-null metadata is restored before Data
+        // destruction and is never dereferenced by the expected reject path.
+        struct ScopedFakeMarlinLayout {
+            fastllm::Data &weight;
+            std::vector<void*> oldExtraCudaData;
+            std::vector<void*> oldExtraCudaHalfData;
+
+            explicit ScopedFakeMarlinLayout(fastllm::Data &weight)
+                : weight(weight),
+                  oldExtraCudaData(weight.extraCudaData),
+                  oldExtraCudaHalfData(weight.extraCudaHalfData) {
+                weight.extraCudaData.resize(4, nullptr);
+                weight.extraCudaHalfData.resize(2, nullptr);
+                weight.extraCudaData[3] = weight.cudaData;
+                weight.extraCudaHalfData[1] = weight.cudaData;
+            }
+
+            ~ScopedFakeMarlinLayout() {
+                weight.extraCudaData = std::move(oldExtraCudaData);
+                weight.extraCudaHalfData = std::move(oldExtraCudaHalfData);
+            }
+        } fakeLayout(state->weight);
+
+        if (!FastllmCudaHasFp8MarlinLayout(state->weight)) {
+            throw std::runtime_error("FP8 layout safety test metadata setup failed");
+        }
+        fastllm::Data cutlass = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+        ok = FastllmCudaCutlassLinearFP8E4M3Block128(
+            state->input, state->weight, state->bias, cutlass,
+            state->batch, state->in, state->out);
+        if (ok) {
+            ForceDeviceSync();
+            throw std::runtime_error(
+                "CUTLASS must reject FP8 weights already repacked for Marlin");
+        }
+    }
+
     static void CheckLinearFp8Block128SwigluCuda(const OpTestParams &params) {
         if (params.GetString("weight_layout") != "separate") {
             throw std::runtime_error("linear_fp8_block128 swiglu check targets separate FP8_E4M3 scale layout");
@@ -1933,6 +2015,9 @@ namespace {
         } else if (params.GetInt("check") == 4) {
             CheckLinearFp8RawBatchOneCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 5) {
+            CheckLinearFp8LayoutSafetyCuda(params);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -2008,7 +2093,7 @@ namespace {
                 params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
                 params.Add("check", "0",
                            "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail, "
-                           "4 raw batch-one check");
+                           "4 raw batch-one, 5 Marlin/CUTLASS layout safety");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },

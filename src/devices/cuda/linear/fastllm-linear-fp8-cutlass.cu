@@ -791,6 +791,11 @@ static bool FastllmCutlassEnsureScratch(
 static bool FastllmCutlassEnsureWeightCache(
     fastllm::Data &weight, int inFeatures, int outFeatures,
     cudaStream_t stream, FastllmCutlassFp8WeightCache *&cache) {
+    // FP8 Marlin warmup repacks cudaData in place. CUTLASS aliases cudaData
+    // as row-major FP8, so accepting that layout silently produces bad logits.
+    if (FastllmCudaHasFp8MarlinLayout(weight)) {
+        return false;
+    }
     const void *key = weight.cudaData;
     if (key == nullptr || weight.scales.empty() || weight.blockM != 128 || weight.blockK != 128) {
         return false;
