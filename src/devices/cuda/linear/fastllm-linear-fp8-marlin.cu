@@ -267,6 +267,11 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
 
 }  // namespace
 
+extern "C" bool FastllmCudaHasFp8MarlinLayout(
+        const fastllm::Data &weight) {
+    return HasFp8MarlinOnDevice(weight);
+}
+
 extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
         const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
         fastllm::Data &output, int n, int m, int k) {

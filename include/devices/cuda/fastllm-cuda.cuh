@@ -246,6 +246,7 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   const void *b_scales, void *c,
                                   int size_m, int size_n, int size_k,
                                   int group_size, int *workspace);
+bool FastllmCudaHasFp8MarlinLayout(const fastllm::Data &weight);
 bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
                                                 fastllm::Data &weight,
                                                 const fastllm::Data &bias,

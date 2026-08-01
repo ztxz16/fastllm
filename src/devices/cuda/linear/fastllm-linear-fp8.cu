@@ -136,7 +136,7 @@ bool FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
         state = cudaDeviceSynchronize();
     }
     if (state != cudaSuccess) {
-        printf("Error: FP8 draft lm_head quantization failed on cuda:%d (%s).\n",
+        printf("Error: FP8 block128 weight quantization failed on cuda:%d (%s).\n",
                device, cudaGetErrorString(state));
         output.FreeSpace();
         return false;
@@ -465,11 +465,12 @@ FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128(const half * __restrict__ A, co
         const int i = g << 4;
         const int scaleCol = i >> 7;
         half2 Bv[ROWS][8];
-        float sc[ROWS];
+        // st0 is ROWS-aligned and every instantiated ROWS divides blockM=128,
+        // so all rows owned by this warp share the same block scale.
+        const float sc = scales[(st0 >> 7) * ms + scaleCol] * 256.0f;
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             if (r >= nValid) continue;
-            sc[r] = scales[((st0 + r) >> 7) * ms + scaleCol] * 256.0f;
             FastllmDequantFp8E4M3x16(bw[r], Bv[r]);
         }
 
@@ -500,7 +501,7 @@ FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128(const half * __restrict__ A, co
                                       __hmul2(ah[wi * 2 + 1], Bv[r][wi * 2 + 1]));
                     gsum += __half2float(p.x) + __half2float(p.y);
                 }
-                acc[x][r] += gsum * sc[r];
+                acc[x][r] += gsum * sc;
             }
         }
     }
@@ -574,6 +575,22 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
     constexpr int ROWS = 4;
     const int grid = (k + W * ROWS - 1) / (W * ROWS);
     const bool useBlock128 = (blockM == 128 && blockK == 128 && (m & 127) == 0);
+
+    // Small batch-one projections do not expose enough warps when each warp
+    // owns four rows (2048 outputs only launch four warps/SM on AD102).  The
+    // activation is cache-resident, so using two rows per warp improves DRAM
+    // latency hiding; keep ROWS=4 for larger outputs and multi-token calls to
+    // limit repeated activation work.
+    if (n == 1 && useBlock128 && k <= 2048) {
+        constexpr int SMALL_W = 2;
+        constexpr int SMALL_ROWS = 2;
+        const int smallGrid =
+            (k + SMALL_W * SMALL_ROWS - 1) / (SMALL_W * SMALL_ROWS);
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
+            <SMALL_W, 1, SMALL_ROWS> <<< smallGrid, SMALL_W * 32 >>>(
+                input, weight, output, bias, scales, m, k);
+        return;
+    }
 
 #define FASTLLM_FP8_WARP_LAUNCH(PARTVAL, AOFF, COFF) do { \
     if (useBlock128) { \

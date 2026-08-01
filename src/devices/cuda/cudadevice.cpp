@@ -1713,6 +1713,12 @@ namespace fastllm {
         if (!packedWeight && !separateScalesWeight) {
             return false;
         }
+        // FP16 warmup may repack separate-scale FP8 weights in place for
+        // Marlin. Triton consumes the original row-major bytes, so it must
+        // fall back once that destructive layout conversion has happened.
+        if (separateScalesWeight && FastllmCudaHasFp8MarlinLayout(weight)) {
+            return false;
+        }
         bool hasBias = bias.dims.size() > 0;
         if (hasBias && (bias.dataType != DataType::FLOAT32 || bias.cudaData == nullptr)) {
             return false;
@@ -3974,6 +3980,12 @@ namespace fastllm {
         } else if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k, true);
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                       bias.dims.empty() &&
+                       FastllmCudaHalfMatMulFloatFP8E4M3Block128AddTo(
+                           input, weight, output, 1.0f, false, n, m, k)) {
+                // Batch-1 decode can accumulate the packed FP8 projection
+                // directly into the residual, avoiding a second AddTo launch.
             } else {
                 return false;
             }
@@ -3982,7 +3994,12 @@ namespace fastllm {
                 return false;
             }
         } else if (input.dataType == DataType::BFLOAT16) {
-            {
+            if (weight.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                bias.dims.empty() &&
+                FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(
+                    input, weight, output, 1.0f, false, n, m, k)) {
+                // See the FLOAT16 path above.
+            } else {
                 return false;
             }
         } else {
