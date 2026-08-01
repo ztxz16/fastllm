@@ -2637,6 +2637,64 @@ namespace fastllm {
             return std::all_of(ok.begin(), ok.end(), [](char state) { return state != 0; });
         }
 
+        static bool DeepSeekV4SqrtSoftplusRouterMultiCuda(
+                Data &logits, Data &gateBias, float routeScale,
+                Data &expertIndex, Data &expertScore) {
+            constexpr int topk = 6;
+            if (!logits.multiDeviceData ||
+                !logits.IsTensorParallelReplicated()) {
+                return FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                    logits, gateBias, routeScale,
+                    expertIndex, expertScore);
+            }
+
+            std::vector<int> devices;
+            std::map<int, int> ratios;
+            FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+            if (devices.size() <= 1) {
+                return FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                    logits, gateBias, routeScale,
+                    expertIndex, expertScore);
+            }
+
+            PrepareMultiCudaReplicatedData(gateBias, devices, true);
+            int tokens = logits.dims.empty() ? 0 :
+                (int)(logits.Count(0) / logits.dims.back());
+            expertIndex.dataType = DataType::INT32;
+            expertIndex.Resize({tokens, topk});
+            expertIndex.dataDevice = DataDevice::CUDA;
+            expertIndex.dataDeviceIds = {devices[0]};
+            PrepareMultiCudaReplicatedData(expertIndex, devices, false);
+
+            expertScore.dataType = DataType::FLOAT32;
+            expertScore.Resize({tokens, topk});
+            expertScore.dataDevice = DataDevice::CUDA;
+            expertScore.dataDeviceIds = {devices[0]};
+            PrepareMultiCudaReplicatedData(expertScore, devices, false);
+
+            std::vector<char> ok(devices.size(), 0);
+            RunDeepSeekV4MultiCuda(devices, [&](int rank, int device) {
+                auto logitsIt = logits.multiDeviceDatas.find(device);
+                auto biasIt = gateBias.multiDeviceDatas.find(device);
+                auto indexIt = expertIndex.multiDeviceDatas.find(device);
+                auto scoreIt = expertScore.multiDeviceDatas.find(device);
+                if (logitsIt != logits.multiDeviceDatas.end() &&
+                    logitsIt->second != nullptr &&
+                    biasIt != gateBias.multiDeviceDatas.end() &&
+                    biasIt->second != nullptr &&
+                    indexIt != expertIndex.multiDeviceDatas.end() &&
+                    indexIt->second != nullptr &&
+                    scoreIt != expertScore.multiDeviceDatas.end() &&
+                    scoreIt->second != nullptr) {
+                    ok[rank] = FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                        *logitsIt->second, *biasIt->second, routeScale,
+                        *indexIt->second, *scoreIt->second);
+                }
+            });
+            return std::all_of(ok.begin(), ok.end(),
+                               [](char state) { return state != 0; });
+        }
+
         static bool DeepSeekV4HashRouteScoreMultiCuda(
                 Data &logits, Data &tid2eid, const int *inputIds, int tokens,
                 int topk, int scoreFuncMode, float routeScale,
@@ -2746,6 +2804,13 @@ namespace fastllm {
                 if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
                     gateBiasData = &weight[prefix + ".gate.bias"];
                     gateBiasData->ToDevice(DataDevice::CUDA);
+                }
+                if (scoreFuncMode == 2 && topk == 6 &&
+                    gateBiasData != nullptr &&
+                    DeepSeekV4SqrtSoftplusRouterMultiCuda(
+                        routerLogits, *gateBiasData, routeScale,
+                        expertIndex, expertScore)) {
+                    return;
                 }
                 if (DeepSeekV4RouteScoreTransformMultiCuda(routerLogits, scoreFuncMode)) {
                     bool needNorm = scoreFunc != "softmax";

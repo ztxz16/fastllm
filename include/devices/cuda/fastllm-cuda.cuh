@@ -475,6 +475,13 @@ bool FastllmCudaDeepSeekV4FusedQKVRopeCacheGraph(
                                             int quantDim, int quantBlockSize,
                                             int windowSize, fastllm::Data &windowKV);
 bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, int scoreFuncMode);
+// Architecture-generic fused DeepSeek-V4 sqrt-softplus router for the
+// production 256-expert, top-6 shape.
+bool FastllmCudaDeepSeekV4SqrtSoftplusRouter(const fastllm::Data &logits,
+                                             const fastllm::Data &gateBias,
+                                             float routeScale,
+                                             fastllm::Data &expertIndex,
+                                             fastllm::Data &expertScore);
 bool FastllmCudaDeepSeekV4HashRouteScore(const fastllm::Data &logits, fastllm::Data &tid2eid,
                                          const int *inputIds, int tokens, int topk,
                                          int scoreFuncMode, float routeScale,

@@ -2,6 +2,7 @@
 #include "fastllm.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1324,6 +1325,125 @@ __global__ void DeepSeekV4RouteScoreTransformKernel(float *logits, int rows, int
         for (int e = threadIdx.x; e < experts; e += blockDim.x) {
             float raw = rowData[e];
             rowData[e] = mode == 1 ? DeepSeekV4Sigmoid(raw) : sqrtf(DeepSeekV4Softplus(raw));
+        }
+    }
+}
+
+struct DeepSeekV4RouterCandidate {
+    float key;
+    int id;
+};
+
+__device__ __forceinline__ bool DeepSeekV4RouterCandidateBetter(
+        const DeepSeekV4RouterCandidate &a,
+        const DeepSeekV4RouterCandidate &b) {
+    if (a.id < 0) {
+        return false;
+    }
+    if (b.id < 0) {
+        return true;
+    }
+    return a.key != b.key ? a.key > b.key : a.id < b.id;
+}
+
+__device__ __forceinline__ DeepSeekV4RouterCandidate
+DeepSeekV4RouterWarpBest(DeepSeekV4RouterCandidate value) {
+    int lane = threadIdx.x & 31;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        DeepSeekV4RouterCandidate other;
+        other.key = __shfl_down_sync(0xffffffffu, value.key, offset);
+        other.id = __shfl_down_sync(0xffffffffu, value.id, offset);
+        if (lane + offset < 32 &&
+            DeepSeekV4RouterCandidateBetter(other, value)) {
+            value = other;
+        }
+    }
+    return value;
+}
+
+// Architecture-generic fused router. One CTA owns one token; every lane
+// transforms one of the 256 logits and six block reductions select the routed
+// experts. A winner writes its unbiased route weight before proceeding; the
+// next round's first barrier also completes that write, avoiding a dedicated
+// third barrier per round. This removes the intermediate transformed-logit
+// write and the generic SelectExpert<64, 50> shared-memory merge tree while
+// remaining usable on pre-SM120 CUDA devices.
+__global__ __launch_bounds__(256)
+void DeepSeekV4SqrtSoftplusTop6GenericKernel(
+        const float *logits, const float *bias,
+        int32_t *index, float *score, int tokens, float routeScale) {
+    constexpr int experts = 256;
+    constexpr int topk = 6;
+    constexpr int warps = 8;
+    constexpr float invalidKey = -FLT_MAX;
+
+    __shared__ DeepSeekV4RouterCandidate warpBest[warps];
+    __shared__ int selectedIds[topk];
+    __shared__ float selectedWeights[topk];
+
+    int token = blockIdx.x;
+    int expert = threadIdx.x;
+    if (token >= tokens || expert >= experts) {
+        return;
+    }
+    int lane = expert & 31;
+    int warp = expert >> 5;
+    float raw = logits[(uint64_t)token * experts + expert];
+    float weight = sqrtf(DeepSeekV4Softplus(raw));
+    float key = weight + bias[expert];
+    if (!isfinite(key)) {
+        key = invalidKey;
+    }
+    if (!isfinite(weight)) {
+        weight = 0.0f;
+    }
+    bool active = true;
+
+#pragma unroll
+    for (int rank = 0; rank < topk; rank++) {
+        DeepSeekV4RouterCandidate local = {
+            active ? key : invalidKey,
+            active ? expert : -1,
+        };
+        local = DeepSeekV4RouterWarpBest(local);
+        if (lane == 0) {
+            warpBest[warp] = local;
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            DeepSeekV4RouterCandidate block = lane < warps ?
+                warpBest[lane] :
+                DeepSeekV4RouterCandidate{invalidKey, -1};
+            block = DeepSeekV4RouterWarpBest(block);
+            if (lane == 0) {
+                selectedIds[rank] = block.id;
+            }
+        }
+        __syncthreads();
+
+        if (expert == selectedIds[rank]) {
+            selectedWeights[rank] = weight;
+            active = false;
+        }
+    }
+    __syncthreads();
+
+    if (expert == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int rank = 0; rank < topk; rank++) {
+            sum += selectedWeights[rank];
+        }
+        if (!isfinite(sum) || fabsf(sum) < 1.0e-20f) {
+            sum = 1.0f;
+        }
+        int32_t *tokenIndex = index + (uint64_t)token * topk;
+        float *tokenScore = score + (uint64_t)token * topk;
+#pragma unroll
+        for (int rank = 0; rank < topk; rank++) {
+            tokenIndex[rank] = selectedIds[rank];
+            tokenScore[rank] = selectedWeights[rank] / sum * routeScale;
         }
     }
 }
@@ -5413,6 +5533,40 @@ extern "C" bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, 
     DeepSeekV4RouteScoreTransformKernel<<<rows, 256>>>((float *)logits.cudaData, rows, experts, scoreFuncMode);
     DeviceSync();
     return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+        const fastllm::Data &logits, const fastllm::Data &gateBias,
+        float routeScale, fastllm::Data &expertIndex,
+        fastllm::Data &expertScore) {
+    constexpr int experts = 256;
+    constexpr int topk = 6;
+    if (logits.dataDevice != fastllm::DataDevice::CUDA ||
+        logits.dataType != fastllm::DataType::FLOAT32 ||
+        logits.cudaData == nullptr || logits.dims.empty() ||
+        logits.dims.back() != experts || logits.Count(0) == 0 ||
+        logits.Count(0) % experts != 0 ||
+        gateBias.dataDevice != fastllm::DataDevice::CUDA ||
+        gateBias.dataType != fastllm::DataType::FLOAT32 ||
+        gateBias.cudaData == nullptr || gateBias.Count(0) != experts ||
+        !isfinite(routeScale)) {
+        return false;
+    }
+    int tokens = (int)(logits.Count(0) / experts);
+    if (!DeepSeekV4PrepareCudaOutput(
+            expertIndex, fastllm::DataType::INT32, {tokens, topk}) ||
+        !DeepSeekV4PrepareCudaOutput(
+            expertScore, fastllm::DataType::FLOAT32, {tokens, topk})) {
+        return false;
+    }
+    DeepSeekV4SqrtSoftplusTop6GenericKernel<<<tokens, experts>>>(
+        (const float *)logits.cudaData,
+        (const float *)gateBias.cudaData,
+        (int32_t *)expertIndex.cudaData,
+        (float *)expertScore.cudaData, tokens, routeScale);
+    bool ok = cudaGetLastError() == cudaSuccess;
+    DeviceSync();
+    return ok;
 }
 
 void FastllmCudaReleaseDeepSeekV4RouteTableCache(
