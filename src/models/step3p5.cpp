@@ -884,6 +884,20 @@ namespace fastllm {
         return casted;
     }
 
+    static DataType ResolveStep3p5ThreadTpComputeType(DataType modelType) {
+        if (modelType == DataType::FLOAT32) {
+            return DataType::FLOAT32;
+        }
+        return DataType::FLOAT16;
+    }
+
+    static DataType ResolveStep3p5ThreadTpCacheType(DataType cacheType, DataType computeType) {
+        if (cacheType == DataType::FP8_E4M3) {
+            return cacheType;
+        }
+        return computeType;
+    }
+
 #ifdef USE_CUDA
     namespace {
         using namespace qwen3cuda;
@@ -1154,20 +1168,6 @@ namespace fastllm {
                 }
             }
             return false;
-        }
-
-        static DataType ResolveStep3p5ThreadTpComputeType(DataType modelType) {
-            if (modelType == DataType::FLOAT32) {
-                return DataType::FLOAT32;
-            }
-            return DataType::FLOAT16;
-        }
-
-        static DataType ResolveStep3p5ThreadTpCacheType(DataType cacheType, DataType computeType) {
-            if (cacheType == DataType::FP8_E4M3) {
-                return cacheType;
-            }
-            return computeType;
         }
 
         static void PrepareStep3p5EmbeddingWeightType(Data &embedWeight,
