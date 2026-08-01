@@ -525,6 +525,7 @@ namespace fastllm {
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
+        {DataType::INT4_W4A8, {"int4_w4a8"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
@@ -597,6 +598,7 @@ namespace fastllm {
         } else if (type == DataType::BFLOAT16 || type == DataType::FLOAT16) {
             return rows * columns * sizeof(uint16_t);
         } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP ||
+                   type == DataType::INT4_W4A8 ||
                    type == DataType::NVFP4) {
             return type == DataType::NVFP4 ? GetNVFP4WeightBytes(rows, columns) : rows * (columns / 2);
         } else if (type == DataType::INT8) {
@@ -919,6 +921,11 @@ namespace fastllm {
     }
 
     void Data::FakeFrom(const Data &ori, size_t offset) {
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         this->dataType = ori.dataType;
         this->UpdateUnitSize();
         this->isFake = true;
@@ -936,6 +943,11 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+#ifdef USE_CUDA
+        if (this != &ori && !this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         this->ToDevice(ori.dataDevice);
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
@@ -952,6 +964,16 @@ namespace fastllm {
         this->tpQHeads = ori.tpQHeads;
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
+        if (ori.dataType == DataType::INT4_W4A8) {
+            this->group = ori.group;
+            this->groupCnt = ori.groupCnt;
+            this->perChannelAxis = ori.perChannelAxis;
+            this->w4a8WeightEncoding = ori.w4a8WeightEncoding;
+            this->w4a8GroupScales = ori.w4a8GroupScales;
+        } else {
+            this->w4a8WeightEncoding = W4A8WeightEncoding::NONE;
+            this->w4a8GroupScales.clear();
+        }
         bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
                                      (this->ggmlTensor == nullptr || this->ggmlType != ori.ggmlType);
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
@@ -1004,6 +1026,98 @@ namespace fastllm {
             FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
 #endif
         }
+    }
+
+    void Data::InitW4A8Weight(W4A8WeightEncoding encoding) {
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
+        AssertInFastLLM(this->dataType == DataType::INT4_W4A8,
+                        "InitW4A8Weight requires INT4_W4A8 dtype.\n");
+        AssertInFastLLM(encoding == W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8,
+                        "Unsupported W4A8 source encoding.\n");
+        AssertInFastLLM(this->dims.size() == 2 && this->dims[0] > 0 && this->dims[1] > 0,
+                        "W4A8 weight should be a positive 2D tensor.\n");
+        AssertInFastLLM(this->dims[0] % COMPRESSED_W4A8_GROUP_SIZE == 0 &&
+                        this->dims[1] % COMPRESSED_W4A8_GROUP_SIZE == 0,
+                        "W4A8 weight dimensions should be 128-aligned.\n");
+
+        this->w4a8WeightEncoding = encoding;
+        this->perChannelAxis = 0;
+        this->groupCnt = COMPRESSED_W4A8_GROUP_SIZE;
+        this->group = this->dims[1] / this->groupCnt;
+        this->perChannelsConfigs.clear();
+        this->scales.clear();
+        this->mins.clear();
+        this->zeros.clear();
+        this->halfScales.clear();
+        this->weightSum.clear();
+        this->w4a8GroupScales.clear();
+    }
+
+    void Data::SetW4A8GroupScales(const uint16_t *groupScales, size_t count) {
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
+        AssertInFastLLM(this->dataType == DataType::INT4_W4A8 &&
+                        this->w4a8WeightEncoding != W4A8WeightEncoding::NONE,
+                        "SetW4A8GroupScales requires an initialized W4A8 weight.\n");
+        size_t expected = (size_t)this->dims[0] * this->group;
+        AssertInFastLLM(count == expected,
+                        "W4A8 BF16 group scale count does not match the logical weight.\n");
+        AssertInFastLLM(groupScales != nullptr || count == 0,
+                        "W4A8 BF16 group scale data is null.\n");
+        this->w4a8GroupScales.assign(groupScales, groupScales + count);
+    }
+
+    bool Data::ValidateW4A8Weight(std::string *reason) const {
+        auto fail = [reason](const std::string &message) {
+            if (reason != nullptr) {
+                *reason = message;
+            }
+            return false;
+        };
+        if (this->dataType != DataType::INT4_W4A8) {
+            return fail("dtype is not INT4_W4A8");
+        }
+        if (this->w4a8WeightEncoding != W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8) {
+            return fail("source encoding is not compressed-tensors uint4b8");
+        }
+        if (this->dims.size() != 2 || this->dims[0] <= 0 || this->dims[1] <= 0) {
+            return fail("logical weight is not a positive 2D tensor");
+        }
+        if (this->dims[0] % COMPRESSED_W4A8_GROUP_SIZE != 0 ||
+            this->dims[1] % COMPRESSED_W4A8_GROUP_SIZE != 0) {
+            return fail("logical weight dimensions are not 128-aligned");
+        }
+        if (this->perChannelAxis != 0 || this->groupCnt != COMPRESSED_W4A8_GROUP_SIZE ||
+            this->group != this->dims[1] / COMPRESSED_W4A8_GROUP_SIZE) {
+            return fail("group metadata is inconsistent with group_size=128");
+        }
+        if (!this->perChannelsConfigs.empty() || !this->scales.empty() ||
+            !this->mins.empty() || !this->zeros.empty() || !this->halfScales.empty()) {
+            return fail("legacy quantization metadata is present");
+        }
+        size_t expectedScaleCount = (size_t)this->dims[0] * this->group;
+        if (this->w4a8GroupScales.size() != expectedScaleCount) {
+            return fail("BF16 group scale count does not match the logical weight");
+        }
+        uint64_t expectedPackedBytes = (uint64_t)this->dims[0] * this->dims[1] / 2;
+        if (this->GetBytes() != expectedPackedBytes) {
+            return fail("packed storage size does not match 4-bit logical dimensions");
+        }
+        if ((this->cpuData != nullptr || this->cudaData != nullptr) &&
+            this->expansionBytes < expectedPackedBytes) {
+            return fail("allocated storage is smaller than the packed weight");
+        }
+        if (reason != nullptr) {
+            reason->clear();
+        }
+        return true;
     }
 
     BF16ToFP16Manager bf16tofp16;
@@ -1592,7 +1706,8 @@ namespace fastllm {
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT4 
                 || this->dataType == DataType::INT4_NOZERO
-                || this->dataType == DataType::INT4_GROUP) {
+                || this->dataType == DataType::INT4_GROUP
+                || this->dataType == DataType::INT4_W4A8) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
         } else if (this->dataType == DataType::INT2
@@ -1629,6 +1744,11 @@ namespace fastllm {
 
     void Data::Resize(const std::vector<int> &dims) {
         std::vector <int> oldDims = this->dims;
+#ifdef USE_CUDA
+        if (oldDims != dims && !this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         uint64_t oldCount = 1, newCount = 1;
         for (int v : oldDims) {
             oldCount *= v;
@@ -1894,6 +2014,11 @@ namespace fastllm {
     }
 
     void Data::FreeSpace() {
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
         if (isFake)
             return;
         this->expansionSize = 0;
@@ -2054,6 +2179,10 @@ namespace fastllm {
 
     Data::~Data() {
 #ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+
         // Hash-route tables keep per-device CUDA replicas while the owning
         // Data is alive. Retire them before either this object or its CPU
         // allocation can be reused by a subsequently loaded model.
@@ -2130,6 +2259,7 @@ namespace fastllm {
                 this->dataDevice = DataDevice::CUDA;
                 this->dataDeviceIds = replica->dataDeviceIds;
                 std::swap(this->cudaData, replica->cudaData);
+                std::swap(this->w4a8CudaCaches, replica->w4a8CudaCaches);
                 std::swap(this->expansionSize, replica->expansionSize);
                 std::swap(this->expansionBytes, replica->expansionBytes);
             }
@@ -2432,6 +2562,12 @@ namespace fastllm {
         if (alreadyOnTarget) {
             return;
         }
+
+#ifdef USE_CUDA
+        if (!this->w4a8CudaCaches.empty()) {
+            FastllmCudaReleaseW4A8WeightCache(*this);
+        }
+#endif
 
         if (this->expansionBytes != 0) {
 #ifdef USE_CUDA
