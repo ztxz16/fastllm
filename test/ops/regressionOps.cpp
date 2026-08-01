@@ -4878,11 +4878,686 @@ namespace {
                (actual.empty() ? std::string("<empty>") : std::to_string(actual[0])));
     }
 
-    void RunCudaInt4GroupBatch1MoeRegression() {
-        const int expertCount = 4;
-        const int hidden = 128;
-        const int inter = 32;
-        const int topk = 2;
+    void RunCudaFp8LinearAddRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int inputDim = 256;
+        constexpr int outputDim = 256;
+        constexpr int block = 128;
+
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::FP8_E4M3_BLOCK_128;
+        weight.UpdateUnitSize();
+        weight.Resize({outputDim, inputDim});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = block;
+        weight.blockM = block;
+        weight.Allocate(false);
+        const size_t perRow = fastllm::GetDataBytes(
+            fastllm::DataType::FP8_E4M3_BLOCK_128, 1, inputDim);
+        uint8_t *weightData = (uint8_t *)weight.cpuData;
+        for (int row = 0; row < outputDim; ++row) {
+            uint8_t *rowData = weightData + (size_t)row * perRow;
+            for (int group = 0; group < inputDim / block; ++group) {
+                uint8_t *groupData =
+                    rowData + group * (block + (int)sizeof(float));
+                for (int column = 0; column < block; ++column) {
+                    groupData[column] = (uint8_t)(
+                        0x20 + ((row * 17 + group * 13 + column) & 0x1f));
+                }
+                const float scale =
+                    0.009f + 0.0002f * (float)((row + group) % 11);
+                std::memcpy(groupData + block, &scale, sizeof(scale));
+            }
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+
+        fastllm::Data emptyBias;
+        for (fastllm::DataType dataType : {
+                 fastllm::DataType::FLOAT16,
+                 fastllm::DataType::BFLOAT16}) {
+            const std::string typeName =
+                dataType == fastllm::DataType::FLOAT16 ? "FP16" : "BF16";
+            fastllm::Data input = MakeCudaTensor(
+                dataType, {1, inputDim},
+                MakeRegressionValues(inputDim, 0.47f, 0.19f));
+            const std::vector<float> residualValues =
+                MakeRegressionValues(outputDim, 1.13f, 0.23f);
+            fastllm::Data reference = MakeCudaTensor(
+                dataType, {1, outputDim}, residualValues);
+            fastllm::Data fused = MakeCudaTensor(
+                dataType, {1, outputDim}, residualValues);
+            fastllm::Data projection;
+            fastllm::Data middle;
+            middle.isFake = true;
+
+            {
+                ScopedFirstDevice guard("cuda");
+                fastllm::Linear(
+                    input, weight, emptyBias, projection);
+                fastllm::AddTo(reference, projection);
+                Expect(fastllm::CanRunLinearAdd(
+                           input, weight, emptyBias, fused),
+                       typeName + " FP8 LinearAdd capability check failed");
+                fastllm::LinearAdd(
+                    input, weight, emptyBias, middle, fused);
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            Expect(middle.dims.empty() && middle.cudaData == nullptr,
+                   typeName + " FP8 LinearAdd used the unfused fallback");
+            const float tolerance =
+                dataType == fastllm::DataType::FLOAT16 ? 2.0e-3f : 2.0e-2f;
+            ExpectFloatNear(
+                ToFloatVector(reference), ToFloatVector(fused),
+                tolerance, tolerance, typeName + " FP8 LinearAdd output");
+        }
+    }
+
+    void RunCudaFp16WarpRowsGemvRegression() {
+        FastllmCudaSetDevice(0);
+        fastllm::Data emptyBias;
+
+        auto runCase = [&](int inputDim, int outputDim, bool withBias,
+                           bool addTo, bool graphTimingCase) {
+            fastllm::Data input = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {1, inputDim},
+                MakeRegressionValues(inputDim, 0.31f, 0.27f));
+            fastllm::Data weight = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {outputDim, inputDim},
+                MakeRegressionValues(
+                    (size_t)outputDim * inputDim, 0.79f, 0.019f));
+            fastllm::Data bias = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {outputDim},
+                MakeRegressionValues(outputDim, 1.23f, 0.043f));
+            std::vector<float> initial =
+                MakeRegressionValues(outputDim, 1.71f, 0.13f);
+            fastllm::Data reference = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {1, outputDim}, initial);
+            fastllm::Data actual = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {1, outputDim}, initial);
+            const fastllm::Data &caseBias = withBias ? bias : emptyBias;
+
+            Expect(FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                       input, weight, caseBias, reference,
+                       1, inputDim, outputDim, addTo, false),
+                   "legacy FP16 GEMV rejected warp-row regression input");
+            Expect(FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                       input, weight, caseBias, actual,
+                       1, inputDim, outputDim, addTo, true),
+                   "warp-row FP16 GEMV rejected valid input");
+            FastllmCudaSyncCurrentThreadStream();
+            ExpectFloatNear(
+                ToFloatVector(reference), ToFloatVector(actual),
+                0.0f, 0.0f,
+                "warp-row FP16 GEMV exact output m=" +
+                    std::to_string(inputDim) + ", k=" +
+                    std::to_string(outputDim));
+
+            if (!graphTimingCase) {
+                return;
+            }
+
+            auto replayGraph = [&](bool specialized) {
+                void *graph = nullptr;
+                void *graphExec = nullptr;
+                Expect(FastllmCudaGraphBeginCapture(),
+                       "FP16 GEMV timing graph capture did not start");
+                for (int repeat = 0; repeat < 64; repeat++) {
+                    Expect(FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                               input, weight, caseBias,
+                               specialized ? actual : reference,
+                               1, inputDim, outputDim, addTo, specialized),
+                           "FP16 GEMV failed during timing graph capture");
+                }
+                Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                       "FP16 GEMV timing graph capture failed");
+                Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                           graphExec != nullptr,
+                       "FP16 GEMV timing graph instantiate failed");
+                Expect(FastllmCudaGraphLaunch(graphExec),
+                       "FP16 GEMV timing graph replay failed");
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaGraphExecDestroy(graphExec);
+                FastllmCudaGraphDestroy(graph);
+            };
+            replayGraph(false);
+            replayGraph(true);
+        };
+
+        runCase(2048, 2048, true, true, true);
+        runCase(256, 2048, false, false, true);
+    }
+
+    void RunCudaFusedRouterSelectionRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int experts = 256;
+        constexpr int topk = 8;
+        constexpr float routeScale = 1.25f;
+        std::vector<float> logitValues(experts);
+        std::vector<float> biasValues(experts);
+        for (int i = 0; i < experts; i++) {
+            logitValues[i] =
+                (float)(((i * 37 + 11) % 257) - 128) * 0.013f +
+                (float)(i % 5) * 0.0007f;
+            biasValues[i] =
+                (float)(((i * 53 + 7) % 251) - 125) * 0.00031f;
+        }
+        fastllm::Data logits = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, experts}, logitValues);
+        fastllm::Data gateBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {experts}, biasValues);
+        fastllm::Data index = MakeIntTensor(
+            {1, topk}, std::vector<int32_t>(topk, -1));
+        index.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data score = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, topk},
+            std::vector<float>(topk, 0.0f));
+
+        Expect(FastllmCudaFusedSoftmaxSelectExpert(
+                   logits, &gateBias, index, score,
+                   topk, true, routeScale),
+               "fused router selection rejected valid Qwen3.5 input");
+        FastllmCudaSyncCurrentThreadStream();
+        std::vector<int32_t> eagerIndex = ToIntVector(index);
+        std::vector<float> eagerScore = ToFloatVector(score);
+
+        std::vector<float> roundedLogits = ToFloatVector(logits);
+        float maxLogit =
+            *std::max_element(roundedLogits.begin(), roundedLogits.end());
+        std::vector<float> probabilities(experts);
+        float probabilitySum = 0.0f;
+        for (int i = 0; i < experts; i++) {
+            probabilities[i] = std::exp(roundedLogits[i] - maxLogit);
+            probabilitySum += probabilities[i];
+        }
+        for (float &probability : probabilities) {
+            probability /= probabilitySum;
+        }
+        std::vector<int32_t> expectedIndex(experts);
+        std::iota(expectedIndex.begin(), expectedIndex.end(), 0);
+        std::sort(
+            expectedIndex.begin(), expectedIndex.end(),
+            [&](int32_t a, int32_t b) {
+                float keyA = probabilities[a] + biasValues[a];
+                float keyB = probabilities[b] + biasValues[b];
+                return keyA != keyB ? keyA > keyB : a < b;
+            });
+        expectedIndex.resize(topk);
+        ExpectIntEqual(expectedIndex, eagerIndex,
+                       "fused router selection top-8");
+        float eagerScoreSum =
+            std::accumulate(eagerScore.begin(), eagerScore.end(), 0.0f);
+        Expect(std::fabs(eagerScoreSum - routeScale) < 2.0e-5f,
+               "fused router normalized scores do not sum to route scale");
+
+        fastllm::Data noBiasIndex = MakeIntTensor(
+            {1, topk}, std::vector<int32_t>(topk, -1));
+        noBiasIndex.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data noBiasScore = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, topk},
+            std::vector<float>(topk, 0.0f));
+        Expect(FastllmCudaFusedSoftmaxSelectExpert(
+                   logits, nullptr, noBiasIndex, noBiasScore,
+                   topk, true, routeScale),
+               "bias-free fused router selection rejected valid input");
+        FastllmCudaSyncCurrentThreadStream();
+        std::vector<int32_t> expectedNoBiasIndex(experts);
+        std::iota(
+            expectedNoBiasIndex.begin(), expectedNoBiasIndex.end(), 0);
+        std::sort(
+            expectedNoBiasIndex.begin(), expectedNoBiasIndex.end(),
+            [&](int32_t a, int32_t b) {
+                return roundedLogits[a] != roundedLogits[b]
+                    ? roundedLogits[a] > roundedLogits[b]
+                    : a < b;
+            });
+        expectedNoBiasIndex.resize(topk);
+        std::vector<int32_t> eagerNoBiasIndex =
+            ToIntVector(noBiasIndex);
+        std::vector<float> eagerNoBiasScore =
+            ToFloatVector(noBiasScore);
+        ExpectIntEqual(expectedNoBiasIndex, eagerNoBiasIndex,
+                       "bias-free fused router selection top-8");
+        float eagerNoBiasScoreSum = std::accumulate(
+            eagerNoBiasScore.begin(), eagerNoBiasScore.end(), 0.0f);
+        Expect(std::fabs(eagerNoBiasScoreSum - routeScale) < 2.0e-5f,
+               "bias-free fused router scores do not sum to route scale");
+
+        fastllm::Data zeroBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {experts},
+            std::vector<float>(experts, 0.0f));
+        fastllm::Data fullSoftmaxIndex = MakeIntTensor(
+            {1, topk}, std::vector<int32_t>(topk, -1));
+        fullSoftmaxIndex.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data fullSoftmaxScore = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, topk},
+            std::vector<float>(topk, 0.0f));
+        Expect(FastllmCudaFusedSoftmaxSelectExpert(
+                   logits, &zeroBias,
+                   fullSoftmaxIndex, fullSoftmaxScore,
+                   topk, true, routeScale),
+               "full-softmax router reference rejected zero bias");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectIntEqual(
+            eagerNoBiasIndex, ToIntVector(fullSoftmaxIndex),
+            "selected-logit and full-softmax router indices");
+        ExpectFloatNear(
+            ToFloatVector(fullSoftmaxScore), eagerNoBiasScore,
+            2.0e-6f, 2.0e-6f,
+            "selected-logit and full-softmax router scores");
+
+        fastllm::Data tiedLogits = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, experts},
+            std::vector<float>(experts, 0.0f));
+        fastllm::Data tiedIndex = MakeIntTensor(
+            {1, topk}, std::vector<int32_t>(topk, -1));
+        tiedIndex.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data tiedScore = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, topk},
+            std::vector<float>(topk, 0.0f));
+        Expect(FastllmCudaFusedSoftmaxSelectExpert(
+                   tiedLogits, nullptr, tiedIndex, tiedScore,
+                   topk, true, routeScale),
+               "bias-free fused router rejected tied logits");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectIntEqual(
+            {31, 95, 159, 223, 63, 127, 191, 255},
+            ToIntVector(tiedIndex),
+            "fused router legacy tie ordering");
+        std::vector<float> tiedScores = ToFloatVector(tiedScore);
+        for (float value : tiedScores) {
+            Expect(std::fabs(value - routeScale / topk) < 1.0e-6f,
+                   "fused router tied score is not uniform");
+        }
+
+        constexpr int multiTokens = 4;
+        std::vector<float> multiLogitValues(multiTokens * experts);
+        for (int token = 0; token < multiTokens; token++) {
+            for (int expert = 0; expert < experts; expert++) {
+                multiLogitValues[token * experts + expert] =
+                    (float)((((expert * (37 + token * 2) +
+                               token * 41 + 11) % 257) - 128)) *
+                        (0.009f + token * 0.001f) +
+                    (float)((expert + token) % 7) * 0.00031f;
+            }
+        }
+        fastllm::Data multiLogits = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {multiTokens, experts},
+            multiLogitValues);
+        fastllm::Data multiReferenceIndex = MakeIntTensor(
+            {multiTokens, topk},
+            std::vector<int32_t>(multiTokens * topk, -1));
+        multiReferenceIndex.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data multiReferenceScore = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {multiTokens, topk},
+            std::vector<float>(multiTokens * topk, 0.0f));
+        fastllm::Data multiPackedIndex = MakeIntTensor(
+            {multiTokens, topk},
+            std::vector<int32_t>(multiTokens * topk, -1));
+        multiPackedIndex.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data multiPackedScore = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {multiTokens, topk},
+            std::vector<float>(multiTokens * topk, 0.0f));
+        Expect(FastllmCudaFusedSoftmaxSelectExpert(
+                   multiLogits, &zeroBias,
+                   multiReferenceIndex, multiReferenceScore,
+                   topk, true, routeScale),
+               "multi-token full-softmax router reference failed");
+        Expect(FastllmCudaFusedSoftmaxSelectExpert(
+                   multiLogits, nullptr,
+                   multiPackedIndex, multiPackedScore,
+                   topk, true, routeScale),
+               "multi-token packed router selection failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectIntEqual(
+            ToIntVector(multiReferenceIndex),
+            ToIntVector(multiPackedIndex),
+            "multi-token packed router indices");
+        ExpectFloatNear(
+            ToFloatVector(multiReferenceScore),
+            ToFloatVector(multiPackedScore),
+            2.0e-6f, 2.0e-6f,
+            "multi-token packed router scores");
+
+        void *graph = nullptr;
+        void *graphExec = nullptr;
+        Expect(FastllmCudaGraphBeginCapture(),
+               "fused router timing graph capture did not start");
+        for (int repeat = 0; repeat < 64; repeat++) {
+            Expect(FastllmCudaFusedSoftmaxSelectExpert(
+                       logits, nullptr, noBiasIndex, noBiasScore,
+                       topk, true, routeScale),
+                   "fused router selection failed during graph capture");
+        }
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "fused router timing graph capture failed");
+        Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                   graphExec != nullptr,
+               "fused router timing graph instantiate failed");
+        Expect(FastllmCudaGraphLaunch(graphExec),
+               "fused router timing graph replay failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectIntEqual(eagerNoBiasIndex, ToIntVector(noBiasIndex),
+                       "bias-free fused router graph top-8");
+        ExpectFloatNear(
+            eagerNoBiasScore, ToFloatVector(noBiasScore),
+            0.0f, 0.0f, "bias-free fused router graph scores");
+        FastllmCudaGraphExecDestroy(graphExec);
+        FastllmCudaGraphDestroy(graph);
+
+        graph = nullptr;
+        graphExec = nullptr;
+        Expect(FastllmCudaGraphBeginCapture(),
+               "multi-token packed router graph capture did not start");
+        Expect(FastllmCudaFusedSoftmaxSelectExpert(
+                   multiLogits, nullptr,
+                   multiPackedIndex, multiPackedScore,
+                   topk, true, routeScale),
+               "multi-token packed router failed during graph capture");
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "multi-token packed router graph capture failed");
+        Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                   graphExec != nullptr,
+               "multi-token packed router graph instantiate failed");
+        Expect(FastllmCudaGraphLaunch(graphExec),
+               "multi-token packed router graph replay failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectIntEqual(
+            ToIntVector(multiReferenceIndex),
+            ToIntVector(multiPackedIndex),
+            "multi-token packed router graph indices");
+        ExpectFloatNear(
+            ToFloatVector(multiReferenceScore),
+            ToFloatVector(multiPackedScore),
+            2.0e-6f, 2.0e-6f,
+            "multi-token packed router graph scores");
+        FastllmCudaGraphExecDestroy(graphExec);
+        FastllmCudaGraphDestroy(graph);
+    }
+
+    void RunCudaQwen35RouterSharedGateFusionRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int hidden = 2048;
+        constexpr int experts = 256;
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, hidden},
+            MakeRegressionValues(hidden, 0.29f, 0.37f));
+        fastllm::Data routerWeight = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {experts, hidden},
+            MakeRegressionValues(experts * hidden, 0.83f, 0.051f));
+        fastllm::Data sharedGateWeight = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, hidden},
+            MakeRegressionValues(hidden, 1.37f, 0.063f));
+        fastllm::Data emptyBias;
+
+        fastllm::Data referenceRouter = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, experts},
+            std::vector<float>(experts, 0.0f));
+        fastllm::Data referenceSharedGate = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, 1},
+            std::vector<float>(1, 0.0f));
+        Expect(FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                   input, routerWeight, emptyBias, referenceRouter,
+                   1, hidden, experts, false, false),
+               "Qwen3.5 router reference GEMV failed");
+        Expect(FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                   input, sharedGateWeight, emptyBias, referenceSharedGate,
+                   1, hidden, 1, false, true),
+               "Qwen3.5 shared-gate reference GEMV failed");
+        Expect(FastllmCudaSigmoid(
+                   referenceSharedGate, referenceSharedGate),
+               "Qwen3.5 shared-gate reference sigmoid failed");
+
+        fastllm::Data fusedRouter = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, experts},
+            std::vector<float>(experts, 0.0f));
+        fastllm::Data fusedSharedGate = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, 1},
+            std::vector<float>(1, 0.0f));
+        Expect(FastllmCudaQwen35RouterSharedGateFloat16(
+                   input, routerWeight, sharedGateWeight,
+                   fusedRouter, fusedSharedGate, true),
+               "Qwen3.5 fused router/shared-gate GEMV rejected valid tensors");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(
+            ToFloatVector(referenceRouter), ToFloatVector(fusedRouter),
+            0.0f, 0.0f,
+            "Qwen3.5 fused router GEMV exact FP16 result");
+        ExpectFloatNear(
+            ToFloatVector(referenceSharedGate),
+            ToFloatVector(fusedSharedGate),
+            0.0f, 0.0f,
+            "Qwen3.5 fused shared-gate GEMV exact FP16 result");
+
+        constexpr int multiRows = 7;
+        fastllm::Data multiInput = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {multiRows, hidden},
+            MakeRegressionValues(multiRows * hidden, 1.73f, 0.41f));
+        fastllm::Data multiReferenceRouter = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {multiRows, experts},
+            std::vector<float>(multiRows * experts, 0.0f));
+        fastllm::Data multiReferenceSharedGate = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {multiRows, 1},
+            std::vector<float>(multiRows, 0.0f));
+        Expect(FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                   multiInput, routerWeight, emptyBias,
+                   multiReferenceRouter,
+                   multiRows, hidden, experts, false, false),
+               "Qwen3.5 multi-row router reference GEMV failed");
+        Expect(FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                   multiInput, sharedGateWeight, emptyBias,
+                   multiReferenceSharedGate,
+                   multiRows, hidden, 1, false, true),
+               "Qwen3.5 multi-row shared-gate reference GEMV failed");
+        Expect(FastllmCudaSigmoid(
+                   multiReferenceSharedGate, multiReferenceSharedGate),
+               "Qwen3.5 multi-row shared-gate reference sigmoid failed");
+
+        fastllm::Data multiFusedRouter = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {multiRows, experts},
+            std::vector<float>(multiRows * experts, 0.0f));
+        fastllm::Data multiFusedSharedGate = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {multiRows, 1},
+            std::vector<float>(multiRows, 0.0f));
+        Expect(FastllmCudaQwen35RouterSharedGateFloat16(
+                   multiInput, routerWeight, sharedGateWeight,
+                   multiFusedRouter, multiFusedSharedGate, true),
+               "Qwen3.5 fused router/shared-gate GEMV rejected multi-row tensors");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(
+            ToFloatVector(multiReferenceRouter),
+            ToFloatVector(multiFusedRouter),
+            0.0f, 0.0f,
+            "Qwen3.5 fused multi-row router exact FP16 result");
+        ExpectFloatNear(
+            ToFloatVector(multiReferenceSharedGate),
+            ToFloatVector(multiFusedSharedGate),
+            0.0f, 0.0f,
+            "Qwen3.5 fused multi-row shared-gate exact FP16 result");
+
+        fastllm::Data graphRouter = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {multiRows, experts},
+            std::vector<float>(multiRows * experts, 0.0f));
+        fastllm::Data graphSharedGate = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {multiRows, 1},
+            std::vector<float>(multiRows, 0.0f));
+        void *graph = nullptr;
+        void *graphExec = nullptr;
+        Expect(FastllmCudaGraphBeginCapture(),
+               "Qwen3.5 fused router/shared-gate graph capture did not start");
+        for (int repeat = 0; repeat < 64; repeat++) {
+            Expect(FastllmCudaQwen35RouterSharedGateFloat16(
+                       multiInput, routerWeight, sharedGateWeight,
+                       graphRouter, graphSharedGate, true),
+                   "Qwen3.5 fused router/shared-gate GEMV failed during graph capture");
+        }
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "Qwen3.5 fused router/shared-gate graph capture failed");
+        Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                   graphExec != nullptr,
+               "Qwen3.5 fused router/shared-gate graph instantiate failed");
+        Expect(FastllmCudaGraphLaunch(graphExec),
+               "Qwen3.5 fused router/shared-gate graph replay failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(
+            ToFloatVector(multiReferenceRouter), ToFloatVector(graphRouter),
+            0.0f, 0.0f,
+            "Qwen3.5 fused multi-row router graph exact FP16 result");
+        ExpectFloatNear(
+            ToFloatVector(multiReferenceSharedGate),
+            ToFloatVector(graphSharedGate),
+            0.0f, 0.0f,
+            "Qwen3.5 fused multi-row shared-gate graph exact FP16 result");
+        FastllmCudaGraphExecDestroy(graphExec);
+        FastllmCudaGraphDestroy(graph);
+
+    }
+
+    void RunCudaQwen35FusedMoeJoinRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int hidden = 2048;
+
+        auto runCase = [&](int rows, bool hasGate, bool addResidual,
+                           bool gateAlreadySigmoid) {
+            const int count = rows * hidden;
+            const std::vector<float> residualValues =
+                MakeRegressionValues(count, 0.17f, 0.45f);
+            const std::vector<float> routedValues =
+                MakeRegressionValues(count, 0.73f, 0.31f);
+            const std::vector<float> sharedValues =
+                MakeRegressionValues(count, 1.19f, 0.27f);
+            const std::vector<float> gateValues =
+                MakeRegressionValues(rows, 1.67f, 1.4f);
+
+            fastllm::Data referenceResidual = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {rows, hidden}, residualValues);
+            fastllm::Data referenceRouted = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {rows, hidden}, routedValues);
+            fastllm::Data referenceShared = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {rows, hidden}, sharedValues);
+            std::unique_ptr<fastllm::Data> referenceGate;
+            if (hasGate) {
+                referenceGate = std::make_unique<fastllm::Data>(
+                    fastllm::DataType::FLOAT16,
+                    std::vector<int>{rows}, gateValues);
+                referenceGate->ToDevice(fastllm::DataDevice::CUDA);
+                Expect(FastllmCudaSigmoid(*referenceGate, *referenceGate),
+                       "Qwen3.5 fused MoE join reference sigmoid failed");
+                Expect(FastllmCudaMulTo(
+                           referenceShared, *referenceGate, 1.0f),
+                       "Qwen3.5 fused MoE join reference scale failed");
+            }
+            Expect(FastllmCudaAddTo(
+                       referenceRouted, referenceShared, 1.0f),
+                   "Qwen3.5 fused MoE join reference branch add failed");
+            fastllm::Data *referenceOutput = &referenceRouted;
+            if (addResidual) {
+                Expect(FastllmCudaAddTo(
+                           referenceResidual, referenceRouted, 1.0f),
+                       "Qwen3.5 fused MoE join reference residual add failed");
+                referenceOutput = &referenceResidual;
+            }
+
+            fastllm::Data fusedResidual = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {rows, hidden}, residualValues);
+            fastllm::Data fusedRouted = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {rows, hidden}, routedValues);
+            fastllm::Data fusedShared = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {rows, hidden}, sharedValues);
+            std::unique_ptr<fastllm::Data> fusedGate;
+            const fastllm::Data *fusedGatePointer = nullptr;
+            if (hasGate) {
+                fusedGate = std::make_unique<fastllm::Data>(
+                    fastllm::DataType::FLOAT16,
+                    std::vector<int>{rows}, gateValues);
+                fusedGate->ToDevice(fastllm::DataDevice::CUDA);
+                if (gateAlreadySigmoid) {
+                    Expect(FastllmCudaSigmoid(*fusedGate, *fusedGate),
+                           "Qwen3.5 fused MoE pre-sigmoid gate setup failed");
+                }
+                fusedGatePointer = fusedGate.get();
+            }
+            fastllm::Data &fusedOutput =
+                addResidual ? fusedResidual : fusedRouted;
+            Expect(FastllmCudaQwen35FusedMoeJoin(
+                       fusedOutput, fusedRouted, fusedShared,
+                       fusedGatePointer, addResidual,
+                       gateAlreadySigmoid),
+                   "Qwen3.5 fused MoE join rejected a valid FLOAT16 case");
+
+            FastllmCudaSyncCurrentThreadStream();
+            ExpectFloatNear(
+                ToFloatVector(*referenceOutput), ToFloatVector(fusedOutput),
+                0.0f, 0.0f,
+                "Qwen3.5 fused MoE join exact FP16 result rows=" +
+                    std::to_string(rows) + " gate=" +
+                    std::to_string(hasGate) + " residual=" +
+                    std::to_string(addResidual) + " pre_sigmoid=" +
+                    std::to_string(gateAlreadySigmoid));
+        };
+
+        runCase(1, false, true, false);
+        runCase(1, true, true, false);
+        runCase(1, true, true, true);
+        runCase(1, true, false, false);
+        runCase(3, true, true, false);
+        runCase(3, false, true, false);
+
+        const std::vector<float> residualValues =
+            MakeRegressionValues(hidden, 2.03f, 0.41f);
+        const std::vector<float> routedValues =
+            MakeRegressionValues(hidden, 2.41f, 0.29f);
+        const std::vector<float> sharedValues =
+            MakeRegressionValues(hidden, 2.79f, 0.23f);
+        const std::vector<float> gateValues = {-0.625f};
+        fastllm::Data referenceResidual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, hidden}, residualValues);
+        fastllm::Data referenceRouted = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, hidden}, routedValues);
+        fastllm::Data referenceShared = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, hidden}, sharedValues);
+        fastllm::Data referenceGate = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1}, gateValues);
+        Expect(FastllmCudaSigmoid(referenceGate, referenceGate) &&
+                   FastllmCudaMulTo(referenceShared, referenceGate, 1.0f) &&
+                   FastllmCudaAddTo(referenceRouted, referenceShared, 1.0f) &&
+                   FastllmCudaAddTo(referenceResidual, referenceRouted, 1.0f),
+               "Qwen3.5 fused MoE graph reference failed");
+
+        fastllm::Data graphResidual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, hidden}, residualValues);
+        fastllm::Data graphRouted = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, hidden}, routedValues);
+        fastllm::Data graphShared = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, hidden}, sharedValues);
+        fastllm::Data graphGate = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1}, gateValues);
+        void *graph = nullptr;
+        void *graphExec = nullptr;
+        Expect(FastllmCudaGraphBeginCapture(),
+               "Qwen3.5 fused MoE join graph capture did not start");
+        Expect(FastllmCudaQwen35FusedMoeJoin(
+                   graphResidual, graphRouted, graphShared,
+                   &graphGate, true),
+               "Qwen3.5 fused MoE join failed during graph capture");
+        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+               "Qwen3.5 fused MoE join graph capture failed");
+        Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                   graphExec != nullptr,
+               "Qwen3.5 fused MoE join graph instantiate failed");
+        Expect(FastllmCudaGraphLaunch(graphExec),
+               "Qwen3.5 fused MoE join graph replay failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(
+            ToFloatVector(referenceResidual), ToFloatVector(graphResidual),
+            0.0f, 0.0f,
+            "Qwen3.5 fused MoE join graph exact FP16 result");
+        FastllmCudaGraphExecDestroy(graphExec);
+        FastllmCudaGraphDestroy(graph);
+    }
+
+    void RunCudaInt4GroupBatch1MoeRegressionCase(int hidden, int inter,
+                                                  int expertCount, int topk,
+                                                  bool runSmallBatchChecks) {
         const int groupCnt = 32;
 
         std::vector<float> inputValues(hidden);
@@ -4899,8 +5574,9 @@ namespace {
                               std::vector<float> &dequantized) {
             auto weight = std::make_unique<fastllm::Data>(
                 fastllm::DataType::INT4_GROUP, std::vector<int>{rows, cols});
-            weight->name = "regression.cuda_int4_group32.moe." + std::to_string(expert) +
-                           "." + std::to_string(salt);
+            weight->name =
+                "regression.model.layers.0.mlp.experts." +
+                std::to_string(expert) + "." + std::to_string(salt);
             weight->groupCnt = groupCnt;
             weight->group = cols / groupCnt;
             weight->perChannelAxis = 0;
@@ -4929,6 +5605,10 @@ namespace {
                     }
                 }
             }
+            // Production AWQ expert shards use direct allocations so the
+            // compact representation can be returned to CUDA immediately
+            // after grouped-Marlin repacking.
+            weight->directMemory = true;
             weight->ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
             return weight;
         };
@@ -4942,8 +5622,17 @@ namespace {
             ownedWeights.push_back(std::move(down));
         }
 
-        const std::vector<int32_t> routeIndices = {1, 3};
-        const std::vector<float> routeScores = {0.625f, 0.375f};
+        std::vector<int32_t> routeIndices(topk);
+        std::vector<float> routeScores(topk);
+        float scoreSum = 0.0f;
+        for (int route = 0; route < topk; route++) {
+            routeIndices[route] = (route * 3 + 1) % expertCount;
+            routeScores[route] = (float)(topk - route);
+            scoreSum += routeScores[route];
+        }
+        for (float &score : routeScores) {
+            score /= scoreSum;
+        }
         std::vector<float> expected(hidden, 0.0f);
         for (int route = 0; route < topk; route++) {
             int expert = routeIndices[route];
@@ -4978,42 +5667,339 @@ namespace {
         output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
         output.Allocate(false);
 
-        bool ok = FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(
-            input, scratch, output, weights.data(), (int)weights.size(),
-            (const int32_t*)index.cudaData, (const float*)score.cudaData, topk);
-        Expect(ok, "CUDA INT4_GROUP batch-1 fused MoE path was not selected.");
-        ExpectFloatNear(expected, ToFloatVector(output), 3e-2f, 3e-2f,
-                        "CUDA INT4_GROUP batch-1 fused MoE");
+        const bool productionMarlinShape =
+            hidden == 2048 && inter == 256 &&
+            expertCount == 8 && topk == 8;
+        bool ok = false;
+        if (!productionMarlinShape) {
+            ok = FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(
+                input, scratch, output, weights.data(), (int)weights.size(),
+                (const int32_t*)index.cudaData,
+                (const float*)score.cudaData, topk);
+            Expect(ok,
+                   "CUDA INT4_GROUP batch-1 fused MoE path was not selected.");
+            ExpectFloatNear(expected, ToFloatVector(output), 3e-2f, 3e-2f,
+                            "CUDA INT4_GROUP batch-1 fused MoE");
 
-        fastllm::Data graphOutput(fastllm::DataType::FLOAT16);
-        graphOutput.Resize({1, hidden});
-        graphOutput.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
-        graphOutput.Allocate(false);
-        FastllmCudaMemset0(output.cudaData, output.GetBytes());
-        FastllmCudaMemset0(graphOutput.cudaData, graphOutput.GetBytes());
+            fastllm::Data graphOutput(fastllm::DataType::FLOAT16);
+            graphOutput.Resize({1, hidden});
+            graphOutput.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+            graphOutput.Allocate(false);
+            FastllmCudaMemset0(output.cudaData, output.GetBytes());
+            FastllmCudaMemset0(
+                graphOutput.cudaData, graphOutput.GetBytes());
 
-        void *graph = nullptr;
-        void *graphExec = nullptr;
-        Expect(FastllmCudaGraphBeginCapture(),
-               "CUDA INT4_GROUP batch-1 fused MoE graph capture did not start.");
-        ok = FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(
-            input, scratch, output, weights.data(), (int)weights.size(),
-            (const int32_t*)index.cudaData, (const float*)score.cudaData, topk);
-        Expect(ok, "CUDA INT4_GROUP batch-1 fused MoE path failed during graph capture.");
-        // Also verify that a downstream operation captured after the fused MoE
-        // observes its completed result during graph replay.
-        FastllmCudaCopyFromDeviceToDevice(graphOutput.cudaData, output.cudaData,
-                                          output.GetBytes());
-        Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
-               "CUDA INT4_GROUP batch-1 fused MoE graph capture failed.");
-        Expect(FastllmCudaGraphInstantiate(graph, &graphExec) && graphExec != nullptr,
-               "CUDA INT4_GROUP batch-1 fused MoE graph instantiate failed.");
-        Expect(FastllmCudaGraphLaunch(graphExec),
-               "CUDA INT4_GROUP batch-1 fused MoE graph replay failed.");
-        ExpectFloatNear(expected, ToFloatVector(graphOutput), 3e-2f, 3e-2f,
-                        "CUDA INT4_GROUP batch-1 fused MoE graph downstream consumer");
-        FastllmCudaGraphExecDestroy(graphExec);
-        FastllmCudaGraphDestroy(graph);
+            void *graph = nullptr;
+            void *graphExec = nullptr;
+            Expect(
+                FastllmCudaGraphBeginCapture(),
+                "CUDA INT4_GROUP batch-1 fused MoE graph capture did not "
+                "start.");
+            ok = FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(
+                input, scratch, output, weights.data(), (int)weights.size(),
+                (const int32_t*)index.cudaData,
+                (const float*)score.cudaData, topk);
+            Expect(
+                ok,
+                "CUDA INT4_GROUP batch-1 fused MoE path failed during graph "
+                "capture.");
+            // Also verify that a downstream operation captured after the
+            // fused MoE observes its completed result during graph replay.
+            FastllmCudaCopyFromDeviceToDevice(
+                graphOutput.cudaData, output.cudaData, output.GetBytes());
+            Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                   "CUDA INT4_GROUP batch-1 fused MoE graph capture failed.");
+            Expect(
+                FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                    graphExec != nullptr,
+                "CUDA INT4_GROUP batch-1 fused MoE graph instantiate failed.");
+            Expect(FastllmCudaGraphLaunch(graphExec),
+                   "CUDA INT4_GROUP batch-1 fused MoE graph replay failed.");
+            ExpectFloatNear(
+                expected, ToFloatVector(graphOutput), 3e-2f, 3e-2f,
+                "CUDA INT4_GROUP batch-1 fused MoE graph downstream "
+                "consumer");
+            FastllmCudaGraphExecDestroy(graphExec);
+            FastllmCudaGraphDestroy(graph);
+        }
+
+        if ((hidden == 128 && inter == 256 &&
+             expertCount == 4 && topk == 2) ||
+            (hidden == 2048 && inter == 256 &&
+             expertCount == 8 && topk == 8)) {
+            // Reproduce the lifecycle that originally exposed the repack
+            // double-free: an earlier legacy linear invocation creates
+            // extraCudaHalfData[0/1] aliases to extraCudaData[0/1], then the
+            // grouped-Marlin builder replaces and releases the compact AWQ
+            // representation. Production routed-expert names deliberately
+            // keep this invocation on the legacy layout.
+            fastllm::Data legacyGateOutput(fastllm::DataType::FLOAT16);
+            legacyGateOutput.Resize({1, inter * 2});
+            legacyGateOutput.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+            legacyGateOutput.Allocate(false);
+            fastllm::Data emptyBias;
+            Expect(
+                FastllmCudaHalfMatMulFloatInt4Group(
+                    input, *weights[2], emptyBias, legacyGateOutput,
+                    1, hidden, inter * 2),
+                "CUDA INT4_GROUP legacy metadata priming failed before "
+                "grouped-Marlin repack.");
+            FastllmCudaSyncCurrentThreadStream();
+            Expect(
+                weights[2]->extraCudaData.size() >= 2 &&
+                    weights[2]->extraCudaHalfData.size() >= 2 &&
+                    weights[2]->extraCudaData[0] != nullptr &&
+                    weights[2]->extraCudaData[1] != nullptr &&
+                    weights[2]->extraCudaHalfData[0] ==
+                        weights[2]->extraCudaData[0] &&
+                    weights[2]->extraCudaHalfData[1] ==
+                        weights[2]->extraCudaData[1],
+                "CUDA INT4_GROUP legacy metadata did not create the expected "
+                "scale/min pointer aliases.");
+
+            fastllm::Data marlinDecodeGate, marlinDecodeActivation;
+            fastllm::Data marlinDecodeOutput(fastllm::DataType::FLOAT16);
+            marlinDecodeOutput.Resize({1, hidden});
+            marlinDecodeOutput.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+            cudaGetLastError();
+            ok = FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
+                input, marlinDecodeGate, marlinDecodeActivation,
+                marlinDecodeOutput, weights.data(), (int)weights.size(),
+                (const int32_t*)index.cudaData,
+                (const float*)score.cudaData, 1, topk);
+            cudaError_t marlinLaunchError = cudaGetLastError();
+            Expect(
+                ok,
+                std::string(
+                    "CUDA INT4_GROUP grouped Marlin decode path was not "
+                    "selected: ") +
+                    cudaGetErrorString(marlinLaunchError));
+            FastllmCudaSyncCurrentThreadStream();
+            ExpectFloatNear(
+                expected, ToFloatVector(marlinDecodeOutput),
+                5e-2f, 5e-2f,
+                "CUDA INT4_GROUP grouped Marlin decode");
+            for (int expert = 0; expert < expertCount; expert++) {
+                fastllm::Data *gateup = weights[2 + expert * 2];
+                fastllm::Data *down = weights[3 + expert * 2];
+                Expect(gateup->cudaData == nullptr &&
+                           down->cudaData == nullptr,
+                       "CUDA INT4_GROUP grouped Marlin repack retained "
+                       "compact expert weights.");
+                for (void *pointer : gateup->extraCudaData) {
+                    Expect(pointer == nullptr,
+                           "CUDA INT4_GROUP grouped Marlin repack retained "
+                           "gate quant metadata.");
+                }
+                for (void *pointer : down->extraCudaData) {
+                    Expect(pointer == nullptr,
+                           "CUDA INT4_GROUP grouped Marlin repack retained "
+                           "down quant metadata.");
+                }
+                for (void *pointer : gateup->extraCudaHalfData) {
+                    Expect(pointer == nullptr,
+                           "CUDA INT4_GROUP grouped Marlin repack retained "
+                           "gate half metadata.");
+                }
+                for (void *pointer : down->extraCudaHalfData) {
+                    Expect(pointer == nullptr,
+                           "CUDA INT4_GROUP grouped Marlin repack retained "
+                           "down half metadata.");
+                }
+            }
+
+            // Once repacking has released the compact weights, a runtime
+            // failure is no longer recoverable through the legacy INT4 path.
+            // Make the activation scratch deliberately non-allocating and
+            // verify that the operator fails explicitly instead of returning
+            // false to the dispatcher's fallback chain.
+            {
+                fastllm::Data failedGateOutput;
+                fastllm::Data failedActivation;
+                fastllm::Data failedOutput(fastllm::DataType::FLOAT16);
+                failedActivation.isFake = true;
+                bool rejectedAfterRepack = false;
+                try {
+                    FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
+                        input, failedGateOutput, failedActivation,
+                        failedOutput, weights.data(), (int)weights.size(),
+                        (const int32_t*)index.cudaData,
+                        (const float*)score.cudaData, 1, topk);
+                } catch (const std::runtime_error &error) {
+                    rejectedAfterRepack =
+                        std::string(error.what()).find(
+                            "legacy INT4_GROUP fallback is unavailable") !=
+                        std::string::npos;
+                }
+                Expect(
+                    rejectedAfterRepack,
+                    "CUDA INT4_GROUP grouped Marlin failure returned to "
+                    "the released-weight fallback path.");
+                FastllmCudaClearThreadError();
+                FastllmCudaClearGraphError();
+            }
+
+            fastllm::Data marlinGraphOutput(fastllm::DataType::FLOAT16);
+            marlinGraphOutput.Resize({1, hidden});
+            marlinGraphOutput.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+            marlinGraphOutput.Allocate(false);
+            void *marlinGraph = nullptr;
+            void *marlinGraphExec = nullptr;
+            Expect(FastllmCudaGraphBeginCapture(),
+                   "CUDA INT4_GROUP grouped Marlin decode graph capture "
+                   "did not start.");
+            ok = FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
+                input, marlinDecodeGate, marlinDecodeActivation,
+                marlinDecodeOutput, weights.data(), (int)weights.size(),
+                (const int32_t*)index.cudaData,
+                (const float*)score.cudaData, 1, topk);
+            Expect(ok,
+                   "CUDA INT4_GROUP grouped Marlin decode failed during "
+                   "graph capture.");
+            FastllmCudaCopyFromDeviceToDevice(
+                marlinGraphOutput.cudaData, marlinDecodeOutput.cudaData,
+                marlinDecodeOutput.GetBytes());
+            Expect(FastllmCudaGraphEndCapture(&marlinGraph) &&
+                       marlinGraph != nullptr,
+                   "CUDA INT4_GROUP grouped Marlin decode graph capture "
+                   "failed.");
+            Expect(FastllmCudaGraphInstantiate(
+                       marlinGraph, &marlinGraphExec) &&
+                       marlinGraphExec != nullptr,
+                   "CUDA INT4_GROUP grouped Marlin decode graph "
+                   "instantiate failed.");
+            const int marlinGraphReplayCount =
+                productionMarlinShape ? 64 : 1;
+            for (int replay = 0; replay < marlinGraphReplayCount; ++replay) {
+                Expect(FastllmCudaGraphLaunch(marlinGraphExec),
+                       "CUDA INT4_GROUP grouped Marlin decode graph replay "
+                       "failed.");
+            }
+            ExpectFloatNear(
+                expected, ToFloatVector(marlinGraphOutput),
+                5e-2f, 5e-2f,
+                "CUDA INT4_GROUP grouped Marlin decode graph");
+
+            if (hidden == 128 && expertCount == 4 && topk == 2) {
+                constexpr int marlinBatch = 65;
+                std::vector<float> marlinInputValues(
+                    (size_t)marlinBatch * hidden);
+                std::vector<int32_t> marlinRouteIndices(
+                    (size_t)marlinBatch * topk);
+                std::vector<float> marlinRouteScores(
+                    (size_t)marlinBatch * topk);
+                std::vector<float> marlinExpected(
+                    (size_t)marlinBatch * hidden, 0.0f);
+                for (int b = 0; b < marlinBatch; b++) {
+                    for (int x = 0; x < hidden; x++) {
+                        marlinInputValues[(size_t)b * hidden + x] =
+                            inputValues[x] * (0.625f + 0.003f * b) +
+                            (float)((b + x) % 11 - 5) / 256.0f;
+                    }
+                    marlinRouteIndices[(size_t)b * topk] =
+                        (b * 3 + 1) % expertCount;
+                    marlinRouteIndices[(size_t)b * topk + 1] =
+                        (b * 5 + 2) % expertCount;
+                    marlinRouteScores[(size_t)b * topk] =
+                        0.35f + 0.05f * (b % 4);
+                    marlinRouteScores[(size_t)b * topk + 1] =
+                        1.0f - marlinRouteScores[(size_t)b * topk];
+                }
+                for (int b = 0; b < marlinBatch; b++) {
+                    const float *rowInput =
+                        marlinInputValues.data() + (size_t)b * hidden;
+                    for (int route = 0; route < topk; route++) {
+                        int routed = b * topk + route;
+                        int expert = marlinRouteIndices[routed];
+                        std::vector<float> middle(inter);
+                        for (int j = 0; j < inter; j++) {
+                            float gate = 0.0f, up = 0.0f;
+                            for (int x = 0; x < hidden; x++) {
+                                gate += rowInput[x] *
+                                    gateupFloat[expert][
+                                        (size_t)j * hidden + x];
+                                up += rowInput[x] *
+                                    gateupFloat[expert][
+                                        (size_t)(inter + j) * hidden + x];
+                            }
+                            middle[j] =
+                                (gate / (1.0f + std::exp(-gate))) * up;
+                        }
+                        for (int out = 0; out < hidden; out++) {
+                            float value = 0.0f;
+                            for (int j = 0; j < inter; j++) {
+                                value += middle[j] *
+                                    downFloat[expert][
+                                        (size_t)out * inter + j];
+                            }
+                            marlinExpected[(size_t)b * hidden + out] +=
+                                marlinRouteScores[routed] * value;
+                        }
+                    }
+                }
+
+                fastllm::Data marlinInput(
+                    fastllm::DataType::FLOAT16,
+                    {marlinBatch, hidden}, marlinInputValues);
+                marlinInput.ToDevice(
+                    fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+                fastllm::Data marlinIndex = MakeIntTensor(
+                    {marlinBatch, topk}, marlinRouteIndices);
+                marlinIndex.ToDevice(
+                    fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+                fastllm::Data marlinScore(
+                    fastllm::DataType::FLOAT32,
+                    {marlinBatch, topk}, marlinRouteScores);
+                marlinScore.ToDevice(
+                    fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+                fastllm::Data marlinGateOutput, marlinActivation;
+                fastllm::Data marlinOutput(fastllm::DataType::FLOAT16);
+                marlinOutput.Resize({marlinBatch, hidden});
+                marlinOutput.ToDevice(
+                    fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+                ok = FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
+                    marlinInput, marlinGateOutput, marlinActivation,
+                    marlinOutput, weights.data(), (int)weights.size(),
+                    (const int32_t*)marlinIndex.cudaData,
+                    (const float*)marlinScore.cudaData,
+                    marlinBatch, topk);
+                Expect(
+                    ok,
+                    "CUDA INT4_GROUP grouped Marlin MoE path was not "
+                    "selected.");
+                FastllmCudaSyncCurrentThreadStream();
+                ExpectFloatNear(
+                    marlinExpected, ToFloatVector(marlinOutput),
+                    5e-2f, 5e-2f,
+                    "CUDA INT4_GROUP grouped Marlin MoE");
+
+                // Large-prefill metadata lives in separate storage. Replaying
+                // the previously captured decode graph proves its route
+                // pointers did not move during prefill growth.
+                FastllmCudaMemset0(
+                    marlinGraphOutput.cudaData,
+                    marlinGraphOutput.GetBytes());
+                Expect(FastllmCudaGraphLaunch(marlinGraphExec),
+                       "CUDA INT4_GROUP grouped Marlin decode graph replay "
+                       "failed after prefill.");
+                ExpectFloatNear(
+                    expected, ToFloatVector(marlinGraphOutput),
+                    5e-2f, 5e-2f,
+                    "CUDA INT4_GROUP grouped Marlin decode graph after "
+                    "prefill");
+            }
+            FastllmCudaGraphExecDestroy(marlinGraphExec);
+            FastllmCudaGraphDestroy(marlinGraph);
+            FastllmCudaReleaseMergeMOEVllmMarlinCache(weights[2]);
+        }
+
+        if (!runSmallBatchChecks) {
+            return;
+        }
 
         const int smallBatch = 4;
         std::vector<float> batchInputValues((size_t)smallBatch * hidden);
@@ -5176,6 +6162,15 @@ namespace {
         ExpectFloatNear(ToFloatVector(fallbackOutput), ToFloatVector(batchOutput),
                         0.0f, 0.0f,
                         "CUDA INT4_GROUP small-batch fused versus generic MergeMOE");
+    }
+
+    void RunCudaInt4GroupBatch1MoeRegression() {
+        // Retain the original extended small-batch coverage, then exercise the
+        // Qwen3.6 local expert shape that selects the paired-output gate/up
+        // and down kernels under TP=2.
+        RunCudaInt4GroupBatch1MoeRegressionCase(2048, 256, 8, 8, false);
+        RunCudaInt4GroupBatch1MoeRegressionCase(128, 32, 4, 2, true);
+        RunCudaInt4GroupBatch1MoeRegressionCase(128, 256, 4, 2, false);
     }
 
     void RunCudaInt8Batch1MoeRegression() {
@@ -5908,6 +6903,11 @@ int main() {
             RunCudaInt4Group32AwqLinearRegression();
             RunCudaCompactInt4Group32LinearRegression();
             RunCudaInt4GroupHalfWeightRoundingRegression();
+            RunCudaFp8LinearAddRegression();
+            RunCudaFp16WarpRowsGemvRegression();
+            RunCudaFusedRouterSelectionRegression();
+            RunCudaQwen35RouterSharedGateFusionRegression();
+            RunCudaQwen35FusedMoeJoinRegression();
             RunCudaInt4GroupBatch1MoeRegression();
             RunCudaInt8Batch1MoeRegression();
             RunCudaConvMultiTokenSnapshotsRegression();

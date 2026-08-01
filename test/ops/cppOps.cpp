@@ -1687,6 +1687,69 @@ namespace {
         }
     }
 
+    static void CheckLinearFp8RawBatchOneCuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "separate" ||
+            params.GetString("input_type") != "fp16" ||
+            params.GetInt("batch") < 2) {
+            throw std::runtime_error(
+                "raw FP8 batch-one check requires separate fp16 weight and batch >= 2");
+        }
+
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+
+        // Keep the weight in its original row-major layout through the public
+        // dispatch policy. This exercises the raw batch-one GEMV without
+        // adding test-only state to Data or production operator metadata.
+        struct ScopedNcclForceSync {
+            bool previous = FastllmCudaGetNcclForceSync();
+            ~ScopedNcclForceSync() {
+                FastllmCudaSetNcclForceSync(previous);
+            }
+        } restoreForceSync;
+        FastllmCudaSetNcclForceSync(false);
+
+        fastllm::Data reference = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+        fastllm::Data single = MakeCudaOutputLike(
+            state->input.dataType, 1, state->out);
+        bool ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, reference,
+            state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("raw FP8 multi-row reference path failed");
+        }
+        ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, single,
+            1, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("raw FP8 batch-one path failed");
+        }
+        ForceDeviceSync();
+
+        std::vector<float> expected =
+            ToFloatVector(ConvertToFloat32Data(reference));
+        expected.resize(state->out);
+        std::vector<float> observed =
+            ToFloatVector(ConvertToFloat32Data(single));
+        PrintLinearFp8Block128CheckStats(
+            expected, observed, 1, state->out);
+
+        int mismatches = 0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            float diff = std::fabs(expected[i] - observed[i]);
+            float tolerance = 0.1f + 0.05f * std::fabs(expected[i]);
+            if (!std::isfinite(observed[i]) || diff > tolerance) {
+                mismatches++;
+            }
+        }
+        if (mismatches != 0) {
+            throw std::runtime_error(
+                "raw FP8 batch-one mismatch count: " +
+                std::to_string(mismatches));
+        }
+    }
+
     static void CheckLinearFp8MarlinCuda(const OpTestParams &params) {
         if (params.GetString("weight_layout") != "separate" ||
             params.GetString("input_type") != "fp16") {
@@ -1867,6 +1930,9 @@ namespace {
         } else if (params.GetInt("check") == 3) {
             CheckLinearFp8MarlinCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 4) {
+            CheckLinearFp8RawBatchOneCuda(params);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -1940,7 +2006,9 @@ namespace {
                 params.Add("weight_layout", "packed", "packed or separate");
                 params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
                 params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
-                params.Add("check", "0", "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail check");
+                params.Add("check", "0",
+                           "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail, "
+                           "4 raw batch-one check");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },
@@ -2659,7 +2727,10 @@ namespace {
             for (size_t i = 0; i < expectedScore.size(); i++) {
                 maxAbsDiff = std::max(maxAbsDiff, std::fabs(expectedScore[i] - actualScore[i]));
             }
-            const float scoreTolerance = sigmoid ? 1.0e-6f : 0.0f;
+            const bool selectedLogitFastPath =
+                !sigmoid && !withBias && needNorm;
+            const float scoreTolerance = sigmoid ? 1.0e-6f :
+                (selectedLogitFastPath ? 2.0e-6f : 0.0f);
             if (maxAbsDiff > scoreTolerance) {
                 std::ostringstream os;
                 os << "fused router score mismatch: max_abs_diff=" << maxAbsDiff;
