@@ -1937,6 +1937,211 @@ void FastllmCudaPagedCacheCopy(
     }
 }
 
+static constexpr int FASTLLM_PAGED_CACHE_COPY_MULTI_MAX_PAGES = 256;
+
+struct FastllmPagedCacheCopyPageList {
+    int pageIdx[FASTLLM_PAGED_CACHE_COPY_MULTI_MAX_PAGES];
+};
+
+// Copy a head-major sequence into multiple (possibly non-contiguous) cache
+// pages in one launch.  The compact page list is passed as a kernel argument,
+// avoiding a temporary H2D metadata copy for the common chunked-prefill path.
+template <typename SrcT, typename DstT>
+__global__ void FastllmPagedCacheCopyMultiPageKernel(
+    uint8_t *pagedData,
+    FastllmPagedCacheCopyPageList pageList,
+    int pageCount,
+    int firstPageOffset,
+    int pageLen,
+    int numHeads,
+    int headDim,
+    uint8_t *inputData,
+    int seqLen) {
+    int totalElements = numHeads * seqLen * headDim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalElements) {
+        return;
+    }
+
+    int head = idx / (seqLen * headDim);
+    int remainder = idx % (seqLen * headDim);
+    int token = remainder / headDim;
+    int dim = remainder % headDim;
+
+    int firstPageCapacity = pageLen - firstPageOffset;
+    int pageSlot;
+    int pageOffset;
+    if (token < firstPageCapacity) {
+        pageSlot = 0;
+        pageOffset = firstPageOffset + token;
+    } else {
+        int tailToken = token - firstPageCapacity;
+        pageSlot = 1 + tailToken / pageLen;
+        pageOffset = tailToken % pageLen;
+    }
+    if (pageSlot >= pageCount) {
+        return;
+    }
+
+    const SrcT *src = (const SrcT*)inputData;
+    DstT *dst = (DstT*)pagedData;
+    int srcOffset = head * seqLen * headDim + token * headDim + dim;
+    int pageStride = pageLen * numHeads * headDim;
+    int tokenStride = numHeads * headDim;
+    int dstOffset = pageList.pageIdx[pageSlot] * pageStride +
+                    pageOffset * tokenStride + head * headDim + dim;
+    dst[dstOffset] = FastllmAttentionFloatToValue<DstT>(
+        FastllmAttentionValueToFloat<SrcT>(src[srcOffset]));
+}
+
+template <typename SrcT, typename DstT>
+static void FastllmCudaPagedCacheCopyMultiPageTyped(
+    uint8_t *pagedData,
+    const FastllmPagedCacheCopyPageList &pageList,
+    int pageCount,
+    int firstPageOffset,
+    int pageLen,
+    int numHeads,
+    int headDim,
+    uint8_t *inputData,
+    int seqLen) {
+    int totalElements = numHeads * seqLen * headDim;
+    if (totalElements == 0) {
+        return;
+    }
+
+    const int THREAD_PER_BLOCK = 256;
+    int numBlocks = (totalElements + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
+    FastllmPagedCacheCopyMultiPageKernel<SrcT, DstT>
+        <<<numBlocks, THREAD_PER_BLOCK>>>(
+            pagedData, pageList, pageCount, firstPageOffset, pageLen,
+            numHeads, headDim, inputData, seqLen);
+    DeviceSync();
+}
+
+bool FastllmCudaPagedCacheCopyMultiPage(
+    uint8_t *pagedData,
+    const int *pageIdxHost,
+    int pageCount,
+    int firstPageOffset,
+    int pageLen,
+    int numHeads,
+    int headDim,
+    fastllm::DataType dstType,
+    uint8_t *inputData,
+    fastllm::DataType srcType,
+    int seqLen) {
+    if (pageIdxHost == nullptr || pageCount <= 0 ||
+        pageCount > FASTLLM_PAGED_CACHE_COPY_MULTI_MAX_PAGES ||
+        firstPageOffset < 0 || firstPageOffset >= pageLen) {
+        return false;
+    }
+
+    FastllmPagedCacheCopyPageList pageList = {};
+    for (int i = 0; i < pageCount; i++) {
+        pageList.pageIdx[i] = pageIdxHost[i];
+    }
+
+#define FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(SRC_T, DST_T) \
+    FastllmCudaPagedCacheCopyMultiPageTyped<SRC_T, DST_T>( \
+        pagedData, pageList, pageCount, firstPageOffset, pageLen, \
+        numHeads, headDim, inputData, seqLen)
+
+    if (srcType == fastllm::DataType::FLOAT32) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(float, float);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(float, half);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(float, __nv_bfloat16);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(float, __nv_fp8_e4m3);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyMultiPage: unsupported dstType.\n");
+        }
+    } else if (srcType == fastllm::DataType::FLOAT16) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(half, float);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(half, half);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(half, __nv_bfloat16);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(half, __nv_fp8_e4m3);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyMultiPage: unsupported dstType.\n");
+        }
+    } else if (srcType == fastllm::DataType::BFLOAT16) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(__nv_bfloat16, float);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(__nv_bfloat16, half);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(__nv_bfloat16, __nv_bfloat16);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH(__nv_bfloat16, __nv_fp8_e4m3);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyMultiPage: unsupported dstType.\n");
+        }
+    } else {
+        fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyMultiPage: unsupported srcType.\n");
+    }
+
+#undef FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH
+    return true;
+}
+
+__global__ void FastllmPreparePagedBatchParamsSingleKernel(
+    int32_t *qSizes,
+    int32_t *pageSizes,
+    int32_t *pageIndexs,
+    int32_t *lastPageLens,
+    FastllmPagedCacheCopyPageList pageList,
+    int pageIndexCount,
+    int totalPages,
+    int qSize,
+    int lastPageLen) {
+    int idx = threadIdx.x;
+    if (idx < pageIndexCount) {
+        pageIndexs[idx] = pageList.pageIdx[idx];
+    }
+    if (idx == 0) {
+        qSizes[0] = 0;
+        qSizes[1] = qSize;
+        pageSizes[0] = 0;
+        pageSizes[1] = totalPages;
+        lastPageLens[0] = lastPageLen;
+    }
+}
+
+bool FastllmCudaPreparePagedBatchParamsSingle(
+    int32_t *qSizes,
+    int32_t *pageSizes,
+    int32_t *pageIndexs,
+    int32_t *lastPageLens,
+    const int *pageIdxHost,
+    int pageIndexCount,
+    int totalPages,
+    int qSize,
+    int lastPageLen) {
+    if (qSizes == nullptr || pageSizes == nullptr || pageIndexs == nullptr ||
+        lastPageLens == nullptr || pageIdxHost == nullptr ||
+        pageIndexCount <= 0 ||
+        pageIndexCount > FASTLLM_PAGED_CACHE_COPY_MULTI_MAX_PAGES) {
+        return false;
+    }
+
+    FastllmPagedCacheCopyPageList pageList = {};
+    for (int i = 0; i < pageIndexCount; i++) {
+        pageList.pageIdx[i] = pageIdxHost[i];
+    }
+    FastllmPreparePagedBatchParamsSingleKernel<<<1, 256>>>(
+        qSizes, pageSizes, pageIndexs, lastPageLens, pageList,
+        pageIndexCount, totalPages, qSize, lastPageLen);
+    DeviceSync();
+    return true;
+}
+
 // CUDA kernel for batch copying data from input to paged KV cache
 // input: [batch, numHeads, headDim], pagedData: [maxPages, pageLen, numHeads, headDim]
 // Each batch has 1 token, so we copy [numHeads, headDim] for each batch

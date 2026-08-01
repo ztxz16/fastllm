@@ -7072,6 +7072,50 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         int pageLen = cache.pageLen;
         uint8_t *pagedData = (uint8_t*)pagedKVCache->cudaData;
         uint8_t *inputData = (uint8_t*)input.cudaData;
+
+        // A chunked prefill commonly spans many 128-token pages.  The legacy
+        // loop below launches one kernel per page.  Pack up to 256 page ids
+        // into a kernel argument so the whole input tensor is appended with
+        // one launch while preserving arbitrary physical page allocation.
+        bool useCurrentPage = !cache.pageIndex.empty() &&
+                              cache.lastPageLen < pageLen;
+        int firstPageOffset = useCurrentPage ? cache.lastPageLen : 0;
+        int firstPageCapacity = pageLen - firstPageOffset;
+        int remainingAfterFirst = std::max(0, seqLen - firstPageCapacity);
+        int appendPageCount = 1 +
+            (remainingAfterFirst + pageLen - 1) / pageLen;
+        bool useMultiPageCopy =
+            CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_PAGED_CACHE_MULTI_PAGE_COPY", true) &&
+            seqLen > 0 && appendPageCount > 1 && appendPageCount <= 256;
+        if (useMultiPageCopy) {
+            std::vector<int> appendPages;
+            appendPages.reserve(appendPageCount);
+            int remaining = seqLen;
+            if (useCurrentPage) {
+                appendPages.push_back(cache.pageIndex.back());
+                int copyLen = std::min(firstPageCapacity, remaining);
+                cache.lastPageLen += copyLen;
+                remaining -= copyLen;
+            }
+            while (remaining > 0) {
+                int newPageIdx =
+                    cache.pagedKVCacheData->GetUnusedPageIndex(true);
+                cache.pageIndex.push_back(newPageIdx);
+                appendPages.push_back(newPageIdx);
+                int copyLen = std::min(pageLen, remaining);
+                cache.lastPageLen = copyLen;
+                remaining -= copyLen;
+            }
+            bool launched = FastllmCudaPagedCacheCopyMultiPage(
+                pagedData, appendPages.data(), (int)appendPages.size(),
+                firstPageOffset, pageLen, numHeads, headDim,
+                pagedKVCache->dataType, inputData, input.dataType, seqLen);
+            AssertInFastLLM(
+                launched,
+                "CudaAppendPagedCacheOp failed to launch multi-page copy.\n");
+            return;
+        }
         
         // 计算当前page的剩余空间
         int remainingInCurrentPage = 0;
@@ -7468,11 +7512,26 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             prepareCudaInt(lastPageLens, batch);
         }
 
-        FastllmCudaCopyFromHostToDevice(qSizes.cudaData, (void*)qSizesHost.data(), (batch + 1) * sizeof(int32_t));
-        FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, (void*)pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
-        FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, (void*)pageIndexsHost.data(), totalPageSlots * sizeof(int32_t));
-        if (!lastPageLensOnDevice) {
-            FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, (void*)lastPageLensHost.data(), batch * sizeof(int32_t));
+        bool singleBatchPrepared = false;
+        if (batch == 1 && !lastPageLensOnDevice &&
+            totalPageSlots <= 256 &&
+            CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_PAGED_BATCH_PARAMS_SINGLE_KERNEL", true)) {
+            singleBatchPrepared = FastllmCudaPreparePagedBatchParamsSingle(
+                (int32_t*)qSizes.cudaData,
+                (int32_t*)pageSizes.cudaData,
+                (int32_t*)pageIndexs.cudaData,
+                (int32_t*)lastPageLens.cudaData,
+                pageIndexsHost.data(), totalPageSlots, totalPages,
+                qSizesHost[1], lastPageLensHost[0]);
+        }
+        if (!singleBatchPrepared) {
+            FastllmCudaCopyFromHostToDevice(qSizes.cudaData, (void*)qSizesHost.data(), (batch + 1) * sizeof(int32_t));
+            FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, (void*)pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
+            FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, (void*)pageIndexsHost.data(), totalPageSlots * sizeof(int32_t));
+            if (!lastPageLensOnDevice) {
+                FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, (void*)lastPageLensHost.data(), batch * sizeof(int32_t));
+            }
         }
     }
 }
