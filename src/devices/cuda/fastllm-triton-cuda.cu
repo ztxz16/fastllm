@@ -1854,7 +1854,7 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
     const char *cubinPath, const char *kernelName,
     int numWarps, int shared, int blockT,
     const fastllm::Data &qInput, const fastllm::Data &kInput,
-    const fastllm::Data &vInput, const fastllm::Data &gInput,
+    const fastllm::Data &qkvInput, const fastllm::Data &gInput,
     const fastllm::Data &betaInput,
     int batch, int seqLen, int keyHeads, int valueHeads,
     int kDim, int vDim, float qScale,
@@ -1870,18 +1870,19 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
         kDim != 128 || vDim != 128 ||
         qInput.dataType != fastllm::DataType::FLOAT16 ||
         kInput.dataType != fastllm::DataType::FLOAT16 ||
-        vInput.dataType != fastllm::DataType::FLOAT16 ||
+        qkvInput.dataType != fastllm::DataType::FLOAT16 ||
         gInput.dataType != fastllm::DataType::FLOAT16 ||
         betaInput.dataType != fastllm::DataType::FLOAT16 ||
         qInput.cudaData == nullptr || kInput.cudaData == nullptr ||
-        vInput.cudaData == nullptr || gInput.cudaData == nullptr ||
+        qkvInput.cudaData == nullptr || gInput.cudaData == nullptr ||
         betaInput.cudaData == nullptr ||
         qInput.Count(0) !=
             (uint64_t)batch * seqLen * keyHeads * kDim ||
         kInput.Count(0) !=
             (uint64_t)batch * seqLen * keyHeads * kDim ||
-        vInput.Count(0) !=
-            (uint64_t)batch * seqLen * valueHeads * vDim ||
+        qkvInput.Count(0) !=
+            (uint64_t)batch * seqLen *
+            (keyHeads * kDim * 2 + valueHeads * vDim) ||
         gInput.Count(0) !=
             (uint64_t)batch * seqLen * valueHeads ||
         betaInput.Count(0) !=
@@ -1898,8 +1899,8 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
     auto prepareOutput = [&](fastllm::Data &output,
                              const std::vector<int> &dims) {
         output.dataType = fastllm::DataType::FLOAT16;
-        output.dataDevice = qInput.dataDevice;
-        output.dataDeviceIds = qInput.dataDeviceIds;
+        output.dataDevice = qkvInput.dataDevice;
+        output.dataDeviceIds = qkvInput.dataDeviceIds;
         output.Resize(dims);
         output.Allocate(false);
         return output.cudaData != nullptr;
@@ -1916,7 +1917,7 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
 
     void *qInputData = FastllmCudaPrepareInput(qInput);
     void *kInputData = FastllmCudaPrepareInput(kInput);
-    void *vInputData = FastllmCudaPrepareInput(vInput);
+    void *qkvInputData = FastllmCudaPrepareInput(qkvInput);
     void *gInputData = FastllmCudaPrepareInput(gInput);
     void *betaInputData = FastllmCudaPrepareInput(betaInput);
     void *qData = FastllmCudaPrepareOutput(q);
@@ -1929,7 +1930,7 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
     auto finishPrepared = [&]() {
         FastllmCudaFinishInput(qInput, qInputData);
         FastllmCudaFinishInput(kInput, kInputData);
-        FastllmCudaFinishInput(vInput, vInputData);
+        FastllmCudaFinishInput(qkvInput, qkvInputData);
         FastllmCudaFinishInput(gInput, gInputData);
         FastllmCudaFinishInput(betaInput, betaInputData);
         FastllmCudaFinishOutput(q, qData);
@@ -1941,8 +1942,9 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
         FastllmCudaFinishOutput(vBeta, vBetaData);
     };
     if (qInputData == nullptr || kInputData == nullptr ||
-        vInputData == nullptr || gInputData == nullptr ||
-        betaInputData == nullptr || qData == nullptr || kData == nullptr ||
+        qkvInputData == nullptr || gInputData == nullptr ||
+        betaInputData == nullptr ||
+        qData == nullptr || kData == nullptr ||
         vData == nullptr || gData == nullptr || betaData == nullptr ||
         kBetaData == nullptr || vBetaData == nullptr) {
         finishPrepared();
@@ -1951,7 +1953,7 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
 
     CUdeviceptr qInputPtr = (CUdeviceptr)qInputData;
     CUdeviceptr kInputPtr = (CUdeviceptr)kInputData;
-    CUdeviceptr vInputPtr = (CUdeviceptr)vInputData;
+    CUdeviceptr qkvInputPtr = (CUdeviceptr)qkvInputData;
     CUdeviceptr gInputPtr = (CUdeviceptr)gInputData;
     CUdeviceptr betaInputPtr = (CUdeviceptr)betaInputData;
     CUdeviceptr qPtr = (CUdeviceptr)qData;
@@ -1966,7 +1968,7 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
     CUdeviceptr globalScratch = 0;
     CUdeviceptr profileScratch = 0;
     void *args[] = {
-        &qInputPtr, &kInputPtr, &vInputPtr, &gInputPtr, &betaInputPtr,
+        &qInputPtr, &kInputPtr, &qkvInputPtr, &gInputPtr, &betaInputPtr,
         &qPtr, &kPtr, &vPtr, &gPtr, &betaPtr, &kBetaPtr, &vBetaPtr,
         &seqLenArg, &chunksArg, &qScale,
         &globalScratch, &profileScratch,
@@ -1978,6 +1980,217 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
         (unsigned int)(numWarps * 32), (unsigned int)shared, args, stream);
     finishPrepared();
     return CheckCu(result, "cuLaunchKernel chunk_gdn_postconv");
+}
+
+namespace {
+struct TritonChunkGdnScaleScratch {
+    void *rowScale = nullptr;
+    void *stateScale = nullptr;
+    size_t rowScaleBytes = 0;
+    size_t stateScaleBytes = 0;
+    int batchHeads = 0;
+    int chunks = 0;
+    int chunkSize = 0;
+    bool valid = false;
+};
+
+static std::map<int, TritonChunkGdnScaleScratch> &
+TritonChunkGdnScaleScratches() {
+    thread_local static std::map<int, TritonChunkGdnScaleScratch> scratches;
+    return scratches;
+}
+
+static TritonChunkGdnScaleScratch *FindTritonChunkGdnScaleScratch() {
+    auto &scratches = TritonChunkGdnScaleScratches();
+    auto it = scratches.find(FastllmCudaGetDevice());
+    return it == scratches.end() ? nullptr : &it->second;
+}
+
+static bool EnsureTritonChunkGdnScaleScratch(
+    size_t rowScaleBytes, size_t stateScaleBytes,
+    int batchHeads, int chunks, int chunkSize,
+    TritonChunkGdnScaleScratch *&scratch) {
+    auto &cached =
+        TritonChunkGdnScaleScratches()[FastllmCudaGetDevice()];
+    cached.valid = false;
+    if (cached.rowScaleBytes < rowScaleBytes ||
+        cached.stateScaleBytes < stateScaleBytes) {
+        if (cached.rowScale != nullptr || cached.stateScale != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        if (cached.rowScale != nullptr) {
+            FastllmCudaFree(cached.rowScale);
+        }
+        if (cached.stateScale != nullptr) {
+            FastllmCudaFree(cached.stateScale);
+        }
+        cached.rowScale = FastllmCudaMalloc(rowScaleBytes);
+        cached.stateScale = FastllmCudaMalloc(stateScaleBytes);
+        if (cached.rowScale == nullptr || cached.stateScale == nullptr) {
+            if (cached.rowScale != nullptr) {
+                FastllmCudaFree(cached.rowScale);
+            }
+            if (cached.stateScale != nullptr) {
+                FastllmCudaFree(cached.stateScale);
+            }
+            cached = TritonChunkGdnScaleScratch();
+            return false;
+        }
+        cached.rowScaleBytes = rowScaleBytes;
+        cached.stateScaleBytes = stateScaleBytes;
+    }
+    cached.batchHeads = batchHeads;
+    cached.chunks = chunks;
+    cached.chunkSize = chunkSize;
+    scratch = &cached;
+    return true;
+}
+}
+
+extern "C" bool FastllmCudaTritonChunkGdnRecompute(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared,
+    bool precomputeScale, bool internalExp, int blockD,
+    const fastllm::Data &attn, const fastllm::Data &vBeta,
+    const fastllm::Data &kBeta, const fastllm::Data &gExp,
+    const fastllm::Data &g,
+    fastllm::Data &vOutput, fastllm::Data &kOutput) {
+    if (cubinPath == nullptr || kernelName == nullptr ||
+        numWarps <= 0 || shared < 0 || blockD != 64 ||
+        attn.dataType != fastllm::DataType::FLOAT16 ||
+        vBeta.dataType != fastllm::DataType::FLOAT16 ||
+        kBeta.dataType != fastllm::DataType::FLOAT16 ||
+        (!internalExp &&
+         gExp.dataType != fastllm::DataType::FLOAT16) ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        attn.cudaData == nullptr || vBeta.cudaData == nullptr ||
+        kBeta.cudaData == nullptr ||
+        (!internalExp && gExp.cudaData == nullptr) ||
+        g.cudaData == nullptr ||
+        attn.dims.size() != 5 ||
+        vBeta.dims.size() != 5 ||
+        kBeta.dims.size() != 5 ||
+        (!internalExp && gExp.dims.size() != 4) ||
+        g.dims.size() != 4) {
+        return false;
+    }
+    int batch = attn.dims[0];
+    int heads = attn.dims[1];
+    int chunks = attn.dims[2];
+    int chunkSize = attn.dims[3];
+    constexpr int kDim = 128;
+    constexpr int vDim = 128;
+    if (batch <= 0 || heads <= 0 || chunks <= 0 ||
+        chunkSize != 64 || attn.dims[4] != chunkSize ||
+        vBeta.dims != std::vector<int>(
+            {batch, heads, chunks, chunkSize, vDim}) ||
+        kBeta.dims != std::vector<int>(
+            {batch, heads, chunks, chunkSize, kDim}) ||
+        (!internalExp &&
+         gExp.dims != std::vector<int>(
+             {batch, heads, chunks, chunkSize})) ||
+        g.dims != std::vector<int>(
+            {batch, heads, chunks, chunkSize})) {
+        return false;
+    }
+
+    LoadedTritonKernel *kernel =
+        LoadTritonKernel(cubinPath, kernelName, shared);
+    if (kernel == nullptr) {
+        return false;
+    }
+
+    auto prepareOutput = [&](fastllm::Data &output,
+                             const std::vector<int> &dims) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.dataDevice = attn.dataDevice;
+        output.dataDeviceIds = attn.dataDeviceIds;
+        output.Resize(dims);
+        output.Allocate(false);
+        return output.cudaData != nullptr;
+    };
+    if (!prepareOutput(vOutput, vBeta.dims) ||
+        !prepareOutput(kOutput, kBeta.dims)) {
+        return false;
+    }
+
+    int batchHeads = batch * heads;
+    TritonChunkGdnScaleScratch *scaleScratch =
+        FindTritonChunkGdnScaleScratch();
+    if (precomputeScale) {
+        size_t rowScaleBytes =
+            (size_t)batchHeads * chunks * chunkSize * sizeof(float);
+        size_t stateScaleBytes =
+            (size_t)batchHeads * chunks * sizeof(float);
+        if (!EnsureTritonChunkGdnScaleScratch(
+                rowScaleBytes, stateScaleBytes,
+                batchHeads, chunks, chunkSize, scaleScratch)) {
+            return false;
+        }
+    } else if (scaleScratch != nullptr) {
+        scaleScratch->valid = false;
+    }
+
+    void *attnData = FastllmCudaPrepareInput(attn);
+    void *vBetaData = FastllmCudaPrepareInput(vBeta);
+    void *kBetaData = FastllmCudaPrepareInput(kBeta);
+    void *gExpData =
+        internalExp ? nullptr : FastllmCudaPrepareInput(gExp);
+    void *gData = FastllmCudaPrepareInput(g);
+    void *vOutputData = FastllmCudaPrepareOutput(vOutput);
+    void *kOutputData = FastllmCudaPrepareOutput(kOutput);
+    auto finishPrepared = [&]() {
+        FastllmCudaFinishInput(attn, attnData);
+        FastllmCudaFinishInput(vBeta, vBetaData);
+        FastllmCudaFinishInput(kBeta, kBetaData);
+        if (!internalExp) {
+            FastllmCudaFinishInput(gExp, gExpData);
+        }
+        FastllmCudaFinishInput(g, gData);
+        FastllmCudaFinishOutput(vOutput, vOutputData);
+        FastllmCudaFinishOutput(kOutput, kOutputData);
+    };
+    if (attnData == nullptr || vBetaData == nullptr ||
+        kBetaData == nullptr ||
+        (!internalExp && gExpData == nullptr) ||
+        gData == nullptr ||
+        vOutputData == nullptr || kOutputData == nullptr) {
+        finishPrepared();
+        return false;
+    }
+
+    CUdeviceptr attnPtr = (CUdeviceptr)attnData;
+    CUdeviceptr vBetaPtr = (CUdeviceptr)vBetaData;
+    CUdeviceptr kBetaPtr = (CUdeviceptr)kBetaData;
+    CUdeviceptr gExpPtr = (CUdeviceptr)gExpData;
+    CUdeviceptr gPtr = (CUdeviceptr)gData;
+    CUdeviceptr vOutputPtr = (CUdeviceptr)vOutputData;
+    CUdeviceptr kOutputPtr = (CUdeviceptr)kOutputData;
+    CUdeviceptr rowScalePtr = precomputeScale
+        ? (CUdeviceptr)scaleScratch->rowScale : 0;
+    CUdeviceptr stateScalePtr = precomputeScale
+        ? (CUdeviceptr)scaleScratch->stateScale : 0;
+    int32_t chunksArg = chunks;
+    CUdeviceptr globalScratch = 0;
+    CUdeviceptr profileScratch = 0;
+    void *args[] = {
+        &attnPtr, &vBetaPtr, &kBetaPtr, &gExpPtr, &gPtr,
+        &vOutputPtr, &kOutputPtr, &rowScalePtr, &stateScalePtr,
+        &chunksArg,
+        &globalScratch, &profileScratch,
+    };
+    CUstream stream = reinterpret_cast<CUstream>(cudaStreamPerThread);
+    CUresult result = LaunchTritonKernel(
+        kernel, (unsigned int)chunks,
+        (unsigned int)(batch * heads), 1,
+        (unsigned int)(numWarps * 32),
+        (unsigned int)shared, args, stream);
+    if (scaleScratch != nullptr) {
+        scaleScratch->valid =
+            precomputeScale && result == CUDA_SUCCESS;
+    }
+    finishPrepared();
+    return CheckCu(result, "cuLaunchKernel chunk_gdn_recompute");
 }
 
 namespace {
@@ -2049,24 +2262,42 @@ static bool EnsureTritonChunkGdnPrefillScratch(
 extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     const char *hCubinPath, const char *hKernelName, int hNumWarps, int hShared,
     const char *oCubinPath, const char *oKernelName, int oNumWarps, int oShared,
-    int chunks, int chunkSize, int kDim, int vDim, int blockV,
+    const char *oFusedDecayCubinPath,
+    const char *oFusedDecayKernelName,
+    int oFusedDecayNumWarps, int oFusedDecayShared,
+    const char *hPrecomputedScaleCubinPath,
+    const char *hPrecomputedScaleKernelName,
+    int hPrecomputedScaleNumWarps, int hPrecomputedScaleShared,
+    bool precomputeScale, bool fuseDecayMask,
+    int chunks, int chunkSize, int kDim, int vDim,
+    int hBlockV, int oBlockV,
     fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
-    fastllm::Data &g, fastllm::Data &attn, fastllm::Data &kCumdecay,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &decayMask, fastllm::Data &kCumdecay,
     fastllm::Data &lastRecurrentState, fastllm::Data &coreAttnOut) {
     if (hCubinPath == nullptr || hKernelName == nullptr ||
         oCubinPath == nullptr || oKernelName == nullptr ||
+        oFusedDecayCubinPath == nullptr ||
+        oFusedDecayKernelName == nullptr ||
+        hPrecomputedScaleCubinPath == nullptr ||
+        hPrecomputedScaleKernelName == nullptr ||
         hNumWarps <= 0 || oNumWarps <= 0 ||
+        oFusedDecayNumWarps <= 0 ||
+        hPrecomputedScaleNumWarps <= 0 ||
         chunks <= 0 || chunkSize != 64 || kDim != 128 || vDim != 128 ||
-        (blockV != 32 && blockV != 64) ||
+        (hBlockV != 32 && hBlockV != 64) ||
+        (oBlockV != 32 && oBlockV != 64) ||
         q.dataType != fastllm::DataType::FLOAT16 ||
         k.dataType != fastllm::DataType::FLOAT16 ||
         v.dataType != fastllm::DataType::FLOAT16 ||
         g.dataType != fastllm::DataType::FLOAT16 ||
         attn.dataType != fastllm::DataType::FLOAT16 ||
+        decayMask.dataType != fastllm::DataType::FLOAT16 ||
         kCumdecay.dataType != fastllm::DataType::FLOAT16 ||
         lastRecurrentState.dataType != fastllm::DataType::FLOAT16 ||
         q.cudaData == nullptr || k.cudaData == nullptr || v.cudaData == nullptr ||
         g.cudaData == nullptr || attn.cudaData == nullptr ||
+        decayMask.cudaData == nullptr ||
         kCumdecay.cudaData == nullptr || lastRecurrentState.cudaData == nullptr ||
         q.dims.size() != 5 || k.dims != q.dims ||
         q.dims[2] != chunks || q.dims[3] != chunkSize ||
@@ -2077,6 +2308,7 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
         g.dims != std::vector<int>({q.dims[0], q.dims[1], chunks, chunkSize}) ||
         attn.dims != std::vector<int>({q.dims[0], q.dims[1], chunks,
                                        chunkSize, chunkSize}) ||
+        decayMask.dims != attn.dims ||
         kCumdecay.dims != q.dims ||
         lastRecurrentState.dims !=
             std::vector<int>({q.dims[0], q.dims[1], kDim, vDim})) {
@@ -2087,11 +2319,35 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
         LoadTritonKernel(hCubinPath, hKernelName, hShared);
     LoadedTritonKernel *oKernel =
         LoadTritonKernel(oCubinPath, oKernelName, oShared);
-    if (hKernel == nullptr || oKernel == nullptr) {
+    LoadedTritonKernel *oFusedDecayKernel =
+        LoadTritonKernel(
+            oFusedDecayCubinPath, oFusedDecayKernelName,
+            oFusedDecayShared);
+    LoadedTritonKernel *hPrecomputedScaleKernel =
+        LoadTritonKernel(
+            hPrecomputedScaleCubinPath, hPrecomputedScaleKernelName,
+            hPrecomputedScaleShared);
+    if (hKernel == nullptr || oKernel == nullptr ||
+        oFusedDecayKernel == nullptr ||
+        hPrecomputedScaleKernel == nullptr) {
         return false;
     }
 
     int batchHeads = q.dims[0] * q.dims[1];
+    TritonChunkGdnScaleScratch *scaleScratch =
+        FindTritonChunkGdnScaleScratch();
+    if (precomputeScale &&
+        (scaleScratch == nullptr || !scaleScratch->valid ||
+         scaleScratch->batchHeads != batchHeads ||
+         scaleScratch->chunks != chunks ||
+         scaleScratch->chunkSize != chunkSize)) {
+        return false;
+    }
+    if (precomputeScale) {
+        // Consume the handoff before any later allocation or launch can fail,
+        // so a fallback cannot leave stale scales valid for the next layer.
+        scaleScratch->valid = false;
+    }
     size_t hBytes =
         (size_t)batchHeads * chunks * kDim * vDim * sizeof(half);
     size_t vNewBytes =
@@ -2118,17 +2374,20 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     void *vData = FastllmCudaPrepareInput(v);
     void *gData = FastllmCudaPrepareInput(g);
     void *attnData = FastllmCudaPrepareInput(attn);
+    void *decayMaskData = FastllmCudaPrepareInput(decayMask);
     void *kCumdecayData = FastllmCudaPrepareInput(kCumdecay);
     void *stateData = FastllmCudaPrepareInput(lastRecurrentState);
     void *outputData = FastllmCudaPrepareOutput(coreAttnOut);
     if (qData == nullptr || kData == nullptr || vData == nullptr ||
-        gData == nullptr || attnData == nullptr || kCumdecayData == nullptr ||
+        gData == nullptr || attnData == nullptr ||
+        decayMaskData == nullptr || kCumdecayData == nullptr ||
         stateData == nullptr || outputData == nullptr) {
         FastllmCudaFinishInput(q, qData);
         FastllmCudaFinishInput(k, kData);
         FastllmCudaFinishInput(v, vData);
         FastllmCudaFinishInput(g, gData);
         FastllmCudaFinishInput(attn, attnData);
+        FastllmCudaFinishInput(decayMask, decayMaskData);
         FastllmCudaFinishInput(kCumdecay, kCumdecayData);
         FastllmCudaFinishInput(lastRecurrentState, stateData);
         FastllmCudaFinishOutput(coreAttnOut, outputData);
@@ -2140,32 +2399,56 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     CUdeviceptr vPtr = (CUdeviceptr)vData;
     CUdeviceptr gPtr = (CUdeviceptr)gData;
     CUdeviceptr attnPtr = (CUdeviceptr)attnData;
+    CUdeviceptr decayMaskPtr = (CUdeviceptr)decayMaskData;
     CUdeviceptr kCumdecayPtr = (CUdeviceptr)kCumdecayData;
     CUdeviceptr statePtr = (CUdeviceptr)stateData;
     CUdeviceptr nextStatePtr = (CUdeviceptr)scratch->nextState;
     CUdeviceptr hPtr = (CUdeviceptr)scratch->h;
     CUdeviceptr vNewPtr = (CUdeviceptr)scratch->vNew;
+    CUdeviceptr rowScalePtr = precomputeScale
+        ? (CUdeviceptr)scaleScratch->rowScale : 0;
+    CUdeviceptr stateScalePtr = precomputeScale
+        ? (CUdeviceptr)scaleScratch->stateScale : 0;
     CUdeviceptr outputPtr = (CUdeviceptr)outputData;
     CUdeviceptr globalScratch = 0;
     CUdeviceptr profileScratch = 0;
     void *hArgs[] = {
         &kPtr, &vPtr, &gPtr, &kCumdecayPtr, &statePtr, &nextStatePtr,
-        &hPtr, &vNewPtr, &globalScratch, &profileScratch,
+        &hPtr, &vNewPtr, &rowScalePtr, &stateScalePtr,
+        &globalScratch, &profileScratch,
     };
     void *oArgs[] = {
-        &qPtr, &gPtr, &attnPtr, &hPtr, &vNewPtr, &outputPtr,
+        &qPtr, &gPtr, &attnPtr, &decayMaskPtr,
+        &hPtr, &vNewPtr, &outputPtr,
         &globalScratch, &profileScratch,
     };
     CUstream stream = reinterpret_cast<CUstream>(cudaStreamPerThread);
-    unsigned int vBlocks = (unsigned int)((vDim + blockV - 1) / blockV);
+    unsigned int hVBlocks =
+        (unsigned int)((vDim + hBlockV - 1) / hBlockV);
+    unsigned int oVBlocks =
+        (unsigned int)((vDim + oBlockV - 1) / oBlockV);
+    LoadedTritonKernel *selectedHKernel =
+        precomputeScale ? hPrecomputedScaleKernel : hKernel;
+    int selectedHNumWarps =
+        precomputeScale ? hPrecomputedScaleNumWarps : hNumWarps;
+    int selectedHShared =
+        precomputeScale ? hPrecomputedScaleShared : hShared;
+    LoadedTritonKernel *selectedOKernel =
+        fuseDecayMask ? oFusedDecayKernel : oKernel;
+    int selectedONumWarps =
+        fuseDecayMask ? oFusedDecayNumWarps : oNumWarps;
+    int selectedOShared =
+        fuseDecayMask ? oFusedDecayShared : oShared;
     CUresult hResult = LaunchTritonKernel(
-        hKernel, vBlocks, (unsigned int)batchHeads, 1,
-        (unsigned int)(hNumWarps * 32), (unsigned int)hShared, hArgs, stream);
+        selectedHKernel, hVBlocks, (unsigned int)batchHeads, 1,
+        (unsigned int)(selectedHNumWarps * 32),
+        (unsigned int)selectedHShared, hArgs, stream);
     CUresult oResult = hResult == CUDA_SUCCESS
         ? LaunchTritonKernel(
-              oKernel, vBlocks, (unsigned int)chunks,
-              (unsigned int)batchHeads, (unsigned int)(oNumWarps * 32),
-              (unsigned int)oShared, oArgs, stream)
+              selectedOKernel, oVBlocks, (unsigned int)chunks,
+              (unsigned int)batchHeads,
+              (unsigned int)(selectedONumWarps * 32),
+              (unsigned int)selectedOShared, oArgs, stream)
         : hResult;
     CUresult stateCommitResult =
         hResult == CUDA_SUCCESS && oResult == CUDA_SUCCESS
@@ -2177,6 +2460,7 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     FastllmCudaFinishInput(v, vData);
     FastllmCudaFinishInput(g, gData);
     FastllmCudaFinishInput(attn, attnData);
+    FastllmCudaFinishInput(decayMask, decayMaskData);
     FastllmCudaFinishInput(kCumdecay, kCumdecayData);
     FastllmCudaFinishInput(lastRecurrentState, stateData);
     FastllmCudaFinishOutput(coreAttnOut, outputData);

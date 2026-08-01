@@ -1656,14 +1656,31 @@ namespace {
                 ? fallback : (int)value;
         };
         int blockV = envIntRange(
-            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_BLOCK_V", 64, 32, 64);
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_BLOCK_V", 32, 32, 64);
         if (blockV != 32 && blockV != 64) {
-            blockV = 64;
+            blockV = 32;
         }
         int numWarps = envIntRange(
             "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_WARPS", 4, 1, 32);
-        int numStages = envIntRange(
-            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_STAGES", 2, 1, 8);
+        constexpr const char *commonStagesKey =
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_STAGES";
+        const char *commonStagesValue = std::getenv(commonStagesKey);
+        bool commonStagesSet =
+            commonStagesValue != nullptr && commonStagesValue[0] != '\0';
+        int commonNumStages =
+            envIntRange(commonStagesKey, 3, 1, 8);
+        int hNumStages = envIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_H_NUM_STAGES",
+            commonStagesSet ? commonNumStages : 2, 1, 8);
+        int oNumStages = envIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_O_NUM_STAGES",
+            commonStagesSet ? commonNumStages : 3, 1, 8);
+        int oBlockV = blockV;
+        if (blockV == 32 && RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_SPLIT_BLOCK_V",
+                true)) {
+            oBlockV = 64;
+        }
 
         std::string cacheDir;
         const char *cacheEnv = std::getenv("FASTLLM_CUDA_TRITON_CACHE_DIR");
@@ -1688,23 +1705,39 @@ namespace {
         }
         std::string separator = cacheDir.empty() || cacheDir.back() == '/'
             ? "" : "/";
-        std::string base = cacheDir + separator +
-            "chunk_gdn_prefill_v2_fp16_sm" + std::to_string(arch) +
-            "_c2_t64_k128_v128_bv" + std::to_string(blockV) +
+        auto metadataBase = [&](int selectedBlockV, int selectedNumStages) {
+            return cacheDir + separator +
+            "chunk_gdn_prefill_v6_fp16_sm" + std::to_string(arch) +
+            "_c2_t64_k128_v128_bv" +
+            std::to_string(selectedBlockV) +
             "_nw" + std::to_string(numWarps) +
-            "_ns" + std::to_string(numStages);
-        std::ifstream metaFile(base + ".json", std::ios::binary);
-        Expect(metaFile.good(),
-               "Triton chunk GDN prefill metadata was not generated");
-        std::string metaText(
-            (std::istreambuf_iterator<char>(metaFile)),
-            std::istreambuf_iterator<char>());
-        std::string jsonError;
-        json11::Json meta = json11::Json::parse(metaText, jsonError);
-        Expect(jsonError.empty() && meta["ok"].bool_value(),
-               "Triton chunk GDN prefill metadata is invalid");
-        json11::Json hMeta = meta["kernels"]["h"];
-        json11::Json oMeta = meta["kernels"]["o"];
+            "_ns" + std::to_string(selectedNumStages);
+        };
+        auto readMetadata = [&](const std::string &base) {
+            std::ifstream metaFile(base + ".json", std::ios::binary);
+            Expect(metaFile.good(),
+                   "Triton chunk GDN prefill metadata was not generated");
+            std::string metaText(
+                (std::istreambuf_iterator<char>(metaFile)),
+                std::istreambuf_iterator<char>());
+            std::string jsonError;
+            json11::Json meta = json11::Json::parse(metaText, jsonError);
+            Expect(jsonError.empty() && meta["ok"].bool_value(),
+                   "Triton chunk GDN prefill metadata is invalid");
+            return meta;
+        };
+        json11::Json hMetadata = readMetadata(
+            metadataBase(blockV, hNumStages));
+        json11::Json oMetadata =
+            oBlockV == blockV && oNumStages == hNumStages
+                ? hMetadata
+                : readMetadata(metadataBase(oBlockV, oNumStages));
+        json11::Json hMeta = hMetadata["kernels"]["h"];
+        json11::Json oMeta = oMetadata["kernels"]["o"];
+        json11::Json oFusedDecayMeta =
+            oMetadata["kernels"]["o_fused_decay_mask"];
+        json11::Json hPrecomputedScaleMeta =
+            hMetadata["kernels"]["h_precomputed_scale"];
         std::string hCubin = hMeta["cubin"].string_value();
         std::string hKernel = hMeta["kernel"].string_value();
         int hNumWarps = hMeta["num_warps"].int_value();
@@ -1713,8 +1746,30 @@ namespace {
         std::string oKernel = oMeta["kernel"].string_value();
         int oNumWarps = oMeta["num_warps"].int_value();
         int oShared = oMeta["shared"].int_value();
+        std::string oFusedDecayCubin =
+            oFusedDecayMeta["cubin"].string_value();
+        std::string oFusedDecayKernel =
+            oFusedDecayMeta["kernel"].string_value();
+        int oFusedDecayNumWarps =
+            oFusedDecayMeta["num_warps"].int_value();
+        int oFusedDecayShared =
+            oFusedDecayMeta["shared"].int_value();
+        std::string hPrecomputedScaleCubin =
+            hPrecomputedScaleMeta["cubin"].string_value();
+        std::string hPrecomputedScaleKernel =
+            hPrecomputedScaleMeta["kernel"].string_value();
+        int hPrecomputedScaleNumWarps =
+            hPrecomputedScaleMeta["num_warps"].int_value();
+        int hPrecomputedScaleShared =
+            hPrecomputedScaleMeta["shared"].int_value();
         Expect(!hCubin.empty() && !hKernel.empty() && hNumWarps > 0 &&
-                   !oCubin.empty() && !oKernel.empty() && oNumWarps > 0,
+                   !oCubin.empty() && !oKernel.empty() && oNumWarps > 0 &&
+                   !oFusedDecayCubin.empty() &&
+                   !oFusedDecayKernel.empty() &&
+                   oFusedDecayNumWarps > 0 &&
+                   !hPrecomputedScaleCubin.empty() &&
+                   !hPrecomputedScaleKernel.empty() &&
+                   hPrecomputedScaleNumWarps > 0,
                "Triton chunk GDN prefill kernel metadata is incomplete");
 
         fastllm::Data directState = MakeCudaTensor(
@@ -1723,8 +1778,16 @@ namespace {
         Expect(FastllmCudaTritonChunkGatedDeltaRulePrefill(
                    hCubin.c_str(), hKernel.c_str(), hNumWarps, hShared,
                    oCubin.c_str(), oKernel.c_str(), oNumWarps, oShared,
-                   chunks, chunkSize, kDim, vDim, blockV,
-                   q, k, v, g, attn, kCumdecay, directState, directOutput),
+                   oFusedDecayCubin.c_str(),
+                   oFusedDecayKernel.c_str(),
+                   oFusedDecayNumWarps, oFusedDecayShared,
+                   hPrecomputedScaleCubin.c_str(),
+                   hPrecomputedScaleKernel.c_str(),
+                   hPrecomputedScaleNumWarps, hPrecomputedScaleShared,
+                   false, false,
+                   chunks, chunkSize, kDim, vDim, blockV, oBlockV,
+                   q, k, v, g, attn, attn,
+                   kCumdecay, directState, directOutput),
                "direct Triton chunk GDN prefill launch failed");
         FastllmCudaSyncCurrentThreadStream();
         ExpectFloatNear(referenceStateValues, ToFloatVector(directState),
@@ -1741,8 +1804,16 @@ namespace {
         bool accepted = FastllmCudaTritonChunkGatedDeltaRulePrefill(
             hCubin.c_str(), hKernel.c_str(), hNumWarps, hShared,
             oCubin.c_str(), oKernel.c_str(), 1024, oShared,
-            chunks, chunkSize, kDim, vDim, blockV,
-            q, k, v, g, attn, kCumdecay, failedState, failedOutput);
+            oFusedDecayCubin.c_str(),
+            oFusedDecayKernel.c_str(),
+            oFusedDecayNumWarps, oFusedDecayShared,
+            hPrecomputedScaleCubin.c_str(),
+            hPrecomputedScaleKernel.c_str(),
+            hPrecomputedScaleNumWarps, hPrecomputedScaleShared,
+            false, false,
+            chunks, chunkSize, kDim, vDim, blockV, oBlockV,
+            q, k, v, g, attn, attn,
+            kCumdecay, failedState, failedOutput);
         Expect(!accepted,
                "fault-injected Triton chunk GDN O launch unexpectedly succeeded");
         FastllmCudaSyncCurrentThreadStream();

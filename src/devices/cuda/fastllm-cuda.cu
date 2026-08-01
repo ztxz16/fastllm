@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <map>
@@ -1647,6 +1648,32 @@ __global__ void FastllmSigmoidMambaSoftplusKernel(half *sigmoidData, const half 
     }
 }
 
+__global__ void FastllmSigmoidMambaSoftplusCombinedHalfKernel(
+        const half *inputData, half *sigmoidOutputData,
+        half *softplusOutputData, const float *aLog,
+        const float *dtBias, int inputChannels,
+        int baOffset, int channels) {
+    int o = blockIdx.x;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        int inputIdx = o * inputChannels + baOffset + i;
+        int outputIdx = o * channels + i;
+#ifdef CUDA_NO_TENSOR_CORE
+        float x = __half2float(inputData[inputIdx]);
+        sigmoidOutputData[outputIdx] =
+            __float2half(1.0f / (1.0f + expf(-x)));
+#else
+        half x = inputData[inputIdx];
+        sigmoidOutputData[outputIdx] =
+            __hdiv(__float2half(1.0f),
+                   __hadd(__float2half(1.0f), hexp(-x)));
+#endif
+        softplusOutputData[outputIdx] = __float2half(
+            -exp((double)aLog[i]) *
+            softplus(__half2float(inputData[inputIdx + channels]) +
+                     dtBias[i]));
+    }
+}
+
 __global__ void FastllmSwigluKernel(float* __restrict__ a, float* __restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -2709,6 +2736,97 @@ __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *out
     }
 }
 
+// Preserve the reduction order of the 1024-thread RMSNorm kernel while using
+// 512 physical threads. Each thread evaluates the work of virtual threads tid
+// and tid + 512 independently; their 32 warp sums are then reduced in the same
+// order as the original launch. This permits more resident blocks without
+// changing the floating-point grouping.
+__global__ __launch_bounds__(512)
+void FastllmRMSNormHalfVirtual1024Kernel(
+        half *input, float *weight, half *output,
+        int channels, float eps) {
+    constexpr int PHYSICAL_THREADS = 512;
+    constexpr int VIRTUAL_THREADS = 1024;
+    constexpr int PHYSICAL_WARPS = PHYSICAL_THREADS / 32;
+    __shared__ float warpSums[VIRTUAL_THREADS / 32];
+    __shared__ float scale;
+
+    int row = blockIdx.x;
+    input += (size_t)row * channels;
+    output += (size_t)row * channels;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int half2Channels = channels / 2;
+    const half2 *input2 = reinterpret_cast<const half2 *>(input);
+
+    float sum0 = 0.0f;
+    for (int i = tid; i < half2Channels; i += VIRTUAL_THREADS) {
+        float2 value = __half22float2(input2[i]);
+        sum0 += value.x * value.x + value.y * value.y;
+    }
+    float sum1 = 0.0f;
+    for (int i = tid + PHYSICAL_THREADS;
+         i < half2Channels; i += VIRTUAL_THREADS) {
+        float2 value = __half22float2(input2[i]);
+        sum1 += value.x * value.x + value.y * value.y;
+    }
+    if ((channels & 1) && tid == 0) {
+        float value = __half2float(input[channels - 1]);
+        sum0 += value * value;
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    if (lane == 0) {
+        warpSums[warp] = sum0;
+        warpSums[warp + PHYSICAL_WARPS] = sum1;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float value = warpSums[lane];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(value / channels + eps);
+        }
+    }
+    __syncthreads();
+
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+    float rowScale = scale;
+    for (int i = tid; i < half2Channels; i += VIRTUAL_THREADS) {
+        float2 value = __half22float2(input2[i]);
+        float2 normalized;
+        normalized.x =
+            value.x * rowScale * __ldg(weight + i * 2);
+        normalized.y =
+            value.y * rowScale * __ldg(weight + i * 2 + 1);
+        output2[i] = __float22half2_rn(normalized);
+    }
+    for (int i = tid + PHYSICAL_THREADS;
+         i < half2Channels; i += VIRTUAL_THREADS) {
+        float2 value = __half22float2(input2[i]);
+        float2 normalized;
+        normalized.x =
+            value.x * rowScale * __ldg(weight + i * 2);
+        normalized.y =
+            value.y * rowScale * __ldg(weight + i * 2 + 1);
+        output2[i] = __float22half2_rn(normalized);
+    }
+    if ((channels & 1) && tid == 0) {
+        int last = channels - 1;
+        output[last] = __float2half(
+            __half2float(input[last]) * rowScale * __ldg(weight + last));
+    }
+}
+
 union FastllmRMSNormHalf8 {
     uint4 packed;
     half2 values[4];
@@ -2814,6 +2932,217 @@ __global__ __launch_bounds__(32) void FastllmRMSNormHalf128ExactKernel(
     normalized1.y = value1.y * scale * __ldg(weight + (lane + 32) * 2 + 1);
     output2[lane] = __float22half2_rn(normalized0);
     output2[lane + 32] = __float22half2_rn(normalized1);
+}
+
+// Normalize Q and K directly from the token-major combined convolution
+// output. Each Q/K row uses the same lane mapping, reduction order, rsqrt,
+// weight application, and fp16 rounding as FastllmRMSNormHalf128ExactKernel.
+__global__ __launch_bounds__(32) void FastllmRMSNormCombinedQKHalf128ExactKernel(
+        const half *qkvInput, const float *weight,
+        half *qOutput, half *kOutput,
+        int keyHeads, int valueHeads, float eps) {
+    constexpr int CHANNELS = 128;
+    int rowHead = blockIdx.x;
+    int row = rowHead / keyHeads;
+    int head = rowHead - row * keyHeads;
+    int lane = threadIdx.x;
+    size_t inputStride =
+        (size_t)(keyHeads * 2 + valueHeads) * CHANNELS;
+    const half *qInput =
+        qkvInput + (size_t)row * inputStride + head * CHANNELS;
+    const half *kInput =
+        qkvInput + (size_t)row * inputStride +
+        (keyHeads + head) * CHANNELS;
+    qOutput += (size_t)rowHead * CHANNELS;
+    kOutput += (size_t)rowHead * CHANNELS;
+
+    const half2 *qInput2 = reinterpret_cast<const half2 *>(qInput);
+    const half2 *kInput2 = reinterpret_cast<const half2 *>(kInput);
+    float2 qValue0 = __half22float2(qInput2[lane]);
+    float2 qValue1 = __half22float2(qInput2[lane + 32]);
+    float2 kValue0 = __half22float2(kInput2[lane]);
+    float2 kValue1 = __half22float2(kInput2[lane + 32]);
+    float qSum0 = qValue0.x * qValue0.x + qValue0.y * qValue0.y;
+    float qSum1 = qValue1.x * qValue1.x + qValue1.y * qValue1.y;
+    float kSum0 = kValue0.x * kValue0.x + kValue0.y * kValue0.y;
+    float kSum1 = kValue1.x * kValue1.x + kValue1.y * kValue1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum0 += __shfl_down_sync(0xffffffffu, qSum0, offset);
+        qSum1 += __shfl_down_sync(0xffffffffu, qSum1, offset);
+        kSum0 += __shfl_down_sync(0xffffffffu, kSum0, offset);
+        kSum1 += __shfl_down_sync(0xffffffffu, kSum1, offset);
+    }
+    float qScale = 0.0f;
+    float kScale = 0.0f;
+    if (lane == 0) {
+        qScale = rsqrtf((qSum0 + qSum1) / CHANNELS + eps);
+        kScale = rsqrtf((kSum0 + kSum1) / CHANNELS + eps);
+    }
+    qScale = __shfl_sync(0xffffffffu, qScale, 0);
+    kScale = __shfl_sync(0xffffffffu, kScale, 0);
+
+    float weights[4] = {
+        __ldg(weight + lane * 2),
+        __ldg(weight + lane * 2 + 1),
+        __ldg(weight + (lane + 32) * 2),
+        __ldg(weight + (lane + 32) * 2 + 1)
+    };
+    float2 qNormalized0, qNormalized1;
+    float2 kNormalized0, kNormalized1;
+    qNormalized0.x = qValue0.x * qScale * weights[0];
+    qNormalized0.y = qValue0.y * qScale * weights[1];
+    qNormalized1.x = qValue1.x * qScale * weights[2];
+    qNormalized1.y = qValue1.y * qScale * weights[3];
+    kNormalized0.x = kValue0.x * kScale * weights[0];
+    kNormalized0.y = kValue0.y * kScale * weights[1];
+    kNormalized1.x = kValue1.x * kScale * weights[2];
+    kNormalized1.y = kValue1.y * kScale * weights[3];
+
+    half2 *qOutput2 = reinterpret_cast<half2 *>(qOutput);
+    half2 *kOutput2 = reinterpret_cast<half2 *>(kOutput);
+    qOutput2[lane] = __float22half2_rn(qNormalized0);
+    qOutput2[lane + 32] = __float22half2_rn(qNormalized1);
+    kOutput2[lane] = __float22half2_rn(kNormalized0);
+    kOutput2[lane + 32] = __float22half2_rn(kNormalized1);
+}
+
+template <bool WRITE_DEAD_OUTPUTS>
+__global__ __launch_bounds__(32)
+void FastllmQwen35GdnPostConvExactHalf128Kernel(
+        const half *qkvInput, const float *weight,
+        const half *gInput, const half *betaInput,
+        half *qOutput, half *kOutput, half *vOutput,
+        half *gOutput, half *betaOutput,
+        half *kBetaOutput, half *vBetaOutput,
+        int seqLen, int paddedSeqLen,
+        int keyHeads, int valueHeads, float eps, half qScale) {
+    constexpr int CHANNELS = 128;
+    int rowHead = blockIdx.x;
+    int paddedRow = rowHead / keyHeads;
+    int head = rowHead - paddedRow * keyHeads;
+    int batchIndex = paddedRow / paddedSeqLen;
+    int token = paddedRow - batchIndex * paddedSeqLen;
+    int lane = threadIdx.x;
+    int headGroup = valueHeads / keyHeads;
+    if (token >= seqLen) {
+        if (lane == 0) {
+            for (int group = 0; group < headGroup; group++) {
+                int valueHead = head * headGroup + group;
+                size_t outputRow =
+                    ((size_t)batchIndex * valueHeads + valueHead) *
+                        paddedSeqLen + token;
+                gOutput[outputRow] = __float2half(0.0f);
+                if constexpr (WRITE_DEAD_OUTPUTS) {
+                    betaOutput[outputRow] = __float2half(0.0f);
+                }
+            }
+        }
+        return;
+    }
+    int row = batchIndex * seqLen + token;
+    size_t inputStride =
+        (size_t)(keyHeads * 2 + valueHeads) * CHANNELS;
+    const half *qInput =
+        qkvInput + (size_t)row * inputStride + head * CHANNELS;
+    const half *kInput =
+        qkvInput + (size_t)row * inputStride +
+        (keyHeads + head) * CHANNELS;
+
+    const half2 *qInput2 = reinterpret_cast<const half2 *>(qInput);
+    const half2 *kInput2 = reinterpret_cast<const half2 *>(kInput);
+    float2 qValue0 = __half22float2(qInput2[lane]);
+    float2 qValue1 = __half22float2(qInput2[lane + 32]);
+    float2 kValue0 = __half22float2(kInput2[lane]);
+    float2 kValue1 = __half22float2(kInput2[lane + 32]);
+    float qSum0 = qValue0.x * qValue0.x + qValue0.y * qValue0.y;
+    float qSum1 = qValue1.x * qValue1.x + qValue1.y * qValue1.y;
+    float kSum0 = kValue0.x * kValue0.x + kValue0.y * kValue0.y;
+    float kSum1 = kValue1.x * kValue1.x + kValue1.y * kValue1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum0 += __shfl_down_sync(0xffffffffu, qSum0, offset);
+        qSum1 += __shfl_down_sync(0xffffffffu, qSum1, offset);
+        kSum0 += __shfl_down_sync(0xffffffffu, kSum0, offset);
+        kSum1 += __shfl_down_sync(0xffffffffu, kSum1, offset);
+    }
+    float qNormScale = 0.0f;
+    float kNormScale = 0.0f;
+    if (lane == 0) {
+        qNormScale = rsqrtf((qSum0 + qSum1) / CHANNELS + eps);
+        kNormScale = rsqrtf((kSum0 + kSum1) / CHANNELS + eps);
+    }
+    qNormScale = __shfl_sync(0xffffffffu, qNormScale, 0);
+    kNormScale = __shfl_sync(0xffffffffu, kNormScale, 0);
+
+    float weights[4] = {
+        __ldg(weight + lane * 2),
+        __ldg(weight + lane * 2 + 1),
+        __ldg(weight + (lane + 32) * 2),
+        __ldg(weight + (lane + 32) * 2 + 1)
+    };
+    float2 qNormalized0, qNormalized1;
+    float2 kNormalized0, kNormalized1;
+    qNormalized0.x = qValue0.x * qNormScale * weights[0];
+    qNormalized0.y = qValue0.y * qNormScale * weights[1];
+    qNormalized1.x = qValue1.x * qNormScale * weights[2];
+    qNormalized1.y = qValue1.y * qNormScale * weights[3];
+    kNormalized0.x = kValue0.x * kNormScale * weights[0];
+    kNormalized0.y = kValue0.y * kNormScale * weights[1];
+    kNormalized1.x = kValue1.x * kNormScale * weights[2];
+    kNormalized1.y = kValue1.y * kNormScale * weights[3];
+    half2 qNormalizedHalf0 = __float22half2_rn(qNormalized0);
+    half2 qNormalizedHalf1 = __float22half2_rn(qNormalized1);
+    half2 kNormalizedHalf0 = __float22half2_rn(kNormalized0);
+    half2 kNormalizedHalf1 = __float22half2_rn(kNormalized1);
+    half2 qScale2 = __halves2half2(qScale, qScale);
+
+    for (int group = 0; group < headGroup; group++) {
+        int valueHead = head * headGroup + group;
+        size_t scalarInputIndex =
+            (size_t)row * valueHeads + valueHead;
+        half betaValue = betaInput[scalarInputIndex];
+        half2 beta2 = __halves2half2(betaValue, betaValue);
+        size_t outputRow =
+            ((size_t)batchIndex * valueHeads + valueHead) *
+                paddedSeqLen + token;
+        size_t outputBase = outputRow * CHANNELS;
+        half2 *qOutput2 =
+            reinterpret_cast<half2 *>(qOutput + outputBase);
+        half2 *kOutput2 =
+            reinterpret_cast<half2 *>(kOutput + outputBase);
+        half2 *vOutput2 =
+            reinterpret_cast<half2 *>(vOutput + outputBase);
+        half2 *kBetaOutput2 =
+            reinterpret_cast<half2 *>(kBetaOutput + outputBase);
+        half2 *vBetaOutput2 =
+            reinterpret_cast<half2 *>(vBetaOutput + outputBase);
+        const half *vInput =
+            qkvInput + (size_t)row * inputStride +
+            (keyHeads * 2 + valueHead) * CHANNELS;
+        const half2 *vInput2 = reinterpret_cast<const half2 *>(vInput);
+        half2 vValue0 = vInput2[lane];
+        half2 vValue1 = vInput2[lane + 32];
+
+        qOutput2[lane] = __hmul2(qNormalizedHalf0, qScale2);
+        qOutput2[lane + 32] = __hmul2(qNormalizedHalf1, qScale2);
+        kOutput2[lane] = kNormalizedHalf0;
+        kOutput2[lane + 32] = kNormalizedHalf1;
+        if constexpr (WRITE_DEAD_OUTPUTS) {
+            vOutput2[lane] = vValue0;
+            vOutput2[lane + 32] = vValue1;
+        }
+        kBetaOutput2[lane] = __hmul2(kNormalizedHalf0, beta2);
+        kBetaOutput2[lane + 32] = __hmul2(kNormalizedHalf1, beta2);
+        vBetaOutput2[lane] = __hmul2(vValue0, beta2);
+        vBetaOutput2[lane + 32] = __hmul2(vValue1, beta2);
+        if (lane == 0) {
+            gOutput[outputRow] = gInput[scalarInputIndex];
+            if constexpr (WRITE_DEAD_OUTPUTS) {
+                betaOutput[outputRow] = betaValue;
+            }
+        }
+    }
 }
 
 template <int THREAD_PER_BLOCK>
@@ -5056,6 +5385,78 @@ bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fa
     return true;
 }
 
+bool FastllmCudaSigmoidMambaSoftplusCombinedFloat16(
+        const fastllm::Data &input,
+        const fastllm::Data &aLogData,
+        const fastllm::Data &dtBiasData,
+        int batch, int seqLen, int inputChannels,
+        int baOffset, int channels,
+        fastllm::Data &sigmoidOutput,
+        fastllm::Data &softplusOutput) {
+    auto isDense = [](const fastllm::Data &data) {
+        if (data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (batch <= 0 || seqLen <= 0 || inputChannels <= 0 ||
+        baOffset < 0 || channels <= 0 ||
+        baOffset + channels * 2 > inputChannels ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        input.cudaData == nullptr || !isDense(input) ||
+        input.dims.back() != inputChannels ||
+        input.Count(0) !=
+            (uint64_t)batch * seqLen * inputChannels ||
+        aLogData.dataDevice != fastllm::DataDevice::CUDA ||
+        aLogData.dataType != fastllm::DataType::FLOAT32 ||
+        aLogData.cudaData == nullptr || !isDense(aLogData) ||
+        aLogData.Count(0) != (uint64_t)channels ||
+        dtBiasData.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBiasData.dataType != fastllm::DataType::FLOAT32 ||
+        dtBiasData.cudaData == nullptr || !isDense(dtBiasData) ||
+        dtBiasData.Count(0) != (uint64_t)channels) {
+        return false;
+    }
+
+    auto prepareOutput = [&](fastllm::Data &output) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.dataDevice = input.dataDevice;
+        output.dataDeviceIds = input.dataDeviceIds;
+        output.Resize({batch, seqLen, channels});
+        output.Allocate(false);
+        return output.cudaData != nullptr;
+    };
+    if (!prepareOutput(sigmoidOutput) ||
+        !prepareOutput(softplusOutput)) {
+        return false;
+    }
+
+    int outer = batch * seqLen;
+    int threadPerBlock = std::min(64, channels);
+    FastllmSigmoidMambaSoftplusCombinedHalfKernel
+        <<<outer, threadPerBlock>>>(
+            (const half *)input.cudaData,
+            (half *)sigmoidOutput.cudaData,
+            (half *)softplusOutput.cudaData,
+            (const float *)aLogData.cudaData,
+            (const float *)dtBiasData.cudaData,
+            inputChannels, baOffset, channels);
+    checkCudaErrors(
+        "Error: CUDA error in "
+        "FastllmCudaSigmoidMambaSoftplusCombinedFloat16.",
+        cudaGetLastError());
+    return true;
+}
+
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     int len = output.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
@@ -5227,6 +5628,183 @@ bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     }
     FastllmCudaFinishInput(input1, input1Data);
     FastllmCudaFinishOutput(input0, cudaData);
+    return true;
+}
+
+__device__ inline float FastllmMulToCausalMaskValue(
+        float a, float b, float alpha) {
+    return a * (b * alpha);
+}
+
+__device__ inline half FastllmMulToCausalMaskValue(
+        half a, half b, float alpha) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return __float2half(__half2float(b) * alpha * __half2float(a));
+#else
+    return __hmul(a, (half)((float)b * alpha));
+#endif
+}
+
+__device__ inline __nv_bfloat16 FastllmMulToCausalMaskValue(
+        __nv_bfloat16 a, __nv_bfloat16 b, float alpha) {
+    return __float2bfloat16_rn(
+        __bfloat162float(a) * __bfloat162float(b) * alpha);
+}
+
+template <typename T>
+__global__ void FastllmMulToCausalMaskKernel(
+        T *data, const T *scale, float alpha, int len,
+        int n, int m, int base, T maskValue) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    int remainder = idx % (n * m);
+    int i = remainder / m;
+    int j = remainder % m;
+    if (j >= i + base) {
+        data[idx] = maskValue;
+    } else {
+        data[idx] =
+            FastllmMulToCausalMaskValue(data[idx], scale[idx], alpha);
+    }
+}
+
+template <typename T>
+__global__ void FastllmMulCausalMaskKernel(
+        const T *input, const T *scale, T *output,
+        float alpha, int len, int n, int m, int base, T maskValue) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    int remainder = idx % (n * m);
+    int i = remainder / m;
+    int j = remainder % m;
+    if (j >= i + base) {
+        output[idx] = maskValue;
+    } else {
+        output[idx] =
+            FastllmMulToCausalMaskValue(input[idx], scale[idx], alpha);
+    }
+}
+
+bool FastllmCudaMulToCausalMask(
+        fastllm::Data &input0,
+        const fastllm::Data &input1,
+        float alpha,
+        int base,
+        float maskValue) {
+    if (input0.dims.size() < 2 || input0.dims != input1.dims ||
+        input0.dataType != input1.dataType) {
+        return false;
+    }
+    if (input0.dataType != fastllm::DataType::FLOAT32 &&
+        input0.dataType != fastllm::DataType::FLOAT16 &&
+        input0.dataType != fastllm::DataType::BFLOAT16) {
+        return false;
+    }
+
+    int len = input0.Count(0);
+    if (len <= 0) {
+        return true;
+    }
+    void *input0Data = FastllmCudaPrepareInput(input0);
+    void *input1Data = FastllmCudaPrepareInput(input1);
+    int dimsLen = input0.dims.size();
+    int n = input0.dims[dimsLen - 2];
+    int m = input0.dims[dimsLen - 1];
+    int blockSize = std::min(256, len);
+    int gridSize = (len + blockSize - 1) / blockSize;
+
+    if (input0.dataType == fastllm::DataType::FLOAT32) {
+        FastllmMulToCausalMaskKernel<float><<<gridSize, blockSize>>>(
+            (float*)input0Data, (const float*)input1Data, alpha,
+            len, n, m, base, maskValue);
+    } else if (input0.dataType == fastllm::DataType::FLOAT16) {
+        FastllmMulToCausalMaskKernel<half><<<gridSize, blockSize>>>(
+            (half*)input0Data, (const half*)input1Data, alpha,
+            len, n, m, base, __float2half(maskValue));
+    } else {
+        FastllmMulToCausalMaskKernel<__nv_bfloat16>
+            <<<gridSize, blockSize>>>(
+                (__nv_bfloat16*)input0Data,
+                (const __nv_bfloat16*)input1Data, alpha,
+                len, n, m, base, __float2bfloat16_rn(maskValue));
+    }
+
+    DeviceSync();
+    FastllmCudaFinishInput(input1, input1Data);
+    FastllmCudaFinishOutput(input0, input0Data);
+    return true;
+}
+
+bool FastllmCudaMulCausalMask(
+        const fastllm::Data &input0,
+        const fastllm::Data &input1,
+        fastllm::Data &output,
+        float alpha,
+        int base,
+        float maskValue) {
+    if (input0.dims.size() < 2 || input0.dims != input1.dims ||
+        output.dims != input0.dims ||
+        input0.dataType != input1.dataType ||
+        output.dataType != input0.dataType ||
+        input0.dataDevice != fastllm::DataDevice::CUDA ||
+        input1.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input0.cudaData == nullptr || input1.cudaData == nullptr ||
+        output.cudaData == nullptr) {
+        return false;
+    }
+    if (input0.dataType != fastllm::DataType::FLOAT32 &&
+        input0.dataType != fastllm::DataType::FLOAT16 &&
+        input0.dataType != fastllm::DataType::BFLOAT16) {
+        return false;
+    }
+
+    int len = input0.Count(0);
+    if (len <= 0) {
+        return true;
+    }
+    void *input0Data = FastllmCudaPrepareInput(input0);
+    void *input1Data = FastllmCudaPrepareInput(input1);
+    void *outputData = FastllmCudaPrepareOutput(output);
+    if (input0Data == nullptr || input1Data == nullptr ||
+        outputData == nullptr) {
+        FastllmCudaFinishInput(input0, input0Data);
+        FastllmCudaFinishInput(input1, input1Data);
+        FastllmCudaFinishOutput(output, outputData);
+        return false;
+    }
+    int dimsLen = input0.dims.size();
+    int n = input0.dims[dimsLen - 2];
+    int m = input0.dims[dimsLen - 1];
+    int blockSize = std::min(256, len);
+    int gridSize = (len + blockSize - 1) / blockSize;
+
+    if (input0.dataType == fastllm::DataType::FLOAT32) {
+        FastllmMulCausalMaskKernel<float><<<gridSize, blockSize>>>(
+            (const float*)input0Data, (const float*)input1Data,
+            (float*)outputData, alpha, len, n, m, base, maskValue);
+    } else if (input0.dataType == fastllm::DataType::FLOAT16) {
+        FastllmMulCausalMaskKernel<half><<<gridSize, blockSize>>>(
+            (const half*)input0Data, (const half*)input1Data,
+            (half*)outputData, alpha, len, n, m, base,
+            __float2half(maskValue));
+    } else {
+        FastllmMulCausalMaskKernel<__nv_bfloat16>
+            <<<gridSize, blockSize>>>(
+                (const __nv_bfloat16*)input0Data,
+                (const __nv_bfloat16*)input1Data,
+                (__nv_bfloat16*)outputData, alpha, len, n, m, base,
+                __float2bfloat16_rn(maskValue));
+    }
+
+    DeviceSync();
+    FastllmCudaFinishInput(input0, input0Data);
+    FastllmCudaFinishInput(input1, input1Data);
+    FastllmCudaFinishOutput(output, outputData);
     return true;
 }
 
@@ -5661,6 +6239,197 @@ bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
+template<typename T>
+__global__ void CumSumLastDimMakeDecayMaskKernel(
+        T *input, T *output, int dim, int outer) {
+    int o = blockIdx.x;
+    if (o >= outer) {
+        return;
+    }
+    T *row = input + (size_t)o * dim;
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < dim; j++) {
+            float sum = FastllmCudaValueToFloat(row[j]) +
+                        FastllmCudaValueToFloat(row[j - 1]);
+            row[j] = FastllmCudaFloatToValue<T>(sum);
+        }
+    }
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        T *out = output + (size_t)o * dim * dim;
+        if (j <= i) {
+            float valI = FastllmCudaValueToFloat(row[i]);
+            float valJ = FastllmCudaValueToFloat(row[j]);
+            out[idx] = FastllmCudaFloatToValue<T>(expf(valI - valJ));
+        } else {
+            out[idx] = FastllmCudaFloatToValue<T>(0.0f);
+        }
+    }
+}
+
+template<typename T>
+__global__ void CumSumDecayMaskNegMulCausalKernel(
+        T *input, const T *matrix, T *decayMask, T *output,
+        int dim, int outer) {
+    int o = blockIdx.x;
+    if (o >= outer) {
+        return;
+    }
+    T *row = input + (size_t)o * dim;
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < dim; j++) {
+            float sum = FastllmCudaValueToFloat(row[j]) +
+                        FastllmCudaValueToFloat(row[j - 1]);
+            row[j] = FastllmCudaFloatToValue<T>(sum);
+        }
+    }
+    __syncthreads();
+
+    const T *matrixRow = matrix + (size_t)o * dim * dim;
+    T *decayRow = decayMask + (size_t)o * dim * dim;
+    T *outputRow = output + (size_t)o * dim * dim;
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        if (j <= i) {
+            float valI = FastllmCudaValueToFloat(row[i]);
+            float valJ = FastllmCudaValueToFloat(row[j]);
+            T decay = FastllmCudaFloatToValue<T>(expf(valI - valJ));
+            decayRow[idx] = decay;
+            if (j < i) {
+                outputRow[idx] = FastllmMulToCausalMaskValue(
+                    matrixRow[idx], decay, -1.0f);
+            } else {
+                outputRow[idx] = FastllmCudaFloatToValue<T>(0.0f);
+            }
+        } else {
+            decayRow[idx] = FastllmCudaFloatToValue<T>(0.0f);
+            outputRow[idx] = FastllmCudaFloatToValue<T>(0.0f);
+        }
+    }
+}
+
+bool FastllmCudaCumSumLastDimMakeDecayMask(
+        fastllm::Data &input, fastllm::Data &output) {
+    if (input.dataType != output.dataType ||
+        (input.dataType != fastllm::DataType::FLOAT32 &&
+         input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16) ||
+        input.dims.empty() || input.dims.back() <= 0 ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || output.cudaData == nullptr) {
+        return false;
+    }
+    std::vector<int> expectedOutputDims = input.dims;
+    expectedOutputDims.push_back(input.dims.back());
+    if (output.dims != expectedOutputDims) {
+        return false;
+    }
+
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *outputData = FastllmCudaPrepareInput(output);
+    int dim = input.dims.back();
+    int outer = input.Count(0) / dim;
+    if (outer <= 0) {
+        FastllmCudaFinishOutput(input, inputData);
+        FastllmCudaFinishOutput(output, outputData);
+        return true;
+    }
+
+    int blockSize = 256;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        CumSumLastDimMakeDecayMaskKernel<float>
+            <<<outer, blockSize>>>(
+                (float*)inputData, (float*)outputData, dim, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        CumSumLastDimMakeDecayMaskKernel<half>
+            <<<outer, blockSize>>>(
+                (half*)inputData, (half*)outputData, dim, outer);
+    } else {
+        CumSumLastDimMakeDecayMaskKernel<__nv_bfloat16>
+            <<<outer, blockSize>>>(
+                (__nv_bfloat16*)inputData,
+                (__nv_bfloat16*)outputData, dim, outer);
+    }
+
+    DeviceSync();
+    FastllmCudaFinishOutput(input, inputData);
+    FastllmCudaFinishOutput(output, outputData);
+    return true;
+}
+
+bool FastllmCudaCumSumDecayMaskNegMulCausal(
+        fastllm::Data &input, const fastllm::Data &matrix,
+        fastllm::Data &decayMask, fastllm::Data &output) {
+    if (input.dataType != matrix.dataType ||
+        input.dataType != decayMask.dataType ||
+        input.dataType != output.dataType ||
+        (input.dataType != fastllm::DataType::FLOAT32 &&
+         input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16) ||
+        input.dims.empty() || input.dims.back() <= 0 ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        matrix.dataDevice != fastllm::DataDevice::CUDA ||
+        decayMask.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || matrix.cudaData == nullptr ||
+        decayMask.cudaData == nullptr || output.cudaData == nullptr) {
+        return false;
+    }
+    std::vector<int> expectedMatrixDims = input.dims;
+    expectedMatrixDims.push_back(input.dims.back());
+    if (matrix.dims != expectedMatrixDims ||
+        decayMask.dims != expectedMatrixDims ||
+        output.dims != expectedMatrixDims) {
+        return false;
+    }
+
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *matrixData = FastllmCudaPrepareInput(matrix);
+    void *decayData = FastllmCudaPrepareOutput(decayMask);
+    void *outputData = FastllmCudaPrepareOutput(output);
+    int dim = input.dims.back();
+    int outer = input.Count(0) / dim;
+    if (outer <= 0) {
+        FastllmCudaFinishOutput(input, inputData);
+        FastllmCudaFinishInput(matrix, matrixData);
+        FastllmCudaFinishOutput(decayMask, decayData);
+        FastllmCudaFinishOutput(output, outputData);
+        return true;
+    }
+
+    int blockSize = 256;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        CumSumDecayMaskNegMulCausalKernel<float>
+            <<<outer, blockSize>>>(
+                (float*)inputData, (const float*)matrixData,
+                (float*)decayData, (float*)outputData, dim, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        CumSumDecayMaskNegMulCausalKernel<half>
+            <<<outer, blockSize>>>(
+                (half*)inputData, (const half*)matrixData,
+                (half*)decayData, (half*)outputData, dim, outer);
+    } else {
+        CumSumDecayMaskNegMulCausalKernel<__nv_bfloat16>
+            <<<outer, blockSize>>>(
+                (__nv_bfloat16*)inputData,
+                (const __nv_bfloat16*)matrixData,
+                (__nv_bfloat16*)decayData,
+                (__nv_bfloat16*)outputData, dim, outer);
+    }
+
+    DeviceSync();
+    FastllmCudaFinishOutput(input, inputData);
+    FastllmCudaFinishInput(matrix, matrixData);
+    FastllmCudaFinishOutput(decayMask, decayData);
+    FastllmCudaFinishOutput(output, outputData);
+    return true;
+}
+
 static bool LaunchFastllmRMSNormFloat16(
         const half *input, const float *weight, half *output,
         int outer, int channels, float eps, int threadCount) {
@@ -5690,6 +6459,17 @@ static bool LaunchFastllmRMSNormFloat16(
         ((uintptr_t)weight % alignof(float4)) == 0) {
         FastllmRMSNormHalf4096Kernel<<<outer, 512>>>(
             input, weight, output, eps);
+        return true;
+    }
+    const char *virtualThreadsEnv = std::getenv(
+        "FASTLLM_CUDA_RMSNORM_VIRTUAL_1024");
+    bool useVirtualThreads =
+        virtualThreadsEnv == nullptr || virtualThreadsEnv[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_RMSNORM_VIRTUAL_1024");
+    if (useVirtualThreads && channels == 5120 && outer >= 64) {
+        FastllmRMSNormHalfVirtual1024Kernel<<<outer, 512>>>(
+            (half*)input, (float*)weight, output, channels, eps);
         return true;
     }
     FastllmRMSNormKernelInner1<1024><<<outer, 1024>>>(
@@ -5812,6 +6592,175 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
 
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaRMSNormCombinedQKFloat16(
+        const fastllm::Data &qkvInput, const fastllm::Data &weight,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float eps,
+        fastllm::Data &q, fastllm::Data &k) {
+    auto isDense = [](const fastllm::Data &data) {
+        if (data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (batch <= 0 || seqLen <= 0 ||
+        keyHeads <= 0 || valueHeads < keyHeads ||
+        kDim != 128 || vDim != 128 ||
+        !std::isfinite(eps) || eps < 0.0f ||
+        qkvInput.dataDevice != fastllm::DataDevice::CUDA ||
+        qkvInput.dataType != fastllm::DataType::FLOAT16 ||
+        qkvInput.cudaData == nullptr || !isDense(qkvInput) ||
+        qkvInput.Count(0) !=
+            (uint64_t)batch * seqLen *
+            (keyHeads * kDim * 2 + valueHeads * vDim) ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        weight.cudaData == nullptr || !isDense(weight) ||
+        weight.Count(0) != (uint64_t)kDim) {
+        return false;
+    }
+
+    auto prepareOutput = [&](fastllm::Data &output) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.dataDevice = qkvInput.dataDevice;
+        output.dataDeviceIds = qkvInput.dataDeviceIds;
+        output.Resize({batch, seqLen, keyHeads, kDim});
+        output.Allocate(false);
+        return output.cudaData != nullptr;
+    };
+    if (!prepareOutput(q) || !prepareOutput(k)) {
+        return false;
+    }
+
+    int rows = batch * seqLen;
+    FastllmRMSNormCombinedQKHalf128ExactKernel<<<rows * keyHeads, 32>>>(
+        (const half *)qkvInput.cudaData,
+        (const float *)weight.cudaData,
+        (half *)q.cudaData, (half *)k.cudaData,
+        keyHeads, valueHeads, eps);
+    checkCudaErrors(
+        "Error: CUDA error in FastllmCudaRMSNormCombinedQKFloat16.",
+        cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaQwen35GdnPostConvExactFloat16(
+        const fastllm::Data &qkvInput,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &gInput,
+        const fastllm::Data &betaInput,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float normEps, float qScale,
+        fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+        fastllm::Data &g, fastllm::Data &beta,
+        fastllm::Data &kBeta, fastllm::Data &vBeta) {
+    auto isDenseCuda = [](const fastllm::Data &data) {
+        if (data.dataDevice != fastllm::DataDevice::CUDA ||
+            data.cudaData == nullptr || data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (batch <= 0 || seqLen <= 0 || seqLen % 64 != 0 ||
+        keyHeads <= 0 || valueHeads < keyHeads ||
+        valueHeads % keyHeads != 0 ||
+        kDim != 128 || vDim != 128 ||
+        !std::isfinite(normEps) || normEps < 0.0f ||
+        !std::isfinite(qScale) ||
+        qkvInput.dataType != fastllm::DataType::FLOAT16 ||
+        gInput.dataType != fastllm::DataType::FLOAT16 ||
+        betaInput.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        !isDenseCuda(qkvInput) || !isDenseCuda(gInput) ||
+        !isDenseCuda(betaInput) || !isDenseCuda(normWeight) ||
+        qkvInput.Count(0) !=
+            (uint64_t)batch * seqLen *
+            (keyHeads * kDim * 2 + valueHeads * vDim) ||
+        gInput.Count(0) !=
+            (uint64_t)batch * seqLen * valueHeads ||
+        betaInput.Count(0) !=
+            (uint64_t)batch * seqLen * valueHeads ||
+        normWeight.Count(0) != (uint64_t)kDim) {
+        return false;
+    }
+
+    int paddedSeqLen = ((seqLen + 63) / 64) * 64;
+    auto prepareOutput = [&](fastllm::Data &output,
+                             const std::vector<int> &dims) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.dataDevice = qkvInput.dataDevice;
+        output.dataDeviceIds = qkvInput.dataDeviceIds;
+        output.Resize(dims);
+        output.Allocate(false);
+        return output.cudaData != nullptr;
+    };
+    if (!prepareOutput(q, {batch, valueHeads, paddedSeqLen, kDim}) ||
+        !prepareOutput(k, {batch, valueHeads, paddedSeqLen, kDim}) ||
+        !prepareOutput(v, {batch, valueHeads, paddedSeqLen, vDim}) ||
+        !prepareOutput(g, {batch, valueHeads, paddedSeqLen}) ||
+        !prepareOutput(beta, {batch, valueHeads, paddedSeqLen}) ||
+        !prepareOutput(kBeta, {batch, valueHeads, paddedSeqLen, kDim}) ||
+        !prepareOutput(vBeta, {batch, valueHeads, paddedSeqLen, vDim})) {
+        return false;
+    }
+
+    int rows = batch * paddedSeqLen;
+    const char *skipDeadOutputsEnv = std::getenv(
+        "FASTLLM_CUDA_QWEN35_GDN_SKIP_DEAD_POSTCONV_OUTPUTS");
+    bool skipDeadOutputs =
+        skipDeadOutputsEnv == nullptr || skipDeadOutputsEnv[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_QWEN35_GDN_SKIP_DEAD_POSTCONV_OUTPUTS");
+    if (skipDeadOutputs) {
+        FastllmQwen35GdnPostConvExactHalf128Kernel<false>
+            <<<rows * keyHeads, 32>>>(
+            (const half *)qkvInput.cudaData,
+            (const float *)normWeight.cudaData,
+            (const half *)gInput.cudaData,
+            (const half *)betaInput.cudaData,
+            (half *)q.cudaData, (half *)k.cudaData,
+            (half *)v.cudaData, (half *)g.cudaData,
+            (half *)beta.cudaData, (half *)kBeta.cudaData,
+            (half *)vBeta.cudaData,
+            seqLen, paddedSeqLen, keyHeads, valueHeads,
+            normEps, __float2half(qScale));
+    } else {
+        FastllmQwen35GdnPostConvExactHalf128Kernel<true>
+            <<<rows * keyHeads, 32>>>(
+            (const half *)qkvInput.cudaData,
+            (const float *)normWeight.cudaData,
+            (const half *)gInput.cudaData,
+            (const half *)betaInput.cudaData,
+            (half *)q.cudaData, (half *)k.cudaData,
+            (half *)v.cudaData, (half *)g.cudaData,
+            (half *)beta.cudaData, (half *)kBeta.cudaData,
+            (half *)vBeta.cudaData,
+            seqLen, paddedSeqLen, keyHeads, valueHeads,
+            normEps, __float2half(qScale));
+    }
+    checkCudaErrors(
+        "Error: CUDA error in "
+        "FastllmCudaQwen35GdnPostConvExactFloat16.",
+        cudaGetLastError());
     return true;
 }
 
@@ -6853,6 +7802,160 @@ __global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128ExactKernel(
     }
 }
 
+// Keep the exact 128-channel RMSNorm and SiLU arithmetic above, but read the
+// gate from one slice of a wider token-major projection.  Each logical input
+// row is one value head, while combinedGateInput advances once per token.
+__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128CombinedGateExactKernel(
+        const half *input, const float *weight,
+        const half *combinedGateInput, half *output,
+        int gateStride, int gateOffset, int gateHeads, float eps) {
+    constexpr int CHANNELS = 128;
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    int token = row / gateHeads;
+    int head = row - token * gateHeads;
+    input += (size_t)row * CHANNELS;
+    combinedGateInput +=
+        (size_t)token * gateStride + gateOffset + head * CHANNELS;
+    output += (size_t)row * CHANNELS;
+    const half2 *input2 = reinterpret_cast<const half2 *>(input);
+    const half2 *gate2 =
+        reinterpret_cast<const half2 *>(combinedGateInput);
+
+    float2 value0 = __half22float2(input2[lane]);
+    float2 value1 = __half22float2(input2[lane + 32]);
+    float sum0 = value0.x * value0.x + value0.y * value0.y;
+    float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+        scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+    }
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+
+    float2 inputValues[2] = {value0, value1};
+    half2 gateValues[2] = {gate2[lane], gate2[lane + 32]};
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+#pragma unroll
+    for (int part = 0; part < 2; part++) {
+        int index = lane + part * 32;
+        float2 value = inputValues[part];
+        half gate0In = __low2half(gateValues[part]);
+        half gate1In = __high2half(gateValues[part]);
+#ifdef CUDA_NO_TENSOR_CORE
+        float gate0Float = __half2float(gate0In);
+        float gate1Float = __half2float(gate1In);
+        half gate0 =
+            __float2half(gate0Float / (1.0f + expf(-gate0Float)));
+        half gate1 =
+            __float2half(gate1Float / (1.0f + expf(-gate1Float)));
+#else
+        half gate0 =
+            __hdiv(gate0In, __hadd(__float2half(1.0f), hexp(-gate0In)));
+        half gate1 =
+            __hdiv(gate1In, __hadd(__float2half(1.0f), hexp(-gate1In)));
+#endif
+        half rms0 = __float2half_rn(
+            value.x * scale * __ldg(weight + index * 2));
+        half rms1 = __float2half_rn(
+            value.y * scale * __ldg(weight + index * 2 + 1));
+#ifdef CUDA_NO_TENSOR_CORE
+        half out0 =
+            __float2half(__half2float(rms0) * __half2float(gate0));
+        half out1 =
+            __float2half(__half2float(rms1) * __half2float(gate1));
+#else
+        half out0 = __hmul(rms0, gate0);
+        half out1 = __hmul(rms1, gate1);
+#endif
+        output2[index] = __halves2half2(out0, out1);
+    }
+}
+
+// Fuse [batch, heads, paddedSeq, 128] -> [batch, seq, heads, 128]
+// with the exact output RMSNorm and z gate.  This avoids the temporary copy
+// required by an in-place head/sequence transpose.
+__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel(
+        const half *headMajorInput, const float *weight,
+        const half *combinedGateInput, half *output,
+        int seqLen, int paddedSeqLen,
+        int gateStride, int gateOffset, int gateHeads, float eps) {
+    constexpr int CHANNELS = 128;
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    int token = row / gateHeads;
+    int head = row - token * gateHeads;
+    int batch = token / seqLen;
+    int tokenInBatch = token - batch * seqLen;
+    headMajorInput +=
+        (((size_t)batch * gateHeads + head) * paddedSeqLen +
+         tokenInBatch) * CHANNELS;
+    combinedGateInput +=
+        (size_t)token * gateStride + gateOffset + head * CHANNELS;
+    output += (size_t)row * CHANNELS;
+    const half2 *input2 =
+        reinterpret_cast<const half2 *>(headMajorInput);
+    const half2 *gate2 =
+        reinterpret_cast<const half2 *>(combinedGateInput);
+
+    float2 value0 = __half22float2(input2[lane]);
+    float2 value1 = __half22float2(input2[lane + 32]);
+    float sum0 = value0.x * value0.x + value0.y * value0.y;
+    float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+        scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+    }
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+
+    float2 inputValues[2] = {value0, value1};
+    half2 gateValues[2] = {gate2[lane], gate2[lane + 32]};
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+#pragma unroll
+    for (int part = 0; part < 2; part++) {
+        int index = lane + part * 32;
+        float2 value = inputValues[part];
+        half gate0In = __low2half(gateValues[part]);
+        half gate1In = __high2half(gateValues[part]);
+#ifdef CUDA_NO_TENSOR_CORE
+        float gate0Float = __half2float(gate0In);
+        float gate1Float = __half2float(gate1In);
+        half gate0 =
+            __float2half(gate0Float / (1.0f + expf(-gate0Float)));
+        half gate1 =
+            __float2half(gate1Float / (1.0f + expf(-gate1Float)));
+#else
+        half gate0 =
+            __hdiv(gate0In, __hadd(__float2half(1.0f), hexp(-gate0In)));
+        half gate1 =
+            __hdiv(gate1In, __hadd(__float2half(1.0f), hexp(-gate1In)));
+#endif
+        half rms0 = __float2half_rn(
+            value.x * scale * __ldg(weight + index * 2));
+        half rms1 = __float2half_rn(
+            value.y * scale * __ldg(weight + index * 2 + 1));
+#ifdef CUDA_NO_TENSOR_CORE
+        half out0 =
+            __float2half(__half2float(rms0) * __half2float(gate0));
+        half out1 =
+            __float2half(__half2float(rms1) * __half2float(gate1));
+#else
+        half out0 = __hmul(rms0, gate0);
+        half out1 = __hmul(rms1, gate1);
+#endif
+        output2[index] = __halves2half2(out0, out1);
+    }
+}
+
 static bool LaunchFastllmRMSNormSiluMulFloat16(
         const half *input, const float *weight, const half *gateInput,
         half *output, int outer, int channels, float eps, int threadCount) {
@@ -6918,6 +8021,153 @@ bool FastllmCudaRMSNormSiluMulFloat16(
     return FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
         input, weight, gateInput, output, eps,
         !input.dims.empty() && input.dims.back() == 128 ? 32 : 0);
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16CombinedGate(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &combinedGateInput,
+        int gateOffset, int gateHeads,
+        fastllm::Data &output, float eps) {
+    auto isDense = [](const fastllm::Data &data) {
+        if (data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        combinedGateInput.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        combinedGateInput.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        input.cudaData == nullptr || combinedGateInput.cudaData == nullptr ||
+        output.cudaData == nullptr || weight.cudaData == nullptr ||
+        !isDense(input) || !isDense(combinedGateInput) ||
+        !isDense(output) || input.dims != output.dims ||
+        input.dims.back() != 128 || weight.dims.size() != 1 ||
+        weight.dims[0] != 128 || gateHeads <= 0 || gateOffset < 0 ||
+        !std::isfinite(eps) || eps < 0.0f) {
+        return false;
+    }
+
+    int gateStride = combinedGateInput.dims.back();
+    if (gateOffset > gateStride ||
+        (int64_t)gateHeads * 128 > gateStride - gateOffset) {
+        return false;
+    }
+    int64_t inputCount = input.Count(0);
+    int64_t combinedCount = combinedGateInput.Count(0);
+    if (inputCount <= 0 || inputCount % 128 != 0 ||
+        combinedCount <= 0 || combinedCount % gateStride != 0) {
+        return false;
+    }
+    int64_t outer64 = inputCount / 128;
+    int64_t tokens64 = combinedCount / gateStride;
+    if (outer64 != tokens64 * gateHeads ||
+        outer64 > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    FastllmRMSNormSiluMulHalf128CombinedGateExactKernel<<<
+        (int)outer64, 32>>>(
+        (const half *)input.cudaData,
+        (const float *)weight.cudaData,
+        (const half *)combinedGateInput.cudaData,
+        (half *)output.cudaData,
+        gateStride, gateOffset, gateHeads, eps);
+    checkCudaErrors(
+        "Error: CUDA error in "
+        "FastllmCudaRMSNormSiluMulFloat16CombinedGate.",
+        cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate(
+        const fastllm::Data &headMajorInput, fastllm::Data &weight,
+        const fastllm::Data &combinedGateInput,
+        int batch, int seqLen,
+        int gateOffset, int gateHeads,
+        fastllm::Data &output, float eps) {
+    auto isDense = [](const fastllm::Data &data) {
+        if (data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (batch <= 0 || seqLen <= 0 || gateHeads <= 0 ||
+        gateOffset < 0 || !std::isfinite(eps) || eps < 0.0f ||
+        headMajorInput.dataDevice != fastllm::DataDevice::CUDA ||
+        combinedGateInput.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        headMajorInput.dataType != fastllm::DataType::FLOAT16 ||
+        combinedGateInput.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        headMajorInput.cudaData == nullptr ||
+        combinedGateInput.cudaData == nullptr ||
+        weight.cudaData == nullptr ||
+        !isDense(headMajorInput) || !isDense(combinedGateInput) ||
+        headMajorInput.dims.size() != 4 ||
+        headMajorInput.dims[0] != batch ||
+        headMajorInput.dims[1] != gateHeads ||
+        headMajorInput.dims[2] < seqLen ||
+        headMajorInput.dims[3] != 128 ||
+        weight.dims.size() != 1 || weight.dims[0] != 128) {
+        return false;
+    }
+
+    int paddedSeqLen = headMajorInput.dims[2];
+    int gateStride = combinedGateInput.dims.back();
+    if (gateOffset > gateStride ||
+        (int64_t)gateHeads * 128 > gateStride - gateOffset ||
+        combinedGateInput.Count(0) !=
+            (uint64_t)batch * seqLen * gateStride) {
+        return false;
+    }
+    int64_t outer64 = (int64_t)batch * seqLen * gateHeads;
+    if (outer64 <= 0 || outer64 > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    output.dataType = fastllm::DataType::FLOAT16;
+    output.dataDevice = headMajorInput.dataDevice;
+    output.dataDeviceIds = headMajorInput.dataDeviceIds;
+    output.Resize({batch, seqLen, gateHeads, 128});
+    output.Allocate(false);
+    if (output.cudaData == nullptr || !isDense(output)) {
+        return false;
+    }
+
+    FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<<<(
+        int)outer64, 32>>>(
+        (const half *)headMajorInput.cudaData,
+        (const float *)weight.cudaData,
+        (const half *)combinedGateInput.cudaData,
+        (half *)output.cudaData,
+        seqLen, paddedSeqLen,
+        gateStride, gateOffset, gateHeads, eps);
+    checkCudaErrors(
+        "Error: CUDA error in "
+        "FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate.",
+        cudaGetLastError());
+    return true;
 }
 
 template <int THREAD_PER_BLOCK>
@@ -9805,6 +11055,249 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     return true;
 }
 
+template <int HEAD_DIM>
+__global__ void FastllmQwen35QGateKVPrefillHalfKernel(
+    const half *qgatekvData,
+    const float *qNormWeight,
+    const float *kNormWeight,
+    const float *positionIds,
+    half *qOutputData,
+    half *gateOutputData,
+    half *kOutputData,
+    half *vOutputData,
+    int totalDim,
+    int qHeads,
+    int kHeads,
+    int seqlen,
+    int positionStride,
+    int rotaryDim,
+    int sectionH,
+    int sectionW,
+    int useInterleavedRope,
+    float eps,
+    float ropeTheta,
+    float ropeScale) {
+    constexpr int WARP_SIZE = 32;
+    constexpr int RMS_THREADS = 64;
+    constexpr int NUM_WARPS = RMS_THREADS / WARP_SIZE;
+    __shared__ float warpSums[NUM_WARPS];
+    __shared__ float normScale;
+
+    int totalHeads = qHeads + kHeads + kHeads;
+    int tokenId = blockIdx.x / totalHeads;
+    int headId = blockIdx.x - tokenId * totalHeads;
+    int tid = threadIdx.x;
+    int qGateDim = qHeads * HEAD_DIM * 2;
+    const half *tokenBase = qgatekvData + (size_t)tokenId * totalDim;
+
+    if (headId >= qHeads + kHeads) {
+        int vHead = headId - qHeads - kHeads;
+        const half2 *src = reinterpret_cast<const half2 *>(
+            tokenBase + qGateDim + kHeads * HEAD_DIM +
+            vHead * HEAD_DIM);
+        half2 *dst = reinterpret_cast<half2 *>(
+            vOutputData +
+            ((size_t)vHead * seqlen + tokenId) * HEAD_DIM);
+        for (int i = tid; i < HEAD_DIM / 2; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+
+    bool isQ = headId < qHeads;
+    int localHead = isQ ? headId : headId - qHeads;
+    const half *srcBase = isQ
+        ? tokenBase + localHead * HEAD_DIM * 2
+        : tokenBase + qGateDim + localHead * HEAD_DIM;
+    const float *normWeight = isQ ? qNormWeight : kNormWeight;
+    const half2 *src2 = reinterpret_cast<const half2 *>(srcBase);
+    float sum2 = 0.0f;
+    if (tid < RMS_THREADS) {
+        for (int i = tid; i < HEAD_DIM / 2;
+             i += RMS_THREADS) {
+            float2 value = __half22float2(src2[i]);
+            sum2 +=
+                value.x * value.x + value.y * value.y;
+        }
+    }
+
+    int laneId = tid & (WARP_SIZE - 1);
+    int warpId = tid / WARP_SIZE;
+    if (tid < RMS_THREADS) {
+        for (int offset = WARP_SIZE / 2;
+             offset > 0; offset >>= 1) {
+            sum2 += __shfl_down_sync(
+                0xffffffff, sum2, offset);
+        }
+        if (laneId == 0) {
+            warpSums[warpId] = sum2;
+        }
+    }
+    __syncthreads();
+    if (tid < WARP_SIZE) {
+        float val = laneId < NUM_WARPS ? warpSums[laneId] : 0.0f;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (laneId == 0) {
+            normScale = rsqrtf(val / HEAD_DIM + eps);
+        }
+    }
+    __syncthreads();
+
+    half *outputBase = isQ
+        ? qOutputData +
+            ((size_t)localHead * seqlen + tokenId) * HEAD_DIM
+        : kOutputData +
+            ((size_t)localHead * seqlen + tokenId) * HEAD_DIM;
+    half2 *output2 = reinterpret_cast<half2 *>(outputBase);
+    if (tid < RMS_THREADS) {
+        float scale = normScale;
+        for (int i = tid; i < HEAD_DIM / 2;
+             i += RMS_THREADS) {
+            float2 value = __half22float2(src2[i]);
+            float2 normalized;
+            normalized.x =
+                value.x * scale *
+                __ldg(normWeight + i * 2);
+            normalized.y =
+                value.y * scale *
+                __ldg(normWeight + i * 2 + 1);
+            output2[i] = __float22half2_rn(normalized);
+        }
+    }
+
+    if (isQ) {
+        const half2 *gateSrc = reinterpret_cast<const half2 *>(
+            srcBase + HEAD_DIM);
+        half2 *gateDst = reinterpret_cast<half2 *>(
+            gateOutputData +
+            ((size_t)tokenId * qHeads + localHead) * HEAD_DIM);
+        for (int i = tid; i < HEAD_DIM / 2; i += blockDim.x) {
+            gateDst[i] = gateSrc[i];
+        }
+    }
+    __syncthreads();
+
+    int halfRotary = rotaryDim / 2;
+    if (tid < halfRotary) {
+        int row = 0;
+        float position;
+        if (useInterleavedRope) {
+            if (tid % 3 == 1 && tid < sectionH * 3) {
+                row = 1;
+            } else if (tid % 3 == 2 && tid < sectionW * 3) {
+                row = 2;
+            }
+            position =
+                positionIds[row * positionStride + tokenId] /
+                ropeScale;
+        } else {
+            int index = (int)positionIds[tokenId];
+            position = (float)index / ropeScale;
+        }
+        float freq =
+            position /
+            powf(ropeTheta, (float)(2 * tid) / rotaryDim);
+        float curSin = sinf(freq);
+        float curCos = cosf(freq);
+        float va = __half2float(outputBase[tid]);
+        float vb =
+            __half2float(outputBase[tid + halfRotary]);
+        outputBase[tid] =
+            __float2half(va * curCos - vb * curSin);
+        outputBase[tid + halfRotary] =
+            __float2half(va * curSin + vb * curCos);
+    }
+}
+
+bool FastllmCudaQwen35QGateKVPrefill(
+    const fastllm::Data &qgatekv,
+    const fastllm::Data &qNormWeight,
+    const fastllm::Data &kNormWeight,
+    const fastllm::Data &positionIds,
+    fastllm::Data &qOutput,
+    fastllm::Data &gateOutput,
+    fastllm::Data &kOutput,
+    fastllm::Data &vOutput,
+    int qHeads, int kHeads, int headDim,
+    int rotaryDim, int sectionT, int sectionH, int sectionW,
+    float eps, float ropeTheta, float ropeScale) {
+    if (qgatekv.dataType != fastllm::DataType::FLOAT16 ||
+        qNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        kNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        qgatekv.dims.size() != 3 || qgatekv.dims[0] != 1 ||
+        (headDim != 128 && headDim != 256) ||
+        rotaryDim <= 0 || rotaryDim > headDim ||
+        (rotaryDim % 2) != 0 ||
+        qHeads <= 0 || kHeads <= 0 ||
+        qgatekv.dims[2] !=
+            qHeads * headDim * 2 + kHeads * headDim * 2 ||
+        qNormWeight.Count(0) != headDim ||
+        kNormWeight.Count(0) != headDim ||
+        qOutput.cudaData == nullptr ||
+        gateOutput.cudaData == nullptr ||
+        kOutput.cudaData == nullptr ||
+        vOutput.cudaData == nullptr) {
+        return false;
+    }
+    int seqlen = qgatekv.dims[1];
+    bool useInterleavedRope =
+        positionIds.dims.size() == 2 && positionIds.dims[0] == 3;
+    if (useInterleavedRope &&
+        sectionT + sectionH + sectionW != rotaryDim / 2) {
+        return false;
+    }
+    if ((!useInterleavedRope &&
+         (positionIds.dims.empty() ||
+          positionIds.dims.back() < seqlen)) ||
+        (useInterleavedRope &&
+         positionIds.dims.back() < seqlen)) {
+        return false;
+    }
+
+    void *qgatekvData = FastllmCudaPrepareInput(qgatekv);
+    void *positionData = FastllmCudaPrepareInput(positionIds);
+    if (qgatekvData == nullptr || positionData == nullptr) {
+        FastllmCudaFinishInput(qgatekv, qgatekvData);
+        FastllmCudaFinishInput(positionIds, positionData);
+        return false;
+    }
+    int totalHeads = qHeads + kHeads + kHeads;
+    auto launch = [&](auto HeadDim) {
+        FastllmQwen35QGateKVPrefillHalfKernel<
+            decltype(HeadDim)::value>
+            <<<(size_t)seqlen * totalHeads, 128, 0,
+               cudaStreamPerThread>>>(
+            (const half*)qgatekvData,
+            (const float*)qNormWeight.cudaData,
+            (const float*)kNormWeight.cudaData,
+            (const float*)positionData,
+            (half*)qOutput.cudaData,
+            (half*)gateOutput.cudaData,
+            (half*)kOutput.cudaData,
+            (half*)vOutput.cudaData,
+            qgatekv.dims[2], qHeads, kHeads, seqlen,
+            (int)positionIds.dims.back(), rotaryDim,
+            sectionH, sectionW,
+            useInterleavedRope ? 1 : 0,
+            eps, ropeTheta, ropeScale);
+    };
+    if (headDim == 128) {
+        launch(std::integral_constant<int, 128>{});
+    } else {
+        launch(std::integral_constant<int, 256>{});
+    }
+    FastllmCudaFinishInput(qgatekv, qgatekvData);
+    FastllmCudaFinishInput(positionIds, positionData);
+    cudaError_t launchError = cudaGetLastError();
+    if (launchError != cudaSuccess) {
+        return false;
+    }
+    return true;
+}
+
 // ============================================================
 // Qwen3.5 gated attention decode fusion:
 //   input layout: [Q/Gate interleaved per Q head, K, V]
@@ -11576,7 +13069,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelPrefillCacheHalfPointerKernel(
 __global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerKernel(
     half **pointers, const half *newTokens, const float *weight,
     const float *bias, half *output, int channels, int numTokens,
-    size_t totalElements) {
+    int inputStride, int inputOffset, size_t totalElements) {
     size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= totalElements) {
         return;
@@ -11598,7 +13091,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPoint
             ? cacheRow[sourceToken + 4]
             : newTokens[
                 ((size_t)batchIndex * numTokens + sourceToken) *
-                    channels + channel];
+                    inputStride + inputOffset + channel];
         value += __half2float(source) * curWeight[kernelIndex];
     }
 
@@ -11612,8 +13105,65 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPoint
 #endif
 }
 
+template <int TOKENS_PER_GROUP>
+__global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerGroupedKernel(
+    half **pointers, const half *__restrict__ newTokens,
+    const float *__restrict__ weight, const float *__restrict__ bias,
+    half *__restrict__ output, int channels, int numTokens,
+    int inputStride, int inputOffset, size_t totalGroups) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= totalGroups) {
+        return;
+    }
+
+    int channel = index % channels;
+    size_t groupRow = index / channels;
+    int tokenGroup = groupRow % (numTokens / TOKENS_PER_GROUP);
+    int batchIndex = groupRow / (numTokens / TOKENS_PER_GROUP);
+    int tokenBase = tokenGroup * TOKENS_PER_GROUP;
+    const half *cacheRow =
+        pointers[batchIndex] + (size_t)channel * 4;
+    const float *curWeight = weight + (size_t)channel * 4;
+
+    half source[TOKENS_PER_GROUP + 3];
+#pragma unroll
+    for (int sourceIndex = 0;
+         sourceIndex < TOKENS_PER_GROUP + 3; sourceIndex++) {
+        int sourceToken = tokenBase + sourceIndex - 3;
+        source[sourceIndex] = sourceToken < 0
+            ? cacheRow[sourceToken + 4]
+            : newTokens[
+                ((size_t)batchIndex * numTokens + sourceToken) *
+                    inputStride + inputOffset + channel];
+    }
+
+    float biasValue = bias == nullptr ? 0.0f : bias[channel];
+#pragma unroll
+    for (int tokenOffset = 0;
+         tokenOffset < TOKENS_PER_GROUP; tokenOffset++) {
+        float value = biasValue;
+#pragma unroll
+        for (int kernelIndex = 0; kernelIndex < 4; kernelIndex++) {
+            value += __half2float(source[tokenOffset + kernelIndex]) *
+                     curWeight[kernelIndex];
+        }
+        half conv = __float2half_rn(value);
+        size_t outputIndex =
+            ((size_t)batchIndex * numTokens + tokenBase + tokenOffset) *
+                channels + channel;
+#ifdef CUDA_NO_TENSOR_CORE
+        float x = __half2float(conv);
+        output[outputIndex] = __float2half(x / (1.0f + expf(-x)));
+#else
+        output[outputIndex] =
+            __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+    }
+}
+
 __global__ void FastllmShiftAppendConv1DPerChannelPrefillCacheTokenMajorHalfPointerKernel(
-    half **pointers, const half *newTokens, int channels, int numTokens,
+    half **pointers, const half *newTokens, int channels,
+    int numTokens, int inputStride, int inputOffset,
     size_t totalRows) {
     size_t row = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= totalRows) {
@@ -11633,7 +13183,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelPrefillCacheTokenMajorHalfPoin
             ? oldCache[sourceToken + 4]
             : newTokens[
                 ((size_t)batchIndex * numTokens + sourceToken) *
-                    channels + channel];
+                    inputStride + inputOffset + channel];
     }
 }
 
@@ -12092,8 +13642,10 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     const std::vector<fastllm::Data*> &caches,
     const fastllm::Data &newTokens,
     fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output,
-    const std::vector<fastllm::Data*> &tokenCaches, int numTokenCaches) {
-    if (caches.empty() || caches[0] == nullptr || numTokenCaches < 0 ||
+    const std::vector<fastllm::Data*> &tokenCaches, int numTokenCaches,
+    int tokenMajorInputOffset) {
+    if (caches.empty() || caches[0] == nullptr ||
+        tokenMajorInputOffset < 0 || numTokenCaches < 0 ||
         numTokenCaches > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
         tokenCaches.size() != caches.size() * (size_t)numTokenCaches ||
         output.isFake || output.cudaDataBorrowed || output.isPagedKVCache ||
@@ -12130,10 +13682,11 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     int channels = first.dims[1];
     bool tokenMajorPrefill =
         numTokenCaches == 0 &&
-        newTokens.dims[2] == channels &&
+        tokenMajorInputOffset + channels <= newTokens.dims[2] &&
         newTokens.dims[1] > 1 &&
         newTokens.dims[1] <= FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX;
     bool channelMajor =
+        tokenMajorInputOffset == 0 &&
         newTokens.dims[1] == channels &&
         newTokens.dims[2] > 1 &&
         newTokens.dims[2] <= (numTokenCaches == 0 ?
@@ -12218,17 +13771,86 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
             (int)((totalElements + threads - 1) / threads);
         int cacheBlocks = (total + threads - 1) / threads;
         if (tokenMajorPrefill) {
-            FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerKernel
-                <<<elementBlocks, threads>>>(
-                    (half**)devicePointers, (const half*)newTokens.cudaData,
-                    (const float*)weight.cudaData,
-                    bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
-                    (half*)output.cudaData, channels, numTokens,
-                    totalElements);
+            const char *token16Env = std::getenv(
+                "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN16");
+            bool useToken16 =
+                (token16Env == nullptr || token16Env[0] == '\0' ||
+                 FastllmCudaEnvFlagEnabled(
+                     "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN16")) &&
+                numTokens >= 16 && numTokens % 16 == 0;
+            const char *token8Env = std::getenv(
+                "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN8");
+            bool useToken8 =
+                (token8Env == nullptr || token8Env[0] == '\0' ||
+                 FastllmCudaEnvFlagEnabled(
+                     "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN8")) &&
+                numTokens >= 8 && numTokens % 8 == 0;
+            const char *token4Env = std::getenv(
+                "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN4");
+            bool useToken4 =
+                (token4Env == nullptr || token4Env[0] == '\0' ||
+                 FastllmCudaEnvFlagEnabled(
+                     "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN4")) &&
+                numTokens >= 4 && numTokens % 4 == 0;
+            if (useToken16) {
+                size_t totalGroups = totalElements / 16;
+                int groupBlocks =
+                    (int)((totalGroups + threads - 1) / threads);
+                FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerGroupedKernel<16>
+                    <<<groupBlocks, threads>>>(
+                        (half**)devicePointers,
+                        (const half*)newTokens.cudaData,
+                        (const float*)weight.cudaData,
+                        bias.dims.empty() ?
+                            nullptr : (const float*)bias.cudaData,
+                        (half*)output.cudaData, channels, numTokens,
+                        newTokens.dims[2], tokenMajorInputOffset,
+                        totalGroups);
+            } else if (useToken8) {
+                size_t totalGroups = totalElements / 8;
+                int groupBlocks =
+                    (int)((totalGroups + threads - 1) / threads);
+                FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerGroupedKernel<8>
+                    <<<groupBlocks, threads>>>(
+                        (half**)devicePointers,
+                        (const half*)newTokens.cudaData,
+                        (const float*)weight.cudaData,
+                        bias.dims.empty() ?
+                            nullptr : (const float*)bias.cudaData,
+                        (half*)output.cudaData, channels, numTokens,
+                        newTokens.dims[2], tokenMajorInputOffset,
+                        totalGroups);
+            } else if (useToken4) {
+                size_t totalGroups = totalElements / 4;
+                int groupBlocks =
+                    (int)((totalGroups + threads - 1) / threads);
+                FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerGroupedKernel<4>
+                    <<<groupBlocks, threads>>>(
+                        (half**)devicePointers,
+                        (const half*)newTokens.cudaData,
+                        (const float*)weight.cudaData,
+                        bias.dims.empty() ?
+                            nullptr : (const float*)bias.cudaData,
+                        (half*)output.cudaData, channels, numTokens,
+                        newTokens.dims[2], tokenMajorInputOffset,
+                        totalGroups);
+            } else {
+                FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerKernel
+                    <<<elementBlocks, threads>>>(
+                        (half**)devicePointers,
+                        (const half*)newTokens.cudaData,
+                        (const float*)weight.cudaData,
+                        bias.dims.empty() ?
+                            nullptr : (const float*)bias.cudaData,
+                        (half*)output.cudaData, channels, numTokens,
+                        newTokens.dims[2], tokenMajorInputOffset,
+                        totalElements);
+            }
             FastllmShiftAppendConv1DPerChannelPrefillCacheTokenMajorHalfPointerKernel
                 <<<cacheBlocks, threads>>>(
                     (half**)devicePointers, (const half*)newTokens.cudaData,
-                    channels, numTokens, (size_t)total);
+                    channels, numTokens, newTokens.dims[2],
+                    tokenMajorInputOffset, (size_t)total);
         } else {
             FastllmShiftAppendConv1DPerChannelSiluPrefillHalfPointerKernel
                 <<<elementBlocks, threads>>>(
