@@ -2085,6 +2085,9 @@ namespace fastllm {
             this->directMemory) {
             MultiCudaReleaseMoeWeightCaches(this);
             FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
+        } else if (this->dataType == DataType::INT4_GROUP &&
+                   this->isModelWeight) {
+            FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
         }
 #endif
         if (isFake) {

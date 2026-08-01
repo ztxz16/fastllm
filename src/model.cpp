@@ -429,6 +429,14 @@ namespace fastllm {
             }
             return false;
         }
+        // Qwen3.5 AWQ routed experts are repacked once into a consolidated
+        // grouped-Marlin layout. Keep their TP shards out of the mixed
+        // model-weight slab so that dropping the compact representation
+        // actually returns its memory instead of leaving slab holes.
+        bool directLocalMemory =
+            model->model_struct == "qwen3_5" &&
+            weightName.find(".mlp.experts.") != std::string::npos &&
+            data.dataType == DataType::INT4_GROUP;
         if (model->model_type == "deepseek_v4" && routedExpert >= 0) {
             constexpr int ownerOffset = 0;
             int ownerCount = (int)devices.size();
@@ -442,17 +450,23 @@ namespace fastllm {
             data.tpLinearType = TP_LINEAR_ROW;
             data.tpPackType = TP_PACK_GATEUP;
             DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 0, explicitDeviceRatios,
+                directLocalMemory);
         }
         if (typeIt->second == "linearRow") {
             data.tpLinearType = TP_LINEAR_ROW;
             DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 0, explicitDeviceRatios,
+                directLocalMemory);
         }
         if (typeIt->second == "linearColumn") {
             data.tpLinearType = TP_LINEAR_COLUMN;
             DivisionScheme scheme = BuildMultiCudaColumnSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 1, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 1, explicitDeviceRatios,
+                directLocalMemory);
         }
         return false;
     }

@@ -949,7 +949,7 @@ DivisionScheme BuildMultiCudaColumnSplitScheme(fastllm::Data &weight, std::vecto
 
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
                     std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme, int splitAxis,
-                    bool explicitDeviceRatios) {
+                    bool explicitDeviceRatios, bool directLocalMemory) {
     int deviceNum = multiCudaCurrentDevices.size();
     int rootDevice = deviceNum > 0 ? multiCudaCurrentDevices[0] : 0;
     BalanceDivisionSchemeByLayer(weight, multiCudaCurrentDevices, divisionScheme, explicitDeviceRatios);
@@ -1073,6 +1073,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
         cudaError_t state = cudaSuccess;
         if (splitAxis == 0) {
             weight.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(weight, {len, m});
+            if (directLocalMemory) {
+                weight.multiDeviceDatas[deviceId]->directMemory = true;
+            }
             weight.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             weight.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
             bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, hasBias ? std::vector<int>{len} : std::vector<int>{});
@@ -1281,6 +1284,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             }
         } else {
             weight.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(weight, {k, len});
+            if (directLocalMemory) {
+                weight.multiDeviceDatas[deviceId]->directMemory = true;
+            }
             weight.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             weight.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
             bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, hasBias ? std::vector<int>{k} : std::vector<int>{});

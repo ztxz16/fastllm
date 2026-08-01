@@ -18,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -6519,6 +6520,71 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             batch, topk);
     }
 
+    static bool CudaInt4GroupMoeCompactFallbackUnavailable(
+            Data **weights, int weightsBatch) {
+        if (weights == nullptr || weightsBatch < 4) {
+            return false;
+        }
+        for (int slot = 2; slot < weightsBatch; ++slot) {
+            Data *weight = weights[slot];
+            if (weight != nullptr && weight->dataType == DataType::INT4_GROUP &&
+                weight->cudaData == nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[noreturn]] static void FailCudaInt4GroupMoeAfterRepack(
+            const char *stage) {
+        std::string message =
+            "AWQ grouped-Marlin " + std::string(stage) +
+            " failed after the compact expert weights were released; "
+            "the legacy INT4_GROUP fallback is unavailable.";
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(message);
+    }
+
+    static bool TryCudaMergeMOEInt4GroupMarlinIndexed(
+            const Data &input, Data &output, const Data &index,
+            const Data &score, int batch, int topk, Data &gateOutput,
+            Data &activation, Data **weights, int weightsBatch,
+            MoeGateType gateType) {
+        bool hasAwqCandidate =
+            weights != nullptr && weightsBatch >= 4 &&
+            weights[2] != nullptr &&
+            weights[2]->dataType == DataType::INT4_GROUP;
+        if (gateType != MoeGateSwiglu ||
+            input.dataType != DataType::FLOAT16 ||
+            input.dataDevice != DataDevice::CUDA ||
+            input.dims.size() != 2 || input.dims[0] != batch ||
+            batch <= 0 || topk <= 0 || topk > 8 ||
+            index.dataDevice != DataDevice::CUDA ||
+            index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA ||
+            score.dataType != DataType::FLOAT32 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            !hasAwqCandidate) {
+            if (hasAwqCandidate &&
+                CudaInt4GroupMoeCompactFallbackUnavailable(
+                    weights, weightsBatch)) {
+                FailCudaInt4GroupMoeAfterRepack(
+                    "received an incompatible invocation");
+            }
+            return false;
+        }
+        bool success = FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
+            input, gateOutput, activation, output, weights, weightsBatch,
+            (const int32_t *)index.cudaData, (const float *)score.cudaData,
+            batch, topk);
+        if (!success &&
+            CudaInt4GroupMoeCompactFallbackUnavailable(
+                weights, weightsBatch)) {
+            FailCudaInt4GroupMoeAfterRepack("execution");
+        }
+        return success;
+    }
+
     static bool TryCudaMergeMOEBatch1Fp8(
         Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
         Data &w1, Data **weights, float sharedScale, MoeGateType gateType) {
@@ -6977,6 +7043,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         {
             int batch = input.dims[0];
 
+            int marlinTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
+            if (TryCudaMergeMOEInt4GroupMarlinIndexed(
+                    input, output, index, score, batch, marlinTopk, w1, w2,
+                    weights, weightsBatch, gateType)) {
+                return;
+            }
             if (batch == 1 && index.dims.size() >= 2) {
                 int topk = index.dims[1];
                 if (TryCudaMergeMOEBatch1Int8Indexed(
