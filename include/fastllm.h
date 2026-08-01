@@ -525,6 +525,7 @@ namespace fastllm {
         int tpQHeads = 0;
         int tpKVHeads = 0;
         int tpHeadDim = 0;
+        int tpSplitUnit = 0;
 
         int weightId;
         bool isRegistered = false;

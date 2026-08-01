@@ -600,6 +600,9 @@ static int GetMultiCudaSplitUnit(const fastllm::Data &data, int splitAxis) {
     if (IsGGUFTensor(data)) {
         unit = LcmInt(unit, GetGGUFBlockSize(data));
     }
+    if (data.tpSplitUnit > 0) {
+        unit = LcmInt(unit, data.tpSplitUnit);
+    }
     return std::max(1, unit);
 }
 
@@ -657,6 +660,7 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     dst.tpQHeads = src.tpQHeads;
     dst.tpKVHeads = src.tpKVHeads;
     dst.tpHeadDim = src.tpHeadDim;
+    dst.tpSplitUnit = src.tpSplitUnit;
 }
 
 static fastllm::Data *CreateMultiCudaLocalTensor(const fastllm::Data &src, const std::vector <int> &dims) {
@@ -759,6 +763,9 @@ void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool cop
             }
         } else {
             data.ToDevice(fastllm::DataDevice::CPU);
+            fastllm::AssertInFastLLM(
+                data.dims.empty() || data.Count(0) == 0 || data.cpuData != nullptr,
+                "CopyToMultiDevices cannot replicate a metadata-only tensor without a payload.\n");
             for (int device : devices) {
                 int mallocType = 0;
                 std::string specialId = "";

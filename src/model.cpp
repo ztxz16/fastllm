@@ -215,6 +215,12 @@ namespace fastllm {
         this->specialWeightLayerIds[weightName] = layerId;
     }
 
+    std::string basellm::SelectSpecialWeightDevice(const std::string &weightName,
+                                                   int layerId) const {
+        (void)weightName;
+        return this->SelectMoeDeviceForLayer(layerId);
+    }
+
     bool basellm::UseLayeredMoeDevice(int layerId) const {
         if (this->moeDeviceLayers < 0 || this->layeredMoeDeviceMap.empty() ||
             this->block_cnt <= 0 || layerId < 0) {
@@ -361,6 +367,23 @@ namespace fastllm {
         Data emptyBias;
         bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
+        if (model->model_type == "deepseek_v4") {
+            const DeepSeekV4Model *deepseekV4 =
+                dynamic_cast<const DeepSeekV4Model*>(model);
+            if (deepseekV4 != nullptr) {
+                if (weightName.find(".attn.wq_b.weight") !=
+                    std::string::npos) {
+                    data.tpSplitUnit =
+                        deepseekV4->GetTensorParallelAttentionSplitUnit();
+                } else if (weightName.find(".attn.wo_a.weight") !=
+                               std::string::npos ||
+                           weightName.find(".attn.wo_b.weight") !=
+                               std::string::npos) {
+                    data.tpSplitUnit =
+                        deepseekV4->GetTensorParallelOutputGroupSplitUnit();
+                }
+            }
+        }
         int routedExpert = ParseRoutedExpertIndex(weightName);
         if (model->model_type == "deepseek_v4" && routedExpert >= 0) {
             constexpr int ownerOffset = 0;
@@ -403,7 +426,7 @@ namespace fastllm {
         if (layerIt == model->specialWeightLayerIds.end() || layerIt->second < 0) {
             return "";
         }
-        return model->SelectMoeDeviceForLayer(layerIt->second);
+        return model->SelectSpecialWeightDevice(weightName, layerIt->second);
     }
 
     static int GetMoeWeightLayerId(const std::string &weightName) {
@@ -500,7 +523,9 @@ namespace fastllm {
             moeSpecialCount++;
             auto layerIt = this->specialWeightLayerIds.find(weightName);
             if (layerIt == this->specialWeightLayerIds.end() || layerIt->second < 0 ||
-                !DeviceNameMatchesType(this->SelectMoeDeviceForLayer(layerIt->second), "numa")) {
+                !DeviceNameMatchesType(
+                    this->SelectSpecialWeightDevice(weightName, layerIt->second),
+                    "numa")) {
                 continue;
             }
             numaSelectedCount++;

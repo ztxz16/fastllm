@@ -952,6 +952,7 @@ namespace fastllm {
         this->tpQHeads = ori.tpQHeads;
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
+        this->tpSplitUnit = ori.tpSplitUnit;
         bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
                                      (this->ggmlTensor == nullptr || this->ggmlType != ori.ggmlType);
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;

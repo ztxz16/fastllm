@@ -224,6 +224,10 @@ namespace fastllm {
         // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
         virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
 
+        // special weight 默认跟随 MoE 设备映射；同时包含非 MoE TP 权重的模型可覆盖此选择。
+        virtual std::string SelectSpecialWeightDevice(const std::string &weightName,
+                                                      int layerId) const;
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,

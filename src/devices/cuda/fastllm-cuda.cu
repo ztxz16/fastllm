@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -4149,6 +4150,30 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     //cudaDeviceSynchronize();
 }
 
+bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
+                                     int expectedDevice) {
+    if (ptr == nullptr) {
+        return bytes == 0;
+    }
+
+    int originalDevice = FastllmCudaGetDevice();
+    cudaError_t state = cudaSetDevice(expectedDevice);
+    CUdeviceptr base = 0;
+    size_t allocation = 0;
+    CUresult rangeState = CUDA_ERROR_INVALID_VALUE;
+    if (state == cudaSuccess) {
+        rangeState = cuMemGetAddressRange(&base, &allocation,
+                                          (CUdeviceptr)ptr);
+    }
+    cudaSetDevice(originalDevice);
+    if (state != cudaSuccess || rangeState != CUDA_SUCCESS || base == 0) {
+        cudaGetLastError();
+        return false;
+    }
+    size_t offset = (size_t)((CUdeviceptr)ptr - base);
+    return offset <= allocation && bytes <= allocation - offset;
+}
+
 void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size) {
     if (size == 0 || dst == src) {
         return;
@@ -7390,6 +7415,13 @@ __global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *i
         if (hasBias) {
             cur += bias[j];
         }
+        // A non-finite router value used to leave idData at -1.  The writeback
+        // below would then read inputData[-1], turning a numerical issue into an
+        // illegal CUDA access and poisoning the entire device context.  Rank a
+        // non-finite value last while retaining a valid expert id instead.
+        if (!isfinite(cur)) {
+            cur = -FLT_MAX;
+        }
         
         for (int l = 0; l < topk; l++) {
             if (cur > maxData[tid][l]) {
@@ -7443,23 +7475,43 @@ __global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *i
             sum = 0.0f;
             for (int i = 0; i < topk; i++) {
                 int expertIdx = idData[0][i];
-                sum += inputData[expertIdx];
+                if (expertIdx >= 0 && expertIdx < numExperts &&
+                    isfinite(inputData[expertIdx])) {
+                    sum += inputData[expertIdx];
+                }
+            }
+            if (!isfinite(sum) || fabsf(sum) < 1.0e-20f) {
+                sum = 1.0f;
             }
         }
         
         // Write index and score
         for (int i = 0; i < topk; i++) {
             int expertIdx = idData[0][i];
+            if (expertIdx < 0 || expertIdx >= numExperts) {
+                expertIdx = 0;
+            }
+            float expertScore = inputData[expertIdx];
+            if (!isfinite(expertScore)) {
+                expertScore = 0.0f;
+            }
             outputIndex[i] = expertIdx;
-            outputScore[i] = inputData[expertIdx] / sum * routeScale;
+            outputScore[i] = expertScore / sum * routeScale;
         }
     }
 }
 
 bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias, 
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale) {
-    if (topk > 50) {
-        printf("SelectExpert: unsupport topk > 50, falling back to CPU implementation.\n");
+    if (logits.dims.empty() || logits.dataType != fastllm::DataType::FLOAT32) {
+        return false;
+    }
+    int dimsLen = logits.dims.size();
+    int numExperts = logits.dims[dimsLen - 1]; // number of experts
+    int n = numExperts > 0 ? logits.Count(0) / numExperts : 0; // number of tokens
+    if (topk <= 0 || topk > 50 || topk > numExperts || n <= 0) {
+        printf("SelectExpert: unsupported shape or topk (tokens=%d, experts=%d, topk=%d), "
+               "falling back to CPU implementation.\n", n, numExperts, topk);
         return false; // 返回 false 表示不支持，应该回退到 CPU
     }
     
@@ -7470,13 +7522,17 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         cudaBias = (float *) FastllmCudaPrepareInput(*gateBias);
         hasBias = 1;
     }
-    int32_t *cudaIndex = (int32_t *) FastllmCudaPrepareInput(index);
-    float *cudaScore = (float *) FastllmCudaPrepareInput(score);
-    
-    int dimsLen = logits.dims.size();
-    int n = logits.Count(0) / logits.dims[dimsLen - 1]; // number of tokens
-    int numExperts = logits.dims[dimsLen - 1]; // number of experts
-    
+    int32_t *cudaIndex = (int32_t *) FastllmCudaPrepareOutput(index);
+    float *cudaScore = (float *) FastllmCudaPrepareOutput(score);
+    if (cudaLogits == nullptr || cudaIndex == nullptr || cudaScore == nullptr ||
+        (hasBias && cudaBias == nullptr)) {
+        FastllmCudaFinishInput(logits, cudaLogits);
+        if (hasBias) {
+            FastllmCudaFinishInput(*gateBias, cudaBias);
+        }
+        return false;
+    }
+
     // Use 64 threads to stay within shared memory limit (64*50*4*2 = 25KB < 48KB)
 #ifdef USE_ROCM
     FastllmSelectExpertKernel<64, 50> <<< n, 64 >>> 

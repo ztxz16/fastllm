@@ -1031,6 +1031,8 @@ void FastllmCudaSetDevice(int gpu_id);
 int FastllmCudaGetDevice();
 int FastllmCudaRuntimeArch();
 int GetPointerDeviceId(void *ptr);
+bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
+                                     int expectedDevice);
 int FastllmCudaGetDeviceCount();
 #ifdef  __cplusplus
 }
