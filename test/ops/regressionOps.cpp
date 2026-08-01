@@ -2,6 +2,7 @@
 #include "fastllm.h"
 #include "model.h"
 #include "models/basellm.h"
+#include "models/deepseekv4.h"
 #include "devices/cpu/computeutils.h"
 #include "gguf.h"
 
@@ -30,6 +31,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -37,6 +39,20 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifdef USE_CUDA
+namespace fastllm {
+    int DeepSeekV4BuildWindowKVPrefixForTest(
+        const Data &windowKV, int bsz, int headDim, int startPos,
+        int windowSize, Data &output);
+    void DeepSeekV4UpdateWindowKVCacheForTest(
+        const Data &kv, int bsz, int headDim, int startPos,
+        int windowSize, Data &windowKV);
+    void DeepSeekV4AppendCompressorRawForTest(
+        const Data &kv, const Data &score, int bsz, int seqlen,
+        int wideDim, Data &allKV, Data &allScore);
+}
+#endif
 
 namespace {
     void Expect(bool condition, const std::string &message);
@@ -1620,6 +1636,151 @@ namespace {
                   << ")\n";
     }
 
+    void RunMultiCudaDeepSeekV4SparsePrefillRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "DeepSeek-V4 multi-CUDA sparse prefill regression: "
+                         "SKIP (two GPUs required)\n";
+            return;
+        }
+
+        const int originalDevice = FastllmCudaGetDevice();
+        const std::vector<int> devices = {0, 1};
+        constexpr int batch = 1;
+        constexpr int seqlen = 17;
+        constexpr int heads = 32;
+        constexpr int headDim = 512;
+        constexpr int windowSize = 128;
+        constexpr int ropeDim = 64;
+        const std::vector<int> qDims = {batch, seqlen, heads, headDim};
+        const std::vector<int> kvDims = {batch, seqlen, headDim};
+        const std::vector<float> qValues = MakeRegressionValues(
+            batch * seqlen * heads * headDim, 0.27f, 0.011f);
+        const std::vector<float> kvValues = MakeRegressionValues(
+            batch * seqlen * headDim, 0.83f, 0.017f);
+        const std::vector<float> sinkValues = MakeRegressionValues(
+            heads, 1.31f, 0.09f);
+
+        std::vector<std::unique_ptr<fastllm::Data>> queries;
+        std::vector<std::unique_ptr<fastllm::Data>> keys;
+        std::vector<std::unique_ptr<fastllm::Data>> sinks;
+        std::vector<std::unique_ptr<fastllm::Data>> outputs;
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            queries.emplace_back(std::make_unique<fastllm::Data>(
+                fastllm::DataType::BFLOAT16, qDims, qValues));
+            keys.emplace_back(std::make_unique<fastllm::Data>(
+                fastllm::DataType::BFLOAT16, kvDims, kvValues));
+            sinks.emplace_back(std::make_unique<fastllm::Data>(
+                fastllm::DataType::FLOAT32, std::vector<int>{heads}, sinkValues));
+            outputs.emplace_back(std::make_unique<fastllm::Data>());
+            const std::vector<int> targetDevice = {device};
+            queries.back()->ToDevice(fastllm::DataDevice::CUDA, targetDevice);
+            keys.back()->ToDevice(fastllm::DataDevice::CUDA, targetDevice);
+            sinks.back()->ToDevice(fastllm::DataDevice::CUDA, targetDevice);
+            Expect(GetPointerDeviceId(queries.back()->cudaData) == device &&
+                       GetPointerDeviceId(keys.back()->cudaData) == device &&
+                       GetPointerDeviceId(sinks.back()->cudaData) == device,
+                   "DeepSeek-V4 sparse prefill fixture was allocated on the wrong GPU");
+        }
+
+        std::vector<char> accepted(devices.size(), 0);
+        bool dispatched = fastllm::MultiCudaRunDeviceCallbacks(
+            devices, [&](int rank, int device) {
+                accepted[rank] = FastllmCudaDeepSeekV4SparseAttentionPrefill(
+                    *queries[rank], *keys[rank], *sinks[rank],
+                    windowSize, 0, 0, ropeDim, 10000.0f, 65536, 16.0f,
+                    32, 1, 1.0f / std::sqrt((float)headDim),
+                    *outputs[rank], 0);
+                if (accepted[rank]) {
+                    accepted[rank] =
+                        outputs[rank]->dims == qDims &&
+                        GetPointerDeviceId(outputs[rank]->cudaData) == device;
+                }
+            });
+        Expect(dispatched,
+               "DeepSeek-V4 sparse prefill did not dispatch on multi-CUDA workers");
+        for (int rank = 0; rank < (int)devices.size(); rank++) {
+            Expect(accepted[rank] != 0,
+                   "DeepSeek-V4 sparse prefill rejected GPU " +
+                       std::to_string(devices[rank]));
+        }
+
+        FastllmCudaSetDevice(devices[0]);
+        const std::vector<float> reference = ToFloatVector(*outputs[0]);
+        FastllmCudaSetDevice(devices[1]);
+        const std::vector<float> actual = ToFloatVector(*outputs[1]);
+        ExpectFloatNear(reference, actual, 0.0f, 0.0f,
+                        "DeepSeek-V4 multi-CUDA sparse prefill output");
+
+        // Prefix-cache hits resume from a 256-token boundary.  Cover a suffix
+        // larger than the 128-token local window, including the compressed KV
+        // rows present at a 2K-token restore point.  This is the geometry that
+        // previously deferred an illegal CUDA access until the following MoE
+        // host handoff.
+        constexpr int cachedStartPos = 2048;
+        constexpr int cachedSeqlen = 156;
+        constexpr int cachedPrefixLen = windowSize;
+        constexpr int cachedCompressedCount = 551;
+        constexpr int cachedKvLen =
+            cachedPrefixLen + cachedSeqlen + cachedCompressedCount;
+        const std::vector<int> cachedQDims =
+            {batch, cachedSeqlen, heads, headDim};
+        const std::vector<int> cachedKvDims =
+            {batch, cachedKvLen, headDim};
+        const std::vector<float> cachedQValues = MakeRegressionValues(
+            batch * cachedSeqlen * heads * headDim, 0.43f, 4.0f);
+        const std::vector<float> cachedKvValues = MakeRegressionValues(
+            batch * cachedKvLen * headDim, 0.91f, 1.5f);
+        queries.clear();
+        keys.clear();
+        sinks.clear();
+        outputs.clear();
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            queries.emplace_back(std::make_unique<fastllm::Data>(
+                fastllm::DataType::BFLOAT16, cachedQDims, cachedQValues));
+            keys.emplace_back(std::make_unique<fastllm::Data>(
+                fastllm::DataType::BFLOAT16, cachedKvDims, cachedKvValues));
+            sinks.emplace_back(std::make_unique<fastllm::Data>(
+                fastllm::DataType::FLOAT32, std::vector<int>{heads}, sinkValues));
+            outputs.emplace_back(std::make_unique<fastllm::Data>());
+            const std::vector<int> targetDevice = {device};
+            queries.back()->ToDevice(fastllm::DataDevice::CUDA, targetDevice);
+            keys.back()->ToDevice(fastllm::DataDevice::CUDA, targetDevice);
+            sinks.back()->ToDevice(fastllm::DataDevice::CUDA, targetDevice);
+        }
+        accepted.assign(devices.size(), 0);
+        dispatched = fastllm::MultiCudaRunDeviceCallbacks(
+            devices, [&](int rank, int device) {
+                accepted[rank] = FastllmCudaDeepSeekV4SparseAttentionPrefill(
+                    *queries[rank], *keys[rank], *sinks[rank],
+                    windowSize, cachedStartPos, 4, ropeDim, 160000.0f,
+                    65536, 16.0f, 32, 1,
+                    1.0f / std::sqrt((float)headDim),
+                    *outputs[rank], cachedPrefixLen);
+                if (accepted[rank]) {
+                    accepted[rank] =
+                        outputs[rank]->dims == cachedQDims &&
+                        GetPointerDeviceId(outputs[rank]->cudaData) == device;
+                }
+            });
+        Expect(dispatched,
+               "DeepSeek-V4 cache-hit sparse prefill did not dispatch on multi-CUDA workers");
+        for (int rank = 0; rank < (int)devices.size(); rank++) {
+            Expect(accepted[rank] != 0,
+                   "DeepSeek-V4 cache-hit sparse prefill rejected GPU " +
+                       std::to_string(devices[rank]));
+        }
+        FastllmCudaSetDevice(devices[0]);
+        const std::vector<float> cachedReference = ToFloatVector(*outputs[0]);
+        FastllmCudaSetDevice(devices[1]);
+        const std::vector<float> cachedActual = ToFloatVector(*outputs[1]);
+        ExpectFloatNear(cachedReference, cachedActual, 4e-2f, 4e-3f,
+                        "DeepSeek-V4 cache-hit multi-CUDA sparse prefill output");
+        FastllmCudaSetDevice(originalDevice);
+        std::cout << "DeepSeek-V4 multi-CUDA sparse prefill regression: PASS\n";
+    }
+
     void RunCudaDeepSeekV4HashRouteCacheRegression() {
         FastllmCudaSetDevice(0);
         constexpr int topk = 2;
@@ -1771,6 +1932,650 @@ namespace {
         std::cout << "DeepSeek-V4 fused HcPreNorm regression: PASS\n";
     }
 
+    void RunMultiCudaDeepSeekV4HcPrePrefillRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "DeepSeek-V4 multi-CUDA HcPre prefill regression: "
+                         "SKIP (two GPUs required)\n";
+            return;
+        }
+
+        constexpr int batch = 1;
+        // Prefix-cache chunking feeds a full 256-token block through this
+        // path before the short residual suffix.  Exercise that production
+        // shape instead of only covering a small prefill.
+        constexpr int seqlen = 256;
+        constexpr int hcMult = 4;
+        constexpr int hidden = 4096;
+        constexpr int mixHc = (2 + hcMult) * hcMult;
+        constexpr int flat = hcMult * hidden;
+        constexpr int sinkhornIters = 20;
+        constexpr float eps = 1e-6f;
+        FastllmCudaSetDevice(0);
+        fastllm::Data warmupInput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {batch, 1, 1, hidden},
+            MakeRegressionValues(batch * hidden, 0.17f, 0.019f));
+        fastllm::Data requestInput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {batch, seqlen, 1, hidden},
+            MakeRegressionValues(batch * seqlen * hidden, 0.19f, 0.021f));
+        fastllm::Data hcFn = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {mixHc, flat},
+            MakeRegressionValues(mixHc * flat, 0.53f, 0.006f));
+        fastllm::Data hcScale = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {3}, {0.71f, 0.83f, 0.57f});
+        fastllm::Data hcBase = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {mixHc},
+            MakeRegressionValues(mixHc, 1.07f, 0.09f));
+
+        fastllm::Data repeated, output, post, comb;
+        {
+            ScopedFirstDevice device("multicuda:0,1");
+            fastllm::Repeat(warmupInput, 2, hcMult, repeated);
+            fastllm::DeepSeekV4HcPre(
+                repeated, hcFn, hcScale, hcBase, hcMult, sinkhornIters,
+                eps, eps, output, post, comb);
+
+            // Reuse the exact workspaces created by a one-token model warmup,
+            // then grow them for the first multi-token server request.  This
+            // covers stale replicated metadata around the generic CUDA Repeat
+            // fallback immediately before the dedicated MultiCuda HcPre op.
+            FastllmCudaSetDevice(1);
+            fastllm::Repeat(requestInput, 2, hcMult, repeated);
+            fastllm::DeepSeekV4HcPre(
+                repeated, hcFn, hcScale, hcBase, hcMult, sinkhornIters,
+                eps, eps, output, post, comb);
+        }
+        const std::vector<fastllm::Data*> outputs = {&output, &post, &comb};
+        const std::vector<std::vector<int>> expectedDims = {
+            {batch, seqlen, hidden},
+            {batch, seqlen, hcMult},
+            {batch, seqlen, hcMult, hcMult}
+        };
+        for (int tensor = 0; tensor < (int)outputs.size(); tensor++) {
+            fastllm::Data &value = *outputs[tensor];
+            Expect(value.IsTensorParallelReplicated() && value.multiDeviceData &&
+                       value.dims == expectedDims[tensor],
+                   "DeepSeek-V4 HcPre prefill output " + std::to_string(tensor) +
+                       " lost its replicated layout: layout=" +
+                       std::to_string((int)value.tpLayout) + ", multi=" +
+                       std::to_string((int)value.multiDeviceData) +
+                       ", rank=" + std::to_string(value.dims.size()));
+            std::vector<std::vector<float>> localValues;
+            for (int device : {0, 1}) {
+                auto it = value.multiDeviceDatas.find(device);
+                Expect(it != value.multiDeviceDatas.end() && it->second != nullptr &&
+                           it->second->dims == expectedDims[tensor] &&
+                           GetPointerDeviceId(it->second->cudaData) == device,
+                       "DeepSeek-V4 HcPre prefill output is missing a local replica");
+                FastllmCudaSetDevice(device);
+                localValues.push_back(ToFloatVector(*it->second));
+            }
+            ExpectFloatNear(localValues[0], localValues[1], 0.0f, 0.0f,
+                            "DeepSeek-V4 multi-CUDA HcPre prefill output");
+        }
+
+        // Request-final prefix snapshots split metadata-only replicated cache
+        // tensors. Reproduce a stale layout with one missing rank: recovery
+        // must preserve a healthy local payload before rebuilding both replicas,
+        // rather than attempting to copy from the null root descriptor.
+        Expect(output.cudaData == nullptr && output.cpuData == nullptr,
+               "DeepSeek-V4 replicated HcPre output unexpectedly owns root storage");
+        std::vector<float> fullOutput;
+        {
+            auto source = output.multiDeviceDatas.find(0);
+            Expect(source != output.multiDeviceDatas.end() && source->second != nullptr,
+                   "DeepSeek-V4 replicated split recovery has no source rank");
+            fullOutput = ToFloatVector(*source->second);
+        }
+        auto missing = output.multiDeviceDatas.find(1);
+        Expect(missing != output.multiDeviceDatas.end() && missing->second != nullptr,
+               "DeepSeek-V4 replicated split recovery cannot remove rank 1");
+        delete missing->second;
+        output.multiDeviceDatas.erase(missing);
+
+        fastllm::Data tail;
+        {
+            ScopedFirstDevice device("multicuda:0,1");
+            fastllm::Split(output, 1, seqlen - 2, seqlen, tail);
+        }
+        Expect(output.IsTensorParallelReplicated() && output.multiDeviceData &&
+                   output.multiDeviceDatas.size() == 2,
+               "DeepSeek-V4 replicated split did not rebuild the missing rank");
+        for (int device : {0, 1}) {
+            auto it = output.multiDeviceDatas.find(device);
+            Expect(it != output.multiDeviceDatas.end() && it->second != nullptr &&
+                       GetPointerDeviceId(it->second->cudaData) == device,
+                   "DeepSeek-V4 replicated split rebuilt a rank on the wrong GPU");
+        }
+        std::vector<float> expectedTail(
+            fullOutput.end() - 2 * hidden, fullOutput.end());
+        Expect(tail.dims == std::vector<int>({batch, 2, hidden}),
+               "DeepSeek-V4 replicated split returned the wrong tail shape");
+        ExpectFloatNear(expectedTail, ToFloatVector(tail), 0.0f, 0.0f,
+                        "DeepSeek-V4 replicated prefix-cache tail split");
+        FastllmCudaSetDevice(0);
+        std::cout << "DeepSeek-V4 multi-CUDA HcPre prefill regression: PASS\n";
+    }
+
+    void RunMultiCudaDeepSeekV4RouterLinearResizeRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "DeepSeek-V4 multi-CUDA router linear resize regression: "
+                         "SKIP (two GPUs required)\n";
+            return;
+        }
+
+        constexpr int hidden = 4096;
+        constexpr int experts = 256;
+        const int originalDevice = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(0);
+        fastllm::Data weight = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {experts, hidden},
+            MakeRegressionValues(experts * hidden, 0.37f, 0.003f));
+        weight.name = "layers.0.ffn.gate.weight";
+        fastllm::Data gateBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {experts},
+            MakeRegressionValues(experts, 8.7f, 0.001f));
+
+        for (int tokens : {121, 137, 1024}) {
+            fastllm::Data input = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, hidden},
+                MakeRegressionValues(tokens * hidden,
+                                     0.61f + tokens * 0.001f, 0.005f));
+            PrepareMultiCudaReplicatedData(input, {0, 1}, true);
+            fastllm::Data output;
+            {
+                ScopedFirstDevice device("multicuda:0,1");
+                fastllm::Linear(input, weight, fastllm::Data(), output, true);
+            }
+            Expect(output.multiDeviceData &&
+                       output.IsTensorParallelReplicated() &&
+                       output.dims == std::vector<int>({tokens, experts}),
+                   "DeepSeek-V4 router linear did not return replicated logits");
+            std::vector<std::vector<float>> localValues;
+            for (int device : {0, 1}) {
+                auto it = output.multiDeviceDatas.find(device);
+                Expect(it != output.multiDeviceDatas.end() &&
+                           it->second != nullptr &&
+                           it->second->dims == output.dims &&
+                           it->second->expansionSize >= it->second->Count(0) &&
+                           GetPointerDeviceId(it->second->cudaData) == device,
+                       "DeepSeek-V4 router linear has an invalid local output");
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+                localValues.push_back(ToFloatVector(*it->second));
+            }
+            ExpectFloatNear(localValues[0], localValues[1], 2e-6f, 2e-6f,
+                            "DeepSeek-V4 replicated router logits");
+
+            std::vector<int> devices = {0, 1};
+            std::vector<char> transformed(devices.size(), 0);
+            Expect(fastllm::MultiCudaRunDeviceCallbacks(
+                       devices, [&](int rank, int device) {
+                           transformed[rank] =
+                               FastllmCudaDeepSeekV4RouteScoreTransform(
+                                   *output.multiDeviceDatas.at(device), 2);
+                       }),
+                   "DeepSeek-V4 router score transform did not dispatch on both GPUs");
+            Expect(std::all_of(transformed.begin(), transformed.end(),
+                               [](char state) { return state != 0; }),
+                   "DeepSeek-V4 router score transform rejected a local replica");
+
+            constexpr int topk = 6;
+            constexpr float routeScale = 1.5f;
+            fastllm::Data expertIndex, expertScore;
+            {
+                ScopedFirstDevice device("multicuda:0,1");
+                fastllm::SelectExpert(output, expertIndex, expertScore,
+                                      topk, true, routeScale, &gateBias);
+            }
+            Expect(expertIndex.multiDeviceData && expertScore.multiDeviceData &&
+                       expertIndex.IsTensorParallelReplicated() &&
+                       expertScore.IsTensorParallelReplicated(),
+                   "DeepSeek-V4 topk=6 routing outputs are not replicated");
+
+            std::vector<std::vector<int32_t>> localIndices;
+            std::vector<std::vector<float>> localScores;
+            for (int device : devices) {
+                auto indexIt = expertIndex.multiDeviceDatas.find(device);
+                auto scoreIt = expertScore.multiDeviceDatas.find(device);
+                Expect(indexIt != expertIndex.multiDeviceDatas.end() &&
+                           indexIt->second != nullptr &&
+                           scoreIt != expertScore.multiDeviceDatas.end() &&
+                           scoreIt->second != nullptr &&
+                           indexIt->second->dims ==
+                               std::vector<int>({tokens, topk}) &&
+                           scoreIt->second->dims ==
+                               std::vector<int>({tokens, topk}) &&
+                           indexIt->second->expansionSize >=
+                               indexIt->second->Count(0) &&
+                           scoreIt->second->expansionSize >=
+                               scoreIt->second->Count(0),
+                       "DeepSeek-V4 topk=6 routing output has invalid local storage");
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+                localIndices.push_back(ToIntVector(*indexIt->second));
+                localScores.push_back(ToFloatVector(*scoreIt->second));
+                for (int token = 0; token < tokens; token++) {
+                    float sum = 0.0f;
+                    for (int rank = 0; rank < topk; rank++) {
+                        int expert = localIndices.back()[token * topk + rank];
+                        float score = localScores.back()[token * topk + rank];
+                        Expect(expert >= 0 && expert < experts &&
+                                   std::isfinite(score),
+                               "DeepSeek-V4 topk=6 routing returned an invalid expert");
+                        sum += score;
+                    }
+                    Expect(std::fabs(sum - routeScale) < 2e-5f,
+                           "DeepSeek-V4 normalized route scores have the wrong sum");
+                }
+            }
+            Expect(localIndices[0] == localIndices[1],
+                   "DeepSeek-V4 topk=6 expert ids differ between TP ranks");
+            ExpectFloatNear(localScores[0], localScores[1], 2e-6f, 2e-6f,
+                            "DeepSeek-V4 replicated topk=6 route scores");
+        }
+
+        // Restored long-context state can expose a numerical failure in an
+        // upstream attention row.  SelectExpert must never turn NaN logits into
+        // inputData[-1] and an illegal CUDA access; it should return bounded ids
+        // and finite zero scores so the request can fail safely downstream.
+        std::vector<float> nonFiniteValues(2 * experts,
+                                           std::numeric_limits<float>::quiet_NaN());
+        fastllm::Data nonFiniteLogits = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {2, experts}, nonFiniteValues);
+        PrepareMultiCudaReplicatedData(nonFiniteLogits, {0, 1}, true);
+        fastllm::Data nonFiniteIndex, nonFiniteScore;
+        {
+            ScopedFirstDevice device("multicuda:0,1");
+            fastllm::SelectExpert(nonFiniteLogits, nonFiniteIndex,
+                                  nonFiniteScore, 6, true, 1.5f, &gateBias);
+        }
+        for (int device : {0, 1}) {
+            FastllmCudaSetDevice(device);
+            ForceDeviceSync();
+            std::vector<int32_t> indices =
+                ToIntVector(*nonFiniteIndex.multiDeviceDatas.at(device));
+            std::vector<float> scores =
+                ToFloatVector(*nonFiniteScore.multiDeviceDatas.at(device));
+            for (int expert : indices) {
+                Expect(expert >= 0 && expert < experts,
+                       "DeepSeek-V4 non-finite route returned an invalid expert id");
+            }
+            for (float score : scores) {
+                Expect(std::isfinite(score) && score == 0.0f,
+                       "DeepSeek-V4 non-finite route returned an invalid score");
+            }
+        }
+
+        FastllmCudaSetDevice(originalDevice);
+        std::cout << "DeepSeek-V4 multi-CUDA router linear resize regression: PASS\n";
+    }
+
+    void RunMultiCudaDeepSeekV4RawCacheAppendRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "DeepSeek-V4 restored raw-cache append regression: "
+                         "SKIP (two GPUs required)\n";
+            return;
+        }
+
+        constexpr int bsz = 1;
+        constexpr int oldLen = 4;
+        constexpr int suffixLen = 156;
+        constexpr int totalLen = oldLen + suffixLen;
+        constexpr int wideDim = 1024;
+        const std::vector<float> oldKV = MakeRegressionValues(
+            (uint64_t)oldLen * wideDim, 0.37f, 0.17f);
+        const std::vector<float> oldScore = MakeRegressionValues(
+            (uint64_t)oldLen * wideDim, 0.61f, 0.13f);
+        const std::vector<float> suffixKV = MakeRegressionValues(
+            (uint64_t)suffixLen * wideDim, 0.83f, 0.11f);
+        const std::vector<float> suffixScore = MakeRegressionValues(
+            (uint64_t)suffixLen * wideDim, 1.07f, 0.09f);
+
+        // History keeps one expanded CPU payload: four live ratio-4 tail rows
+        // inside a 128-row allocation.  The resumed projections are replicated
+        // CUDA tensors and push the destination past that original capacity.
+        fastllm::Data allKV(fastllm::DataType::FLOAT32,
+                            {bsz, oldLen, wideDim}, oldKV);
+        fastllm::Data allScore(fastllm::DataType::FLOAT32,
+                               {bsz, oldLen, wideDim}, oldScore);
+        allKV.Expansion({bsz, 128, wideDim});
+        allScore.Expansion({bsz, 128, wideDim});
+        allKV.lockInCPU = true;
+        allScore.lockInCPU = true;
+
+        fastllm::Data newKV(fastllm::DataType::FLOAT32,
+                            {bsz, suffixLen, wideDim}, suffixKV);
+        fastllm::Data newScore(fastllm::DataType::FLOAT32,
+                               {bsz, suffixLen, wideDim}, suffixScore);
+        FastllmCudaSetDevice(0);
+        newKV.ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+        newScore.ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+        PrepareMultiCudaReplicatedData(newKV, {0, 1}, true);
+        PrepareMultiCudaReplicatedData(newScore, {0, 1}, true);
+        {
+            ScopedFirstDevice device("multicuda:0,1");
+            fastllm::DeepSeekV4AppendCompressorRawForTest(
+                newKV, newScore, bsz, suffixLen, wideDim, allKV, allScore);
+        }
+
+        Expect(allKV.multiDeviceData && allScore.multiDeviceData &&
+                   allKV.IsTensorParallelReplicated() &&
+                   allScore.IsTensorParallelReplicated() &&
+                   allKV.dims == std::vector<int>({bsz, totalLen, wideDim}) &&
+                   allScore.dims == allKV.dims &&
+                   allKV.expansionDims ==
+                       std::vector<int>({bsz, 256, wideDim}) &&
+                   allScore.expansionDims == allKV.expansionDims &&
+                   allKV.cpuData == nullptr && allKV.cudaData == nullptr &&
+                   allScore.cpuData == nullptr && allScore.cudaData == nullptr,
+               "DeepSeek-V4 restored raw cache has stale root storage or layout");
+
+        std::vector<float> expectedKV = oldKV;
+        expectedKV.insert(expectedKV.end(), suffixKV.begin(), suffixKV.end());
+        std::vector<float> expectedScore = oldScore;
+        expectedScore.insert(expectedScore.end(), suffixScore.begin(), suffixScore.end());
+        for (int device : {0, 1}) {
+            FastllmCudaSetDevice(device);
+            ForceDeviceSync();
+            fastllm::Data *localKV = allKV.multiDeviceDatas.at(device);
+            fastllm::Data *localScore = allScore.multiDeviceDatas.at(device);
+            Expect(localKV->dims == allKV.dims &&
+                       localKV->strides == allKV.strides &&
+                       localKV->expansionDims == allKV.expansionDims &&
+                       localKV->expansionSize == allKV.expansionSize &&
+                       localKV->expansionBytes == allKV.expansionBytes &&
+                       localScore->dims == allScore.dims &&
+                       localScore->strides == allScore.strides &&
+                       localScore->expansionDims == allScore.expansionDims &&
+                       localScore->expansionSize == allScore.expansionSize &&
+                       localScore->expansionBytes == allScore.expansionBytes,
+                   "DeepSeek-V4 restored raw-cache root/local metadata mismatch");
+            std::vector<float> actualKV = ToFloatVector(*localKV);
+            std::vector<float> actualScore = ToFloatVector(*localScore);
+            actualKV.resize(expectedKV.size());
+            actualScore.resize(expectedScore.size());
+            ExpectFloatNear(expectedKV, actualKV, 0.0f, 0.0f,
+                            "DeepSeek-V4 restored raw KV append");
+            ExpectFloatNear(expectedScore, actualScore, 0.0f, 0.0f,
+                            "DeepSeek-V4 restored raw score append");
+        }
+        FastllmCudaSetDevice(0);
+        std::cout << "DeepSeek-V4 restored raw-cache append regression: PASS\n";
+    }
+
+    void RunMultiCudaDeepSeekV4CompressedCacheAppendRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "DeepSeek-V4 restored compressed-cache append regression: "
+                         "SKIP (two GPUs required)\n";
+            return;
+        }
+
+        constexpr int bsz = 1;
+        constexpr int headDim = 512;
+        constexpr int ropeDim = 64;
+        constexpr int compressRatio = 4;
+        constexpr int wideDim = 2 * headDim;
+        constexpr int rawTokenBase = 2044;
+        constexpr int rawLen = 160;
+        constexpr int blockStart = 512;
+        constexpr int blockCount = 39;
+        constexpr int totalBlocks = blockStart + blockCount;
+
+        const std::vector<float> kvValues = MakeRegressionValues(
+            (uint64_t)bsz * rawLen * wideDim, 0.43f, 0.013f);
+        const std::vector<float> scoreValues = MakeRegressionValues(
+            (uint64_t)bsz * rawLen * wideDim, 0.19f, 0.007f);
+        const std::vector<float> apeValues = MakeRegressionValues(
+            (uint64_t)compressRatio * wideDim, 0.11f, 0.009f);
+        std::vector<float> normValues(headDim, 1.0f);
+        const std::vector<float> cacheValues = MakeRegressionValues(
+            (uint64_t)bsz * blockStart * headDim, 0.71f, 0.005f);
+
+        fastllm::Data cpuKV(fastllm::DataType::BFLOAT16,
+                            {bsz, rawLen, wideDim}, kvValues);
+        fastllm::Data cpuScore(fastllm::DataType::BFLOAT16,
+                               {bsz, rawLen, wideDim}, scoreValues);
+        fastllm::Data cpuApe(fastllm::DataType::FLOAT32,
+                             {compressRatio, wideDim}, apeValues);
+        fastllm::Data cpuNorm(fastllm::DataType::BFLOAT16,
+                              {headDim}, normValues);
+        fastllm::Data cpuCache(fastllm::DataType::BFLOAT16,
+                               {bsz, blockStart, headDim}, cacheValues);
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                cpuKV, cpuScore, cpuApe, cpuNorm,
+                rawTokenBase, rawLen, blockStart, blockCount,
+                compressRatio, headDim, ropeDim, 10000.0f,
+                1.0f, 32, 1, 4096, true, false, cpuCache);
+        }
+        Expect(cpuCache.dims ==
+                   std::vector<int>({bsz, totalBlocks, headDim}),
+               "DeepSeek-V4 CPU compressed-cache append returned the wrong shape");
+
+        fastllm::Data actualKV(fastllm::DataType::BFLOAT16,
+                               {bsz, rawLen, wideDim}, kvValues);
+        fastllm::Data actualScore(fastllm::DataType::BFLOAT16,
+                                  {bsz, rawLen, wideDim}, scoreValues);
+        fastllm::Data actualApe(fastllm::DataType::FLOAT32,
+                                {compressRatio, wideDim}, apeValues);
+        fastllm::Data actualNorm(fastllm::DataType::BFLOAT16,
+                                 {headDim}, normValues);
+        fastllm::Data residentCache(fastllm::DataType::BFLOAT16,
+                                    {bsz, blockStart, headDim}, cacheValues);
+        // The cold suffix starts from an already replicated compressed cache.
+        // Use it as the CUDA-path reference; the CPU implementation is also
+        // exercised above, but CUDA's RMS/quant rounding is intentionally not
+        // required to be bit-identical to it.
+        PrepareMultiCudaReplicatedData(residentCache, {0, 1}, true);
+        {
+            ScopedFirstDevice device("multicuda:0,1");
+            fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                actualKV, actualScore, actualApe, actualNorm,
+                rawTokenBase, rawLen, blockStart, blockCount,
+                compressRatio, headDim, ropeDim, 10000.0f,
+                1.0f, 32, 1, 4096, true, true, residentCache);
+        }
+        fastllm::Data actualCache(fastllm::DataType::BFLOAT16,
+                                  {bsz, blockStart, headDim}, cacheValues);
+        // Match a history snapshot: one CPU cache payload is restored to the
+        // root GPU immediately before the MultiCUDA operator recreates both
+        // physical replicas and appends the suffix-compressed rows.
+        actualCache.lockInCPU = false;
+        FastllmCudaSetDevice(0);
+        actualCache.ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+        {
+            ScopedFirstDevice device("multicuda:0,1");
+            fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                actualKV, actualScore, actualApe, actualNorm,
+                rawTokenBase, rawLen, blockStart, blockCount,
+                compressRatio, headDim, ropeDim, 10000.0f,
+                1.0f, 32, 1, 4096, true, true, actualCache);
+        }
+        Expect(actualCache.multiDeviceData &&
+                   actualCache.IsTensorParallelReplicated() &&
+                   actualCache.dims ==
+                       std::vector<int>({bsz, totalBlocks, headDim}),
+               "DeepSeek-V4 restored compressed cache was not replicated");
+        for (int device : {0, 1}) {
+            FastllmCudaSetDevice(device);
+            ForceDeviceSync();
+            auto it = actualCache.multiDeviceDatas.find(device);
+            Expect(it != actualCache.multiDeviceDatas.end() &&
+                       it->second != nullptr && it->second->cudaData != nullptr,
+                   "DeepSeek-V4 restored compressed cache is missing a TP replica");
+            ExpectFloatNear(
+                            ToFloatVector(*residentCache.multiDeviceDatas.at(device)),
+                            ToFloatVector(*it->second), 0.0f, 0.0f,
+                            "DeepSeek-V4 restored compressed-cache append");
+        }
+        FastllmCudaSetDevice(0);
+        std::cout << "DeepSeek-V4 restored compressed-cache append regression: PASS\n";
+    }
+
+    void RunMultiCudaDeepSeekV4ExpandedSnapshotRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "DeepSeek-V4 expanded prefix snapshot regression: "
+                         "SKIP (two GPUs required)\n";
+            return;
+        }
+        ScopedFirstDevice firstDevice("multicuda:0,1");
+
+        constexpr int logicalTokens = 3;
+        constexpr int capacityTokens = 8;
+        constexpr int dim = 16;
+        fastllm::DeepSeekV4HistoryLayerCache source;
+        fastllm::Data &cache = source.windowKV;
+        cache.dataType = fastllm::DataType::FLOAT32;
+        cache.UpdateUnitSize();
+        cache.Resize({1, logicalTokens, dim});
+        cache.dataDevice = fastllm::DataDevice::CUDA;
+        cache.dataDeviceIds = {0};
+        FastllmCudaSetDevice(0);
+        cache.Allocate(false);
+        std::vector<float> values =
+            MakeRegressionValues(logicalTokens * dim, 0.73f, 0.14f);
+        fastllm::Data initial = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, logicalTokens, dim}, values);
+        FastllmCudaCopyFromDeviceToDevice(
+            cache.cudaData, initial.cudaData, initial.GetBytes());
+        cache.Expansion({1, capacityTokens, dim});
+        PrepareMultiCudaReplicatedData(cache, {0, 1}, true);
+
+        FastllmCudaSetDevice(0);
+        fastllm::DeepSeekV4HistoryLayerCache snapshot(source);
+        Expect(FastllmCudaGetDevice() == 0,
+               "DeepSeek-V4 prefix snapshot leaked its last CUDA device");
+        Expect(snapshot.windowKV.dataDevice == fastllm::DataDevice::CPU &&
+                   !snapshot.windowKV.multiDeviceData &&
+                   snapshot.windowKV.expansionDims ==
+                       source.windowKV.multiDeviceDatas.at(0)->expansionDims &&
+                   snapshot.windowKV.strides ==
+                       source.windowKV.multiDeviceDatas.at(0)->strides &&
+                   snapshot.windowKV.expansionBytes >=
+                       source.windowKV.multiDeviceDatas.at(0)->GetBytes(),
+               "DeepSeek-V4 expanded prefix snapshot did not retain one CPU cache copy");
+        FastllmCudaSetDevice(0);
+        ExpectFloatNear(ToFloatVector(*source.windowKV.multiDeviceDatas.at(0)),
+                        ToFloatVector(snapshot.windowKV), 0.0f, 0.0f,
+                        "DeepSeek-V4 expanded prefix snapshot payload");
+
+        // A restored CPU snapshot has one physical GPU allocation but retains
+        // the logical {0,1} device list.  Launch the direct prefix builder while
+        // GPU 1 is current and verify that it follows the source pointer to GPU 0.
+        snapshot.windowKV.ToDevice(fastllm::DataDevice::CUDA, {0, 1}, true);
+        Expect(GetPointerDeviceId(snapshot.windowKV.cudaData) == 0,
+               "DeepSeek-V4 restored prefix snapshot is not resident on GPU 0");
+        FastllmCudaSetDevice(1);
+        fastllm::Data prefix;
+        Expect(FastllmCudaDeepSeekV4BuildWindowKVPrefix(
+                   snapshot.windowKV, logicalTokens, logicalTokens, 2, prefix),
+               "DeepSeek-V4 prefix builder rejected a restored snapshot");
+        ForceDeviceSync();
+        Expect(GetPointerDeviceId(prefix.cudaData) == 0,
+               "DeepSeek-V4 prefix builder launched on the stale current GPU");
+        std::vector<float> expectedPrefix(values.begin() + dim, values.end());
+        ExpectFloatNear(expectedPrefix, ToFloatVector(prefix), 0.0f, 0.0f,
+                        "DeepSeek-V4 restored snapshot prefix payload");
+
+        // Model inference promotes the restored cache to one physical replica
+        // per TP rank before building the prefix.  Exercise that exact path so
+        // the model helper cannot accidentally launch through the metadata-only
+        // root tensor or return a single-rank prefix.
+        fastllm::DeepSeekV4HistoryLayerCache replicatedSnapshot(source);
+        replicatedSnapshot.windowKV.lockInCPU = false;
+        replicatedSnapshot.windowKV.ToDevice(
+            fastllm::DataDevice::CUDA, {0}, true);
+        PrepareMultiCudaReplicatedData(
+            replicatedSnapshot.windowKV, {0, 1}, true);
+        fastllm::Data replicatedPrefix;
+        Expect(fastllm::DeepSeekV4BuildWindowKVPrefixForTest(
+                   replicatedSnapshot.windowKV, 1, dim, logicalTokens,
+                   logicalTokens, replicatedPrefix) == logicalTokens,
+               "DeepSeek-V4 replicated prefix builder rejected a restored snapshot");
+        Expect(replicatedPrefix.multiDeviceData &&
+                   replicatedPrefix.IsTensorParallelReplicated(),
+               "DeepSeek-V4 replicated prefix builder returned a single-rank tensor");
+        for (int device : {0, 1}) {
+            auto it = replicatedPrefix.multiDeviceDatas.find(device);
+            Expect(it != replicatedPrefix.multiDeviceDatas.end() &&
+                       it->second != nullptr && it->second->cudaData != nullptr &&
+                       GetPointerDeviceId(it->second->cudaData) == device,
+                   "DeepSeek-V4 replicated prefix builder used the wrong GPU");
+            ExpectFloatNear(values, ToFloatVector(*it->second),
+                            0.0f, 0.0f,
+                            "DeepSeek-V4 replicated restored prefix payload");
+        }
+
+        // Match the full model's cache-hit geometry: a 128-token float window,
+        // 512-wide KV head, followed by a 36-token suffix update on both ranks.
+        constexpr int modelWindow = 128;
+        constexpr int modelHeadDim = 512;
+        constexpr int suffixTokens = 137;
+        std::vector<float> modelWindowValues = MakeRegressionValues(
+            modelWindow * modelHeadDim, 0.41f, 0.07f);
+        fastllm::DeepSeekV4HistoryLayerCache modelSource;
+        fastllm::Data modelWindowInitial = MakeCudaTensor(
+            fastllm::DataType::FLOAT32,
+            {1, modelWindow, modelHeadDim}, modelWindowValues);
+        modelSource.windowKV.dataType = fastllm::DataType::FLOAT32;
+        modelSource.windowKV.UpdateUnitSize();
+        modelSource.windowKV.Resize({1, modelWindow, modelHeadDim});
+        modelSource.windowKV.dataDevice = fastllm::DataDevice::CUDA;
+        modelSource.windowKV.dataDeviceIds = {0};
+        FastllmCudaSetDevice(0);
+        modelSource.windowKV.Allocate(false);
+        FastllmCudaCopyFromDeviceToDevice(
+            modelSource.windowKV.cudaData, modelWindowInitial.cudaData,
+            modelWindowInitial.GetBytes());
+        PrepareMultiCudaReplicatedData(modelSource.windowKV, {0, 1}, true);
+        fastllm::DeepSeekV4HistoryLayerCache modelSnapshot(modelSource);
+        modelSnapshot.windowKV.lockInCPU = false;
+        modelSnapshot.windowKV.ToDevice(
+            fastllm::DataDevice::CUDA, {0}, true);
+        PrepareMultiCudaReplicatedData(
+            modelSnapshot.windowKV, {0, 1}, true);
+
+        fastllm::Data modelPrefix;
+        Expect(fastllm::DeepSeekV4BuildWindowKVPrefixForTest(
+                   modelSnapshot.windowKV, 1, modelHeadDim, 256,
+                   modelWindow, modelPrefix) == modelWindow,
+               "DeepSeek-V4 model-shape prefix builder rejected the restored window");
+        std::vector<float> suffixValues = MakeRegressionValues(
+            suffixTokens * modelHeadDim, 0.83f, 0.11f);
+        fastllm::Data suffix = MakeCudaTensor(
+            fastllm::DataType::FLOAT32,
+            {1, suffixTokens, modelHeadDim}, suffixValues);
+        PrepareMultiCudaReplicatedData(suffix, {0, 1}, true);
+        fastllm::DeepSeekV4UpdateWindowKVCacheForTest(
+            suffix, 1, modelHeadDim, 256, modelWindow,
+            modelSnapshot.windowKV);
+
+        std::vector<float> expectedWindow = modelWindowValues;
+        for (int s = 0; s < suffixTokens; ++s) {
+            int slot = (256 + s) % modelWindow;
+            std::copy(suffixValues.begin() + (uint64_t)s * modelHeadDim,
+                      suffixValues.begin() + (uint64_t)(s + 1) * modelHeadDim,
+                      expectedWindow.begin() + (uint64_t)slot * modelHeadDim);
+        }
+        for (int device : {0, 1}) {
+            ExpectFloatNear(
+                modelWindowValues,
+                ToFloatVector(*modelPrefix.multiDeviceDatas.at(device)),
+                0.0f, 0.0f,
+                "DeepSeek-V4 model-shape replicated prefix payload");
+            ExpectFloatNear(
+                expectedWindow,
+                ToFloatVector(*modelSnapshot.windowKV.multiDeviceDatas.at(device)),
+                0.0f, 0.0f,
+                "DeepSeek-V4 model-shape replicated window update");
+        }
+        FastllmCudaSetDevice(0);
+        std::cout << "DeepSeek-V4 expanded prefix snapshot regression: PASS\n";
+    }
+
     void RunCudaDeepSeekV4FusedQKVRopeCacheRegression() {
         FastllmCudaSetDevice(0);
         constexpr int heads = 64;
@@ -1779,6 +2584,52 @@ namespace {
         constexpr int windowSize = 128;
         constexpr int position = 173;
         constexpr float eps = 1e-6f;
+
+        // Internal prefix-cache splitting continues a prefill with a multi-token
+        // suffix.  Cover the exact 256 + 28 shape used by the full-model cache
+        // regression on every TP rank.
+        for (int device = 0; device < std::min(2, FastllmCudaGetDeviceCount()); device++) {
+            FastllmCudaSetDevice(device);
+            fastllm::Data chunkKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, {1, 28, 1, headDim},
+                MakeRegressionValues(28 * headDim, 0.37f + device, 0.61f));
+            Expect(FastllmCudaDeepSeekV4RotaryQuant(
+                       chunkKV, ropeDim, 160000.0f, 256,
+                       65536, 16.0f, 32, 1,
+                       headDim - ropeDim, 64, 1),
+                   "DeepSeek-V4 chunk-continuation KV rotary rejected its input");
+            ForceDeviceSync();
+        }
+        FastllmCudaSetDevice(0);
+
+        if (FastllmCudaGetDeviceCount() >= 2) {
+            fastllm::Data chunkKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, {1, 28, 1, headDim},
+                MakeRegressionValues(28 * headDim, 0.83f, 0.61f));
+            {
+                ScopedFirstDevice device("multicuda:0,1");
+                bool previousAsync = fastllm::MultiCudaSetPersistentAsyncDispatch(true);
+                fastllm::DeepSeekV4RotaryQuant(
+                    chunkKV, ropeDim, 10000.0f, 256,
+                    65536, 16.0f, 32, 1,
+                    headDim - ropeDim, 64, 1);
+                fastllm::MultiCudaSetPersistentAsyncDispatch(previousAsync);
+            }
+            Expect(chunkKV.IsTensorParallelReplicated() &&
+                       chunkKV.multiDeviceData &&
+                       chunkKV.multiDeviceDatas.size() == 2,
+                   "DeepSeek-V4 chunk-continuation rotary lost its replicated TP layout");
+            for (int device : {0, 1}) {
+                auto it = chunkKV.multiDeviceDatas.find(device);
+                Expect(it != chunkKV.multiDeviceDatas.end() &&
+                           it->second != nullptr &&
+                           GetPointerDeviceId(it->second->cudaData) == device,
+                       "DeepSeek-V4 chunk-continuation rotary is missing a TP replica");
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+            }
+            FastllmCudaSetDevice(0);
+        }
 
         std::vector<float> qValues =
             MakeRegressionValues(heads * headDim, 0.47f, 0.65f);
@@ -2348,6 +3199,47 @@ namespace {
     }
 
 #ifndef USE_ROCM
+    void RunMultiCudaDeepSeekV4AttentionSplitUnitRegression() {
+        fastllm::Data weight(
+            fastllm::DataType::FP8_E4M3_BLOCK_128, {64 * 512, 1024});
+        weight.name = "layers.0.attn.wq_b.weight";
+        weight.tpSplitUnit = 8 * 512;
+        std::vector<int> devices = {0, 1};
+        std::map<int, int> ratios = {{0, 64}, {1, 57}};
+        DivisionScheme scheme =
+            BuildMultiCudaRowSplitScheme(weight, devices, ratios);
+
+        Expect(scheme[0] == DivisionScheme::mapped_type({{0, 32 * 512}}) &&
+                   scheme[1] == DivisionScheme::mapped_type({{32 * 512, 64 * 512}}),
+               "DeepSeek-V4 heterogeneous attention split did not preserve wo_a groups");
+        for (int device : devices) {
+            for (const auto &range : scheme[device]) {
+                Expect(range.first % weight.tpSplitUnit == 0 &&
+                           range.second % weight.tpSplitUnit == 0,
+                       "DeepSeek-V4 attention split is not group aligned");
+            }
+        }
+
+        fastllm::Data woA(fastllm::DataType::BFLOAT16, {8 * 1024, 4096});
+        woA.name = "layers.0.attn.wo_a.weight";
+        woA.tpSplitUnit = 1024;
+        DivisionScheme woAScheme =
+            BuildMultiCudaRowSplitScheme(woA, devices, ratios);
+        Expect(woAScheme[0] == DivisionScheme::mapped_type({{0, 4 * 1024}}) &&
+                   woAScheme[1] == DivisionScheme::mapped_type({{4 * 1024, 8 * 1024}}),
+               "DeepSeek-V4 wo_a split did not follow attention output groups");
+
+        fastllm::Data woB(fastllm::DataType::BFLOAT16, {6144, 8 * 1024});
+        woB.name = "layers.0.attn.wo_b.weight";
+        woB.tpSplitUnit = 1024;
+        DivisionScheme woBScheme =
+            BuildMultiCudaColumnSplitScheme(woB, devices, ratios);
+        Expect(woBScheme[0] == DivisionScheme::mapped_type({{0, 4 * 1024}}) &&
+                   woBScheme[1] == DivisionScheme::mapped_type({{4 * 1024, 8 * 1024}}),
+               "DeepSeek-V4 wo_b split did not follow attention output groups");
+        std::cout << "DeepSeek-V4 heterogeneous attention split-unit regression: PASS\n";
+    }
+
     void RunMultiCudaInt4GroupColumnSplitRegression() {
         constexpr int rows = 3;
         constexpr int columns = 128;
@@ -4653,8 +5545,14 @@ int main() {
             RunCudaTritonChunkGdnPrefillRegression();
             RunCudaDeepSeekV4TritonWoARegression();
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
+            RunMultiCudaDeepSeekV4SparsePrefillRegression();
             RunCudaDeepSeekV4HashRouteCacheRegression();
             RunCudaDeepSeekV4FusedHcPreNormRegression();
+            RunMultiCudaDeepSeekV4HcPrePrefillRegression();
+            RunMultiCudaDeepSeekV4RouterLinearResizeRegression();
+            RunMultiCudaDeepSeekV4RawCacheAppendRegression();
+            RunMultiCudaDeepSeekV4CompressedCacheAppendRegression();
+            RunMultiCudaDeepSeekV4ExpandedSnapshotRegression();
             RunCudaDeepSeekV4FusedQKVRopeCacheRegression();
             RunCudaGraphMemoryPoolOwnershipRegression();
             RunCudaLinearDataTypeCapabilityRegression();
@@ -4671,6 +5569,7 @@ int main() {
             ranCrossDeviceViewRegression = RunCudaCrossDeviceViewRejectionRegression();
             RunMultiCudaReplicatedExpansionRegression();
 #ifndef USE_ROCM
+            RunMultiCudaDeepSeekV4AttentionSplitUnitRegression();
             RunMultiCudaInt4GroupColumnSplitRegression();
             ranLargeWeightOffsetRegression = RunMultiCudaLargeWeightOffsetRegression();
 #endif
