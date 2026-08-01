@@ -60,7 +60,7 @@ namespace fastllm {
 
     static int GetMultiCudaWorkerCpuBase() {
         const char *v = std::getenv("FASTLLM_MULTICUDA_WORKER_CPU_BASE");
-        return v == nullptr ? 0 : std::max(0, std::atoi(v));
+        return v == nullptr ? -1 : std::max(0, std::atoi(v));
     }
 
     static int GetMultiCudaWorkerSpinIters() {
@@ -70,11 +70,15 @@ namespace fastllm {
 
     static void BindCurrentThreadToCpu(int workerIndex) {
 #if defined(__linux__)
+        int cpuBase = GetMultiCudaWorkerCpuBase();
+        if (cpuBase < 0) {
+            return;
+        }
         long cpuCount = sysconf(_SC_NPROCESSORS_ONLN);
         if (cpuCount <= 0) {
             return;
         }
-        int cpuId = (GetMultiCudaWorkerCpuBase() + workerIndex) % (int)cpuCount;
+        int cpuId = (cpuBase + workerIndex) % (int)cpuCount;
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(cpuId, &cpuset);

@@ -4,6 +4,7 @@ import os
 import sys
 import subprocess
 import glob
+import math
 
 def _positive_int(value: str) -> int:
     try:
@@ -81,6 +82,142 @@ def _cuda_device_count() -> int:
     except Exception:
         return 0
 
+def _cuda_driver_device_info(device_ids):
+    """Return CUDA-ordinal SM counts and PCI bus ids without creating a context."""
+    try:
+        import ctypes
+        driver = ctypes.CDLL("libcuda.so.1")
+        driver.cuInit.argtypes = [ctypes.c_uint]
+        driver.cuInit.restype = ctypes.c_int
+        driver.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        driver.cuDeviceGet.restype = ctypes.c_int
+        driver.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int),
+                                                 ctypes.c_int, ctypes.c_int]
+        driver.cuDeviceGetAttribute.restype = ctypes.c_int
+        driver.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                                               ctypes.c_int]
+        driver.cuDeviceGetPCIBusId.restype = ctypes.c_int
+        if driver.cuInit(0) != 0:
+            return {}
+
+        # CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT.  CUDA ordinals are used
+        # deliberately: their FASTEST_FIRST order can differ from nvidia-smi.
+        multiprocessor_count = 16
+        result = {}
+        for ordinal in device_ids:
+            device = ctypes.c_int()
+            sm_count = ctypes.c_int()
+            bus_id = ctypes.create_string_buffer(32)
+            if driver.cuDeviceGet(ctypes.byref(device), ordinal) != 0:
+                return {}
+            if driver.cuDeviceGetAttribute(ctypes.byref(sm_count),
+                                           multiprocessor_count,
+                                           device.value) != 0:
+                return {}
+            pci_bus_id = ""
+            if driver.cuDeviceGetPCIBusId(bus_id, len(bus_id), device.value) == 0:
+                pci_bus_id = bus_id.value.decode("ascii", errors="ignore")
+            result[ordinal] = {
+                "sm_count": sm_count.value,
+                "pci_bus_id": pci_bus_id,
+            }
+        return result
+    except Exception:
+        return {}
+
+def _auto_balanced_cuda_spec(device_ids) -> str:
+    infos = _cuda_driver_device_info(device_ids)
+    sm_counts = [infos.get(i, {}).get("sm_count", 0) for i in device_ids]
+    if len(device_ids) <= 1 or any(count <= 0 for count in sm_counts) or \
+            len(set(sm_counts)) == 1:
+        return "cuda:" + ",".join(str(i) for i in device_ids)
+
+    divisor = 0
+    for count in sm_counts:
+        divisor = math.gcd(divisor, count)
+    divisor = max(1, divisor)
+    return "cuda:" + ",".join(
+        f"{device_id}:{sm_count // divisor}"
+        for device_id, sm_count in zip(device_ids, sm_counts)
+    )
+
+def _parse_cpu_list(value):
+    cpus = []
+    for item in str(value).strip().split(","):
+        if not item:
+            continue
+        if "-" in item:
+            first, last = item.split("-", 1)
+            cpus.extend(range(int(first), int(last) + 1))
+        else:
+            cpus.append(int(item))
+    return cpus
+
+def _thread_tp_cuda_device_ids(tp):
+    spec = _thread_tp_cuda_device_spec(tp)
+    if ":" not in spec:
+        return []
+    result = []
+    for part in spec.split(":", 1)[1].split(","):
+        device = part.strip().split(":", 1)[0].split("-", 1)[0]
+        if device.isdigit():
+            result.append(int(device))
+    return result
+
+def _configure_multicuda_worker_affinity(tp, threads):
+    """Keep GPU launch workers off the NUMA MoE worker cores when possible."""
+    if "FASTLLM_MULTICUDA_WORKER_CPU_BASE" in os.environ:
+        return
+    device_ids = _thread_tp_cuda_device_ids(tp)
+    if len(device_ids) <= 1:
+        return
+    try:
+        node_paths = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
+        if not node_paths:
+            return
+        infos = _cuda_driver_device_info(device_ids)
+        gpu_nodes = []
+        for device_id in device_ids:
+            bus_id = infos.get(device_id, {}).get("pci_bus_id", "").lower()
+            numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
+            if bus_id and os.path.exists(numa_path):
+                with open(numa_path, "r", encoding="utf-8") as f:
+                    node = int(f.read().strip())
+                if node >= 0:
+                    gpu_nodes.append(node)
+        target_node = max(set(gpu_nodes), key=gpu_nodes.count) if gpu_nodes else 0
+        target_node = min(target_node, len(node_paths) - 1)
+
+        used_cpus = set()
+        per_node_threads = max(0, int(threads) // len(node_paths))
+        for node_path in node_paths:
+            with open(os.path.join(node_path, "cpulist"), "r", encoding="utf-8") as f:
+                used_cpus.update(_parse_cpu_list(f.read())[:per_node_threads])
+
+        allowed = set(os.sched_getaffinity(0))
+        physical_cpus = []
+        for cpu_path in glob.glob(os.path.join(node_paths[target_node], "cpu[0-9]*")):
+            cpu_id = int(os.path.basename(cpu_path)[3:])
+            sibling_path = os.path.join(cpu_path, "topology", "thread_siblings_list")
+            with open(sibling_path, "r", encoding="utf-8") as f:
+                siblings = _parse_cpu_list(f.read())
+            if siblings and cpu_id == min(siblings) and cpu_id in allowed and \
+                    cpu_id not in used_cpus:
+                physical_cpus.append(cpu_id)
+        physical_cpus.sort()
+
+        worker_count = len(device_ids)
+        for end in range(len(physical_cpus), worker_count - 1, -1):
+            selected = physical_cpus[end - worker_count:end]
+            if selected == list(range(selected[0], selected[0] + worker_count)):
+                os.environ["FASTLLM_MULTICUDA_WORKER_CPU_BASE"] = str(selected[0])
+                print("[tp] MultiCuda launch workers use reserved CPU(s): " +
+                      ",".join(str(cpu) for cpu in selected))
+                return
+    except Exception:
+        # Unbound C++ workers remain the safe fallback on unusual topologies.
+        return
+
 def _first_thread_tp_cuda_device(tp) -> str:
     spec = str(tp or "").strip()
     lower = spec.lower()
@@ -113,7 +250,7 @@ def _thread_tp_cuda_device_spec(tp) -> str:
         count = _cuda_device_count()
         if count <= 1:
             return "cuda:0"
-        return "cuda:" + ",".join(str(i) for i in range(count))
+        return _auto_balanced_cuda_spec(list(range(count)))
     if lower.isdigit():
         requested = int(lower)
         if requested == 0:
@@ -121,6 +258,12 @@ def _thread_tp_cuda_device_spec(tp) -> str:
         count = _cuda_device_count()
         if count > 0:
             requested = min(requested, count)
+        # A numeric TP request means equal logical ranks. Model-specific split
+        # units (for example DeepSeek-V4's eight output groups) can quantize a
+        # small hardware ratio back to equal attention shards while leaving FFN
+        # shards asymmetric, which is slower than a consistently equal split.
+        # Explicit ratios remain available, while `--tp auto` keeps SM-count
+        # balancing for users who request topology-based weighting.
         return "cuda:" + ",".join(str(i) for i in range(requested))
 
     if lower.startswith("multicuda:") or lower.startswith("cuda:"):
@@ -524,11 +667,17 @@ def make_normal_llm_model(args, startup_progress = None):
         tp_device = _first_thread_tp_cuda_device(args.tp)
         cuda_spec = _thread_tp_cuda_device_spec(args.tp)
         if is_multicuda_tp_model:
-            multicuda_spec = "multicuda:" + cuda_spec.split(":", 1)[1]
-            if (not user_set_device):
-                args.device = multicuda_spec
+            target_spec = cuda_spec
+            if len(_thread_tp_cuda_device_ids(cuda_spec)) > 1:
+                target_spec = "multicuda:" + cuda_spec.split(":", 1)[1]
+            if user_set_device and str(args.device).strip().lower() != target_spec:
+                print("[tp] DeepSeek-V4 --tp overrides the main device "
+                      f"{args.device} => {target_spec}")
+            # DeepSeek-V4 executes multi-device tensor parallel through the
+            # MultiCuda executor. A one-device --tp remains a normal CUDA path.
+            args.device = target_spec
             if (not user_set_moe_device):
-                args.moe_device = multicuda_spec
+                args.moe_device = target_spec
         else:
             if (not user_set_device):
                 args.device = tp_device
@@ -569,6 +718,9 @@ def make_normal_llm_model(args, startup_progress = None):
             args.threads = max(1, min(32, available_cores - 2))
         except:
             args.threads = max(1, min(32, os.cpu_count() - 2))
+    if is_multicuda_tp_model and _uses_multicuda_device(args.device) and \
+            "numa" in str(args.moe_device).lower():
+        _configure_multicuda_worker_affinity(args.tp, args.threads)
     if ("FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ):
         os.environ["FT_THREADS"] = str(args.threads)
     atype_was_auto = (args.atype == "auto")
