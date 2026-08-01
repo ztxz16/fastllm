@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -5925,6 +5926,27 @@ namespace fastllm {
         }
     }
 
+    struct CudaMergeMoeFromCpuWorkspace {
+        std::mutex mutex;
+        Data tempInput;
+        Data tempMiddle;
+        Data tempSwiglu;
+        Data tempOutput;
+    };
+
+    static CudaMergeMoeFromCpuWorkspace &GetCudaMergeMoeFromCpuWorkspace(
+            int deviceId) {
+        static std::mutex registryMutex;
+        static auto *workspaces =
+            new std::map<int, std::unique_ptr<CudaMergeMoeFromCpuWorkspace> >();
+        std::lock_guard<std::mutex> guard(registryMutex);
+        auto &workspace = (*workspaces)[deviceId];
+        if (!workspace) {
+            workspace.reset(new CudaMergeMoeFromCpuWorkspace());
+        }
+        return *workspace;
+    }
+
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
         MoeGateType gateType) {
@@ -5938,6 +5960,13 @@ namespace fastllm {
 // auto st = std::chrono::system_clock::now();
 // auto xxx = std::chrono::system_clock::now();
         int curDeviceId = FastllmCudaGetDevice();
+        CudaMergeMoeFromCpuWorkspace &workspace =
+            GetCudaMergeMoeFromCpuWorkspace(curDeviceId);
+        std::lock_guard<std::mutex> workspaceGuard(workspace.mutex);
+        Data &tempInput = workspace.tempInput;
+        Data &tempMiddle = workspace.tempMiddle;
+        Data &tempSwiglu = workspace.tempSwiglu;
+        Data &tempOutput = workspace.tempOutput;
         if (output.cudaData != nullptr) {
             int outputPtrDevice = GetPointerDeviceId(output.cudaData);
             if (outputPtrDevice >= 0 && outputPtrDevice != curDeviceId) {
@@ -6004,28 +6033,31 @@ namespace fastllm {
         FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
         FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
 // ForceDeviceSync(); timeCnt["copy index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-        static Data tempInput, tempMiddle, tempSwiglu, tempOutput;
         tempInput.Resize(input.dims);
         tempInput.dataType = input.dataType;
-        tempInput.ToDevice(input.dataDevice);
+        tempInput.ToDevice(
+            input.dataDevice, std::vector<int>{curDeviceId}, false);
         tempInput.Allocate();
 
         tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
         tempMiddle.dataType = input.dataType;
-        tempMiddle.ToDevice(input.dataDevice);
+        tempMiddle.ToDevice(
+            input.dataDevice, std::vector<int>{curDeviceId}, false);
         tempMiddle.Allocate();
 
         tempSwiglu.Resize({input.dims[0], weights[2]->dims[0] / 2});
         tempSwiglu.dataType = input.dataType;
-        tempSwiglu.ToDevice(input.dataDevice);
+        tempSwiglu.ToDevice(
+            input.dataDevice, std::vector<int>{curDeviceId}, false);
         tempSwiglu.Allocate();
 
         tempOutput.Resize(output.dims);
         tempOutput.dataType = input.dataType;
-        tempOutput.ToDevice(output.dataDevice);
+        tempOutput.ToDevice(
+            output.dataDevice, std::vector<int>{curDeviceId}, false);
         tempOutput.Allocate();
 // ForceDeviceSync(); timeCnt["alloc data"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-static float total = 0.0f;
+float total = 0.0f;
 std::map <int, int> eeCnt;
 for (int e = 0; e < expertTasks.size(); e++) {
     if (weights[e * 2] != nullptr) {
