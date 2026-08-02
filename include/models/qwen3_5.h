@@ -40,6 +40,11 @@ namespace fastllm {
     Qwen35AttentionProjectionLayout ResolveQwen35AttentionProjectionLayout(
             const WeightMap &weight,
             const std::string &layerPrefix);
+    bool MergeQwen35TemporalPatchEmbeddings(
+            const Data &firstFrameWeight,
+            const Data &secondFrameWeight,
+            Data &mergedWeight,
+            std::string &error);
 
     int SelectQwen35DecodeTokensForPageBudget(
             int requestedTokens,
@@ -198,6 +203,14 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr) override;
+
+        virtual std::string GetImagePlaceholder() const override;
+
+        virtual bool PrepareMultimodalImageInputs(
+                std::string &prompt,
+                const std::vector<MultimodalImage> &images,
+                std::map<std::string, std::vector<Data*> > &multimodalInput,
+                std::string &error) const override;
         
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
@@ -413,6 +426,8 @@ namespace fastllm {
         std::vector<int> vision_deepstack_visual_indexes;
         std::vector<float> vision_image_mean = {0.5f, 0.5f, 0.5f};
         std::vector<float> vision_image_std = {0.5f, 0.5f, 0.5f};
+        int vision_image_min_pixels = 56 * 56;
+        int vision_image_max_pixels = 28 * 28 * 1280;
         Data visionSinData;
         Data visionCosData;
 

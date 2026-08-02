@@ -12,6 +12,7 @@
 #include "utils/stop_string_matcher.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -78,6 +79,65 @@ namespace fastllm {
             return Qwen35AttentionProjectionLayout::SplitQkv;
         }
         return Qwen35AttentionProjectionLayout::Missing;
+    }
+    bool MergeQwen35TemporalPatchEmbeddings(
+            const Data &firstFrameWeight,
+            const Data &secondFrameWeight,
+            Data &mergedWeight,
+            std::string &error) {
+        error.clear();
+        if (firstFrameWeight.dims != secondFrameWeight.dims ||
+            firstFrameWeight.dims.size() != 4 ||
+            firstFrameWeight.dims[0] <= 0 ||
+            firstFrameWeight.dims[1] <= 0 ||
+            firstFrameWeight.dims[2] <= 0 ||
+            firstFrameWeight.dims[3] <= 0) {
+            error =
+                "split patch embedding weights must have identical [out, channels, height, width] dimensions";
+            return false;
+        }
+
+        Data firstCpu(firstFrameWeight);
+        Data secondCpu(secondFrameWeight);
+        firstCpu.ToDevice(DataDevice::CPU);
+        secondCpu.ToDevice(DataDevice::CPU);
+        if (firstCpu.dataType != DataType::FLOAT32) {
+            ToDataType(firstCpu, DataType::FLOAT32);
+            firstCpu.ToDevice(DataDevice::CPU);
+        }
+        if (secondCpu.dataType != DataType::FLOAT32) {
+            ToDataType(secondCpu, DataType::FLOAT32);
+            secondCpu.ToDevice(DataDevice::CPU);
+        }
+
+        const int outputChannels = firstCpu.dims[0];
+        const int inputChannels = firstCpu.dims[1];
+        const size_t spatial =
+            (size_t)firstCpu.dims[2] * firstCpu.dims[3];
+        mergedWeight = Data(
+            DataType::FLOAT32,
+            {outputChannels, inputChannels, 2,
+             firstCpu.dims[2], firstCpu.dims[3]});
+        mergedWeight.Allocate();
+        const float *first = (const float *)firstCpu.cpuData;
+        const float *second = (const float *)secondCpu.cpuData;
+        float *merged = (float *)mergedWeight.cpuData;
+        for (int out = 0; out < outputChannels; out++) {
+            for (int channel = 0; channel < inputChannels; channel++) {
+                const size_t sourceOffset =
+                    ((size_t)out * inputChannels + channel) * spatial;
+                const size_t targetOffset =
+                    (((size_t)out * inputChannels + channel) * 2) *
+                    spatial;
+                std::memcpy(merged + targetOffset,
+                            first + sourceOffset,
+                            spatial * sizeof(float));
+                std::memcpy(merged + targetOffset + spatial,
+                            second + sourceOffset,
+                            spatial * sizeof(float));
+            }
+        }
+        return true;
     }
 
     int SelectQwen35DecodeTokensForPageBudget(
@@ -5581,6 +5641,151 @@ namespace fastllm {
 
     static inline int ClampInt(int value, int low, int high) {
         return std::max(low, std::min(value, high));
+    }
+
+    std::string Qwen3_5Model::GetImagePlaceholder() const {
+        return "<|vision_start|><|image_pad|><|vision_end|>";
+    }
+
+    bool Qwen3_5Model::PrepareMultimodalImageInputs(
+            std::string &prompt,
+            const std::vector<MultimodalImage> &images,
+            std::map<std::string, std::vector<Data*> > &multimodalInput,
+            std::string &error) const {
+        static const std::string imageToken = "<|image_pad|>";
+        error.clear();
+        if (images.empty()) {
+            error = "at least one decoded image is required";
+            return false;
+        }
+        if (vision_depth <= 0 || vision_hidden_size <= 0 ||
+            vision_patch_size <= 0 || vision_spatial_merge_size <= 0) {
+            error = "the loaded Qwen3.5 model has no usable vision projector";
+            return false;
+        }
+
+        size_t placeholderCount = 0;
+        for (size_t pos = 0;
+             (pos = prompt.find(imageToken, pos)) != std::string::npos;
+             pos += imageToken.size()) {
+            placeholderCount++;
+        }
+        if (placeholderCount != images.size()) {
+            error = "image placeholder count (" +
+                    std::to_string(placeholderCount) +
+                    ") does not match decoded image count (" +
+                    std::to_string(images.size()) + ")";
+            return false;
+        }
+
+        const int factor = vision_patch_size * vision_spatial_merge_size;
+        if (factor <= 0 || vision_image_min_pixels <= 0 ||
+            vision_image_max_pixels < vision_image_min_pixels) {
+            error = "the loaded Qwen3.5 image processor configuration is invalid";
+            return false;
+        }
+
+        std::vector<std::array<int32_t, 3>> grids;
+        std::vector<size_t> tokenCounts;
+        grids.reserve(images.size());
+        tokenCounts.reserve(images.size());
+        for (const auto &image : images) {
+            if (image.width <= 0 || image.height <= 0 ||
+                image.rgb.size() !=
+                    (size_t)image.width * image.height * 3) {
+                error = "decoded image dimensions do not match its RGB payload";
+                return false;
+            }
+            const double aspect =
+                (double)std::max(image.width, image.height) /
+                std::min(image.width, image.height);
+            if (aspect > 200.0) {
+                error = "image absolute aspect ratio must be at most 200";
+                return false;
+            }
+            int resizedHeight =
+                (int)std::llround((double)image.height / factor) * factor;
+            int resizedWidth =
+                (int)std::llround((double)image.width / factor) * factor;
+            int64_t resizedPixels =
+                (int64_t)resizedHeight * resizedWidth;
+            if (resizedPixels > vision_image_max_pixels) {
+                const double beta = std::sqrt(
+                    (double)image.height * image.width /
+                    vision_image_max_pixels);
+                resizedHeight = std::max(
+                    factor,
+                    (int)std::floor(image.height / beta / factor) * factor);
+                resizedWidth = std::max(
+                    factor,
+                    (int)std::floor(image.width / beta / factor) * factor);
+            } else if (resizedPixels < vision_image_min_pixels) {
+                const double beta = std::sqrt(
+                    (double)vision_image_min_pixels /
+                    ((double)image.height * image.width));
+                resizedHeight =
+                    (int)std::ceil(image.height * beta / factor) * factor;
+                resizedWidth =
+                    (int)std::ceil(image.width * beta / factor) * factor;
+            }
+            const int gridHeight = resizedHeight / vision_patch_size;
+            const int gridWidth = resizedWidth / vision_patch_size;
+            if (gridHeight <= 0 || gridWidth <= 0 ||
+                gridHeight % vision_spatial_merge_size != 0 ||
+                gridWidth % vision_spatial_merge_size != 0) {
+                error = "computed Qwen3.5 image grid is invalid";
+                return false;
+            }
+            grids.push_back({1, gridHeight, gridWidth});
+            tokenCounts.push_back(
+                (size_t)(gridHeight / vision_spatial_merge_size) *
+                (gridWidth / vision_spatial_merge_size));
+        }
+
+        std::string expandedPrompt = prompt;
+        size_t searchFrom = 0;
+        for (size_t imageIndex = 0; imageIndex < images.size(); imageIndex++) {
+            const size_t position =
+                expandedPrompt.find(imageToken, searchFrom);
+            std::string replacement;
+            replacement.reserve(tokenCounts[imageIndex] * imageToken.size());
+            for (size_t token = 0; token < tokenCounts[imageIndex]; token++) {
+                replacement += imageToken;
+            }
+            expandedPrompt.replace(
+                position, imageToken.size(), replacement);
+            searchFrom = position + replacement.size();
+        }
+
+        std::map<std::string, std::vector<Data*> > candidate;
+        std::vector<std::unique_ptr<Data>> owned;
+        auto gridTensor = std::make_unique<Data>(
+            DataType::INT32, std::vector<int>{(int)grids.size(), 3});
+        gridTensor->Allocate(false);
+        auto *gridValues =
+            reinterpret_cast<int32_t*>(gridTensor->cpuData);
+        for (size_t i = 0; i < grids.size(); i++) {
+            gridValues[i * 3] = grids[i][0];
+            gridValues[i * 3 + 1] = grids[i][1];
+            gridValues[i * 3 + 2] = grids[i][2];
+        }
+        candidate["image_grid_thw"].push_back(gridTensor.get());
+        owned.push_back(std::move(gridTensor));
+        for (const auto &image : images) {
+            auto frame = std::make_unique<Data>(
+                DataType::FLOAT32,
+                std::vector<int>{image.height, image.width, 3},
+                image.rgb);
+            candidate["image_frames"].push_back(frame.get());
+            owned.push_back(std::move(frame));
+        }
+
+        prompt = std::move(expandedPrompt);
+        multimodalInput = std::move(candidate);
+        for (auto &tensor : owned) {
+            tensor.release();
+        }
+        return true;
     }
 
     static float Qwen35BicubicWeight(float x) {
@@ -18070,6 +18275,37 @@ namespace fastllm {
                 convIt->second.Reshape({channels, 1, kernel});
             }
         }
+        const std::string patchWeightName =
+            visual_prefix + "patch_embed.proj.weight";
+        const std::string firstPatchWeightName =
+            patchWeightName + ".0";
+        const std::string secondPatchWeightName =
+            patchWeightName + ".1";
+        auto firstPatchIt = weight.weight.find(firstPatchWeightName);
+        auto secondPatchIt = weight.weight.find(secondPatchWeightName);
+        if (firstPatchIt != weight.weight.end() ||
+            secondPatchIt != weight.weight.end()) {
+            AssertInFastLLM(
+                firstPatchIt != weight.weight.end() &&
+                    secondPatchIt != weight.weight.end() &&
+                    weight.weight.find(patchWeightName) ==
+                        weight.weight.end(),
+                "Qwen3.5 split temporal patch embedding weights are incomplete or conflict with a merged weight.\n");
+            Data mergedPatchWeight;
+            std::string mergeError;
+            AssertInFastLLM(
+                MergeQwen35TemporalPatchEmbeddings(
+                    firstPatchIt->second, secondPatchIt->second,
+                    mergedPatchWeight, mergeError),
+                "Unable to merge Qwen3.5 split temporal patch embeddings: " +
+                    mergeError + ".\n");
+            weight.weight.erase(firstPatchWeightName);
+            weight.weight.erase(secondPatchWeightName);
+            Data &storedPatchWeight =
+                weight.weight[patchWeightName];
+            storedPatchWeight.CopyFrom(mergedPatchWeight);
+            storedPatchWeight.name = patchWeightName;
+        }
         if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
             return;
         }
@@ -18185,6 +18421,15 @@ namespace fastllm {
     void Qwen3_5Model::PrepareVision() {
         if (visionPrepared) {
             return;
+        }
+        if (this->dataType == DataType::FLOAT16 ||
+            this->dataType == DataType::FLOAT32) {
+            for (auto &item : this->weight.weight) {
+                if (StartWith(item.first, visual_prefix) &&
+                    item.second.dataType == DataType::BFLOAT16) {
+                    ToDataType(item.second, this->dataType);
+                }
+            }
         }
         AssertInFastLLM(vision_depth > 0 && vision_hidden_size > 0 && vision_num_heads > 0 &&
                         vision_intermediate_size > 0 && vision_out_hidden_size > 0 &&

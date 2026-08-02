@@ -211,6 +211,63 @@ namespace fastllm {
                 }
             },
             {
+                "qwen3_5_mmproj",
+                {
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.patch_embd\.weight$)"),
+                        "model.visual.patch_embed.proj.weight.0"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.patch_embd\.weight\.1$)"),
+                        "model.visual.patch_embed.proj.weight.1"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.patch_embd\.bias$)"),
+                        "model.visual.patch_embed.proj.bias"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.position_embd\.weight$)"),
+                        "model.visual.pos_embed.weight"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.ln1\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.norm1.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.attn_qkv\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.attn.qkv.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.attn_out\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.attn.proj.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.ln2\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.norm2.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.ffn_up\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.mlp.linear_fc1.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.blk\.(\d+)\.ffn_down\.(weight|bias)$)"),
+                        "model.visual.blocks.$1.mlp.linear_fc2.$2"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^v\.post_ln\.(weight|bias)$)"),
+                        "model.visual.merger.norm.$1"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^mm\.0\.(weight|bias)$)"),
+                        "model.visual.merger.linear_fc1.$1"
+                    ),
+                    GGUFWeightReplaceRule(
+                        std::regex(R"(^mm\.2\.(weight|bias)$)"),
+                        "model.visual.merger.linear_fc2.$1"
+                    )
+                }
+            },
+            {
                 "deepseek_v4",
                 {
                     GGUFWeightReplaceRule(

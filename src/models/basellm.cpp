@@ -2419,6 +2419,22 @@ namespace fastllm {
         exit(0);
     }
 
+    std::string basellm::GetImagePlaceholder() const {
+        return "";
+    }
+
+    bool basellm::PrepareMultimodalImageInputs(
+            std::string &prompt,
+            const std::vector<MultimodalImage> &images,
+            std::map<std::string, std::vector<Data*> > &multimodalInput,
+            std::string &error) const {
+        (void)prompt;
+        (void)images;
+        multimodalInput.clear();
+        error = "the loaded model does not support native image inputs";
+        return false;
+    }
+
     void basellm::NewMainLoop() {
         RunNewMainLoop(false);
     }

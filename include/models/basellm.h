@@ -24,6 +24,12 @@ using RuntimeResultBatch = std::function<void(int index, std::vector <std::strin
 namespace fastllm {
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
 
+    struct MultimodalImage {
+        int width = 0;
+        int height = 0;
+        std::vector<float> rgb;
+    };
+
     enum ResponseContextError {
         ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong
     };
@@ -354,6 +360,14 @@ namespace fastllm {
                 const GenerationConfig &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+
+        virtual std::string GetImagePlaceholder() const;
+
+        virtual bool PrepareMultimodalImageInputs(
+                std::string &prompt,
+                const std::vector<MultimodalImage> &images,
+                std::map<std::string, std::vector<Data*> > &multimodalInput,
+                std::string &error) const;
 
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);

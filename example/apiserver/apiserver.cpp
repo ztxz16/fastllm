@@ -126,7 +126,31 @@ using socket_t = int;
 #include "openai_output_parser.h"
 #include "output_token_limit.h"
 #include "stop_parser.h"
+#include "image_loader.h"
+#include "openai_multimodal_request.h"
 #include "utils/stop_string_matcher.h"
+
+class MultimodalInputGuard {
+public:
+    std::map<std::string, std::vector<fastllm::Data*> > inputs;
+
+    ~MultimodalInputGuard() {
+        if (!released) {
+            for (auto &entry : inputs) {
+                for (auto *tensor : entry.second) {
+                    delete tensor;
+                }
+            }
+        }
+    }
+
+    void Release() {
+        released = true;
+    }
+
+private:
+    bool released = false;
+};
 
 long long _GetCurrentTime() {
     auto now = std::chrono::high_resolution_clock::now();
@@ -162,6 +186,7 @@ std::map <std::string, fastllm::DataType> dataTypeDict = {
 struct APIConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     std::string modelName = "fastllm";
+    std::string multimodalProjectorPath;
 
     int threads = 4; // 使用的线程数
     bool lowMemMode = false; // 是否使用低内存模式
@@ -393,6 +418,8 @@ struct WorkQueue {
                 {"kv_cache_dtype", kvCacheDtype},
                 {"activation_dtype", fastllm::GetDataTypeName(::config.atype)},
                 {"default_max_tokens", ::config.defaultMaxTokens},
+                {"multimodal_projector_loaded",
+                    !::config.multimodalProjectorPath.empty()},
                 {"cpu_request_swap_enabled",
                     model->IsCpuRequestSwapEnabled()},
                 {"cpu_request_swap_zstd_enabled",
@@ -573,12 +600,22 @@ struct WorkQueue {
             std::string message;
 
             fastllm::ChatMessages chatMessages;
+            OpenAIParsedChatInput parsedChatInput;
             if (node->config["messages"].is_array()) {
-                for (auto &it : node->config["messages"].array_items()) {
-                    chatMessages.push_back({it["role"].string_value(), it["content"].string_value()});
+                if (!ParseOpenAIChatInput(
+                        node->config["messages"],
+                        model->GetImagePlaceholder(),
+                        parsedChatInput, node->error)) {
+                    writeJsonAndClose(
+                        400, OpenAIHttpError(node->error,
+                                             "invalid_request_error",
+                                             "invalid_messages"));
+                    return;
                 }
+                chatMessages = parsedChatInput.messages;
             } else if (node->config["prompt"].is_string()) {
-                chatMessages.push_back({"user", node->config["prompt"].string_value()});
+                chatMessages.push_back(
+                    {"user", node->config["prompt"].string_value()});
             } else {
                 node->error = "no input.\n";
             }
@@ -603,6 +640,9 @@ struct WorkQueue {
             if (rawPrompt) {
                 if (!node->config["prompt"].is_string()) {
                     node->error = "raw_prompt requires a string prompt.\n";
+                } else if (!parsedChatInput.imageUrls.empty()) {
+                    node->error =
+                        "raw_prompt cannot be combined with image content.\n";
                 } else {
                     prompt = node->config["prompt"].string_value();
                 }
@@ -615,6 +655,35 @@ struct WorkQueue {
                                          "invalid_request_error",
                                          "invalid_raw_prompt"));
                 return;
+            }
+            MultimodalInputGuard multimodalGuard;
+            if (!parsedChatInput.imageUrls.empty()) {
+                std::vector<fastllm::MultimodalImage> images;
+                images.reserve(parsedChatInput.imageUrls.size());
+                for (const auto &url : parsedChatInput.imageUrls) {
+                    OpenAIDecodedImage decoded;
+                    if (!LoadOpenAIImageUrl(url, decoded, node->error)) {
+                        writeJsonAndClose(
+                            400, OpenAIHttpError(
+                                node->error, "invalid_request_error",
+                                "invalid_image_url"));
+                        return;
+                    }
+                    fastllm::MultimodalImage image;
+                    image.width = decoded.width;
+                    image.height = decoded.height;
+                    image.rgb = std::move(decoded.rgb);
+                    images.push_back(std::move(image));
+                }
+                if (!model->PrepareMultimodalImageInputs(
+                        prompt, images, multimodalGuard.inputs,
+                        node->error)) {
+                    writeJsonAndClose(
+                        400, OpenAIHttpError(
+                            node->error, "invalid_request_error",
+                            "invalid_multimodal_input"));
+                    return;
+                }
             }
             fastllm::Data inputs = model->weight.tokenizer.Encode(prompt);
             std::vector<int> tokens;
@@ -708,7 +777,9 @@ struct WorkQueue {
                 config.tool_call_name_terminator = ">";
             }
 
-            int handleId = model->LaunchResponseTokens(tokens, config);
+            int handleId = model->LaunchResponseTokens(
+                tokens, config, multimodalGuard.inputs);
+            multimodalGuard.Release();
             const bool isStream = node->config["stream"].is_bool() &&
                                   node->config["stream"].bool_value();
             const std::string curId = "fastllm-" + GenerateRandomID();
@@ -984,6 +1055,7 @@ void Usage() {
     std::cout << "Usage:" << std::endl;
     std::cout << "[-h|--help]:                  显示帮助" << std::endl;
     std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
+    std::cout << "<--mmproj> <args>:           Qwen3.5/3.6 vision projector GGUF path" << std::endl;
     std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
@@ -1009,6 +1081,10 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             exit(0);
         } else if (sargv[i] == "-p" || sargv[i] == "--path") {
             config.path = sargv[++i];
+        } else if (sargv[i] == "--mmproj") {
+            fastllm::AssertInFastLLM(
+                i + 1 < argc, "--mmproj requires a value");
+            config.multimodalProjectorPath = sargv[++i];
         } else if (sargv[i] == "-t" || sargv[i] == "--threads") {
             config.threads = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "-l" || sargv[i] == "--low") {
@@ -1076,9 +1152,19 @@ int main(int argc, char** argv) {
         printf("模型文件 %s 不存在！\n", config.path.c_str());
         exit(0);
     }
+    if (!config.multimodalProjectorPath.empty() &&
+        !fastllm::FileExists(config.multimodalProjectorPath)) {
+        printf("多模态投影器文件 %s 不存在！\n",
+               config.multimodalProjectorPath.c_str());
+        exit(0);
+    }
     bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
+    fastllm::AssertInFastLLM(
+        !isHFDir || config.multimodalProjectorPath.empty(),
+        "--mmproj currently requires a GGUF text model.");
     workQueue.model = isHFDir ? fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt)
-        : fastllm::CreateLLMModelFromFile(config.path);
+        : fastllm::CreateLLMModelFromFile(
+              config.path, config.multimodalProjectorPath);
     workQueue.model->SetTokenLimit(config.tokens);
     workQueue.model->SetDataType(config.atype);
     if (config.kvCacheDtype != fastllm::DataType::DATA_AUTO_NONE) {

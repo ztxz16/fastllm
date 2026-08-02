@@ -25,6 +25,7 @@
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
+#include <mma.h>
 #include "sampling.cuh"
 
 extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
@@ -13992,6 +13993,442 @@ __global__ void FastllmChunkGatedDeltaRulePrefillOKernel(
         }
     }
 }
+namespace {
+constexpr int kFastllmSm70WmmaChunkSize = 64;
+constexpr int kFastllmSm70WmmaDim = 128;
+constexpr int kFastllmSm70WmmaThreads = 256;
+constexpr int kFastllmSm70WmmaStateElements =
+    kFastllmSm70WmmaDim * kFastllmSm70WmmaDim;
+constexpr int kFastllmSm70WmmaChunkElements =
+    kFastllmSm70WmmaChunkSize * kFastllmSm70WmmaDim;
+constexpr int kFastllmSm70WmmaIdentityElements = 16 * 16;
+constexpr int kFastllmSm70WmmaWarpTileFloats = 8 * 16 * 16;
+constexpr size_t kFastllmSm70WmmaSharedBytes =
+    (kFastllmSm70WmmaStateElements +
+     kFastllmSm70WmmaChunkElements +
+     kFastllmSm70WmmaIdentityElements) * sizeof(half) +
+    kFastllmSm70WmmaWarpTileFloats * sizeof(float);
+
+__global__ __launch_bounds__(kFastllmSm70WmmaThreads, 1)
+void FastllmChunkGatedDeltaRulePrefillSm70WmmaKernel(
+        const half *__restrict__ q,
+        const half *__restrict__ k,
+        const half *__restrict__ v,
+        const half *__restrict__ g,
+        const half *__restrict__ attn,
+        const half *__restrict__ kCumdecay,
+        const half *__restrict__ initialState,
+        half *__restrict__ finalState,
+        half *__restrict__ output,
+        int chunks) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    using MatrixA = wmma::fragment<
+        wmma::matrix_a, 16, 16, 16, half, wmma::row_major>;
+    using MatrixB = wmma::fragment<
+        wmma::matrix_b, 16, 16, 16, half, wmma::row_major>;
+    using Accumulator = wmma::fragment<
+        wmma::accumulator, 16, 16, 16, float>;
+
+    extern __shared__ half sharedHalf[];
+    half *stateTile = sharedHalf;
+    half *workTile =
+        stateTile + kFastllmSm70WmmaStateElements;
+    half *identityTile =
+        workTile + kFastllmSm70WmmaChunkElements;
+    float *warpTiles = reinterpret_cast<float *>(
+        identityTile + kFastllmSm70WmmaIdentityElements);
+
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const size_t stateBase =
+        (size_t)bh * kFastllmSm70WmmaStateElements;
+
+    for (int index = tid;
+         index < kFastllmSm70WmmaStateElements;
+         index += blockDim.x) {
+        stateTile[index] =
+            initialState[stateBase + index];
+    }
+    for (int index = tid;
+         index < kFastllmSm70WmmaIdentityElements;
+         index += blockDim.x) {
+        identityTile[index] = __float2half(
+            index / 16 == index % 16 ? 1.0f : 0.0f);
+    }
+    __syncthreads();
+
+    for (int chunk = 0; chunk < chunks; chunk++) {
+        const size_t chunkBase =
+            ((size_t)bh * chunks + chunk) *
+            kFastllmSm70WmmaChunkElements;
+        const size_t gBase =
+            ((size_t)bh * chunks + chunk) *
+            kFastllmSm70WmmaChunkSize;
+        const size_t attnBase =
+            ((size_t)bh * chunks + chunk) *
+            kFastllmSm70WmmaChunkSize *
+            kFastllmSm70WmmaChunkSize;
+        float *warpTile =
+            warpTiles + warp * 16 * 16;
+
+        if (tid < kFastllmSm70WmmaChunkSize) {
+            warpTiles[tid] =
+                expf(__half2float(g[gBase + tid]));
+        }
+        __syncthreads();
+        for (int index = tid;
+             index < kFastllmSm70WmmaChunkElements;
+             index += blockDim.x) {
+            int token =
+                index / kFastllmSm70WmmaDim;
+            workTile[index] = __float2half(
+                __half2float(q[chunkBase + index]) *
+                warpTiles[token]);
+        }
+        __syncthreads();
+
+        Accumulator outputFragments[4];
+        for (int rowTile = 0; rowTile < 4;
+             rowTile++) {
+            wmma::fill_fragment(
+                outputFragments[rowTile], 0.0f);
+            for (int innerTile = 0;
+                 innerTile < 8; innerTile++) {
+                MatrixA qFragment;
+                MatrixB stateFragment;
+                wmma::load_matrix_sync(
+                    qFragment,
+                    workTile +
+                        rowTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        innerTile * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::load_matrix_sync(
+                    stateFragment,
+                    stateTile +
+                        innerTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        warp * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::mma_sync(
+                    outputFragments[rowTile],
+                    qFragment, stateFragment,
+                    outputFragments[rowTile]);
+            }
+        }
+
+        for (int rowTile = 0; rowTile < 4;
+             rowTile++) {
+            wmma::store_matrix_sync(
+                warpTile, outputFragments[rowTile],
+                16, wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < 16 * 16;
+                 index += 32) {
+                warpTile[index] = __half2float(
+                    __float2half(warpTile[index]));
+            }
+            __syncwarp();
+            wmma::load_matrix_sync(
+                outputFragments[rowTile], warpTile,
+                16, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        for (int rowTile = 0; rowTile < 4;
+             rowTile++) {
+            Accumulator vNewFragment;
+            wmma::fill_fragment(vNewFragment, 0.0f);
+            for (int innerTile = 0;
+                 innerTile < 8; innerTile++) {
+                MatrixA kCumFragment;
+                MatrixB stateFragment;
+                wmma::load_matrix_sync(
+                    kCumFragment,
+                    kCumdecay + chunkBase +
+                        rowTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        innerTile * 16,
+                    kFastllmSm70WmmaDim);
+                for (int element = 0;
+                     element <
+                         kCumFragment.num_elements;
+                     element++) {
+                    kCumFragment.x[element] =
+                        __float2half(-__half2float(
+                            kCumFragment.x[element]));
+                }
+                wmma::load_matrix_sync(
+                    stateFragment,
+                    stateTile +
+                        innerTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        warp * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::mma_sync(
+                    vNewFragment, kCumFragment,
+                    stateFragment, vNewFragment);
+            }
+            wmma::store_matrix_sync(
+                warpTile, vNewFragment, 16,
+                wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < 16 * 16;
+                 index += 32) {
+                int row = index >> 4;
+                int column = index & 15;
+                int workIndex =
+                    (rowTile * 16 + row) *
+                        kFastllmSm70WmmaDim +
+                    warp * 16 + column;
+                workTile[workIndex] = __float2half(
+                    __half2float(
+                        v[chunkBase + workIndex]) +
+                    warpTile[index]);
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+
+        for (int rowTile = 0; rowTile < 4;
+             rowTile++) {
+            for (int innerTile = 0;
+                 innerTile < 4; innerTile++) {
+                MatrixA attnFragment;
+                MatrixB vNewFragment;
+                wmma::load_matrix_sync(
+                    attnFragment,
+                    attn + attnBase +
+                        rowTile * 16 *
+                            kFastllmSm70WmmaChunkSize +
+                        innerTile * 16,
+                    kFastllmSm70WmmaChunkSize);
+                wmma::load_matrix_sync(
+                    vNewFragment,
+                    workTile +
+                        innerTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        warp * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::mma_sync(
+                    outputFragments[rowTile],
+                    attnFragment, vNewFragment,
+                    outputFragments[rowTile]);
+            }
+            wmma::store_matrix_sync(
+                warpTile, outputFragments[rowTile],
+                16, wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < 16 * 16;
+                 index += 32) {
+                int row = index >> 4;
+                int column = index & 15;
+                int outputIndex =
+                    (rowTile * 16 + row) *
+                        kFastllmSm70WmmaDim +
+                    warp * 16 + column;
+                output[chunkBase + outputIndex] =
+                    __float2half(warpTile[index]);
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            warpTiles[0] = expf(__half2float(
+                g[gBase +
+                  kFastllmSm70WmmaChunkSize - 1]));
+        }
+        __syncthreads();
+        const float lastGate = warpTiles[0];
+        for (int index = tid;
+             index < kFastllmSm70WmmaStateElements;
+             index += blockDim.x) {
+            stateTile[index] = __float2half(
+                __half2float(stateTile[index]) *
+                lastGate);
+        }
+        __syncthreads();
+
+        half *scaledKTile =
+            reinterpret_cast<half *>(warpTiles);
+        for (int keyTile = 0; keyTile < 8;
+             keyTile++) {
+            Accumulator stateFragment;
+            MatrixA identityFragment;
+            MatrixB oldStateFragment;
+            wmma::fill_fragment(
+                stateFragment, 0.0f);
+            wmma::load_matrix_sync(
+                identityFragment, identityTile, 16);
+            wmma::load_matrix_sync(
+                oldStateFragment,
+                stateTile +
+                    keyTile * 16 *
+                        kFastllmSm70WmmaDim +
+                    warp * 16,
+                kFastllmSm70WmmaDim);
+            wmma::mma_sync(
+                stateFragment, identityFragment,
+                oldStateFragment, stateFragment);
+
+            for (int tokenTile = 0;
+                 tokenTile < 4; tokenTile++) {
+                if (tid < 16 * 16) {
+                    int keyRow = tid >> 4;
+                    int tokenColumn = tid & 15;
+                    int token =
+                        tokenTile * 16 + tokenColumn;
+                    int keyColumn =
+                        keyTile * 16 + keyRow;
+                    float scale = expf(
+                        __half2float(
+                            g[gBase +
+                              kFastllmSm70WmmaChunkSize -
+                              1]) -
+                        __half2float(g[gBase + token]));
+                    scaledKTile[tid] = __float2half(
+                        __half2float(
+                            k[chunkBase +
+                              token *
+                                  kFastllmSm70WmmaDim +
+                              keyColumn]) *
+                        scale);
+                }
+                __syncthreads();
+                MatrixA scaledKFragment;
+                MatrixB vNewFragment;
+                wmma::load_matrix_sync(
+                    scaledKFragment,
+                    scaledKTile, 16);
+                wmma::load_matrix_sync(
+                    vNewFragment,
+                    workTile +
+                        tokenTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        warp * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::mma_sync(
+                    stateFragment, scaledKFragment,
+                    vNewFragment, stateFragment);
+                __syncthreads();
+            }
+
+            wmma::store_matrix_sync(
+                warpTile, stateFragment, 16,
+                wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < 16 * 16;
+                 index += 32) {
+                int row = index >> 4;
+                int column = index & 15;
+                int stateIndex =
+                    (keyTile * 16 + row) *
+                        kFastllmSm70WmmaDim +
+                    warp * 16 + column;
+                stateTile[stateIndex] =
+                    __float2half(warpTile[index]);
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int index = tid;
+         index < kFastllmSm70WmmaStateElements;
+         index += blockDim.x) {
+        finalState[stateBase + index] =
+            stateTile[index];
+    }
+#endif
+}
+}
+
+bool FastllmCudaSm70WmmaChunkGdnPrefillSupported(
+        fastllm::DataType dataType, int chunks, int chunkSize,
+        int kDim, int vDim) {
+    if (dataType != fastllm::DataType::FLOAT16 || chunks <= 0 ||
+        chunkSize != kFastllmSm70WmmaChunkSize ||
+        kDim != kFastllmSm70WmmaDim ||
+        vDim != kFastllmSm70WmmaDim) {
+        return false;
+    }
+    int device = -1;
+    int major = 0;
+    int minor = 0;
+    int maxOptinShared = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(
+            &major, cudaDevAttrComputeCapabilityMajor, device) !=
+            cudaSuccess ||
+        cudaDeviceGetAttribute(
+            &minor, cudaDevAttrComputeCapabilityMinor, device) !=
+            cudaSuccess ||
+        cudaDeviceGetAttribute(
+            &maxOptinShared, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+            device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return major == 7 && minor == 0 &&
+        maxOptinShared >= (int)kFastllmSm70WmmaSharedBytes;
+}
+
+static bool FastllmCudaSm70WmmaChunkGdnPrefillEnabled(
+        fastllm::DataType dataType, int chunks, int chunkSize,
+        int kDim, int vDim) {
+    return FastllmCudaEnvFlagEnabled(
+               "FASTLLM_CUDA_SM70_WMMA_CHUNK_GDN_PREFILL") &&
+        FastllmCudaSm70WmmaChunkGdnPrefillSupported(
+            dataType, chunks, chunkSize, kDim, vDim);
+}
+
+static bool FastllmCudaTrySm70WmmaChunkGdnPrefill(
+        const half *q, const half *k, const half *v, const half *g,
+        const half *attn, const half *kCumdecay,
+        const half *initialState, half *finalState, half *output,
+        int batchHeads, int chunks, size_t stateBytes) {
+    cudaError_t status = cudaFuncSetAttribute(
+        FastllmChunkGatedDeltaRulePrefillSm70WmmaKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)kFastllmSm70WmmaSharedBytes);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaGetLastError();
+    FastllmChunkGatedDeltaRulePrefillSm70WmmaKernel<<<
+        batchHeads, kFastllmSm70WmmaThreads,
+        kFastllmSm70WmmaSharedBytes, cudaStreamPerThread>>>(
+            q, k, v, g, attn, kCumdecay, initialState, finalState,
+            output, chunks);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    status = cudaStreamSynchronize(cudaStreamPerThread);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    status = cudaMemcpyAsync(
+        const_cast<half *>(initialState), finalState, stateBytes,
+        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    int device = FastllmCudaGetDevice();
+    static thread_local std::set<int> loggedDevices;
+    if (loggedDevices.insert(device).second) {
+        printf("[FastLLM] SM70 WMMA chunk GDN prefill enabled on CUDA device %d.\n",
+               device);
+    }
+    return true;
+}
 
 static bool FastllmCudaSm70FusedChunkGdnPrefillEnabled(
         fastllm::DataType dataType, int chunks, int chunkSize,
@@ -14066,8 +14503,12 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     long long qChunkStride = (long long)chunk_size * kdim;
     long long vChunkStride = (long long)chunk_size * vdim;
     long long attnChunkStride = (long long)chunk_size * chunk_size;
-    bool useSm70Fused = FastllmCudaSm70FusedChunkGdnPrefillEnabled(
-        q.dataType, chunks, chunk_size, kdim, vdim);
+    bool useSm70Wmma =
+        FastllmCudaSm70WmmaChunkGdnPrefillEnabled(
+            q.dataType, chunks, chunk_size, kdim, vdim);
+    bool useSm70Fused = !useSm70Wmma &&
+        FastllmCudaSm70FusedChunkGdnPrefillEnabled(
+            q.dataType, chunks, chunk_size, kdim, vdim);
     bool useBatchedGemm = !useSm70Fused &&
                           (q.dataType == fastllm::DataType::FLOAT32 ||
                            q.dataType == fastllm::DataType::FLOAT16);
@@ -14076,8 +14517,9 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     bool useFusedPreprocess = useBatchedGemm && chunk_size == 64 &&
         FastllmCudaEnvFlagEnabled(
             "FASTLLM_CUDA_CHUNK_GDN_FUSED_PREPROCESS");
-    bool usePersistentScratch = FastllmCudaEnvFlagEnabled(
-        "FASTLLM_CUDA_CHUNK_GDN_PERSISTENT_SCRATCH");
+    bool usePersistentScratch = useSm70Wmma ||
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_CHUNK_GDN_PERSISTENT_SCRATCH");
 
     size_t hElems = (size_t)batch * heads * chunks * kdim * vdim;
     size_t vNewElems = useBatchedGemm ? (size_t)bhCount * vChunkStride
@@ -14093,8 +14535,11 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         FastllmCudaAlignBytes((size_t)bhCount * chunk_size * sizeof(float), 256) : 0;
     size_t gLastExpBytes = useBatchedGemm && !useFusedPreprocess ?
         FastllmCudaAlignBytes((size_t)bhCount * sizeof(float), 256) : 0;
+    size_t wmmaStateBytes = useSm70Wmma ? FastllmCudaAlignBytes(
+        (size_t)bhCount * stateStride * unitBytes, 256) : 0;
     size_t scratchBytes = hBytes + vNewBytes + qScaledBytes +
-        kScaledTransBytes + gScaleBytes + gLastExpBytes;
+        kScaledTransBytes + gScaleBytes + gLastExpBytes +
+        wmmaStateBytes;
     uint8_t *persistentScratch = usePersistentScratch ?
         (uint8_t*)FastllmBorrowChunkGdnPersistentScratch(scratchBytes) : nullptr;
     usePersistentScratch = persistentScratch != nullptr;
@@ -14109,6 +14554,8 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     };
     void *hData = useBatchedGemm ? nullptr : borrowScratch(hBytes);
     void *vNewData = borrowScratch(vNewBytes);
+    void *wmmaStateData = useSm70Wmma ?
+        borrowScratch(wmmaStateBytes) : nullptr;
 
     void *qData = FastllmCudaPrepareInput(q);
     void *kData = FastllmCudaPrepareInput(k);
@@ -14122,17 +14569,32 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     void *kScaledTransData = nullptr;
     float *gScaleData = nullptr;
     float *gLastExpData = nullptr;
+    size_t qScaledElems = (size_t)bhCount * qChunkStride;
+    size_t stateElems = (size_t)bhCount * stateStride;
+    size_t kScaledTransElems =
+        (size_t)bhCount * kdim * chunk_size;
 
     if (useBatchedGemm) {
-        size_t qScaledElems = (size_t)bhCount * qChunkStride;
-        size_t stateElems = (size_t)bhCount * stateStride;
-        size_t kScaledTransElems = (size_t)bhCount * kdim * chunk_size;
         qScaledData = borrowScratch(qScaledBytes);
         kScaledTransData = borrowScratch(kScaledTransBytes);
         if (!useFusedPreprocess) {
             gScaleData = (float*)borrowScratch(gScaleBytes);
             gLastExpData = (float*)borrowScratch(gLastExpBytes);
         }
+    }
+
+    bool wmmaCompleted = false;
+    if (useSm70Wmma && wmmaStateData != nullptr) {
+        wmmaCompleted = FastllmCudaTrySm70WmmaChunkGdnPrefill(
+            (const half *)qData, (const half *)kData,
+            (const half *)vData, (const half *)gData,
+            (const half *)attnData, (const half *)kCumData,
+            (const half *)stateData, (half *)wmmaStateData,
+            (half *)outData, (int)bhCount, chunks,
+            (size_t)bhCount * stateStride * unitBytes);
+    }
+
+    if (!wmmaCompleted && useBatchedGemm) {
 
         const int threads = 256;
         int qScaleBlocks = (int)((qScaledElems + threads - 1) / threads);
@@ -14220,7 +14682,7 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                 (long long)kdim * chunk_size, vChunkStride, stateStride,
                 1.0f, 1.0f);
         }
-    } else {
+    } else if (!wmmaCompleted) {
         const int BVHSmall = 16;
         const int BVHLarge = 32;
         const int BVO = 32;
@@ -14316,6 +14778,7 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         if (gLastExpData != nullptr) FastllmCudaFree(gLastExpData);
         if (hData != nullptr) FastllmCudaFree(hData);
         if (vNewData != nullptr) FastllmCudaFree(vNewData);
+        if (wmmaStateData != nullptr) FastllmCudaFree(wmmaStateData);
     }
 }
 

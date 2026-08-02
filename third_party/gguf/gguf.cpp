@@ -1016,6 +1016,8 @@ namespace fastllm {
             weight->dataType = DataType::FLOAT32;
         } else if (tensor->type == ggml_type::GGML_TYPE_F16) {
             weight->dataType = DataType::FLOAT16;
+        } else if (tensor->type == ggml_type::GGML_TYPE_BF16) {
+            weight->dataType = DataType::BFLOAT16;
         } else if (tensor->type == ggml_type::GGML_TYPE_I32) {
             weight->dataType = DataType::INT32;
         } else {

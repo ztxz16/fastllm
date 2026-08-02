@@ -15,6 +15,8 @@
 #include "../../example/apiserver/openai_output_parser.h"
 #include "../../example/apiserver/output_token_limit.h"
 #include "../../example/apiserver/stop_parser.h"
+#include "../../example/apiserver/image_loader.h"
+#include "../../example/apiserver/openai_multimodal_request.h"
 #include "../../include/utils/stop_token_matcher.h"
 #include "../../include/utils/stop_string_matcher.h"
 
@@ -389,6 +391,96 @@ int main() {
           "before<tool_call><function=demo>");
     CHECK(unfinishedToolDelta.toolCalls.empty());
     CHECK(unfinishedToolTrailing.toolCalls.empty());
+
+    OpenAIParsedChatInput parsedChatInput;
+    std::string multimodalError;
+    const std::string imagePlaceholder =
+        "<|vision_start|><|image_pad|><|vision_end|>";
+    const json11::Json multimodalMessages = json11::Json::array {
+        json11::Json::object {
+            {"role", "system"},
+            {"content", "Describe images precisely."}
+        },
+        json11::Json::object {
+            {"role", "user"},
+            {"content", json11::Json::array {
+                json11::Json::object {
+                    {"type", "text"}, {"text", "before "}
+                },
+                json11::Json::object {
+                    {"type", "image_url"},
+                    {"image_url", json11::Json::object {
+                        {"url", "data:image/png;base64,aGVsbG8="}
+                    }}
+                },
+                json11::Json::object {
+                    {"type", "text"}, {"text", " after"}
+                }
+            }}
+        }
+    };
+    CHECK(ParseOpenAIChatInput(multimodalMessages, imagePlaceholder,
+                               parsedChatInput, multimodalError));
+    CHECK(multimodalError.empty());
+    CHECK(parsedChatInput.messages.size() == 2);
+    CHECK(parsedChatInput.messages[1].first == "user");
+    CHECK(parsedChatInput.messages[1].second ==
+          "before " + imagePlaceholder + " after");
+    CHECK(parsedChatInput.imageUrls ==
+          std::vector<std::string>{"data:image/png;base64,aGVsbG8="});
+
+    const json11::Json malformedImageMessages = json11::Json::array {
+        json11::Json::object {
+            {"role", "user"},
+            {"content", json11::Json::array {
+                json11::Json::object {
+                    {"type", "image_url"},
+                    {"image_url", json11::Json::object {{"detail", "auto"}}}
+                }
+            }}
+        }
+    };
+    CHECK(!ParseOpenAIChatInput(malformedImageMessages, imagePlaceholder,
+                                parsedChatInput, multimodalError));
+    CHECK(multimodalError.find("image_url.url") != std::string::npos);
+
+    const json11::Json assistantImageMessages = json11::Json::array {
+        json11::Json::object {
+            {"role", "assistant"},
+            {"content", json11::Json::array {
+                json11::Json::object {
+                    {"type", "image_url"},
+                    {"image_url", json11::Json::object {
+                        {"url", "data:image/png;base64,aGVsbG8="}
+                    }}
+                }
+            }}
+        }
+    };
+    CHECK(!ParseOpenAIChatInput(assistantImageMessages, imagePlaceholder,
+                                parsedChatInput, multimodalError));
+    CHECK(multimodalError.find("user messages") != std::string::npos);
+
+    OpenAIDecodedImage decodedImage;
+#ifdef FASTLLM_APISERVER_IMAGE_DECODERS
+    CHECK(LoadOpenAIImageUrl(
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+        "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        decodedImage, multimodalError));
+    CHECK(decodedImage.width == 1);
+    CHECK(decodedImage.height == 1);
+    CHECK(decodedImage.rgb.size() == 3);
+#else
+    CHECK(!LoadOpenAIImageUrl(
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+        "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        decodedImage, multimodalError));
+    CHECK(multimodalError.find("PNG/JPEG") != std::string::npos);
+#endif
+    CHECK(!LoadOpenAIImageUrl("data:image/png;base64,not-base64!",
+                              decodedImage, multimodalError));
 
 #ifndef _WIN32
     int sockets[2];

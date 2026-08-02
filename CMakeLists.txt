@@ -502,6 +502,29 @@ if (USE_TOPS) # For suiyuan
     #target_link_libraries(main rtcu)
 endif()
 
+find_package(PNG QUIET)
+find_package(JPEG QUIET)
+find_package(OpenSSL QUIET)
+set(FASTLLM_APISERVER_IMAGE_LIBS)
+set(FASTLLM_APISERVER_IMAGE_DEFINITIONS)
+if (PNG_FOUND AND JPEG_FOUND)
+    list(APPEND FASTLLM_APISERVER_IMAGE_LIBS PNG::PNG JPEG::JPEG)
+    list(APPEND FASTLLM_APISERVER_IMAGE_DEFINITIONS
+         FASTLLM_APISERVER_IMAGE_DECODERS)
+    message(STATUS "API server PNG/JPEG image decoding enabled")
+else()
+    message(WARNING "libpng or libjpeg was not found; API image decoding is disabled")
+endif()
+if (OpenSSL_FOUND)
+    list(APPEND FASTLLM_APISERVER_IMAGE_LIBS
+         OpenSSL::SSL OpenSSL::Crypto)
+    list(APPEND FASTLLM_APISERVER_IMAGE_DEFINITIONS
+         FASTLLM_APISERVER_OPENSSL)
+    message(STATUS "API server HTTPS image loading enabled")
+else()
+    message(WARNING "OpenSSL was not found; API image loading supports data: and HTTP URLs only")
+endif()
+
 if (PY_API)
     if(POLICY CMP0148)
         cmake_policy(SET CMP0148 NEW)
@@ -551,7 +574,12 @@ if (UNIT_TEST)
 
     add_executable(testApiServerSocket
         test/apiserver/socketWriteTest.cpp
+        example/apiserver/image_loader.cpp
         third_party/json11/json11.cpp)
+    target_compile_definitions(testApiServerSocket PRIVATE
+        ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
+    target_link_libraries(testApiServerSocket PRIVATE
+        ${FASTLLM_APISERVER_IMAGE_LIBS})
 
     add_executable(testDeepSeekV4GGUFAdapter
         test/gguf/deepseek4AdapterTest.cpp)
@@ -604,8 +632,12 @@ add_custom_command(
 add_executable(benchmark example/benchmark/benchmark.cpp)
 target_link_libraries(benchmark fastllm)
 
-add_executable(apiserver example/apiserver/apiserver.cpp)
-target_link_libraries(apiserver fastllm)
+add_executable(apiserver
+    example/apiserver/apiserver.cpp
+    example/apiserver/image_loader.cpp)
+target_compile_definitions(apiserver PRIVATE
+    ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
+target_link_libraries(apiserver fastllm ${FASTLLM_APISERVER_IMAGE_LIBS})
 
 if (BUILD_CLI)
     add_executable(FastllmStudio_cli example/FastllmStudio/cli/cli.cpp example/FastllmStudio/cli/ui.cpp)

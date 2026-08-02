@@ -2669,7 +2669,97 @@ namespace fastllm {
                layerId >= mainLayerCount;
     }
 
-    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath) {
+    static void ApplyQwen35VisionProjectorMetadata(
+            basellm *model, const json11::Json &params) {
+        AssertInFastLLM(
+            params["general.architecture"].string_value() == "clip" &&
+            params["general.type"].string_value() == "mmproj",
+            "Qwen3.5 multimodal projector must be a clip mmproj GGUF.\n");
+        AssertInFastLLM(
+            params["clip.has_vision_encoder"].bool_value(),
+            "Qwen3.5 multimodal projector has no vision encoder.\n");
+        AssertInFastLLM(
+            params["clip.projector_type"].string_value() ==
+                "qwen3vl_merger",
+            "Qwen3.5 multimodal projector must use qwen3vl_merger.\n");
+
+        auto requiredInt = [&](const std::string &key) {
+            AssertInFastLLM(
+                params[key].is_number() && params[key].int_value() > 0,
+                "Qwen3.5 multimodal projector metadata `" + key +
+                    "` must be a positive integer.\n");
+            return params[key].int_value();
+        };
+        const int depth = requiredInt("clip.vision.block_count");
+        const int hiddenSize =
+            requiredInt("clip.vision.embedding_length");
+        const int numHeads =
+            requiredInt("clip.vision.attention.head_count");
+        const int intermediateSize =
+            requiredInt("clip.vision.feed_forward_length");
+        const int patchSize = requiredInt("clip.vision.patch_size");
+        const int mergeSize =
+            requiredInt("clip.vision.spatial_merge_size");
+        const int outputSize =
+            requiredInt("clip.vision.projection_dim");
+        const int imageSize = requiredInt("clip.vision.image_size");
+        AssertInFastLLM(
+            hiddenSize % numHeads == 0 &&
+            imageSize % patchSize == 0 &&
+            outputSize == model->embed_dim,
+            "Qwen3.5 multimodal projector dimensions do not match the text model.\n");
+
+        for (const auto &item :
+             params["clip.vision.is_deepstack_layers"].array_items()) {
+            AssertInFastLLM(
+                !item.bool_value(),
+                "Qwen3.5 deepstack vision projectors are not supported yet.\n");
+        }
+
+        model->weight.AddDict("vision_config.depth",
+                              std::to_string(depth));
+        model->weight.AddDict("vision_config.hidden_size",
+                              std::to_string(hiddenSize));
+        model->weight.AddDict("vision_config.num_heads",
+                              std::to_string(numHeads));
+        model->weight.AddDict("vision_config.intermediate_size",
+                              std::to_string(intermediateSize));
+        model->weight.AddDict("vision_config.patch_size",
+                              std::to_string(patchSize));
+        model->weight.AddDict("vision_config.temporal_patch_size", "2");
+        model->weight.AddDict("vision_config.spatial_merge_size",
+                              std::to_string(mergeSize));
+        model->weight.AddDict("vision_config.out_hidden_size",
+                              std::to_string(outputSize));
+        const int gridSize = imageSize / patchSize;
+        model->weight.AddDict(
+            "vision_config.num_position_embeddings",
+            std::to_string(gridSize * gridSize));
+
+        auto addTokenId = [&](const std::string &token,
+                              const std::string &dictKey,
+                              bool required) {
+            auto tokenIt =
+                model->weight.tokenizer.stringToTokenDict.find(token);
+            if (tokenIt == model->weight.tokenizer.stringToTokenDict.end()) {
+                AssertInFastLLM(
+                    !required,
+                    "Qwen3.5 tokenizer is missing required multimodal token `" +
+                        token + "`.\n");
+                return;
+            }
+            model->weight.AddDict(dictKey,
+                                  std::to_string(tokenIt->second));
+        };
+        addTokenId("<|image_pad|>", "image_token_id", true);
+        addTokenId("<|video_pad|>", "video_token_id", false);
+        addTokenId("<|vision_start|>", "vision_start_token_id", true);
+        addTokenId("<|vision_end|>", "vision_end_token_id", true);
+    }
+
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
+            const std::string &fileName, const std::string &originalPath,
+            const std::string &multimodalProjectorPath) {
         std::vector <ReadGGUFTask> readGGUFTasks;
         std::map <std::string, ReadGGUFTask*> readGGUFTaskDict;
         std::vector <std::string> ggufFileNames = GenerateGGUFFileList(fileName);
@@ -2686,6 +2776,33 @@ namespace fastllm {
         std::string arch = sourceArch;
         const bool sourceQwen35GGUF = sourceArch == "qwen35" || sourceArch == "qwen3_5";
         const bool sourceDeepSeek4GGUF = sourceArch == "deepseek4" || sourceArch == "deepseek_v4";
+        std::vector <std::string> multimodalProjectorFiles;
+        json11::Json multimodalProjectorParams;
+        if (!multimodalProjectorPath.empty()) {
+            AssertInFastLLM(
+                sourceQwen35GGUF,
+                "A Qwen3.5 multimodal projector can only be attached to a Qwen3.5 GGUF model.\n");
+            multimodalProjectorFiles =
+                GenerateGGUFFileList(multimodalProjectorPath);
+            AssertInFastLLM(
+                !multimodalProjectorFiles.empty(),
+                "0 multimodal projector GGUF files found!\n");
+            json11::Json projectorConfig;
+            ReadGGUFMetaData(multimodalProjectorFiles.front(),
+                             projectorConfig);
+            multimodalProjectorParams = projectorConfig["params"];
+            AssertInFastLLM(
+                multimodalProjectorParams["general.architecture"].string_value() ==
+                        "clip" &&
+                    multimodalProjectorParams["general.type"].string_value() ==
+                        "mmproj",
+                "Multimodal projector must be a clip mmproj GGUF file.\n");
+            printf("Load multimodal projector from files:\n");
+            for (const auto &projectorFile :
+                 multimodalProjectorFiles) {
+                printf("%s\n", projectorFile.c_str());
+            }
+        }
         if (sourceArch == "qwen35moe" || sourceArch == "qwen3_5_moe") {
             throw std::runtime_error("Unsupported Qwen3.5 MoE GGUF architecture: " + sourceArch + ".");
         }
@@ -2948,6 +3065,28 @@ namespace fastllm {
                     ReportModelLoadProgress("tokenizer", idx, tokenTotal);
                 }
             }
+            const auto &tokenTypeItems =
+                params["tokenizer.ggml.token_type"].array_items();
+            if (tokenTypeItems.size() == tokenItems.size()) {
+                std::map<std::string, int> specialTokens;
+                for (int tokenIndex = 0; tokenIndex < tokenTotal;
+                     tokenIndex++) {
+                    const int tokenType =
+                        tokenTypeItems[tokenIndex].int_value();
+                    // GGML token types 3 and 4 are CONTROL and
+                    // USER_DEFINED. Both must remain atomic during BPE.
+                    if (tokenType == 3 || tokenType == 4) {
+                        specialTokens[
+                            tokenItems[tokenIndex].string_value()] =
+                                tokenIndex;
+                    }
+                }
+                if (!specialTokens.empty()) {
+                    model->weight.tokenizer.SetSpecialTokens(specialTokens);
+                    model->weight.AddDict(
+                        "tokenizer_has_special_tokens", "1");
+                }
+            }
             if (tokenTotal == 0) {
                 ReportModelLoadProgress("tokenizer", 1, 1);
             }
@@ -2972,6 +3111,10 @@ namespace fastllm {
                 }
             }
         }
+        if (!multimodalProjectorFiles.empty()) {
+            ApplyQwen35VisionProjectorMetadata(
+                model, multimodalProjectorParams);
+        }
 
         arch = ConvertGGUFTypeToFastllmType(sourceArch);
         int ggufMainLayerCount = GetGLMDSAGGUFMainLayerCount(params, arch, model);
@@ -2987,6 +3130,10 @@ namespace fastllm {
         ReportModelLoadProgress("weights_prepare", 0, 1);
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
+        }
+        for (const auto &projectorFile : multimodalProjectorFiles) {
+            AppendGGUFTasks("qwen3_5_mmproj", projectorFile,
+                            readGGUFTasks);
         }
         // Qwen3.5 GGUF: the nextn-specific tensors (eh_proj/enorm/hnorm/...)
         // are renamed to mtp.* by the GGUF rules. The MTP block's attention/FFN
@@ -3354,10 +3501,16 @@ namespace fastllm {
         return std::unique_ptr<fastllm::basellm> (model);
     }
 
-    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
+    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(
+            const std::string &fileName,
+            const std::string &multimodalProjectorPath) {
         if (IsGGUFFile(fileName)) {
-            return CreateLLMModelFromGGUFFile(fileName, "");
+            return CreateLLMModelFromGGUFFile(
+                fileName, "", multimodalProjectorPath);
         }
+        AssertInFastLLM(
+            multimodalProjectorPath.empty(),
+            "A GGUF multimodal projector requires a GGUF text model.\n");
         std::string modelType = GetModelTypeFromFile(fileName);
         basellm *model = CreateModelWithType(modelType);
         if(modelType == "bert"){

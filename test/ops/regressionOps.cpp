@@ -264,6 +264,56 @@ namespace {
             }
         }
 
+        void ConfigureVisionPreparationFixture(
+                fastllm::DataType computeType) {
+            this->dataType = computeType;
+            visionPrepared = false;
+            vision_depth = 1;
+            vision_hidden_size = 1;
+            vision_num_heads = 1;
+            vision_head_dim = 4;
+            vision_intermediate_size = 1;
+            vision_patch_size = 1;
+            vision_temporal_patch_size = 1;
+            vision_out_hidden_size = 1;
+            vision_num_position_embeddings = 1;
+            vision_num_grid_per_side = 1;
+
+            auto addBf16Weight = [&](const std::string &name,
+                                     const std::vector<int> &dims) {
+                size_t count = 1;
+                for (int dim : dims) {
+                    count *= (size_t)dim;
+                }
+                weight.weight[name].CopyFrom(fastllm::Data(
+                    fastllm::DataType::BFLOAT16, dims,
+                    std::vector<float>(count, 1.0f)));
+            };
+            addBf16Weight(
+                visual_prefix + "patch_embed.proj.weight", {1, 3});
+            addBf16Weight(
+                visual_prefix + "patch_embed.proj.bias", {1});
+            addBf16Weight(visual_prefix + "pos_embed.weight", {1});
+            addBf16Weight(visual_prefix + "merger.norm.weight", {1});
+            addBf16Weight(visual_prefix + "merger.norm.bias", {1});
+            addBf16Weight(
+                visual_prefix + "merger.linear_fc1.weight", {1, 1});
+            addBf16Weight(
+                visual_prefix + "merger.linear_fc1.bias", {1});
+            addBf16Weight(
+                visual_prefix + "merger.linear_fc2.weight", {1, 1});
+            addBf16Weight(
+                visual_prefix + "merger.linear_fc2.bias", {1});
+            addBf16Weight(
+                visual_prefix + "blocks.0.attn.qkv.weight", {1, 1});
+            addBf16Weight(
+                language_prefix + "embed_tokens.weight", {1, 1});
+        }
+
+        void PrepareVisionForTest() {
+            PrepareVision();
+        }
+
         void InstallMtpCacheFixture(
                 fastllm::ResponseContext *context,
                 int tokens) {
@@ -906,6 +956,24 @@ namespace {
         tensor.rawData.resize(ggml_row_size(type, dims[0]) * rows, 0);
         return tensor;
     }
+    SyntheticGGUFTensor MakeSyntheticBf16Tensor(
+            const std::string &name,
+            const std::vector<int64_t> &dims,
+            const std::vector<float> &values) {
+        SyntheticGGUFTensor tensor;
+        tensor.name = name;
+        tensor.dims = dims;
+        tensor.ggmlType = GGML_TYPE_BF16;
+        tensor.rawData.resize(values.size() * sizeof(uint16_t));
+        auto *output =
+            reinterpret_cast<uint16_t*>(tensor.rawData.data());
+        for (size_t i = 0; i < values.size(); i++) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &values[i], sizeof(bits));
+            output[i] = (uint16_t)(bits >> 16);
+        }
+        return tensor;
+    }
 
     template <typename T>
     void WritePod(std::ofstream &out, T value) {
@@ -936,6 +1004,12 @@ namespace {
         WriteGGUFString(out, key);
         WritePod<int32_t>(out, 6);
         WritePod<float>(out, value);
+    }
+    void WriteGGUFBoolKV(std::ofstream &out, const std::string &key,
+                         bool value) {
+        WriteGGUFString(out, key);
+        WritePod<int32_t>(out, 7);
+        WritePod<uint8_t>(out, value ? 1 : 0);
     }
 
     void WriteGGUFInt32ArrayKV(std::ofstream &out, const std::string &key,
@@ -1025,7 +1099,7 @@ namespace {
         WritePod<uint32_t>(out, 0x46554747u);
         WritePod<uint32_t>(out, 3u);
         WritePod<uint64_t>(out, tensors.size());
-        WritePod<uint64_t>(out, 18u + (tokens.empty() ? 0u : 2u));
+        WritePod<uint64_t>(out, 18u + (tokens.empty() ? 0u : 3u));
 
         WriteGGUFStringKV(out, "general.architecture", arch);
         WriteGGUFStringKV(out, "general.name", "synthetic qwen35");
@@ -1049,6 +1123,16 @@ namespace {
             Expect(eosTokenId >= 0 && eosTokenId < (int)tokens.size(),
                    "synthetic GGUF eos token must index the tokenizer vocabulary.");
             WriteGGUFStringArrayKV(out, "tokenizer.ggml.tokens", tokens);
+            std::vector<int32_t> tokenTypes(tokens.size(), 1);
+            for (size_t i = 0; i < tokens.size(); i++) {
+                if (tokens[i].size() >= 4 &&
+                    tokens[i].compare(0, 2, "<|") == 0 &&
+                    tokens[i].compare(tokens[i].size() - 2, 2, "|>") == 0) {
+                    tokenTypes[i] = 3;
+                }
+            }
+            WriteGGUFInt32ArrayKV(
+                out, "tokenizer.ggml.token_type", tokenTypes);
             WriteGGUFUInt32KV(out, "tokenizer.ggml.eos_token_id", (uint32_t)eosTokenId);
         }
 
@@ -1090,6 +1174,69 @@ namespace {
             }
             uint64_t paddedBytes = Pad32(bytes);
             for (uint64_t i = bytes; i < paddedBytes; i++) {
+                out.put('\0');
+            }
+        }
+    }
+    void WriteSyntheticQwen35MMProjGGUF(
+            const std::string &path,
+            const std::vector<SyntheticGGUFTensor> &tensors) {
+        std::ofstream out(path, std::ios::binary);
+        Expect(out.good(), "failed to create synthetic mmproj GGUF file.");
+
+        WritePod<uint32_t>(out, 0x46554747u);
+        WritePod<uint32_t>(out, 3u);
+        WritePod<uint64_t>(out, tensors.size());
+        WritePod<uint64_t>(out, 12u);
+        WriteGGUFStringKV(out, "general.architecture", "clip");
+        WriteGGUFStringKV(out, "general.type", "mmproj");
+        WriteGGUFBoolKV(out, "clip.has_vision_encoder", true);
+        WriteGGUFStringKV(out, "clip.projector_type",
+                          "qwen3vl_merger");
+        WriteGGUFUInt32KV(out, "clip.vision.block_count", 27);
+        WriteGGUFUInt32KV(out, "clip.vision.embedding_length", 1152);
+        WriteGGUFUInt32KV(out, "clip.vision.attention.head_count", 16);
+        WriteGGUFUInt32KV(out, "clip.vision.feed_forward_length", 4304);
+        WriteGGUFUInt32KV(out, "clip.vision.patch_size", 16);
+        WriteGGUFUInt32KV(out, "clip.vision.spatial_merge_size", 2);
+        WriteGGUFUInt32KV(out, "clip.vision.projection_dim", 5120);
+        WriteGGUFUInt32KV(out, "clip.vision.image_size", 768);
+
+        uint64_t offset = 0;
+        for (const auto &tensor : tensors) {
+            WriteGGUFString(out, tensor.name);
+            WritePod<uint32_t>(out, tensor.dims.size());
+            int64_t elements = 1;
+            for (int64_t dim : tensor.dims) {
+                WritePod<int64_t>(out, dim);
+                elements *= dim;
+            }
+            const uint64_t bytes = SyntheticGGUFTensorBytes(tensor);
+            Expect(tensor.ggmlType != GGML_TYPE_F32 ||
+                       elements == (int64_t)tensor.values.size(),
+                   "synthetic mmproj tensor element mismatch.");
+            WritePod<int32_t>(out, tensor.ggmlType);
+            WritePod<uint64_t>(out, offset);
+            offset += Pad32(bytes);
+        }
+
+        const uint64_t headerSize = (uint64_t)out.tellp();
+        const uint64_t paddedHeader = Pad32(headerSize);
+        for (uint64_t i = headerSize; i < paddedHeader; i++) {
+            out.put('\0');
+        }
+        for (const auto &tensor : tensors) {
+            const uint64_t bytes = SyntheticGGUFTensorBytes(tensor);
+            if (tensor.ggmlType == GGML_TYPE_F32) {
+                out.write(
+                    reinterpret_cast<const char*>(tensor.values.data()),
+                    (std::streamsize)bytes);
+            } else {
+                out.write(
+                    reinterpret_cast<const char*>(tensor.rawData.data()),
+                    (std::streamsize)bytes);
+            }
+            for (uint64_t i = bytes; i < Pad32(bytes); i++) {
                 out.put('\0');
             }
         }
@@ -1148,6 +1295,200 @@ namespace {
                        model->weight.dicts["ggufOutProjColumnsTiled"] == "1",
                    arch + " GGUF runtime layout markers were not imported.");
         }
+    }
+
+    void RunQwen35GGUFMultimodalProjectorRegression() {
+        const std::string modelPath =
+            MakeTempGGUFPath("fastllm-qwen35-mmproj-model");
+        const std::string projectorPath =
+            MakeTempGGUFPath("fastllm-qwen35-mmproj");
+        WriteSyntheticQwen35GGUF(
+            modelPath, {}, "qwen35", 1,
+            {"ordinary", "<|image_pad|>", "<|video_pad|>",
+             "<|vision_start|>", "<|vision_end|>"},
+            0);
+        WriteSyntheticQwen35MMProjGGUF(
+            projectorPath,
+            {
+                MakeSyntheticBf16Tensor(
+                    "v.patch_embd.weight", {2, 1, 2, 1},
+                    {1.0f, 2.0f, 3.0f, 4.0f}),
+                MakeSyntheticBf16Tensor(
+                    "v.patch_embd.weight.1", {2, 1, 2, 1},
+                    {5.0f, 6.0f, 7.0f, 8.0f}),
+                MakeSyntheticBf16Tensor(
+                    "v.blk.0.attn_qkv.weight", {2, 2},
+                    {9.0f, 10.0f, 11.0f, 12.0f}),
+                MakeSyntheticBf16Tensor(
+                    "mm.2.weight", {2, 2},
+                    {13.0f, 14.0f, 15.0f, 16.0f})
+            });
+
+        auto model = fastllm::CreateLLMModelFromGGUFFile(
+            modelPath, "", projectorPath);
+        std::remove(modelPath.c_str());
+        std::remove(projectorPath.c_str());
+        ExpectFloatNear(
+            {3.0f, 1.0f, 4.0f},
+            ToFloatVector(model->weight.tokenizer.Encode(
+                "<|vision_start|><|image_pad|><|vision_end|>")),
+            0.0f, 0.0f,
+            "Qwen3.5 GGUF multimodal special-token encoding");
+
+        Expect(model->weight.dicts["vision_config.depth"] == "27" &&
+                   model->weight.dicts["vision_config.hidden_size"] ==
+                       "1152" &&
+                   model->weight.dicts[
+                       "vision_config.num_position_embeddings"] == "2304",
+               "Qwen3.5 mmproj metadata was not imported.");
+        Expect(model->weight.dicts["image_token_id"] == "1" &&
+                   model->weight.dicts["video_token_id"] == "2" &&
+                   model->weight.dicts["vision_start_token_id"] == "3" &&
+                   model->weight.dicts["vision_end_token_id"] == "4",
+               "Qwen3.5 mmproj token ids were not resolved from the text tokenizer.");
+        const fastllm::Data &patch = RequireWeight(
+            *model, "model.visual.patch_embed.proj.weight");
+        Expect(
+            patch.dims == std::vector<int>({1, 2, 2, 1, 2}),
+            "Qwen3.5 mmproj split patch weights were not merged.");
+        ExpectFloatNear(
+            {1.0f, 2.0f, 5.0f, 6.0f,
+             3.0f, 4.0f, 7.0f, 8.0f},
+            ToFloatVector(patch), 0.0f, 0.0f,
+            "Qwen3.5 mmproj split patch weight order");
+        Expect(
+            model->weight.weight.find(
+                "model.visual.patch_embed.proj.weight.0") ==
+                    model->weight.weight.end() &&
+                model->weight.weight.find(
+                    "model.visual.patch_embed.proj.weight.1") ==
+                    model->weight.weight.end(),
+            "Qwen3.5 mmproj retained split patch source weights.");
+        const fastllm::Data &qkv = RequireWeight(
+            *model, "model.visual.blocks.0.attn.qkv.weight");
+        Expect(qkv.dataType == fastllm::DataType::BFLOAT16,
+               "GGUF BF16 mmproj weights were not imported as native BF16 tensors.");
+        RequireWeight(*model, "model.visual.merger.linear_fc2.weight");
+    }
+
+    void RunQwen35VisionWeightConversionRegression() {
+        ScopedFirstDevice device("cpu");
+        Qwen35ConfigTestModel model;
+        model.ConfigureVisionPreparationFixture(
+            fastllm::DataType::FLOAT16);
+        model.PrepareVisionForTest();
+
+        Expect(
+            RequireWeight(
+                model,
+                "model.visual.blocks.0.attn.qkv.weight").dataType ==
+                    fastllm::DataType::FLOAT16 &&
+                RequireWeight(
+                    model,
+                    "model.visual.patch_embed.proj.weight").dataType ==
+                    fastllm::DataType::FLOAT16,
+            "Qwen3.5 vision preparation did not convert BF16 weights "
+            "to the model compute dtype.");
+        Expect(
+            RequireWeight(
+                model,
+                "model.language_model.embed_tokens.weight").dataType ==
+                    fastllm::DataType::BFLOAT16,
+            "Qwen3.5 vision preparation converted a non-visual weight.");
+    }
+
+    void RunQwen35MultimodalPreparationRegression() {
+        Qwen35ConfigTestModel model;
+        model.weight.dicts = {
+            {"model_type", "qwen3_5"},
+            {"num_hidden_layers", "1"},
+            {"hidden_size", "5120"},
+            {"num_attention_heads", "24"},
+            {"num_key_value_heads", "4"},
+            {"head_dim", "256"},
+            {"linear_num_key_heads", "16"},
+            {"linear_num_value_heads", "48"},
+            {"linear_key_head_dim", "128"},
+            {"linear_value_head_dim", "128"},
+            {"vision_config.depth", "27"},
+            {"vision_config.hidden_size", "1152"},
+            {"vision_config.num_heads", "16"},
+            {"vision_config.intermediate_size", "4304"},
+            {"vision_config.patch_size", "16"},
+            {"vision_config.temporal_patch_size", "2"},
+            {"vision_config.spatial_merge_size", "2"},
+            {"vision_config.out_hidden_size", "5120"},
+            {"vision_config.num_position_embeddings", "2304"},
+            {"image_token_id", "10"},
+            {"video_token_id", "11"},
+            {"vision_start_token_id", "12"},
+            {"vision_end_token_id", "13"}
+        };
+        model.InitParams();
+
+        fastllm::MultimodalImage image;
+        image.width = 64;
+        image.height = 64;
+        image.rgb.assign((size_t)image.width * image.height * 3, 127.0f);
+        std::string prompt = "before<|image_pad|>after";
+        std::map<std::string, std::vector<fastllm::Data*>> inputs;
+        std::string error;
+        Expect(model.GetImagePlaceholder() ==
+                   "<|vision_start|><|image_pad|><|vision_end|>",
+               "Qwen3.5 image placeholder changed.");
+        Expect(model.PrepareMultimodalImageInputs(
+                   prompt, {image}, inputs, error),
+               "Qwen3.5 image preparation failed: " + error);
+        Expect(prompt ==
+                   "before<|image_pad|><|image_pad|><|image_pad|><|image_pad|>after",
+               "Qwen3.5 image placeholder expansion did not match the 4-token grid.");
+        Expect(inputs["image_grid_thw"].size() == 1 &&
+                   inputs["image_frames"].size() == 1,
+               "Qwen3.5 image preparation omitted native input tensors.");
+        const fastllm::Data &grid = *inputs["image_grid_thw"][0];
+        Expect(grid.dataType == fastllm::DataType::INT32 &&
+                   grid.dims == std::vector<int>({1, 3}),
+               "Qwen3.5 image grid tensor metadata is invalid.");
+        const int32_t *gridValues =
+            reinterpret_cast<const int32_t*>(grid.cpuData);
+        Expect(gridValues[0] == 1 && gridValues[1] == 4 &&
+                   gridValues[2] == 4,
+               "Qwen3.5 image grid values are invalid.");
+        const fastllm::Data &frames = *inputs["image_frames"][0];
+        Expect(frames.dataType == fastllm::DataType::FLOAT32 &&
+                   frames.dims == std::vector<int>({64, 64, 3}),
+               "Qwen3.5 raw image tensor metadata is invalid.");
+        for (auto &entry : inputs) {
+            for (auto *tensor : entry.second) {
+                delete tensor;
+            }
+        }
+        inputs.clear();
+
+        prompt = "no placeholder";
+        Expect(!model.PrepareMultimodalImageInputs(
+                   prompt, {image}, inputs, error),
+               "Qwen3.5 image preparation accepted a missing placeholder.");
+        Expect(inputs.empty(),
+               "failed Qwen3.5 image preparation leaked partial tensors.");
+        fastllm::Data firstPatch(
+            fastllm::DataType::FLOAT32, {1, 2, 1, 2},
+            std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f});
+        fastllm::Data secondPatch(
+            fastllm::DataType::FLOAT32, {1, 2, 1, 2},
+            std::vector<float>{5.0f, 6.0f, 7.0f, 8.0f});
+        fastllm::Data mergedPatch;
+        Expect(fastllm::MergeQwen35TemporalPatchEmbeddings(
+                   firstPatch, secondPatch, mergedPatch, error),
+               "Qwen3.5 split patch embedding merge failed: " + error);
+        Expect(
+            mergedPatch.dims == std::vector<int>({1, 2, 2, 1, 2}),
+            "Qwen3.5 merged patch embedding dimensions are invalid.");
+        ExpectFloatNear(
+            {1.0f, 2.0f, 5.0f, 6.0f,
+             3.0f, 4.0f, 7.0f, 8.0f},
+            ToFloatVector(mergedPatch), 0.0f, 0.0f,
+            "Qwen3.5 split patch embedding temporal order");
     }
 
     void RunQwen35GGUFFailFastRegression() {
@@ -3954,6 +4295,16 @@ namespace {
             std::cout << "SM70 fused chunk GDN prefill regression: SKIP\n";
             return;
         }
+        Expect(
+            FastllmCudaSm70WmmaChunkGdnPrefillSupported(
+                fastllm::DataType::FLOAT16, 32, 64, 128, 128),
+            "SM70 WMMA chunk GDN rejected the supported production shape.");
+        Expect(
+            !FastllmCudaSm70WmmaChunkGdnPrefillSupported(
+                fastllm::DataType::FLOAT16, 32, 32, 128, 128),
+            "SM70 WMMA chunk GDN accepted an unsupported chunk size.");
+        ScopedEnvVar wmmaDisabled(
+            "FASTLLM_CUDA_SM70_WMMA_CHUNK_GDN_PREFILL", "0");
 
         constexpr int batch = 1;
         constexpr int heads = 48;
@@ -4006,6 +4357,9 @@ namespace {
         fastllm::Data optimizedState = MakeCudaTensor(
             fastllm::DataType::FLOAT16, stateDims, initialState);
         fastllm::Data optimizedOutput;
+        fastllm::Data wmmaState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data wmmaOutput;
         fastllm::Data arenaState = MakeCudaTensor(
             fastllm::DataType::FLOAT16, stateDims, initialState);
         fastllm::Data arenaOutput;
@@ -4028,6 +4382,13 @@ namespace {
                 "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL", "1");
             FastllmChunkGatedDeltaRulePrefill(
                 q, k, v, g, attn, kCumdecay, fusedState, fusedOutput);
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        {
+            ScopedEnvVar enabled(
+                "FASTLLM_CUDA_SM70_WMMA_CHUNK_GDN_PREFILL", "1");
+            FastllmChunkGatedDeltaRulePrefill(
+                q, k, v, g, attn, kCumdecay, wmmaState, wmmaOutput);
             FastllmCudaSyncCurrentThreadStream();
         }
         {
@@ -4061,6 +4422,12 @@ namespace {
         ExpectFloatNear(ToFloatVector(gemmOutput), ToFloatVector(fusedOutput),
                         2e-3f, 2e-3f,
                         "SM70 fused chunk GDN output");
+        ExpectFloatNear(ToFloatVector(gemmState), ToFloatVector(wmmaState),
+                        2e-3f, 2e-3f,
+                        "SM70 WMMA chunk GDN recurrent state");
+        ExpectFloatNear(ToFloatVector(gemmOutput), ToFloatVector(wmmaOutput),
+                        2e-3f, 2e-3f,
+                        "SM70 WMMA chunk GDN output");
         ExpectFloatNear(ToFloatVector(gemmState), ToFloatVector(optimizedState),
                         0.0f, 0.0f,
                         "optimized chunk GDN recurrent state");
@@ -4073,11 +4440,14 @@ namespace {
         ExpectFloatNear(ToFloatVector(gemmOutput), ToFloatVector(arenaOutput),
                         0.0f, 0.0f,
                         "persistent scratch chunk GDN output");
-        auto benchmark = [&](const char *fused, const char *asyncGather,
+        auto benchmark = [&](const char *wmma, const char *fused,
+                             const char *asyncGather,
                              const char *fusedPreprocess,
                              const char *persistentScratch,
                              fastllm::Data &state,
                              fastllm::Data &output) {
+            ScopedEnvVar wmmaGate(
+                "FASTLLM_CUDA_SM70_WMMA_CHUNK_GDN_PREFILL", wmma);
             ScopedEnvVar fusedGate(
                 "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL", fused);
             ScopedEnvVar gatherGate(
@@ -4100,21 +4470,27 @@ namespace {
             return std::chrono::duration<double, std::milli>(end - begin).count() /
                    iterations;
         };
-        double gemmMs = benchmark("0", "0", "0", "0", gemmState, gemmOutput);
-        double arenaMs = benchmark("0", "0", "0", "1", arenaState, arenaOutput);
-        double asyncGatherMs = benchmark("0", "1", "0", "0", optimizedState,
-                                         optimizedOutput);
-        double fusedPreprocessMs = benchmark("0", "0", "1", "0", optimizedState,
-                                             optimizedOutput);
-        double combinedMs = benchmark("0", "1", "1", "0", optimizedState,
-                                      optimizedOutput);
-        double fusedMs = benchmark("1", "0", "0", "0", fusedState, fusedOutput);
+        double gemmMs = benchmark("0", "0", "0", "0", "0",
+                                  gemmState, gemmOutput);
+        double arenaMs = benchmark("0", "0", "0", "0", "1",
+                                   arenaState, arenaOutput);
+        double asyncGatherMs = benchmark("0", "0", "1", "0", "0",
+                                         optimizedState, optimizedOutput);
+        double fusedPreprocessMs = benchmark("0", "0", "0", "1", "0",
+                                             optimizedState, optimizedOutput);
+        double combinedMs = benchmark("0", "0", "1", "1", "0",
+                                      optimizedState, optimizedOutput);
+        double fusedMs = benchmark("0", "1", "0", "0", "0",
+                                   fusedState, fusedOutput);
+        double wmmaMs = benchmark("1", "0", "0", "0", "0",
+                                  wmmaState, wmmaOutput);
         std::cout << "SM70 chunk GDN prefill 2K microbenchmark: baseline="
                   << gemmMs << " ms persistent_scratch=" << arenaMs
                   << " ms async_gather=" << asyncGatherMs
                   << " ms fused_preprocess=" << fusedPreprocessMs
-                  << " ms combined=" << combinedMs << " ms fused_h_o="
-                  << fusedMs << " ms\n";
+                  << " ms combined=" << combinedMs
+                  << " ms fused_h_o=" << fusedMs
+                  << " ms wmma=" << wmmaMs << " ms\n";
         std::cout << "SM70 fused chunk GDN prefill regression: PASS\n";
     }
 
@@ -9582,6 +9958,9 @@ int main() {
             RunQwen35GGUFFailFastRegression();
             RunQwen35GGUFWorkerExceptionRegression();
             RunQwen35MixedQuantGGUFProjectionRegression();
+            RunQwen35GGUFMultimodalProjectorRegression();
+            RunQwen35VisionWeightConversionRegression();
+            RunQwen35MultimodalPreparationRegression();
 #ifdef USE_CUDA
             RunQwen35OutProjTpLayoutRegression();
 #endif
@@ -9814,6 +10193,9 @@ int main() {
         RunQwen35GGUFFailFastRegression();
         RunQwen35GGUFWorkerExceptionRegression();
         RunQwen35MixedQuantGGUFProjectionRegression();
+        RunQwen35GGUFMultimodalProjectorRegression();
+        RunQwen35VisionWeightConversionRegression();
+        RunQwen35MultimodalPreparationRegression();
         RunCpuEmbeddingDirectInMemoryLowMemRegression();
         RunQwen35SplitGdnProjectionLayoutRegression();
         RunQwen35SplitAttentionProjectionLayoutRegression();

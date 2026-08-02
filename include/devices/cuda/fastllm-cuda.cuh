@@ -1060,6 +1060,9 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
     fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
+bool FastllmCudaSm70WmmaChunkGdnPrefillSupported(
+    fastllm::DataType dataType, int chunks, int chunkSize,
+    int kDim, int vDim);
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out);

@@ -201,13 +201,14 @@ IQ4_XS 的大 batch prefill 走“量化权重反量化到 FP16 scratch + cuBLAS
 1. **先量化 IQ4_XS 大 N 线性。** 已加入 SM70 wide-N tiled prefill 路径，并用 N=2048/4096/8192 microbenchmark 与完整 32K 请求共同门控；不支持的 shape 保留原 GEMM fallback。
 2. **实现 compute/snapshot 解耦。** 这是保持 2K 缓存粒度同时减少大权重重复反量化的最高杠杆候选，当前仍未实现。
 3. **只保留正确的通用小优化。** SM70 GDN pre-core 从约 0.637ms 降至 0.446ms/层/2K，但整机仅约 0.4%，因此仍默认关闭。
-4. **不启用负结果。** SM70 fused H/O 为约 8.05ms，对比 cuBLAS fallback 约 1.88ms；GQA batched cuBLAS、async gather、fused preprocess 和 persistent scratch 也没有稳定收益。
+4. **不启用负结果。** SM70 fused H/O 为约 8.05ms，对比 cuBLAS fallback 约 1.88ms；SM70 WMMA 最佳单 CTA/head V128 调度为 3.052ms，对比同轮 cuBLAS 1.870ms，慢 63.2%；GQA batched cuBLAS、async gather、fused preprocess 和 persistent scratch 也没有稳定收益。
 5. **容量优化与算子优化分别记账。** resident batch、CPU state swap、zstd 请求状态层和成本门控的 NVMe prefix 页层已经交付，解决多会话容量与热前缀命中，不代表 cold prefill 算子本身变快。
 
 当前实验 gate 均默认关闭：
 
 - `FASTLLM_CUDA_SM70_GDN_PRECORE`
 - `FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL`
+- `FASTLLM_CUDA_SM70_WMMA_CHUNK_GDN_PREFILL`
 - `FASTLLM_CUDA_CHUNK_GDN_ASYNC_GATHER`
 - `FASTLLM_CUDA_CHUNK_GDN_FUSED_PREPROCESS`
 - `FASTLLM_CUDA_CHUNK_GDN_PERSISTENT_SCRATCH`
