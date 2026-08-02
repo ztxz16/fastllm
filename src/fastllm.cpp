@@ -123,14 +123,20 @@ namespace fastllm {
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
             if (data.isModelWeight && !data.directMemory) {
-                return FastllmCudaMallocModelWeight(bytes);
+                return FastllmCudaMallocModelWeight(bytes, data.name);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
 
-        static void CheckCudaMallocForData(const Data &data, void *ptr, uint64_t bytes, const char *context) {
+        static bool CheckCudaMallocForData(const Data &data, void *&ptr,
+                                           uint64_t bytes, const char *context,
+                                           bool allowGraphCapturePlaceholder = false) {
             if (ptr != nullptr) {
-                return;
+                return true;
+            }
+            if (allowGraphCapturePlaceholder &&
+                FastllmCudaGraphGetAllocationFailurePlaceholder(&ptr)) {
+                return false;
             }
             std::string msg = "Error: cuda malloc failed in " + std::string(context) +
                               ". requestBytes = " + std::to_string(bytes) +
@@ -144,6 +150,7 @@ namespace fastllm {
             }
             msg += ".\n";
             ErrorInFastLLM(msg);
+            return false;
         }
 
         static void CudaFreeForData(const Data &data, void *ptr) {
@@ -996,6 +1003,7 @@ namespace fastllm {
         this->tpQHeads = ori.tpQHeads;
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
+        this->tpSplitUnit = ori.tpSplitUnit;
         bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
                                      (this->ggmlTensor == nullptr || this->ggmlType != ori.ggmlType);
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
@@ -1925,7 +1933,18 @@ namespace fastllm {
 #ifdef USE_CUDA
             this->cudaData = CudaMallocForData(*this, this->expansionBytes);
             this->cudaDataBorrowed = false;
-            CheckCudaMallocForData(*this, this->cudaData, this->expansionBytes, "Data::MallocSpace");
+            bool allocated = CheckCudaMallocForData(
+                *this, this->cudaData, this->expansionBytes,
+                "Data::MallocSpace", true);
+            if (!allocated) {
+                // The placeholder keeps host-side operator setup and TP/NCCL
+                // sequencing intact until every rank reaches the common graph
+                // abort barrier. Mark it borrowed and force the next eager
+                // Allocate() to replace it with real storage.
+                this->cudaDataBorrowed = true;
+                this->expansionSize = 0;
+                return;
+            }
             if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
                 for (auto it : this->multiDeviceDatas) {
                     delete it.second;
@@ -2113,6 +2132,9 @@ namespace fastllm {
         if (this->dataType == DataType::NVFP4 && this->isModelWeight &&
             this->directMemory) {
             MultiCudaReleaseMoeWeightCaches(this);
+            FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
+        } else if (this->dataType == DataType::INT4_GROUP &&
+                   this->isModelWeight) {
             FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
         }
 #endif
@@ -4608,6 +4630,33 @@ namespace fastllm {
         }, {{"ropeTheta", ropeTheta}, {"factor", factor},
             {"originalMaxPosition", originalMaxPosition},
             {"lowFreqFactor", lowFreqFactor}, {"highFreqFactor", highFreqFactor}},
+           {{"rotaryDim", rotaryDim}});
+    }
+
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor) {
+        AssertInFastLLM(rotaryDim > 0 && rotaryDim % 2 == 0,
+                        "YaRN rotary_dim must be a positive even number.");
+        AssertInFastLLM(ropeTheta > 0.0f && factor > 0.0f && originalMaxPosition > 0.0f &&
+                        betaFast > 0.0f && betaSlow > 0.0f,
+                        "YaRN theta, factor, original_max_position, beta_fast and beta_slow must be positive.");
+        auto findCorrectionDim = [&](float rotations) {
+            return (rotaryDim * std::log(originalMaxPosition /
+                    (rotations * 2.0f * (float)M_PI))) /
+                   (2.0f * std::log(ropeTheta));
+        };
+        float correctionLow = std::max(0.0f, std::floor(findCorrectionDim(betaFast)));
+        float correctionHigh = std::min((float)rotaryDim - 1.0f,
+                                        std::ceil(findCorrectionDim(betaSlow)));
+        if (correctionLow == correctionHigh) {
+            correctionHigh += 0.001f;
+        }
+        curExecutor->Run("YarnRopeEncoding", {
+            {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"factor", factor},
+            {"attentionFactor", attentionFactor},
+            {"correctionLow", correctionLow}, {"correctionHigh", correctionHigh}},
            {{"rotaryDim", rotaryDim}});
     }
 

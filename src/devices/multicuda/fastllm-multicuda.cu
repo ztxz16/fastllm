@@ -600,6 +600,9 @@ static int GetMultiCudaSplitUnit(const fastllm::Data &data, int splitAxis) {
     if (IsGGUFTensor(data)) {
         unit = LcmInt(unit, GetGGUFBlockSize(data));
     }
+    if (data.tpSplitUnit > 0) {
+        unit = LcmInt(unit, data.tpSplitUnit);
+    }
     return std::max(1, unit);
 }
 
@@ -657,6 +660,7 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     dst.tpQHeads = src.tpQHeads;
     dst.tpKVHeads = src.tpKVHeads;
     dst.tpHeadDim = src.tpHeadDim;
+    dst.tpSplitUnit = src.tpSplitUnit;
 }
 
 static fastllm::Data *CreateMultiCudaLocalTensor(const fastllm::Data &src, const std::vector <int> &dims) {
@@ -759,6 +763,9 @@ void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool cop
             }
         } else {
             data.ToDevice(fastllm::DataDevice::CPU);
+            fastllm::AssertInFastLLM(
+                data.dims.empty() || data.Count(0) == 0 || data.cpuData != nullptr,
+                "CopyToMultiDevices cannot replicate a metadata-only tensor without a payload.\n");
             for (int device : devices) {
                 int mallocType = 0;
                 std::string specialId = "";
@@ -942,7 +949,7 @@ DivisionScheme BuildMultiCudaColumnSplitScheme(fastllm::Data &weight, std::vecto
 
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
                     std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme, int splitAxis,
-                    bool explicitDeviceRatios) {
+                    bool explicitDeviceRatios, bool directLocalMemory) {
     int deviceNum = multiCudaCurrentDevices.size();
     int rootDevice = deviceNum > 0 ? multiCudaCurrentDevices[0] : 0;
     BalanceDivisionSchemeByLayer(weight, multiCudaCurrentDevices, divisionScheme, explicitDeviceRatios);
@@ -1066,6 +1073,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
         cudaError_t state = cudaSuccess;
         if (splitAxis == 0) {
             weight.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(weight, {len, m});
+            if (directLocalMemory) {
+                weight.multiDeviceDatas[deviceId]->directMemory = true;
+            }
             weight.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             weight.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
             bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, hasBias ? std::vector<int>{len} : std::vector<int>{});
@@ -1274,6 +1284,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             }
         } else {
             weight.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(weight, {k, len});
+            if (directLocalMemory) {
+                weight.multiDeviceDatas[deviceId]->directMemory = true;
+            }
             weight.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             weight.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
             bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, hasBias ? std::vector<int>{k} : std::vector<int>{});
@@ -2462,10 +2475,10 @@ __global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceAddDirectKernel(
         Packed residualValue = packedResidual[index];
 #pragma unroll
         for (int i = 0; i < valuesPerPack; i++) {
-            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
-                                                 rank1.values[i]);
-            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
-                                                 residualValue.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(
+                residualValue.values[i], rank0.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(
+                rank0.values[i], rank1.values[i]);
         }
         packedDst[index] = rank0;
     }
@@ -2525,10 +2538,10 @@ __global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceAddKnownPeerKernel(
         Packed residualValue = packedResidual[index];
 #pragma unroll
         for (int i = 0; i < valuesPerPack; i++) {
-            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
-                                                 rank1.values[i]);
-            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
-                                                 residualValue.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(
+                residualValue.values[i], rank0.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(
+                rank0.values[i], rank1.values[i]);
         }
         packedDst[index] = rank0;
     }
@@ -2908,12 +2921,15 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
 }
 
 // 功能：将所有卡上的 data 数据进行 Sum 求和，结果保存在 dest 中 (支持 in-place，即 data == dest)
-void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {
+static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
+                                    int dataType, int deviceId,
+                                    bool allowCustomAllReduce) {
     if (data == nullptr || dest == nullptr || count <= 0) {
         return;
     }
 
-    if (FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId)) {
+    if (allowCustomAllReduce &&
+        FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId)) {
         return;
     }
 
@@ -2974,6 +2990,15 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
         cudaError_t syncState = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL allreduce!", syncState);
     }
+}
+
+void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {
+    FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, true);
+}
+
+void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
+                                  int dataType, int deviceId) {
+    FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
 }
 
 // Sums all ranks but materializes the result only on root.  This is preferable

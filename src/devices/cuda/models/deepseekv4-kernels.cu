@@ -962,6 +962,12 @@ __global__ void DeepSeekV4UpdateWindowKVCacheKernel(const T *kv, float *windowKV
     int tmp = idx / headDim;
     int s = tmp % seqlen;
     int b = tmp / seqlen;
+    // Only the newest window survives when a cache-hit suffix is longer than
+    // the ring.  Skipping older rows avoids multiple CUDA threads racing to
+    // write the same slot and makes the result match the sequential CPU path.
+    if (s < seqlen - windowSize) {
+        return;
+    }
     int dynamicStartPos = decodeMeta == nullptr ? startPos : decodeMeta[0];
     windowKV[((uint64_t)b * windowSize + ((dynamicStartPos + s) % windowSize)) * headDim + d] =
         Dsv4ToFloat(kv[((uint64_t)b * seqlen + s) * headDim + d]);
@@ -5154,6 +5160,15 @@ extern "C" bool FastllmCudaDeepSeekV4BuildWindowKVPrefix(const fastllm::Data &wi
         return false;
     }
     int bsz = windowKV.dims[0], headDim = windowKV.dims[2];
+    int sourceDevice = GetPointerDeviceId(windowKV.cudaData);
+    if (sourceDevice < 0) {
+        return false;
+    }
+    // Prefix snapshots can restore a replicated MultiCUDA cache as a single
+    // physical CUDA tensor.  dataDeviceIds still describes the logical replica
+    // set, so select the device from the actual pointer before launching this
+    // direct (non-executor) CUDA operator.
+    FastllmCudaSetDevice(sourceDevice);
     if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::FLOAT32, {bsz, prefixLen, headDim})) {
         return false;
     }

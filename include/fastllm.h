@@ -531,6 +531,7 @@ namespace fastllm {
         int tpQHeads = 0;
         int tpKVHeads = 0;
         int tpHeadDim = 0;
+        int tpSplitUnit = 0;
 
         int weightId;
         bool isRegistered = false;
@@ -1343,6 +1344,11 @@ namespace fastllm {
     void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
                             float factor, float originalMaxPosition,
                             float lowFreqFactor, float highFreqFactor);
+
+    // YaRN RoPE encoding computed directly from positions, without a sin/cos cache.
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor);
 
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,

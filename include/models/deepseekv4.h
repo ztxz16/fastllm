@@ -125,6 +125,7 @@ namespace fastllm {
         std::vector<DeepSeekV4DecodeLayerCache> decodeLayerCaches;
         std::vector<int> historyTokens;
         std::shared_ptr<void> cudaGraphState;
+        bool restoredHistoryCache = false;
     };
 
     struct DeepSeekV4ExpertAllowList {
@@ -187,6 +188,20 @@ namespace fastllm {
         DeepSeekV4Model(); // 构造函数
 
         virtual void InitParams(); // 初始化参数信息
+
+        virtual std::string SelectSpecialWeightDevice(
+                const std::string &weightName, int layerId) const override;
+
+        virtual void OnModelWeightsLoaded() override;
+
+        int GetTensorParallelAttentionSplitUnit() const {
+            return o_groups > 0 && num_attention_heads % o_groups == 0 ?
+                head_dim_full * (num_attention_heads / o_groups) : 0;
+        }
+
+        int GetTensorParallelOutputGroupSplitUnit() const {
+            return o_lora_rank;
+        }
 
         // 推理
         virtual int Forward(

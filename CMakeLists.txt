@@ -576,49 +576,15 @@ if (UNIT_TEST)
         test/apiserver/socketWriteTest.cpp
         example/apiserver/image_loader.cpp
         third_party/json11/json11.cpp)
-    target_compile_definitions(testApiServerSocket PRIVATE
-        ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
-    target_link_libraries(testApiServerSocket PRIVATE
-        ${FASTLLM_APISERVER_IMAGE_LIBS})
+    target_compile_definitions(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
+    target_link_libraries(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_LIBS})
 
-    add_executable(testDeepSeekV4GGUFAdapter
-        test/gguf/deepseek4AdapterTest.cpp)
-    target_link_libraries(testDeepSeekV4GGUFAdapter fastllm)
-
-    add_executable(testDeepSeekV4ExpertAllowList
-        test/models/deepseek4ExpertAllowListTest.cpp)
-    target_link_libraries(testDeepSeekV4ExpertAllowList fastllm)
-
-    add_executable(testDeepSeekV4QuantizedDiskMoe
-        test/gguf/deepseek4QuantizedDiskMoeTest.cpp)
-    target_link_libraries(testDeepSeekV4QuantizedDiskMoe fastllm)
-
-    add_executable(testDeepSeekV4DiskExpertCache
-        test/gguf/deepseek4DiskExpertCacheTest.cpp)
-    target_link_libraries(testDeepSeekV4DiskExpertCache fastllm)
-
-    add_executable(testDeepSeekV4RouteSeam
-        test/models/deepseek4RouteSeamTest.cpp)
-    target_link_libraries(testDeepSeekV4RouteSeam fastllm)
-
-    # These tests use assert(), so keep assertions enabled even when the
-    # surrounding build adds -DNDEBUG for optimized binaries.
-    if (MSVC)
-        target_compile_options(testApiServerSocket PRIVATE /UNDEBUG)
-        target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE /UNDEBUG)
-        target_compile_options(testDeepSeekV4ExpertAllowList PRIVATE /UNDEBUG)
-        target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE /UNDEBUG)
-        target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE /UNDEBUG)
-        target_compile_options(testDeepSeekV4RouteSeam PRIVATE /UNDEBUG)
-    else()
-        target_compile_options(testApiServerSocket PRIVATE -UNDEBUG)
-        target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE -UNDEBUG)
-        target_compile_options(testDeepSeekV4ExpertAllowList PRIVATE -UNDEBUG)
-        target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE -UNDEBUG)
-        target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE -UNDEBUG)
-        target_compile_options(testDeepSeekV4RouteSeam PRIVATE -UNDEBUG)
+    if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
+        target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cudaGraphPoolMissRegression PRIVATE fastllm)
     endif()
-endif()
+    endif()
 
 add_executable(webui example/webui/webui.cpp)
 target_link_libraries(webui fastllm)

@@ -46,6 +46,8 @@ namespace fastllm {
         if (count == 0) {
             return ret;
         }
+        AssertInFastLLM(input.dataDevice == DataDevice::CPU && input.cpuData != nullptr,
+                        "DeepSeek-V4 CPU op received a tensor without CPU storage.\n");
         if (input.dataType == DataType::FLOAT32) {
             memcpy(ret.data(), input.cpuData, count * sizeof(float));
         } else if (input.dataType == DataType::FLOAT16) {

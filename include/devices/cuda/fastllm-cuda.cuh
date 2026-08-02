@@ -88,6 +88,9 @@ CudaInfos *getCudaInfos();
 
 // FlashInfer attention requires compute capability >= 7.5 (Turing+).
 bool FastllmCudaFlashInferSupported();
+// BF16 FlashInfer kernels additionally require SM80; FP16 remains available
+// from SM75. Other compute types are rejected.
+bool FastllmCudaFlashInferDataTypeSupported(fastllm::DataType dataType);
 
 void *FastllmCudaPrepareInput(const fastllm::Data &input);
 void *FastllmCudaPrepareOutput(fastllm::Data &output);
@@ -118,6 +121,10 @@ void FastllmCudaStreamWaitEvent(void *stream, void *event);
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event);
 
 bool FastllmCudaGraphBeginCapture();
+// Resolve per-device process-lifetime graph sentinels before any stream in a
+// multi-GPU capture has begun. Calling cudaMalloc after the first rank starts
+// capture invalidates that rank even when the allocation targets another GPU.
+bool FastllmCudaGraphPrepareCaptureDevice();
 bool FastllmCudaGraphEndCapture(void **graph);
 bool FastllmCudaGraphInstantiate(void *graph, void **exec);
 bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
@@ -157,6 +164,10 @@ bool FastllmCudaGraphMemoryPoolBegin();
 bool FastllmCudaGraphMemoryPoolEnd(std::vector<void*> &reservedPointers);
 void FastllmCudaGraphMemoryPoolAbort();
 void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointers);
+// Returns a valid device address only after an allocation failure in a managed
+// whole-step capture. Kernels may retain this address while the failed capture
+// is completed and discarded, but it must never be launched or freed by Data.
+bool FastllmCudaGraphGetAllocationFailurePlaceholder(void **ptr);
 
 // 线程级 CUDA 错误标志：showError 报错时置位；graph 捕获路径用于错误熔断。
 void FastllmCudaClearThreadError();
@@ -183,7 +194,7 @@ void FastllmCudaSetNcclForceSync(bool value);
 bool FastllmCudaGetNcclForceSync();
 void FastllmCudaSetWeightSlabBytes(size_t bytes);
 size_t FastllmCudaGetWeightSlabBytes();
-void *FastllmCudaMallocModelWeight(size_t size);
+void *FastllmCudaMallocModelWeight(size_t size, const std::string &name);
 void FastllmCudaMemPoolStats();
 void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
@@ -239,6 +250,7 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   const void *b_scales, void *c,
                                   int size_m, int size_n, int size_k,
                                   int group_size, int *workspace);
+bool FastllmCudaHasFp8MarlinLayout(const fastllm::Data &weight);
 bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
                                                 fastllm::Data &weight,
                                                 const fastllm::Data &bias,
@@ -284,6 +296,14 @@ void FastllmCudaRepeat(void *input, void *output, int outer, int repeatTimes, in
 void FastllmCudaPagedCacheCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads, int headDim,
                                fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
                                int seqLen, int inputOffset, int copyLen, int pageOffset);
+bool FastllmCudaPagedCacheCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost, int pageCount,
+                                        int firstPageOffset, int pageLen, int numHeads, int headDim,
+                                        fastllm::DataType dstType, uint8_t *inputData,
+                                        fastllm::DataType srcType, int seqLen);
+bool FastllmCudaPreparePagedBatchParamsSingle(
+    int32_t *qSizes, int32_t *pageSizes, int32_t *pageIndexs,
+    int32_t *lastPageLens, const int *pageIdxHost, int pageIndexCount,
+    int totalPages, int qSize, int lastPageLen);
 void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, int32_t *pageOffsetArray,
                                     int pageLen, int batch, int numHeads, int headDim,
                                     fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
@@ -327,10 +347,20 @@ bool FastllmCudaGeglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
+                             const fastllm::Data &gate);
 bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue);
 bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
-bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData);
+bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale = 1.0f);
 bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput, fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData);
+bool FastllmCudaSigmoidMambaSoftplusCombinedFloat16(
+        const fastllm::Data &input,
+        const fastllm::Data &aLogData,
+        const fastllm::Data &dtBiasData,
+        int batch, int seqLen, int inputChannels,
+        int baOffset, int channels,
+        fastllm::Data &sigmoidOutput,
+        fastllm::Data &softplusOutput);
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaCopy(const fastllm::Data &input, fastllm::Data &output);
@@ -339,6 +369,26 @@ bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int axis);
 bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha);
 bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha);
+bool FastllmCudaMulToCausalMask(fastllm::Data &input0,
+                                const fastllm::Data &input1,
+                                float alpha, int base, float maskValue);
+bool FastllmCudaMulCausalMask(const fastllm::Data &input0,
+                              const fastllm::Data &input1,
+                              fastllm::Data &output,
+                              float alpha, int base, float maskValue);
+// Merge the routed and shared Qwen3.5 MoE branches into destination. When
+// sharedGate is non-null it contains the per-token gate. It is pre-sigmoid
+// unless sharedGateAlreadySigmoid is true. Setting addResidual preserves
+// destination and adds the merged local result to it; otherwise destination
+// is overwritten. The FLOAT16 path deliberately keeps the same intermediate
+// FP16 rounding as Sigmoid + MulTo + AddTo (+ AddTo).
+bool FastllmCudaQwen35FusedMoeJoin(
+        fastllm::Data &destination,
+        const fastllm::Data &routedOutput,
+        const fastllm::Data &sharedOutput,
+        const fastllm::Data *sharedGate,
+        bool addResidual,
+        bool sharedGateAlreadySigmoid = false);
 bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaTransferAttn(fastllm::Data &input);
@@ -352,9 +402,27 @@ bool FastllmCudaGatedDeltaRuleApplyDecayMask(
 bool FastllmCudaCumSumLastDim(fastllm::Data &input);
 bool FastllmCudaCausalMask(fastllm::Data &input, int base, float maskValue);
 bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaCumSumLastDimMakeDecayMask(fastllm::Data &input,
+                                           fastllm::Data &output);
+bool FastllmCudaCumSumDecayMaskNegMulCausal(
+        fastllm::Data &input, const fastllm::Data &matrix,
+        fastllm::Data &decayMask, fastllm::Data &output);
 bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::Data &g);
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
+bool FastllmCudaRMSNormCombinedQKFloat16(
+        const fastllm::Data &qkvInput, const fastllm::Data &weight,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float eps,
+        fastllm::Data &q, fastllm::Data &k);
+bool FastllmCudaQwen35GdnPostConvExactFloat16(
+        const fastllm::Data &qkvInput, const fastllm::Data &normWeight,
+        const fastllm::Data &gInput, const fastllm::Data &betaInput,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float normEps, float qScale,
+        fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+        fastllm::Data &g, fastllm::Data &beta,
+        fastllm::Data &kBeta, fastllm::Data &vBeta);
 bool FastllmCudaKimiK3RMSNorm(const fastllm::Data &input,
                               const fastllm::Data &weight,
                               fastllm::Data &output, float eps);
@@ -396,6 +464,10 @@ bool FastllmCudaKimiK3CausalAttention(
 // threadCount == 32 selects the exact FP16 channel-128 specialization.
 bool FastllmCudaRMSNormFloat16WithThreadCount(const fastllm::Data &input, fastllm::Data &weight,
                                               fastllm::Data &output, float eps, int threadCount);
+// Benchmark/validation entry. threadCount == 0 selects the legacy launch;
+// threadCount == 256 selects the exact BF16 channel-3072 specialization.
+bool FastllmCudaRMSNormBFloat16WithThreadCount(const fastllm::Data &input, fastllm::Data &weight,
+                                               fastllm::Data &output, float eps, int threadCount);
 bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
                                        int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
@@ -532,13 +604,38 @@ bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
 namespace fastllm {
 bool FastllmCudaTryTritonDeepSeekV4WoA(const Data &o, Data &woA,
                                        int groups, int oRank, Data &output);
+bool FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
+        const Data &input, const Data &aLog, const Data &dtBias,
+        int batch, int seqLen, int inputChannels,
+        int baOffset, int channels,
+        Data &sigmoidOutput, Data &softplusOutput);
+bool FastllmCudaTryCombinedGdnConvInput(
+        const std::vector<Data*> &caches,
+        const Data &combinedInput,
+        Data &weight, Data &bias, Data &output);
+bool FastllmCudaTryCombinedGdnZGate(
+        const Data &input, Data &weight,
+        const Data &combinedGateInput,
+        int gateOffset, int gateHeads,
+        Data &output, float eps);
+bool FastllmCudaTryCombinedGdnOutputGate(
+        const Data &headMajorInput, Data &weight,
+        const Data &combinedGateInput,
+        int batch, int seqLen,
+        int gateOffset, int gateHeads,
+        Data &output, float eps);
 bool FastllmCudaTryTritonChunkGdnPostConv(
-        const Data &qInput, const Data &kInput, const Data &vInput,
+        const Data &qkvInput, const Data &normWeight,
         const Data &gInput, const Data &betaInput,
         int batch, int seqLen, int keyHeads, int valueHeads,
-        int kDim, int vDim, float qScale,
+        int kDim, int vDim, float normEps, float qScale,
+        Data &normalizedQ, Data &normalizedK,
         Data &q, Data &k, Data &v, Data &g, Data &beta,
         Data &kBeta, Data &vBeta);
+bool FastllmCudaTryTritonChunkGdnRecompute(
+        const Data &attn, const Data &vBeta,
+        const Data &kBeta, const Data &gExp, const Data &g,
+        Data &vOutput, Data &kOutput);
 bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
         const Data &q, const Data &windowKV, const Data &compressedKV,
         const Data &attnSink, int windowSize, int compressRatio,
@@ -562,6 +659,17 @@ bool FastllmCudaRMSNormSiluMulFloat16(const fastllm::Data &input, fastllm::Data 
 bool FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &gateInput,
     fastllm::Data &output, float eps, int threadCount);
+bool FastllmCudaRMSNormSiluMulFloat16CombinedGate(
+    const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &combinedGateInput,
+    int gateOffset, int gateHeads,
+    fastllm::Data &output, float eps);
+bool FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate(
+    const fastllm::Data &headMajorInput, fastllm::Data &weight,
+    const fastllm::Data &combinedGateInput,
+    int batch, int seqLen,
+    int gateOffset, int gateHeads,
+    fastllm::Data &output, float eps);
 bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fastllm::Data &beta, fastllm::Data &output, int axis);
 bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk);
 bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias, 
@@ -570,6 +678,8 @@ bool FastllmCudaFusedSoftmaxSelectExpert(const fastllm::Data &logits, const fast
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
 bool FastllmCudaFusedSigmoidSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias,
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
+// Remap global expert ids in [expertStart, expertEnd) to local ids. Remote slots
+// become index -1 with score 0 so fused MoE kernels can skip them entirely.
 bool FastllmCudaMaskAndRemapExpertsForLocalRange(fastllm::Data &index, fastllm::Data &score,
                                                  int expertStart, int expertEnd);
 bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis);
@@ -623,10 +733,27 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(fastllm::Data &
 bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     const std::vector<fastllm::Data*> &caches, const fastllm::Data &newTokens,
     fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output,
-    const std::vector<fastllm::Data*> &tokenCaches, int numTokenCaches);
+    const std::vector<fastllm::Data*> &tokenCaches, int numTokenCaches,
+    int tokenMajorInputOffset = 0);
+bool FastllmCudaShiftAppendConv1DPerChannelSiluRaggedPrefillFloat16BatchPointers(
+    const std::vector<fastllm::Data*> &caches, const fastllm::Data &newTokens,
+    const std::vector<int> &seqLens, fastllm::Data &weight,
+    fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(const std::vector<fastllm::Data*> &caches, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchDevicePointers(void *cudaCachePointers, int batch, const fastllm::Data &firstCache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchSlots(void *cudaCachePool, void *cudaSlotIds, int batch, const fastllm::Data &firstCache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
+
+bool FastllmCudaPackRaggedGdnPrefillFloat16(
+    const fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &b,
+    const fastllm::Data &g, const std::vector<int> &seqLens,
+    int paddedSeqLen, float qScale,
+    fastllm::Data &qPadded, fastllm::Data &kPadded,
+    fastllm::Data &vPadded, fastllm::Data &bPadded,
+    fastllm::Data &gPadded);
+bool FastllmCudaUnpackRaggedGdnPrefillFloat16(
+    const fastllm::Data &padded, const std::vector<int> &seqLens,
+    fastllm::Data &ragged);
 
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output);
 
@@ -650,6 +777,9 @@ bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionI
 bool FastllmCudaLlama3RopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                    float ropeTheta, float factor, float originalMaxPosition,
                                    float lowFreqFactor, float highFreqFactor);
+bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
+                                 float ropeTheta, float factor, float attentionFactor,
+                                 float correctionLow, float correctionHigh);
 bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                       int sectionT, int sectionH, int sectionW,
                                       float ropeTheta, float ropeScale);
@@ -674,7 +804,11 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int useLlama3 = 0, float llama3Factor = 1.0f,
     float llama3OriginalMaxPosition = 131072.0f,
     float llama3LowFreqFactor = 1.0f,
-    float llama3HighFreqFactor = 32.0f);
+    float llama3HighFreqFactor = 32.0f,
+    int useYarn = 0, float yarnFactor = 1.0f,
+    float yarnAttentionFactor = 1.0f,
+    float yarnCorrectionLow = 0.0f,
+    float yarnCorrectionHigh = 1.0f);
 bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
     fastllm::Data &qgatekv, fastllm::Data &qNormWeight, fastllm::Data &kNormWeight,
     const fastllm::Data &positionIds,
@@ -687,6 +821,16 @@ bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
     float eps, float ropeTheta, float ropeScale,
     int pageLen, fastllm::DataType pagedDataType, int batch,
     int doQKNorm);
+bool FastllmCudaQwen35QGateKVPrefill(
+    const fastllm::Data &qgatekv,
+    const fastllm::Data &qNormWeight,
+    const fastllm::Data &kNormWeight,
+    const fastllm::Data &positionIds,
+    fastllm::Data &qOutput, fastllm::Data &gateOutput,
+    fastllm::Data &kOutput, fastllm::Data &vOutput,
+    int qHeads, int kHeads, int headDim,
+    int rotaryDim, int sectionT, int sectionH, int sectionW,
+    float eps, float ropeTheta, float ropeScale);
 bool FastllmCudaAdvanceDecodeMeta(
     int32_t *insertPositions, int32_t *lastPageLens, int batch);
 bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale);
@@ -708,6 +852,9 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float typicalPosteriorAlpha);
 bool FastllmCudaGreedySampling(float *logits, int *output,
                                int batch, int vocabSize);
+bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
+                                              float *floatOutput,
+                                              int batch, int vocabSize);
 bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
                                          float *scores, int batch,
                                          int vocabSize);
@@ -733,9 +880,12 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
 bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType);
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1);
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
 bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo, bool allowRouterSpecialization);
+// Fuses the Qwen3.5 FP16 router and shared-gate projections for one to seven
+// flattened decode rows. Larger batches keep the cuBLAS GEMM path.
+bool FastllmCudaQwen35RouterSharedGateFloat16(const fastllm::Data &input, fastllm::Data &routerWeight, fastllm::Data &sharedGateWeight, fastllm::Data &routerOutput, fastllm::Data &sharedGateOutput, bool sigmoidSharedGate = false);
 bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -766,6 +916,12 @@ bool FastllmCudaHalfMergeMOEInt4GroupSmallBatchIndexed(const fastllm::Data &inpu
                                                        const float *scores,
                                                        int batch,
                                                        int topk);
+bool FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &activation, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int batch, int topk);
 bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -910,7 +1066,27 @@ bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fast
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128Add(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNorm(const fastllm::Data &input, fastllm::Data &normWeight, float eps, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNormMaterialize(
+        const fastllm::Data &input, fastllm::Data &normWeight, float eps,
+        fastllm::Data &normOutput,
+        fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGate(
+        const fastllm::Data &headMajorInput, fastllm::Data &normWeight,
+        const fastllm::Data &combinedGateInput,
+        int batch, int seqLen, int gateOffset, int gateHeads, float eps,
+        fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGateAdd(
+        const fastllm::Data &headMajorInput, fastllm::Data &normWeight,
+        const fastllm::Data &combinedGateInput,
+        int batch, int seqLen, int gateOffset, int gateHeads, float eps,
+        fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAdd(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -932,8 +1108,12 @@ bool FastllmCudaTritonDeepSeekV4WoA(
     int numTokens, int groups, int outRank, int hiddenSize);
 
 bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
-    const char *cubinPath, const char *kernelName, int numWarps, int shared,
-    int headBlock, int blockD, const fastllm::Data &q,
+    const char *splitCubinPath, const char *splitKernelName,
+    int splitNumWarps, int splitShared,
+    const char *mergeCubinPath, const char *mergeKernelName,
+    int mergeNumWarps, int mergeShared,
+    int compressedCapacity, int numSplits, int splitSize,
+    int splitHeadBlock, int blockD, int mergeBlockD, const fastllm::Data &q,
     const fastllm::Data &windowKV, const fastllm::Data &compressedKV,
     const fastllm::Data &attnSink, int windowSize, int compressRatio,
     const int32_t *decodeMeta, float softmaxScale, float *output);
@@ -941,22 +1121,40 @@ bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
 bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     const char *hCubinPath, const char *hKernelName, int hNumWarps, int hShared,
     const char *oCubinPath, const char *oKernelName, int oNumWarps, int oShared,
-    int chunks, int chunkSize, int kDim, int vDim, int blockV,
+    const char *oFusedDecayCubinPath,
+    const char *oFusedDecayKernelName,
+    int oFusedDecayNumWarps, int oFusedDecayShared,
+    const char *hPrecomputedScaleCubinPath,
+    const char *hPrecomputedScaleKernelName,
+    int hPrecomputedScaleNumWarps, int hPrecomputedScaleShared,
+    bool precomputeScale, bool fuseDecayMask,
+    int chunks, int chunkSize, int kDim, int vDim,
+    int hBlockV, int oBlockV,
     fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
-    fastllm::Data &g, fastllm::Data &attn, fastllm::Data &kCumdecay,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &decayMask, fastllm::Data &kCumdecay,
     fastllm::Data &lastRecurrentState, fastllm::Data &coreAttnOut);
 
 bool FastllmCudaTritonChunkGdnPostConv(
     const char *cubinPath, const char *kernelName,
     int numWarps, int shared, int blockT,
     const fastllm::Data &qInput, const fastllm::Data &kInput,
-    const fastllm::Data &vInput, const fastllm::Data &gInput,
+    const fastllm::Data &qkvInput, const fastllm::Data &gInput,
     const fastllm::Data &betaInput,
     int batch, int seqLen, int keyHeads, int valueHeads,
     int kDim, int vDim, float qScale,
     fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &beta,
     fastllm::Data &kBeta, fastllm::Data &vBeta);
+
+bool FastllmCudaTritonChunkGdnRecompute(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared,
+    bool precomputeScale, bool internalExp, int blockD,
+    const fastllm::Data &attn, const fastllm::Data &vBeta,
+    const fastllm::Data &kBeta, const fastllm::Data &gExp,
+    const fastllm::Data &g,
+    fastllm::Data &vOutput, fastllm::Data &kOutput);
 
 bool FastllmCudaTritonMergeMOEFP8E4M3Indexed(
     const char *const *cubinPaths, const char *const *kernelNames,
@@ -1071,6 +1269,8 @@ void FastllmCudaSetDevice(int gpu_id);
 int FastllmCudaGetDevice();
 int FastllmCudaRuntimeArch();
 int GetPointerDeviceId(void *ptr);
+bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
+                                     int expectedDevice);
 int FastllmCudaGetDeviceCount();
 #ifdef  __cplusplus
 }

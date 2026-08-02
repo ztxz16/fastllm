@@ -187,6 +187,18 @@ class FastLLmCompletion:
         self._handle_condition.notify_all()
     return handle
 
+  def _request_owns_handle_locked(self, request_id: str, handle: int) -> bool:
+    owner = self._handle_owners.get(handle)
+    if owner is not None:
+      return owner == request_id
+    # Older callers and lightweight adapters may populate only the original
+    # request-to-handle map. Adopt that mapping only when it is unambiguous.
+    if any(other_request != request_id and other_handle == handle
+           for other_request, other_handle in self.conversation_handles.items()):
+      return False
+    self._handle_owners[handle] = request_id
+    return True
+
   def _release_owned_handle(self, request_id: str,
                             expected_handle: Optional[int] = None) -> bool:
     self._ensure_handle_tracking()
@@ -195,7 +207,7 @@ class FastLLmCompletion:
       if handle is None or (expected_handle is not None and
                             handle != expected_handle):
         return False
-      if self._handle_owners.get(handle) != request_id:
+      if not self._request_owns_handle_locked(request_id, handle):
         del self.conversation_handles[request_id]
         return False
       del self.conversation_handles[request_id]
@@ -212,7 +224,7 @@ class FastLLmCompletion:
       if handle is None or (expected_handle is not None and
                             handle != expected_handle):
         return False
-      if self._handle_owners.get(handle) != request_id:
+      if not self._request_owns_handle_locked(request_id, handle):
         del self.conversation_handles[request_id]
         return False
       self.model.abort_handle(handle)
@@ -1916,8 +1928,18 @@ class FastLLmCompletion:
       fallback_output_tokens: int,
   ) -> Tuple[int, int, int, int]:
       statistics = dict(response_statistics or {})
+      # FetchResponseTokens removes a finished context, and handle ids are
+      # reused immediately.  The streaming adapter captures the terminal
+      # counters before that removal, so a complete captured snapshot is more
+      # authoritative than a later lookup by handle.  Looking the handle up
+      # again can otherwise read counters from an unrelated, newly launched
+      # request (the classic handle ABA problem).
+      has_captured_statistics = all(
+          key in statistics for key in (
+              "cached_input_tokens", "missed_input_tokens", "output_tokens"))
       get_statistics = getattr(self.model, "get_response_statistics", None)
-      if handle is not None and callable(get_statistics):
+      if (not has_captured_statistics and handle is not None
+              and callable(get_statistics)):
           latest = get_statistics(handle)
           if latest is not None:
               statistics.update(latest)
@@ -2888,12 +2910,22 @@ class FastLLmCompletion:
               self._release_owned_handle(request_id, handle)
               return self.create_error_response(str(e))
 
+  def _release_conversation_handle(
+      self, request_id: str, handle: Optional[int]
+  ) -> bool:
+    return self._release_owned_handle(request_id, handle)
+
+  def _abort_conversation_handle(
+      self, request_id: str, handle: Optional[int]
+  ) -> bool:
+    return self._abort_owned_handle(request_id, handle)
+
   async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # Starlette runs this task after a stream disconnects or completes. The
-    # integer handle may already have been recycled for another request, so
-    # abort only while this request still owns that exact handle.
-    if self._abort_owned_handle(request_id, handle):
-      logging.info(f"Abort request: {request_id}")
+    # A terminal generator releases ownership before its final SSE. Only an
+    # interrupted request can still own this exact, potentially reusable handle.
+    if not self._abort_owned_handle(request_id, handle):
+      return
+    logging.info(f"Abort disconnected request: {request_id}")
       
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
@@ -3082,6 +3114,7 @@ class FastLLmCompletion:
             "content_done": False,
         }
 
+        stream_exhausted = False
         async for res in result_generator:
             res = self._normalize_model_delta(res)
             completion_tokens += 1
@@ -3183,6 +3216,18 @@ class FastLLmCompletion:
             if stopped_by_stop_string:
                 break
             #await asyncio.sleep(0)
+        else:
+            stream_exhausted = True
+
+        # FetchResponseTokens removes a terminal backend context, so its
+        # integer handle can be reused immediately.  Drop request ownership in
+        # the same event-loop turn, before yielding any final content/usage
+        # event.  An early server-side stop has not exhausted the backend and
+        # must be aborted explicitly before ownership is released.
+        if stream_exhausted:
+            self._release_conversation_handle(request_id, handle)
+        elif self._abort_conversation_handle(request_id, handle):
+            logging.info(f"Abort early-terminated request: {request_id}")
 
         if (not request.tools) and not stopped_by_stop_string:
             delta_text = self._flush_stop_buffer(stop_strings, stop_filter_state)
@@ -3316,13 +3361,12 @@ class FastLLmCompletion:
                 yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
+        if self._abort_conversation_handle(request_id, handle):
+          logging.info(f"Abort failed streaming request: {request_id}")
         data = self.create_streaming_error_response(str(e))
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
-      
-      self._release_owned_handle(request_id, handle)
-          # logging.info(f"Removed completed stream conversation from tracking: {request_id}")
-      
+
       yield "data: [DONE]\n\n"
       await asyncio.sleep(0)
 
@@ -3518,6 +3562,11 @@ class FastLLmCompletion:
                                   partial_json = tool_delta.function.arguments),
                           ))
 
+          # Release the terminal handle before any closing SSE is yielded.  A
+          # client cancellation after message_delta/message_stop must not let
+          # the old BackgroundTask abort a newly recycled numeric handle.
+          self._release_conversation_handle(request_id, handle)
+
           if text_block_index is not None:
               yield self._create_anthropic_sse_event(
                   "content_block_stop",
@@ -3545,6 +3594,8 @@ class FastLLmCompletion:
               "message_stop",
               MessageStopEvent())
       except ValueError as e:
+          if self._abort_conversation_handle(request_id, handle):
+              logging.info(f"Abort failed Anthropic streaming request: {request_id}")
           error_data = json.dumps({
               "type": "error",
               "error": {
@@ -3555,7 +3606,6 @@ class FastLLmCompletion:
           yield f"event: error\ndata: {error_data}\n\n"
           await asyncio.sleep(0)
 
-      self._release_owned_handle(request_id, handle)
 
       await asyncio.sleep(0)
       

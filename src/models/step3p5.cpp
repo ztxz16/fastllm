@@ -40,6 +40,22 @@ namespace fastllm {
         return lowered == "1" || lowered == "true" || lowered == "on";
     }
 
+#ifdef USE_CUDA
+    static bool Step3p5CudaEnvFlagEnabled(const char *name) {
+        const char *value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return false;
+        }
+        return std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "FALSE") != 0 &&
+               std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "OFF") != 0 &&
+               std::strcmp(value, "disable") != 0 &&
+               std::strcmp(value, "DISABLE") != 0;
+    }
+#endif
+
     static bool Step3p5DisableFusedMoe() {
         const char *env = getenv("FASTLLM_STEP3P5_DISABLE_FUSED_MOE");
         return env != nullptr && Step3p5IsTrueString(env);
@@ -387,6 +403,219 @@ namespace fastllm {
 #endif
     }
 
+#ifdef USE_CUDA
+    static Data *Step3p5GetExpertLocalWeight(Data *root, int device) {
+        if (root == nullptr) {
+            return nullptr;
+        }
+        if (!root->multiDeviceData) {
+            if (root->dataDevice != DataDevice::CUDA || root->cudaData == nullptr ||
+                (!root->dataDeviceIds.empty() && root->dataDeviceIds[0] != device)) {
+                return nullptr;
+            }
+            return root;
+        }
+        // Tensor-sharded experts contain only one intermediate slice and
+        // cannot be repacked as expert-parallel FusedMOE weights.
+        if (root->tpLayout != TP_LAYOUT_NONE) {
+            return nullptr;
+        }
+        auto it = root->multiDeviceDatas.find(device);
+        return it == root->multiDeviceDatas.end() ? nullptr : it->second;
+    }
+
+    static void Step3p5InitLocalFusedMoeWeight(
+            Data &dst, const Data &src, const std::string &name,
+            int experts, int rows, int columns) {
+        dst = Data(src.dataType, {experts, rows, columns});
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+        dst.directMemory = true;
+        dst.blockK = src.blockK;
+        dst.blockM = src.blockM;
+        dst.group = src.group;
+        dst.groupCnt = src.groupCnt;
+        dst.perChannelAxis = src.perChannelAxis;
+        dst.tpLinearType = src.tpLinearType;
+        dst.tpPackType = src.tpPackType;
+        dst.Allocate(false);
+    }
+
+    static bool Step3p5AppendLocalFusedMoeRows(
+            Data &dst, int dstRowStart,
+            Data &src, int srcRowStart, int rows) {
+        if (dst.dims.size() != 3 || src.dims.size() != 2 ||
+            dst.dataType != src.dataType || rows <= 0 ||
+            srcRowStart < 0 || srcRowStart + rows > src.dims[0] ||
+            dstRowStart < 0 || dstRowStart + rows > dst.dims[0] * dst.dims[1] ||
+            dst.dims[2] != src.dims[1]) {
+            return false;
+        }
+        src.ToDevice(DataDevice::CPU, true);
+        if (src.cpuData == nullptr || dst.cpuData == nullptr) {
+            return false;
+        }
+        size_t bytesPerRow = GetDataBytes(src.dataType, 1, src.dims[1]);
+        memcpy(dst.cpuData + (size_t)dstRowStart * bytesPerRow,
+               src.cpuData + (size_t)srcRowStart * bytesPerRow,
+               (size_t)rows * bytesPerRow);
+
+        if (src.dataType == DataType::FP8_E4M3) {
+            if (src.blockK <= 0 || src.blockM <= 0 ||
+                srcRowStart % src.blockK != 0 || rows % src.blockK != 0 ||
+                src.scales.empty()) {
+                return false;
+            }
+            int scaleColumns = (src.dims[1] - 1) / src.blockM + 1;
+            int scaleOffset = (srcRowStart / src.blockK) * scaleColumns;
+            int scaleCount = (rows / src.blockK) * scaleColumns;
+            if (scaleOffset + scaleCount > (int)src.scales.size()) {
+                return false;
+            }
+            dst.scales.insert(dst.scales.end(),
+                              src.scales.begin() + scaleOffset,
+                              src.scales.begin() + scaleOffset + scaleCount);
+        }
+        return true;
+    }
+
+    static bool Step3p5CanAppendLocalFusedMoeRows(
+            const Data &src, int srcRowStart, int rows) {
+        if (src.dims.size() != 2 || rows <= 0 ||
+            srcRowStart < 0 || srcRowStart + rows > src.dims[0]) {
+            return false;
+        }
+        if (src.dataType != DataType::FP8_E4M3) {
+            return src.dataType == DataType::FP8_E4M3_BLOCK_128;
+        }
+        if (src.blockK <= 0 || src.blockM <= 0 ||
+            srcRowStart % src.blockK != 0 || rows % src.blockK != 0 ||
+            src.scales.empty()) {
+            return false;
+        }
+        int scaleColumns = (src.dims[1] - 1) / src.blockM + 1;
+        int scaleOffset = (srcRowStart / src.blockK) * scaleColumns;
+        int scaleCount = (rows / src.blockK) * scaleColumns;
+        return scaleOffset + scaleCount <= (int)src.scales.size();
+    }
+
+    static void Step3p5ReleaseConsumedExpertLocalWeight(
+            Data *root, Data *local, int device) {
+        if (root == nullptr || local == nullptr) {
+            return;
+        }
+        if (root == local) {
+            root->FreeSpace();
+            root->scales.clear();
+            return;
+        }
+        auto it = root->multiDeviceDatas.find(device);
+        if (it != root->multiDeviceDatas.end() && it->second == local) {
+            delete it->second;
+            root->multiDeviceDatas.erase(it);
+        }
+    }
+
+    static bool Step3p5BuildLocalExpertRangeFusedMoe(
+            const std::vector<Data*> &layerWeights,
+            int expertStart, int expertEnd, int device, int layer,
+            std::vector<Data> &ownedFused) {
+        if (expertStart < 0 || expertStart >= expertEnd ||
+            (int)layerWeights.size() < (expertEnd + 1) * 2) {
+            return false;
+        }
+        Data *firstGateupRoot = layerWeights[(expertStart + 1) * 2];
+        Data *firstDownRoot = layerWeights[(expertStart + 1) * 2 + 1];
+        Data *firstGateup = Step3p5GetExpertLocalWeight(firstGateupRoot, device);
+        Data *firstDown = Step3p5GetExpertLocalWeight(firstDownRoot, device);
+        if (firstGateup == nullptr || firstDown == nullptr ||
+            firstGateup->dims.size() != 2 || firstDown->dims.size() != 2 ||
+            firstGateup->dims[0] <= 0 || (firstGateup->dims[0] & 1) != 0 ||
+            (firstGateup->dataType != DataType::FP8_E4M3 &&
+             firstGateup->dataType != DataType::FP8_E4M3_BLOCK_128) ||
+            firstDown->dataType != firstGateup->dataType) {
+            return false;
+        }
+        int inter = firstGateup->dims[0] / 2;
+        int hidden = firstGateup->dims[1];
+        if (firstDown->dims[0] != hidden || firstDown->dims[1] != inter) {
+            return false;
+        }
+
+        int experts = expertEnd - expertStart;
+        struct ExpertWeights {
+            Data *gateupRoot;
+            Data *downRoot;
+            Data *gateup;
+            Data *down;
+        };
+        std::vector<ExpertWeights> expertWeights;
+        expertWeights.reserve(experts);
+        for (int expert = expertStart; expert < expertEnd; expert++) {
+            Data *gateupRoot = layerWeights[(expert + 1) * 2];
+            Data *downRoot = layerWeights[(expert + 1) * 2 + 1];
+            Data *gateup = Step3p5GetExpertLocalWeight(gateupRoot, device);
+            Data *down = Step3p5GetExpertLocalWeight(downRoot, device);
+            if (gateup == nullptr || down == nullptr ||
+                gateup->dims != firstGateup->dims || down->dims != firstDown->dims ||
+                gateup->dataType != firstGateup->dataType ||
+                down->dataType != firstDown->dataType ||
+                gateup->blockK != firstGateup->blockK ||
+                gateup->blockM != firstGateup->blockM ||
+                down->blockK != firstDown->blockK ||
+                down->blockM != firstDown->blockM ||
+                !Step3p5CanAppendLocalFusedMoeRows(*gateup, 0, inter) ||
+                !Step3p5CanAppendLocalFusedMoeRows(*gateup, inter, inter) ||
+                !Step3p5CanAppendLocalFusedMoeRows(*down, 0, hidden)) {
+                return false;
+            }
+            expertWeights.push_back({gateupRoot, downRoot, gateup, down});
+        }
+
+        ownedFused.resize(3);
+        std::string prefix = "model.layers." + std::to_string(layer) +
+            ".moe.tp." + std::to_string(device) + ".experts." +
+            std::to_string(expertStart) + "_" + std::to_string(expertEnd) + ".";
+        Step3p5InitLocalFusedMoeWeight(ownedFused[0], *firstGateup,
+                                      prefix + "gate_proj.weight",
+                                      experts, inter, hidden);
+        Step3p5InitLocalFusedMoeWeight(ownedFused[1], *firstGateup,
+                                      prefix + "up_proj.weight",
+                                      experts, inter, hidden);
+        Step3p5InitLocalFusedMoeWeight(ownedFused[2], *firstDown,
+                                      prefix + "down_proj.weight",
+                                      experts, hidden, inter);
+
+        std::vector<std::pair<Data*, Data*> > consumed;
+        consumed.reserve(experts * 2);
+        for (int localExpert = 0; localExpert < experts; localExpert++) {
+            ExpertWeights &cur = expertWeights[localExpert];
+            if (!Step3p5AppendLocalFusedMoeRows(
+                    ownedFused[0], localExpert * inter, *cur.gateup, 0, inter) ||
+                !Step3p5AppendLocalFusedMoeRows(
+                    ownedFused[1], localExpert * inter, *cur.gateup, inter, inter) ||
+                !Step3p5AppendLocalFusedMoeRows(
+                    ownedFused[2], localExpert * hidden, *cur.down, 0, hidden)) {
+                ownedFused.clear();
+                return false;
+            }
+            consumed.push_back({cur.gateupRoot, cur.gateup});
+            consumed.push_back({cur.downRoot, cur.down});
+        }
+
+        for (Data &fused : ownedFused) {
+            Step3p5PrepareFusedMoeWeightForCuda(
+                fused, fused.dims[1], device);
+        }
+        for (auto &item : consumed) {
+            Step3p5ReleaseConsumedExpertLocalWeight(
+                item.first, item.second, device);
+        }
+        return true;
+    }
+#endif
+
     static void Step3p5MakeExpertView(Data &dst, const Data &src, const std::string &name, int expert) {
         AssertInFastLLM(src.dims.size() == 3, "Step3p5 MoE expert source weight should be 3D.");
         AssertInFastLLM(expert >= 0 && expert < src.dims[0], "Step3p5 MoE expert index out of range.");
@@ -653,6 +882,20 @@ namespace fastllm {
         }
         ToDataType(src, casted, targetType);
         return casted;
+    }
+
+    static DataType ResolveStep3p5ThreadTpComputeType(DataType modelType) {
+        if (modelType == DataType::FLOAT32) {
+            return DataType::FLOAT32;
+        }
+        return DataType::FLOAT16;
+    }
+
+    static DataType ResolveStep3p5ThreadTpCacheType(DataType cacheType, DataType computeType) {
+        if (cacheType == DataType::FP8_E4M3) {
+            return cacheType;
+        }
+        return computeType;
     }
 
 #ifdef USE_CUDA
@@ -927,20 +1170,6 @@ namespace fastllm {
             return false;
         }
 
-        static DataType ResolveStep3p5ThreadTpComputeType(DataType modelType) {
-            if (modelType == DataType::FLOAT32) {
-                return DataType::FLOAT32;
-            }
-            return DataType::FLOAT16;
-        }
-
-        static DataType ResolveStep3p5ThreadTpCacheType(DataType cacheType, DataType computeType) {
-            if (cacheType == DataType::FP8_E4M3) {
-                return cacheType;
-            }
-            return computeType;
-        }
-
         static void PrepareStep3p5EmbeddingWeightType(Data &embedWeight,
                                                       DataType outputType,
                                                       bool requireCpu) {
@@ -1023,7 +1252,6 @@ namespace fastllm {
             FastllmCudaCopyFromHostToDevice(hiddenStates.multiDeviceDatas[rootDevice]->cudaData,
                                             hiddenStates.cpuData,
                                             hiddenStates.GetBytes());
-
             std::vector<std::exception_ptr> errors(devices.size());
             workerGroup.Run(devices, [&](int r) {
                 int device = devices[r];
@@ -1068,6 +1296,62 @@ namespace fastllm {
                 cache.UpdateUnitSize();
             }
             cache.ToDevice(DataDevice::CUDA, {device}, false);
+        }
+
+        static void TrimStep3p5BoundedPagedCache(Data *cache,
+                                                  int retainedTokens) {
+            if (cache == nullptr || retainedTokens < 0 ||
+                !cache->isPagedKVCache || cache->pagedKVCacheData == nullptr ||
+                cache->pageIndex.size() <= 1 || cache->pageLen <= 0) {
+                return;
+            }
+
+            const int pageLen = cache->pageLen;
+            const long long cachedTokens =
+                (long long)(cache->pageIndex.size() - 1) * pageLen +
+                cache->lastPageLen;
+            int dropPages = 0;
+            while (dropPages + 1 < (int)cache->pageIndex.size() &&
+                   cachedTokens - (long long)(dropPages + 1) * pageLen >=
+                       retainedTokens) {
+                dropPages++;
+            }
+            if (dropPages <= 0) {
+                return;
+            }
+
+            std::vector<int> released(cache->pageIndex.begin(),
+                                      cache->pageIndex.begin() + dropPages);
+            cache->pagedKVCacheData->ReleasePageIndices(released);
+            cache->pageIndex.erase(cache->pageIndex.begin(),
+                                   cache->pageIndex.begin() + dropPages);
+        }
+
+        static bool Step3p5PagedCacheMetaAlignedAcrossLayers(
+                const std::vector<std::pair<Data*, Data*> > &pastKeyValues,
+                int batch, int blockCnt) {
+            if (batch <= 0 || blockCnt <= 0 ||
+                (int)pastKeyValues.size() < batch * blockCnt) {
+                return false;
+            }
+            for (int b = 0; b < batch; b++) {
+                Data *referenceKey = pastKeyValues[b * blockCnt].first;
+                if (referenceKey == nullptr) {
+                    return false;
+                }
+                for (int i = 0; i < blockCnt; i++) {
+                    Data *pastKey = pastKeyValues[b * blockCnt + i].first;
+                    Data *pastValue = pastKeyValues[b * blockCnt + i].second;
+                    if (pastKey == nullptr || pastValue == nullptr ||
+                        pastKey->pageIndex != referenceKey->pageIndex ||
+                        pastValue->pageIndex != referenceKey->pageIndex ||
+                        pastKey->lastPageLen != referenceKey->lastPageLen ||
+                        pastValue->lastPageLen != referenceKey->lastPageLen) {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
 
         static void SyncStep3p5ThreadTpRootCacheMetaFromLocal(Data &root,
@@ -1327,6 +1611,8 @@ namespace fastllm {
             Data attenOutput;
             Data attenLastOutput;
             Data gate;
+            Data gateFp16;
+            Data gateActivated;
             Data ffMiddle;
             Data ffAct;
             Data ffUp;
@@ -1396,6 +1682,8 @@ namespace fastllm {
             Step3p5FreeReusableTensor(buf.attenOutput);
             Step3p5FreeReusableTensor(buf.attenLastOutput);
             Step3p5FreeReusableTensor(buf.gate);
+            Step3p5FreeReusableTensor(buf.gateFp16);
+            Step3p5FreeReusableTensor(buf.gateActivated);
             Step3p5FreeReusableTensor(buf.ffMiddle);
             Step3p5FreeReusableTensor(buf.ffAct);
             Step3p5FreeReusableTensor(buf.ffUp);
@@ -1430,11 +1718,12 @@ namespace fastllm {
         struct Step3p5CudaGraphDecodeState {
             std::mutex mutex;
             std::string signature;
-            bool warmed = false;
+            int warmupRuns = 0;
             bool captured = false;
             bool disabled = false;
             void *graph = nullptr;
             void *exec = nullptr;
+            std::vector<void*> reservedPointers;
             Data inputIds;
             Data positionIds;
             Step3p5ForwardSingleBuffers buffers;
@@ -1456,6 +1745,10 @@ namespace fastllm {
                     FastllmCudaGraphDestroy(graph);
                     graph = nullptr;
                 }
+                if (!reservedPointers.empty()) {
+                    FastllmCudaGraphMemoryPoolRelease(reservedPointers);
+                    reservedPointers.clear();
+                }
             }
         };
 
@@ -1474,10 +1767,22 @@ namespace fastllm {
                    (model == nullptr || !model->autoWarmupRunning.load());
         }
 
+        static std::mutex &Step3p5CudaGraphSyncStatesMutex() {
+            static auto *syncsMutex = new std::mutex();
+            return *syncsMutex;
+        }
+
+        static std::map<const Step3p5Model*, std::unique_ptr<Step3p5CudaGraphSyncState> > &
+                Step3p5CudaGraphSyncStates() {
+            static auto *syncs = new std::map<
+                    const Step3p5Model*,
+                    std::unique_ptr<Step3p5CudaGraphSyncState> >();
+            return *syncs;
+        }
+
         static Step3p5CudaGraphSyncState &GetStep3p5CudaGraphSyncState(const Step3p5Model *model) {
-            static std::mutex syncsMutex;
-            static std::map<const Step3p5Model*, std::unique_ptr<Step3p5CudaGraphSyncState> > syncs;
-            std::lock_guard<std::mutex> guard(syncsMutex);
+            std::lock_guard<std::mutex> guard(Step3p5CudaGraphSyncStatesMutex());
+            auto &syncs = Step3p5CudaGraphSyncStates();
             auto &sync = syncs[model];
             if (sync == nullptr) {
                 sync.reset(new Step3p5CudaGraphSyncState());
@@ -1534,8 +1839,12 @@ namespace fastllm {
                 FastllmCudaGraphDestroy(state.graph);
                 state.graph = nullptr;
             }
+            if (!state.reservedPointers.empty()) {
+                FastllmCudaGraphMemoryPoolRelease(state.reservedPointers);
+                state.reservedPointers.clear();
+            }
             state.captured = false;
-            state.warmed = false;
+            state.warmupRuns = 0;
             state.lastInsertIndexHost.clear();
             state.lastPageSizesHost.clear();
             state.lastPageIndexHost.clear();
@@ -1587,13 +1896,15 @@ namespace fastllm {
         using Step3p5CudaGraphStateKey = std::tuple<const Step3p5Model*, int, int>;
 
         static std::mutex &Step3p5CudaGraphStatesMutex() {
-            static std::mutex statesMutex;
-            return statesMutex;
+            static auto *statesMutex = new std::mutex();
+            return *statesMutex;
         }
 
         static std::map<Step3p5CudaGraphStateKey, std::unique_ptr<Step3p5CudaGraphDecodeState> > &Step3p5CudaGraphStates() {
-            static std::map<Step3p5CudaGraphStateKey, std::unique_ptr<Step3p5CudaGraphDecodeState> > states;
-            return states;
+            static auto *states = new std::map<
+                    Step3p5CudaGraphStateKey,
+                    std::unique_ptr<Step3p5CudaGraphDecodeState> >();
+            return *states;
         }
 
         static Step3p5CudaGraphDecodeState &GetStep3p5CudaGraphDecodeState(
@@ -1608,17 +1919,36 @@ namespace fastllm {
             return *state;
         }
 
-        static void Step3p5DestroyCudaGraphDecodeStates(const Step3p5Model *model, int gpuId) {
-            std::lock_guard<std::mutex> guard(Step3p5CudaGraphStatesMutex());
-            auto &states = Step3p5CudaGraphStates();
-            for (auto &it : states) {
-                if (std::get<0>(it.first) == model && std::get<1>(it.first) == gpuId &&
-                    it.second != nullptr) {
-                    std::lock_guard<std::mutex> stateGuard(it.second->mutex);
-                    Step3p5DestroyCudaGraph(*it.second);
-                    Step3p5ReinitializeForwardSingleBuffers(it.second->buffers);
-                    Step3p5ReinitializeForwardSingleBuffers(it.second->metaBuffers);
+        static void Step3p5EraseCudaGraphDecodeStates(const Step3p5Model *model) {
+            int previousDevice = FastllmCudaGetDevice();
+            {
+                std::lock_guard<std::mutex> guard(Step3p5CudaGraphStatesMutex());
+                auto &states = Step3p5CudaGraphStates();
+                for (auto it = states.begin(); it != states.end();) {
+                    if (std::get<0>(it->first) != model) {
+                        ++it;
+                        continue;
+                    }
+
+                    FastllmCudaSetDevice(std::get<1>(it->first));
+                    if (it->second != nullptr) {
+                        {
+                            std::lock_guard<std::mutex> stateGuard(it->second->mutex);
+                            Step3p5DestroyCudaGraph(*it->second);
+                            Step3p5ReinitializeForwardSingleBuffers(it->second->buffers);
+                            Step3p5ReinitializeForwardSingleBuffers(it->second->metaBuffers);
+                        }
+                    }
+                    it = states.erase(it);
                 }
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(Step3p5CudaGraphSyncStatesMutex());
+                Step3p5CudaGraphSyncStates().erase(model);
+            }
+            if (previousDevice >= 0) {
+                FastllmCudaSetDevice(previousDevice);
             }
         }
 
@@ -1791,7 +2121,9 @@ namespace fastllm {
                 if (expert >= expertStart && expert < expertEnd) {
                     indexData[i] = expert - expertStart;
                 } else {
-                    indexData[i] = 0;
+                    // The fused local-expert kernels use a negative index as
+                    // the inactive-route sentinel and skip its projections.
+                    indexData[i] = -1;
                     scoreData[i] = 0.0f;
                 }
             }
@@ -1818,6 +2150,46 @@ namespace fastllm {
                        FloatDict(), IntDict(), {"output"});
         }
 
+        static void Step3p5CudaMambaSoftplus(
+                Qwen3CudaDirectRunner &runner,
+                Data &input, Data &aLog, Data &dtBias,
+                Data &output, float outputScale = 1.0f) {
+            runner.Run("MambaSoftplus",
+                       DataDict{{"input", &input}, {"aLog", &aLog},
+                                {"dtBias", &dtBias}, {"output", &output}},
+                       FloatDict{{"outputScale", outputScale}}, IntDict(),
+                       {"output"});
+        }
+
+        static Data *Step3p5CudaApplyAttentionGate(
+                Qwen3CudaDirectRunner &runner,
+                Data &gate, bool useMambaSoftplus,
+                Data *aLog, Data *dtBias,
+                Data &gateFp16, Data &gateActivated) {
+            if (!useMambaSoftplus) {
+                Step3p5CudaSigmoid(runner, gate, gate);
+                return &gate;
+            }
+            AssertInFastLLM(aLog != nullptr && dtBias != nullptr,
+                            "Step3p5 MambaSoftplus attention gate is missing parameters.\n");
+            Data *softplusInput = &gate;
+            if (gate.dataType == DataType::BFLOAT16) {
+                Qwen3CudaConvertToDataType(runner, gate, gateFp16,
+                                           DataType::FLOAT16);
+                softplusInput = &gateFp16;
+            }
+            // MambaSoftplus returns -exp(A_log) * softplus(x + dt_bias).
+            // Laguna's attention gate uses the positive value.
+            Step3p5CudaMambaSoftplus(runner, *softplusInput, *aLog, *dtBias,
+                                     gateActivated, -1.0f);
+            if (gateActivated.dataType != gate.dataType) {
+                Qwen3CudaConvertToDataType(runner, gateActivated, gate,
+                                           gate.dataType);
+                return &gate;
+            }
+            return &gateActivated;
+        }
+
         static void Step3p5CudaSilu(Qwen3CudaDirectRunner &runner,
                                     Data &input, Data &output) {
             runner.Run("Silu",
@@ -1842,8 +2214,21 @@ namespace fastllm {
                                            float factor,
                                            float originalMaxPosition,
                                            float lowFreqFactor,
-                                           float highFreqFactor) {
-            if (useLlama3) {
+                                           float highFreqFactor,
+                                           bool useYarn,
+                                           float yarnAttentionFactor,
+                                           float yarnCorrectionLow,
+                                           float yarnCorrectionHigh) {
+            if (useYarn) {
+                runner.Run("YarnRopeEncoding",
+                           DataDict{{"input", &input}, {"positionIds", (Data*)&positionIds}},
+                           FloatDict{{"ropeTheta", ropeTheta},
+                                     {"factor", factor},
+                                     {"attentionFactor", yarnAttentionFactor},
+                                     {"correctionLow", yarnCorrectionLow},
+                                     {"correctionHigh", yarnCorrectionHigh}},
+                           IntDict{{"rotaryDim", rotaryDim}});
+            } else if (useLlama3) {
                 runner.Run("Llama3RopeEncoding",
                            DataDict{{"input", &input}, {"positionIds", (Data*)&positionIds}},
                            FloatDict{{"ropeTheta", ropeTheta},
@@ -1879,6 +2264,11 @@ namespace fastllm {
                 float llama3OriginalMaxPosition,
                 float llama3LowFreqFactor,
                 float llama3HighFreqFactor,
+                bool useYarn,
+                float yarnFactor,
+                float yarnAttentionFactor,
+                float yarnCorrectionLow,
+                float yarnCorrectionHigh,
                 int pageLen,
                 int batch,
                 Data *lastPageLens) {
@@ -1906,10 +2296,15 @@ namespace fastllm {
                                  {"llama3Factor", llama3Factor},
                                  {"llama3OriginalMaxPosition", llama3OriginalMaxPosition},
                                  {"llama3LowFreqFactor", llama3LowFreqFactor},
-                                 {"llama3HighFreqFactor", llama3HighFreqFactor}},
+                                 {"llama3HighFreqFactor", llama3HighFreqFactor},
+                                 {"yarnFactor", yarnFactor},
+                                 {"yarnAttentionFactor", yarnAttentionFactor},
+                                 {"yarnCorrectionLow", yarnCorrectionLow},
+                                 {"yarnCorrectionHigh", yarnCorrectionHigh}},
                        IntDict{{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
                                {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch},
-                               {"doQKNorm", 1}, {"useLlama3", useLlama3 ? 1 : 0}},
+                               {"doQKNorm", 1}, {"useLlama3", useLlama3 ? 1 : 0},
+                               {"useYarn", useYarn ? 1 : 0}},
                        outputs);
         }
 
@@ -1932,13 +2327,15 @@ namespace fastllm {
         static void Step3p5CudaFusedMOE(Qwen3CudaDirectRunner &runner,
                                         Data &input, Data &expertIndex, Data &expertScore,
                                         Data &gate, Data &up, Data &down, Data &w1,
-                                        Data &output, int layer, float swigluLimit) {
+                                        Data &output, int layer, float swigluLimit,
+                                        bool allowTriton = true) {
             runner.Run("FusedMOE",
                        DataDict{{"input", &input}, {"index", &expertIndex}, {"score", &expertScore},
                                 {"gate", &gate}, {"up", &up}, {"down", &down},
                                 {"w1", &w1}, {"output", &output}},
                        FloatDict{{"swigluLimit", swigluLimit}},
-                       IntDict{{"layer", layer}, {"gateType", (int)MoeGateSwiglu}},
+                       IntDict{{"layer", layer}, {"gateType", (int)MoeGateSwiglu},
+                               {"allowTriton", allowTriton ? 1 : 0}},
                        {"w1", "output"});
         }
 
@@ -1965,8 +2362,15 @@ namespace fastllm {
                 float llama3OriginalMaxPosition,
                 float llama3LowFreqFactor,
                 float llama3HighFreqFactor,
+                bool useYarn,
+                float yarnFactor,
+                float yarnAttentionFactor,
+                float yarnCorrectionLow,
+                float yarnCorrectionHigh,
+                int attentionWindowLeft,
                 bool kvCacheInCPU,
                 int pagedCacheLayerOffset,
+                int pagedCacheMaxPages,
                 bool isPrefill,
                 bool externalDecodeMeta,
                 bool enableFlashInferCudaGraph = false,
@@ -2050,7 +2454,11 @@ namespace fastllm {
                         useLlama3 ? 1 : 0, ropeFactor,
                         llama3OriginalMaxPosition,
                         llama3LowFreqFactor,
-                        llama3HighFreqFactor),
+                        llama3HighFreqFactor,
+                        useYarn ? 1 : 0, yarnFactor,
+                        yarnAttentionFactor,
+                        yarnCorrectionLow,
+                        yarnCorrectionHigh),
                     "Step3p5 CUDA graph fused QKV append failed.\n");
 
                 Data &kCaches = *(*batchPastKeys)[0];
@@ -2059,8 +2467,9 @@ namespace fastllm {
                     if (cacheType == DataType::FP8_E4M3) {
                         return queryType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
                     }
-                    if (queryType == DataType::FLOAT16 || queryType == DataType::BFLOAT16) {
-                        return queryType;
+                    if (cacheType == DataType::FLOAT16 ||
+                        cacheType == DataType::BFLOAT16) {
+                        return cacheType;
                     }
                     return DataType::FLOAT16;
                 };
@@ -2075,7 +2484,8 @@ namespace fastllm {
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
                     *attenOutput, numAttentionHeads / numKeyValueHeads,
                     1.0f / std::sqrt((float)headDim), 1, layerIdx > 0,
-                    enableFlashInferCudaGraph, flashInferCudaGraph);
+                    enableFlashInferCudaGraph, flashInferCudaGraph,
+                    attentionWindowLeft);
                 attenOutput->Reshape({seqlen, bsz, -1});
                 Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
                 return;
@@ -2147,13 +2557,16 @@ namespace fastllm {
                     llama3OriginalMaxPosition,
                     llama3LowFreqFactor,
                     llama3HighFreqFactor,
+                    useYarn, yarnFactor, yarnAttentionFactor,
+                    yarnCorrectionLow, yarnCorrectionHigh,
                     pagedKData.dims[1], batch,
                     fillLastPageLensOnDevice ? lastPageLens : nullptr);
 
                 for (int b = 0; b < batch; b++) {
                     auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
                         if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
-                            cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                            int page = mgr->GetUnusedPageIndex(true);
+                            cache->pageIndex.push_back(page);
                             cache->lastPageLen = 1;
                         } else {
                             cache->lastPageLen++;
@@ -2167,8 +2580,9 @@ namespace fastllm {
                     if (cacheType == DataType::FP8_E4M3) {
                         return queryType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
                     }
-                    if (queryType == DataType::FLOAT16 || queryType == DataType::BFLOAT16) {
-                        return queryType;
+                    if (cacheType == DataType::FLOAT16 ||
+                        cacheType == DataType::BFLOAT16) {
+                        return cacheType;
                     }
                     return DataType::FLOAT16;
                 };
@@ -2192,7 +2606,8 @@ namespace fastllm {
                                              kCaches, vCaches,
                                              *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
                                              *attenOutput, numAttentionHeads / numKeyValueHeads,
-                                             1.0f / std::sqrt((float)headDim), 1, layerIdx > 0);
+                                             1.0f / std::sqrt((float)headDim), 1, layerIdx > 0,
+                                             false, -1, attentionWindowLeft);
                 attenOutput->Reshape({seqlen, bsz, -1});
                 Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
                 return;
@@ -2216,10 +2631,14 @@ namespace fastllm {
             Qwen3CudaRMSNorm(runner, k, *kNormWeight, rmsNormEps, k);
             Step3p5CudaApplyRotary(runner, *q, *allPositionIds, rotaryDim, ropeTheta,
                                    useLlama3, ropeFactor, llama3OriginalMaxPosition,
-                                   llama3LowFreqFactor, llama3HighFreqFactor);
+                                   llama3LowFreqFactor, llama3HighFreqFactor,
+                                   useYarn, yarnAttentionFactor,
+                                   yarnCorrectionLow, yarnCorrectionHigh);
             Step3p5CudaApplyRotary(runner, k, *allPositionIds, rotaryDim, ropeTheta,
                                    useLlama3, ropeFactor, llama3OriginalMaxPosition,
-                                   llama3LowFreqFactor, llama3HighFreqFactor);
+                                   llama3LowFreqFactor, llama3HighFreqFactor,
+                                   useYarn, yarnAttentionFactor,
+                                   yarnCorrectionLow, yarnCorrectionHigh);
 
             Qwen3CudaPermuteSelf(runner, *q, {0, 2, 1, 3});
             Qwen3CudaPermuteSelf(runner, k, {0, 2, 1, 3});
@@ -2251,9 +2670,11 @@ namespace fastllm {
                 Data vCacheDesc = makeCacheDesc(v, pastValue.dataType);
                 int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
                 PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                    cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                    kCacheDesc, -1, pagedCacheMaxPages);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                    cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                    vCacheDesc, -1, pagedCacheMaxPages);
                 Qwen3CudaAppendPagedCache(runner, *pagedCacheKManager, pastKey, k);
                 Qwen3CudaAppendPagedCache(runner, *pagedCacheVManager, pastValue, v);
             } else {
@@ -2269,9 +2690,11 @@ namespace fastllm {
                     Data vCacheDesc = makeCacheDesc(curV, pastValue.dataType);
                     int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
                     PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                        cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                        cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                        kCacheDesc, -1, pagedCacheMaxPages);
                     PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                        cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                        cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                        vCacheDesc, -1, pagedCacheMaxPages);
                     Qwen3CudaAppendPagedCache(runner, *pagedCacheKManager, pastKey, curK);
                     Qwen3CudaAppendPagedCache(runner, *pagedCacheVManager, pastValue, curV);
                     total += seqLens[b];
@@ -2284,8 +2707,9 @@ namespace fastllm {
                 if (cacheType == DataType::FP8_E4M3) {
                     return queryType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
                 }
-                if (queryType == DataType::FLOAT16 || queryType == DataType::BFLOAT16) {
-                    return queryType;
+                if (cacheType == DataType::FLOAT16 ||
+                    cacheType == DataType::BFLOAT16) {
+                    return cacheType;
                 }
                 return DataType::FLOAT16;
             };
@@ -2301,7 +2725,8 @@ namespace fastllm {
                                          kCaches, vCaches,
                                          *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
                                          *attenOutput, numAttentionHeads / numKeyValueHeads,
-                                         1.0f / std::sqrt((float)headDim), 1, layerIdx > 0);
+                                         1.0f / std::sqrt((float)headDim), 1, layerIdx > 0,
+                                         false, -1, attentionWindowLeft);
             attenOutput->Reshape({1, seqlen, -1});
         }
     }
@@ -2342,6 +2767,19 @@ namespace fastllm {
         };
     }
 
+    Step3p5Model::~Step3p5Model() {
+        // Graph states retain model-owned CUDA buffers and are keyed by this
+        // model's address.  Stop every producer before removing those entries
+        // so a later model at the same address cannot inherit stale state.
+        ShutdownRuntime();
+        if (threadTpWorkerGroup.HasWorkers()) {
+            threadTpWorkerGroup.Stop();
+        }
+#ifdef USE_CUDA
+        Step3p5EraseCudaGraphDecodeStates(this);
+#endif
+    }
+
     std::map <std::string, std::vector <std::pair <std::string, DataType> > >
             Step3p5Model::GetTensorMap(const std::vector <std::string> &tensorNames) {
         std::map <std::string, std::vector <std::pair <std::string, DataType> > > ret;
@@ -2379,6 +2817,53 @@ namespace fastllm {
         std::vector<int> devices;
         std::map<int, int> ratios;
         return GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios);
+#else
+        return false;
+#endif
+    }
+
+    bool Step3p5Model::GPUForwardTargetsSupportFlashInfer() const {
+#ifdef USE_CUDA
+        if (Step3p5CudaEnvFlagEnabled("FASTLLM_FORCE_NATIVE_ATTN")) {
+            return false;
+        }
+
+        int cached = gpuForwardTargetsFlashInferSupportCache.load(
+            std::memory_order_acquire);
+        if (cached >= 0) {
+            return cached != 0;
+        }
+
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios) ||
+            devices.empty()) {
+            return false;
+        }
+
+        int originalDevice = FastllmCudaGetDevice();
+        bool supported = true;
+        const DataType computeType = GPUForwardComputeType();
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            // The CUDA backend owns the runtime API dependency and applies
+            // both FlashInfer's architecture and compute-type constraints.
+            if (!FastllmCudaFlashInferDataTypeSupported(computeType)) {
+                supported = false;
+                break;
+            }
+        }
+        if (originalDevice >= 0) {
+            FastllmCudaSetDevice(originalDevice);
+        }
+
+        // Keep the environment override live, but cache the immutable device capability.
+        if (Step3p5CudaEnvFlagEnabled("FASTLLM_FORCE_NATIVE_ATTN")) {
+            return false;
+        }
+        gpuForwardTargetsFlashInferSupportCache.store(
+            supported ? 1 : 0, std::memory_order_release);
+        return supported;
 #else
         return false;
 #endif
@@ -2590,7 +3075,11 @@ namespace fastllm {
             bool tensorParallel,
             bool firstTensorParallelRank,
             int pagedCacheLayerOffset,
-            Data &logits) {
+            Data &logits,
+            bool *pagedCacheAllocationDiverged) {
+        if (pagedCacheAllocationDiverged != nullptr) {
+            *pagedCacheAllocationDiverged = false;
+        }
 #ifndef USE_CUDA
         return false;
 #else
@@ -2622,6 +3111,10 @@ namespace fastllm {
         auto syncGraphPeers = [&](bool ok = true) {
             return Step3p5CudaGraphSyncPhase(this, graphParticipants, ok);
         };
+        if (!syncGraphPeers(Step3p5PagedCacheMetaAlignedAcrossLayers(
+                pastKeyValues, batch, block_cnt))) {
+            return rejectGraph("paged cache metadata diverged across layers");
+        }
 
         auto &fusedMoeByDevice = tensorParallel ? threadTpFusedMoeWeights : singleGpuFusedMoeWeights;
         auto &fusedMoeRangesByDevice = tensorParallel ?
@@ -2705,7 +3198,6 @@ namespace fastllm {
                     pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA ||
                     pastKey->dataDeviceIds.empty() || pastValue->dataDeviceIds.empty() ||
                     pastKey->dataDeviceIds[0] != gpuId || pastValue->dataDeviceIds[0] != gpuId ||
-                    pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3 ||
                     pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
                     pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
                     pastKey->lastPageLen != pastValue->lastPageLen) {
@@ -2752,12 +3244,10 @@ namespace fastllm {
         std::vector<int> lastPageLensHost(batch, 0);
         std::vector<int> qSizesHost(batch + 1, 0);
         std::vector<int> pageSizesHost(batch + 1, 0);
-        std::vector<int> graphPlanPageSizesHost(batch + 1, 0);
         std::vector<int> pageIndexHost;
         std::vector<const Data*> currentPastKeyHosts(batch, nullptr);
         std::vector<char> needNewPage(batch, 0);
         bool anyNewPage = false;
-        int maxActualPagesPerRequest = 1;
 
         for (int b = 0; b < batch; b++) {
             Data *firstKey = pastKeyValues[b * block_cnt].first;
@@ -2771,34 +3261,87 @@ namespace fastllm {
             }
         }
 
-        for (int i = 0; i < block_cnt; i++) {
+        struct PendingPagedCacheUpdate {
+            Data *key = nullptr;
+            Data *value = nullptr;
+            int keyPage = -1;
+            int valuePage = -1;
+            bool newPage = false;
+        };
+        std::vector<PendingPagedCacheUpdate> pendingCacheUpdates;
+        pendingCacheUpdates.reserve(batch * block_cnt);
+        bool pageAllocationOk = true;
+        for (int i = 0; i < block_cnt && pageAllocationOk; i++) {
             for (int b = 0; b < batch; b++) {
                 Data *pastKey = pastKeyValues[b * block_cnt + i].first;
                 Data *pastValue = pastKeyValues[b * block_cnt + i].second;
-                bool layerNeedNewPage = pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
-                AssertInFastLLM(layerNeedNewPage == (needNewPage[b] != 0),
-                                "Step3p5 CUDA graph requires aligned paged cache layout across layers.\n");
-                if (needNewPage[b]) {
-                    int keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
-                    int valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
-                    if (insertIndexHost[b] < 0) {
-                        insertIndexHost[b] = keyPage;
-                    }
-                    AssertInFastLLM(keyPage == insertIndexHost[b] && valuePage == insertIndexHost[b],
-                                    "Step3p5 CUDA graph requires aligned K/V page indices across layers.\n");
-                    pastKey->pageIndex.push_back(keyPage);
-                    pastValue->pageIndex.push_back(valuePage);
-                    pastKey->lastPageLen = 1;
-                    pastValue->lastPageLen = 1;
-                } else {
-                    AssertInFastLLM(pastKey->pageIndex.back() == insertIndexHost[b] &&
-                                    pastValue->pageIndex.back() == insertIndexHost[b] &&
-                                    pastKey->lastPageLen == insertPositionHost[b] &&
-                                    pastValue->lastPageLen == insertPositionHost[b],
-                                    "Step3p5 CUDA graph requires aligned paged cache positions across layers.\n");
-                    pastKey->lastPageLen++;
-                    pastValue->lastPageLen++;
+                bool layerNeedNewPage =
+                    pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
+                if (layerNeedNewPage != (needNewPage[b] != 0)) {
+                    pageAllocationOk = false;
+                    break;
                 }
+
+                PendingPagedCacheUpdate update;
+                update.key = pastKey;
+                update.value = pastValue;
+                update.newPage = layerNeedNewPage;
+                if (layerNeedNewPage) {
+                    update.keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
+                    update.valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
+                    pendingCacheUpdates.push_back(update);
+                    if (insertIndexHost[b] < 0) {
+                        insertIndexHost[b] = update.keyPage;
+                    }
+                    if (update.keyPage != insertIndexHost[b] ||
+                        update.valuePage != insertIndexHost[b]) {
+                        pageAllocationOk = false;
+                        break;
+                    }
+                } else {
+                    if (pastKey->pageIndex.back() != insertIndexHost[b] ||
+                        pastValue->pageIndex.back() != insertIndexHost[b] ||
+                        pastKey->lastPageLen != insertPositionHost[b] ||
+                        pastValue->lastPageLen != insertPositionHost[b]) {
+                        pageAllocationOk = false;
+                        break;
+                    }
+                    pendingCacheUpdates.push_back(update);
+                }
+            }
+        }
+
+        if (!syncGraphPeers(pageAllocationOk)) {
+            // GetUnusedPageIndex owns one reference immediately.  Roll back in
+            // reverse order to restore each manager's LIFO free-page order as
+            // closely as possible, then let the caller run the per-layer eager
+            // metadata path for this decode step.
+            for (auto it = pendingCacheUpdates.rbegin();
+                 it != pendingCacheUpdates.rend(); ++it) {
+                if (!it->newPage) {
+                    continue;
+                }
+                it->value->pagedKVCacheData->ReleasePageIndex(it->valuePage);
+                it->key->pagedKVCacheData->ReleasePageIndex(it->keyPage);
+            }
+            if (pagedCacheAllocationDiverged != nullptr) {
+                *pagedCacheAllocationDiverged = true;
+            }
+            return rejectGraph("paged cache allocator ids diverged across layers");
+        }
+
+        // Do not mutate request metadata until every layer and every TP rank
+        // has validated its allocation.  This makes graph rejection atomic
+        // from the eager fallback's point of view.
+        for (auto &update : pendingCacheUpdates) {
+            if (update.newPage) {
+                update.key->pageIndex.push_back(update.keyPage);
+                update.value->pageIndex.push_back(update.valuePage);
+                update.key->lastPageLen = 1;
+                update.value->lastPageLen = 1;
+            } else {
+                update.key->lastPageLen++;
+                update.value->lastPageLen++;
             }
         }
 
@@ -2811,7 +3354,6 @@ namespace fastllm {
             int requestPages = (int)firstKey->pageIndex.size();
             AssertInFastLLM(requestPages <= graphMaxPagesPerRequest,
                             "Step3p5 CUDA graph page metadata exceeds captured capacity.\n");
-            maxActualPagesPerRequest = std::max(maxActualPagesPerRequest, requestPages);
             pageSizesHost[b + 1] = pageSizesHost[b] + requestPages;
             pageIndexHost.insert(pageIndexHost.end(),
                                  firstKey->pageIndex.begin(), firstKey->pageIndex.end());
@@ -2828,17 +3370,13 @@ namespace fastllm {
                                 "Step3p5 CUDA graph requires aligned paged cache pages across layers.\n");
             }
         }
-        int graphPlanPagesPerRequest = 1;
-        while (graphPlanPagesPerRequest < maxActualPagesPerRequest &&
-               graphPlanPagesPerRequest < graphMaxPagesPerRequest) {
-            graphPlanPagesPerRequest <<= 1;
-        }
-        graphPlanPagesPerRequest = std::min(graphPlanPagesPerRequest, graphMaxPagesPerRequest);
-        for (int b = 0; b < batch; b++) {
-            graphPlanPageSizesHost[b + 1] =
-                graphPlanPageSizesHost[b] + graphPlanPagesPerRequest;
-        }
-        int pageIndexCapacity = batch * graphPlanPagesPerRequest;
+        // Keep page-index storage fixed for the graph lifetime.  FlashInfer's
+        // dynamic decode plan reads the actual page indptr from pageSizes, so
+        // unused entries in the padded pageIndexs buffer are never consumed.
+        // Using the current request's page count here would change the graph
+        // signature at every power-of-two boundary and force recapture.
+        const int graphPlanPagesPerRequest = graphMaxPagesPerRequest;
+        const int pageIndexCapacity = batch * graphPlanPagesPerRequest;
 
         std::ostringstream signature;
         signature << "gpu=" << gpuId
@@ -2853,10 +3391,9 @@ namespace fastllm {
         for (int dim : state.positionIds.dims) {
             signature << dim << ",";
         }
-        signature << ";pageSizes=";
-        for (int pageSize : graphPlanPageSizesHost) {
-            signature << pageSize << ",";
-        }
+        // The FlashInfer tile schedule is rebuilt from the device page indptr
+        // by a kernel captured ahead of attention.  Exact page counts do not
+        // affect graph topology; the configured maximum fixes storage capacity.
         signature << ";pages=" << pageIndexCapacity
                   << ";inputType=" << (int)state.inputIds.dataType
                   << ";posType=" << (int)state.positionIds.dataType
@@ -2896,8 +3433,6 @@ namespace fastllm {
             Step3p5PrepareGraphIntTensor(state.metaBuffers.insertPositions, gpuId, insertPositionHost);
             Step3p5PrepareGraphIntTensor(state.metaBuffers.qSizes, gpuId, qSizesHost);
             Step3p5PrepareGraphIntTensor(state.metaBuffers.pageSizes, gpuId, pageSizesHost);
-            // FlashInfer graph planning uses the CPU indptr; kernels still read the real CUDA indptr.
-            state.metaBuffers.pageSizes.cpuIntDatas = graphPlanPageSizesHost;
             Step3p5PrepareGraphIntTensor(state.metaBuffers.pageIndexs, gpuId, paddedPageIndexHost);
             Step3p5PrepareGraphIntTensor(state.metaBuffers.lastPageLens, gpuId, lastPageLensHost);
             state.lastInsertIndexHost = insertIndexHost;
@@ -2919,7 +3454,7 @@ namespace fastllm {
             state.lastPastKeyHosts = currentPastKeyHosts;
         }
 
-        const DataType computeType = ResolveStep3p5ThreadTpComputeType(this->dataType);
+        const DataType computeType = GPUForwardComputeType();
         auto runGraphBodyWithBuffers = [&](Step3p5ForwardSingleBuffers &buf,
                                            Step3p5ForwardSingleBuffers &metaBuf) {
             Qwen3CudaDirectRunner cudaRunner(gpuId);
@@ -3028,6 +3563,14 @@ namespace fastllm {
                 AssertInFastLLM(localKVHeads > 0 && localQHeads > 0,
                                 "Step3p5 ForwardSingleGPU graph got empty local attention shard.\n");
 
+                bool useYarn = GPUForwardUseYarnRope(i);
+                float yarnFactor = 1.0f, yarnAttentionFactor = 1.0f;
+                float yarnCorrectionLow = 0.0f, yarnCorrectionHigh = 1.0f;
+                GPUForwardYarnRopeParams(i, yarnFactor, yarnAttentionFactor,
+                                         yarnCorrectionLow, yarnCorrectionHigh);
+                float rotaryFactor = useYarn ? yarnFactor : rope_factor;
+                int attentionWindowLeft = GPUForwardAttentionWindowLeft(i);
+
                 const bool enableStableFlashInferGraphPlan = true;
                 const int flashInferCudaGraph = 1;
                 Step3p5CudaAttentionPagedBlock(
@@ -3048,12 +3591,16 @@ namespace fastllm {
                     seqLens,
                     localQHeads, localKVHeads, head_dim,
                     curRotaryDim, rms_norm_eps,
-                    curTheta, rope_factor, UseLlama3Rope(i),
+                    curTheta, rotaryFactor, UseLlama3Rope(i),
                     llama3_original_max_position_embeddings,
                     llama3_low_freq_factor,
                     llama3_high_freq_factor,
+                    useYarn, yarnFactor, yarnAttentionFactor,
+                    yarnCorrectionLow, yarnCorrectionHigh,
+                    attentionWindowLeft,
                     GetKVCacheInCPU(),
                     pagedCacheLayerOffset,
+                    GPUForwardPagedCacheMaxPages(i),
                     false,
                     true,
                     enableStableFlashInferGraphPlan,
@@ -3066,14 +3613,27 @@ namespace fastllm {
                 Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                 *requireLocal(weight[gProjName], gProjName),
                                 *GetEmptyData(), buf.gate);
-                Step3p5CudaSigmoid(cudaRunner, buf.gate, buf.gate);
+                bool useMambaGate = GPUForwardUseMambaSoftplusGate(i);
+                Data *gateALog = GPUForwardMambaSoftplusALog();
+                Data *gateDtBias = GPUForwardMambaSoftplusDtBias();
+                if (useMambaGate) {
+                    AssertInFastLLM(gateALog != nullptr && gateDtBias != nullptr,
+                                    "Step3p5 graph MambaSoftplus gate parameters are missing.\n");
+                    gateALog = requireLocal(*gateALog, "attention_gate.a_log");
+                    gateDtBias = requireLocal(*gateDtBias, "attention_gate.dt_bias");
+                }
+                Data *activeGate = Step3p5CudaApplyAttentionGate(
+                    cudaRunner, buf.gate, useMambaGate,
+                    gateALog, gateDtBias, buf.gateFp16, buf.gateActivated);
                 int bsz = buf.attenInput.dims[0], seqlen = buf.attenInput.dims[1];
-                buf.gate.Reshape({bsz, seqlen, localQHeads, 1});
-                if (buf.gate.dataType != buf.attenOutput.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, buf.gate, buf.attenOutput.dataType);
+                activeGate->Reshape({bsz, seqlen, localQHeads, 1});
+                if (activeGate->dataType != buf.attenOutput.dataType) {
+                    Qwen3CudaConvertToDataType(cudaRunner, *activeGate,
+                                               buf.gate, buf.attenOutput.dataType);
+                    activeGate = &buf.gate;
                 }
                 buf.attenOutput.Reshape({bsz, seqlen, localQHeads, head_dim});
-                Step3p5CudaMulTo(cudaRunner, buf.attenOutput, buf.gate);
+                Step3p5CudaMulTo(cudaRunner, buf.attenOutput, *activeGate);
                 buf.attenOutput.Reshape({bsz, seqlen, localQHeads * head_dim});
 
                 Qwen3CudaLinearResidualReduce(
@@ -3103,14 +3663,6 @@ namespace fastllm {
                                          prefix + "share_expert.down_proj.weight",
                                          Step3p5LayerLimit(swiglu_limits_shared, i),
                                          buf.ffMiddle, buf.ffAct, buf.ffUp, buf.shareOutput);
-                    if (buf.shareOutput.dataType != buf.hiddenStates.dataType) {
-                        Qwen3CudaToDataType(cudaRunner, buf.shareOutput, buf.hiddenStates.dataType);
-                    }
-                    if (tensorParallel) {
-                        FastllmNcclAllReduce(buf.shareOutput.cudaData, buf.shareOutput.cudaData,
-                                             buf.shareOutput.Count(0), buf.shareOutput.dataType, gpuId);
-                    }
-                    Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.shareOutput);
 
                     int flatBatch = buf.attenInput.dims[0];
                     int flatLen = buf.attenInput.dims[1];
@@ -3118,16 +3670,23 @@ namespace fastllm {
                     Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                     *requireLocal(weight[prefix + "moe.gate.weight"], prefix + "moe.gate.weight"),
                                     *GetEmptyData(), buf.routerLogits, true);
-                    Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits, buf.routerProb, DataType::FLOAT32);
-                    Step3p5CudaSigmoid(cudaRunner, buf.routerProb, buf.routerProb);
                     Data *localGateBias = nullptr;
                     if (use_moe_router_bias &&
                         weight.weight.find(prefix + "moe.router_bias") != weight.weight.end()) {
                         localGateBias = requireLocal(weight[prefix + "moe.router_bias"], prefix + "moe.router_bias");
                     }
-                    Qwen3CudaSelectExpert(cudaRunner, buf.routerProb, buf.expertIndex, buf.expertScore,
-                                          num_experts_per_tok, norm_topk_prob,
-                                          routed_scaling_factor, localGateBias);
+                    if (!Qwen3CudaTryFusedSigmoidSelectExpert(
+                            cudaRunner, buf.routerLogits, buf.expertIndex, buf.expertScore,
+                            num_experts_per_tok, norm_topk_prob,
+                            routed_scaling_factor, localGateBias)) {
+                        Qwen3CudaConvertToDataType(
+                            cudaRunner, buf.routerLogits, buf.routerProb, DataType::FLOAT32);
+                        Step3p5CudaSigmoid(cudaRunner, buf.routerProb, buf.routerProb);
+                        Qwen3CudaSelectExpert(
+                            cudaRunner, buf.routerProb, buf.expertIndex, buf.expertScore,
+                            num_experts_per_tok, norm_topk_prob,
+                            routed_scaling_factor, localGateBias);
+                    }
 
                     auto &localFusedWeights = fusedMoeByDevice.at(gpuId)[i];
                     std::pair<int, int> expertRange = fusedMoeRangesByDevice.at(gpuId)[i];
@@ -3145,14 +3704,14 @@ namespace fastllm {
                                         *localFusedWeights[2], buf.w1, buf.moeFinal, i,
                                         Step3p5LayerLimit(swiglu_limits, i));
                     buf.moeFinal.Reshape(buf.hiddenStates.dims);
-                    if (buf.moeFinal.dataType != buf.hiddenStates.dataType) {
-                        Qwen3CudaToDataType(cudaRunner, buf.moeFinal, buf.hiddenStates.dataType);
+                    if (buf.shareOutput.dataType != buf.moeFinal.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, buf.shareOutput, buf.moeFinal.dataType);
                     }
-                    if (tensorParallel) {
-                        FastllmNcclAllReduce(buf.moeFinal.cudaData, buf.moeFinal.cudaData,
-                                             buf.moeFinal.Count(0), buf.moeFinal.dataType, gpuId);
-                    }
-                    Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.moeFinal);
+                    buf.shareOutput.Reshape(buf.moeFinal.dims);
+                    // Both tensors are rank-local partials. Merge them before
+                    // the collective so each MoE layer needs one all-reduce.
+                    Qwen3CudaAddTo(cudaRunner, buf.moeFinal, buf.shareOutput);
+                    addPartialToResidualReduce(buf.moeFinal);
                 }
             }
 
@@ -3198,13 +3757,20 @@ namespace fastllm {
             return true;
         }
 
-        if (!state.warmed) {
+        // The first eager pass creates persistent graph-state tensors while it
+        // is also warming transient operator workspaces. Some of those first-
+        // pass workspace blocks can subsequently become owned by persistent
+        // tensors, so one more eager pass is required to leave a stable pool
+        // before stream capture (notably for the two BF16 GEMM conversion
+        // buffers used at batch >= 8).
+        const int requiredWarmupRuns = 2;
+        if (state.warmupRuns < requiredWarmupRuns) {
             runWithoutGraph();
             if (!syncGraphPeers()) {
                 Step3p5DisableCudaGraphState(this, state);
                 return true;
             }
-            state.warmed = true;
+            state.warmupRuns++;
             return true;
         }
 
@@ -3212,30 +3778,89 @@ namespace fastllm {
         if (!syncGraphPeers()) {
             return false;
         }
-        bool beginOk = FastllmCudaGraphBeginCapture();
-        if (!Step3p5SyncCudaGraphStage(this, state, graphParticipants,
-                                       "begin capture", gpuId, beginOk)) {
-            if (beginOk) {
-                Step3p5AbortCudaGraphCapture();
-            }
-            runWithoutGraph();
-            return true;
+        const bool captureCoordinator = !tensorParallel || firstTensorParallelRank;
+        bool poolBeginOk = true;
+        if (captureCoordinator) {
+            poolBeginOk = FastllmCudaGraphMemoryPoolBegin();
         }
-        runGraphBody();
-        if (!syncGraphPeers()) {
-            Step3p5AbortCudaGraphCapture();
+        if (!syncGraphPeers(poolBeginOk)) {
+            if (captureCoordinator && poolBeginOk) {
+                FastllmCudaGraphMemoryPoolAbort();
+            }
+            syncGraphPeers();
+            Step3p5WarnCudaGraphStage("reserve capture workspace", gpuId, poolBeginOk);
             Step3p5DisableCudaGraphState(this, state);
             runWithoutGraph();
             return true;
         }
+
+        bool beginOk = FastllmCudaGraphBeginCapture();
+        if (!syncGraphPeers(beginOk)) {
+            if (beginOk) {
+                Step3p5AbortCudaGraphCapture();
+            }
+            syncGraphPeers();
+            if (captureCoordinator) {
+                FastllmCudaGraphMemoryPoolAbort();
+            }
+            syncGraphPeers();
+            Step3p5WarnCudaGraphStage("begin capture", gpuId, beginOk);
+            Step3p5DisableCudaGraphState(this, state);
+            runWithoutGraph();
+            return true;
+        }
+
+        FastllmCudaClearThreadError();
+        runGraphBody();
+        bool bodyOk = !FastllmCudaGetThreadError() &&
+                      !FastllmCudaGetGraphError() &&
+                      !FastllmCudaGraphCaptureInvalidated();
+        if (!syncGraphPeers(bodyOk)) {
+            Step3p5AbortCudaGraphCapture();
+            syncGraphPeers();
+            if (captureCoordinator) {
+                FastllmCudaGraphMemoryPoolAbort();
+            }
+            syncGraphPeers();
+            Step3p5WarnCudaGraphStage("captured model body", gpuId, bodyOk);
+            Step3p5DisableCudaGraphState(this, state);
+            FastllmCudaClearThreadError();
+            runWithoutGraph();
+            return true;
+        }
+
         bool endOk = FastllmCudaGraphEndCapture(&capturedGraph) && capturedGraph != nullptr;
-        if (!Step3p5SyncCudaGraphStage(this, state, graphParticipants,
-                                       "end capture", gpuId, endOk)) {
+        if (!syncGraphPeers(endOk)) {
             if (capturedGraph != nullptr) {
                 FastllmCudaGraphDestroy(capturedGraph);
             }
+            syncGraphPeers();
+            if (captureCoordinator) {
+                FastllmCudaGraphMemoryPoolAbort();
+            }
+            syncGraphPeers();
+            Step3p5WarnCudaGraphStage("end capture", gpuId, endOk);
+            Step3p5DisableCudaGraphState(this, state);
             runWithoutGraph();
             return true;
+        }
+
+        std::vector<void*> capturedReservedPointers;
+        bool poolEndOk = true;
+        if (captureCoordinator) {
+            poolEndOk = FastllmCudaGraphMemoryPoolEnd(capturedReservedPointers);
+        }
+        if (!syncGraphPeers(poolEndOk)) {
+            FastllmCudaGraphDestroy(capturedGraph);
+            capturedGraph = nullptr;
+            syncGraphPeers();
+            Step3p5WarnCudaGraphStage("pin captured workspace", gpuId, poolEndOk);
+            Step3p5DisableCudaGraphState(this, state);
+            runWithoutGraph();
+            return true;
+        }
+        if (captureCoordinator) {
+            state.reservedPointers.swap(capturedReservedPointers);
         }
 
         void *capturedExec = nullptr;
@@ -3308,20 +3933,23 @@ namespace fastllm {
             return nullptr;
         };
 
-        const DataType computeType = ResolveStep3p5ThreadTpComputeType(this->dataType);
+        const DataType computeType = GPUForwardComputeType();
         Data localHiddenStates;
         Data *hiddenStatesPtr = nullptr;
+        bool pagedCacheAllocationDiverged = false;
         if (precomputedHiddenStates != nullptr) {
             hiddenStatesPtr = requireLocal(*precomputedHiddenStates, "precomputedHiddenStates");
         } else {
             if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                             seqLens, pastKeyValues, all1, isPrefill,
                                             tensorParallel, firstTensorParallelRank,
-                                            pagedCacheLayerOffset, logits)) {
+                                            pagedCacheLayerOffset, logits,
+                                            &pagedCacheAllocationDiverged)) {
                 return;
             }
+            Data *localInputIds = requireLocal((Data&)inputIds, "inputIds");
             Qwen3CudaEmbeddingDirect(cudaRunner,
-                                     *requireLocal((Data&)inputIds, "inputIds"),
+                                     *localInputIds,
                                      *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
                                      localHiddenStates);
             hiddenStatesPtr = &localHiddenStates;
@@ -3332,13 +3960,29 @@ namespace fastllm {
         }
 
         Data attenInput, qkv, q, qForAttentionHolder, attenOutput, attenLastOutput;
-        Data gate;
+        Data gate, gateFp16, gateActivated;
         Data ffMiddle, ffAct, ffUp, ffOut;
         Data routerLogits, routerProb, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp, moeFinal, shareOutput;
         Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
         bool generatedAppendParams = false;
         bool generatedDecodeParams = false;
+        bool decodeNeedsNewPage = false;
+        if (all1) {
+            for (int b = 0; b < batch; b++) {
+                Data *pastKey = pastKeyValues[b * block_cnt].first;
+                if (pastKey == nullptr || pastKey->pageIndex.empty() ||
+                    pastKey->lastPageLen >= pastKey->pageLen) {
+                    decodeNeedsNewPage = true;
+                    break;
+                }
+            }
+        }
+        const bool reusePagedMetaAcrossLayers =
+            !pagedCacheAllocationDiverged &&
+            !decodeNeedsNewPage &&
+            Step3p5PagedCacheMetaAlignedAcrossLayers(
+                pastKeyValues, batch, block_cnt);
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
         auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
         auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
@@ -3400,8 +4044,15 @@ namespace fastllm {
                 } else {
                     Step3p5CudaCopyTensor(cudaRunner, partial, hiddenStates);
                 }
-                FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
-                                     hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+                if (GPUForwardPreferNativeNccl(
+                        isPrefill, hiddenStates.GetBytes(), (int)ratios.size())) {
+                    FastllmNcclAllReduceNoCustom(
+                        hiddenStates.cudaData, hiddenStates.cudaData,
+                        hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+                } else {
+                    FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
+                                         hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+                }
             } else {
                 Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
             }
@@ -3436,6 +4087,24 @@ namespace fastllm {
             AssertInFastLLM(localKVHeads > 0 && localQHeads > 0,
                             "Step3p5 ForwardSingleGPU got empty local attention shard.\n");
 
+            bool useYarn = GPUForwardUseYarnRope(i);
+            float yarnFactor = 1.0f, yarnAttentionFactor = 1.0f;
+            float yarnCorrectionLow = 0.0f, yarnCorrectionHigh = 1.0f;
+            GPUForwardYarnRopeParams(i, yarnFactor, yarnAttentionFactor,
+                                     yarnCorrectionLow, yarnCorrectionHigh);
+            float rotaryFactor = useYarn ? yarnFactor : rope_factor;
+            int attentionWindowLeft = GPUForwardAttentionWindowLeft(i);
+
+            if (!reusePagedMetaAcrossLayers) {
+                // Sliding-window layers reclaim old pages while full-attention
+                // layers keep them. Their insert/page metadata can therefore
+                // diverge. Even when the existing chains are aligned, a page
+                // boundary is unsafe to reuse: independent layer managers can
+                // return different ids from their free lists for the new page.
+                generatedAppendParams = false;
+                generatedDecodeParams = false;
+            }
+
             Step3p5CudaAttentionPagedBlock(
                 cudaRunner,
                 &attenInput,
@@ -3454,12 +4123,16 @@ namespace fastllm {
                 seqLens,
                 localQHeads, localKVHeads, head_dim,
                 curRotaryDim, rms_norm_eps,
-                curTheta, rope_factor, UseLlama3Rope(i),
+                curTheta, rotaryFactor, UseLlama3Rope(i),
                 llama3_original_max_position_embeddings,
                 llama3_low_freq_factor,
                 llama3_high_freq_factor,
+                useYarn, yarnFactor, yarnAttentionFactor,
+                yarnCorrectionLow, yarnCorrectionHigh,
+                attentionWindowLeft,
                 GetKVCacheInCPU(),
                 pagedCacheLayerOffset,
+                GPUForwardPagedCacheMaxPages(i),
                 isPrefill,
                 false
             );
@@ -3470,14 +4143,27 @@ namespace fastllm {
             Qwen3CudaLinear(cudaRunner, attenInput,
                             *requireLocal(weight[gProjName], gProjName),
                             *GetEmptyData(), gate);
-            Step3p5CudaSigmoid(cudaRunner, gate, gate);
+            bool useMambaGate = GPUForwardUseMambaSoftplusGate(i);
+            Data *gateALog = GPUForwardMambaSoftplusALog();
+            Data *gateDtBias = GPUForwardMambaSoftplusDtBias();
+            if (useMambaGate) {
+                AssertInFastLLM(gateALog != nullptr && gateDtBias != nullptr,
+                                "Step3p5 MambaSoftplus gate parameters are missing.\n");
+                gateALog = requireLocal(*gateALog, "attention_gate.a_log");
+                gateDtBias = requireLocal(*gateDtBias, "attention_gate.dt_bias");
+            }
+            Data *activeGate = Step3p5CudaApplyAttentionGate(
+                cudaRunner, gate, useMambaGate,
+                gateALog, gateDtBias, gateFp16, gateActivated);
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
-            gate.Reshape({bsz, seqlen, localQHeads, 1});
-            if (gate.dataType != attenOutput.dataType) {
-                Qwen3CudaToDataType(cudaRunner, gate, attenOutput.dataType);
+            activeGate->Reshape({bsz, seqlen, localQHeads, 1});
+            if (activeGate->dataType != attenOutput.dataType) {
+                Qwen3CudaConvertToDataType(cudaRunner, *activeGate,
+                                           gate, attenOutput.dataType);
+                activeGate = &gate;
             }
             attenOutput.Reshape({bsz, seqlen, localQHeads, head_dim});
-            Step3p5CudaMulTo(cudaRunner, attenOutput, gate);
+            Step3p5CudaMulTo(cudaRunner, attenOutput, *activeGate);
             attenOutput.Reshape({bsz, seqlen, localQHeads * head_dim});
 
             Qwen3CudaLinearResidualReduce(
@@ -3485,7 +4171,9 @@ namespace fastllm {
                 *requireLocal(weight[oWeightName], oWeightName),
                 *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
                 attenLastOutput, hiddenStates,
-                tensorParallel, firstTensorParallelRank, gpuId);
+                tensorParallel, firstTensorParallelRank, gpuId, false,
+                GPUForwardPreferNativeNccl(
+                    isPrefill, hiddenStates.GetBytes(), (int)ratios.size()));
 
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
@@ -3507,14 +4195,6 @@ namespace fastllm {
                 runFeedForwardOutput(attenInput, sharedGateupName, sharedGateName, sharedUpName, sharedDownName,
                                      Step3p5LayerLimit(swiglu_limits_shared, i),
                                      ffMiddle, ffAct, ffUp, shareOutput);
-                if (shareOutput.dataType != hiddenStates.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, shareOutput, hiddenStates.dataType);
-                }
-                if (tensorParallel) {
-                    FastllmNcclAllReduce(shareOutput.cudaData, shareOutput.cudaData,
-                                         shareOutput.Count(0), shareOutput.dataType, gpuId);
-                }
-                Qwen3CudaAddTo(cudaRunner, hiddenStates, shareOutput);
 
                 int flatBatch = attenInput.dims[0];
                 int flatLen = attenInput.dims[1];
@@ -3522,16 +4202,23 @@ namespace fastllm {
                 Qwen3CudaLinear(cudaRunner, attenInput,
                                 *requireLocal(weight[prefix + "moe.gate.weight"], prefix + "moe.gate.weight"),
                                 *GetEmptyData(), routerLogits, true);
-                Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerProb, DataType::FLOAT32);
-                Step3p5CudaSigmoid(cudaRunner, routerProb, routerProb);
                 Data *localGateBias = nullptr;
                 if (use_moe_router_bias &&
                     weight.weight.find(prefix + "moe.router_bias") != weight.weight.end()) {
                     localGateBias = requireLocal(weight[prefix + "moe.router_bias"], prefix + "moe.router_bias");
                 }
-                Qwen3CudaSelectExpert(cudaRunner, routerProb, expertIndex, expertScore,
-                                      num_experts_per_tok, norm_topk_prob,
-                                      routed_scaling_factor, localGateBias);
+                if (!Qwen3CudaTryFusedSigmoidSelectExpert(
+                        cudaRunner, routerLogits, expertIndex, expertScore,
+                        num_experts_per_tok, norm_topk_prob,
+                        routed_scaling_factor, localGateBias)) {
+                    Qwen3CudaConvertToDataType(
+                        cudaRunner, routerLogits, routerProb, DataType::FLOAT32);
+                    Step3p5CudaSigmoid(cudaRunner, routerProb, routerProb);
+                    Qwen3CudaSelectExpert(
+                        cudaRunner, routerProb, expertIndex, expertScore,
+                        num_experts_per_tok, norm_topk_prob,
+                        routed_scaling_factor, localGateBias);
+                }
 
                 bool ranFusedMoe = false;
                 auto fusedIt = fusedMoeByDevice.find(gpuId);
@@ -3550,10 +4237,18 @@ namespace fastllm {
                             expertIndex, expertScore,
                             expertRange.first, expertRange.second,
                             num_experts, gpuId, true)) {
+                        // Laguna's FP8 routed experts are sensitive to the
+                        // scheduler's prefill batch shape in the Triton
+                        // grouped-GEMM path.  Keep prefill on the stable CUDA
+                        // implementation; decode (including CUDA Graph) still
+                        // uses Triton.
+                        const bool allowTritonFusedMoe =
+                            !isPrefill || model_type != "laguna";
                         Step3p5CudaFusedMOE(cudaRunner, attenInput, expertIndex, expertScore,
                                             *localFusedWeights[0], *localFusedWeights[1],
                                             *localFusedWeights[2], w1, moeFinal, i,
-                                            Step3p5LayerLimit(swiglu_limits, i));
+                                            Step3p5LayerLimit(swiglu_limits, i),
+                                            allowTritonFusedMoe);
                         ranFusedMoe = true;
                     }
                 }
@@ -3584,14 +4279,14 @@ namespace fastllm {
                     }
                 }
                 moeFinal.Reshape(hiddenStates.dims);
-                if (moeFinal.dataType != hiddenStates.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, moeFinal, hiddenStates.dataType);
+                if (shareOutput.dataType != moeFinal.dataType) {
+                    Qwen3CudaToDataType(cudaRunner, shareOutput, moeFinal.dataType);
                 }
-                if (tensorParallel) {
-                    FastllmNcclAllReduce(moeFinal.cudaData, moeFinal.cudaData,
-                                         moeFinal.Count(0), moeFinal.dataType, gpuId);
-                }
-                Qwen3CudaAddTo(cudaRunner, hiddenStates, moeFinal);
+                shareOutput.Reshape(moeFinal.dims);
+                // Keep eager and graph execution on the same single-reduction
+                // dataflow as Qwen3.5's shared+routed expert implementation.
+                Qwen3CudaAddTo(cudaRunner, moeFinal, shareOutput);
+                addPartialToResidualReduce(moeFinal);
             }
         }
 
@@ -3780,6 +4475,63 @@ namespace fastllm {
     bool Step3p5Model::UseLlama3Rope(int layer) const {
         return IsFullAttentionLayer(layer) &&
                Step3p5GetDict(weight.dicts, "rope_scaling.rope_type", "") == "llama3";
+    }
+
+    DataType Step3p5Model::GPUForwardComputeType() const {
+        return ResolveStep3p5ThreadTpComputeType(this->dataType);
+    }
+
+    DataType Step3p5Model::GPUForwardCacheType(
+            int layer, DataType requestedType, DataType computeType) const {
+        (void)layer;
+        return ResolveStep3p5ThreadTpCacheType(requestedType, computeType);
+    }
+
+    bool Step3p5Model::GPUForwardUseYarnRope(int layer) const {
+        (void)layer;
+        return false;
+    }
+
+    void Step3p5Model::GPUForwardYarnRopeParams(
+            int layer, float &factor, float &attentionFactor,
+            float &correctionLow, float &correctionHigh) const {
+        (void)layer;
+        factor = 1.0f;
+        attentionFactor = 1.0f;
+        correctionLow = 0.0f;
+        correctionHigh = 1.0f;
+    }
+
+    int Step3p5Model::GPUForwardAttentionWindowLeft(int layer) const {
+        (void)layer;
+        return -1;
+    }
+
+    int Step3p5Model::GPUForwardPagedCacheMaxPages(int layer) const {
+        (void)layer;
+        return -1;
+    }
+
+    bool Step3p5Model::GPUForwardPreferNativeNccl(
+            bool isPrefill, uint64_t tensorBytes,
+            int tensorParallelSize) const {
+        (void)isPrefill;
+        (void)tensorBytes;
+        (void)tensorParallelSize;
+        return false;
+    }
+
+    bool Step3p5Model::GPUForwardUseMambaSoftplusGate(int layer) const {
+        (void)layer;
+        return false;
+    }
+
+    Data *Step3p5Model::GPUForwardMambaSoftplusALog() {
+        return nullptr;
+    }
+
+    Data *Step3p5Model::GPUForwardMambaSoftplusDtBias() {
+        return nullptr;
     }
 
     void Step3p5Model::PrepareMoeWeights() {
@@ -4709,7 +5461,7 @@ namespace fastllm {
         bool useCpuEmbedding = hasPrecomputedHiddenStates ||
                                skipCudaEmbeddingForVisionWarmup ||
                                !GetCudaEmbedding() || GetLowMemMode();
-        const DataType computeType = ResolveStep3p5ThreadTpComputeType(this->dataType);
+        const DataType computeType = GPUForwardComputeType();
         if (!useCpuEmbedding) {
             PrepareStep3p5CudaEmbeddingWeightType(weight["model.embed_tokens.weight"], computeType);
         }
@@ -4768,21 +5520,10 @@ namespace fastllm {
         }
 
         auto ensureInitializedAdd1 = [&]() {
-            if (initialized_add1) {
-                return;
-            }
-            for (int i = 0; i < block_cnt; i++) {
-                Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"]);
-                Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
-                Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
-                Step3p5Add1(this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
-                std::string routerName = "model.layers." + std::to_string(i) + ".moe.gate.weight";
-                if (need_fp32_gate && weight.weight.find(routerName) != weight.weight.end()) {
-                    ToDataType(this->weight[routerName], DataType::FLOAT32);
-                }
-            }
-            Step3p5Add1(this->weight["model.norm.weight"]);
-            initialized_add1 = true;
+            // Runtime normalization semantics are model-specific.  Step3.5
+            // checkpoints store residual deltas and add one, while Laguna
+            // stores ordinary RMSNorm scales and must leave them unchanged.
+            PrepareRuntimeWeights();
         };
 
         auto hasMoeCache = [&](const std::unordered_map<int, std::vector<std::vector<Data*> > > &weightCache,
@@ -4848,20 +5589,19 @@ namespace fastllm {
                     if (!IsMoeLayer(i)) {
                         continue;
                     }
+                    std::pair<int, int> expertRange = {0, this->num_experts};
+                    if (expertParallel) {
+                        auto schemeIt = expertScheme.find(device);
+                        if (schemeIt == expertScheme.end() ||
+                            (int)schemeIt->second.size() != 1) {
+                            expertRange = {-1, -1};
+                        } else {
+                            expertRange = schemeIt->second[0];
+                        }
+                    }
                     if (i < (int)moeGate3DWeights.size() &&
                         moeGate3DWeights[i] != nullptr && moeUp3DWeights[i] != nullptr &&
                         moeDown3DWeights[i] != nullptr) {
-                        std::pair<int, int> expertRange = {0, this->num_experts};
-                        if (expertParallel) {
-                            auto schemeIt = expertScheme.find(device);
-                            if (schemeIt == expertScheme.end() ||
-                                (int)schemeIt->second.size() != 1) {
-                                expertRange = {-1, -1};
-                            } else {
-                                expertRange = schemeIt->second[0];
-                            }
-                        }
-
                         if (expertRange.first >= 0 && expertRange.first < expertRange.second &&
                             expertRange.second <= this->num_experts) {
                             layerOwnedFused.resize(3);
@@ -4886,6 +5626,18 @@ namespace fastllm {
                             deviceFusedRanges[i] = expertRange;
                             continue;
                         }
+                    }
+                    if (!Step3p5DisableFusedMoe() &&
+                        expertRange.first >= 0 &&
+                        expertRange.first < expertRange.second &&
+                        i < (int)weights.size() &&
+                        Step3p5BuildLocalExpertRangeFusedMoe(
+                            weights[i], expertRange.first, expertRange.second,
+                            device, i, layerOwnedFused)) {
+                        layerFused = {&layerOwnedFused[0], &layerOwnedFused[1],
+                                      &layerOwnedFused[2]};
+                        deviceFusedRanges[i] = expertRange;
+                        continue;
                     }
                     for (int expert = 0; expert < this->num_experts; expert++) {
                         if (expertParallel && !Step3p5ExpertOnDevice(expertScheme, device, expert)) {
@@ -4920,6 +5672,19 @@ namespace fastllm {
                             int idx = (expert + 1) * 2;
                             gateup = weights[i][idx];
                             down = weights[i][idx + 1];
+                        }
+                        if (gateup == nullptr || down == nullptr) {
+                            continue;
+                        }
+                        if (gateup->multiDeviceData) {
+                            auto localIt = gateup->multiDeviceDatas.find(device);
+                            gateup = localIt == gateup->multiDeviceDatas.end()
+                                ? nullptr : localIt->second;
+                        }
+                        if (down->multiDeviceData) {
+                            auto localIt = down->multiDeviceDatas.find(device);
+                            down = localIt == down->multiDeviceDatas.end()
+                                ? nullptr : localIt->second;
                         }
                         if (gateup == nullptr || down == nullptr) {
                             continue;
@@ -5014,6 +5779,19 @@ namespace fastllm {
                         prepareReplicated("model.embed_tokens.weight");
                     }
                     prepareReplicated("model.norm.weight");
+                    bool needsMambaGateParams = false;
+                    for (int i = 0; i < block_cnt; i++) {
+                        needsMambaGateParams = needsMambaGateParams ||
+                            GPUForwardUseMambaSoftplusGate(i);
+                    }
+                    if (needsMambaGateParams) {
+                        Data *aLog = GPUForwardMambaSoftplusALog();
+                        Data *dtBias = GPUForwardMambaSoftplusDtBias();
+                        AssertInFastLLM(aLog != nullptr && dtBias != nullptr,
+                                        "Step3p5 MambaSoftplus gate parameters are missing.\n");
+                        PrepareMultiCudaReplicatedData(*aLog, devices, true);
+                        PrepareMultiCudaReplicatedData(*dtBias, devices, true);
+                    }
                     threadTpKVHeadSchemes.assign(block_cnt, DivisionScheme());
 
                     for (int i = 0; i < block_cnt; i++) {
@@ -5148,13 +5926,15 @@ namespace fastllm {
             if (precomputedHiddenStates->dataType != computeType) {
                 ToDataType(*precomputedHiddenStates, computeType);
             }
-            PrepareStep3p5CpuEmbeddingHiddenStates(*precomputedHiddenStates, devices, threadTpWorkerGroup);
+            PrepareStep3p5CpuEmbeddingHiddenStates(
+                *precomputedHiddenStates, devices, threadTpWorkerGroup);
         } else if (useCpuEmbedding) {
             Data cpuInputIds;
             cpuInputIds.CopyFrom(inputIds);
             Step3p5CpuEmbeddingDirect(cpuInputIds, weight["model.embed_tokens.weight"],
                                       cpuEmbeddingHiddenStates, computeType);
-            PrepareStep3p5CpuEmbeddingHiddenStates(cpuEmbeddingHiddenStates, devices, threadTpWorkerGroup);
+            PrepareStep3p5CpuEmbeddingHiddenStates(
+                cpuEmbeddingHiddenStates, devices, threadTpWorkerGroup);
             precomputedHiddenStates = &cpuEmbeddingHiddenStates;
         }
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
@@ -5164,10 +5944,11 @@ namespace fastllm {
                 int device = devices[r];
                 localPastKeyValues[r].resize(pastKeyValues.size());
                 for (int i = 0; i < (int)pastKeyValues.size(); i++) {
-                    DataType keyCacheType = ResolveStep3p5ThreadTpCacheType(
-                        pastKeyValues[i].first->dataType, computeType);
-                    DataType valueCacheType = ResolveStep3p5ThreadTpCacheType(
-                        pastKeyValues[i].second->dataType, computeType);
+                    int layer = i % block_cnt;
+                    DataType keyCacheType = GPUForwardCacheType(
+                        layer, pastKeyValues[i].first->dataType, computeType);
+                    DataType valueCacheType = GPUForwardCacheType(
+                        layer, pastKeyValues[i].second->dataType, computeType);
                     localPastKeyValues[r][i].first = EnsureStep3p5ThreadTpLocalCache(
                         *pastKeyValues[i].first, device, keyCacheType);
                     localPastKeyValues[r][i].second = EnsureStep3p5ThreadTpLocalCache(
@@ -5177,10 +5958,11 @@ namespace fastllm {
         } else {
             int device = devices[0];
             for (int i = 0; i < (int)pastKeyValues.size(); i++) {
-                DataType keyCacheType = ResolveStep3p5ThreadTpCacheType(
-                    pastKeyValues[i].first->dataType, computeType);
-                DataType valueCacheType = ResolveStep3p5ThreadTpCacheType(
-                    pastKeyValues[i].second->dataType, computeType);
+                int layer = i % block_cnt;
+                DataType keyCacheType = GPUForwardCacheType(
+                    layer, pastKeyValues[i].first->dataType, computeType);
+                DataType valueCacheType = GPUForwardCacheType(
+                    layer, pastKeyValues[i].second->dataType, computeType);
                 PrepareStep3p5SingleCudaCache(*pastKeyValues[i].first, device, keyCacheType);
                 PrepareStep3p5SingleCudaCache(*pastKeyValues[i].second, device, valueCacheType);
             }
@@ -5188,6 +5970,35 @@ namespace fastllm {
 
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
+        auto trimBoundedPagedCaches = [&](std::vector<std::pair<Data*, Data*> > &caches) {
+            // Decode graphs intentionally share one page table across all
+            // attention layers.  Trimming only a sliding-window layer would
+            // make its page ids diverge from the full-attention layers and
+            // permanently force this request back to eager decode.  Keep the
+            // logical pages aligned while graph decode is still usable;
+            // windowLeft continues to bound the actual attention work.
+            //
+            // Paged managers preallocate their backing storage, so returning
+            // these ids earlier would not reduce GPU memory.  Once graph mode
+            // is disabled this guard becomes false and the same forward trims
+            // all accumulated sliding pages immediately.  Normal request
+            // teardown also releases every root and TP-local page id.
+            bool preserveCudaGraphPageAlignment =
+                Step3p5CudaGraphEnabled(this) &&
+                !Step3p5CudaGraphIsDisabled(this) &&
+                (!step3p7VisionAvailable || Step3p7CudaGraphDecodeEnabled());
+            if (preserveCudaGraphPageAlignment) {
+                return;
+            }
+            for (int idx = 0; idx < (int)caches.size(); idx++) {
+                int retainedTokens = GetKVCacheRetainedTokens(idx % block_cnt);
+                if (retainedTokens < 0) {
+                    continue;
+                }
+                TrimStep3p5BoundedPagedCache(caches[idx].first, retainedTokens);
+                TrimStep3p5BoundedPagedCache(caches[idx].second, retainedTokens);
+            }
+        };
         if (devices.size() == 1) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
@@ -5196,6 +6007,7 @@ namespace fastllm {
                              seqLens, pastKeyValues, all1, isPrefill,
                              false, true, threadTpPagedCacheBase, localLogits[0],
                              precomputedHiddenStates);
+            trimBoundedPagedCaches(pastKeyValues);
         } else {
             threadTpWorkerGroup.Run(devices, [&](int r) {
                 ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
@@ -5205,6 +6017,7 @@ namespace fastllm {
                                  localLogits[r], precomputedHiddenStates);
                 FastllmCudaSetDevice(devices[r]);
                 ForceDeviceSync();
+                trimBoundedPagedCaches(localPastKeyValues[r]);
             }, errors);
             for (auto &error : errors) {
                 if (error) {

@@ -38,6 +38,10 @@ bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId);
 void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, int root, int deviceId);
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
+// Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
+// prefill tensors can be bandwidth-bound on the direct-peer implementation
+// even though it is faster for decode tensors.
+void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.
 // Callers use this preflight to preserve their existing NCCL fallback without
 // first changing the reduction's compute or accumulation order.
@@ -62,7 +66,7 @@ void BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(const std::string &wei
     int mid, bool explicitDeviceRatios = false);
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
     std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme, int splitAxis,
-    bool explicitDeviceRatios = false);
+    bool explicitDeviceRatios = false, bool directLocalMemory = false);
 bool SplitMultiCudaWeight1D(fastllm::Data &bias, std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme); // 1维的多卡切分
 bool PlaceMultiCudaWeightOnDevice(fastllm::Data &weight, std::vector <int> &multiCudaCurrentDevices, int targetDevice);
 void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool copyData);

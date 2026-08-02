@@ -298,6 +298,10 @@ namespace fastllm {
         // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
         virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
 
+        // special weight 默认跟随 MoE 设备映射；同时包含非 MoE TP 权重的模型可覆盖此选择。
+        virtual std::string SelectSpecialWeightDevice(const std::string &weightName,
+                                                      int layerId) const;
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,
@@ -430,6 +434,12 @@ namespace fastllm {
             (void)layer;
             return -1;
         }
+
+        // Some direct GPU paths keep the page ids of logically bounded caches
+        // aligned with token-growing layers (for example during CUDA Graph
+        // replay).  Such caches must be charged as token-growing storage even
+        // though attention and the generic path still use a bounded tail.
+        virtual bool BoundedKVCacheUsesTokenGrowingStorage() const { return false; }
 
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
@@ -705,6 +715,10 @@ namespace fastllm {
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
+
+        // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
+        // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。
+        bool isIntermediateChunkedPrefill = false;
 
         int defaultChunkedPrefillSize = 8192;
 

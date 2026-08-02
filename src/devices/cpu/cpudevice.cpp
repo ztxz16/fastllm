@@ -360,6 +360,7 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CpuLlamaRotatePosition2DPartOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new CpuRopeEncodingOp());
         this->ops["Llama3RopeEncoding"] = (BaseOperator*)(new CpuLlama3RopeEncodingOp());
+        this->ops["YarnRopeEncoding"] = (BaseOperator*)(new CpuYarnRopeEncodingOp());
         this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new CpuQwen35InterleavedRopeOp());
         this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CpuQKVRMSNormRopeOp());
         this->ops["QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CpuQKVRMSNormRopeSplitAppendPagedCacheOp());
@@ -9572,6 +9573,58 @@ ops += (long long)lines * inputDim * interDim * 2;
             ((uint16_t*)data.cpuData)[index] = float_to_half(value);
         } else {
             Float32ToBFloat16(&value, ((uint16_t*)data.cpuData) + index, 1);
+        }
+    }
+
+    void CpuYarnRopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float factor = floatParams.find("factor") != floatParams.end() ? floatParams.find("factor")->second : 1.0f;
+        float attentionFactor = floatParams.find("attentionFactor") != floatParams.end() ? floatParams.find("attentionFactor")->second : 1.0f;
+        float correctionLow = floatParams.find("correctionLow") != floatParams.end() ? floatParams.find("correctionLow")->second : 0.0f;
+        float correctionHigh = floatParams.find("correctionHigh") != floatParams.end() ? floatParams.find("correctionHigh")->second : 1.0f;
+
+        AssertInFastLLM(data.dims.size() == 4,
+                        "YaRN RoPE expects [batch, seq, heads, dim] input.");
+        AssertInFastLLM(positionIds.dataType == DataType::FLOAT32,
+                        "YaRN RoPE expects FLOAT32 position ids.");
+        AssertInFastLLM(data.dataType == DataType::FLOAT32 ||
+                        data.dataType == DataType::FLOAT16 ||
+                        data.dataType == DataType::BFLOAT16,
+                        "YaRN RoPE supports FLOAT32, FLOAT16 and BFLOAT16 input.");
+        AssertInFastLLM(rotaryDim <= data.dims[3],
+                        "YaRN rotary_dim exceeds the input head dimension.");
+
+        int bs = data.dims[0], len = data.dims[1], n = data.dims[2], m = data.dims[3];
+        int spatial = data.Count(2), half = rotaryDim / 2, posStride = positionIds.dims.back();
+        for (int batch = 0; batch < bs; batch++) {
+            for (int token = 0; token < len; token++) {
+                float position = (float)(int)((float*)positionIds.cpuData)[batch * posStride + token];
+                int tokenOffset = (batch * len + token) * spatial;
+                for (int j = 0; j < half; j++) {
+                    float posFreq = powf(ropeTheta, (float)(2 * j) / rotaryDim);
+                    float extrapolation = 1.0f / posFreq;
+                    float interpolation = 1.0f / (factor * posFreq);
+                    float ramp = std::max(0.0f, std::min(1.0f,
+                        (j - correctionLow) / (correctionHigh - correctionLow)));
+                    float extrapolationFactor = 1.0f - ramp;
+                    float invFreq = interpolation * (1.0f - extrapolationFactor) +
+                                    extrapolation * extrapolationFactor;
+                    float angle = position * invFreq;
+                    float curSin = sinf(angle) * attentionFactor;
+                    float curCos = cosf(angle) * attentionFactor;
+                    for (int h = 0; h < n; h++) {
+                        int headOffset = tokenOffset + h * m;
+                        float a = CpuRopeRead(data, headOffset + j);
+                        float b = CpuRopeRead(data, headOffset + j + half);
+                        CpuRopeWrite(data, headOffset + j, a * curCos - b * curSin);
+                        CpuRopeWrite(data, headOffset + j + half, a * curSin + b * curCos);
+                    }
+                }
+            }
         }
     }
 

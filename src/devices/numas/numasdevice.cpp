@@ -43,6 +43,7 @@
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudadevice.h"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
 namespace fastllm {
@@ -90,6 +91,46 @@ namespace fastllm {
         CopyTensorToCPU(src, scratch, name);
         return &scratch;
     }
+
+#ifdef USE_CUDA
+    struct NumasMoeCudaInputReplica {
+        int deviceId = -1;
+        void *cudaData = nullptr;
+    };
+
+    static std::vector<NumasMoeCudaInputReplica>
+    GetNumasMoeCudaInputReplicas(const Data &input) {
+        std::vector<NumasMoeCudaInputReplica> replicas;
+        if (input.multiDeviceData && input.IsTensorParallelReplicated()) {
+            for (const auto &it : input.multiDeviceDatas) {
+                const Data *local = it.second;
+                if (local == nullptr || local->cudaData == nullptr ||
+                    local->dataType != input.dataType ||
+                    local->dims != input.dims ||
+                    GetPointerDeviceId(local->cudaData) != it.first) {
+                    continue;
+                }
+                replicas.push_back({it.first, local->cudaData});
+            }
+        }
+        if (replicas.empty() && input.cudaData != nullptr) {
+            int deviceId = GetPointerDeviceId(input.cudaData);
+            if (deviceId < 0 && !input.dataDeviceIds.empty()) {
+                deviceId = input.dataDeviceIds[0];
+            }
+            if (deviceId >= 0) {
+                replicas.push_back({deviceId, input.cudaData});
+            }
+        }
+        std::sort(
+            replicas.begin(), replicas.end(),
+            [](const NumasMoeCudaInputReplica &a,
+               const NumasMoeCudaInputReplica &b) {
+                return a.deviceId < b.deviceId;
+            });
+        return replicas;
+    }
+#endif
 
     class MoeEnvConfig {
     public:
@@ -1046,6 +1087,7 @@ namespace fastllm {
             std::unique_ptr<void, FastllmCudaFreeDeleter> gpuOutputStaging {nullptr};
             size_t gpuOutputStagingBytes = 0;
             int gpuOutputStagingDevice = -1;
+            std::map<int, std::unique_ptr<Data>> gpuInputReplicas;
             std::unique_ptr<void, FastllmCudaStreamDestroyDeleter> gpuOutputCopyStream {
                 nullptr, FastllmCudaStreamDestroyDeleter {}
             };
@@ -1076,6 +1118,41 @@ namespace fastllm {
                     gpuOutputStagingBytes = bytes;
                 }
                 return gpuOutputStaging.get();
+            }
+
+            Data *StageGpuInputReplica(const Data &input, int gpuId) {
+                auto &replica = gpuInputReplicas[gpuId];
+                bool stale = replica == nullptr ||
+                    replica->dataType != input.dataType ||
+                    replica->dims != input.dims ||
+                    replica->cudaData == nullptr ||
+                    GetPointerDeviceId(replica->cudaData) != gpuId;
+                if (stale) {
+                    replica.reset(new Data(input.dataType, input.dims));
+                    replica->dataDevice = DataDevice::CUDA;
+                    replica->dataDeviceIds = {gpuId};
+                    int oriDevice = FastllmCudaGetDevice();
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    replica->Allocate(false);
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(oriDevice);
+                    }
+                }
+                AssertInFastLLM(
+                    input.cpuData != nullptr,
+                    "NUMA MoE cannot stage a CUDA input replica without CPU data.");
+                int oriDevice = FastllmCudaGetDevice();
+                if (oriDevice != gpuId) {
+                    FastllmCudaSetDevice(gpuId);
+                }
+                FastllmCudaCopyFromHostToDevice(
+                    replica->cudaData, input.cpuData, input.GetBytes());
+                if (oriDevice != gpuId) {
+                    FastllmCudaSetDevice(oriDevice);
+                }
+                return replica.get();
             }
 
             void *EnsureGpuOutputCopyStream(int gpuId) {
@@ -3306,12 +3383,13 @@ namespace fastllm {
             Data &input, Data &output, Data &w1, Data &w2, Data &w3,
             Data **weights, Data **biass, int weightsBatch, int topk, float sharedScale,
             const std::vector<std::vector<std::pair<int, float> > > &expertTasks,
-            int defaultExpertLimit
+            int defaultExpertLimit, int gpuCount
         ) {
 #ifdef USE_CUDA
             if (input.cudaData == nullptr || input.cpuData == nullptr) {
                 return defaultExpertLimit;
             }
+            gpuCount = std::max(1, gpuCount);
 
             int m = weightsBatch / 2 - 1;
             int maxTaskSize = 0;
@@ -3366,13 +3444,19 @@ namespace fastllm {
             }
 
             int bestLimit = defaultExpertLimit;
-            double bestGap = DBL_MAX;
+            double bestMetric = DBL_MAX;
             double bestCpuTime = 0.0;
             double bestGpuTime = 0.0;
+            int activeExpertCount = 0;
+            for (int e = 0; e < numExperts; e++) {
+                if (expertValid[e] && expertSz[e] > 0) {
+                    activeExpertCount++;
+                }
+            }
             maxTaskSize = std::min(maxTaskSize, defaultExpertLimit);
             for (int t = 1; t <= maxTaskSize + 1; t++) {
                 double cpuTime = 0.0;
-                double gpuTime = 0.0;
+                std::vector<std::pair<double, int> > gpuJobs;
                 for (int e = 0; e < numExperts; e++) {
                     if (!expertValid[e]) {
                         continue;
@@ -3380,12 +3464,35 @@ namespace fastllm {
                     if (expertSz[e] < t) {
                         cpuTime += expertCpu[e];
                     } else {
-                        gpuTime += expertGpu[e];
+                        gpuJobs.push_back({expertGpu[e], e});
                     }
                 }
-                double gap = std::fabs(cpuTime - gpuTime);
-                if (gap < bestGap) {
-                    bestGap = gap;
+                if (gpuCount > 1 && activeExpertCount >= gpuCount &&
+                    (int)gpuJobs.size() < gpuCount) {
+                    continue;
+                }
+                std::sort(
+                    gpuJobs.begin(), gpuJobs.end(),
+                    [](const std::pair<double, int> &a,
+                       const std::pair<double, int> &b) {
+                        if (a.first != b.first) {
+                            return a.first > b.first;
+                        }
+                        return a.second < b.second;
+                    });
+                std::vector<double> gpuLoads(gpuCount, 0.0);
+                for (const auto &job : gpuJobs) {
+                    auto loadIt = std::min_element(
+                        gpuLoads.begin(), gpuLoads.end());
+                    *loadIt += job.first;
+                }
+                double gpuTime = gpuLoads.empty() ? 0.0 :
+                    *std::max_element(gpuLoads.begin(), gpuLoads.end());
+                double metric = gpuCount == 1 ?
+                    std::fabs(cpuTime - gpuTime) :
+                    std::max(cpuTime, gpuTime);
+                if (metric < bestMetric) {
+                    bestMetric = metric;
                     bestLimit = t;
                     bestCpuTime = cpuTime;
                     bestGpuTime = gpuTime;
@@ -3408,6 +3515,7 @@ namespace fastllm {
             (void)topk;
             (void)sharedScale;
             (void)expertTasks;
+            (void)gpuCount;
             return defaultExpertLimit;
 #endif
         }
@@ -3544,6 +3652,9 @@ namespace fastllm {
             for (auto it = allSamples.rbegin(); it != allSamples.rend(); ++it) {
                 int k = *it;
                 Data benchInput(input.dataType, {k, inputDim}, DataDevice::CPU, input.cpuData);
+                benchInput.cudaData = input.cudaData;
+                benchInput.cudaDataBorrowed = true;
+                benchInput.dataDeviceIds = input.dataDeviceIds;
                 Data benchIndexK(DataType::INT32, {k, 1}, DataDevice::CPU, benchIndex.cpuData);
                 Data benchScoreK(DataType::FLOAT32, {k, 1}, DataDevice::CPU, benchScore.cpuData);
 
@@ -4486,6 +4597,22 @@ namespace fastllm {
                 break;
             }
         }
+#ifdef USE_CUDA
+        if (std::getenv("FASTLLM_NUMAS_MOE_GPU_TRACE") != nullptr) {
+            std::vector<NumasMoeCudaInputReplica> traceReplicas =
+                GetNumasMoeCudaInputReplicas(input);
+            printf(
+                "[Fastllm] NUMA MoE input layer=%d tokens=%d type=%s "
+                "cpu=%d cuda=%d multi=%d replicated=%d replicas=%zu "
+                "mixed_types=%d\n",
+                layer, n, GetDataTypeName(input.dataType).c_str(),
+                input.cpuData != nullptr, input.cudaData != nullptr,
+                input.multiDeviceData,
+                input.IsTensorParallelReplicated(),
+                traceReplicas.size(), mixedActiveTypes);
+            fflush(stdout);
+        }
+#endif
         if (mixedActiveTypes) {
             std::unordered_set<int> activeExperts(
                 activeExpertList.begin(), activeExpertList.end());
@@ -5396,18 +5523,66 @@ namespace fastllm {
             int expertLimit = moeConfig.GetExpertLimit();
             bool hasExpertLimitOverride = moeConfig.HasExpertLimitOverride();
             bool gpuPrefill = moeConfig.GetGpuPrefill();
-#ifndef USE_CUDA
-            gpuPrefill = false;
-#endif
-            if (input.cudaData == nullptr) {
+#ifdef USE_CUDA
+            std::vector<NumasMoeCudaInputReplica> cudaInputReplicas =
+                GetNumasMoeCudaInputReplicas(input);
+            // DeepSeek-V4 deliberately hands its routed-MoE hidden state to
+            // NUMA as a CPU tensor even when the surrounding model is running
+            // with tensor parallel CUDA devices.  Only synthesize CUDA input
+            // replicas for that explicit mode.  Other NUMA callers must keep
+            // the historical contract: GPU prefill requires an input that
+            // already owns a CUDA mirror.  In particular, do not let stale
+            // process-global MultiCUDA device state promote an unrelated
+            // CPU-only MergeMOE invocation to CUDA.
+            if (gpuPrefill && deepSeekV4Mode && input.cpuData != nullptr) {
+                std::vector<int> tpDevices;
+                std::map<int, int> tpRatios;
+                FastllmGetMulticudaDeviceAndRatio(
+                    tpDevices, tpRatios, true);
+                std::unordered_set<int> presentDevices;
+                for (const auto &replica : cudaInputReplicas) {
+                    presentDevices.insert(replica.deviceId);
+                }
+                for (int device : tpDevices) {
+                    if (presentDevices.count(device) != 0) {
+                        continue;
+                    }
+                    Data *staged = fastllmMoeDataManagerNumas.
+                        StageGpuInputReplica(input, device);
+                    cudaInputReplicas.push_back(
+                        {device, staged->cudaData});
+                    presentDevices.insert(device);
+                }
+                std::sort(
+                    cudaInputReplicas.begin(),
+                    cudaInputReplicas.end(),
+                    [](const NumasMoeCudaInputReplica &a,
+                       const NumasMoeCudaInputReplica &b) {
+                        return a.deviceId < b.deviceId;
+                    });
+            }
+            if (cudaInputReplicas.empty()) {
                 gpuPrefill = false;
             }
+#else
+            gpuPrefill = false;
+#endif
             if (gpuPrefill && !CanUseCudaMoePrefill(input.dataType, weights, weightsBatch)) {
                 gpuPrefill = false;
             }
-            if (gpuPrefill && input.cudaData != nullptr && output.cudaData == nullptr) {
-                output.ToDevice(DataDevice::CUDA);
-                output.ToDevice(DataDevice::CPU);
+
+            if (std::getenv("FASTLLM_NUMAS_MOE_GPU_TRACE") != nullptr) {
+                printf(
+                    "[Fastllm] NUMA MoE decision layer=%d gpu_prefill=%d "
+                    "replicas=%zu\n",
+                    layer, gpuPrefill,
+#ifdef USE_CUDA
+                    cudaInputReplicas.size()
+#else
+                    (size_t)0
+#endif
+                );
+                fflush(stdout);
             }
 
             if (!gpuPrefill) {
@@ -5429,13 +5604,25 @@ namespace fastllm {
             // Respect an explicit FT_EXPERT_LIMIT override and skip the dynamic
             // CPU/GPU expert split benchmark in that case.
             if (gpuPrefill && !hasExpertLimitOverride) {
+#ifdef USE_CUDA
+                const NumasMoeCudaInputReplica &profileReplica =
+                    cudaInputReplicas.front();
+                FastllmCudaSetDevice(profileReplica.deviceId);
+                Data profileInput(
+                    input.dataType, input.dims,
+                    DataDevice::CPU, input.cpuData);
+                profileInput.cudaData = profileReplica.cudaData;
+                profileInput.cudaDataBorrowed = true;
+                profileInput.dataDeviceIds = {profileReplica.deviceId};
                 expertLimit = std::min(expertLimit, 
                     MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
-                        input, output, w1, w2, w3,
+                        profileInput, output, w1, w2, w3,
                         weights, biass, weightsBatch, topk, sharedScale,
-                        expertTasks, expertLimit
+                        expertTasks, expertLimit,
+                        (int)cudaInputReplicas.size()
                     )
                 );
+#endif
             }
 // printf("get expertLimit spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 根据 expertLimit 阈值生成 cpuExperts / gpuExperts 集合
@@ -5452,30 +5639,118 @@ namespace fastllm {
             }
 // printf("MoE expertLimit=%d, cpuExperts=%d, gpuExperts=%d\n", expertLimit, (int)cpuExperts.size(), (int)gpuExperts.size());
 // printf("prepare 1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-            // 若 gpuPrefill 且所有专家都归 GPU（cpuExperts 为空），直接调用 GPU 处理并返回
             uint8_t *cpuOutputPinned = nullptr;
 #ifdef USE_CUDA
-            if (gpuPrefill && cpuExperts.empty()) {
-                int gpuId = FastllmCudaGetDevice();
-                DoCudaMergeMOEFromCPU (
-                    input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, gpuExperts, true
-                );
-                output.dataDevice = DataDevice::CUDA;
-                output.dataDeviceIds = {gpuId};
-                return;
-            }
-
-            int gpuId = FastllmCudaGetDevice();
-            std::thread gpuThread;
+            int gpuId = -1;
+            std::vector<std::unordered_set<int> > gpuExpertSets;
+            std::vector<size_t> gpuExpertLoads;
+            std::vector<std::unique_ptr<Data> > gpuInputAliases;
+            std::vector<std::unique_ptr<Data> > gpuOutputPartials;
+            std::vector<std::thread> gpuThreads;
             void *cpuOutputStaging = nullptr;
             void *cpuOutputCopyStream = nullptr;
             if (gpuPrefill && !gpuExperts.empty()) {
-                gpuThread = std::thread([&, gpuId, gpuExperts]() {
-                    FastllmCudaSetDevice(gpuId);
-                    DoCudaMergeMOEFromCPU (
-                        input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, gpuExperts, true
-                    );
-                });
+                int gpuWorkerCount = std::min(
+                    (int)cudaInputReplicas.size(),
+                    (int)gpuExperts.size());
+                gpuExpertSets.resize(gpuWorkerCount);
+                gpuExpertLoads.assign(gpuWorkerCount, 0);
+
+                std::vector<int> orderedGpuExperts(
+                    gpuExperts.begin(), gpuExperts.end());
+                std::sort(
+                    orderedGpuExperts.begin(), orderedGpuExperts.end(),
+                    [&](int a, int b) {
+                        if (expertTasks[a].size() != expertTasks[b].size()) {
+                            return expertTasks[a].size() >
+                                expertTasks[b].size();
+                        }
+                        return a < b;
+                    });
+                for (int expert : orderedGpuExperts) {
+                    auto loadIt = std::min_element(
+                        gpuExpertLoads.begin(), gpuExpertLoads.end());
+                    int worker = (int)(loadIt - gpuExpertLoads.begin());
+                    gpuExpertSets[worker].insert(expert);
+                    gpuExpertLoads[worker] += expertTasks[expert].size();
+                }
+
+                gpuId = cudaInputReplicas.front().deviceId;
+                FastllmCudaSetDevice(gpuId);
+                output.ToDevice(
+                    DataDevice::CUDA, std::vector<int>{gpuId}, false);
+                output.ToDevice(
+                    DataDevice::CPU, std::vector<int>{gpuId}, false);
+                AssertInFastLLM(
+                    output.cudaData != nullptr &&
+                    GetPointerDeviceId(output.cudaData) == gpuId,
+                    "NumasMergeMOE failed to allocate the root GPU partial output.");
+
+                gpuInputAliases.reserve(gpuWorkerCount);
+                gpuOutputPartials.reserve(gpuWorkerCount);
+                for (int i = 0; i < gpuWorkerCount; i++) {
+                    const NumasMoeCudaInputReplica &replica =
+                        cudaInputReplicas[i];
+                    std::unique_ptr<Data> inputAlias(new Data(
+                        input.dataType, input.dims,
+                        DataDevice::CUDA, replica.cudaData));
+                    inputAlias->cudaDataBorrowed = true;
+                    inputAlias->dataDeviceIds = {replica.deviceId};
+                    inputAlias->strides = input.strides;
+                    gpuInputAliases.push_back(std::move(inputAlias));
+
+                    if (i == 0) {
+                        std::unique_ptr<Data> outputAlias(new Data(
+                            output.dataType, output.dims,
+                            DataDevice::CUDA, output.cudaData));
+                        outputAlias->cudaDataBorrowed = true;
+                        outputAlias->dataDeviceIds = {replica.deviceId};
+                        gpuOutputPartials.push_back(std::move(outputAlias));
+                    } else {
+                        std::unique_ptr<Data> outputPartial(
+                            new Data(output.dataType, output.dims));
+                        outputPartial->dataDevice = DataDevice::CUDA;
+                        outputPartial->dataDeviceIds = {replica.deviceId};
+                        FastllmCudaSetDevice(replica.deviceId);
+                        outputPartial->Allocate(false);
+                        gpuOutputPartials.push_back(
+                            std::move(outputPartial));
+                    }
+                }
+
+                if (std::getenv("FASTLLM_NUMAS_MOE_GPU_TRACE") != nullptr) {
+                    size_t cpuRoutes = 0;
+                    for (int expert : cpuExperts) {
+                        cpuRoutes += expertTasks[expert].size();
+                    }
+                    printf(
+                        "[Fastllm] NUMA MoE prefill layer=%d limit=%d "
+                        "cpu_experts=%d cpu_routes=%zu",
+                        layer, expertLimit, (int)cpuExperts.size(),
+                        cpuRoutes);
+                    for (int i = 0; i < gpuWorkerCount; i++) {
+                        printf(
+                            " gpu%d_experts=%d gpu%d_routes=%zu",
+                            cudaInputReplicas[i].deviceId,
+                            (int)gpuExpertSets[i].size(),
+                            cudaInputReplicas[i].deviceId,
+                            gpuExpertLoads[i]);
+                    }
+                    printf("\n");
+                    fflush(stdout);
+                }
+
+                gpuThreads.reserve(gpuWorkerCount);
+                for (int i = 0; i < gpuWorkerCount; i++) {
+                    int workerDevice = cudaInputReplicas[i].deviceId;
+                    gpuThreads.emplace_back([&, i, workerDevice]() {
+                        FastllmCudaSetDevice(workerDevice);
+                        DoCudaMergeMOEFromCPU(
+                            *gpuInputAliases[i], *gpuOutputPartials[i],
+                            index, score, w1, w2, w3, weights, biass,
+                            sharedScale, true, gpuExpertSets[i], true);
+                    });
+                }
             }
 // printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #endif
@@ -5506,16 +5781,50 @@ namespace fastllm {
 // printf("cpu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #ifdef USE_CUDA
             if (gpuPrefill && !gpuExperts.empty()) {
-                gpuThread.join();
+                for (std::thread &gpuThread : gpuThreads) {
+                    gpuThread.join();
+                }
                 FastllmCudaSetDevice(gpuId);
+                Data gpuOutputAlias(
+                    output.dataType, output.dims,
+                    DataDevice::CUDA, output.cudaData);
                 if (cpuOutputStaging != nullptr) {
                     FastllmCudaStreamSynchronize(cpuOutputCopyStream);
-                    Data gpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, output.cudaData);
                     Data cpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, cpuOutputStaging);
                     FastllmCudaAddTo(gpuOutputAlias, cpuOutputAlias, 1.0f);
+                    FastllmCudaSyncCurrentThreadStream();
+                }
+                if (gpuOutputPartials.size() > 1) {
+                    size_t outputBytes = output.GetBytes();
+                    void *reduceStaging =
+                        fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(
+                            outputBytes, gpuId);
+                    Data reduceAlias(
+                        output.dataType, output.dims,
+                        DataDevice::CUDA, reduceStaging);
+                    for (int i = 1;
+                         i < (int)gpuOutputPartials.size(); i++) {
+                        int sourceDevice =
+                            cudaInputReplicas[i].deviceId;
+                        FastllmCudaMemcpyBetweenDevices(
+                            gpuId, reduceStaging, sourceDevice,
+                            gpuOutputPartials[i]->cudaData,
+                            outputBytes);
+                        FastllmCudaSetDevice(gpuId);
+                        FastllmCudaAddTo(
+                            gpuOutputAlias, reduceAlias, 1.0f);
+                        FastllmCudaSyncCurrentThreadStream();
+                    }
                 }
                 output.dataDevice = DataDevice::CUDA;
                 output.dataDeviceIds = {gpuId};
+                for (int i = 1;
+                     i < (int)gpuOutputPartials.size(); i++) {
+                    FastllmCudaSetDevice(
+                        cudaInputReplicas[i].deviceId);
+                    gpuOutputPartials[i].reset();
+                }
+                FastllmCudaSetDevice(gpuId);
             }
 #endif
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));

@@ -93,6 +93,23 @@ namespace fastllm {
 #endif
 
 #ifdef USE_CUDA
+    static void SelectCudaDeviceForCandidate(BaseDevice *device) {
+        if (device == nullptr) {
+            return;
+        }
+        if (device->deviceType == "cuda" && !device->deviceIds.empty()) {
+            FastllmCudaSetDevice(device->deviceIds[0]);
+        } else if (device->deviceType == "multicuda" &&
+                   !device->deviceIds.empty()) {
+            // Several MultiCuda CanRun implementations use the active rank set
+            // to decide whether their true TP path is available.  Publish it
+            // before capability probing so the first invocation cannot fall
+            // through to a single-GPU CUDA implementation.
+            FastllmMultiCudaSetDevice(device->deviceIds);
+            FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
+        }
+    }
+
     static void SyncCudaDeviceForProfiler(BaseDevice *device) {
         if (!GetFastllmEnv().cudaSync || device == nullptr) {
             return;
@@ -189,7 +206,10 @@ namespace fastllm {
     }
 
     bool Executor::CanRunOnFirstDevice(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
-                       const fastllm::IntDict &intParams) {     
+                       const fastllm::IntDict &intParams) {
+#ifdef USE_CUDA
+        SelectCudaDeviceForCandidate(this->devices[0]);
+#endif
         return this->devices[0]->CanRun(opType, datas, floatParams, intParams);
     }
 
@@ -224,16 +244,10 @@ namespace fastllm {
             if (lockInCPU && device->deviceType != "cpu") {
                 continue;
             }
-            if (device->CanRun(opType, datas, floatParams, intParams)) {
 #ifdef USE_CUDA
-                if (device->deviceType == "cuda" && device->deviceIds.size() > 0) {
-                    FastllmCudaSetDevice(device->deviceIds[0]);
-                }
-                if (device->deviceType == "multicuda" && device->deviceIds.size() > 0) {
-                    FastllmMultiCudaSetDevice(device->deviceIds);
-                    FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
-                }
+            SelectCudaDeviceForCandidate(device);
 #endif
+            if (device->CanRun(opType, datas, floatParams, intParams)) {
                 bool intParamsSize = intParams.size();
                 for (auto &it: datas) {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
@@ -332,18 +346,12 @@ namespace fastllm {
             if (device->deviceType != deviceType) {
                 continue;
             }
+#ifdef USE_CUDA
+            SelectCudaDeviceForCandidate(device);
+#endif
             if (!device->CanRun(opType, datas, floatParams, intParams)) {
                 continue;
             }
-#ifdef USE_CUDA
-            if (device->deviceType == "cuda" && device->deviceIds.size() > 0) {
-                FastllmCudaSetDevice(device->deviceIds[0]);
-            }
-            if (device->deviceType == "multicuda" && device->deviceIds.size() > 0) {
-                FastllmMultiCudaSetDevice(device->deviceIds);
-                FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
-            }
-#endif
             bool intParamsSize = intParams.size();
             for (auto &it: datas) {
                 if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {

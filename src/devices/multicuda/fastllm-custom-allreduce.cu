@@ -1,9 +1,9 @@
 // Graph-safe small-tensor all-reduce for single-process MultiCUDA.
 //
 // The kernel/barrier design is adapted from vLLM's Apache-2.0 licensed
-// csrc/custom_all_reduce.cuh.  FastLLM only needs the one-stage path here:
-// DeepSeek-V4 decode reduces 4096 BF16/FP16 values, all GPUs are peer-accessible,
-// and fixed graph workspaces let us register every pointer during warmup.
+// csrc/custom_all_reduce.cuh. Decode-sized messages use its one-stage direct
+// peer-read shape; larger TP>=4 messages use reduce-scatter/all-gather. Fixed
+// graph workspaces let us register every pointer during warmup.
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
@@ -70,6 +70,10 @@ struct __align__(16) CustomArRankSignals {
     CustomArSignal *signals[kCustomArMaxRanks];
 };
 
+struct __align__(16) CustomArRankScratch {
+    void *scratch[kCustomArMaxRanks];
+};
+
 template <typename T, int N>
 struct __align__(sizeof(T) * N) CustomArArray {
     T data[N];
@@ -116,6 +120,27 @@ __device__ __forceinline__ CustomArFlag CustomArLoadVolatile(CustomArFlag *ptr) 
     return value;
 }
 
+__device__ __forceinline__ void CustomArStoreRelease(CustomArFlag *ptr,
+                                                      CustomArFlag value) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    asm volatile("st.release.sys.global.u32 [%1], %0;" :: "r"(value), "l"(ptr));
+#else
+    asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::
+                 "r"(value), "l"(ptr));
+#endif
+}
+
+__device__ __forceinline__ CustomArFlag CustomArLoadAcquire(CustomArFlag *ptr) {
+    CustomArFlag value;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
+#else
+    asm volatile("ld.volatile.global.u32 %0, [%1]; membar.gl;" :
+                 "=r"(value) : "l"(ptr));
+#endif
+    return value;
+}
+
 template <int Ranks>
 __device__ __forceinline__ void CustomArBarrierStart(
         const CustomArRankSignals &allSignals, CustomArSignal *self,
@@ -134,8 +159,11 @@ __device__ __forceinline__ void CustomArBarrierStart(
     }
 }
 
+// The final barrier only prevents in-place overwrite while peers are still
+// reading. Keep this byte-for-byte equivalent to the original fast volatile
+// handshake used by decode-sized one-stage reductions.
 template <int Ranks>
-__device__ __forceinline__ void CustomArBarrierEnd(
+__device__ __forceinline__ void CustomArBarrierFinal(
         const CustomArRankSignals &allSignals, CustomArSignal *self,
         int rank) {
     __syncthreads();
@@ -147,6 +175,28 @@ __device__ __forceinline__ void CustomArBarrierEnd(
                    &self->end[blockIdx.x][threadIdx.x]) != next) {
         }
     }
+    if (threadIdx.x == 0) {
+        self->flag[blockIdx.x] = next;
+    }
+}
+
+// A publish barrier orders scratch writes before peer GPUs consume them in the
+// all-gather stage, so it requires system-scope release/acquire operations and
+// a trailing block barrier.
+template <int Ranks>
+__device__ __forceinline__ void CustomArBarrierPublish(
+        const CustomArRankSignals &allSignals, CustomArSignal *self,
+        int rank) {
+    __syncthreads();
+    CustomArFlag next = self->flag[blockIdx.x] + 1;
+    if (threadIdx.x < Ranks) {
+        CustomArStoreRelease(
+            &allSignals.signals[threadIdx.x]->end[blockIdx.x][rank], next);
+        while (CustomArLoadAcquire(
+                   &self->end[blockIdx.x][threadIdx.x]) != next) {
+        }
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
         self->flag[blockIdx.x] = next;
     }
@@ -187,7 +237,77 @@ void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
         }
         reinterpret_cast<P *>(output)[index] = result;
     }
-    CustomArBarrierEnd<Ranks>(allSignals, selfSignal, rank);
+    CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+}
+
+// The one-stage kernel makes every rank read the complete tensor from every
+// peer. That is ideal for decode-sized messages, but it is not the algorithm
+// vLLM uses for larger TP>=4 messages. Reduce-scatter into per-rank scratch,
+// publish it with a system-scope barrier, then all-gather into the destination.
+// The publish barrier also makes in-place output safe: all peer reads from the
+// original inputs have completed before any rank starts overwriting them.
+template <typename T, int Ranks>
+__global__ __launch_bounds__(kCustomArThreads, 1)
+void FastllmCustomAllReduceTwoStageKernel(
+        CustomArRankData *rankData,
+        CustomArRankSignals allSignals,
+        CustomArSignal *selfSignal,
+        CustomArRankScratch allScratch,
+        T *__restrict__ output,
+        int rank, int packedCount) {
+    using P = typename CustomArPacked<T>::P;
+    using A = typename CustomArPacked<T>::A;
+    CustomArRankData pointers = *rankData;
+    P *localScratch = reinterpret_cast<P *>(allScratch.scratch[rank]);
+    const int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    const int part = packedCount / Ranks;
+    const int localStart = rank * part;
+    const int localEnd = rank == Ranks - 1 ? packedCount : localStart + part;
+    const int largestPart = part + packedCount % Ranks;
+
+    CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
+    for (int index = localStart + thread; index < localEnd; index += stride) {
+        P firstValue = reinterpret_cast<const P *>(pointers.ptrs[0])[index];
+        A sum;
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            sum.data[item] = CustomArUpcast(firstValue.data[item]);
+        }
+#pragma unroll
+        for (int peer = 1; peer < Ranks; ++peer) {
+            P value = reinterpret_cast<const P *>(pointers.ptrs[peer])[index];
+#pragma unroll
+            for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+                sum.data[item] += CustomArUpcast(value.data[item]);
+            }
+        }
+        P result;
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            result.data[item] = CustomArDowncast<T>(sum.data[item]);
+        }
+        localScratch[index - localStart] = result;
+    }
+
+    CustomArBarrierPublish<Ranks>(allSignals, selfSignal, rank);
+    P *packedOutput = reinterpret_cast<P *>(output);
+    // Keep the same global thread mapping as reduce-scatter: the system-scope
+    // publish barrier guarantees peer visibility for matching producer and
+    // consumer threads.  The start barrier of the next collective also keeps
+    // this shared scratch from being reused before every rank finishes gather.
+    for (int offset = thread; offset < largestPart; offset += stride) {
+#pragma unroll
+        for (int source = 0; source < Ranks; ++source) {
+            const int sourceCount = source == Ranks - 1
+                ? packedCount - source * part : part;
+            if (offset < sourceCount) {
+                const P *sourceScratch =
+                    reinterpret_cast<const P *>(allScratch.scratch[source]);
+                packedOutput[source * part + offset] = sourceScratch[offset];
+            }
+        }
+    }
 }
 
 template <typename T>
@@ -242,7 +362,7 @@ void FastllmCustomAllReduceAddKernel(CustomArRankData *rankData,
         }
         reinterpret_cast<P *>(output)[index] = first;
     }
-    CustomArBarrierEnd<2>(allSignals, selfSignal, rank);
+    CustomArBarrierFinal<2>(allSignals, selfSignal, rank);
 }
 
 struct CustomArState {
@@ -254,6 +374,7 @@ struct CustomArState {
     std::vector<int> devices;
     std::map<int, int> rankByDevice;
     CustomArRankSignals allSignals{};
+    CustomArRankScratch allScratch{};
     void *inplaceScratch[kCustomArMaxRanks]{};
     std::map<std::vector<uintptr_t>, std::vector<CustomArRankData *> > registrations;
 
@@ -276,9 +397,14 @@ CustomArState &GetCustomArState() {
 
 constexpr size_t CustomArMaxBytes() {
     // Match vLLM's custom-all-reduce registration envelope. TP=2 always uses
-    // the one-stage direct-read kernel; batch 32 x hidden 5120 is already
-    // 320 KiB and must not fall back to NCCL at the old DeepSeek-only limit.
+    // the one-stage direct-read kernel; larger TP groups switch to two-stage
+    // instead of falling back at the old DeepSeek-only limit.
     return 8ULL * 1024ULL * 1024ULL;
+}
+
+bool CustomArUseTwoStage(size_t ranks, size_t bytes) {
+    return ranks > 2 &&
+        bytes >= (ranks <= 4 ? 512ULL * 1024ULL : 256ULL * 1024ULL);
 }
 
 size_t CustomArTypeBytes(int dataType) {
@@ -429,15 +555,26 @@ bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
                     T *output, int rank, int count) {
     constexpr int packedWidth = CustomArPacked<T>::size;
     int packedCount = count / packedWidth;
+    const size_t bytes = (size_t)count * sizeof(T);
+    const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
     int blocks = std::max(1, std::min(kCustomArMaxBlocks,
                           (packedCount + kCustomArThreads - 1) /
                               kCustomArThreads));
-#define CUSTOM_AR_RANK_CASE(RANKS)                                              \
-    case RANKS:                                                                 \
-        FastllmCustomAllReduceKernel<T, RANKS>                                  \
-            <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(              \
-                rankData, state.allSignals, state.allSignals.signals[rank],      \
-                output, rank, packedCount);                                      \
+#define CUSTOM_AR_RANK_CASE(RANKS)                                           \
+    case RANKS:                                                              \
+        if (useTwoStage) {                                                   \
+            FastllmCustomAllReduceTwoStageKernel<T, RANKS>                   \
+                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                    rankData, state.allSignals,                              \
+                    state.allSignals.signals[rank], state.allScratch,        \
+                    output, rank, packedCount);                              \
+        } else {                                                             \
+            FastllmCustomAllReduceKernel<T, RANKS>                           \
+                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                    rankData, state.allSignals,                              \
+                    state.allSignals.signals[rank], output, rank,            \
+                    packedCount);                                            \
+        }                                                                    \
         break
     switch (state.devices.size()) {
         CUSTOM_AR_RANK_CASE(2);
@@ -556,7 +693,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         }
         state.allSignals.signals[rank] = signal;
         // The one-stage direct-read algorithm cannot overwrite an input before
-        // every peer has consumed it.  FastLLM's TP reductions are normally
+        // every peer has consumed it. FastLLM's TP reductions are normally
         // in-place, so reduce into a fixed per-rank scratch buffer and enqueue
         // the copy-back after the kernel's final cross-GPU barrier.
         state.inplaceScratch[rank] = FastllmCudaMalloc(CustomArMaxBytes());
@@ -564,6 +701,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
             ok = false;
             break;
         }
+        state.allScratch.scratch[rank] = state.inplaceScratch[rank];
     }
     if (ok) {
         for (int device : devices) {
@@ -625,7 +763,12 @@ bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
                                         dataType, rankData)) {
         return false;
     }
-    void *kernelDest = data == dest ? state.inplaceScratch[rank] : dest;
+    const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
+    // The two-stage path has completed every peer read before writing dest and
+    // is safe in-place. Preserve the original asynchronous scratch copy-back
+    // for one-stage decode messages; it is faster than extending the kernel.
+    void *kernelDest = data == dest && !useTwoStage
+        ? state.inplaceScratch[rank] : dest;
     bool launched = false;
     if (dataType == fastllm::DataType::FLOAT16) {
         launched = LaunchCustomAr(state, rankData,

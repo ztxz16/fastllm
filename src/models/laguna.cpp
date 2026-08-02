@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -181,7 +182,12 @@ namespace fastllm {
                 }
                 const Data &gateup = gateupIt->second;
                 const Data &down = downIt->second;
-                if (gateup.isDiskWeight || down.isDiskWeight ||
+                // Tensor-parallel expert weights already own per-device shards.
+                // Rebuilding them as one fused 3D tensor would duplicate the
+                // complete expert layer on the root GPU and can exhaust its
+                // memory before the first request finishes.
+                if (gateup.multiDeviceData || down.multiDeviceData ||
+                    gateup.isDiskWeight || down.isDiskWeight ||
                     gateup.dims.size() != 2 || down.dims.size() != 2 ||
                     gateup.dims[0] <= 0 || (gateup.dims[0] & 1) != 0 ||
                     !LagunaMoeIsFusedFp8Type(gateup.dataType) ||
@@ -259,9 +265,16 @@ namespace fastllm {
 
         struct LagunaPrefixSnapshotTensor {
             bool valid = false;
+            bool multiDevice = false;
             Data data;
             DataDevice targetDevice = DataDevice::CPU;
             std::vector<int> targetDeviceIds;
+            std::vector<int> targetDims;
+            TensorParallelLayoutType targetTpLayout = TP_LAYOUT_NONE;
+            int targetTpAxis = -1;
+            std::vector<int> targetTpGlobalDims;
+            std::map<int, std::vector<std::pair<int, int> > > targetTpRanges;
+            std::map<int, std::unique_ptr<LagunaPrefixSnapshotTensor> > locals;
         };
 
         struct LagunaPrefixSnapshotLayer {
@@ -274,7 +287,7 @@ namespace fastllm {
             int cachedLen = 0;
             long long timestamp = 0;
             std::vector<int> tokens;
-            std::vector<LagunaPrefixSnapshotLayer> layers;
+            std::vector<std::unique_ptr<LagunaPrefixSnapshotLayer> > layers;
         };
 
         static std::mutex &LagunaPrefixSnapshotsMutex() {
@@ -333,16 +346,64 @@ namespace fastllm {
             return cache.dims.size() > 1 ? cache.dims[1] : 0;
         }
 
-        static bool LagunaCopyPrefixTensor(const Data &source,
-                                            int begin, int end,
-                                            LagunaPrefixSnapshotTensor &target) {
+        static bool LagunaCopySinglePrefixTensor(
+                const Data &source, int begin, int end,
+                LagunaPrefixSnapshotTensor &target) {
             target.valid = false;
-            if (source.multiDeviceData || source.dims.size() < 3 ||
-                begin < 0 || end <= begin || end > source.dims[1]) {
+            target.multiDevice = false;
+            if (source.multiDeviceData || begin < 0 || end <= begin) {
                 return false;
             }
             target.targetDevice = source.dataDevice;
             target.targetDeviceIds = source.dataDeviceIds;
+
+            if (source.isPagedKVCache) {
+                Data *storage = (Data*)source.pagedKVCacheData;
+                int physicalLen = LagunaCacheTokenLen(source);
+                if (storage == nullptr || storage->dims.size() < 4 ||
+                    source.pageLen <= 0 || source.pageIndex.empty() ||
+                    end > physicalLen) {
+                    return false;
+                }
+
+                // A paged cache cannot express an offset into its first page.
+                // Retain the preceding partial page as well; Laguna's windowLeft
+                // still limits attention to the final sliding_window tokens.
+                int firstPage = begin / source.pageLen;
+                int endPage = (end + source.pageLen - 1) / source.pageLen;
+                if (firstPage < 0 || endPage <= firstPage ||
+                    endPage > (int)source.pageIndex.size()) {
+                    return false;
+                }
+                int heldStart = firstPage * source.pageLen;
+                int heldLen = end - heldStart;
+                int heldLastPageLen = end - (endPage - 1) * source.pageLen;
+                if (heldLastPageLen <= 0) {
+                    heldLastPageLen = source.pageLen;
+                }
+
+                target.data.dataType = source.dataType;
+                target.data.UpdateUnitSize();
+                target.data.dataDevice = storage->dataDevice;
+                target.data.dataDeviceIds = source.dataDeviceIds;
+                target.data.Resize(
+                    {storage->dims[2], heldLen, storage->dims[3]});
+                target.data.isKVCache = true;
+                target.data.isPagedKVCache = true;
+                target.data.pagedKVCacheData = source.pagedKVCacheData;
+                target.data.pageLen = source.pageLen;
+                target.data.pageIndex.assign(
+                    source.pageIndex.begin() + firstPage,
+                    source.pageIndex.begin() + endPage);
+                target.data.lastPageLen = heldLastPageLen;
+                target.data.pagedKVCacheData->Pick(target.data.pageIndex);
+                target.valid = true;
+                return true;
+            }
+
+            if (source.dims.size() < 3 || end > source.dims[1]) {
+                return false;
+            }
             Data sliced;
             Split(source, 1, begin, end, sliced);
             target.data.CopyFrom(sliced);
@@ -357,13 +418,178 @@ namespace fastllm {
             return target.valid;
         }
 
+        static bool LagunaCopyPrefixTensor(
+                const Data &source, int begin, int end,
+                LagunaPrefixSnapshotTensor &target) {
+            target.valid = false;
+            target.multiDevice = source.multiDeviceData;
+            target.targetDevice = source.dataDevice;
+            target.targetDeviceIds = source.dataDeviceIds;
+            target.targetDims = source.dims;
+            target.targetTpLayout = source.tpLayout;
+            target.targetTpAxis = source.tpAxis;
+            target.targetTpGlobalDims = source.tpGlobalDims;
+            target.targetTpRanges = source.tpRanges;
+            target.locals.clear();
+
+            if (!source.multiDeviceData) {
+                return LagunaCopySinglePrefixTensor(source, begin, end, target);
+            }
+
+            std::vector<int> devices = source.dataDeviceIds;
+            if (devices.empty()) {
+                for (const auto &it : source.multiDeviceDatas) {
+                    devices.push_back(it.first);
+                }
+            }
+            int heldLen = -1;
+            for (int device : devices) {
+                auto it = source.multiDeviceDatas.find(device);
+                if (it == source.multiDeviceDatas.end() || it->second == nullptr) {
+                    return false;
+                }
+                std::unique_ptr<LagunaPrefixSnapshotTensor> local(
+                    new LagunaPrefixSnapshotTensor());
+                if (!LagunaCopySinglePrefixTensor(
+                        *it->second, begin, end, *local)) {
+                    return false;
+                }
+                int localLen = local->data.dims.size() > 1
+                    ? local->data.dims[1] : 0;
+                if (heldLen < 0) {
+                    heldLen = localLen;
+                } else if (localLen != heldLen) {
+                    return false;
+                }
+                target.locals[device] = std::move(local);
+            }
+            if (target.locals.empty() || heldLen <= 0) {
+                return false;
+            }
+            if (target.targetDims.size() > 1) {
+                target.targetDims[1] = heldLen;
+            }
+            if (target.targetTpGlobalDims.size() > 1) {
+                target.targetTpGlobalDims[1] = heldLen;
+            }
+            target.valid = true;
+            return true;
+        }
+
+        static void LagunaClearPrefixTensor(Data &target) {
+            std::set<std::pair<PagedCacheManager*, int> > releasedPages;
+            auto releasePages = [&](Data &cache) {
+                if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+                    cache.pageIndex.clear();
+                    cache.lastPageLen = 0;
+                    return;
+                }
+                std::vector<int> uniquePages;
+                for (int page : cache.pageIndex) {
+                    auto key = std::make_pair(cache.pagedKVCacheData, page);
+                    if (releasedPages.insert(key).second) {
+                        uniquePages.push_back(page);
+                    }
+                }
+                if (!uniquePages.empty()) {
+                    cache.pagedKVCacheData->ReleasePageIndices(uniquePages);
+                }
+                cache.pageIndex.clear();
+                cache.lastPageLen = 0;
+            };
+
+            releasePages(target);
+            for (auto &it : target.multiDeviceDatas) {
+                if (it.second != nullptr) {
+                    releasePages(*it.second);
+                    delete it.second;
+                }
+            }
+            target.multiDeviceDatas.clear();
+            target.multiDeviceData = false;
+            target.FreeSpace();
+            target.dims.clear();
+            target.strides.clear();
+            target.isPagedKVCache = false;
+            target.pagedKVCacheData = nullptr;
+            target.ClearTensorParallelLayout();
+        }
+
         static bool LagunaRestorePrefixTensor(
                 const LagunaPrefixSnapshotTensor &source, Data &target) {
-            if (!source.valid || source.data.dims.size() < 3) {
+            if (!source.valid) {
                 return false;
             }
             long long cacheUid = target.cacheUid;
-            target.FreeSpace();
+
+            if (source.multiDevice) {
+                if (source.locals.empty() || source.targetDims.size() < 3) {
+                    return false;
+                }
+                LagunaClearPrefixTensor(target);
+                target.cacheUid = cacheUid;
+                target.dataDevice = source.targetDevice;
+                target.dataDeviceIds = source.targetDeviceIds;
+                target.Resize(source.targetDims);
+                target.multiDeviceData = true;
+                target.tpLayout = source.targetTpLayout;
+                target.tpAxis = source.targetTpAxis;
+                target.tpGlobalDims = source.targetTpGlobalDims;
+                target.tpRanges = source.targetTpRanges;
+                target.isKVCache = true;
+
+                Data *firstLocal = nullptr;
+                for (const auto &it : source.locals) {
+                    Data *local = new Data();
+                    local->cacheUid = cacheUid;
+                    if (!LagunaRestorePrefixTensor(*it.second, *local)) {
+                        delete local;
+                        LagunaClearPrefixTensor(target);
+                        target.cacheUid = cacheUid;
+                        return false;
+                    }
+                    target.multiDeviceDatas[it.first] = local;
+                    if (firstLocal == nullptr) {
+                        firstLocal = local;
+                    }
+                }
+                if (firstLocal == nullptr) {
+                    LagunaClearPrefixTensor(target);
+                    target.cacheUid = cacheUid;
+                    return false;
+                }
+                target.dataType = firstLocal->dataType;
+                target.UpdateUnitSize();
+                target.isPagedKVCache = firstLocal->isPagedKVCache;
+                target.pagedKVCacheData = firstLocal->pagedKVCacheData;
+                target.pageLen = firstLocal->pageLen;
+                target.pageIndex = firstLocal->pageIndex;
+                target.lastPageLen = firstLocal->lastPageLen;
+                target.cudaData = nullptr;
+                return true;
+            }
+
+            if (source.data.dims.size() < 3) {
+                return false;
+            }
+            LagunaClearPrefixTensor(target);
+            target.cacheUid = cacheUid;
+            if (source.data.isPagedKVCache) {
+                target.dataType = source.data.dataType;
+                target.UpdateUnitSize();
+                target.dataDevice = source.data.dataDevice;
+                target.dataDeviceIds = source.data.dataDeviceIds;
+                target.Resize(source.data.dims);
+                target.isKVCache = true;
+                target.isPagedKVCache = true;
+                target.pagedKVCacheData = source.data.pagedKVCacheData;
+                target.pageLen = source.data.pageLen;
+                target.pageIndex = source.data.pageIndex;
+                target.lastPageLen = source.data.lastPageLen;
+                target.pagedKVCacheData->Pick(target.pageIndex);
+                return true;
+            }
+
             target.CopyFrom(source.data);
             target.cacheUid = cacheUid;
             target.isKVCache = true;
@@ -625,54 +851,6 @@ namespace fastllm {
 
         this->initialized_add1 = false;
         this->moeWeightsPrepared = false;
-        BuildYarnCache();
-    }
-
-    void LagunaModel::BuildYarnCache() {
-        const int rotaryHalf = this->fullRotaryDim / 2;
-        const int cacheLength = std::max(1, this->max_positions);
-        std::vector<float> invFreq(rotaryHalf);
-
-        auto findCorrectionDim = [&](float rotations) {
-            return (this->fullRotaryDim *
-                    std::log(this->fullRopeOriginalMaxPosition /
-                             (rotations * 2.0f * (float)M_PI))) /
-                   (2.0f * std::log(this->fullRopeTheta));
-        };
-        float low = std::floor(findCorrectionDim(this->fullRopeBetaFast));
-        float high = std::ceil(findCorrectionDim(this->fullRopeBetaSlow));
-        low = std::max(low, 0.0f);
-        high = std::min(high, (float)this->fullRotaryDim - 1.0f);
-        if (low == high) {
-            high += 0.001f;
-        }
-
-        for (int i = 0; i < rotaryHalf; i++) {
-            float posFreq = std::pow(
-                this->fullRopeTheta, (float)(2 * i) / this->fullRotaryDim);
-            float extrapolation = 1.0f / posFreq;
-            float interpolation = 1.0f / (this->fullRopeFactor * posFreq);
-            float ramp = std::max(0.0f, std::min(1.0f, (i - low) / (high - low)));
-            float extrapolationFactor = 1.0f - ramp;
-            invFreq[i] = interpolation * (1.0f - extrapolationFactor) +
-                         extrapolation * extrapolationFactor;
-        }
-
-        this->yarnSinData = Data(DataType::FLOAT32, {cacheLength, rotaryHalf});
-        this->yarnCosData = Data(DataType::FLOAT32, {cacheLength, rotaryHalf});
-        this->yarnSinData.Allocate();
-        this->yarnCosData.Allocate();
-        float *sinData = (float*)this->yarnSinData.cpuData;
-        float *cosData = (float*)this->yarnCosData.cpuData;
-        for (int position = 0; position < cacheLength; position++) {
-            for (int i = 0; i < rotaryHalf; i++) {
-                float angle = position * invFreq[i];
-                sinData[(size_t)position * rotaryHalf + i] =
-                    std::sin(angle) * this->fullRopeAttentionFactor;
-                cosData[(size_t)position * rotaryHalf + i] =
-                    std::cos(angle) * this->fullRopeAttentionFactor;
-            }
-        }
     }
 
     std::string LagunaModel::MapTensorName(const std::string &name) const {
@@ -820,11 +998,136 @@ namespace fastllm {
         this->initialized_add1 = true;
     }
 
+    DataType LagunaModel::GPUForwardComputeType() const {
+        // Laguna activations overflow in the later layers when the whole
+        // direct path is kept in FP16.  Preserve BF16 for the model compute
+        // path; attention capability is handled independently.
+        return DataType::BFLOAT16;
+    }
+
+    DataType LagunaModel::GPUForwardCacheType(
+            int layer, DataType requestedType, DataType computeType) const {
+        if (requestedType == DataType::FP8_E4M3) {
+            return requestedType;
+        }
+        return this->IsFullAttentionLayer(layer)
+            ? computeType : DataType::FLOAT16;
+    }
+
+    bool LagunaModel::GPUForwardUseYarnRope(int layer) const {
+        return this->IsFullAttentionLayer(layer);
+    }
+
+    void LagunaModel::GPUForwardYarnRopeParams(
+            int layer, float &factor, float &attentionFactor,
+            float &correctionLow, float &correctionHigh) const {
+        if (!this->IsFullAttentionLayer(layer)) {
+            factor = 1.0f;
+            attentionFactor = 1.0f;
+            correctionLow = 0.0f;
+            correctionHigh = 1.0f;
+            return;
+        }
+        auto findCorrectionDim = [&](float rotations) {
+            return (this->fullRotaryDim * std::log(
+                        (float)this->fullRopeOriginalMaxPosition /
+                        (rotations * 2.0f * (float)M_PI))) /
+                   (2.0f * std::log(this->fullRopeTheta));
+        };
+        factor = this->fullRopeFactor;
+        attentionFactor = this->fullRopeAttentionFactor;
+        correctionLow = std::max(
+            0.0f, std::floor(findCorrectionDim(this->fullRopeBetaFast)));
+        correctionHigh = std::min(
+            (float)this->fullRotaryDim - 1.0f,
+            std::ceil(findCorrectionDim(this->fullRopeBetaSlow)));
+        if (correctionLow == correctionHigh) {
+            correctionHigh += 0.001f;
+        }
+    }
+
+    int LagunaModel::GPUForwardAttentionWindowLeft(int layer) const {
+        // FlashInfer's window_left excludes the current token, while Laguna's
+        // sliding_window includes it.
+        return this->IsFullAttentionLayer(layer)
+            ? -1 : std::max(0, this->sliding_window - 1);
+    }
+
+    int LagunaModel::GPUForwardPagedCacheMaxPages(int layer) const {
+        // The Step3p5 decode graph reuses one fixed page-index metadata buffer
+        // for every attention layer.  Full-attention and sliding-window cache
+        // managers therefore need the same page-number space while graph mode
+        // is enabled; compact per-layer pools allocate different descending
+        // page IDs and make graph replay invalid.  Eager mode keeps the smaller
+        // sliding-window pools below.
+        if (GetFastllmEnv().cudaGraph) {
+            return -1;
+        }
+
+        int retainedTokens = this->GetKVCacheRetainedTokens(layer);
+        if (retainedTokens < 0) {
+            return -1;
+        }
+
+        const int pageLen = std::max(1, fastllm::GetPageLen());
+        const int globalMaxTokens = fastllm::GetMaxTokens();
+        const int globalPages = globalMaxTokens > 0
+            ? std::max(1, (int)(((long long)globalMaxTokens + pageLen - 1) /
+                                pageLen))
+            : 300;
+        int batchLimit = this->maxBatch > 0 ? this->maxBatch : 512;
+        if (globalMaxTokens > 0) {
+            batchLimit = std::min(
+                batchLimit, std::max(1, globalMaxTokens / 128));
+        }
+
+        int prefillChunk = this->chunkedPrefillSize >= 0
+            ? this->chunkedPrefillSize : this->defaultChunkedPrefillSize;
+        if (prefillChunk <= 0) {
+            prefillChunk = globalMaxTokens > 0 ? globalMaxTokens : 128;
+        }
+        // A cache is compacted after attention. Before the next compaction it
+        // can contain the retained tail, one partially used page, and one
+        // complete prefill chunk. Prefix snapshots pin one additional tail per
+        // retained record, so reserve those pages in the compact eager pool as
+        // well. CUDA Graph uses the global token-growing pool above.
+        const long long peakTokensPerRequest =
+            (long long)retainedTokens + prefillChunk + pageLen - 1;
+        const long long pagesPerRequest =
+            (peakTokensPerRequest + pageLen - 1) / pageLen;
+        long long snapshotPages = 0;
+        if (LagunaPrefixCacheEnabled()) {
+            const long long pagesPerSnapshot =
+                ((long long)retainedTokens + pageLen - 1) / pageLen;
+            snapshotPages = pagesPerSnapshot *
+                            LagunaPrefixSnapshotMaxRecords();
+        }
+        const long long boundedPages = std::max(
+            1LL, pagesPerRequest * std::max(1, batchLimit) + snapshotPages);
+        return (int)std::min<long long>(globalPages, boundedPages);
+    }
+
+    bool LagunaModel::GPUForwardUseMambaSoftplusGate(int layer) const {
+        (void)layer;
+        return true;
+    }
+
+    Data *LagunaModel::GPUForwardMambaSoftplusALog() {
+        return &this->softplusALog;
+    }
+
+    Data *LagunaModel::GPUForwardMambaSoftplusDtBias() {
+        return &this->softplusDtBias;
+    }
+
     void LagunaModel::ApplyStepRotary(Data &input, const Data &positionIds, int layer) {
         if (this->IsFullAttentionLayer(layer)) {
-            fastllm::LlamaRotatePosition2DPart(
-                input, positionIds, this->yarnSinData, this->yarnCosData,
-                this->fullRotaryDim / 2, this->fullRotaryDim);
+            fastllm::YarnRopeEncoding(
+                input, positionIds, this->fullRotaryDim,
+                this->fullRopeTheta, this->fullRopeFactor,
+                (float)this->fullRopeOriginalMaxPosition,
+                this->fullRopeBetaFast, this->fullRopeBetaSlow,
+                this->fullRopeAttentionFactor);
         } else {
             fastllm::RopeEncoding(
                 input, positionIds, this->slidingRotaryDim,
@@ -871,6 +1174,13 @@ namespace fastllm {
         // Prefix snapshots are captured while chunked prefill passes their
         // aligned boundary, so no extra post-hoc history needs to be retained.
         return std::max(1, this->sliding_window - 1);
+    }
+
+    bool LagunaModel::BoundedKVCacheUsesTokenGrowingStorage() const {
+        // The direct decode graph keeps sliding-window page ids aligned with
+        // full-attention layers.  The logical attention window stays bounded,
+        // but the backing page pools grow with the advertised token limit.
+        return GetFastllmEnv().cudaGraph;
     }
 
     bool LagunaModel::TryRecordPagedPrefixCacheExtra(ResponseContext *context) {
@@ -942,13 +1252,15 @@ namespace fastllm {
             int valueStart = currentLen - valueLen;
             int keyOffset = desiredStart - keyStart;
             int valueOffset = desiredStart - valueStart;
-            auto &layer = snapshot->layers[i];
+            snapshot->layers[i].reset(new LagunaPrefixSnapshotLayer());
+            auto &layer = *snapshot->layers[i];
             layer.sliding = true;
-            if (!LagunaCopyPrefixTensor(key, keyOffset,
-                                        keyOffset + desiredTokens, layer.key) ||
-                !LagunaCopyPrefixTensor(value, valueOffset,
-                                        valueOffset + desiredTokens,
-                                        layer.value)) {
+            if (!LagunaCopyPrefixTensor(
+                    key, keyOffset, keyOffset + desiredTokens,
+                    layer.key) ||
+                !LagunaCopyPrefixTensor(
+                    value, valueOffset, valueOffset + desiredTokens,
+                    layer.value)) {
                 return false;
             }
         }
@@ -1004,8 +1316,10 @@ namespace fastllm {
         std::lock_guard<std::mutex> guard(LagunaPrefixSnapshotsMutex());
         const LagunaPrefixSnapshot *snapshot = LagunaFindPrefixSnapshotLocked(
             this, context->currentTokens, cachedLen, cachedLen);
-        if (snapshot == nullptr ||
-            (int)snapshot->layers.size() < this->block_cnt) {
+        if (snapshot == nullptr) {
+            return false;
+        }
+        if ((int)snapshot->layers.size() < this->block_cnt) {
             return false;
         }
         for (int i = 0; i < this->block_cnt; i++) {
@@ -1013,11 +1327,11 @@ namespace fastllm {
                 continue;
             }
             const auto &layer = snapshot->layers[i];
-            if (!layer.sliding ||
+            if (layer == nullptr || !layer->sliding ||
                 !LagunaRestorePrefixTensor(
-                    layer.key, context->pastKeyValues[i].first) ||
+                    layer->key, context->pastKeyValues[i].first) ||
                 !LagunaRestorePrefixTensor(
-                    layer.value, context->pastKeyValues[i].second)) {
+                    layer->value, context->pastKeyValues[i].second)) {
                 return false;
             }
         }
@@ -1065,10 +1379,10 @@ namespace fastllm {
     }
 
     bool LagunaModel::CanUseGPUForward() const {
-        // Step3p5's direct CUDA path hard-codes sigmoid attention gates and its
-        // own RoPE. The generic path still supports device maps and preserves
-        // Laguna's softplus + YaRN semantics.
-        return false;
+        // The numerically safe BF16 direct path requires FlashInfer on SM80+.
+        // Older GPUs use the existing ForwardV2 dense-mask SWA path.
+        return Step3p5Model::CanUseGPUForward() &&
+               GPUForwardTargetsSupportFlashInfer();
     }
 
     bool LagunaModel::NeedAttentionMask(int qlen, int klen) {
