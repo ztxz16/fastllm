@@ -1843,10 +1843,6 @@ namespace {
         constexpr int hidden = (heads / groups) * headDim;
         constexpr int outRank = 128;
 
-        std::vector<float> inputValues(heads * headDim, 1.0f);
-        fastllm::Data input = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, heads, headDim}, inputValues);
-
         fastllm::Data weight;
         weight.dataType = fastllm::DataType::FP8_E4M3;
         weight.UpdateUnitSize();
@@ -1862,28 +1858,40 @@ namespace {
         weight.scales = {1.0f / 64.0f, 1.0f / 32.0f};
         weight.ToDevice(fastllm::DataDevice::CUDA);
 
-        fastllm::Data reference;
-        Expect(FastllmCudaDeepSeekV4WoA(
-                   input, weight, groups, outRank, reference, false),
-               "built-in DeepSeek-V4 WoA reference rejected its test input");
+        for (int tokens : {1, 8}) {
+            std::vector<float> inputValues(
+                (size_t)tokens * heads * headDim, 1.0f);
+            fastllm::Data input = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, tokens, heads, headDim}, inputValues);
 
-        fastllm::Data actual = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, groups * outRank},
-            std::vector<float>(groups * outRank, 0.0f));
-        bool usedTriton = fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
-            input, weight, groups, outRank, actual);
-        if (tritonEnabled) {
-            Expect(usedTriton,
-                   "Triton DeepSeek-V4 WoA rejected its supported test input");
-        } else {
-            Expect(!usedTriton,
-                   "DeepSeek-V4 WoA ignored its disabled Triton gate");
+            fastllm::Data reference;
             Expect(FastllmCudaDeepSeekV4WoA(
-                       input, weight, groups, outRank, actual),
-                   "built-in DeepSeek-V4 WoA fallback rejected its test input");
+                       input, weight, groups, outRank, reference, false),
+                   "built-in DeepSeek-V4 WoA reference rejected its test input");
+
+            fastllm::Data actual = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, tokens, groups * outRank},
+                std::vector<float>((size_t)tokens * groups * outRank, 0.0f));
+            bool usedTriton = fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
+                input, weight, groups, outRank, actual);
+            if (tritonEnabled) {
+                Expect(usedTriton,
+                       "Triton DeepSeek-V4 WoA rejected its supported test input");
+            } else {
+                Expect(!usedTriton,
+                       "DeepSeek-V4 WoA ignored its disabled Triton gate");
+                Expect(FastllmCudaDeepSeekV4WoA(
+                           input, weight, groups, outRank, actual),
+                       "built-in DeepSeek-V4 WoA fallback rejected its test input");
+            }
+            ExpectFloatNear(
+                ToFloatVector(reference), ToFloatVector(actual),
+                2e-2f, 2e-3f,
+                "DeepSeek-V4 Triton WoA output rows=" +
+                    std::to_string(tokens));
         }
-        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
-                        2e-2f, 2e-3f, "DeepSeek-V4 Triton WoA output");
         std::cout << "DeepSeek-V4 Triton WoA regression: PASS ("
                   << (tritonEnabled ? "Triton" : "disabled-gate fallback")
                   << ")\n";
@@ -1923,7 +1931,8 @@ namespace {
         for (int compressRatio : compressRatios) {
             fastllm::Data reference;
             Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
-                       q, windowKV, compressedKV, sink, windowSize, compressRatio,
+                       q, windowKV, compressedKV, nullptr, nullptr, sink,
+                       windowSize, compressRatio,
                        decodeMetaPtr, ropeDim, 10000.0f, 4096, 8.0f, 32, 1,
                        softmaxScale, reference, false),
                    "built-in DeepSeek-V4 sparse decode rejected ratio=" +
@@ -1950,7 +1959,8 @@ namespace {
             // Compare final outputs through the production wrapper, which
             // applies the rotary cast after either Triton or native fallback.
             Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
-                       q, windowKV, compressedKV, sink, windowSize, compressRatio,
+                       q, windowKV, compressedKV, nullptr, nullptr, sink,
+                       windowSize, compressRatio,
                        decodeMetaPtr, ropeDim, 10000.0f, 4096, 8.0f, 32, 1,
                        softmaxScale, actual),
                    "DeepSeek-V4 sparse decode wrapper rejected ratio=" +
@@ -1992,12 +2002,14 @@ namespace {
         float smSoftmaxScale = 1.0f / std::sqrt((float)smHeadDim);
         fastllm::Data smReference, smActual;
         Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
-                   smQ, smWindowKV, smCompressedKV, smSink, smWindowSize, 4,
+                   smQ, smWindowKV, smCompressedKV, nullptr, nullptr, smSink,
+                   smWindowSize, 4,
                    smDecodeMetaPtr, 64, 10000.0f, 4096, 8.0f, 32, 1,
                    smSoftmaxScale, smReference, false),
                "built-in DeepSeek-V4 sparse decode rejected SM120 shape");
         Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
-                   smQ, smWindowKV, smCompressedKV, smSink, smWindowSize, 4,
+                   smQ, smWindowKV, smCompressedKV, nullptr, nullptr, smSink,
+                   smWindowSize, 4,
                    smDecodeMetaPtr, 64, 10000.0f, 4096, 8.0f, 32, 1,
                    smSoftmaxScale, smActual),
                "DeepSeek-V4 Triton sparse decode rejected SM120 shape");
@@ -2007,6 +2019,79 @@ namespace {
         std::cout << "DeepSeek-V4 Triton sparse decode regression: PASS ("
                   << (tritonEnabled ? "Triton" : "disabled-gate fallback")
                   << ")\n";
+    }
+
+    void RunCudaDeepSeekV4IndexerRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int heads = 64;
+        constexpr int headDim = 128;
+        constexpr int topk = 512;
+        constexpr int compressedRows = 640;
+        constexpr int startPos = compressedRows * 4 - 1;
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, heads, headDim},
+            MakeRegressionValues(heads * headDim, 0.271f, 0.37f));
+        fastllm::Data weights = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, heads},
+            MakeRegressionValues(heads, 0.613f, 0.29f));
+        fastllm::Data compressedKV = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, compressedRows, headDim},
+            MakeRegressionValues(compressedRows * headDim, 0.947f, 0.41f));
+        fastllm::Data decodeMeta =
+            MakeIntTensor({2}, {startPos, 123});
+        decodeMeta.ToDevice(fastllm::DataDevice::CUDA);
+        const int32_t *decodeMetaPtr =
+            reinterpret_cast<const int32_t *>(decodeMeta.cudaData);
+
+        fastllm::Data optimizedIndices, optimizedLengths;
+        Expect(FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
+                   q, weights, compressedKV, decodeMetaPtr, 4,
+                   160000.0f, 65536, 16.0f, 32, 1,
+                   optimizedIndices, optimizedLengths),
+               "DeepSeek-V4 optimized indexer rejected a valid long row");
+
+        ExpectIntEqual({topk}, ToIntVector(optimizedLengths),
+                       "DeepSeek-V4 optimized indexer length");
+        std::vector<int32_t> optimized = ToIntVector(optimizedIndices);
+        auto validateSelection = [&](const std::vector<int32_t> &selection,
+                                     const std::string &name) {
+            Expect((int)selection.size() == topk,
+                   name + " returned the wrong number of indices");
+            std::vector<int32_t> sorted = selection;
+            std::sort(sorted.begin(), sorted.end());
+            Expect(sorted.front() >= 0 && sorted.back() < compressedRows,
+                   name + " returned an out-of-range index");
+            Expect(std::adjacent_find(sorted.begin(), sorted.end()) ==
+                       sorted.end(),
+                   name + " returned duplicate indices");
+            return sorted;
+        };
+        validateSelection(optimized, "DeepSeek-V4 optimized indexer");
+
+        // vLLM bypasses q/score/top-k entirely while the compressed row has no
+        // more than 512 candidates.  The public helper must preserve that exact
+        // ascending-order contract as well.
+        fastllm::Data shortMeta =
+            MakeIntTensor({2}, {127 * 4 - 1, 456});
+        shortMeta.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data shortIndices, shortLengths;
+        Expect(FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
+                   q, weights, compressedKV,
+                   reinterpret_cast<const int32_t *>(shortMeta.cudaData), 4,
+                   160000.0f, 65536, 16.0f, 32, 1,
+                   shortIndices, shortLengths),
+               "DeepSeek-V4 indexer rejected a valid short row");
+        ExpectIntEqual({127}, ToIntVector(shortLengths),
+                       "DeepSeek-V4 short indexer length");
+        std::vector<int32_t> shortSelection = ToIntVector(shortIndices);
+        for (int index = 0; index < topk; index++) {
+            int32_t expected = index < 127 ? index : -1;
+            Expect(shortSelection[index] == expected,
+                   "DeepSeek-V4 short indexer is not ascending");
+        }
+        std::cout << "DeepSeek-V4 learned indexer regression: PASS\n";
     }
 
     void RunMultiCudaDeepSeekV4SparsePrefillRegression() {
@@ -2426,12 +2511,13 @@ namespace {
         constexpr int hidden = 4096;
         constexpr int mixHc = (2 + hcMult) * hcMult;
         constexpr int flat = hcMult * hidden;
+        constexpr int tokens = 1;
         constexpr int sinkhornIters = 20;
         constexpr float eps = 1e-6f;
 
         fastllm::Data input = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, hcMult, hidden},
-            MakeRegressionValues(flat, 0.23f, 0.06f));
+            fastllm::DataType::BFLOAT16, {1, tokens, hcMult, hidden},
+            MakeRegressionValues(tokens * flat, 0.23f, 0.06f));
         fastllm::Data hcFn = MakeCudaTensor(
             fastllm::DataType::FLOAT32, {mixHc, flat},
             MakeRegressionValues(mixHc * flat, 0.67f, 0.008f));
@@ -2453,8 +2539,8 @@ namespace {
                    eps, eps, preOutput, referencePost, referenceComb),
                "built-in DeepSeek-V4 HcPre rejected fused-norm regression input");
         fastllm::Data referenceNorm = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, hidden},
-            std::vector<float>(hidden, 0.0f));
+            fastllm::DataType::BFLOAT16, {1, tokens, hidden},
+            std::vector<float>(tokens * hidden, 0.0f));
         Expect(FastllmCudaRMSNorm(preOutput, normWeight, referenceNorm, eps),
                "built-in RMSNorm rejected fused HcPre regression input");
 
@@ -2471,21 +2557,19 @@ namespace {
                         2e-5f, 2e-5f, "DeepSeek-V4 fused HcPreNorm comb mix");
 
         fastllm::Data layerOutput = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, hidden},
-            MakeRegressionValues(hidden, 0.91f, 0.09f));
+            fastllm::DataType::BFLOAT16, {1, tokens, hidden},
+            MakeRegressionValues(tokens * hidden, 0.91f, 0.09f));
         fastllm::Data previousPost = MakeCudaTensor(
-            fastllm::DataType::FLOAT32, {1, 1, hcMult},
-            {0.62f, 0.48f, 0.71f, 0.55f});
+            fastllm::DataType::FLOAT32, {1, tokens, hcMult},
+            MakeRegressionValues(tokens * hcMult, 0.62f, 0.08f));
         fastllm::Data previousComb = MakeCudaTensor(
-            fastllm::DataType::FLOAT32, {1, 1, hcMult, hcMult},
-            {0.70f, 0.12f, 0.09f, 0.09f,
-             0.10f, 0.72f, 0.08f, 0.10f,
-             0.08f, 0.11f, 0.73f, 0.08f,
-             0.12f, 0.07f, 0.10f, 0.71f});
+            fastllm::DataType::FLOAT32,
+            {1, tokens, hcMult, hcMult},
+            MakeRegressionValues(tokens * hcMult * hcMult, 0.70f, 0.05f));
         fastllm::Data referenceResidual;
         Expect(FastllmCudaDeepSeekV4HcPostCudaMix(
                    layerOutput, input, previousPost, previousComb,
-                   1, 1, hcMult, hidden, referenceResidual),
+                   1, tokens, hcMult, hidden, referenceResidual),
                "built-in DeepSeek-V4 HcPost rejected transition regression input");
         fastllm::Data transitionReferenceNorm;
         fastllm::Data transitionReferencePost;
@@ -2518,6 +2602,108 @@ namespace {
         ExpectFloatNear(ToFloatVector(transitionReferenceComb),
                         ToFloatVector(transitionComb), 2e-3f, 2e-3f,
                         "DeepSeek-V4 fused HcPostPreNorm comb mix");
+
+        // DSpark-7 verifies eight target rows in one graph replay.  Exercise
+        // that production shape against the established operator-composed
+        // path; every row must preserve the same BF16 tensor boundaries.
+        constexpr int dsparkRows = 8;
+        fastllm::Data dsparkInput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, dsparkRows, hcMult, hidden},
+            MakeRegressionValues(dsparkRows * flat, 0.29f, 0.055f));
+        fastllm::Data dsparkPre, dsparkReferencePost, dsparkReferenceComb;
+        Expect(FastllmCudaDeepSeekV4HcPre(
+                   dsparkInput, hcFn, hcScale, hcBase, hcMult,
+                   sinkhornIters, eps, eps, dsparkPre,
+                   dsparkReferencePost, dsparkReferenceComb),
+               "built-in DeepSeek-V4 HcPre rejected DSpark rows");
+        fastllm::Data dsparkReferenceNorm = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, dsparkRows, hidden},
+            std::vector<float>(dsparkRows * hidden, 0.0f));
+        Expect(FastllmCudaRMSNorm(
+                   dsparkPre, normWeight, dsparkReferenceNorm, eps),
+               "built-in RMSNorm rejected DSpark HcPre rows");
+
+        fastllm::Data dsparkNorm, dsparkPost, dsparkComb;
+        Expect(FastllmCudaDeepSeekV4HcPreNorm(
+                   dsparkInput, hcFn, hcScale, hcBase, normWeight,
+                   hcMult, sinkhornIters, eps, eps, dsparkNorm,
+                   dsparkPost, dsparkComb),
+               "fused DeepSeek-V4 HcPreNorm rejected DSpark rows");
+        ExpectFloatNear(ToFloatVector(dsparkReferenceNorm),
+                        ToFloatVector(dsparkNorm), 0.0f, 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPreNorm output");
+        ExpectFloatNear(ToFloatVector(dsparkReferencePost),
+                        ToFloatVector(dsparkPost), 0.0f, 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPreNorm post mix");
+        ExpectFloatNear(ToFloatVector(dsparkReferenceComb),
+                        ToFloatVector(dsparkComb), 0.0f, 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPreNorm comb mix");
+
+        fastllm::Data dsparkLayerOutput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, dsparkRows, hidden},
+            MakeRegressionValues(dsparkRows * hidden, 0.87f, 0.085f));
+        fastllm::Data dsparkPreviousPost = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, dsparkRows, hcMult},
+            MakeRegressionValues(dsparkRows * hcMult, 0.59f, 0.075f));
+        fastllm::Data dsparkPreviousComb = MakeCudaTensor(
+            fastllm::DataType::FLOAT32,
+            {1, dsparkRows, hcMult, hcMult},
+            MakeRegressionValues(dsparkRows * hcMult * hcMult,
+                                 0.73f, 0.045f));
+        fastllm::Data dsparkReferenceResidual;
+        Expect(FastllmCudaDeepSeekV4HcPostCudaMix(
+                   dsparkLayerOutput, dsparkInput, dsparkPreviousPost,
+                   dsparkPreviousComb, 1, dsparkRows, hcMult, hidden,
+                   dsparkReferenceResidual),
+               "built-in DeepSeek-V4 HcPost rejected DSpark rows");
+        fastllm::Data dsparkTransitionPre;
+        fastllm::Data dsparkTransitionReferencePost;
+        fastllm::Data dsparkTransitionReferenceComb;
+        Expect(FastllmCudaDeepSeekV4HcPre(
+                   dsparkReferenceResidual, hcFn, hcScale, hcBase,
+                   hcMult, sinkhornIters, eps, eps, dsparkTransitionPre,
+                   dsparkTransitionReferencePost,
+                   dsparkTransitionReferenceComb),
+               "built-in DeepSeek-V4 HcPre rejected DSpark transition");
+        fastllm::Data dsparkTransitionReferenceNorm = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, dsparkRows, hidden},
+            std::vector<float>(dsparkRows * hidden, 0.0f));
+        Expect(FastllmCudaRMSNorm(
+                   dsparkTransitionPre, normWeight,
+                   dsparkTransitionReferenceNorm, eps),
+               "built-in RMSNorm rejected DSpark transition");
+
+        fastllm::Data dsparkTransitionResidual;
+        fastllm::Data dsparkTransitionNorm;
+        fastllm::Data dsparkTransitionPost;
+        fastllm::Data dsparkTransitionComb;
+        Expect(FastllmCudaDeepSeekV4HcPostPreNorm(
+                   dsparkLayerOutput, dsparkInput, dsparkPreviousPost,
+                   dsparkPreviousComb, hcFn, hcScale, hcBase, normWeight,
+                   hcMult, sinkhornIters, eps, eps,
+                   dsparkTransitionResidual, dsparkTransitionNorm,
+                   dsparkTransitionPost, dsparkTransitionComb),
+               "fused DeepSeek-V4 HcPostPreNorm rejected DSpark rows");
+        // SM120 automatically selects vLLM's float-transition, split-K4
+        // schedule.  Older architectures retain the bit-exact generic path.
+        const bool sm120 = FastllmCudaRuntimeArch() >= 120;
+        ExpectFloatNear(ToFloatVector(dsparkReferenceResidual),
+                        ToFloatVector(dsparkTransitionResidual),
+                        sm120 ? 4e-3f : 0.0f, sm120 ? 2e-3f : 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPostPreNorm residual");
+        ExpectFloatNear(ToFloatVector(dsparkTransitionReferenceNorm),
+                        ToFloatVector(dsparkTransitionNorm),
+                        sm120 ? 3e-2f : 0.0f, sm120 ? 4e-3f : 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPostPreNorm norm output");
+        ExpectFloatNear(ToFloatVector(dsparkTransitionReferencePost),
+                        ToFloatVector(dsparkTransitionPost),
+                        sm120 ? 2e-3f : 0.0f, sm120 ? 2e-3f : 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPostPreNorm post mix");
+        ExpectFloatNear(ToFloatVector(dsparkTransitionReferenceComb),
+                        ToFloatVector(dsparkTransitionComb),
+                        sm120 ? 2e-3f : 0.0f, sm120 ? 2e-3f : 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPostPreNorm comb mix");
 
         std::cout << "DeepSeek-V4 fused HcPreNorm regression: PASS\n";
     }
@@ -3241,6 +3427,89 @@ namespace {
         fastllm::Data kvNormWeight = MakeCudaTensor(
             fastllm::DataType::FLOAT32, {headDim}, weightValues);
 
+        // CUDA graphs keep the decode position in a stable device-side metadata
+        // buffer.  Its dynamic-position kernels must remain bit-identical to
+        // the ordinary scalar-position path for every speculative row, not just
+        // the first row.  In particular, DSpark KV RoPE advances once per draft
+        // token; using a zero position step makes later draft logits diverge.
+        {
+            constexpr int draftTokens = 7;
+            constexpr int localHeads = 8;
+            const std::vector<float> draftQValues = MakeRegressionValues(
+                draftTokens * localHeads * headDim, 0.73f, 0.41f);
+            fastllm::Data staticQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, localHeads, headDim}, draftQValues);
+            fastllm::Data dynamicQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, localHeads, headDim}, draftQValues);
+            Expect(FastllmCudaDeepSeekV4ScaleQRotary(
+                       staticQ, ropeDim, 160000.0f, position,
+                       0, 16.0f, 32, 1, eps),
+                   "static DeepSeek-V4 draft Q rotary rejected its input");
+            Expect(FastllmCudaDeepSeekV4ScaleQRotaryGraph(
+                       dynamicQ, ropeDim, 160000.0f, decodeMetaPtr,
+                       0, 16.0f, 32, 1, eps),
+                   "dynamic DeepSeek-V4 draft Q rotary rejected its input");
+            ExpectFloatNear(ToFloatVector(staticQ), ToFloatVector(dynamicQ),
+                            0.0f, 0.0f,
+                            "DeepSeek-V4 dynamic draft Q rotary");
+
+            const std::vector<float> draftKVValues = MakeRegressionValues(
+                draftTokens * headDim, 1.17f, 0.37f);
+            fastllm::Data staticKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, 1, headDim}, draftKVValues);
+            fastllm::Data dynamicKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, 1, headDim}, draftKVValues);
+            Expect(FastllmCudaDeepSeekV4RotaryQuant(
+                       staticKV, ropeDim, 160000.0f, position,
+                       0, 16.0f, 32, 1, headDim - ropeDim, 64, 1),
+                   "static DeepSeek-V4 draft KV rotary rejected its input");
+            Expect(FastllmCudaDeepSeekV4RotaryQuantGraph(
+                       dynamicKV, ropeDim, 160000.0f, decodeMetaPtr,
+                       0, 16.0f, 32, 1, headDim - ropeDim, 64, 1),
+                   "dynamic DeepSeek-V4 draft KV rotary rejected its input");
+            ExpectFloatNear(ToFloatVector(staticKV), ToFloatVector(dynamicKV),
+                            0.0f, 0.0f,
+                            "DeepSeek-V4 dynamic draft KV rotary");
+
+            const std::vector<float> attentionQValues = MakeRegressionValues(
+                draftTokens * localHeads * headDim, 0.39f, 0.53f);
+            const std::vector<float> attentionKVValues = MakeRegressionValues(
+                (windowSize + draftTokens) * headDim, 0.97f, 0.43f);
+            const std::vector<float> attentionSinkValues =
+                MakeRegressionValues(localHeads, 1.23f, 0.17f);
+            fastllm::Data attentionQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, localHeads, headDim}, attentionQValues);
+            fastllm::Data attentionKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, windowSize + draftTokens, headDim}, attentionKVValues);
+            fastllm::Data attentionSink = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {localHeads},
+                attentionSinkValues);
+            fastllm::Data staticAttention, dynamicAttention;
+            Expect(FastllmCudaDeepSeekV4SparseAttentionPrefill(
+                       attentionQ, attentionKV, attentionSink,
+                       windowSize, position, 0, ropeDim, 160000.0f,
+                       0, 16.0f, 32, 1,
+                       1.0f / std::sqrt((float)headDim), staticAttention,
+                       windowSize, true, nullptr),
+                   "static DeepSeek-V4 draft sparse attention rejected its input");
+            Expect(FastllmCudaDeepSeekV4SparseAttentionPrefill(
+                       attentionQ, attentionKV, attentionSink,
+                       windowSize, position, 0, ropeDim, 160000.0f,
+                       0, 16.0f, 32, 1,
+                       1.0f / std::sqrt((float)headDim), dynamicAttention,
+                       windowSize, true, decodeMetaPtr),
+                   "dynamic DeepSeek-V4 draft sparse attention rejected its input");
+            ExpectFloatNear(ToFloatVector(staticAttention),
+                            ToFloatVector(dynamicAttention), 0.0f, 0.0f,
+                            "DeepSeek-V4 dynamic draft sparse attention");
+        }
+
         fastllm::Data referenceQ = MakeCudaTensor(
             fastllm::DataType::BFLOAT16, {1, 1, heads, headDim}, qValues);
         fastllm::Data referenceKVInput = MakeCudaTensor(
@@ -3278,11 +3547,11 @@ namespace {
                "fused DeepSeek-V4 QKV rope/cache rejected its decode shape");
 
         ExpectFloatNear(ToFloatVector(referenceQ), ToFloatVector(actualQ),
-                        3e-2f, 3e-3f, "DeepSeek-V4 fused Q output");
+                        0.0f, 0.0f, "DeepSeek-V4 fused Q output");
         ExpectFloatNear(ToFloatVector(referenceKV), ToFloatVector(actualKV),
-                        3e-2f, 3e-3f, "DeepSeek-V4 fused KV output");
+                        0.0f, 0.0f, "DeepSeek-V4 fused KV output");
         ExpectFloatNear(ToFloatVector(referenceCache), ToFloatVector(actualCache),
-                        3e-2f, 3e-3f, "DeepSeek-V4 fused window cache");
+                        0.0f, 0.0f, "DeepSeek-V4 fused window cache");
 
         // TP8 shards the model's 64 global query heads into eight local heads.
         // Keep this shape covered so the fused path cannot silently fall back to
@@ -3335,16 +3604,84 @@ namespace {
                    "fused DeepSeek-V4 QKV rope/cache rejected TP8 local heads");
             ExpectFloatNear(ToFloatVector(localReferenceQ),
                             ToFloatVector(localActualQ),
-                            3e-2f, 3e-3f,
+                            0.0f, 0.0f,
                             "DeepSeek-V4 TP8 fused Q output");
             ExpectFloatNear(ToFloatVector(localReferenceKV),
                             ToFloatVector(localActualKV),
-                            3e-2f, 3e-3f,
+                            0.0f, 0.0f,
                             "DeepSeek-V4 TP8 fused KV output");
             ExpectFloatNear(ToFloatVector(localReferenceCache),
                             ToFloatVector(localActualCache),
-                            3e-2f, 3e-3f,
+                            0.0f, 0.0f,
                             "DeepSeek-V4 TP8 fused window cache");
+        }
+
+        // DSpark-7 verifies eight target rows at once.  This is the production
+        // TP8 shape that used to miss the single-row fusion and execute four
+        // separate Q/KV preparation kernels per layer.
+        if (FastllmCudaRuntimeArch() >= 120) {
+            constexpr int targetTokens = 8;
+            constexpr int localHeads = 8;
+            std::vector<float> targetQValues = MakeRegressionValues(
+                targetTokens * localHeads * headDim, 1.07f, 0.54f);
+            std::vector<float> targetKVValues = MakeRegressionValues(
+                targetTokens * headDim, 1.41f, 0.69f);
+
+            fastllm::Data targetReferenceQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, localHeads, headDim}, targetQValues);
+            fastllm::Data targetReferenceKVInput = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, 1, headDim}, targetKVValues);
+            fastllm::Data targetReferenceKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, 1, headDim},
+                std::vector<float>(targetTokens * headDim, 0.0f));
+            Expect(FastllmCudaRMSNorm(
+                       targetReferenceKVInput, kvNormWeight,
+                       targetReferenceKV, eps),
+                   "built-in RMSNorm rejected DSpark target QKV input");
+            Expect(FastllmCudaDeepSeekV4ScaleQRotaryGraph(
+                       targetReferenceQ, ropeDim, 160000.0f, decodeMetaPtr,
+                       4096, 4.0f, 32, 1, eps),
+                   "built-in Q rotary rejected DSpark target QKV input");
+            Expect(FastllmCudaDeepSeekV4RotaryQuantGraph(
+                       targetReferenceKV, ropeDim, 160000.0f, decodeMetaPtr,
+                       4096, 4.0f, 32, 1, headDim - ropeDim, 64, 1),
+                   "built-in KV rotary rejected DSpark target QKV input");
+            targetReferenceKV.Reshape({1, targetTokens, headDim});
+            fastllm::Data targetReferenceCache = MakeCudaTensor(
+                fastllm::DataType::FLOAT32,
+                {1, windowSize, headDim}, cacheValues);
+            Expect(FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(
+                       targetReferenceKV, decodeMetaPtr,
+                       windowSize, targetReferenceCache),
+                   "built-in cache update rejected DSpark target QKV input");
+
+            fastllm::Data targetActualQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, localHeads, headDim}, targetQValues);
+            fastllm::Data targetActualKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, 1, headDim}, targetKVValues);
+            fastllm::Data targetActualCache = MakeCudaTensor(
+                fastllm::DataType::FLOAT32,
+                {1, windowSize, headDim}, cacheValues);
+            Expect(FastllmCudaDeepSeekV4FusedQKVRopeCacheGraph(
+                       targetActualQ, targetActualKV, kvNormWeight,
+                       decodeMetaPtr, ropeDim, 160000.0f, 4096, 4.0f,
+                       32, 1, eps, headDim - ropeDim, 64, windowSize,
+                       targetActualCache),
+                   "fused DeepSeek-V4 QKV rope/cache rejected DSpark target rows");
+            ExpectFloatNear(ToFloatVector(targetReferenceQ),
+                            ToFloatVector(targetActualQ), 0.0f, 0.0f,
+                            "DeepSeek-V4 DSpark target fused Q output");
+            ExpectFloatNear(ToFloatVector(targetReferenceKV),
+                            ToFloatVector(targetActualKV), 0.0f, 0.0f,
+                            "DeepSeek-V4 DSpark target fused KV output");
+            ExpectFloatNear(ToFloatVector(targetReferenceCache),
+                            ToFloatVector(targetActualCache), 0.0f, 0.0f,
+                            "DeepSeek-V4 DSpark target fused window cache");
         }
 
         std::cout << "DeepSeek-V4 fused QKV rope/cache regression: PASS\n";
@@ -7146,6 +7483,7 @@ int main() {
             RunCudaTritonChunkGdnPrefillRegression();
             RunCudaDeepSeekV4TritonWoARegression();
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
+            RunCudaDeepSeekV4IndexerRegression();
             RunMultiCudaDeepSeekV4SparsePrefillRegression();
             RunCudaDeepSeekV4HashRouteCacheRegression();
             RunCudaDeepSeekV4FusedRouterRegression();
