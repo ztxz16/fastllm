@@ -1326,7 +1326,10 @@ static void ReleaseLayerCache(const fastllm::Data *key) {
     layerCacheFront.erase(key);
 }
 
-__global__ void BuildRouteMetadataKernel(
+// Reference implementation retained for precision/performance A/B testing.
+// The production kernel below must preserve this exact first-appearance
+// ordering because DeepGEMM uses groupedLayout and routePositions together.
+__global__ void BuildRouteMetadataReferenceKernel(
         const int32_t *__restrict__ globalIndices,
         int32_t *__restrict__ groupedLayout,
         int32_t *__restrict__ routePositions, int routes) {
@@ -1389,6 +1392,87 @@ __global__ void BuildRouteMetadataKernel(
     if (localOffset == 0) {
         groupedLayout[uniqueBlock * kTpExpertBlockM] = expert;
     }
+}
+
+__global__ void BuildRouteMetadataKernel(
+        const int32_t *__restrict__ globalIndices,
+        int32_t *__restrict__ groupedLayout,
+        int32_t *__restrict__ routePositions, int routes) {
+    if (blockIdx.x != 0) {
+        return;
+    }
+
+    __shared__ int32_t sharedExperts[kMaxRoutes];
+    __shared__ uint32_t firstMasks[2];
+    const int thread = threadIdx.x;
+    const bool active = thread < routes;
+    const int32_t expert = active ? globalIndices[thread] : -1;
+    sharedExperts[thread] = expert;
+    groupedLayout[thread * kTpExpertBlockM] = -1;
+    if (active) {
+        routePositions[thread] = -1;
+    }
+    __syncthreads();
+
+    const bool valid = active &&
+        (unsigned int)expert < (unsigned int)kTpExperts;
+    int firstRoute = thread;
+    int localOffset = 0;
+    if (valid) {
+        // Stage the route list once in shared memory.  This single ordered
+        // scan replaces the reference kernel's repeated global scans and its
+        // nested first-occurrence search, while keeping local route order.
+        for (int previous = 0; previous < thread; ++previous) {
+            if (sharedExperts[previous] == expert) {
+                if (localOffset == 0) {
+                    firstRoute = previous;
+                }
+                ++localOffset;
+            }
+        }
+    }
+
+    const bool firstOccurrence = valid && localOffset == 0;
+    const uint32_t firstMask = __ballot_sync(0xffffffffu, firstOccurrence);
+    if ((thread & 31) == 0) {
+        firstMasks[thread >> 5] = firstMask;
+    }
+    __syncthreads();
+
+    if (!valid || localOffset >= kTpExpertBlockM) {
+        return;
+    }
+
+    // Count first appearances before this route's first occurrence.  The
+    // bitmask prefix is deterministic and therefore assigns exactly the same
+    // grouped block as BuildRouteMetadataReferenceKernel.
+    int uniqueBlock;
+    if (firstRoute < 32) {
+        const uint32_t prefix = firstRoute == 0
+            ? 0u : ((1u << firstRoute) - 1u);
+        uniqueBlock = __popc(firstMasks[0] & prefix);
+    } else {
+        const int upperBits = firstRoute - 32;
+        const uint32_t prefix = upperBits == 0
+            ? 0u : ((1u << upperBits) - 1u);
+        uniqueBlock = __popc(firstMasks[0]) +
+            __popc(firstMasks[1] & prefix);
+    }
+    const int position = uniqueBlock * kTpExpertBlockM + localOffset;
+    routePositions[thread] = position;
+    if (firstOccurrence) {
+        groupedLayout[uniqueBlock * kTpExpertBlockM] = expert;
+    }
+}
+
+static bool UseReferenceRouteMetadata() {
+    static const bool enabled = []() {
+        const char *env = std::getenv(
+            "FASTLLM_DSV4_REFERENCE_ROUTE_METADATA");
+        return env != nullptr && env[0] != '\0' &&
+            std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
 }
 
 static bool LaunchDeepGemm(DeepGemmKernel kernel,
@@ -1471,9 +1555,19 @@ static bool RunDeepGemmMoe(
         __nv_bfloat16 *chunkOutput =
             (__nv_bfloat16 *)output.cudaData + (size_t)rowBase * kHidden;
 
-        BuildRouteMetadataKernel<<<1, kMaxRoutes, 0, stream>>>(
-            chunkIndices, workspace.groupedLayout,
-            workspace.routePositions, routes);
+        // Keep single-row draft/ordinary decode on the established kernel.
+        // The verification bottleneck is the multi-row (normally M=8) path;
+        // limiting the new scheduling there also keeps draft proposal timing
+        // unchanged while its metadata work is already negligible.
+        if (UseReferenceRouteMetadata() || chunkRows == 1) {
+            BuildRouteMetadataReferenceKernel<<<1, kMaxRoutes, 0, stream>>>(
+                chunkIndices, workspace.groupedLayout,
+                workspace.routePositions, routes);
+        } else {
+            BuildRouteMetadataKernel<<<1, kMaxRoutes, 0, stream>>>(
+                chunkIndices, workspace.groupedLayout,
+                workspace.routePositions, routes);
+        }
         QuantizeRoutedRowsKernel<false, kTpWorkspaceRows><<<
             routes, quantThreads, 0, stream>>>(
             chunkInput, workspace.routePositions, workspace.gateInput,
