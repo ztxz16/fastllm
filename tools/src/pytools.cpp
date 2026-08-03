@@ -949,6 +949,13 @@ extern "C" {
         return model->FetchResponseTokens(handleId);
     }
 
+    DLL_EXPORT int fetch_response_tokens_batch_llm_model(
+            int modelId, int handleId, int *output, int maxTokens) {
+        auto model = models.GetModel(modelId);
+        return model->FetchResponseTokensBatch(
+            handleId, output, maxTokens);
+    }
+
     DLL_EXPORT int fetch_response_logits_llm_model(int modelId, int handleId, float *logits) {
         auto model = models.GetModel(modelId);
         std::vector <float> retLogits;

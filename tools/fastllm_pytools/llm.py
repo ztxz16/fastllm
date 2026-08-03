@@ -361,6 +361,11 @@ fastllm_lib.add_cache_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c
 fastllm_lib.fetch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.fetch_response_llm_model.restype = ctypes.c_int
 
+fastllm_lib.fetch_response_tokens_batch_llm_model.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int
+]
+fastllm_lib.fetch_response_tokens_batch_llm_model.restype = ctypes.c_int
+
 fastllm_lib.fetch_response_logits_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
 fastllm_lib.fetch_response_logits_llm_model.restype = ctypes.c_int
 
@@ -2494,21 +2499,37 @@ class model:
             if statistics is not None:
                 response_statistics.update(statistics)
 
-        if self._can_apply_hf_chat_template():
+        # DSpark commits at most a small speculative block per scheduler turn,
+        # but more than one block may be ready when the HTTP consumer is slow.
+        # Drain a generous bounded batch through one C call and one scheduler
+        # mutex acquisition.
+        fetch_batch_capacity = 64
+        fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)()
+
+        def fetch_ready_tokens():
+            count = fastllm_lib.fetch_response_tokens_batch_llm_model(
+                self.model, handle, fetch_batch_buffer,
+                fetch_batch_capacity)
+            if count <= 0:
+                return count, []
+            return count, [fetch_batch_buffer[i] for i in range(count)]
+
+        if (self._can_apply_hf_chat_template() or
+                self._uses_hf_deepseek_v4_tokenizer()):
             tokenizer = self.hf_tokenizer
             tokens = []
-            while True:
-                if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
+            finished = False
+            while not finished:
+                count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
+                if count == 0:
                     if (is_prefill and time.time() - start_time > 5):
                         start_time = time.time()
                         yield ""
-                    await asyncio.sleep(0)
                     continue
                 is_prefill = False
                 capture_response_statistics()
-                cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
-                if (cur <= -1):
-                    if (cur == -2):
+                if count <= -1:
+                    if count == -2:
                         yield "prompt too long"
                     if (self.save_history):
                         try:
@@ -2517,16 +2538,23 @@ class model:
                         except:
                             pass
                     break
-                tokens.append(cur)
-                ret = tokenizer.decode(tokens)
-                if (ret.encode().find(b'\xef\xbf\xbd') == -1):
-                    if (self.save_history and handle in self.current_tokenizer_cache):
-                        self.current_tokenizer_cache[handle][0].append(ret)
-                        self.current_tokenizer_cache[handle][1].append([] + tokens)
-                    tokens.clear()
-                    yield ret
-                else:
-                    yield ""
+
+                # Decode at the original token boundaries and only coalesce
+                # the yielded text. This keeps byte-fallback handling and exact
+                # output text identical to the one-token streaming path.
+                ready_text = ""
+                for token in ready_tokens:
+                    tokens.append(token)
+                    ret = tokenizer.decode(tokens)
+                    if ret.encode().find(b'\xef\xbf\xbd') == -1:
+                        if (self.save_history and
+                                handle in self.current_tokenizer_cache):
+                            self.current_tokenizer_cache[handle][0].append(ret)
+                            self.current_tokenizer_cache[handle][1].append(
+                                [] + tokens)
+                        tokens.clear()
+                        ready_text += ret
+                yield ready_text
             if len(tokens) > 0:
                 if (self.save_history and handle in self.current_tokenizer_cache):
                     self.current_tokenizer_cache[handle][0].append(tokenizer.decode(tokens))
@@ -2538,23 +2566,26 @@ class model:
             pending_tokens = []
             fail_cnt = 0
             while True:
-                if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
-                    await asyncio.sleep(0)
+                count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
+                if count == 0:
                     continue
                 capture_response_statistics()
-                if (self.save_history and handle in self.current_tokenizer_cache):
-                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
-                    if (token <= -1):
+                if count <= -1:
+                    if count == -2:
+                        yield "prompt too long"
+                    if (self.save_history and
+                            handle in self.current_tokenizer_cache):
                         try:
                             cur = self.current_tokenizer_cache.pop(handle)
                             self.tokenizer_cache.add(cur[0], cur[1])
                         except:
                             pass
-                        break
+                    break
+                for token in ready_tokens:
                     ret += self._decode_fastllm_token(token)
-                    pending_tokens.append(token)
-                else:
-                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                    if (self.save_history and
+                            handle in self.current_tokenizer_cache):
+                        pending_tokens.append(token)
                 cur = ""
                 try:
                     cur = ret.decode()

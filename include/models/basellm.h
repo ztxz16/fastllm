@@ -321,6 +321,13 @@ namespace fastllm {
 
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 
 
+        // Drain several already-generated tokens under one scheduler lock.
+        // Returns the number written, -1 on normal completion, or -2 when the
+        // prompt is too long.  Speculative decoders use this to publish an
+        // accepted block without one Python/ASGI round trip per token.
+        virtual int FetchResponseTokensBatch(int handleId, int *output,
+                                             int maxTokens);
+
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
         virtual bool GetResponseStatistics(int handleId, int &cachedInputTokens,

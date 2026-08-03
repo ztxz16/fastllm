@@ -16482,6 +16482,7 @@ namespace fastllm {
                         }
                     }
                 }
+                model->dictCV.notify_all();
                 releasePendingResultLogits(logits);
             }
 

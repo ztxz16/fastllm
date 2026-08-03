@@ -2639,6 +2639,7 @@ namespace fastllm {
                         }
                     }
                 }
+                model->dictCV.notify_all();
                 ReleasePendingResultLogits(logits);
             } else {
                 // 没有任何请求可以调度时，等待新请求
@@ -3101,6 +3102,7 @@ namespace fastllm {
                                     }
                                 }
                             }
+                            model->dictCV.notify_all();
                             ReleasePendingResultLogits(logits);
                         } else {
                             int maxLen = -1, select = -1;
@@ -3253,6 +3255,51 @@ namespace fastllm {
                 dictLocker.unlock();
                 MySleep(0);
                 dictLocker.lock();
+            }
+        }
+    }
+
+    int basellm::FetchResponseTokensBatch(int handleId, int *output,
+                                          int maxTokens) {
+        if (output == nullptr || maxTokens <= 0) {
+            return 0;
+        }
+        std::unique_lock<std::mutex> dictLocker(this->dictLocker);
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        if (context == nullptr) {
+            return -1;
+        }
+        while (true) {
+            if (!context->resultTokenQueue.empty()) {
+                int count = 0;
+                while (count < maxTokens &&
+                       !context->resultTokenQueue.empty()) {
+                    output[count++] = context->resultTokenQueue.front();
+                    context->resultTokenQueue.pop();
+                }
+                return count;
+            }
+            if (context->isEnding) {
+                ResponseContextError err = context->error;
+                RemoveResponseContext(handleId);
+                dictLocker.unlock();
+                dictCV.notify_one();
+                return err == ResponseContextErrorPromptTooLong ? -2 : -1;
+            }
+            // The async Python server used to pair CanFetchResponse() with a
+            // zero-sleep polling loop here.  During a long CUDA graph replay
+            // that loop continuously reacquired dictLocker and delayed the
+            // scheduler precisely when it wanted to publish the accepted
+            // speculative block.  Wait for the scheduler notification instead.
+            // The bounded timeout preserves the server's periodic prefill
+            // keepalive even if a legacy scheduler misses a notification.
+            if (dictCV.wait_for(dictLocker, std::chrono::seconds(1)) ==
+                std::cv_status::timeout) {
+                return 0;
+            }
+            context = responseContextDict.GetHandle(handleId);
+            if (context == nullptr) {
+                return -1;
             }
         }
     }
