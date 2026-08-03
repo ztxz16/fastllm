@@ -7396,8 +7396,17 @@ namespace fastllm {
                     headInput, weight["mtp.2.norm.weight"],
                     rms_norm_eps, headInput, DataType::BFLOAT16);
             }
-            Linear(*normalizedHead, weight["head.weight"], Data(), baseLogits);
-            ToDataType(baseLogits, DataType::FLOAT32);
+            // Keep the LM-head output and its FP32 conversion in separate
+            // persistent tensors.  In-place BF16/FP16 -> FP32 conversion must
+            // allocate a second buffer before releasing the source.  Short
+            // prefills do not necessarily leave a large enough idle block in
+            // FastLLM's pool, so doing that allocation for the first time
+            // during CUDA graph capture used to reject the capture at the
+            // 128-token DSpark window boundary.
+            Linear(*normalizedHead, weight["head.weight"], Data(),
+                   draftWorkspace.samplingLogits);
+            ToDataType(draftWorkspace.samplingLogits, baseLogits,
+                       DataType::FLOAT32);
 #ifdef USE_CUDA
             if (!draftGraphHealthy("head")) {
                 return false;
@@ -7695,7 +7704,7 @@ namespace fastllm {
                 }
                 FastllmCudaSetDevice(oldDevice);
             };
-            auto markovGraphHealthy = [&](const char *, int) {
+            auto markovGraphHealthy = [&](const char *stage, int step) {
                 if (!graphState.capturing) {
                     return true;
                 }
@@ -7709,6 +7718,13 @@ namespace fastllm {
                     }
                 }
                 FastllmCudaSetDevice(oldDevice);
+                if (!healthy) {
+                    draftBackboneFailure = std::string("markov-") + stage;
+                    if (step >= 0) {
+                        draftBackboneFailure += "[" +
+                            std::to_string(step) + "]";
+                    }
+                }
                 return healthy;
             };
 
@@ -8373,7 +8389,22 @@ namespace fastllm {
                         failureStage = "captured draft body";
                     }
                 }
-                if (workersJoined) {
+                bool captureInvalidated = false;
+                if (begunCaptures ==
+                    (int)draftGraphState->devices.size()) {
+                    for (auto &deviceState : draftGraphState->devices) {
+                        FastllmCudaSetDevice(deviceState->device);
+                        captureInvalidated |=
+                            FastllmCudaGraphCaptureInvalidated();
+                    }
+                }
+                if (captureInvalidated) {
+                    captureOk = false;
+                    if (failureStage == nullptr) {
+                        failureStage = "invalidated captured draft body";
+                    }
+                }
+                if (workersJoined && !captureInvalidated) {
                     if (!MultiCudaGraphWorkersRecordEvents(
                             draftGraphDevices, workerEndEvents)) {
                         captureOk = false;
@@ -8385,7 +8416,7 @@ namespace fastllm {
                             deviceState->workerEndEvent);
                     }
                 }
-                if (begunCaptures ==
+                if (!captureInvalidated && begunCaptures ==
                     (int)draftGraphState->devices.size()) {
                     for (auto &deviceState : draftGraphState->devices) {
                         FastllmCudaSetDevice(deviceState->device);
@@ -8460,9 +8491,14 @@ namespace fastllm {
                     std::fprintf(
                         stderr,
                         "[Fastllm] DeepSeek-V4 DSpark draft CUDA graph "
-                        "disabled at %s: %s\n",
+                        "disabled at %s (body=%s, thread_error=%d, "
+                        "graph_error=%d): %s\n",
                         failureStage == nullptr ? "unknown stage" :
                             failureStage,
+                        draftBackboneFailure.empty() ? "unknown" :
+                            draftBackboneFailure.c_str(),
+                        FastllmCudaGetThreadError() ? 1 : 0,
+                        FastllmCudaGetGraphError() ? 1 : 0,
                         FastllmCudaGraphLastError());
                     std::fflush(stderr);
                 }
