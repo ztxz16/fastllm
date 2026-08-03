@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <cuda_fp8.h>
+#include <cooperative_groups.h>
 #include <cub/block/block_scan.cuh>
 
 #ifdef FASTLLM_ENABLE_DSV4_SPARSE_MLA_SM120
@@ -4680,6 +4681,7 @@ void DeepSeekV4HcPostPreDots4x4096Sm120Kernel(
 // same contiguous 2048-element slice and uses the same 256-thread reduction
 // tree as DeepSeekV4HcPreDotsBlockKernel.  These details preserve the numerical
 // behavior of the unfused path for DSpark's eight-row target verification.
+template <bool materializeTransitionOnce>
 __global__ void DeepSeekV4HcPostPreDots4x4096Kernel(
         const __nv_bfloat16 *x, const __nv_bfloat16 *residual,
         const float *post, const float *comb, const float *nextFn,
@@ -4704,8 +4706,48 @@ __global__ void DeepSeekV4HcPostPreDots4x4096Kernel(
     int tile = blockIdx.x;
     int part = blockIdx.y;
     int token = blockIdx.z;
-    if (token >= tokens || tile >= mixHc / tileN || part >= splitK) {
-        return;
+    if constexpr (!materializeTransitionOnce) {
+        if (token >= tokens || tile >= mixHc / tileN || part >= splitK) {
+            return;
+        }
+    } else {
+        // Ordinary SM120 decode launches the complete 8 x 16 CTA grid
+        // cooperatively.  Materialize the double -> BF16 transition exactly
+        // once, then make it visible to every projection CTA without adding
+        // a second CUDA Graph node.
+        uint64_t linearBlock =
+            ((uint64_t)blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x +
+            blockIdx.x;
+        uint64_t gridThreads =
+            (uint64_t)gridDim.x * gridDim.y * gridDim.z * blockDim.x;
+        uint64_t transitionTotal = (uint64_t)tokens * flatDim;
+        for (uint64_t idx = linearBlock * blockDim.x + threadIdx.x;
+             idx < transitionTotal; idx += gridThreads) {
+            int d = idx % dim;
+            uint64_t tmp = idx / dim;
+            int target = tmp % hcMult;
+            int transitionToken = tmp / hcMult;
+            const __nv_bfloat16 *transitionX =
+                x + (uint64_t)transitionToken * dim;
+            const __nv_bfloat16 *transitionResidual =
+                residual + (uint64_t)transitionToken * flatDim;
+            const float *transitionPost =
+                post + (uint64_t)transitionToken * hcMult;
+            const float *transitionComb =
+                comb + (uint64_t)transitionToken * hcMult * hcMult;
+            double value =
+                (double)transitionPost[target] *
+                (double)__bfloat162float(transitionX[d]);
+#pragma unroll
+            for (int source = 0; source < hcMult; ++source) {
+                value +=
+                    (double)transitionComb[source * hcMult + target] *
+                    (double)__bfloat162float(
+                        transitionResidual[(uint64_t)source * dim + d]);
+            }
+            residualOutput[idx] = __float2bfloat16_rn((float)value);
+        }
+        cooperative_groups::this_grid().sync();
     }
 
     const __nv_bfloat16 *xRow = x + (uint64_t)token * dim;
@@ -4732,8 +4774,11 @@ __global__ void DeepSeekV4HcPostPreDots4x4096Kernel(
     const float *targetWeight2 = weight2 + (uint64_t)target * dim;
 
     auto roundedTransition = [&](int d) {
-        double value = (double)postRow[target] *
-                       (double)__bfloat162float(xRow[d]);
+        if constexpr (materializeTransitionOnce) {
+            return outputRow[(uint64_t)target * dim + d];
+        }
+        double value =
+            (double)postRow[target] * (double)__bfloat162float(xRow[d]);
 #pragma unroll
         for (int source = 0; source < hcMult; ++source) {
             value += (double)combRow[source * hcMult + target] *
@@ -4825,6 +4870,42 @@ __global__ void DeepSeekV4HcPostPreDots4x4096Kernel(
                 reducedSquare;
         }
     }
+}
+
+bool DeepSeekV4CanLaunchHcPostPreCooperative() {
+    struct CooperativeCapacity {
+        int device = -1;
+        bool supported = false;
+    };
+    static thread_local CooperativeCapacity capacity;
+
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return false;
+    }
+    if (capacity.device == device) {
+        return capacity.supported;
+    }
+
+    int cooperative = 0;
+    int multiprocessors = 0;
+    int blocksPerMultiprocessor = 0;
+    cudaError_t cooperativeState = cudaDeviceGetAttribute(
+        &cooperative, cudaDevAttrCooperativeLaunch, device);
+    cudaError_t multiprocessorState = cudaDeviceGetAttribute(
+        &multiprocessors, cudaDevAttrMultiProcessorCount, device);
+    cudaError_t occupancyState =
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocksPerMultiprocessor,
+            DeepSeekV4HcPostPreDots4x4096Kernel<true>, 256, 0);
+    constexpr int requiredBlocks = (24 / 3) * 16;
+    capacity.device = device;
+    capacity.supported =
+        cooperativeState == cudaSuccess &&
+        multiprocessorState == cudaSuccess &&
+        occupancyState == cudaSuccess && cooperative != 0 &&
+        multiprocessors * blocksPerMultiprocessor >= requiredBlocks;
+    return capacity.supported;
 }
 
 bool DeepSeekV4PrepareCudaOutput(fastllm::Data &output, fastllm::DataType dataType,
@@ -6647,6 +6728,10 @@ extern "C" bool FastllmCudaDeepSeekV4HcPostPreNorm(
     int bsz = residual.dims[0];
     int seqlen = residual.dims[1];
     int tokens = bsz * seqlen;
+    const bool useSm120PreciseDecode =
+        tokens == 1 && FastllmCudaRuntimeArch() >= 120 &&
+        DeepSeekV4CanLaunchHcPostPreCooperative() &&
+        std::getenv("FASTLLM_DSV4_DISABLE_SM120_HC_PRECISE_DECODE") == nullptr;
     const bool useSm120VllmSchedule =
         tokens == 8 && FastllmCudaRuntimeArch() >= 120;
     const int dotParts = useSm120VllmSchedule ? 4 : 16;
@@ -6682,7 +6767,34 @@ extern "C" bool FastllmCudaDeepSeekV4HcPostPreNorm(
     }
 
     dim3 transitionGrid(mixHc / 3, dotParts, tokens);
-    if (useSm120VllmSchedule) {
+    if (useSm120PreciseDecode) {
+        // The DSpark-oriented SM120 kernel intentionally follows vLLM's
+        // float transition boundary.  Ordinary decode instead requires the
+        // established double -> BF16 transition and split-K16 reduction
+        // contract.  A cooperative grid materializes that rounded transition
+        // once, synchronizes on-device, and then executes the established
+        // reduction tree.  Keeping both phases in one kernel avoids adding a
+        // CUDA Graph node for every transformer layer.
+        const __nv_bfloat16 *xData =
+            (const __nv_bfloat16 *)x.cudaData;
+        const __nv_bfloat16 *residualData =
+            (const __nv_bfloat16 *)residual.cudaData;
+        const float *postData = (const float *)previousPost.cudaData;
+        const float *combData = (const float *)previousComb.cudaData;
+        const float *fnData = (const float *)nextHcFn.cudaData;
+        __nv_bfloat16 *residualOutputData =
+            (__nv_bfloat16 *)residualOutput.cudaData;
+        void *kernelArgs[] = {
+            &xData, &residualData, &postData, &combData, &fnData,
+            &dots, &residualOutputData, &tokens};
+        cudaError_t launchError = cudaLaunchCooperativeKernel(
+            (const void *)DeepSeekV4HcPostPreDots4x4096Kernel<true>,
+            transitionGrid, dim3(256), kernelArgs, 0, cudaStreamPerThread);
+        if (launchError != cudaSuccess) {
+            FastllmCudaFree(dots);
+            return false;
+        }
+    } else if (useSm120VllmSchedule) {
         DeepSeekV4HcPostPreDots4x4096Sm120Kernel<<<transitionGrid, 256>>>(
             (const __nv_bfloat16 *)x.cudaData,
             (const __nv_bfloat16 *)residual.cudaData,
@@ -6691,7 +6803,7 @@ extern "C" bool FastllmCudaDeepSeekV4HcPostPreNorm(
             (const float *)nextHcFn.cudaData, dots,
             (__nv_bfloat16 *)residualOutput.cudaData, tokens);
     } else {
-        DeepSeekV4HcPostPreDots4x4096Kernel<<<transitionGrid, 256>>>(
+        DeepSeekV4HcPostPreDots4x4096Kernel<false><<<transitionGrid, 256>>>(
             (const __nv_bfloat16 *)x.cudaData,
             (const __nv_bfloat16 *)residual.cudaData,
             (const float *)previousPost.cudaData,
