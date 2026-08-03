@@ -51,6 +51,12 @@ namespace fastllm {
         return !MultiCudaEnvFlagEnabled("FASTLLM_DISABLE_MULTICUDA_DEDICATED_WORKERS");
     }
 
+    static bool MultiCudaDsv4DeepGemmMoeEnabled() {
+        const char *v = std::getenv("FASTLLM_CUDA_DSV4_MOE_DEEPGEMM_SM120");
+        return v == nullptr || MultiCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_DSV4_MOE_DEEPGEMM_SM120");
+    }
+
     static bool IsDedicatedWorkerCudaDevice(int device) {
         std::string specialId;
         int mallocType = 0;
@@ -5677,7 +5683,8 @@ auto st = std::chrono::system_clock::now();
                     (const float*)((uint8_t*)gpuRoutePacket.cudaData + routeOffset + routeBytes);
                 bool ok = false;
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (input->dataType == DataType::BFLOAT16) {
+                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                    input->dataType == DataType::BFLOAT16) {
                     ok = FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
                         packetInput, *output,
                         localExpertTable->localWeights.data(),
@@ -5831,7 +5838,8 @@ auto st = std::chrono::system_clock::now();
                 int topk = deviceIndex->dims[1];
                 bool deepGemmOk = false;
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (input->dataType == DataType::BFLOAT16) {
+                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                    input->dataType == DataType::BFLOAT16) {
                     deepGemmOk =
                         FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
                             *input, *output,
@@ -5892,7 +5900,8 @@ auto st = std::chrono::system_clock::now();
                 }
                 broadcastInput();
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (!expertParallel && directGpuRouteAvailable &&
+                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                    !expertParallel && directGpuRouteAvailable &&
                     input->dataType == DataType::BFLOAT16) {
                     const int topk = deviceIndex->dims[1];
                     ran = FastllmCudaBFloat16MergeMOEDeepGemmSm120TensorParallel(

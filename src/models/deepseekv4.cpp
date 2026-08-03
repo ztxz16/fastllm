@@ -121,6 +121,13 @@ namespace fastllm {
             return !(s.empty() || s == "0" || s == "false" || s == "off" || s == "no");
         }
 
+        static bool DeepSeekV4SparseMlaSm120Enabled() {
+            const char *v = std::getenv(
+                "FASTLLM_CUDA_DSV4_SPARSE_MLA_SM120");
+            return v == nullptr || EnvFlagEnabled(
+                "FASTLLM_CUDA_DSV4_SPARSE_MLA_SM120");
+        }
+
         static bool DeepSeekV4PairedAllReduceEnabled() {
 #ifdef USE_CUDA
             return FastllmCudaCustomAllReduceEnabled() &&
@@ -2834,7 +2841,8 @@ namespace fastllm {
                         Data *localScratch = sm120Scratch == nullptr ?
                             nullptr : GetTensorCudaReplica(
                                 *sm120Scratch, device);
-                        if (localPackedWindow != nullptr &&
+                        if (DeepSeekV4SparseMlaSm120Enabled() &&
+                            localPackedWindow != nullptr &&
                             localPackedCompressed != nullptr &&
                             (sm120Scratch == nullptr ||
                              localScratch != nullptr)) {
@@ -2916,7 +2924,8 @@ namespace fastllm {
                 attnSink.ToDevice(DataDevice::CUDA, targetDeviceIds);
                 if (decodeMeta != nullptr && decodeMeta->dataDevice == DataDevice::CUDA &&
                     decodeMeta->cudaData != nullptr) {
-                    if (packedWindowKV != nullptr &&
+                    if (DeepSeekV4SparseMlaSm120Enabled() &&
+                        packedWindowKV != nullptr &&
                         packedCompressedKV != nullptr &&
                         FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                             *qForCuda, *windowForCuda, *compressedForCuda,
@@ -4563,6 +4572,9 @@ namespace fastllm {
             return false;
         }
         auto preparePackedSm120Caches = [&](int compressedCapacity) {
+            if (!DeepSeekV4SparseMlaSm120Enabled()) {
+                return true;
+            }
             bool useSm120 = true;
             int originalDevice = FastllmCudaGetDevice();
             for (int device : devices) {
@@ -9969,8 +9981,9 @@ namespace fastllm {
                 }
                 if (graphPrepared) {
                     const size_t sparseMlaScratchBytes =
+                        DeepSeekV4SparseMlaSm120Enabled() ?
                         FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
-                            seqlen, num_attention_heads, 4);
+                            seqlen, num_attention_heads, 4) : 0;
                     if (sparseMlaScratchBytes >
                             (size_t)std::numeric_limits<int>::max()) {
                         graphPrepared = false;
