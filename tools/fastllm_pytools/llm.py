@@ -1381,6 +1381,22 @@ class model:
         except Exception:
             return False
 
+    def _uses_hf_deepseek_v4_tokenizer(self) -> bool:
+        """Use the checkpoint tokenizer after rendering the official V4 prompt.
+
+        DeepSeek-V4 ships ``encoding_dsv4.py`` instead of a Jinja chat
+        template.  Prompt rendering therefore remains model-specific, but the
+        resulting text must still be tokenized by the checkpoint's Hugging
+        Face tokenizer.  FastLLM's generic native BPE path does not currently
+        reproduce every pre-tokenizer rule in this checkpoint and can split an
+        otherwise identical prompt into a different token sequence.
+        """
+        return (
+            self._is_deepseek_v4()
+            and not self.force_chat_template
+            and self.hf_tokenizer is not None
+        )
+
     def _is_laguna(self) -> bool:
         if self._get_architecture() in {"LagunaForCausalLM", "LagunaForConditionalGeneration"}:
             return True
@@ -1672,6 +1688,28 @@ class model:
             architecture = self.config["architectures"][0]
         except:
             architecture = ""
+        if self._uses_hf_deepseek_v4_tokenizer():
+            from ftllm.encoding_dsv4 import encode_messages
+            thinking_mode = "thinking" if enable_thinking else "chat"
+            rendered_conversation = self._inject_deepseek_v4_tools(
+                copy.deepcopy(conversation), tools)
+            prompt = encode_messages(
+                rendered_conversation, thinking_mode=thinking_mode)
+            input_ids = encode_hf_prompt(self.hf_tokenizer, prompt)
+            # The OpenAI server asks for the count immediately before launching
+            # the same request.  Reuse the exact ids so count and execution can
+            # never diverge across tokenizer versions or concurrent requests.
+            self.thread_local_obj.pending_text_input_token_cache = {
+                "conversation": copy.deepcopy(conversation),
+                "add_generation_prompt": add_generation_prompt,
+                "enable_thinking": enable_thinking,
+                "tools": copy.deepcopy(tools),
+                "thinking_effort": thinking_effort,
+                "tool_choice": copy.deepcopy(tool_choice),
+                "chat_template_kwargs": copy.deepcopy(chat_template_kwargs),
+                "input_ids": list(input_ids),
+            }
+            return len(input_ids)
         if self._can_apply_hf_chat_template():
             template_conversation = self.trans_conversation(
                 copy.deepcopy(conversation))
@@ -1908,7 +1946,8 @@ class model:
         conversation = None
         if (isinstance(query, List)):
             conversation = query
-        if self._can_apply_hf_chat_template():
+        if (self._can_apply_hf_chat_template() or
+                self._uses_hf_deepseek_v4_tokenizer()):
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -1922,10 +1961,17 @@ class model:
             else:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
-                                                    add_generation_prompt = add_generation_prompt,
-                                                    tokenize = False,
-                                                    enable_thinking = self.enable_thinking)
+                    if self._uses_hf_deepseek_v4_tokenizer():
+                        from ftllm.encoding_dsv4 import encode_messages
+                        thinking_mode = (
+                            "thinking" if self.enable_thinking else "chat")
+                        prompt = encode_messages(
+                            conversation, thinking_mode=thinking_mode)
+                    else:
+                        prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
+                                                        add_generation_prompt = add_generation_prompt,
+                                                        tokenize = False,
+                                                        enable_thinking = self.enable_thinking)
                     #input = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = True)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
@@ -2223,7 +2269,8 @@ class model:
                 print("Error: can't support architectures: " + architecture)
                 exit(0)
 
-        if self._can_apply_hf_chat_template():
+        if (self._can_apply_hf_chat_template() or
+                self._uses_hf_deepseek_v4_tokenizer()):
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -2251,7 +2298,16 @@ class model:
                 if can_reuse_token_count:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
-                    if self._is_kimi_k3():
+                    if self._uses_hf_deepseek_v4_tokenizer():
+                        from ftllm.encoding_dsv4 import encode_messages
+                        thinking_mode = (
+                            "thinking" if enable_thinking else "chat")
+                        rendered_conversation = self._inject_deepseek_v4_tools(
+                            copy.deepcopy(conversation), tools)
+                        prompt = encode_messages(
+                            rendered_conversation,
+                            thinking_mode=thinking_mode)
+                    elif self._is_kimi_k3():
                         direct_template_tokens = apply_hf_chat_template(
                             tokenizer,
                             self.trans_conversation(conversation),
@@ -2365,7 +2421,8 @@ class model:
         }
     
     def stream_response_handle(self, handle):
-        if self._can_apply_hf_chat_template():
+        if (self._can_apply_hf_chat_template() or
+                self._uses_hf_deepseek_v4_tokenizer()):
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:
