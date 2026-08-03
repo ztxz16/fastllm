@@ -2704,7 +2704,9 @@ namespace fastllm {
 
     bool FastllmCudaTryTritonDeepSeekV4WoA(
         const Data &input, Data &weight, int groups, int oRank, Data &output) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+        const bool dsparkAuto =
+            CudaEnvIntRange("FASTLLM_DSPARK_TOKENS", 0, 0, 1024) > 0;
+        if ((!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") && !dsparkAuto) ||
             !CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_FP8_WOA", true)) {
             return false;
@@ -2721,7 +2723,11 @@ namespace fastllm {
         int numTokens = input.dims[0] * input.dims[1];
         int heads = input.dims[2];
         int headDim = input.dims[3];
-        if (numTokens != 1 || heads <= 0 || headDim <= 0 ||
+        // The AOT kernel tiles tokens in blocks of 16 and already masks the
+        // tail.  DSpark-7 verifies eight target rows at once, so restricting
+        // this path to scalar decode needlessly sent that hot shape through
+        // the generic one-output-per-CTA reduction kernel.
+        if (numTokens <= 0 || numTokens > 16 || heads <= 0 || headDim <= 0 ||
             heads % groups != 0 || (oRank % 128) != 0) {
             return false;
         }
@@ -4917,9 +4923,11 @@ namespace fastllm {
         if (!FastllmCudaRMSNorm(compressedForNorm, normWeight, newRows, 1e-6f)) {
             ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: rmsnorm failed.\n");
         }
+        const int quantDim = headDim == 128 ? headDim : headDim - ropeDim;
+        const int quantBlock = headDim == 128 ? 128 : 64;
         if (!FastllmCudaDeepSeekV4RotaryQuant(newRows, ropeDim, ropeBase, blockStart * compressRatio,
                                               originalSeqLen, ropeFactor, betaFast, betaSlow,
-                                              headDim - ropeDim, 64, compressRatio)) {
+                                              quantDim, quantBlock, compressRatio)) {
             ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: rotary quant failed.\n");
         }
 

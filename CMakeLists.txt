@@ -334,6 +334,41 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/deepseekv4-kernels.cu)
 
+    # FlashInfer's DeepSeek-V4 sparse MLA decode kernel uses SM120-only
+    # block-scaled FP8 MMA instructions.  Compile it as a separate fatbin so a
+    # multi-architecture FastLLM build keeps the generic sparse-attention path
+    # for older GPUs instead of embedding unsupported PTX in their code.
+    if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        include_directories(
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm/include")
+        set(FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE
+            src/devices/cuda/models/fastllm-deepseekv4-sparse-mla-sm120.cu)
+        set(FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE
+            src/devices/cuda/moe/fastllm-moe-deepgemm-sm120.cu)
+        set(FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE
+            src/devices/cuda/models/fastllm-deepseekv4-woa-deepgemm-sm120.cu)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
+            ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE})
+        set_source_files_properties(
+            ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
+            ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
+            PROPERTIES CUDA_ARCHITECTURES "120f")
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_SPARSE_MLA_SM120)
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120)
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120)
+        message(STATUS "DeepSeek-V4 SM120 sparse MLA kernel: ON")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM MoE kernel: ON")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: ON")
+    else()
+        message(STATUS "DeepSeek-V4 SM120 sparse MLA kernel: OFF")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM MoE kernel: OFF")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF")
+    endif()
+
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
     # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
 

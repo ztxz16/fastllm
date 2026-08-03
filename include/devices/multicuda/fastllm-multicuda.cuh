@@ -109,6 +109,14 @@ namespace fastllm {
     bool MultiCudaRunDeviceCallbacks(
         const std::vector<int> &devices,
         const std::function<void(int, int)> &callback);
+    // Enqueue persistent-buffer work on each dedicated worker and wait only
+    // until the callbacks have submitted their CUDA work.  Unlike the generic
+    // callback path, this does not insert worker-completion waits into the
+    // caller streams.  The callback must provide its own GPU-side producer /
+    // consumer ordering and keep every referenced allocation alive.
+    bool MultiCudaRunDeviceCallbacksEnqueueOnly(
+        const std::vector<int> &devices,
+        const std::function<void(int, int)> &callback);
     bool MultiCudaCurrentThreadWaitForWorker(int device);
 
     // Broadcast a root CUDA tensor into its fixed per-device replicas, then

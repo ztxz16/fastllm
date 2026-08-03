@@ -529,6 +529,60 @@ bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fastllm::Data 
 bool FastllmCudaDeepSeekV4HcHead(const fastllm::Data &x, const fastllm::Data &hcFn,
                                  const fastllm::Data &hcScale, const fastllm::Data &hcBase,
                                  int hcMult, float eps, float normEps, fastllm::Data &output);
+// FP32-accumulating mean over the mHC axis. Unsupported layouts return false
+// so CPU and older/general execution retain the operator-composed fallback.
+bool FastllmCudaDeepSeekV4HcMean(const fastllm::Data &x,
+                                 fastllm::Data &output);
+bool FastllmCudaDeepSeekV4DsparkMarkovLocalArgmax(
+    const float *baseLogits, const float *markovBias,
+    int *packedCandidate, int vocabSize);
+// SM120 graph path: copy the root rank's tiny FP32 Markov latent once to each
+// TP rank, then compute the local FP16 weight shard from that local replica.
+// Unsupported devices return false and retain the operator-composed fallback.
+bool FastllmCudaDeepSeekV4DsparkMarkovPeerAvailable();
+bool FastllmCudaDeepSeekV4DsparkMarkovLinearPeer(
+    const float *peerLatent, const fastllm::Data &localWeight,
+    float *localOutput, int hiddenSize, int localVocabSize);
+bool FastllmCudaDeepSeekV4DsparkMarkovSignal(
+    uint32_t *signal, int step);
+bool FastllmCudaDeepSeekV4DsparkMarkovCopyPeer(
+    const uint32_t *peerSignal, uint32_t *localSeen, int step,
+    const float *peerLatent, float *localLatent, int hiddenSize);
+bool FastllmCudaDeepSeekV4DsparkMarkovWaitPeer(
+    const uint32_t *peerSignal, uint32_t *localSeen, int step);
+bool FastllmCudaDeepSeekV4DsparkMarkovSelect(
+    const int *packedCandidates, const int *globalOffsets,
+    int ranks, int *proposalIds, float *previousId, int step);
+bool FastllmCudaDeepSeekV4DsparkMarkovSelectPeer(
+    const uint64_t *peerCandidatePointers,
+    const uint64_t *peerSignalPointers, uint32_t *localSeen,
+    const int *globalOffsets, int ranks, int steps,
+    int *proposalIds, float *previousId, int step);
+// SM120 steady-state DSpark handoff.  Wait for the root draft proposal and
+// populate this rank's target decode metadata without a GPU-to-host boundary.
+bool FastllmCudaDeepSeekV4DsparkPrepareTargetPeer(
+    const uint32_t *peerSignal, uint32_t *localSeen,
+    const int *peerProposalIds, int proposalCount,
+    int anchorToken, int startPos, int32_t *decodeMeta,
+    float *inputIds);
+// SM120 verifier postprocess: reduce the TP-local greedy candidates, compare
+// them with the draft proposal, and publish the accepted prefix on the root.
+bool FastllmCudaDeepSeekV4DsparkAcceptPeer(
+    const int *candidateIds, const float *candidateScores,
+    const int *globalOffsets, const int *proposalIds,
+    int ranks, int rows, int *result, uint32_t *readySignal);
+// SM120 next-draft preamble.  Every TP rank waits for the root acceptance,
+// commits the dynamic prefix into its three chronological draft KV windows,
+// and fills the stable draft graph metadata/input allocations.
+bool FastllmCudaDeepSeekV4DsparkPrepareDraftPeer(
+    const uint32_t *peerSignal, uint32_t *localSeen,
+    const int *peerResult, int baseCommittedTokens,
+    const void *stageKv0, void *windowKv0,
+    const void *stageKv1, void *windowKv1,
+    const void *stageKv2, void *windowKv2,
+    int rows, int windowSize, int headDim,
+    int noiseTokenId, int proposalCount,
+    int32_t *decodeMeta, float *inputIds);
 bool FastllmCudaDeepSeekV4StoreWindowKVCache(const fastllm::Data &kv, int startPos,
                                              int windowSize, fastllm::Data &windowKV);
 bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
@@ -536,6 +590,12 @@ bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int start
 bool FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(const fastllm::Data &kv,
                                                    const int32_t *decodeMeta,
                                                    int windowSize, fastllm::Data &windowKV);
+// Append the first appendTokens rows of kv to an already-full chronological
+// window in place. This steady-state DSpark update keeps the cache address
+// captured by the draft CUDA graph stable and needs no temporary allocation.
+bool FastllmCudaDeepSeekV4AppendFullWindowKVCache(const fastllm::Data &kv,
+                                                  int appendTokens,
+                                                  fastllm::Data &windowKV);
 bool FastllmCudaDeepSeekV4BuildWindowKVPrefix(const fastllm::Data &windowKV, int startPos,
                                              int windowSize, int prefixLen, fastllm::Data &output);
 bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv, const fastllm::Data &score,
@@ -564,12 +624,57 @@ bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
                                                       const fastllm::Data &q,
                                                       const fastllm::Data &windowKV,
                                                       const fastllm::Data &compressedKV,
+                                                      const fastllm::Data *compressedIndices,
+                                                      const fastllm::Data *compressedLengths,
                                                       fastllm::Data &attnSink, int windowSize,
                                                       int compressRatio, const int32_t *decodeMeta,
                                                       int ropeDim, float ropeBase, int originalSeqLen,
                                                       float ropeFactor, int betaFast, int betaSlow,
                                                       float softmaxScale, fastllm::Data &output,
                                                       bool allowTriton = true);
+// SM120-only optimized path. The two cache tensors use FlashInfer's packed
+// DSv4 ABI (64-token pages, 584 logical bytes/token). These helpers return
+// false on unsupported devices/layouts so callers retain the generic kernel.
+bool FastllmCudaDeepSeekV4SparseMlaSm120Available();
+bool FastllmCudaDeepSeekV4PrepareSparseMlaSm120Cache(
+                                                      const fastllm::Data &windowKV,
+                                                      int totalLen, int windowSize,
+                                                      const fastllm::Data &compressedKV,
+                                                      int compressedCount,
+                                                      fastllm::Data &packedWindowKV,
+                                                      fastllm::Data &packedCompressedKV);
+// Build C4 learned-indexer candidates.  The function uses the exact SM120
+// DeepGEMM MQA scorer when available and an architecture-independent CUDA
+// scorer otherwise; both preserve vLLM's ascending shortcut for <=512 rows.
+bool FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
+                                                      const fastllm::Data &q,
+                                                      const fastllm::Data &weights,
+                                                      const fastllm::Data &compressedKV,
+                                                      const int32_t *decodeMeta,
+                                                      int compressRatio,
+                                                      float ropeBase,
+                                                      int originalSeqLen,
+                                                      float ropeFactor,
+                                                      int betaFast,
+                                                      int betaSlow,
+                                                      fastllm::Data &indices,
+                                                      fastllm::Data &lengths);
+bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
+                                                      const fastllm::Data &q,
+                                                      const fastllm::Data &windowKV,
+                                                      const fastllm::Data &compressedKV,
+                                                      const fastllm::Data *compressedIndices,
+                                                      const fastllm::Data *compressedLengths,
+                                                      fastllm::Data &packedWindowKV,
+                                                      fastllm::Data &packedCompressedKV,
+                                                      fastllm::Data &attnSink,
+                                                      int windowSize, int compressRatio,
+                                                      const int32_t *decodeMeta,
+                                                      int ropeDim, float ropeBase,
+                                                      int originalSeqLen, float ropeFactor,
+                                                      int betaFast, int betaSlow,
+                                                      float softmaxScale,
+                                                      fastllm::Data &output);
 bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedBatch(
                                                       const std::vector<fastllm::Data*> &q,
                                                       const std::vector<fastllm::Data*> &windowKV,
@@ -586,10 +691,19 @@ bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data &q, const f
                                                  int compressRatio, int ropeDim, float ropeBase,
                                                  int originalSeqLen, float ropeFactor, int betaFast,
                                                  int betaSlow, float softmaxScale, fastllm::Data &output,
-                                                 int prefixLen = 0);
+                                                 int prefixLen = 0,
+                                                 bool nonCausalBlock = false,
+                                                 const int32_t *decodeMeta = nullptr);
 bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
                               int groups, int oRank, fastllm::Data &output,
                               bool allowTriton = true);
+#ifdef FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120
+extern "C" bool FastllmCudaDeepSeekV4WoADeepGemmSm120(
+                              const fastllm::Data &o,
+                              const fastllm::Data &woA,
+                              int groups, int oRank,
+                              fastllm::Data &output);
+#endif
 namespace fastllm {
 bool FastllmCudaTryTritonDeepSeekV4WoA(const Data &o, Data &woA,
                                        int groups, int oRank, Data &output);
@@ -1024,6 +1138,20 @@ bool FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
         fastllm::Data **weights, int weightsBatch, const int32_t *globalIndices,
         const float *scores, int topk, int ownerRank, int ownerCount);
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(const fastllm::Data *layerKey);
+#ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
+bool FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
+        const fastllm::Data &input, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *globalIndices, const float *scores,
+        int topk, int ownerRank, int ownerCount, float swigluLimit);
+bool FastllmCudaBFloat16MergeMOEDeepGemmSm120TensorParallel(
+        const fastllm::Data &input, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *globalIndices, const float *scores, int topk,
+        float swigluLimit);
+void FastllmCudaReleaseMergeMOEDeepGemmSm120Cache(
+        const fastllm::Data *layerKey);
+#endif
 bool FastllmCudaBFloat16MergeMOENVFP4Batch1IndexedSharedFP8(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                             fastllm::Data **weights, int weightsBatch, const int32_t *indices,
                                                             const float *scores, float sharedScale,

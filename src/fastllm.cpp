@@ -2081,10 +2081,14 @@ namespace fastllm {
         // Retire routed-expert caches owned by this Data before its address can
         // be reused by a subsequently loaded model. These calls are no-ops for
         // weights that were never used as cache keys.
-        if (this->dataType == DataType::NVFP4 && this->isModelWeight &&
-            this->directMemory) {
-            MultiCudaReleaseMoeWeightCaches(this);
-            FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
+        if (this->dataType == DataType::NVFP4 && this->isModelWeight) {
+            if (this->directMemory) {
+                MultiCudaReleaseMoeWeightCaches(this);
+                FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
+            }
+#ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
+            FastllmCudaReleaseMergeMOEDeepGemmSm120Cache(this);
+#endif
         } else if (this->dataType == DataType::INT4_GROUP &&
                    this->isModelWeight) {
             FastllmCudaReleaseMergeMOEVllmMarlinCache(this);

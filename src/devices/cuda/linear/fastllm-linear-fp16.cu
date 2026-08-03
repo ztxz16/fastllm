@@ -1135,6 +1135,10 @@ bool FastllmCudaBFloat16MatMulFloat16(const fastllm::Data &input, fastllm::Data 
         // 大 batch：将 BF16 input 转为 FP16，使用 cublas FP16 gemm，再将输出转为 BF16
         auto fastllmCublasHandle = getFastllmCublasHandle();
         half *cudaFp16Input = (half *)FastllmCudaMalloc(n * m * sizeof(half));
+        if (cudaFp16Input == nullptr) {
+            FastllmCudaSetThreadError();
+            return false;
+        }
 
         int len = n * m;
         int threadPerBlock = std::min(256, len);
@@ -1143,6 +1147,11 @@ bool FastllmCudaBFloat16MatMulFloat16(const fastllm::Data &input, fastllm::Data 
         cublasStatus_t status;
 #ifdef CUDA_NO_TENSOR_CORE
         float *cudaFp32Output = (float *)FastllmCudaMalloc(n * k * sizeof(float));
+        if (cudaFp32Output == nullptr) {
+            FastllmCudaFree(cudaFp16Input);
+            FastllmCudaSetThreadError();
+            return false;
+        }
         float h_alpha = 1.0f, h_beta = 0.0f;
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
 
@@ -1156,6 +1165,11 @@ bool FastllmCudaBFloat16MatMulFloat16(const fastllm::Data &input, fastllm::Data 
                               k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #else
         half *cudaFp16Output = (half *)FastllmCudaMalloc(n * k * sizeof(half));
+        if (cudaFp16Output == nullptr) {
+            FastllmCudaFree(cudaFp16Input);
+            FastllmCudaSetThreadError();
+            return false;
+        }
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
 

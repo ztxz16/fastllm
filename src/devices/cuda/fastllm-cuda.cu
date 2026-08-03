@@ -3882,12 +3882,14 @@ static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
     // at a time during the first ForwardGPU call.  Do not mix different layers
     // in the same slab, otherwise one live tensor from a later layer pins all
     // already-consumed blocks and makes the repack peak grow every layer.
-    const std::string marker = ".moe.experts.";
-    size_t pos = name.find(marker);
-    if (pos == std::string::npos) {
-        return "";
+    const char *markers[] = {".moe.experts.", ".ffn.experts."};
+    for (const char *marker : markers) {
+        size_t pos = name.find(marker);
+        if (pos != std::string::npos) {
+            return name.substr(0, pos + std::strlen(marker));
+        }
     }
-    return name.substr(0, pos + marker.size());
+    return "";
 }
 
 void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
