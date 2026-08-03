@@ -57,6 +57,8 @@ namespace fastllm {
     extern std::vector <float> yarn_linear_ramp_mask(float min, float max, int dim);
 
     namespace {
+        static constexpr int DEEPSEEK_V4_DSPARK_LOG_INTERVAL = 64;
+
         // A DSpark target verification writes a speculative multi-token suffix
         // into the ordinary decode cache.  Keep the compressor raw rows alive
         // until the verifier decides how much of that suffix to commit; the
@@ -5960,32 +5962,6 @@ namespace fastllm {
                 forwardLocker.unlock();
                 dictLocker.lock();
 
-                if (model->verbose) {
-                    genTokens += seqLens.size();
-                    auto nowTime = std::chrono::system_clock::now();
-                    float spend = GetSpan(lastRecordTime, nowTime);
-                    if (spend > 1) {
-                        int alive = 0, pending = 0, aliveLen = 0;
-                        for (auto &it : model->responseContextDict.dicts) {
-                            if (it.second->isEnding) {
-                                continue;
-                            }
-                            int ctxLen = getContextLen(it.second);
-                            if (it.second->preTokens > 0 || ctxLen > 0) {
-                                alive++;
-                                aliveLen += ctxLen;
-                            } else {
-                                pending++;
-                            }
-                        }
-                        float kvUsage = maxTotalLens > 0 ? aliveLen * 100.0f / maxTotalLens : 0;
-                        printf("[Decode] alive = %d, pending = %d, context len: %d, Speed: %f tokens / s.\n",
-                               alive, pending, aliveLen, (float)genTokens / spend);
-                        lastRecordTime = nowTime;
-                        genTokens = 0;
-                    }
-                }
-
                 int resultCount = std::min((int)handles.size(), (int)ret.size());
                 for (int i = 0; i < resultCount; i++) {
                     auto contextIt = model->responseContextDict.dicts.find(handles[i]);
@@ -6061,6 +6037,7 @@ namespace fastllm {
                             ctx->allTokens.push_back(curRet);
                             ctx->tokens.Push(curRet);
                             ctx->curTokens++;
+                            genTokens++;
                             if ((ctx->generationConfig.output_token_limit > 0 &&
                                  ctx->curTokens >=
                                     ctx->generationConfig.output_token_limit) ||
@@ -6073,6 +6050,31 @@ namespace fastllm {
                         if (ctx->isEnding) {
                             break;
                         }
+                    }
+                }
+                if (model->verbose) {
+                    auto nowTime = std::chrono::system_clock::now();
+                    float spend = GetSpan(lastRecordTime, nowTime);
+                    if (spend > 1) {
+                        int alive = 0, pending = 0, aliveLen = 0;
+                        for (auto &it : model->responseContextDict.dicts) {
+                            if (it.second->isEnding) {
+                                continue;
+                            }
+                            int ctxLen = getContextLen(it.second);
+                            if (it.second->preTokens > 0 || ctxLen > 0) {
+                                alive++;
+                                aliveLen += ctxLen;
+                            } else {
+                                pending++;
+                            }
+                        }
+                        printf("[Decode] alive = %d, pending = %d, "
+                               "context len: %d, Speed: %f tokens / s.\n",
+                               alive, pending, aliveLen,
+                               spend > 0 ? (float)genTokens / spend : 0.0f);
+                        lastRecordTime = nowTime;
+                        genTokens = 0;
                     }
                 }
                 model->dictCV.notify_all();
@@ -8693,6 +8695,15 @@ namespace fastllm {
 
         const int anchorToken = tokenIds[0];
         const int oldTokens = context.committedTokens;
+        if (!dsparkLogPrinted.exchange(true)) {
+            std::printf(
+                "[DeepSeek-V4 DSpark] enabled: layers=%d, "
+                "drafts_per_step=%d, acceptance=exact, "
+                "log_interval=%d validations.\n",
+                dsparkLayers, dsparkTokens,
+                DEEPSEEK_V4_DSPARK_LOG_INTERVAL);
+            std::fflush(stdout);
+        }
 #ifdef USE_CUDA
         bool deferGpuProposal = false;
         if (requestState->cudaGraphState != nullptr) {
@@ -9150,6 +9161,54 @@ namespace fastllm {
         context.proposedTokens += dsparkTokens;
         context.acceptedTokens += accepted;
         context.verifyRounds++;
+        const int trackedDrafts = std::min(
+            dsparkTokens,
+            (int)dsparkDraftPositionAttempts.size());
+        for (int position = 0; position < trackedDrafts; ++position) {
+            dsparkDraftPositionAttempts[position].fetch_add(
+                1, std::memory_order_relaxed);
+            if (accepted > position) {
+                dsparkDraftPositionAccepts[position].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+        dsparkProposedTokenCount.fetch_add(
+            dsparkTokens, std::memory_order_relaxed);
+        dsparkAcceptedTokenCount.fetch_add(
+            accepted, std::memory_order_relaxed);
+        const long long validations =
+            dsparkValidationCount.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+        if (validations % DEEPSEEK_V4_DSPARK_LOG_INTERVAL == 0) {
+            const long long proposed = dsparkProposedTokenCount.load(
+                std::memory_order_relaxed);
+            const long long acceptedTotal = dsparkAcceptedTokenCount.load(
+                std::memory_order_relaxed);
+            const double acceptRate = proposed > 0 ?
+                (double)acceptedTotal * 100.0 / (double)proposed : 0.0;
+            const double averageAccepted = validations > 0 ?
+                (double)acceptedTotal / (double)validations : 0.0;
+            std::printf(
+                "[DeepSeek-V4 DSpark] validations=%lld, "
+                "accept_rate=%.2f%%, avg_accepted=%.2f/%d, "
+                "pos_accept_rate=[",
+                validations, acceptRate, averageAccepted, dsparkTokens);
+            for (int position = 0; position < trackedDrafts; ++position) {
+                const long long attempts =
+                    dsparkDraftPositionAttempts[position].load(
+                        std::memory_order_relaxed);
+                const long long positionAccepts =
+                    dsparkDraftPositionAccepts[position].load(
+                        std::memory_order_relaxed);
+                const double positionRate = attempts > 0 ?
+                    (double)positionAccepts * 100.0 /
+                        (double)attempts : 0.0;
+                std::printf("%s%.2f%%",
+                            position == 0 ? "" : ", ", positionRate);
+            }
+            std::printf("].\n");
+            std::fflush(stdout);
+        }
 
         std::vector<int> outputs;
         outputs.insert(outputs.end(), proposal.tokens.begin(),

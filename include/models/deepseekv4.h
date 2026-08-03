@@ -31,6 +31,8 @@
 
 #include "cmath"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <iostream>
@@ -430,6 +432,14 @@ namespace fastllm {
         std::vector<int> dsparkTargetLayerIds;
         std::vector<std::vector<Data*> > dsparkWeights;
         std::vector<std::vector<Data*> > dsparkBiass;
+        std::atomic<bool> dsparkLogPrinted{false};
+        std::atomic<long long> dsparkValidationCount{0};
+        std::atomic<long long> dsparkProposedTokenCount{0};
+        std::atomic<long long> dsparkAcceptedTokenCount{0};
+        std::array<std::atomic<long long>, 64>
+            dsparkDraftPositionAttempts{};
+        std::array<std::atomic<long long>, 64>
+            dsparkDraftPositionAccepts{};
 
         // 调试对齐用：decode 阶段保存已生成 token，并可选择完整重算上下文。
         std::vector<int> debugFullRecomputeTokens;
