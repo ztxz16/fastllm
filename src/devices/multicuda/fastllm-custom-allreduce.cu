@@ -46,6 +46,22 @@ bool CustomArEnabledByEnv() {
     return enabled;
 }
 
+bool CustomArFusedCopyBackEnabledByEnv() {
+    static const bool enabled = []() {
+        const char *env = std::getenv(
+            "FASTLLM_CUDA_CUSTOM_ALLREDUCE_FUSED_COPYBACK");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        std::string value(env);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return value != "0" && value != "false" && value != "off" &&
+               value != "no";
+    }();
+    return enabled;
+}
+
 void LogCustomArDisabledOnce() {
     static std::once_flag once;
     std::call_once(once, []() {
@@ -208,11 +224,14 @@ void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
                                   CustomArRankSignals allSignals,
                                   CustomArSignal *selfSignal,
                                   T *__restrict__ output,
-                                  int rank, int packedCount) {
+                                  int rank, int packedCount,
+                                  bool writeAfterBarrier) {
     using P = typename CustomArPacked<T>::P;
     using A = typename CustomArPacked<T>::A;
     CustomArRankData pointers = *rankData;
     CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
+    P deferredResult;
+    int deferredIndex = -1;
     for (int index = blockIdx.x * blockDim.x + threadIdx.x;
          index < packedCount; index += gridDim.x * blockDim.x) {
         const P *first = reinterpret_cast<const P *>(pointers.ptrs[0]);
@@ -235,9 +254,26 @@ void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
         for (int item = 0; item < CustomArPacked<T>::size; ++item) {
             result.data[item] = CustomArDowncast<T>(sum.data[item]);
         }
-        reinterpret_cast<P *>(output)[index] = result;
+        if (writeAfterBarrier) {
+            // The launch side enables this only when each thread owns at most
+            // one packed vector, so the exact result can stay in registers.
+            deferredResult = result;
+            deferredIndex = index;
+        } else {
+            reinterpret_cast<P *>(output)[index] = result;
+        }
     }
     CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+    if (writeAfterBarrier) {
+        // All signal lanes must finish the cross-GPU final barrier before any
+        // rank overwrites its input.  This replaces the old scratch write plus
+        // 8 KiB graph memcpy node with one local store, while preserving the
+        // rank-ordered FP32 accumulation byte for byte.
+        __syncthreads();
+        if (deferredIndex >= 0) {
+            reinterpret_cast<P *>(output)[deferredIndex] = deferredResult;
+        }
+    }
 }
 
 // The one-stage kernel makes every rank read the complete tensor from every
@@ -553,7 +589,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
 
 template <typename T>
 bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
-                    T *output, int rank, int count) {
+                    T *output, int rank, int count, bool writeAfterBarrier) {
     constexpr int packedWidth = CustomArPacked<T>::size;
     int packedCount = count / packedWidth;
     const size_t bytes = (size_t)count * sizeof(T);
@@ -582,7 +618,7 @@ bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
                 <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
                     rankData, state.allSignals,                              \
                     state.allSignals.signals[rank], output, rank,            \
-                    packedCount);                                            \
+                    packedCount, writeAfterBarrier);                         \
         }                                                                    \
         break
     switch (state.devices.size()) {
@@ -773,24 +809,28 @@ bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
         return false;
     }
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
-    // The two-stage path has completed every peer read before writing dest and
-    // is safe in-place. Preserve the original asynchronous scratch copy-back
-    // for one-stage decode messages; it is faster than extending the kernel.
-    void *kernelDest = data == dest && !useTwoStage
+    const bool fusedCopyBack =
+        data == dest && !useTwoStage &&
+        bytes <= (size_t)kCustomArMaxBlocks * kCustomArThreads * 16 &&
+        CustomArFusedCopyBackEnabledByEnv();
+    // Two-stage reduction is already safe in-place.  Decode-sized one-stage
+    // reductions keep their result in registers until every peer has consumed
+    // the inputs; larger messages retain the established scratch copy-back.
+    void *kernelDest = data == dest && !useTwoStage && !fusedCopyBack
         ? state.inplaceScratch[rank] : dest;
     bool launched = false;
     if (dataType == fastllm::DataType::FLOAT16) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<half *>(kernelDest),
-                                  rank, count);
+                                  rank, count, fusedCopyBack);
     } else if (dataType == fastllm::DataType::BFLOAT16) {
         launched = LaunchCustomAr(
             state, rankData, reinterpret_cast<__nv_bfloat16 *>(kernelDest),
-            rank, count);
+            rank, count, fusedCopyBack);
     } else if (dataType == fastllm::DataType::FLOAT32) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<float *>(kernelDest),
-                                  rank, count);
+                                  rank, count, fusedCopyBack);
     }
     if (!launched) {
         return false;
