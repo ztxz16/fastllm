@@ -2192,6 +2192,37 @@ namespace {
         std::cout << "DeepSeek-V4 full-window append regression: PASS\n";
     }
 
+    void RunCudaPeerAccessInitRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "CUDA peer-access initialization regression: "
+                         "SKIP (two GPUs required)\n";
+            return;
+        }
+
+        int canAccess01 = 0;
+        int canAccess10 = 0;
+        cudaError_t state01 = cudaDeviceCanAccessPeer(&canAccess01, 0, 1);
+        cudaError_t state10 = cudaDeviceCanAccessPeer(&canAccess10, 1, 0);
+        if (state01 != cudaSuccess || state10 != cudaSuccess ||
+            !canAccess01 || !canAccess10) {
+            cudaGetLastError();
+            std::cout << "CUDA peer-access initialization regression: "
+                         "SKIP (bidirectional P2P unavailable)\n";
+            return;
+        }
+
+        const int originalDevice = FastllmCudaGetDevice();
+        Expect(FastllmCudaPeerAccessInit({0, 1}),
+               "CUDA peer access incorrectly depended on custom all-reduce");
+        Expect(FastllmCudaGetDevice() == originalDevice,
+               "CUDA peer-access initialization changed the current device");
+        Expect(FastllmCudaPeerAccessInit({1, 0, 1}),
+               "CUDA peer-access initialization did not reuse a canonical topology");
+        Expect(FastllmCudaGetDevice() == originalDevice,
+               "cached CUDA peer-access initialization changed the current device");
+        std::cout << "CUDA peer-access initialization regression: PASS\n";
+    }
+
     void RunMultiCudaDeepSeekV4SparsePrefillRegression() {
         if (FastllmCudaGetDeviceCount() < 2) {
             std::cout << "DeepSeek-V4 multi-CUDA sparse prefill regression: "
@@ -7585,6 +7616,7 @@ int main() {
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
             RunCudaDeepSeekV4IndexerRegression();
             RunCudaDeepSeekV4FullWindowAppendRegression();
+            RunCudaPeerAccessInitRegression();
             RunMultiCudaDeepSeekV4SparsePrefillRegression();
             RunCudaDeepSeekV4HashRouteCacheRegression();
             RunCudaDeepSeekV4FusedRouterRegression();

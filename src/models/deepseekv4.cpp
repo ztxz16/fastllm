@@ -7788,7 +7788,14 @@ namespace fastllm {
                 !baseLogits.tpGlobalDims.empty() &&
                 markovW2.dims[0] == baseLogits.tpGlobalDims.back() &&
                 markovRanges == baseLogits.tpRanges &&
-                FastllmCudaCustomAllReduceInit(markovDevices);
+                FastllmCudaPeerAccessInit(markovDevices);
+            if (graphState.capturing && !peerLinearReady) {
+                // The eager fallback records one event per GPU and makes the
+                // root wait for all of them.  Those waits are valid outside a
+                // graph, but would merge independently captured GPU streams.
+                draftBackboneFailure = "markov-peer-access";
+                return nullptr;
+            }
             draftWorkspace.dsparkMarkovProposalPeerReady = false;
             for (int device : markovDevices) {
                 auto weightIt = markovW2.multiDeviceDatas.find(device);
@@ -8128,6 +8135,28 @@ namespace fastllm {
                 // stream capture; lazy communicator creation invalidates every
                 // participating CUDA graph stream.
                 prepared = FastllmInitNccl(draftGraphDevices);
+            }
+            bool graphSafePeerReady = true;
+            if (prepared) {
+                // DSpark's Markov proposal uses GPU-side peer signals to keep
+                // each device in its own capture sequence.  This only needs
+                // CUDA P2P; it must not depend on custom all-reduce being
+                // enabled because NCCL remains a valid reduction backend.
+                graphSafePeerReady =
+                    FastllmCudaDeepSeekV4DsparkMarkovPeerAvailable() &&
+                    FastllmCudaPeerAccessInit(draftGraphDevices);
+                prepared = graphSafePeerReady;
+            }
+            if (!graphSafePeerReady) {
+                static std::once_flag peerFallbackLog;
+                std::call_once(peerFallbackLog, []() {
+                    std::fprintf(
+                        stderr,
+                        "[Fastllm] DeepSeek-V4 DSpark draft CUDA graph "
+                        "disabled: graph-safe full-mesh CUDA peer access is "
+                        "unavailable; using eager NCCL fallback.\n");
+                    std::fflush(stderr);
+                });
             }
             if (prepared && draftGraphState->devices.empty()) {
                 draftGraphState->PrepareDevices(

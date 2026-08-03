@@ -19,6 +19,10 @@ extern "C" {
 using DivisionScheme = std::map <int, std::vector <std::pair <int, int> > >;
 
 bool FastllmInitNccl(const std::vector<int>& devices);
+// Enables and validates direct CUDA peer access for every device pair.  This
+// capability is independent of the optional custom all-reduce implementation
+// and can also be used by graph-safe peer signaling with NCCL collectives.
+bool FastllmCudaPeerAccessInit(const std::vector<int>& devices);
 // Graph-safe small-tensor all-reduce backed by direct peer reads and a GPU-side
 // barrier. It is opt-in through FASTLLM_CUDA_CUSTOM_ALLREDUCE=1; all functions
 // return false when disabled or unsupported so NCCL remains the fallback.

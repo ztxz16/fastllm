@@ -2031,6 +2031,8 @@ struct FastllmNcclGraphPeerComms {
 static std::mutex g_ncclGraphPeerMutex;
 static std::map<std::pair<int, int>, FastllmNcclGraphPeerComms>
     g_ncclGraphPeerComms;
+static std::mutex g_cudaPeerAccessMutex;
+static std::map<std::vector<int>, bool> g_cudaPeerAccessStates;
 
 static std::vector<int> FastllmUniqueNcclDevices(const std::vector<int> &devices) {
     std::vector<int> uniqueDevices;
@@ -2041,6 +2043,66 @@ static std::vector<int> FastllmUniqueNcclDevices(const std::vector<int> &devices
         }
     }
     return uniqueDevices;
+}
+
+bool FastllmCudaPeerAccessInit(const std::vector<int> &devices) {
+    std::vector<int> uniqueDevices = FastllmUniqueNcclDevices(devices);
+    if (uniqueDevices.empty()) {
+        return false;
+    }
+    std::sort(uniqueDevices.begin(), uniqueDevices.end());
+
+    std::lock_guard<std::mutex> guard(g_cudaPeerAccessMutex);
+    auto cached = g_cudaPeerAccessStates.find(uniqueDevices);
+    if (cached != g_cudaPeerAccessStates.end()) {
+        return cached->second;
+    }
+
+    int originalDevice = -1;
+    cudaError_t state = cudaGetDevice(&originalDevice);
+    bool ready = state == cudaSuccess;
+    if (!ready) {
+        cudaGetLastError();
+    }
+    for (int device : uniqueDevices) {
+        if (!ready) {
+            break;
+        }
+        state = cudaSetDevice(device);
+        if (state != cudaSuccess) {
+            cudaGetLastError();
+            ready = false;
+            break;
+        }
+        for (int peer : uniqueDevices) {
+            if (peer == device) {
+                continue;
+            }
+            int canAccess = 0;
+            state = cudaDeviceCanAccessPeer(&canAccess, device, peer);
+            if (state != cudaSuccess || !canAccess) {
+                if (state != cudaSuccess) {
+                    cudaGetLastError();
+                }
+                ready = false;
+                break;
+            }
+            state = cudaDeviceEnablePeerAccess(peer, 0);
+            if (state == cudaErrorPeerAccessAlreadyEnabled) {
+                cudaGetLastError();
+            } else if (state != cudaSuccess) {
+                cudaGetLastError();
+                ready = false;
+                break;
+            }
+        }
+    }
+    if (originalDevice >= 0 && cudaSetDevice(originalDevice) != cudaSuccess) {
+        cudaGetLastError();
+        ready = false;
+    }
+    g_cudaPeerAccessStates[uniqueDevices] = ready;
+    return ready;
 }
 
 static size_t FastllmNcclDataTypeBytes(int dataType) {
