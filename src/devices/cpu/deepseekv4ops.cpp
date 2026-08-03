@@ -550,7 +550,10 @@ namespace fastllm {
         DeepSeekV4ApplyRotaryReference(rows, {bsz, blockCount, headDim}, ropeDim, ropeBase,
                                        blockStart * compressRatio, originalSeqLen, ropeFactor,
                                        betaFast, betaSlow, compressRatio);
-        DeepSeekV4ActQuantInplaceReference(rows, {bsz, blockCount, headDim}, headDim - ropeDim, 64);
+        const int quantDim = headDim == 128 ? headDim : headDim - ropeDim;
+        const int quantBlock = headDim == 128 ? 128 : 64;
+        DeepSeekV4ActQuantInplaceReference(rows, {bsz, blockCount, headDim},
+                                           quantDim, quantBlock);
     }
 
     void CpuDeepSeekV4BuildCompressedKVFromRawOp::Run(const std::string &opType,

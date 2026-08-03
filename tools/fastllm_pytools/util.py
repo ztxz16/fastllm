@@ -409,6 +409,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--dspark", type = int, default = 0,
+                        help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
                         help = "投机解码算法；当前支持 dspark")
@@ -494,13 +496,22 @@ def make_normal_llm_model(args, startup_progress = None):
         getattr(args, "speculative_algorithm", "") or "").strip().lower()
     speculative_draft_path = str(
         getattr(args, "speculative_draft_model_path", "") or "").strip()
+    dspark_tokens = int(getattr(args, "dspark", 0) or 0)
+    if dspark_tokens < 0:
+        raise ValueError("--dspark must be >= 0")
+    if dspark_tokens > 0 and not speculative_algorithm:
+        speculative_algorithm = "dspark"
     if speculative_draft_path and not speculative_algorithm:
         speculative_algorithm = "dspark"
     if speculative_algorithm and speculative_algorithm != "dspark":
         raise ValueError("--speculative_algorithm currently only supports dspark")
-    if speculative_algorithm == "dspark" and not speculative_draft_path:
-        raise ValueError("DSpark requires --speculative_draft_model_path")
+    if (speculative_algorithm == "dspark" and not speculative_draft_path and
+            dspark_tokens <= 0):
+        raise ValueError(
+            "DSpark requires either --dspark N for an embedded checkpoint or "
+            "--speculative_draft_model_path")
     if speculative_draft_path:
+        os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
         draft_config_path = os.path.join(speculative_draft_path, "config.json")
@@ -518,6 +529,8 @@ def make_normal_llm_model(args, startup_progress = None):
         configured_block = int(draft_config.get("block_size", 0))
         requested_block = int(
             getattr(args, "speculative_dspark_block_size", -1))
+        if dspark_tokens > 0:
+            requested_block = dspark_tokens
         if requested_block > 0 and requested_block != configured_block:
             raise ValueError(
                 "FastLLM currently requires the DSpark runtime block size "
@@ -535,6 +548,11 @@ def make_normal_llm_model(args, startup_progress = None):
         args.speculative_algorithm = "dspark"
     else:
         os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
+        if dspark_tokens > 0:
+            os.environ["FASTLLM_DSPARK_TOKENS"] = str(dspark_tokens)
+            args.speculative_algorithm = "dspark"
+        else:
+            os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
         os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
 
     usenuma = False
@@ -587,13 +605,39 @@ def make_normal_llm_model(args, startup_progress = None):
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
-            if (speculative_algorithm == "dspark" and
-                    architecture != "KimiK3ForConditionalGeneration" and
-                    model_type != "kimi_k3"):
-                raise ValueError(
-                    "this DSpark integration currently targets Kimi-K3, got "
-                    "architecture=%s model_type=%s" %
-                    (architecture, model_type))
+            if speculative_algorithm == "dspark":
+                if speculative_draft_path:
+                    if (architecture != "KimiK3ForConditionalGeneration" and
+                            model_type != "kimi_k3"):
+                        raise ValueError(
+                            "external DSpark draft checkpoints currently target "
+                            "Kimi-K3, got architecture=%s model_type=%s" %
+                            (architecture, model_type))
+                else:
+                    is_deepseek_v4 = (
+                        architecture in ("DeepseekV4ForCausalLM",
+                                         "DeepSeekV4ForCausalLM") or
+                        model_type == "deepseek_v4")
+                    if not is_deepseek_v4:
+                        raise ValueError(
+                            "--dspark N requires a DeepSeek-V4 checkpoint with "
+                            "embedded mtp.* DSpark weights, got architecture=%s "
+                            "model_type=%s" % (architecture, model_type))
+                    checkpoint_block = int(config.get(
+                        "dspark_block_size", 0) or 0)
+                    target_layers = config.get("dspark_target_layer_ids", [])
+                    noise_token = int(config.get(
+                        "dspark_noise_token_id", -1) or -1)
+                    if (checkpoint_block <= 0 or not target_layers or
+                            noise_token < 0):
+                        raise ValueError(
+                            "DeepSeek-V4 checkpoint is missing embedded DSpark "
+                            "configuration")
+                    if dspark_tokens < checkpoint_block:
+                        raise ValueError(
+                            "--dspark must be at least the checkpoint training "
+                            "block size (requested=%d, checkpoint=%d)" %
+                            (dspark_tokens, checkpoint_block))
             is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)
 
             is_step3p5 = (architecture == 'Step3p5ForCausalLM' or

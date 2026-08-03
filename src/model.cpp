@@ -376,21 +376,20 @@ namespace fastllm {
         Data emptyBias;
         bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
-        if (model->model_type == "deepseek_v4") {
-            const DeepSeekV4Model *deepseekV4 =
-                dynamic_cast<const DeepSeekV4Model*>(model);
-            if (deepseekV4 != nullptr) {
-                if (weightName.find(".attn.wq_b.weight") !=
-                    std::string::npos) {
-                    data.tpSplitUnit =
-                        deepseekV4->GetTensorParallelAttentionSplitUnit();
-                } else if (weightName.find(".attn.wo_a.weight") !=
-                               std::string::npos ||
-                           weightName.find(".attn.wo_b.weight") !=
-                               std::string::npos) {
-                    data.tpSplitUnit =
-                        deepseekV4->GetTensorParallelOutputGroupSplitUnit();
-                }
+        const DeepSeekV4Model *deepseekV4 =
+            model->model_type == "deepseek_v4" ?
+                dynamic_cast<const DeepSeekV4Model*>(model) : nullptr;
+        if (deepseekV4 != nullptr) {
+            if (weightName.find(".attn.wq_b.weight") !=
+                std::string::npos) {
+                data.tpSplitUnit =
+                    deepseekV4->GetTensorParallelAttentionSplitUnit();
+            } else if (weightName.find(".attn.wo_a.weight") !=
+                           std::string::npos ||
+                       weightName.find(".attn.wo_b.weight") !=
+                           std::string::npos) {
+                data.tpSplitUnit =
+                    deepseekV4->GetTensorParallelOutputGroupSplitUnit();
             }
         }
         int routedExpert = ParseRoutedExpertIndex(weightName);
@@ -433,11 +432,18 @@ namespace fastllm {
         // grouped-Marlin layout. Keep their TP shards out of the mixed
         // model-weight slab so that dropping the compact representation
         // actually returns its memory instead of leaving slab holes.
+        // Embedded DeepSeek-V4 DSpark runs in no-EP mode: shard every expert's
+        // intermediate dimension across the TP devices.  Ordinary DeepSeek-V4
+        // execution keeps the established round-robin expert placement.
+        const bool deepSeekV4TensorParallelExperts =
+            deepseekV4 != nullptr &&
+            deepseekV4->UseTensorParallelRoutedExperts();
         bool directLocalMemory =
             model->model_struct == "qwen3_5" &&
             weightName.find(".mlp.experts.") != std::string::npos &&
             data.dataType == DataType::INT4_GROUP;
-        if (model->model_type == "deepseek_v4" && routedExpert >= 0) {
+        if (model->model_type == "deepseek_v4" && routedExpert >= 0 &&
+            !deepSeekV4TensorParallelExperts) {
             constexpr int ownerOffset = 0;
             int ownerCount = (int)devices.size();
             if (ownerCount <= 0) {

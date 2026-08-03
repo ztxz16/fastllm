@@ -32,6 +32,7 @@
 #include "cmath"
 
 #include <cstdint>
+#include <deque>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -61,6 +62,17 @@ namespace fastllm {
         Data compressorTailKV;
         Data compressorTailScore;
 
+        // C4 attention has a second, 128-wide compressor that feeds the
+        // learned sparse-attention indexer.  Its lifetime mirrors the main
+        // 512-wide attention compressor, but the resulting rows are used only
+        // for scoring/selecting the compressed-attention top-k.
+        int indexerCompressorWideDim = 0;
+        Data indexerCompressorKVRaw;
+        Data indexerCompressorScoreRaw;
+        int indexerCompressorRawTokenBase = 0;
+        Data indexerCompressedKV;
+        int indexerCompressedBlocks = 0;
+
         // 单 token CUDA Graph 使用固定地址的原始 compressor ring 和压缩 KV。
         // 这些是运行时派生缓存，不进入 history/prefix cache 的拷贝。
         bool cudaGraphCacheReady = false;
@@ -70,6 +82,30 @@ namespace fastllm {
         Data cudaGraphCompressorScoreRing;
         Data cudaGraphApe;
         Data cudaGraphNormWeight;
+        int cudaGraphIndexerRawCapacity = 0;
+        int cudaGraphIndexerCompressedCapacity = 0;
+        Data cudaGraphIndexerCompressorKVRing;
+        Data cudaGraphIndexerCompressorScoreRing;
+        Data cudaGraphIndexerApe;
+        Data cudaGraphIndexerNormWeight;
+
+        // Optional SM120 cache mirrors. FlashInfer's sparse MLA kernel reads
+        // 64-token pages with a 584-byte logical token ABI (FP8 NoPE, BF16
+        // RoPE, and UE8M0 footer scales). The generic FLOAT32/BF16 caches
+        // above remain authoritative and provide the fallback on older GPUs.
+        int cudaGraphPackedWindowCapacity = 0;
+        int cudaGraphPackedCompressedCapacity = 0;
+        Data cudaGraphPackedWindowKV;
+        Data cudaGraphPackedCompressedKV;
+
+        // FP8 indexer K rows use the same scalar power-of-two scale contract
+        // as vLLM/DeepGEMM: 128 E4M3 bytes plus one FP32 scale per compressed
+        // token.  The BF16 cache above remains authoritative for the generic
+        // CUDA fallback and cache rollback.
+        Data cudaGraphIndexerFp8KV;
+        Data cudaGraphIndexerFp8Scale;
+        Data cudaGraphIndexerIndices;
+        Data cudaGraphIndexerLengths;
     };
 
     struct DeepSeekV4HistoryLayerCache {
@@ -94,6 +130,12 @@ namespace fastllm {
         int rawTailStartPos = 0;
         Data compressorTailKV;
         Data compressorTailScore;
+        int indexerCompressorWideDim = 0;
+        Data indexerCompressorKVRaw;
+        Data indexerCompressorScoreRaw;
+        int indexerCompressorRawTokenBase = 0;
+        Data indexerCompressedKV;
+        int indexerCompressedBlocks = 0;
     };
 
     struct DeepSeekV4HistoryCacheMemory {
@@ -119,11 +161,108 @@ namespace fastllm {
         bool Get(const std::vector<int> &inputToken, DeepSeekV4HistoryCacheMemory &memory, int &hitLen);
     };
 
+    struct DeepSeekV4DsparkPendingStep {
+        int expectedInput = -1;
+        int outputToken = -1;
+    };
+
+    struct DeepSeekV4DsparkTargetCapture {
+        std::map<int, Data> targetHidden;
+        Data headInput;
+        // A steady-state CUDA graph also produces the sharded verifier logits
+        // and each TP rank's local top-1 candidates.  These non-owning pointers
+        // refer to the request's graph workspace; generic/eager paths leave
+        // samplingReady false and keep using the established sampler.
+        Data *samplingLogitsFloat = nullptr;
+        Data *samplingGreedyIds = nullptr;
+        Data *samplingGreedyScores = nullptr;
+        std::map<int, void*> samplingReadyEvents;
+        bool samplingReady = false;
+        bool samplingDevicesDrained = false;
+        // The steady verifier graph also precomputes the fixed eight-row
+        // DSpark context projection.  AppendDsparkTargetHidden only commits
+        // the dynamically accepted prefix into the rolling windows.
+        std::vector<Data*> contextStageKV;
+        int contextRows = 0;
+        bool contextReady = false;
+    };
+
+    struct DeepSeekV4DsparkProposal {
+        std::vector<int> tokens;
+        // A steady-state CUDA-graph draft can leave its proposal on the root
+        // GPU.  ForwardDspark then feeds it directly into the target graph and
+        // materializes tokens only after target sampling has synchronized the
+        // round.  CPU, lower-SM and eager paths keep using tokens directly.
+        Data *gpuTokens = nullptr;
+        Data *gpuReadySignal = nullptr;
+        Data *gpuReadySeen = nullptr;
+        bool gpuDeferred = false;
+    };
+
+    struct DeepSeekV4DsparkContext {
+        bool initialized = false;
+        int committedTokens = 0;
+        // DSpark 的三个 attention block 只缓存由目标模型 main hidden
+        // 生成的滑窗 KV；draft token 自身的 KV 只在一次 proposal 内使用。
+        std::vector<Data> mainWindowKV;
+        std::deque<DeepSeekV4DsparkPendingStep> pending;
+        std::vector<int> historyTokens;
+        uint64_t proposedTokens = 0;
+        uint64_t acceptedTokens = 0;
+        uint64_t verifyRounds = 0;
+        // CUDA Graph replays write to the addresses captured during warmup.
+        // Keep verification outputs request-local and alive for the full graph
+        // lifetime instead of publishing into an invocation-local temporary.
+        DeepSeekV4DsparkTargetCapture targetCapture;
+        // Retain the fixed-shape verification projection workspace per request.
+        // Destroying these MultiCUDA tensors after every accepted block forced
+        // allocator synchronization between otherwise asynchronous graphs.
+        Data targetCombinedTemp;
+        Data targetCombined;
+        Data targetProjected;
+        Data targetMainHidden;
+        std::vector<Data> targetStageKV;
+        std::vector<Data> targetCommittedKV;
+        std::vector<Data> targetAppendedKV;
+        // LLMSamplingBlock mutates its input, so keep a reusable copy separate
+        // from the persistent target CUDA-graph capture.
+        Data targetSamplingInput;
+        Data targetSamplingLogits;
+        Data targetSamplingLogitsFloat;
+        // SM120 verifier postprocess workspace.  Local top-1 candidates are
+        // gathered to the target root, reduced and rejection-sampled on GPU;
+        // the result also drives the next draft's dynamic context commit.
+        Data targetAcceptanceCandidateIds;
+        Data targetAcceptanceCandidateScores;
+        Data targetAcceptanceGlobalOffsets;
+        Data targetAcceptanceResult;
+        Data targetAcceptanceSignal;
+        Data targetAcceptanceSeen;
+        std::shared_ptr<void> targetAcceptanceHost;
+        std::vector<int> targetAcceptanceDevices;
+        std::vector<int> targetAcceptanceOffsets;
+        int targetAcceptanceRootDevice = -1;
+        bool targetAcceptanceReady = false;
+        // vLLM proposes the next draft at the end of the current verifier
+        // iteration.  Keep the same one-round lookahead here so the async
+        // draft graph can overlap server output and scheduler bookkeeping.
+        DeepSeekV4DsparkProposal prefetchedProposal;
+        int prefetchedAnchorToken = -1;
+        int prefetchedCommittedTokens = -1;
+        bool prefetchedProposalReady = false;
+        // Declared last so the draft graph executable and its pinned workspace
+        // are released before the request-local cache tensors it references.
+        std::shared_ptr<void> cudaGraphState;
+    };
+
     struct DeepSeekV4RequestState {
         std::vector<DeepSeekV4DecodeLayerCache> decodeLayerCaches;
         std::vector<int> historyTokens;
-        std::shared_ptr<void> cudaGraphState;
         bool restoredHistoryCache = false;
+        std::shared_ptr<DeepSeekV4DsparkContext> dspark;
+        // Declared after dspark so graph executables are destroyed before the
+        // persistent capture buffers referenced by their kernel nodes.
+        std::shared_ptr<void> cudaGraphState;
     };
 
     class DeepSeekV4Model : public basellm {
@@ -131,6 +270,11 @@ namespace fastllm {
         DeepSeekV4Model(); // 构造函数
 
         virtual void InitParams(); // 初始化参数信息
+
+        virtual std::map<std::string,
+                         std::vector<std::pair<std::string, DataType> > >
+                GetTensorMap(
+                    const std::vector<std::string> &tensorNames) override;
 
         virtual std::string SelectSpecialWeightDevice(
                 const std::string &weightName, int layerId) const override;
@@ -144,6 +288,10 @@ namespace fastllm {
 
         int GetTensorParallelOutputGroupSplitUnit() const {
             return o_lora_rank;
+        }
+
+        bool UseTensorParallelRoutedExperts() const {
+            return dsparkEnabled;
         }
 
         // 推理
@@ -273,6 +421,16 @@ namespace fastllm {
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
 
+        // -------- Embedded DSpark（DeepSeek-V4 的 mtp.0/1/2） --------
+        bool dsparkEnabled = false;
+        int dsparkTokens = 0;
+        int dsparkLayers = 0;
+        int dsparkNoiseTokenId = -1;
+        int dsparkMarkovRank = 0;
+        std::vector<int> dsparkTargetLayerIds;
+        std::vector<std::vector<Data*> > dsparkWeights;
+        std::vector<std::vector<Data*> > dsparkBiass;
+
         // 调试对齐用：decode 阶段保存已生成 token，并可选择完整重算上下文。
         std::vector<int> debugFullRecomputeTokens;
         int debugGeneratedTokens = 0;
@@ -296,6 +454,33 @@ namespace fastllm {
                                    const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches);
         std::shared_ptr<DeepSeekV4RequestState> GetRequestState(std::vector<std::pair<Data, Data> > &pastKeyValues);
         std::shared_ptr<DeepSeekV4RequestState> GetRequestStateByFirstKey(const Data *firstPastKey);
+
+        std::vector<int> RunDsparkTarget(
+                const std::vector<int> &tokenIds, int startPos,
+                std::vector<std::pair<Data, Data> > &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *retLogits,
+                DeepSeekV4DsparkTargetCapture *capture);
+
+        void AppendDsparkTargetHidden(
+                const DeepSeekV4DsparkTargetCapture &capture, int tokens,
+                DeepSeekV4DsparkContext &context);
+
+        DeepSeekV4DsparkProposal RunDsparkDraft(
+            int anchorToken, DeepSeekV4DsparkContext &context,
+            bool forceEager = false, bool deferGpuCopy = false);
+
+        std::vector<int> SampleDsparkTargetRows(
+                Data &headInput,
+                DeepSeekV4DsparkContext *persistentContext = nullptr);
+
+        int ForwardDspark(
+                const Data &inputIds,
+                std::vector<std::pair<Data, Data> > &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *retLogits);
     };
 }
 
