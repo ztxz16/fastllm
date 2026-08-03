@@ -2094,6 +2094,57 @@ namespace {
         std::cout << "DeepSeek-V4 learned indexer regression: PASS\n";
     }
 
+    void RunCudaDeepSeekV4FullWindowAppendRegression() {
+        const int originalDevice = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(0);
+        constexpr int bsz = 1;
+        constexpr int windowSize = 8;
+        constexpr int appendTokens = 13;
+        constexpr int headDim = 5;
+
+        fastllm::Data source = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {bsz, appendTokens, headDim},
+            MakeRegressionValues(appendTokens * headDim, 0.37f, 0.17f));
+        const std::vector<float> sourceValues = ToFloatVector(source);
+
+        fastllm::Data longWindow = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {bsz, windowSize, headDim},
+            MakeRegressionValues(windowSize * headDim, 0.71f, 0.13f));
+        Expect(FastllmCudaDeepSeekV4AppendFullWindowKVCache(
+                   source, appendTokens, longWindow),
+               "DeepSeek-V4 full-window append rejected a long prefill chunk");
+        ForceDeviceSync();
+        const std::vector<float> expectedLong(
+            sourceValues.begin() +
+                (appendTokens - windowSize) * headDim,
+            sourceValues.end());
+        ExpectFloatNear(expectedLong, ToFloatVector(longWindow), 0.0f, 0.0f,
+                        "DeepSeek-V4 long-prefill full-window append");
+
+        constexpr int shortAppend = 3;
+        fastllm::Data shortWindow = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {bsz, windowSize, headDim},
+            MakeRegressionValues(windowSize * headDim, 0.91f, 0.11f));
+        const std::vector<float> shortWindowValues = ToFloatVector(shortWindow);
+        Expect(FastllmCudaDeepSeekV4AppendFullWindowKVCache(
+                   source, shortAppend, shortWindow),
+               "DeepSeek-V4 full-window append rejected a decode-sized suffix");
+        ForceDeviceSync();
+        std::vector<float> expectedShort(
+            shortWindowValues.begin() + shortAppend * headDim,
+            shortWindowValues.end());
+        expectedShort.insert(
+            expectedShort.end(), sourceValues.begin(),
+            sourceValues.begin() + shortAppend * headDim);
+        ExpectFloatNear(expectedShort, ToFloatVector(shortWindow), 0.0f, 0.0f,
+                        "DeepSeek-V4 decode-sized full-window append");
+        FastllmCudaSetDevice(originalDevice);
+        std::cout << "DeepSeek-V4 full-window append regression: PASS\n";
+    }
+
     void RunMultiCudaDeepSeekV4SparsePrefillRegression() {
         if (FastllmCudaGetDeviceCount() < 2) {
             std::cout << "DeepSeek-V4 multi-CUDA sparse prefill regression: "
@@ -7484,6 +7535,7 @@ int main() {
             RunCudaDeepSeekV4TritonWoARegression();
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
             RunCudaDeepSeekV4IndexerRegression();
+            RunCudaDeepSeekV4FullWindowAppendRegression();
             RunMultiCudaDeepSeekV4SparsePrefillRegression();
             RunCudaDeepSeekV4HashRouteCacheRegression();
             RunCudaDeepSeekV4FusedRouterRegression();

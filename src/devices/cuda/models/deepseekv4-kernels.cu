@@ -2140,17 +2140,22 @@ __global__ void DeepSeekV4AppendFullWindowKVCacheKernel(
     if (b >= bsz) {
         return;
     }
-    const int retained = windowSize - appendTokens;
+    // A long-prefill chunk can be much larger than the fixed DSpark window.
+    // In that case none of the old window survives and only the trailing
+    // windowSize rows from the committed prefix need to be copied.
+    const int copied = appendTokens < windowSize ? appendTokens : windowSize;
+    const int retained = windowSize - copied;
+    const int sourceStart = appendTokens - copied;
     for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
         T *window = windowKV + (uint64_t)b * windowSize * headDim;
         const T *source = kv + (uint64_t)b * seqlen * headDim;
         for (int s = 0; s < retained; ++s) {
             window[(uint64_t)s * headDim + d] =
-                window[(uint64_t)(s + appendTokens) * headDim + d];
+                window[(uint64_t)(s + copied) * headDim + d];
         }
-        for (int s = 0; s < appendTokens; ++s) {
+        for (int s = 0; s < copied; ++s) {
             window[(uint64_t)(retained + s) * headDim + d] =
-                source[(uint64_t)s * headDim + d];
+                source[(uint64_t)(sourceStart + s) * headDim + d];
         }
     }
 }
@@ -7083,7 +7088,6 @@ extern "C" bool FastllmCudaDeepSeekV4AppendFullWindowKVCache(
         kv.dims[0] <= 0 || kv.dims[0] != windowKV.dims[0] ||
         kv.dims[2] <= 0 || kv.dims[2] != windowKV.dims[2] ||
         appendTokens <= 0 || appendTokens > kv.dims[1] ||
-        appendTokens > windowKV.dims[1] ||
         kv.dataType != windowKV.dataType) {
         return false;
     }

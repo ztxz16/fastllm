@@ -591,8 +591,9 @@ bool FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(const fastllm::Data &kv,
                                                    const int32_t *decodeMeta,
                                                    int windowSize, fastllm::Data &windowKV);
 // Append the first appendTokens rows of kv to an already-full chronological
-// window in place. This steady-state DSpark update keeps the cache address
-// captured by the draft CUDA graph stable and needs no temporary allocation.
+// window in place. Appends longer than the window retain the trailing window
+// rows of that committed prefix. This keeps the cache address captured by the
+// draft CUDA graph stable and needs no temporary allocation.
 bool FastllmCudaDeepSeekV4AppendFullWindowKVCache(const fastllm::Data &kv,
                                                   int appendTokens,
                                                   fastllm::Data &windowKV);
