@@ -403,8 +403,9 @@ constexpr size_t CustomArMaxBytes() {
 }
 
 bool CustomArUseTwoStage(size_t ranks, size_t bytes) {
-    return ranks > 2 &&
-        bytes >= (ranks <= 4 ? 512ULL * 1024ULL : 256ULL * 1024ULL);
+    const size_t threshold = ranks <= 4 ? 512ULL * 1024ULL :
+        (ranks >= 8 ? 48ULL * 1024ULL : 256ULL * 1024ULL);
+    return ranks > 2 && bytes >= threshold;
 }
 
 size_t CustomArTypeBytes(int dataType) {
@@ -557,8 +558,16 @@ bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
     int packedCount = count / packedWidth;
     const size_t bytes = (size_t)count * sizeof(T);
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
+    // In the two-stage algorithm every rank reduces only its 1/RANKS shard
+    // and then gathers equally sized peer shards.  Size the grid for that
+    // largest shard; using the full tensor count creates RANKS-1 idle blocks
+    // for DSpark's 7/8-row hidden states and multiplies barrier traffic.
+    const int ranks = (int)state.devices.size();
+    int workPackedCount = useTwoStage
+        ? packedCount / ranks + packedCount % ranks
+        : packedCount;
     int blocks = std::max(1, std::min(kCustomArMaxBlocks,
-                          (packedCount + kCustomArThreads - 1) /
+                          (workPackedCount + kCustomArThreads - 1) /
                               kCustomArThreads));
 #define CUSTOM_AR_RANK_CASE(RANKS)                                           \
     case RANKS:                                                              \

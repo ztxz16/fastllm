@@ -109,6 +109,31 @@ cudaError_t FastllmCudaMemcpy2D(void* dst, size_t dpitch, const void* src,
 #endif
 
     cudaError_t state = cudaSuccess;
+    if (type == cudaMemcpyDeviceToDevice &&
+        dstDeviceId == srcDeviceId) {
+        cudaSetDevice(dstDeviceId);
+        cudaStreamCaptureStatus captureStatus =
+            cudaStreamCaptureStatusNone;
+        state = cudaStreamIsCapturing(
+            cudaStreamPerThread, &captureStatus);
+        if (state == cudaSuccess &&
+            captureStatus != cudaStreamCaptureStatusNone) {
+            state = cudaMemcpy2DAsync(
+                dst, dpitch, src, spitch, width, height,
+                cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            if (state != cudaSuccess) {
+                checkCudaErrors(
+                    "Error: CUDA error when async memcpy2D!", state);
+            }
+            return state;
+        }
+        if (state != cudaSuccess) {
+            checkCudaErrors(
+                "Error: CUDA error when checking memcpy2D capture status!",
+                state);
+            return state;
+        }
+    }
     if (type == cudaMemcpyDeviceToDevice) {
         cudaSetDevice(dstDeviceId);
         if (dstDeviceId != srcDeviceId) {
