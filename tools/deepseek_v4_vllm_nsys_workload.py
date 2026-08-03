@@ -17,6 +17,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-tokens", type=int, default=8)
     parser.add_argument("--result", required=True)
     parser.add_argument("--tp", type=int, default=8)
+    parser.add_argument(
+        "--post-profile-wait", type=float, default=5.0,
+        help="leave worker processes alive briefly so Nsight can flush CUPTI data",
+    )
+    parser.add_argument(
+        "--dspark", type=int, default=0,
+        help="enable embedded DSpark with this many draft tokens",
+    )
+    parser.add_argument(
+        "--enforce-eager", action="store_true",
+        help="disable CUDA graphs (useful for one-off logits alignment probes)",
+    )
     return parser.parse_args()
 
 
@@ -60,6 +72,15 @@ def main() -> None:
 
     input_ids = read_input_ids(args.input_ids)
     max_model_len = max(512, len(input_ids) + args.output_tokens + 1)
+    graph_sizes = [1]
+    speculative_config = None
+    if args.dspark > 0:
+        graph_sizes.append(args.dspark + 1)
+        speculative_config = {
+            "method": "dspark",
+            "num_speculative_tokens": args.dspark,
+            "draft_sample_method": "greedy",
+        }
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tp,
@@ -70,12 +91,12 @@ def main() -> None:
         gpu_memory_utilization=0.90,
         kv_cache_dtype="fp8",
         block_size=256,
-        enforce_eager=False,
-        cudagraph_capture_sizes=[1],
-        max_cudagraph_capture_size=1,
+        enforce_eager=args.enforce_eager,
+        cudagraph_capture_sizes=graph_sizes,
+        max_cudagraph_capture_size=max(graph_sizes),
         enable_prefix_caching=False,
-        disable_custom_all_reduce=True,
         enable_flashinfer_autotune=False,
+        speculative_config=speculative_config,
         profiler_config={"profiler": "cuda"},
         seed=0,
     )
@@ -89,6 +110,12 @@ def main() -> None:
     finally:
         if profiling:
             llm.stop_profile()
+            # vLLM owns CUDA contexts in spawned worker processes.  Returning
+            # immediately lets LLM teardown terminate those workers while
+            # Nsight Systems is still draining CUPTI buffers, which can yield
+            # an empty report even though profiling did run successfully.
+            if args.post_profile_wait > 0:
+                time.sleep(args.post_profile_wait)
 
     result = {
         "engine": "vllm",
@@ -101,10 +128,10 @@ def main() -> None:
         "mode": {
             "tp": args.tp,
             "kv_cache_dtype": "fp8",
-            "cuda_graph_sizes": [1],
+            "cuda_graph_sizes": graph_sizes,
             "prefix_caching": False,
             "expert_parallel": False,
-            "dspark": False,
+            "dspark": args.dspark,
         },
     }
     Path(args.result).write_text(

@@ -23,6 +23,7 @@ from typing import Callable, Iterable
 
 
 FAST_ATTENTION_PATTERNS = (
+    "%sparse_mla_decode_dsv4_kernel%",
     "%fastllm_deepseek_v4_sparse_decode%split_kernel%",
     "%fastllm_deepseek_v4_sparse_decode_kernel%",
 )
@@ -53,7 +54,10 @@ def parse_args() -> argparse.Namespace:
 
 def fast_family(name: str) -> str:
     lower_name = name.lower()
-    if "fastllm_deepseek_v4_sparse_decode" in name:
+    if (
+        "fastllm_deepseek_v4_sparse_decode" in name
+        or "sparse_mla_decode_dsv4" in name
+    ):
         return "sparse_attention_core"
     if "CustomAllReduce" in name or "ncclDevKernel" in name:
         return "communication"
