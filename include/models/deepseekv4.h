@@ -148,6 +148,13 @@ namespace fastllm {
         int recordTimes = 0;
         long long flushTime = 0;
         std::vector<DeepSeekV4HistoryLayerCache> layers;
+        // DSpark derives a separate three-stage rolling window from target
+        // hidden states.  A target-only prefix cannot resume speculative
+        // decoding, so keep the committed draft context with the target cache.
+        bool dsparkValid = false;
+        int dsparkCommittedTokens = 0;
+        std::vector<int> dsparkHistoryTokens;
+        std::vector<Data> dsparkMainWindowKV;
     };
 
     struct DeepSeekV4HistoryCacheManager {
@@ -160,7 +167,9 @@ namespace fastllm {
 
         void SetMaxRecordNum(int maxRecordNum);
         void Record(const DeepSeekV4HistoryCacheMemory &memory);
-        bool Get(const std::vector<int> &inputToken, DeepSeekV4HistoryCacheMemory &memory, int &hitLen);
+        bool Get(const std::vector<int> &inputToken,
+                 DeepSeekV4HistoryCacheMemory &memory, int &hitLen,
+                 bool requireDspark = false);
     };
 
     struct DeepSeekV4DsparkPendingStep {
@@ -461,7 +470,8 @@ namespace fastllm {
                                        DeepSeekV4RequestState &state);
         void RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen);
         void RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen,
-                                   const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches);
+                                   const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches,
+                                   const DeepSeekV4DsparkContext *dsparkContext = nullptr);
         std::shared_ptr<DeepSeekV4RequestState> GetRequestState(std::vector<std::pair<Data, Data> > &pastKeyValues);
         std::shared_ptr<DeepSeekV4RequestState> GetRequestStateByFirstKey(const Data *firstPastKey);
 

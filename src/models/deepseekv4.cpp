@@ -992,18 +992,26 @@ namespace fastllm {
             }
 #endif
 
+            Data compactPayload;
+            if (payload->dims.size() >= 2 &&
+                !payload->expansionDims.empty()) {
+                // GetBytes() follows expanded strides. Materialize the logical
+                // sequence before copying so a graph-sized reserve is not
+                // mistaken for live prefix data.
+                Split(*payload, 1, 0, payload->dims[1], compactPayload);
+                payload = &compactPayload;
+            }
+
             dst.dataType = payload->dataType;
             dst.UpdateUnitSize();
             dst.Resize(payload->dims);
             dst.dataDevice = DataDevice::CPU;
             dst.dataDeviceIds.clear();
-            if (!payload->expansionDims.empty() && payload->expansionSize > 0) {
-                dst.strides = payload->strides;
-                dst.expansionDims = payload->expansionDims;
-                dst.MallocSpace(payload->expansionSize, false);
-            } else {
-                dst.Allocate(false);
-            }
+            // CUDA Graph expands compressed caches to the request's planned
+            // output bound.  A prefix snapshot only owns the logical rows;
+            // retaining graph capacity here can copy gigabytes of unused
+            // storage per record and ties the next request to stale addresses.
+            dst.Allocate(false);
             AssertInFastLLM(dst.expansionBytes >= payload->GetBytes(),
                             "DeepSeek V4 CPU history snapshot allocation is too small.\n");
 
@@ -4955,12 +4963,27 @@ namespace fastllm {
                EnvFlagEnabled("FASTLLM_DSV4_DEBUG_PREFIX_CACHE");
     }
 
+    static bool DeepSeekV4PrefixCacheEnabledByEnv() {
+        const char *value = std::getenv("FASTLLM_PREFIX_CACHE");
+        if (value == nullptr || value[0] == 0) {
+            return true;
+        }
+        std::string normalized(value);
+        std::transform(normalized.begin(), normalized.end(),
+                       normalized.begin(), [](unsigned char c) {
+                           return (char)std::tolower(c);
+                       });
+        return normalized != "0" && normalized != "false" &&
+               normalized != "off" && normalized != "no";
+    }
+
     static bool DeepSeekV4PrefixCacheDisabled() {
-        // Prefix snapshots linearize the compressor raw tail and can reallocate
-        // compressed KV.  A fixed-address full-step graph cannot coexist with
-        // that ownership model, so the full-step decode graph takes precedence.
+        // Match Qwen3.5 prefix-cache semantics: enabled by default and
+        // explicitly disabled through the common flag.  Restored V4 caches
+        // acquire a fresh request-local graph, so their old addresses never
+        // leak into CUDA Graph replay.
         return EnvFlagEnabled("FASTLLM_DSV4_DISABLE_PREFIX_CACHE") ||
-               DeepSeekV4DecodeCudaGraphEnabled();
+               !DeepSeekV4PrefixCacheEnabledByEnv();
     }
 
     static bool DeepSeekV4PrefixCacheEveryBlockSplitEnabled() {
@@ -5095,7 +5118,10 @@ namespace fastllm {
             return;
         }
         std::lock_guard<std::mutex> guard(this->locker);
-        int envMax = EnvInt("FASTLLM_DSV4_PREFIX_CACHE_MAX_RECORDS", this->maxRecordNum);
+        int commonMax = EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS",
+                               this->maxRecordNum);
+        int envMax = EnvInt("FASTLLM_DSV4_PREFIX_CACHE_MAX_RECORDS",
+                            commonMax);
         this->maxRecordNum = std::max(1, envMax);
 
         auto old = this->memorys.find(memory.inputToken);
@@ -5132,9 +5158,10 @@ namespace fastllm {
         this->blockIndex[inserted.first->second.blockHash] = inserted.first->second.inputToken;
     }
 
-    bool DeepSeekV4HistoryCacheManager::Get(const std::vector<int> &inputToken,
-                                            DeepSeekV4HistoryCacheMemory &memory,
-                                            int &hitLen) {
+    bool DeepSeekV4HistoryCacheManager::Get(
+            const std::vector<int> &inputToken,
+            DeepSeekV4HistoryCacheMemory &memory,
+            int &hitLen, bool requireDspark) {
         hitLen = 0;
         if ((int)inputToken.size() <= this->logicalBlockSize) {
             return false;
@@ -5156,6 +5183,9 @@ namespace fastllm {
             if (memIt == this->memorys.end()) {
                 continue;
             }
+            if (requireDspark && !memIt->second.dsparkValid) {
+                continue;
+            }
             bool match = true;
             for (int i = 0; i < len; i++) {
                 if (inputToken[i] != memIt->second.inputToken[i]) {
@@ -5175,6 +5205,9 @@ namespace fastllm {
         for (auto &it : this->memorys) {
             int len = (int)it.first.size();
             if (len <= hitLen || len > maxProbeLen) {
+                continue;
+            }
+            if (requireDspark && !it.second.dsparkValid) {
                 continue;
             }
             bool match = true;
@@ -5283,11 +5316,61 @@ namespace fastllm {
             }
 #endif
         }
+        if (this->dsparkEnabled) {
+            if (!memory.dsparkValid ||
+                memory.dsparkCommittedTokens != memory.tokens ||
+                (int)memory.dsparkHistoryTokens.size() < memory.tokens ||
+                (int)memory.dsparkMainWindowKV.size() != this->dsparkLayers) {
+                return false;
+            }
+            auto dspark = std::make_shared<DeepSeekV4DsparkContext>();
+            dspark->initialized = true;
+            dspark->committedTokens = memory.dsparkCommittedTokens;
+            dspark->historyTokens.assign(
+                memory.dsparkHistoryTokens.begin(),
+                memory.dsparkHistoryTokens.begin() + memory.tokens);
+            dspark->mainWindowKV.resize(this->dsparkLayers);
+            for (int stage = 0; stage < this->dsparkLayers; ++stage) {
+                const Data &src = memory.dsparkMainWindowKV[stage];
+                Data &dst = dspark->mainWindowKV[stage];
+                if (!HasTensorData(src) || src.dims.size() != 3 ||
+                    src.dims[0] != 1 || src.dims[1] > this->window_size ||
+                    src.dims[2] != this->head_dim_full) {
+                    return false;
+                }
+                CopyTensorData(dst, src);
+#ifdef USE_CUDA
+                if (DeepSeekV4PreferCuda()) {
+                    std::vector<int> devices;
+                    std::map<int, int> ratios;
+                    FastllmGetMulticudaDeviceAndRatio(
+                        devices, ratios, true);
+                    if (devices.empty()) {
+                        int rootDevice = GetTensorCudaDevice(
+                            this->weight["embed.weight"]);
+                        if (rootDevice >= 0) {
+                            devices.push_back(rootDevice);
+                        }
+                    }
+                    if (!devices.empty()) {
+                        dst.lockInCPU = false;
+                        PrepareMultiCudaReplicatedData(dst, devices, true);
+                        PublishReplicatedCudaRootMetadata(
+                            dst, devices, true);
+                    }
+                }
+#endif
+            }
+            state.dspark = std::move(dspark);
+        } else {
+            state.dspark.reset();
+        }
         state.historyTokens = memory.inputToken;
         state.restoredHistoryCache = true;
         if (DeepSeekV4PrefixCacheDebugEnabled()) {
-            printf("[fastllm-dsv4-prefix-cache] restore hit_len=%d blocks=%d layers=%d\n",
-                   memory.tokens, memory.blockCount, (int)memory.layers.size());
+            printf("[fastllm-dsv4-prefix-cache] restore hit_len=%d blocks=%d layers=%d dspark=%d\n",
+                   memory.tokens, memory.blockCount,
+                   (int)memory.layers.size(), memory.dsparkValid ? 1 : 0);
             for (int i = 0; i < (int)state.decodeLayerCaches.size(); i++) {
                 const auto &layer = state.decodeLayerCaches[i];
                 printf("[fastllm-dsv4-prefix-cache]   layer=%02d ratio=%d total_len=%d compressed_blocks=%d window=%d raw_tail_start=%d tail_tokens=%d\n",
@@ -5303,12 +5386,14 @@ namespace fastllm {
     }
 
     void DeepSeekV4Model::RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen) {
-        RecordHistorySnapshot(tokens, totalLen, this->decodeLayerCaches);
+        RecordHistorySnapshot(tokens, totalLen, this->decodeLayerCaches,
+                              nullptr);
     }
 
     void DeepSeekV4Model::RecordHistorySnapshot(const std::vector<int> &tokens,
                                                 int totalLen,
-                                                const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches) {
+                                                const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches,
+                                                const DeepSeekV4DsparkContext *dsparkContext) {
         if (DeepSeekV4HistorySnapshotSuppressed()) {
             return;
         }
@@ -5397,10 +5482,35 @@ namespace fastllm {
                 }
             }
         }
+        if (this->dsparkEnabled && dsparkContext != nullptr &&
+            dsparkContext->initialized &&
+            dsparkContext->committedTokens == totalLen &&
+            (int)dsparkContext->historyTokens.size() >= totalLen &&
+            (int)dsparkContext->mainWindowKV.size() == this->dsparkLayers) {
+            memory.dsparkValid = true;
+            memory.dsparkCommittedTokens = totalLen;
+            memory.dsparkHistoryTokens.assign(
+                dsparkContext->historyTokens.begin(),
+                dsparkContext->historyTokens.begin() + totalLen);
+            memory.dsparkMainWindowKV.resize(this->dsparkLayers);
+            for (int stage = 0; stage < this->dsparkLayers; ++stage) {
+                const Data &src = dsparkContext->mainWindowKV[stage];
+                if (!HasTensorData(src) || src.dims.size() != 3 ||
+                    src.dims[0] != 1 || src.dims[1] > this->window_size ||
+                    src.dims[2] != this->head_dim_full) {
+                    memory.dsparkValid = false;
+                    memory.dsparkMainWindowKV.clear();
+                    break;
+                }
+                CopyHistoryTensorData(
+                    memory.dsparkMainWindowKV[stage], src);
+            }
+        }
         this->deepseekV4HistoryCacheManager.Record(memory);
         if (DeepSeekV4PrefixCacheDebugEnabled()) {
-            printf("[fastllm-dsv4-prefix-cache] record tokens=%d blocks=%d layers=%d residual_only=%d\n",
-                   totalLen, memory.blockCount, (int)memory.layers.size(), storeFullRaw ? 0 : 1);
+            printf("[fastllm-dsv4-prefix-cache] record tokens=%d blocks=%d layers=%d residual_only=%d dspark=%d\n",
+                   totalLen, memory.blockCount, (int)memory.layers.size(),
+                   storeFullRaw ? 0 : 1, memory.dsparkValid ? 1 : 0);
             fflush(stdout);
         }
     }
@@ -5417,7 +5527,7 @@ namespace fastllm {
         }
         if (DeepSeekV4PrefixCacheDisabled()) {
             if (debugPrefixCache) {
-                printf("[fastllm-dsv4-prefix-cache] disabled: FASTLLM_DSV4_DISABLE_PREFIX_CACHE input_tokens=%d\n",
+                printf("[fastllm-dsv4-prefix-cache] disabled by environment input_tokens=%d\n",
                        (int)inputTokens.size());
                 fflush(stdout);
             }
@@ -5433,7 +5543,9 @@ namespace fastllm {
         }
         DeepSeekV4HistoryCacheMemory memory;
         int hitLen = 0;
-        if (!this->deepseekV4HistoryCacheManager.Get(inputTokens, memory, hitLen) || hitLen <= 0) {
+        if (!this->deepseekV4HistoryCacheManager.Get(
+                inputTokens, memory, hitLen, this->dsparkEnabled) ||
+            hitLen <= 0) {
             if (debugPrefixCache) {
                 int alignedProbeLen = ((int)inputTokens.size() - 1) / 256 * 256;
                 printf("[fastllm-dsv4-prefix-cache] miss input_tokens=%d aligned_probe=%d\n",
@@ -5581,7 +5693,14 @@ namespace fastllm {
         }
         int totalLen = state->decodeLayerCaches[0].totalLen;
         if (totalLen > 0 && (int)context->allTokens.size() >= totalLen) {
-            this->RecordHistorySnapshot(context->allTokens, totalLen, state->decodeLayerCaches);
+#ifdef USE_CUDA
+            if (DeepSeekV4PreferCuda()) {
+                SynchronizeDeepSeekV4TensorParallelDevices(this->deviceMap);
+            }
+#endif
+            this->RecordHistorySnapshot(
+                context->allTokens, totalLen, state->decodeLayerCaches,
+                state->dspark.get());
         } else if (DeepSeekV4PrefixCacheDebugEnabled()) {
             printf("[fastllm-dsv4-prefix-cache] skip record: total_len=%d all_tokens=%d\n",
                    totalLen, (int)context->allTokens.size());
@@ -5678,6 +5797,12 @@ namespace fastllm {
             printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
             printf("Fastllm Batch limit: %d.\n", maxBatch);
             printf("Fastllm Scheduler: DeepSeekV4.\n");
+            printf("Fastllm Prefix Cache: %s (history=%s, CUDA graph=%s, DSpark state=%s).\n",
+                   (!model->saveHistoryChat || DeepSeekV4PrefixCacheDisabled()) ?
+                       "disabled" : "enabled",
+                   model->saveHistoryChat ? "on" : "off",
+                   DeepSeekV4DecodeCudaGraphEnabled() ? "on" : "off",
+                   model->dsparkEnabled ? "included" : "unused");
         }
 
         auto lastRecordTime = std::chrono::system_clock::now();
@@ -5717,7 +5842,12 @@ namespace fastllm {
                     continue;
                 }
                 int ctxLen = getContextLen(it.second);
-                if (it.second->preTokens > 0 || ctxLen > 0) {
+                // A newly restored prefix has model cache state but its prompt
+                // suffix has not been scheduled yet (preTokens == 0).  Counting
+                // it as an active request makes max_batch=1 reject that same
+                // request forever.  It becomes active only after the scheduler
+                // has actually submitted its first prompt/suffix chunk.
+                if (it.second->preTokens > 0) {
                     lenSum += ctxLen;
                     currentActivate++;
                 }
@@ -5776,7 +5906,10 @@ namespace fastllm {
                         }
                         lenSum += predictLen;
                     } else {
-                        lenSum += ctx->currentTokens.size();
+                        // Restored pages are not part of currentTokens, but
+                        // they still consume the shared cache token budget.
+                        lenSum += ctx->cacheLen +
+                                  ctx->currentTokens.size();
                         currentActivate++;
                     }
 
@@ -8678,16 +8811,69 @@ namespace fastllm {
                 context.initialized || targetStart == 0,
                 "DSpark cannot restore a target-only prefix cache; disable "
                 "prefix caching for this request.");
-            DeepSeekV4DsparkTargetCapture capture;
-            std::vector<int> result = RunDsparkTarget(
-                tokenIds, targetStart, pastKeyValues, generationConfig,
-                lastTokens, retLogits, &capture);
-            AppendDsparkTargetHidden(
-                capture, (int)tokenIds.size(), context);
-            context.historyTokens.insert(
-                context.historyTokens.end(), tokenIds.begin(),
-                tokenIds.end());
-            context.initialized = true;
+            const bool prefixCacheEnabled =
+                this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled();
+            auto publishPromptSnapshot = [&]() {
+                // DSpark may verify several decode tokens ahead of the HTTP
+                // response.  Publish snapshots while target and draft state
+                // still describe an exact prompt prefix, rather than waiting
+                // for request teardown where allTokens can lag the caches.
+                if (!prefixCacheEnabled ||
+                    context.committedTokens <=
+                        this->deepseekV4HistoryCacheManager.logicalBlockSize) {
+                    return;
+                }
+#ifdef USE_CUDA
+                if (DeepSeekV4PreferCuda()) {
+                    SynchronizeDeepSeekV4TensorParallelDevices(
+                        this->deviceMap);
+                }
+#endif
+                this->RecordHistorySnapshot(
+                    context.historyTokens, context.committedTokens,
+                    requestState->decodeLayerCaches, &context);
+            };
+            auto runPrefillChunk = [&](int offset, int count,
+                                       bool finalChunk) {
+                std::vector<int> chunk(
+                    tokenIds.begin() + offset,
+                    tokenIds.begin() + offset + count);
+                DeepSeekV4DsparkTargetCapture capture;
+                std::vector<int> chunkResult = RunDsparkTarget(
+                    chunk, context.committedTokens, pastKeyValues,
+                    generationConfig, lastTokens,
+                    finalChunk ? retLogits : nullptr, &capture);
+                AppendDsparkTargetHidden(capture, count, context);
+                context.historyTokens.insert(
+                    context.historyTokens.end(), chunk.begin(), chunk.end());
+                context.initialized = true;
+                publishPromptSnapshot();
+                return chunkResult;
+            };
+
+            // Chat templates usually replace the previous request's final
+            // assistant-generation marker, so a snapshot keyed only by the
+            // complete prompt often misses on the next turn.  Materialize the
+            // last shared 256-token page boundary with synchronized DSpark
+            // state, then finish the short tail.  This keeps DSpark hidden
+            // capture complete for each target invocation and gives the next
+            // request a stable Qwen-style page prefix to match.
+            const int finalPromptLen = targetStart + (int)tokenIds.size();
+            const int pageSize =
+                this->deepseekV4HistoryCacheManager.logicalBlockSize;
+            const int lastPageBoundary = finalPromptLen / pageSize * pageSize;
+            const int firstChunkTokens = lastPageBoundary - targetStart;
+            std::vector<int> result;
+            if (prefixCacheEnabled && firstChunkTokens > 0 &&
+                firstChunkTokens < (int)tokenIds.size()) {
+                runPrefillChunk(0, firstChunkTokens, false);
+                result = runPrefillChunk(
+                    firstChunkTokens,
+                    (int)tokenIds.size() - firstChunkTokens, true);
+            } else {
+                result = runPrefillChunk(
+                    0, (int)tokenIds.size(), true);
+            }
             AssertInFastLLM(result.size() == 1,
                             "DSpark target prefill sampling failed.");
             return result[0];
@@ -9279,7 +9465,8 @@ namespace fastllm {
             requestState == nullptr ? &this->deepseekV4HistoryTokens : &requestState->historyTokens;
         auto &activeDecodeLayerCaches = *decodeCachesPtr;
         auto &activeHistoryTokens = *historyTokensPtr;
-        if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+        if (!this->dsparkEnabled && this->saveHistoryChat &&
+            !DeepSeekV4PrefixCacheDisabled() &&
             batch == 1 && inputIds.dims.size() >= 2 && inputIds.dims[1] > 1 &&
             !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DISABLE_CHUNK_SPLIT")) {
             int seq = inputIds.dims[1];
@@ -9471,7 +9658,6 @@ namespace fastllm {
         if (graphRequested && batch == 1 && graphSequenceSupported &&
             seqlen + 1 <= kDeepSeekV4CudaGraphMetaInts &&
             originalStartPos > 0 && useDecodeCache &&
-            (!this->saveHistoryChat || DeepSeekV4PrefixCacheDisabled()) &&
             DeepSeekV4PreferCuda() &&
             (int)activeDecodeLayerCaches.size() == block_cnt) {
             std::shared_ptr<void> &graphSlot = requestState != nullptr ?
@@ -11641,7 +11827,8 @@ namespace fastllm {
 
         int finalTotalLen = originalStartPos + inputIds.dims[1];
         UpdateDebugPastKeyValues(pastKeyValues, bsz, finalTotalLen, block_cnt);
-        if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+        if (!this->dsparkEnabled && this->saveHistoryChat &&
+            !DeepSeekV4PrefixCacheDisabled() &&
             batch == 1 && finalTotalLen % 256 == 0 &&
             (int)activeHistoryTokens.size() >= finalTotalLen) {
 #ifdef USE_CUDA
@@ -11652,11 +11839,19 @@ namespace fastllm {
             SynchronizeDeepSeekV4TensorParallelDevices(this->deviceMap);
 #endif
             this->RecordHistorySnapshot(activeHistoryTokens, finalTotalLen, activeDecodeLayerCaches);
-        } else if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+        } else if (!this->dsparkEnabled && this->saveHistoryChat &&
+                   !DeepSeekV4PrefixCacheDisabled() &&
                    batch == 1 && finalTotalLen % 256 == 0 && DeepSeekV4PrefixCacheDebugEnabled()) {
             printf("[fastllm-dsv4-prefix-cache] skip boundary record: final_len=%d history_tokens=%d\n",
                    finalTotalLen, (int)activeHistoryTokens.size());
             fflush(stdout);
+        }
+        if (requestState != nullptr && requestState->restoredHistoryCache &&
+            originalStartPos > 0) {
+            // Restore-specific raw-tail rebuilding is required only for the
+            // first suffix.  Leaving the flag set makes every DSpark verifier
+            // chunk take the expensive restored-prefill synchronization path.
+            requestState->restoredHistoryCache = false;
         }
         return ret;
     }

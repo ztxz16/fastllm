@@ -520,6 +520,53 @@ namespace {
 #endif
     }
 
+    void RunDeepSeekV4DsparkPrefixSelectionRegression() {
+        fastllm::DeepSeekV4HistoryCacheManager manager;
+        std::vector<int> input(700);
+        for (int i = 0; i < (int)input.size(); ++i) {
+            input[i] = (i * 37 + 11) % 32000;
+        }
+        auto prefixHash = [&](int tokens) {
+            uint64_t hash = 1469598103934665603ULL;
+            auto mix = [&](uint64_t value) {
+                hash ^= value + 0x9e3779b97f4a7c15ULL +
+                        (hash << 6) + (hash >> 2);
+                hash *= 1099511628211ULL;
+            };
+            mix((uint64_t)manager.logicalBlockSize);
+            for (int i = 0; i < tokens; ++i) {
+                mix((uint64_t)(uint32_t)input[i]);
+                if ((i + 1) % manager.logicalBlockSize == 0) {
+                    mix(0xff51afd7ed558ccdULL ^
+                        (uint64_t)((i + 1) / manager.logicalBlockSize));
+                }
+            }
+            return hash;
+        };
+
+        auto makeMemory = [&](int tokens, bool dsparkValid) {
+            fastllm::DeepSeekV4HistoryCacheMemory memory;
+            memory.tokens = tokens;
+            memory.blockCount = tokens / manager.logicalBlockSize;
+            memory.inputToken.assign(input.begin(), input.begin() + tokens);
+            memory.blockHash = prefixHash(tokens);
+            memory.layers.resize(1);
+            memory.dsparkValid = dsparkValid;
+            memory.dsparkCommittedTokens = dsparkValid ? tokens : 0;
+            return memory;
+        };
+
+        manager.Record(makeMemory(256, true));
+        manager.Record(makeMemory(512, false));
+        fastllm::DeepSeekV4HistoryCacheMemory hit;
+        int hitLen = 0;
+        Expect(manager.Get(input, hit, hitLen, false) && hitLen == 512,
+               "DeepSeek-V4 target prefix lookup did not choose the longest snapshot.");
+        Expect(manager.Get(input, hit, hitLen, true) && hitLen == 256 &&
+                   hit.dsparkValid,
+               "DeepSeek-V4 DSpark prefix lookup reused a target-only snapshot.");
+    }
+
 #ifdef USE_CUDA
     void RunCudaGreedyTieBreakRegression() {
         constexpr int vocabSize = 32768;
@@ -3277,16 +3324,15 @@ namespace {
                "DeepSeek-V4 prefix snapshot leaked its last CUDA device");
         Expect(snapshot.windowKV.dataDevice == fastllm::DataDevice::CPU &&
                    !snapshot.windowKV.multiDeviceData &&
-                   snapshot.windowKV.expansionDims ==
-                       source.windowKV.multiDeviceDatas.at(0)->expansionDims &&
-                   snapshot.windowKV.strides ==
-                       source.windowKV.multiDeviceDatas.at(0)->strides &&
+                   snapshot.windowKV.expansionDims.empty() &&
                    snapshot.windowKV.expansionBytes >=
-                       source.windowKV.multiDeviceDatas.at(0)->GetBytes(),
-               "DeepSeek-V4 expanded prefix snapshot did not retain one CPU cache copy");
+                       snapshot.windowKV.GetBytes() &&
+                   snapshot.windowKV.expansionBytes <
+                       source.windowKV.multiDeviceDatas.at(0)->expansionBytes,
+               "DeepSeek-V4 prefix snapshot retained CUDA graph reserve capacity");
         FastllmCudaSetDevice(0);
-        ExpectFloatNear(ToFloatVector(*source.windowKV.multiDeviceDatas.at(0)),
-                        ToFloatVector(snapshot.windowKV), 0.0f, 0.0f,
+        ExpectFloatNear(values, ToFloatVector(snapshot.windowKV),
+                        0.0f, 0.0f,
                         "DeepSeek-V4 expanded prefix snapshot payload");
 
         // A restored CPU snapshot has one physical GPU allocation but retains
@@ -7492,6 +7538,9 @@ int main() {
 
         RunPerRequestMinOutputLengthRegression();
         std::cout << "per-request minimum output length regression: PASS\n";
+
+        RunDeepSeekV4DsparkPrefixSelectionRegression();
+        std::cout << "DeepSeek-V4 DSpark prefix selection regression: PASS\n";
 
         RunYarnRopeEncodingRegression();
         std::cout << "direct YaRN RoPE cached-reference regression: PASS\n";
