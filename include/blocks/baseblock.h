@@ -125,7 +125,8 @@ namespace fastllm {
         MoeGateType gateType = MoeGateSwiglu,
         bool expertParallel = false,
         float swigluLimit = 0.0f,
-        bool deepSeekV4Mode = false
+        bool deepSeekV4Mode = false,
+        Data *pairedReduceInput = nullptr
     );
 
     class basellm;

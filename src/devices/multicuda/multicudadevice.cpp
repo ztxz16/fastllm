@@ -4683,15 +4683,17 @@ namespace fastllm {
         return true;
     }
 
-    static bool RunMultiCudaColumnLinear(Data &input, Data &weight, Data &bias, Data &output,
-                                         bool keepTpReplicated = false) {
+    static bool RunMultiCudaColumnLinear(Data &input, Data &weight, Data &bias,
+                                         Data &output,
+                                         bool keepTpReplicated = false,
+                                         bool deferReduction = false) {
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
         if (devices.size() <= 1 || !input.IsTensorParallelSharded()) {
             return false;
         }
-        bool useNccl = FastllmInitNccl(devices);
+        bool useNccl = !deferReduction && FastllmInitNccl(devices);
         if (const char *disableNccl = getenv("FASTLLM_DISABLE_NCCL")) {
             if (strcmp(disableNccl, "1") == 0 || strcasecmp(disableNccl, "true") == 0) {
                 useNccl = false;
@@ -4718,10 +4720,14 @@ namespace fastllm {
         }
         RunMultiCudaDeviceOpsAndDelete(devices, ops);
 
-        if (!useNccl) {
+        if (!useNccl && !deferReduction) {
             ReduceReplicatedOutputOnRoot(output, devices);
         }
-        if (keepTpReplicated) {
+        if (deferReduction) {
+            // Values intentionally differ by rank until a following paired
+            // collective consumes them; only publish root shape/layout here.
+            SyncReplicatedRootMetaFromDevice0(output, devices);
+        } else if (keepTpReplicated) {
             if (multiCudaPersistentAsyncDispatch) {
                 SyncReplicatedRootMetaFromDevice0(output, devices);
             } else {
@@ -4737,6 +4743,12 @@ namespace fastllm {
 
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output) {
         return RunMultiCudaColumnLinear(input, weight, bias, output);
+    }
+
+    bool MultiCudaLinearColumnLocal(Data &input, Data &weight, Data &bias,
+                                    Data &output) {
+        return RunMultiCudaColumnLinear(
+            input, weight, bias, output, false, true);
     }
 
     bool MultiCudaLinearOp::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
@@ -5501,6 +5513,7 @@ auto st = std::chrono::system_clock::now();
         float sharedScale;
         float swigluLimit;
         Data *output;
+        Data *pairedReduceInput;
         int rootDeviceId;
         int deviceId;
         size_t partOutputBytes;
@@ -5531,12 +5544,14 @@ auto st = std::chrono::system_clock::now();
                 bool gpuExpertRoute = false, Data *broadcastIndexSource = nullptr,
                 Data *broadcastScoreSource = nullptr,
                 int expertOwnerRank = -1, int expertOwnerCount = 0,
-                Data *persistentRoutePacket = nullptr, void *inputReadyEvent = nullptr) :
+                Data *persistentRoutePacket = nullptr, void *inputReadyEvent = nullptr,
+                Data *pairedReduceInput = nullptr) :
                 partOutput(partOutput),
                 input(input), weights(weights), index(index), score(score), 
                 w1(w1), w2(w2), w3(w3),
                 wBatch(wBatch), sharedScale(sharedScale), swigluLimit(0.0f),
-                output(output), rootDeviceId(rootDeviceId), deviceId(deviceId),
+                output(output), pairedReduceInput(pairedReduceInput),
+                rootDeviceId(rootDeviceId), deviceId(deviceId),
                 partOutputBytes(partOutputBytes), doNcclReduce(doNcclReduce),
                 expertParallel(expertParallel), reduceToRoot(reduceToRoot),
                 broadcastSource(broadcastSource), preparedHostIndex(preparedHostIndex),
@@ -5902,6 +5917,34 @@ auto st = std::chrono::system_clock::now();
             }
 
             if (doNcclReduce) {
+                if (pairedReduceInput != nullptr) {
+                    AssertInFastLLM(
+                        !reduceToRoot &&
+                        pairedReduceInput->dataType == output->dataType &&
+                        pairedReduceInput->Count(0) == output->Count(0) &&
+                        pairedReduceInput->cudaData != nullptr,
+                        "Paired MoE reduction received incompatible local tensors.\n");
+                    if (FastllmCudaCustomAllReducePairAdd(
+                            output->cudaData, pairedReduceInput->cudaData,
+                            output->cudaData, output->Count(0),
+                            output->dataType, deviceId)) {
+                        return;
+                    }
+
+                    // Exact fallback: preserve the established collective and
+                    // rounding order when peer-access custom AR is disabled or
+                    // unavailable on this topology.
+                    FastllmNcclAllReduce(
+                        pairedReduceInput->cudaData,
+                        pairedReduceInput->cudaData,
+                        pairedReduceInput->Count(0),
+                        pairedReduceInput->dataType, deviceId);
+                    FastllmNcclAllReduce(
+                        output->cudaData, output->cudaData,
+                        output->Count(0), output->dataType, deviceId);
+                    FastllmCudaAddTo(*output, *pairedReduceInput, 1.0f);
+                    return;
+                }
                 if (reduceToRoot) {
                     FastllmNcclReduce(output->cudaData, output->cudaData, output->Count(0),
                                       output->dataType, rootDeviceId, deviceId);
@@ -6083,6 +6126,11 @@ auto st = std::chrono::system_clock::now();
         Data &w1 = *(datas.find("w1")->second);
         Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
+        Data *pairedReduceInput = nullptr;
+        auto pairedReduceIt = datas.find("pairedReduceInput");
+        if (pairedReduceIt != datas.end()) {
+            pairedReduceInput = pairedReduceIt->second;
+        }
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
@@ -6439,12 +6487,26 @@ auto st = std::chrono::system_clock::now();
         if (useNcclReduce) {
             useNcclReduce = FastllmInitNccl(devices);
         }
+        AssertInFastLLM(
+            pairedReduceInput == nullptr || useNcclReduce,
+            "Paired MoE reduction requires CUDA TP collectives.\n");
 
         if (useNcclReduce) {
             output.dataDevice = DataDevice::CUDA;
             output.dataDeviceIds = devices.empty() ? std::vector <int>() : std::vector <int> {devices[0]};
             EnsureReplicatedMultiCudaTensor(output, devices, false);
             SyncReplicatedLocalShapeFromRoot(output, devices);
+            if (pairedReduceInput != nullptr) {
+                AssertInFastLLM(
+                    !useExpertParallel &&
+                    pairedReduceInput->multiDeviceData &&
+                    pairedReduceInput->IsTensorParallelReplicated() &&
+                    pairedReduceInput->dataType == output.dataType &&
+                    pairedReduceInput->dims == output.dims,
+                    "Paired MoE reduction requires matching TP-local shared partials.\n");
+                SyncReplicatedLocalShapeFromRoot(
+                    *pairedReduceInput, devices);
+            }
 
             std::vector<fastllm::MultiThreadBaseOp*> ops;
             int rootDeviceId = devices.empty() ? 0 : devices[0];
@@ -6457,12 +6519,15 @@ auto st = std::chrono::system_clock::now();
                     index.multiDeviceDatas[device], score.multiDeviceDatas[device],
                     w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
                     wBatch, sharedScale,
-                    output.multiDeviceDatas[device], rootDeviceId, device, outputBytes, true, useExpertParallel
+                    output.multiDeviceDatas[device], rootDeviceId, device,
+                    outputBytes, true, useExpertParallel
                 );
                 op->gateType = gateType;
                 op->swigluLimit = swigluLimit;
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
+                op->pairedReduceInput = pairedReduceInput == nullptr ? nullptr :
+                    pairedReduceInput->multiDeviceDatas[device];
                 ops.push_back(op);
             }
             RunMultiCudaDeviceOpsAndDelete(devices, ops);

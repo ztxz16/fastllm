@@ -365,6 +365,150 @@ __device__ __forceinline__ float CustomArAdd(float a, float b) {
     return a + b;
 }
 
+// Reduce the routed and shared-expert partials independently, including the
+// destination-type rounding boundary of each collective, and only then add
+// them.  A rank-local pre-add would instead round before the cross-rank sum and
+// changes DeepSeek-V4 target logits.
+template <typename T, int Ranks>
+__global__ __launch_bounds__(kCustomArThreads, 1)
+void FastllmCustomAllReducePairAddKernel(
+        CustomArRankData *firstRankData,
+        CustomArRankData *secondRankData,
+        CustomArRankSignals allSignals,
+        CustomArSignal *selfSignal,
+        CustomArRankScratch allScratch,
+        T *__restrict__ output,
+        int rank, int packedCount) {
+    using P = typename CustomArPacked<T>::P;
+    using A = typename CustomArPacked<T>::A;
+    CustomArRankData firstPointers = *firstRankData;
+    CustomArRankData secondPointers = *secondRankData;
+    P *localScratch = reinterpret_cast<P *>(allScratch.scratch[rank]);
+    const int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+
+    CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
+    for (int index = thread; index < packedCount; index += stride) {
+        P firstValue =
+            reinterpret_cast<const P *>(firstPointers.ptrs[0])[index];
+        P secondValue =
+            reinterpret_cast<const P *>(secondPointers.ptrs[0])[index];
+        A firstSum;
+        A secondSum;
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            firstSum.data[item] = CustomArUpcast(firstValue.data[item]);
+            secondSum.data[item] = CustomArUpcast(secondValue.data[item]);
+        }
+#pragma unroll
+        for (int peer = 1; peer < Ranks; ++peer) {
+            firstValue =
+                reinterpret_cast<const P *>(firstPointers.ptrs[peer])[index];
+            secondValue =
+                reinterpret_cast<const P *>(secondPointers.ptrs[peer])[index];
+#pragma unroll
+            for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+                firstSum.data[item] += CustomArUpcast(firstValue.data[item]);
+                secondSum.data[item] += CustomArUpcast(secondValue.data[item]);
+            }
+        }
+        P result;
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            const T firstRounded =
+                CustomArDowncast<T>(firstSum.data[item]);
+            const T secondRounded =
+                CustomArDowncast<T>(secondSum.data[item]);
+            result.data[item] = CustomArAdd(firstRounded, secondRounded);
+        }
+        localScratch[index] = result;
+    }
+
+    // All peers must finish reading both source tensors before an in-place
+    // destination may overwrite the first source.
+    CustomArBarrierFinal<Ranks>(allSignals, selfSignal, rank);
+    __syncthreads();
+    P *packedOutput = reinterpret_cast<P *>(output);
+    for (int index = thread; index < packedCount; index += stride) {
+        packedOutput[index] = localScratch[index];
+    }
+}
+
+template <typename T, int Ranks>
+__global__ __launch_bounds__(kCustomArThreads, 1)
+void FastllmCustomAllReducePairAddTwoStageKernel(
+        CustomArRankData *firstRankData,
+        CustomArRankData *secondRankData,
+        CustomArRankSignals allSignals,
+        CustomArSignal *selfSignal,
+        CustomArRankScratch allScratch,
+        T *__restrict__ output,
+        int rank, int packedCount) {
+    using P = typename CustomArPacked<T>::P;
+    using A = typename CustomArPacked<T>::A;
+    CustomArRankData firstPointers = *firstRankData;
+    CustomArRankData secondPointers = *secondRankData;
+    P *localScratch = reinterpret_cast<P *>(allScratch.scratch[rank]);
+    const int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    const int part = packedCount / Ranks;
+    const int localStart = rank * part;
+    const int localEnd = rank == Ranks - 1 ? packedCount : localStart + part;
+    const int largestPart = part + packedCount % Ranks;
+
+    CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
+    for (int index = localStart + thread; index < localEnd; index += stride) {
+        P firstValue =
+            reinterpret_cast<const P *>(firstPointers.ptrs[0])[index];
+        P secondValue =
+            reinterpret_cast<const P *>(secondPointers.ptrs[0])[index];
+        A firstSum;
+        A secondSum;
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            firstSum.data[item] = CustomArUpcast(firstValue.data[item]);
+            secondSum.data[item] = CustomArUpcast(secondValue.data[item]);
+        }
+#pragma unroll
+        for (int peer = 1; peer < Ranks; ++peer) {
+            firstValue =
+                reinterpret_cast<const P *>(firstPointers.ptrs[peer])[index];
+            secondValue =
+                reinterpret_cast<const P *>(secondPointers.ptrs[peer])[index];
+#pragma unroll
+            for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+                firstSum.data[item] += CustomArUpcast(firstValue.data[item]);
+                secondSum.data[item] += CustomArUpcast(secondValue.data[item]);
+            }
+        }
+        P result;
+#pragma unroll
+        for (int item = 0; item < CustomArPacked<T>::size; ++item) {
+            const T firstRounded =
+                CustomArDowncast<T>(firstSum.data[item]);
+            const T secondRounded =
+                CustomArDowncast<T>(secondSum.data[item]);
+            result.data[item] = CustomArAdd(firstRounded, secondRounded);
+        }
+        localScratch[index - localStart] = result;
+    }
+
+    CustomArBarrierPublish<Ranks>(allSignals, selfSignal, rank);
+    P *packedOutput = reinterpret_cast<P *>(output);
+    for (int offset = thread; offset < largestPart; offset += stride) {
+#pragma unroll
+        for (int source = 0; source < Ranks; ++source) {
+            const int sourceCount = source == Ranks - 1
+                ? packedCount - source * part : part;
+            if (offset < sourceCount) {
+                const P *sourceScratch =
+                    reinterpret_cast<const P *>(allScratch.scratch[source]);
+                packedOutput[source * part + offset] = sourceScratch[offset];
+            }
+        }
+    }
+}
+
 // Qwen's tensor-parallel row projections reduce a rank-local partial and then
 // add a replicated residual. Folding both operations into the direct-read
 // kernel removes the rank-0 add/rank-1 copy, in-place scratch output and
@@ -671,6 +815,61 @@ bool LaunchCustomArAdd(CustomArState &state, CustomArRankData *rankData,
     return true;
 }
 
+template <typename T>
+bool LaunchCustomArPairAdd(CustomArState &state,
+                           CustomArRankData *firstRankData,
+                           CustomArRankData *secondRankData,
+                           T *output, int rank, int count) {
+    constexpr int packedWidth = CustomArPacked<T>::size;
+    const int packedCount = count / packedWidth;
+    const size_t bytes = (size_t)count * sizeof(T);
+    const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
+    const int ranks = (int)state.devices.size();
+    const int workPackedCount = useTwoStage
+        ? packedCount / ranks + packedCount % ranks
+        : packedCount;
+    const int blocks = std::max(
+        1, std::min(kCustomArMaxBlocks,
+                    (workPackedCount + kCustomArThreads - 1) /
+                        kCustomArThreads));
+#define CUSTOM_AR_PAIR_RANK_CASE(RANKS)                              \
+    case RANKS:                                                      \
+        if (useTwoStage) {                                           \
+            FastllmCustomAllReducePairAddTwoStageKernel<T, RANKS>    \
+                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(\
+                    firstRankData, secondRankData, state.allSignals, \
+                    state.allSignals.signals[rank], state.allScratch,\
+                    output, rank, packedCount);                      \
+        } else {                                                     \
+            FastllmCustomAllReducePairAddKernel<T, RANKS>            \
+                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(\
+                    firstRankData, secondRankData, state.allSignals, \
+                    state.allSignals.signals[rank], state.allScratch,\
+                    output, rank, packedCount);                      \
+        }                                                            \
+        break
+    switch (state.devices.size()) {
+        CUSTOM_AR_PAIR_RANK_CASE(2);
+        CUSTOM_AR_PAIR_RANK_CASE(4);
+        CUSTOM_AR_PAIR_RANK_CASE(6);
+        CUSTOM_AR_PAIR_RANK_CASE(8);
+        default:
+            return false;
+    }
+#undef CUSTOM_AR_PAIR_RANK_CASE
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr,
+                     "[Fastllm] paired custom all-reduce-add launch failed "
+                     "on GPU %d: %s.\n",
+                     state.devices[rank], cudaGetErrorString(launchState));
+        std::fflush(stderr);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool FastllmCudaCustomAllReduceEnabled() {
@@ -850,6 +1049,59 @@ bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
         }
     }
     return true;
+}
+
+bool FastllmCudaCustomAllReducePairAdd(void *first, void *second, void *dest,
+                                      int count, int dataType, int deviceId) {
+    if (!CustomArEnabledByEnv() || first == nullptr || second == nullptr ||
+        dest == nullptr || count <= 0) {
+        return false;
+    }
+    const size_t typeBytes = CustomArTypeBytes(dataType);
+    const size_t bytes = (size_t)count * typeBytes;
+    if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
+        bytes % 16 != 0) {
+        return false;
+    }
+
+    CustomArState &state = GetCustomArState();
+    int rank = -1;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!state.initialized) {
+            return false;
+        }
+        auto rankIt = state.rankByDevice.find(deviceId);
+        if (rankIt == state.rankByDevice.end()) {
+            return false;
+        }
+        rank = rankIt->second;
+    }
+
+    CustomArRankData *firstRankData = nullptr;
+    CustomArRankData *secondRankData = nullptr;
+    if (!FindOrRegisterCustomArPointers(
+            state, rank, first, count, dataType, firstRankData) ||
+        !FindOrRegisterCustomArPointers(
+            state, rank, second, count, dataType, secondRankData)) {
+        return false;
+    }
+    if (dataType == fastllm::DataType::FLOAT16) {
+        return LaunchCustomArPairAdd(
+            state, firstRankData, secondRankData,
+            reinterpret_cast<half *>(dest), rank, count);
+    }
+    if (dataType == fastllm::DataType::BFLOAT16) {
+        return LaunchCustomArPairAdd(
+            state, firstRankData, secondRankData,
+            reinterpret_cast<__nv_bfloat16 *>(dest), rank, count);
+    }
+    if (dataType == fastllm::DataType::FLOAT32) {
+        return LaunchCustomArPairAdd(
+            state, firstRankData, secondRankData,
+            reinterpret_cast<float *>(dest), rank, count);
+    }
+    return false;
 }
 
 bool FastllmCudaCustomAllReduceAdd(void *data, void *dest, int count,

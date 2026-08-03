@@ -121,6 +121,25 @@ namespace fastllm {
             return !(s.empty() || s == "0" || s == "false" || s == "off" || s == "no");
         }
 
+        static bool DeepSeekV4PairedAllReduceEnabled() {
+#ifdef USE_CUDA
+            return FastllmCudaCustomAllReduceEnabled() &&
+                   !EnvFlagEnabled(
+                       "FASTLLM_DSV4_DISABLE_PAIRED_ALLREDUCE");
+#else
+            return false;
+#endif
+        }
+
+        static bool DeepSeekV4LinearColumnLocal(
+                Data &input, Data &weight, Data &bias, Data &output) {
+#ifdef USE_CUDA
+            return MultiCudaLinearColumnLocal(input, weight, bias, output);
+#else
+            return false;
+#endif
+        }
+
         static void PrepareDeepSeekV4SamplingConfig(GenerationConfig &config) {
             // top_k=1 is the public greedy default. Only widen it for an
             // explicitly sampled request; otherwise batch decode would turn a
@@ -7422,6 +7441,8 @@ namespace fastllm {
 
             std::vector<Data*> moeWeights = dsparkWeights[stage];
             bool hasSharedExpertOut = false;
+            const bool routedTensorParallel =
+                this->UseTensorParallelRoutedExperts();
             auto sharedGateupIt = weight.weight.find(
                 pre + ".ffn.shared_experts.gateup.weight");
             auto sharedDownIt = weight.weight.find(
@@ -7437,16 +7458,19 @@ namespace fastllm {
                 LinearSwigluBlock(
                     &ffnInput, &sharedGateupIt->second, GetEmptyData(),
                     &sharedW3, &sharedW1);
+                // Draft stages stay byte-for-byte on the established two
+                // collectives.  The paired reduction targets M=8 validation,
+                // where the saved collective is material; changing draft
+                // launch timing can otherwise perturb proposal acceptance even
+                // when the arithmetic itself is identical.
                 DeepSeekV4Linear(
                     sharedW1, sharedDownIt->second, *GetEmptyData(),
                     sharedExpertOut);
-                moeWeights[0] = moeWeights[1] = nullptr;
                 hasSharedExpertOut = true;
+                moeWeights[0] = moeWeights[1] = nullptr;
             }
 
             this->ApplyMoeDeviceMapForLayer(layerId);
-            const bool routedTensorParallel =
-                this->UseTensorParallelRoutedExperts();
             const bool routedExpertParallel =
                 !routedTensorParallel && DeepSeekV4DeviceSpecUsesType(
                     this->SelectMoeDeviceForLayer(layerId), "multicuda");
@@ -10883,6 +10907,7 @@ namespace fastllm {
                 // MOE
                 bool hasSharedExpertOut = false;
                 bool fuseSharedExpert = false;
+                Data *pairedReduceInput = nullptr;
                 std::vector<Data*> moeWeights = weights[layer];
                 auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
                 auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
@@ -10955,12 +10980,11 @@ namespace fastllm {
                             (ffnInput.dims[0] == 1 ||
                              dsparkGraphVerification);
                         // The expert-parallel path owns a complete routed
-                        // expert partial per rank, so it can safely fold the
-                        // local shared-expert shard into the same reduction.
-                        // Tensor parallel reduces a different intermediate
-                        // partitioning contract; folding the shared partial
-                        // there changes target logits.  Keep TP on the
-                        // separately validated shared-expert reduction.
+                        // expert partial per rank, so it can safely pre-add the
+                        // local shared shard.  Tensor parallel must instead
+                        // preserve two independent rank-ordered FP32 sums and
+                        // their BF16 rounding boundaries; the M=8 verifier uses
+                        // the paired collective below for that exact contract.
                         fuseSharedExpert =
                             routedExpertParallel && fuseSharedExpertRows;
                         if (!fuseSharedExpert) {
@@ -10973,10 +10997,24 @@ namespace fastllm {
                             }
                             LinearSwigluBlock(sharedInputPtr, &sharedGateupIt->second, GetEmptyData(),
                                               &sharedW3, &sharedW1);
-                            DeepSeekV4Linear(sharedW1, sharedDownIt->second, *GetEmptyData(),
-                                             sharedExpertOut);
+                            const bool pairSharedReduction =
+                                routedTensorParallel &&
+                                dsparkGraphVerification &&
+                                DeepSeekV4PairedAllReduceEnabled();
+                            if (pairSharedReduction) {
+                                AssertInFastLLM(
+                                    DeepSeekV4LinearColumnLocal(
+                                        sharedW1, sharedDownIt->second,
+                                        *GetEmptyData(), sharedExpertOut),
+                                    "DeepSeek-V4 failed to defer the shared-expert TP reduction.\n");
+                                pairedReduceInput = &sharedExpertOut;
+                            } else {
+                                DeepSeekV4Linear(
+                                    sharedW1, sharedDownIt->second,
+                                    *GetEmptyData(), sharedExpertOut);
+                                hasSharedExpertOut = true;
+                            }
                             moeWeights[0] = moeWeights[1] = nullptr;
-                            hasSharedExpertOut = true;
                         }
                     }
                 }
@@ -10998,7 +11036,8 @@ namespace fastllm {
                                   ffnInput.dataType, effectiveMoeAtype,
                                   &moeInputTemp, &moeOutputTemp,
                                   MoeGateSwiglu, routedExpertParallel,
-                                  swiglu_limit, true);
+                                  swiglu_limit, true,
+                                  pairedReduceInput);
                     ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 }
 #ifdef USE_CUDA

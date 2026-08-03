@@ -30,6 +30,13 @@ bool FastllmCudaCustomAllReduceEnabled();
 bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// Reduces two independent rank-local tensors, rounds each reduction to the
+// destination type, then adds the rounded values into dest.  Keeping the two
+// reduction accumulators separate preserves the result of
+// Add(allreduce(first), allreduce(second)); this is not equivalent to reducing
+// rank-local pre-added partials for FLOAT16/BFLOAT16.
+bool FastllmCudaCustomAllReducePairAdd(void* first, void* second, void* dest,
+                                      int count, int dataType, int deviceId);
 // TP=2 graph-safe fused residual path: dest = allreduce(data) + dest.
 // Returns false without modifying dest when the topology/type is unsupported.
 bool FastllmCudaCustomAllReduceAdd(void* data, void* dest, int count,
@@ -97,6 +104,11 @@ namespace fastllm {
 
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
+    // Computes the rank-local column-linear partials without reducing them.
+    // The returned tensor temporarily uses replicated storage so a following
+    // fused collective can consume one partial from every device.
+    bool MultiCudaLinearColumnLocal(Data &input, Data &weight, Data &bias,
+                                    Data &output);
 
     // 将常驻 MultiCUDA worker 的 per-thread stream 接入/并回调用线程正在捕获的
     // 每卡 CUDA Graph。events 必须与 devices 一一对应并归属相同设备。
