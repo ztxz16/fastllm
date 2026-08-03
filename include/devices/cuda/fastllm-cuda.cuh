@@ -660,6 +660,9 @@ bool FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
                                                       int betaSlow,
                                                       fastllm::Data &indices,
                                                       fastllm::Data &lengths);
+size_t FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
+                                                      int seqlen, int heads,
+                                                      int compressRatio);
 bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                                       const fastllm::Data &q,
                                                       const fastllm::Data &windowKV,
@@ -668,6 +671,7 @@ bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                                       const fastllm::Data *compressedLengths,
                                                       fastllm::Data &packedWindowKV,
                                                       fastllm::Data &packedCompressedKV,
+                                                      fastllm::Data *scratch,
                                                       fastllm::Data &attnSink,
                                                       int windowSize, int compressRatio,
                                                       const int32_t *decodeMeta,

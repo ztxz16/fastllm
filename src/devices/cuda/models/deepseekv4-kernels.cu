@@ -7913,6 +7913,50 @@ extern "C" bool FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
     return ok;
 }
 
+extern "C" size_t
+FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
+        int seqlen, int heads, int compressRatio) {
+#ifndef FASTLLM_ENABLE_DSV4_SPARSE_MLA_SM120
+    (void)seqlen;
+    (void)heads;
+    (void)compressRatio;
+    return 0;
+#else
+    if (seqlen <= 0 || seqlen > 64 || heads <= 0 || heads > 128 ||
+        (compressRatio != 0 && compressRatio != 4 &&
+         compressRatio != 128)) {
+        return 0;
+    }
+    constexpr int mainTopk = 128;
+    const int extraTopk = compressRatio > 0 ? 512 : 0;
+    const int numSplits = 2 + (extraTopk > 0 ? 8 : 0);
+    auto align256 = [](size_t value) {
+        return (value + 255) & ~(size_t)255;
+    };
+    const size_t mainIndicesBytes =
+        (size_t)seqlen * mainTopk * sizeof(int32_t);
+    const size_t mainLengthsBytes = (size_t)seqlen * sizeof(int);
+    const size_t extraIndicesBytes =
+        (size_t)seqlen * extraTopk * sizeof(int32_t);
+    const size_t extraLengthsBytes = extraTopk > 0 ?
+        (size_t)seqlen * sizeof(int) : 0;
+    const size_t midOutBytes =
+        (size_t)seqlen * heads * numSplits *
+        kDeepSeekV4SparseMlaHeadDim * sizeof(__nv_bfloat16);
+    const size_t midLseBytes =
+        (size_t)seqlen * heads * numSplits * sizeof(float);
+    const size_t mainLengthsOffset = align256(mainIndicesBytes);
+    const size_t extraIndicesOffset =
+        align256(mainLengthsOffset + mainLengthsBytes);
+    const size_t extraLengthsOffset =
+        align256(extraIndicesOffset + extraIndicesBytes);
+    const size_t midOutOffset =
+        align256(extraLengthsOffset + extraLengthsBytes);
+    const size_t midLseOffset = align256(midOutOffset + midOutBytes);
+    return align256(midLseOffset + midLseBytes);
+#endif
+}
+
 extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                                         const fastllm::Data &q,
                                                         const fastllm::Data &windowKV,
@@ -7921,6 +7965,7 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                                         const fastllm::Data *compressedLengths,
                                                         fastllm::Data &packedWindowKV,
                                                         fastllm::Data &packedCompressedKV,
+                                                        fastllm::Data *scratchWorkspace,
                                                         fastllm::Data &attnSink,
                                                         int windowSize, int compressRatio,
                                                         const int32_t *decodeMeta,
@@ -7931,7 +7976,7 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                                         fastllm::Data &output) {
 #ifndef FASTLLM_ENABLE_DSV4_SPARSE_MLA_SM120
     (void)q; (void)windowKV; (void)compressedKV; (void)packedWindowKV;
-    (void)compressedIndices; (void)compressedLengths;
+    (void)compressedIndices; (void)compressedLengths; (void)scratchWorkspace;
     (void)packedCompressedKV; (void)attnSink; (void)windowSize;
     (void)compressRatio; (void)decodeMeta; (void)ropeDim; (void)ropeBase;
     (void)originalSeqLen; (void)ropeFactor; (void)betaFast; (void)betaSlow;
@@ -8055,8 +8100,25 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
     size_t midOutOffset =
         align256(extraLengthsOffset + extraLengthsBytes);
     size_t midLseOffset = align256(midOutOffset + midOutBytes);
-    size_t scratchBytes = align256(midLseOffset + midLseBytes);
-    uint8_t *scratch = (uint8_t *)FastllmCudaMalloc(scratchBytes);
+    size_t scratchBytes =
+        FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
+            seqlen, heads, compressRatio);
+    if (scratchBytes == 0 ||
+        scratchBytes != align256(midLseOffset + midLseBytes)) {
+        return false;
+    }
+    const bool ownsScratch = scratchWorkspace == nullptr;
+    if (!ownsScratch &&
+        (scratchWorkspace->dataDevice != fastllm::DataDevice::CUDA ||
+         scratchWorkspace->dataType != fastllm::DataType::INT8 ||
+         scratchWorkspace->cudaData == nullptr ||
+         scratchWorkspace->Count(0) < scratchBytes ||
+         GetPointerDeviceId(scratchWorkspace->cudaData) != device)) {
+        return false;
+    }
+    uint8_t *scratch = ownsScratch ?
+        (uint8_t *)FastllmCudaMalloc(scratchBytes) :
+        (uint8_t *)scratchWorkspace->cudaData;
     if (scratch == nullptr) {
         return false;
     }
@@ -8100,7 +8162,9 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
             heads, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
         DeviceSync();
     }
-    FastllmCudaFree(scratch);
+    if (ownsScratch) {
+        FastllmCudaFree(scratch);
+    }
     return ok;
 #endif
 }

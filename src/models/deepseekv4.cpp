@@ -2775,6 +2775,7 @@ namespace fastllm {
                                                          int compressRatio = 0,
                                                          Data *packedWindowKV = nullptr,
                                                          Data *packedCompressedKV = nullptr,
+                                                         Data *sm120Scratch = nullptr,
                                                          const Data *compressedIndices = nullptr,
                                                          const Data *compressedLengths = nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCached");
@@ -2811,14 +2812,20 @@ namespace fastllm {
                         Data *localPackedCompressed =
                             packedCompressedKV == nullptr ? nullptr :
                             GetTensorCudaReplica(*packedCompressedKV, device);
+                        Data *localScratch = sm120Scratch == nullptr ?
+                            nullptr : GetTensorCudaReplica(
+                                *sm120Scratch, device);
                         if (localPackedWindow != nullptr &&
-                            localPackedCompressed != nullptr) {
+                            localPackedCompressed != nullptr &&
+                            (sm120Scratch == nullptr ||
+                             localScratch != nullptr)) {
                             ok[rank] =
                                 FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                     *localQ, *localWindow, *localCompressed,
                                     localIndices, localLengths,
                                     *localPackedWindow, *localPackedCompressed,
-                                    *localSink, windowSize, compressRatio,
+                                    localScratch, *localSink, windowSize,
+                                    compressRatio,
                                     (const int32_t*)localMeta->cudaData, ropeDim,
                                     ropeBase, originalSeqLen, ropeFactor,
                                     betaFast, betaSlow, softmaxScale,
@@ -2895,8 +2902,8 @@ namespace fastllm {
                         FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                             *qForCuda, *windowForCuda, *compressedForCuda,
                             compressedIndices, compressedLengths,
-                            *packedWindowKV, *packedCompressedKV, attnSink,
-                            windowSize, compressRatio,
+                            *packedWindowKV, *packedCompressedKV,
+                            sm120Scratch, attnSink, windowSize, compressRatio,
                             (const int32_t*)decodeMeta->cudaData, ropeDim,
                             ropeBase, originalSeqLen, ropeFactor, betaFast,
                             betaSlow, softmaxScale, output)) {
@@ -3572,6 +3579,10 @@ namespace fastllm {
         Data indexerCompressorScore;
         Data indexerQ;
         Data indexerWeights;
+        // SM120 sparse-MLA decode uses one temporary buffer per TP rank. Keep
+        // it request-owned so CUDA Graph capture never depends on incidental
+        // allocator-pool sizes left behind by prefill or KV-cache dtype.
+        Data sparseMlaScratch;
         Data attnOut4;
         Data woAOut;
         Data attnOut;
@@ -9933,6 +9944,30 @@ namespace fastllm {
                     previousLayerDevice = layerDevice;
                 }
                 if (graphPrepared) {
+                    const size_t sparseMlaScratchBytes =
+                        FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
+                            seqlen, num_attention_heads, 4);
+                    if (sparseMlaScratchBytes >
+                            (size_t)std::numeric_limits<int>::max()) {
+                        graphPrepared = false;
+                    } else if (sparseMlaScratchBytes > 0) {
+                        const std::vector<int> scratchDims = {
+                            (int)sparseMlaScratchBytes};
+                        const bool scratchStale =
+                            !DeepSeekV4GraphTensorMatches(
+                                graphState->workspace->sparseMlaScratch,
+                                DataType::INT8, scratchDims, graphDevices);
+                        if (scratchStale &&
+                            !DeepSeekV4AllocateGraphTensor(
+                                graphState->workspace->sparseMlaScratch,
+                                DataType::INT8, scratchDims, graphDevices,
+                                false)) {
+                            graphPrepared = false;
+                        }
+                        addressChanged |= scratchStale;
+                    }
+                }
+                if (graphPrepared) {
                     // A full-TP capture owns one graph per GPU.  Every graph
                     // must be launched; launching only the metadata/root GPU
                     // would strand custom all-reduce barriers on its peers.
@@ -10761,6 +10796,8 @@ namespace fastllm {
                                                         &decodeCache->cudaGraphPackedWindowKV : nullptr,
                                                      graphSafeDecode ?
                                                         &decodeCache->cudaGraphPackedCompressedKV : nullptr,
+                                                     graphSafeDecode ?
+                                                        &decodeWorkspace->sparseMlaScratch : nullptr,
                                                      activeIndexerIndices,
                                                      activeIndexerLengths
 #endif
