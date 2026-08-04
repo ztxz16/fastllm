@@ -11326,6 +11326,29 @@ namespace {
 
 int main(int argc, char **argv) {
     try {
+#ifdef USE_CUDA
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-dsv4-compressed-kv") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "DeepSeek-V4 compressed-KV regression requires CUDA.");
+            RunCudaDeepSeekV4CompressedKvMaintenanceRegression();
+            RunMultiCudaDeepSeekV4CompressedCacheAppendRegression();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--cuda-dsv4-woa") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "DeepSeek-V4 WoA regression requires CUDA.");
+            RunCudaDeepSeekV4TokenTiledWoARegression();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--bench-cuda-dsv4-woa") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "DeepSeek-V4 WoA benchmark requires CUDA.");
+            RunCudaDeepSeekV4TokenTiledWoABenchmark();
+            return 0;
+        }
+#endif
         if (argc == 2 &&
             std::string(argv[1]) == "--cpu-dsv4-preprocess") {
             RunCpuDeepSeekV4PreprocessRegression();
