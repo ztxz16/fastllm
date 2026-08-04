@@ -398,6 +398,50 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
         )
     return args
 
+def _triton_python_works(python: str) -> bool:
+    if not python or not os.path.isfile(python) or not os.access(python, os.X_OK):
+        return False
+    try:
+        return subprocess.run(
+            [python, "-c", "import triton"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def _find_triton_python() -> str:
+    if not sys.executable:
+        return ""
+    # Keep the current virtualenv's Python path instead of resolving its
+    # symlink: resolving it may bypass pyvenv.cfg and hide installed packages.
+    current_python = os.path.abspath(os.path.expanduser(sys.executable))
+    return current_python if _triton_python_works(current_python) else ""
+
+def _configure_triton_compiler_python() -> str:
+    python_env_name = "FASTLLM_CUDA_TRITON_PYTHON"
+    triton_env_name = "FASTLLM_CUDA_TRITON"
+    detected = _find_triton_python()
+    if detected:
+        os.environ[python_env_name] = detected
+        os.environ[triton_env_name] = "1"
+        print(
+            "[Fastllm] Triton enabled with the current Python environment: %s"
+            % detected,
+            flush=True,
+        )
+    else:
+        os.environ.pop(python_env_name, None)
+        os.environ[triton_env_name] = "0"
+        current_python = sys.executable or "unknown"
+        print(
+            "[Fastllm] Triton is unavailable in the current Python "
+            "environment (%s); --triton has been disabled and built-in "
+            "CUDA will be used." % current_python,
+            flush=True,
+        )
+    return detected
 
 def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
     return (architecture in [
@@ -637,7 +681,8 @@ def make_normal_llm_model(args, startup_progress = None):
         print("model can't be empty. (Example: ftllm run MODELNAME)")
         exit(0)
     if (_arg_enabled(getattr(args, "triton", False))):
-        os.environ["FASTLLM_CUDA_TRITON"] = "1"
+        if not _configure_triton_compiler_python():
+            args.triton = False
     if not(os.path.exists(args.path)):
         if (hasattr(args, "model_name") and args.model_name == ''):
             args.model_name = args.path
