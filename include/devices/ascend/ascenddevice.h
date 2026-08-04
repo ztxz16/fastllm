@@ -72,6 +72,42 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class AscendSoftMaxOp : public BaseAscendOperator {
+    public:
+        AscendSoftMaxOp();
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class AscendSigmoidOp : public BaseAscendOperator {
+    public:
+        AscendSigmoidOp();
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class AscendTanHOp : public BaseAscendOperator {
+    public:
+        AscendTanHOp();
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class AscendReluOp : public BaseAscendOperator {
+    public:
+        AscendReluOp();
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class AscendGeluOp : public BaseAscendOperator {
+    public:
+        AscendGeluOp();
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class AscendGeluNewOp : public BaseAscendOperator {
+    public:
+    	AscendGeluNewOp();
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class AscendMulToOp : public BaseAscendOperator {
     public:
         AscendMulToOp();

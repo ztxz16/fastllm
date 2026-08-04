@@ -12,7 +12,13 @@ namespace fastllm {
         npu::FastllmAclInit();
         this->ops["Linear"] = new AscendLinearOp();
         this->ops["Split"] = new AscendSplitOp();
+        this->ops["SoftMax"] = new AscendSoftMaxOp();
+        this->ops["Sigmoid"] = new AscendSigmoidOp();
         this->ops["Silu"] = new AscendSiluOp();
+        this->ops["TanH"] = new AscendTanHOp();
+        this->ops["Relu"] = new AscendReluOp();
+        this->ops["Gelu"] = new AscendGeluOp();
+        this->ops["GeluNew"] = new AscendGeluNewOp();
         this->ops["MulTo"] = new AscendMulToOp();
         this->ops["Swiglu"] = new AscendSwigluOp();
         this->ops["AddTo"] = new AscendAddToOp();
@@ -296,6 +302,94 @@ namespace fastllm {
             dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
             deviceOk = CompileAndRunSingleOp(this->name, inputDict, {{"y", &output}}, dynamicShapes, {}, {}, {});
         }
+    }
+
+    AscendSoftMaxOp::AscendSoftMaxOp() :
+        BaseAscendOperator("SoftmaxV2") {}
+
+    void AscendSoftMaxOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = datas.find("input")->second;
+        Data *output = datas.find("output")->second;
+        output->Allocate();
+        int axis = intParams.find("axis")->second;
+        if (axis < 0)
+            axis = axis + input->dims.size();
+
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 2, 3}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 2, 3}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x", input}}, {{"y", output}}, dynamicShapes, {}, {{"axis", axis}}, {});
+    }
+
+    AscendSigmoidOp::AscendSigmoidOp() :
+        BaseAscendOperator("Sigmoid") {}
+
+    void AscendSigmoidOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = datas.find("input")->second;
+        Data *output = datas.find("output")->second;
+        output->Allocate();
+        AssertInFastLLM(input->dataType == DataType::FLOAT32 ||
+                        input->dataType == DataType::FLOAT16,
+                        "Sigmoid error: Data's type should be float32 or float16.\n");
+
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x", input}}, {{"y", output}}, dynamicShapes, {}, {}, {});
+    }
+
+    AscendTanHOp::AscendTanHOp() :
+        BaseAscendOperator("Tanh") {}
+
+    void AscendTanHOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = datas.find("input")->second;
+        Data *output = datas.find("output")->second;
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x", input}}, {{"y", output}}, dynamicShapes, {}, {}, {});
+    }
+
+    AscendReluOp::AscendReluOp() :
+        BaseAscendOperator("Relu") {}
+
+    void AscendReluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = datas.find("input")->second;
+        Data *output = datas.find("output")->second;
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x", input}}, {{"y", output}}, dynamicShapes, {}, {}, {});
+    }
+
+    AscendGeluOp::AscendGeluOp() :
+        BaseAscendOperator("GeluV2") {}
+
+    void AscendGeluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = datas.find("input")->second;
+        Data *output = datas.find("output")->second;
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x", input}}, {{"y", output}}, dynamicShapes, {}, {}, {});
+    }
+
+    AscendGeluNewOp::AscendGeluNewOp() :
+        BaseAscendOperator("Gelu") {}
+
+    void AscendGeluNewOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = datas.find("input")->second;
+        Data *output = datas.find("output")->second;
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x", input}}, {{"y", output}}, dynamicShapes, {}, {}, {});
     }
 
     AscendSiluOp::AscendSiluOp() : 
