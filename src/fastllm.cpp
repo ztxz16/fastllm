@@ -132,8 +132,16 @@ namespace fastllm {
                 msg += ", name = " + data.name;
             }
             msg += ".\n";
-            ErrorInFastLLM(msg);
-            return false;
+            // Tensor-parallel ranks are worker threads in one process.  Waiting
+            // for stdin here leaves peer ranks blocked in NCCL and makes an API
+            // server look healthy while every request hangs.  Allocation
+            // failure is not recoverable at this layer, so fail the complete TP
+            // process promptly; the serving supervisor can restart it and
+            // clients receive a connection failure instead of an infinite wait.
+            fprintf(stderr, "FastLLM fatal CUDA allocation error: %s", msg.c_str());
+            fflush(stdout);
+            fflush(stderr);
+            std::_Exit(EXIT_FAILURE);
         }
 
         static void CudaFreeForData(const Data &data, void *ptr) {

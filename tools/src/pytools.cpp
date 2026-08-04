@@ -7,6 +7,8 @@
 #include <cstring>
 #include <csignal>
 #include <cstdint>
+#include <exception>
+#include <string>
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -32,6 +34,8 @@ struct FASTLLM_PYTOOLS_INIT {
         std::signal(SIGINT, signal_handler);
     }
 } fastllm_pytools_init;
+
+static thread_local std::string fastllmPytoolsWarmupError;
 
 extern "C" {
     typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
@@ -596,10 +600,24 @@ extern "C" {
         return;
     }
 
-    DLL_EXPORT void warmup_llm_model(int modelId) {
-        auto model = models.GetModel(modelId);
-        model->AutoWarmup();
-        return;
+    DLL_EXPORT const char *warmup_llm_model(int modelId) {
+        fastllmPytoolsWarmupError.clear();
+        try {
+            auto model = models.GetModel(modelId);
+            model->AutoWarmup();
+            return nullptr;
+        } catch (const std::exception &error) {
+            fastllmPytoolsWarmupError = error.what();
+        } catch (const char *error) {
+            fastllmPytoolsWarmupError = error == nullptr ?
+                "unknown FastLLM warmup error" : error;
+        } catch (...) {
+            fastllmPytoolsWarmupError = "unknown FastLLM warmup error";
+        }
+        fprintf(stderr, "[Fastllm] Model warmup failed: %s\n",
+                fastllmPytoolsWarmupError.c_str());
+        fflush(stderr);
+        return fastllmPytoolsWarmupError.c_str();
     }
 
     DLL_EXPORT void save_llm_model(int modelId, char *path) {

@@ -192,6 +192,12 @@ bool FastllmCudaGetThreadError();
 void FastllmCudaClearGraphError();
 bool FastllmCudaGetGraphError();
 
+// Best-effort warmup reserve allocation.  Returns the number of blocks added
+// and preserves every existing pool entry when a later block cannot be
+// allocated.  Capacity failures are reported to the caller without poisoning
+// the CUDA thread/graph error flags, so the caller can restore its state and
+// fail startup cleanly.
+int FastllmCudaTryMallocBigBuffers(size_t size, int count);
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
 #ifdef __CUDACC__

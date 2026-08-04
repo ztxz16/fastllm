@@ -2692,6 +2692,13 @@ namespace fastllm {
         static int Qwen35LinearSlotCapacity(const Qwen3_5Model *model, int batch) {
             int capacity = std::max(1, batch);
             capacity = std::max(capacity, Qwen35PreCaptureMaxBatch(model));
+            // The same slot pool is used by eager prefill/decode after graph
+            // capture.  Size it to the scheduler's admitted batch up front;
+            // otherwise the first batch above the graph limit creates a larger
+            // manager after the serving allocation freeze.
+            if (model != nullptr && model->maxBatch > 0) {
+                capacity = std::max(capacity, model->maxBatch);
+            }
             return capacity;
         }
 
@@ -6455,6 +6462,173 @@ namespace fastllm {
             }
             printProgress(warmupIndex + 1, warmupBatchCount, batch);
         }
+
+        auto runEagerPrefillWarmup = [&](int eagerWarmupBatch,
+                                         int eagerWarmupTokens,
+                                         const char *reason) {
+            eagerWarmupBatch = std::max(1, eagerWarmupBatch);
+            eagerWarmupTokens = std::max(eagerWarmupBatch, eagerWarmupTokens);
+            std::vector<Data*> attentionMasks(eagerWarmupBatch, nullptr);
+            std::vector<GenerationConfig> generationConfigs(eagerWarmupBatch);
+            LastTokensManager lastTokens;
+            std::vector<std::pair<Data, Data> > pastKeyValuesStorage;
+            std::vector<std::pair<Data*, Data*> > pastKeyValues;
+            pastKeyValuesStorage.reserve(eagerWarmupBatch * block_cnt);
+            pastKeyValues.reserve(eagerWarmupBatch * block_cnt);
+            for (int b = 0; b < eagerWarmupBatch; b++) {
+                for (int i = 0; i < block_cnt; i++) {
+                    bool isLinearLayer = Qwen35LayerIsLinearAttention(this, i);
+                    DataType cacheType = isLinearLayer ?
+                        Qwen35LinearAttentionCacheDataType(this->dataType) :
+                        this->kvCacheDataType;
+                    pastKeyValuesStorage.push_back(std::make_pair(Data(cacheType),
+                                                                  Data(cacheType)));
+                    pastKeyValuesStorage.back().first.SetKVCache();
+                    pastKeyValuesStorage.back().second.SetKVCache();
+                    if (isLinearLayer) {
+                        Qwen35PrepareLinearAttentionCache(
+                            pastKeyValuesStorage.back().first, cacheType);
+                        Qwen35PrepareLinearAttentionCache(
+                            pastKeyValuesStorage.back().second, cacheType);
+                    }
+                    pastKeyValues.push_back(std::make_pair(
+                        &pastKeyValuesStorage.back().first,
+                        &pastKeyValuesStorage.back().second));
+                }
+            }
+
+            std::vector<int> seqLens(eagerWarmupBatch,
+                                     eagerWarmupTokens / eagerWarmupBatch);
+            for (int i = 0; i < eagerWarmupTokens % eagerWarmupBatch; i++) {
+                seqLens[i]++;
+            }
+            std::vector<float> inputIdsHost(eagerWarmupTokens, 1.0f);
+            Data inputIds(DataType::FLOAT32, {1, eagerWarmupTokens}, inputIdsHost);
+            std::vector<Data> positionIdsStorage;
+            std::vector<Data*> positionIds;
+            positionIdsStorage.reserve(eagerWarmupBatch);
+            positionIds.reserve(eagerWarmupBatch);
+            for (int b = 0; b < eagerWarmupBatch; b++) {
+                std::vector<float> positions(seqLens[b]);
+                for (int i = 0; i < seqLens[b]; i++) {
+                    positions[i] = (float)i;
+                }
+                positionIdsStorage.push_back(
+                    Data(DataType::FLOAT32, {1, seqLens[b]}, positions));
+                positionIds.push_back(&positionIdsStorage.back());
+            }
+            ForwardGPU(eagerWarmupBatch, inputIds, attentionMasks, positionIds,
+                       seqLens, pastKeyValues, generationConfigs, lastTokens,
+                       nullptr);
+            printf("[Fastllm] Qwen3.5 post-graph eager prefill warmup (%s): "
+                   "batch %d, total tokens %d.\n",
+                   reason, eagerWarmupBatch, eagerWarmupTokens);
+            fflush(stdout);
+        };
+
+        // Graph capture pins the pool addresses touched by decode.  Those
+        // addresses can include the idle eager-prefill scratch left by the
+        // earlier AutoWarmup, so capture must be followed by one final eager
+        // max-batch prefill.  Its temporaries are released back to the ordinary
+        // pool and become the allocation-free reserve used after serve starts.
+        int eagerWarmupBatch = this->maxBatch > 0 ? this->maxBatch : maxWarmupBatch;
+        eagerWarmupBatch = std::max(1, eagerWarmupBatch);
+        int eagerWarmupTokens = std::max(eagerWarmupBatch, this->GetChunkedPrefillSize());
+        if (this->tokensLimit > 0) {
+            eagerWarmupBatch = std::min(eagerWarmupBatch,
+                                        std::max(1, this->tokensLimit / 128));
+            eagerWarmupTokens = std::min(eagerWarmupTokens, this->tokensLimit);
+        }
+        runEagerPrefillWarmup(eagerWarmupBatch, eagerWarmupTokens,
+                              "batched serving");
+
+        // A few graph/runtime objects intentionally remain alive after the
+        // prefill above and can retain its exact-size scratch blocks.  Keep a
+        // separate, bounded reserve of concurrently reusable blocks for eager
+        // serving.  Frozen allocation mode may use an oversized block, so this
+        // also covers smaller shape-specific scratch without per-shape mallocs.
+        const int serveLargeReserveBlocks = 8;
+        const int serveMediumReserveBlocks = 8;
+        // chunked_prefill_size=8192 needs roughly 112 MB for one
+        // [tokens, hidden] fp16 activation on the 7168-wide model.  Keep the
+        // reserve above that size so frozen serving can reuse it for a second
+        // ragged burst while the previous burst is still being retired.
+        const size_t serveLargeReserveBlockBytes = 128ULL * 1024ULL * 1024ULL;
+        // Long batch-1 recompute also keeps several 32--48 MB gated-attention
+        // tensors alive at once.  If every reserve has the same 128 MB size,
+        // those medium tensors consume all large blocks and a later gate
+        // allocation misses despite ample physical headroom.  A second size
+        // class lets best-fit reuse keep the 128 MB blocks for genuinely large
+        // activations while covering every gate shape up to the 8192-token
+        // scheduler chunk (48 MB for 3072 fp16 channels).
+        const size_t serveMediumReserveBlockBytes = 64ULL * 1024ULL * 1024ULL;
+        int previousDevice = FastllmCudaGetDevice();
+        int failedReserveDevice = -1;
+        int failedLargeReserveBlocks = 0;
+        int failedMediumReserveBlocks = 0;
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            int allocatedLargeReserveBlocks = FastllmCudaTryMallocBigBuffers(
+                serveLargeReserveBlockBytes, serveLargeReserveBlocks);
+            int allocatedMediumReserveBlocks =
+                allocatedLargeReserveBlocks == serveLargeReserveBlocks
+                    ? FastllmCudaTryMallocBigBuffers(
+                          serveMediumReserveBlockBytes,
+                          serveMediumReserveBlocks)
+                    : 0;
+            printf("[Fastllm] Qwen3.5 post-graph serve reserve GPU %d: "
+                   "%d/%d x %.0f MB plus %d/%d x %.0f MB.\n",
+                   device,
+                   allocatedLargeReserveBlocks, serveLargeReserveBlocks,
+                   serveLargeReserveBlockBytes / 1048576.0,
+                   allocatedMediumReserveBlocks, serveMediumReserveBlocks,
+                   serveMediumReserveBlockBytes / 1048576.0);
+            FastllmCudaMemPoolStats();
+            if (allocatedLargeReserveBlocks != serveLargeReserveBlocks ||
+                allocatedMediumReserveBlocks != serveMediumReserveBlocks) {
+                failedReserveDevice = device;
+                failedLargeReserveBlocks = allocatedLargeReserveBlocks;
+                failedMediumReserveBlocks = allocatedMediumReserveBlocks;
+                break;
+            }
+        }
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
+        if (failedReserveDevice >= 0) {
+            std::ostringstream error;
+            error << "Qwen3.5 post-graph CUDA serve reserve is incomplete on GPU "
+                  << failedReserveDevice << ": allocated "
+                  << failedLargeReserveBlocks << "/" << serveLargeReserveBlocks
+                  << " large blocks and " << failedMediumReserveBlocks << "/"
+                  << serveMediumReserveBlocks
+                  << " medium blocks. Starting with an incomplete reserve is unsafe "
+                     "because CUDA allocations are frozen after warmup.";
+            throw std::runtime_error(error.str());
+        }
+        printf("[Fastllm] Qwen3.5 post-graph serve reserve: "
+               "%d x %.0f MB plus %d x %.0f MB per GPU.\n",
+               serveLargeReserveBlocks,
+               serveLargeReserveBlockBytes / 1048576.0,
+               serveMediumReserveBlocks,
+               serveMediumReserveBlockBytes / 1048576.0);
+        fflush(stdout);
+
+        // KV pressure can evict one long request and later recompute it as a
+        // batch-1 prefill.  The batched warmup above intentionally exercises
+        // the packed-ragged path and therefore does not allocate the batch-1
+        // gated-attention Q/gate scratch (for example [1, 6657, 3072]).  Run
+        // the largest scheduler-sized single sequence while cudaMalloc is still
+        // allowed.  The generic reserve participates in this warmup; any extra
+        // shape-specific blocks needed at its peak are then retained in the pool
+        // for allocation-free serving.
+        int recomputeWarmupTokens = std::max(1, this->GetChunkedPrefillSize());
+        if (this->tokensLimit > 0) {
+            recomputeWarmupTokens = std::min(recomputeWarmupTokens,
+                                             this->tokensLimit);
+        }
+        runEagerPrefillWarmup(1, recomputeWarmupTokens,
+                              "single-request recompute");
 #endif
     }
 

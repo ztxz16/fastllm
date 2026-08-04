@@ -121,6 +121,7 @@ void showError(cudaError_t result, char const* const message, const char* const 
 }
 
 static std::atomic<bool> fastllmCudaMallocDisabled(false);
+static std::atomic<int> fastllmCudaMallocRejectLogCount(0);
 static std::mutex fastllmCudaMallocCheckMutex;
 
 // A graph keeps raw kernel arguments after host-side Data temporaries have been
@@ -297,15 +298,25 @@ static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line,
 }
 
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
-    if (fastllm::GetFastllmEnv().cudaMemCheck) {
-        bool rejected = fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
+    bool rejected = fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
+    int rejectLogIndex = rejected ?
+        fastllmCudaMallocRejectLogCount.fetch_add(1, std::memory_order_relaxed) : -1;
+    // A rejected post-startup allocation is always actionable.  Print the first
+    // few call stacks even when the verbose startup allocation audit is off, so
+    // a frozen server can identify the missing warmup path without flooding the
+    // log after the first failure cascades through concurrent requests.
+    if (fastllm::GetFastllmEnv().cudaMemCheck ||
+        (rejected && rejectLogIndex < 4)) {
         FastllmCudaPrintMallocStack(size, file, line, rejected);
-        if (rejected) {
-            if (ret != nullptr) {
-                *ret = nullptr;
-            }
-            return cudaErrorMemoryAllocation;
+    }
+    // The serving frontend freezes CUDA allocations after model warmup.  The
+    // audit flag controls diagnostics only; it must never control whether the
+    // freeze itself is enforced.
+    if (rejected) {
+        if (ret != nullptr) {
+            *ret = nullptr;
         }
+        return cudaErrorMemoryAllocation;
     }
     if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
         // 真实 cudaMalloc 前排空在途 NCCL 集合通信，避免与 cudaMalloc 争用 CUDA 驱动锁导致跨 rank 死锁。
@@ -315,9 +326,11 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
 }
 
 void DisableCudaMalloc() {
-    fastllmCudaMallocDisabled.store(true, std::memory_order_relaxed);
-    if (fastllm::GetFastllmEnv().cudaMemCheck) {
-        fprintf(stderr, "[FASTLLM_CUDA_MEM_CHECK] cudaMalloc disabled.\n");
+    bool wasDisabled = fastllmCudaMallocDisabled.exchange(
+        true, std::memory_order_acq_rel);
+    if (!wasDisabled) {
+        fprintf(stderr,
+                "[Fastllm] CUDA allocation frozen; future pool misses will be rejected.\n");
         fflush(stderr);
     }
 }
@@ -4443,7 +4456,9 @@ static bool FastllmCudaCanReusePooledBigBuffer(size_t bufferSize, size_t request
 static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
                                                   std::vector<CudaMemoryBuffer> *bigBuffersPtr,
                                                   std::vector<CudaMemoryBuffer> *smallBuffersPtr) {
-    if (!fastllm::GetFastllmEnv().cudaMemCheck) {
+    if (!fastllm::GetFastllmEnv().cudaMemCheck &&
+        (!fastllmCudaMallocDisabled.load(std::memory_order_relaxed) ||
+         fastllmCudaMallocRejectLogCount.load(std::memory_order_relaxed) >= 4)) {
         return;
     }
     fprintf(stderr, "[FASTLLM_CUDA_MEM_CHECK] pooled buffers on device %d before rejecting %.2f MB:\n",
@@ -4536,6 +4551,12 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(size_t size, void **ret, in
     // ordinary OOM recovery, which would invalidate every participating rank.
     if (FastllmCudaGraphIsCapturing()) {
         FastllmCudaSetThreadError();
+        return false;
+    }
+    // Once serving has frozen allocations, idle blocks are the reserve that
+    // future requests must reuse.  Releasing them cannot make a forbidden
+    // allocation succeed and would only destroy the warmed pool.
+    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return false;
     }
     cudaGetLastError();
@@ -5060,6 +5081,62 @@ void FastllmCudaFree(void *ret) {
     cudaError_t restoreState = cudaSetDevice(oriId);
     checkCudaErrors("CUDA error when release memory!", state);
     checkCudaErrors("CUDA error when restoring device after release!", restoreState);
+}
+
+int FastllmCudaTryMallocBigBuffers(size_t size, int count) {
+    if (size == 0 || count <= 0) {
+        return 0;
+    }
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    if (state != cudaSuccess || id < 0) {
+        checkCudaErrors("Error: CUDA error when finding device for reserve allocation!", state);
+        return 0;
+    }
+
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    auto &bigBuffers = *view.bigBuffers;
+    int allocated = 0;
+    for (; allocated < count; allocated++) {
+        void *ret = nullptr;
+        // A reserve is itself reusable idle-pool capacity.  Do not use the
+        // ordinary OOM retry here: that retry releases existing idle blocks and
+        // could turn a partially successful reserve into one final block while
+        // still reporting success to the caller.
+        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+        if (state == cudaSuccess && ret == nullptr) {
+            state = cudaErrorMemoryAllocation;
+        }
+        if (state != cudaSuccess || ret == nullptr) {
+            if (ret != nullptr) {
+                cudaFree(ret);
+                ret = nullptr;
+            }
+            size_t freeMem = 0, totalMem = 0;
+            cudaMemGetInfo(&freeMem, &totalMem);
+            fprintf(stderr,
+                    "[Fastllm] CUDA reserve allocation stopped on device %d: "
+                    "%d/%d blocks of %.0f MB allocated, gpuFree %.0f/%.0f MB, "
+                    "error=%s. Existing pool blocks were preserved.\n",
+                    id, allocated, count, size / 1048576.0,
+                    freeMem / 1048576.0, totalMem / 1048576.0,
+                    cudaGetErrorString(state));
+            fflush(stderr);
+            // Capacity failures are handled by the return value.  Clear the
+            // runtime's last-error slot without setting FastLLM's capture-wide
+            // error flags; callers that require the full reserve will abort.
+            cudaGetLastError();
+            if (state != cudaErrorMemoryAllocation) {
+                checkCudaErrors(
+                    "Error: unexpected CUDA failure during reserve allocation!",
+                    state);
+            }
+            break;
+        }
+        bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
+    }
+    return allocated;
 }
 
 void FastllmCudaMallocBigBuffer(size_t size) {

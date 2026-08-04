@@ -433,6 +433,7 @@ fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 
 fastllm_lib.warmup_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.warmup_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.get_max_input_len_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
@@ -2728,7 +2729,9 @@ class model:
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
     def warmup(self):
-        fastllm_lib.warmup_llm_model(self.model)
+        error = fastllm_lib.warmup_llm_model(self.model)
+        if error:
+            raise RuntimeError(error.decode("utf-8", errors="replace"))
 
     def set_moe_experts(self, experts: int):
         fastllm_lib.set_moe_experts(self.model, experts)
