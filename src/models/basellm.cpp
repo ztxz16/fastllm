@@ -4724,11 +4724,14 @@ namespace fastllm {
                         long long reserved = (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
                         long long rawAvail = freeSizes[id] - reserved;
                         long long runtimeHeadroom = getCudaRuntimeHeadroom(id, rawAvail);
-                        long long avail = rawAvail - runtimeHeadroom;
+                        long long servingReserve = std::max(
+                            0LL, this->GetAutoWarmupCudaServingReserveBytes(id));
+                        long long avail = rawAvail - runtimeHeadroom - servingReserve;
                         updateLinearAttentionBatchLimit(id, avail);
-                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, availForKV=%.2f GB, localKVPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
+                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, servingReserve=%.2f MB, availForKV=%.2f GB, localKVPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                id, freeSizes[id] / 1e9, totalSizes[id] / 1e9, reserved / 1e9,
-                               runtimeHeadroom / 1e6, avail / 1e9, perPageOnDevice / 1e6,
+                               runtimeHeadroom / 1e6, servingReserve / 1e6,
+                               avail / 1e9, perPageOnDevice / 1e6,
                                deviceLayerCount.count(id) ? deviceLayerCount[id] : 0);
                         if (autoCalcPages && perPageOnDevice > 0) {
                             int pages = fitPagesWithLinearReserve(id, avail, perPageOnDevice);
@@ -4754,7 +4757,10 @@ namespace fastllm {
                     for (int id : deviceIds) {
                         if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
                             long long rawAvail = freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
-                            long long avail = rawAvail - getCudaRuntimeHeadroom(id, rawAvail);
+                            long long servingReserve = std::max(
+                                0LL, this->GetAutoWarmupCudaServingReserveBytes(id));
+                            long long avail = rawAvail - getCudaRuntimeHeadroom(id, rawAvail) -
+                                              servingReserve;
                             int layers = deviceLayerCount.count(id) ? deviceLayerCount[id] : 0;
                             printf("  GPU %d: layers=%d, avail=%.2f GB.\n", id, layers, avail / 1e9);
                         }
@@ -4775,11 +4781,15 @@ namespace fastllm {
                         long long reserved = (long long)(totalSizes[cacheDeviceId] * (1.0 - fastllm::GetGpuMemRatio()));
                         long long rawAvail = freeSizes[cacheDeviceId] - reserved;
                         long long runtimeHeadroom = getCudaRuntimeHeadroom(cacheDeviceId, rawAvail);
-                        cacheAvail = rawAvail - runtimeHeadroom;
+                        long long servingReserve = std::max(
+                            0LL, this->GetAutoWarmupCudaServingReserveBytes(cacheDeviceId));
+                        cacheAvail = rawAvail - runtimeHeadroom - servingReserve;
                         updateLinearAttentionBatchLimit(cacheDeviceId, cacheAvail);
-                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
+                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, servingReserve=%.2f MB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                cacheDeviceId, freeSizes[cacheDeviceId] / 1e9, totalSizes[cacheDeviceId] / 1e9,
-                               reserved / 1e9, runtimeHeadroom / 1e6, cacheAvail / 1e9, cacheBytesPerPage / 1e6,
+                               reserved / 1e9, runtimeHeadroom / 1e6,
+                               servingReserve / 1e6, cacheAvail / 1e9,
+                               cacheBytesPerPage / 1e6,
                                deviceLayerCount.count(cacheDeviceId) ? deviceLayerCount[cacheDeviceId] : 0);
                     }
                 }
@@ -4929,7 +4939,10 @@ namespace fastllm {
                             std::max(
                                 0LL,
                                 this->GetAutoWarmupCudaRuntimeReserveBytes(
-                                    id, warmupMaxBatch));
+                                    id, warmupMaxBatch)) +
+                            std::max(
+                                0LL,
+                                this->GetAutoWarmupCudaServingReserveBytes(id));
                         deviceTargetFree[id] = targetFree;
 
                         long long deficit = targetFree - freeBeforeRuntime[id];
@@ -4983,6 +4996,14 @@ namespace fastllm {
                 shrinkCachePagesForRuntimeBuffers();
                 this->WarmupCudaRuntimeBuffers(warmupMaxBatch);
                 printCudaWarmupPoolStats("batch and sampling warmup");
+                if (updatedPages) {
+                    // Model-specific serving paths may retain substantially more
+                    // scratch than the generic batch warmup. Materialize that
+                    // high-water mark before the last page calibration so the
+                    // automatic KV budget observes its real CUDA-pool footprint.
+                    this->WarmupCudaServingHighWaterBuffers();
+                    printCudaWarmupPoolStats("serving high-water warmup");
+                }
 
                 auto calibrateCachePagesToGpuBudget = [&]() {
                     if (!updatedPages || pageLen <= 0 || deviceBytesPerPage.empty()) {
@@ -5014,6 +5035,9 @@ namespace fastllm {
                         targetFree += std::max(
                             0LL,
                             this->GetAutoWarmupCudaRuntimeReserveBytes(id, warmupMaxBatch));
+                        targetFree += std::max(
+                            0LL,
+                            this->GetAutoWarmupCudaServingReserveBytes(id));
                         long long delayedReservePerPage =
                             deviceDelayedCacheBytesPerPage.count(id) ? deviceDelayedCacheBytesPerPage[id] : 0;
                         delayedReservePerPage = std::max(0LL, delayedReservePerPage);

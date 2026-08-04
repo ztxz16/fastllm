@@ -4499,6 +4499,42 @@ namespace fastllm {
             return (32LL + 16LL + 8LL + 8LL) * 1024LL * 1024LL;
         }
 
+        static constexpr int QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS = 8;
+        static constexpr int QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS = 8;
+        static constexpr size_t QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES =
+            128ULL * 1024ULL * 1024ULL;
+        static constexpr size_t QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES =
+            64ULL * 1024ULL * 1024ULL;
+
+        static long long Qwen35CudaServingPoolReserveBytes() {
+            return (long long)QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS *
+                       QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES +
+                   (long long)QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS *
+                       QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES;
+        }
+
+        static bool Qwen35ServingHighWaterWarmupRequested() {
+            const char *servingWarmup =
+                std::getenv("FASTLLM_CUDA_SERVING_WARMUP");
+            const char *legacyFreezeAfterWarmup =
+                std::getenv("FASTLLM_CUDA_FREEZE_AFTER_WARMUP");
+            return GetFastllmEnv().cudaGraph ||
+                   GetFastllmEnv().cudaMemCheck ||
+                   (servingWarmup != nullptr &&
+                    Qwen35MoeIsTrueString(servingWarmup)) ||
+                   (legacyFreezeAfterWarmup != nullptr &&
+                    Qwen35MoeIsTrueString(legacyFreezeAfterWarmup));
+        }
+
+        static bool Qwen35NeedsAllocationFreeServing() {
+            // DisableCudaMalloc() is a no-op unless cudaMemCheck is enabled.
+            // CUDA graph independently requires stable, preallocated storage.
+            // The API serving-warmup marker alone must not charge the fixed
+            // allocation-free pool against KV when real allocations stay legal.
+            return GetFastllmEnv().cudaGraph ||
+                   GetFastllmEnv().cudaMemCheck;
+        }
+
         static void Qwen35WarmupCudaRuntimeScratchBuffers() {
             for (size_t bytes : {
                     32ULL * 1024ULL * 1024ULL,
@@ -5874,6 +5910,28 @@ namespace fastllm {
 #endif
     }
 
+    long long Qwen3_5Model::GetAutoWarmupCudaServingReserveBytes(int deviceId) const {
+#ifdef USE_CUDA
+        if (!Qwen35NeedsAllocationFreeServing()) {
+            return 0;
+        }
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
+            std::find(devices.begin(), devices.end(), deviceId) == devices.end()) {
+            return 0;
+        }
+        // PrepareCudaServingAfterWarmup() creates this fixed idle-pool capacity
+        // on every participating GPU after the serving high-water forwards.
+        // Charge it before automatic KV sizing so those later allocations cannot
+        // consume memory already promised to paged KV cache.
+        return Qwen35CudaServingPoolReserveBytes();
+#else
+        (void)deviceId;
+        return 0;
+#endif
+    }
+
     void Qwen3_5Model::WarmupCudaRuntimeBuffers(int batch) {
 #ifdef USE_CUDA
         if (batch <= 0) {
@@ -5918,8 +5976,11 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::OnAutoWarmupFinished() {
+    void Qwen3_5Model::PrepareMtpCudaServingWarmup() {
 #ifdef USE_CUDA
+        if (mtpCudaServingWarmupPrepared) {
+            return;
+        }
         if (!Qwen35MtpDisabledByEnv() && Qwen35MtpWarmupEnabled() && HasMtpWeights()) {
             std::vector<int> devices;
             std::map<int, int> ratios;
@@ -5931,6 +5992,27 @@ namespace fastllm {
                 fflush(stdout);
             }
         }
+        mtpCudaServingWarmupPrepared = true;
+#endif
+    }
+
+    void Qwen3_5Model::WarmupCudaServingHighWaterBuffers() {
+#ifdef USE_CUDA
+        // CUDA graph capture owns page-backed pointers and must retain the
+        // original post-AutoWarmup ordering. The non-graph API path can safely
+        // materialize its eager-serving scratch before final KV calibration.
+        if (GetFastllmEnv().cudaGraph ||
+            !Qwen35ServingHighWaterWarmupRequested()) {
+            return;
+        }
+        PrepareMtpCudaServingWarmup();
+        PrepareCudaServingAfterWarmup(true);
+#endif
+    }
+
+    void Qwen3_5Model::OnAutoWarmupFinished() {
+#ifdef USE_CUDA
+        PrepareMtpCudaServingWarmup();
         if (GetFastllmEnv().cudaGraph) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
@@ -5938,10 +6020,9 @@ namespace fastllm {
             ClearAllPagedCacheManagers();
             FastllmCudaClearBigBuffer();
         }
-        // The API frontend freezes real CUDA allocations after startup for
-        // every serving mode, not only when CUDA graph is enabled.  Prepare the
-        // eager-serving pool unconditionally before that freeze; the helper
-        // keeps graph capture itself conditional.
+        // Strict memcheck serving and CUDA graph need a reusable allocation-free
+        // pool after warmup. Ordinary API serving only materializes its high-water
+        // scratch before final KV calibration and may allocate normally later.
         PrepareCudaServingAfterWarmup();
         Qwen35ReleaseThreadLocalCudaSamplingBuffers();
 #endif
@@ -6346,19 +6427,24 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::PrepareCudaServingAfterWarmup() {
+    void Qwen3_5Model::PrepareCudaServingAfterWarmup(bool highWaterOnly) {
 #ifdef USE_CUDA
-        const char *freezeAfterWarmup =
-            std::getenv("FASTLLM_CUDA_FREEZE_AFTER_WARMUP");
+        if (cudaServingPrepared ||
+            (highWaterOnly && cudaServingHighWaterPrepared)) {
+            return;
+        }
+        const bool servingHighWaterWarmup =
+            Qwen35ServingHighWaterWarmupRequested();
         const bool allocationFreeServing =
-            GetFastllmEnv().cudaGraph ||
-            (freezeAfterWarmup != nullptr &&
-             Qwen35MoeIsTrueString(freezeAfterWarmup));
-        // The extra high-water forwards and reserve are required by the API
-        // server because it freezes real allocations at ready.  Keep ordinary
-        // non-graph CLI/library inference from paying that serving-only memory
-        // cost; CUDA graph still needs the same preparation independently.
-        if (!allocationFreeServing || autoWarmupRunning.load() ||
+            Qwen35NeedsAllocationFreeServing();
+        // Ordinary API serving needs the real high-water footprint for KV
+        // calibration, but only strict memcheck/CUDA-graph serving needs the
+        // additional fixed idle-pool reserve.
+        const bool preparationRequested = highWaterOnly
+            ? servingHighWaterWarmup
+            : allocationFreeServing;
+        if (!preparationRequested ||
+            (!highWaterOnly && autoWarmupRunning.load()) ||
             GetKVCacheInCPU()) {
             return;
         }
@@ -6385,9 +6471,10 @@ namespace fastllm {
                     flag.store(false, std::memory_order_release);
                 }
             }
-        } preCaptureScope(cudaGraphPreCaptureRunning, cudaGraphEnabled);
+        } preCaptureScope(cudaGraphPreCaptureRunning,
+                          cudaGraphEnabled && !cudaServingHighWaterPrepared);
 
-        if (cudaGraphEnabled) {
+        if (cudaGraphEnabled && !cudaServingHighWaterPrepared) {
             const bool mtpEnabled = !Qwen35MtpDisabledByEnv() && HasMtpWeights();
             if (mtpEnabled && this->maxBatch > maxWarmupBatch) {
                 printf("[Fastllm] Qwen3.5 CUDA graph: MTP is enabled; "
@@ -6576,44 +6663,53 @@ namespace fastllm {
             fflush(stdout);
         };
 
-        // Graph capture can pin eager-prefill scratch, while non-graph serving
-        // still needs a final runtime-shaped high-water pass before allocations
-        // are frozen.  Its temporaries return to the ordinary pool and become
-        // reusable serving capacity.
-        int eagerWarmupBatch = this->maxBatch > 0 ? this->maxBatch : maxWarmupBatch;
-        eagerWarmupBatch = std::max(1, eagerWarmupBatch);
-        // The scheduler may aggregate unrelated prompts up to a larger token
-        // budget than the per-request chunk size.  Qwen3.5 deliberately does
-        // this when linear-prefix snapshots clamp GetChunkedPrefillSize()
-        // (for example 2048) but serving still batches up to the configured
-        // 8192 tokens.  Warm the same high-water shape that RunNewMainLoop can
-        // actually submit after cudaMalloc is frozen.
-        int servingPrefillTokenLimit = std::max(
-            this->GetChunkedPrefillSize(), this->GetBatchedPrefillTokenLimit());
-        int eagerWarmupTokens = std::max(eagerWarmupBatch,
-                                         servingPrefillTokenLimit);
-        if (this->tokensLimit > 0) {
-            eagerWarmupBatch = std::min(eagerWarmupBatch,
-                                        std::max(1, this->tokensLimit / 128));
-            eagerWarmupTokens = std::min(eagerWarmupTokens, this->tokensLimit);
+        if (!cudaServingHighWaterPrepared) {
+            // Graph capture can pin eager-prefill scratch, while non-graph
+            // serving still needs a final runtime-shaped high-water pass. Its
+            // temporaries return to the ordinary pool and become reusable
+            // serving capacity. Auto-sized deployments run this phase before
+            // their final KV calibration so that retained footprint is measured.
+            int eagerWarmupBatch =
+                this->maxBatch > 0 ? this->maxBatch : maxWarmupBatch;
+            eagerWarmupBatch = std::max(1, eagerWarmupBatch);
+            // The scheduler may aggregate unrelated prompts up to a larger
+            // token budget than the per-request chunk size. Qwen3.5 deliberately
+            // does this when linear-prefix snapshots clamp GetChunkedPrefillSize()
+            // (for example 2048) but serving still batches up to 8192 tokens.
+            int servingPrefillTokenLimit = std::max(
+                this->GetChunkedPrefillSize(),
+                this->GetBatchedPrefillTokenLimit());
+            int eagerWarmupTokens = std::max(eagerWarmupBatch,
+                                             servingPrefillTokenLimit);
+            int warmupTokenLimit = this->tokensLimit > 0
+                ? this->tokensLimit
+                : fastllm::GetMaxTokens();
+            if (warmupTokenLimit > 0) {
+                eagerWarmupBatch = std::min(
+                    eagerWarmupBatch,
+                    std::max(1, warmupTokenLimit / 128));
+                eagerWarmupTokens = std::min(eagerWarmupTokens,
+                                             warmupTokenLimit);
+            }
+            runEagerPrefillWarmup(eagerWarmupBatch, eagerWarmupTokens,
+                                  "batched serving", false);
+            runEagerPrefillWarmup(eagerWarmupBatch, eagerWarmupTokens,
+                                  "ragged batched serving", true);
+            cudaServingHighWaterPrepared = true;
         }
-        runEagerPrefillWarmup(eagerWarmupBatch, eagerWarmupTokens,
-                              "batched serving", false);
-        runEagerPrefillWarmup(eagerWarmupBatch, eagerWarmupTokens,
-                              "ragged batched serving", true);
+        if (highWaterOnly) {
+            return;
+        }
 
         // A few graph/runtime objects intentionally remain alive after the
         // prefill above and can retain its exact-size scratch blocks.  Keep a
         // separate, bounded reserve of concurrently reusable blocks for eager
         // serving.  Frozen allocation mode may use an oversized block, so this
         // also covers smaller shape-specific scratch without per-shape mallocs.
-        const int serveLargeReserveBlocks = 8;
-        const int serveMediumReserveBlocks = 8;
         // chunked_prefill_size=8192 needs roughly 112 MB for one
         // [tokens, hidden] fp16 activation on the 7168-wide model.  Keep the
         // reserve above that size so frozen serving can reuse it for a second
         // ragged burst while the previous burst is still being retired.
-        const size_t serveLargeReserveBlockBytes = 128ULL * 1024ULL * 1024ULL;
         // Long batch-1 recompute also keeps several 32--48 MB gated-attention
         // tensors alive at once.  If every reserve has the same 128 MB size,
         // those medium tensors consume all large blocks and a later gate
@@ -6621,7 +6717,6 @@ namespace fastllm {
         // class lets best-fit reuse keep the 128 MB blocks for genuinely large
         // activations while covering every gate shape up to the 8192-token
         // scheduler chunk (48 MB for 3072 fp16 channels).
-        const size_t serveMediumReserveBlockBytes = 64ULL * 1024ULL * 1024ULL;
         int previousDevice = FastllmCudaGetDevice();
         int failedReserveDevice = -1;
         int failedLargeReserveBlocks = 0;
@@ -6629,23 +6724,29 @@ namespace fastllm {
         for (int device : devices) {
             FastllmCudaSetDevice(device);
             int allocatedLargeReserveBlocks = FastllmCudaTryMallocBigBuffers(
-                serveLargeReserveBlockBytes, serveLargeReserveBlocks);
+                QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES,
+                QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS);
             int allocatedMediumReserveBlocks =
-                allocatedLargeReserveBlocks == serveLargeReserveBlocks
+                allocatedLargeReserveBlocks ==
+                        QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS
                     ? FastllmCudaTryMallocBigBuffers(
-                          serveMediumReserveBlockBytes,
-                          serveMediumReserveBlocks)
+                          QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES,
+                          QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS)
                     : 0;
             printf("[Fastllm] Qwen3.5 CUDA serve reserve GPU %d: "
                    "%d/%d x %.0f MB plus %d/%d x %.0f MB.\n",
                    device,
-                   allocatedLargeReserveBlocks, serveLargeReserveBlocks,
-                   serveLargeReserveBlockBytes / 1048576.0,
-                   allocatedMediumReserveBlocks, serveMediumReserveBlocks,
-                   serveMediumReserveBlockBytes / 1048576.0);
+                   allocatedLargeReserveBlocks,
+                   QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS,
+                   QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES / 1048576.0,
+                   allocatedMediumReserveBlocks,
+                   QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS,
+                   QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES / 1048576.0);
             FastllmCudaMemPoolStats();
-            if (allocatedLargeReserveBlocks != serveLargeReserveBlocks ||
-                allocatedMediumReserveBlocks != serveMediumReserveBlocks) {
+            if (allocatedLargeReserveBlocks !=
+                    QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS ||
+                allocatedMediumReserveBlocks !=
+                    QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS) {
                 failedReserveDevice = device;
                 failedLargeReserveBlocks = allocatedLargeReserveBlocks;
                 failedMediumReserveBlocks = allocatedMediumReserveBlocks;
@@ -6659,19 +6760,20 @@ namespace fastllm {
             std::ostringstream error;
             error << "Qwen3.5 CUDA serve reserve is incomplete on GPU "
                   << failedReserveDevice << ": allocated "
-                  << failedLargeReserveBlocks << "/" << serveLargeReserveBlocks
+                  << failedLargeReserveBlocks << "/"
+                  << QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS
                   << " large blocks and " << failedMediumReserveBlocks << "/"
-                  << serveMediumReserveBlocks
+                  << QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS
                   << " medium blocks. Starting with an incomplete reserve is unsafe "
                      "because CUDA allocations are frozen after warmup.";
             throw std::runtime_error(error.str());
         }
         printf("[Fastllm] Qwen3.5 CUDA serve reserve: "
                "%d x %.0f MB plus %d x %.0f MB per GPU.\n",
-               serveLargeReserveBlocks,
-               serveLargeReserveBlockBytes / 1048576.0,
-               serveMediumReserveBlocks,
-               serveMediumReserveBlockBytes / 1048576.0);
+               QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS,
+               QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES / 1048576.0,
+               QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS,
+               QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES / 1048576.0);
         fflush(stdout);
 
         // KV pressure can evict one long request and later recompute it as a
@@ -6689,6 +6791,7 @@ namespace fastllm {
         }
         runEagerPrefillWarmup(1, recomputeWarmupTokens,
                               "single-request recompute", false);
+        cudaServingPrepared = true;
 #endif
     }
 

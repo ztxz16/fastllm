@@ -347,6 +347,11 @@ namespace fastllm {
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
 
+        // Fixed per-device CUDA capacity that must still be available after
+        // model-specific serving high-water warmup. Unlike runtime reserve,
+        // this cost is not multiplied by the active request count.
+        virtual long long GetAutoWarmupCudaServingReserveBytes(int deviceId) const { return 0; }
+
         // AutoWarmup 最多允许 linear-attention 固定状态和模型 runtime buffer
         // 占用多少比例的可用 KV 预算。其余空间优先留给 token-growing KV cache。
         virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const { return 50; }
@@ -369,6 +374,10 @@ namespace fastllm {
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
+
+        // Materialize model-specific serving scratch before the final automatic
+        // KV-cache calibration so its actual pool footprint is observable.
+        virtual void WarmupCudaServingHighWaterBuffers() {}
 
         // 当前运行配置是否可以使用 ForwardGPU。
         // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
