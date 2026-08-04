@@ -1215,9 +1215,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 for (auto &it : div) {
                     int copyLen = it.second - it.first;
                     state = cudaMemcpy((uint8_t*)deviceWeightData + (size_t)curLen * rowBytes,
-                                       (uint8_t*)weight.cudaData + (size_t)it.first * rowBytes,
+                                       (uint8_t*)sourceWeightData + (size_t)it.first * rowBytes,
                                        (size_t)copyLen * rowBytes,
-                                       GetCudaMemcpyType(mallocType, 1));
+                                       GetCudaMemcpyType(mallocType, sourceWeightType));
                     if (state != cudaSuccess) {
                         break;
                     }
@@ -1269,7 +1269,8 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += copyLen;
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
-                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0) {
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
                 size_t rowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
                 if (mallocType == 0) {
                     cudaSetDevice(rootDevice);
@@ -1459,21 +1460,31 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += copyLen;
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
-                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0) {
-                const size_t blockBytes = weight.dataType == fastllm::DataType::NVFP4_BLOCK_16
-                    ? 8 + sizeof(float) : 8 + sizeof(uint8_t);
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
+                const size_t packedBlock = weight.dataType ==
+                        fastllm::DataType::NVFP4_BLOCK_32_E8M0 ? 32 : 16;
+                const size_t blockBytes = weight.dataType ==
+                        fastllm::DataType::NVFP4_BLOCK_16 ?
+                    8 + sizeof(float) : packedBlock / 2 + sizeof(uint8_t);
                 size_t srcRowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
                 size_t dstRowBytes = fastllm::GetDataBytes(weight.dataType, 1, len);
                 for (auto &it : div) {
                     int copyLen = it.second - it.first;
-                    fastllm::AssertInFastLLM(it.first % 16 == 0 && copyLen % 16 == 0,
-                                             "NVFP4_BLOCK_16 tensor parallel column split should align to 16.\n");
+                    fastllm::AssertInFastLLM(
+                        it.first % packedBlock == 0 &&
+                            copyLen % packedBlock == 0,
+                        "Packed NVFP4 tensor parallel column split should "
+                        "align to its block size.\n");
                     if (mallocType == 0) {
                         cudaSetDevice(rootDevice);
                     }
-                    size_t dstOffsetBytes = static_cast<size_t>(curLen / 16) * blockBytes;
-                    size_t srcOffsetBytes = static_cast<size_t>(it.first / 16) * blockBytes;
-                    size_t copyBytes = static_cast<size_t>(copyLen / 16) * blockBytes;
+                    size_t dstOffsetBytes =
+                        static_cast<size_t>(curLen / packedBlock) * blockBytes;
+                    size_t srcOffsetBytes =
+                        static_cast<size_t>(it.first / packedBlock) * blockBytes;
+                    size_t copyBytes =
+                        static_cast<size_t>(copyLen / packedBlock) * blockBytes;
                     state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
                                                 dstRowBytes,
                                                 (uint8_t*)sourceWeightData + srcOffsetBytes,
