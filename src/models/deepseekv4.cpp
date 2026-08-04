@@ -9694,15 +9694,16 @@ namespace fastllm {
         DeepSeekV4DecodeWorkspace localDecodeWorkspace;
         DeepSeekV4DecodeWorkspace *decodeWorkspace = &localDecodeWorkspace;
         const Data *modelInputIds = &inputIds;
+        bool graphSafeDecode = false;
+        bool dsparkGraphVerification = false;
 #ifdef USE_CUDA
         std::shared_ptr<DeepSeekV4CudaGraphState> graphState;
         std::unique_lock<std::mutex> graphLock;
-        bool graphSafeDecode = false;
         bool graphGpuReplayInputs = false;
         const DeepSeekV4DsparkTargetGpuInput *targetGpuInput =
             deepSeekV4DsparkTargetGpuInput;
         std::vector<int> graphDevices;
-        const bool dsparkGraphVerification =
+        dsparkGraphVerification =
             DeepSeekV4DsparkVerificationActive() && dsparkEnabled &&
             dsparkTokens > 0 && seqlen == dsparkTokens + 1;
         // Size and specialize a request-local decode graph for the complete
