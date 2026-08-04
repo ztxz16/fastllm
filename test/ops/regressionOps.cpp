@@ -2451,6 +2451,9 @@ namespace {
 #endif
         bool expectSm120Triton = tritonGate && haveArch &&
             (major * 10 + minor == 120 || major * 10 + minor == 121);
+        bool expectSm120Production = haveArch &&
+            (major * 10 + minor == 120 || major * 10 + minor == 121);
+        float productionTolerance = expectSm120Triton ? 2.0e-5f : 0.0f;
 
         for (int tokens : {1, 7, 127}) {
             std::vector<float> logitsValues((size_t)tokens * experts);
@@ -2501,6 +2504,20 @@ namespace {
             ExpectFloatNear(logitsValues, ToFloatVector(fusedLogits),
                             0.0f, 0.0f,
                             "generic DeepSeek-V4 fused router input");
+
+            // Exercise the production dispatch as well. With Triton disabled
+            // this selects the native one-warp-per-row SM120 kernel; with it
+            // enabled it continues to validate the preferred Triton kernel.
+            fastllm::Data productionIndex, productionScore;
+            Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                       fusedLogits, gateBias, routeScale,
+                       productionIndex, productionScore, true),
+                   "production DeepSeek-V4 fused router rejected a valid input");
+            ExpectIntEqual(expectedIndex, ToIntVector(productionIndex),
+                           "production DeepSeek-V4 fused router indices");
+            ExpectFloatNear(expectedScore, ToFloatVector(productionScore),
+                            productionTolerance, productionTolerance,
+                            "production DeepSeek-V4 fused router scores");
 
             for (int token = 0; token < tokens; token++) {
                 float sum = std::accumulate(
@@ -2559,6 +2576,30 @@ namespace {
                 FastllmCudaGraphExecDestroy(graphExec);
                 FastllmCudaGraphDestroy(graph);
 
+                graph = nullptr;
+                graphExec = nullptr;
+                Expect(FastllmCudaGraphBeginCapture(),
+                       "production DeepSeek-V4 router graph capture did not start");
+                Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                           fusedLogits, gateBias, routeScale,
+                           productionIndex, productionScore, true),
+                       "production DeepSeek-V4 router failed during graph capture");
+                Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                       "production DeepSeek-V4 router graph capture failed");
+                Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                           graphExec != nullptr,
+                       "production DeepSeek-V4 router graph instantiate failed");
+                Expect(FastllmCudaGraphLaunch(graphExec),
+                       "production DeepSeek-V4 router graph replay failed");
+                FastllmCudaSyncCurrentThreadStream();
+                ExpectIntEqual(expectedIndex, ToIntVector(productionIndex),
+                               "production DeepSeek-V4 router graph indices");
+                ExpectFloatNear(expectedScore, ToFloatVector(productionScore),
+                                productionTolerance, productionTolerance,
+                                "production DeepSeek-V4 router graph scores");
+                FastllmCudaGraphExecDestroy(graphExec);
+                FastllmCudaGraphDestroy(graph);
+
                 if (expectSm120Triton) {
                     graph = nullptr;
                     graphExec = nullptr;
@@ -2605,6 +2646,19 @@ namespace {
             Expect(std::isfinite(score) && score == 0.0f,
                    "generic DeepSeek-V4 router returned a non-finite score");
         }
+        fastllm::Data productionNonFiniteIndex, productionNonFiniteScore;
+        Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                   nonFiniteLogits, gateBias, routeScale,
+                   productionNonFiniteIndex, productionNonFiniteScore, true),
+               "production DeepSeek-V4 router rejected non-finite input");
+        for (int expert : ToIntVector(productionNonFiniteIndex)) {
+            Expect(expert >= 0 && expert < experts,
+                   "production DeepSeek-V4 router returned an invalid expert");
+        }
+        for (float score : ToFloatVector(productionNonFiniteScore)) {
+            Expect(std::isfinite(score) && score == 0.0f,
+                   "production DeepSeek-V4 router returned a non-finite score");
+        }
         if (expectSm120Triton) {
             fastllm::Data tritonIndex = MakeIntTensor(
                 {2, topk}, std::vector<int32_t>(2 * topk, -1));
@@ -2630,7 +2684,8 @@ namespace {
 
         std::cout << "DeepSeek-V4 fused sqrt-softplus router regression: PASS ("
                   << (expectSm120Triton ? "generic + SM120 Triton" :
-                                         "generic fallback")
+                      expectSm120Production ? "generic + SM120 native" :
+                                              "generic fallback")
                   << ")\n";
     }
 

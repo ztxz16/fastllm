@@ -2559,6 +2559,23 @@ DeepSeekV4RouterWarpBest(DeepSeekV4RouterCandidate value) {
     return value;
 }
 
+// Return the same best candidate to every lane in a warp. A DeepSeek-V4
+// routing row has exactly 256 values, so one warp can keep eight candidates
+// per lane in registers and perform all six selections without shared memory.
+// The explicit id tie-break matches the established 256-thread kernel.
+__device__ __forceinline__ DeepSeekV4RouterCandidate
+DeepSeekV4RouterWarpConsensusBest(DeepSeekV4RouterCandidate value) {
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        DeepSeekV4RouterCandidate other;
+        other.key = __shfl_xor_sync(0xffffffffu, value.key, mask);
+        other.id = __shfl_xor_sync(0xffffffffu, value.id, mask);
+        if (DeepSeekV4RouterCandidateBetter(other, value)) {
+            value = other;
+        }
+    }
+    return value;
+}
+
 // Architecture-generic fused router. One CTA owns one token; every lane
 // transforms one of the 256 logits and six block reductions select the routed
 // experts. A winner writes its unbiased route weight before proceeding; the
@@ -2645,6 +2662,123 @@ void DeepSeekV4SqrtSoftplusTop6GenericKernel(
         }
     }
 }
+
+#ifndef USE_ROCM
+// SM120 decode/verification specialization modeled after vLLM's
+// topkGatingSoftplusSqrt schedule. Four independent routing rows share one
+// CTA, while each warp owns one row and each lane keeps two aligned float4
+// chunks. There are no block barriers or shared-memory round trips.
+__global__ __launch_bounds__(128)
+void DeepSeekV4SqrtSoftplusTop6Warp4Kernel(
+        const float *logits, const float *bias,
+        int32_t *index, float *score, int tokens, float routeScale) {
+    constexpr int experts = 256;
+    constexpr int topk = 6;
+    constexpr int rowsPerBlock = 4;
+    constexpr float invalidKey = -FLT_MAX;
+
+    int lane = threadIdx.x;
+    int rowInBlock = threadIdx.y;
+    int token = blockIdx.x * rowsPerBlock + rowInBlock;
+    if (lane >= 32 || rowInBlock >= rowsPerBlock || token >= tokens) {
+        return;
+    }
+
+    const float4 *row4 = reinterpret_cast<const float4 *>(
+        logits + (uint64_t)token * experts);
+    const float4 *bias4 = reinterpret_cast<const float4 *>(bias);
+    float4 raw0 = row4[lane];
+    float4 raw1 = row4[32 + lane];
+    float4 bias0 = bias4[lane];
+    float4 bias1 = bias4[32 + lane];
+    float rawValues[8] = {
+        raw0.x, raw0.y, raw0.z, raw0.w,
+        raw1.x, raw1.y, raw1.z, raw1.w,
+    };
+    float biasValues[8] = {
+        bias0.x, bias0.y, bias0.z, bias0.w,
+        bias1.x, bias1.y, bias1.z, bias1.w,
+    };
+    float weights[8];
+    float keys[8];
+    int ids[8];
+    bool active[8];
+
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        int half = item >> 2;
+        int component = item & 3;
+        int expert = half * 128 + lane * 4 + component;
+        float weight = sqrtf(DeepSeekV4Softplus(rawValues[item]));
+        float key = weight + biasValues[item];
+        if (!isfinite(key)) {
+            key = invalidKey;
+        }
+        if (!isfinite(weight)) {
+            weight = 0.0f;
+        }
+        weights[item] = weight;
+        keys[item] = key;
+        ids[item] = expert;
+        active[item] = true;
+    }
+
+    int selectedIds[topk];
+    float selectedWeights[topk];
+#pragma unroll
+    for (int rank = 0; rank < topk; ++rank) {
+        DeepSeekV4RouterCandidate local = {invalidKey, -1};
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            DeepSeekV4RouterCandidate candidate = {
+                active[item] ? keys[item] : invalidKey,
+                active[item] ? ids[item] : -1,
+            };
+            if (DeepSeekV4RouterCandidateBetter(candidate, local)) {
+                local = candidate;
+            }
+        }
+        DeepSeekV4RouterCandidate best =
+            DeepSeekV4RouterWarpConsensusBest(local);
+
+        float selectedWeight = 0.0f;
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            if (ids[item] == best.id) {
+                selectedWeight = weights[item];
+                active[item] = false;
+            }
+        }
+        // Both 128-expert halves use the same lane mapping.
+        int ownerLane = (best.id & 127) >> 2;
+        selectedWeight = __shfl_sync(
+            0xffffffffu, selectedWeight, ownerLane);
+        if (lane == 0) {
+            selectedIds[rank] = best.id;
+            selectedWeights[rank] = selectedWeight;
+        }
+    }
+
+    if (lane == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int rank = 0; rank < topk; ++rank) {
+            sum += selectedWeights[rank];
+        }
+        if (!isfinite(sum) || fabsf(sum) < 1.0e-20f) {
+            sum = 1.0f;
+        }
+        int32_t *tokenIndex = index + (uint64_t)token * topk;
+        float *tokenScore = score + (uint64_t)token * topk;
+#pragma unroll
+        for (int rank = 0; rank < topk; ++rank) {
+            tokenIndex[rank] = selectedIds[rank];
+            tokenScore[rank] =
+                selectedWeights[rank] / sum * routeScale;
+        }
+    }
+}
+#endif
 
 template <typename RouteT>
 __global__ void DeepSeekV4HashRouteScoreKernel(float *logits, const RouteT *tid2eid,
@@ -7531,6 +7665,21 @@ extern "C" bool FastllmCudaDeepSeekV4SqrtSoftplusRouter(
         fastllm::FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
             logits, gateBias, routeScale, expertIndex, expertScore)) {
         return true;
+    }
+    if (allowTriton && FastllmCudaRuntimeArch() >= 120 &&
+        std::getenv(
+            "FASTLLM_DSV4_REFERENCE_SQRTSOFTPLUS_ROUTER") == nullptr) {
+        constexpr int rowsPerBlock = 4;
+        dim3 threads(32, rowsPerBlock);
+        DeepSeekV4SqrtSoftplusTop6Warp4Kernel<<<
+            (tokens + rowsPerBlock - 1) / rowsPerBlock, threads>>>(
+                (const float *)logits.cudaData,
+                (const float *)gateBias.cudaData,
+                (int32_t *)expertIndex.cudaData,
+                (float *)expertScore.cudaData, tokens, routeScale);
+        bool ok = cudaGetLastError() == cudaSuccess;
+        DeviceSync();
+        return ok;
     }
 #else
     (void)allowTriton;
