@@ -250,12 +250,26 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   const void *b_scales, void *c,
                                   int size_m, int size_n, int size_k,
                                   int group_size, int *workspace);
+// SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
+// two-stage Turing specialization; SM80+ selects the four-stage kernel.
+bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a,
+                                    const uint32_t *b_q_weight,
+                                    const void *b_scales,
+                                    const float *global_scale, void *c,
+                                    int size_m, int size_n, int size_k,
+                                    int *workspace, void *c_tmp);
+bool FastllmCudaMarlinNVFP4Supported(int size_n, int size_k);
 bool FastllmCudaHasFp8MarlinLayout(const fastllm::Data &weight);
 bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
                                                 fastllm::Data &weight,
                                                 const fastllm::Data &bias,
-                                                fastllm::Data &output,
-                                                int n, int m, int k);
+                                                 fastllm::Data &output,
+                                                 int n, int m, int k);
+bool FastllmCudaHasNVFP4MarlinLayout(const fastllm::Data &weight);
+bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k);
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);

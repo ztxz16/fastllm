@@ -674,6 +674,13 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     dst.groupCnt = src.groupCnt;
     dst.blockK = src.blockK;
     dst.blockM = src.blockM;
+    // NVFP4_BLOCK_16 stores its block scales inline.  Its scales vector only
+    // carries the tensor-level dequant multipliers needed when preparing the
+    // Marlin layout, so every tensor-parallel shard must retain that metadata.
+    // Shape-dependent scale arrays for other formats are split below instead.
+    if (src.dataType == fastllm::DataType::NVFP4_BLOCK_16) {
+        dst.scales = src.scales;
+    }
     dst.perChannelAxis = src.perChannelAxis;
     dst.isGGUFData = src.isGGUFData || src.dataType == fastllm::DataType::DATA_GGUF_FORMAT;
     dst.ggmlType = src.ggmlType;

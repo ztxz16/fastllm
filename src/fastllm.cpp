@@ -1308,6 +1308,14 @@ namespace fastllm {
             this->blockM = blockM;
             if (dataType == DataType::NVFP4) {
                 this->scales.clear();
+            } else if (dataType == DataType::NVFP4_BLOCK_16) {
+                // NVFP4_BLOCK_16 keeps its block scales inline.  oriScales, when
+                // present, contains only the tensor-level dequant multiplier
+                // retained by the safetensors loader for Marlin preparation.
+                this->scales.clear();
+                if (oriScales != nullptr) {
+                    this->scales.push_back(oriScales[0]);
+                }
             }
             if (dataType == DataType::INT4_GROUP32) {
                 AssertInFastLLM(this->dims.size() == 2 && this->dims[1] % 32 == 0,

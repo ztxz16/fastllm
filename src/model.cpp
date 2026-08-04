@@ -1005,6 +1005,19 @@ namespace fastllm {
                         }
                     }
 
+                    // Keep the per-tensor dequant multiplier as metadata.  The
+                    // compact CUDA layout below stores only the already-combined
+                    // float scale (FP8 scale * multiplier) in each 16-value
+                    // block.  NVFP4 Marlin needs a tensor-level multiplier as
+                    // well, so retain it here rather than trying to infer it
+                    // later from rounded block scales.  Merged linear weights
+                    // append this vector, allowing the Marlin preparation path
+                    // to choose a common multiplier for all merged partitions.
+                    if (dstType == DataType::NVFP4_BLOCK_16) {
+                        scalesBuffer = new float[1];
+                        scalesBuffer[0] = scale2Value;
+                    }
+
                     size_t blockBytes = dstType == DataType::NVFP4_BLOCK_16 ? 8 + sizeof(float) : 9;
                     size_t scaleCols = (m - 1) / 16 + 1;
                     size_t outputBytes = GetDataBytes(dstType, n, m);
