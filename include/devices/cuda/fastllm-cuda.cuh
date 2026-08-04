@@ -205,6 +205,12 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
 #endif
 void *FastllmCudaMalloc(size_t size);
 void FastllmCudaForceFree(void *ret);
+// Return a pooled allocation after all work already submitted to this host
+// thread's per-thread stream has completed. The allocation is detached from
+// its Data owner immediately but is not eligible for pool reuse until the
+// recorded stream event is ready. Returns false for non-pooled allocations or
+// while CUDA Graph capture owns the ordinary free path.
+bool FastllmCudaFreeAfterCurrentThreadStream(void *ret);
 void FastllmCudaFree(void *ret);
 void DisableCudaMalloc();
 // 由 multicuda 在 NCCL 初始化成功后置位；置位后真实 cudaMalloc 前会先排空在途 NCCL 集合通信，

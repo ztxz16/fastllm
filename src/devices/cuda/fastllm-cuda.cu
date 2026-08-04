@@ -3880,12 +3880,42 @@ struct CudaMemoryBuffer {
     size_t size;
     bool busy;
     int graphPins;
+    cudaEvent_t reuseReadyEvent;
+    bool reusePending;
 
-    CudaMemoryBuffer () : data(nullptr), size(0), busy(false), graphPins(0) {}
+    CudaMemoryBuffer () : data(nullptr), size(0), busy(false), graphPins(0),
+            reuseReadyEvent(nullptr), reusePending(false) {}
 
     CudaMemoryBuffer (void *data, size_t size, bool busy) :
-            data(data), size(size), busy(busy), graphPins(0) {}
+            data(data), size(size), busy(busy), graphPins(0),
+            reuseReadyEvent(nullptr), reusePending(false) {}
 };
+
+static bool FastllmCudaBufferReadyForReuseLocked(CudaMemoryBuffer &buffer) {
+    if (!buffer.reusePending) {
+        return true;
+    }
+    cudaError_t state = cudaEventQuery(buffer.reuseReadyEvent);
+    if (state == cudaSuccess) {
+        buffer.reusePending = false;
+        return true;
+    }
+    if (state == cudaErrorNotReady) {
+        return false;
+    }
+    checkCudaErrors("Error: CUDA error when checking deferred pool reuse!", state);
+    return false;
+}
+
+static void FastllmCudaDestroyReuseEventLocked(CudaMemoryBuffer &buffer) {
+    if (buffer.reuseReadyEvent == nullptr) {
+        return;
+    }
+    cudaError_t state = cudaEventDestroy(buffer.reuseReadyEvent);
+    buffer.reuseReadyEvent = nullptr;
+    buffer.reusePending = false;
+    checkCudaErrors("Error: CUDA error when destroying deferred pool event!", state);
+}
 std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
 std::map<int, int> cudaBuffersMinId; // 最小的空闲id
 std::map<int, size_t> noBusyCnt;
@@ -3986,10 +4016,11 @@ static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMem
         cudaDeviceSynchronize();
     }
     for (auto &buffer : bigBuffers) {
-        if (buffer.busy) {
+        if (buffer.busy || !FastllmCudaBufferReadyForReuseLocked(buffer)) {
             keep.push_back(buffer);
             continue;
         }
+        FastllmCudaDestroyReuseEventLocked(buffer);
         state = cudaFree(buffer.data);
         if (cudaSuccess == state) {
             released += buffer.size;
@@ -4511,9 +4542,11 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         busyBuffers.reserve(bigBuffers.size());
         for (auto &buffer : bigBuffers) {
             if (buffer.busy || buffer.graphPins > 0 ||
+                !FastllmCudaBufferReadyForReuseLocked(buffer) ||
                 FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
                 busyBuffers.push_back(buffer);
             } else {
+                FastllmCudaDestroyReuseEventLocked(buffer);
                 state = cudaFree(buffer.data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when releasing idle big buffer on device %d!", id);
@@ -4531,9 +4564,11 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         busyBuffers.reserve(cudaBuffers.size());
         for (auto &buffer : cudaBuffers) {
             if (buffer.busy || buffer.graphPins > 0 ||
+                !FastllmCudaBufferReadyForReuseLocked(buffer) ||
                 FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
                 busyBuffers.push_back(buffer);
             } else {
+                FastllmCudaDestroyReuseEventLocked(buffer);
                 state = cudaFree(buffer.data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when releasing idle buffer on device %d!", id);
@@ -4721,6 +4756,7 @@ void * FastllmCudaMalloc(size_t size) {
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
                 FastllmCudaGraphPoolPointerReusableLocked(
                     bigBuffers[i].data, captureIdentity) &&
                 FastllmCudaCanReusePooledBigBuffer(bigBuffers[i].size, size)) {
@@ -4741,6 +4777,7 @@ void * FastllmCudaMalloc(size_t size) {
         if (useAnyFittingPooledBuffer) {
             for (int i = 0; i < bigBuffers.size(); i++) {
                 if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                    FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
                     bigBuffers[i].size >= size &&
                     FastllmCudaGraphPoolPointerReusableLocked(
                         bigBuffers[i].data, captureIdentity)) {
@@ -4793,6 +4830,7 @@ void * FastllmCudaMalloc(size_t size) {
     for (int i = *view.minId; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy &&
             cudaBuffers[i].graphPins == 0 &&
+            FastllmCudaBufferReadyForReuseLocked(cudaBuffers[i]) &&
             FastllmCudaGraphPoolPointerReusableLocked(
                 cudaBuffers[i].data, captureIdentity)) {
             cudaBuffers[i].busy = true;
@@ -4815,6 +4853,7 @@ void * FastllmCudaMalloc(size_t size) {
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
                 bigBuffers[i].size >= size &&
                 FastllmCudaGraphPoolPointerReusableLocked(
                     bigBuffers[i].data, captureIdentity)) {
@@ -4894,6 +4933,7 @@ void FastllmCudaForceFree(void *ret) {
                     return;
                 }
                 state = cudaSetDevice(view.device);
+                FastllmCudaDestroyReuseEventLocked(cudaBuffers[i]);
                 state = cudaFree(cudaBuffers[i].data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when force releasing memory on device %d!", view.device);
@@ -4927,6 +4967,7 @@ void FastllmCudaForceFree(void *ret) {
                     return;
                 }
                 state = cudaSetDevice(view.device);
+                FastllmCudaDestroyReuseEventLocked(bigBuffers[i]);
                 state = cudaFree(bigBuffers[i].data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when force releasing big memory on device %d!", view.device);
@@ -4947,6 +4988,68 @@ void FastllmCudaForceFree(void *ret) {
     state = cudaFree(ret);
     FastllmCudaSetDevice(oriId);
     checkCudaErrors("CUDA error when force releasing uncached memory!", state);
+}
+
+bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
+    if (ret == nullptr) {
+        return true;
+    }
+    FastllmCudaGraphCaptureIdentity captureIdentity =
+        FastllmCudaGraphCurrentCaptureIdentity();
+    if (captureIdentity.valid || FastllmCudaGraphIsCapturing()) {
+        return false;
+    }
+
+    int device = FastllmCudaGetDevice();
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(device);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    auto deferBuffer = [&](CudaMemoryBuffer &buffer, int smallIndex) {
+        if (!buffer.busy || buffer.reusePending ||
+            !FastllmCudaGraphPoolBeforeFreeLocked(ret, captureIdentity)) {
+            return false;
+        }
+        if (buffer.reuseReadyEvent == nullptr) {
+            cudaError_t createState = cudaEventCreateWithFlags(
+                &buffer.reuseReadyEvent, cudaEventDisableTiming);
+            if (createState != cudaSuccess) {
+                checkCudaErrors(
+                    "Error: CUDA error when creating deferred pool event!",
+                    createState);
+                return false;
+            }
+        }
+        cudaError_t recordState = cudaEventRecord(
+            buffer.reuseReadyEvent, cudaStreamPerThread);
+        if (recordState != cudaSuccess) {
+            checkCudaErrors(
+                "Error: CUDA error when recording deferred pool event!",
+                recordState);
+            return false;
+        }
+        buffer.reusePending = true;
+        buffer.busy = false;
+        if (smallIndex >= 0 && buffer.graphPins == 0) {
+            *view.noBusy += buffer.size;
+            *view.minId = std::min(*view.minId, smallIndex);
+        }
+#ifdef CUDA_MEM_DEBUG
+        CudaMemDebugRemove(ret);
+#endif
+        return true;
+    };
+
+    for (int i = 0; i < (int)view.smallBuffers->size(); ++i) {
+        CudaMemoryBuffer &buffer = (*view.smallBuffers)[i];
+        if (buffer.data == ret) {
+            return deferBuffer(buffer, i);
+        }
+    }
+    for (CudaMemoryBuffer &buffer : *view.bigBuffers) {
+        if (buffer.data == ret) {
+            return deferBuffer(buffer, -1);
+        }
+    }
+    return false;
 }
 
 void FastllmCudaFree(void *ret) {
@@ -5171,13 +5274,18 @@ void FastllmCudaClearBigBuffer() {
     // 不会同时持有多把设备锁，避免跨设备阻塞。
     for (auto &view : views) {
         std::lock_guard<std::mutex> lock(*view.lock);
+        state = cudaSetDevice(view.device);
+        checkCudaErrors(
+            "Error: CUDA error when switching device to clear big buffers!",
+            state);
         auto &bigBuffers = *view.bigBuffers;
         std::vector <CudaMemoryBuffer> temp;
         long long littleMemSum = 0;        
         long long littleMemSumLimit = 300 * 1024 * 1024; // 留一小部分复用  
         std::vector <std::pair <std::size_t, int > > v;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0) {
+            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i])) {
                 v.push_back(std::make_pair(bigBuffers[i].size, i));
             }
         }
@@ -5192,10 +5300,12 @@ void FastllmCudaClearBigBuffer() {
         }
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
                 littleMemIds.find(i) == littleMemIds.end() &&
                 !FastllmCudaGraphPoolPointerProtectedLocked(
                     bigBuffers[i].data)) {
                 state = cudaSetDevice(view.device);
+                FastllmCudaDestroyReuseEventLocked(bigBuffers[i]);
                 state = cudaFree(bigBuffers[i].data);
                 if (cudaSuccess != state)
                     printf("Error: CUDA error when release memory on device %d!", view.device);

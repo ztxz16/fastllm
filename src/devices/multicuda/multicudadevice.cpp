@@ -500,6 +500,19 @@ namespace fastllm {
         for (int i = 0; i < (int)ops.size(); i++) {
             pool->Wait(i);
         }
+
+        // AliveThreadPool only reports that Run() returned. CUDA work launched by
+        // those threads can still be pending on their per-thread streams, while
+        // the caller is free to destroy the ops and recycle their tensor buffers.
+        // Wait until every rank has enqueued its work before synchronizing, so
+        // collective launches cannot deadlock while another rank is still queued.
+        int originalDevice = FastllmCudaGetDevice();
+        for (int device : opDevices) {
+            if (IsDedicatedWorkerCudaDevice(device)) {
+                FastllmCudaSyncDevice(device);
+            }
+        }
+        FastllmCudaSetDevice(originalDevice);
     }
 
     static void RunMultiCudaDeviceOpsAndDelete(const std::vector<int> &opDevices,
@@ -896,6 +909,28 @@ namespace fastllm {
             std::swap(data.cudaData, replica->cudaData);
             std::swap(data.expansionSize, replica->expansionSize);
             std::swap(data.expansionBytes, replica->expansionBytes);
+
+            // Local MultiCUDA operators publish replica results on this host
+            // thread's per-device streams. Detach their allocations now, but
+            // keep each pool block unavailable until its producer stream has
+            // reached the recorded event. This preserves asynchronous decode
+            // without letting ResetMultiCudaTensor recycle an in-flight buffer.
+            for (auto &localIt : data.multiDeviceDatas) {
+                Data *local = localIt.second;
+                if (local == nullptr || local->dataDevice != DataDevice::CUDA ||
+                    local->cudaData == nullptr || local->cudaDataBorrowed ||
+                    local->directMemory) {
+                    continue;
+                }
+                int localDevice = local->dataDeviceIds.empty() ?
+                    localIt.first : local->dataDeviceIds[0];
+                FastllmCudaSetDevice(localDevice);
+                if (FastllmCudaFreeAfterCurrentThreadStream(local->cudaData)) {
+                    local->cudaData = nullptr;
+                    local->expansionSize = 0;
+                    local->expansionBytes = 0;
+                }
+            }
             ResetMultiCudaTensor(data);
             // The returned tensor now owns storage on the root GPU.  Keep the
             // CUDA current device consistent with that ownership; otherwise a
