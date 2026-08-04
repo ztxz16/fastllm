@@ -588,6 +588,10 @@ if (UNIT_TEST)
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+
+        add_executable(customAllReduceRegression test/ops/customAllReduceRegression.cpp)
+        target_link_libraries(customAllReduceRegression fastllm)
+        target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
 endif()
 

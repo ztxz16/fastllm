@@ -2036,6 +2036,8 @@ static std::map<int, ncclComm_t> g_ncclComms;
 static std::map<int, int> g_ncclRanks;
 static bool g_ncclInitialized = false;
 static int g_ncclWorldSize = 0;
+static std::atomic<uint64_t> g_ncclGeneration{0};
+static std::mutex g_ncclInitMutex;
 
 struct FastllmNcclGraphPeerComms {
     int devices[2] = {-1, -1};
@@ -2141,7 +2143,12 @@ static ncclComm_t FindNcclCommNoLog(int deviceId) {
     return it == g_ncclComms.end() ? nullptr : it->second;
 }
 
+uint64_t FastllmGetNcclGeneration() {
+    return g_ncclGeneration.load(std::memory_order_acquire);
+}
+
 bool FastllmInitNccl(const std::vector<int>& devices) {
+    std::lock_guard<std::mutex> initGuard(g_ncclInitMutex);
     std::vector<int> uniqueDevices = FastllmUniqueNcclDevices(devices);
     if (uniqueDevices.size() <= 1) {
         return false;
@@ -2163,6 +2170,12 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         FastllmCudaCustomAllReduceInit(uniqueDevices);
         return true;
     }
+
+    // Publish a new generation before tearing down the old group. Even if a
+    // future initialization error prevents custom state from being rebuilt,
+    // every rank will consistently reject the stale state and use NCCL.
+    g_ncclGeneration.fetch_add(1, std::memory_order_acq_rel);
+    FastllmCudaCustomAllReduceReset();
 
     for (auto &it : g_ncclComms) {
         if (it.second != nullptr) {
@@ -2824,7 +2837,8 @@ static bool FastllmCanUseTP2P2PAllReduceAddImpl(
     // CUDA Graph uses pre-registered pointer tuples and device-side counters.
     // Avoid touching the eager path's host sequence state while capturing.
     if (fastllm::GetFastllmEnv().cudaGraph) {
-        return FastllmCudaCustomAllReduceEnabled() &&
+        return FastllmCudaCustomAllReduceCanRun(
+                   count, dataType, deviceId) &&
                g_ncclWorldSize == 2 &&
                g_ncclRanks.find(deviceId) != g_ncclRanks.end();
     }

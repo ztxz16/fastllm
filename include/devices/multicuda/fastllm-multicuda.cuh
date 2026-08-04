@@ -6,6 +6,7 @@
 
 #include "fastllm.h"
 
+#include <cstdint>
 #include <functional>
 
 std::vector <long long> FastllmCudaGetFreeSizes();
@@ -19,15 +20,26 @@ extern "C" {
 using DivisionScheme = std::map <int, std::vector <std::pair <int, int> > >;
 
 bool FastllmInitNccl(const std::vector<int>& devices);
+// Monotonically identifies the currently initialized global NCCL communicator
+// group. Custom collective state must match this generation before it can run.
+uint64_t FastllmGetNcclGeneration();
 // Enables and validates direct CUDA peer access for every device pair.  This
 // capability is independent of the optional custom all-reduce implementation
 // and can also be used by graph-safe peer signaling with NCCL collectives.
 bool FastllmCudaPeerAccessInit(const std::vector<int>& devices);
 // Graph-safe small-tensor all-reduce backed by direct peer reads and a GPU-side
-// barrier. It is opt-in through FASTLLM_CUDA_CUSTOM_ALLREDUCE=1; all functions
-// return false when disabled or unsupported so NCCL remains the fallback.
+// barrier. With FASTLLM_CUDA_CUSTOM_ALLREDUCE unset or set to "auto", it is
+// correctness-tested and benchmarked against NCCL on the active eager or CUDA
+// Graph path. FP16/BF16/FP32 and small/large messages are selected independently
+// for supported 2/4/6/8-GPU groups. Set the variable to 1 to
+// force-enable every supported path, or 0 to force-disable it. Unsupported or
+// disabled tensors return false so NCCL remains the fallback.
 bool FastllmCudaCustomAllReduceEnabled();
+bool FastllmCudaCustomAllReduceCanRun(int count, int dataType, int deviceId);
 bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
+// Disable the published policy, drain the old device group and release all
+// group-owned signal, scratch and pointer-registration allocations.
+void FastllmCudaCustomAllReduceReset();
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
 // Reduces two independent rank-local tensors, rounds each reduction to the
