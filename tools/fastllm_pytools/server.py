@@ -303,6 +303,10 @@ def _fastllm_server(args, startup_progress):
     apply_page_size_default(args)
     init_logging()
     logging.info(args)
+    # The server freezes real CUDA allocations after Uvicorn startup.  Tell
+    # model warmup to prepare allocation-free serving capacity before model
+    # construction completes; non-server CLI/library users need not reserve it.
+    os.environ["FASTLLM_CUDA_FREEZE_AFTER_WARMUP"] = "1"
     from .util import make_normal_llm_model
     model = make_normal_llm_model(args, startup_progress = startup_progress)
     apply_default_generation_config_overrides(model, args)

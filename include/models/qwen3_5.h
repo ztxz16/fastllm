@@ -190,7 +190,7 @@ namespace fastllm {
                 Data &logits,
                 Data *precomputedHiddenStates = nullptr);
 
-        void PreCaptureCudaGraphAfterWarmup();
+        void PrepareCudaServingAfterWarmup();
         void PreAllocateLinearSlotPoolsForCudaGraph(
                 const std::vector<int> &devices,
                 const std::map<int, int> &ratios,

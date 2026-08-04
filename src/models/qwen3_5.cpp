@@ -5937,8 +5937,12 @@ namespace fastllm {
             }
             ClearAllPagedCacheManagers();
             FastllmCudaClearBigBuffer();
-            PreCaptureCudaGraphAfterWarmup();
         }
+        // The API frontend freezes real CUDA allocations after startup for
+        // every serving mode, not only when CUDA graph is enabled.  Prepare the
+        // eager-serving pool unconditionally before that freeze; the helper
+        // keeps graph capture itself conditional.
+        PrepareCudaServingAfterWarmup();
         Qwen35ReleaseThreadLocalCudaSamplingBuffers();
 #endif
     }
@@ -6342,9 +6346,19 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::PreCaptureCudaGraphAfterWarmup() {
+    void Qwen3_5Model::PrepareCudaServingAfterWarmup() {
 #ifdef USE_CUDA
-        if (!GetFastllmEnv().cudaGraph || autoWarmupRunning.load() ||
+        const char *freezeAfterWarmup =
+            std::getenv("FASTLLM_CUDA_FREEZE_AFTER_WARMUP");
+        const bool allocationFreeServing =
+            GetFastllmEnv().cudaGraph ||
+            (freezeAfterWarmup != nullptr &&
+             Qwen35MoeIsTrueString(freezeAfterWarmup));
+        // The extra high-water forwards and reserve are required by the API
+        // server because it freezes real allocations at ready.  Keep ordinary
+        // non-graph CLI/library inference from paying that serving-only memory
+        // cost; CUDA graph still needs the same preparation independently.
+        if (!allocationFreeServing || autoWarmupRunning.load() ||
             GetKVCacheInCPU()) {
             return;
         }
@@ -6355,117 +6369,127 @@ namespace fastllm {
             return;
         }
 
-        const bool mtpEnabled = !Qwen35MtpDisabledByEnv() && HasMtpWeights();
+        const bool cudaGraphEnabled = GetFastllmEnv().cudaGraph;
         int maxWarmupBatch = Qwen35PreCaptureMaxBatch(this);
-        if (mtpEnabled && this->maxBatch > maxWarmupBatch) {
-            printf("[Fastllm] Qwen3.5 CUDA graph: MTP is enabled; "
-                   "capture batch 1 only to preserve runtime memory for speculative validation.\n");
-        }
-        std::vector<int> warmupBatches = Qwen35PreCaptureBatches(maxWarmupBatch);
-        int warmupBatchCount = (int)warmupBatches.size();
-        int linearSlotCapacity = Qwen35LinearSlotCapacity(this, maxWarmupBatch);
-        PreAllocateLinearSlotPoolsForCudaGraph(devices, ratios, linearSlotCapacity);
-
         struct CudaGraphPreCaptureScope {
             std::atomic<bool> &flag;
-            explicit CudaGraphPreCaptureScope(std::atomic<bool> &flag) : flag(flag) {
-                flag.store(true, std::memory_order_release);
+            bool active;
+            CudaGraphPreCaptureScope(std::atomic<bool> &flag, bool active)
+                : flag(flag), active(active) {
+                if (active) {
+                    flag.store(true, std::memory_order_release);
+                }
             }
             ~CudaGraphPreCaptureScope() {
-                flag.store(false, std::memory_order_release);
-            }
-        } preCaptureScope(cudaGraphPreCaptureRunning);
-
-        auto printProgress = [](int done, int total, int batch) {
-            const int barWidth = 32;
-            int filled = total > 0 ? done * barWidth / total : barWidth;
-            printf("\r[Fastllm] Qwen3.5 CUDA graph warmup capture [");
-            for (int i = 0; i < barWidth; i++) {
-                putchar(i < filled ? '#' : '-');
-            }
-            printf("] %d/%d batch=%d%s", done, total, batch,
-                   done >= total ? " done" : "     ");
-            if (done >= total) {
-                printf("\n");
-            }
-            fflush(stdout);
-        };
-        printProgress(0, warmupBatchCount, 0);
-
-        for (int warmupIndex = 0; warmupIndex < warmupBatchCount; warmupIndex++) {
-            int batch = warmupBatches[warmupIndex];
-            std::vector<Data*> attentionMasks(batch, nullptr);
-            std::vector<GenerationConfig> generationConfigs(batch);
-            LastTokensManager lastTokens;
-
-            std::vector<std::pair<Data, Data> > pastKeyValuesStorage;
-            std::vector<std::pair<Data*, Data*> > pastKeyValues;
-            pastKeyValuesStorage.reserve(batch * block_cnt);
-            pastKeyValues.reserve(batch * block_cnt);
-            for (int b = 0; b < batch; b++) {
-                for (int i = 0; i < block_cnt; i++) {
-                    bool isLinearLayer = Qwen35LayerIsLinearAttention(this, i);
-                    DataType cacheType = isLinearLayer ?
-                        Qwen35LinearAttentionCacheDataType(this->dataType) : this->kvCacheDataType;
-                    pastKeyValuesStorage.push_back(std::make_pair(Data(cacheType),
-                                                                  Data(cacheType)));
-                    pastKeyValuesStorage.back().first.SetKVCache();
-                    pastKeyValuesStorage.back().second.SetKVCache();
-                    if (isLinearLayer) {
-                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().first, cacheType);
-                        Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().second, cacheType);
-                    }
-                    pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
-                                                           &pastKeyValuesStorage.back().second));
+                if (active) {
+                    flag.store(false, std::memory_order_release);
                 }
             }
+        } preCaptureScope(cudaGraphPreCaptureRunning, cudaGraphEnabled);
 
-            const int cudaGraphPreCapturePrefillTokens = 8;
-            std::vector<float> prefillInputIdsHost(batch * cudaGraphPreCapturePrefillTokens, 1.0f);
-            Data prefillInputIds(DataType::FLOAT32,
-                                 {1, batch * cudaGraphPreCapturePrefillTokens},
-                                 prefillInputIdsHost);
-            std::vector<int> prefillSeqLens(batch, cudaGraphPreCapturePrefillTokens);
-            std::vector<Data> prefillPositionIdsStorage;
-            std::vector<Data*> prefillPositionIds;
-            prefillPositionIdsStorage.reserve(batch);
-            prefillPositionIds.reserve(batch);
-            std::vector<float> prefillPositions(cudaGraphPreCapturePrefillTokens);
-            for (int i = 0; i < cudaGraphPreCapturePrefillTokens; i++) {
-                prefillPositions[i] = (float)i;
+        if (cudaGraphEnabled) {
+            const bool mtpEnabled = !Qwen35MtpDisabledByEnv() && HasMtpWeights();
+            if (mtpEnabled && this->maxBatch > maxWarmupBatch) {
+                printf("[Fastllm] Qwen3.5 CUDA graph: MTP is enabled; "
+                       "capture batch 1 only to preserve runtime memory for speculative validation.\n");
             }
-            for (int b = 0; b < batch; b++) {
-                prefillPositionIdsStorage.push_back(
-                    Data(DataType::FLOAT32, {1, cudaGraphPreCapturePrefillTokens}, prefillPositions));
-                prefillPositionIds.push_back(&prefillPositionIdsStorage.back());
-            }
-            ForwardGPU(batch, prefillInputIds, attentionMasks, prefillPositionIds,
-                       prefillSeqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
+            std::vector<int> warmupBatches = Qwen35PreCaptureBatches(maxWarmupBatch);
+            int warmupBatchCount = (int)warmupBatches.size();
+            int linearSlotCapacity = Qwen35LinearSlotCapacity(this, maxWarmupBatch);
+            PreAllocateLinearSlotPoolsForCudaGraph(devices, ratios, linearSlotCapacity);
 
-            std::vector<float> inputIdsHost(batch, 1.0f);
-            Data inputIds(DataType::FLOAT32, {1, batch}, inputIdsHost);
-            std::vector<int> seqLens(batch, 1);
-            const int cudaGraphPreCaptureDecodeSteps = 2;
-            for (int step = 0; step < cudaGraphPreCaptureDecodeSteps; step++) {
-                std::vector<Data> positionIdsStorage;
-                std::vector<Data*> positionIds;
-                positionIdsStorage.reserve(batch);
-                positionIds.reserve(batch);
+            auto printProgress = [](int done, int total, int batch) {
+                const int barWidth = 32;
+                int filled = total > 0 ? done * barWidth / total : barWidth;
+                printf("\r[Fastllm] Qwen3.5 CUDA graph warmup capture [");
+                for (int i = 0; i < barWidth; i++) {
+                    putchar(i < filled ? '#' : '-');
+                }
+                printf("] %d/%d batch=%d%s", done, total, batch,
+                       done >= total ? " done" : "     ");
+                if (done >= total) {
+                    printf("\n");
+                }
+                fflush(stdout);
+            };
+            printProgress(0, warmupBatchCount, 0);
+
+            for (int warmupIndex = 0; warmupIndex < warmupBatchCount; warmupIndex++) {
+                int batch = warmupBatches[warmupIndex];
+                std::vector<Data*> attentionMasks(batch, nullptr);
+                std::vector<GenerationConfig> generationConfigs(batch);
+                LastTokensManager lastTokens;
+
+                std::vector<std::pair<Data, Data> > pastKeyValuesStorage;
+                std::vector<std::pair<Data*, Data*> > pastKeyValues;
+                pastKeyValuesStorage.reserve(batch * block_cnt);
+                pastKeyValues.reserve(batch * block_cnt);
                 for (int b = 0; b < batch; b++) {
-                    positionIdsStorage.push_back(
-                        Data(DataType::FLOAT32, {1, 1},
-                             {(float)(cudaGraphPreCapturePrefillTokens + step)}));
-                    positionIds.push_back(&positionIdsStorage.back());
+                    for (int i = 0; i < block_cnt; i++) {
+                        bool isLinearLayer = Qwen35LayerIsLinearAttention(this, i);
+                        DataType cacheType = isLinearLayer ?
+                            Qwen35LinearAttentionCacheDataType(this->dataType) : this->kvCacheDataType;
+                        pastKeyValuesStorage.push_back(std::make_pair(Data(cacheType),
+                                                                      Data(cacheType)));
+                        pastKeyValuesStorage.back().first.SetKVCache();
+                        pastKeyValuesStorage.back().second.SetKVCache();
+                        if (isLinearLayer) {
+                            Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().first, cacheType);
+                            Qwen35PrepareLinearAttentionCache(pastKeyValuesStorage.back().second, cacheType);
+                        }
+                        pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
+                                                               &pastKeyValuesStorage.back().second));
+                    }
                 }
-                ForwardGPU(batch, inputIds, attentionMasks, positionIds, seqLens,
-                           pastKeyValues, generationConfigs, lastTokens, nullptr);
+
+                const int cudaGraphPreCapturePrefillTokens = 8;
+                std::vector<float> prefillInputIdsHost(batch * cudaGraphPreCapturePrefillTokens, 1.0f);
+                Data prefillInputIds(DataType::FLOAT32,
+                                     {1, batch * cudaGraphPreCapturePrefillTokens},
+                                     prefillInputIdsHost);
+                std::vector<int> prefillSeqLens(batch, cudaGraphPreCapturePrefillTokens);
+                std::vector<Data> prefillPositionIdsStorage;
+                std::vector<Data*> prefillPositionIds;
+                prefillPositionIdsStorage.reserve(batch);
+                prefillPositionIds.reserve(batch);
+                std::vector<float> prefillPositions(cudaGraphPreCapturePrefillTokens);
+                for (int i = 0; i < cudaGraphPreCapturePrefillTokens; i++) {
+                    prefillPositions[i] = (float)i;
+                }
+                for (int b = 0; b < batch; b++) {
+                    prefillPositionIdsStorage.push_back(
+                        Data(DataType::FLOAT32, {1, cudaGraphPreCapturePrefillTokens}, prefillPositions));
+                    prefillPositionIds.push_back(&prefillPositionIdsStorage.back());
+                }
+                ForwardGPU(batch, prefillInputIds, attentionMasks, prefillPositionIds,
+                           prefillSeqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
+
+                std::vector<float> inputIdsHost(batch, 1.0f);
+                Data inputIds(DataType::FLOAT32, {1, batch}, inputIdsHost);
+                std::vector<int> seqLens(batch, 1);
+                const int cudaGraphPreCaptureDecodeSteps = 2;
+                for (int step = 0; step < cudaGraphPreCaptureDecodeSteps; step++) {
+                    std::vector<Data> positionIdsStorage;
+                    std::vector<Data*> positionIds;
+                    positionIdsStorage.reserve(batch);
+                    positionIds.reserve(batch);
+                    for (int b = 0; b < batch; b++) {
+                        positionIdsStorage.push_back(
+                            Data(DataType::FLOAT32, {1, 1},
+                                 {(float)(cudaGraphPreCapturePrefillTokens + step)}));
+                        positionIds.push_back(&positionIdsStorage.back());
+                    }
+                    ForwardGPU(batch, inputIds, attentionMasks, positionIds, seqLens,
+                               pastKeyValues, generationConfigs, lastTokens, nullptr);
+                }
+                printProgress(warmupIndex + 1, warmupBatchCount, batch);
             }
-            printProgress(warmupIndex + 1, warmupBatchCount, batch);
         }
 
         auto runEagerPrefillWarmup = [&](int eagerWarmupBatch,
                                          int eagerWarmupTokens,
-                                         const char *reason) {
+                                         const char *reason,
+                                         bool ragged) {
             eagerWarmupBatch = std::max(1, eagerWarmupBatch);
             eagerWarmupTokens = std::max(eagerWarmupBatch, eagerWarmupTokens);
             std::vector<Data*> attentionMasks(eagerWarmupBatch, nullptr);
@@ -6497,10 +6521,36 @@ namespace fastllm {
                 }
             }
 
-            std::vector<int> seqLens(eagerWarmupBatch,
-                                     eagerWarmupTokens / eagerWarmupBatch);
-            for (int i = 0; i < eagerWarmupTokens % eagerWarmupBatch; i++) {
-                seqLens[i]++;
+            std::vector<int> seqLens(eagerWarmupBatch, 1);
+            if (ragged && eagerWarmupBatch > 1) {
+                // Equal-length synthetic prompts miss scratch-lifetime
+                // combinations used by a real ragged batch.  Distribute the
+                // remaining tokens as a deterministic ramp: at batch 16 and
+                // 8192 tokens this spans roughly 60..960 tokens/request, which
+                // exercises the same uneven packed-prefill path as a burst of
+                // independently sized API requests.
+                int remainingTokens = eagerWarmupTokens - eagerWarmupBatch;
+                long long weightSum = (long long)eagerWarmupBatch *
+                                      (eagerWarmupBatch + 1) / 2;
+                int assignedTokens = 0;
+                for (int b = 0; b < eagerWarmupBatch; b++) {
+                    int extraTokens = (int)((long long)remainingTokens *
+                                            (b + 1) / weightSum);
+                    seqLens[b] += extraTokens;
+                    assignedTokens += extraTokens;
+                }
+                for (int b = eagerWarmupBatch - 1;
+                     assignedTokens < remainingTokens;
+                     b = (b + eagerWarmupBatch - 1) % eagerWarmupBatch) {
+                    seqLens[b]++;
+                    assignedTokens++;
+                }
+            } else {
+                std::fill(seqLens.begin(), seqLens.end(),
+                          eagerWarmupTokens / eagerWarmupBatch);
+                for (int i = 0; i < eagerWarmupTokens % eagerWarmupBatch; i++) {
+                    seqLens[i]++;
+                }
             }
             std::vector<float> inputIdsHost(eagerWarmupTokens, 1.0f);
             Data inputIds(DataType::FLOAT32, {1, eagerWarmupTokens}, inputIdsHost);
@@ -6520,27 +6570,37 @@ namespace fastllm {
             ForwardGPU(eagerWarmupBatch, inputIds, attentionMasks, positionIds,
                        seqLens, pastKeyValues, generationConfigs, lastTokens,
                        nullptr);
-            printf("[Fastllm] Qwen3.5 post-graph eager prefill warmup (%s): "
+            printf("[Fastllm] Qwen3.5 serving eager prefill warmup (%s): "
                    "batch %d, total tokens %d.\n",
                    reason, eagerWarmupBatch, eagerWarmupTokens);
             fflush(stdout);
         };
 
-        // Graph capture pins the pool addresses touched by decode.  Those
-        // addresses can include the idle eager-prefill scratch left by the
-        // earlier AutoWarmup, so capture must be followed by one final eager
-        // max-batch prefill.  Its temporaries are released back to the ordinary
-        // pool and become the allocation-free reserve used after serve starts.
+        // Graph capture can pin eager-prefill scratch, while non-graph serving
+        // still needs a final runtime-shaped high-water pass before allocations
+        // are frozen.  Its temporaries return to the ordinary pool and become
+        // reusable serving capacity.
         int eagerWarmupBatch = this->maxBatch > 0 ? this->maxBatch : maxWarmupBatch;
         eagerWarmupBatch = std::max(1, eagerWarmupBatch);
-        int eagerWarmupTokens = std::max(eagerWarmupBatch, this->GetChunkedPrefillSize());
+        // The scheduler may aggregate unrelated prompts up to a larger token
+        // budget than the per-request chunk size.  Qwen3.5 deliberately does
+        // this when linear-prefix snapshots clamp GetChunkedPrefillSize()
+        // (for example 2048) but serving still batches up to the configured
+        // 8192 tokens.  Warm the same high-water shape that RunNewMainLoop can
+        // actually submit after cudaMalloc is frozen.
+        int servingPrefillTokenLimit = std::max(
+            this->GetChunkedPrefillSize(), this->GetBatchedPrefillTokenLimit());
+        int eagerWarmupTokens = std::max(eagerWarmupBatch,
+                                         servingPrefillTokenLimit);
         if (this->tokensLimit > 0) {
             eagerWarmupBatch = std::min(eagerWarmupBatch,
                                         std::max(1, this->tokensLimit / 128));
             eagerWarmupTokens = std::min(eagerWarmupTokens, this->tokensLimit);
         }
         runEagerPrefillWarmup(eagerWarmupBatch, eagerWarmupTokens,
-                              "batched serving");
+                              "batched serving", false);
+        runEagerPrefillWarmup(eagerWarmupBatch, eagerWarmupTokens,
+                              "ragged batched serving", true);
 
         // A few graph/runtime objects intentionally remain alive after the
         // prefill above and can retain its exact-size scratch blocks.  Keep a
@@ -6576,7 +6636,7 @@ namespace fastllm {
                           serveMediumReserveBlockBytes,
                           serveMediumReserveBlocks)
                     : 0;
-            printf("[Fastllm] Qwen3.5 post-graph serve reserve GPU %d: "
+            printf("[Fastllm] Qwen3.5 CUDA serve reserve GPU %d: "
                    "%d/%d x %.0f MB plus %d/%d x %.0f MB.\n",
                    device,
                    allocatedLargeReserveBlocks, serveLargeReserveBlocks,
@@ -6597,7 +6657,7 @@ namespace fastllm {
         }
         if (failedReserveDevice >= 0) {
             std::ostringstream error;
-            error << "Qwen3.5 post-graph CUDA serve reserve is incomplete on GPU "
+            error << "Qwen3.5 CUDA serve reserve is incomplete on GPU "
                   << failedReserveDevice << ": allocated "
                   << failedLargeReserveBlocks << "/" << serveLargeReserveBlocks
                   << " large blocks and " << failedMediumReserveBlocks << "/"
@@ -6606,7 +6666,7 @@ namespace fastllm {
                      "because CUDA allocations are frozen after warmup.";
             throw std::runtime_error(error.str());
         }
-        printf("[Fastllm] Qwen3.5 post-graph serve reserve: "
+        printf("[Fastllm] Qwen3.5 CUDA serve reserve: "
                "%d x %.0f MB plus %d x %.0f MB per GPU.\n",
                serveLargeReserveBlocks,
                serveLargeReserveBlockBytes / 1048576.0,
@@ -6628,7 +6688,7 @@ namespace fastllm {
                                              this->tokensLimit);
         }
         runEagerPrefillWarmup(1, recomputeWarmupTokens,
-                              "single-request recompute");
+                              "single-request recompute", false);
 #endif
     }
 
