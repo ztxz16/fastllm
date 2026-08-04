@@ -200,6 +200,9 @@ namespace fastllm {
 
     struct DeepSeekV4DsparkProposal {
         std::vector<int> tokens;
+        // Conditional probability that each draft survives verification
+        // after every preceding draft in the block has been accepted.
+        std::vector<float> confidence;
         // A steady-state CUDA-graph draft can leave its proposal on the root
         // GPU.  ForwardDspark then feeds it directly into the target graph and
         // materializes tokens only after target sampling has synchronized the
@@ -221,6 +224,16 @@ namespace fastllm {
         uint64_t proposedTokens = 0;
         uint64_t acceptedTokens = 0;
         uint64_t verifyRounds = 0;
+        // An optional target-only cooldown can skip draft construction after
+        // an unprofitable confidence probe.  It defaults to zero because
+        // proposal confidence changes quickly between prose and code.
+        int targetOnlyRoundsRemaining = 0;
+        // Two-round request-local throughput window.  Confidence calibration
+        // predicts whether a prefix should pay off; this window closes the
+        // loop with the acceptance and wall time actually observed.
+        double speculativeWindowMs = 0.0;
+        uint64_t speculativeWindowCommitted = 0;
+        int speculativeWindowRounds = 0;
         // CUDA Graph replays write to the addresses captured during warmup.
         // Keep verification outputs request-local and alive for the full graph
         // lifetime instead of publishing into an invocation-local temporary.
@@ -438,6 +451,7 @@ namespace fastllm {
         int dsparkLayers = 0;
         int dsparkNoiseTokenId = -1;
         int dsparkMarkovRank = 0;
+        float dsparkConfidenceThreshold = 0.5f;
         std::vector<int> dsparkTargetLayerIds;
         std::vector<std::vector<Data*> > dsparkWeights;
         std::vector<std::vector<Data*> > dsparkBiass;
@@ -445,10 +459,21 @@ namespace fastllm {
         std::atomic<long long> dsparkValidationCount{0};
         std::atomic<long long> dsparkProposedTokenCount{0};
         std::atomic<long long> dsparkAcceptedTokenCount{0};
+        // Minimum steady latency observed for the complete draft and each
+        // verifier prefix length, in microseconds.  The confidence scheduler
+        // uses this model-wide curve across requests and ignores cold outliers
+        // naturally by retaining minima.
+        std::atomic<long long> dsparkDraftBestUs{0};
+        std::array<std::atomic<long long>, 65> dsparkVerifyBestUs{};
         std::array<std::atomic<long long>, 64>
             dsparkDraftPositionAttempts{};
         std::array<std::atomic<long long>, 64>
             dsparkDraftPositionAccepts{};
+        // Cumulative prefix-survival confidence, scaled by 1e6.  Comparing
+        // this with observed survival supplies the online calibration that is
+        // not shipped as metadata with the standalone checkpoint.
+        std::array<std::atomic<long long>, 64>
+            dsparkDraftPositionPredictedSurvival{};
 
         // 调试对齐用：decode 阶段保存已生成 token，并可选择完整重算上下文。
         std::vector<int> debugFullRecomputeTokens;
@@ -490,6 +515,11 @@ namespace fastllm {
         DeepSeekV4DsparkProposal RunDsparkDraft(
             int anchorToken, DeepSeekV4DsparkContext &context,
             bool forceEager = false, bool deferGpuCopy = false);
+
+        int SelectDsparkVerifyDrafts(
+                const DeepSeekV4DsparkProposal &proposal,
+                const DeepSeekV4DsparkContext &context,
+                bool *preferTargetOnly = nullptr) const;
 
         std::vector<int> SampleDsparkTargetRows(
                 Data &headInput,

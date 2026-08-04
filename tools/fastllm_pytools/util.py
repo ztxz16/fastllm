@@ -550,10 +550,17 @@ def make_normal_llm_model(args, startup_progress = None):
         os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
         if dspark_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(dspark_tokens)
+            confidence_threshold = float(getattr(
+                args, "speculative_dspark_confidence_threshold", 0.5))
+            if not 0.0 <= confidence_threshold <= 1.0:
+                raise ValueError(
+                    "--speculative_dspark_confidence_threshold must be in [0, 1]")
+            os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(
+                confidence_threshold)
             args.speculative_algorithm = "dspark"
         else:
             os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
-        os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
+            os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
 
     usenuma = False
     try:

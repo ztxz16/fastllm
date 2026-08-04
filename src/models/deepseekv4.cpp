@@ -59,6 +59,7 @@ namespace fastllm {
 
     namespace {
         static constexpr int DEEPSEEK_V4_DSPARK_LOG_INTERVAL = 64;
+        static constexpr int DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS = 7;
 
         // A DSpark target verification writes a speculative multi-token suffix
         // into the ordinary decode cache.  Keep the compressor raw rows alive
@@ -6532,7 +6533,14 @@ namespace fastllm {
             };
             for (auto &source : mapped) {
                 for (auto &destination : source.second) {
-                    if (isDsparkAux(destination.first)) {
+                    if (destination.first ==
+                        "mtp.2.confidence_head.proj.weight") {
+                        // The reference implementation promotes this tiny
+                        // BF16 checkpoint tensor to FP32 because its sigmoid
+                        // output is a scheduling probability, not an
+                        // activation passed into the next model layer.
+                        destination.second = DataType::FLOAT32;
+                    } else if (isDsparkAux(destination.first)) {
                         destination.second = DataType::BFLOAT16;
                     }
                 }
@@ -6792,6 +6800,20 @@ namespace fastllm {
                 dsparkMarkovRank > 0 &&
                 dsparkTargetLayerIds == std::vector<int>({40, 41, 42}),
                 "The embedded DeepSeek-V4 DSpark configuration is unsupported.");
+            const char *confidenceThresholdEnv = std::getenv(
+                "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD");
+            if (confidenceThresholdEnv != nullptr &&
+                confidenceThresholdEnv[0] != '\0') {
+                char *end = nullptr;
+                dsparkConfidenceThreshold = std::strtof(
+                    confidenceThresholdEnv, &end);
+                AssertInFastLLM(
+                    end != confidenceThresholdEnv && *end == '\0' &&
+                    std::isfinite(dsparkConfidenceThreshold) &&
+                    dsparkConfidenceThreshold >= 0.0f &&
+                    dsparkConfidenceThreshold <= 1.0f,
+                    "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD must be in [0, 1].");
+            }
         }
 
         // -------- Hyper-Connections --------
@@ -7394,7 +7416,8 @@ namespace fastllm {
                                     const std::vector<Data> &activeMainWindowKV,
                                     const Data *decodeMeta,
                                     Data &baseLogits,
-                                    DeepSeekV4DecodeWorkspace *persistentWorkspace)
+                                    DeepSeekV4DecodeWorkspace *persistentWorkspace,
+                                    Data *confidenceHidden)
                                     -> bool {
             draftBackboneFailure.clear();
 #ifdef USE_CUDA
@@ -7683,6 +7706,12 @@ namespace fastllm {
                 weight["mtp.2.hc_head_scale"],
                 weight["mtp.2.hc_head_base"], hc_mult, hc_eps,
                 rms_norm_eps, headInput);
+            if (confidenceHidden != nullptr) {
+                // Confidence is trained on the unnormalized HcHead output.
+                // The eager LM-head path normalizes headInput in place, so
+                // preserve this small [1, block, hidden] tensor first.
+                Copy(headInput, *confidenceHidden);
+            }
             Data *normalizedHead = &headInput;
 #ifdef USE_CUDA
             if (decodeMeta != nullptr &&
@@ -8301,6 +8330,8 @@ namespace fastllm {
 #endif
 
         Data eagerBaseLogits;
+        Data eagerConfidenceHidden;
+        Data *confidenceHiddenPtr = nullptr;
         Data *baseLogitsPtr = &eagerBaseLogits;
         Data *gpuProposalIdsPtr = nullptr;
 #ifdef USE_CUDA
@@ -8633,7 +8664,7 @@ namespace fastllm {
                         context.mainWindowKV,
                         &draftGraphState->decodeMeta,
                         draftGraphState->baseLogits,
-                        draftGraphState->workspace.get());
+                        draftGraphState->workspace.get(), nullptr);
                     if (ready && draftGraphState->workspace) {
                         gpuProposalIdsPtr = runGpuMarkovProposal(
                             draftGraphState->inputIds,
@@ -8880,10 +8911,20 @@ namespace fastllm {
             AssertInFastLLM(
                 runDraftBackbone(
                     inputIds, context.mainWindowKV, nullptr,
-                    eagerBaseLogits, nullptr),
+                    eagerBaseLogits, nullptr, &eagerConfidenceHidden),
                 "DSpark draft backbone failed.");
             baseLogitsPtr = &eagerBaseLogits;
+            confidenceHiddenPtr = &eagerConfidenceHidden;
         }
+#ifdef USE_CUDA
+        if (draftBackboneReady && draftGraphState != nullptr &&
+            draftGraphState->workspace != nullptr) {
+            // The persistent path keeps HcHead output separate from its
+            // normalized LM-head workspace, so no additional graph node or
+            // copy is needed.
+            confidenceHiddenPtr = &draftGraphState->workspace->headInput;
+        }
+#endif
         Data &baseLogits = *baseLogitsPtr;
 
         DeepSeekV4DsparkProposal proposal;
@@ -8932,6 +8973,69 @@ namespace fastllm {
             }
             return tokens;
         };
+        auto populateProposalConfidence = [&] (
+                DeepSeekV4DsparkProposal &activeProposal) {
+            if (dsparkConfidenceThreshold <= 0.0f ||
+                confidenceHiddenPtr == nullptr) {
+                activeProposal.confidence.assign(dsparkTokens, 1.0f);
+                return;
+            }
+            AssertInFastLLM(
+                (int)activeProposal.tokens.size() == dsparkTokens &&
+                confidenceHiddenPtr->dims ==
+                    std::vector<int>({1, dsparkTokens, embed_dim}),
+                "DSpark confidence input has an invalid shape.");
+
+            // The confidence head consumes the unnormalized draft backbone
+            // state and the Markov embedding of [anchor, draft[:-1]].  Batch
+            // all positions into one tiny projection so scheduling adds a
+            // single device-to-host synchronization per proposal.
+            std::vector<float> previousTokens(dsparkTokens);
+            previousTokens[0] = (float)anchorToken;
+            for (int step = 1; step < dsparkTokens; ++step) {
+                previousTokens[step] =
+                    (float)activeProposal.tokens[step - 1];
+            }
+            Data previousIds(
+                DataType::FLOAT32, {1, dsparkTokens}, previousTokens);
+            Data markovEmbeddings;
+            EmbeddingDirect(
+                previousIds,
+                weight["mtp.2.markov_head.markov_w1.weight"],
+                markovEmbeddings);
+            Data confidenceHidden, confidenceMarkov;
+            Copy(*confidenceHiddenPtr, confidenceHidden);
+            Copy(markovEmbeddings, confidenceMarkov);
+            ToDataType(confidenceHidden, DataType::FLOAT32);
+            ToDataType(confidenceMarkov, DataType::FLOAT32);
+            Data confidenceFeatures;
+            Cat(confidenceHidden, confidenceMarkov, -1,
+                confidenceFeatures);
+            Data confidenceLogits;
+            Linear(
+                confidenceFeatures,
+                weight["mtp.2.confidence_head.proj.weight"],
+                Data(), confidenceLogits);
+            ToDataType(confidenceLogits, DataType::FLOAT32);
+            confidenceLogits.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(
+                confidenceLogits.dims ==
+                    std::vector<int>({1, dsparkTokens, 1}),
+                "DSpark confidence head output has an invalid shape.");
+            activeProposal.confidence.resize(dsparkTokens);
+            const float *confidenceData =
+                (const float*)confidenceLogits.cpuData;
+            for (int step = 0; step < dsparkTokens; ++step) {
+                const float value = confidenceData[step];
+                const float probability = value >= 0.0f ?
+                    1.0f / (1.0f + std::exp(-value)) :
+                    std::exp(value) / (1.0f + std::exp(value));
+                AssertInFastLLM(
+                    std::isfinite(probability),
+                    "DSpark confidence head produced NaN or Inf.");
+                activeProposal.confidence[step] = probability;
+            }
+        };
 #ifdef USE_CUDA
         if (gpuProposalIdsPtr != nullptr &&
             gpuProposalIdsPtr->dataDevice == DataDevice::CUDA &&
@@ -8956,6 +9060,10 @@ namespace fastllm {
                     proposal.gpuReadySignal = &readySignal;
                     proposal.gpuReadySeen = &readySeen;
                     proposal.gpuDeferred = true;
+                    // Deferred graph proposals remain fixed-shape.  Their
+                    // confidence tensor is intentionally not synchronized to
+                    // the host, preserving the existing overlapped pipeline.
+                    proposal.confidence.assign(dsparkTokens, 1.0f);
                     return proposal;
                 }
             }
@@ -8981,11 +9089,177 @@ namespace fastllm {
                     proposal.tokens.data(), gpuProposalIdsPtr->cudaData,
                     proposal.tokens.size() * sizeof(int));
             }
+            populateProposalConfidence(proposal);
             return proposal;
         }
 #endif
         proposal.tokens = runHostMarkov(baseLogits);
+        populateProposalConfidence(proposal);
         return proposal;
+    }
+
+    int DeepSeekV4Model::SelectDsparkVerifyDrafts(
+            const DeepSeekV4DsparkProposal &proposal,
+            const DeepSeekV4DsparkContext &context,
+            bool *preferTargetOnly) const {
+        (void)context;
+        if (preferTargetOnly != nullptr) {
+            *preferTargetOnly = false;
+        }
+        if (proposal.gpuDeferred) {
+            return dsparkTokens;
+        }
+        AssertInFastLLM(
+            (int)proposal.tokens.size() == dsparkTokens &&
+            (int)proposal.confidence.size() == dsparkTokens,
+            "DSpark proposal has an invalid confidence length.");
+        // Threshold zero is the exact fixed-block compatibility mode used by
+        // acceptance and performance regressions.
+        if (dsparkConfidenceThreshold <= 0.0f) {
+            return dsparkTokens;
+        }
+
+        // Start with a few complete blocks.  Besides warming the verifier,
+        // these rounds provide an unbiased prefix-survival sample for online
+        // confidence calibration.  A 32-token application warmup normally
+        // covers these five full-block probes plus two target-only probes.
+        if (dsparkValidationCount.load(std::memory_order_relaxed) <
+                DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS - 2) {
+            return dsparkTokens;
+        }
+
+        std::vector<double> calibratedSurvival(dsparkTokens, 0.0);
+        double rawSurvival = 1.0;
+        double previousSurvival = 1.0;
+        int confidenceLimit = dsparkTokens;
+        auto clampProbability = [](double value) {
+            return std::max(1.0e-4, std::min(1.0 - 1.0e-4, value));
+        };
+        for (int position = 0; position < dsparkTokens; ++position) {
+            rawSurvival *= clampProbability(
+                proposal.confidence[position]);
+            double survival = rawSurvival;
+            const long long attempts =
+                dsparkDraftPositionAttempts[position].load(
+                    std::memory_order_relaxed);
+            const long long accepted =
+                dsparkDraftPositionAccepts[position].load(
+                    std::memory_order_relaxed);
+            const long long predictedScaled =
+                dsparkDraftPositionPredictedSurvival[position].load(
+                    std::memory_order_relaxed);
+            if (attempts > 0 && predictedScaled > 0) {
+                const double observed = clampProbability(
+                    (double)accepted / (double)attempts);
+                const double averagePrediction = clampProbability(
+                    (double)predictedScaled /
+                    (1000000.0 * (double)attempts));
+                const double ratioCalibrated = clampProbability(
+                    rawSurvival * observed / averagePrediction);
+                // Retain proposal-specific confidence while smoothly moving
+                // toward the observed curve.  Four virtual raw samples keep
+                // the short warmup from overreacting.
+                const double weight = (double)attempts /
+                    ((double)attempts + 4.0);
+                survival = rawSurvival +
+                    weight * (ratioCalibrated - rawSurvival);
+            }
+            survival = std::min(previousSurvival,
+                                clampProbability(survival));
+            calibratedSurvival[position] = survival;
+            const double conditional = survival / previousSurvival;
+            if (conditional < dsparkConfidenceThreshold &&
+                confidenceLimit == dsparkTokens) {
+                confidenceLimit = position;
+            }
+            previousSurvival = survival;
+        }
+
+        const long long draftUs = dsparkDraftBestUs.load(
+            std::memory_order_relaxed);
+        struct VerifyPoint {
+            int drafts;
+            double milliseconds;
+        };
+        std::vector<VerifyPoint> observed;
+        observed.reserve(2);
+        for (int drafts = dsparkTokens;
+             drafts >= 0 && observed.size() < 2; --drafts) {
+            const long long verifyUs = dsparkVerifyBestUs[drafts].load(
+                std::memory_order_relaxed);
+            // Kernel compilation and graph preparation can make the first
+            // encounter tens of seconds long.  Such startup work is not the
+            // steady SPS curve the scheduler is meant to optimize.
+            if (verifyUs > 0 && verifyUs < 5000000) {
+                observed.push_back(
+                    {drafts, (double)verifyUs / 1000.0});
+            }
+        }
+        // Before the warmup request has populated a throughput curve, use the
+        // calibrated confidence limit.  Once prefix timing is available, fit
+        // the NUMA verifier's marginal token cost without cold compilation.
+        if (draftUs <= 0 || observed.empty()) {
+            return confidenceLimit;
+        }
+
+        const double draftMs = (double)draftUs / 1000.0;
+        double slopeMs = 0.0;
+        double interceptMs = 0.0;
+        bool linearCurve = observed.size() >= 2 &&
+            observed[0].drafts != observed[1].drafts;
+        if (linearCurve) {
+            slopeMs =
+                (observed[0].milliseconds - observed[1].milliseconds) /
+                (double)(observed[0].drafts - observed[1].drafts);
+            interceptMs = observed[0].milliseconds -
+                slopeMs * observed[0].drafts;
+            linearCurve = slopeMs > 0.0 && interceptMs > 0.0 &&
+                std::isfinite(slopeMs) && std::isfinite(interceptMs);
+        }
+        auto estimateTargetMs = [&](int drafts) {
+            if (linearCurve) {
+                return interceptMs + slopeMs * drafts;
+            }
+            // One observed point is enough for a conservative bootstrap.  A
+            // NUMA MoE verifier is dominated by expert-weight traffic and is
+            // close to linear; 0.7 is the measured marginal/full-decode ratio
+            // and is refined as soon as the second point arrives.
+            const VerifyPoint &reference = observed[0];
+            return reference.milliseconds *
+                (1.0 + 0.7 * drafts) /
+                (1.0 + 0.7 * reference.drafts);
+        };
+
+        double expectedCommit = 1.0;
+        double bestThroughput = 0.0;
+        int bestDrafts = 0;
+        for (int drafts = 1; drafts <= confidenceLimit; ++drafts) {
+            expectedCommit += calibratedSurvival[drafts - 1];
+            const double throughput = expectedCommit /
+                (draftMs + estimateTargetMs(drafts));
+            if (throughput > bestThroughput) {
+                bestThroughput = throughput;
+                bestDrafts = drafts;
+            }
+        }
+
+        // Compare speculation with an actual one-row verifier observation
+        // when available.  Otherwise the fitted curve's intercept is the best
+        // target-only estimate.  The recommendation is returned separately
+        // because the current round has already paid its draft cost.
+        const long long targetOnlyUs = dsparkVerifyBestUs[0].load(
+            std::memory_order_relaxed);
+        const double targetOnlyMs = targetOnlyUs > 0 ?
+            (double)targetOnlyUs / 1000.0 : estimateTargetMs(0);
+        const double targetOnlyThroughput = 1.0 / targetOnlyMs;
+        if (preferTargetOnly != nullptr) {
+            *preferTargetOnly = bestDrafts == 0 ||
+                bestThroughput <= targetOnlyThroughput;
+        }
+        // The draft cost is already sunk in the current probe, so verify the
+        // best immediate prefix even when future rounds should run target
+        // only.  This avoids turning a probe into draft + one-token decode.
+        return bestDrafts;
     }
 
     int DeepSeekV4Model::ForwardDspark(
@@ -9113,6 +9387,21 @@ namespace fastllm {
 
         const int anchorToken = tokenIds[0];
         const int oldTokens = context.committedTokens;
+        using DsparkProfileClock = std::chrono::steady_clock;
+        const int dsparkTargetOnlyCooldownRounds = std::max(
+            0, std::min(
+                1024,
+                EnvInt(
+                    "FASTLLM_DSV4_DSPARK_TARGET_ONLY_COOLDOWN_ROUNDS",
+                    0)));
+        const auto dsparkRoundBegin = DsparkProfileClock::now();
+        double dsparkDraftSubmitMs = 0.0;
+        double dsparkTargetSubmitMs = 0.0;
+        double dsparkTargetFinishMs = 0.0;
+        auto dsparkElapsedMs = [](const auto &begin, const auto &end) {
+            return std::chrono::duration<double, std::milli>(
+                end - begin).count();
+        };
         if (!dsparkLogPrinted.exchange(true)) {
             std::printf(
                 "[DeepSeek-V4 DSpark] enabled: layers=%d, "
@@ -9158,7 +9447,23 @@ namespace fastllm {
         }
 #endif
         DeepSeekV4DsparkProposal proposal;
-        bool usedPrefetchedProposal =
+        // Reserve the last two calibration rounds for genuine no-draft target
+        // decode.  The first compiles the one-row verifier shape; the second
+        // supplies its steady baseline for the throughput comparison.
+        const long long completedCalibrations =
+            dsparkValidationCount.load(std::memory_order_relaxed);
+        const bool calibrationTargetOnlyRound =
+            dsparkConfidenceThreshold > 0.0f &&
+            completedCalibrations >=
+                DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS - 2 &&
+            completedCalibrations <
+                DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS;
+        const bool targetOnlyRound = calibrationTargetOnlyRound ||
+            context.targetOnlyRoundsRemaining > 0;
+        if (targetOnlyRound && !calibrationTargetOnlyRound) {
+            context.targetOnlyRoundsRemaining--;
+        }
+        bool usedPrefetchedProposal = !targetOnlyRound &&
             context.prefetchedProposalReady &&
             context.prefetchedAnchorToken == anchorToken &&
             context.prefetchedCommittedTokens == oldTokens;
@@ -9169,7 +9474,11 @@ namespace fastllm {
         context.prefetchedAnchorToken = -1;
         context.prefetchedCommittedTokens = -1;
         context.prefetchedProposalReady = false;
-        if (!usedPrefetchedProposal) {
+        if (targetOnlyRound) {
+            proposal.tokens.assign(dsparkTokens, dsparkNoiseTokenId);
+            proposal.confidence.assign(dsparkTokens, 0.0f);
+        } else if (!usedPrefetchedProposal) {
+            const auto draftBegin = DsparkProfileClock::now();
             proposal = RunDsparkDraft(
                 anchorToken, context, false,
 #ifdef USE_CUDA
@@ -9178,21 +9487,42 @@ namespace fastllm {
                 false
 #endif
             );
+            dsparkDraftSubmitMs = dsparkElapsedMs(
+                draftBegin, DsparkProfileClock::now());
         }
         AssertInFastLLM(
             proposal.gpuDeferred ||
-                (int)proposal.tokens.size() == dsparkTokens,
+                ((int)proposal.tokens.size() == dsparkTokens &&
+                 (int)proposal.confidence.size() == dsparkTokens),
             "DSpark proposal has an invalid length.");
+        bool preferTargetOnly = false;
+        const int verifyDrafts = targetOnlyRound ? 0 :
+            SelectDsparkVerifyDrafts(
+                proposal, context, &preferTargetOnly);
+        // Confidence and acceptance can change at every token as a response
+        // moves between prose and code, so retry on the next token by default.
+        // An explicitly configured cooldown performs target-only rounds
+        // without paying for draft construction.
+        if (!targetOnlyRound && preferTargetOnly) {
+            context.targetOnlyRoundsRemaining =
+                dsparkTargetOnlyCooldownRounds;
+        } else if (!targetOnlyRound && verifyDrafts > 0) {
+            context.targetOnlyRoundsRemaining = 0;
+        }
+        const int verifyTokens = verifyDrafts + 1;
+        AssertInFastLLM(
+            verifyDrafts >= 0 && verifyDrafts <= dsparkTokens,
+            "DSpark confidence scheduler returned an invalid prefix.");
 
         std::vector<int> verifyIds;
-        verifyIds.reserve(dsparkTokens + 1);
+        verifyIds.reserve(verifyTokens);
         verifyIds.push_back(anchorToken);
         if (proposal.gpuDeferred) {
             verifyIds.insert(
-                verifyIds.end(), dsparkTokens, dsparkNoiseTokenId);
+                verifyIds.end(), verifyDrafts, dsparkNoiseTokenId);
         } else {
             verifyIds.insert(verifyIds.end(), proposal.tokens.begin(),
-                             proposal.tokens.end());
+                             proposal.tokens.begin() + verifyDrafts);
         }
         DeepSeekV4DsparkTargetCapture &capture = context.targetCapture;
         ScopedDeepSeekV4DsparkVerification verificationScope;
@@ -9204,13 +9534,17 @@ namespace fastllm {
         targetGpuInput.readySeen = proposal.gpuReadySeen;
         targetGpuInput.anchorToken = anchorToken;
         targetGpuInput.startPos = oldTokens;
-        targetGpuInput.proposalCount = dsparkTokens;
+        targetGpuInput.proposalCount = verifyDrafts;
         DeepSeekV4DsparkTargetGpuInputScope gpuInputScope(
             proposal.gpuDeferred ? &targetGpuInput : nullptr);
 #endif
+        const auto targetSubmitBegin = DsparkProfileClock::now();
         RunDsparkTarget(
             verifyIds, oldTokens, pastKeyValues, generationConfig,
             lastTokens, nullptr, &capture);
+        dsparkTargetSubmitMs = dsparkElapsedMs(
+            targetSubmitBegin, DsparkProfileClock::now());
+        const auto targetFinishBegin = DsparkProfileClock::now();
         std::vector<int> targetRows;
         DeepSeekV4DsparkProposal pipelinedProposal;
         bool gpuPostprocess = false;
@@ -9218,9 +9552,10 @@ namespace fastllm {
         int gpuCommitTokens = -1;
         int gpuNextToken = -1;
 #ifdef USE_CUDA
-        const int verifyRows = dsparkTokens + 1;
+        const int verifyRows = verifyTokens;
         bool gpuPostprocessEligible =
-            proposal.gpuDeferred && capture.samplingReady &&
+            verifyDrafts == dsparkTokens && proposal.gpuDeferred &&
+            capture.samplingReady &&
             capture.contextReady && capture.contextRows == verifyRows &&
             FastllmCudaDeepSeekV4DsparkMarkovPeerAvailable() &&
             proposal.gpuTokens != nullptr &&
@@ -9510,21 +9845,43 @@ namespace fastllm {
 #else
         targetRows = SampleDsparkTargetRows(capture.headInput, &context);
 #endif
+        dsparkTargetFinishMs = dsparkElapsedMs(
+            targetFinishBegin, DsparkProfileClock::now());
+        auto updateBestLatency = [](
+                std::atomic<long long> &slot, double milliseconds) {
+            const long long candidate = (long long)std::llround(
+                milliseconds * 1000.0);
+            if (candidate <= 0) {
+                return;
+            }
+            long long current = slot.load(std::memory_order_relaxed);
+            while ((current == 0 || candidate < current) &&
+                   !slot.compare_exchange_weak(
+                       current, candidate,
+                       std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {
+            }
+        };
+        if (!usedPrefetchedProposal && dsparkDraftSubmitMs > 0.0) {
+            updateBestLatency(dsparkDraftBestUs, dsparkDraftSubmitMs);
+        }
+        updateBestLatency(
+            dsparkVerifyBestUs[verifyDrafts],
+            dsparkTargetSubmitMs + dsparkTargetFinishMs);
         AssertInFastLLM(
             (int)proposal.tokens.size() == dsparkTokens,
             "DSpark proposal materialization returned an invalid length.");
         AssertInFastLLM(
-            (int)targetRows.size() == dsparkTokens + 1,
+            (int)targetRows.size() == verifyTokens,
             "DSpark target verification returned an invalid row count.");
 
         int accepted = 0;
-        while (accepted < dsparkTokens &&
+        while (accepted < verifyDrafts &&
                proposal.tokens[accepted] == targetRows[accepted]) {
             accepted++;
         }
         const int nextToken = targetRows[accepted];
         const int commitTokens = accepted + 1;
-        const int verifyTokens = dsparkTokens + 1;
         if (gpuPostprocess) {
             AssertInFastLLM(
                 accepted == gpuAccepted &&
@@ -9576,27 +9933,71 @@ namespace fastllm {
         context.historyTokens.insert(
             context.historyTokens.end(), verifyIds.begin(),
             verifyIds.begin() + commitTokens);
-        context.proposedTokens += dsparkTokens;
+        context.proposedTokens += verifyDrafts;
         context.acceptedTokens += accepted;
         context.verifyRounds++;
         const int trackedDrafts = std::min(
-            dsparkTokens,
+            verifyDrafts,
             (int)dsparkDraftPositionAttempts.size());
+        double predictedSurvival = 1.0;
         for (int position = 0; position < trackedDrafts; ++position) {
+            predictedSurvival *= std::max(
+                1.0e-4, std::min(
+                    1.0 - 1.0e-4,
+                    (double)proposal.confidence[position]));
             dsparkDraftPositionAttempts[position].fetch_add(
                 1, std::memory_order_relaxed);
+            dsparkDraftPositionPredictedSurvival[position].fetch_add(
+                (long long)std::llround(predictedSurvival * 1000000.0),
+                std::memory_order_relaxed);
             if (accepted > position) {
                 dsparkDraftPositionAccepts[position].fetch_add(
                     1, std::memory_order_relaxed);
             }
         }
         dsparkProposedTokenCount.fetch_add(
-            dsparkTokens, std::memory_order_relaxed);
+            verifyDrafts, std::memory_order_relaxed);
         dsparkAcceptedTokenCount.fetch_add(
             accepted, std::memory_order_relaxed);
         const long long validations =
             dsparkValidationCount.fetch_add(
                 1, std::memory_order_relaxed) + 1;
+        if (!targetOnlyRound && verifyDrafts > 0 &&
+            !preferTargetOnly &&
+            validations > DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS) {
+            context.speculativeWindowMs += dsparkElapsedMs(
+                dsparkRoundBegin, DsparkProfileClock::now());
+            context.speculativeWindowCommitted += commitTokens;
+            context.speculativeWindowRounds++;
+            if (context.speculativeWindowRounds >= 2) {
+                const long long targetOnlyUs =
+                    dsparkVerifyBestUs[0].load(
+                        std::memory_order_relaxed);
+                if (targetOnlyUs > 0 &&
+                    context.speculativeWindowMs > 0.0) {
+                    const double speculativeTokensPerSecond =
+                        (double)context.speculativeWindowCommitted * 1000.0 /
+                        context.speculativeWindowMs;
+                    const double targetOnlyTokensPerSecond =
+                        1000000.0 / (double)targetOnlyUs;
+                    // Require a small positive margin so measurement noise
+                    // cannot keep a non-improving speculative path enabled.
+                    if (speculativeTokensPerSecond <=
+                            targetOnlyTokensPerSecond * 1.01) {
+                        context.targetOnlyRoundsRemaining =
+                            dsparkTargetOnlyCooldownRounds;
+                    }
+                }
+                context.speculativeWindowMs = 0.0;
+                context.speculativeWindowCommitted = 0;
+                context.speculativeWindowRounds = 0;
+            }
+        } else if (targetOnlyRound || preferTargetOnly ||
+                   verifyDrafts == 0) {
+            context.speculativeWindowMs = 0.0;
+            context.speculativeWindowCommitted = 0;
+            context.speculativeWindowRounds = 0;
+        }
         if (validations % DEEPSEEK_V4_DSPARK_LOG_INTERVAL == 0) {
             const long long proposed = dsparkProposedTokenCount.load(
                 std::memory_order_relaxed);
@@ -9611,7 +10012,10 @@ namespace fastllm {
                 "accept_rate=%.2f%%, avg_accepted=%.2f/%d, "
                 "pos_accept_rate=[",
                 validations, acceptRate, averageAccepted, dsparkTokens);
-            for (int position = 0; position < trackedDrafts; ++position) {
+            const int loggedDrafts = std::min(
+                dsparkTokens,
+                (int)dsparkDraftPositionAttempts.size());
+            for (int position = 0; position < loggedDrafts; ++position) {
                 const long long attempts =
                     dsparkDraftPositionAttempts[position].load(
                         std::memory_order_relaxed);
