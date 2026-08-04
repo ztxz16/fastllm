@@ -282,11 +282,12 @@ if (USE_CUDA)
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cuda/linear/marlin_dense_fp8)
     set(FASTLLM_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
     set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED OFF)
+    set(FASTLLM_CUTLASS_FP8_SM89_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM120_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM121_ENABLED OFF)
     foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
-        if (FASTLLM_CUDA_ARCH STREQUAL "120f" OR FASTLLM_CUDA_ARCH STREQUAL "121f")
-            set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+        if (FASTLLM_CUDA_ARCH STREQUAL "89")
+            set(FASTLLM_CUTLASS_FP8_SM89_ENABLED ON)
         endif()
         if (FASTLLM_CUDA_ARCH STREQUAL "120f")
             set(FASTLLM_CUTLASS_FP8_SM120_ENABLED ON)
@@ -294,18 +295,32 @@ if (USE_CUDA)
             set(FASTLLM_CUTLASS_FP8_SM121_ENABLED ON)
         endif()
     endforeach()
+    if (FASTLLM_CUTLASS_FP8_SM89_ENABLED AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.4)
+        set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+    endif()
+    if ((FASTLLM_CUTLASS_FP8_SM120_ENABLED OR FASTLLM_CUTLASS_FP8_SM121_ENABLED) AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+    endif()
     if (NOT FASTLLM_CUTLASS_DIR STREQUAL "" AND EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
-        FASTLLM_CUTLASS_FP8_ARCH_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        FASTLLM_CUTLASS_FP8_ARCH_ENABLED)
         message(STATUS "CUTLASS FP8 kernels: ON (${FASTLLM_CUTLASS_DIR})")
         include_directories("${FASTLLM_CUTLASS_DIR}/include")
         if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include")
             include_directories("${FASTLLM_CUTLASS_DIR}/tools/util/include")
         endif()
         add_compile_definitions(FASTLLM_ENABLE_CUTLASS_FP8)
-        if (FASTLLM_CUTLASS_FP8_SM120_ENABLED)
+        if (FASTLLM_CUTLASS_FP8_SM89_ENABLED AND
+            CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.4)
+            add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM89)
+        endif()
+        if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND
+            CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
             add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
         endif()
-        if (FASTLLM_CUTLASS_FP8_SM121_ENABLED)
+        if (FASTLLM_CUTLASS_FP8_SM121_ENABLED AND
+            CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
             add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
         endif()
     else()
@@ -326,6 +341,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
+        src/devices/cuda/linear/fastllm-linear-fp8-cutlass-sm89.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu

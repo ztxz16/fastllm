@@ -16,7 +16,8 @@
 #include <utility>
 #include <vector>
 
-#ifdef FASTLLM_ENABLE_CUTLASS_FP8
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"

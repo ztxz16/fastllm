@@ -2067,6 +2067,235 @@ namespace fastllm {
         return false;
     }
 
+    struct CudaLinearFp8PerChannelAutotuneKey {
+        int device;
+        int dataType;
+        int cudaGraph;
+        int hasBias;
+        int n;
+        int m;
+        int k;
+
+        bool operator<(const CudaLinearFp8PerChannelAutotuneKey &other) const {
+            return std::tie(device, dataType, cudaGraph, hasBias, n, m, k) <
+                   std::tie(other.device, other.dataType, other.cudaGraph,
+                            other.hasBias, other.n, other.m, other.k);
+        }
+    };
+
+    static bool CudaLinearFp8IsPerChannelWeight(
+        const Data &weight, int m, int k) {
+        return m > 0 && k > 0 && weight.dataDevice == DataDevice::CUDA &&
+               weight.cudaData != nullptr &&
+               weight.dataType == DataType::FP8_E4M3 &&
+               weight.dims.size() == 2 && weight.dims[0] == k &&
+               weight.dims[1] == m && weight.blockK == 1 &&
+               weight.blockM >= m && weight.scales.size() == (size_t)k &&
+               !FastllmCudaHasFp8MarlinLayout(weight);
+    }
+
+    static bool RunCudaCutlassLinearFp8PerChannel(
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k) {
+        return FastllmCudaCutlassLinearFP8E4M3PerChannel(
+            input, weight, bias, output, n, m, k);
+    }
+
+    static float BenchmarkCudaLinearFp8PerChannelPath(
+        bool cutlass, bool cudaGraph, int iterations,
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k, bool &ok) {
+        auto run = [&]() {
+            return cutlass
+                ? RunCudaCutlassLinearFp8PerChannel(
+                      input, weight, bias, output, n, m, k)
+                : RunCudaNativeLinearFp8Block128(
+                      input, weight, bias, output, n, m, k);
+        };
+        if (!cudaGraph) {
+            FastllmCudaSyncCurrentThreadStream();
+            auto start = std::chrono::steady_clock::now();
+            int completed = 0;
+            for (; completed < iterations; ++completed) {
+                bool currentOk = run();
+                ok = ok && currentOk;
+                if (!currentOk) {
+                    break;
+                }
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            auto end = std::chrono::steady_clock::now();
+            float elapsedMs = std::chrono::duration<float, std::milli>(
+                end - start).count();
+            return elapsedMs / std::max(completed, 1);
+        }
+
+        void *start = FastllmCudaEventCreateTiming();
+        void *end = FastllmCudaEventCreateTiming();
+        FastllmCudaEventRecordCurrentThread(start);
+        int completed = 0;
+        for (; completed < iterations; ++completed) {
+            bool currentOk = run();
+            ok = ok && currentOk;
+            if (!currentOk) {
+                break;
+            }
+        }
+        FastllmCudaEventRecordCurrentThread(end);
+        FastllmCudaEventSynchronize(end);
+        float elapsedMs = FastllmCudaEventElapsedTime(start, end);
+        FastllmCudaEventDestroy(start);
+        FastllmCudaEventDestroy(end);
+        return elapsedMs / std::max(completed, 1);
+    }
+
+    // Returns true once the operation has been handled by either CUTLASS or
+    // native.  A false return means this is not an eligible per-channel FP8
+    // shape and lets the existing blockwise/Triton/native dispatch continue.
+    static bool TryCudaCutlassLinearFp8PerChannel(
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k) {
+        if (!CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_CUTLASS_LINEAR_FP8", true) ||
+            !CudaLinearFp8IsPerChannelWeight(weight, m, k) ||
+            n <= 0 || (m % 16) != 0 || (k % 4) != 0 ||
+            input.dataDevice != DataDevice::CUDA ||
+            input.cudaData == nullptr ||
+            (input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::BFLOAT16) ||
+            output.dataType != input.dataType ||
+            (bias.dims.size() > 0 &&
+             (bias.dataType != DataType::FLOAT32 ||
+              bias.cudaData == nullptr))) {
+            return false;
+        }
+        // The compiled CUTLASS 2.x specialization is intentionally limited
+        // to Ada. Hopper and newer use different CUTLASS 3.x kernels.
+        if (CudaTritonRuntimeArch() != 89) {
+            return false;
+        }
+
+        bool cudaGraph = GetFastllmEnv().cudaGraph;
+        CudaLinearFp8PerChannelAutotuneKey key = {
+            FastllmCudaGetDevice(), (int)input.dataType,
+            cudaGraph ? 1 : 0, bias.dims.empty() ? 0 : 1,
+            n, m, k};
+        // Model warmup and request execution can run on different host
+        // threads. Cache by CUDA device rather than by host thread so the
+        // measured choice is reused by the first real request as well.
+        static std::mutex decisionsMutex;
+        static std::map<CudaLinearFp8PerChannelAutotuneKey, bool> decisions;
+        bool foundDecision = false;
+        bool cachedUseCutlass = false;
+        {
+            std::lock_guard<std::mutex> guard(decisionsMutex);
+            auto found = decisions.find(key);
+            if (found != decisions.end()) {
+                foundDecision = true;
+                cachedUseCutlass = found->second;
+            }
+        }
+        if (foundDecision) {
+            if (cachedUseCutlass) {
+                bool ok = RunCudaCutlassLinearFp8PerChannel(
+                    input, weight, bias, output, n, m, k);
+                if (ok) {
+                    TraceCudaLinearFp8Path(
+                        "cutlass-fp8-e4m3-perchannel", n, m, k);
+                }
+                return ok;
+            }
+            bool ok = RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+            if (ok) {
+                TraceCudaLinearFp8Path(
+                    "native-fp8-e4m3-perchannel-autotuned", n, m, k);
+            }
+            return ok;
+        }
+
+        // Synchronizing an event during stream capture is illegal. The graph
+        // warmup normally fills this cache; if it did not, retain native until
+        // an eager execution can make an evidence-based decision.
+        if (FastllmCudaGraphIsCapturing()) {
+            bool ok = RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+            if (ok) {
+                TraceCudaLinearFp8Path(
+                    "native-fp8-e4m3-perchannel-capture", n, m, k);
+            }
+            return ok;
+        }
+
+        bool cutlassOk = RunCudaCutlassLinearFp8PerChannel(
+            input, weight, bias, output, n, m, k);
+        if (!cutlassOk) {
+            std::lock_guard<std::mutex> guard(decisionsMutex);
+            decisions[key] = false;
+            return RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+        bool nativeOk = RunCudaNativeLinearFp8Block128(
+            input, weight, bias, output, n, m, k);
+        if (!nativeOk) {
+            std::lock_guard<std::mutex> guard(decisionsMutex);
+            decisions[key] = true;
+            return RunCudaCutlassLinearFp8PerChannel(
+                input, weight, bias, output, n, m, k);
+        }
+        for (int i = 0; i < 2; ++i) {
+            cutlassOk = RunCudaCutlassLinearFp8PerChannel(
+                input, weight, bias, output, n, m, k) && cutlassOk;
+            nativeOk = RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k) && nativeOk;
+        }
+        FastllmCudaSyncCurrentThreadStream();
+
+        int iterations = n >= 32 ? 8 : 16;
+        float cutlassMs = BenchmarkCudaLinearFp8PerChannelPath(
+            true, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, cutlassOk);
+        float nativeMs = BenchmarkCudaLinearFp8PerChannelPath(
+            false, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, nativeOk);
+        float nativeMs2 = BenchmarkCudaLinearFp8PerChannelPath(
+            false, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, nativeOk);
+        float cutlassMs2 = BenchmarkCudaLinearFp8PerChannelPath(
+            true, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, cutlassOk);
+        cutlassMs = std::min(cutlassMs, cutlassMs2);
+        nativeMs = std::min(nativeMs, nativeMs2);
+
+        // A small margin prevents timer noise from moving a shape to CUTLASS
+        // when the two implementations are effectively tied.
+        bool useCutlass = cutlassOk &&
+                          (!nativeOk || cutlassMs < nativeMs * 0.98f);
+        {
+            std::lock_guard<std::mutex> guard(decisionsMutex);
+            decisions[key] = useCutlass;
+        }
+        if (CudaEnvFlagEnabled("FASTLLM_CUDA_LINEAR_FP8_TRACE")) {
+            printf("FastLLM CUDA FP8 per-channel autotune: "
+                   "n=%d m=%d k=%d cutlass=%.4fms native=%.4fms -> %s\n",
+                   n, m, k, cutlassMs, nativeMs,
+                   useCutlass ? "cutlass" : "native");
+        }
+
+        bool ok = useCutlass
+            ? RunCudaCutlassLinearFp8PerChannel(
+                  input, weight, bias, output, n, m, k)
+            : RunCudaNativeLinearFp8Block128(
+                  input, weight, bias, output, n, m, k);
+        if (ok) {
+            TraceCudaLinearFp8Path(
+                useCutlass ? "cutlass-fp8-e4m3-perchannel" :
+                             "native-fp8-e4m3-perchannel-autotuned",
+                n, m, k);
+        }
+        return ok;
+    }
+
     static bool PreferCudaTritonLinearFp8Sm89Fallback(
         DataType inputType, int n, int m, int k) {
         // At n >= 32 the native implementation dequantizes the full weight
@@ -4244,7 +4473,8 @@ namespace fastllm {
             } else if (weight.dataType == DataType::INT4_NOZERO) {
                 FastllmCudaHalfMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
-                if (!TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
+                if (!TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
+                    !TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
                     TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
                     FastllmCudaHalfMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
@@ -4312,7 +4542,8 @@ namespace fastllm {
             } else if (weight.dataType == DataType::INT4_GROUP32) {
                 FastllmCudaBFloat16MatMulInt4Group32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
-                if (!TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
+                if (!TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
+                    !TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
                     TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
                     FastllmCudaBFloat16MatMulFP8E4M3(input, weight, bias, output, n, m, k);
