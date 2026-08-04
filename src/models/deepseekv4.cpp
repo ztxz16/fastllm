@@ -308,6 +308,47 @@ namespace fastllm {
             return true;
         }
 
+        static bool DeepSeekV4NumasGpuPrefillEnabled() {
+            const char *value = std::getenv("FT_GPU_PREFILL");
+            if (value == nullptr) {
+                return true;
+            }
+            std::string normalized(value);
+            std::transform(
+                normalized.begin(), normalized.end(), normalized.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            return normalized != "0" && normalized != "false" &&
+                   normalized != "off";
+        }
+
+        // NUMA evaluates the official FP8 activation boundary on CPU, while
+        // its large-prefill path may stream selected experts to CUDA.  Publish
+        // the already quantized/dequantized BF16 bytes on that CUDA device;
+        // borrowing the original pre-quantization activation would make the
+        // CPU and GPU expert subsets observe different model inputs.
+        static bool AddDeepSeekV4QuantizedCudaReplica(
+            Data &activation, int device
+        ) {
+            if (device < 0 || activation.dataDevice != DataDevice::CPU ||
+                activation.cpuData == nullptr || activation.cudaData != nullptr) {
+                return false;
+            }
+            activation.ToDevice(
+                DataDevice::CUDA, std::vector<int>{device}, true);
+            if (activation.cudaData == nullptr ||
+                GetPointerDeviceId(activation.cudaData) != device) {
+                return false;
+            }
+            // Activation storage is not a model weight or KV cache, so the
+            // CPU allocation remains valid.  Switching the authoritative view
+            // back does not copy data and retains the owned CUDA allocation.
+            activation.ToDevice(
+                DataDevice::CPU, std::vector<int>{device}, false);
+            return activation.cpuData != nullptr &&
+                   activation.cudaData != nullptr &&
+                   !activation.cudaDataBorrowed;
+        }
+
         static std::vector<int> GetReplicatedCudaDevices(const Data &data) {
             std::vector<int> devices;
             if (data.multiDeviceData && data.IsTensorParallelReplicated()) {
@@ -3712,6 +3753,11 @@ namespace fastllm {
     bool DeepSeekV4CopyCudaTensorToCpuForTest(
             const Data &source, Data &destination) {
         return CopyDeepSeekV4CudaTensorToCpu(source, destination);
+    }
+
+    bool DeepSeekV4AddQuantizedCudaReplicaForTest(
+            Data &activation, int device) {
+        return AddDeepSeekV4QuantizedCudaReplica(activation, device);
     }
 
     int DeepSeekV4BuildWindowKVPrefixForTest(
@@ -11629,7 +11675,21 @@ namespace fastllm {
                     if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
                         moeWeights.size() > 2 && moeWeights[2] != nullptr &&
                         IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
+#ifdef USE_CUDA
+                        int moeInputCudaDevice = GetTensorCudaDevice(*moeInput);
+#endif
                         DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
+#ifdef USE_CUDA
+                        if (moeInputCudaDevice >= 0 &&
+                            moeQuantizedInput.dims.size() > 0 &&
+                            moeQuantizedInput.dims[0] >= 32 &&
+                            DeepSeekV4NumasGpuPrefillEnabled()) {
+                            AssertInFastLLM(
+                                AddDeepSeekV4QuantizedCudaReplica(
+                                    moeQuantizedInput, moeInputCudaDevice),
+                                "DeepSeek-V4 failed to stage its quantized NUMA MoE activation on CUDA.");
+                        }
+#endif
                         moeInput = &moeQuantizedInput;
                     }
                     MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
@@ -13054,7 +13114,21 @@ namespace fastllm {
                     if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
                         moeWeights.size() > 2 && moeWeights[2] != nullptr &&
                         IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
+#ifdef USE_CUDA
+                        int moeInputCudaDevice = GetTensorCudaDevice(*moeInput);
+#endif
                         DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
+#ifdef USE_CUDA
+                        if (moeInputCudaDevice >= 0 &&
+                            moeQuantizedInput.dims.size() > 0 &&
+                            moeQuantizedInput.dims[0] >= 32 &&
+                            DeepSeekV4NumasGpuPrefillEnabled()) {
+                            AssertInFastLLM(
+                                AddDeepSeekV4QuantizedCudaReplica(
+                                    moeQuantizedInput, moeInputCudaDevice),
+                                "DeepSeek-V4 failed to stage its quantized batched NUMA MoE activation on CUDA.");
+                        }
+#endif
                         moeInput = &moeQuantizedInput;
                     }
                     MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,

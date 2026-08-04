@@ -889,6 +889,98 @@ bool DeepSeekV4PrepareWoAQuantizedInput(const fastllm::Data &input,
     return cudaGetLastError() == cudaSuccess;
 }
 
+// Reproduce inference/model.py::Expert.forward before the down projection.
+// DeepSeek-V4 applies the routed score before its second dynamic activation
+// quantization; moving the score after the GEMM is not equivalent once the
+// UE8M0 scale and E4M3 rounding are observable.
+__global__ void DeepSeekV4PrepareMoeDownInputKernel(
+        const __nv_bfloat16 *__restrict__ gateUp,
+        __nv_bfloat16 *__restrict__ downInput,
+        const float *__restrict__ routeScales,
+        int intermediateDimension, float swigluLimit, bool quantize) {
+    __shared__ float warpMax[4];
+    __shared__ float quantScale;
+    const int blocksPerRow = intermediateDimension / 128;
+    const int row = blockIdx.x / blocksPerRow;
+    const int blockInRow = blockIdx.x - row * blocksPerRow;
+    const int dimension = blockInRow * 128 + threadIdx.x;
+    const uint64_t gateUpOffset =
+        (uint64_t)row * intermediateDimension * 2 + dimension * 2;
+    const uint64_t outputOffset =
+        (uint64_t)row * intermediateDimension + dimension;
+
+    float gate = __bfloat162float(gateUp[gateUpOffset]);
+    float up = __bfloat162float(gateUp[gateUpOffset + 1]);
+    if (swigluLimit > 0.0f) {
+        gate = fminf(gate, swigluLimit);
+        up = fminf(swigluLimit, fmaxf(-swigluLimit, up));
+    }
+    // Keep the expert's observable multiplication order: SwiGLU forms h
+    // first, then the routed score is applied before the BF16 boundary.
+    // Reassociating this as (score * silu) * up can change the final BF16 bit.
+    float h = (gate / (1.0f + expf(-gate))) * up;
+    float value = routeScales[row] * h;
+    // The expert contract has a BF16 boundary before act_quant.
+    value = __bfloat162float(__float2bfloat16_rn(value));
+    if (!quantize) {
+        downInput[outputOffset] = __float2bfloat16_rn(value);
+        return;
+    }
+
+    float maximum = fmaxf(1.0e-4f, fabsf(value));
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int delta = 16; delta > 0; delta >>= 1) {
+        maximum = fmaxf(
+            maximum,
+            __shfl_down_sync(0xffffffffu, maximum, delta));
+    }
+    if (lane == 0) {
+        warpMax[warp] = maximum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        maximum = lane < 4 ? warpMax[lane] : 0.0f;
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            maximum = fmaxf(
+                maximum,
+                __shfl_down_sync(0xffffffffu, maximum, delta));
+        }
+        if (lane == 0) {
+            quantScale = exp2f(ceilf(log2f(maximum / 448.0f)));
+        }
+    }
+    __syncthreads();
+    downInput[outputOffset] = __float2bfloat16_rn(
+        Dsv4Fp8E4M3RoundTrip(value, quantScale));
+}
+
+bool DeepSeekV4PrepareMoeDownInputImpl(
+        const fastllm::Data &gateUp, fastllm::Data &downInput,
+        const float *routeScales, float swigluLimit, bool quantize) {
+    if (gateUp.dataDevice != fastllm::DataDevice::CUDA ||
+        gateUp.dataType != fastllm::DataType::BFLOAT16 ||
+        gateUp.cudaData == nullptr || routeScales == nullptr ||
+        gateUp.dims.size() != 2 || gateUp.dims[0] <= 0 ||
+        gateUp.dims[1] <= 0 || (gateUp.dims[1] & 1) != 0) {
+        return false;
+    }
+    const int rows = gateUp.dims[0];
+    const int intermediateDimension = gateUp.dims[1] / 2;
+    if ((intermediateDimension & 127) != 0 ||
+        !DeepSeekV4PrepareCudaOutput(
+            downInput, fastllm::DataType::BFLOAT16,
+            {rows, intermediateDimension})) {
+        return false;
+    }
+    const int blocks = rows * intermediateDimension / 128;
+    DeepSeekV4PrepareMoeDownInputKernel<<<blocks, 128>>>(
+        (const __nv_bfloat16*)gateUp.cudaData,
+        (__nv_bfloat16*)downInput.cudaData,
+        routeScales, intermediateDimension, swigluLimit, quantize);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 template <typename InT>
 __global__ void DeepSeekV4WoAFp8PairBlockReduceKernel(
         const InT *o, const uint8_t *w, const float *scales, __nv_bfloat16 *output,
@@ -6504,6 +6596,13 @@ bool DeepSeekV4LaunchHcHeadDotsByWeight(const fastllm::Data &x,
 }
 
 } // namespace
+
+extern "C" bool FastllmCudaDeepSeekV4PrepareMoeDownInput(
+        const fastllm::Data &gateUp, fastllm::Data &downInput,
+        const float *routeScales, float swigluLimit, bool quantize) {
+    return DeepSeekV4PrepareMoeDownInputImpl(
+        gateUp, downInput, routeScales, swigluLimit, quantize);
+}
 
 extern "C" bool FastllmCudaDeepSeekV4DsparkMarkovLocalArgmax(
         const float *baseLogits, const float *markovBias,

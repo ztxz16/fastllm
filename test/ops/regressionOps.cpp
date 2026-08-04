@@ -53,6 +53,8 @@ namespace fastllm {
 namespace fastllm {
     bool DeepSeekV4CopyCudaTensorToCpuForTest(
         const Data &source, Data &destination);
+    bool DeepSeekV4AddQuantizedCudaReplicaForTest(
+        Data &activation, int device);
     int DeepSeekV4BuildWindowKVPrefixForTest(
         const Data &windowKV, int bsz, int headDim, int startPos,
         int windowSize, Data &output);
@@ -10673,6 +10675,106 @@ namespace {
         const uint16_t *actual = (const uint16_t*)destination.cpuData;
         Expect(std::equal(expected.begin(), expected.end(), actual),
                "DeepSeek-V4 mixed-inference CUDA-to-CPU copy changed BF16 data.");
+
+        constexpr int quantizedElements = 256;
+        std::vector<uint16_t> rawQuantizedInput(quantizedElements);
+        std::vector<uint16_t> quantizedExpected(quantizedElements);
+        for (int i = 0; i < quantizedElements; i++) {
+            float value = ((i * 37) % 257 - 128) * 0.03125f;
+            rawQuantizedInput[i] =
+                fastllm::Float32ToBFloat16RNEBits(value);
+        }
+        fastllm::RunCpuDeepSeekV4ActivationQuantization(
+            rawQuantizedInput.data(), quantizedExpected.data(),
+            quantizedElements);
+        fastllm::Data quantizedActivation(
+            fastllm::DataType::BFLOAT16, {2, 128});
+        quantizedActivation.Allocate(false);
+        memcpy(quantizedActivation.cpuData, quantizedExpected.data(),
+               quantizedActivation.GetBytes());
+        Expect(fastllm::DeepSeekV4AddQuantizedCudaReplicaForTest(
+                   quantizedActivation, 0),
+               "DeepSeek-V4 failed to add a quantized CUDA activation replica.");
+        Expect(quantizedActivation.dataDevice == fastllm::DataDevice::CPU &&
+                   quantizedActivation.cpuData != nullptr &&
+                   quantizedActivation.cudaData != nullptr &&
+                   !quantizedActivation.cudaDataBorrowed,
+               "DeepSeek-V4 quantized activation is not CPU/CUDA dual-resident.");
+        std::vector<uint16_t> quantizedRoundTrip(quantizedElements);
+        FastllmCudaCopyFromDeviceToHost(
+            quantizedRoundTrip.data(), quantizedActivation.cudaData,
+            quantizedActivation.GetBytes());
+        Expect(quantizedExpected == quantizedRoundTrip,
+               "DeepSeek-V4 quantized CUDA activation replica changed BF16 bits.");
+
+        constexpr int moeRows = 2;
+        constexpr int moeIntermediate = 256;
+        std::vector<uint16_t> gateUpBits(
+            (size_t)moeRows * moeIntermediate * 2);
+        for (int row = 0; row < moeRows; row++) {
+            for (int d = 0; d < moeIntermediate; d++) {
+                float gate =
+                    (((d * 13 + row * 5) % 41) - 20) * 0.625f;
+                float up =
+                    (((d * 17 + row * 3) % 37) - 18) * 0.75f;
+                gateUpBits[((size_t)row * moeIntermediate + d) * 2] =
+                    fastllm::Float32ToBFloat16RNEBits(gate);
+                gateUpBits[((size_t)row * moeIntermediate + d) * 2 + 1] =
+                    fastllm::Float32ToBFloat16RNEBits(up);
+            }
+        }
+        // This pair lands on opposite sides of a BF16 tie if route, SiLU and
+        // up are reassociated.  It locks the official (SiLU * up) * route
+        // boundary used by the CPU expert path.
+        gateUpBits[0] = fastllm::Float32ToBFloat16RNEBits(-4.546875f);
+        gateUpBits[1] = fastllm::Float32ToBFloat16RNEBits(-1.453125f);
+        fastllm::Data gateUp(
+            fastllm::DataType::BFLOAT16,
+            {moeRows, moeIntermediate * 2});
+        gateUp.Allocate(false);
+        memcpy(gateUp.cpuData, gateUpBits.data(), gateUp.GetBytes());
+        gateUp.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        std::vector<float> routeScaleValues = {1.85298490524292f, 1.25f};
+        fastllm::Data routeScales(
+            fastllm::DataType::FLOAT32, {moeRows}, routeScaleValues);
+        routeScales.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data cudaDownInput;
+        Expect(FastllmCudaDeepSeekV4PrepareMoeDownInput(
+                   gateUp, cudaDownInput,
+                   (const float*)routeScales.cudaData, 10.0f, true),
+               "DeepSeek-V4 CUDA MoE down-input preparation failed.");
+
+        std::vector<uint16_t> preQuantized(
+            (size_t)moeRows * moeIntermediate);
+        for (int row = 0; row < moeRows; row++) {
+            for (int d = 0; d < moeIntermediate; d++) {
+                size_t gateUpOffset =
+                    ((size_t)row * moeIntermediate + d) * 2;
+                float gate = fastllm::BFloat16BitsToFloat32(
+                    gateUpBits[gateUpOffset]);
+                float up = fastllm::BFloat16BitsToFloat32(
+                    gateUpBits[gateUpOffset + 1]);
+                gate = std::min(gate, 10.0f);
+                up = std::max(-10.0f, std::min(up, 10.0f));
+                float h = (gate / (1.0f + std::exp(-gate))) * up;
+                float value = routeScaleValues[row] * h;
+                preQuantized[(size_t)row * moeIntermediate + d] =
+                    fastllm::Float32ToBFloat16RNEBits(value);
+            }
+        }
+        std::vector<uint16_t> expectedDownInput(preQuantized.size());
+        fastllm::RunCpuDeepSeekV4ActivationQuantization(
+            preQuantized.data(), expectedDownInput.data(),
+            expectedDownInput.size());
+        std::vector<uint16_t> actualDownInput(expectedDownInput.size());
+        FastllmCudaCopyFromDeviceToHost(
+            actualDownInput.data(), cudaDownInput.cudaData,
+            cudaDownInput.GetBytes());
+        Expect(expectedDownInput == actualDownInput,
+               "DeepSeek-V4 CUDA MoE down input differs from the CPU "
+               "clip/SwiGLU/route/UE8M0 reference.");
     }
 #endif
 

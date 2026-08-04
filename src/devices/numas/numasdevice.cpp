@@ -4204,7 +4204,8 @@ namespace fastllm {
 
     extern void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts,
-        bool isCrossSwiglu, MoeGateType gateType = MoeGateSwiglu);
+        bool isCrossSwiglu, MoeGateType gateType = MoeGateSwiglu,
+        bool deepSeekV4Mode = false, float swigluLimit = 0.0f);
     extern void ReduceSumFromCPU(Data &output);
     void DoNumasMergeMOEOnCPU(
         Data &input, Data &output,
@@ -6784,7 +6785,8 @@ namespace fastllm {
                         DoCudaMergeMOEFromCPU(
                             *gpuInputAliases[i], *gpuOutputPartials[i],
                             index, score, w1, w2, w3, weights, biass,
-                            sharedScale, true, gpuExpertSets[i], true);
+                            sharedScale, true, gpuExpertSets[i], true,
+                            MoeGateSwiglu, deepSeekV4Mode, swigluLimit);
                     });
                 }
             }

@@ -750,6 +750,12 @@ bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data &q, const f
 bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
                               int groups, int oRank, fastllm::Data &output,
                               bool allowTriton = true);
+bool FastllmCudaDeepSeekV4PrepareMoeDownInput(
+                              const fastllm::Data &gateUp,
+                              fastllm::Data &downInput,
+                              const float *routeScales,
+                              float swigluLimit,
+                              bool quantize);
 #ifdef FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120
 extern "C" bool FastllmCudaDeepSeekV4WoADeepGemmSm120(
                               const fastllm::Data &o,

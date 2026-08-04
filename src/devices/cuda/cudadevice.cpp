@@ -7080,9 +7080,19 @@ namespace fastllm {
         return *workspace;
     }
 
+    static bool IsDeepSeekV4CudaQuantizedWeight(const Data &weight) {
+        return weight.dataType == DataType::FP8_E4M3 ||
+               weight.dataType == DataType::FP8_E4M3_BLOCK_128 ||
+               weight.dataType == DataType::FP8_E4M3_PERCHANNEL ||
+               weight.dataType == DataType::NVFP4 ||
+               weight.dataType == DataType::NVFP4_BLOCK_16 ||
+               weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+               weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
+    }
+
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
-        MoeGateType gateType) {
+        MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit) {
 // static std::map <std::string, float> timeCnt;
 // static std::chrono::steady_clock::time_point lastMergeMoeCallTime;
 // auto now = std::chrono::steady_clock::now();
@@ -7162,9 +7172,21 @@ namespace fastllm {
 // ForceDeviceSync(); timeCnt["get experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         int *cudaIndex = (int*)FastllmCudaMalloc(indexVec.size() * sizeof(int));
         float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
+        float *cudaUnitScales = nullptr;
 // ForceDeviceSync(); timeCnt["malloc index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
         FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
+        if (deepSeekV4Mode) {
+            AssertInFastLLM(
+                isCrossSwiglu && gateType == MoeGateSwiglu,
+                "DeepSeek-V4 CUDA NUMA MoE requires cross-SwiGLU weights.");
+            std::vector<float> unitScales(scales.size(), 1.0f);
+            cudaUnitScales = (float*)FastllmCudaMalloc(
+                unitScales.size() * sizeof(float));
+            FastllmCudaCopyFromHostToDevice(
+                cudaUnitScales, unitScales.data(),
+                unitScales.size() * sizeof(float));
+        }
 // ForceDeviceSync(); timeCnt["copy index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         tempInput.Resize(input.dims);
         tempInput.dataType = input.dataType;
@@ -7246,7 +7268,18 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             );
             DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
             DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
-            ApplyCudaMoeGate(tempMiddle, tempSwiglu, gateType, isCrossSwiglu);
+            if (deepSeekV4Mode) {
+                AssertInFastLLM(
+                    FastllmCudaDeepSeekV4PrepareMoeDownInput(
+                        tempMiddle, tempSwiglu,
+                        cudaScales + startIdx[i], swigluLimit,
+                        IsDeepSeekV4CudaQuantizedWeight(
+                            *weights[i * 2 + 1])),
+                    "DeepSeek-V4 failed to prepare its CUDA MoE down input.");
+            } else {
+                ApplyCudaMoeGate(
+                    tempMiddle, tempSwiglu, gateType, isCrossSwiglu);
+            }
             DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
             DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
 
@@ -7324,12 +7357,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             } */
 
             FastllmCudaPickOutput (
-                (uint8_t*)tempOutput.cudaData, 
-                (uint8_t*)output.cudaData, 
-                expertTasks[i].size(), 
-                output.dims[1], 
+                (uint8_t*)tempOutput.cudaData,
+                (uint8_t*)output.cudaData,
+                expertTasks[i].size(),
+                output.dims[1],
                 cudaIndex + startIdx[i],
-                cudaScales + startIdx[i], 
+                (deepSeekV4Mode ? cudaUnitScales : cudaScales) +
+                    startIdx[i],
                 tempOutput.dataType
             );
 
@@ -7354,12 +7388,14 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             weights[prevExpert * 2]->FreeCudaTemporary({}, false);
             weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
         }
-
         FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);
 
         FastllmCudaFree(cudaIndex);
         FastllmCudaFree(cudaScales);
+        if (cudaUnitScales != nullptr) {
+            FastllmCudaFree(cudaUnitScales);
+        }
 // printf("copy weight %f G.\n", total / 1e9);
 
         input.FreeCudaTemporary({}, false);
