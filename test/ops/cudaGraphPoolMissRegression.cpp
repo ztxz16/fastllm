@@ -154,10 +154,9 @@ int main() {
         std::cerr << "failed reserve allocation was not reported cleanly\n";
         return 9;
     }
-    // The API server freezes real CUDA allocations after warmup. Verify that
-    // the freeze is effective without FASTLLM_CUDA_MEM_CHECK, that warmed pool
-    // storage remains reusable, and that a rejected miss does not discard the
-    // reserve while attempting an impossible retry.
+    // The API server requests an allocation freeze after warmup. The request
+    // must be ignored by default and enforced only with
+    // FASTLLM_CUDA_MEM_CHECK enabled.
     FastllmCudaSetDevice(0);
     constexpr size_t warmedBytes = 2ULL * 1024ULL * 1024ULL;
     constexpr size_t missBytes = 64ULL * 1024ULL * 1024ULL;
@@ -168,6 +167,31 @@ int main() {
     }
     FastllmCudaFree(warmed);
     DisableCudaMalloc();
+
+    if (!fastllm::GetFastllmEnv().cudaMemCheck) {
+        FastllmCudaClearThreadError();
+        void *miss = FastllmCudaMalloc(missBytes);
+        if (miss == nullptr || FastllmCudaGetThreadError()) {
+            std::cerr << "allocator freeze was enabled without "
+                         "FASTLLM_CUDA_MEM_CHECK\n";
+            return 10;
+        }
+        FastllmCudaFree(miss);
+
+        void *direct = FastllmCudaDirectMalloc(1);
+        if (direct == nullptr || FastllmCudaGetThreadError()) {
+            std::cerr << "direct allocator freeze was enabled without "
+                         "FASTLLM_CUDA_MEM_CHECK\n";
+            return 10;
+        }
+        FastllmCudaDirectFree(direct);
+
+        std::cout << "CUDA graph pool-miss regression: PASS; allocation "
+                     "freeze disabled by FASTLLM_CUDA_MEM_CHECK ("
+                  << participants << " GPU" << (participants == 1 ? "" : "s")
+                  << ")\n";
+        return 0;
+    }
 
     // Acquire every reserve block simultaneously after the freeze.  This can
     // only succeed from the existing pool, so an OOM retry that discarded the
@@ -215,7 +239,8 @@ int main() {
     }
     FastllmCudaClearThreadError();
 
-    std::cout << "CUDA graph pool-miss and allocation-freeze regression: PASS ("
+    std::cout << "CUDA graph pool-miss regression: PASS; allocation freeze "
+                 "enabled by FASTLLM_CUDA_MEM_CHECK ("
               << participants << " GPU" << (participants == 1 ? "" : "s")
               << ")\n";
     return 0;

@@ -309,9 +309,8 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
         (rejected && rejectLogIndex < 4)) {
         FastllmCudaPrintMallocStack(size, file, line, rejected);
     }
-    // The serving frontend freezes CUDA allocations after model warmup.  The
-    // audit flag controls diagnostics only; it must never control whether the
-    // freeze itself is enforced.
+    // The serving frontend arms this freeze only when
+    // FASTLLM_CUDA_MEM_CHECK is enabled.
     if (rejected) {
         if (ret != nullptr) {
             *ret = nullptr;
@@ -326,6 +325,9 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
 }
 
 void DisableCudaMalloc() {
+    if (!fastllm::GetFastllmEnv().cudaMemCheck) {
+        return;
+    }
     bool wasDisabled = fastllmCudaMallocDisabled.exchange(
         true, std::memory_order_acq_rel);
     if (!wasDisabled) {
