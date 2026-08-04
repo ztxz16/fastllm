@@ -1847,6 +1847,32 @@ namespace fastllm {
             return GetDataSeqLen(raw, bsz, wideDim);
         }
 
+#ifdef USE_CUDA
+        static bool CompactCompressorRawInPlaceCuda(Data &kv, Data &score,
+                                                     int dropLen) {
+            if (kv.multiDeviceData || score.multiDeviceData) {
+                // Keep replicated caches on the established Split path until
+                // this optimization has a multi-device atomic-commit path.
+                return false;
+            }
+            if (kv.dataDevice != DataDevice::CUDA ||
+                score.dataDevice != DataDevice::CUDA ||
+                kv.cudaData == nullptr || score.cudaData == nullptr) {
+                return false;
+            }
+            int device = GetPointerDeviceId(kv.cudaData);
+            if (device < 0 || GetPointerDeviceId(score.cudaData) != device) {
+                return false;
+            }
+            int originalDevice = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(device);
+            bool ok = FastllmCudaDeepSeekV4CompactCompressorRaw(
+                kv, score, dropLen);
+            FastllmCudaSetDevice(originalDevice);
+            return ok;
+        }
+#endif
+
         static void TrimCompressorRawCache(int bsz, int totalLen, int compressRatio, int wideDim,
                                            int compressedBlocks, Data &allKV,
                                            Data &allScore, int &rawTokenBase) {
@@ -1878,6 +1904,17 @@ namespace fastllm {
             }
 
             int dropLen = retainStart - rawTokenBase;
+#ifdef USE_CUDA
+            // The ratio-4 overlap tail is disjoint from the dropped prefix
+            // (normally rows [4, 8) -> [0, 4)).  Keep the 128-row reserve and
+            // copy both FP32 projections in one launch instead of allocating,
+            // splitting and replacing two tensors every fourth token.
+            if (dropLen >= newLen &&
+                CompactCompressorRawInPlaceCuda(allKV, allScore, dropLen)) {
+                rawTokenBase = retainStart;
+                return;
+            }
+#endif
             Data nextKV, nextScore;
             Split(allKV, 1, dropLen, oldLen, nextKV);
             Split(allScore, 1, dropLen, oldLen, nextScore);
@@ -3779,6 +3816,15 @@ namespace fastllm {
             int wideDim, Data &allKV, Data &allScore) {
         AppendCompressorRaw(
             kv, score, bsz, seqlen, wideDim, allKV, allScore);
+    }
+
+    void DeepSeekV4TrimCompressorRawForTest(
+            int bsz, int totalLen, int compressRatio, int wideDim,
+            int compressedBlocks, Data &allKV, Data &allScore,
+            int &rawTokenBase) {
+        TrimCompressorRawCache(
+            bsz, totalLen, compressRatio, wideDim, compressedBlocks,
+            allKV, allScore, rawTokenBase);
     }
 #endif
 

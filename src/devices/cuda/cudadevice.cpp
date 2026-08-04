@@ -5661,6 +5661,9 @@ namespace fastllm {
         int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
         int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
         bool overlap = intParams.find("overlap") != intParams.end() && intParams.find("overlap")->second != 0;
+        bool multiCudaDispatch =
+            intParams.find("multiCudaDispatch") != intParams.end() &&
+            intParams.find("multiCudaDispatch")->second != 0;
         float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
         float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
         int bsz = kv.dims[0];
@@ -5671,6 +5674,61 @@ namespace fastllm {
                                                     blockStart, blockCount, compressRatio,
                                                     headDim, wideDim, overlap, compressed)) {
             ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: build kernel rejected input.\n");
+        }
+
+        const bool fusedFinalize =
+            std::getenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV") == nullptr &&
+            !multiCudaDispatch && bsz == 1 &&
+            (headDim == 128 || headDim == 512) &&
+            normWeight.dataType == DataType::FLOAT32 &&
+            (blockStart > 0 || cache.dims.empty()) &&
+            (blockStart <= 0 ||
+             (cache.dataType == DataType::BFLOAT16 &&
+              cache.dims.size() == 3 && cache.dims[0] == bsz &&
+              cache.dims[1] >= blockStart && cache.dims[2] == headDim &&
+              cache.expansionDims.empty() &&
+              cache.strides.size() == 3 &&
+              cache.strides[0] == cache.dims[1] * headDim &&
+              cache.strides[1] == headDim &&
+              cache.cudaData != nullptr));
+        if (fusedFinalize) {
+            const int totalBlocks = blockStart + blockCount;
+            const int allocationUnit = 64;
+            const int requiredCapacity =
+                ((totalBlocks + allocationUnit - 1) / allocationUnit) *
+                allocationUnit;
+            std::vector<int> currentDevice = {FastllmCudaGetDevice()};
+            if (cache.dims.empty()) {
+                cache.dataType = DataType::BFLOAT16;
+                cache.UpdateUnitSize();
+                cache.Resize({bsz, requiredCapacity, headDim});
+                cache.SetKVCache();
+                cache.ToDevice(DataDevice::CUDA, currentDevice, false);
+                cache.Allocate(false);
+                cache.Resize({bsz, totalBlocks, headDim});
+            } else {
+                int capacity = (int)(cache.expansionSize / headDim);
+                if (capacity < requiredCapacity) {
+                    cache.Expansion({bsz, requiredCapacity, headDim});
+                    // For bsz == 1 the reserved rows do not participate in
+                    // addressing: sequence rows are contiguous and there is
+                    // no second batch whose base needs a capacity stride.
+                    // Keep the allocation size as the private reserve, while
+                    // publishing compact logical strides to every consumer.
+                    cache.expansionDims.clear();
+                }
+                cache.Resize({bsz, totalBlocks, headDim});
+            }
+            cache.SetKVCache();
+            if (!FastllmCudaDeepSeekV4FinalizeCompressedKV(
+                    compressed, normWeight, blockStart, compressRatio,
+                    ropeDim, ropeBase, originalSeqLen, ropeFactor,
+                    betaFast, betaSlow, cache)) {
+                ErrorInFastLLM(
+                    "DeepSeekV4BuildCompressedKVFromRaw CUDA error: "
+                    "fused finalize rejected prepared input.\n");
+            }
+            return;
         }
 
         Data compressedForNorm(DataType::BFLOAT16, {bsz, blockCount, headDim});

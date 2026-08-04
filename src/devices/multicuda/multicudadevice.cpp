@@ -4313,8 +4313,10 @@ namespace fastllm {
                                 "DeepSeek V4 MultiCuda op is missing local tensor " + it.first + ".\n");
                 localDatas[it.first] = localIt->second;
             }
+            IntDict localIntParams = intParams;
+            localIntParams["multiCudaDispatch"] = 1;
             ops.push_back(new MultiCudaDelegatedCudaOp(cudaOp, opType, localDatas,
-                                                       floatParams, intParams, device));
+                                                       floatParams, localIntParams, device));
         }
         RunMultiCudaDeviceOpsAndDelete(devices, ops);
         for (const auto &name : outputNames) {

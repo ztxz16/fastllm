@@ -652,6 +652,23 @@ bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv, const fastl
                                             int blockStart, int blockCount, int compressRatio,
                                             int headDim, int wideDim, bool overlap,
                                             fastllm::Data &output);
+// Preserve the eager pipeline's FP32 -> BF16 -> RMSNorm -> BF16 -> RoPE /
+// quantization boundaries, but finish each compressed row in one launch and
+// write it directly into an already-reserved cache.
+bool FastllmCudaDeepSeekV4FinalizeCompressedKV(
+                                            const fastllm::Data &compressed,
+                                            const fastllm::Data &normWeight,
+                                            int blockStart, int compressRatio,
+                                            int ropeDim, float ropeBase,
+                                            int originalSeqLen, float ropeFactor,
+                                            int betaFast, int betaSlow,
+                                            fastllm::Data &cache);
+// Drop a disjoint prefix from the two raw compressor caches in place.  The
+// allocation and its reserve stride remain stable; only logical dimensions
+// are shortened after the byte-identical device copy is enqueued.
+bool FastllmCudaDeepSeekV4CompactCompressorRaw(fastllm::Data &kv,
+                                               fastllm::Data &score,
+                                               int dropLen);
 bool FastllmCudaDeepSeekV4InitGraphRawRing(const fastllm::Data &raw, int rawTokenBase,
                                            fastllm::Data &ring);
 bool FastllmCudaDeepSeekV4UpdateCompressedKVGraph(

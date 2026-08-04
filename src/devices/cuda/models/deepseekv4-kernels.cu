@@ -2373,6 +2373,161 @@ __global__ void DeepSeekV4BuildCompressedKVKernel(const T *kv, const T *score, c
     compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] = value / fmaxf(sum, 1e-30f);
 }
 
+// Finish the eager compressed-KV pipeline without materializing its two BF16
+// temporaries.  The numerical boundaries deliberately mirror the standalone
+// kernels:
+//   FP32 build -> BF16 -> RMSNorm -> BF16 -> RoPE -> BF16 -> quant -> BF16.
+// RMSNorm also preserves the exact virtual-thread/reduction layout used by
+// FastllmRMSNormKernelInner1<64/512>, which is required for bitwise equality.
+__global__ void DeepSeekV4FinalizeCompressedKVKernel(
+        const float *compressed, const float *normWeight,
+        __nv_bfloat16 *cache, int bsz, int blockCount, int blockStart,
+        int cacheStride, int compressRatio, int headDim, int ropeDim,
+        float ropeBase, int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow, bool realFp8) {
+    extern __shared__ float shared[];
+    float *values = shared;
+    float *warpSums = values + headDim;
+    float *quantPartial = warpSums + 16;
+    __shared__ float normScale;
+    __shared__ float quantScale;
+
+    int row = blockIdx.x;
+    int localBlock = row % blockCount;
+    int b = row / blockCount;
+    if (b >= bsz) {
+        return;
+    }
+
+    for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
+        float value = compressed[((uint64_t)b * blockCount + localBlock) *
+                                 headDim + d];
+        values[d] = __bfloat162float(__float2bfloat16_rn(value));
+    }
+    __syncthreads();
+
+    const int rmsThreads = headDim == 128 ? 64 : 512;
+    if (threadIdx.x < rmsThreads) {
+        float sum2 = 0.0f;
+        int bf2Channels = headDim / 2;
+        for (int i = threadIdx.x; i < bf2Channels; i += rmsThreads) {
+            float lo = values[i * 2];
+            float hi = values[i * 2 + 1];
+            sum2 += lo * lo + hi * hi;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
+        }
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        if (lane == 0) {
+            warpSums[warp] = sum2;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        int rmsWarps = rmsThreads / 32;
+        float value = threadIdx.x < rmsWarps ? warpSums[threadIdx.x] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (threadIdx.x == 0) {
+            normScale = rsqrtf(value / headDim + 1.0e-6f);
+        }
+    }
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
+        values[d] = __bfloat162float(__float2bfloat16_rn(
+            values[d] * normScale * __ldg(normWeight + d)));
+    }
+    __syncthreads();
+
+    int ropeOffset = headDim - ropeDim;
+    int rotaryPos = (blockStart + localBlock) * compressRatio;
+    for (int i = threadIdx.x * 2; i < ropeDim; i += blockDim.x * 2) {
+        float inv = DeepSeekV4InvFreq(i / 2, ropeDim, ropeBase,
+                                      originalSeqLen, ropeFactor,
+                                      betaFast, betaSlow);
+        float angle = rotaryPos * inv;
+        float c = cosf(angle);
+        float s = sinf(angle);
+        float a = values[ropeOffset + i];
+        float bb = values[ropeOffset + i + 1];
+        values[ropeOffset + i] = __bfloat162float(
+            __float2bfloat16_rn(a * c - bb * s));
+        values[ropeOffset + i + 1] = __bfloat162float(
+            __float2bfloat16_rn(a * s + bb * c));
+    }
+    __syncthreads();
+
+    const int quantDim = headDim == 128 ? headDim : ropeOffset;
+    const int quantBlock = headDim == 128 ? 128 : 64;
+    for (int start = 0; start < quantDim; start += quantBlock) {
+        int end = min(start + quantBlock, quantDim);
+        if (threadIdx.x < 256) {
+            float amax = 1.0e-4f;
+            for (int d = start + threadIdx.x; d < end; d += 256) {
+                amax = fmaxf(amax, fabsf(values[d]));
+            }
+            quantPartial[threadIdx.x] = amax;
+        }
+        __syncthreads();
+        for (int stride = 128; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                quantPartial[threadIdx.x] = fmaxf(
+                    quantPartial[threadIdx.x],
+                    quantPartial[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            quantScale = powf(
+                2.0f, ceilf(log2f(quantPartial[0] / 448.0f)));
+        }
+        __syncthreads();
+        if (threadIdx.x < 256) {
+            for (int d = start + threadIdx.x; d < end; d += 256) {
+                float value = values[d];
+                float qv = fminf(
+                    448.0f, fmaxf(-448.0f, value / quantScale));
+                float rounded = realFp8 ?
+                    Dsv4Fp8E4M3RoundTrip(value, quantScale) :
+                    __bfloat162float(__float2bfloat16_rn(qv)) * quantScale;
+                values[d] = __bfloat162float(
+                    __float2bfloat16_rn(rounded));
+            }
+        }
+        __syncthreads();
+    }
+
+    int block = blockStart + localBlock;
+    for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
+        cache[((uint64_t)b * cacheStride + block) * headDim + d] =
+            __float2bfloat16_rn(values[d]);
+    }
+}
+
+template <typename T>
+__global__ void DeepSeekV4CompactCompressorRawKernel(
+        T *kv, T *score, int bsz, int newLen,
+        int wideDim, int rowCapacity, int dropLen) {
+    uint64_t tensorElems = (uint64_t)bsz * newLen * wideDim;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= tensorElems * 2) {
+        return;
+    }
+    T *data = idx < tensorElems ? kv : score;
+    uint64_t local = idx < tensorElems ? idx : idx - tensorElems;
+    int d = local % wideDim;
+    uint64_t row = local / wideDim;
+    int s = row % newLen;
+    int b = row / newLen;
+    uint64_t dst = ((uint64_t)b * rowCapacity + s) * wideDim + d;
+    uint64_t src = ((uint64_t)b * rowCapacity + dropLen + s) * wideDim + d;
+    data[dst] = data[src];
+}
+
 template <typename T>
 __global__ void DeepSeekV4InitGraphRawRingKernel(const T *raw, T *ring,
                                                  int bsz, int rawLen, int wideDim,
@@ -7564,6 +7719,108 @@ extern "C" bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv,
         return false;
     }
     DeviceSync();
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4FinalizeCompressedKV(
+                                            const fastllm::Data &compressed,
+                                            const fastllm::Data &normWeight,
+                                            int blockStart, int compressRatio,
+                                            int ropeDim, float ropeBase,
+                                            int originalSeqLen, float ropeFactor,
+                                            int betaFast, int betaSlow,
+                                            fastllm::Data &cache) {
+    if (compressed.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        cache.dataDevice != fastllm::DataDevice::CUDA ||
+        compressed.dataType != fastllm::DataType::FLOAT32 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        cache.dataType != fastllm::DataType::BFLOAT16 ||
+        compressed.cudaData == nullptr || normWeight.cudaData == nullptr ||
+        cache.cudaData == nullptr || compressed.dims.size() != 3 ||
+        cache.dims.size() != 3 || blockStart < 0 || compressRatio <= 0) {
+        return false;
+    }
+    int bsz = compressed.dims[0];
+    int blockCount = compressed.dims[1];
+    int headDim = compressed.dims[2];
+    int totalBlocks = blockStart + blockCount;
+    int cacheStride = cache.dims[1];
+    if (cache.expansionDims.size() == 3) {
+        cacheStride = cache.expansionDims[1];
+    }
+    if (bsz != 1 || blockCount <= 0 ||
+        (headDim != 128 && headDim != 512) ||
+        ropeDim <= 0 || ropeDim > headDim ||
+        normWeight.Count(0) < (uint64_t)headDim ||
+        cache.dims[0] != bsz || cache.dims[1] != totalBlocks ||
+        cache.dims[2] != headDim || cacheStride < totalBlocks) {
+        return false;
+    }
+
+    int threads = 512;
+    size_t sharedBytes = (size_t)(headDim + 16 + 256) * sizeof(float);
+    bool realFp8 = DeepSeekV4SparseMlaSm120RuntimeEnabled();
+    DeepSeekV4FinalizeCompressedKVKernel<<<
+        bsz * blockCount, threads, sharedBytes>>>(
+            (const float*)compressed.cudaData,
+            (const float*)normWeight.cudaData,
+            (__nv_bfloat16*)cache.cudaData,
+            bsz, blockCount, blockStart, cacheStride, compressRatio,
+            headDim, ropeDim, ropeBase, originalSeqLen, ropeFactor,
+            betaFast, betaSlow, realFp8);
+    DeviceSync();
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4CompactCompressorRaw(
+                                            fastllm::Data &kv,
+                                            fastllm::Data &score,
+                                            int dropLen) {
+    if (kv.dataDevice != fastllm::DataDevice::CUDA ||
+        score.dataDevice != fastllm::DataDevice::CUDA ||
+        kv.cudaData == nullptr || score.cudaData == nullptr ||
+        kv.dataType != score.dataType || kv.dims.size() != 3 ||
+        score.dims != kv.dims || kv.strides.size() != 3 ||
+        score.strides != kv.strides || dropLen <= 0) {
+        return false;
+    }
+    int bsz = kv.dims[0];
+    int oldLen = kv.dims[1];
+    int wideDim = kv.dims[2];
+    int newLen = oldLen - dropLen;
+    if (bsz <= 0 || wideDim <= 0 || newLen <= 0 || dropLen < newLen ||
+        kv.strides[0] % wideDim != 0) {
+        return false;
+    }
+    int rowCapacity = kv.strides[0] / wideDim;
+    if (rowCapacity < oldLen) {
+        return false;
+    }
+
+    uint64_t total = (uint64_t)bsz * newLen * wideDim * 2;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    if (kv.dataType == fastllm::DataType::FLOAT32) {
+        DeepSeekV4CompactCompressorRawKernel<<<blocks, threads>>>(
+            (float*)kv.cudaData, (float*)score.cudaData, bsz, newLen,
+            wideDim, rowCapacity, dropLen);
+    } else if (kv.dataType == fastllm::DataType::BFLOAT16) {
+        DeepSeekV4CompactCompressorRawKernel<<<blocks, threads>>>(
+            (__nv_bfloat16*)kv.cudaData, (__nv_bfloat16*)score.cudaData,
+            bsz, newLen, wideDim, rowCapacity, dropLen);
+    } else if (kv.dataType == fastllm::DataType::FLOAT16) {
+        DeepSeekV4CompactCompressorRawKernel<<<blocks, threads>>>(
+            (half*)kv.cudaData, (half*)score.cudaData, bsz, newLen,
+            wideDim, rowCapacity, dropLen);
+    } else {
+        return false;
+    }
+    DeviceSync();
+    std::vector<int> dims = kv.dims;
+    dims[1] = newLen;
+    kv.Resize(dims);
+    score.Resize(dims);
     return true;
 }
 

@@ -29,6 +29,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -64,6 +65,10 @@ namespace fastllm {
     void DeepSeekV4AppendCompressorRawForTest(
         const Data &kv, const Data &score, int bsz, int seqlen,
         int wideDim, Data &allKV, Data &allScore);
+    void DeepSeekV4TrimCompressorRawForTest(
+        int bsz, int totalLen, int compressRatio, int wideDim,
+        int compressedBlocks, Data &allKV, Data &allScore,
+        int &rawTokenBase);
 }
 #endif
 
@@ -5852,6 +5857,226 @@ namespace {
         std::cout << "DeepSeek-V4 restored raw-cache append regression: PASS\n";
     }
 
+    void RunCudaDeepSeekV4CompressedKvMaintenanceRegression() {
+        auto toLogicalBFloat16Bits = [](fastllm::Data data) {
+            const int count = std::accumulate(
+                data.dims.begin(), data.dims.end(), 1,
+                std::multiplies<int>());
+            Expect(data.dataType == fastllm::DataType::BFLOAT16,
+                   "Expected a BFLOAT16 tensor.");
+            data.ToDevice(fastllm::DataDevice::CPU);
+            std::vector<uint16_t> values(count);
+            if (count > 0) {
+                Expect(data.cpuData != nullptr,
+                       "BFLOAT16 tensor has no CPU buffer.");
+                std::memcpy(values.data(), data.cpuData,
+                            (size_t) count * sizeof(uint16_t));
+            }
+            return values;
+        };
+        auto toLogicalFloatVector = [](fastllm::Data data) {
+            const int count = std::accumulate(
+                data.dims.begin(), data.dims.end(), 1,
+                std::multiplies<int>());
+            Expect(data.dataType == fastllm::DataType::FLOAT32,
+                   "Expected a FLOAT32 tensor.");
+            data.ToDevice(fastllm::DataDevice::CPU);
+            std::vector<float> values(count);
+            if (count > 0) {
+                Expect(data.cpuData != nullptr,
+                       "FLOAT32 tensor has no CPU buffer.");
+                std::memcpy(values.data(), data.cpuData,
+                            (size_t) count * sizeof(float));
+            }
+            return values;
+        };
+        const char *oldDisable = std::getenv(
+            "FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV");
+        const bool hadOldDisable = oldDisable != nullptr;
+        const std::string oldDisableValue =
+            oldDisable == nullptr ? std::string() : std::string(oldDisable);
+
+        auto runFinalizeCase = [&](int headDim, int ropeDim, bool indexer) {
+            constexpr int bsz = 1;
+            constexpr int compressRatio = 4;
+            constexpr int blockStart = 2;
+            constexpr int blockCount = 2;
+            constexpr int rawTokenBase = 4;
+            constexpr int rawLen = 24;
+            const int wideDim = 2 * headDim;
+
+            std::vector<float> kvValues = MakeRegressionValues(
+                (uint64_t)bsz * rawLen * wideDim, 0.43f, 0.013f);
+            std::vector<float> scoreValues = MakeRegressionValues(
+                (uint64_t)bsz * rawLen * wideDim, 0.19f, 0.007f);
+            std::vector<float> apeValues = MakeRegressionValues(
+                (uint64_t)compressRatio * wideDim, 0.11f, 0.009f);
+            std::vector<float> normValues = MakeRegressionValues(
+                headDim, 0.03f, 0.001f);
+            for (float &value : normValues) {
+                value += 0.75f;
+            }
+            std::vector<float> cacheValues = MakeRegressionValues(
+                (uint64_t)bsz * blockStart * headDim, 0.71f, 0.005f);
+
+            fastllm::Data kv(fastllm::DataType::FLOAT32,
+                              {bsz, rawLen, wideDim}, kvValues);
+            fastllm::Data score(fastllm::DataType::FLOAT32,
+                                 {bsz, rawLen, wideDim}, scoreValues);
+            fastllm::Data ape(fastllm::DataType::FLOAT32,
+                               {compressRatio, wideDim}, apeValues);
+            fastllm::Data norm(fastllm::DataType::FLOAT32,
+                                {headDim}, normValues);
+            fastllm::Data referenceCache(fastllm::DataType::BFLOAT16,
+                                          {bsz, blockStart, headDim},
+                                          cacheValues);
+            fastllm::Data fusedCache(fastllm::DataType::BFLOAT16,
+                                      {bsz, blockStart, headDim},
+                                      cacheValues);
+            FastllmCudaSetDevice(0);
+            for (fastllm::Data *data :
+                 {&kv, &score, &ape, &norm, &referenceCache, &fusedCache}) {
+                data->ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+            }
+
+            setenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV", "1", 1);
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                    kv, score, ape, norm, rawTokenBase, rawLen,
+                    blockStart, blockCount, compressRatio, headDim,
+                    ropeDim, 10000.0f, 1.0f, 32, 1, 4096,
+                    true, true, referenceCache, indexer);
+            }
+            unsetenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV");
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                    kv, score, ape, norm, rawTokenBase, rawLen,
+                    blockStart, blockCount, compressRatio, headDim,
+                    ropeDim, 10000.0f, 1.0f, 32, 1, 4096,
+                    true, true, fusedCache, indexer);
+            }
+            ForceDeviceSync();
+
+            Expect(referenceCache.dims == fusedCache.dims &&
+                       fusedCache.dims == std::vector<int>(
+                           {bsz, blockStart + blockCount, headDim}),
+                   "DeepSeek-V4 fused compressed finalize returned the wrong shape");
+            Expect(fusedCache.strides.size() == 3 &&
+                       fusedCache.strides[0] ==
+                           fusedCache.dims[1] * headDim &&
+                       fusedCache.expansionDims.empty() &&
+                       fusedCache.expansionSize >=
+                           (uint64_t)bsz * 64 * headDim,
+                   "DeepSeek-V4 fused compressed finalize exposed reserve rows");
+            const std::vector<uint16_t> referenceBits =
+                toLogicalBFloat16Bits(referenceCache);
+            const std::vector<uint16_t> fusedBits =
+                toLogicalBFloat16Bits(fusedCache);
+            if (referenceBits != fusedBits) {
+                size_t first = 0;
+                while (first < referenceBits.size() &&
+                       referenceBits[first] == fusedBits[first]) {
+                    first++;
+                }
+                std::cerr << "DeepSeek-V4 finalize mismatch: headDim="
+                          << headDim << " first=" << first
+                          << " reference="
+                          << (first < referenceBits.size()
+                                  ? referenceBits[first] : 0)
+                          << " fused="
+                          << (first < fusedBits.size()
+                                  ? fusedBits[first] : 0)
+                          << "\n";
+            }
+            Expect(referenceBits == fusedBits,
+                   "DeepSeek-V4 fused compressed finalize changed BF16 bits");
+
+            void *reservedPointer = fusedCache.cudaData;
+            setenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV", "1", 1);
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                    kv, score, ape, norm, rawTokenBase, rawLen,
+                    blockStart + blockCount, blockCount, compressRatio,
+                    headDim, ropeDim, 10000.0f, 1.0f, 32, 1, 4096,
+                    true, true, referenceCache, indexer);
+            }
+            unsetenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV");
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                    kv, score, ape, norm, rawTokenBase, rawLen,
+                    blockStart + blockCount, blockCount, compressRatio,
+                    headDim, ropeDim, 10000.0f, 1.0f, 32, 1, 4096,
+                    true, true, fusedCache, indexer);
+            }
+            ForceDeviceSync();
+            Expect(fusedCache.cudaData == reservedPointer &&
+                       fusedCache.dims == std::vector<int>(
+                           {bsz, blockStart + 2 * blockCount, headDim}) &&
+                       fusedCache.strides[0] ==
+                           fusedCache.dims[1] * headDim &&
+                       fusedCache.expansionDims.empty(),
+                   "DeepSeek-V4 fused compressed append did not reuse its hidden reserve");
+            Expect(toLogicalBFloat16Bits(referenceCache) ==
+                       toLogicalBFloat16Bits(fusedCache),
+                   "DeepSeek-V4 repeated fused append changed BF16 bits");
+        };
+
+        runFinalizeCase(512, 64, false);
+        runFinalizeCase(128, 64, true);
+
+        constexpr int bsz = 1;
+        constexpr int oldLen = 8;
+        constexpr int wideDim = 32;
+        std::vector<float> rawKvValues = MakeRegressionValues(
+            (uint64_t)bsz * oldLen * wideDim, 0.37f, 0.017f);
+        std::vector<float> rawScoreValues = MakeRegressionValues(
+            (uint64_t)bsz * oldLen * wideDim, 0.61f, 0.011f);
+        std::vector<float> expectedKv(
+            rawKvValues.begin() + 4 * wideDim, rawKvValues.end());
+        std::vector<float> expectedScore(
+            rawScoreValues.begin() + 4 * wideDim, rawScoreValues.end());
+        fastllm::Data rawKv(fastllm::DataType::FLOAT32,
+                             {bsz, oldLen, wideDim}, rawKvValues);
+        fastllm::Data rawScore(fastllm::DataType::FLOAT32,
+                                {bsz, oldLen, wideDim}, rawScoreValues);
+        rawKv.ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+        rawScore.ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+        rawKv.Expansion({bsz, 128, wideDim});
+        rawScore.Expansion({bsz, 128, wideDim});
+        void *kvPointer = rawKv.cudaData;
+        void *scorePointer = rawScore.cudaData;
+        int rawTokenBase = 0;
+        fastllm::DeepSeekV4TrimCompressorRawForTest(
+            bsz, oldLen, 4, wideDim, 2,
+            rawKv, rawScore, rawTokenBase);
+        ForceDeviceSync();
+        Expect(rawTokenBase == 4 &&
+                   rawKv.dims == std::vector<int>({bsz, 4, wideDim}) &&
+                   rawScore.dims == rawKv.dims &&
+                   rawKv.expansionDims ==
+                       std::vector<int>({bsz, 128, wideDim}) &&
+                   rawScore.expansionDims == rawKv.expansionDims &&
+                   rawKv.cudaData == kvPointer &&
+                   rawScore.cudaData == scorePointer,
+               "DeepSeek-V4 raw compressor compaction changed its reserve");
+        ExpectFloatNear(expectedKv, toLogicalFloatVector(rawKv), 0.0f, 0.0f,
+                        "DeepSeek-V4 raw KV in-place compaction");
+        ExpectFloatNear(expectedScore, toLogicalFloatVector(rawScore), 0.0f, 0.0f,
+                        "DeepSeek-V4 raw score in-place compaction");
+
+        if (hadOldDisable) {
+            setenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV",
+                   oldDisableValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV");
+        }
+        std::cout << "DeepSeek-V4 compressed-KV maintenance regression: PASS\n";
+    }
+
     void RunMultiCudaDeepSeekV4CompressedCacheAppendRegression() {
         if (FastllmCudaGetDeviceCount() < 2) {
             std::cout << "DeepSeek-V4 restored compressed-cache append regression: "
@@ -11056,6 +11281,7 @@ int main(int argc, char **argv) {
             RunMultiCudaDeepSeekV4HcPrePrefillRegression();
             RunMultiCudaDeepSeekV4RouterLinearResizeRegression();
             RunMultiCudaDeepSeekV4RawCacheAppendRegression();
+            RunCudaDeepSeekV4CompressedKvMaintenanceRegression();
             RunMultiCudaDeepSeekV4CompressedCacheAppendRegression();
             RunMultiCudaDeepSeekV4ExpandedSnapshotRegression();
             RunCudaDeepSeekV4FusedQKVRopeCacheRegression();
