@@ -1015,6 +1015,58 @@ namespace {
                std::strcmp(value, "OFF") != 0;
     }
 
+    class ScopedEnvOverride {
+    public:
+        ScopedEnvOverride(const char *name, const char *value)
+            : name(name) {
+            const char *current = std::getenv(name);
+            hadValue = current != nullptr;
+            if (hadValue) {
+                oldValue = current;
+            }
+            setenv(name, value, 1);
+        }
+
+        ~ScopedEnvOverride() {
+            if (hadValue) {
+                setenv(name.c_str(), oldValue.c_str(), 1);
+            } else {
+                unsetenv(name.c_str());
+            }
+        }
+
+    private:
+        std::string name;
+        std::string oldValue;
+        bool hadValue = false;
+    };
+
+    bool RunCudaVarlenChunkGdnSelected(
+            fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+            fastllm::Data &g, fastllm::Data &attn,
+            fastllm::Data &decayMask, fastllm::Data &kCumdecay,
+            fastllm::Data &lastRecurrentState,
+            bool fuseDecayMask, bool directOutputQk,
+            const std::vector<int> &seqLens, fastllm::Data &coreAttnOut,
+            const std::string &label) {
+        bool requireTriton = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_VARLEN_PREFILL", true);
+        bool ok = requireTriton
+            ? fastllm::FastllmCudaTryTritonChunkGdnVarlenPrefill(
+                  q, k, v, g, attn, decayMask, kCumdecay,
+                  lastRecurrentState, fuseDecayMask, directOutputQk,
+                  seqLens, coreAttnOut)
+            : fastllm::FastllmCudaChunkGatedDeltaRuleVarlenPrefill(
+                  q, k, v, g, attn, decayMask, kCumdecay,
+                  lastRecurrentState, fuseDecayMask, directOutputQk,
+                  seqLens, coreAttnOut);
+        if (requireTriton) {
+            Expect(ok, label + " did not execute the enabled Triton path");
+        }
+        return ok;
+    }
+
     fastllm::Data MakeCudaTensor(fastllm::DataType dataType, const std::vector<int> &dims,
                                  const std::vector<float> &values) {
         fastllm::Data data(dataType, dims, values);
@@ -1025,6 +1077,142 @@ namespace {
     std::vector<float> MakeRegressionValues(int count, float seed, float scale);
 
 #ifndef USE_ROCM
+    fastllm::Data MakeNvfp4Block16Weight(
+            int outputDim, int inputDim, float globalScale) {
+        Expect(outputDim > 0 && inputDim > 0 && inputDim % 16 == 0,
+               "NVFP4_BLOCK_16 regression weight shape is invalid");
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::NVFP4_BLOCK_16;
+        weight.UpdateUnitSize();
+        weight.Resize({outputDim, inputDim});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = 1;
+        weight.blockM = 16;
+        weight.Allocate(false);
+
+        const int groups = inputDim / 16;
+        const size_t rowBytes = fastllm::GetDataBytes(
+            fastllm::DataType::NVFP4_BLOCK_16, 1, inputDim);
+        auto *bytes = reinterpret_cast<uint8_t *>(weight.cpuData);
+        for (int row = 0; row < outputDim; row++) {
+            for (int group = 0; group < groups; group++) {
+                uint8_t *block = bytes + (size_t)row * rowBytes + group * 12;
+                for (int packed = 0; packed < 8; packed++) {
+                    uint8_t low = static_cast<uint8_t>(
+                        (row * 3 + group * 5 + packed * 7 + 1) & 0xf);
+                    uint8_t high = static_cast<uint8_t>(
+                        (row * 11 + group * 13 + packed * 3 + 2) & 0xf);
+                    block[packed] = static_cast<uint8_t>((high << 4) | low);
+                }
+                float effectiveScale = globalScale *
+                    static_cast<float>(1 << ((row + group) & 3));
+                std::memcpy(block + 8, &effectiveScale, sizeof(float));
+            }
+        }
+        // Multiple entries model merged weights whose partitions retained
+        // different tensor-level scales.  Marlin must select the common minimum
+        // without losing the effective inline block scales.
+        weight.scales = {globalScale * 2.0f, globalScale};
+        weight.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        return weight;
+    }
+
+    void RunCudaNVFP4MarlinRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int inputDim = 128;
+        constexpr int outputDim = 256;
+        constexpr int batch = 31;
+        if (!FastllmCudaMarlinNVFP4Supported(outputDim, inputDim)) {
+            std::cout << "CUDA NVFP4 Marlin regression: SKIP\n";
+            return;
+        }
+
+        ScopedEnvOverride forceMarlin("FASTLLM_CUDA_NVFP4_MARLIN", "1");
+        struct ScopedNcclForceSyncRestore {
+            bool previous = FastllmCudaGetNcclForceSync();
+            ~ScopedNcclForceSyncRestore() {
+                FastllmCudaSetNcclForceSync(previous);
+            }
+        } restoreForceSync;
+
+        constexpr float globalScale = 1.0f / 256.0f;
+        fastllm::Data referenceWeight = MakeNvfp4Block16Weight(
+            outputDim, inputDim, globalScale);
+        fastllm::Data marlinWeight = MakeNvfp4Block16Weight(
+            outputDim, inputDim, globalScale);
+        std::vector<float> inputValues = MakeRegressionValues(
+            batch * inputDim, 0.43f, 0.08f);
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, inputDim}, inputValues);
+        fastllm::Data warmupInput = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {2, inputDim},
+            std::vector<float>(inputValues.begin(),
+                               inputValues.begin() + 2 * inputDim));
+        fastllm::Data bias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {outputDim},
+            MakeRegressionValues(outputDim, 0.79f, 0.015f));
+        fastllm::Data noBias;
+        fastllm::Data reference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, outputDim},
+            std::vector<float>((size_t)batch * outputDim, 0.0f));
+        fastllm::Data actual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, outputDim},
+            std::vector<float>((size_t)batch * outputDim, 0.0f));
+        fastllm::Data warmup = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {2, outputDim},
+            std::vector<float>(2 * outputDim, 0.0f));
+
+        FastllmCudaSetNcclForceSync(false);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, referenceWeight, bias, reference,
+                   batch, inputDim, outputDim),
+               "native NVFP4_BLOCK_16 reference failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(!FastllmCudaHasNVFP4MarlinLayout(referenceWeight),
+               "large-M NVFP4 reference unexpectedly repacked its weight");
+
+        FastllmCudaSetNcclForceSync(true);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   warmupInput, marlinWeight, bias, warmup,
+                   2, inputDim, outputDim),
+               "NVFP4 Marlin warmup conversion failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(FastllmCudaHasNVFP4MarlinLayout(marlinWeight),
+               "NVFP4 Marlin warmup did not mark the in-place layout");
+
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, marlinWeight, bias, actual,
+                   batch, inputDim, outputDim),
+               "NVFP4 Marlin large-M path failed after repack");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                        2.0e-2f, 2.0e-3f,
+                        "NVFP4 Marlin large-M output with bias");
+
+        fastllm::Data referenceSingle = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, outputDim},
+            std::vector<float>(outputDim, 0.0f));
+        fastllm::Data actualSingle = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, outputDim},
+            std::vector<float>(outputDim, 0.0f));
+        FastllmCudaSetNcclForceSync(false);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, referenceWeight, noBias, referenceSingle,
+                   1, inputDim, outputDim),
+               "native NVFP4_BLOCK_16 batch-one reference failed");
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, marlinWeight, noBias, actualSingle,
+                   1, inputDim, outputDim),
+               "NVFP4 Marlin batch-one path failed after repack");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceSingle),
+                        ToFloatVector(actualSingle),
+                        2.0e-2f, 2.0e-3f,
+                        "NVFP4 Marlin batch-one output without bias");
+        std::cout << "CUDA NVFP4 Marlin regression: PASS\n";
+    }
+
     void RunCudaBFloat16Hidden3072RMSNormRegression() {
         FastllmCudaSetDevice(0);
         constexpr int outer = 7;
@@ -1877,6 +2065,671 @@ namespace {
                         0.0f, 0.0f,
                         "Triton chunk GDN native fallback output");
         std::cout << "Triton chunk GDN prefill transaction regression: PASS\n";
+    }
+
+    void RunCudaRaggedGdnLogicalPrepRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int chunkSize = 64;
+        constexpr int kDim = 128;
+        constexpr int vDim = 128;
+        constexpr int keyHeads = 2;
+        constexpr int valueHeads = 6;
+        constexpr int headGroup = valueHeads / keyHeads;
+        constexpr int baOffset = 5;
+        constexpr int baChannels = baOffset + valueHeads * 2 + 3;
+        constexpr float eps = 1.0e-6f;
+        const float qScale = 1.0f / std::sqrt((float)kDim);
+        const std::vector<int> seqLens = {65, 7};
+        const int totalTokens =
+            std::accumulate(seqLens.begin(), seqLens.end(), 0);
+        int totalChunks = 0;
+        for (int len : seqLens) {
+            totalChunks += (len + chunkSize - 1) / chunkSize;
+        }
+        const int packedTokens = totalChunks * chunkSize;
+        const int qkvChannels =
+            keyHeads * kDim * 2 + valueHeads * vDim;
+
+        std::vector<float> qkvValues = MakeRegressionValues(
+            (size_t)totalTokens * qkvChannels, 0.23f, 0.013f);
+        std::vector<float> baValues = MakeRegressionValues(
+            (size_t)totalTokens * baChannels, 0.41f, 0.017f);
+        std::vector<float> normValues = MakeRegressionValues(
+            kDim, 0.59f, 0.004f);
+        std::vector<float> aLogValues = MakeRegressionValues(
+            valueHeads, -1.7f, 0.03f);
+        std::vector<float> dtBiasValues = MakeRegressionValues(
+            valueHeads, -0.2f, 0.02f);
+        fastllm::Data qkv = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, qkvChannels}, qkvValues);
+        fastllm::Data combinedBa = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, baChannels}, baValues);
+        fastllm::Data normWeight = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {kDim}, normValues);
+        fastllm::Data aLog = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {valueHeads}, aLogValues);
+        fastllm::Data dtBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {valueHeads}, dtBiasValues);
+
+        fastllm::Data logicalQ, logicalK, packedG, kBeta, vBeta;
+        Expect(FastllmCudaQwen35GdnPostConvRaggedExactFloat16(
+                   qkv, normWeight, combinedBa, aLog, dtBias,
+                   baOffset, seqLens, chunkSize,
+                   keyHeads, valueHeads, kDim, vDim,
+                   eps, qScale, logicalQ, logicalK,
+                   packedG, kBeta, vBeta),
+               "ragged exact GDN post-conv rejected valid input");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            logicalQ, fastllm::DataType::FLOAT16,
+            {1, keyHeads, packedTokens, kDim},
+            "ragged logical Q");
+        ExpectCudaTensorMeta(
+            logicalK, fastllm::DataType::FLOAT16,
+            {1, keyHeads, packedTokens, kDim},
+            "ragged logical K");
+        ExpectCudaTensorMeta(
+            packedG, fastllm::DataType::FLOAT16,
+            {1, valueHeads, packedTokens},
+            "ragged packed G");
+
+        fastllm::Data normalizedQ, normalizedK;
+        Expect(FastllmCudaRMSNormCombinedQKFloat16(
+                   qkv, normWeight, 1, totalTokens,
+                   keyHeads, valueHeads, kDim, vDim, eps,
+                   normalizedQ, normalizedK),
+               "combined Q/K RMSNorm reference failed");
+        fastllm::Data tokenBeta, tokenG;
+        Expect(FastllmCudaSigmoidMambaSoftplusCombinedFloat16(
+                   combinedBa, aLog, dtBias, 1, totalTokens,
+                   baChannels, baOffset, valueHeads,
+                   tokenBeta, tokenG),
+               "combined BA reference failed");
+        FastllmCudaSyncCurrentThreadStream();
+
+        std::vector<float> normalizedQValues = ToFloatVector(normalizedQ);
+        std::vector<float> normalizedKValues = ToFloatVector(normalizedK);
+        std::vector<float> repeatedQValues(
+            (size_t)totalTokens * valueHeads * kDim);
+        std::vector<float> repeatedKValues(repeatedQValues.size());
+        std::vector<float> tokenVValues(
+            (size_t)totalTokens * valueHeads * vDim);
+        for (int token = 0; token < totalTokens; token++) {
+            for (int keyHead = 0; keyHead < keyHeads; keyHead++) {
+                for (int group = 0; group < headGroup; group++) {
+                    int valueHead = keyHead * headGroup + group;
+                    for (int d = 0; d < kDim; d++) {
+                        size_t source =
+                            ((size_t)token * keyHeads + keyHead) * kDim + d;
+                        size_t target =
+                            ((size_t)token * valueHeads + valueHead) * kDim + d;
+                        repeatedQValues[target] = normalizedQValues[source];
+                        repeatedKValues[target] = normalizedKValues[source];
+                    }
+                }
+            }
+            for (int valueHead = 0; valueHead < valueHeads; valueHead++) {
+                for (int d = 0; d < vDim; d++) {
+                    tokenVValues[
+                        ((size_t)token * valueHeads + valueHead) * vDim + d] =
+                        qkvValues[(size_t)token * qkvChannels +
+                                  keyHeads * kDim * 2 +
+                                  valueHead * vDim + d];
+                }
+            }
+        }
+        fastllm::Data repeatedQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, valueHeads, kDim}, repeatedQValues);
+        fastllm::Data repeatedK = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, valueHeads, kDim}, repeatedKValues);
+        fastllm::Data tokenV = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, valueHeads, vDim}, tokenVValues);
+        fastllm::Data referenceQRepeated, referenceKRepeated;
+        fastllm::Data referenceV, referenceBeta, referenceG;
+        Expect(FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+                   repeatedQ, repeatedK, tokenV, tokenBeta, tokenG,
+                   seqLens, chunkSize, qScale,
+                   referenceQRepeated, referenceKRepeated,
+                   referenceV, referenceBeta, referenceG),
+               "legacy repeated-head ragged pack reference failed");
+
+        std::vector<float> zeros(
+            (size_t)totalTokens * keyHeads * kDim, 0.0f);
+        std::vector<float> scalarZeros(
+            (size_t)totalTokens * keyHeads, 0.0f);
+        fastllm::Data dummyV = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, keyHeads, vDim}, zeros);
+        fastllm::Data dummyB = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, keyHeads}, scalarZeros);
+        fastllm::Data dummyG = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, keyHeads}, scalarZeros);
+        fastllm::Data referenceLogicalQ, referenceLogicalK;
+        fastllm::Data unusedV, unusedB, unusedG;
+        Expect(FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+                   normalizedQ, normalizedK, dummyV, dummyB, dummyG,
+                   seqLens, chunkSize, qScale,
+                   referenceLogicalQ, referenceLogicalK,
+                   unusedV, unusedB, unusedG),
+               "legacy logical-head ragged pack reference failed");
+
+        referenceBeta.Reshape(
+            {1, valueHeads, packedTokens, 1});
+        fastllm::Data referenceKBeta = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            referenceKRepeated.dims, ToFloatVector(referenceKRepeated));
+        fastllm::Data referenceVBeta = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            referenceV.dims, ToFloatVector(referenceV));
+        Expect(FastllmCudaMulTo(referenceKBeta, referenceBeta, 1.0f),
+               "legacy K beta reference failed");
+        Expect(FastllmCudaMulTo(referenceVBeta, referenceBeta, 1.0f),
+               "legacy V beta reference failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceLogicalQ),
+                        ToFloatVector(logicalQ), 0.0f, 0.0f,
+                        "ragged fused logical Q bitwise output");
+        ExpectFloatNear(ToFloatVector(referenceLogicalK),
+                        ToFloatVector(logicalK), 0.0f, 0.0f,
+                        "ragged fused logical K bitwise output");
+        ExpectFloatNear(ToFloatVector(referenceG), ToFloatVector(packedG),
+                        0.0f, 0.0f,
+                        "ragged fused G bitwise output");
+        ExpectFloatNear(ToFloatVector(referenceKBeta), ToFloatVector(kBeta),
+                        0.0f, 0.0f,
+                        "ragged fused K-beta bitwise output");
+        ExpectFloatNear(ToFloatVector(referenceVBeta), ToFloatVector(vBeta),
+                        0.0f, 0.0f,
+                        "ragged fused V-beta bitwise output");
+
+        logicalK.Reshape(
+            {1, keyHeads, totalChunks, chunkSize, kDim});
+        kBeta.Reshape(
+            {1, valueHeads, totalChunks, chunkSize, kDim});
+        referenceKRepeated.Reshape(
+            {1, valueHeads, totalChunks, chunkSize, kDim});
+        referenceKBeta.Reshape(
+            {1, valueHeads, totalChunks, chunkSize, kDim});
+        fastllm::Data mappedAt;
+        Expect(FastllmCudaBatchMatMulTransBHeadMapped(
+                   kBeta, logicalK, mappedAt, headGroup, 1.0f),
+               "mapped ragged GDN KKT failed");
+        fastllm::Data referenceAt;
+        referenceAt.dataType = fastllm::DataType::FLOAT16;
+        referenceAt.Resize(
+            {1, valueHeads, totalChunks, chunkSize, chunkSize});
+        referenceAt.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        referenceAt.Allocate(false);
+        Expect(FastllmCudaBatchMatMulTransB(
+                   referenceKBeta, referenceKRepeated, referenceAt,
+                   chunkSize * kDim, chunkSize * kDim,
+                   chunkSize * chunkSize, kDim, kDim,
+                   valueHeads * totalChunks,
+                   chunkSize, kDim, chunkSize, 1.0f),
+               "repeated-head GDN KKT reference failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceAt), ToFloatVector(mappedAt),
+                        0.0f, 0.0f,
+                        "mapped ragged GDN KKT bitwise output");
+        {
+            ScopedEnvOverride forceRepeatedHead(
+                "FASTLLM_CUDA_GDN_MAPPED_KKT_BATCHED_POINTERS", "0");
+            fastllm::Data fallbackAt;
+            Expect(FastllmCudaBatchMatMulTransBHeadMapped(
+                       kBeta, logicalK, fallbackAt, headGroup, 1.0f),
+                   "repeated-head GDN KKT fallback failed");
+            FastllmCudaSyncCurrentThreadStream();
+            ExpectFloatNear(
+                ToFloatVector(referenceAt), ToFloatVector(fallbackAt),
+                0.0f, 0.0f,
+                "repeated-head GDN KKT fallback bitwise output");
+        }
+        std::cout << "CUDA repeated-head GDN KKT fallback regression: PASS\n";
+        bool mappedKktSelected = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_MAPPED_KKT", true);
+        if (mappedKktSelected) {
+            fastllm::Data selectedAt;
+            Expect(fastllm::FastllmCudaMappedGdnKkt(
+                       kBeta, logicalK, headGroup, selectedAt),
+                   "selected mapped ragged GDN KKT failed");
+            FastllmCudaSyncCurrentThreadStream();
+            bool tritonKkt = RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_KKT", false);
+            float tolerance = tritonKkt ? 2e-3f : 0.0f;
+            ExpectFloatNear(
+                ToFloatVector(referenceAt), ToFloatVector(selectedAt),
+                tolerance, tolerance,
+                tritonKkt ? "Triton mapped ragged GDN KKT output"
+                          : "default mapped ragged GDN KKT output");
+        }
+        std::cout << "CUDA ragged GDN logical prep regression: PASS\n";
+    }
+
+    void RunCudaVarlenChunkGdnPrefillRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int heads = 1;
+        constexpr int chunkSize = 64;
+        constexpr int kDim = 128;
+        constexpr int vDim = 128;
+        const std::vector<int> seqLens = {65, 129, 7};
+        const int batch = (int)seqLens.size();
+        std::vector<int> tokenOffsets(batch + 1, 0);
+        std::vector<int> chunkOffsets(batch + 1, 0);
+        for (int request = 0; request < batch; request++) {
+            tokenOffsets[request + 1] =
+                tokenOffsets[request] + seqLens[request];
+            chunkOffsets[request + 1] = chunkOffsets[request] +
+                (seqLens[request] + chunkSize - 1) / chunkSize;
+        }
+        const int totalTokens = tokenOffsets.back();
+        const int totalChunks = chunkOffsets.back();
+
+        const std::vector<float> tokenQValues = MakeRegressionValues(
+            totalTokens * heads * kDim, 0.17f, 0.01f);
+        const std::vector<float> tokenKValues = MakeRegressionValues(
+            totalTokens * heads * kDim, 0.31f, 0.009f);
+        const std::vector<float> tokenVValues = MakeRegressionValues(
+            totalTokens * heads * vDim, 0.47f, 0.012f);
+        const std::vector<float> tokenBValues = MakeRegressionValues(
+            totalTokens * heads, 0.61f, 0.02f);
+        const std::vector<float> tokenGValues = MakeRegressionValues(
+            totalTokens * heads, 0.79f, 0.001f);
+        fastllm::Data tokenQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, kDim}, tokenQValues);
+        fastllm::Data tokenK = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, kDim}, tokenKValues);
+        fastllm::Data tokenV = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, vDim}, tokenVValues);
+        fastllm::Data tokenB = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads}, tokenBValues);
+        fastllm::Data tokenG = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads}, tokenGValues);
+        fastllm::Data packedQ, packedK, packedV, packedB, packedG;
+        Expect(FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+                   tokenQ, tokenK, tokenV, tokenB, tokenG,
+                   seqLens, chunkSize, 1.0f,
+                   packedQ, packedK, packedV, packedB, packedG),
+               "packed varlen GDN input packing failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            packedQ, fastllm::DataType::FLOAT16,
+            {1, heads, totalChunks * chunkSize, kDim},
+            "packed varlen GDN Q");
+        fastllm::Data unpackedQ;
+        Expect(FastllmCudaUnpackRaggedGdnPrefillChunksFloat16(
+                   packedQ, seqLens, chunkSize, unpackedQ),
+               "packed varlen GDN output unpacking failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(tokenQ), ToFloatVector(unpackedQ),
+                        0.0f, 0.0f,
+                        "packed varlen GDN pack/unpack round trip");
+
+        const std::vector<int> qDims =
+            {1, heads, totalChunks, chunkSize, kDim};
+        const std::vector<int> vDims =
+            {1, heads, totalChunks, chunkSize, vDim};
+        const std::vector<int> gDims =
+            {1, heads, totalChunks, chunkSize};
+        const std::vector<int> attnDims =
+            {1, heads, totalChunks, chunkSize, chunkSize};
+        const std::vector<int> stateDims =
+            {batch, heads, kDim, vDim};
+        const std::vector<float> qValues = MakeRegressionValues(
+            totalChunks * chunkSize * kDim, 1.01f, 0.004f);
+        const std::vector<float> kValues = MakeRegressionValues(
+            totalChunks * chunkSize * kDim, 1.19f, 0.003f);
+        const std::vector<float> vValues = MakeRegressionValues(
+            totalChunks * chunkSize * vDim, 1.37f, 0.006f);
+        const std::vector<float> gValues = MakeRegressionValues(
+            totalChunks * chunkSize, 1.53f, 0.0004f);
+        const std::vector<float> attnValues = MakeRegressionValues(
+            totalChunks * chunkSize * chunkSize, 1.71f, 0.001f);
+        const std::vector<float> kCumValues = MakeRegressionValues(
+            totalChunks * chunkSize * kDim, 1.89f, 0.003f);
+        const std::vector<float> initialState = MakeRegressionValues(
+            batch * kDim * vDim, 2.07f, 0.002f);
+
+        auto makeChunkSlice = [](
+            const std::vector<float> &values, size_t begin,
+            size_t count) {
+            return std::vector<float>(
+                values.begin() + begin, values.begin() + begin + count);
+        };
+        std::vector<float> referenceOutputValues;
+        std::vector<float> referenceStateValues;
+        for (int request = 0; request < batch; request++) {
+            int requestChunks =
+                chunkOffsets[request + 1] - chunkOffsets[request];
+            size_t qBegin =
+                (size_t)chunkOffsets[request] * chunkSize * kDim;
+            size_t vBegin =
+                (size_t)chunkOffsets[request] * chunkSize * vDim;
+            size_t gBegin =
+                (size_t)chunkOffsets[request] * chunkSize;
+            size_t attnBegin =
+                (size_t)chunkOffsets[request] * chunkSize * chunkSize;
+            std::vector<int> requestQDims =
+                {1, heads, requestChunks, chunkSize, kDim};
+            std::vector<int> requestVDims =
+                {1, heads, requestChunks, chunkSize, vDim};
+            std::vector<int> requestGDims =
+                {1, heads, requestChunks, chunkSize};
+            std::vector<int> requestAttnDims =
+                {1, heads, requestChunks, chunkSize, chunkSize};
+            fastllm::Data requestQ = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestQDims,
+                makeChunkSlice(qValues, qBegin,
+                               (size_t)requestChunks * chunkSize * kDim));
+            fastllm::Data requestK = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestQDims,
+                makeChunkSlice(kValues, qBegin,
+                               (size_t)requestChunks * chunkSize * kDim));
+            fastllm::Data requestV = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestVDims,
+                makeChunkSlice(vValues, vBegin,
+                               (size_t)requestChunks * chunkSize * vDim));
+            fastllm::Data requestG = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestGDims,
+                makeChunkSlice(gValues, gBegin,
+                               (size_t)requestChunks * chunkSize));
+            fastllm::Data requestAttn = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestAttnDims,
+                makeChunkSlice(
+                    attnValues, attnBegin,
+                    (size_t)requestChunks * chunkSize * chunkSize));
+            fastllm::Data requestKCum = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestQDims,
+                makeChunkSlice(kCumValues, qBegin,
+                               (size_t)requestChunks * chunkSize * kDim));
+            fastllm::Data requestState = MakeCudaTensor(
+                fastllm::DataType::FLOAT16,
+                {1, heads, kDim, vDim},
+                makeChunkSlice(
+                    initialState, (size_t)request * kDim * vDim,
+                    (size_t)kDim * vDim));
+            fastllm::Data requestOutput;
+            FastllmChunkGatedDeltaRulePrefill(
+                requestQ, requestK, requestV, requestG, requestAttn,
+                requestKCum, requestState, requestOutput);
+            FastllmCudaSyncCurrentThreadStream();
+            std::vector<float> output = ToFloatVector(requestOutput);
+            std::vector<float> state = ToFloatVector(requestState);
+            referenceOutputValues.insert(
+                referenceOutputValues.end(), output.begin(),
+                output.begin() + (size_t)seqLens[request] * vDim);
+            referenceStateValues.insert(
+                referenceStateValues.end(), state.begin(), state.end());
+        }
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims, qValues);
+        fastllm::Data k = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims, kValues);
+        fastllm::Data v = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, vDims, vValues);
+        fastllm::Data g = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims, gValues);
+        fastllm::Data attn = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, attnDims, attnValues);
+        fastllm::Data kCum = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims, kCumValues);
+
+        fastllm::Data nativeState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data nativeOutput;
+        Expect(FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+                   q, k, v, g, attn, kCum, nativeState,
+                   seqLens, nativeOutput),
+               "native packed varlen GDN prefill failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            nativeOutput, fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, vDim},
+            "native direct ragged GDN output");
+        ExpectFloatNear(referenceStateValues, ToFloatVector(nativeState),
+                        2e-3f, 2e-3f,
+                        "native packed varlen GDN recurrent state");
+        ExpectFloatNear(referenceOutputValues, ToFloatVector(nativeOutput),
+                        2e-3f, 2e-3f,
+                        "native packed varlen GDN output");
+
+        fastllm::Data selectedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data selectedOutput;
+        Expect(RunCudaVarlenChunkGdnSelected(
+                   q, k, v, g, attn, attn, kCum, selectedState,
+                   false, false, seqLens, selectedOutput,
+                   "packed varlen GDN"),
+               "selected packed varlen GDN prefill failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            selectedOutput, fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, vDim},
+            "selected direct ragged GDN output");
+        ExpectFloatNear(referenceStateValues, ToFloatVector(selectedState),
+                        2e-3f, 2e-3f,
+                        "selected packed varlen GDN recurrent state");
+        ExpectFloatNear(referenceOutputValues, ToFloatVector(selectedOutput),
+                        2e-3f, 2e-3f,
+                        "selected packed varlen GDN output");
+        std::cout << "CUDA packed varlen chunk GDN regression: PASS\n";
+    }
+
+    void RunCudaVarlenChunkGdnHeadMappingRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int keyHeads = 2;
+        constexpr int valueHeads = 6;
+        constexpr int headGroup = valueHeads / keyHeads;
+        constexpr int chunkSize = 64;
+        constexpr int kDim = 128;
+        constexpr int vDim = 128;
+        const std::vector<int> seqLens = {65, 7};
+        const int batch = (int)seqLens.size();
+        const int totalTokens =
+            std::accumulate(seqLens.begin(), seqLens.end(), 0);
+        int totalChunks = 0;
+        for (int len : seqLens) {
+            totalChunks += (len + chunkSize - 1) / chunkSize;
+        }
+        const size_t keyMatrixElements =
+            (size_t)totalChunks * chunkSize * kDim;
+        const size_t attnElements =
+            (size_t)totalChunks * chunkSize * chunkSize;
+        std::vector<float> logicalQValues = MakeRegressionValues(
+            keyHeads * keyMatrixElements, 0.29f, 0.003f);
+        std::vector<float> logicalKValues = MakeRegressionValues(
+            keyHeads * keyMatrixElements, 0.47f, 0.002f);
+        std::vector<float> logicalAttnValues = MakeRegressionValues(
+            keyHeads * attnElements, 0.61f, 0.0007f);
+        std::vector<float> physicalQValues(
+            valueHeads * keyMatrixElements);
+        std::vector<float> physicalKValues(
+            valueHeads * keyMatrixElements);
+        std::vector<float> physicalAttnValues(
+            valueHeads * attnElements);
+        for (int valueHead = 0; valueHead < valueHeads; valueHead++) {
+            int keyHead = valueHead / headGroup;
+            std::copy_n(
+                logicalQValues.begin() + keyHead * keyMatrixElements,
+                keyMatrixElements,
+                physicalQValues.begin() + valueHead * keyMatrixElements);
+            std::copy_n(
+                logicalKValues.begin() + keyHead * keyMatrixElements,
+                keyMatrixElements,
+                physicalKValues.begin() + valueHead * keyMatrixElements);
+            std::copy_n(
+                logicalAttnValues.begin() + keyHead * attnElements,
+                attnElements,
+                physicalAttnValues.begin() + valueHead * attnElements);
+        }
+        const std::vector<int> logicalQDims =
+            {1, keyHeads, totalChunks, chunkSize, kDim};
+        const std::vector<int> physicalQDims =
+            {1, valueHeads, totalChunks, chunkSize, kDim};
+        const std::vector<int> vDims =
+            {1, valueHeads, totalChunks, chunkSize, vDim};
+        const std::vector<int> gDims =
+            {1, valueHeads, totalChunks, chunkSize};
+        const std::vector<int> logicalAttnDims =
+            {1, keyHeads, totalChunks, chunkSize, chunkSize};
+        const std::vector<int> physicalAttnDims =
+            {1, valueHeads, totalChunks, chunkSize, chunkSize};
+        const std::vector<int> stateDims =
+            {batch, valueHeads, kDim, vDim};
+        std::vector<float> vValues = MakeRegressionValues(
+            (size_t)valueHeads * totalChunks * chunkSize * vDim,
+            0.83f, 0.004f);
+        std::vector<float> gValues = MakeRegressionValues(
+            (size_t)valueHeads * totalChunks * chunkSize,
+            -0.019f, 0.00003f);
+        std::vector<float> decayValues = MakeRegressionValues(
+            valueHeads * attnElements, 0.91f, 0.0002f);
+        std::vector<float> kCumValues = MakeRegressionValues(
+            (size_t)valueHeads * totalChunks * chunkSize * kDim,
+            1.07f, 0.002f);
+        std::vector<float> stateValues = MakeRegressionValues(
+            (size_t)batch * valueHeads * kDim * vDim,
+            1.23f, 0.001f);
+
+        fastllm::Data physicalQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, physicalQDims, physicalQValues);
+        fastllm::Data physicalK = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, physicalQDims, physicalKValues);
+        fastllm::Data logicalQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, logicalQDims, logicalQValues);
+        fastllm::Data logicalK = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, logicalQDims, logicalKValues);
+        fastllm::Data v = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, vDims, vValues);
+        fastllm::Data g = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims, gValues);
+        fastllm::Data physicalAttn = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            physicalAttnDims, physicalAttnValues);
+        fastllm::Data logicalAttn = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            logicalAttnDims, logicalAttnValues);
+        fastllm::Data decay = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            physicalAttnDims, decayValues);
+        fastllm::Data kCum = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, physicalQDims, kCumValues);
+
+        fastllm::Data referenceState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data referenceOutput;
+        Expect(FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+                   physicalQ, physicalK, v, g, physicalAttn,
+                   kCum, referenceState, seqLens, referenceOutput,
+                   &decay, true),
+               "physical-head varlen GDN reference failed");
+        fastllm::Data mappedNativeState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data mappedNativeOutput;
+        Expect(FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+                   logicalQ, logicalK, v, g, logicalAttn,
+                   kCum, mappedNativeState, seqLens, mappedNativeOutput,
+                   &decay, true),
+               "logical-head native varlen GDN failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceState),
+                        ToFloatVector(mappedNativeState),
+                        0.0f, 0.0f,
+                        "logical-head native varlen GDN state");
+        ExpectFloatNear(ToFloatVector(referenceOutput),
+                        ToFloatVector(mappedNativeOutput),
+                        0.0f, 0.0f,
+                        "logical-head native varlen GDN output");
+
+        fastllm::Data selectedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data selectedOutput;
+        Expect(RunCudaVarlenChunkGdnSelected(
+                   logicalQ, logicalK, v, g, logicalAttn, decay,
+                   kCum, selectedState, true, false,
+                   seqLens, selectedOutput,
+                   "logical-head varlen GDN"),
+               "selected logical-head varlen GDN failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            selectedOutput, fastllm::DataType::FLOAT16,
+            {1, totalTokens, valueHeads, vDim},
+            "selected logical-head direct varlen output");
+        ExpectFloatNear(ToFloatVector(referenceState),
+                        ToFloatVector(selectedState),
+                        2e-3f, 2e-3f,
+                        "selected logical-head varlen GDN state");
+        ExpectFloatNear(ToFloatVector(referenceOutput),
+                        ToFloatVector(selectedOutput),
+                        2e-3f, 2e-3f,
+                        "selected logical-head varlen GDN output");
+
+        // Exercise the direct-QK O variant against the legacy FP16
+        // materialization boundary. This comparison keeps QK and the decay
+        // mask explicit only on the reference side.
+        fastllm::Data directAttn;
+        directAttn.dataType = fastllm::DataType::FLOAT16;
+        directAttn.Resize(logicalAttnDims);
+        directAttn.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        directAttn.Allocate(false);
+        Expect(FastllmCudaBatchMatMulTransB(
+                   logicalQ, logicalK, directAttn,
+                   chunkSize * kDim, chunkSize * kDim,
+                   chunkSize * chunkSize, kDim, kDim,
+                   keyHeads * totalChunks,
+                   chunkSize, kDim, chunkSize, 1.0f),
+               "direct-QK legacy attention reference failed");
+        fastllm::Data directDecay;
+        directDecay.dataType = fastllm::DataType::FLOAT16;
+        directDecay.Resize(physicalAttnDims);
+        directDecay.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        directDecay.Allocate(false);
+        Expect(FastllmCudaMakeDecayMask(g, directDecay),
+               "direct-QK decay reference failed");
+
+        fastllm::Data directReferenceState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data directReferenceOutput;
+        Expect(FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+                   logicalQ, logicalK, v, g, directAttn,
+                   kCum, directReferenceState, seqLens,
+                   directReferenceOutput, &directDecay, true),
+               "direct-QK native reference failed");
+        fastllm::Data directSelectedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data directSelectedOutput;
+        Expect(RunCudaVarlenChunkGdnSelected(
+                   logicalQ, logicalK, v, g, directAttn, directDecay,
+                   kCum, directSelectedState, true, true,
+                   seqLens, directSelectedOutput,
+                   "direct-QK logical-head varlen GDN"),
+               "selected direct-QK logical-head varlen GDN failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(directReferenceState),
+                        ToFloatVector(directSelectedState),
+                        2e-3f, 2e-3f,
+                        "direct-QK logical-head varlen GDN state");
+        ExpectFloatNear(ToFloatVector(directReferenceOutput),
+                        ToFloatVector(directSelectedOutput),
+                        3e-3f, 3e-3f,
+                        "direct-QK logical-head varlen GDN output");
+        std::cout << "CUDA logical-head varlen chunk GDN regression: PASS\n";
     }
 
     void RunCudaDeepSeekV4TritonWoARegression() {
@@ -7659,6 +8512,7 @@ int main() {
         if (fastllm::HasDeviceType("cuda")) {
 #ifdef USE_CUDA
 #ifndef USE_ROCM
+            RunCudaNVFP4MarlinRegression();
             RunCudaBFloat16Hidden3072RMSNormRegression();
             std::cout << "cuda BF16 hidden-3072 RMSNorm regression: PASS\n";
 #endif
@@ -7667,6 +8521,9 @@ int main() {
             Expect(FastllmCudaGraphQwen35MoeSelfTest(),
                    "Qwen3.5 CUDA graph shared/routed MoE parallelization/fallback self-test failed");
             RunCudaTritonChunkGdnPrefillRegression();
+            RunCudaRaggedGdnLogicalPrepRegression();
+            RunCudaVarlenChunkGdnPrefillRegression();
+            RunCudaVarlenChunkGdnHeadMappingRegression();
             RunCudaDeepSeekV4TritonWoARegression();
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
             RunCudaDeepSeekV4IndexerRegression();

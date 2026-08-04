@@ -1492,6 +1492,32 @@ namespace {
             }
         }
 
+        static void InitPerChannelWeight(
+                fastllm::Data &weight, int out, int in, float seed) {
+            if ((in % 16) != 0 || (out % 4) != 0) {
+                throw std::runtime_error(
+                    "linear_fp8 per-channel layout requires in aligned to 16 and out aligned to 4");
+            }
+            weight.dataType = fastllm::DataType::FP8_E4M3;
+            weight.UpdateUnitSize();
+            weight.Resize({out, in});
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.blockK = 1;
+            weight.blockM = in;
+            weight.Allocate(false);
+
+            uint8_t *ptr = reinterpret_cast<uint8_t*>(weight.cpuData);
+            for (uint64_t i = 0; i < weight.GetBytes(); ++i) {
+                ptr[i] = static_cast<uint8_t>(
+                    0x20 + ((i * 17 + (uint64_t)(seed * 11.0f)) & 0x1f));
+            }
+            weight.scales.resize(out);
+            for (int row = 0; row < out; ++row) {
+                weight.scales[row] =
+                    0.006f + 0.00015f * (float)((row + (int)seed) % 17);
+            }
+        }
+
         static void MakeBlockyInput(fastllm::Data &input, int batch, int in, int block) {
             float *ptr = reinterpret_cast<float*>(input.cpuData);
             int groups = (in + block - 1) / block;
@@ -1534,8 +1560,11 @@ namespace {
                 InitPackedWeight(weight, out, in, block, 0.7f);
             } else if (weightLayout == "separate") {
                 InitSeparateScaleWeight(weight, out, in, block, 0.7f);
+            } else if (weightLayout == "perchannel") {
+                InitPerChannelWeight(weight, out, in, 0.7f);
             } else {
-                throw std::runtime_error("weight_layout must be packed or separate");
+                throw std::runtime_error(
+                    "weight_layout must be packed, separate or perchannel");
             }
             weight.ToDevice(fastllm::DataDevice::CUDA);
 
@@ -1597,6 +1626,10 @@ namespace {
     static void PrintLinearFp8Block128CheckStats(const std::vector<float> &expected,
                                                  const std::vector<float> &actual,
                                                  int batch, int out) {
+        if (expected.empty() || expected.size() != actual.size()) {
+            throw std::runtime_error(
+                "linear FP8 check received empty or mismatched output vectors");
+        }
         float maxAbsDiff = 0.0f;
         float maxRelDiff = 0.0f;
         size_t maxIndex = 0;
@@ -1635,6 +1668,39 @@ namespace {
         std::cout << "  abs_diff>1e-2: " << over1e2
                   << ", >1e-1: " << over1e1
                   << ", >1: " << over1e0 << "\n";
+    }
+
+    static void CheckLinearFp8Near(const std::vector<float> &expected,
+                                   const std::vector<float> &actual,
+                                   float atol, float rtol,
+                                   const std::string &label) {
+        if (expected.size() != actual.size()) {
+            throw std::runtime_error(
+                label + " output size mismatch: " +
+                std::to_string(expected.size()) + " vs " +
+                std::to_string(actual.size()));
+        }
+        size_t mismatches = 0;
+        float maxExcess = 0.0f;
+        size_t maxIndex = 0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            float tolerance = atol + rtol * std::fabs(expected[i]);
+            float diff = std::fabs(expected[i] - actual[i]);
+            if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) ||
+                diff > tolerance) {
+                mismatches++;
+                float excess = std::isfinite(diff) ? diff - tolerance : INFINITY;
+                if (excess > maxExcess) {
+                    maxExcess = excess;
+                    maxIndex = i;
+                }
+            }
+        }
+        if (mismatches != 0) {
+            throw std::runtime_error(
+                label + " mismatch count: " + std::to_string(mismatches) +
+                ", worst index: " + std::to_string(maxIndex));
+        }
     }
 
     static void CheckLinearFp8Block128Cuda(const OpTestParams &params) {
@@ -1685,6 +1751,47 @@ namespace {
             ref32.Print("linear_fp8_check.ref.float32");
             cutlass32.Print("linear_fp8_check.cutlass.float32");
         }
+    }
+
+    static void CheckLinearFp8PerChannelCuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "perchannel") {
+            throw std::runtime_error(
+                "per-channel CUTLASS check requires weight_layout=perchannel");
+        }
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+        fastllm::Data reference = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+        fastllm::Data cutlass = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+
+        bool ok = state->input.dataType == fastllm::DataType::FLOAT16
+            ? FastllmCudaHalfMatMulFloatFP8E4M3(
+                  state->input, state->weight, state->bias, reference,
+                  state->batch, state->in, state->out)
+            : FastllmCudaBFloat16MatMulFP8E4M3(
+                  state->input, state->weight, state->bias, reference,
+                  state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("native per-channel FP8 linear failed");
+        }
+        ForceDeviceSync();
+        ok = FastllmCudaCutlassLinearFP8E4M3PerChannel(
+            state->input, state->weight, state->bias, cutlass,
+            state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("CUTLASS per-channel FP8 linear failed");
+        }
+        ForceDeviceSync();
+
+        std::vector<float> refVec = ToFloatVector(ConvertToFloat32Data(reference));
+        std::vector<float> cutlassVec = ToFloatVector(ConvertToFloat32Data(cutlass));
+        PrintLinearFp8Block128CheckStats(
+            refVec, cutlassVec, state->batch, state->out);
+        const float atol = state->input.dataType == fastllm::DataType::FLOAT16
+            ? 2.0e-3f : 8.0e-3f;
+        CheckLinearFp8Near(refVec, cutlassVec, atol, 2.0e-3f,
+                           "CUTLASS per-channel FP8 linear");
     }
 
     static void CheckLinearFp8RawBatchOneCuda(const OpTestParams &params) {
@@ -2018,6 +2125,9 @@ namespace {
         } else if (params.GetInt("check") == 5) {
             CheckLinearFp8LayoutSafetyCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 6) {
+            CheckLinearFp8PerChannelCuda(params);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -2088,12 +2198,13 @@ namespace {
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "bf16", "fp16 or bf16");
                 params.Add("input_pattern", "blocky", "smooth or blocky");
-                params.Add("weight_layout", "packed", "packed or separate");
+                params.Add("weight_layout", "packed", "packed, separate or perchannel");
                 params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
                 params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
                 params.Add("check", "0",
                            "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail, "
-                           "4 raw batch-one, 5 Marlin/CUTLASS layout safety");
+                           "4 raw batch-one, 5 Marlin/CUTLASS layout safety, "
+                           "6 per-channel CUTLASS scaled-mm");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },
