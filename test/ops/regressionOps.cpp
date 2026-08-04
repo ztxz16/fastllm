@@ -1057,6 +1057,96 @@ namespace {
         FastllmCudaFree(cudaLogits);
     }
 
+    void RunCudaHandoffSamplingRegression() {
+        constexpr int batch = 2;
+        constexpr int vocabSize = 128;
+        constexpr int penaltyTokens = 1;
+        const size_t logitsBytes =
+            (size_t)batch * vocabSize * sizeof(float);
+        FastllmCudaSetDevice(0);
+
+        std::vector<float> logits(batch * vocabSize, -20.0f);
+        logits[7] = 10.0f;
+        logits[9] = 9.0f;
+        logits[vocabSize + 5] = 8.0f;
+        logits[vocabSize + 6] = 7.0f;
+        std::vector<float> temperatures(batch, 1.0f);
+        std::vector<int> topKs(batch, 2);
+        std::vector<float> topPs(batch, 0.01f);
+        std::vector<int> penaltyIds = {-1, 5};
+        std::vector<float> penaltyFactors = {1.0f, 100.0f};
+
+        float *cudaLogits = (float*)FastllmCudaMalloc(logitsBytes);
+        float *cudaProbs = (float*)FastllmCudaMalloc(logitsBytes);
+        float *cudaTemperatures =
+            (float*)FastllmCudaMalloc(batch * sizeof(float));
+        int *cudaTopKs = (int*)FastllmCudaMalloc(batch * sizeof(int));
+        float *cudaTopPs =
+            (float*)FastllmCudaMalloc(batch * sizeof(float));
+        int *cudaPenaltyIds =
+            (int*)FastllmCudaMalloc(batch * penaltyTokens * sizeof(int));
+        float *cudaPenaltyFactors = (float*)FastllmCudaMalloc(
+            batch * penaltyTokens * sizeof(float));
+        int *cudaOutput = (int*)FastllmCudaMalloc(batch * sizeof(int));
+        float *cudaFloatOutput =
+            (float*)FastllmCudaMalloc(batch * sizeof(float));
+        Expect(cudaLogits != nullptr && cudaProbs != nullptr &&
+                   cudaTemperatures != nullptr && cudaTopKs != nullptr &&
+                   cudaTopPs != nullptr && cudaPenaltyIds != nullptr &&
+                   cudaPenaltyFactors != nullptr && cudaOutput != nullptr &&
+                   cudaFloatOutput != nullptr,
+               "failed to allocate CUDA handoff sampling buffers");
+
+        FastllmCudaCopyFromHostToDevice(
+            cudaLogits, logits.data(), logitsBytes);
+        FastllmCudaCopyFromHostToDevice(
+            cudaTemperatures, temperatures.data(),
+            batch * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(
+            cudaTopKs, topKs.data(), batch * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(
+            cudaTopPs, topPs.data(), batch * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(
+            cudaPenaltyIds, penaltyIds.data(),
+            batch * penaltyTokens * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(
+            cudaPenaltyFactors, penaltyFactors.data(),
+            batch * penaltyTokens * sizeof(float));
+
+        Expect(FastllmCudaTopKTopPSamplingToDevice(
+                   cudaLogits, cudaProbs,
+                   cudaTemperatures, cudaTopKs, cudaTopPs,
+                   cudaPenaltyIds, cudaPenaltyFactors, penaltyTokens,
+                   cudaOutput, cudaFloatOutput, batch, vocabSize),
+               "CUDA handoff top-k/top-p launch failed");
+        std::vector<int> output(batch, -1);
+        std::vector<float> floatOutput(batch, -1.0f);
+        std::vector<float> penalizedLogits(batch * vocabSize);
+        FastllmCudaCopyFromDeviceToHost(
+            output.data(), cudaOutput, batch * sizeof(int));
+        FastllmCudaCopyFromDeviceToHost(
+            floatOutput.data(), cudaFloatOutput, batch * sizeof(float));
+        FastllmCudaCopyFromDeviceToHost(
+            penalizedLogits.data(), cudaLogits, logitsBytes);
+        Expect(output[0] == 7 && output[1] == 6,
+               "CUDA handoff sampling ignored top-p or repetition penalty");
+        Expect(floatOutput[0] == 7.0f && floatOutput[1] == 6.0f,
+               "CUDA handoff sampling float tokens differ from int output");
+        Expect(std::fabs(penalizedLogits[vocabSize + 5] - 0.08f) <
+                   1.0e-6f,
+               "CUDA handoff repetition factor was not applied exactly once");
+
+        FastllmCudaFree(cudaFloatOutput);
+        FastllmCudaFree(cudaOutput);
+        FastllmCudaFree(cudaPenaltyFactors);
+        FastllmCudaFree(cudaPenaltyIds);
+        FastllmCudaFree(cudaTopPs);
+        FastllmCudaFree(cudaTopKs);
+        FastllmCudaFree(cudaTemperatures);
+        FastllmCudaFree(cudaProbs);
+        FastllmCudaFree(cudaLogits);
+    }
+
     void RunCudaLinearDataTypeCapabilityRegression() {
         using fastllm::DataType;
         using fastllm::IsCudaLinearDataTypeSupported;
@@ -11476,6 +11566,8 @@ int main(int argc, char **argv) {
             std::cout << "cuda local expert range mask regression: PASS\n";
             RunCudaGreedyTieBreakRegression();
             std::cout << "cuda greedy tie-break regression: PASS\n";
+            RunCudaHandoffSamplingRegression();
+            std::cout << "cuda handoff sampling regression: PASS\n";
         }
 #endif
 

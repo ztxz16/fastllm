@@ -336,6 +336,69 @@ def apply_prefix_cache_env(args):
             os.environ[env_name] = str(value)
     return args
 
+def _fastllm_env_flag_enabled(name: str, fallback_name: str = "") -> bool:
+    value = os.environ.get(name)
+    if value is None and fallback_name:
+        value = os.environ.get(fallback_name)
+    if value is None:
+        return False
+    return str(value).strip().lower() in ["1", "true", "on", "yes"]
+
+def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
+    """Select the tested Qwen3.5 CUDA TP fast path without deployment env vars.
+
+    Environment variables remain authoritative debugging overrides.  The
+    automatic path is deliberately limited to the configuration for which the
+    scheduler can safely fall back row-by-row: CUDA thread TP, no MTP, and no
+    low-memory mode.
+    """
+    tp_arg = getattr(args, "tp", "")
+    device = getattr(args, "device", "")
+    eligible = (is_qwen35_model and mtp == 0 and
+                not bool(getattr(args, "low", False)) and
+                _uses_thread_tp(tp_arg) and _uses_cuda_device(device))
+
+    if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
+        os.environ["FASTLLM_CUDA_GRAPH"] = "1"
+
+    handoff_envs = (
+        "FASTLLM_QWEN35_GPU_TOKEN_HANDOFF",
+        "FASTLLM_GPU_TOKEN_HANDOFF",
+    )
+    if eligible and not any(name in os.environ for name in handoff_envs):
+        os.environ["FASTLLM_QWEN35_GPU_TOKEN_HANDOFF"] = "1"
+
+    graph_enabled = _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")
+    handoff_enabled = _fastllm_env_flag_enabled(
+        "FASTLLM_QWEN35_GPU_TOKEN_HANDOFF",
+        "FASTLLM_GPU_TOKEN_HANDOFF",
+    )
+    if is_qwen35_model and (graph_enabled or handoff_enabled):
+        # Qwen3.5 handoff keeps sampled tokens on device, and graph replay also
+        # benefits from avoiding a host embedding round trip.
+        args.cuda_embedding = True
+
+    graph_batch_env = "FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH"
+    requested_batch = int(getattr(args, "max_batch", -1) or -1)
+    if (eligible and graph_enabled and requested_batch > 0 and
+            graph_batch_env not in os.environ):
+        os.environ[graph_batch_env] = str(min(requested_batch, 64))
+
+    if eligible:
+        print(
+            "[Fastllm] Qwen3.5 auto fast paths: cuda_graph=%s, "
+            "gpu_token_handoff=%s, cuda_embedding=%s, graph_max_batch=%s."
+            % (
+                "on" if graph_enabled else "off",
+                "on" if handoff_enabled else "off",
+                "on" if bool(getattr(args, "cuda_embedding", False)) else "off",
+                os.environ.get(graph_batch_env, "default"),
+            ),
+            flush=True,
+        )
+    return args
+
+
 def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
     return (architecture in [
         "DeepseekV3ForCausalLM",
@@ -601,6 +664,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_multicuda_tp_model = False
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
+    is_qwen35_model = False
     if (os.path.exists(config_path)):
         try:
             with open(config_path, "r", encoding="utf-8") as file:
@@ -612,6 +676,14 @@ def make_normal_llm_model(args, startup_progress = None):
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
+            is_qwen35_model = (
+                architecture in (
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
+                ) or
+                model_type in ("qwen3_5", "qwen3_5_moe") or
+                text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
+            )
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
@@ -839,6 +911,7 @@ def make_normal_llm_model(args, startup_progress = None):
             args.device = expanded
     if (args.moe_device and args.moe_device != ""):
         args.moe_device = expand_cudapp_device(args.moe_device)
+    _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     from ftllm import llm
     llm.set_moe_device_layers(-1)
     if (args.device and args.device != ""):

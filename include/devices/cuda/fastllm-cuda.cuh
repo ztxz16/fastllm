@@ -1062,6 +1062,14 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int typicalCount,
                                   float typicalPosteriorThreshold,
                                   float typicalPosteriorAlpha);
+bool FastllmCudaTopKTopPSamplingToDevice(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr,
+                                  float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors,
+                                  int penaltyTokens,
+                                  int *output, float *floatOutput,
+                                  int batch, int vocabSize);
 bool FastllmCudaGreedySampling(float *logits, int *output,
                                int batch, int vocabSize);
 bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
@@ -1070,6 +1078,15 @@ bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
 bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
                                          float *scores, int batch,
                                          int vocabSize);
+bool FastllmCudaGreedySamplingPackedCandidateWithIdOffset(
+                                         float *logits,
+                                         void *packedCandidates,
+                                         int batch, int vocabSize,
+                                         int idOffset);
+bool FastllmCudaMergeShardedGreedyCandidates(
+                                         const void *packedCandidates,
+                                         int *output, float *floatOutput,
+                                         int ranks, int batch);
 bool FastllmCudaSampleTopK(float *topk, float *temperatures,
                            int *topKArr, float *topPArr, float *randoms,
                            int *output,

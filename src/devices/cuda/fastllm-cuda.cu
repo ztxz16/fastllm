@@ -5547,8 +5547,16 @@ bool FastllmCudaMemcpyPeerAsyncCurrentThread(
         return FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
             dst, src, size);
     }
-    return cudaMemcpyPeerAsync(dst, dstId, src, srcId, size,
-                               cudaStreamPerThread) == cudaSuccess;
+    cudaError_t state = cudaMemcpyPeerAsync(dst, dstId, src, srcId, size,
+                                            cudaStreamPerThread);
+    if (state != cudaSuccess) {
+        // Callers may deliberately fall back to a staged synchronous copy.
+        // Consume the sticky runtime error before that fallback issues more
+        // CUDA work.
+        cudaGetLastError();
+        return false;
+    }
+    return true;
 }
 
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
@@ -13448,6 +13456,81 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     return true;
 }
 
+template <int BLOCK_THREADS>
+__global__ void FastllmRepeatPenaltyFactorsKernel(
+        float *logits, const int *penaltyIds,
+        const float *penaltyFactors, int penaltyTokens,
+        int vocabSize) {
+    int row = blockIdx.x;
+    float *rowLogits = logits + (long long)row * vocabSize;
+    const int *rowIds = penaltyIds + (long long)row * penaltyTokens;
+    const float *rowFactors =
+        penaltyFactors + (long long)row * penaltyTokens;
+    for (int i = threadIdx.x; i < penaltyTokens; i += BLOCK_THREADS) {
+        int token = rowIds[i];
+        if (token >= 0 && token < vocabSize) {
+            float factor = rowFactors[i];
+            float value = rowLogits[token];
+            rowLogits[token] = value < 0.0f ? value * factor : value / factor;
+        }
+    }
+}
+
+__global__ void FastllmSamplingIdsToFloatKernel(
+        const int *input, float *output, int batch) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < batch) {
+        output[index] = (float)input[index];
+    }
+}
+
+bool FastllmCudaTopKTopPSamplingToDevice(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr,
+                                  float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors,
+                                  int penaltyTokens,
+                                  int *output, float *floatOutput,
+                                  int batch, int vocabSize) {
+    if (logits == nullptr || probs == nullptr || temperatures == nullptr ||
+        topKArr == nullptr || topPArr == nullptr || output == nullptr ||
+        floatOutput == nullptr || batch <= 0 || vocabSize <= 0 ||
+        penaltyTokens < 0 ||
+        (penaltyTokens > 0 &&
+         (penaltyIds == nullptr || penaltyFactors == nullptr))) {
+        return false;
+    }
+
+    if (penaltyTokens > 0) {
+        FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
+            logits, penaltyIds, penaltyFactors,
+            penaltyTokens, vocabSize);
+    }
+    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(
+        logits, probs, temperatures, vocabSize);
+
+    static thread_local std::mt19937 rng(std::random_device{}());
+    uint64_t seed = rng();
+    flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        probs, topKArr, topPArr, output,
+        (int *)nullptr,
+        (uint32_t)batch, (int)0, 0.0f,
+        (uint32_t)vocabSize, false, seed, 0, 0);
+
+    int threads = 256;
+    FastllmSamplingIdsToFloatKernel<<<(batch + threads - 1) / threads,
+                                      threads>>>(
+        output, floatOutput, batch);
+    cudaError_t state = cudaGetLastError();
+    if (state != cudaSuccess) {
+        printf("FastllmCudaTopKTopPSamplingToDevice: launch failed: %s\n",
+               cudaGetErrorString(state));
+        fflush(stdout);
+        return false;
+    }
+    return true;
+}
+
 bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
@@ -13665,9 +13748,19 @@ bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
     return true;
 }
 
+struct FastllmGreedyCandidate {
+    int id;
+    float score;
+};
+
+static_assert(sizeof(FastllmGreedyCandidate) == 2 * sizeof(int),
+              "greedy candidate must stay compact for peer copies");
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmGreedySamplingWithScoresKernel(float *logits, int *output,
-                                                      float *scores, int vocabSize) {
+                                                      float *scores,
+                                                      FastllmGreedyCandidate *packed,
+                                                      int vocabSize, int idOffset) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     float *row = logits + (long long)b * vocabSize;
@@ -13701,8 +13794,13 @@ __global__ void FastllmGreedySamplingWithScoresKernel(float *logits, int *output
     }
 
     if (tid == 0) {
-        output[b] = idData[0];
-        scores[b] = maxData[0];
+        int id = idData[0] + idOffset;
+        if (packed != nullptr) {
+            packed[b] = {id, maxData[0]};
+        } else {
+            output[b] = id;
+            scores[b] = maxData[0];
+        }
     }
 }
 
@@ -13718,11 +13816,85 @@ bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
         return false;
     }
     FastllmGreedySamplingWithScoresKernel<256><<<batch, 256>>>(
-        logits, output, scores, vocabSize);
+        logits, output, scores, nullptr, vocabSize, 0);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         printf("FastllmCudaGreedySamplingWithScores: kernel launch failed: %s\n",
                cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaGreedySamplingPackedCandidateWithIdOffset(
+        float *logits, void *packedCandidates, int batch,
+        int vocabSize, int idOffset) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (logits == nullptr || packedCandidates == nullptr ||
+        vocabSize <= 0 || idOffset < 0) {
+        fastllm::ErrorInFastLLM(
+            "FastllmCudaGreedySamplingPackedCandidateWithIdOffset: invalid input.\n");
+        return false;
+    }
+    FastllmGreedySamplingWithScoresKernel<256><<<batch, 256>>>(
+        logits, nullptr, nullptr,
+        (FastllmGreedyCandidate*)packedCandidates,
+        vocabSize, idOffset);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaGreedySamplingPackedCandidateWithIdOffset: "
+               "kernel launch failed: %s\n", cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+__global__ void FastllmMergeShardedGreedyCandidatesKernel(
+        const FastllmGreedyCandidate *candidates,
+        int *output, float *floatOutput, int ranks, int batch) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) {
+        return;
+    }
+    int bestId = 0;
+    float bestScore = -INFINITY;
+    for (int r = 0; r < ranks; r++) {
+        int index = r * batch + b;
+        int id = candidates[index].id;
+        float score = candidates[index].score;
+        if (r == 0 || score > bestScore ||
+            (score == bestScore && id < bestId)) {
+            bestId = id;
+            bestScore = score;
+        }
+    }
+    output[b] = bestId;
+    floatOutput[b] = (float)bestId;
+}
+
+bool FastllmCudaMergeShardedGreedyCandidates(
+        const void *packedCandidates,
+        int *output, float *floatOutput, int ranks, int batch) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (packedCandidates == nullptr ||
+        output == nullptr || floatOutput == nullptr || ranks <= 0) {
+        fastllm::ErrorInFastLLM(
+            "FastllmCudaMergeShardedGreedyCandidates: invalid input.\n");
+        return false;
+    }
+    int threads = 128;
+    int blocks = (batch + threads - 1) / threads;
+    FastllmMergeShardedGreedyCandidatesKernel<<<blocks, threads>>>(
+        (const FastllmGreedyCandidate*)packedCandidates,
+        output, floatOutput, ranks, batch);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaMergeShardedGreedyCandidates: "
+               "kernel launch failed: %s\n", cudaGetErrorString(status));
         return false;
     }
     return true;
