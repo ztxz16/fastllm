@@ -3101,8 +3101,14 @@ __global__ void DeepSeekV4HcPreFinishKernel(const XT *x, const float *dots, cons
 // Build one adjacent pair of the rounded HcPre output.  The two accumulators
 // intentionally use the same h=0..3 statement order as the scalar fallback;
 // only the memory transaction is widened to BF16x2.
-__device__ __forceinline__ float DeepSeekV4HcPreRoundedPair4x4096(
-        const __nv_bfloat162 *xPairs, __nv_bfloat162 *yPairs, int pair,
+struct DeepSeekV4HcPreRoundedPair {
+    __nv_bfloat162 value;
+    float square;
+};
+
+__device__ __forceinline__ DeepSeekV4HcPreRoundedPair
+DeepSeekV4HcPreRoundedPair4x4096(
+        const __nv_bfloat162 *xPairs, int pair,
         float pre0, float pre1, float pre2, float pre3) {
     constexpr int pairCount = 4096 / 2;
     __nv_bfloat162 x0 = xPairs[pair];
@@ -3124,10 +3130,9 @@ __device__ __forceinline__ float DeepSeekV4HcPreRoundedPair4x4096(
     __nv_bfloat162 rounded;
     rounded.x = __float2bfloat16_rn(lo);
     rounded.y = __float2bfloat16_rn(hi);
-    yPairs[pair] = rounded;
     lo = Dsv4ToFloat(rounded.x);
     hi = Dsv4ToFloat(rounded.y);
-    return lo * lo + hi * hi;
+    return {rounded, lo * lo + hi * hi};
 }
 
 // Decode specialization for hc_mult=4 and hidden_size=4096.  The generic
@@ -3345,12 +3350,14 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
         float pre2 = pre[2];
         float pre3 = pre[3];
         int pair = threadIdx.x;
-        float sum2 = 0.0f;
-        sum2 += DeepSeekV4HcPreRoundedPair4x4096(
-            xPairs, yShared, pair, pre0, pre1, pre2, pre3);
-        sum2 += DeepSeekV4HcPreRoundedPair4x4096(
-            xPairs, yShared, pair + finishThreads,
-            pre0, pre1, pre2, pre3);
+        DeepSeekV4HcPreRoundedPair rounded0 =
+            DeepSeekV4HcPreRoundedPair4x4096(
+                xPairs, pair, pre0, pre1, pre2, pre3);
+        DeepSeekV4HcPreRoundedPair rounded1 =
+            DeepSeekV4HcPreRoundedPair4x4096(
+                xPairs, pair + finishThreads,
+                pre0, pre1, pre2, pre3);
+        float sum2 = rounded0.square + rounded1.square;
         for (int offset = 16; offset > 0; offset >>= 1) {
             sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
         }
@@ -3375,8 +3382,11 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
         const float2 *weightPairs =
             reinterpret_cast<const float2 *>(normWeight);
         float finalScale = normScale;
-        for (int i = threadIdx.x; i < pairCount; i += finishThreads) {
-            __nv_bfloat162 rounded = yShared[i];
+        DeepSeekV4HcPreRoundedPair roundedPairs[2] = {rounded0, rounded1};
+#pragma unroll
+        for (int item = 0; item < 2; ++item) {
+            int i = pair + item * finishThreads;
+            __nv_bfloat162 rounded = roundedPairs[item].value;
             float lo = Dsv4ToFloat(rounded.x);
             float hi = Dsv4ToFloat(rounded.y);
             float2 weights = __ldg(weightPairs + i);
@@ -3459,7 +3469,8 @@ void DeepSeekV4LaunchHcPreFinishNorm4x4096(
         __nv_bfloat16 *normOutput, float *post, float *comb,
         int tokens, int sinkhornIters, float eps, float normEps,
         int dotsStride, int dotParts) {
-    bool useSm120 = FastllmCudaRuntimeArch() >= 120;
+    bool useSm120 = FastllmCudaRuntimeArch() >= 120 &&
+        std::getenv("FASTLLM_DSV4_REFERENCE_HC_PRE_FINISH") == nullptr;
     if (!useSm120) {
         constexpr int finishThreads = 1024;
         DeepSeekV4HcPreFinishNorm4x4096Kernel<finishThreads, false>
