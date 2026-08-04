@@ -1120,9 +1120,25 @@ namespace fastllm {
             }
             for (int block = 0; block < blocks; block++) {
                 const uint8_t *blockStart = rowStart + block * 17;
-                const float scale =
-                    NVFP4E8M0ScaleToFloatFast(blockStart[16]);
-                const __m512 scaleVec = _mm512_set1_ps(scale);
+                const uint8_t scaleByte = blockStart[16];
+                const bool fuseMagicScale = scaleByte <= 190;
+                __m512 scaleVec;
+                if (fuseMagicScale) {
+                    // Both E8M0 and the internal magic compensation are
+                    // powers of two.  In this exponent range their product
+                    // is finite, so fold them into one exact scale and
+                    // remove a vector multiply from every block.
+                    const uint32_t combinedBits =
+                        (uint32_t)(scaleByte == 0 ? 64 :
+                            scaleByte + 64) << 23;
+                    float combinedScale;
+                    memcpy(&combinedScale, &combinedBits,
+                           sizeof(combinedScale));
+                    scaleVec = _mm512_set1_ps(combinedScale);
+                } else {
+                    scaleVec = _mm512_set1_ps(
+                        NVFP4E8M0ScaleToFloatFast(scaleByte));
+                }
                 const int l = block * 32;
                 const int blockElems = std::min(32, m - l);
                 const __m512bh vw =
@@ -1140,9 +1156,10 @@ namespace fastllm {
                             input + l);
                     const __m512 sum = _mm512_dpbf16_ps(
                         _mm512_setzero_ps(), vi, vw);
+                    const __m512 adjustedSum = fuseMagicScale ?
+                        sum : _mm512_mul_ps(sum, magicVec);
                     scaledSums[row] = _mm512_fmadd_ps(
-                        _mm512_mul_ps(sum, magicVec),
-                        scaleVec, scaledSums[row]);
+                        adjustedSum, scaleVec, scaledSums[row]);
                 }
             }
             for (int row = 0; row < ROWS; row++) {

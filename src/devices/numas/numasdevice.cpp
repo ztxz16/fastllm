@@ -5841,6 +5841,15 @@ namespace fastllm {
                     int totalExperts = v.size();
                     int k = interDim * 2;
                     int kPer = k / numaConfig->numaCnt;
+                    // With one NUMA node and 30 workers, six routed experts
+                    // use 210 down tasks.  These are exactly seven full worker
+                    // waves, avoiding the decode tail left by the two-NUMA
+                    // default above.
+                    if (numaConfig->numaCnt == 1 &&
+                        numaConfig->threads == 30 &&
+                        totalExperts == 6 && kPer == 4096) {
+                        downRowsPerTask = 120;
+                    }
                     // Group-32 quantization can be fused only when every
                     // NUMA shard begins and ends at a complete 32-value
                     // SwiGLU group (64 interleaved gate/up columns).

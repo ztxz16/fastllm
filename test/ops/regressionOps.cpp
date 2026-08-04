@@ -103,6 +103,9 @@ namespace {
             (size_t)outputDim * block16Stride);
         std::vector<uint8_t> block32Weight(
             (size_t)outputDim * block32Stride);
+        constexpr uint8_t scaleValues[] = {
+            0, 1, 63, 64, 119, 120, 121, 190, 191
+        };
         for (int outputChannel = 0;
              outputChannel < outputDim; outputChannel++) {
             uint8_t *row16 = block16Weight.data() +
@@ -114,8 +117,9 @@ namespace {
                 }
                 // The model's blockM=32 source scale is duplicated across
                 // each adjacent pair of repacked blockM=16 blocks.
-                packed[8] = (uint8_t)(120 +
-                    (((outputChannel * 17 + block / 2) % 3) != 0));
+                packed[8] = scaleValues[
+                    (outputChannel * 17 + block / 2) %
+                    (sizeof(scaleValues) / sizeof(scaleValues[0]))];
             }
             uint8_t *row32 = block32Weight.data() +
                 (size_t)outputChannel * block32Stride;
@@ -10595,15 +10599,24 @@ namespace {
 
 #ifdef USE_NUMAS
     void RunNumasDeepSeekV4Nvfp4MoeBenchmark() {
-        constexpr int batch = 8;
+        auto readPositiveEnv = [](const char *name, int fallback) {
+            const char *value = std::getenv(name);
+            int parsed = value == nullptr ? 0 : std::atoi(value);
+            return parsed > 0 ? parsed : fallback;
+        };
+        const int batch = readPositiveEnv(
+            "FASTLLM_DSV4_NUMAS_MOE_BENCH_BATCH", 8);
+        const int threads = readPositiveEnv(
+            "FASTLLM_DSV4_NUMAS_MOE_BENCH_THREADS", 24);
+        const int iterations = readPositiveEnv(
+            "FASTLLM_DSV4_NUMAS_MOE_BENCH_ITERATIONS", 40);
         constexpr int topk = 6;
         constexpr int expertCount = 24;
         constexpr int inputDim = 4096;
         constexpr int interDim = 2048;
         constexpr int outputDim = 4096;
-        constexpr int iterations = 40;
 
-        fastllm::SetThreads(24);
+        fastllm::SetThreads(threads);
         fastllm::Data input = MakeTensor(
             fastllm::DataType::BFLOAT16, {batch, inputDim}, 0.73f);
         std::vector<int32_t> indices((size_t)batch * topk);
@@ -10707,7 +10720,7 @@ namespace {
         std::sort(samples.begin(), samples.end());
         const double mean = std::accumulate(
             samples.begin(), samples.end(), 0.0) / samples.size();
-        std::cout << "threads=24 rows=" << batch << " routes="
+        std::cout << "threads=" << threads << " rows=" << batch << " routes="
                   << batch * topk << " unique_experts=" << expertCount
                   << " iterations=" << iterations
                   << " min_ms=" << samples.front()
