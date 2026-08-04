@@ -17,6 +17,7 @@
 #include "deepseekv4.h"
 
 #include "baseblock.h"
+#include "devices/cpu/computeutils.h"
 #include "executor.h"
 #include "utils.h"
 
@@ -296,6 +297,13 @@ namespace fastllm {
             FastllmCudaCopyFromDeviceToHost(
                 destination.cpuData, replica->cudaData,
                 destination.GetBytes());
+            // Keep the source allocation as a non-owning mirror.  NUMA MoE
+            // uses the CPU copy for its local experts, while mixed inference
+            // can still recognize that this tensor genuinely came from CUDA
+            // and reuse the existing replica instead of staging it again.
+            destination.cudaData = replica->cudaData;
+            destination.cudaDataBorrowed = true;
+            destination.dataDeviceIds = {device};
             return true;
         }
 
@@ -630,7 +638,8 @@ namespace fastllm {
                    weight.dataType == DataType::FP8_E4M3_PERCHANNEL ||
                    weight.dataType == DataType::NVFP4 ||
                    weight.dataType == DataType::NVFP4_BLOCK_16 ||
-                   weight.dataType == DataType::NVFP4_BLOCK_16_E8M0;
+                   weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
         }
 
         static void ResetData(Data &data);
@@ -646,45 +655,12 @@ namespace fastllm {
                             "DeepSeek-V4 FP8 activation quantization expects BF16 rows divisible by 128.\n");
             if (input.dataDevice == DataDevice::CPU && input.cpuData != nullptr &&
                 std::getenv("FASTLLM_DSV4_DISABLE_CPU_ACT_QUANT_FAST") == nullptr) {
-                static const FP8E4M3ToFP32Manager fp8;
                 ResetData(output);
                 output = Data(DataType::BFLOAT16, input.dims);
                 output.Allocate(false);
-                const uint16_t *src = (const uint16_t*)input.cpuData;
-                uint16_t *dst = (uint16_t*)output.cpuData;
-                int dim = input.dims.back();
-                uint64_t count = input.Count(0);
-                for (uint64_t rowStart = 0; rowStart < count; rowStart += dim) {
-                    for (int blockStart = 0; blockStart < dim; blockStart += 128) {
-                        uint64_t start = rowStart + blockStart;
-                        uint64_t end = std::min<uint64_t>(start + 128, rowStart + dim);
-                        float amax = 1e-4f;
-                        for (uint64_t i = start; i < end; i++) {
-                            amax = std::max(amax, std::fabs(BFloat16ToFloat(src[i])));
-                        }
-                        float normalized = amax / 448.0f;
-                        uint32_t bits;
-                        memcpy(&bits, &normalized, sizeof(bits));
-                        int exponent = (int)((bits >> 23) & 0xFF) - 127 +
-                                       ((bits & ((1u << 23) - 1)) != 0);
-                        float scale = std::ldexp(1.0f, exponent);
-                        const uint16_t *lookupRow =
-                            GetFP8E4M3BFloat16QuantizeLookupRow(exponent);
-                        if (lookupRow != nullptr) {
-                            for (uint64_t i = start; i < end; i++) {
-                                dst[i] = lookupRow[src[i]];
-                            }
-                        } else {
-                            for (uint64_t i = start; i < end; i++) {
-                                float value = BFloat16ToFloat(src[i]);
-                                float q = std::max(
-                                    -448.0f, std::min(448.0f, value / scale));
-                                dst[i] = FloatToBFloat16(
-                                    fp8.quantizeDequantize(q) * scale);
-                            }
-                        }
-                    }
-                }
+                RunCpuDeepSeekV4ActivationQuantization(
+                    (const uint16_t*)input.cpuData,
+                    (uint16_t*)output.cpuData, input.Count(0));
                 return;
             }
             std::vector<float> values = ReadFloatData(input);
@@ -1375,27 +1351,20 @@ namespace fastllm {
 
         static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
             if (!DeepSeekV4PreferCuda() && input.dataDevice == DataDevice::CPU &&
+                input.cpuData != nullptr && input.dataType == DataType::BFLOAT16 &&
                 dtype == DataType::BFLOAT16 && !input.dims.empty()) {
                 const int channels = input.dims.back();
                 const int rows = (int)(input.Count(0) / channels);
-                std::vector<float> values = ReadFloatData(input);
                 auto weightValues = ReadWeightFloatDataCached(weight);
-                std::vector<float> normalized(values.size());
-                for (int row = 0; row < rows; row++) {
-                    const float *src = values.data() + (uint64_t)row * channels;
-                    float *dst = normalized.data() + (uint64_t)row * channels;
-                    double sumSquares = 0.0;
-                    for (int channel = 0; channel < channels; channel++) {
-                        sumSquares += (double)src[channel] * src[channel];
-                    }
-                    float scale = 1.0f / std::sqrt((float)(sumSquares / channels) + eps);
-                    for (int channel = 0; channel < channels; channel++) {
-                        dst[channel] = src[channel] * scale * (*weightValues)[channel];
-                    }
+                const uint16_t *source = (const uint16_t*)input.cpuData;
+                if (&input != &output) {
+                    ResetData(output);
+                    output = Data(DataType::BFLOAT16, input.dims);
+                    output.Allocate(false);
                 }
-                // torch.Tensor.to(torch.bfloat16) uses round-to-nearest-even;
-                // the generic CPU RMSNorm BF16 path truncates instead.
-                WriteFloatData(normalized, input.dims, output, DataType::BFLOAT16);
+                RunCpuDeepSeekV4RMSNormBFloat16(
+                    source, weightValues->data(),
+                    (uint16_t*)output.cpuData, rows, channels, eps);
                 return;
             }
             RMSNorm(input, weight, eps, output);
@@ -2222,7 +2191,8 @@ namespace fastllm {
                                              int headDim, int ropeDim, float ropeBase,
                                              float ropeFactor, int betaFast, int betaSlow,
                                              int originalSeqLen, Data &output,
-                                             bool preferCudaOutput = false) {
+                                             bool preferCudaOutput = false,
+                                             bool indexer = false) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4BuildCompressedKV");
             if (compressRatio <= 0 || totalLen < compressRatio) {
                 return false;
@@ -2269,7 +2239,7 @@ namespace fastllm {
                                                rawTokenBase, rawLen, reusableBlocks, addBlocks,
                                                compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
                                                betaFast, betaSlow, originalSeqLen, overlap,
-                                               preferCudaOutput, output);
+                                               preferCudaOutput, output, indexer);
             return true;
         }
 
@@ -2589,11 +2559,13 @@ namespace fastllm {
                                              float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1,
                                              int prefixLen = 0,
                                              bool nonCausalBlock = false,
-                                             const Data *decodeMeta = nullptr) {
+                                             const Data *decodeMeta = nullptr,
+                                             const Data *compressedTopK = nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseAttention");
 #ifdef USE_CUDA
             std::vector<int> tpDevices;
-            if (PrepareDeepSeekV4AttentionTp(q, kv, attnSink, output, tpDevices)) {
+            if (compressedTopK == nullptr &&
+                PrepareDeepSeekV4AttentionTp(q, kv, attnSink, output, tpDevices)) {
                 std::vector<char> ok(tpDevices.size(), 0);
                 RunDeepSeekV4MultiCuda(tpDevices, [&](int rank, int device) {
                     const Data *localMeta = decodeMeta == nullptr ? nullptr :
@@ -2613,7 +2585,8 @@ namespace fastllm {
                 }
                 return;
             }
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL") &&
+            if (compressedTopK == nullptr &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL") &&
                 DeepSeekV4PreferCuda() && q.dims.size() == 4 && kv.dims.size() == 3) {
                 Data qCuda, kvCuda;
                 const Data *qForCuda = &q;
@@ -2639,6 +2612,14 @@ namespace fastllm {
                 }
             }
 #endif
+            if (compressedTopK != nullptr) {
+                DeepSeekV4SparseAttention(
+                    q, kv, attnSink, windowSize, ropeDim, ropeBase,
+                    startPos, softmaxScale, output, compressRatio,
+                    originalSeqLen, ropeFactor, betaFast, betaSlow,
+                    prefixLen, compressedTopK);
+                return;
+            }
             auto qv = ReadFloatData(q);
             auto kvv = ReadFloatData(kv);
             auto sinkPtr = ReadWeightFloatDataCached(attnSink);
@@ -2803,13 +2784,15 @@ namespace fastllm {
                                                          Data *packedCompressedKV = nullptr,
                                                          Data *sm120Scratch = nullptr,
                                                          const Data *compressedIndices = nullptr,
-                                                         const Data *compressedLengths = nullptr) {
+                                                         const Data *compressedLengths = nullptr,
+                                                         const Data *compressedTopK = nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCached");
 #ifdef USE_CUDA
             Data &windowMutable = (Data&)windowKV;
             Data &compressedMutable = (Data&)compressedKV;
             std::vector<int> tpDevices;
-            if (PrepareDeepSeekV4AttentionTp(q, windowMutable, attnSink, output, tpDevices)) {
+            if (compressedTopK == nullptr &&
+                PrepareDeepSeekV4AttentionTp(q, windowMutable, attnSink, output, tpDevices)) {
                 PrepareMultiCudaReplicatedData(compressedMutable, tpDevices, true);
                 if (compressedIndices != nullptr) {
                     PrepareMultiCudaReplicatedData(
@@ -2883,7 +2866,7 @@ namespace fastllm {
                 }
                 return;
             }
-            if (q.dims[1] == 1) {
+            if (compressedTopK == nullptr && q.dims[1] == 1) {
                 Data qCuda, windowCuda, compressedCuda;
                 const Data *qForCuda = &q;
                 if (q.dataDevice != DataDevice::CUDA) {
@@ -2957,6 +2940,20 @@ namespace fastllm {
                 }
             }
 #endif
+            if (q.dataDevice == DataDevice::CPU &&
+                windowKV.dataDevice == DataDevice::CPU &&
+                attnSink.dataDevice == DataDevice::CPU &&
+                (compressedCount <= 0 ||
+                 compressedKV.dataDevice == DataDevice::CPU) &&
+                (compressedTopK == nullptr ||
+                 compressedTopK->dataDevice == DataDevice::CPU)) {
+                DeepSeekV4SparseAttentionDecodeCached(
+                    q, windowKV, compressedKV, attnSink, windowSize,
+                    startPos, compressedCount, ropeDim, ropeBase,
+                    softmaxScale, output, originalSeqLen, ropeFactor,
+                    betaFast, betaSlow, compressedTopK);
+                return;
+            }
             auto qv = ReadFloatData(q);
             auto windowValues = ReadFloatData(windowKV);
             std::vector<float> compressed;
@@ -2981,8 +2978,25 @@ namespace fastllm {
                     idxs.push_back(i);
                 }
             }
-            for (int i = 0; i < compressedCount; i++) {
-                idxs.push_back(windowSize + i);
+            if (compressedTopK != nullptr && compressedTopK->Count(0) > 0) {
+                AssertInFastLLM(
+                    compressedTopK->dataDevice == DataDevice::CPU &&
+                        compressedTopK->dataType == DataType::INT32 &&
+                        compressedTopK->cpuData != nullptr,
+                    "DeepSeekV4 sparse decode received invalid top-k indices.\n");
+                const int32_t *topKData =
+                    (const int32_t*)compressedTopK->cpuData;
+                int topKCount = (int)compressedTopK->Count(0);
+                for (int i = 0; i < topKCount; i++) {
+                    int idx = topKData[i];
+                    if (idx >= 0 && idx < compressedCount) {
+                        idxs.push_back(windowSize + idx);
+                    }
+                }
+            } else {
+                for (int i = 0; i < compressedCount; i++) {
+                    idxs.push_back(windowSize + i);
+                }
             }
 
             auto getKVRow = [&](int b, int idx) -> const float* {
@@ -3148,6 +3162,143 @@ namespace fastllm {
                                      compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
                                      betaFast, betaSlow, originalSeqLen, output);
             return true;
+        }
+
+        static bool HasCpuIndexerWeights(WeightMap &weight,
+                                         const std::string &attentionPrefix) {
+            static const char *suffixes[] = {
+                ".indexer.wq_b.weight",
+                ".indexer.weights_proj.weight",
+                ".indexer.compressor.wkv.weight",
+                ".indexer.compressor.wgate.weight",
+                ".indexer.compressor.ape",
+                ".indexer.compressor.norm.weight"
+            };
+            for (const char *suffix : suffixes) {
+                if (weight.weight.find(attentionPrefix + suffix) ==
+                    weight.weight.end()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static bool PrepareCpuIndexerTopK(
+                WeightMap &weight, const std::string &attentionPrefix,
+                Data &attnInput, Data &qNorm, int bsz, int seqlen,
+                int startPos, int compressRatio, int indexHeads,
+                int indexHeadDim, int indexTopK, int ropeDim,
+                float ropeBase, int originalSeqLen, float ropeFactor,
+                int betaFast, int betaSlow,
+                DeepSeekV4DecodeLayerCache *decodeCache,
+                Data &topKIndices) {
+            if (compressRatio != 4 || DeepSeekV4PreferCuda() ||
+                EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_INDEXER") ||
+                !HasCpuIndexerWeights(weight, attentionPrefix)) {
+                return false;
+            }
+            ScopedExecutorProfiler executorProfile("DeepSeekV4Indexer");
+            const std::string indexerPrefix = attentionPrefix + ".indexer";
+            const std::string compressorPrefix = indexerPrefix + ".compressor";
+
+            Data indexQ, indexWeights;
+            weight[indexerPrefix + ".wq_b.weight"].tpLinearType =
+                TP_LINEAR_ROW;
+            DeepSeekV4Linear(
+                qNorm, weight[indexerPrefix + ".wq_b.weight"], Data(),
+                indexQ);
+            indexQ.Reshape({bsz, seqlen, indexHeads, indexHeadDim});
+            weight[indexerPrefix + ".weights_proj.weight"].tpLinearType =
+                TP_LINEAR_ROW;
+            DeepSeekV4Linear(
+                attnInput, weight[indexerPrefix + ".weights_proj.weight"],
+                Data(), indexWeights);
+            indexWeights.Reshape({bsz, seqlen, indexHeads});
+            if (indexWeights.dataType != DataType::BFLOAT16) {
+                ToDataType(indexWeights, DataType::BFLOAT16);
+            }
+
+            Data rawKV, rawScore;
+            ComputeCompressorRaw(
+                weight, compressorPrefix, attnInput, rawKV, rawScore);
+            const int wideDim = 2 * indexHeadDim;
+            const int totalLen = startPos + seqlen;
+            const int targetBlocks = totalLen / compressRatio;
+            if (targetBlocks <= 0) {
+                return false;
+            }
+
+            Data transientCompressed;
+            Data *compressed = &transientCompressed;
+            if (decodeCache == nullptr) {
+                if (startPos != 0 || !BuildCompressedKVFromRaw(
+                        weight, compressorPrefix, rawKV, rawScore, bsz, 0,
+                        totalLen, compressRatio, indexHeadDim, ropeDim,
+                        ropeBase, ropeFactor, betaFast, betaSlow,
+                        originalSeqLen, transientCompressed, false, true)) {
+                    return false;
+                }
+            } else {
+                if (startPos == 0) {
+                    decodeCache->indexerCompressorWideDim = wideDim;
+                    decodeCache->indexerCompressorRawTokenBase = 0;
+                    decodeCache->indexerCompressedBlocks = 0;
+                    ResetData(decodeCache->indexerCompressedKV);
+                    CopyTensorData(decodeCache->indexerCompressorKVRaw, rawKV);
+                    CopyTensorData(decodeCache->indexerCompressorScoreRaw,
+                                   rawScore);
+                    EnsureCompressorRawCapacity(
+                        decodeCache->indexerCompressorKVRaw, seqlen);
+                    EnsureCompressorRawCapacity(
+                        decodeCache->indexerCompressorScoreRaw, seqlen);
+                } else {
+                    AppendCompressorRaw(
+                        rawKV, rawScore, bsz, seqlen, wideDim,
+                        decodeCache->indexerCompressorKVRaw,
+                        decodeCache->indexerCompressorScoreRaw);
+                }
+
+                bool targetReady =
+                    decodeCache->indexerCompressedBlocks == targetBlocks &&
+                    HasCompressedKVData(decodeCache->indexerCompressedKV);
+                if (!targetReady) {
+                    bool built = BuildCompressedKVFromRaw(
+                        weight, compressorPrefix,
+                        decodeCache->indexerCompressorKVRaw,
+                        decodeCache->indexerCompressorScoreRaw, bsz,
+                        decodeCache->indexerCompressorRawTokenBase, totalLen,
+                        compressRatio, indexHeadDim, ropeDim, ropeBase,
+                        ropeFactor, betaFast, betaSlow, originalSeqLen,
+                        decodeCache->indexerCompressedKV, false, true);
+                    if (!built) {
+                        return false;
+                    }
+                    decodeCache->indexerCompressedBlocks =
+                        GetReusableCompressedBlocks(
+                            decodeCache->indexerCompressedKV, bsz,
+                            targetBlocks, indexHeadDim);
+                }
+                TrimCompressorRawCache(
+                    bsz, totalLen, compressRatio, wideDim,
+                    decodeCache->indexerCompressedBlocks,
+                    decodeCache->indexerCompressorKVRaw,
+                    decodeCache->indexerCompressorScoreRaw,
+                    decodeCache->indexerCompressorRawTokenBase);
+                compressed = &decodeCache->indexerCompressedKV;
+            }
+
+            if (!HasCompressedKVData(*compressed) ||
+                compressed->dataDevice != DataDevice::CPU) {
+                return false;
+            }
+            DeepSeekV4IndexerTopK(
+                indexQ, indexWeights, *compressed, indexTopK,
+                compressRatio, ropeDim, ropeBase, startPos,
+                originalSeqLen, ropeFactor, betaFast, betaSlow,
+                topKIndices);
+            return topKIndices.dataType == DataType::INT32 &&
+                topKIndices.dims.size() == 3 &&
+                topKIndices.Count(0) > 0;
         }
 
         static void ConcatSeqReference(const Data &a, const Data &b, Data &output) {
@@ -3557,6 +3708,11 @@ namespace fastllm {
     }
 
 #ifdef USE_CUDA
+    bool DeepSeekV4CopyCudaTensorToCpuForTest(
+            const Data &source, Data &destination) {
+        return CopyDeepSeekV4CudaTensorToCpu(source, destination);
+    }
+
     int DeepSeekV4BuildWindowKVPrefixForTest(
             const Data &windowKV, int bsz, int headDim, int startPos,
             int windowSize, Data &output) {
@@ -5303,12 +5459,12 @@ namespace fastllm {
             dst.compressedTokenBase = src.compressedTokenBase;
             dst.rawTailStartPos = src.rawTailStartPos;
             dst.compressorRawTokenBase = src.compressorRawTokenBase;
-            CopyTensorData(dst.compressorTailKV, src.compressorTailKV);
-            CopyTensorData(dst.compressorTailScore, src.compressorTailScore);
             dst.indexerCompressorWideDim = src.indexerCompressorWideDim;
             dst.indexerCompressorRawTokenBase =
                 src.indexerCompressorRawTokenBase;
             dst.indexerCompressedBlocks = src.indexerCompressedBlocks;
+            CopyTensorData(dst.compressorTailKV, src.compressorTailKV);
+            CopyTensorData(dst.compressorTailScore, src.compressorTailScore);
 
             ResetData(dst.compressedKV);
             if (src.compressedBlocks > 0 && src.compressedKV.dims.size() >= 2) {
@@ -5488,7 +5644,7 @@ namespace fastllm {
                 dst.indexerCompressedKV.ToDevice(DataDevice::CPU);
                 dst.indexerCompressedKV.lockInCPU = true;
             }
-            if (storeFullRaw) {
+            if (storeFullRaw || src.compressRatio == 4) {
                 CopyHistoryTensorData(dst.indexerCompressorKVRaw,
                                       src.indexerCompressorKVRaw);
                 CopyHistoryTensorData(dst.indexerCompressorScoreRaw,
@@ -10109,6 +10265,11 @@ namespace fastllm {
         }
 #endif
 
+#ifndef USE_CUDA
+        const bool graphSafeDecode = false;
+        const bool dsparkGraphVerification = false;
+#endif
+
         Data &hiddenStates = decodeWorkspace->hiddenStates;
         Data &hiddenStatesBeforeHcExpand = decodeWorkspace->hiddenStatesBeforeHcExpand;
         Data &hiddenStatesTemp = decodeWorkspace->hiddenStatesTemp;
@@ -10818,6 +10979,23 @@ namespace fastllm {
                 }
                 sparsePrefillKVPtr = &sparsePrefillKV;
             }
+            Data compressedTopK;
+            const Data *compressedTopKPtr = nullptr;
+            if (compressRatio == 4 && !DeepSeekV4PreferCuda() &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_INDEXER") &&
+                startPos + seqlen >= compressRatio) {
+                bool indexerReady = PrepareCpuIndexerTopK(
+                    weight, pre + ".attn", attnInput, qNorm, bsz, seqlen,
+                    startPos, compressRatio, index_n_heads, index_head_dim,
+                    index_topk, qk_rope_head_dim, layerRopeBase,
+                    layerOriginalSeqLen, rope_factor,
+                    rope_scaling_beta_fast, rope_scaling_beta_slow,
+                    decodeCache, compressedTopK);
+                AssertInFastLLM(
+                    indexerReady,
+                    "DeepSeekV4Model: CPU CSA indexer failed to produce top-k indices.\n");
+                compressedTopKPtr = &compressedTopK;
+            }
             if (decodeCache != nullptr && startPos > 0 &&
                 (seqlen == 1 || graphSafeDecode)) {
                 SparseAttentionDecodeCachedReference(q, decodeCache->windowKV,
@@ -10837,7 +11015,13 @@ namespace fastllm {
                                                      graphSafeDecode ?
                                                         &decodeWorkspace->sparseMlaScratch : nullptr,
                                                      activeIndexerIndices,
-                                                     activeIndexerLengths
+                                                     activeIndexerLengths,
+                                                     compressedTopKPtr
+#else
+                                                     , nullptr, 0,
+                                                     nullptr, nullptr,
+                                                     nullptr, nullptr,
+                                                     compressedTopKPtr
 #endif
                                                      );
             } else {
@@ -10846,7 +11030,8 @@ namespace fastllm {
                                          1.0f / std::sqrt((float)head_dim_full), attnOut4,
                                          compressRatio, layerOriginalSeqLen, rope_factor,
                                          rope_scaling_beta_fast, rope_scaling_beta_slow,
-                                         sparsePrefillPrefixLen);
+                                         sparsePrefillPrefixLen,
+                                         false, nullptr, compressedTopKPtr);
             }
             DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             DeepSeekV4Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
@@ -12177,12 +12362,25 @@ namespace fastllm {
 
             std::vector<Data> qParts(batch);
             std::vector<Data*> qPartPtrs(batch);
+            bool cpuIndexerLayer =
+                compressRatio == 4 && !DeepSeekV4PreferCuda() &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_INDEXER");
+            std::vector<Data> indexerAttnInputParts(batch);
+            std::vector<Data> indexerQNormParts(batch);
+            std::vector<Data> compressedTopKParts(batch);
+            std::vector<Data*> compressedTopKPtrs(batch, nullptr);
             for (int b = 0; b < batch; b++) {
                 Split(q, 0, b, b + 1, qParts[b]);
                 ScaleQRatory(qParts[b], rms_norm_eps, qk_rope_head_dim, layerRopeBase,
                              startPositions[b], layerOriginalSeqLen, rope_factor,
                              rope_scaling_beta_fast, rope_scaling_beta_slow);
                 qPartPtrs[b] = &qParts[b];
+                if (cpuIndexerLayer) {
+                    Split(attnInput, 0, b, b + 1,
+                          indexerAttnInputParts[b]);
+                    Split(qNorm, 0, b, b + 1,
+                          indexerQNormParts[b]);
+                }
             }
 
             DeepSeekV4Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv, true);
@@ -12293,12 +12491,28 @@ namespace fastllm {
                 compressedKVPtrs[b] = (Data*)decodeCompressedKVForAttention;
                 layerCompressedCounts[b] = decodeCompressedCount;
                 cachedDecode[b] = startPos > 0 ? 1 : 0;
+                if (cpuIndexerLayer &&
+                    startPos + seqlen >= compressRatio) {
+                    bool indexerReady = PrepareCpuIndexerTopK(
+                        weight, pre + ".attn", indexerAttnInputParts[b],
+                        indexerQNormParts[b], 1, seqlen, startPos,
+                        compressRatio, index_n_heads, index_head_dim,
+                        index_topk, qk_rope_head_dim, layerRopeBase,
+                        layerOriginalSeqLen, rope_factor,
+                        rope_scaling_beta_fast, rope_scaling_beta_slow,
+                        &decodeCache, compressedTopKParts[b]);
+                    AssertInFastLLM(
+                        indexerReady,
+                        "DeepSeekV4Model::ForwardBatch: CPU CSA indexer failed.\n");
+                    compressedTopKPtrs[b] = &compressedTopKParts[b];
+                }
             }
 
             Data attnOut4, woAOut, attnOut;
             bool allCachedDecode = batch > 1;
             for (int b = 0; b < batch; b++) {
-                allCachedDecode = allCachedDecode && cachedDecode[b] != 0;
+                allCachedDecode = allCachedDecode && cachedDecode[b] != 0 &&
+                    compressedTopKPtrs[b] == nullptr;
             }
             bool usedBatchSparseDecode = false;
             if (allCachedDecode) {
@@ -12324,13 +12538,19 @@ namespace fastllm {
                                                              1.0f / std::sqrt((float)head_dim_full),
                                                              attnOutParts[b], layerOriginalSeqLen,
                                                              rope_factor, rope_scaling_beta_fast,
-                                                             rope_scaling_beta_slow);
+                                                             rope_scaling_beta_slow,
+                                                             nullptr, 0,
+                                                             nullptr, nullptr,
+                                                             nullptr, nullptr,
+                                                             compressedTopKPtrs[b]);
                     } else {
                         SparseAttentionReference(qParts[b], kvParts[b], weight[pre + ".attn.attn_sink"], window_size,
                                                  qk_rope_head_dim, layerRopeBase, startPositions[b],
                                                  1.0f / std::sqrt((float)head_dim_full), attnOutParts[b],
                                                  compressRatio, layerOriginalSeqLen, rope_factor,
-                                                 rope_scaling_beta_fast, rope_scaling_beta_slow);
+                                                 rope_scaling_beta_fast, rope_scaling_beta_slow,
+                                                 0, false, nullptr,
+                                                 compressedTopKPtrs[b]);
                     }
                     attnOutPtrs[b] = &attnOutParts[b];
                 }

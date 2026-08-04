@@ -327,6 +327,9 @@ namespace fastllm {
         // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
         // The final partial block has no padding. The implicit zero point is 8.
         INT4_GROUP32 = 1008,
+        // Internal NUMA layout for NVFP4 blockM=32 weights:
+        // [16 packed fp4 bytes] [one inline E8M0 scale byte].
+        NVFP4_BLOCK_32_E8M0 = 1009,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -1066,6 +1069,29 @@ namespace fastllm {
                                int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                int quantDim, int blockSize, int posStep = 1);
 
+    void DeepSeekV4SparseAttention(const Data &q, const Data &kv, Data &attnSink,
+                                   int windowSize, int ropeDim, float ropeBase,
+                                   int startPos, float softmaxScale, Data &output,
+                                   int compressRatio, int originalSeqLen,
+                                   float ropeFactor, int betaFast, int betaSlow,
+                                   int prefixLen,
+                                   const Data *compressedTopK = nullptr);
+
+    void DeepSeekV4SparseAttentionDecodeCached(
+            const Data &q, const Data &windowKV, const Data &compressedKV,
+            Data &attnSink, int windowSize, int startPos,
+            int compressedCount, int ropeDim, float ropeBase,
+            float softmaxScale, Data &output, int originalSeqLen,
+            float ropeFactor, int betaFast, int betaSlow,
+            const Data *compressedTopK = nullptr);
+
+    void DeepSeekV4IndexerTopK(const Data &q, const Data &weights,
+                               const Data &compressedKV, int topK,
+                               int compressRatio, int ropeDim, float ropeBase,
+                               int startPos, int originalSeqLen,
+                               float ropeFactor, int betaFast, int betaSlow,
+                               Data &output);
+
     void DeepSeekV4WoA(Data &o, Data &woA, int groups, int oRank, Data &output);
 
     void DeepSeekV4BuildCompressedKVFromRaw(const Data &kv, const Data &score,
@@ -1077,7 +1103,7 @@ namespace fastllm {
                                             float ropeFactor, int betaFast,
                                             int betaSlow, int originalSeqLen,
                                             bool overlap, bool preferCudaOutput,
-                                            Data &cache);
+                                            Data &cache, bool indexer = false);
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 

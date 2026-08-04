@@ -30,6 +30,13 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class NumasDeepSeekV4WoAOp : public CpuDeepSeekV4WoAOp {
+    protected:
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams,
+                 const IntDict &intParams) override;
+    };
+
     class NumasFusedMOE : BaseOperator {
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
