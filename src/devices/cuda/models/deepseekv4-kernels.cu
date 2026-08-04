@@ -2060,39 +2060,40 @@ __global__ void DeepSeekV4FusedQKVRopeCache512Kernel(
 
     if (isKV) {
         for (int start = 0; start < kNopeDim; start += 64) {
-            int end = min(start + 64, kNopeDim);
-            if (tid < 256) {
-                float amax = 1.0e-4f;
-                for (int d = start + tid; d < end; d += 256) {
-                    amax = fmaxf(amax, fabsf(__bfloat162float(row[d])));
+            // A quant block is exactly 64 values. Two warp reductions preserve
+            // the max/scale result while replacing the former 256-thread
+            // shared-memory tree and its eight block-wide barriers.
+            if (tid < 64) {
+                float amax = fmaxf(
+                    1.0e-4f,
+                    fabsf(__bfloat162float(row[start + tid])));
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    amax = fmaxf(
+                        amax,
+                        __shfl_down_sync(0xffffffffu, amax, offset));
                 }
-                partial[tid] = amax;
+                if (lane == 0) {
+                    partial[warp] = amax;
+                }
             }
             __syncthreads();
-            for (int stride = 128; stride > 0; stride >>= 1) {
-                if (tid < stride) {
-                    partial[tid] =
-                        fmaxf(partial[tid], partial[tid + stride]);
-                }
-                __syncthreads();
-            }
             if (tid == 0) {
                 partial[0] = powf(
-                    2.0f, ceilf(log2f(partial[0] / kQuantMax)));
+                    2.0f, ceilf(log2f(
+                        fmaxf(partial[0], partial[1]) / kQuantMax)));
             }
             __syncthreads();
             float quantScale = partial[0];
-            if (tid < 256) {
-                for (int d = start + tid; d < end; d += 256) {
-                    float value = __bfloat162float(row[d]);
-                    float quantValue = fminf(
-                        kQuantMax, fmaxf(-kQuantMax, value / quantScale));
-                    float rounded = realFp8 ?
-                        Dsv4Fp8E4M3RoundTrip(value, quantScale) :
-                        __bfloat162float(__float2bfloat16_rn(quantValue)) *
-                            quantScale;
-                    row[d] = __float2bfloat16_rn(rounded);
-                }
+            if (tid < 64) {
+                int d = start + tid;
+                float value = __bfloat162float(row[d]);
+                float quantValue = fminf(
+                    kQuantMax, fmaxf(-kQuantMax, value / quantScale));
+                float rounded = realFp8 ?
+                    Dsv4Fp8E4M3RoundTrip(value, quantScale) :
+                    __bfloat162float(__float2bfloat16_rn(quantValue)) *
+                        quantScale;
+                row[d] = __float2bfloat16_rn(rounded);
             }
             __syncthreads();
         }
