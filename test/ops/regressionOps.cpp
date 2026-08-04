@@ -4471,6 +4471,217 @@ namespace {
         std::cout << "CUDA logical-head varlen chunk GDN regression: PASS\n";
     }
 
+    void RunCudaDeepSeekV4TokenTiledWoARegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int groups = 2;
+        constexpr int heads = 8;
+        constexpr int headDim = 1024;
+        constexpr int hidden = (heads / groups) * headDim;
+        constexpr int outRank = 128;
+
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::FP8_E4M3;
+        weight.UpdateUnitSize();
+        weight.Resize({groups * outRank, hidden});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = 128;
+        weight.blockM = 128;
+        weight.Allocate(false);
+        uint8_t *weightBytes = reinterpret_cast<uint8_t*>(weight.cpuData);
+        for (uint64_t i = 0; i < weight.GetBytes(); i++) {
+            weightBytes[i] = static_cast<uint8_t>(
+                ((i * 29 + i / 97 + 0x11) & 0x7e) |
+                (((i / 43) & 1) << 7));
+        }
+        const int scaleRows = groups * outRank / weight.blockK;
+        const int scaleCols = hidden / weight.blockM;
+        weight.scales.resize((size_t)scaleRows * scaleCols);
+        for (size_t i = 0; i < weight.scales.size(); i++) {
+            weight.scales[i] = 1.0f / (float)(16 << (i % 4));
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+
+        const char *savedDisable = std::getenv(
+            "FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+        const bool hadDisable = savedDisable != nullptr;
+        const std::string disableValue = hadDisable ? savedDisable : "";
+        const char *savedTile = std::getenv(
+            "FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK");
+        const bool hadTile = savedTile != nullptr;
+        const std::string tileValue = hadTile ? savedTile : "";
+        const char *savedRowTile = std::getenv(
+            "FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
+        const bool hadRowTile = savedRowTile != nullptr;
+        const std::string rowTileValue = hadRowTile ? savedRowTile : "";
+
+        const std::vector<std::pair<int, int>> tiles = {
+            {2, 4}, {4, 4}, {8, 4}, {2, 8}, {4, 8}, {8, 8}};
+        const std::vector<fastllm::DataType> inputTypes = {
+            fastllm::DataType::BFLOAT16,
+            fastllm::DataType::FLOAT16,
+            fastllm::DataType::FLOAT32};
+
+        for (const std::pair<int, int> shape : {
+                 std::pair<int, int>{1, 2}, {1, 7}, {1, 8}, {1, 9}, {2, 5}}) {
+            const int bsz = shape.first;
+            const int seqlen = shape.second;
+            const int tokens = bsz * seqlen;
+            std::vector<float> inputValues(
+                (size_t)tokens * heads * headDim);
+            for (size_t i = 0; i < inputValues.size(); i++) {
+                inputValues[i] =
+                    (float)((int)((i * 17 + i / 31) % 257) - 128) /
+                    64.0f;
+            }
+            for (const fastllm::DataType inputType : inputTypes) {
+                fastllm::Data input = MakeCudaTensor(
+                    inputType, {bsz, seqlen, heads, headDim}, inputValues);
+
+                setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE", "1", 1);
+                fastllm::Data reference;
+                Expect(FastllmCudaDeepSeekV4WoA(
+                           input, weight, groups, outRank, reference, false),
+                       "one-token DeepSeek-V4 WoA reference rejected input");
+                reference.ToDevice(fastllm::DataDevice::CPU);
+                for (const auto &tile : tiles) {
+                    unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+                    setenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK",
+                           std::to_string(tile.first).c_str(), 1);
+                    setenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK",
+                           std::to_string(tile.second).c_str(), 1);
+                    fastllm::Data actual;
+                    Expect(FastllmCudaDeepSeekV4WoA(
+                               input, weight, groups, outRank, actual, false),
+                           "token-tiled DeepSeek-V4 WoA rejected input");
+                    actual.ToDevice(fastllm::DataDevice::CPU);
+                    Expect(reference.dataType == fastllm::DataType::BFLOAT16 &&
+                               actual.dataType == fastllm::DataType::BFLOAT16 &&
+                               reference.GetBytes() == actual.GetBytes(),
+                           "token-tiled DeepSeek-V4 WoA output metadata mismatch");
+                    Expect(std::memcmp(reference.cpuData, actual.cpuData,
+                                       reference.GetBytes()) == 0,
+                           "token-tiled DeepSeek-V4 WoA changed BF16 output bits at "
+                           "input_type=" + std::to_string((int)inputType) +
+                           " batch=" + std::to_string(bsz) +
+                           " tokens=" + std::to_string(seqlen) +
+                           " tile=" + std::to_string(tile.first) + "x" +
+                           std::to_string(tile.second));
+                }
+            }
+        }
+
+        if (hadDisable) {
+            setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE",
+                   disableValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+        }
+        if (hadTile) {
+            setenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK",
+                   tileValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK");
+        }
+        if (hadRowTile) {
+            setenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK",
+                   rowTileValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
+        }
+        std::cout << "DeepSeek-V4 CUDA token-tiled WoA regression: PASS "
+                  << "(BF16 output bitwise, BF16/FP16/FP32 inputs, K=4096, "
+                     "tiles=2/4/8 x rows=4/8)\n";
+    }
+
+    void RunCudaDeepSeekV4TokenTiledWoABenchmark() {
+        FastllmCudaSetDevice(0);
+        constexpr int groups = 8;
+        constexpr int heads = 64;
+        constexpr int headDim = 512;
+        constexpr int hidden = (heads / groups) * headDim;
+        constexpr int outRank = 1024;
+
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::FP8_E4M3;
+        weight.UpdateUnitSize();
+        weight.Resize({groups * outRank, hidden});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = 128;
+        weight.blockM = 128;
+        weight.Allocate(false);
+        uint8_t *weightBytes = reinterpret_cast<uint8_t*>(weight.cpuData);
+        for (uint64_t i = 0; i < weight.GetBytes(); i++) {
+            weightBytes[i] = static_cast<uint8_t>(
+                0x18 + ((i * 13 + i / 127) & 0x3f));
+        }
+        const int scaleRows = groups * outRank / weight.blockK;
+        const int scaleCols = hidden / weight.blockM;
+        weight.scales.resize((size_t)scaleRows * scaleCols);
+        for (size_t i = 0; i < weight.scales.size(); i++) {
+            weight.scales[i] = 1.0f / (float)(32 << (i % 3));
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+
+        const char *benchTokens = std::getenv(
+            "FASTLLM_DSV4_WOA_BENCH_TOKENS");
+        const int tokens = benchTokens == nullptr ? 2048 :
+            std::max(1, std::atoi(benchTokens));
+        fastllm::Data input(
+            fastllm::DataType::BFLOAT16,
+            {1, tokens, heads, headDim});
+        input.Allocate(false);
+        uint16_t *inputBits = reinterpret_cast<uint16_t*>(input.cpuData);
+        for (uint64_t i = 0; i < input.Count(0); i++) {
+            const float value =
+                (float)((int)((i * 17 + i / 31) % 257) - 128) / 64.0f;
+            inputBits[i] = fastllm::Float32ToBFloat16RNEBits(value);
+        }
+        input.ToDevice(fastllm::DataDevice::CUDA);
+
+        auto measure = [&](const char *label, int tokenTile, int rowTile,
+                           bool disabled) {
+            if (disabled) {
+                setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE", "1", 1);
+            } else {
+                unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+                setenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK",
+                       std::to_string(tokenTile).c_str(), 1);
+                setenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK",
+                       std::to_string(rowTile).c_str(), 1);
+            }
+            fastllm::Data output;
+            for (int i = 0; i < 2; i++) {
+                Expect(FastllmCudaDeepSeekV4WoA(
+                           input, weight, groups, outRank, output, false),
+                       "DeepSeek-V4 WoA benchmark launch failed");
+            }
+            ForceDeviceSync();
+            constexpr int iterations = 5;
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                Expect(FastllmCudaDeepSeekV4WoA(
+                           input, weight, groups, outRank, output, false),
+                       "DeepSeek-V4 WoA benchmark launch failed");
+            }
+            ForceDeviceSync();
+            const double milliseconds = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count() / iterations;
+            std::cout << "woa tokens=" << tokens << " " << label
+                      << " ms=" << milliseconds << "\n";
+        };
+
+        measure("one-token", 1, 4, true);
+        measure("tile=2x4", 2, 4, false);
+        measure("tile=4x4", 4, 4, false);
+        measure("tile=8x4", 8, 4, false);
+        measure("tile=2x8", 2, 8, false);
+        measure("tile=4x8", 4, 8, false);
+        measure("tile=8x8", 8, 8, false);
+        unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+        unsetenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK");
+        unsetenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
+    }
+
     void RunCudaDeepSeekV4TritonWoARegression() {
         bool tritonEnabled = fastllm::GetFastllmEnv().cudaTriton &&
             RegressionEnvFlagDefaultEnabled(
@@ -11269,6 +11480,7 @@ int main(int argc, char **argv) {
             RunCudaRaggedGdnLogicalPrepRegression();
             RunCudaVarlenChunkGdnPrefillRegression();
             RunCudaVarlenChunkGdnHeadMappingRegression();
+            RunCudaDeepSeekV4TokenTiledWoARegression();
             RunCudaDeepSeekV4TritonWoARegression();
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
             RunCudaDeepSeekV4IndexerRegression();

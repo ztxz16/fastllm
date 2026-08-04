@@ -1113,6 +1113,145 @@ __global__ void DeepSeekV4WoAFp8RowsBlockReduceKernel(
     }
 }
 
+// Prefill has many query tokens but reuses the same wo_a matrix for every
+// token.  The one-token kernel above reloads each FP8 weight once per token.
+// Tile the token dimension as well as the output-row dimension so one decoded
+// weight feeds several independent dot products.  Every (token, row) sum still
+// visits d in exactly the same order and uses the same 256-way reduction tree
+// as DeepSeekV4WoAFp8RowsBlockReduceKernel.  Consequently this changes neither
+// the FP8 -> FP16 weight rounding nor the FP32 accumulation semantics.
+template <typename InT, int TokensPerBlock, int RowsPerBlock>
+__global__ void DeepSeekV4WoAFp8TokenRowsBlockReduceKernel(
+        const InT *o, const uint8_t *w, const float *scales,
+        __nv_bfloat16 *output,
+        int bsz, int seqlen, int heads, int headDim, int groups, int oRank,
+        int blockK, int blockM, int scaleCols) {
+    extern __shared__ float partial[];
+    constexpr int threads = 256;
+
+    const int totalTokens = bsz * seqlen;
+    const int tokenStart = blockIdx.x * TokensPerBlock;
+    const int rowStart = blockIdx.y * RowsPerBlock;
+    const int g = blockIdx.z;
+    if (tokenStart >= totalTokens || rowStart >= oRank || g >= groups) {
+        return;
+    }
+
+    const int headsPerGroup = heads / groups;
+    const int groupDim = headsPerGroup * headDim;
+    const int weightRowStart = g * oRank + rowStart;
+    const uint8_t *weightRows =
+        w + (uint64_t)weightRowStart * groupDim;
+    const float *rowScales =
+        scales + (weightRowStart / blockK) * scaleCols;
+
+    float sums[TokensPerBlock][RowsPerBlock] = {};
+    for (int d = threadIdx.x; d < groupDim; d += threads) {
+        const float scale = rowScales[d / blockM];
+        float decodedWeights[RowsPerBlock];
+#pragma unroll
+        for (int row = 0; row < RowsPerBlock; row++) {
+            decodedWeights[row] = DeepSeekV4Fp8E4M3ScaledHalfToFloat(
+                weightRows[(uint64_t)row * groupDim + d], scale);
+        }
+#pragma unroll
+        for (int token = 0; token < TokensPerBlock; token++) {
+            const int flatToken = tokenStart + token;
+            float x = 0.0f;
+            if (flatToken < totalTokens) {
+                const InT *src =
+                    o + ((uint64_t)flatToken * heads +
+                         g * headsPerGroup) * headDim;
+                x = Dsv4ToFloat(src[d]);
+            }
+#pragma unroll
+            for (int row = 0; row < RowsPerBlock; row++) {
+                sums[token][row] += x * decodedWeights[row];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int token = 0; token < TokensPerBlock; token++) {
+#pragma unroll
+        for (int row = 0; row < RowsPerBlock; row++) {
+            partial[(token * RowsPerBlock + row) * threads + threadIdx.x] =
+                sums[token][row];
+        }
+    }
+    __syncthreads();
+
+    // The first three levels cross warp boundaries and therefore stay in
+    // shared memory.  After stride 32, warp 0 owns the same 32 partials that
+    // the original block-wide tree would reduce; shuffles reproduce the
+    // remaining 16/8/4/2/1 additions without four more CTA barriers.
+    for (int stride = threads >> 1; stride >= 32; stride >>= 1) {
+        if (threadIdx.x < stride) {
+#pragma unroll
+            for (int token = 0; token < TokensPerBlock; token++) {
+#pragma unroll
+                for (int row = 0; row < RowsPerBlock; row++) {
+                    const int base =
+                        (token * RowsPerBlock + row) * threads + threadIdx.x;
+                    partial[base] += partial[base + stride];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x < 32) {
+#pragma unroll
+        for (int token = 0; token < TokensPerBlock; token++) {
+            const int flatToken = tokenStart + token;
+#pragma unroll
+            for (int row = 0; row < RowsPerBlock; row++) {
+                float value = partial[
+                    (token * RowsPerBlock + row) * threads + threadIdx.x];
+#pragma unroll
+                for (int stride = 16; stride > 0; stride >>= 1) {
+                    value += __shfl_down_sync(0xffffffffu, value, stride);
+                }
+                if (threadIdx.x == 0 && flatToken < totalTokens) {
+                    const uint64_t outBase =
+                        ((uint64_t)flatToken * groups + g) * oRank + rowStart;
+                    output[outBase + row] = __float2bfloat16_rn(
+                        value);
+                }
+            }
+        }
+    }
+}
+
+template <typename InT, int TokensPerBlock, int RowsPerBlock>
+bool DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce(
+        const InT *o, const uint8_t *w, const float *scales,
+        __nv_bfloat16 *output,
+        int bsz, int seqlen, int heads, int headDim, int groups, int oRank,
+        int blockK, int blockM, int scaleCols) {
+    constexpr int sharedBytes =
+        TokensPerBlock * RowsPerBlock * 256 * sizeof(float);
+    if (sharedBytes > 48 * 1024) {
+        cudaError_t state = cudaFuncSetAttribute(
+            DeepSeekV4WoAFp8TokenRowsBlockReduceKernel<
+                InT, TokensPerBlock, RowsPerBlock>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, sharedBytes);
+        if (state != cudaSuccess) {
+            return false;
+        }
+    }
+    const int totalTokens = bsz * seqlen;
+    const dim3 grid(
+        (totalTokens + TokensPerBlock - 1) / TokensPerBlock,
+        oRank / RowsPerBlock, groups);
+    DeepSeekV4WoAFp8TokenRowsBlockReduceKernel<
+        InT, TokensPerBlock, RowsPerBlock>
+        <<<grid, 256, sharedBytes>>>(
+            o, w, scales, output, bsz, seqlen, heads, headDim,
+            groups, oRank, blockK, blockM, scaleCols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 template <typename InT, typename WT>
 __global__ void DeepSeekV4WoAFloatAccKernel(const InT *o, const WT *w, __nv_bfloat16 *output,
                                             int bsz, int seqlen, int heads, int headDim,
@@ -5516,19 +5655,87 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
         if (mutableWeight.extraCudaData.empty() || mutableWeight.extraCudaData[0] == nullptr) {
             return false;
         }
-        constexpr int rowsPerBlock = 4;
-        const bool rowsCompatible =
-            rowsPerBlock > 0 && oRank % rowsPerBlock == 0 &&
-            woA.blockK % rowsPerBlock == 0 &&
+        const float *scaleData =
+            (const float*)mutableWeight.extraCudaData[0];
+        constexpr int fallbackRowsPerBlock = 4;
+        const bool fallbackRowsCompatible =
+            oRank % fallbackRowsPerBlock == 0 &&
+            woA.blockK % fallbackRowsPerBlock == 0 &&
             oRank % woA.blockK == 0;
-        if (rowsCompatible && rowsPerBlock == 4) {
-            int rowBlocks = bsz * seqlen * groups * (oRank / 4);
-            DeepSeekV4WoAFp8RowsBlockReduceKernel<InT, 4>
-                <<<rowBlocks, 256, 4 * 256 * sizeof(float)>>>(
-                    oData, (const uint8_t*)woA.cudaData,
-                    (const float*)mutableWeight.extraCudaData[0], outData,
-                    bsz, seqlen, heads, headDim, groups, oRank,
-                    woA.blockK, woA.blockM, scaleCols);
+        if (fallbackRowsCompatible) {
+            const int totalTokens = bsz * seqlen;
+            int tokensPerBlock = totalTokens == 2 ? 2 : 4;
+            const char *tokenTile =
+                std::getenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK");
+            if (tokenTile != nullptr) {
+                tokensPerBlock = std::atoi(tokenTile);
+            }
+            int rowsPerBlock =
+                (oRank % 8 == 0 && woA.blockK % 8 == 0) ? 8 : 4;
+            const char *rowTile =
+                std::getenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
+            if (rowTile != nullptr) {
+                rowsPerBlock = std::atoi(rowTile);
+            }
+            const bool useTokenTile =
+                totalTokens >= 2 &&
+                std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE") ==
+                    nullptr && rowsPerBlock > 0 &&
+                oRank % rowsPerBlock == 0 &&
+                woA.blockK % rowsPerBlock == 0;
+            bool launched = false;
+            const uint8_t *weightData = (const uint8_t*)woA.cudaData;
+            if (useTokenTile && tokensPerBlock == 2 &&
+                rowsPerBlock == 4) {
+                launched = DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce<
+                    InT, 2, 4>(
+                        oData, weightData, scaleData, outData,
+                        bsz, seqlen, heads, headDim, groups, oRank,
+                        woA.blockK, woA.blockM, scaleCols);
+            } else if (useTokenTile && tokensPerBlock == 4 &&
+                       rowsPerBlock == 4) {
+                launched = DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce<
+                    InT, 4, 4>(
+                        oData, weightData, scaleData, outData,
+                        bsz, seqlen, heads, headDim, groups, oRank,
+                        woA.blockK, woA.blockM, scaleCols);
+            } else if (useTokenTile && tokensPerBlock == 8 &&
+                       rowsPerBlock == 4) {
+                launched = DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce<
+                    InT, 8, 4>(
+                        oData, weightData, scaleData, outData,
+                        bsz, seqlen, heads, headDim, groups, oRank,
+                        woA.blockK, woA.blockM, scaleCols);
+            } else if (useTokenTile && tokensPerBlock == 2 &&
+                       rowsPerBlock == 8) {
+                launched = DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce<
+                    InT, 2, 8>(
+                        oData, weightData, scaleData, outData,
+                        bsz, seqlen, heads, headDim, groups, oRank,
+                        woA.blockK, woA.blockM, scaleCols);
+            } else if (useTokenTile && tokensPerBlock == 4 &&
+                       rowsPerBlock == 8) {
+                launched = DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce<
+                    InT, 4, 8>(
+                        oData, weightData, scaleData, outData,
+                        bsz, seqlen, heads, headDim, groups, oRank,
+                        woA.blockK, woA.blockM, scaleCols);
+            } else if (useTokenTile && tokensPerBlock == 8 &&
+                       rowsPerBlock == 8) {
+                launched = DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce<
+                    InT, 8, 8>(
+                        oData, weightData, scaleData, outData,
+                        bsz, seqlen, heads, headDim, groups, oRank,
+                        woA.blockK, woA.blockM, scaleCols);
+            }
+            if (!launched) {
+                int rowBlocks = totalTokens * groups * (oRank / 4);
+                DeepSeekV4WoAFp8RowsBlockReduceKernel<InT, 4>
+                    <<<rowBlocks, 256, 4 * 256 * sizeof(float)>>>(
+                        oData, weightData, scaleData, outData,
+                        bsz, seqlen, heads, headDim, groups, oRank,
+                        woA.blockK, woA.blockM, scaleCols);
+            }
         } else {
             DeepSeekV4WoAFp8PairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
                 oData, (const uint8_t*)woA.cudaData,
