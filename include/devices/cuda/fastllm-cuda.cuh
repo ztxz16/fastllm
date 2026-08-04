@@ -3,6 +3,22 @@
 
 #include "fastllm.h"
 
+// Device-resident request/chunk offsets shared by the ragged GDN frontend,
+// recurrent kernels, and output layout conversion.  The backing storage is
+// owned by a per-worker CUDA cache; callers must only retain this view until
+// the next call made by the same worker with different sequence lengths.
+struct FastllmCudaRaggedGdnMetadataView {
+    const int *tokenOffsets = nullptr;
+    const int *chunkOffsets = nullptr;
+    const int *chunkTokenBases = nullptr;
+    const int *chunkValidTokens = nullptr;
+    int batch = 0;
+    int totalTokens = 0;
+    int totalChunks = 0;
+    int maxChunks = 0;
+    int maxPaddedTokens = 0;
+};
+
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -417,6 +433,18 @@ bool FastllmCudaQwen35GdnPostConvExactFloat16(
         fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
         fastllm::Data &g, fastllm::Data &beta,
         fastllm::Data &kBeta, fastllm::Data &vBeta);
+bool FastllmCudaQwen35GdnPostConvRaggedExactFloat16(
+        const fastllm::Data &qkvInput,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &combinedBaInput,
+        const fastllm::Data &aLog,
+        const fastllm::Data &dtBias,
+        int baOffset, const std::vector<int> &seqLens,
+        int chunkSize, int keyHeads, int valueHeads,
+        int kDim, int vDim, float normEps, float qScale,
+        fastllm::Data &q, fastllm::Data &k,
+        fastllm::Data &g, fastllm::Data &kBeta,
+        fastllm::Data &vBeta);
 bool FastllmCudaKimiK3RMSNorm(const fastllm::Data &input,
                               const fastllm::Data &weight,
                               fastllm::Data &output, float eps);
@@ -754,10 +782,34 @@ bool FastllmCudaTryTritonChunkGdnPostConv(
         Data &normalizedQ, Data &normalizedK,
         Data &q, Data &k, Data &v, Data &g, Data &beta,
         Data &kBeta, Data &vBeta);
+bool FastllmCudaTryChunkGdnRaggedPostConv(
+        const Data &qkvInput, const Data &normWeight,
+        const Data &combinedBaInput, const Data &aLog,
+        const Data &dtBias, int baOffset,
+        const std::vector<int> &seqLens, int chunkSize,
+        int keyHeads, int valueHeads, int kDim, int vDim,
+        float normEps, float qScale,
+        Data &q, Data &k, Data &g,
+        Data &kBeta, Data &vBeta);
+bool FastllmCudaMappedGdnKkt(
+        const Data &kBeta, const Data &k,
+        int headGroup, Data &output);
 bool FastllmCudaTryTritonChunkGdnRecompute(
         const Data &attn, const Data &vBeta,
         const Data &kBeta, const Data &gExp, const Data &g,
         Data &vOutput, Data &kOutput);
+bool FastllmCudaChunkGatedDeltaRuleVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data &decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut);
+// Runs only the optional Triton implementation. Unlike the availability-first
+// wrapper above, this returns false without entering the native CUDA fallback.
+bool FastllmCudaTryTritonChunkGdnVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data &decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut);
 bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
         const Data &q, const Data &windowKV, const Data &compressedKV,
         const Data &attnSink, int windowSize, int compressRatio,
@@ -862,6 +914,20 @@ bool FastllmCudaPackRaggedGdnPrefillFloat16(
 bool FastllmCudaUnpackRaggedGdnPrefillFloat16(
     const fastllm::Data &padded, const std::vector<int> &seqLens,
     fastllm::Data &ragged);
+bool FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+    const fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &b,
+    const fastllm::Data &g, const std::vector<int> &seqLens,
+    int chunkSize, float qScale,
+    fastllm::Data &qPacked, fastllm::Data &kPacked,
+    fastllm::Data &vPacked, fastllm::Data &bPacked,
+    fastllm::Data &gPacked);
+bool FastllmCudaUnpackRaggedGdnPrefillChunksFloat16(
+    const fastllm::Data &packed, const std::vector<int> &seqLens,
+    int chunkSize, fastllm::Data &ragged);
+bool FastllmCudaGetRaggedGdnMetadata(
+    const std::vector<int> &seqLens, int chunkSize,
+    FastllmCudaRaggedGdnMetadataView &view);
 
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output);
 
@@ -873,6 +939,9 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                               int input0Spatial, int input1Spatial, int outputSpatial,
                               int input0Stride, int input1Stride,
                               int batch, int n, int m, int k, float alpha);
+bool FastllmCudaBatchMatMulTransBHeadMapped(
+    const fastllm::Data &input0, const fastllm::Data &input1,
+    fastllm::Data &output, int headGroup, float alpha = 1.0f);
 bool FastllmCudaRotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds,
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim);
 bool FastllmCudaNearlyRotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds,
@@ -1265,6 +1334,35 @@ bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     fastllm::Data &decayMask, fastllm::Data &kCumdecay,
     fastllm::Data &lastRecurrentState, fastllm::Data &coreAttnOut);
 
+bool FastllmCudaTritonChunkGatedDeltaRuleVarlenPrefill(
+    const char *hCubinPath, const char *hKernelName,
+    int hNumWarps, int hShared,
+    const char *oCubinPath, const char *oKernelName,
+    int oNumWarps, int oShared,
+    const char *oFusedDecayCubinPath,
+    const char *oFusedDecayKernelName,
+    int oFusedDecayNumWarps, int oFusedDecayShared,
+    const char *hPrecomputedScaleCubinPath,
+    const char *hPrecomputedScaleKernelName,
+    int hPrecomputedScaleNumWarps, int hPrecomputedScaleShared,
+    const char *oDirectQkCubinPath,
+    const char *oDirectQkKernelName,
+    int oDirectQkNumWarps, int oDirectQkShared,
+    bool precomputeScale, bool fuseDecayMask, bool directOutputQk,
+    int maxChunks, int chunkSize, int kDim, int vDim,
+    int hBlockV, int oBlockV, const std::vector<int> &seqLens,
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &decayMask, fastllm::Data &kCumdecay,
+    fastllm::Data &lastRecurrentState,
+    fastllm::Data &coreAttnOut);
+
+bool FastllmCudaTritonChunkGdnKkt(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared,
+    const fastllm::Data &kBeta, const fastllm::Data &k,
+    int headGroup, fastllm::Data &output);
+
 bool FastllmCudaTritonChunkGdnPostConv(
     const char *cubinPath, const char *kernelName,
     int numWarps, int shared, int blockT,
@@ -1391,6 +1489,13 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out);
+bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &k_cumdecay, fastllm::Data &last_recurrent_state,
+    const std::vector<int> &seqLens, fastllm::Data &core_attn_out,
+    const fastllm::Data *decay_mask = nullptr,
+    bool apply_decay_mask = false);
 
 void FastllmCudaSetDevice(int gpu_id);
 int FastllmCudaGetDevice();

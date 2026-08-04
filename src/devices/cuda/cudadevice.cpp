@@ -132,12 +132,22 @@ namespace fastllm {
         "h_precomputed_scale",
         "o_fused_decay_mask",
     };
-    static const int kCudaTritonChunkGdnRecomputeKernelCount = 4;
+    static const int kCudaTritonChunkGdnVarlenPrefillKernelCount = 5;
+    static const char *kCudaTritonChunkGdnVarlenPrefillKernelKeys[
+        kCudaTritonChunkGdnVarlenPrefillKernelCount] = {
+        "h",
+        "o",
+        "h_precomputed_scale",
+        "o_fused_decay_mask",
+        "o_direct_qk",
+    };
+    static const int kCudaTritonChunkGdnRecomputeKernelCount = 5;
     static const char *kCudaTritonChunkGdnRecomputeKernelKeys[kCudaTritonChunkGdnRecomputeKernelCount] = {
         "recompute",
         "recompute_precomputed_scale",
         "recompute_internal_exp",
         "recompute_precomputed_scale_internal_exp",
+        "kkt",
     };
 
     static const int kCudaTritonDeepSeekV4SparseDecodeKernelCount = 2;
@@ -192,6 +202,19 @@ namespace fastllm {
         int vDim = 128;
         int blockV = 32;
         int numStages = 3;
+    };
+
+    struct CudaTritonChunkGdnVarlenPrefillMeta {
+        CudaTritonKernelMeta kernels[
+            kCudaTritonChunkGdnVarlenPrefillKernelCount];
+        int maxChunks = 1;
+        int chunkSize = 64;
+        int kDim = 128;
+        int vDim = 128;
+        int hBlockV = 32;
+        int oBlockV = 64;
+        int hNumStages = 2;
+        int oNumStages = 3;
     };
 
     struct CudaTritonChunkGdnPostConvMeta {
@@ -377,6 +400,20 @@ namespace fastllm {
         return os.str();
     }
 
+    static std::string CudaTritonChunkGdnVarlenPrefillBaseName(
+        int arch, int maxChunks, int chunkSize, int kDim, int vDim,
+        int hBlockV, int oBlockV, int numWarps,
+        int hNumStages, int oNumStages) {
+        std::ostringstream os;
+        os << "chunk_gdn_varlen_prefill_v7_fp16_sm" << arch
+           << "_mc" << maxChunks << "_t" << chunkSize
+           << "_k" << kDim << "_v" << vDim
+           << "_hbv" << hBlockV << "_obv" << oBlockV
+           << "_nw" << numWarps
+           << "_hns" << hNumStages << "_ons" << oNumStages;
+        return os.str();
+    }
+
     static std::string CudaTritonChunkGdnPostConvBaseName(
         int arch, int keyHeads, int valueHeads, int kDim, int vDim,
         int blockT, int numWarps, int numStages) {
@@ -393,7 +430,7 @@ namespace fastllm {
         int arch, int chunkSize, int kDim, int vDim,
         int blockD, int numWarps, int numStages) {
         std::ostringstream os;
-        os << "chunk_gdn_recompute_v4_fp16_sm" << arch
+        os << "chunk_gdn_recompute_v7_fp16_sm" << arch
            << "_t" << chunkSize
            << "_k" << kDim << "_v" << vDim
            << "_bd" << blockD
@@ -549,6 +586,55 @@ namespace fastllm {
         for (int i = 0; i < kCudaTritonChunkGdnPrefillKernelCount; i++) {
             json11::Json item =
                 kernels[kCudaTritonChunkGdnPrefillKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonReadChunkGdnVarlenPrefillMeta(
+        const std::string &path,
+        CudaTritonChunkGdnVarlenPrefillMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() !=
+                "chunk_gdn_varlen_prefill" ||
+            json["dtype"].string_value() != "fp16") {
+            return false;
+        }
+        meta.maxChunks = json["max_chunks"].int_value();
+        meta.chunkSize = json["chunk_size"].int_value();
+        meta.kDim = json["k_dim"].int_value();
+        meta.vDim = json["v_dim"].int_value();
+        meta.hBlockV = json["h_block_v"].int_value();
+        meta.oBlockV = json["o_block_v"].int_value();
+        meta.hNumStages = json["h_num_stages"].int_value();
+        meta.oNumStages = json["o_num_stages"].int_value();
+        if (meta.maxChunks <= 0 || meta.chunkSize != 64 ||
+            meta.kDim != 128 || meta.vDim != 128 ||
+            (meta.hBlockV != 32 && meta.hBlockV != 64) ||
+            (meta.oBlockV != 32 && meta.oBlockV != 64) ||
+            meta.hNumStages <= 0 || meta.oNumStages <= 0) {
+            return false;
+        }
+        json11::Json kernels = json["kernels"];
+        for (int i = 0;
+             i < kCudaTritonChunkGdnVarlenPrefillKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonChunkGdnVarlenPrefillKernelKeys[i]];
             meta.kernels[i].cubinPath = item["cubin"].string_value();
             meta.kernels[i].kernelName = item["kernel"].string_value();
             meta.kernels[i].shared = item["shared"].int_value();
@@ -1234,6 +1320,133 @@ namespace fastllm {
         return true;
     }
 
+    static bool CudaTritonRequestChunkGdnVarlenPrefillKernel(
+        const std::string &cacheDir, int arch, int maxChunks,
+        int chunkSize, int kDim, int vDim,
+        int hBlockV, int oBlockV, int numWarps,
+        int hNumStages, int oNumStages,
+        CudaTritonChunkGdnVarlenPrefillMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            // Version the wire op as well as the cache name.  A compiler
+            // server started from older sources must reject this request
+            // instead of returning a cubin with an incompatible argument ABI.
+            {"op", "chunk_gdn_varlen_prefill_v7"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"dtype", "fp16"},
+            {"max_chunks", maxChunks},
+            {"chunk_size", chunkSize},
+            {"k_dim", kDim},
+            {"v_dim", vDim},
+            {"h_block_v", hBlockV},
+            {"o_block_v", oBlockV},
+            {"num_warps", numWarps},
+            {"h_num_stages", hNumStages},
+            {"o_num_stages", oNumStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: packed varlen chunk GDN prefill "
+                       "compile failed; falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.maxChunks = response["max_chunks"].int_value();
+        meta.chunkSize = response["chunk_size"].int_value();
+        meta.kDim = response["k_dim"].int_value();
+        meta.vDim = response["v_dim"].int_value();
+        meta.hBlockV = response["h_block_v"].int_value();
+        meta.oBlockV = response["o_block_v"].int_value();
+        meta.hNumStages = response["h_num_stages"].int_value();
+        meta.oNumStages = response["o_num_stages"].int_value();
+        if (meta.maxChunks != maxChunks ||
+            meta.chunkSize != chunkSize || meta.kDim != kDim ||
+            meta.vDim != vDim || meta.hBlockV != hBlockV ||
+            meta.oBlockV != oBlockV ||
+            meta.hNumStages != hNumStages ||
+            meta.oNumStages != oNumStages) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0;
+             i < kCudaTritonChunkGdnVarlenPrefillKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonChunkGdnVarlenPrefillKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonGetChunkGdnVarlenPrefillMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, int maxChunks, int chunkSize, int kDim, int vDim,
+        int hBlockV, int oBlockV, int numWarps,
+        int hNumStages, int oNumStages,
+        const CudaTritonChunkGdnVarlenPrefillMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string,
+                        CudaTritonChunkGdnVarlenPrefillMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath =
+            CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+        CudaTritonChunkGdnVarlenPrefillMeta loaded;
+        if (!CudaTritonReadChunkGdnVarlenPrefillMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestChunkGdnVarlenPrefillKernel(
+                    cacheDir, arch, maxChunks, chunkSize, kDim, vDim,
+                    hBlockV, oBlockV, numWarps,
+                    hNumStages, oNumStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.maxChunks != maxChunks ||
+            loaded.chunkSize != chunkSize || loaded.kDim != kDim ||
+            loaded.vDim != vDim || loaded.hBlockV != hBlockV ||
+            loaded.oBlockV != oBlockV ||
+            loaded.hNumStages != hNumStages ||
+            loaded.oNumStages != oNumStages) {
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
     static bool CudaTritonRequestChunkGdnPostConvKernel(
         const std::string &cacheDir, int arch,
         int keyHeads, int valueHeads, int kDim, int vDim,
@@ -1345,7 +1558,7 @@ namespace fastllm {
             return false;
         }
         json11::Json request = json11::Json::object {
-            {"op", "chunk_gdn_recompute"},
+            {"op", "chunk_gdn_recompute_v7"},
             {"cache_dir", cacheDir},
             {"arch", arch},
             {"dtype", "fp16"},
@@ -2641,6 +2854,161 @@ namespace fastllm {
             lastRecurrentState, coreAttnOut);
     }
 
+    static bool TryCudaTritonChunkGdnVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data *decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_VARLEN_PREFILL", true) ||
+            seqLens.empty()) {
+            return false;
+        }
+        auto isDense = [](const Data &data) {
+            if (data.dims.empty() ||
+                data.strides.size() != data.dims.size()) {
+                return false;
+            }
+            uint64_t expected = 1;
+            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+                if (data.strides[i] != expected) {
+                    return false;
+                }
+                expected *= (uint64_t)data.dims[i];
+            }
+            return true;
+        };
+        auto isCudaFp16 = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA &&
+                   data.dataType == DataType::FLOAT16 &&
+                   data.cudaData != nullptr && isDense(data);
+        };
+        if (!isCudaFp16(q) || !isCudaFp16(k) || !isCudaFp16(v) ||
+            !isCudaFp16(g) ||
+            (!directOutputQk && !isCudaFp16(attn)) ||
+            ((fuseDecayMask || directOutputQk) &&
+             (decayMask == nullptr || !isCudaFp16(*decayMask))) ||
+            !isCudaFp16(kCumdecay) ||
+            !isCudaFp16(lastRecurrentState) ||
+            q.dims.size() != 5 || q.dims[0] != 1 || k.dims != q.dims) {
+            return false;
+        }
+        int batch = (int)seqLens.size();
+        int keyHeads = q.dims[1];
+        int valueHeads = v.dims.size() == 5 ? v.dims[1] : 0;
+        int totalChunks = q.dims[2];
+        int chunkSize = q.dims[3];
+        int kDim = q.dims[4];
+        int vDim = v.dims.size() == 5 ? v.dims[4] : 0;
+        if (batch <= 1 || keyHeads <= 0 || valueHeads < keyHeads ||
+            valueHeads % keyHeads != 0 || totalChunks <= 0 ||
+            chunkSize != 64 || kDim != 128 || vDim != 128 ||
+            v.dims != std::vector<int>({1, valueHeads, totalChunks,
+                                        chunkSize, vDim}) ||
+            g.dims != std::vector<int>({1, valueHeads, totalChunks, chunkSize}) ||
+            (!directOutputQk && attn.dims !=
+                std::vector<int>({1, keyHeads, totalChunks,
+                                  chunkSize, chunkSize})) ||
+            ((fuseDecayMask || directOutputQk) && decayMask->dims !=
+                std::vector<int>({1, valueHeads, totalChunks,
+                                  chunkSize, chunkSize})) ||
+            kCumdecay.dims !=
+                std::vector<int>({1, valueHeads, totalChunks,
+                                  chunkSize, kDim}) ||
+            lastRecurrentState.dims !=
+                std::vector<int>({batch, valueHeads, kDim, vDim})) {
+            return false;
+        }
+        int countedChunks = 0;
+        int actualMaxChunks = 0;
+        for (int len : seqLens) {
+            if (len <= 0) {
+                return false;
+            }
+            int requestChunks = (len + chunkSize - 1) / chunkSize;
+            countedChunks += requestChunks;
+            actualMaxChunks = std::max(actualMaxChunks, requestChunks);
+        }
+        int maxChunks = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_VARLEN_PREFILL_MAX_CHUNKS",
+            256, 1, 1024);
+        if (countedChunks != totalChunks || actualMaxChunks > maxChunks) {
+            return false;
+        }
+        int compiledMaxChunks = 1;
+        while (compiledMaxChunks < actualMaxChunks) {
+            compiledMaxChunks <<= 1;
+        }
+
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 80) {
+            return false;
+        }
+        int hBlockV = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_BLOCK_V", 32, 32, 64);
+        int oBlockV = CudaEnvFlagDefaultEnabled(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_SPLIT_BLOCK_V", true)
+            ? 64 : hBlockV;
+        if ((hBlockV != 32 && hBlockV != 64) ||
+            (oBlockV != 32 && oBlockV != 64)) {
+            return false;
+        }
+        int numWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_WARPS", 4, 1, 32);
+        constexpr const char *commonStagesKey =
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_STAGES";
+        const char *commonStagesValue = std::getenv(commonStagesKey);
+        bool commonStagesSet =
+            commonStagesValue != nullptr && commonStagesValue[0] != '\0';
+        int commonNumStages =
+            CudaEnvIntRange(commonStagesKey, 3, 1, 8);
+        int hNumStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_H_NUM_STAGES",
+            commonStagesSet ? commonNumStages : 2, 1, 8);
+        int oNumStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_O_NUM_STAGES",
+            commonStagesSet ? commonNumStages : 3, 1, 8);
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonChunkGdnVarlenPrefillBaseName(
+            arch, compiledMaxChunks, chunkSize, kDim, vDim,
+            hBlockV, oBlockV, numWarps, hNumStages, oNumStages);
+        const CudaTritonChunkGdnVarlenPrefillMeta *meta = nullptr;
+        if (!CudaTritonGetChunkGdnVarlenPrefillMeta(
+                cacheDir, base, arch, compiledMaxChunks,
+                chunkSize, kDim, vDim, hBlockV, oBlockV,
+                numWarps, hNumStages, oNumStages, meta) ||
+            meta == nullptr) {
+            return false;
+        }
+        bool precomputeScale = CudaEnvFlagDefaultEnabled(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_PRECOMPUTE_SCALE",
+            true);
+        Data &decayMaskArg =
+            decayMask == nullptr ? attn : *decayMask;
+        return FastllmCudaTritonChunkGatedDeltaRuleVarlenPrefill(
+            meta->kernels[0].cubinPath.c_str(),
+            meta->kernels[0].kernelName.c_str(),
+            meta->kernels[0].numWarps, meta->kernels[0].shared,
+            meta->kernels[1].cubinPath.c_str(),
+            meta->kernels[1].kernelName.c_str(),
+            meta->kernels[1].numWarps, meta->kernels[1].shared,
+            meta->kernels[3].cubinPath.c_str(),
+            meta->kernels[3].kernelName.c_str(),
+            meta->kernels[3].numWarps, meta->kernels[3].shared,
+            meta->kernels[2].cubinPath.c_str(),
+            meta->kernels[2].kernelName.c_str(),
+            meta->kernels[2].numWarps, meta->kernels[2].shared,
+            meta->kernels[4].cubinPath.c_str(),
+            meta->kernels[4].kernelName.c_str(),
+            meta->kernels[4].numWarps, meta->kernels[4].shared,
+            precomputeScale, fuseDecayMask, directOutputQk,
+            meta->maxChunks, meta->chunkSize, meta->kDim, meta->vDim,
+            meta->hBlockV, meta->oBlockV, seqLens,
+            q, k, v, g, attn, decayMaskArg, kCumdecay,
+            lastRecurrentState, coreAttnOut);
+    }
+
     bool FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
         const Data &input, const Data &aLog, const Data &dtBias,
         int batch, int seqLen, int inputChannels,
@@ -2824,6 +3192,92 @@ namespace fastllm {
             batch, seqLen, keyHeads, valueHeads,
             kDim, vDim, qScale,
             q, k, v, g, beta, kBeta, vBeta);
+    }
+
+    bool FastllmCudaTryChunkGdnRaggedPostConv(
+        const Data &qkvInput, const Data &normWeight,
+        const Data &combinedBaInput, const Data &aLog,
+        const Data &dtBias, int baOffset,
+        const std::vector<int> &seqLens, int chunkSize,
+        int keyHeads, int valueHeads, int kDim, int vDim,
+        float normEps, float qScale,
+        Data &q, Data &k, Data &g,
+        Data &kBeta, Data &vBeta) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_RAGGED_POSTCONV", true) ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_MAPPED_KKT", true) ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_QWEN35_GDN_FUSED_RMSNORM_POSTCONV", true)) {
+            return false;
+        }
+        return FastllmCudaQwen35GdnPostConvRaggedExactFloat16(
+            qkvInput, normWeight, combinedBaInput, aLog, dtBias,
+            baOffset, seqLens, chunkSize, keyHeads, valueHeads,
+            kDim, vDim, normEps, qScale,
+            q, k, g, kBeta, vBeta);
+    }
+
+    bool FastllmCudaMappedGdnKkt(
+        const Data &kBeta, const Data &k,
+        int headGroup, Data &output) {
+        if (headGroup <= 1 ||
+            !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_MAPPED_KKT", true)) {
+            return false;
+        }
+        // The Triton logical-head KKT kernel is numerically close, but it does
+        // not reproduce cuBLAS Hgemm bit-for-bit and showed no stable
+        // end-to-end gain. Keep the exact mapped-cuBLAS path as the default.
+        if (CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_KKT", false) &&
+            kBeta.dataDevice == DataDevice::CUDA &&
+            kBeta.dataType == DataType::FLOAT16 &&
+            kBeta.cudaData != nullptr && kBeta.dims.size() == 5 &&
+            k.dataDevice == DataDevice::CUDA &&
+            k.dataType == DataType::FLOAT16 &&
+            k.cudaData != nullptr && k.dims.size() == 5 &&
+            kBeta.dims[0] == 1 && k.dims[0] == 1 &&
+            kBeta.dims[1] == k.dims[1] * headGroup &&
+            kBeta.dims[2] == k.dims[2] &&
+            kBeta.dims[3] == 64 && k.dims[3] == 64 &&
+            kBeta.dims[4] == 128 && k.dims[4] == 128) {
+            int arch = CudaTritonRuntimeArch();
+            constexpr int chunkSize = 64;
+            constexpr int kDim = 128;
+            constexpr int vDim = 128;
+            constexpr int blockD = 64;
+            int numWarps = CudaEnvIntRange(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE_NUM_WARPS",
+                4, 1, 32);
+            int numStages = CudaEnvIntRange(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE_NUM_STAGES",
+                2, 1, 8);
+            if (arch >= 80) {
+                std::string cacheDir = CudaTritonCacheDir();
+                std::string base = CudaTritonChunkGdnRecomputeBaseName(
+                    arch, chunkSize, kDim, vDim,
+                    blockD, numWarps, numStages);
+                const CudaTritonChunkGdnRecomputeMeta *meta = nullptr;
+                if (CudaTritonGetChunkGdnRecomputeMeta(
+                        cacheDir, base, arch, chunkSize, kDim, vDim,
+                        blockD, numWarps, numStages, meta) &&
+                    meta != nullptr) {
+                    const CudaTritonKernelMeta &kernel = meta->kernels[4];
+                    if (FastllmCudaTritonChunkGdnKkt(
+                            kernel.cubinPath.c_str(),
+                            kernel.kernelName.c_str(),
+                            kernel.numWarps, kernel.shared,
+                            kBeta, k, headGroup, output)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return FastllmCudaBatchMatMulTransBHeadMapped(
+            kBeta, k, output, headGroup, 1.0f);
     }
 
     bool FastllmCudaTryTritonChunkGdnRecompute(
@@ -3422,6 +3876,13 @@ namespace fastllm {
         return false;
     }
 
+    static bool TryCudaTritonChunkGdnVarlenPrefill(
+        Data &, Data &, Data &, Data &, Data &, Data *, Data &, Data &,
+        bool, bool,
+        const std::vector<int> &, Data &) {
+        return false;
+    }
+
     bool FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
         const Data &, const Data &, const Data &,
         int, int, int, int, int, Data &, Data &) {
@@ -3455,6 +3916,19 @@ namespace fastllm {
         return false;
     }
 
+    bool FastllmCudaTryChunkGdnRaggedPostConv(
+        const Data &, const Data &, const Data &, const Data &,
+        const Data &, int, const std::vector<int> &, int,
+        int, int, int, int, float, float,
+        Data &, Data &, Data &, Data &, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaMappedGdnKkt(
+        const Data &, const Data &, int, Data &) {
+        return false;
+    }
+
     bool FastllmCudaTryTritonChunkGdnRecompute(
         const Data &, const Data &, const Data &, const Data &,
         const Data &,
@@ -3473,6 +3947,58 @@ namespace fastllm {
         return false;
     }
 #endif
+
+    bool FastllmCudaTryTritonChunkGdnVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data &decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut) {
+        return TryCudaTritonChunkGdnVarlenPrefill(
+            q, k, v, g, attn, &decayMask, kCumdecay,
+            lastRecurrentState, fuseDecayMask, directOutputQk,
+            seqLens, coreAttnOut);
+    }
+
+    bool FastllmCudaChunkGatedDeltaRuleVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data &decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut) {
+        if (FastllmCudaTryTritonChunkGdnVarlenPrefill(
+                q, k, v, g, attn, decayMask, kCumdecay,
+                lastRecurrentState, fuseDecayMask, directOutputQk,
+                seqLens, coreAttnOut)) {
+            return true;
+        }
+        // The direct Triton O kernel does not require the materialized QK^T
+        // tensor. If its launch is unavailable, reconstruct the exact legacy
+        // input before entering the native fallback so this optimization can
+        // never change correctness or availability.
+        if (directOutputQk) {
+            if (q.dims.size() != 5 || k.dims != q.dims ||
+                q.dims[0] != 1 || q.dims[3] != 64 || q.dims[4] != 128) {
+                return false;
+            }
+            int keyHeads = q.dims[1];
+            int totalChunks = q.dims[2];
+            attn.dataType = DataType::FLOAT16;
+            attn.dataDevice = q.dataDevice;
+            attn.dataDeviceIds = q.dataDeviceIds;
+            attn.Resize({1, keyHeads, totalChunks, 64, 64});
+            attn.Allocate(false);
+            if (!FastllmCudaBatchMatMulTransB(
+                    q, k, attn,
+                    64 * 128, 64 * 128, 64 * 64,
+                    128, 128, keyHeads * totalChunks,
+                    64, 128, 64, 1.0f)) {
+                return false;
+            }
+        }
+        return ::FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+            q, k, v, g, attn, kCumdecay,
+            lastRecurrentState, seqLens, coreAttnOut,
+            &decayMask, fuseDecayMask);
+    }
 
     static void InvalidateCpuMirror(Data &data) {
         if (data.cpuData == nullptr) {

@@ -8301,27 +8301,16 @@ namespace fastllm {
                     (int)seqLens.size() == batch && bsz == 1 &&
                     !batchedUniformPrefill;
                 int raggedPrefillTotalTokens = 0;
-                int raggedPrefillMaxSeqLen = 0;
+                int raggedPrefillTotalChunks = 0;
                 if (batchedRaggedPrefill) {
                     for (int len : seqLens) {
                         batchedRaggedPrefill &=
                             len > 1 && len <= QWEN35_BATCH_PREFILL_SEQ_MAX;
-                        raggedPrefillMaxSeqLen =
-                            std::max(raggedPrefillMaxSeqLen, len);
                         raggedPrefillTotalTokens += len;
+                        raggedPrefillTotalChunks += (len + 63) / 64;
                     }
                     batchedRaggedPrefill &=
                         raggedPrefillTotalTokens == seqlen;
-                }
-                int raggedPrefillPaddedSeqLen = batchedRaggedPrefill ?
-                    ((raggedPrefillMaxSeqLen + 63) / 64) * 64 : 0;
-                // The native chunk kernel has a rectangular batch dimension.
-                // Avoid pathological memory growth for extremely skewed
-                // batches; the caller retains its request-local fallback.
-                if (batchedRaggedPrefill) {
-                    batchedRaggedPrefill &=
-                        (long long)batch * raggedPrefillPaddedSeqLen <=
-                        (long long)raggedPrefillTotalTokens * 2;
                 }
                 bool batchedPrefill =
                     batchedUniformPrefill || batchedRaggedPrefill;
@@ -8332,7 +8321,8 @@ namespace fastllm {
                     keepCombinedBaForSmallDecode ||
                     keepCombinedBaForBatchSpeculative ||
                     keepCombinedBaForBatchRecurrent;
-                bool deferBaSplitForUniformPrefill = uniformPrefill;
+                bool deferBaSplitForPrefill =
+                    uniformPrefill || batchedRaggedPrefill;
                 bool baSplitReady = false;
                 if (hasMergedGdnInLinear) {
                     if (keepCombinedBa) {
@@ -8340,7 +8330,7 @@ namespace fastllm {
                                        localQkvDim + localVd,
                                        localQkvDim + localVd + localValueHeads * 2,
                                        baMerged);
-                    } else if (!deferBaSplitForUniformPrefill) {
+                    } else if (!deferBaSplitForPrefill) {
                         Qwen3CudaSplit(cudaRunner, gdnMerged, -1, localQkvDim + localVd,
                                        localQkvDim + localVd + localValueHeads, b);
                         Qwen3CudaSplit(cudaRunner, gdnMerged, -1,
@@ -8355,7 +8345,7 @@ namespace fastllm {
                                                   baWeightName + ".tp_bias"),
                                     baMerged);
                     if (!keepCombinedBa &&
-                        !deferBaSplitForUniformPrefill) {
+                        !deferBaSplitForPrefill) {
                         Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
                         Qwen3CudaSplit(cudaRunner, baMerged, -1, localValueHeads,
                                        localValueHeads * 2, a);
@@ -8369,7 +8359,7 @@ namespace fastllm {
                     Data *splitSource = &baMerged;
                     int splitOffset = 0;
                     if (hasMergedGdnInLinear &&
-                        deferBaSplitForUniformPrefill) {
+                        deferBaSplitForPrefill) {
                         splitSource = &gdnMerged;
                         splitOffset = localQkvDim + localVd;
                     }
@@ -8948,43 +8938,53 @@ namespace fastllm {
                 int deferredGdnOutputSeqLen = 0;
                 int deferredGdnOutputPaddedSeqLen = 0;
                 auto runChunkLinearAttention = [&]() {
-                    bool combinedBaPostProcess = false;
-#ifdef USE_CUDA
-                    if (uniformPrefill) {
-                        Data *combinedBaSource =
-                            hasMergedGdnInLinear ? &gdnMerged : &baMerged;
-                        int combinedBaOffset = hasMergedGdnInLinear ?
-                            localQkvDim + localVd : 0;
-                        combinedBaPostProcess =
-                            FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
-                                *combinedBaSource,
-                                *requireLocal(weight[aLogName], aLogName),
-                                *requireLocal(weight[dtBiasName], dtBiasName),
-                                batch, uniformPrefillSeqLen,
-                                combinedBaSource->dims.back(),
-                                combinedBaOffset, localValueHeads,
-                                b, g);
-                    }
-#endif
-                    if (!combinedBaPostProcess) {
-                        ensureBaSplit();
-                        if (uniformPrefill) {
-                            b.Reshape(
-                                {batch, uniformPrefillSeqLen,
-                                 b.dims.back()});
-                            a.Reshape(
-                                {batch, uniformPrefillSeqLen,
-                                 a.dims.back()});
+                    int chunkSize = 64;
+                    bool baPostProcessReady = false;
+                    auto ensureBaPostProcess = [&]() {
+                        if (baPostProcessReady) {
+                            return;
                         }
-                        Qwen35CudaSigmoidMambaSoftplus(
-                            cudaRunner, b, a,
-                            *requireLocal(weight[aLogName], aLogName),
-                            *requireLocal(weight[dtBiasName], dtBiasName), g);
+                        bool combinedBaPostProcess = false;
+#ifdef USE_CUDA
+                        if (uniformPrefill) {
+                            Data *combinedBaSource =
+                                hasMergedGdnInLinear ? &gdnMerged : &baMerged;
+                            int combinedBaOffset = hasMergedGdnInLinear ?
+                                localQkvDim + localVd : 0;
+                            combinedBaPostProcess =
+                                FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
+                                    *combinedBaSource,
+                                    *requireLocal(weight[aLogName], aLogName),
+                                    *requireLocal(weight[dtBiasName], dtBiasName),
+                                    batch, uniformPrefillSeqLen,
+                                    combinedBaSource->dims.back(),
+                                    combinedBaOffset, localValueHeads,
+                                    b, g);
+                        }
+#endif
+                        if (!combinedBaPostProcess) {
+                            ensureBaSplit();
+                            if (uniformPrefill) {
+                                b.Reshape(
+                                    {batch, uniformPrefillSeqLen,
+                                     b.dims.back()});
+                                a.Reshape(
+                                    {batch, uniformPrefillSeqLen,
+                                     a.dims.back()});
+                            }
+                            Qwen35CudaSigmoidMambaSoftplus(
+                                cudaRunner, b, a,
+                                *requireLocal(weight[aLogName], aLogName),
+                                *requireLocal(weight[dtBiasName], dtBiasName), g);
+                        }
+                        baPostProcessReady = true;
+                    };
+                    if (!batchedRaggedPrefill) {
+                        ensureBaPostProcess();
                     }
                     if (batch == 1 && chunkPastValue->dims.size() > 0) {
                         Qwen35EnsureCudaLinearAttnStateKVLayout(*chunkPastValue);
                     }
-                    int chunkSize = 64;
                     int keyBatchSize = 0;
                     int keySequenceLength = 0;
                     int keyKHeadDim = 0;
@@ -8995,7 +8995,15 @@ namespace fastllm {
                     Data *pbb = nullptr, *pgg = nullptr;
                     bool fusedPostConv = false;
                     bool packedRagged = false;
+                    bool logicalRagged = false;
                     bool normalizedBeforeRepeat = false;
+                    const char *fusedOutputDecayMaskKey =
+                        "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_"
+                        "O_FUSED_DECAY_MASK";
+                    bool fuseOutputDecayMask =
+                        GetFastllmEnv().cudaTriton &&
+                        qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                            fusedOutputDecayMaskKey);
 #ifdef USE_CUDA
                     if (uniformPrefill) {
                         // Normalize Q/K directly from the combined token-major
@@ -9033,46 +9041,71 @@ namespace fastllm {
                         }
                     }
                     if (batchedRaggedPrefill) {
-                        ensureConvQkvSplit();
-                        if (num_v_heads / num_k_heads > 1) {
-                            Qwen35CudaMul(cudaRunner, q, 1.0f, qRepeat);
-                            Qwen35CudaMul(cudaRunner, k, 1.0f, kRepeat);
-                            qRepeat.Resize({q.dims[0], q.dims[1],
-                                            q.dims[2], 1, q.dims[3]});
-                            kRepeat.Resize({k.dims[0], k.dims[1],
-                                            k.dims[2], 1, k.dims[3]});
-                            Qwen35CudaRepeat(cudaRunner, qRepeat, 3,
-                                            num_v_heads / num_k_heads, q);
-                            Qwen35CudaRepeat(cudaRunner, kRepeat, 3,
-                                            num_v_heads / num_k_heads, k);
-                            q.Reshape({q.dims[0], q.dims[1], -1,
-                                       q.dims.back()});
-                            k.Reshape({k.dims[0], k.dims[1], -1,
-                                       k.dims.back()});
-                        }
-                        Qwen3CudaRMSNorm(
-                            cudaRunner, q,
-                            *requireLocal(inv_scale_data,
-                                          "linear_attn.inv_scale"),
-                            rms_norm_eps, q);
-                        Qwen3CudaRMSNorm(
-                            cudaRunner, k,
-                            *requireLocal(inv_scale_data,
-                                          "linear_attn.inv_scale"),
-                            rms_norm_eps, k);
-                        normalizedBeforeRepeat = true;
-                        packedRagged =
-                            FastllmCudaPackRaggedGdnPrefillFloat16(
-                                q, k, v, b, g, seqLens,
-                                raggedPrefillPaddedSeqLen,
+                        Data *combinedBaSource =
+                            hasMergedGdnInLinear ? &gdnMerged : &baMerged;
+                        int combinedBaOffset = hasMergedGdnInLinear ?
+                            localQkvDim + localVd : 0;
+                        logicalRagged = fuseOutputDecayMask &&
+                            FastllmCudaTryChunkGdnRaggedPostConv(
+                                *convOutputForRecurrent,
+                                *requireLocal(inv_scale_data,
+                                              "linear_attn.inv_scale"),
+                                *combinedBaSource,
+                                *requireLocal(weight[aLogName], aLogName),
+                                *requireLocal(weight[dtBiasName], dtBiasName),
+                                combinedBaOffset, seqLens, chunkSize,
+                                localKeyHeads, localValueHeads,
+                                head_k_dim, head_v_dim, rms_norm_eps,
                                 1.0f / std::sqrt((float)head_k_dim),
-                                qq, kkPad, vvPad, bbPad, ggPad);
+                                qq, kkPad, ggPad, kBeta, vBeta);
+                        if (logicalRagged) {
+                            packedRagged = true;
+                            fusedPostConv = true;
+                        } else {
+                            ensureBaPostProcess();
+                            ensureConvQkvSplit();
+                            if (num_v_heads / num_k_heads > 1) {
+                                Qwen35CudaMul(cudaRunner, q, 1.0f, qRepeat);
+                                Qwen35CudaMul(cudaRunner, k, 1.0f, kRepeat);
+                                qRepeat.Resize({q.dims[0], q.dims[1],
+                                                q.dims[2], 1, q.dims[3]});
+                                kRepeat.Resize({k.dims[0], k.dims[1],
+                                                k.dims[2], 1, k.dims[3]});
+                                Qwen35CudaRepeat(
+                                    cudaRunner, qRepeat, 3,
+                                    num_v_heads / num_k_heads, q);
+                                Qwen35CudaRepeat(
+                                    cudaRunner, kRepeat, 3,
+                                    num_v_heads / num_k_heads, k);
+                                q.Reshape({q.dims[0], q.dims[1], -1,
+                                           q.dims.back()});
+                                k.Reshape({k.dims[0], k.dims[1], -1,
+                                           k.dims.back()});
+                            }
+                            Qwen3CudaRMSNorm(
+                                cudaRunner, q,
+                                *requireLocal(inv_scale_data,
+                                              "linear_attn.inv_scale"),
+                                rms_norm_eps, q);
+                            Qwen3CudaRMSNorm(
+                                cudaRunner, k,
+                                *requireLocal(inv_scale_data,
+                                              "linear_attn.inv_scale"),
+                                rms_norm_eps, k);
+                            normalizedBeforeRepeat = true;
+                            packedRagged =
+                                FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+                                    q, k, v, b, g, seqLens,
+                                    chunkSize,
+                                    1.0f / std::sqrt((float)head_k_dim),
+                                    qq, kkPad, vvPad, bbPad, ggPad);
+                        }
                         AssertInFastLLM(
                             packedRagged,
                             "Qwen3.5 failed to pack ragged GDN prefill.\n");
                     }
 #endif
-                    if (fusedPostConv) {
+                    if (fusedPostConv && !logicalRagged) {
                         keyBatchSize = batch;
                         keySequenceLength = localValueHeads;
                         keyKHeadDim = head_k_dim;
@@ -9086,7 +9119,7 @@ namespace fastllm {
                         keyBatchSize = batch;
                         keySequenceLength = localValueHeads;
                         keyKHeadDim = head_k_dim;
-                        seq = raggedPrefillPaddedSeqLen;
+                        seq = raggedPrefillTotalChunks * chunkSize;
                         padSize = 0;
                         pkk = &kkPad;
                         pvv = &vvPad;
@@ -9184,7 +9217,16 @@ namespace fastllm {
                                 cudaRunner, *pgg, decayMask);
                         }
                     }
-                    Qwen35CudaMatMulTransB(cudaRunner, kBeta, *pkk, at);
+                    if (logicalRagged) {
+                        AssertInFastLLM(
+                            FastllmCudaMappedGdnKkt(
+                                kBeta, *pkk,
+                                localValueHeads / localKeyHeads, at),
+                            "Qwen3.5 mapped ragged GDN KKT is unavailable.\n");
+                    } else {
+                        Qwen35CudaMatMulTransB(
+                            cudaRunner, kBeta, *pkk, at);
+                    }
                     if (!tryFusedCumSumDecayNegMask ||
                         !Qwen35CudaTryCumSumDecayNegMulCausalMask(
                             cudaRunner, *pgg, at,
@@ -9230,15 +9272,25 @@ namespace fastllm {
                         Qwen35CudaMatMul(
                             cudaRunner, attn, kBeta, kCumdecay);
                     }
-                    Qwen35CudaMatMulTransB(cudaRunner, qq, *pkk, attn);
-                    const char *fusedOutputDecayMaskKey =
-                        "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_"
-                        "O_FUSED_DECAY_MASK";
-                    bool fuseOutputDecayMask =
+                    const char *directOutputQkKey =
+                        "FASTLLM_CUDA_TRITON_CHUNK_GDN_"
+                        "DIRECT_OUTPUT_QK";
+                    const char *directOutputQkEnv =
+                        std::getenv(directOutputQkKey);
+                    // Keep the fused QK variant opt-in: its Triton dot is
+                    // close numerically, but it does not reproduce cuBLAS
+                    // Hgemm closely enough to preserve the model benchmark.
+                    bool directOutputQk =
+                        logicalRagged && fuseOutputDecayMask &&
                         GetFastllmEnv().cudaTriton &&
-                        qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                            fusedOutputDecayMaskKey);
-                    if (!fuseOutputDecayMask) {
+                        directOutputQkEnv != nullptr &&
+                        directOutputQkEnv[0] != '\0' &&
+                        Qwen3CudaEnvDefaultEnabled(directOutputQkKey);
+                    if (!directOutputQk) {
+                        Qwen35CudaMatMulTransB(
+                            cudaRunner, qq, *pkk, attn);
+                    }
+                    if (!fuseOutputDecayMask && !directOutputQk) {
                         if (!Qwen35CudaTryMulToCausalMask(
                                 attn, decayMask, 1, 0.0f)) {
                             Qwen35CudaMulTo(
@@ -9254,21 +9306,29 @@ namespace fastllm {
                         chunkPastValue->Resize({keyBatchSize, keySequenceLength, keyKHeadDim, vHeadDimLocal});
                         chunkPastValue->Allocate(0.0f);
                     }
-                    Qwen35CudaChunkGatedDeltaRulePrefill(cudaRunner, qq, *pkk, vvPad, *pgg,
-                                                         attn, decayMask, kCumdecay,
-                                                         *chunkPastValue, coreAttnOut,
-                                                         fuseOutputDecayMask);
-                    coreAttnOut.Reshape({coreAttnOut.dims[0], coreAttnOut.dims[1],
-                                         -1, coreAttnOut.dims.back()});
                     if (packedRagged) {
-                        bool unpacked =
-                            FastllmCudaUnpackRaggedGdnPrefillFloat16(
-                                coreAttnOut, seqLens, coreTemp);
                         AssertInFastLLM(
-                            unpacked,
-                            "Qwen3.5 failed to unpack ragged GDN prefill.\n");
-                        Qwen35CudaMul(
-                            cudaRunner, coreTemp, 1.0f, coreAttnOut);
+                            FastllmCudaChunkGatedDeltaRuleVarlenPrefill(
+                                qq, *pkk, vvPad, *pgg, attn, decayMask,
+                                kCumdecay, *chunkPastValue,
+                                fuseOutputDecayMask, directOutputQk,
+                                seqLens, coreAttnOut),
+                            "Qwen3.5 failed packed varlen GDN prefill.\n");
+                    } else {
+                        Qwen35CudaChunkGatedDeltaRulePrefill(
+                            cudaRunner, qq, *pkk, vvPad, *pgg,
+                            attn, decayMask, kCumdecay,
+                            *chunkPastValue, coreAttnOut,
+                            fuseOutputDecayMask);
+                    }
+                    if (!packedRagged) {
+                        coreAttnOut.Reshape(
+                            {coreAttnOut.dims[0], coreAttnOut.dims[1],
+                             -1, coreAttnOut.dims.back()});
+                    }
+                    if (packedRagged) {
+                        // Varlen O already writes flattened token-major
+                        // [1, total_tokens, value_heads, v_dim].
                     } else if (uniformPrefill) {
                         deferredGdnOutputLayout = true;
                         deferredGdnOutputSeqLen = seq;
@@ -10190,15 +10250,11 @@ namespace fastllm {
                 return false;
             }
             int totalTokens = 0;
-            int maxSeqLen = 0;
-            bool uniform = true;
             for (int b = 0; b < batch; b++) {
                 if (seqLens[b] <= 1 ||
                     seqLens[b] > QWEN35_BATCH_PREFILL_SEQ_MAX) {
                     return false;
                 }
-                maxSeqLen = std::max(maxSeqLen, seqLens[b]);
-                uniform &= seqLens[b] == seqLens[0];
                 totalTokens += seqLens[b];
                 for (int i = 0; i < block_cnt; i++) {
                     Data *pastKey = pastKeyValues[b * block_cnt + i].first;
@@ -10215,13 +10271,6 @@ namespace fastllm {
                         (!pastKey->dims.empty() || !pastValue->dims.empty())) {
                         return false;
                     }
-                }
-            }
-            int paddedSeqLen = ((maxSeqLen + 63) / 64) * 64;
-            if (!uniform) {
-                if ((long long)batch * paddedSeqLen >
-                    (long long)totalTokens * 2) {
-                    return false;
                 }
             }
             return inputIds.dims.size() == 2 && inputIds.dims[0] == 1 &&

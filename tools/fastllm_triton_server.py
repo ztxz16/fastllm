@@ -328,6 +328,383 @@ if triton is not None:
 
 
     @triton.jit
+    def fastllm_chunk_gdn_varlen_prefill_h_kernel(
+        k_ptr,
+        v_ptr,
+        g_ptr,
+        k_cumdecay_ptr,
+        state_ptr,
+        next_state_ptr,
+        chunk_offsets_ptr,
+        h_ptr,
+        v_new_ptr,
+        row_scale_ptr,
+        state_scale_ptr,
+        total_chunks,
+        key_heads,
+        heads,
+        MAX_CHUNKS: tl.constexpr,
+        CHUNK_SIZE: tl.constexpr,
+        K_DIM: tl.constexpr,
+        V_DIM: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+        USE_PRECOMPUTED_SCALE: tl.constexpr,
+    ):
+        """Build recurrent states for packed variable-length GDN chunks.
+
+        Packed tensors have layout [1, heads, total_chunks, 64, dim].  Chunk
+        offsets delimit each request in the shared chunk axis.  One program
+        owns one request/head/V tile, preserving the required sequential
+        recurrence without padding every request to the global maximum.
+        """
+        v_block = tl.program_id(0)
+        batch_head = tl.program_id(1)
+        batch_index = batch_head // heads
+        head = batch_head - batch_index * heads
+        key_head = head * key_heads // heads
+        chunk_begin = tl.load(chunk_offsets_ptr + batch_index)
+        chunk_end = tl.load(chunk_offsets_ptr + batch_index + 1)
+        chunk_count = chunk_end - chunk_begin
+
+        v_offsets = v_block * BLOCK_V + tl.arange(0, BLOCK_V)
+        t_offsets = tl.arange(0, CHUNK_SIZE)
+        k_offsets = tl.arange(0, 64)
+        v_mask = v_offsets < V_DIM
+
+        state_base = batch_head * K_DIM * V_DIM
+        state_offsets_0 = (
+            state_base
+            + k_offsets[:, None] * V_DIM
+            + v_offsets[None, :]
+        )
+        state_0 = tl.load(
+            state_ptr + state_offsets_0,
+            mask=v_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        state_offsets_1 = state_offsets_0 + 64 * V_DIM
+        state_1 = tl.load(
+            state_ptr + state_offsets_1,
+            mask=v_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        for relative_chunk in range(0, MAX_CHUNKS):
+            if relative_chunk < chunk_count:
+                global_chunk = chunk_begin + relative_chunk
+                chunk_index = head * total_chunks + global_chunk
+                key_chunk_index = key_head * total_chunks + global_chunk
+                k_base = key_chunk_index * CHUNK_SIZE * K_DIM
+                k_cum_base = chunk_index * CHUNK_SIZE * K_DIM
+                v_base = chunk_index * CHUNK_SIZE * V_DIM
+                g_base = chunk_index * CHUNK_SIZE
+                h_base = chunk_index * K_DIM * V_DIM
+
+                h_offsets_0 = (
+                    h_base
+                    + k_offsets[:, None] * V_DIM
+                    + v_offsets[None, :]
+                )
+                tl.store(
+                    h_ptr + h_offsets_0,
+                    state_0.to(h_ptr.dtype.element_ty),
+                    mask=v_mask[None, :],
+                )
+                tl.store(
+                    h_ptr + h_offsets_0 + 64 * V_DIM,
+                    state_1.to(h_ptr.dtype.element_ty),
+                    mask=v_mask[None, :],
+                )
+
+                k_cum_offsets_0 = (
+                    k_cum_base
+                    + t_offsets[:, None] * K_DIM
+                    + k_offsets[None, :]
+                )
+                k_cum_0 = tl.load(k_cumdecay_ptr + k_cum_offsets_0)
+                k_cum_1 = tl.load(k_cumdecay_ptr + k_cum_offsets_0 + 64)
+                v_offsets_2d = (
+                    v_base
+                    + t_offsets[:, None] * V_DIM
+                    + v_offsets[None, :]
+                )
+                v_value = tl.load(
+                    v_ptr + v_offsets_2d,
+                    mask=v_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                v_new = v_value - tl.dot(
+                    k_cum_0, state_0.to(k_cum_0.dtype)
+                )
+                v_new -= tl.dot(
+                    k_cum_1, state_1.to(k_cum_1.dtype)
+                )
+                v_new_half = v_new.to(v_new_ptr.dtype.element_ty)
+                tl.store(
+                    v_new_ptr + v_offsets_2d,
+                    v_new_half,
+                    mask=v_mask[None, :],
+                )
+
+                if USE_PRECOMPUTED_SCALE:
+                    row_scale = tl.load(
+                        row_scale_ptr + g_base + t_offsets
+                    )
+                    state_scale = tl.load(
+                        state_scale_ptr + chunk_index
+                    )
+                else:
+                    g = tl.load(
+                        g_ptr + g_base + t_offsets
+                    ).to(tl.float32)
+                    g_last = tl.load(
+                        g_ptr + g_base + CHUNK_SIZE - 1
+                    ).to(tl.float32)
+                    row_scale = tl.exp(g_last - g)
+                    state_scale = tl.exp(g_last)
+                state_0 *= state_scale
+                state_1 *= state_scale
+
+                k_offsets_2d = (
+                    k_base
+                    + t_offsets[:, None] * K_DIM
+                    + k_offsets[None, :]
+                )
+                k_0 = tl.load(k_ptr + k_offsets_2d)
+                k_1 = tl.load(k_ptr + k_offsets_2d + 64)
+                k_scaled_0 = (
+                    k_0.to(tl.float32) * row_scale[:, None]
+                ).to(k_0.dtype)
+                k_scaled_1 = (
+                    k_1.to(tl.float32) * row_scale[:, None]
+                ).to(k_1.dtype)
+                state_0 += tl.dot(tl.trans(k_scaled_0), v_new_half)
+                state_1 += tl.dot(tl.trans(k_scaled_1), v_new_half)
+
+        tl.store(
+            next_state_ptr + state_offsets_0,
+            state_0.to(next_state_ptr.dtype.element_ty),
+            mask=v_mask[None, :],
+        )
+        tl.store(
+            next_state_ptr + state_offsets_1,
+            state_1.to(next_state_ptr.dtype.element_ty),
+            mask=v_mask[None, :],
+        )
+
+
+    @triton.jit
+    def fastllm_chunk_gdn_varlen_prefill_o_kernel(
+        q_ptr,
+        k_ptr,
+        g_ptr,
+        attn_ptr,
+        decay_mask_ptr,
+        h_ptr,
+        v_new_ptr,
+        chunk_token_bases_ptr,
+        chunk_valid_tokens_ptr,
+        output_ptr,
+        total_chunks,
+        total_tokens,
+        key_heads,
+        heads,
+        CHUNK_SIZE: tl.constexpr,
+        K_DIM: tl.constexpr,
+        V_DIM: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+        APPLY_DECAY_MASK: tl.constexpr,
+        DIRECT_QK: tl.constexpr,
+    ):
+        """Compute outputs for packed variable-length GDN chunks."""
+        v_block = tl.program_id(0)
+        chunk = tl.program_id(1)
+        head = tl.program_id(2)
+        key_head = head * key_heads // heads
+        v_offsets = v_block * BLOCK_V + tl.arange(0, BLOCK_V)
+        t_offsets = tl.arange(0, CHUNK_SIZE)
+        k_offsets = tl.arange(0, 64)
+        v_mask = v_offsets < V_DIM
+
+        chunk_index = head * total_chunks + chunk
+        key_chunk_index = key_head * total_chunks + chunk
+        q_base = key_chunk_index * CHUNK_SIZE * K_DIM
+        v_base = chunk_index * CHUNK_SIZE * V_DIM
+        g_base = chunk_index * CHUNK_SIZE
+        attn_base = key_chunk_index * CHUNK_SIZE * CHUNK_SIZE
+        decay_mask_base = chunk_index * CHUNK_SIZE * CHUNK_SIZE
+        h_base = chunk_index * K_DIM * V_DIM
+
+        q_offsets_0 = (
+            q_base
+            + t_offsets[:, None] * K_DIM
+            + k_offsets[None, :]
+        )
+        q_0 = tl.load(q_ptr + q_offsets_0)
+        q_1 = tl.load(q_ptr + q_offsets_0 + 64)
+        g = tl.load(g_ptr + g_base + t_offsets).to(tl.float32)
+        q_scale = tl.exp(g)
+        q_scaled_0 = (
+            q_0.to(tl.float32) * q_scale[:, None]
+        ).to(q_0.dtype)
+        q_scaled_1 = (
+            q_1.to(tl.float32) * q_scale[:, None]
+        ).to(q_1.dtype)
+
+        h_offsets_0 = (
+            h_base
+            + k_offsets[:, None] * V_DIM
+            + v_offsets[None, :]
+        )
+        h_0 = tl.load(
+            h_ptr + h_offsets_0,
+            mask=v_mask[None, :],
+            other=0.0,
+        )
+        h_1 = tl.load(
+            h_ptr + h_offsets_0 + 64 * V_DIM,
+            mask=v_mask[None, :],
+            other=0.0,
+        )
+        output = tl.dot(q_scaled_0, h_0)
+        output += tl.dot(q_scaled_1, h_1)
+
+        if DIRECT_QK:
+            k_base = key_chunk_index * CHUNK_SIZE * K_DIM
+            k_offsets_2d = (
+                k_base
+                + t_offsets[:, None] * K_DIM
+                + k_offsets[None, :]
+            )
+            k_0 = tl.load(k_ptr + k_offsets_2d)
+            k_1 = tl.load(k_ptr + k_offsets_2d + 64)
+            attn = tl.dot(q_0, tl.trans(k_0))
+            attn += tl.dot(q_1, tl.trans(k_1))
+            # Match the legacy materialized FP16 QK tensor exactly at the
+            # numerical boundary before applying the FP16 decay mask.
+            attn = attn.to(q_0.dtype)
+            decay_mask_offsets = (
+                decay_mask_base
+                + t_offsets[:, None] * CHUNK_SIZE
+                + t_offsets[None, :]
+            )
+            decay = tl.load(
+                decay_mask_ptr + decay_mask_offsets
+            )
+            causal_mask = (
+                t_offsets[None, :] <= t_offsets[:, None]
+            )
+            attn = tl.where(
+                causal_mask,
+                (attn * decay).to(v_new_ptr.dtype.element_ty),
+                0.0,
+            )
+        else:
+            attn_offsets = (
+                attn_base
+                + t_offsets[:, None] * CHUNK_SIZE
+                + t_offsets[None, :]
+            )
+            attn = tl.load(attn_ptr + attn_offsets)
+            if APPLY_DECAY_MASK:
+                decay_mask_offsets = (
+                    decay_mask_base
+                    + t_offsets[:, None] * CHUNK_SIZE
+                    + t_offsets[None, :]
+                )
+                decay_mask = tl.load(
+                    decay_mask_ptr + decay_mask_offsets
+                )
+                causal_mask = (
+                    t_offsets[None, :] <= t_offsets[:, None]
+                )
+                attn = tl.where(
+                    causal_mask,
+                    (attn * decay_mask).to(
+                        attn_ptr.dtype.element_ty
+                    ),
+                    0.0,
+                )
+        v_offsets_2d = (
+            v_base
+            + t_offsets[:, None] * V_DIM
+            + v_offsets[None, :]
+        )
+        v_new = tl.load(
+            v_new_ptr + v_offsets_2d,
+            mask=v_mask[None, :],
+            other=0.0,
+        )
+        output += tl.dot(attn, v_new)
+        token_base = tl.load(chunk_token_bases_ptr + chunk)
+        valid_tokens = tl.load(chunk_valid_tokens_ptr + chunk)
+        output_offsets = (
+            ((token_base + t_offsets[:, None]) * heads + head)
+            * V_DIM
+            + v_offsets[None, :]
+        )
+        output_mask = (
+            (t_offsets[:, None] < valid_tokens)
+            & v_mask[None, :]
+            & (token_base + t_offsets[:, None] < total_tokens)
+        )
+        tl.store(
+            output_ptr + output_offsets,
+            output.to(output_ptr.dtype.element_ty),
+            mask=output_mask,
+        )
+
+
+    @triton.jit
+    def fastllm_chunk_gdn_kkt_kernel(
+        k_beta_ptr,
+        k_ptr,
+        output_ptr,
+        total_chunks,
+        key_heads,
+        value_heads,
+        CHUNK_SIZE: tl.constexpr,
+        K_DIM: tl.constexpr,
+    ):
+        """Compute mapped (K * beta) @ K^T without repeating K heads."""
+        chunk = tl.program_id(0)
+        value_head = tl.program_id(1)
+        key_head = value_head * key_heads // value_heads
+        t_offsets = tl.arange(0, CHUNK_SIZE)
+        d_offsets = tl.arange(0, 64)
+        value_chunk = value_head * total_chunks + chunk
+        key_chunk = key_head * total_chunks + chunk
+        k_beta_base = value_chunk * CHUNK_SIZE * K_DIM
+        k_base = key_chunk * CHUNK_SIZE * K_DIM
+        output_base = value_chunk * CHUNK_SIZE * CHUNK_SIZE
+        k_beta_offsets = (
+            k_beta_base
+            + t_offsets[:, None] * K_DIM
+            + d_offsets[None, :]
+        )
+        k_offsets = (
+            k_base
+            + t_offsets[:, None] * K_DIM
+            + d_offsets[None, :]
+        )
+        k_beta_0 = tl.load(k_beta_ptr + k_beta_offsets)
+        k_beta_1 = tl.load(k_beta_ptr + k_beta_offsets + 64)
+        k_0 = tl.load(k_ptr + k_offsets)
+        k_1 = tl.load(k_ptr + k_offsets + 64)
+        output = tl.dot(k_beta_0, tl.trans(k_0))
+        output += tl.dot(k_beta_1, tl.trans(k_1))
+        output_offsets = (
+            output_base
+            + t_offsets[:, None] * CHUNK_SIZE
+            + t_offsets[None, :]
+        )
+        tl.store(
+            output_ptr + output_offsets,
+            output.to(output_ptr.dtype.element_ty),
+        )
+
+
+    @triton.jit
     def fastllm_chunk_gdn_postconv_kernel(
         q_input_ptr,
         k_input_ptr,
@@ -1986,11 +2363,19 @@ CHUNK_GDN_PREFILL_KERNEL_ORDER = (
     "h_precomputed_scale",
     "o_fused_decay_mask",
 )
+CHUNK_GDN_VARLEN_PREFILL_KERNEL_ORDER = (
+    "h",
+    "o",
+    "h_precomputed_scale",
+    "o_fused_decay_mask",
+    "o_direct_qk",
+)
 CHUNK_GDN_RECOMPUTE_KERNEL_ORDER = (
     "recompute",
     "recompute_precomputed_scale",
     "recompute_internal_exp",
     "recompute_precomputed_scale_internal_exp",
+    "kkt",
 )
 
 
@@ -2021,6 +2406,40 @@ def chunk_gdn_prefill_cache_paths(payload):
     cubins = {
         key: cache_dir / f"{name}_{key}.cubin"
         for key in CHUNK_GDN_PREFILL_KERNEL_ORDER
+    }
+    return cubins, cache_dir / f"{name}.json"
+
+
+def chunk_gdn_varlen_prefill_cache_paths(payload):
+    arch = require_int(payload, "arch")
+    dtype = require_dtype(payload, "dtype")
+    if dtype != "fp16":
+        raise ValueError("chunk_gdn_varlen_prefill currently requires fp16")
+    max_chunks = require_int(payload, "max_chunks")
+    chunk_size = require_int(payload, "chunk_size", 64)
+    k_dim = require_int(payload, "k_dim", 128)
+    v_dim = require_int(payload, "v_dim", 128)
+    h_block_v = require_int(payload, "h_block_v", 32)
+    o_block_v = require_int(payload, "o_block_v", 64)
+    num_warps = require_int(payload, "num_warps", 4)
+    h_num_stages = require_int(payload, "h_num_stages", 2)
+    o_num_stages = require_int(payload, "o_num_stages", 3)
+    if chunk_size != 64 or k_dim != 128 or v_dim != 128:
+        raise ValueError(
+            "chunk_gdn_varlen_prefill requires chunk_size=64, k_dim=128, v_dim=128"
+        )
+    if h_block_v not in {32, 64} or o_block_v not in {32, 64}:
+        raise ValueError("chunk_gdn_varlen_prefill block_v must be 32 or 64")
+    cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
+    name = (
+        f"chunk_gdn_varlen_prefill_v7_{dtype}_sm{arch}"
+        f"_mc{max_chunks}_t{chunk_size}_k{k_dim}_v{v_dim}"
+        f"_hbv{h_block_v}_obv{o_block_v}_nw{num_warps}"
+        f"_hns{h_num_stages}_ons{o_num_stages}"
+    )
+    cubins = {
+        key: cache_dir / f"{name}_{key}.cubin"
+        for key in CHUNK_GDN_VARLEN_PREFILL_KERNEL_ORDER
     }
     return cubins, cache_dir / f"{name}.json"
 
@@ -2070,7 +2489,7 @@ def chunk_gdn_recompute_cache_paths(payload):
         )
     cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
     name = (
-        f"chunk_gdn_recompute_v4_{dtype}_sm{arch}"
+        f"chunk_gdn_recompute_v7_{dtype}_sm{arch}"
         f"_t{chunk_size}_k{k_dim}_v{v_dim}_bd{block_d}"
         f"_nw{num_warps}_ns{num_stages}"
     )
@@ -2463,6 +2882,154 @@ def compile_chunk_gdn_prefill(payload):
     return meta
 
 
+def compile_chunk_gdn_varlen_prefill(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+
+    arch = require_int(payload, "arch")
+    dtype = require_dtype(payload, "dtype")
+    if dtype != "fp16":
+        raise ValueError("chunk_gdn_varlen_prefill currently requires fp16")
+    max_chunks = require_int(payload, "max_chunks")
+    chunk_size = require_int(payload, "chunk_size", 64)
+    k_dim = require_int(payload, "k_dim", 128)
+    v_dim = require_int(payload, "v_dim", 128)
+    h_block_v = require_int(payload, "h_block_v", 32)
+    o_block_v = require_int(payload, "o_block_v", 64)
+    num_warps = require_int(payload, "num_warps", 4)
+    h_num_stages = require_int(payload, "h_num_stages", 2)
+    o_num_stages = require_int(payload, "o_num_stages", 3)
+    cubin_paths, meta_path = chunk_gdn_varlen_prefill_cache_paths(payload)
+    if all(path.exists() for path in cubin_paths.values()) and meta_path.exists():
+        return json.loads(meta_path.read_text())
+
+    for path in cubin_paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    h_constexprs = {
+        "MAX_CHUNKS": max_chunks,
+        "CHUNK_SIZE": chunk_size,
+        "K_DIM": k_dim,
+        "V_DIM": v_dim,
+        "BLOCK_V": h_block_v,
+        "USE_PRECOMPUTED_SCALE": False,
+    }
+    h_precomputed_scale_constexprs = dict(h_constexprs)
+    h_precomputed_scale_constexprs["USE_PRECOMPUTED_SCALE"] = True
+    o_constexprs = {
+        "CHUNK_SIZE": chunk_size,
+        "K_DIM": k_dim,
+        "V_DIM": v_dim,
+        "BLOCK_V": o_block_v,
+        "APPLY_DECAY_MASK": False,
+        "DIRECT_QK": False,
+    }
+    o_fused_decay_mask_constexprs = dict(o_constexprs)
+    o_fused_decay_mask_constexprs["APPLY_DECAY_MASK"] = True
+    o_direct_qk_constexprs = dict(o_constexprs)
+    o_direct_qk_constexprs["DIRECT_QK"] = True
+    h_signature = {
+        "k_ptr": f"*{dtype}",
+        "v_ptr": f"*{dtype}",
+        "g_ptr": f"*{dtype}",
+        "k_cumdecay_ptr": f"*{dtype}",
+        "state_ptr": f"*{dtype}",
+        "next_state_ptr": f"*{dtype}",
+        "chunk_offsets_ptr": "*i32",
+        "h_ptr": f"*{dtype}",
+        "v_new_ptr": f"*{dtype}",
+        "row_scale_ptr": "*fp32",
+        "state_scale_ptr": "*fp32",
+        "total_chunks": "i32",
+        "key_heads": "i32",
+        "heads": "i32",
+        "MAX_CHUNKS": "constexpr",
+        "CHUNK_SIZE": "constexpr",
+        "K_DIM": "constexpr",
+        "V_DIM": "constexpr",
+        "BLOCK_V": "constexpr",
+        "USE_PRECOMPUTED_SCALE": "constexpr",
+    }
+    o_signature = {
+        "q_ptr": f"*{dtype}",
+        "k_ptr": f"*{dtype}",
+        "g_ptr": f"*{dtype}",
+        "attn_ptr": f"*{dtype}",
+        "decay_mask_ptr": f"*{dtype}",
+        "h_ptr": f"*{dtype}",
+        "v_new_ptr": f"*{dtype}",
+        "chunk_token_bases_ptr": "*i32",
+        "chunk_valid_tokens_ptr": "*i32",
+        "output_ptr": f"*{dtype}",
+        "total_chunks": "i32",
+        "total_tokens": "i32",
+        "key_heads": "i32",
+        "heads": "i32",
+        "CHUNK_SIZE": "constexpr",
+        "K_DIM": "constexpr",
+        "V_DIM": "constexpr",
+        "BLOCK_V": "constexpr",
+        "APPLY_DECAY_MASK": "constexpr",
+        "DIRECT_QK": "constexpr",
+    }
+    ccinfos = {
+        "h": _compile_cubin(
+            fastllm_chunk_gdn_varlen_prefill_h_kernel,
+            h_signature, h_constexprs, arch, num_warps,
+            h_num_stages, cubin_paths["h"],
+        ),
+        "o": _compile_cubin(
+            fastllm_chunk_gdn_varlen_prefill_o_kernel,
+            o_signature, o_constexprs, arch, num_warps,
+            o_num_stages, cubin_paths["o"],
+        ),
+        "h_precomputed_scale": _compile_cubin(
+            fastllm_chunk_gdn_varlen_prefill_h_kernel,
+            h_signature, h_precomputed_scale_constexprs,
+            arch, num_warps, h_num_stages,
+            cubin_paths["h_precomputed_scale"],
+        ),
+        "o_fused_decay_mask": _compile_cubin(
+            fastllm_chunk_gdn_varlen_prefill_o_kernel,
+            o_signature, o_fused_decay_mask_constexprs,
+            arch, num_warps, o_num_stages,
+            cubin_paths["o_fused_decay_mask"],
+        ),
+        "o_direct_qk": _compile_cubin(
+            fastllm_chunk_gdn_varlen_prefill_o_kernel,
+            o_signature, o_direct_qk_constexprs,
+            arch, num_warps, o_num_stages,
+            cubin_paths["o_direct_qk"],
+        ),
+    }
+    kernels = {
+        key: {
+            "cubin": str(cubin_paths[key]),
+            "kernel": ccinfos[key].metadata.name,
+            "shared": int(ccinfos[key].metadata.shared),
+            "num_warps": int(ccinfos[key].metadata.num_warps),
+        }
+        for key in CHUNK_GDN_VARLEN_PREFILL_KERNEL_ORDER
+    }
+    meta = {
+        "ok": True,
+        "op": "chunk_gdn_varlen_prefill",
+        "kernels": kernels,
+        "arch": arch,
+        "dtype": dtype,
+        "max_chunks": max_chunks,
+        "chunk_size": chunk_size,
+        "k_dim": k_dim,
+        "v_dim": v_dim,
+        "h_block_v": h_block_v,
+        "o_block_v": o_block_v,
+        "num_warps": num_warps,
+        "h_num_stages": h_num_stages,
+        "o_num_stages": o_num_stages,
+    }
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
 def compile_chunk_gdn_postconv(payload):
     if triton is None:
         raise RuntimeError(f"failed to import triton: {_triton_error}")
@@ -2602,6 +3169,20 @@ def compile_chunk_gdn_recompute(payload):
     precomputed_scale_internal_exp_constexprs = dict(constexprs)
     precomputed_scale_internal_exp_constexprs["WRITE_SCALE"] = True
     precomputed_scale_internal_exp_constexprs["COMPUTE_G_EXP"] = True
+    kkt_signature = {
+        "k_beta_ptr": f"*{dtype}",
+        "k_ptr": f"*{dtype}",
+        "output_ptr": f"*{dtype}",
+        "total_chunks": "i32",
+        "key_heads": "i32",
+        "value_heads": "i32",
+        "CHUNK_SIZE": "constexpr",
+        "K_DIM": "constexpr",
+    }
+    kkt_constexprs = {
+        "CHUNK_SIZE": chunk_size,
+        "K_DIM": k_dim,
+    }
     ccinfos = {
         "recompute": _compile_cubin(
             fastllm_chunk_gdn_recompute_kernel,
@@ -2640,6 +3221,15 @@ def compile_chunk_gdn_recompute(payload):
             cubin_paths[
                 "recompute_precomputed_scale_internal_exp"
             ],
+        ),
+        "kkt": _compile_cubin(
+            fastllm_chunk_gdn_kkt_kernel,
+            kkt_signature,
+            kkt_constexprs,
+            arch,
+            num_warps,
+            num_stages,
+            cubin_paths["kkt"],
         ),
     }
     kernels = {
@@ -3723,9 +4313,23 @@ def handle_compile(payload):
             return compile_linear(payload)
         if op == "chunk_gdn_prefill":
             return compile_chunk_gdn_prefill(payload)
+        if op in (
+            "chunk_gdn_varlen_prefill",
+            "chunk_gdn_varlen_prefill_v3",
+            "chunk_gdn_varlen_prefill_v4",
+            "chunk_gdn_varlen_prefill_v5",
+            "chunk_gdn_varlen_prefill_v6",
+            "chunk_gdn_varlen_prefill_v7",
+        ):
+            return compile_chunk_gdn_varlen_prefill(payload)
         if op == "chunk_gdn_postconv":
             return compile_chunk_gdn_postconv(payload)
-        if op == "chunk_gdn_recompute":
+        if op in (
+            "chunk_gdn_recompute",
+            "chunk_gdn_recompute_v5",
+            "chunk_gdn_recompute_v6",
+            "chunk_gdn_recompute_v7",
+        ):
             return compile_chunk_gdn_recompute(payload)
         if op == "linear_fp8_block128":
             return compile_linear_fp8_block128(payload)

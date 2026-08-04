@@ -33,6 +33,12 @@ extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
                                           int srcDevice, const void *src,
                                           size_t bytes);
 
+static bool FastllmCudaDataHasDenseStrides(const fastllm::Data &data);
+static bool FastllmCudaResolveDataDeviceId(const fastllm::Data &data,
+                                           int &device);
+static bool FastllmCudaDataCanShareDevice(const fastllm::Data &reference,
+                                          const fastllm::Data &other);
+
 #if defined(__linux__) || defined(__APPLE__)
 #include <execinfo.h>
 #endif
@@ -3265,6 +3271,162 @@ void FastllmQwen35GdnPostConvExactHalf128Kernel(
             if constexpr (WRITE_DEAD_OUTPUTS) {
                 betaOutput[outputRow] = betaValue;
             }
+        }
+    }
+}
+
+// Exact ragged counterpart of the uniform post-conv kernel.  Q/K remain in
+// their native key-head cardinality; value-head expansion is performed only
+// for beta-dependent K and V.  This preserves the legacy half rounding while
+// avoiding split, repeat, RMSNorm, and five independent pack launches.
+__global__ __launch_bounds__(32)
+void FastllmQwen35GdnPostConvRaggedExactHalf128Kernel(
+        const half *qkvInput, const float *weight,
+        const half *combinedBaInput, const float *aLog,
+        const float *dtBias, const int *chunkTokenBases,
+        const int *chunkValidTokens,
+        half *qOutput, half *kOutput, half *gOutput,
+        half *kBetaOutput, half *vBetaOutput,
+        int totalChunks, int baChannels, int baOffset,
+        int keyHeads, int valueHeads, float eps, float qScale) {
+    constexpr int CHANNELS = 128;
+    constexpr int CHUNK_SIZE = 64;
+    int rowHead = blockIdx.x;
+    int packedRow = rowHead / keyHeads;
+    int keyHead = rowHead - packedRow * keyHeads;
+    int chunk = packedRow / CHUNK_SIZE;
+    int tokenInChunk = packedRow - chunk * CHUNK_SIZE;
+    int lane = threadIdx.x;
+    int headGroup = valueHeads / keyHeads;
+    int validTokens = chunkValidTokens[chunk];
+    size_t keyOutputBase =
+        ((size_t)keyHead * totalChunks * CHUNK_SIZE + packedRow) * CHANNELS;
+    half2 *qOutput2 = reinterpret_cast<half2 *>(qOutput + keyOutputBase);
+    half2 *kOutput2 = reinterpret_cast<half2 *>(kOutput + keyOutputBase);
+
+    if (tokenInChunk >= validTokens) {
+        half2 zero2 = __float2half2_rn(0.0f);
+        qOutput2[lane] = zero2;
+        qOutput2[lane + 32] = zero2;
+        kOutput2[lane] = zero2;
+        kOutput2[lane + 32] = zero2;
+        for (int group = 0; group < headGroup; group++) {
+            int valueHead = keyHead * headGroup + group;
+            size_t valueRow =
+                (size_t)valueHead * totalChunks * CHUNK_SIZE + packedRow;
+            half2 *kBetaOutput2 = reinterpret_cast<half2 *>(
+                kBetaOutput + valueRow * CHANNELS);
+            half2 *vBetaOutput2 = reinterpret_cast<half2 *>(
+                vBetaOutput + valueRow * CHANNELS);
+            kBetaOutput2[lane] = zero2;
+            kBetaOutput2[lane + 32] = zero2;
+            vBetaOutput2[lane] = zero2;
+            vBetaOutput2[lane + 32] = zero2;
+            if (lane == 0) {
+                gOutput[valueRow] = __float2half(0.0f);
+            }
+        }
+        return;
+    }
+
+    int row = chunkTokenBases[chunk] + tokenInChunk;
+    size_t qkvStride =
+        (size_t)(keyHeads * 2 + valueHeads) * CHANNELS;
+    const half *qInput =
+        qkvInput + (size_t)row * qkvStride + keyHead * CHANNELS;
+    const half *kInput =
+        qkvInput + (size_t)row * qkvStride +
+        (keyHeads + keyHead) * CHANNELS;
+    const half2 *qInput2 = reinterpret_cast<const half2 *>(qInput);
+    const half2 *kInput2 = reinterpret_cast<const half2 *>(kInput);
+    float2 qValue0 = __half22float2(qInput2[lane]);
+    float2 qValue1 = __half22float2(qInput2[lane + 32]);
+    float2 kValue0 = __half22float2(kInput2[lane]);
+    float2 kValue1 = __half22float2(kInput2[lane + 32]);
+    float qSum0 = qValue0.x * qValue0.x + qValue0.y * qValue0.y;
+    float qSum1 = qValue1.x * qValue1.x + qValue1.y * qValue1.y;
+    float kSum0 = kValue0.x * kValue0.x + kValue0.y * kValue0.y;
+    float kSum1 = kValue1.x * kValue1.x + kValue1.y * kValue1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum0 += __shfl_down_sync(0xffffffffu, qSum0, offset);
+        qSum1 += __shfl_down_sync(0xffffffffu, qSum1, offset);
+        kSum0 += __shfl_down_sync(0xffffffffu, kSum0, offset);
+        kSum1 += __shfl_down_sync(0xffffffffu, kSum1, offset);
+    }
+    float qNormScale = 0.0f;
+    float kNormScale = 0.0f;
+    if (lane == 0) {
+        qNormScale = rsqrtf((qSum0 + qSum1) / CHANNELS + eps);
+        kNormScale = rsqrtf((kSum0 + kSum1) / CHANNELS + eps);
+    }
+    qNormScale = __shfl_sync(0xffffffffu, qNormScale, 0);
+    kNormScale = __shfl_sync(0xffffffffu, kNormScale, 0);
+
+    float weights[4] = {
+        __ldg(weight + lane * 2),
+        __ldg(weight + lane * 2 + 1),
+        __ldg(weight + (lane + 32) * 2),
+        __ldg(weight + (lane + 32) * 2 + 1)
+    };
+    half2 qNormalized0 = __floats2half2_rn(
+        qValue0.x * qNormScale * weights[0],
+        qValue0.y * qNormScale * weights[1]);
+    half2 qNormalized1 = __floats2half2_rn(
+        qValue1.x * qNormScale * weights[2],
+        qValue1.y * qNormScale * weights[3]);
+    half2 kNormalized0 = __floats2half2_rn(
+        kValue0.x * kNormScale * weights[0],
+        kValue0.y * kNormScale * weights[1]);
+    half2 kNormalized1 = __floats2half2_rn(
+        kValue1.x * kNormScale * weights[2],
+        kValue1.y * kNormScale * weights[3]);
+    float2 qNormalizedFloat0 = __half22float2(qNormalized0);
+    float2 qNormalizedFloat1 = __half22float2(qNormalized1);
+    qOutput2[lane] = __floats2half2_rn(
+        qNormalizedFloat0.x * qScale,
+        qNormalizedFloat0.y * qScale);
+    qOutput2[lane + 32] = __floats2half2_rn(
+        qNormalizedFloat1.x * qScale,
+        qNormalizedFloat1.y * qScale);
+    kOutput2[lane] = kNormalized0;
+    kOutput2[lane + 32] = kNormalized1;
+
+    const half *baRow = combinedBaInput + (size_t)row * baChannels;
+    for (int group = 0; group < headGroup; group++) {
+        int valueHead = keyHead * headGroup + group;
+        half betaRaw = baRow[baOffset + valueHead];
+#ifdef CUDA_NO_TENSOR_CORE
+        half betaValue = __float2half(
+            1.0f / (1.0f + expf(-__half2float(betaRaw))));
+#else
+        half betaValue = __hdiv(
+            __float2half(1.0f),
+            __hadd(__float2half(1.0f), hexp(-betaRaw)));
+#endif
+        half gateValue = __float2half(
+            -exp((double)aLog[valueHead]) *
+            softplus(__half2float(
+                baRow[baOffset + valueHeads + valueHead]) +
+                dtBias[valueHead]));
+        half2 beta2 = __halves2half2(betaValue, betaValue);
+        size_t valueRow =
+            (size_t)valueHead * totalChunks * CHUNK_SIZE + packedRow;
+        half2 *kBetaOutput2 = reinterpret_cast<half2 *>(
+            kBetaOutput + valueRow * CHANNELS);
+        half2 *vBetaOutput2 = reinterpret_cast<half2 *>(
+            vBetaOutput + valueRow * CHANNELS);
+        const half *vInput =
+            qkvInput + (size_t)row * qkvStride +
+            (keyHeads * 2 + valueHead) * CHANNELS;
+        const half2 *vInput2 = reinterpret_cast<const half2 *>(vInput);
+        kBetaOutput2[lane] = __hmul2(kNormalized0, beta2);
+        kBetaOutput2[lane + 32] = __hmul2(kNormalized1, beta2);
+        vBetaOutput2[lane] = __hmul2(vInput2[lane], beta2);
+        vBetaOutput2[lane + 32] =
+            __hmul2(vInput2[lane + 32], beta2);
+        if (lane == 0) {
+            gOutput[valueRow] = gateValue;
         }
     }
 }
@@ -6959,6 +7121,128 @@ bool FastllmCudaQwen35GdnPostConvExactFloat16(
         "Error: CUDA error in "
         "FastllmCudaQwen35GdnPostConvExactFloat16.",
         cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaQwen35GdnPostConvRaggedExactFloat16(
+        const fastllm::Data &qkvInput,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &combinedBaInput,
+        const fastllm::Data &aLog,
+        const fastllm::Data &dtBias,
+        int baOffset, const std::vector<int> &seqLens,
+        int chunkSize, int keyHeads, int valueHeads,
+        int kDim, int vDim, float normEps, float qScale,
+        fastllm::Data &q, fastllm::Data &k,
+        fastllm::Data &g, fastllm::Data &kBeta,
+        fastllm::Data &vBeta) {
+    auto isDenseCuda = [](const fastllm::Data &data) {
+        if (data.dataDevice != fastllm::DataDevice::CUDA ||
+            data.cudaData == nullptr || data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (seqLens.size() <= 1 || chunkSize != 64 ||
+        keyHeads <= 0 || valueHeads <= keyHeads ||
+        valueHeads % keyHeads != 0 || kDim != 128 || vDim != 128 ||
+        baOffset < 0 || !std::isfinite(normEps) || normEps < 0.0f ||
+        !std::isfinite(qScale) ||
+        qkvInput.dataType != fastllm::DataType::FLOAT16 ||
+        combinedBaInput.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        !isDenseCuda(qkvInput) || !isDenseCuda(combinedBaInput) ||
+        !isDenseCuda(normWeight) || !isDenseCuda(aLog) ||
+        !isDenseCuda(dtBias) ||
+        normWeight.Count(0) != (uint64_t)kDim ||
+        aLog.Count(0) != (uint64_t)valueHeads ||
+        dtBias.Count(0) != (uint64_t)valueHeads) {
+        return false;
+    }
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(
+            seqLens, chunkSize, metadata)) {
+        return false;
+    }
+    const int totalTokens = metadata.totalTokens;
+    const int totalChunks = metadata.totalChunks;
+    const int qkvChannels =
+        keyHeads * kDim * 2 + valueHeads * vDim;
+    const int baChannels = combinedBaInput.dims.back();
+    if (totalTokens <= 0 || totalChunks <= 0 ||
+        baOffset + valueHeads * 2 > baChannels ||
+        qkvInput.dims.back() != qkvChannels ||
+        qkvInput.Count(0) !=
+            (uint64_t)totalTokens * qkvChannels ||
+        combinedBaInput.Count(0) !=
+            (uint64_t)totalTokens * baChannels) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(qkvInput, device) ||
+        FastllmCudaGetDevice() != device ||
+        !FastllmCudaDataCanShareDevice(qkvInput, combinedBaInput) ||
+        !FastllmCudaDataCanShareDevice(qkvInput, normWeight) ||
+        !FastllmCudaDataCanShareDevice(qkvInput, aLog) ||
+        !FastllmCudaDataCanShareDevice(qkvInput, dtBias)) {
+        return false;
+    }
+    std::set<fastllm::Data*> outputs = {&q, &k, &g, &kBeta, &vBeta};
+    if (outputs.size() != 5) {
+        return false;
+    }
+    const int packedTokens = totalChunks * chunkSize;
+    auto prepareOutput = [&](fastllm::Data &output,
+                             const std::vector<int> &dims) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.Resize(dims);
+        output.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{device});
+        output.Allocate(false);
+        output.isKVCache = false;
+        output.isLinearAttention = false;
+        output.isLinearAttentionTransposed = false;
+        return output.cudaData != nullptr &&
+               FastllmCudaDataHasDenseStrides(output) &&
+               FastllmCudaDataCanShareDevice(qkvInput, output);
+    };
+    if (!prepareOutput(q, {1, keyHeads, packedTokens, kDim}) ||
+        !prepareOutput(k, {1, keyHeads, packedTokens, kDim}) ||
+        !prepareOutput(g, {1, valueHeads, packedTokens}) ||
+        !prepareOutput(kBeta, {1, valueHeads, packedTokens, kDim}) ||
+        !prepareOutput(vBeta, {1, valueHeads, packedTokens, vDim})) {
+        return false;
+    }
+
+    int rows = packedTokens * keyHeads;
+    FastllmQwen35GdnPostConvRaggedExactHalf128Kernel<<<rows, 32>>>(
+        (const half *)qkvInput.cudaData,
+        (const float *)normWeight.cudaData,
+        (const half *)combinedBaInput.cudaData,
+        (const float *)aLog.cudaData,
+        (const float *)dtBias.cudaData,
+        metadata.chunkTokenBases, metadata.chunkValidTokens,
+        (half *)q.cudaData, (half *)k.cudaData,
+        (half *)g.cudaData, (half *)kBeta.cudaData,
+        (half *)vBeta.cudaData, totalChunks, baChannels, baOffset,
+        keyHeads, valueHeads, normEps, qScale);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in ragged exact GDN post-conv.",
+            launchState);
+        return false;
+    }
     return true;
 }
 
@@ -10886,6 +11170,207 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
     return true;
 }
 
+__global__ void FastllmMappedGdnKktPointerKernel(
+        const half *input0, const half *input1, half *output,
+        const half **input0Pointers, const half **input1Pointers,
+        half **outputPointers, int totalChunks, int keyHeads,
+        int valueHeads, int matrixElements, int outputElements) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = valueHeads * totalChunks;
+    if (index >= count) {
+        return;
+    }
+    int valueHead = index / totalChunks;
+    int chunk = index - valueHead * totalChunks;
+    int keyHead = valueHead / (valueHeads / keyHeads);
+    input0Pointers[index] =
+        input0 + ((size_t)valueHead * totalChunks + chunk) * matrixElements;
+    input1Pointers[index] =
+        input1 + ((size_t)keyHead * totalChunks + chunk) * matrixElements;
+    outputPointers[index] =
+        output + ((size_t)valueHead * totalChunks + chunk) * outputElements;
+}
+
+static cublasStatus_t FastllmRunRepeatedHeadGdnKkt(
+        cublasHandle_t handle,
+        const half *input0, const half *input1, half *output,
+        int totalChunks, int keyHeads, int valueHeads,
+        int rows, int columns, int inner, float alpha) {
+    if (handle == nullptr || input0 == nullptr || input1 == nullptr ||
+        output == nullptr || totalChunks <= 0 || keyHeads <= 0 ||
+        valueHeads <= keyHeads || valueHeads % keyHeads != 0) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    const int headGroup = valueHeads / keyHeads;
+    const long long input0MatrixElements = (long long)rows * inner;
+    const long long input1MatrixElements = (long long)columns * inner;
+    const long long outputMatrixElements = (long long)rows * columns;
+    half hAlpha = __float2half(alpha);
+    half hBeta = __float2half(0.0f);
+    for (int valueHead = 0; valueHead < valueHeads; valueHead++) {
+        int keyHead = valueHead / headGroup;
+        cublasStatus_t status = cublasHgemmStridedBatched(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            columns, rows, inner, &hAlpha,
+            input1 + (long long)keyHead * totalChunks * input1MatrixElements,
+            inner, input1MatrixElements,
+            input0 + (long long)valueHead * totalChunks * input0MatrixElements,
+            inner, input0MatrixElements, &hBeta,
+            output + (long long)valueHead * totalChunks * outputMatrixElements,
+            columns, outputMatrixElements, totalChunks);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+bool FastllmCudaBatchMatMulTransBHeadMapped(
+        const fastllm::Data &input0, const fastllm::Data &input1,
+        fastllm::Data &output, int headGroup, float alpha) {
+    if (headGroup <= 1 || !std::isfinite(alpha) ||
+        input0.dataDevice != fastllm::DataDevice::CUDA ||
+        input1.dataDevice != fastllm::DataDevice::CUDA ||
+        input0.dataType != fastllm::DataType::FLOAT16 ||
+        input1.dataType != fastllm::DataType::FLOAT16 ||
+        input0.cudaData == nullptr || input1.cudaData == nullptr ||
+        input0.dims.size() != 5 || input1.dims.size() != 5 ||
+        input0.dims[0] != 1 || input1.dims[0] != 1 ||
+        input0.dims[1] != input1.dims[1] * headGroup ||
+        input0.dims[2] != input1.dims[2] ||
+        input0.dims[3] != input1.dims[3] ||
+        input0.dims[4] != input1.dims[4] ||
+        input0.dims[3] != 64 || input0.dims[4] != 128 ||
+        !FastllmCudaDataHasDenseStrides(input0) ||
+        !FastllmCudaDataHasDenseStrides(input1) ||
+        !FastllmCudaDataCanShareDevice(input0, input1)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(input0, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+    const int valueHeads = input0.dims[1];
+    const int keyHeads = input1.dims[1];
+    const int totalChunks = input0.dims[2];
+    const int rows = input0.dims[3];
+    const int inner = input0.dims[4];
+    const int columns = input1.dims[3];
+    const int batch = valueHeads * totalChunks;
+    if (batch <= 0) {
+        return false;
+    }
+    output.dataType = fastllm::DataType::FLOAT16;
+    output.Resize({1, valueHeads, totalChunks, rows, columns});
+    output.ToDevice(
+        fastllm::DataDevice::CUDA, std::vector<int>{device});
+    output.Allocate(false);
+    if (output.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(input0, output)) {
+        return false;
+    }
+
+    auto runRepeatedHeadFallback = [&](const char *reason,
+                                       int mappedStatus) -> bool {
+        static bool warned = false;
+        if (reason != nullptr && !warned) {
+            printf("FastLLM CUDA: mapped ragged GDN KKT %s (%d); "
+                   "falling back to strided repeated-head GEMMs.\n",
+                   reason, mappedStatus);
+            warned = true;
+        }
+        cublasStatus_t fallbackStatus = FastllmRunRepeatedHeadGdnKkt(
+            getFastllmCublasHandle(),
+            (const half *)input0.cudaData,
+            (const half *)input1.cudaData,
+            (half *)output.cudaData,
+            totalChunks, keyHeads, valueHeads,
+            rows, columns, inner, alpha);
+        if (fallbackStatus != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: repeated-head GDN KKT fallback failed (%d).\n",
+                   (int)fallbackStatus);
+            return false;
+        }
+        return true;
+    };
+
+    const char *pointerMode =
+        std::getenv("FASTLLM_CUDA_GDN_MAPPED_KKT_BATCHED_POINTERS");
+    bool useMappedPointers = pointerMode == nullptr || pointerMode[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_GDN_MAPPED_KKT_BATCHED_POINTERS");
+    if (!useMappedPointers) {
+        return runRepeatedHeadFallback(nullptr, 0);
+    }
+
+    struct PointerScratch {
+        void *data = nullptr;
+        size_t capacity = 0;
+        int device = -1;
+        ~PointerScratch() {
+            if (data == nullptr || device < 0) {
+                return;
+            }
+            int oldDevice = 0;
+            cudaGetDevice(&oldDevice);
+            cudaSetDevice(device);
+            FastllmCudaFree(data);
+            cudaSetDevice(oldDevice);
+        }
+    };
+    static thread_local PointerScratch scratch;
+    size_t pointerBytes = (size_t)batch * sizeof(half*);
+    size_t needBytes = pointerBytes * 3;
+    if (scratch.device != device || scratch.capacity < needBytes) {
+        if (scratch.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(scratch.data);
+        }
+        scratch.data = FastllmCudaMalloc(needBytes);
+        if (scratch.data == nullptr) {
+            scratch.capacity = 0;
+            scratch.device = -1;
+            return runRepeatedHeadFallback("pointer scratch allocation failed", 0);
+        }
+        scratch.capacity = needBytes;
+        scratch.device = device;
+    }
+    const half **input0Pointers = (const half **)scratch.data;
+    const half **input1Pointers = (const half **)(
+        (uint8_t*)scratch.data + pointerBytes);
+    half **outputPointers = (half **)(
+        (uint8_t*)scratch.data + pointerBytes * 2);
+    int threads = 256;
+    FastllmMappedGdnKktPointerKernel<<<
+        (batch + threads - 1) / threads, threads>>>(
+        (const half *)input0.cudaData,
+        (const half *)input1.cudaData,
+        (half *)output.cudaData,
+        input0Pointers, input1Pointers, outputPointers,
+        totalChunks, keyHeads, valueHeads, rows * inner,
+        rows * columns);
+    cudaError_t pointerState = cudaGetLastError();
+    if (pointerState != cudaSuccess) {
+        return runRepeatedHeadFallback(
+            "pointer setup failed", (int)pointerState);
+    }
+
+    half hAlpha = __float2half(alpha);
+    half hBeta = __float2half(0.0f);
+    cublasStatus_t status = cublasHgemmBatched(
+        getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        columns, rows, inner, &hAlpha,
+        input1Pointers, inner,
+        input0Pointers, inner, &hBeta,
+        outputPointers, columns, batch);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return runRepeatedHeadFallback("batched GEMM failed", (int)status);
+    }
+    return true;
+}
+
 bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
                                   int input0Spatial, int input1Spatial, int outputSpatial,
                                   int input0Stride, int input1Stride,
@@ -13590,16 +14075,18 @@ static void **FastllmCudaStagePointers(const std::vector<void*> &pointers) {
     return (void**)scratch.data;
 }
 
-// Ragged prefill metadata is tiny and reused by every linear-attention layer.
-// Keep a per-worker staging allocation for the same reason as cache pointers:
-// cudaMalloc/cudaFree here would serialize the TP worker on every layer.
-static int *FastllmCudaStageInts(const std::vector<int> &values) {
-    struct IntScratch {
-        void *data = nullptr;
+bool FastllmCudaGetRaggedGdnMetadata(
+        const std::vector<int> &seqLens, int chunkSize,
+        FastllmCudaRaggedGdnMetadataView &view) {
+    struct RaggedMetadataCache {
+        int *data = nullptr;
         size_t capacity = 0;
         int device = -1;
+        int chunkSize = 0;
+        std::vector<int> seqLens;
+        FastllmCudaRaggedGdnMetadataView view;
 
-        ~IntScratch() {
+        ~RaggedMetadataCache() {
             if (data == nullptr || device < 0) {
                 return;
             }
@@ -13610,26 +14097,97 @@ static int *FastllmCudaStageInts(const std::vector<int> &values) {
             cudaSetDevice(oldDevice);
         }
     };
-    static thread_local IntScratch scratch;
-    if (values.empty()) {
-        return nullptr;
+    static thread_local RaggedMetadataCache cache;
+    view = FastllmCudaRaggedGdnMetadataView();
+    if (seqLens.empty() || chunkSize <= 0) {
+        return false;
     }
     int device = FastllmCudaGetDevice();
-    size_t bytes = values.size() * sizeof(int);
-    if (scratch.device != device || scratch.capacity < bytes) {
-        if (scratch.data != nullptr) {
-            FastllmCudaSyncCurrentThreadStream();
-            FastllmCudaFree(scratch.data);
-        }
-        scratch.data = FastllmCudaMalloc(bytes);
-        scratch.capacity = bytes;
-        scratch.device = device;
+    if (cache.data != nullptr && cache.device == device &&
+        cache.chunkSize == chunkSize && cache.seqLens == seqLens) {
+        view = cache.view;
+        return true;
     }
-    checkCudaErrors(
-        "Error: CUDA error when staging ragged sequence offsets.",
-        cudaMemcpyAsync(scratch.data, values.data(), bytes,
-                        cudaMemcpyHostToDevice, cudaStreamPerThread));
-    return (int*)scratch.data;
+
+    const int batch = (int)seqLens.size();
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    std::vector<int> chunkOffsets(batch + 1, 0);
+    int maxChunks = 0;
+    int maxPaddedTokens = 0;
+    for (int request = 0; request < batch; request++) {
+        const int len = seqLens[request];
+        if (len <= 0 || tokenOffsets[request] >
+                std::numeric_limits<int>::max() - len) {
+            return false;
+        }
+        const int chunks = (len + chunkSize - 1) / chunkSize;
+        if (chunkOffsets[request] >
+                std::numeric_limits<int>::max() - chunks) {
+            return false;
+        }
+        tokenOffsets[request + 1] = tokenOffsets[request] + len;
+        chunkOffsets[request + 1] = chunkOffsets[request] + chunks;
+        maxChunks = std::max(maxChunks, chunks);
+        maxPaddedTokens = std::max(maxPaddedTokens, chunks * chunkSize);
+    }
+    const int totalChunks = chunkOffsets.back();
+    std::vector<int> metadata;
+    metadata.reserve((batch + 1) * 2 + totalChunks * 2);
+    metadata.insert(metadata.end(), tokenOffsets.begin(), tokenOffsets.end());
+    metadata.insert(metadata.end(), chunkOffsets.begin(), chunkOffsets.end());
+    for (int request = 0; request < batch; request++) {
+        int token = tokenOffsets[request];
+        for (int chunk = chunkOffsets[request];
+             chunk < chunkOffsets[request + 1]; chunk++) {
+            metadata.push_back(token);
+            token += chunkSize;
+        }
+    }
+    for (int request = 0; request < batch; request++) {
+        int remaining = seqLens[request];
+        for (int chunk = chunkOffsets[request];
+             chunk < chunkOffsets[request + 1]; chunk++) {
+            metadata.push_back(std::min(chunkSize, remaining));
+            remaining -= chunkSize;
+        }
+    }
+
+    const size_t bytes = metadata.size() * sizeof(int);
+    if (cache.device != device || cache.capacity < bytes) {
+        if (cache.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(cache.data);
+        }
+        cache.data = (int*)FastllmCudaMalloc(bytes);
+        if (cache.data == nullptr) {
+            cache = RaggedMetadataCache();
+            return false;
+        }
+        cache.capacity = bytes;
+        cache.device = device;
+    }
+    cudaError_t copyState = cudaMemcpyAsync(
+        cache.data, metadata.data(), bytes, cudaMemcpyHostToDevice,
+        cudaStreamPerThread);
+    if (copyState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error caching ragged GDN metadata.", copyState);
+        return false;
+    }
+    cache.chunkSize = chunkSize;
+    cache.seqLens = seqLens;
+    cache.view.tokenOffsets = cache.data;
+    cache.view.chunkOffsets = cache.data + batch + 1;
+    cache.view.chunkTokenBases = cache.data + (batch + 1) * 2;
+    cache.view.chunkValidTokens =
+        cache.view.chunkTokenBases + totalChunks;
+    cache.view.batch = batch;
+    cache.view.totalTokens = tokenOffsets.back();
+    cache.view.totalChunks = totalChunks;
+    cache.view.maxChunks = maxChunks;
+    cache.view.maxPaddedTokens = maxPaddedTokens;
+    view = cache.view;
+    return true;
 }
 
 // 处理最多6个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
@@ -14050,6 +14608,66 @@ __global__ void FastllmUnpackRaggedGdnHalfKernel(
         (((size_t)batchIndex * heads + head) * paddedSeqLen + token) * dim + d;
     size_t outputIndex =
         (((size_t)begin + token) * heads + head) * dim + d;
+    output[outputIndex] = input[inputIndex];
+}
+
+__global__ void FastllmPackRaggedGdnChunksHalfKernel(
+    const half *input, const int *tokenOffsets, const int *chunkOffsets,
+    half *output, int totalChunks, int heads, int dim, int chunkSize,
+    float scale) {
+    int batchIndex = blockIdx.y;
+    int tokenBegin = tokenOffsets[batchIndex];
+    int numTokens = tokenOffsets[batchIndex + 1] - tokenBegin;
+    int chunkBegin = chunkOffsets[batchIndex];
+    int paddedTokens =
+        (chunkOffsets[batchIndex + 1] - chunkBegin) * chunkSize;
+    size_t localIndex = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t requestElements = (size_t)heads * paddedTokens * dim;
+    if (localIndex >= requestElements) {
+        return;
+    }
+
+    int d = localIndex % dim;
+    size_t row = localIndex / dim;
+    int token = row % paddedTokens;
+    int head = row / paddedTokens;
+    half value = __float2half(0.0f);
+    if (token < numTokens) {
+        size_t inputIndex =
+            (((size_t)tokenBegin + token) * heads + head) * dim + d;
+        value = input[inputIndex];
+        if (scale != 1.0f) {
+            value = __float2half_rn(__half2float(value) * scale);
+        }
+    }
+    size_t packedToken = (size_t)chunkBegin * chunkSize + token;
+    size_t outputIndex =
+        ((size_t)head * totalChunks * chunkSize + packedToken) * dim + d;
+    output[outputIndex] = value;
+}
+
+__global__ void FastllmUnpackRaggedGdnChunksHalfKernel(
+    const half *input, const int *tokenOffsets, const int *chunkOffsets,
+    half *output, int totalChunks, int heads, int dim, int chunkSize) {
+    int batchIndex = blockIdx.y;
+    int tokenBegin = tokenOffsets[batchIndex];
+    int numTokens = tokenOffsets[batchIndex + 1] - tokenBegin;
+    int chunkBegin = chunkOffsets[batchIndex];
+    size_t localIndex = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t requestElements = (size_t)numTokens * heads * dim;
+    if (localIndex >= requestElements) {
+        return;
+    }
+
+    int d = localIndex % dim;
+    size_t row = localIndex / dim;
+    int head = row % heads;
+    int token = row / heads;
+    size_t packedToken = (size_t)chunkBegin * chunkSize + token;
+    size_t inputIndex =
+        ((size_t)head * totalChunks * chunkSize + packedToken) * dim + d;
+    size_t outputIndex =
+        (((size_t)tokenBegin + token) * heads + head) * dim + d;
     output[outputIndex] = input[inputIndex];
 }
 
@@ -14730,7 +15348,12 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluRaggedPrefillFloat16BatchPointers
     }
 
     void **devicePointers = FastllmCudaStagePointers(pointers);
-    int *deviceOffsets = FastllmCudaStageInts(tokenOffsets);
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(seqLens, 64, metadata) ||
+        metadata.totalTokens != tokenOffsets.back()) {
+        return false;
+    }
+    const int *deviceOffsets = metadata.tokenOffsets;
     int threads = 256;
     int elementBlocks = (int)(((size_t)maxSeqLen * channels + threads - 1) /
                               threads);
@@ -14845,7 +15468,12 @@ bool FastllmCudaPackRaggedGdnPrefillFloat16(
         return false;
     }
 
-    int *deviceOffsets = FastllmCudaStageInts(tokenOffsets);
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(seqLens, 64, metadata) ||
+        metadata.totalTokens != tokenOffsets.back()) {
+        return false;
+    }
+    const int *deviceOffsets = metadata.tokenOffsets;
     int threads = 256;
     auto launchPack = [&](const fastllm::Data &input,
                           fastllm::Data &output, int dim, float scale) {
@@ -14912,7 +15540,12 @@ bool FastllmCudaUnpackRaggedGdnPrefillFloat16(
         return false;
     }
 
-    int *deviceOffsets = FastllmCudaStageInts(tokenOffsets);
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(seqLens, 64, metadata) ||
+        metadata.totalTokens != tokenOffsets.back()) {
+        return false;
+    }
+    const int *deviceOffsets = metadata.tokenOffsets;
     int threads = 256;
     int blocks = (int)(((size_t)maxSeqLen * heads * dim + threads - 1) /
                        threads);
@@ -14923,6 +15556,217 @@ bool FastllmCudaUnpackRaggedGdnPrefillFloat16(
     if (launchState != cudaSuccess) {
         checkCudaErrors(
             "Error: CUDA error when unpacking ragged GDN prefill.",
+            launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+    const fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &b,
+    const fastllm::Data &g, const std::vector<int> &seqLens,
+    int chunkSize, float qScale,
+    fastllm::Data &qPacked, fastllm::Data &kPacked,
+    fastllm::Data &vPacked, fastllm::Data &bPacked,
+    fastllm::Data &gPacked) {
+    std::set<const fastllm::Data*> inputs = {&q, &k, &v, &b, &g};
+    if (seqLens.empty() || chunkSize <= 0 || inputs.size() != 5 ||
+        q.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::FLOAT16 ||
+        k.dataType != fastllm::DataType::FLOAT16 ||
+        v.dataType != fastllm::DataType::FLOAT16 ||
+        b.dataType != fastllm::DataType::FLOAT16 ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        q.dims.size() != 4 || q.dims[0] != 1 || k.dims != q.dims ||
+        v.dims.size() != 4 || v.dims[0] != 1 ||
+        b.dims.size() != 3 || b.dims[0] != 1 || g.dims != b.dims ||
+        v.dims[1] != q.dims[1] || b.dims[1] != q.dims[1] ||
+        v.dims[2] != q.dims[2] || b.dims[2] != q.dims[2] ||
+        q.cudaData == nullptr || k.cudaData == nullptr ||
+        v.cudaData == nullptr || b.cudaData == nullptr || g.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(q) ||
+        !FastllmCudaDataHasDenseStrides(k) ||
+        !FastllmCudaDataHasDenseStrides(v) ||
+        !FastllmCudaDataHasDenseStrides(b) ||
+        !FastllmCudaDataHasDenseStrides(g) ||
+        !FastllmCudaDataCanShareDevice(q, k) ||
+        !FastllmCudaDataCanShareDevice(q, v) ||
+        !FastllmCudaDataCanShareDevice(q, b) ||
+        !FastllmCudaDataCanShareDevice(q, g)) {
+        return false;
+    }
+    std::set<fastllm::Data*> outputs = {
+        &qPacked, &kPacked, &vPacked, &bPacked, &gPacked
+    };
+    if (outputs.size() != 5) {
+        return false;
+    }
+    for (fastllm::Data *output : outputs) {
+        if (inputs.count(output) != 0 || output->isFake ||
+            output->cudaDataBorrowed || output->isPagedKVCache ||
+            output->multiDeviceData) {
+            return false;
+        }
+    }
+
+    int batch = (int)seqLens.size();
+    int maxPaddedTokens = 0;
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    std::vector<int> chunkOffsets(batch + 1, 0);
+    for (int request = 0; request < batch; request++) {
+        int len = seqLens[request];
+        if (len <= 0) {
+            return false;
+        }
+        int chunks = (len + chunkSize - 1) / chunkSize;
+        tokenOffsets[request + 1] = tokenOffsets[request] + len;
+        chunkOffsets[request + 1] = chunkOffsets[request] + chunks;
+        maxPaddedTokens = std::max(maxPaddedTokens, chunks * chunkSize);
+    }
+    int totalTokens = tokenOffsets.back();
+    int totalChunks = chunkOffsets.back();
+    if (totalTokens != q.dims[1] || totalChunks <= 0) {
+        return false;
+    }
+
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(q, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+    int heads = q.dims[2];
+    int packedTokens = totalChunks * chunkSize;
+    auto prepareOutput = [&](fastllm::Data &output,
+                             const std::vector<int> &dims) -> bool {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.Resize(dims);
+        output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
+        output.Allocate(false);
+        output.isKVCache = false;
+        output.isLinearAttention = false;
+        output.isLinearAttentionTransposed = false;
+        return output.cudaData != nullptr &&
+               FastllmCudaDataHasDenseStrides(output) &&
+               FastllmCudaDataCanShareDevice(q, output);
+    };
+    if (!prepareOutput(qPacked, {1, heads, packedTokens, q.dims[3]}) ||
+        !prepareOutput(kPacked, {1, heads, packedTokens, k.dims[3]}) ||
+        !prepareOutput(vPacked, {1, heads, packedTokens, v.dims[3]}) ||
+        !prepareOutput(bPacked, {1, heads, packedTokens}) ||
+        !prepareOutput(gPacked, {1, heads, packedTokens})) {
+        return false;
+    }
+
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(
+            seqLens, chunkSize, metadata) ||
+        metadata.totalTokens != totalTokens ||
+        metadata.totalChunks != totalChunks) {
+        return false;
+    }
+    const int *deviceTokenOffsets = metadata.tokenOffsets;
+    const int *deviceChunkOffsets = metadata.chunkOffsets;
+    int threads = 256;
+    auto launchPack = [&](const fastllm::Data &input,
+                          fastllm::Data &output, int dim, float scale) {
+        size_t requestElements = (size_t)heads * maxPaddedTokens * dim;
+        int blocks = (int)((requestElements + threads - 1) / threads);
+        FastllmPackRaggedGdnChunksHalfKernel
+            <<<dim3(blocks, batch), threads>>>(
+                (const half*)input.cudaData, deviceTokenOffsets,
+                deviceChunkOffsets, (half*)output.cudaData,
+                totalChunks, heads, dim, chunkSize, scale);
+    };
+    launchPack(q, qPacked, q.dims[3], qScale);
+    launchPack(k, kPacked, k.dims[3], 1.0f);
+    launchPack(v, vPacked, v.dims[3], 1.0f);
+    launchPack(b, bPacked, 1, 1.0f);
+    launchPack(g, gPacked, 1, 1.0f);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error when packing chunk-major ragged GDN prefill.",
+            launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaUnpackRaggedGdnPrefillChunksFloat16(
+    const fastllm::Data &packed, const std::vector<int> &seqLens,
+    int chunkSize, fastllm::Data &ragged) {
+    if (seqLens.empty() || chunkSize <= 0 ||
+        packed.dataDevice != fastllm::DataDevice::CUDA ||
+        packed.dataType != fastllm::DataType::FLOAT16 ||
+        packed.dims.size() != 4 || packed.dims[0] != 1 ||
+        packed.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(packed) ||
+        ragged.isFake || ragged.cudaDataBorrowed ||
+        ragged.isPagedKVCache || ragged.multiDeviceData ||
+        &ragged == &packed) {
+        return false;
+    }
+    int batch = (int)seqLens.size();
+    int maxSeqLen = 0;
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    std::vector<int> chunkOffsets(batch + 1, 0);
+    for (int request = 0; request < batch; request++) {
+        int len = seqLens[request];
+        if (len <= 0) {
+            return false;
+        }
+        tokenOffsets[request + 1] = tokenOffsets[request] + len;
+        chunkOffsets[request + 1] =
+            chunkOffsets[request] + (len + chunkSize - 1) / chunkSize;
+        maxSeqLen = std::max(maxSeqLen, len);
+    }
+    int totalChunks = chunkOffsets.back();
+    if (packed.dims[2] != totalChunks * chunkSize) {
+        return false;
+    }
+    int heads = packed.dims[1];
+    int dim = packed.dims[3];
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(packed, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    ragged.dataType = fastllm::DataType::FLOAT16;
+    ragged.Resize({1, tokenOffsets.back(), heads, dim});
+    ragged.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
+    ragged.Allocate(false);
+    ragged.isKVCache = false;
+    ragged.isLinearAttention = false;
+    ragged.isLinearAttentionTransposed = false;
+    if (ragged.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(ragged) ||
+        !FastllmCudaDataCanShareDevice(packed, ragged)) {
+        return false;
+    }
+
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(
+            seqLens, chunkSize, metadata) ||
+        metadata.totalTokens != tokenOffsets.back() ||
+        metadata.totalChunks != totalChunks) {
+        return false;
+    }
+    const int *deviceTokenOffsets = metadata.tokenOffsets;
+    const int *deviceChunkOffsets = metadata.chunkOffsets;
+    int threads = 256;
+    int blocks = (int)(((size_t)maxSeqLen * heads * dim + threads - 1) /
+                       threads);
+    FastllmUnpackRaggedGdnChunksHalfKernel
+        <<<dim3(blocks, batch), threads>>>(
+            (const half*)packed.cudaData, deviceTokenOffsets,
+            deviceChunkOffsets, (half*)ragged.cudaData,
+            totalChunks, heads, dim, chunkSize);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error when unpacking chunk-major ragged GDN prefill.",
             launchState);
         return false;
     }
@@ -17814,6 +18658,480 @@ __global__ void FastllmChunkGatedDeltaRulePrefillOKernel(
             outChunk[t * vdim + lane] = FastllmCudaFloatToValue<T>(sum);
         }
     }
+}
+
+template <typename T, int BV, int BK>
+__global__ void FastllmChunkGatedDeltaRuleVarlenPrefillHKernel(
+    const T *k, const T *v, const T *g, const T *k_cumdecay,
+    const T *last_recurrent_state, T *next_recurrent_state,
+    const int *chunk_offsets, T *h_states, T *v_new_store,
+    int key_heads, int heads, int total_chunks,
+    int chunk_size, int kdim, int vdim) {
+    int vTile = blockIdx.x;
+    int bh = blockIdx.y;
+    int b = bh / heads, h = bh % heads;
+    int keyHead = h * key_heads / heads;
+    int vStart = vTile * BV;
+    if (h >= heads || vStart >= vdim) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    extern __shared__ float shared_mem[];
+    float *stateTile = shared_mem;                         // [kdim, BV]
+    float *vNewTile = stateTile + kdim * BV;              // [chunk_size, BV]
+    float *tempTile = vNewTile + chunk_size * BV;         // [chunk_size, BK]
+    float *gScale = tempTile + chunk_size * BK;           // [chunk_size]
+
+    const size_t chunkStrideK = (size_t)chunk_size * kdim;
+    const size_t chunkStrideV = (size_t)chunk_size * vdim;
+    const size_t chunkStrideG = (size_t)chunk_size;
+    const size_t headBaseK =
+        (size_t)keyHead * total_chunks * chunkStrideK;
+    const size_t headBaseKCum =
+        (size_t)h * total_chunks * chunkStrideK;
+    const size_t headBaseV = (size_t)h * total_chunks * chunkStrideV;
+    const size_t headBaseG = (size_t)h * total_chunks * chunkStrideG;
+    const size_t stateBase = (size_t)bh * kdim * vdim;
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        stateTile[idx] = vcol < vdim
+            ? FastllmCudaValueToFloat(
+                  last_recurrent_state[stateBase + (size_t)kd * vdim + vcol])
+            : 0.0f;
+    }
+    __syncthreads();
+
+    int chunkBegin = chunk_offsets[b];
+    int chunkEnd = chunk_offsets[b + 1];
+    for (int ci = chunkBegin; ci < chunkEnd; ci++) {
+        const T *kChunk = k + (size_t)ci * chunkStrideK + headBaseK;
+        const T *vChunk = v + (size_t)ci * chunkStrideV + headBaseV;
+        const T *gChunk = g + (size_t)ci * chunkStrideG + headBaseG;
+        const T *kCumChunk =
+            k_cumdecay + (size_t)ci * chunkStrideK + headBaseKCum;
+        T *hChunk = h_states +
+            ((size_t)h * total_chunks + ci) * kdim * vdim + vStart;
+        T *vNewChunk = v_new_store +
+            ((size_t)h * total_chunks + ci) * chunkStrideV + vStart;
+
+        for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+            int kd = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            if (vcol < vdim) {
+                hChunk[(size_t)kd * vdim + vo] =
+                    FastllmCudaFloatToValue<T>(stateTile[idx]);
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+            int t = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            vNewTile[idx] = vcol < vdim
+                ? FastllmCudaValueToFloat(vChunk[t * vdim + vcol])
+                : 0.0f;
+        }
+        __syncthreads();
+
+        for (int ks = 0; ks < kdim; ks += BK) {
+            int curBK = min(BK, kdim - ks);
+            for (int idx = tid; idx < chunk_size * curBK;
+                 idx += blockDim.x) {
+                int t = idx / curBK;
+                int kk = idx % curBK;
+                tempTile[t * BK + kk] = FastllmCudaValueToFloat(
+                    kCumChunk[t * kdim + ks + kk]);
+            }
+            __syncthreads();
+            for (int idx = tid; idx < chunk_size * BV;
+                 idx += blockDim.x) {
+                int t = idx / BV;
+                int vo = idx % BV;
+                float sum = 0.0f;
+#pragma unroll
+                for (int kk = 0; kk < BK; kk++) {
+                    if (kk < curBK) {
+                        sum += tempTile[t * BK + kk] *
+                               stateTile[(ks + kk) * BV + vo];
+                    }
+                }
+                vNewTile[idx] -= sum;
+            }
+            __syncthreads();
+        }
+
+        float gLast =
+            FastllmCudaValueToFloat(gChunk[chunk_size - 1]);
+        float gLastExp = expf(gLast);
+        for (int idx = tid; idx < chunk_size; idx += blockDim.x) {
+            gScale[idx] =
+                expf(gLast - FastllmCudaValueToFloat(gChunk[idx]));
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+            int t = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            if (vcol < vdim) {
+                vNewChunk[t * vdim + vo] =
+                    FastllmCudaFloatToValue<T>(vNewTile[idx]);
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+            stateTile[idx] *= gLastExp;
+        }
+        __syncthreads();
+
+        for (int ks = 0; ks < kdim; ks += BK) {
+            int curBK = min(BK, kdim - ks);
+            for (int idx = tid; idx < chunk_size * curBK;
+                 idx += blockDim.x) {
+                int t = idx / curBK;
+                int kk = idx % curBK;
+                tempTile[t * BK + kk] =
+                    FastllmCudaValueToFloat(
+                        kChunk[t * kdim + ks + kk]) * gScale[t];
+            }
+            __syncthreads();
+            for (int idx = tid; idx < curBK * BV; idx += blockDim.x) {
+                int kk = idx / BV;
+                int vo = idx % BV;
+                float update = 0.0f;
+#pragma unroll
+                for (int t = 0; t < chunk_size; t++) {
+                    update += tempTile[t * BK + kk] *
+                              vNewTile[t * BV + vo];
+                }
+                stateTile[(ks + kk) * BV + vo] += update;
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        if (vcol < vdim) {
+            next_recurrent_state[stateBase + (size_t)kd * vdim + vcol] =
+                FastllmCudaFloatToValue<T>(stateTile[idx]);
+        }
+    }
+}
+
+template <typename T, int BV>
+__global__ void FastllmChunkGatedDeltaRuleVarlenPrefillOKernel(
+    const T *q, const T *g, const T *attn, const T *decay_mask,
+    const T *h_states, const T *v_new_store, T *core_attn_out,
+    const int *chunk_token_bases, const int *chunk_valid_tokens,
+    int total_tokens, int key_heads, int heads, int total_chunks,
+    int chunk_size, int kdim, int vdim, bool apply_decay_mask) {
+    int vTile = blockIdx.x;
+    int ci = blockIdx.y;
+    int h = blockIdx.z;
+    int keyHead = h * key_heads / heads;
+    int vStart = vTile * BV;
+    if (h >= heads || ci >= total_chunks || vStart >= vdim) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int warpCount = (blockDim.x + 31) >> 5;
+    const unsigned int warpMask = 0xffffffffu;
+    extern __shared__ float shared_mem[];
+    float *hTile = shared_mem;                            // [kdim, BV]
+    float *vNewTile = hTile + kdim * BV;                 // [chunk_size, BV]
+
+    const size_t chunkStrideQ = (size_t)chunk_size * kdim;
+    const size_t chunkStrideV = (size_t)chunk_size * vdim;
+    const size_t chunkStrideG = (size_t)chunk_size;
+    const size_t chunkStrideAttn = (size_t)chunk_size * chunk_size;
+    const size_t headBaseQ =
+        (size_t)keyHead * total_chunks * chunkStrideQ;
+    const size_t headBaseG = (size_t)h * total_chunks * chunkStrideG;
+    const size_t headBaseAttn =
+        (size_t)keyHead * total_chunks * chunkStrideAttn;
+    const size_t headBaseDecay =
+        (size_t)h * total_chunks * chunkStrideAttn;
+    const T *qChunk = q + (size_t)ci * chunkStrideQ + headBaseQ;
+    const T *gChunk = g + (size_t)ci * chunkStrideG + headBaseG;
+    const T *attnChunk =
+        attn + (size_t)ci * chunkStrideAttn + headBaseAttn;
+    const T *decayChunk = apply_decay_mask
+        ? decay_mask + (size_t)ci * chunkStrideAttn + headBaseDecay
+        : nullptr;
+    const T *hChunk = h_states +
+        ((size_t)h * total_chunks + ci) * kdim * vdim + vStart;
+    const T *vNewChunk = v_new_store +
+        ((size_t)h * total_chunks + ci) * chunkStrideV + vStart;
+    int tokenBase = chunk_token_bases[ci];
+    int validTokens = chunk_valid_tokens[ci];
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        hTile[idx] = vcol < vdim
+            ? FastllmCudaValueToFloat(hChunk[(size_t)kd * vdim + vo])
+            : 0.0f;
+    }
+    for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+        int t = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        vNewTile[idx] = vcol < vdim
+            ? FastllmCudaValueToFloat(vNewChunk[t * vdim + vo])
+            : 0.0f;
+    }
+    __syncthreads();
+
+    for (int t = warp; t < validTokens; t += warpCount) {
+        int vcol = vStart + lane;
+        if (vcol < vdim) {
+            float gExp = 0.0f;
+            if (lane == 0) {
+                gExp = expf(FastllmCudaValueToFloat(gChunk[t]));
+            }
+            gExp = __shfl_sync(warpMask, gExp, 0);
+            float sum = 0.0f;
+            for (int kd = 0; kd < kdim; kd++) {
+                float qValue = 0.0f;
+                if (lane == 0) {
+                    qValue =
+                        FastllmCudaValueToFloat(qChunk[t * kdim + kd]);
+                }
+                qValue = __shfl_sync(warpMask, qValue, 0);
+                sum += qValue * hTile[(size_t)kd * BV + lane];
+            }
+            sum *= gExp;
+            const T *attnRow = attnChunk + (size_t)t * chunk_size;
+            for (int j = 0; j < chunk_size; j++) {
+                float attnValue = 0.0f;
+                if (lane == 0) {
+                    attnValue = FastllmCudaValueToFloat(attnRow[j]);
+                    if (apply_decay_mask) {
+                        attnValue = j <= t
+                            ? FastllmCudaValueToFloat(
+                                  FastllmCudaFloatToValue<T>(
+                                      attnValue * FastllmCudaValueToFloat(
+                                          decayChunk[(size_t)t *
+                                              chunk_size + j])))
+                            : 0.0f;
+                    }
+                }
+                attnValue = __shfl_sync(warpMask, attnValue, 0);
+                sum += attnValue * vNewTile[j * BV + lane];
+            }
+            int outputToken = tokenBase + t;
+            if (outputToken < total_tokens) {
+                core_attn_out[
+                    ((size_t)outputToken * heads + h) * vdim +
+                    vStart + lane] = FastllmCudaFloatToValue<T>(sum);
+            }
+        }
+    }
+}
+
+namespace {
+struct FastllmChunkGdnVarlenScratch {
+    void *h = nullptr;
+    void *vNew = nullptr;
+    void *nextState = nullptr;
+    size_t hBytes = 0;
+    size_t vNewBytes = 0;
+    size_t stateBytes = 0;
+};
+
+static bool FastllmEnsureChunkGdnVarlenScratch(
+    size_t hBytes, size_t vNewBytes, size_t stateBytes,
+    FastllmChunkGdnVarlenScratch *&scratch) {
+    thread_local static std::map<int, FastllmChunkGdnVarlenScratch> scratches;
+    int device = FastllmCudaGetDevice();
+    FastllmChunkGdnVarlenScratch &cached = scratches[device];
+    if (cached.hBytes < hBytes || cached.vNewBytes < vNewBytes ||
+        cached.stateBytes < stateBytes) {
+        if (cached.h != nullptr || cached.vNew != nullptr ||
+            cached.nextState != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        if (cached.h != nullptr) FastllmCudaFree(cached.h);
+        if (cached.vNew != nullptr) FastllmCudaFree(cached.vNew);
+        if (cached.nextState != nullptr) FastllmCudaFree(cached.nextState);
+        cached = FastllmChunkGdnVarlenScratch();
+        cached.h = FastllmCudaMalloc(hBytes);
+        cached.vNew = FastllmCudaMalloc(vNewBytes);
+        cached.nextState = FastllmCudaMalloc(stateBytes);
+        if (cached.h == nullptr || cached.vNew == nullptr ||
+            cached.nextState == nullptr) {
+            if (cached.h != nullptr) FastllmCudaFree(cached.h);
+            if (cached.vNew != nullptr) FastllmCudaFree(cached.vNew);
+            if (cached.nextState != nullptr) FastllmCudaFree(cached.nextState);
+            cached = FastllmChunkGdnVarlenScratch();
+            return false;
+        }
+        cached.hBytes = hBytes;
+        cached.vNewBytes = vNewBytes;
+        cached.stateBytes = stateBytes;
+    }
+    scratch = &cached;
+    return true;
+}
+}
+
+bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &k_cumdecay, fastllm::Data &last_recurrent_state,
+    const std::vector<int> &seqLens, fastllm::Data &core_attn_out,
+    const fastllm::Data *decay_mask, bool apply_decay_mask) {
+    if (seqLens.empty() || q.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::FLOAT16 ||
+        k.dataType != fastllm::DataType::FLOAT16 ||
+        v.dataType != fastllm::DataType::FLOAT16 ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        attn.dataType != fastllm::DataType::FLOAT16 ||
+        k_cumdecay.dataType != fastllm::DataType::FLOAT16 ||
+        last_recurrent_state.dataType != fastllm::DataType::FLOAT16 ||
+        (apply_decay_mask &&
+         (decay_mask == nullptr ||
+          decay_mask->dataType != fastllm::DataType::FLOAT16 ||
+          decay_mask->cudaData == nullptr)) ||
+        q.cudaData == nullptr || k.cudaData == nullptr ||
+        v.cudaData == nullptr || g.cudaData == nullptr ||
+        attn.cudaData == nullptr || k_cumdecay.cudaData == nullptr ||
+        last_recurrent_state.cudaData == nullptr ||
+        q.dims.size() != 5 || q.dims[0] != 1 || k.dims != q.dims) {
+        return false;
+    }
+    int batch = (int)seqLens.size();
+    int keyHeads = q.dims[1];
+    int heads = v.dims.size() == 5 ? v.dims[1] : 0;
+    int totalChunks = q.dims[2];
+    int chunkSize = q.dims[3];
+    int kdim = q.dims[4];
+    int vdim = v.dims.size() == 5 ? v.dims[4] : 0;
+    if (keyHeads <= 0 || heads < keyHeads || heads % keyHeads != 0 ||
+        totalChunks <= 0 || chunkSize != 64 ||
+        kdim != 128 || vdim != 128 ||
+        v.dims != std::vector<int>({1, heads, totalChunks, chunkSize, vdim}) ||
+        g.dims != std::vector<int>({1, heads, totalChunks, chunkSize}) ||
+        attn.dims !=
+            std::vector<int>({1, keyHeads, totalChunks,
+                              chunkSize, chunkSize}) ||
+        (apply_decay_mask && decay_mask->dims !=
+            std::vector<int>({1, heads, totalChunks,
+                              chunkSize, chunkSize})) ||
+        k_cumdecay.dims !=
+            std::vector<int>({1, heads, totalChunks, chunkSize, kdim}) ||
+        last_recurrent_state.dims !=
+            std::vector<int>({batch, heads, kdim, vdim})) {
+        return false;
+    }
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(
+            seqLens, chunkSize, metadata) ||
+        metadata.totalChunks != totalChunks) {
+        return false;
+    }
+
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(q, device) ||
+        FastllmCudaGetDevice() != device ||
+        !FastllmCudaDataCanShareDevice(q, k) ||
+        !FastllmCudaDataCanShareDevice(q, v) ||
+        !FastllmCudaDataCanShareDevice(q, g) ||
+        !FastllmCudaDataCanShareDevice(q, attn) ||
+        !FastllmCudaDataCanShareDevice(q, k_cumdecay) ||
+        !FastllmCudaDataCanShareDevice(q, last_recurrent_state) ||
+        (apply_decay_mask &&
+         !FastllmCudaDataCanShareDevice(q, *decay_mask))) {
+        return false;
+    }
+
+    core_attn_out.dataType = fastllm::DataType::FLOAT16;
+    core_attn_out.Resize({1, metadata.totalTokens, heads, vdim});
+    core_attn_out.ToDevice(
+        fastllm::DataDevice::CUDA, std::vector<int>{device});
+    core_attn_out.Allocate(false);
+    if (core_attn_out.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(core_attn_out)) {
+        return false;
+    }
+
+    size_t hBytes =
+        (size_t)heads * totalChunks * kdim * vdim * sizeof(half);
+    size_t vNewBytes =
+        (size_t)heads * totalChunks * chunkSize * vdim * sizeof(half);
+    size_t stateBytes =
+        (size_t)batch * heads * kdim * vdim * sizeof(half);
+    FastllmChunkGdnVarlenScratch *scratch = nullptr;
+    if (!FastllmEnsureChunkGdnVarlenScratch(
+            hBytes, vNewBytes, stateBytes, scratch)) {
+        return false;
+    }
+    constexpr int BVH = 32;
+    constexpr int BKH = 64;
+    constexpr int BVO = 32;
+    int threadsH = 256;
+    int threadsO = 256;
+    size_t sharedH =
+        (size_t)(kdim * BVH + chunkSize * BVH +
+                 chunkSize * BKH + chunkSize) * sizeof(float);
+    size_t sharedO =
+        (size_t)(kdim * BVO + chunkSize * BVO) * sizeof(float);
+    dim3 gridH((vdim + BVH - 1) / BVH, batch * heads);
+    dim3 gridO((vdim + BVO - 1) / BVO, totalChunks, heads);
+    FastllmChunkGatedDeltaRuleVarlenPrefillHKernel<half, BVH, BKH>
+        <<<gridH, threadsH, sharedH, cudaStreamPerThread>>>(
+            (const half*)k.cudaData, (const half*)v.cudaData,
+            (const half*)g.cudaData, (const half*)k_cumdecay.cudaData,
+            (const half*)last_recurrent_state.cudaData,
+            (half*)scratch->nextState, metadata.chunkOffsets,
+            (half*)scratch->h, (half*)scratch->vNew,
+            keyHeads, heads, totalChunks, chunkSize, kdim, vdim);
+    cudaError_t hState = cudaGetLastError();
+    if (hState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in packed varlen GDN H fallback.", hState);
+        return false;
+    }
+    FastllmChunkGatedDeltaRuleVarlenPrefillOKernel<half, BVO>
+        <<<gridO, threadsO, sharedO, cudaStreamPerThread>>>(
+            (const half*)q.cudaData, (const half*)g.cudaData,
+            (const half*)attn.cudaData,
+            apply_decay_mask ? (const half*)decay_mask->cudaData : nullptr,
+            (const half*)scratch->h,
+            (const half*)scratch->vNew, (half*)core_attn_out.cudaData,
+            metadata.chunkTokenBases, metadata.chunkValidTokens,
+            metadata.totalTokens, keyHeads, heads, totalChunks,
+            chunkSize, kdim, vdim, apply_decay_mask);
+    cudaError_t oState = cudaGetLastError();
+    if (oState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in packed varlen GDN O fallback.", oState);
+        return false;
+    }
+    cudaError_t commitState = cudaMemcpyAsync(
+        last_recurrent_state.cudaData, scratch->nextState, stateBytes,
+        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    if (commitState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error committing packed varlen GDN state.",
+            commitState);
+        return false;
+    }
+    return true;
 }
 
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
