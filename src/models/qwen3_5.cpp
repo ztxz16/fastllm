@@ -6354,6 +6354,19 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
+        // Paged-prefix restore runs before the first forward.  Mark recurrent
+        // state slots now so the generic atomic TP restore plan does not treat
+        // linear-attention layers (which deliberately have no paged managers)
+        // as missing ordinary KV-cache shards.
+        int layerCount = std::min(this->block_cnt,
+                                  (int)context->pastKeyValues.size());
+        for (int i = 0; i < layerCount; i++) {
+            if (!Qwen35LayerIsLinearAttention(this, i)) {
+                continue;
+            }
+            context->pastKeyValues[i].first.isLinearAttention = true;
+            context->pastKeyValues[i].second.isLinearAttention = true;
+        }
         std::lock_guard<std::mutex> guard(mtpCacheMutex);
         mtpCaches.erase(context);
     }
