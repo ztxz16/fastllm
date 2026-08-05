@@ -1111,6 +1111,19 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
+enum FastllmCudaLinearFp16Path {
+    FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO = 0,
+    FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE = 1,
+    FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS = 2,
+};
+// AUTO keeps B1-B7 on the native kernels, uses the verified Qwen3.6 B8 GDN
+// specialization for 5120x48 without bias, and retains cuBLAS otherwise.
+// Exposed so correctness tests can verify the production dispatch policy.
+FastllmCudaLinearFp16Path FastllmCudaResolveLinearFp16AutoPath(int n, int m, int k, bool addTo, bool hasBias);
+// Explicit path selection is intended for correctness tests and benchmarks.
+// Production callers should use AUTO through FastllmCudaHalfMatMulFloat16.
+// NATIVE supports one to eight rows; CUBLAS bypasses AUTO dispatch.
+bool FastllmCudaHalfMatMulFloat16WithPath(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo, bool allowRouterSpecialization, FastllmCudaLinearFp16Path path);
 bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo, bool allowRouterSpecialization);
 // Fuses the Qwen3.5 FP16 router and shared-gate projections for one to seven
 // flattened decode rows. Larger batches keep the cuBLAS GEMM path.

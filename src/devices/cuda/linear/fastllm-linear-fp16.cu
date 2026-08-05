@@ -5,6 +5,9 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
 #endif
@@ -705,8 +708,12 @@ void LaunchFastllmGemmFp16Fp16(half *input, half *weight, half *output, half *bi
         FastllmGemvFp16Fp16Kernel2MultiRow<256, 7, false>
             <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
                          nullptr, nullptr, false);
+    } else if (n == 8) {
+        FastllmGemvFp16Fp16Kernel2MultiRow<256, 8, false>
+            <<<k, 256>>>(input, weight, output, bias, m, k, addTo,
+                         nullptr, nullptr, false);
     } else {
-        printf("Error: LaunchFastllmGemmFp16Fp16: n > 7.\n");
+        printf("Error: LaunchFastllmGemmFp16Fp16: n > 8.\n");
         exit(0);
     }
 }
@@ -732,11 +739,118 @@ void LaunchFastllmGemmFp16Fp16AddToNoBias(half *input, half *weight, half *outpu
     }
 }
 
-bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+FastllmCudaLinearFp16Path FastllmCudaResolveLinearFp16AutoPath(
+        int n, int m, int k, bool addTo, bool hasBias) {
+    if (n >= 1 && n < 8) {
+        return FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE;
+    }
+    // Qwen3.6's B8 GDN projection is the only N=8 shape where the native
+    // multi-row kernel has been verified to beat cuBLAS in both eager and
+    // CUDA Graph execution. Keep every other N=8 shape on the established
+    // cuBLAS path instead of extrapolating from eager launch overhead.
+    if (n == 8 && m == 5120 && k == 48 && !addTo && !hasBias) {
+        return FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE;
+    }
+    return FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS;
+}
+
+namespace {
+
+    static bool RunFastllmCudaLinearFp16Cublas(
+            half *input, half *weight, half *output, half *bias,
+            int n, int m, int k, bool addTo) {
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        cublasStatus_t status;
+#ifdef CUDA_NO_TENSOR_CORE
+        float *cudaFp32Output =
+            (float *)FastllmCudaMalloc((size_t)n * k * sizeof(float));
+        if (cudaFp32Output == nullptr) {
+            return false;
+        }
+        float h_alpha = 1.0f, h_beta = 0.0f;
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F;
+        cudaDataType_t CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
+        status = cublasGemmEx(
+            fastllmCublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+            k, n, m, &h_alpha, weight, AType, m, input, BType, m,
+            &h_beta, cudaFp32Output, CType, k, ComputeType,
+            static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#else
+        __half h_alpha = __float2half_rn(1.0f);
+        __half h_beta = addTo ? __float2half_rn(1.0f)
+                              : __float2half_rn(0.0f);
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F;
+        cudaDataType_t CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+        status = cublasGemmEx(
+            fastllmCublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+            k, n, m, &h_alpha, weight, AType, m, input, BType, m,
+            &h_beta, output, CType, k, ComputeType,
+            static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#endif
+        if (status != CUBLAS_STATUS_SUCCESS) {
+#ifdef CUDA_NO_TENSOR_CORE
+            FastllmCudaFree(cudaFp32Output);
+#endif
+            return false;
+        }
+
+#ifdef CUDA_NO_TENSOR_CORE
+        int len = n * k;
+        int threadPerBlock = std::min(256, len);
+        if (addTo) {
+            half *cudaTempOutput =
+                (half *)FastllmCudaMalloc((size_t)len * sizeof(half));
+            if (cudaTempOutput == nullptr) {
+                FastllmCudaFree(cudaFp32Output);
+                return false;
+            }
+            FastllmCudaFloat2HalfKernel
+                <<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+                    cudaFp32Output, cudaTempOutput, len);
+            FastllmAddToKernel
+                <<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+                    output, cudaTempOutput, __float2half_rn(1.0f), len);
+            FastllmCudaFree(cudaTempOutput);
+        } else {
+            FastllmCudaFloat2HalfKernel
+                <<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+                    cudaFp32Output, output, len);
+        }
+        FastllmCudaFree(cudaFp32Output);
+#endif
+        if (bias != nullptr) {
+            FastllmCudaBiasKernel<<<n, 256>>>(output, bias, k);
+        }
+        return true;
+    }
+
+    static bool RunFastllmCudaLinearFp16Native(
+            half *input, half *weight, half *output, half *bias,
+            int n, int m, int k, bool addTo,
+            bool allowRouterSpecialization) {
+        LaunchFastllmGemmFp16Fp16(
+            input, weight, output, bias, n, m, k, addTo,
+            allowRouterSpecialization);
+        cudaError_t state = cudaPeekAtLastError();
+        if (state != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return true;
+    }
+
+    static void ThrowFastllmCudaLinearFp16CublasError() {
+        printf("Error: cublas error.\n");
+        throw("cublas error");
+    }
+}
+
+bool FastllmCudaHalfMatMulFloat16WithPath(
                                  const fastllm::Data &input, fastllm::Data &weight,
                                  const fastllm::Data &bias, fastllm::Data &output,
                                  int n, int m, int k, bool addTo,
-                                 bool allowRouterSpecialization) {
+                                 bool allowRouterSpecialization,
+                                 FastllmCudaLinearFp16Path path) {
     FastllmCudaFP16EnsureBiasOnDevice(weight, bias, k);
     FastllmCudaFP16EnsureBiasHalfOnDevice(weight, bias, k);
 
@@ -744,63 +858,49 @@ bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
     half *cudaOutput = (half *) FastllmCudaPrepareOutput(output);
     half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];
 
-    if (n < 8) {
-        LaunchFastllmGemmFp16Fp16(cudaInput, (half*)weight.cudaData, cudaOutput, cudaBiasData,
-                                  n, m, k, addTo, allowRouterSpecialization);
+    bool ok = true;
+    if (path == FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE) {
+        ok = n >= 1 && n <= 8 && RunFastllmCudaLinearFp16Native(
+            cudaInput, (half *)weight.cudaData, cudaOutput, cudaBiasData,
+            n, m, k, addTo, allowRouterSpecialization);
+    } else if (path == FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS) {
+        ok = RunFastllmCudaLinearFp16Cublas(
+            cudaInput, (half *)weight.cudaData, cudaOutput, cudaBiasData,
+            n, m, k, addTo);
+    } else if (path == FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO) {
+        FastllmCudaLinearFp16Path autoPath =
+            FastllmCudaResolveLinearFp16AutoPath(
+                n, m, k, addTo, cudaBiasData != nullptr);
+        if (autoPath == FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE) {
+            ok = RunFastllmCudaLinearFp16Native(
+                cudaInput, (half *)weight.cudaData, cudaOutput, cudaBiasData,
+                n, m, k, addTo, allowRouterSpecialization);
+        }
+        if (autoPath == FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS || !ok) {
+            ok = RunFastllmCudaLinearFp16Cublas(
+                cudaInput, (half *)weight.cudaData, cudaOutput, cudaBiasData,
+                n, m, k, addTo);
+        }
     } else {
-        auto fastllmCublasHandle = getFastllmCublasHandle();
-        cublasStatus_t status;
-#ifdef CUDA_NO_TENSOR_CORE
-        float *cudaFp32Output = (float *) FastllmCudaMalloc(n * k * sizeof(float));
-        float h_alpha = 1.0, h_beta = 0.0;
-        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
-        status = cublasGemmEx(fastllmCublasHandle,
-                            CUBLAS_OP_T, CUBLAS_OP_N,
-                            k, n, m,
-                            &h_alpha, (half *) weight.cudaData, AType,
-                            m, cudaInput, BType,
-                            m, &h_beta,
-                            cudaFp32Output, CType,
-                            k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-#else
-        __half h_alpha = __float2half_rn(1.0), h_beta = addTo ? __float2half_rn(1.0) : __float2half_rn(0.0);
-        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
-        status = cublasGemmEx(fastllmCublasHandle,
-                            CUBLAS_OP_T, CUBLAS_OP_N,
-                            k, n, m,
-                            &h_alpha, (half *) weight.cudaData, AType,
-                            m, cudaInput, BType,
-                            m, &h_beta,
-                            cudaOutput, CType,
-                            k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-#endif
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error.\n");
-            throw ("cublas error");
-            exit(0);
-        }
-
-#ifdef CUDA_NO_TENSOR_CORE
-        int len = n * k;
-        int threadPerBlock = std::min(256, len);
-        if (addTo) {
-            half *cudaTempOutput = (half *) FastllmCudaMalloc(len * sizeof(half));
-            FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp32Output, cudaTempOutput, len);
-            FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaOutput, cudaTempOutput, __float2half_rn(1.0), len);
-            FastllmCudaFree(cudaTempOutput);
-        } else {
-            FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp32Output, cudaOutput, len);
-        }
-        FastllmCudaFree(cudaFp32Output);
-#endif
-        if (bias.dims.size() > 0) {
-            FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, (half *) weight.extraCudaHalfData[0], k);
-        }
+        ok = false;
+    }
+    if (!ok && path == FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO) {
+        ThrowFastllmCudaLinearFp16CublasError();
     }
 
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
-    return true;
+    return ok;
+}
+
+bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
+                                 const fastllm::Data &input, fastllm::Data &weight,
+                                 const fastllm::Data &bias, fastllm::Data &output,
+                                 int n, int m, int k, bool addTo,
+                                 bool allowRouterSpecialization) {
+    return FastllmCudaHalfMatMulFloat16WithPath(
+        input, weight, bias, output, n, m, k, addTo,
+        allowRouterSpecialization, FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO);
 }
 
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
