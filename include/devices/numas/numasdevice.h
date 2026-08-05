@@ -54,6 +54,10 @@ namespace fastllm {
     bool IsNumasLinearWeightSupported(const Data *weight);
     bool IsNumasLinearWeightRegistered(const Data *weight);
 
+    // NUMA MoE keeps reusable host/CUDA staging buffers outside the model.
+    // Release them explicitly while the CUDA allocator is still alive.
+    void ClearNumasMoeRuntimeCache();
+
     class NumasKimiK3RoutedExpertsOp : BaseOperator {
         bool CanRun(const std::string &opType, const DataDict &datas,
                     const FloatDict &floatParams, const IntDict &intParams);

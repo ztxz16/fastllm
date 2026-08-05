@@ -14,6 +14,10 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
+
 #ifdef WIN32
 #define DLL_EXPORT _declspec(dllexport)
 #else
@@ -185,6 +189,15 @@ extern "C" {
             auto ret = models[handle].get();
             locker.unlock();
             return ret;
+        }
+
+        std::unique_ptr<fastllm::basellm> TakeModel(int handle) {
+            std::lock_guard<std::mutex> guard(locker);
+            auto it = models.find(handle);
+            if (it == models.end()) {
+                return nullptr;
+            }
+            return std::move(it->second);
         }
     };
 
@@ -492,8 +505,14 @@ extern "C" {
     }
 
     DLL_EXPORT void release_memory(int modelId) {
-        auto model = models.GetModel(modelId);
-        model->weight.ReleaseWeight();
+        // release_memory is terminal.  Destroy the model while the CUDA runtime
+        // and process-wide caches are still alive instead of deferring it to
+        // ModelManager's static destruction during interpreter shutdown.
+        auto model = models.TakeModel(modelId);
+        model.reset();
+#ifdef USE_NUMAS
+        fastllm::ClearNumasMoeRuntimeCache();
+#endif
         return;
     }
 

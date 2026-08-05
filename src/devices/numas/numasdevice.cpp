@@ -1253,8 +1253,19 @@ namespace fastllm {
             }
     #endif
     };
-    // 每层一个 MoE 缓存，避免层间共享导致的数据竞争
-    std::unordered_map<int, FastllmMoeDataManagerNumas> fastllmMoeDataManagerNumasPerLayer;
+    // 每层一个 MoE 缓存，避免层间共享导致的数据竞争。缓存中包含 CUDA
+    // staging buffers，因此不能依赖跨翻译单元的静态析构顺序：CUDA 内存池可能
+    // 先被析构。使用进程生命周期的容器，并由 release_memory 在 CUDA 仍可用时显式清理。
+    static std::unordered_map<int, FastllmMoeDataManagerNumas> &
+    GetNumasMoeRuntimeCache() {
+        static auto *cache =
+            new std::unordered_map<int, FastllmMoeDataManagerNumas>();
+        return *cache;
+    }
+
+    void ClearNumasMoeRuntimeCache() {
+        GetNumasMoeRuntimeCache().clear();
+    }
 
     // CrossSwiglu 重排：将 a[n, m] 重排为 b[n, m]
     // b[0] = a[0], b[1] = a[n/2], b[2] = a[1], b[3] = a[n/2+1], ...
@@ -5499,7 +5510,8 @@ namespace fastllm {
 
         int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
         auto &layerWeights = GetNumasFusedMoeLayerWeights(layer, gate, up, down);
-        FastllmMoeDataManagerNumas &manager = fastllmMoeDataManagerNumasPerLayer[layer % 2];
+        FastllmMoeDataManagerNumas &manager =
+            GetNumasMoeRuntimeCache()[layer % 2];
 
         output.dataType = input.dataType;
         output.expansionDims.clear();
@@ -5550,7 +5562,8 @@ namespace fastllm {
         int topk = index.dims[1];
         int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
         int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
-        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas = fastllmMoeDataManagerNumasPerLayer[layer % 2];
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas =
+            GetNumasMoeRuntimeCache()[layer % 2];
         // `moeFinal` is reused across layers and may have been reshaped back to
         // `[batch, seq, hidden]` by the caller. Reset it to the flattened MoE
         // input shape here before the NUMA path reads `output.dims[1]`.

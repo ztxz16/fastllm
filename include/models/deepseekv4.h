@@ -293,6 +293,8 @@ namespace fastllm {
     public:
         DeepSeekV4Model(); // 构造函数
 
+        ~DeepSeekV4Model() override;
+
         virtual void InitParams(); // 初始化参数信息
 
         virtual std::map<std::string,

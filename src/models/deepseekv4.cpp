@@ -6590,6 +6590,10 @@ namespace fastllm {
         };
     }
 
+    DeepSeekV4Model::~DeepSeekV4Model() {
+        ShutdownRuntime();
+    }
+
     std::map<std::string,
              std::vector<std::pair<std::string, DataType> > >
     DeepSeekV4Model::GetTensorMap(
