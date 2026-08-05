@@ -2715,7 +2715,7 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
                 total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
                 pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
                 /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
-                /*num_colocated_ctas=*/0, stream);
+                /*num_colocated_ctas=*/0, /*uniform_q_len=*/0, stream);
 
             if (plan_status != cudaSuccess) {
                 printf("DoCudaAttentionPaged: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
@@ -3330,7 +3330,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                     total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
                     pageLen, useFlashInferCudaGraph, /*sizeof_dtype_o=*/sizeof(QType),
                     /*window_left=*/windowLeft, /*fixed_split_size=*/-1, /*disable_split_kv=*/false,
-                    /*num_colocated_ctas=*/0, stream);
+                    /*num_colocated_ctas=*/0, /*uniform_q_len=*/0, stream);
 
             if (plan_status != cudaSuccess) {
                 printf("FastllmCudaHalfPagedAttentionBatch: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));

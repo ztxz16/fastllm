@@ -21,8 +21,10 @@
 #include <cstdint>
 #include <vector>
 
-#include "trtllmGen_bmm_export/Enums.h"
-#include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmGatedActOptions.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmOptions.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -39,12 +41,44 @@ enum class ActType {
   // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
   //
   // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
-  SwiGlu,
+  SwiGlu = 0,
   // For ActType == GeGlu, we use the simplified version
   //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
   // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
   // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
-  GeGlu,
+  GeGlu = 1,
+  SiTuGlu = 2,
+  None = 3,
+};
+
+static_assert(static_cast<int>(ActType::SwiGlu) ==
+              static_cast<int>(batchedGemm::gemmGatedAct::ActType::SwiGlu));
+static_assert(static_cast<int>(ActType::GeGlu) ==
+              static_cast<int>(batchedGemm::gemmGatedAct::ActType::GeGlu));
+#ifndef TLLM_RUBIN_FEATURES
+// The pinned Rubin BMM package (TRTLLM_GEN_BMM_RUBIN) predates SiTuGlu: its
+// gemmGatedAct::ActType is {SwiGlu, GeGlu, None} with None == 2, so these two
+// symbols/values exist only in the Blackwell package. Drop this guard when the
+// Rubin pin is bumped to a package that carries SiTuGlu.
+static_assert(static_cast<int>(ActType::SiTuGlu) ==
+              static_cast<int>(batchedGemm::gemmGatedAct::ActType::SiTuGlu));
+static_assert(static_cast<int>(ActType::None) ==
+              static_cast<int>(batchedGemm::gemmGatedAct::ActType::None));
+#endif
+
+// Type of the element-wise activation to apply after the Gemm
+enum class EltwiseActType {
+  None = 0,
+  // Gelu is defined as the following operation:
+  // act = x0 * phi(x0)
+  // where x0 is the output of the Gemm
+  // phi is the CDF of standard normal distribution approximated by
+  // phi(x) = 0.5 * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+  Gelu,
+  // Relu2 (also known as squared Relu) is defined as the following operation:
+  // act = relu(x0) ^ 2
+  // where x0 is the output of the Gemm.
+  Relu2,
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions {
@@ -52,6 +86,7 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   batchedGemm::trtllm::gen::Dtype dtypeB;
   batchedGemm::trtllm::gen::Dtype dtypeC;
   ActType actType{ActType::SwiGlu};
+  EltwiseActType eltwiseActType{EltwiseActType::None};
   bool deepSeekFp8{false};
   bool fusedAct{false};
   bool routeAct{false};
@@ -59,8 +94,18 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool transposeMmaOutput{false};
   int32_t tileSize{8};
   int32_t epilogueTileM{128};
-  bool useShuffledMatrixA{false};
+  bool useShuffledMatrix{false};
   batchedGemm::gemm::MatrixLayout weightLayout{batchedGemm::gemm::MatrixLayout::MajorK};
+  batchedGemm::gemm::BiasType biasType{batchedGemm::gemm::BiasType::None};
+  batchedGemm::gemm::FusedBiasShuffleMode fusedBiasShuffleMode{
+      batchedGemm::gemm::FusedBiasShuffleMode::None};
+  batchedGemm::trtllm::gen::Dtype biasDtype{batchedGemm::trtllm::gen::Dtype::Fp32};
+  // whether to apply row-wise scaling factors to the activations
+  bool usePerTokenScaling{false};
+  // dtype of the row-wise scaling factors when usePerTokenScaling is enabled
+  batchedGemm::trtllm::gen::Dtype perTokenSfDtype{batchedGemm::trtllm::gen::Dtype::Void};
+  // whether to apply row-wise scaling factors to the weights
+  bool usePerChannelScaling{false};
 };
 
 class TrtllmGenBatchedGemmRunner {
@@ -81,8 +126,9 @@ class TrtllmGenBatchedGemmRunner {
            float const* bias, float const* gatedActAlpha, float const* gatedActBeta,
            float const* clampLimit, void* c, void* outSfC, int32_t const* routeMap,
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
-           int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-           CUstream stream, int device, int32_t configIndex, bool enable_pdl);
+           int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
+           int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
+           int32_t configIndex, bool enable_pdl);
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,

@@ -13370,10 +13370,11 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     }
 
     // temperatures | top-k | top-p | sampled ids | candidates | candidate rows |
-    // recovered ids | accepted flags
+    // recovered ids | accepted flags | FlashInfer sampling-valid flags
     size_t paramBytes = batch * (sizeof(float) + sizeof(int) + sizeof(float) + sizeof(int)) +
                         actualTypicalCount * (sizeof(int) + sizeof(int) + sizeof(int) +
-                                              sizeof(unsigned char));
+                                              sizeof(unsigned char)) +
+                        batch * sizeof(bool);
     size_t alignedProbsBytes = FastllmCudaAlignBytes(probsBytes, 256);
     size_t alignedParamBytes = FastllmCudaAlignBytes(paramBytes, 256);
     size_t scratchBytes = 0;
@@ -13397,6 +13398,8 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     int   *cudaTypicalRecovered = cudaTypicalRows + actualTypicalCount;
     unsigned char *cudaTypicalAccepted =
         (unsigned char *)(cudaTypicalRecovered + actualTypicalCount);
+    bool *cudaSamplingValid =
+        (bool *)(cudaTypicalAccepted + actualTypicalCount);
 
     static thread_local std::vector<uint8_t> hostParamBuf;
     hostParamBuf.resize(batch * (sizeof(float) + sizeof(int) + sizeof(float)));
@@ -13436,11 +13439,22 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     static std::mt19937 rng(std::random_device{}());
     uint64_t seed = rng();
 
-    flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+    cudaError_t samplingState =
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
         cudaProbs, cudaTopKArr, cudaTopPArr, cudaOutput,
+        cudaSamplingValid,
         (int *)nullptr,
         (uint32_t)batch, (int)0, 0.0f,
-        (uint32_t)vocabSize, false, seed, 0, 0);
+        (uint32_t)vocabSize, false,
+        (uint64_t *)nullptr, seed,
+        (uint64_t *)nullptr, 0, 0);
+    if (samplingState != cudaSuccess) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        printf("FastllmCudaTopKTopPSampling: launch failed: %s\n",
+               cudaGetErrorString(samplingState));
+        fflush(stdout);
+        return false;
+    }
 
     FastllmCudaCopyFromDeviceToHost(output, cudaOutput, batch * sizeof(int));
     if (actualTypicalCount > 0) {
@@ -13511,11 +13525,21 @@ bool FastllmCudaTopKTopPSamplingToDevice(
 
     static thread_local std::mt19937 rng(std::random_device{}());
     uint64_t seed = rng();
-    flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+    cudaError_t samplingState =
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
         probs, topKArr, topPArr, output,
+        (bool *)floatOutput,
         (int *)nullptr,
         (uint32_t)batch, (int)0, 0.0f,
-        (uint32_t)vocabSize, false, seed, 0, 0);
+        (uint32_t)vocabSize, false,
+        (uint64_t *)nullptr, seed,
+        (uint64_t *)nullptr, 0, 0);
+    if (samplingState != cudaSuccess) {
+        printf("FastllmCudaTopKTopPSamplingToDevice: launch failed: %s\n",
+               cudaGetErrorString(samplingState));
+        fflush(stdout);
+        return false;
+    }
 
     int threads = 256;
     FastllmSamplingIdsToFloatKernel<<<(batch + threads - 1) / threads,
