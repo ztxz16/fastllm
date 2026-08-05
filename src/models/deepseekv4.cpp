@@ -10832,15 +10832,25 @@ namespace fastllm {
         bool persistentTpAsync = multiCudaTensorParallel && batch == 1 &&
                                  ((seqlen == 1 && originalStartPos > 0) ||
                                   seqlen > 1);
+        // The direct fused helper launches with raw CUDA pointers on the
+        // executor's current device.  A serial device map can switch that
+        // device between layers while the residual still belongs to the
+        // previous GPU, so let the generic Executor path perform the boundary
+        // transfer.  Single-CUDA tensors and replicated MultiCUDA tensors have
+        // stable placement and can safely retain the fused path.
+        const bool cudaHcFusionPlacementSafe =
+            multiCudaTensorParallel ||
+            DeepSeekV4DeviceMapUsesSingleCuda(this->deviceMap);
         // The decode-only HcPre+RMSNorm kernel preserves the BF16 tensor
         // boundary between both operators while avoiding a second global
         // memory round trip.  Keep prefill and non-CUDA execution on the
         // established generic path, and retain an explicit A/B fallback.
         bool cudaHcPreNormDecode =
-            graphSafeDecode ||
-            (batch == 1 && seqlen == 1 && originalStartPos > 0 &&
-             DeepSeekV4PreferCuda() &&
-             !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_HCPRENORM"));
+            cudaHcFusionPlacementSafe &&
+            (graphSafeDecode ||
+             (batch == 1 && seqlen == 1 && originalStartPos > 0 &&
+              DeepSeekV4PreferCuda() &&
+              !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_HCPRENORM")));
 #else
         bool persistentTpAsync = false;
 #endif
@@ -11537,7 +11547,7 @@ namespace fastllm {
 #endif
             bool fusedFfnHcPostPreNorm = false;
 #ifdef USE_CUDA
-            if (graphSafeDecode) {
+            if (graphSafeDecode && cudaHcFusionPlacementSafe) {
                 fusedFfnHcPostPreNorm = DeepSeekV4HcPostPreNormMultiCuda(
                     attnOut, *curHiddenStates, attnMix.postData,
                     attnMix.combData, weight[pre + ".hc_ffn_fn"],
@@ -11771,7 +11781,8 @@ namespace fastllm {
 #endif
                 bool fusedNextAttnHcPreNorm = false;
 #ifdef USE_CUDA
-                if (layer + 1 < block_cnt && graphSafeDecode) {
+                if (layer + 1 < block_cnt && graphSafeDecode &&
+                    cudaHcFusionPlacementSafe) {
                     std::string nextPre =
                         "layers." + std::to_string(layer + 1);
                     fusedNextAttnHcPreNorm =
