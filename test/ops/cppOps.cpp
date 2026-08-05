@@ -838,6 +838,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct RmsNormSpecializedBenchState {
         std::string kind;
         std::string path;
@@ -959,6 +960,7 @@ namespace {
             }
         }
     };
+#endif
 
     static BenchmarkResult BenchmarkRmsNormSpecializedCuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {
@@ -1024,6 +1026,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct RecurrentFromConvFp16BenchState {
         std::string path;
         int tileV = 8;
@@ -1118,6 +1121,7 @@ namespace {
             }
         }
     };
+#endif
 
     static BenchmarkResult BenchmarkRecurrentFromConvFp16Cuda(
             const OpTestParams &params, const std::string &device,
@@ -1429,6 +1433,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct LinearFp8Block128BenchState {
         int batch = 16;
         int in = 4096;
@@ -2104,6 +2109,7 @@ namespace {
             fused32.Print("linear_fp8_swiglu_check.fused.float32");
         }
     }
+#endif
 
     static BenchmarkResult BenchmarkLinearFp8Block128Cuda(const OpTestParams &params,
                                                           const std::string &device,
@@ -2483,6 +2489,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct FusedMoeFp8BenchState {
         int batch = 1;
         int topk = 8;
@@ -2636,6 +2643,7 @@ namespace {
             }
         }
     };
+#endif
 
     static BenchmarkResult BenchmarkFusedMoeFp8Cuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {
@@ -2706,6 +2714,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct RouterLinearFp16BenchState {
         std::string path;
         fastllm::Data input, weight, bias;
@@ -2776,6 +2785,7 @@ namespace {
             }
         }
     };
+#endif
     static BenchmarkResult BenchmarkRouterLinearFp16Cuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {
 #ifdef USE_CUDA
@@ -2833,6 +2843,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct FusedRouterTopKBenchState {
         int batch = 1;
         int topk = 8;
@@ -3020,6 +3031,7 @@ namespace {
             }
         }
     };
+#endif
 
     static BenchmarkResult BenchmarkFusedRouterTopKCuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {

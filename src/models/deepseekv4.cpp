@@ -10761,11 +10761,6 @@ namespace fastllm {
         }
 #endif
 
-#ifndef USE_CUDA
-        const bool graphSafeDecode = false;
-        const bool dsparkGraphVerification = false;
-#endif
-
         Data &hiddenStates = decodeWorkspace->hiddenStates;
         Data &hiddenStatesBeforeHcExpand = decodeWorkspace->hiddenStatesBeforeHcExpand;
         Data &hiddenStatesTemp = decodeWorkspace->hiddenStatesTemp;
