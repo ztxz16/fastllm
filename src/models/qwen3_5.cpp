@@ -1461,7 +1461,7 @@ namespace fastllm {
 
         static void Qwen35ZeroCudaLike(Data &dst, const Data &like, int device) {
             bool needReset = dst.isFake || dst.dataType != like.dataType ||
-                             dst.dataDevice != DataDevice::CUDA || dst.dims != like.dims ||
+                             dst.dataDevice != DataDevice::CUDA ||
                              (!dst.dataDeviceIds.empty() && dst.dataDeviceIds[0] != device);
             if (!needReset && dst.cudaData != nullptr) {
                 int ptrDevice = GetPointerDeviceId(dst.cudaData);
@@ -1483,8 +1483,9 @@ namespace fastllm {
                 dst.UpdateUnitSize();
                 dst.dataDevice = DataDevice::CUDA;
                 dst.dataDeviceIds = {device};
-                dst.Resize(like.dims);
             }
+            dst.expansionDims.clear();
+            dst.Resize(like.dims);
             dst.Allocate();
             if (dst.cudaData != nullptr) {
                 FastllmCudaMemset0(dst.cudaData, dst.GetBytes());
@@ -2285,6 +2286,83 @@ namespace fastllm {
                 linearConvCaches(1), recurrentStates(1) {}
         };
 
+        struct Qwen35CudaGraphDecodeState;
+
+        // CUDA graph kernels retain every device pointer used during capture.
+        // Keep one device workspace per model/GPU and only retain graph objects
+        // plus host-side metadata per batch.  Capturing the largest batch first
+        // gives every Data object enough capacity for the smaller graph shapes.
+        struct Qwen35CudaGraphWorkspace {
+            std::mutex mutex;
+            Qwen35CudaGraphDecodeState *activeState = nullptr;
+            int capacityBatch = 0;
+            std::set<void*> capturedDataPointers;
+            Data inputIds;
+            Data positionIds;
+            Qwen35ForwardSingleBuffers buffers;
+            Data logits;
+            Data linearSlotIds;
+        };
+
+        template <typename Visitor>
+        static void Qwen35VisitCudaGraphWorkspaceData(
+                const Qwen35CudaGraphWorkspace &workspace,
+                Visitor visitor) {
+            visitor(workspace.inputIds);
+            visitor(workspace.positionIds);
+            visitor(workspace.logits);
+            visitor(workspace.linearSlotIds);
+            const Qwen35ForwardSingleBuffers &buf = workspace.buffers;
+            visitor(buf.embedOutput); visitor(buf.hiddenStates); visitor(buf.attenInput);
+            visitor(buf.merged); visitor(buf.qgate); visitor(buf.gate);
+            visitor(buf.q); visitor(buf.k); visitor(buf.v);
+            visitor(buf.attenOutput); visitor(buf.attenLastOutput);
+            visitor(buf.qForAttentionHolder); visitor(buf.kAppend); visitor(buf.vAppend);
+            visitor(buf.gateupResult); visitor(buf.swigluResult); visitor(buf.mlpPart);
+            visitor(buf.routerLogits); visitor(buf.routerLogitsTemp);
+            visitor(buf.expertIndex); visitor(buf.expertScore);
+            visitor(buf.w1); visitor(buf.w2); visitor(buf.w3);
+            visitor(buf.tempInput); visitor(buf.tempOutput);
+            visitor(buf.moeInputTemp); visitor(buf.moeOutputTemp);
+            visitor(buf.moeFinal); visitor(buf.sharedGate); visitor(buf.sharedOutput);
+            visitor(buf.qSizes); visitor(buf.pageSizes); visitor(buf.pageIndexs);
+            visitor(buf.lastPageLens); visitor(buf.insertIndexs);
+            visitor(buf.insertPositions); visitor(buf.gdnMerged);
+            visitor(buf.qkvConvInput); visitor(buf.z); visitor(buf.ba);
+            visitor(buf.b); visitor(buf.a); visitor(buf.g); visitor(buf.convOutput);
+            visitor(buf.coreAttnOut); visitor(buf.linearQ); visitor(buf.linearK);
+            visitor(buf.linearV); visitor(buf.qRepeat); visitor(buf.kRepeat);
+            visitor(buf.qq); visitor(buf.kkPad); visitor(buf.vvPad);
+            visitor(buf.bbPad); visitor(buf.ggPad); visitor(buf.decayMask);
+            visitor(buf.kBeta); visitor(buf.vBeta); visitor(buf.attn); visitor(buf.at);
+            visitor(buf.kCumdecay); visitor(buf.gExp); visitor(buf.coreTemp);
+            visitor(buf.logitsHalf); visitor(buf.batchConvCache);
+            visitor(buf.batchRecurrentState);
+        }
+
+        static std::set<void*> Qwen35CudaGraphWorkspaceDataPointers(
+                const Qwen35CudaGraphWorkspace &workspace) {
+            std::set<void*> pointers;
+            Qwen35VisitCudaGraphWorkspaceData(workspace, [&](const Data &data) {
+                if (data.cudaData != nullptr) {
+                    pointers.insert(data.cudaData);
+                }
+            });
+            return pointers;
+        }
+
+        static long long Qwen35CudaGraphWorkspaceAllocatedBytes(
+                const Qwen35CudaGraphWorkspace &workspace) {
+            std::set<void*> pointers;
+            long long bytes = 0;
+            Qwen35VisitCudaGraphWorkspaceData(workspace, [&](const Data &data) {
+                if (data.cudaData != nullptr && pointers.insert(data.cudaData).second) {
+                    bytes += (long long)data.expansionBytes;
+                }
+            });
+            return bytes;
+        }
+
         struct Qwen35CudaGraphDecodeState {
             std::mutex mutex;
             std::string signature;
@@ -2293,11 +2371,7 @@ namespace fastllm {
             bool disabled = false;
             void *graph = nullptr;
             void *exec = nullptr;
-            Data inputIds;
-            Data positionIds;
-            Qwen35ForwardSingleBuffers buffers;
-            Data logits;
-            Data linearSlotIds;
+            std::vector<int> logitsDims;
             std::vector<int> lastInsertIndexHost;
             std::vector<int> lastPageSizesHost;
             std::vector<int> lastPageIndexHost;
@@ -2343,103 +2417,12 @@ namespace fastllm {
             }
         }
 
-        static void Qwen35DetachGraphDataStorage(Data &data) {
-            data.pageIndex.clear();
-            data.pagedKVCacheData = nullptr;
-            data.isPagedKVCache = false;
-            data.multiDeviceDatas.clear();
-            data.multiDeviceData = false;
-            data.ClearTensorParallelLayout();
-            data.cpuData = nullptr;
-            data.cudaData = nullptr;
-            data.cudaDataBorrowed = false;
-            data.deviceData = nullptr;
-            data.extraCudaData.clear();
-            data.extraCudaHalfData.clear();
-            data.extraDeviceData.clear();
-            data.expansionSize = 0;
-            data.expansionBytes = 0;
-            data.isFake = true;
-        }
-
-        static void Qwen35DetachGraphBuffers(Qwen35ForwardSingleBuffers &buf) {
-            Qwen35DetachGraphDataStorage(buf.embedOutput);
-            Qwen35DetachGraphDataStorage(buf.hiddenStates);
-            Qwen35DetachGraphDataStorage(buf.attenInput);
-            Qwen35DetachGraphDataStorage(buf.merged);
-            Qwen35DetachGraphDataStorage(buf.qgate);
-            Qwen35DetachGraphDataStorage(buf.gate);
-            Qwen35DetachGraphDataStorage(buf.q);
-            Qwen35DetachGraphDataStorage(buf.k);
-            Qwen35DetachGraphDataStorage(buf.v);
-            Qwen35DetachGraphDataStorage(buf.attenOutput);
-            Qwen35DetachGraphDataStorage(buf.attenLastOutput);
-            Qwen35DetachGraphDataStorage(buf.qForAttentionHolder);
-            Qwen35DetachGraphDataStorage(buf.kAppend);
-            Qwen35DetachGraphDataStorage(buf.vAppend);
-            Qwen35DetachGraphDataStorage(buf.gateupResult);
-            Qwen35DetachGraphDataStorage(buf.swigluResult);
-            Qwen35DetachGraphDataStorage(buf.mlpPart);
-            Qwen35DetachGraphDataStorage(buf.routerLogits);
-            Qwen35DetachGraphDataStorage(buf.routerLogitsTemp);
-            Qwen35DetachGraphDataStorage(buf.expertIndex);
-            Qwen35DetachGraphDataStorage(buf.expertScore);
-            Qwen35DetachGraphDataStorage(buf.w1);
-            Qwen35DetachGraphDataStorage(buf.w2);
-            Qwen35DetachGraphDataStorage(buf.w3);
-            Qwen35DetachGraphDataStorage(buf.tempInput);
-            Qwen35DetachGraphDataStorage(buf.tempOutput);
-            Qwen35DetachGraphDataStorage(buf.moeInputTemp);
-            Qwen35DetachGraphDataStorage(buf.moeOutputTemp);
-            Qwen35DetachGraphDataStorage(buf.moeFinal);
-            Qwen35DetachGraphDataStorage(buf.sharedGate);
-            Qwen35DetachGraphDataStorage(buf.sharedOutput);
-            Qwen35DetachGraphDataStorage(buf.qSizes);
-            Qwen35DetachGraphDataStorage(buf.pageSizes);
-            Qwen35DetachGraphDataStorage(buf.pageIndexs);
-            Qwen35DetachGraphDataStorage(buf.lastPageLens);
-            Qwen35DetachGraphDataStorage(buf.insertIndexs);
-            Qwen35DetachGraphDataStorage(buf.insertPositions);
-            Qwen35DetachGraphDataStorage(buf.gdnMerged);
-            Qwen35DetachGraphDataStorage(buf.qkvConvInput);
-            Qwen35DetachGraphDataStorage(buf.z);
-            Qwen35DetachGraphDataStorage(buf.ba);
-            Qwen35DetachGraphDataStorage(buf.b);
-            Qwen35DetachGraphDataStorage(buf.a);
-            Qwen35DetachGraphDataStorage(buf.g);
-            Qwen35DetachGraphDataStorage(buf.convOutput);
-            Qwen35DetachGraphDataStorage(buf.coreAttnOut);
-            Qwen35DetachGraphDataStorage(buf.linearQ);
-            Qwen35DetachGraphDataStorage(buf.linearK);
-            Qwen35DetachGraphDataStorage(buf.linearV);
-            Qwen35DetachGraphDataStorage(buf.qRepeat);
-            Qwen35DetachGraphDataStorage(buf.kRepeat);
-            Qwen35DetachGraphDataStorage(buf.qq);
-            Qwen35DetachGraphDataStorage(buf.kkPad);
-            Qwen35DetachGraphDataStorage(buf.vvPad);
-            Qwen35DetachGraphDataStorage(buf.bbPad);
-            Qwen35DetachGraphDataStorage(buf.ggPad);
-            Qwen35DetachGraphDataStorage(buf.decayMask);
-            Qwen35DetachGraphDataStorage(buf.kBeta);
-            Qwen35DetachGraphDataStorage(buf.vBeta);
-            Qwen35DetachGraphDataStorage(buf.attn);
-            Qwen35DetachGraphDataStorage(buf.at);
-            Qwen35DetachGraphDataStorage(buf.kCumdecay);
-            Qwen35DetachGraphDataStorage(buf.gExp);
-            Qwen35DetachGraphDataStorage(buf.coreTemp);
-            Qwen35DetachGraphDataStorage(buf.logitsHalf);
-        }
-
         static void Qwen35PrepareGraphStateForErase(Qwen35CudaGraphDecodeState &state) {
             Qwen35DestroyCudaGraph(state);
-            Qwen35DetachGraphDataStorage(state.inputIds);
-            Qwen35DetachGraphDataStorage(state.positionIds);
-            Qwen35DetachGraphDataStorage(state.logits);
-            Qwen35DetachGraphDataStorage(state.linearSlotIds);
-            Qwen35DetachGraphBuffers(state.buffers);
         }
 
         using Qwen35CudaGraphStateKey = std::tuple<const Qwen3_5Model*, int, int>;
+        using Qwen35CudaGraphWorkspaceKey = std::pair<const Qwen3_5Model*, int>;
 
         static std::mutex &Qwen35CudaGraphStatesMutex() {
             static std::mutex *statesMutex = new std::mutex();
@@ -2449,6 +2432,11 @@ namespace fastllm {
         static std::map<Qwen35CudaGraphStateKey, std::unique_ptr<Qwen35CudaGraphDecodeState> > &Qwen35CudaGraphStates() {
             static auto *states = new std::map<Qwen35CudaGraphStateKey, std::unique_ptr<Qwen35CudaGraphDecodeState> >();
             return *states;
+        }
+
+        static std::map<Qwen35CudaGraphWorkspaceKey, std::unique_ptr<Qwen35CudaGraphWorkspace> > &Qwen35CudaGraphWorkspaces() {
+            static auto *workspaces = new std::map<Qwen35CudaGraphWorkspaceKey, std::unique_ptr<Qwen35CudaGraphWorkspace> >();
+            return *workspaces;
         }
 
         static Qwen35CudaGraphDecodeState &GetQwen35CudaGraphDecodeState(const Qwen3_5Model *model, int gpuId, int batch) {
@@ -2462,6 +2450,18 @@ namespace fastllm {
             return *state;
         }
 
+        static Qwen35CudaGraphWorkspace &GetQwen35CudaGraphWorkspace(
+                const Qwen3_5Model *model, int gpuId) {
+            std::lock_guard<std::mutex> guard(Qwen35CudaGraphStatesMutex());
+            auto &workspaces = Qwen35CudaGraphWorkspaces();
+            auto key = std::make_pair(model, gpuId);
+            auto &workspace = workspaces[key];
+            if (workspace == nullptr) {
+                workspace.reset(new Qwen35CudaGraphWorkspace());
+            }
+            return *workspace;
+        }
+
         static void Qwen35EraseCudaGraphDecodeStates(const Qwen3_5Model *model) {
             std::lock_guard<std::mutex> guard(Qwen35CudaGraphStatesMutex());
             auto &states = Qwen35CudaGraphStates();
@@ -2472,6 +2472,14 @@ namespace fastllm {
                         Qwen35PrepareGraphStateForErase(*it->second);
                     }
                     it = states.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            auto &workspaces = Qwen35CudaGraphWorkspaces();
+            for (auto it = workspaces.begin(); it != workspaces.end();) {
+                if (it->first.first == model) {
+                    it = workspaces.erase(it);
                 } else {
                     ++it;
                 }
@@ -2490,7 +2498,7 @@ namespace fastllm {
             FastllmCudaSetDevice(device);
 
             bool needReset = dst.isFake || dst.dataDevice != DataDevice::CUDA ||
-                             dst.dataType != src.dataType || dst.dims != src.dims ||
+                             dst.dataType != src.dataType ||
                              (!dst.dataDeviceIds.empty() && dst.dataDeviceIds[0] != device);
             if (!needReset && dst.cudaData != nullptr) {
                 int ptrDevice = GetPointerDeviceId(dst.cudaData);
@@ -2512,8 +2520,12 @@ namespace fastllm {
                 dst.UpdateUnitSize();
                 dst.dataDevice = DataDevice::CUDA;
                 dst.dataDeviceIds = {device};
-                dst.Resize(src.dims);
             }
+            // Resize without freeing when the existing max-batch allocation is
+            // large enough. CUDA graphs for other batch shapes keep this same
+            // pointer alive and only bake their own dimensions into the nodes.
+            dst.expansionDims.clear();
+            dst.Resize(src.dims);
             dst.Allocate(false);
             if (asyncCopy) {
                 AssertInFastLLM(
@@ -2531,7 +2543,6 @@ namespace fastllm {
             FastllmCudaSetDevice(device);
             bool needReset = dst.isFake || dst.dataDevice != DataDevice::CUDA ||
                              dst.dataType != DataType::INT32 ||
-                             dst.dims != std::vector<int>{(int)host.size()} ||
                              (!dst.dataDeviceIds.empty() && dst.dataDeviceIds[0] != device);
             if (!needReset && dst.cudaData != nullptr) {
                 int ptrDevice = GetPointerDeviceId(dst.cudaData);
@@ -2553,8 +2564,9 @@ namespace fastllm {
                 dst.UpdateUnitSize();
                 dst.dataDevice = DataDevice::CUDA;
                 dst.dataDeviceIds = {device};
-                dst.Resize({(int)host.size()});
             }
+            dst.expansionDims.clear();
+            dst.Resize({(int)host.size()});
             dst.Allocate(false);
             FastllmCudaCopyFromHostToDevice(dst.cudaData, (void*)host.data(), host.size() * sizeof(int32_t));
             dst.cpuIntDatas = host;
@@ -2687,6 +2699,27 @@ namespace fastllm {
             batches.erase(std::unique(batches.begin(), batches.end()),
                           batches.end());
             return batches;
+        }
+
+        static long long Qwen35CudaGraphServingReserveBytes(
+                const Qwen3_5Model *model) {
+            if (!GetFastllmEnv().cudaGraph) {
+                return 0;
+            }
+            // This is accounting headroom for automatic KV sizing, not a
+            // physically allocated dummy pool. The persistent device Data is
+            // one max-batch workspace; each selected shape then only adds its
+            // CUDA graph/exec objects. Decode graphs are independent of the
+            // chunked-prefill token size because every captured sequence has
+            // length one.
+            const long long mib = 1024LL * 1024LL;
+            const long long alignment = 64LL * mib;
+            int maxGraphBatch = Qwen35PreCaptureMaxBatch(model);
+            int graphCount = (int)Qwen35PreCaptureBatches(maxGraphBatch).size();
+            long long bytes = 64LL * mib +
+                              (long long)maxGraphBatch * 8LL * mib +
+                              (long long)graphCount * 16LL * mib;
+            return (bytes + alignment - 1) / alignment * alignment;
         }
 
         static int Qwen35LinearSlotCapacity(const Qwen3_5Model *model, int batch) {
@@ -4528,11 +4561,9 @@ namespace fastllm {
 
         static bool Qwen35NeedsAllocationFreeServing() {
             // DisableCudaMalloc() is a no-op unless cudaMemCheck is enabled.
-            // CUDA graph independently requires stable, preallocated storage.
-            // The API serving-warmup marker alone must not charge the fixed
-            // allocation-free pool against KV when real allocations stay legal.
-            return GetFastllmEnv().cudaGraph ||
-                   GetFastllmEnv().cudaMemCheck;
+            // CUDA graph owns an explicit max-batch workspace and does not need
+            // the fixed 1.5 GiB allocation-free dummy pool in ordinary mode.
+            return GetFastllmEnv().cudaMemCheck;
         }
 
         static void Qwen35WarmupCudaRuntimeScratchBuffers() {
@@ -5912,7 +5943,9 @@ namespace fastllm {
 
     long long Qwen3_5Model::GetAutoWarmupCudaServingReserveBytes(int deviceId) const {
 #ifdef USE_CUDA
-        if (!Qwen35NeedsAllocationFreeServing()) {
+        const bool cudaGraphEnabled = GetFastllmEnv().cudaGraph;
+        const bool allocationFreeServing = Qwen35NeedsAllocationFreeServing();
+        if (!cudaGraphEnabled && !allocationFreeServing) {
             return 0;
         }
         std::vector<int> devices;
@@ -5921,11 +5954,16 @@ namespace fastllm {
             std::find(devices.begin(), devices.end(), deviceId) == devices.end()) {
             return 0;
         }
-        // PrepareCudaServingAfterWarmup() creates this fixed idle-pool capacity
-        // on every participating GPU after the serving high-water forwards.
-        // Charge it before automatic KV sizing so those later allocations cannot
-        // consume memory already promised to paged KV cache.
-        return Qwen35CudaServingPoolReserveBytes();
+        // Ordinary graph mode only reserves accounting headroom for the shared
+        // max-batch workspace and graph objects. Strict memcheck additionally
+        // materializes the fixed allocation-free pool after warmup.
+        long long reserveBytes = cudaGraphEnabled
+            ? Qwen35CudaGraphServingReserveBytes(this)
+            : 0;
+        if (allocationFreeServing) {
+            reserveBytes += Qwen35CudaServingPoolReserveBytes();
+        }
+        return reserveBytes;
 #else
         (void)deviceId;
         return 0;
@@ -6020,9 +6058,9 @@ namespace fastllm {
             ClearAllPagedCacheManagers();
             FastllmCudaClearBigBuffer();
         }
-        // Strict memcheck serving and CUDA graph need a reusable allocation-free
-        // pool after warmup. Ordinary API serving only materializes its high-water
-        // scratch before final KV calibration and may allocate normally later.
+        // CUDA graph builds its explicit shared workspace here. Strict memcheck
+        // additionally builds the reusable allocation-free pool; ordinary API
+        // serving may continue to allocate normally after its high-water pass.
         PrepareCudaServingAfterWarmup();
         Qwen35ReleaseThreadLocalCudaSamplingBuffers();
 #endif
@@ -6435,14 +6473,14 @@ namespace fastllm {
         }
         const bool servingHighWaterWarmup =
             Qwen35ServingHighWaterWarmupRequested();
+        const bool cudaGraphEnabled = GetFastllmEnv().cudaGraph;
         const bool allocationFreeServing =
             Qwen35NeedsAllocationFreeServing();
-        // Ordinary API serving needs the real high-water footprint for KV
-        // calibration, but only strict memcheck/CUDA-graph serving needs the
-        // additional fixed idle-pool reserve.
+        // Graph capture has an explicit shared workspace. Only strict memcheck
+        // serving still needs the additional fixed allocation-free pool.
         const bool preparationRequested = highWaterOnly
             ? servingHighWaterWarmup
-            : allocationFreeServing;
+            : (cudaGraphEnabled || allocationFreeServing);
         if (!preparationRequested ||
             (!highWaterOnly && autoWarmupRunning.load()) ||
             GetKVCacheInCPU()) {
@@ -6455,7 +6493,6 @@ namespace fastllm {
             return;
         }
 
-        const bool cudaGraphEnabled = GetFastllmEnv().cudaGraph;
         int maxWarmupBatch = Qwen35PreCaptureMaxBatch(this);
         struct CudaGraphPreCaptureScope {
             std::atomic<bool> &flag;
@@ -6481,9 +6518,17 @@ namespace fastllm {
                        "capture batch 1 only to preserve runtime memory for speculative validation.\n");
             }
             std::vector<int> warmupBatches = Qwen35PreCaptureBatches(maxWarmupBatch);
+            // Seed every shared Data allocation with the largest shape. Smaller
+            // captures can then reuse the same addresses without invalidating
+            // the already-instantiated max-batch graph.
+            std::reverse(warmupBatches.begin(), warmupBatches.end());
             int warmupBatchCount = (int)warmupBatches.size();
             int linearSlotCapacity = Qwen35LinearSlotCapacity(this, maxWarmupBatch);
             PreAllocateLinearSlotPoolsForCudaGraph(devices, ratios, linearSlotCapacity);
+            printf("[Fastllm] Qwen3.5 CUDA graph shared workspace: "
+                   "max batch %d, %d graph shape(s), KV accounting reserve %.0f MB/GPU.\n",
+                   maxWarmupBatch, warmupBatchCount,
+                   Qwen35CudaGraphServingReserveBytes(this) / 1048576.0);
 
             auto printProgress = [](int done, int total, int batch) {
                 const int barWidth = 32;
@@ -6701,80 +6746,82 @@ namespace fastllm {
             return;
         }
 
-        // A few graph/runtime objects intentionally remain alive after the
-        // prefill above and can retain its exact-size scratch blocks.  Keep a
-        // separate, bounded reserve of concurrently reusable blocks for eager
-        // serving.  Frozen allocation mode may use an oversized block, so this
-        // also covers smaller shape-specific scratch without per-shape mallocs.
-        // chunked_prefill_size=8192 needs roughly 112 MB for one
-        // [tokens, hidden] fp16 activation on the 7168-wide model.  Keep the
-        // reserve above that size so frozen serving can reuse it for a second
-        // ragged burst while the previous burst is still being retired.
-        // Long batch-1 recompute also keeps several 32--48 MB gated-attention
-        // tensors alive at once.  If every reserve has the same 128 MB size,
-        // those medium tensors consume all large blocks and a later gate
-        // allocation misses despite ample physical headroom.  A second size
-        // class lets best-fit reuse keep the 128 MB blocks for genuinely large
-        // activations while covering every gate shape up to the 8192-token
-        // scheduler chunk (48 MB for 3072 fp16 channels).
-        int previousDevice = FastllmCudaGetDevice();
-        int failedReserveDevice = -1;
-        int failedLargeReserveBlocks = 0;
-        int failedMediumReserveBlocks = 0;
-        for (int device : devices) {
-            FastllmCudaSetDevice(device);
-            int allocatedLargeReserveBlocks = FastllmCudaTryMallocBigBuffers(
-                QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES,
-                QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS);
-            int allocatedMediumReserveBlocks =
-                allocatedLargeReserveBlocks ==
-                        QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS
-                    ? FastllmCudaTryMallocBigBuffers(
-                          QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES,
-                          QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS)
-                    : 0;
-            printf("[Fastllm] Qwen3.5 CUDA serve reserve GPU %d: "
-                   "%d/%d x %.0f MB plus %d/%d x %.0f MB.\n",
-                   device,
-                   allocatedLargeReserveBlocks,
+        if (allocationFreeServing) {
+            // A few graph/runtime objects intentionally remain alive after the
+            // prefill above and can retain its exact-size scratch blocks.  Keep a
+            // separate, bounded reserve of concurrently reusable blocks for eager
+            // serving.  Frozen allocation mode may use an oversized block, so this
+            // also covers smaller shape-specific scratch without per-shape mallocs.
+            // chunked_prefill_size=8192 needs roughly 112 MB for one
+            // [tokens, hidden] fp16 activation on the 7168-wide model.  Keep the
+            // reserve above that size so frozen serving can reuse it for a second
+            // ragged burst while the previous burst is still being retired.
+            // Long batch-1 recompute also keeps several 32--48 MB gated-attention
+            // tensors alive at once.  If every reserve has the same 128 MB size,
+            // those medium tensors consume all large blocks and a later gate
+            // allocation misses despite ample physical headroom.  A second size
+            // class lets best-fit reuse keep the 128 MB blocks for genuinely large
+            // activations while covering every gate shape up to the 8192-token
+            // scheduler chunk (48 MB for 3072 fp16 channels).
+            int previousDevice = FastllmCudaGetDevice();
+            int failedReserveDevice = -1;
+            int failedLargeReserveBlocks = 0;
+            int failedMediumReserveBlocks = 0;
+            for (int device : devices) {
+                FastllmCudaSetDevice(device);
+                int allocatedLargeReserveBlocks = FastllmCudaTryMallocBigBuffers(
+                    QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES,
+                    QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS);
+                int allocatedMediumReserveBlocks =
+                    allocatedLargeReserveBlocks ==
+                            QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS
+                        ? FastllmCudaTryMallocBigBuffers(
+                              QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES,
+                              QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS)
+                        : 0;
+                printf("[Fastllm] Qwen3.5 CUDA serve reserve GPU %d: "
+                       "%d/%d x %.0f MB plus %d/%d x %.0f MB.\n",
+                       device,
+                       allocatedLargeReserveBlocks,
+                       QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS,
+                       QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES / 1048576.0,
+                       allocatedMediumReserveBlocks,
+                       QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS,
+                       QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES / 1048576.0);
+                FastllmCudaMemPoolStats();
+                if (allocatedLargeReserveBlocks !=
+                        QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS ||
+                    allocatedMediumReserveBlocks !=
+                        QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS) {
+                    failedReserveDevice = device;
+                    failedLargeReserveBlocks = allocatedLargeReserveBlocks;
+                    failedMediumReserveBlocks = allocatedMediumReserveBlocks;
+                    break;
+                }
+            }
+            if (previousDevice >= 0) {
+                FastllmCudaSetDevice(previousDevice);
+            }
+            if (failedReserveDevice >= 0) {
+                std::ostringstream error;
+                error << "Qwen3.5 CUDA serve reserve is incomplete on GPU "
+                      << failedReserveDevice << ": allocated "
+                      << failedLargeReserveBlocks << "/"
+                      << QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS
+                      << " large blocks and " << failedMediumReserveBlocks << "/"
+                      << QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS
+                      << " medium blocks. Starting with an incomplete reserve is unsafe "
+                         "because CUDA allocations are frozen after warmup.";
+                throw std::runtime_error(error.str());
+            }
+            printf("[Fastllm] Qwen3.5 CUDA serve reserve: "
+                   "%d x %.0f MB plus %d x %.0f MB per GPU.\n",
                    QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS,
                    QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES / 1048576.0,
-                   allocatedMediumReserveBlocks,
                    QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS,
                    QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES / 1048576.0);
-            FastllmCudaMemPoolStats();
-            if (allocatedLargeReserveBlocks !=
-                    QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS ||
-                allocatedMediumReserveBlocks !=
-                    QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS) {
-                failedReserveDevice = device;
-                failedLargeReserveBlocks = allocatedLargeReserveBlocks;
-                failedMediumReserveBlocks = allocatedMediumReserveBlocks;
-                break;
-            }
+            fflush(stdout);
         }
-        if (previousDevice >= 0) {
-            FastllmCudaSetDevice(previousDevice);
-        }
-        if (failedReserveDevice >= 0) {
-            std::ostringstream error;
-            error << "Qwen3.5 CUDA serve reserve is incomplete on GPU "
-                  << failedReserveDevice << ": allocated "
-                  << failedLargeReserveBlocks << "/"
-                  << QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS
-                  << " large blocks and " << failedMediumReserveBlocks << "/"
-                  << QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS
-                  << " medium blocks. Starting with an incomplete reserve is unsafe "
-                     "because CUDA allocations are frozen after warmup.";
-            throw std::runtime_error(error.str());
-        }
-        printf("[Fastllm] Qwen3.5 CUDA serve reserve: "
-               "%d x %.0f MB plus %d x %.0f MB per GPU.\n",
-               QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCKS,
-               QWEN35_CUDA_SERVE_LARGE_RESERVE_BLOCK_BYTES / 1048576.0,
-               QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCKS,
-               QWEN35_CUDA_SERVE_MEDIUM_RESERVE_BLOCK_BYTES / 1048576.0);
-        fflush(stdout);
 
         // KV pressure can evict one long request and later recompute it as a
         // batch-1 prefill.  The batched warmup above intentionally exercises
@@ -6783,7 +6830,7 @@ namespace fastllm {
         // the largest scheduler-sized single sequence while cudaMalloc is still
         // allowed.  The generic reserve participates in this warmup; any extra
         // shape-specific blocks needed at its peak are then retained in the pool
-        // for allocation-free serving.
+        // for strict allocation-free serving, or remain ordinarily reusable.
         int recomputeWarmupTokens = std::max(1, this->GetChunkedPrefillSize());
         if (this->tokensLimit > 0) {
             recomputeWarmupTokens = std::min(recomputeWarmupTokens,
@@ -7010,6 +7057,10 @@ namespace fastllm {
         }
 
         Qwen35CudaGraphDecodeState &state = GetQwen35CudaGraphDecodeState(this, gpuId, batch);
+        Qwen35CudaGraphWorkspace &workspace = GetQwen35CudaGraphWorkspace(this, gpuId);
+        // Every captured shape shares the same device addresses. Serialize all
+        // replay/capture and metadata updates on this model/GPU workspace.
+        std::unique_lock<std::mutex> workspaceLock(workspace.mutex);
         std::unique_lock<std::mutex> graphLock(state.mutex);
         bool gpuTokenHandoffLaunch =
             qwen35GpuTokenHandoffControl != nullptr &&
@@ -7017,17 +7068,22 @@ namespace fastllm {
         if (state.disabled) {
             return false;
         }
-        bool allowCapture = autoWarmupRunning.load(std::memory_order_acquire) ||
-                            cudaGraphPreCaptureRunning.load(std::memory_order_acquire);
+        // Opportunistic capture during generic AutoWarmup could see a smaller
+        // shape first and later grow the workspace, invalidating that graph.
+        // The dedicated pass captures max batch first and is the sole owner of
+        // graph creation; serving only replays those prepared shapes.
+        bool allowCapture =
+            cudaGraphPreCaptureRunning.load(std::memory_order_acquire);
         if (!state.captured && !allowCapture) {
             return false;
         }
+        bool workspaceChanged = workspace.activeState != &state;
 
         FastllmCudaSetDevice(gpuId);
-        state.buffers.batchPastKeys.resize(batch);
-        state.buffers.batchPastValues.resize(batch);
-        state.buffers.linearConvCaches.resize(batch);
-        state.buffers.recurrentStates.resize(batch);
+        workspace.buffers.batchPastKeys.resize(batch);
+        workspace.buffers.batchPastValues.resize(batch);
+        workspace.buffers.linearConvCaches.resize(batch);
+        workspace.buffers.recurrentStates.resize(batch);
         std::vector<int> linearSlotIdsHost;
         int linearSlotCapacity = Qwen35LinearSlotCapacity(this, batch);
         if (!Qwen35CollectExistingLinearSlotCaches(
@@ -7230,13 +7286,16 @@ namespace fastllm {
                                 "Qwen3.5 CUDA graph requires identical page metadata across attention layers.\n");
             }
         }
-        Qwen35PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId,
+        // From this point a failed/exceptional preparation must force the next
+        // shape to refresh all shared metadata rather than trust its host cache.
+        workspace.activeState = nullptr;
+        Qwen35PrepareGraphCudaTensor(workspace.positionIds, *localPositionIds, gpuId,
                                      gpuTokenHandoffLaunch);
         if (precomputedHiddenStates == nullptr) {
-            Qwen35PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId,
+            Qwen35PrepareGraphCudaTensor(workspace.inputIds, *localInputIds, gpuId,
                                          gpuTokenHandoffLaunch);
         } else {
-            Qwen35PrepareGraphCudaTensor(state.buffers.hiddenStates,
+            Qwen35PrepareGraphCudaTensor(workspace.buffers.hiddenStates,
                                          *localPrecomputedHiddenStates, gpuId);
         }
 
@@ -7249,23 +7308,23 @@ namespace fastllm {
                       << ";batch=" << batch
                       << ";preHidden=" << (precomputedHiddenStates != nullptr ? 1 : 0)
                       << ";posDims=";
-            for (int dim : state.positionIds.dims) {
+            for (int dim : workspace.positionIds.dims) {
                 signature << dim << ",";
             }
             if (precomputedHiddenStates == nullptr) {
                 signature << ";inputDims=";
-                for (int dim : state.inputIds.dims) {
+                for (int dim : workspace.inputIds.dims) {
                     signature << dim << ",";
                 }
-                signature << ";inputType=" << (int)state.inputIds.dataType;
+                signature << ";inputType=" << (int)workspace.inputIds.dataType;
             } else {
                 signature << ";hiddenDims=";
-                for (int dim : state.buffers.hiddenStates.dims) {
+                for (int dim : workspace.buffers.hiddenStates.dims) {
                     signature << dim << ",";
                 }
-                signature << ";hiddenType=" << (int)state.buffers.hiddenStates.dataType;
+                signature << ";hiddenType=" << (int)workspace.buffers.hiddenStates.dataType;
             }
-            signature << ";posType=" << (int)state.positionIds.dataType
+            signature << ";posType=" << (int)workspace.positionIds.dataType
                       << ";pageSizes=";
             for (int pageSize : graphPlanPageSizesHost) {
                 signature << pageSize << ",";
@@ -7301,27 +7360,28 @@ namespace fastllm {
         }
 
         if (!linearLayers.empty() &&
-            (state.linearSlotIds.cudaData == nullptr ||
+            (workspaceChanged || workspace.linearSlotIds.cudaData == nullptr ||
              state.lastLinearSlotIdsHost != linearSlotIdsHost ||
              signatureChanged)) {
-            Qwen35PrepareGraphIntTensor(state.linearSlotIds, gpuId, linearSlotIdsHost);
+            Qwen35PrepareGraphIntTensor(workspace.linearSlotIds, gpuId, linearSlotIdsHost);
             state.lastLinearSlotIdsHost = linearSlotIdsHost;
         }
 
         bool graphMetaMissing =
-            state.buffers.insertIndexs.cudaData == nullptr ||
-            state.buffers.insertPositions.cudaData == nullptr ||
-            state.buffers.qSizes.cudaData == nullptr ||
-            state.buffers.pageSizes.cudaData == nullptr ||
-            state.buffers.pageIndexs.cudaData == nullptr ||
-            state.buffers.lastPageLens.cudaData == nullptr;
+            workspace.buffers.insertIndexs.cudaData == nullptr ||
+            workspace.buffers.insertPositions.cudaData == nullptr ||
+            workspace.buffers.qSizes.cudaData == nullptr ||
+            workspace.buffers.pageSizes.cudaData == nullptr ||
+            workspace.buffers.pageIndexs.cudaData == nullptr ||
+            workspace.buffers.lastPageLens.cudaData == nullptr;
         bool metadataChanged =
             state.lastInsertIndexHost != insertIndexHost ||
             state.lastPageSizesHost != pageSizesHost ||
             state.lastPageIndexHost != pageIndexHost ||
             state.lastDecodePageLensHost != insertPositionHost ||
             state.lastPastKeyHosts != currentPastKeyHosts;
-        bool needFullMetaCopy = graphMetaMissing || signatureChanged || anyNeedNewPage || metadataChanged;
+        bool needFullMetaCopy = workspaceChanged || graphMetaMissing ||
+                                signatureChanged || anyNeedNewPage || metadataChanged;
         if (needFullMetaCopy) {
             AssertInFastLLM((int)pageIndexHost.size() <= pageIndexCapacity,
                             "Qwen3.5 CUDA graph page metadata exceeds fixed graph capacity.\n");
@@ -7329,13 +7389,13 @@ namespace fastllm {
             paddedPageIndexHost.resize(pageIndexCapacity,
                                        paddedPageIndexHost.empty() ? 0 : paddedPageIndexHost.back());
 
-            Qwen35PrepareGraphIntTensor(state.buffers.insertIndexs, gpuId, insertIndexHost);
-            Qwen35PrepareGraphIntTensor(state.buffers.insertPositions, gpuId, insertPositionHost);
-            Qwen35PrepareGraphIntTensor(state.buffers.qSizes, gpuId, qSizesHost);
-            Qwen35PrepareGraphIntTensor(state.buffers.pageSizes, gpuId, pageSizesHost);
-            state.buffers.pageSizes.cpuIntDatas = graphPlanPageSizesHost;
-            Qwen35PrepareGraphIntTensor(state.buffers.pageIndexs, gpuId, paddedPageIndexHost);
-            Qwen35PrepareGraphIntTensor(state.buffers.lastPageLens, gpuId, lastPageLensHost);
+            Qwen35PrepareGraphIntTensor(workspace.buffers.insertIndexs, gpuId, insertIndexHost);
+            Qwen35PrepareGraphIntTensor(workspace.buffers.insertPositions, gpuId, insertPositionHost);
+            Qwen35PrepareGraphIntTensor(workspace.buffers.qSizes, gpuId, qSizesHost);
+            Qwen35PrepareGraphIntTensor(workspace.buffers.pageSizes, gpuId, pageSizesHost);
+            workspace.buffers.pageSizes.cpuIntDatas = graphPlanPageSizesHost;
+            Qwen35PrepareGraphIntTensor(workspace.buffers.pageIndexs, gpuId, paddedPageIndexHost);
+            Qwen35PrepareGraphIntTensor(workspace.buffers.lastPageLens, gpuId, lastPageLensHost);
             state.lastInsertIndexHost = insertIndexHost;
             state.lastPageSizesHost = pageSizesHost;
             state.lastPageIndexHost = pageIndexHost;
@@ -7344,15 +7404,15 @@ namespace fastllm {
         } else {
             FastllmCudaSetDevice(gpuId);
             if (!FastllmCudaAdvanceDecodeMeta(
-                    (int32_t*)state.buffers.insertPositions.cudaData,
-                    (int32_t*)state.buffers.lastPageLens.cudaData,
+                    (int32_t*)workspace.buffers.insertPositions.cudaData,
+                    (int32_t*)workspace.buffers.lastPageLens.cudaData,
                     batch)) {
                 Qwen35DestroyCudaGraph(state);
                 state.disabled = true;
                 return false;
             }
-            state.buffers.insertPositions.cpuIntDatas = insertPositionHost;
-            state.buffers.lastPageLens.cpuIntDatas = lastPageLensHost;
+            workspace.buffers.insertPositions.cpuIntDatas = insertPositionHost;
+            workspace.buffers.lastPageLens.cpuIntDatas = lastPageLensHost;
             state.lastDecodePageLensHost = lastPageLensHost;
             state.lastPastKeyHosts = currentPastKeyHosts;
         }
@@ -7372,9 +7432,9 @@ namespace fastllm {
         auto runGraphBody = [&]() {
             using namespace qwen3cuda;
             Qwen3CudaDirectRunner cudaRunner(gpuId);
-            Qwen35ForwardSingleBuffers &buf = state.buffers;
+            Qwen35ForwardSingleBuffers &buf = workspace.buffers;
             if (precomputedHiddenStates == nullptr) {
-                Qwen3CudaEmbeddingDirect(cudaRunner, state.inputIds,
+                Qwen3CudaEmbeddingDirect(cudaRunner, workspace.inputIds,
                                          *requireLocal(weight[language_prefix + "embed_tokens.weight"],
                                                        language_prefix + "embed_tokens.weight"),
                                          buf.hiddenStates);
@@ -7450,7 +7510,7 @@ namespace fastllm {
                             requireLocal(weight[kNormName], kNormName),
                             requireLocal(weight[oWeightName], oWeightName),
                             requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                            &state.positionIds,
+                            &workspace.positionIds,
                             &pastKeyValues,
                             &buf.batchPastKeys, &buf.batchPastValues,
                             &buf.merged, &buf.qgate, &buf.gate,
@@ -7545,14 +7605,24 @@ namespace fastllm {
                                                       qkvzWeightName + ".tp_bias"),
                                         buf.gdnMerged);
                     }
+                    // Preserve the batch-1 zero-copy path without replacing the
+                    // owning max-batch workspace tensors with borrowed views.
+                    // The temporary view objects are non-owning; captured nodes
+                    // retain only their stable offsets into gdnMerged.
                     bool useSingleRowGdnViews =
                         batch == 1 && CanUseSingleRowLastDimView(buf.gdnMerged);
+                    Data singleRowQkvConvInput, singleRowZ, singleRowBa;
+                    Data *graphQkvConvInput = &buf.qkvConvInput;
+                    Data *graphZ = &buf.z;
+                    Data *graphBa = &buf.ba;
                     if (useSingleRowGdnViews) {
                         MakeSingleRowLastDimView(
-                            buf.gdnMerged, 0, localQkvDim, buf.qkvConvInput);
+                            buf.gdnMerged, 0, localQkvDim, singleRowQkvConvInput);
                         MakeSingleRowLastDimView(
                             buf.gdnMerged, localQkvDim,
-                            localQkvDim + localVd, buf.z);
+                            localQkvDim + localVd, singleRowZ);
+                        graphQkvConvInput = &singleRowQkvConvInput;
+                        graphZ = &singleRowZ;
                     } else {
                         Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1, 0,
                                        localQkvDim, buf.qkvConvInput);
@@ -7564,7 +7634,8 @@ namespace fastllm {
                         MakeSingleRowLastDimView(
                             buf.gdnMerged, localQkvDim + localVd,
                             localQkvDim + localVd + localValueHeads * 2,
-                            buf.ba);
+                            singleRowBa);
+                        graphBa = &singleRowBa;
                     } else if (hasMergedGdnInLinear) {
                         Qwen3CudaSplit(cudaRunner, buf.gdnMerged, -1,
                                        localQkvDim + localVd,
@@ -7578,14 +7649,18 @@ namespace fastllm {
                                                       baWeightName + ".tp_bias"),
                                         buf.ba);
                     }
+                    Data &activeQkvConvInput = *graphQkvConvInput;
+                    Data &activeZ = *graphZ;
+                    Data &activeBa = *graphBa;
 
                     Data &pastKey = *pastKeyValues[i].first;
                     if (batch == 1) {
-                        SwapSingleTokenSeqHeadByReshape(buf.qkvConvInput);
+                        SwapSingleTokenSeqHeadByReshape(activeQkvConvInput);
                     } else {
-                        buf.qkvConvInput.Reshape({batch, buf.qkvConvInput.dims.back(), 1});
+                        activeQkvConvInput.Reshape(
+                            {batch, activeQkvConvInput.dims.back(), 1});
                     }
-                    buf.z.Reshape({bsz, seqlen, localValueHeads, head_v_dim});
+                    activeZ.Reshape({bsz, seqlen, localValueHeads, head_v_dim});
 
                     for (int bidx = 0; bidx < batch; bidx++) {
                         buf.linearConvCaches[bidx] = pastKeyValues[bidx * block_cnt + i].first;
@@ -7594,11 +7669,11 @@ namespace fastllm {
                     PagedCacheManager *linearConvPool = Qwen35FindLinearSlotPool(
                         this, gpuId, i, QWEN35_LINEAR_SLOT_CONV,
                         linearSlotCapacity);
-                    if (linearConvPool != nullptr && state.linearSlotIds.cudaData != nullptr) {
+                    if (linearConvPool != nullptr && workspace.linearSlotIds.cudaData != nullptr) {
                         directBatchDecodeConvSilu =
                             FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchSlots(
-                                linearConvPool->cudaData, state.linearSlotIds.cudaData,
-                                batch, *buf.linearConvCaches[0], buf.qkvConvInput,
+                                linearConvPool->cudaData, workspace.linearSlotIds.cudaData,
+                                batch, *buf.linearConvCaches[0], activeQkvConvInput,
                                 *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                                 *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                                 buf.convOutput);
@@ -7607,12 +7682,13 @@ namespace fastllm {
                         buf.convOutput.Reshape({1, batch, buf.convOutput.dims[1]});
                     } else if (batch == 1) {
                         bool fusedDecodeConvSilu = FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
-                            pastKey, buf.qkvConvInput,
+                            pastKey, activeQkvConvInput,
                             *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                             *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                             buf.convOutput);
                         if (!fusedDecodeConvSilu) {
-                            ShiftAppendSingleTokenLinearAttentionCache(pastKey, buf.qkvConvInput);
+                            ShiftAppendSingleTokenLinearAttentionCache(
+                                pastKey, activeQkvConvInput);
                             Qwen35CudaConv1DPerChannel(cudaRunner, pastKey,
                                                        *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                                                        *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
@@ -7625,12 +7701,13 @@ namespace fastllm {
                     } else {
                         CatBatchFirstDim(buf.linearConvCaches, buf.batchConvCache);
                         bool fusedBatchDecodeConvSilu = FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
-                            buf.batchConvCache, buf.qkvConvInput,
+                            buf.batchConvCache, activeQkvConvInput,
                             *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                             *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                             buf.convOutput);
                         if (!fusedBatchDecodeConvSilu) {
-                            ShiftAppendSingleTokenLinearAttentionCache(buf.batchConvCache, buf.qkvConvInput);
+                            ShiftAppendSingleTokenLinearAttentionCache(
+                                buf.batchConvCache, activeQkvConvInput);
                             Qwen35CudaConv1DPerChannel(cudaRunner, buf.batchConvCache,
                                                        *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                                                        *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
@@ -7653,15 +7730,15 @@ namespace fastllm {
                         this, gpuId, i, QWEN35_LINEAR_SLOT_RECURRENT,
                         linearSlotCapacity);
                     bool fusedBatchRecurrentFromConvBa = false;
-                    if (linearStatePool != nullptr && state.linearSlotIds.cudaData != nullptr) {
+                    if (linearStatePool != nullptr && workspace.linearSlotIds.cudaData != nullptr) {
                         float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
                         fusedBatchRecurrentFromConvBa =
                             FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
-                                buf.convOutput, buf.ba,
+                                buf.convOutput, activeBa,
                                 *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                                 *requireLocal(weight[aLogName], aLogName),
                                 *requireLocal(weight[dtBiasName], dtBiasName),
-                                linearStatePool->cudaData, state.linearSlotIds.cudaData, batch,
+                                linearStatePool->cudaData, workspace.linearSlotIds.cudaData, batch,
                                 buf.coreAttnOut,
                                 localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
                                 rms_norm_eps, recurrentQScale);
@@ -7685,8 +7762,8 @@ namespace fastllm {
                                              localKeyHeads, head_k_dim});
                         buf.linearV.Reshape({buf.linearV.dims[0], buf.linearV.dims[1],
                                              localValueHeads, head_v_dim});
-                        Qwen3CudaSplit(cudaRunner, buf.ba, -1, 0, localValueHeads, buf.b);
-                        Qwen3CudaSplit(cudaRunner, buf.ba, -1,
+                        Qwen3CudaSplit(cudaRunner, activeBa, -1, 0, localValueHeads, buf.b);
+                        Qwen3CudaSplit(cudaRunner, activeBa, -1,
                                        localValueHeads, localValueHeads * 2, buf.a);
                         Qwen35CudaSigmoidMambaSoftplus(cudaRunner, buf.b, buf.a,
                                                        *requireLocal(weight[aLogName], aLogName),
@@ -7717,23 +7794,24 @@ namespace fastllm {
                                                  buf.coreAttnOut.dims[3]});
                     }
 
-                    std::vector<int> zShape = buf.z.dims;
+                    std::vector<int> zShape = activeZ.dims;
                     buf.coreAttnOut.Reshape({-1, buf.coreAttnOut.dims.back()});
-                    buf.z.Reshape({-1, buf.z.dims.back()});
+                    activeZ.Reshape({-1, activeZ.dims.back()});
                     bool fusedPostLinearAttn =
                         Qwen35TryCudaRMSNormSiluMul(
                             buf.coreAttnOut,
                             *requireLocal(weight[outNormWeightName], outNormWeightName),
-                            buf.z, buf.coreAttnOut, rms_norm_eps);
+                            activeZ, buf.coreAttnOut, rms_norm_eps);
                     if (!fusedPostLinearAttn) {
                         Qwen3CudaRMSNorm(cudaRunner, buf.coreAttnOut,
                                          *requireLocal(weight[outNormWeightName], outNormWeightName),
                                          rms_norm_eps, buf.coreAttnOut);
-                        Qwen35CudaSilu(cudaRunner, buf.z, buf.z);
-                        if (buf.z.dataType != buf.coreAttnOut.dataType) {
-                            Qwen3CudaToDataType(cudaRunner, buf.z, buf.coreAttnOut.dataType);
+                        Qwen35CudaSilu(cudaRunner, activeZ, activeZ);
+                        if (activeZ.dataType != buf.coreAttnOut.dataType) {
+                            Qwen3CudaToDataType(cudaRunner, activeZ,
+                                               buf.coreAttnOut.dataType);
                         }
-                        Qwen35CudaMulTo(cudaRunner, buf.coreAttnOut, buf.z);
+                        Qwen35CudaMulTo(cudaRunner, buf.coreAttnOut, activeZ);
                     }
                     buf.coreAttnOut.Reshape({zShape[0], zShape[1], localVd});
                     Qwen3CudaLinearResidualReduce(
@@ -7983,15 +8061,22 @@ namespace fastllm {
                             *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
                                           "lm_head.weight.tp_bias"),
                             buf.logitsHalf);
-            Qwen3CudaConvertToDataType(cudaRunner, buf.logitsHalf, state.logits, DataType::FLOAT32);
+            Qwen3CudaConvertToDataType(cudaRunner, buf.logitsHalf, workspace.logits, DataType::FLOAT32);
         };
 
         auto finishWithLogits = [&]() {
-            if (gpuTokenHandoffLaunch) {
-                Qwen35BorrowCudaTensor(logits, state.logits);
+            if (state.logitsDims.empty()) {
+                state.logitsDims = workspace.logits.dims;
             } else {
-                Qwen35PrepareGraphCudaTensor(logits, state.logits, gpuId);
+                workspace.logits.Resize(state.logitsDims);
             }
+            if (gpuTokenHandoffLaunch) {
+                Qwen35BorrowCudaTensor(logits, workspace.logits);
+            } else {
+                Qwen35PrepareGraphCudaTensor(logits, workspace.logits, gpuId);
+            }
+            workspace.capacityBatch = std::max(workspace.capacityBatch, batch);
+            workspace.activeState = &state;
         };
 
         auto runWithoutGraph = [&]() -> bool {
@@ -8163,9 +8248,28 @@ namespace fastllm {
             return true;
         }
 
+        std::set<void*> capturedDataPointers =
+            Qwen35CudaGraphWorkspaceDataPointers(workspace);
+        if (workspace.capturedDataPointers.empty()) {
+            workspace.capturedDataPointers = capturedDataPointers;
+        } else if (workspace.capturedDataPointers != capturedDataPointers) {
+            FastllmCudaGraphExecDestroy(capturedExec);
+            FastllmCudaGraphDestroy(capturedGraph);
+            throw std::runtime_error(
+                "Qwen3.5 CUDA graph shared workspace changed device addresses "
+                "after the max-batch capture.");
+        }
+
         state.graph = capturedGraph;
         state.exec = capturedExec;
         state.captured = true;
+        printf("[Fastllm] Qwen3.5 CUDA graph captured GPU %d batch %d: "
+               "shared Data %.2f MB, capacity batch %d, stable pointers %zu.\n",
+               gpuId, batch,
+               Qwen35CudaGraphWorkspaceAllocatedBytes(workspace) / 1048576.0,
+               workspace.capacityBatch,
+               workspace.capturedDataPointers.size());
+        fflush(stdout);
         bool firstLaunchOk = FastllmCudaGraphLaunch(state.exec);
         if (!firstLaunchOk) {
             printf("Warning: Qwen3.5 CUDA graph first launch failed on gpu %d: %s. Disable graph for this GPU.\n",
