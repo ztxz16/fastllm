@@ -5005,9 +5005,10 @@ namespace fastllm {
                     printCudaWarmupPoolStats("serving high-water warmup");
                 }
 
-                auto calibrateCachePagesToGpuBudget = [&]() {
+                auto calibrateCachePagesToGpuBudget =
+                        [&](bool servingFootprintMaterialized) -> bool {
                     if (!updatedPages || pageLen <= 0 || deviceBytesPerPage.empty()) {
-                        return;
+                        return false;
                     }
                     int currentPages = std::max(1, (fastllm::GetMaxTokens() + pageLen - 1) / pageLen);
                     auto freeAfterWarmup = FastllmCudaGetFreeSizes();
@@ -5035,9 +5036,17 @@ namespace fastllm {
                         targetFree += std::max(
                             0LL,
                             this->GetAutoWarmupCudaRuntimeReserveBytes(id, warmupMaxBatch));
-                        targetFree += std::max(
-                            0LL,
-                            this->GetAutoWarmupCudaServingReserveBytes(id));
+                        // Before model-specific serving resources exist, retain
+                        // their estimated accounting reserve.  Once graphs and
+                        // serving high-water buffers have been materialized,
+                        // freeAfterWarmup already includes their real physical
+                        // footprint; charging the estimate again would shrink KV
+                        // twice for the same allocation.
+                        if (!servingFootprintMaterialized) {
+                            targetFree += std::max(
+                                0LL,
+                                this->GetAutoWarmupCudaServingReserveBytes(id));
+                        }
                         long long delayedReservePerPage =
                             deviceDelayedCacheBytesPerPage.count(id) ? deviceDelayedCacheBytesPerPage[id] : 0;
                         delayedReservePerPage = std::max(0LL, delayedReservePerPage);
@@ -5060,16 +5069,18 @@ namespace fastllm {
                     }
 
                     if (targetPages == LLONG_MAX) {
-                        return;
+                        return false;
                     }
 
                     long long calibratedPagesLong = std::max(1LL, targetPages);
                     int calibratedPages = (int)calibratedPagesLong;
                     if (calibratedPages == currentPages) {
-                        return;
+                        return false;
                     }
 
-                    printf("[Fastllm] AutoWarmup calibrate cache pages by post-warmup GPU budget: %d -> %d (tokens: %lld -> %lld).\n",
+                    printf("[Fastllm] AutoWarmup calibrate cache pages by %s GPU budget: %d -> %d (tokens: %lld -> %lld).\n",
+                           servingFootprintMaterialized ?
+                               "materialized CUDA serving" : "post-warmup",
                            currentPages, calibratedPages,
                            (long long)currentPages * pageLen,
                            (long long)calibratedPages * pageLen);
@@ -5088,14 +5099,49 @@ namespace fastllm {
                                it.second / 1e6, delayedReservePerPage / 1e6, pages);
                     }
 
+                    if (servingFootprintMaterialized) {
+                        // CUDA graphs and slot pools may embed pointers owned by
+                        // the provisional paged cache. Destroy them before the
+                        // manager so no stale address survives the resize.
+                        this->ResetCudaServingForKvCacheResize();
+                    }
                     autoWarmupPagedCacheManager = nullptr;
                     ClearAllPagedCacheManagers();
                     fastllm::SetMaxTokens(calibratedPages * pageLen);
                     calculatedMaxPages = calibratedPages;
                     runUniformBatchWarmup(1, 1, false);
                     printCudaWarmupPoolStats("calibrated paged cache allocation");
+                    return true;
                 };
-                calibrateCachePagesToGpuBudget();
+                calibrateCachePagesToGpuBudget(false);
+
+                // CUDA Graph capture must see real page-backed pointers, so use
+                // the current cache as a provisional first stage.  Its measured
+                // footprint then replaces the estimate above.  If the resulting
+                // page count changes, the model reset hook destroys every object
+                // referencing the old cache and a second capture binds the final
+                // allocation.
+                if (updatedPages) {
+                    autoWarmupPagedCacheManager = nullptr;
+                    bool servingFootprintMaterialized =
+                        this->MaterializeCudaServingForFinalKvCalibration();
+                    if (servingFootprintMaterialized) {
+                        printCudaWarmupPoolStats(
+                            "materialized CUDA serving before final KV calibration");
+                        bool resizedForServing =
+                            calibrateCachePagesToGpuBudget(true);
+                        if (resizedForServing) {
+                            autoWarmupPagedCacheManager = nullptr;
+                            if (!this->MaterializeCudaServingForFinalKvCalibration()) {
+                                throw std::runtime_error(
+                                    "CUDA serving resources could not be rebuilt "
+                                    "after final KV-cache calibration.");
+                            }
+                            printCudaWarmupPoolStats(
+                                "final CUDA serving recapture");
+                        }
+                    }
+                }
             }
 #endif
         }

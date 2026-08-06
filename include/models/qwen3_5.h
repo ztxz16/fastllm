@@ -119,6 +119,10 @@ namespace fastllm {
 
         virtual void WarmupCudaServingHighWaterBuffers() override;
 
+        virtual bool MaterializeCudaServingForFinalKvCalibration() override;
+
+        virtual void ResetCudaServingForKvCacheResize() override;
+
         virtual void OnResponseContextCreated(ResponseContext *context) override;
 
         virtual void OnResponseContextRemoved(ResponseContext *context) override;
@@ -195,7 +199,8 @@ namespace fastllm {
                 Data *precomputedHiddenStates = nullptr);
 
         void PrepareMtpCudaServingWarmup();
-        void PrepareCudaServingAfterWarmup(bool highWaterOnly = false);
+        void PrepareCudaServingAfterWarmup(bool highWaterOnly = false,
+                                           bool allowDuringAutoWarmup = false);
         void PreAllocateLinearSlotPoolsForCudaGraph(
                 const std::vector<int> &devices,
                 const std::map<int, int> &ratios,

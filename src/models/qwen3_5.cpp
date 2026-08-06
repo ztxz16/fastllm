@@ -6861,9 +6861,9 @@ namespace fastllm {
 
     void Qwen3_5Model::WarmupCudaServingHighWaterBuffers() {
 #ifdef USE_CUDA
-        // CUDA graph capture owns page-backed pointers and must retain the
-        // original post-AutoWarmup ordering. The non-graph API path can safely
-        // materialize its eager-serving scratch before final KV calibration.
+        // CUDA graph capture owns page-backed pointers and is handled by the
+        // explicit two-stage final-KV calibration. The non-graph API path can
+        // safely materialize eager-serving scratch directly here.
         if (GetFastllmEnv().cudaGraph ||
             !Qwen35ServingHighWaterWarmupRequested()) {
             return;
@@ -6873,10 +6873,53 @@ namespace fastllm {
 #endif
     }
 
+    bool Qwen3_5Model::MaterializeCudaServingForFinalKvCalibration() {
+#ifdef USE_CUDA
+        if (!GetFastllmEnv().cudaGraph || GetKVCacheInCPU()) {
+            return false;
+        }
+        if (cudaServingPrepared) {
+            return true;
+        }
+
+        PrepareMtpCudaServingWarmup();
+        if (threadTpWorkerGroup.HasWorkers()) {
+            threadTpWorkerGroup.Stop();
+        }
+        // Match the normal post-AutoWarmup ordering: discard the generic warmup
+        // manager and idle scratch, then let graph pre-capture create a clean
+        // provisional manager whose page addresses remain stable for the graph.
+        ClearAllPagedCacheManagers();
+        FastllmCudaClearBigBuffer();
+        PrepareCudaServingAfterWarmup(false, true);
+        Qwen35ReleaseThreadLocalCudaSamplingBuffers();
+        return cudaServingPrepared;
+#else
+        return false;
+#endif
+    }
+
+    void Qwen3_5Model::ResetCudaServingForKvCacheResize() {
+#ifdef USE_CUDA
+        if (threadTpWorkerGroup.HasWorkers()) {
+            threadTpWorkerGroup.Stop();
+        }
+        // Graph execs must be destroyed before their shared Data and before any
+        // page-backed cache manager. Linear slot pools are also capture inputs
+        // and must be rebuilt together with the final graph workspace.
+        Qwen35EraseCudaGraphDecodeStates(this);
+        Qwen35EraseLinearSlotPools(this);
+        Qwen35ReleaseThreadLocalCudaSamplingBuffers();
+        cudaServingHighWaterPrepared = false;
+        cudaServingPrepared = false;
+        FastllmCudaClearBigBuffer();
+#endif
+    }
+
     void Qwen3_5Model::OnAutoWarmupFinished() {
 #ifdef USE_CUDA
         PrepareMtpCudaServingWarmup();
-        if (GetFastllmEnv().cudaGraph) {
+        if (GetFastllmEnv().cudaGraph && !cudaServingPrepared) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
@@ -7303,7 +7346,8 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::PrepareCudaServingAfterWarmup(bool highWaterOnly) {
+    void Qwen3_5Model::PrepareCudaServingAfterWarmup(
+            bool highWaterOnly, bool allowDuringAutoWarmup) {
 #ifdef USE_CUDA
         if (cudaServingPrepared ||
             (highWaterOnly && cudaServingHighWaterPrepared)) {
@@ -7320,7 +7364,8 @@ namespace fastllm {
             ? servingHighWaterWarmup
             : (cudaGraphEnabled || allocationFreeServing);
         if (!preparationRequested ||
-            (!highWaterOnly && autoWarmupRunning.load()) ||
+            (!highWaterOnly && !allowDuringAutoWarmup &&
+             autoWarmupRunning.load()) ||
             GetKVCacheInCPU()) {
             return;
         }
