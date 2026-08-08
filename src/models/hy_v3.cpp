@@ -1418,7 +1418,8 @@ namespace fastllm {
         static bool HyV3IsNVFP4WeightType(DataType dataType) {
             return dataType == DataType::NVFP4 ||
                    dataType == DataType::NVFP4_BLOCK_16 ||
-                   dataType == DataType::NVFP4_BLOCK_16_E8M0;
+                   dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   dataType == DataType::NVFP4_BLOCK_32_E8M0;
         }
 
         struct HyV3ForwardSingleBuffers {

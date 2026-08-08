@@ -32,6 +32,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -62,8 +63,21 @@ namespace fastllm {
         double recomputeTokensPerSecond);
 }
 
+namespace fastllm {
+    bool FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb,
+        void *C, long ldc, int n, int m, int k, int st, int end);
+    bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb,
+        void *C, long ldc, int n, int m, int k, int st, int end);
+}
+
 #ifdef USE_CUDA
 namespace fastllm {
+    bool DeepSeekV4CopyCudaTensorToCpuForTest(
+        const Data &source, Data &destination);
+    bool DeepSeekV4AddQuantizedCudaReplicaForTest(
+        Data &activation, int device);
     int DeepSeekV4BuildWindowKVPrefixForTest(
         const Data &windowKV, int bsz, int headDim, int startPos,
         int windowSize, Data &output);
@@ -73,11 +87,386 @@ namespace fastllm {
     void DeepSeekV4AppendCompressorRawForTest(
         const Data &kv, const Data &score, int bsz, int seqlen,
         int wideDim, Data &allKV, Data &allScore);
+    void DeepSeekV4TrimCompressorRawForTest(
+        int bsz, int totalLen, int compressRatio, int wideDim,
+        int compressedBlocks, Data &allKV, Data &allScore,
+        int &rawTokenBase);
 }
 #endif
 
 namespace {
     void Expect(bool condition, const std::string &message);
+    void ExpectIntEqual(const std::vector<int32_t> &expected,
+                        const std::vector<int32_t> &actual,
+                        const std::string &name);
+    void RunCpuDeepSeekV4IndexerBenchmark(int sequence);
+
+    void RunCpuDeepSeekV4Nvfp4Block32Benchmark() {
+        constexpr int rows = 8;
+        constexpr int inputDim = 4096;
+        constexpr int outputDim = 4096;
+        constexpr int block16Count = inputDim / 16;
+        constexpr int block16Stride = block16Count * 9;
+        constexpr int block32Count = inputDim / 32;
+        constexpr int block32Stride = block32Count * 17;
+        constexpr int iterations = 40;
+
+        uint32_t state = 0x9e3779b9u;
+        auto nextRandom = [&state]() {
+            state = state * 1664525u + 1013904223u;
+            return state;
+        };
+        std::vector<uint16_t> input((size_t)rows * inputDim);
+        for (uint16_t &bits : input) {
+            const int value = (int)(nextRandom() >> 24) - 128;
+            bits = fastllm::Float32ToBFloat16RNEBits(value / 32.0f);
+        }
+        std::vector<uint8_t> block16Weight(
+            (size_t)outputDim * block16Stride);
+        std::vector<uint8_t> block32Weight(
+            (size_t)outputDim * block32Stride);
+        constexpr uint8_t scaleValues[] = {
+            0, 1, 63, 64, 119, 120, 121, 190, 191
+        };
+        for (int outputChannel = 0;
+             outputChannel < outputDim; outputChannel++) {
+            uint8_t *row16 = block16Weight.data() +
+                (size_t)outputChannel * block16Stride;
+            for (int block = 0; block < block16Count; block++) {
+                uint8_t *packed = row16 + block * 9;
+                for (int byte = 0; byte < 8; byte++) {
+                    packed[byte] = (uint8_t)(nextRandom() >> 24);
+                }
+                // The model's blockM=32 source scale is duplicated across
+                // each adjacent pair of repacked blockM=16 blocks.
+                packed[8] = scaleValues[
+                    (outputChannel * 17 + block / 2) %
+                    (sizeof(scaleValues) / sizeof(scaleValues[0]))];
+            }
+            uint8_t *row32 = block32Weight.data() +
+                (size_t)outputChannel * block32Stride;
+            for (int block = 0; block < block32Count; block++) {
+                const uint8_t *first = row16 + block * 18;
+                const uint8_t *second = first + 9;
+                Expect(first[8] == second[8],
+                       "block16 scale pair is not compactable.");
+                uint8_t *packed = row32 + block * 17;
+                std::memcpy(packed, first, 8);
+                std::memcpy(packed + 8, second, 8);
+                packed[16] = first[8];
+            }
+        }
+        std::vector<float> output((size_t)rows * outputDim);
+        auto run = [&](bool block32, int activeRows) {
+            std::fill(output.begin(), output.end(), 0.0f);
+            bool used = block32 ? fastllm::
+                FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+                    input.data(), inputDim * (long)sizeof(uint16_t),
+                    block32Weight.data(), block32Stride,
+                    output.data(), outputDim * (long)sizeof(float),
+                    activeRows, inputDim, outputDim, 0, outputDim) :
+                fastllm::
+                FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(
+                    input.data(), inputDim * (long)sizeof(uint16_t),
+                    block16Weight.data(), block16Stride,
+                    output.data(), outputDim * (long)sizeof(float),
+                    activeRows, inputDim, outputDim, 0, outputDim);
+            Expect(used, "AVX512-BF16 NVFP4 E8M0 kernel is unavailable.");
+            uint64_t hash = 1469598103934665603ull;
+            for (size_t index = 0;
+                 index < (size_t)activeRows * outputDim; index++) {
+                uint32_t bits;
+                std::memcpy(&bits, &output[index], sizeof(bits));
+                hash ^= bits;
+                hash *= 1099511628211ull;
+            }
+            return hash;
+        };
+
+        for (int activeRows = 1; activeRows <= rows; activeRows++) {
+            const uint64_t block16Hash = run(false, activeRows);
+            const uint64_t block32Hash = run(true, activeRows);
+            Expect(block16Hash == block32Hash,
+                   "NVFP4 block32 kernel changed FP32 output bits at rows=" +
+                       std::to_string(activeRows) + ".");
+            std::cout << "rows=" << activeRows << " hash="
+                      << std::hex << block32Hash << std::dec << "\n";
+        }
+        constexpr int prefillRows = 64;
+        std::vector<uint16_t> prefillInput(
+            (size_t)prefillRows * inputDim);
+        for (int row = 0; row < prefillRows; row++) {
+            std::memcpy(
+                prefillInput.data() + (size_t)row * inputDim,
+                input.data() + (size_t)(row % rows) * inputDim,
+                (size_t)inputDim * sizeof(uint16_t));
+        }
+        std::vector<float> prefillOutput16(
+            (size_t)prefillRows * outputDim);
+        std::vector<float> prefillOutput32(
+            (size_t)prefillRows * outputDim);
+        fastllm::FastllmGemm(
+            prefillRows, inputDim, outputDim,
+            prefillInput.data(), inputDim * (long)sizeof(uint16_t),
+            block16Weight.data(), block16Stride,
+            prefillOutput16.data(), outputDim * (long)sizeof(float),
+            0, outputDim, fastllm::DataType::BFLOAT16,
+            fastllm::DataType::NVFP4_BLOCK_16_E8M0,
+            fastllm::DataType::FLOAT32);
+        fastllm::FastllmGemm(
+            prefillRows, inputDim, outputDim,
+            prefillInput.data(), inputDim * (long)sizeof(uint16_t),
+            block32Weight.data(), block32Stride,
+            prefillOutput32.data(), outputDim * (long)sizeof(float),
+            0, outputDim, fastllm::DataType::BFLOAT16,
+            fastllm::DataType::NVFP4_BLOCK_32_E8M0,
+            fastllm::DataType::FLOAT32);
+        Expect(std::memcmp(
+                   prefillOutput16.data(), prefillOutput32.data(),
+                   prefillOutput16.size() * sizeof(float)) == 0,
+               "CPU NVFP4 block32 prefill changed FP32 output bits.");
+        std::cout << "cpu block32 prefill_rows=" << prefillRows
+                  << " hash=bitwise-match\n";
+#ifdef USE_CUDA
+        int cudaDeviceCount = 0;
+        if (cudaGetDeviceCount(&cudaDeviceCount) == cudaSuccess &&
+            cudaDeviceCount > 0) {
+            constexpr int cudaRows = 64;
+            std::vector<uint16_t> cudaInputValues(
+                (size_t)cudaRows * inputDim);
+            for (int row = 0; row < cudaRows; row++) {
+                std::memcpy(
+                    cudaInputValues.data() + (size_t)row * inputDim,
+                    input.data() + (size_t)(row % rows) * inputDim,
+                    (size_t)inputDim * sizeof(uint16_t));
+            }
+            fastllm::Data cudaInput(
+                fastllm::DataType::BFLOAT16, {cudaRows, inputDim});
+            cudaInput.Allocate(false);
+            std::memcpy(cudaInput.cpuData, cudaInputValues.data(),
+                        cudaInput.GetBytes());
+            cudaInput.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+
+            fastllm::Data cudaWeight16(
+                fastllm::DataType::NVFP4_BLOCK_16_E8M0,
+                {outputDim, inputDim});
+            cudaWeight16.Allocate(false);
+            std::memcpy(cudaWeight16.cpuData, block16Weight.data(),
+                        block16Weight.size());
+            cudaWeight16.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            fastllm::Data cudaWeight32(
+                fastllm::DataType::NVFP4_BLOCK_32_E8M0,
+                {outputDim, inputDim});
+            cudaWeight32.Allocate(false);
+            std::memcpy(cudaWeight32.cpuData, block32Weight.data(),
+                        block32Weight.size());
+            cudaWeight32.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+
+            fastllm::Data cudaOutput16(
+                fastllm::DataType::BFLOAT16, {cudaRows, outputDim});
+            fastllm::Data cudaOutput32(
+                fastllm::DataType::BFLOAT16, {cudaRows, outputDim});
+            cudaOutput16.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+            cudaOutput32.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, false);
+            cudaOutput16.Allocate(false);
+            cudaOutput32.Allocate(false);
+            fastllm::Data emptyBias;
+            Expect(fastllm::IsCudaLinearDataTypeSupported(
+                       fastllm::DataType::BFLOAT16,
+                       fastllm::DataType::NVFP4_BLOCK_32_E8M0,
+                       fastllm::DataType::FLOAT32),
+                   "CUDA Linear does not advertise NVFP4 block32 support.");
+            Expect(FastllmCudaBFloat16MatMulNVFP4Block16E8M0(
+                       cudaInput, cudaWeight16, emptyBias, cudaOutput16,
+                       cudaRows, inputDim, outputDim),
+                   "CUDA NVFP4 block16 E8M0 reference failed.");
+            Expect(FastllmCudaBFloat16MatMulNVFP4Block16E8M0(
+                       cudaInput, cudaWeight32, emptyBias, cudaOutput32,
+                       cudaRows, inputDim, outputDim),
+                   "CUDA NVFP4 block32 E8M0 path failed.");
+            FastllmCudaSyncCurrentThreadStream();
+            cudaOutput16.ToDevice(fastllm::DataDevice::CPU);
+            cudaOutput32.ToDevice(fastllm::DataDevice::CPU);
+            Expect(std::memcmp(
+                       cudaOutput16.cpuData, cudaOutput32.cpuData,
+                       cudaOutput16.GetBytes()) == 0,
+                   "CUDA NVFP4 block32 changed BF16 output bits.");
+            for (int gemvRows : {1, 7, 8, 31}) {
+                fastllm::Data halfInput(
+                    fastllm::DataType::FLOAT16,
+                    {gemvRows, inputDim});
+                halfInput.Allocate(false);
+                uint16_t *halfBits = (uint16_t*)halfInput.cpuData;
+                for (int index = 0; index < gemvRows * inputDim;
+                     index++) {
+                    const float value = fastllm::BFloat16BitsToFloat32(
+                        input[(size_t)(index % (rows * inputDim))]);
+                    halfBits[index] = fastllm::float_to_half(value);
+                }
+                halfInput.ToDevice(
+                    fastllm::DataDevice::CUDA,
+                    std::vector<int>{0}, true);
+                fastllm::Data halfOutput16(
+                    fastllm::DataType::FLOAT16,
+                    {gemvRows, outputDim});
+                fastllm::Data halfOutput32(
+                    fastllm::DataType::FLOAT16,
+                    {gemvRows, outputDim});
+                halfOutput16.ToDevice(
+                    fastllm::DataDevice::CUDA,
+                    std::vector<int>{0}, false);
+                halfOutput32.ToDevice(
+                    fastllm::DataDevice::CUDA,
+                    std::vector<int>{0}, false);
+                halfOutput16.Allocate(false);
+                halfOutput32.Allocate(false);
+                Expect(FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(
+                           halfInput, cudaWeight16, emptyBias,
+                           halfOutput16, gemvRows, inputDim, outputDim),
+                       "CUDA NVFP4 block16 FP16 GEMV reference failed.");
+                Expect(FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(
+                           halfInput, cudaWeight32, emptyBias,
+                           halfOutput32, gemvRows, inputDim, outputDim),
+                       "CUDA NVFP4 block32 FP16 GEMV failed.");
+                FastllmCudaSyncCurrentThreadStream();
+                halfOutput16.ToDevice(fastllm::DataDevice::CPU);
+                halfOutput32.ToDevice(fastllm::DataDevice::CPU);
+                Expect(std::memcmp(
+                           halfOutput16.cpuData, halfOutput32.cpuData,
+                           halfOutput16.GetBytes()) == 0,
+                       "CUDA NVFP4 block32 FP16 GEMV changed output bits at "
+                       "rows=" + std::to_string(gemvRows) + ".");
+            }
+            std::cout << "cuda block32 hash=bitwise-match "
+                      << "gemv_rows=1,7,8,31\n";
+
+            if (cudaDeviceCount >= 2) {
+                const int originalDevice = FastllmCudaGetDevice();
+                const std::vector<int> devices = {0, 1};
+                auto makeCpuWeight = [&]() {
+                    fastllm::Data weight(
+                        fastllm::DataType::NVFP4_BLOCK_32_E8M0,
+                        {outputDim, inputDim});
+                    weight.name =
+                        "regression.nvfp4_block32_cpu_source.weight";
+                    weight.Allocate(false);
+                    std::memcpy(
+                        weight.cpuData, block32Weight.data(),
+                        block32Weight.size());
+                    return weight;
+                };
+                auto copyLocalBytes = [](fastllm::Data *local) {
+                    Expect(
+                        local != nullptr && local->cudaData != nullptr,
+                        "NVFP4 block32 TP shard is missing CUDA storage.");
+                    FastllmCudaSetDevice(
+                        GetPointerDeviceId(local->cudaData));
+                    std::vector<uint8_t> bytes(local->GetBytes());
+                    FastllmCudaCopyFromDeviceToHost(
+                        bytes.data(), local->cudaData, bytes.size());
+                    return bytes;
+                };
+
+                {
+                    fastllm::Data weight = makeCpuWeight();
+                    fastllm::Data bias;
+                    DivisionScheme scheme = {
+                        {0, {{0, outputDim / 2}}},
+                        {1, {{outputDim / 2, outputDim}}}
+                    };
+                    std::vector<int> mutableDevices = devices;
+                    Expect(
+                        SplitMultiCudaWeight(
+                            weight, bias, mutableDevices, scheme, 0, true),
+                        "NVFP4 block32 CPU-source TP row split failed.");
+                    for (int device : devices) {
+                        fastllm::Data *local =
+                            weight.multiDeviceDatas.at(device);
+                        std::vector<uint8_t> actual =
+                            copyLocalBytes(local);
+                        const int rowBegin = scheme[device][0].first;
+                        const uint8_t *expected = block32Weight.data() +
+                            (size_t)rowBegin * block32Stride;
+                        Expect(
+                            std::memcmp(
+                                actual.data(), expected,
+                                actual.size()) == 0,
+                            "NVFP4 block32 TP row split copied the wrong "
+                            "CPU-source bytes.");
+                    }
+                }
+
+                {
+                    fastllm::Data weight = makeCpuWeight();
+                    fastllm::Data bias;
+                    DivisionScheme scheme = {
+                        {0, {{0, inputDim / 2}}},
+                        {1, {{inputDim / 2, inputDim}}}
+                    };
+                    std::vector<int> mutableDevices = devices;
+                    Expect(
+                        SplitMultiCudaWeight(
+                            weight, bias, mutableDevices, scheme, 1, true),
+                        "NVFP4 block32 CPU-source TP column split failed.");
+                    const size_t localRowBytes =
+                        fastllm::GetDataBytes(
+                            fastllm::DataType::NVFP4_BLOCK_32_E8M0,
+                            1, inputDim / 2);
+                    for (int device : devices) {
+                        fastllm::Data *local =
+                            weight.multiDeviceDatas.at(device);
+                        std::vector<uint8_t> actual =
+                            copyLocalBytes(local);
+                        const size_t sourceOffset =
+                            (size_t)(scheme[device][0].first / 32) * 17;
+                        for (int row = 0; row < outputDim; row++) {
+                            const uint8_t *expected =
+                                block32Weight.data() +
+                                (size_t)row * block32Stride + sourceOffset;
+                            Expect(
+                                std::memcmp(
+                                    actual.data() +
+                                        (size_t)row * localRowBytes,
+                                    expected, localRowBytes) == 0,
+                                "NVFP4 block32 TP column split copied the "
+                                "wrong CPU-source bytes.");
+                        }
+                    }
+                }
+                FastllmCudaSetDevice(originalDevice);
+                std::cout << "cuda block32 TP CPU-source row/column "
+                          << "split=bytewise-match\n";
+            }
+        }
+#endif
+        for (int timedRows = 2; timedRows <= rows; timedRows++) {
+            for (bool block32 : {false, true}) {
+                for (int warmup = 0; warmup < 3; warmup++) {
+                    run(block32, timedRows);
+                }
+                const auto begin = std::chrono::steady_clock::now();
+                uint64_t hash = 0;
+                for (int iteration = 0; iteration < iterations;
+                     iteration++) {
+                    hash ^= run(block32, timedRows);
+                }
+                const double elapsedMs =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - begin).count();
+                std::cout << (block32 ? "block32" : "block16")
+                          << " rows=" << timedRows
+                          << " iterations=" << iterations
+                          << " average_ms=" << elapsedMs / iterations
+                          << " guard=" << std::hex << hash << std::dec
+                          << "\n";
+            }
+        }
+    }
 
     class ScopedTempDirectory {
     public:
@@ -2931,6 +3320,90 @@ namespace {
 #endif
     }
 
+    void RunDeepSeekV4DsparkPrefixSelectionRegression() {
+        fastllm::DeepSeekV4HistoryCacheManager manager;
+        std::vector<int> input(700);
+        for (int i = 0; i < (int)input.size(); ++i) {
+            input[i] = (i * 37 + 11) % 32000;
+        }
+        auto prefixHash = [&](int tokens) {
+            uint64_t hash = 1469598103934665603ULL;
+            auto mix = [&](uint64_t value) {
+                hash ^= value + 0x9e3779b97f4a7c15ULL +
+                        (hash << 6) + (hash >> 2);
+                hash *= 1099511628211ULL;
+            };
+            mix((uint64_t)manager.logicalBlockSize);
+            for (int i = 0; i < tokens; ++i) {
+                mix((uint64_t)(uint32_t)input[i]);
+                if ((i + 1) % manager.logicalBlockSize == 0) {
+                    mix(0xff51afd7ed558ccdULL ^
+                        (uint64_t)((i + 1) / manager.logicalBlockSize));
+                }
+            }
+            return hash;
+        };
+
+        auto makeMemory = [&](int tokens, bool dsparkValid) {
+            fastllm::DeepSeekV4HistoryCacheMemory memory;
+            memory.tokens = tokens;
+            memory.blockCount = tokens / manager.logicalBlockSize;
+            memory.inputToken.assign(input.begin(), input.begin() + tokens);
+            memory.blockHash = prefixHash(tokens);
+            memory.layers.resize(1);
+            memory.dsparkValid = dsparkValid;
+            memory.dsparkCommittedTokens = dsparkValid ? tokens : 0;
+            return memory;
+        };
+
+        manager.Record(makeMemory(256, true));
+        manager.Record(makeMemory(512, false));
+        fastllm::DeepSeekV4HistoryCacheMemory hit;
+        int hitLen = 0;
+        Expect(manager.Get(input, hit, hitLen, false) && hitLen == 512,
+               "DeepSeek-V4 target prefix lookup did not choose the longest snapshot.");
+        Expect(manager.Get(input, hit, hitLen, true) && hitLen == 256 &&
+                   hit.dsparkValid,
+               "DeepSeek-V4 DSpark prefix lookup reused a target-only snapshot.");
+
+        struct TestDeepSeekV4Model : fastllm::DeepSeekV4Model {
+            using fastllm::DeepSeekV4Model::dsparkConfidenceThreshold;
+            using fastllm::DeepSeekV4Model::dsparkDraftBestUs;
+            using fastllm::DeepSeekV4Model::dsparkTokens;
+            using fastllm::DeepSeekV4Model::dsparkValidationCount;
+            using fastllm::DeepSeekV4Model::dsparkVerifyBestUs;
+            using fastllm::DeepSeekV4Model::SelectDsparkVerifyDrafts;
+        } model;
+        model.dsparkTokens = 7;
+        model.dsparkConfidenceThreshold = 0.5f;
+        fastllm::DeepSeekV4DsparkProposal proposal;
+        proposal.tokens.assign(7, 11);
+        proposal.confidence = {
+            0.96f, 0.83f, 0.61f, 0.49f, 0.80f, 0.77f, 0.75f};
+        fastllm::DeepSeekV4DsparkContext context;
+        Expect(model.SelectDsparkVerifyDrafts(proposal, context) == 7,
+               "DeepSeek-V4 DSpark scheduler skipped calibration probes.");
+        model.dsparkValidationCount.store(6);
+        Expect(model.SelectDsparkVerifyDrafts(proposal, context) == 3,
+               "DeepSeek-V4 DSpark confidence scheduler did not prune at "
+               "the first low-confidence draft.");
+        model.dsparkDraftBestUs.store(15000);
+        model.dsparkVerifyBestUs[0].store(50000);
+        model.dsparkVerifyBestUs[6].store(180000);
+        model.dsparkVerifyBestUs[7].store(205000);
+        Expect(model.SelectDsparkVerifyDrafts(proposal, context) == 2,
+               "DeepSeek-V4 DSpark hardware-aware scheduler ignored the "
+               "profiled verifier curve.");
+        model.dsparkConfidenceThreshold = 0.0f;
+        Expect(model.SelectDsparkVerifyDrafts(proposal, context) == 7,
+               "DeepSeek-V4 DSpark fixed-block compatibility mode was pruned.");
+        proposal = fastllm::DeepSeekV4DsparkProposal();
+        proposal.gpuDeferred = true;
+        model.dsparkConfidenceThreshold = 0.5f;
+        Expect(model.SelectDsparkVerifyDrafts(proposal, context) == 7,
+               "DeepSeek-V4 DSpark deferred GPU proposal lost fixed shape.");
+    }
+
 #ifdef USE_CUDA
     void RunCudaGreedyTieBreakRegression() {
         constexpr int vocabSize = 32768;
@@ -2992,6 +3465,96 @@ namespace {
 
         FastllmCudaFree(cudaFloatOutput);
         FastllmCudaFree(cudaOutput);
+        FastllmCudaFree(cudaLogits);
+    }
+
+    void RunCudaHandoffSamplingRegression() {
+        constexpr int batch = 2;
+        constexpr int vocabSize = 128;
+        constexpr int penaltyTokens = 1;
+        const size_t logitsBytes =
+            (size_t)batch * vocabSize * sizeof(float);
+        FastllmCudaSetDevice(0);
+
+        std::vector<float> logits(batch * vocabSize, -20.0f);
+        logits[7] = 10.0f;
+        logits[9] = 9.0f;
+        logits[vocabSize + 5] = 8.0f;
+        logits[vocabSize + 6] = 7.0f;
+        std::vector<float> temperatures(batch, 1.0f);
+        std::vector<int> topKs(batch, 2);
+        std::vector<float> topPs(batch, 0.01f);
+        std::vector<int> penaltyIds = {-1, 5};
+        std::vector<float> penaltyFactors = {1.0f, 100.0f};
+
+        float *cudaLogits = (float*)FastllmCudaMalloc(logitsBytes);
+        float *cudaProbs = (float*)FastllmCudaMalloc(logitsBytes);
+        float *cudaTemperatures =
+            (float*)FastllmCudaMalloc(batch * sizeof(float));
+        int *cudaTopKs = (int*)FastllmCudaMalloc(batch * sizeof(int));
+        float *cudaTopPs =
+            (float*)FastllmCudaMalloc(batch * sizeof(float));
+        int *cudaPenaltyIds =
+            (int*)FastllmCudaMalloc(batch * penaltyTokens * sizeof(int));
+        float *cudaPenaltyFactors = (float*)FastllmCudaMalloc(
+            batch * penaltyTokens * sizeof(float));
+        int *cudaOutput = (int*)FastllmCudaMalloc(batch * sizeof(int));
+        float *cudaFloatOutput =
+            (float*)FastllmCudaMalloc(batch * sizeof(float));
+        Expect(cudaLogits != nullptr && cudaProbs != nullptr &&
+                   cudaTemperatures != nullptr && cudaTopKs != nullptr &&
+                   cudaTopPs != nullptr && cudaPenaltyIds != nullptr &&
+                   cudaPenaltyFactors != nullptr && cudaOutput != nullptr &&
+                   cudaFloatOutput != nullptr,
+               "failed to allocate CUDA handoff sampling buffers");
+
+        FastllmCudaCopyFromHostToDevice(
+            cudaLogits, logits.data(), logitsBytes);
+        FastllmCudaCopyFromHostToDevice(
+            cudaTemperatures, temperatures.data(),
+            batch * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(
+            cudaTopKs, topKs.data(), batch * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(
+            cudaTopPs, topPs.data(), batch * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(
+            cudaPenaltyIds, penaltyIds.data(),
+            batch * penaltyTokens * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(
+            cudaPenaltyFactors, penaltyFactors.data(),
+            batch * penaltyTokens * sizeof(float));
+
+        Expect(FastllmCudaTopKTopPSamplingToDevice(
+                   cudaLogits, cudaProbs,
+                   cudaTemperatures, cudaTopKs, cudaTopPs,
+                   cudaPenaltyIds, cudaPenaltyFactors, penaltyTokens,
+                   cudaOutput, cudaFloatOutput, batch, vocabSize),
+               "CUDA handoff top-k/top-p launch failed");
+        std::vector<int> output(batch, -1);
+        std::vector<float> floatOutput(batch, -1.0f);
+        std::vector<float> penalizedLogits(batch * vocabSize);
+        FastllmCudaCopyFromDeviceToHost(
+            output.data(), cudaOutput, batch * sizeof(int));
+        FastllmCudaCopyFromDeviceToHost(
+            floatOutput.data(), cudaFloatOutput, batch * sizeof(float));
+        FastllmCudaCopyFromDeviceToHost(
+            penalizedLogits.data(), cudaLogits, logitsBytes);
+        Expect(output[0] == 7 && output[1] == 6,
+               "CUDA handoff sampling ignored top-p or repetition penalty");
+        Expect(floatOutput[0] == 7.0f && floatOutput[1] == 6.0f,
+               "CUDA handoff sampling float tokens differ from int output");
+        Expect(std::fabs(penalizedLogits[vocabSize + 5] - 0.08f) <
+                   1.0e-6f,
+               "CUDA handoff repetition factor was not applied exactly once");
+
+        FastllmCudaFree(cudaFloatOutput);
+        FastllmCudaFree(cudaOutput);
+        FastllmCudaFree(cudaPenaltyFactors);
+        FastllmCudaFree(cudaPenaltyIds);
+        FastllmCudaFree(cudaTopPs);
+        FastllmCudaFree(cudaTopKs);
+        FastllmCudaFree(cudaTemperatures);
+        FastllmCudaFree(cudaProbs);
         FastllmCudaFree(cudaLogits);
     }
 
@@ -3225,6 +3788,1323 @@ namespace {
         return values;
     }
 
+    void RunCpuDeepSeekV4HcPreRegressionCase(int tokens) {
+        constexpr int hcMult = 4;
+        constexpr int dim = 64;
+        constexpr int flatDim = hcMult * dim;
+        constexpr int mixHc = (2 + hcMult) * hcMult;
+        std::vector<float> inputValues((size_t)tokens * flatDim);
+        std::vector<float> fnValues((size_t)mixHc * flatDim);
+        std::vector<float> baseValues(mixHc);
+        for (size_t i = 0; i < inputValues.size(); i++) {
+            inputValues[i] =
+                (float)((int)((i * 17 + i / 11) % 97) - 48) / 64.0f;
+        }
+        for (size_t i = 0; i < fnValues.size(); i++) {
+            fnValues[i] =
+                (float)((int)((i * 13 + i / 7) % 89) - 44) / 4096.0f;
+        }
+        for (int i = 0; i < mixHc; i++) {
+            baseValues[i] = (float)((i * 5) % 17 - 8) / 32.0f;
+        }
+        fastllm::Data input(
+            fastllm::DataType::BFLOAT16,
+            {1, tokens, hcMult, dim});
+        input.Allocate();
+        uint16_t *inputBits = (uint16_t*)input.cpuData;
+        for (size_t i = 0; i < inputValues.size(); i++) {
+            inputBits[i] =
+                fastllm::Float32ToBFloat16RNEBits(inputValues[i]);
+        }
+        fastllm::Data hcFn(
+            fastllm::DataType::FLOAT32, {mixHc, flatDim}, fnValues);
+        fastllm::Data hcScale(
+            fastllm::DataType::FLOAT32, {3},
+            std::vector<float>({0.75f, -0.5f, 1.25f}));
+        fastllm::Data hcBase(
+            fastllm::DataType::FLOAT32, {mixHc}, baseValues);
+
+        std::vector<float> roundedInputValues(inputValues.size());
+        for (size_t i = 0; i < inputValues.size(); i++) {
+            roundedInputValues[i] = fastllm::BFloat16BitsToFloat32(
+                inputBits[i]);
+        }
+        fastllm::Data referenceInput(
+            fastllm::DataType::FLOAT32,
+            {1, tokens, hcMult, dim}, roundedInputValues);
+        fastllm::Data referenceOutput, referencePost, referenceComb;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4HcPre(
+                referenceInput, hcFn, hcScale, hcBase, hcMult, 20,
+                1e-6f, 1e-6f, referenceOutput, referencePost,
+                referenceComb);
+        }
+        fastllm::Data parallelOutput, parallelPost, parallelComb;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4HcPre(
+                input, hcFn, hcScale, hcBase, hcMult, 20,
+                1e-6f, 1e-6f, parallelOutput, parallelPost,
+                parallelComb);
+        }
+        std::vector<float> referenceOutputValues =
+            ToFloatVector(referenceOutput);
+        fastllm::Data roundedReferenceOutput(
+            fastllm::DataType::BFLOAT16, referenceOutput.dims);
+        roundedReferenceOutput.Allocate();
+        uint16_t *referenceOutputBits =
+            (uint16_t*)roundedReferenceOutput.cpuData;
+        for (size_t i = 0; i < referenceOutputValues.size(); i++) {
+            referenceOutputBits[i] = fastllm::Float32ToBFloat16RNEBits(
+                referenceOutputValues[i]);
+        }
+        ExpectFloatNear(
+            ToFloatVector(roundedReferenceOutput),
+            ToFloatVector(parallelOutput),
+            0.0f, 0.0f,
+            "DeepSeek-V4 CPU HcPre BF16 output fast versus reference");
+        ExpectFloatNear(
+            ToFloatVector(referencePost), ToFloatVector(parallelPost),
+            0.0f, 0.0f,
+            "DeepSeek-V4 CPU HcPre post fast versus reference");
+        ExpectFloatNear(
+            ToFloatVector(referenceComb), ToFloatVector(parallelComb),
+            0.0f, 0.0f,
+            "DeepSeek-V4 CPU HcPre comb fast versus reference");
+    }
+
+    void RunCpuDeepSeekV4HcPreRegression() {
+        // Cover both the mix-parallel one-token decode path and the
+        // token-partitioned prefill path.
+        RunCpuDeepSeekV4HcPreRegressionCase(1);
+        RunCpuDeepSeekV4HcPreRegressionCase(73);
+    }
+
+    void RunCpuDeepSeekV4HcPreDecodeBenchmark() {
+        constexpr int hcMult = 4;
+        constexpr int dim = 4096;
+        constexpr int flatDim = hcMult * dim;
+        constexpr int mixHc = (2 + hcMult) * hcMult;
+        constexpr int repeats = 200;
+        fastllm::SetThreads(40);
+
+        fastllm::Data input(
+            fastllm::DataType::BFLOAT16, {1, 1, hcMult, dim});
+        input.Allocate();
+        for (int i = 0; i < flatDim; i++) {
+            ((uint16_t*)input.cpuData)[i] =
+                fastllm::Float32ToBFloat16RNEBits(
+                    (float)((i * 17) % 257 - 128) / 256.0f);
+        }
+        std::vector<float> fnValues((size_t)mixHc * flatDim);
+        for (size_t i = 0; i < fnValues.size(); i++) {
+            fnValues[i] =
+                (float)((int)((i * 13 + i / 7) % 251) - 125) /
+                16384.0f;
+        }
+        fastllm::Data hcFn(
+            fastllm::DataType::FLOAT32,
+            {mixHc, flatDim}, fnValues);
+        fastllm::Data hcScale(
+            fastllm::DataType::FLOAT32, {3},
+            std::vector<float>({0.75f, -0.5f, 1.25f}));
+        fastllm::Data hcBase(
+            fastllm::DataType::FLOAT32, {mixHc},
+            std::vector<float>(mixHc, 0.125f));
+        fastllm::Data output, post, comb;
+        {
+            ScopedFirstDevice device("cpu");
+            for (int i = 0; i < 5; i++) {
+                fastllm::DeepSeekV4HcPre(
+                    input, hcFn, hcScale, hcBase, hcMult, 20,
+                    1e-6f, 1e-6f, output, post, comb);
+            }
+            auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < repeats; i++) {
+                fastllm::DeepSeekV4HcPre(
+                    input, hcFn, hcScale, hcBase, hcMult, 20,
+                    1e-6f, 1e-6f, output, post, comb);
+            }
+            auto end = std::chrono::steady_clock::now();
+            double milliseconds = std::chrono::duration<double, std::milli>(
+                end - begin).count() / repeats;
+            std::cout << "DeepSeek-V4 CPU HcPre decode benchmark: "
+                      << milliseconds << " ms/call, checksum="
+                      << ((const uint16_t*)output.cpuData)[dim / 2]
+                      << "\n";
+        }
+    }
+
+    void RunCpuDeepSeekV4WindowKVUpdateRegressionCase(
+            fastllm::DataType inputType) {
+        constexpr int batch = 2;
+        constexpr int sequence = 8;
+        constexpr int window = 5;
+        constexpr int headDim = 7;
+        constexpr int startPos = 7;
+        std::vector<float> initialValues(batch * window * headDim);
+        std::vector<float> sourceValues(batch * sequence * headDim);
+        for (size_t i = 0; i < initialValues.size(); i++) {
+            initialValues[i] = (float)((int)(i % 31) - 15) / 8.0f;
+        }
+        for (size_t i = 0; i < sourceValues.size(); i++) {
+            sourceValues[i] = (float)((int)((i * 13 + 5) % 67) - 33) /
+                              16.0f;
+        }
+
+        fastllm::Data input(inputType, {batch, sequence, headDim});
+        input.Allocate();
+        std::vector<float> roundedSource(sourceValues.size());
+        if (inputType == fastllm::DataType::FLOAT32) {
+            memcpy(input.cpuData, sourceValues.data(),
+                   sourceValues.size() * sizeof(float));
+            roundedSource = sourceValues;
+        } else if (inputType == fastllm::DataType::FLOAT16) {
+            uint16_t *bits = (uint16_t*)input.cpuData;
+            for (size_t i = 0; i < sourceValues.size(); i++) {
+                bits[i] = fastllm::float_to_half(sourceValues[i]);
+                roundedSource[i] = fastllm::half_to_float(bits[i]);
+            }
+        } else {
+            uint16_t *bits = (uint16_t*)input.cpuData;
+            for (size_t i = 0; i < sourceValues.size(); i++) {
+                bits[i] = fastllm::Float32ToBFloat16RNEBits(sourceValues[i]);
+                roundedSource[i] =
+                    fastllm::BFloat16BitsToFloat32(bits[i]);
+            }
+        }
+
+        fastllm::Data cache(
+            fastllm::DataType::FLOAT32,
+            {batch, window, headDim}, initialValues);
+        std::vector<float> expected = initialValues;
+        for (int b = 0; b < batch; b++) {
+            for (int s = 0; s < sequence; s++) {
+                int slot = (startPos + s) % window;
+                memcpy(expected.data() +
+                           ((uint64_t)b * window + slot) * headDim,
+                       roundedSource.data() +
+                           ((uint64_t)b * sequence + s) * headDim,
+                       headDim * sizeof(float));
+            }
+        }
+
+        {
+            ScopedFirstDevice device("cpu");
+            auto *executor =
+                (fastllm::Executor*)fastllm::GetExecutor();
+            executor->Run(
+                "DeepSeekV4UpdateWindowKVCache",
+                {{"input", &input}, {"cache", &cache}}, {},
+                {{"startPos", startPos}, {"windowSize", window}});
+        }
+        Expect(cache.dataType == fastllm::DataType::FLOAT32,
+               "DeepSeek-V4 CPU window update changed cache dtype.");
+        Expect(cache.dims == std::vector<int>({batch, window, headDim}),
+               "DeepSeek-V4 CPU window update changed cache shape.");
+        Expect(memcmp(cache.cpuData, expected.data(),
+                      expected.size() * sizeof(float)) == 0,
+               "DeepSeek-V4 CPU window update is not bitwise aligned.");
+    }
+
+    void RunCpuDeepSeekV4WindowKVUpdateRegression() {
+        RunCpuDeepSeekV4WindowKVUpdateRegressionCase(
+            fastllm::DataType::FLOAT32);
+        RunCpuDeepSeekV4WindowKVUpdateRegressionCase(
+            fastllm::DataType::FLOAT16);
+        RunCpuDeepSeekV4WindowKVUpdateRegressionCase(
+            fastllm::DataType::BFLOAT16);
+    }
+
+    void RunCpuDeepSeekV4ScaleQRatoryRegressionCase(int tokens) {
+        constexpr int heads = 7;
+        constexpr int dim = 96;
+        constexpr int ropeDim = 32;
+        std::vector<uint16_t> inputBits((size_t)tokens * heads * dim);
+        std::vector<float> referenceValues(inputBits.size());
+        uint32_t state = 0x91e10da5u;
+        for (size_t i = 0; i < inputBits.size(); i++) {
+            state = state * 1664525u + 1013904223u;
+            float value = (float)((int32_t)(state % 32749u) - 16374) /
+                          2048.0f;
+            inputBits[i] = fastllm::Float32ToBFloat16RNEBits(value);
+            referenceValues[i] =
+                fastllm::BFloat16BitsToFloat32(inputBits[i]);
+        }
+
+        fastllm::Data reference(
+            fastllm::DataType::FLOAT32,
+            {1, tokens, heads, dim}, referenceValues);
+        fastllm::Data actual(
+            fastllm::DataType::BFLOAT16,
+            {1, tokens, heads, dim});
+        actual.Allocate();
+        memcpy(actual.cpuData, inputBits.data(),
+               inputBits.size() * sizeof(uint16_t));
+
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::ScaleQRatory(
+                reference, 1e-6f, ropeDim, 10000.0f, 137, 4096,
+                8.0f, 32, 1);
+            fastllm::ScaleQRatory(
+                actual, 1e-6f, ropeDim, 10000.0f, 137, 4096,
+                8.0f, 32, 1);
+        }
+
+        Expect(reference.dataType == fastllm::DataType::BFLOAT16,
+               "ScaleQRatory reference output should be BF16.");
+        Expect(actual.dataType == fastllm::DataType::BFLOAT16,
+               "ScaleQRatory optimized output should be BF16.");
+        Expect(reference.Count(0) == actual.Count(0),
+               "ScaleQRatory reference and optimized output sizes differ.");
+        Expect(memcmp(reference.cpuData, actual.cpuData,
+                      inputBits.size() * sizeof(uint16_t)) == 0,
+               "DeepSeek-V4 CPU ScaleQRatory BF16 output is not bitwise aligned with the reference path.");
+    }
+
+    void RunCpuDeepSeekV4ScaleQRatoryRegression() {
+        // One token covers the inline decode path; 373 tokens create enough
+        // rows to exercise all active prefill workers.
+        RunCpuDeepSeekV4ScaleQRatoryRegressionCase(1);
+        RunCpuDeepSeekV4ScaleQRatoryRegressionCase(373);
+    }
+
+    void RunCpuDeepSeekV4PreprocessRegression() {
+        fastllm::SetThreads(40);
+
+        // More than 4K independent blocks exercise the parallel activation
+        // quantizer.  Periodic very large blocks also cover the non-lookup
+        // fallback without introducing infinities or NaNs.
+        constexpr int quantRows = 129;
+        constexpr int quantDim = 4096;
+        constexpr uint64_t quantCount =
+            (uint64_t)quantRows * quantDim;
+        std::vector<uint16_t> quantInput(quantCount);
+        uint32_t state = 0x6a09e667u;
+        for (uint64_t i = 0; i < quantCount; i++) {
+            state = state * 1664525u + 1013904223u;
+            uint64_t block = i / 128;
+            int exponent = (int)((block * 13) % 31) - 15;
+            if (block % 257 == 0) {
+                exponent = 100;
+            }
+            float mantissa =
+                (float)((int32_t)(state % 2047u) - 1023) / 1024.0f;
+            quantInput[i] = fastllm::Float32ToBFloat16RNEBits(
+                std::ldexp(mantissa, exponent));
+        }
+
+        std::vector<uint16_t> quantReference(quantCount);
+        static const fastllm::FP8E4M3ToFP32Manager fp8;
+        for (uint64_t start = 0; start < quantCount; start += 128) {
+            float amax = 1e-4f;
+            for (uint64_t i = start; i < start + 128; i++) {
+                amax = std::max(
+                    amax, std::fabs(
+                        fastllm::BFloat16BitsToFloat32(quantInput[i])));
+            }
+            float normalized = amax / 448.0f;
+            uint32_t bits;
+            memcpy(&bits, &normalized, sizeof(bits));
+            int exponent = (int)((bits >> 23) & 0xFF) - 127 +
+                           ((bits & ((1u << 23) - 1)) != 0);
+            float scale = std::ldexp(1.0f, exponent);
+            const uint16_t *lookupRow =
+                fastllm::GetFP8E4M3BFloat16QuantizeLookupRow(exponent);
+            for (uint64_t i = start; i < start + 128; i++) {
+                if (lookupRow != nullptr) {
+                    quantReference[i] = lookupRow[quantInput[i]];
+                } else {
+                    float value = fastllm::BFloat16BitsToFloat32(
+                        quantInput[i]);
+                    float q = std::max(
+                        -448.0f, std::min(448.0f, value / scale));
+                    quantReference[i] =
+                        fastllm::Float32ToBFloat16RNEBits(
+                            fp8.quantizeDequantize(q) * scale);
+                }
+            }
+        }
+        std::vector<uint16_t> quantActual(quantCount);
+        fastllm::RunCpuDeepSeekV4ActivationQuantization(
+            quantInput.data(), quantActual.data(), quantCount);
+        Expect(memcmp(
+                   quantReference.data(), quantActual.data(),
+                   quantCount * sizeof(uint16_t)) == 0,
+               "DeepSeek-V4 parallel activation quantization changed BF16 bits.");
+
+        // Match the model's hidden-size norm and cover both separate output
+        // storage and the in-place KV normalization call.
+        constexpr int normRows = 257;
+        constexpr int normChannels = 7168;
+        constexpr float normEps = 1e-6f;
+        constexpr uint64_t normCount =
+            (uint64_t)normRows * normChannels;
+        std::vector<uint16_t> normInput(normCount);
+        std::vector<float> normWeight(normChannels);
+        state = 0xbb67ae85u;
+        for (uint64_t i = 0; i < normCount; i++) {
+            state = state * 1103515245u + 12345u;
+            float value =
+                (float)((int32_t)(state % 8191u) - 4095) / 1024.0f;
+            normInput[i] =
+                fastllm::Float32ToBFloat16RNEBits(value);
+        }
+        for (int channel = 0; channel < normChannels; channel++) {
+            normWeight[channel] =
+                0.75f + (float)((channel * 37) % 257) / 512.0f;
+        }
+        std::vector<uint16_t> normReference(normCount);
+        for (int row = 0; row < normRows; row++) {
+            const uint16_t *source =
+                normInput.data() + (uint64_t)row * normChannels;
+            uint16_t *destination =
+                normReference.data() + (uint64_t)row * normChannels;
+            double sumSquares = 0.0;
+            for (int channel = 0; channel < normChannels; channel++) {
+                float value =
+                    fastllm::BFloat16BitsToFloat32(source[channel]);
+                sumSquares += (double)value * value;
+            }
+            float scale = 1.0f / std::sqrt(
+                (float)(sumSquares / normChannels) + normEps);
+            for (int channel = 0; channel < normChannels; channel++) {
+                float value =
+                    fastllm::BFloat16BitsToFloat32(source[channel]);
+                destination[channel] =
+                    fastllm::Float32ToBFloat16RNEBits(
+                        value * scale * normWeight[channel]);
+            }
+        }
+
+        std::vector<uint16_t> normActual(normCount);
+        fastllm::RunCpuDeepSeekV4RMSNormBFloat16(
+            normInput.data(), normWeight.data(), normActual.data(),
+            normRows, normChannels, normEps);
+        Expect(memcmp(
+                   normReference.data(), normActual.data(),
+                   normCount * sizeof(uint16_t)) == 0,
+               "DeepSeek-V4 parallel BF16 RMSNorm changed output bits.");
+
+        std::vector<uint16_t> normInPlace = normInput;
+        fastllm::RunCpuDeepSeekV4RMSNormBFloat16(
+            normInPlace.data(), normWeight.data(), normInPlace.data(),
+            normRows, normChannels, normEps);
+        Expect(memcmp(
+                   normReference.data(), normInPlace.data(),
+                   normCount * sizeof(uint16_t)) == 0,
+               "DeepSeek-V4 in-place BF16 RMSNorm changed output bits.");
+    }
+
+    void RunCpuDeepSeekV4WoARegression() {
+        constexpr int tokens = 37;
+        constexpr int groups = 8;
+        constexpr int heads = 16;
+        constexpr int headDim = 64;
+        constexpr int groupDim = heads / groups * headDim;
+        constexpr int oRank = 257;
+        constexpr int inputStride = heads * headDim;
+        constexpr int outputStride = groups * oRank;
+
+        fastllm::SetThreads(40);
+        fastllm::Data input(
+            fastllm::DataType::BFLOAT16,
+            {1, tokens, heads, headDim});
+        input.Allocate();
+        uint16_t *inputBits = (uint16_t*)input.cpuData;
+        uint32_t inputState = 0x7f4a7c15u;
+        for (uint64_t i = 0; i < input.Count(0); i++) {
+            inputState = inputState * 1664525u + 1013904223u;
+            float value =
+                (float)((int32_t)(inputState % 4093u) - 2046) / 512.0f;
+            inputBits[i] = fastllm::Float32ToBFloat16RNEBits(value);
+        }
+
+        fastllm::Data weight(
+            fastllm::DataType::FLOAT16,
+            {groups, oRank, groupDim});
+        weight.Allocate();
+        uint16_t *weightBits = (uint16_t*)weight.cpuData;
+        uint32_t weightState = 0x243f6a88u;
+        for (uint64_t i = 0; i < weight.Count(0); i++) {
+            weightState = weightState * 1103515245u + 12345u;
+            float value =
+                (float)((int32_t)(weightState % 2039u) - 1019) / 4096.0f;
+            weightBits[i] = fastllm::float_to_half(value);
+        }
+
+        // Reproduce the old prefill path exactly: materialize token-major FP32,
+        // run each group through the same Linear kernel sequentially, scatter to
+        // token-major FP32, then round to BF16.
+        std::vector<float> inputFloat(input.Count(0));
+        for (uint64_t i = 0; i < input.Count(0); i++) {
+            inputFloat[i] = fastllm::BFloat16BitsToFloat32(inputBits[i]);
+        }
+        std::vector<float> referenceFloat(
+            (uint64_t)tokens * outputStride, 0.0f);
+        std::vector<float> groupInput((uint64_t)tokens * groupDim);
+        std::vector<float> groupOutput((uint64_t)tokens * oRank);
+        fastllm::AliveThreadPool *pool = fastllm::GetAlivePool();
+        int threadCount = (int)pool->threads.size();
+        for (int group = 0; group < groups; group++) {
+            for (int token = 0; token < tokens; token++) {
+                memcpy(
+                    groupInput.data() + (uint64_t)token * groupDim,
+                    inputFloat.data() + (uint64_t)token * inputStride +
+                        (uint64_t)group * groupDim,
+                    (uint64_t)groupDim * sizeof(float));
+            }
+            fastllm::RunLinearFloat32Float16(
+                groupInput.data(),
+                weightBits + (uint64_t)group * oRank * groupDim,
+                groupOutput.data(), nullptr,
+                tokens, groupDim, oRank, pool, 0, threadCount);
+            for (int token = 0; token < tokens; token++) {
+                memcpy(
+                    referenceFloat.data() +
+                        (uint64_t)token * outputStride +
+                        (uint64_t)group * oRank,
+                    groupOutput.data() + (uint64_t)token * oRank,
+                    (uint64_t)oRank * sizeof(float));
+            }
+        }
+        std::vector<uint16_t> referenceBits(referenceFloat.size());
+        for (size_t i = 0; i < referenceFloat.size(); i++) {
+            referenceBits[i] =
+                fastllm::Float32ToBFloat16RNEBits(referenceFloat[i]);
+        }
+
+        fastllm::Data output;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4WoA(
+                input, weight, groups, oRank, output);
+        }
+        Expect(output.dataType == fastllm::DataType::BFLOAT16,
+               "DeepSeek-V4 CPU WoA output should be BF16.");
+        Expect(output.dims == std::vector<int>({1, tokens, outputStride}),
+               "DeepSeek-V4 CPU WoA output shape mismatch.");
+        Expect(output.Count(0) == referenceBits.size(),
+               "DeepSeek-V4 CPU WoA output size mismatch.");
+        Expect(memcmp(output.cpuData, referenceBits.data(),
+                      referenceBits.size() * sizeof(uint16_t)) == 0,
+               "DeepSeek-V4 CPU WoA global Linear queue changed BF16 output bits.");
+
+#ifdef USE_NUMAS
+        if (fastllm::HasDeviceType("numa")) {
+            fastllm::Data numaOutput;
+            {
+                ScopedFirstDevice device("numa");
+                fastllm::DeepSeekV4WoA(
+                    input, weight, groups, oRank, numaOutput);
+            }
+            Expect(
+                numaOutput.dataType == fastllm::DataType::BFLOAT16 &&
+                    numaOutput.dims ==
+                        std::vector<int>({1, tokens, outputStride}),
+                "DeepSeek-V4 NUMA WoA prefill output metadata mismatch.");
+            Expect(memcmp(
+                       numaOutput.cpuData, referenceBits.data(),
+                       referenceBits.size() * sizeof(uint16_t)) == 0,
+                   "DeepSeek-V4 NUMA WoA prefill changed BF16 output bits.");
+            Expect(weight.cpuData == nullptr,
+                   "DeepSeek-V4 NUMA WoA did not release the source weight.");
+            Expect(!weight.numasData.empty() &&
+                       std::all_of(
+                           weight.numasData.begin(), weight.numasData.end(),
+                           [](const uint8_t *shard) {
+                               return shard != nullptr;
+                           }),
+                   "DeepSeek-V4 NUMA WoA did not create every weight shard.");
+
+            fastllm::Data decodeInput(
+                fastllm::DataType::BFLOAT16,
+                {1, 1, heads, headDim});
+            decodeInput.Allocate();
+            memcpy(
+                decodeInput.cpuData, input.cpuData,
+                (size_t)inputStride * sizeof(uint16_t));
+            fastllm::Data decodeOutput;
+            {
+                ScopedFirstDevice device("numa");
+                fastllm::DeepSeekV4WoA(
+                    decodeInput, weight, groups, oRank, decodeOutput);
+            }
+            Expect(
+                decodeOutput.dataType == fastllm::DataType::BFLOAT16 &&
+                    decodeOutput.dims ==
+                        std::vector<int>({1, 1, outputStride}),
+                "DeepSeek-V4 NUMA WoA decode output metadata mismatch.");
+            Expect(memcmp(
+                       decodeOutput.cpuData, referenceBits.data(),
+                       (size_t)outputStride * sizeof(uint16_t)) == 0,
+                   "DeepSeek-V4 NUMA WoA decode changed BF16 output bits.");
+        }
+#endif
+    }
+
+    void RunCpuDeepSeekV4SparseAttentionRegression() {
+        fastllm::Data q(
+            fastllm::DataType::FLOAT32, {1, 1, 1, 4},
+            std::vector<float>({1.0f, 1.0f, 1.0f, 1.0f}));
+        fastllm::Data kv(
+            fastllm::DataType::FLOAT32, {1, 1, 4},
+            std::vector<float>({
+                std::numeric_limits<float>::quiet_NaN(), 1.0f, 2.0f, 3.0f
+            }));
+        fastllm::Data sink(
+            fastllm::DataType::FLOAT32, {1}, std::vector<float>({0.0f}));
+        fastllm::Data output;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4SparseAttention(
+                q, kv, sink, 1, 2, 10000.0f, 0, 0.5f, output,
+                0, 0, 1.0f, 32, 1, 0);
+        }
+        for (float value : ToFloatVector(output)) {
+            Expect(std::isfinite(value) && value == 0.0f,
+                   "DeepSeek-V4 CPU sparse attention did not skip a "
+                   "non-finite score.");
+        }
+
+        fastllm::Data fusedQ(
+            fastllm::DataType::BFLOAT16, {1, 2, 1, 4},
+            std::vector<float>(8, 0.0f));
+        fastllm::Data fusedKv(
+            fastllm::DataType::BFLOAT16, {1, 2, 4},
+            std::vector<float>({1.0f, 2.0f, 3.0f, 4.0f,
+                                5.0f, 6.0f, 7.0f, 8.0f}));
+        fastllm::Data fusedSink(
+            fastllm::DataType::FLOAT32, {1},
+            std::vector<float>({
+                -std::numeric_limits<float>::infinity()
+            }));
+        fastllm::Data fusedOutput;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4SparseAttention(
+                fusedQ, fusedKv, fusedSink, 2, 2, 10000.0f, 0, 1.0f,
+                fusedOutput, 0, 0, 1.0f, 32, 1, 0);
+        }
+        float c = std::cos(1.0f), sn = std::sin(1.0f);
+        std::vector<float> fusedExpected = {
+            1.0f, 2.0f, 3.0f, 4.0f,
+            3.0f, 4.0f, 5.0f * c + 6.0f * sn,
+            -5.0f * sn + 6.0f * c
+        };
+        Expect(fusedOutput.dataType == fastllm::DataType::BFLOAT16 &&
+                   fusedOutput.cpuData != nullptr,
+               "DeepSeek-V4 fused sparse output should be CPU BF16.");
+        const uint16_t *fusedBits =
+            reinterpret_cast<const uint16_t *>(fusedOutput.cpuData);
+        for (int i = 0; i < (int)fusedExpected.size(); i++) {
+            Expect(fusedBits[i] ==
+                       fastllm::Float32ToBFloat16RNEBits(fusedExpected[i]),
+                   "DeepSeek-V4 fused sparse output mismatch at index " +
+                       std::to_string(i));
+        }
+
+        constexpr int batch = 2;
+        constexpr int sequence = 4;
+        constexpr int heads = 3;
+        constexpr int dimension = 8;
+        std::vector<float> qValues(batch * sequence * heads * dimension);
+        std::vector<float> kvValues(batch * sequence * dimension);
+        for (int i = 0; i < (int)qValues.size(); i++) {
+            qValues[i] = (float)((i * 17) % 41 - 20) / 23.0f;
+        }
+        for (int i = 0; i < (int)kvValues.size(); i++) {
+            kvValues[i] = (float)((i * 13) % 37 - 18) / 19.0f;
+        }
+        fastllm::Data finiteQ(
+            fastllm::DataType::FLOAT32,
+            {batch, sequence, heads, dimension}, qValues);
+        fastllm::Data finiteKv(
+            fastllm::DataType::FLOAT32,
+            {batch, sequence, dimension}, kvValues);
+        fastllm::Data finiteSink(
+            fastllm::DataType::FLOAT32, {heads},
+            std::vector<float>({-0.25f, 0.0f, 0.25f}));
+        fastllm::Data serialOutput, parallelOutput;
+        const char *oldDisable = std::getenv(
+            "FASTLLM_DSV4_DISABLE_CPU_SPARSE_PREFILL_PARALLEL");
+        std::string oldDisableValue = oldDisable == nullptr ? "" : oldDisable;
+        setenv("FASTLLM_DSV4_DISABLE_CPU_SPARSE_PREFILL_PARALLEL", "1", 1);
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4SparseAttention(
+                finiteQ, finiteKv, finiteSink, sequence, 4, 10000.0f,
+                0, 0.5f, serialOutput, 0, 0, 1.0f, 32, 1, 0);
+        }
+        unsetenv("FASTLLM_DSV4_DISABLE_CPU_SPARSE_PREFILL_PARALLEL");
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4SparseAttention(
+                finiteQ, finiteKv, finiteSink, sequence, 4, 10000.0f,
+                0, 0.5f, parallelOutput, 0, 0, 1.0f, 32, 1, 0);
+        }
+        if (oldDisable != nullptr) {
+            setenv("FASTLLM_DSV4_DISABLE_CPU_SPARSE_PREFILL_PARALLEL",
+                   oldDisableValue.c_str(), 1);
+        }
+        ExpectFloatNear(
+            ToFloatVector(serialOutput), ToFloatVector(parallelOutput),
+            0.0f, 0.0f,
+            "DeepSeek-V4 CPU sparse attention serial versus parallel");
+
+        // The compressed index tensor must be consumed as a real gather, not
+        // merely computed and then ignored.  With zero queries and no sink the
+        // selected live/compressed values have uniform attention weights.
+        fastllm::Data gatherQ(
+            fastllm::DataType::FLOAT32, {1, 4, 1, 4},
+            std::vector<float>(16, 0.0f));
+        fastllm::Data gatherKv(
+            fastllm::DataType::FLOAT32, {1, 6, 4},
+            std::vector<float>({
+                1.0f, 0.0f, 0.0f, 0.0f,
+                2.0f, 0.0f, 0.0f, 0.0f,
+                3.0f, 0.0f, 0.0f, 0.0f,
+                4.0f, 0.0f, 0.0f, 0.0f,
+                10.0f, 0.0f, 0.0f, 0.0f,
+                20.0f, 0.0f, 0.0f, 0.0f
+            }));
+        fastllm::Data gatherTopK = MakeIntTensor(
+            {1, 4, 1}, {-1, 0, 0, 1});
+        fastllm::Data gatherOutput;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4SparseAttention(
+                gatherQ, gatherKv, fusedSink, 1, 2, 10000.0f, 0,
+                1.0f, gatherOutput, 2, 0, 1.0f, 32, 1, 0,
+                &gatherTopK);
+        }
+        ExpectFloatNear(
+            {1.0f, 0.0f, 0.0f, 0.0f,
+             6.0f, 0.0f, 0.0f, 0.0f,
+             6.5f, 0.0f, 0.0f, 0.0f,
+             12.0f, 0.0f, 0.0f, 0.0f},
+            ToFloatVector(gatherOutput), 0.0f, 0.0f,
+            "DeepSeek-V4 CPU sparse attention compressed top-k gather");
+
+        // Exercise the production top-k=512 limit beyond the 2048-token
+        // crossover (compression ratio 4).  The monotonically increasing
+        // prepared keys also verify score ordering, not just output shape.
+        constexpr int indexSequence = 2080;
+        constexpr int indexHeads = 1;
+        constexpr int indexDimension = 32;
+        constexpr int indexBlocks = indexSequence / 4;
+        constexpr int indexTopK = 512;
+        std::vector<float> indexQ(
+            (size_t)indexSequence * indexHeads * indexDimension, 0.0f);
+        for (int token = 0; token < indexSequence; token++) {
+            indexQ[(size_t)token * indexDimension] = 1.0f;
+        }
+        std::vector<float> indexKv((size_t)indexBlocks * indexDimension);
+        for (int block = 0; block < indexBlocks; block++) {
+            std::fill(indexKv.begin() + (size_t)block * indexDimension,
+                      indexKv.begin() + (size_t)(block + 1) * indexDimension,
+                      (float)(block + 1));
+        }
+        fastllm::Data indexQData(
+            fastllm::DataType::FLOAT32,
+            {1, indexSequence, indexHeads, indexDimension}, indexQ);
+        fastllm::Data indexWeights(
+            fastllm::DataType::FLOAT32,
+            {1, indexSequence, indexHeads},
+            std::vector<float>(indexSequence * indexHeads, 1.0f));
+        fastllm::Data indexKvData(
+            fastllm::DataType::FLOAT32,
+            {1, indexBlocks, indexDimension}, indexKv);
+        fastllm::Data indexTopKData;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                indexQData, indexWeights, indexKvData, indexTopK, 4,
+                2, 10000.0f, 0, 0, 1.0f, 32, 1, indexTopKData);
+        }
+        Expect(indexTopKData.dims ==
+                   std::vector<int>({1, indexSequence, indexTopK}),
+               "DeepSeek-V4 CPU indexer top-k output shape mismatch.");
+        std::vector<int32_t> indexValues = ToIntVector(indexTopKData);
+        for (int token = 0; token < indexSequence; token++) {
+            int available = (token + 1) / 4;
+            int keep = std::min(available, indexTopK);
+            for (int i = 0; i < indexTopK; i++) {
+                int32_t expected = i < keep ? available - 1 - i : -1;
+                int32_t actual =
+                    indexValues[(size_t)token * indexTopK + i];
+                Expect(actual == expected,
+                       "DeepSeek-V4 CPU indexer causal top-k mismatch at "
+                       "token " + std::to_string(token) + ", rank " +
+                       std::to_string(i) + ": expected " +
+                       std::to_string(expected) + ", got " +
+                       std::to_string(actual));
+            }
+        }
+
+        // Hit the production 64-head x 128-dim SIMD scorer and compare its
+        // selected indices with the generic dot-product fallback.
+        constexpr int simdSequence = 40;
+        constexpr int simdHeads = 64;
+        constexpr int simdDimension = 128;
+        constexpr int simdBlocks = simdSequence / 4;
+        constexpr int simdTopK = 5;
+        std::vector<float> simdQ(
+            (size_t)simdSequence * simdHeads * simdDimension, 0.0f);
+        for (int token = 0; token < simdSequence; token++) {
+            for (int head = 0; head < simdHeads; head++) {
+                simdQ[((size_t)token * simdHeads + head) *
+                      simdDimension] = 1.0f;
+            }
+        }
+        std::vector<float> simdKv((size_t)simdBlocks * simdDimension);
+        for (int block = 0; block < simdBlocks; block++) {
+            std::fill(simdKv.begin() + (size_t)block * simdDimension,
+                      simdKv.begin() + (size_t)(block + 1) * simdDimension,
+                      (float)(block + 1));
+        }
+        fastllm::Data simdQData(
+            fastllm::DataType::FLOAT32,
+            {1, simdSequence, simdHeads, simdDimension}, simdQ);
+        fastllm::Data simdWeights(
+            fastllm::DataType::FLOAT32,
+            {1, simdSequence, simdHeads},
+            std::vector<float>(simdSequence * simdHeads, 1.0f));
+        fastllm::Data simdKvData(
+            fastllm::DataType::FLOAT32,
+            {1, simdBlocks, simdDimension}, simdKv);
+        fastllm::Data fallbackTopK, simdTopKData;
+        const char *oldHeadSimd = std::getenv(
+            "FASTLLM_DSV4_DISABLE_CPU_INDEXER_HEAD_SIMD");
+        std::string oldHeadSimdValue =
+            oldHeadSimd == nullptr ? "" : oldHeadSimd;
+        setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_HEAD_SIMD", "1", 1);
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                simdQData, simdWeights, simdKvData, simdTopK, 4,
+                64, 10000.0f, 0, 0, 1.0f, 32, 1, fallbackTopK);
+        }
+        unsetenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_HEAD_SIMD");
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                simdQData, simdWeights, simdKvData, simdTopK, 4,
+                64, 10000.0f, 0, 0, 1.0f, 32, 1, simdTopKData);
+        }
+        if (oldHeadSimd != nullptr) {
+            setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_HEAD_SIMD",
+                   oldHeadSimdValue.c_str(), 1);
+        }
+        ExpectIntEqual(
+            ToIntVector(fallbackTopK), ToIntVector(simdTopKData),
+            "DeepSeek-V4 CPU indexer 64-head SIMD versus fallback");
+        std::vector<int32_t> simdIndices = ToIntVector(simdTopKData);
+        for (int token = 0; token < simdSequence; token++) {
+            int available = (token + 1) / 4;
+            int keep = std::min(available, simdTopK);
+            for (int rank = 0; rank < simdTopK; rank++) {
+                int32_t expected = rank < keep ?
+                    available - 1 - rank : -1;
+                Expect(simdIndices[(size_t)token * simdTopK + rank] ==
+                           expected,
+                       "DeepSeek-V4 CPU indexer 64-head SIMD ranking "
+                       "mismatch at token " + std::to_string(token) +
+                       ", rank " + std::to_string(rank));
+            }
+        }
+
+        std::vector<float> mixedQ(simdQ.size());
+        std::vector<float> mixedWeights(
+            (size_t)simdSequence * simdHeads);
+        std::vector<float> mixedKv(simdKv.size());
+        for (int token = 0; token < simdSequence; token++) {
+            for (int head = 0; head < simdHeads; head++) {
+                mixedWeights[(size_t)token * simdHeads + head] =
+                    (float)((token * 3 + head * 5) % 17 - 8) / 9.0f;
+                for (int d = 0; d < simdDimension; d++) {
+                    mixedQ[((size_t)token * simdHeads + head) *
+                           simdDimension + d] =
+                        (float)((token * 3 + head * 7 + d * 11) % 29 - 14) /
+                        17.0f;
+                }
+            }
+        }
+        for (int block = 0; block < simdBlocks; block++) {
+            for (int d = 0; d < simdDimension; d++) {
+                mixedKv[(size_t)block * simdDimension + d] =
+                    (float)((block * 13 + d * 7) % 31 - 15) / 16.0f;
+            }
+        }
+        fastllm::Data mixedQData(
+            fastllm::DataType::FLOAT32,
+            {1, simdSequence, simdHeads, simdDimension}, mixedQ);
+        fastllm::Data mixedWeightData(
+            fastllm::DataType::FLOAT32,
+            {1, simdSequence, simdHeads}, mixedWeights);
+        fastllm::Data mixedKvData(
+            fastllm::DataType::FLOAT32,
+            {1, simdBlocks, simdDimension}, mixedKv);
+        fastllm::Data mixedFallbackTopK, mixedSimdTopK;
+        setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_HEAD_SIMD", "1", 1);
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                mixedQData, mixedWeightData, mixedKvData, simdTopK, 4,
+                64, 10000.0f, 0, 0, 1.0f, 32, 1,
+                mixedFallbackTopK);
+        }
+        unsetenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_HEAD_SIMD");
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                mixedQData, mixedWeightData, mixedKvData, simdTopK, 4,
+                64, 10000.0f, 0, 0, 1.0f, 32, 1,
+                mixedSimdTopK);
+        }
+        if (oldHeadSimd != nullptr) {
+            setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_HEAD_SIMD",
+                   oldHeadSimdValue.c_str(), 1);
+        }
+        ExpectIntEqual(
+            ToIntVector(mixedFallbackTopK), ToIntVector(mixedSimdTopK),
+            "DeepSeek-V4 CPU indexer mixed 64-head SIMD versus fallback");
+
+        // The fused path converts and preprocesses each token in the scoring
+        // worker instead of materializing a full FP32 Q tensor first.  It must
+        // preserve the exact selected indices of the original two-pass path.
+        const char *oldFusedPrep = std::getenv(
+            "FASTLLM_DSV4_DISABLE_CPU_INDEXER_FUSED_PREP");
+        std::string oldFusedPrepValue =
+            oldFusedPrep == nullptr ? "" : oldFusedPrep;
+        fastllm::Data mixedTwoPassTopK, mixedFusedTopK;
+        setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FUSED_PREP", "1", 1);
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                mixedQData, mixedWeightData, mixedKvData, simdTopK, 4,
+                64, 10000.0f, 0, 0, 1.0f, 32, 1,
+                mixedTwoPassTopK);
+        }
+        unsetenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FUSED_PREP");
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                mixedQData, mixedWeightData, mixedKvData, simdTopK, 4,
+                64, 10000.0f, 0, 0, 1.0f, 32, 1,
+                mixedFusedTopK);
+        }
+        if (oldFusedPrep != nullptr) {
+            setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FUSED_PREP",
+                   oldFusedPrepValue.c_str(), 1);
+        }
+        ExpectIntEqual(
+            ToIntVector(mixedTwoPassTopK), ToIntVector(mixedFusedTopK),
+            "DeepSeek-V4 CPU indexer fused versus two-pass preprocessing");
+
+        // Production indexer activations are BF16.  Exercise the vectorized
+        // raw-row loader as well as the fused preprocessing/scoring handoff
+        // with all three inputs in their production dtype.
+        auto makeBFloat16Tensor = [](
+                const std::vector<int> &dims,
+                const std::vector<float> &values) {
+            fastllm::Data tensor(fastllm::DataType::BFLOAT16, dims);
+            tensor.Allocate();
+            uint16_t *bits = (uint16_t*)tensor.cpuData;
+            for (size_t i = 0; i < values.size(); i++) {
+                bits[i] = fastllm::Float32ToBFloat16RNEBits(values[i]);
+            }
+            return tensor;
+        };
+        fastllm::Data mixedQBFloat = makeBFloat16Tensor(
+            {1, simdSequence, simdHeads, simdDimension}, mixedQ);
+        fastllm::Data mixedWeightBFloat = makeBFloat16Tensor(
+            {1, simdSequence, simdHeads}, mixedWeights);
+        fastllm::Data mixedKvBFloat = makeBFloat16Tensor(
+            {1, simdBlocks, simdDimension}, mixedKv);
+        fastllm::Data mixedBFloatTwoPassTopK, mixedBFloatFusedTopK;
+        setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FUSED_PREP", "1", 1);
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                mixedQBFloat, mixedWeightBFloat, mixedKvBFloat,
+                simdTopK, 4, 64, 10000.0f, 0, 0, 1.0f, 32, 1,
+                mixedBFloatTwoPassTopK);
+        }
+        unsetenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FUSED_PREP");
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                mixedQBFloat, mixedWeightBFloat, mixedKvBFloat,
+                simdTopK, 4, 64, 10000.0f, 0, 0, 1.0f, 32, 1,
+                mixedBFloatFusedTopK);
+        }
+        if (oldFusedPrep != nullptr) {
+            setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FUSED_PREP",
+                   oldFusedPrepValue.c_str(), 1);
+        }
+        ExpectIntEqual(
+            ToIntVector(mixedBFloatTwoPassTopK),
+            ToIntVector(mixedBFloatFusedTopK),
+            "DeepSeek-V4 CPU BF16 indexer fused versus two-pass preprocessing");
+
+        // Compare the AVX-512 FP4 preprocessing path with the original scalar
+        // log2/pow plus exhaustive E2M1 nearest-value implementation.  The
+        // mixed signs and non-power-of-two inputs exercise scale selection,
+        // midpoint direction and signed dequantization before top-k scoring.
+        const char *oldFp4Simd = std::getenv(
+            "FASTLLM_DSV4_DISABLE_CPU_INDEXER_FP4_SIMD");
+        std::string oldFp4SimdValue =
+            oldFp4Simd == nullptr ? "" : oldFp4Simd;
+        fastllm::Data mixedFp4ReferenceTopK, mixedFp4SimdTopK;
+        setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FP4_SIMD", "1", 1);
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                mixedQData, mixedWeightData, mixedKvData, simdTopK, 4,
+                64, 10000.0f, 0, 0, 1.0f, 32, 1,
+                mixedFp4ReferenceTopK);
+        }
+        unsetenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FP4_SIMD");
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4IndexerTopK(
+                mixedQData, mixedWeightData, mixedKvData, simdTopK, 4,
+                64, 10000.0f, 0, 0, 1.0f, 32, 1,
+                mixedFp4SimdTopK);
+        }
+        if (oldFp4Simd != nullptr) {
+            setenv("FASTLLM_DSV4_DISABLE_CPU_INDEXER_FP4_SIMD",
+                   oldFp4SimdValue.c_str(), 1);
+        }
+        ExpectIntEqual(
+            ToIntVector(mixedFp4ReferenceTopK),
+            ToIntVector(mixedFp4SimdTopK),
+            "DeepSeek-V4 CPU indexer FP4 SIMD versus scalar reference");
+    }
+
+    void RunCpuDeepSeekV4SparseDecodeCachedRegression() {
+        constexpr int batch = 1;
+        constexpr int heads = 64;
+        constexpr int dimension = 192;
+        constexpr int windowSize = 128;
+        constexpr int compressedCount = 520;
+        constexpr int startPos = 2048;
+        constexpr int ropeDim = 64;
+        constexpr float ropeBase = 10000.0f;
+        constexpr float softmaxScale = 0.07216878f;
+        constexpr int originalSeqLen = 4096;
+        constexpr float ropeFactor = 4.0f;
+        constexpr int betaFast = 32;
+        constexpr int betaSlow = 1;
+
+        std::vector<float> qInput((size_t)heads * dimension);
+        std::vector<float> windowValues(
+            (size_t)windowSize * dimension);
+        std::vector<float> compressedValues(
+            (size_t)compressedCount * dimension);
+        std::vector<float> sinkValues(heads);
+        for (size_t i = 0; i < qInput.size(); i++) {
+            qInput[i] = (float)((int)(i * 17 % 73) - 36) / 29.0f;
+        }
+        for (size_t i = 0; i < windowValues.size(); i++) {
+            windowValues[i] =
+                (float)((int)(i * 13 % 61) - 30) / 31.0f;
+        }
+        for (size_t i = 0; i < compressedValues.size(); i++) {
+            compressedValues[i] =
+                (float)((int)(i * 19 % 67) - 33) / 37.0f;
+        }
+        for (int head = 0; head < heads; head++) {
+            sinkValues[head] =
+                (float)((head * 7) % 19 - 9) / 11.0f;
+        }
+
+        fastllm::Data q(
+            fastllm::DataType::BFLOAT16,
+            {batch, 1, heads, dimension}, qInput);
+        fastllm::Data windowKV(
+            fastllm::DataType::BFLOAT16,
+            {batch, windowSize, dimension}, windowValues);
+        windowValues = ToFloatVector(windowKV);
+        fastllm::Data compressedKV(
+            fastllm::DataType::BFLOAT16,
+            {batch, compressedCount, dimension}, compressedValues);
+        compressedValues = ToFloatVector(compressedKV);
+        fastllm::Data sink(
+            fastllm::DataType::FLOAT32, {heads}, sinkValues);
+        std::vector<int32_t> topKValues = {-1, compressedCount};
+        for (int i = 0; i < 512; i++) {
+            topKValues.push_back(compressedCount - 1 - i);
+        }
+        fastllm::Data topK = MakeIntTensor(
+            {batch, 1, (int)topKValues.size()}, topKValues);
+
+        std::vector<float> qValues = ToFloatVector(q);
+        std::vector<int> indices;
+        int ringPosition = startPos % windowSize;
+        for (int i = ringPosition + 1; i < windowSize; i++) {
+            indices.push_back(i);
+        }
+        for (int i = 0; i <= ringPosition; i++) {
+            indices.push_back(i);
+        }
+        for (int32_t index : topKValues) {
+            if (index >= 0 && index < compressedCount) {
+                indices.push_back(windowSize + index);
+            }
+        }
+
+        std::vector<float> reference((size_t)heads * dimension, 0.0f);
+        std::vector<float> scores(indices.size());
+        for (int head = 0; head < heads; head++) {
+            const float *qrow =
+                qValues.data() + (size_t)head * dimension;
+            float maxScore =
+                -std::numeric_limits<float>::infinity();
+            for (int k = 0; k < (int)indices.size(); k++) {
+                int index = indices[k];
+                const float *kvrow = index < windowSize ?
+                    windowValues.data() + (size_t)index * dimension :
+                    compressedValues.data() +
+                        (size_t)(index - windowSize) * dimension;
+                double dot = 0.0;
+                for (int d = 0; d < dimension; d++) {
+                    dot += (double)qrow[d] * kvrow[d];
+                }
+                scores[k] = (float)dot * softmaxScale;
+                maxScore = std::max(maxScore, scores[k]);
+            }
+            float safeMax =
+                std::isfinite(maxScore) ? maxScore : 0.0f;
+            double denominator =
+                std::exp((double)sinkValues[head] - safeMax);
+            for (float score : scores) {
+                denominator += std::exp((double)score - safeMax);
+            }
+            float *outputRow =
+                reference.data() + (size_t)head * dimension;
+            for (int k = 0; k < (int)indices.size(); k++) {
+                float weight = (float)(
+                    std::exp((double)scores[k] - safeMax) /
+                    std::max(denominator, 1e-30));
+                int index = indices[k];
+                const float *kvrow = index < windowSize ?
+                    windowValues.data() + (size_t)index * dimension :
+                    compressedValues.data() +
+                        (size_t)(index - windowSize) * dimension;
+                for (int d = 0; d < dimension; d++) {
+                    outputRow[d] += weight * kvrow[d];
+                }
+            }
+        }
+
+        std::vector<float> invFreq;
+        for (int i = 0; i < ropeDim; i += 2) {
+            invFreq.push_back(
+                1.0f / std::pow(ropeBase, (float)i / ropeDim));
+        }
+        float lowF = ropeDim * std::log(
+            (float)originalSeqLen /
+            (betaFast * 2.0f * (float)M_PI)) /
+            (2.0f * std::log(ropeBase));
+        float highF = ropeDim * std::log(
+            (float)originalSeqLen /
+            (betaSlow * 2.0f * (float)M_PI)) /
+            (2.0f * std::log(ropeBase));
+        int low = std::max((int)std::floor(lowF), 0);
+        int high = std::min((int)std::ceil(highF), ropeDim - 1);
+        if (low == high) {
+            high++;
+        }
+        for (int i = 0; i < (int)invFreq.size(); i++) {
+            float ramp = std::max(
+                0.0f,
+                std::min(1.0f, ((float)i - low) / (high - low)));
+            float smooth = 1.0f - ramp;
+            invFreq[i] = invFreq[i] / ropeFactor * (1.0f - smooth) +
+                         invFreq[i] * smooth;
+        }
+        int rotaryOffset = dimension - ropeDim;
+        for (int head = 0; head < heads; head++) {
+            float *row = reference.data() +
+                (size_t)head * dimension + rotaryOffset;
+            for (int i = 0; i < ropeDim; i += 2) {
+                float angle = startPos * invFreq[i / 2];
+                float cosine = std::cos(angle);
+                float sine = -std::sin(angle);
+                float a = row[i], b = row[i + 1];
+                row[i] = a * cosine - b * sine;
+                row[i + 1] = a * sine + b * cosine;
+            }
+        }
+        std::vector<uint16_t> referenceBits(reference.size());
+        for (size_t i = 0; i < reference.size(); i++) {
+            referenceBits[i] =
+                fastllm::Float32ToBFloat16RNEBits(reference[i]);
+        }
+
+        fastllm::Data output;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4SparseAttentionDecodeCached(
+                q, windowKV, compressedKV, sink, windowSize, startPos,
+                compressedCount, ropeDim, ropeBase, softmaxScale, output,
+                originalSeqLen, ropeFactor, betaFast, betaSlow, &topK);
+        }
+        Expect(output.dataType == fastllm::DataType::BFLOAT16 &&
+                   output.dims ==
+                       std::vector<int>({batch, 1, heads, dimension}) &&
+                   output.cpuData != nullptr,
+               "DeepSeek-V4 CPU cached sparse decode output metadata "
+               "mismatch.");
+        Expect(memcmp(output.cpuData, referenceBits.data(),
+                      referenceBits.size() * sizeof(uint16_t)) == 0,
+               "DeepSeek-V4 CPU cached sparse decode changed BF16 output "
+               "bits versus the scalar reference.");
+    }
+
+    void RunCpuDeepSeekV4SparseDecodeCachedBenchmarkCase(
+            int compressedCount) {
+        constexpr int batch = 1;
+        constexpr int heads = 64;
+        constexpr int dimension = 512;
+        constexpr int windowSize = 128;
+        constexpr int startPos = 2048;
+        constexpr int ropeDim = 64;
+        constexpr int repeats = 100;
+        fastllm::Data q(
+            fastllm::DataType::BFLOAT16,
+            {batch, 1, heads, dimension});
+        fastllm::Data windowKV(
+            fastllm::DataType::BFLOAT16,
+            {batch, windowSize, dimension});
+        fastllm::Data compressedKV(
+            fastllm::DataType::BFLOAT16,
+            {batch, compressedCount, dimension});
+        q.Allocate();
+        windowKV.Allocate();
+        compressedKV.Allocate();
+        auto fillBFloat = [](fastllm::Data &data, uint32_t state) {
+            uint16_t *values = (uint16_t*)data.cpuData;
+            for (uint64_t i = 0; i < data.Count(0); i++) {
+                state = state * 1664525u + 1013904223u;
+                values[i] = fastllm::Float32ToBFloat16RNEBits(
+                    (float)((int32_t)(state % 4093u) - 2046) / 4096.0f);
+            }
+        };
+        fillBFloat(q, 0x243f6a88u);
+        fillBFloat(windowKV, 0x85a308d3u);
+        fillBFloat(compressedKV, 0x13198a2eu);
+        std::vector<float> sinkValues(heads);
+        for (int head = 0; head < heads; head++) {
+            sinkValues[head] =
+                (float)((head * 7) % 19 - 9) / 11.0f;
+        }
+        fastllm::Data sink(
+            fastllm::DataType::FLOAT32, {heads}, sinkValues);
+        const int topKCount = std::min(512, compressedCount);
+        std::vector<int32_t> topKValues(topKCount);
+        std::iota(topKValues.begin(), topKValues.end(), 0);
+        fastllm::Data topK = MakeIntTensor(
+            {batch, 1, topKCount}, topKValues);
+        fastllm::Data output;
+        {
+            ScopedFirstDevice device("cpu");
+            for (int repeat = 0; repeat < 5; repeat++) {
+                fastllm::DeepSeekV4SparseAttentionDecodeCached(
+                    q, windowKV, compressedKV, sink, windowSize,
+                    startPos, compressedCount, ropeDim, 160000.0f,
+                    0.04419417f, output, 65536, 16.0f, 32, 1,
+                    &topK);
+            }
+            auto begin = std::chrono::steady_clock::now();
+            for (int repeat = 0; repeat < repeats; repeat++) {
+                fastllm::DeepSeekV4SparseAttentionDecodeCached(
+                    q, windowKV, compressedKV, sink, windowSize,
+                    startPos, compressedCount, ropeDim, 160000.0f,
+                    0.04419417f, output, 65536, 16.0f, 32, 1,
+                    &topK);
+            }
+            auto end = std::chrono::steady_clock::now();
+            double milliseconds =
+                std::chrono::duration<double, std::milli>(
+                    end - begin).count() / repeats;
+            std::cout
+                << "DeepSeek-V4 CPU sparse decode benchmark: compressed="
+                << compressedCount << ", candidates="
+                << windowSize + topKCount << ", " << milliseconds
+                << " ms/call, checksum="
+                << ((const uint16_t*)output.cpuData)[dimension / 2]
+                << "\n";
+        }
+    }
+
+    void RunCpuDeepSeekV4SparseDecodeCachedBenchmark() {
+        fastllm::SetThreads(40);
+        RunCpuDeepSeekV4SparseDecodeCachedBenchmarkCase(512);
+        RunCpuDeepSeekV4SparseDecodeCachedBenchmarkCase(16);
+    }
+
+    void RunCpuDeepSeekV4IndexerBenchmark(int sequence) {
+        constexpr int heads = 64;
+        constexpr int dim = 128;
+        constexpr int topK = 512;
+        int blocks = sequence / 4;
+        Expect(sequence >= 4 && sequence % 4 == 0,
+               "DeepSeek-V4 indexer benchmark length must be divisible by 4.");
+
+        fastllm::SetThreads(40);
+        fastllm::Data q(
+            fastllm::DataType::BFLOAT16, {1, sequence, heads, dim});
+        fastllm::Data weights(
+            fastllm::DataType::BFLOAT16, {1, sequence, heads});
+        fastllm::Data kv(
+            fastllm::DataType::BFLOAT16, {1, blocks, dim});
+        q.Allocate();
+        weights.Allocate();
+        kv.Allocate();
+        std::fill_n(
+            (uint16_t*)q.cpuData, q.Count(0),
+            fastllm::Float32ToBFloat16RNEBits(0.375f));
+        std::fill_n(
+            (uint16_t*)weights.cpuData, weights.Count(0),
+            fastllm::Float32ToBFloat16RNEBits(1.0f / heads));
+        uint16_t *kvBits = (uint16_t*)kv.cpuData;
+        for (int block = 0; block < blocks; block++) {
+            for (int d = 0; d < dim; d++) {
+                float value = (float)((block * 13 + d * 7) % 31 - 15) /
+                    16.0f;
+                kvBits[(uint64_t)block * dim + d] =
+                    fastllm::Float32ToBFloat16RNEBits(value);
+            }
+        }
+
+        for (int repeat = 0; repeat < 2; repeat++) {
+            fastllm::Data output;
+            auto begin = std::chrono::steady_clock::now();
+            {
+                ScopedFirstDevice device("cpu");
+                fastllm::DeepSeekV4IndexerTopK(
+                    q, weights, kv, topK, 4, 64, 10000.0f, 0, 0,
+                    1.0f, 32, 1, output);
+            }
+            auto end = std::chrono::steady_clock::now();
+            const int32_t *indices = (const int32_t*)output.cpuData;
+            int64_t checksum = 0;
+            for (uint64_t i = 0; i < output.Count(0); i += 257) {
+                checksum += indices[i];
+            }
+            double seconds = std::chrono::duration<double>(end - begin).count();
+            std::cout << "DeepSeek-V4 CPU IndexerTopK benchmark: sequence="
+                      << sequence << ", repeat=" << repeat + 1
+                      << ", seconds=" << seconds
+                      << ", checksum=" << checksum << "\n";
+        }
+    }
+
     void ExpectIntEqual(const std::vector<int32_t> &expected, const std::vector<int32_t> &actual,
                         const std::string &name) {
         Expect(expected.size() == actual.size(), name + " size mismatch.");
@@ -3383,6 +5263,58 @@ namespace {
                std::strcmp(value, "OFF") != 0;
     }
 
+    class ScopedEnvOverride {
+    public:
+        ScopedEnvOverride(const char *name, const char *value)
+            : name(name) {
+            const char *current = std::getenv(name);
+            hadValue = current != nullptr;
+            if (hadValue) {
+                oldValue = current;
+            }
+            setenv(name, value, 1);
+        }
+
+        ~ScopedEnvOverride() {
+            if (hadValue) {
+                setenv(name.c_str(), oldValue.c_str(), 1);
+            } else {
+                unsetenv(name.c_str());
+            }
+        }
+
+    private:
+        std::string name;
+        std::string oldValue;
+        bool hadValue = false;
+    };
+
+    bool RunCudaVarlenChunkGdnSelected(
+            fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+            fastllm::Data &g, fastllm::Data &attn,
+            fastllm::Data &decayMask, fastllm::Data &kCumdecay,
+            fastllm::Data &lastRecurrentState,
+            bool fuseDecayMask, bool directOutputQk,
+            const std::vector<int> &seqLens, fastllm::Data &coreAttnOut,
+            const std::string &label) {
+        bool requireTriton = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_VARLEN_PREFILL", true);
+        bool ok = requireTriton
+            ? fastllm::FastllmCudaTryTritonChunkGdnVarlenPrefill(
+                  q, k, v, g, attn, decayMask, kCumdecay,
+                  lastRecurrentState, fuseDecayMask, directOutputQk,
+                  seqLens, coreAttnOut)
+            : fastllm::FastllmCudaChunkGatedDeltaRuleVarlenPrefill(
+                  q, k, v, g, attn, decayMask, kCumdecay,
+                  lastRecurrentState, fuseDecayMask, directOutputQk,
+                  seqLens, coreAttnOut);
+        if (requireTriton) {
+            Expect(ok, label + " did not execute the enabled Triton path");
+        }
+        return ok;
+    }
+
     fastllm::Data MakeCudaTensor(fastllm::DataType dataType, const std::vector<int> &dims,
                                  const std::vector<float> &values) {
         fastllm::Data data(dataType, dims, values);
@@ -3393,6 +5325,142 @@ namespace {
     std::vector<float> MakeRegressionValues(int count, float seed, float scale);
 
 #ifndef USE_ROCM
+    fastllm::Data MakeNvfp4Block16Weight(
+            int outputDim, int inputDim, float globalScale) {
+        Expect(outputDim > 0 && inputDim > 0 && inputDim % 16 == 0,
+               "NVFP4_BLOCK_16 regression weight shape is invalid");
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::NVFP4_BLOCK_16;
+        weight.UpdateUnitSize();
+        weight.Resize({outputDim, inputDim});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = 1;
+        weight.blockM = 16;
+        weight.Allocate(false);
+
+        const int groups = inputDim / 16;
+        const size_t rowBytes = fastllm::GetDataBytes(
+            fastllm::DataType::NVFP4_BLOCK_16, 1, inputDim);
+        auto *bytes = reinterpret_cast<uint8_t *>(weight.cpuData);
+        for (int row = 0; row < outputDim; row++) {
+            for (int group = 0; group < groups; group++) {
+                uint8_t *block = bytes + (size_t)row * rowBytes + group * 12;
+                for (int packed = 0; packed < 8; packed++) {
+                    uint8_t low = static_cast<uint8_t>(
+                        (row * 3 + group * 5 + packed * 7 + 1) & 0xf);
+                    uint8_t high = static_cast<uint8_t>(
+                        (row * 11 + group * 13 + packed * 3 + 2) & 0xf);
+                    block[packed] = static_cast<uint8_t>((high << 4) | low);
+                }
+                float effectiveScale = globalScale *
+                    static_cast<float>(1 << ((row + group) & 3));
+                std::memcpy(block + 8, &effectiveScale, sizeof(float));
+            }
+        }
+        // Multiple entries model merged weights whose partitions retained
+        // different tensor-level scales.  Marlin must select the common minimum
+        // without losing the effective inline block scales.
+        weight.scales = {globalScale * 2.0f, globalScale};
+        weight.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        return weight;
+    }
+
+    void RunCudaNVFP4MarlinRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int inputDim = 128;
+        constexpr int outputDim = 256;
+        constexpr int batch = 31;
+        if (!FastllmCudaMarlinNVFP4Supported(outputDim, inputDim)) {
+            std::cout << "CUDA NVFP4 Marlin regression: SKIP\n";
+            return;
+        }
+
+        ScopedEnvOverride forceMarlin("FASTLLM_CUDA_NVFP4_MARLIN", "1");
+        struct ScopedNcclForceSyncRestore {
+            bool previous = FastllmCudaGetNcclForceSync();
+            ~ScopedNcclForceSyncRestore() {
+                FastllmCudaSetNcclForceSync(previous);
+            }
+        } restoreForceSync;
+
+        constexpr float globalScale = 1.0f / 256.0f;
+        fastllm::Data referenceWeight = MakeNvfp4Block16Weight(
+            outputDim, inputDim, globalScale);
+        fastllm::Data marlinWeight = MakeNvfp4Block16Weight(
+            outputDim, inputDim, globalScale);
+        std::vector<float> inputValues = MakeRegressionValues(
+            batch * inputDim, 0.43f, 0.08f);
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, inputDim}, inputValues);
+        fastllm::Data warmupInput = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {2, inputDim},
+            std::vector<float>(inputValues.begin(),
+                               inputValues.begin() + 2 * inputDim));
+        fastllm::Data bias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {outputDim},
+            MakeRegressionValues(outputDim, 0.79f, 0.015f));
+        fastllm::Data noBias;
+        fastllm::Data reference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, outputDim},
+            std::vector<float>((size_t)batch * outputDim, 0.0f));
+        fastllm::Data actual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, outputDim},
+            std::vector<float>((size_t)batch * outputDim, 0.0f));
+        fastllm::Data warmup = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {2, outputDim},
+            std::vector<float>(2 * outputDim, 0.0f));
+
+        FastllmCudaSetNcclForceSync(false);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, referenceWeight, bias, reference,
+                   batch, inputDim, outputDim),
+               "native NVFP4_BLOCK_16 reference failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(!FastllmCudaHasNVFP4MarlinLayout(referenceWeight),
+               "large-M NVFP4 reference unexpectedly repacked its weight");
+
+        FastllmCudaSetNcclForceSync(true);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   warmupInput, marlinWeight, bias, warmup,
+                   2, inputDim, outputDim),
+               "NVFP4 Marlin warmup conversion failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(FastllmCudaHasNVFP4MarlinLayout(marlinWeight),
+               "NVFP4 Marlin warmup did not mark the in-place layout");
+
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, marlinWeight, bias, actual,
+                   batch, inputDim, outputDim),
+               "NVFP4 Marlin large-M path failed after repack");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                        2.0e-2f, 2.0e-3f,
+                        "NVFP4 Marlin large-M output with bias");
+
+        fastllm::Data referenceSingle = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, outputDim},
+            std::vector<float>(outputDim, 0.0f));
+        fastllm::Data actualSingle = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, outputDim},
+            std::vector<float>(outputDim, 0.0f));
+        FastllmCudaSetNcclForceSync(false);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, referenceWeight, noBias, referenceSingle,
+                   1, inputDim, outputDim),
+               "native NVFP4_BLOCK_16 batch-one reference failed");
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, marlinWeight, noBias, actualSingle,
+                   1, inputDim, outputDim),
+               "NVFP4 Marlin batch-one path failed after repack");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceSingle),
+                        ToFloatVector(actualSingle),
+                        2.0e-2f, 2.0e-3f,
+                        "NVFP4 Marlin batch-one output without bias");
+        std::cout << "CUDA NVFP4 Marlin regression: PASS\n";
+    }
+
     void RunCudaBFloat16Hidden3072RMSNormRegression() {
         FastllmCudaSetDevice(0);
         constexpr int outer = 7;
@@ -5035,6 +7103,882 @@ namespace {
         std::cout << "Triton chunk GDN prefill transaction regression: PASS\n";
     }
 
+    void RunCudaRaggedGdnLogicalPrepRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int chunkSize = 64;
+        constexpr int kDim = 128;
+        constexpr int vDim = 128;
+        constexpr int keyHeads = 2;
+        constexpr int valueHeads = 6;
+        constexpr int headGroup = valueHeads / keyHeads;
+        constexpr int baOffset = 5;
+        constexpr int baChannels = baOffset + valueHeads * 2 + 3;
+        constexpr float eps = 1.0e-6f;
+        const float qScale = 1.0f / std::sqrt((float)kDim);
+        const std::vector<int> seqLens = {65, 7};
+        const int totalTokens =
+            std::accumulate(seqLens.begin(), seqLens.end(), 0);
+        int totalChunks = 0;
+        for (int len : seqLens) {
+            totalChunks += (len + chunkSize - 1) / chunkSize;
+        }
+        const int packedTokens = totalChunks * chunkSize;
+        const int qkvChannels =
+            keyHeads * kDim * 2 + valueHeads * vDim;
+
+        std::vector<float> qkvValues = MakeRegressionValues(
+            (size_t)totalTokens * qkvChannels, 0.23f, 0.013f);
+        std::vector<float> baValues = MakeRegressionValues(
+            (size_t)totalTokens * baChannels, 0.41f, 0.017f);
+        std::vector<float> normValues = MakeRegressionValues(
+            kDim, 0.59f, 0.004f);
+        std::vector<float> aLogValues = MakeRegressionValues(
+            valueHeads, -1.7f, 0.03f);
+        std::vector<float> dtBiasValues = MakeRegressionValues(
+            valueHeads, -0.2f, 0.02f);
+        fastllm::Data qkv = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, qkvChannels}, qkvValues);
+        fastllm::Data combinedBa = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, baChannels}, baValues);
+        fastllm::Data normWeight = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {kDim}, normValues);
+        fastllm::Data aLog = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {valueHeads}, aLogValues);
+        fastllm::Data dtBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {valueHeads}, dtBiasValues);
+
+        fastllm::Data logicalQ, logicalK, packedG, kBeta, vBeta;
+        Expect(FastllmCudaQwen35GdnPostConvRaggedExactFloat16(
+                   qkv, normWeight, combinedBa, aLog, dtBias,
+                   baOffset, seqLens, chunkSize,
+                   keyHeads, valueHeads, kDim, vDim,
+                   eps, qScale, logicalQ, logicalK,
+                   packedG, kBeta, vBeta),
+               "ragged exact GDN post-conv rejected valid input");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            logicalQ, fastllm::DataType::FLOAT16,
+            {1, keyHeads, packedTokens, kDim},
+            "ragged logical Q");
+        ExpectCudaTensorMeta(
+            logicalK, fastllm::DataType::FLOAT16,
+            {1, keyHeads, packedTokens, kDim},
+            "ragged logical K");
+        ExpectCudaTensorMeta(
+            packedG, fastllm::DataType::FLOAT16,
+            {1, valueHeads, packedTokens},
+            "ragged packed G");
+
+        fastllm::Data normalizedQ, normalizedK;
+        Expect(FastllmCudaRMSNormCombinedQKFloat16(
+                   qkv, normWeight, 1, totalTokens,
+                   keyHeads, valueHeads, kDim, vDim, eps,
+                   normalizedQ, normalizedK),
+               "combined Q/K RMSNorm reference failed");
+        fastllm::Data tokenBeta, tokenG;
+        Expect(FastllmCudaSigmoidMambaSoftplusCombinedFloat16(
+                   combinedBa, aLog, dtBias, 1, totalTokens,
+                   baChannels, baOffset, valueHeads,
+                   tokenBeta, tokenG),
+               "combined BA reference failed");
+        FastllmCudaSyncCurrentThreadStream();
+
+        std::vector<float> normalizedQValues = ToFloatVector(normalizedQ);
+        std::vector<float> normalizedKValues = ToFloatVector(normalizedK);
+        std::vector<float> repeatedQValues(
+            (size_t)totalTokens * valueHeads * kDim);
+        std::vector<float> repeatedKValues(repeatedQValues.size());
+        std::vector<float> tokenVValues(
+            (size_t)totalTokens * valueHeads * vDim);
+        for (int token = 0; token < totalTokens; token++) {
+            for (int keyHead = 0; keyHead < keyHeads; keyHead++) {
+                for (int group = 0; group < headGroup; group++) {
+                    int valueHead = keyHead * headGroup + group;
+                    for (int d = 0; d < kDim; d++) {
+                        size_t source =
+                            ((size_t)token * keyHeads + keyHead) * kDim + d;
+                        size_t target =
+                            ((size_t)token * valueHeads + valueHead) * kDim + d;
+                        repeatedQValues[target] = normalizedQValues[source];
+                        repeatedKValues[target] = normalizedKValues[source];
+                    }
+                }
+            }
+            for (int valueHead = 0; valueHead < valueHeads; valueHead++) {
+                for (int d = 0; d < vDim; d++) {
+                    tokenVValues[
+                        ((size_t)token * valueHeads + valueHead) * vDim + d] =
+                        qkvValues[(size_t)token * qkvChannels +
+                                  keyHeads * kDim * 2 +
+                                  valueHead * vDim + d];
+                }
+            }
+        }
+        fastllm::Data repeatedQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, valueHeads, kDim}, repeatedQValues);
+        fastllm::Data repeatedK = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, valueHeads, kDim}, repeatedKValues);
+        fastllm::Data tokenV = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, valueHeads, vDim}, tokenVValues);
+        fastllm::Data referenceQRepeated, referenceKRepeated;
+        fastllm::Data referenceV, referenceBeta, referenceG;
+        Expect(FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+                   repeatedQ, repeatedK, tokenV, tokenBeta, tokenG,
+                   seqLens, chunkSize, qScale,
+                   referenceQRepeated, referenceKRepeated,
+                   referenceV, referenceBeta, referenceG),
+               "legacy repeated-head ragged pack reference failed");
+
+        std::vector<float> zeros(
+            (size_t)totalTokens * keyHeads * kDim, 0.0f);
+        std::vector<float> scalarZeros(
+            (size_t)totalTokens * keyHeads, 0.0f);
+        fastllm::Data dummyV = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, keyHeads, vDim}, zeros);
+        fastllm::Data dummyB = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, keyHeads}, scalarZeros);
+        fastllm::Data dummyG = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, keyHeads}, scalarZeros);
+        fastllm::Data referenceLogicalQ, referenceLogicalK;
+        fastllm::Data unusedV, unusedB, unusedG;
+        Expect(FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+                   normalizedQ, normalizedK, dummyV, dummyB, dummyG,
+                   seqLens, chunkSize, qScale,
+                   referenceLogicalQ, referenceLogicalK,
+                   unusedV, unusedB, unusedG),
+               "legacy logical-head ragged pack reference failed");
+
+        referenceBeta.Reshape(
+            {1, valueHeads, packedTokens, 1});
+        fastllm::Data referenceKBeta = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            referenceKRepeated.dims, ToFloatVector(referenceKRepeated));
+        fastllm::Data referenceVBeta = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            referenceV.dims, ToFloatVector(referenceV));
+        Expect(FastllmCudaMulTo(referenceKBeta, referenceBeta, 1.0f),
+               "legacy K beta reference failed");
+        Expect(FastllmCudaMulTo(referenceVBeta, referenceBeta, 1.0f),
+               "legacy V beta reference failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceLogicalQ),
+                        ToFloatVector(logicalQ), 0.0f, 0.0f,
+                        "ragged fused logical Q bitwise output");
+        ExpectFloatNear(ToFloatVector(referenceLogicalK),
+                        ToFloatVector(logicalK), 0.0f, 0.0f,
+                        "ragged fused logical K bitwise output");
+        ExpectFloatNear(ToFloatVector(referenceG), ToFloatVector(packedG),
+                        0.0f, 0.0f,
+                        "ragged fused G bitwise output");
+        ExpectFloatNear(ToFloatVector(referenceKBeta), ToFloatVector(kBeta),
+                        0.0f, 0.0f,
+                        "ragged fused K-beta bitwise output");
+        ExpectFloatNear(ToFloatVector(referenceVBeta), ToFloatVector(vBeta),
+                        0.0f, 0.0f,
+                        "ragged fused V-beta bitwise output");
+
+        logicalK.Reshape(
+            {1, keyHeads, totalChunks, chunkSize, kDim});
+        kBeta.Reshape(
+            {1, valueHeads, totalChunks, chunkSize, kDim});
+        referenceKRepeated.Reshape(
+            {1, valueHeads, totalChunks, chunkSize, kDim});
+        referenceKBeta.Reshape(
+            {1, valueHeads, totalChunks, chunkSize, kDim});
+        fastllm::Data mappedAt;
+        Expect(FastllmCudaBatchMatMulTransBHeadMapped(
+                   kBeta, logicalK, mappedAt, headGroup, 1.0f),
+               "mapped ragged GDN KKT failed");
+        fastllm::Data referenceAt;
+        referenceAt.dataType = fastllm::DataType::FLOAT16;
+        referenceAt.Resize(
+            {1, valueHeads, totalChunks, chunkSize, chunkSize});
+        referenceAt.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        referenceAt.Allocate(false);
+        Expect(FastllmCudaBatchMatMulTransB(
+                   referenceKBeta, referenceKRepeated, referenceAt,
+                   chunkSize * kDim, chunkSize * kDim,
+                   chunkSize * chunkSize, kDim, kDim,
+                   valueHeads * totalChunks,
+                   chunkSize, kDim, chunkSize, 1.0f),
+               "repeated-head GDN KKT reference failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceAt), ToFloatVector(mappedAt),
+                        0.0f, 0.0f,
+                        "mapped ragged GDN KKT bitwise output");
+        {
+            ScopedEnvOverride forceRepeatedHead(
+                "FASTLLM_CUDA_GDN_MAPPED_KKT_BATCHED_POINTERS", "0");
+            fastllm::Data fallbackAt;
+            Expect(FastllmCudaBatchMatMulTransBHeadMapped(
+                       kBeta, logicalK, fallbackAt, headGroup, 1.0f),
+                   "repeated-head GDN KKT fallback failed");
+            FastllmCudaSyncCurrentThreadStream();
+            ExpectFloatNear(
+                ToFloatVector(referenceAt), ToFloatVector(fallbackAt),
+                0.0f, 0.0f,
+                "repeated-head GDN KKT fallback bitwise output");
+        }
+        std::cout << "CUDA repeated-head GDN KKT fallback regression: PASS\n";
+        bool mappedKktSelected = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_MAPPED_KKT", true);
+        if (mappedKktSelected) {
+            fastllm::Data selectedAt;
+            Expect(fastllm::FastllmCudaMappedGdnKkt(
+                       kBeta, logicalK, headGroup, selectedAt),
+                   "selected mapped ragged GDN KKT failed");
+            FastllmCudaSyncCurrentThreadStream();
+            bool tritonKkt = RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_KKT", false);
+            float tolerance = tritonKkt ? 2e-3f : 0.0f;
+            ExpectFloatNear(
+                ToFloatVector(referenceAt), ToFloatVector(selectedAt),
+                tolerance, tolerance,
+                tritonKkt ? "Triton mapped ragged GDN KKT output"
+                          : "default mapped ragged GDN KKT output");
+        }
+        std::cout << "CUDA ragged GDN logical prep regression: PASS\n";
+    }
+
+    void RunCudaVarlenChunkGdnPrefillRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int heads = 1;
+        constexpr int chunkSize = 64;
+        constexpr int kDim = 128;
+        constexpr int vDim = 128;
+        const std::vector<int> seqLens = {65, 129, 7};
+        const int batch = (int)seqLens.size();
+        std::vector<int> tokenOffsets(batch + 1, 0);
+        std::vector<int> chunkOffsets(batch + 1, 0);
+        for (int request = 0; request < batch; request++) {
+            tokenOffsets[request + 1] =
+                tokenOffsets[request] + seqLens[request];
+            chunkOffsets[request + 1] = chunkOffsets[request] +
+                (seqLens[request] + chunkSize - 1) / chunkSize;
+        }
+        const int totalTokens = tokenOffsets.back();
+        const int totalChunks = chunkOffsets.back();
+
+        const std::vector<float> tokenQValues = MakeRegressionValues(
+            totalTokens * heads * kDim, 0.17f, 0.01f);
+        const std::vector<float> tokenKValues = MakeRegressionValues(
+            totalTokens * heads * kDim, 0.31f, 0.009f);
+        const std::vector<float> tokenVValues = MakeRegressionValues(
+            totalTokens * heads * vDim, 0.47f, 0.012f);
+        const std::vector<float> tokenBValues = MakeRegressionValues(
+            totalTokens * heads, 0.61f, 0.02f);
+        const std::vector<float> tokenGValues = MakeRegressionValues(
+            totalTokens * heads, 0.79f, 0.001f);
+        fastllm::Data tokenQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, kDim}, tokenQValues);
+        fastllm::Data tokenK = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, kDim}, tokenKValues);
+        fastllm::Data tokenV = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, vDim}, tokenVValues);
+        fastllm::Data tokenB = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads}, tokenBValues);
+        fastllm::Data tokenG = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads}, tokenGValues);
+        fastllm::Data packedQ, packedK, packedV, packedB, packedG;
+        Expect(FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+                   tokenQ, tokenK, tokenV, tokenB, tokenG,
+                   seqLens, chunkSize, 1.0f,
+                   packedQ, packedK, packedV, packedB, packedG),
+               "packed varlen GDN input packing failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            packedQ, fastllm::DataType::FLOAT16,
+            {1, heads, totalChunks * chunkSize, kDim},
+            "packed varlen GDN Q");
+        fastllm::Data unpackedQ;
+        Expect(FastllmCudaUnpackRaggedGdnPrefillChunksFloat16(
+                   packedQ, seqLens, chunkSize, unpackedQ),
+               "packed varlen GDN output unpacking failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(tokenQ), ToFloatVector(unpackedQ),
+                        0.0f, 0.0f,
+                        "packed varlen GDN pack/unpack round trip");
+
+        const std::vector<int> qDims =
+            {1, heads, totalChunks, chunkSize, kDim};
+        const std::vector<int> vDims =
+            {1, heads, totalChunks, chunkSize, vDim};
+        const std::vector<int> gDims =
+            {1, heads, totalChunks, chunkSize};
+        const std::vector<int> attnDims =
+            {1, heads, totalChunks, chunkSize, chunkSize};
+        const std::vector<int> stateDims =
+            {batch, heads, kDim, vDim};
+        const std::vector<float> qValues = MakeRegressionValues(
+            totalChunks * chunkSize * kDim, 1.01f, 0.004f);
+        const std::vector<float> kValues = MakeRegressionValues(
+            totalChunks * chunkSize * kDim, 1.19f, 0.003f);
+        const std::vector<float> vValues = MakeRegressionValues(
+            totalChunks * chunkSize * vDim, 1.37f, 0.006f);
+        const std::vector<float> gValues = MakeRegressionValues(
+            totalChunks * chunkSize, 1.53f, 0.0004f);
+        const std::vector<float> attnValues = MakeRegressionValues(
+            totalChunks * chunkSize * chunkSize, 1.71f, 0.001f);
+        const std::vector<float> kCumValues = MakeRegressionValues(
+            totalChunks * chunkSize * kDim, 1.89f, 0.003f);
+        const std::vector<float> initialState = MakeRegressionValues(
+            batch * kDim * vDim, 2.07f, 0.002f);
+
+        auto makeChunkSlice = [](
+            const std::vector<float> &values, size_t begin,
+            size_t count) {
+            return std::vector<float>(
+                values.begin() + begin, values.begin() + begin + count);
+        };
+        std::vector<float> referenceOutputValues;
+        std::vector<float> referenceStateValues;
+        for (int request = 0; request < batch; request++) {
+            int requestChunks =
+                chunkOffsets[request + 1] - chunkOffsets[request];
+            size_t qBegin =
+                (size_t)chunkOffsets[request] * chunkSize * kDim;
+            size_t vBegin =
+                (size_t)chunkOffsets[request] * chunkSize * vDim;
+            size_t gBegin =
+                (size_t)chunkOffsets[request] * chunkSize;
+            size_t attnBegin =
+                (size_t)chunkOffsets[request] * chunkSize * chunkSize;
+            std::vector<int> requestQDims =
+                {1, heads, requestChunks, chunkSize, kDim};
+            std::vector<int> requestVDims =
+                {1, heads, requestChunks, chunkSize, vDim};
+            std::vector<int> requestGDims =
+                {1, heads, requestChunks, chunkSize};
+            std::vector<int> requestAttnDims =
+                {1, heads, requestChunks, chunkSize, chunkSize};
+            fastllm::Data requestQ = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestQDims,
+                makeChunkSlice(qValues, qBegin,
+                               (size_t)requestChunks * chunkSize * kDim));
+            fastllm::Data requestK = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestQDims,
+                makeChunkSlice(kValues, qBegin,
+                               (size_t)requestChunks * chunkSize * kDim));
+            fastllm::Data requestV = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestVDims,
+                makeChunkSlice(vValues, vBegin,
+                               (size_t)requestChunks * chunkSize * vDim));
+            fastllm::Data requestG = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestGDims,
+                makeChunkSlice(gValues, gBegin,
+                               (size_t)requestChunks * chunkSize));
+            fastllm::Data requestAttn = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestAttnDims,
+                makeChunkSlice(
+                    attnValues, attnBegin,
+                    (size_t)requestChunks * chunkSize * chunkSize));
+            fastllm::Data requestKCum = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, requestQDims,
+                makeChunkSlice(kCumValues, qBegin,
+                               (size_t)requestChunks * chunkSize * kDim));
+            fastllm::Data requestState = MakeCudaTensor(
+                fastllm::DataType::FLOAT16,
+                {1, heads, kDim, vDim},
+                makeChunkSlice(
+                    initialState, (size_t)request * kDim * vDim,
+                    (size_t)kDim * vDim));
+            fastllm::Data requestOutput;
+            FastllmChunkGatedDeltaRulePrefill(
+                requestQ, requestK, requestV, requestG, requestAttn,
+                requestKCum, requestState, requestOutput);
+            FastllmCudaSyncCurrentThreadStream();
+            std::vector<float> output = ToFloatVector(requestOutput);
+            std::vector<float> state = ToFloatVector(requestState);
+            referenceOutputValues.insert(
+                referenceOutputValues.end(), output.begin(),
+                output.begin() + (size_t)seqLens[request] * vDim);
+            referenceStateValues.insert(
+                referenceStateValues.end(), state.begin(), state.end());
+        }
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims, qValues);
+        fastllm::Data k = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims, kValues);
+        fastllm::Data v = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, vDims, vValues);
+        fastllm::Data g = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims, gValues);
+        fastllm::Data attn = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, attnDims, attnValues);
+        fastllm::Data kCum = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, qDims, kCumValues);
+
+        fastllm::Data nativeState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data nativeOutput;
+        Expect(FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+                   q, k, v, g, attn, kCum, nativeState,
+                   seqLens, nativeOutput),
+               "native packed varlen GDN prefill failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            nativeOutput, fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, vDim},
+            "native direct ragged GDN output");
+        ExpectFloatNear(referenceStateValues, ToFloatVector(nativeState),
+                        2e-3f, 2e-3f,
+                        "native packed varlen GDN recurrent state");
+        ExpectFloatNear(referenceOutputValues, ToFloatVector(nativeOutput),
+                        2e-3f, 2e-3f,
+                        "native packed varlen GDN output");
+
+        fastllm::Data selectedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, initialState);
+        fastllm::Data selectedOutput;
+        Expect(RunCudaVarlenChunkGdnSelected(
+                   q, k, v, g, attn, attn, kCum, selectedState,
+                   false, false, seqLens, selectedOutput,
+                   "packed varlen GDN"),
+               "selected packed varlen GDN prefill failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            selectedOutput, fastllm::DataType::FLOAT16,
+            {1, totalTokens, heads, vDim},
+            "selected direct ragged GDN output");
+        ExpectFloatNear(referenceStateValues, ToFloatVector(selectedState),
+                        2e-3f, 2e-3f,
+                        "selected packed varlen GDN recurrent state");
+        ExpectFloatNear(referenceOutputValues, ToFloatVector(selectedOutput),
+                        2e-3f, 2e-3f,
+                        "selected packed varlen GDN output");
+        std::cout << "CUDA packed varlen chunk GDN regression: PASS\n";
+    }
+
+    void RunCudaVarlenChunkGdnHeadMappingRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int keyHeads = 2;
+        constexpr int valueHeads = 6;
+        constexpr int headGroup = valueHeads / keyHeads;
+        constexpr int chunkSize = 64;
+        constexpr int kDim = 128;
+        constexpr int vDim = 128;
+        const std::vector<int> seqLens = {65, 7};
+        const int batch = (int)seqLens.size();
+        const int totalTokens =
+            std::accumulate(seqLens.begin(), seqLens.end(), 0);
+        int totalChunks = 0;
+        for (int len : seqLens) {
+            totalChunks += (len + chunkSize - 1) / chunkSize;
+        }
+        const size_t keyMatrixElements =
+            (size_t)totalChunks * chunkSize * kDim;
+        const size_t attnElements =
+            (size_t)totalChunks * chunkSize * chunkSize;
+        std::vector<float> logicalQValues = MakeRegressionValues(
+            keyHeads * keyMatrixElements, 0.29f, 0.003f);
+        std::vector<float> logicalKValues = MakeRegressionValues(
+            keyHeads * keyMatrixElements, 0.47f, 0.002f);
+        std::vector<float> logicalAttnValues = MakeRegressionValues(
+            keyHeads * attnElements, 0.61f, 0.0007f);
+        std::vector<float> physicalQValues(
+            valueHeads * keyMatrixElements);
+        std::vector<float> physicalKValues(
+            valueHeads * keyMatrixElements);
+        std::vector<float> physicalAttnValues(
+            valueHeads * attnElements);
+        for (int valueHead = 0; valueHead < valueHeads; valueHead++) {
+            int keyHead = valueHead / headGroup;
+            std::copy_n(
+                logicalQValues.begin() + keyHead * keyMatrixElements,
+                keyMatrixElements,
+                physicalQValues.begin() + valueHead * keyMatrixElements);
+            std::copy_n(
+                logicalKValues.begin() + keyHead * keyMatrixElements,
+                keyMatrixElements,
+                physicalKValues.begin() + valueHead * keyMatrixElements);
+            std::copy_n(
+                logicalAttnValues.begin() + keyHead * attnElements,
+                attnElements,
+                physicalAttnValues.begin() + valueHead * attnElements);
+        }
+        const std::vector<int> logicalQDims =
+            {1, keyHeads, totalChunks, chunkSize, kDim};
+        const std::vector<int> physicalQDims =
+            {1, valueHeads, totalChunks, chunkSize, kDim};
+        const std::vector<int> vDims =
+            {1, valueHeads, totalChunks, chunkSize, vDim};
+        const std::vector<int> gDims =
+            {1, valueHeads, totalChunks, chunkSize};
+        const std::vector<int> logicalAttnDims =
+            {1, keyHeads, totalChunks, chunkSize, chunkSize};
+        const std::vector<int> physicalAttnDims =
+            {1, valueHeads, totalChunks, chunkSize, chunkSize};
+        const std::vector<int> stateDims =
+            {batch, valueHeads, kDim, vDim};
+        std::vector<float> vValues = MakeRegressionValues(
+            (size_t)valueHeads * totalChunks * chunkSize * vDim,
+            0.83f, 0.004f);
+        std::vector<float> gValues = MakeRegressionValues(
+            (size_t)valueHeads * totalChunks * chunkSize,
+            -0.019f, 0.00003f);
+        std::vector<float> decayValues = MakeRegressionValues(
+            valueHeads * attnElements, 0.91f, 0.0002f);
+        std::vector<float> kCumValues = MakeRegressionValues(
+            (size_t)valueHeads * totalChunks * chunkSize * kDim,
+            1.07f, 0.002f);
+        std::vector<float> stateValues = MakeRegressionValues(
+            (size_t)batch * valueHeads * kDim * vDim,
+            1.23f, 0.001f);
+
+        fastllm::Data physicalQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, physicalQDims, physicalQValues);
+        fastllm::Data physicalK = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, physicalQDims, physicalKValues);
+        fastllm::Data logicalQ = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, logicalQDims, logicalQValues);
+        fastllm::Data logicalK = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, logicalQDims, logicalKValues);
+        fastllm::Data v = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, vDims, vValues);
+        fastllm::Data g = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, gDims, gValues);
+        fastllm::Data physicalAttn = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            physicalAttnDims, physicalAttnValues);
+        fastllm::Data logicalAttn = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            logicalAttnDims, logicalAttnValues);
+        fastllm::Data decay = MakeCudaTensor(
+            fastllm::DataType::FLOAT16,
+            physicalAttnDims, decayValues);
+        fastllm::Data kCum = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, physicalQDims, kCumValues);
+
+        fastllm::Data referenceState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data referenceOutput;
+        Expect(FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+                   physicalQ, physicalK, v, g, physicalAttn,
+                   kCum, referenceState, seqLens, referenceOutput,
+                   &decay, true),
+               "physical-head varlen GDN reference failed");
+        fastllm::Data mappedNativeState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data mappedNativeOutput;
+        Expect(FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+                   logicalQ, logicalK, v, g, logicalAttn,
+                   kCum, mappedNativeState, seqLens, mappedNativeOutput,
+                   &decay, true),
+               "logical-head native varlen GDN failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(referenceState),
+                        ToFloatVector(mappedNativeState),
+                        0.0f, 0.0f,
+                        "logical-head native varlen GDN state");
+        ExpectFloatNear(ToFloatVector(referenceOutput),
+                        ToFloatVector(mappedNativeOutput),
+                        0.0f, 0.0f,
+                        "logical-head native varlen GDN output");
+
+        fastllm::Data selectedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data selectedOutput;
+        Expect(RunCudaVarlenChunkGdnSelected(
+                   logicalQ, logicalK, v, g, logicalAttn, decay,
+                   kCum, selectedState, true, false,
+                   seqLens, selectedOutput,
+                   "logical-head varlen GDN"),
+               "selected logical-head varlen GDN failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectCudaTensorMeta(
+            selectedOutput, fastllm::DataType::FLOAT16,
+            {1, totalTokens, valueHeads, vDim},
+            "selected logical-head direct varlen output");
+        ExpectFloatNear(ToFloatVector(referenceState),
+                        ToFloatVector(selectedState),
+                        2e-3f, 2e-3f,
+                        "selected logical-head varlen GDN state");
+        ExpectFloatNear(ToFloatVector(referenceOutput),
+                        ToFloatVector(selectedOutput),
+                        2e-3f, 2e-3f,
+                        "selected logical-head varlen GDN output");
+
+        // Exercise the direct-QK O variant against the legacy FP16
+        // materialization boundary. This comparison keeps QK and the decay
+        // mask explicit only on the reference side.
+        fastllm::Data directAttn;
+        directAttn.dataType = fastllm::DataType::FLOAT16;
+        directAttn.Resize(logicalAttnDims);
+        directAttn.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        directAttn.Allocate(false);
+        Expect(FastllmCudaBatchMatMulTransB(
+                   logicalQ, logicalK, directAttn,
+                   chunkSize * kDim, chunkSize * kDim,
+                   chunkSize * chunkSize, kDim, kDim,
+                   keyHeads * totalChunks,
+                   chunkSize, kDim, chunkSize, 1.0f),
+               "direct-QK legacy attention reference failed");
+        fastllm::Data directDecay;
+        directDecay.dataType = fastllm::DataType::FLOAT16;
+        directDecay.Resize(physicalAttnDims);
+        directDecay.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        directDecay.Allocate(false);
+        Expect(FastllmCudaMakeDecayMask(g, directDecay),
+               "direct-QK decay reference failed");
+
+        fastllm::Data directReferenceState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data directReferenceOutput;
+        Expect(FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+                   logicalQ, logicalK, v, g, directAttn,
+                   kCum, directReferenceState, seqLens,
+                   directReferenceOutput, &directDecay, true),
+               "direct-QK native reference failed");
+        fastllm::Data directSelectedState = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, stateDims, stateValues);
+        fastllm::Data directSelectedOutput;
+        Expect(RunCudaVarlenChunkGdnSelected(
+                   logicalQ, logicalK, v, g, directAttn, directDecay,
+                   kCum, directSelectedState, true, true,
+                   seqLens, directSelectedOutput,
+                   "direct-QK logical-head varlen GDN"),
+               "selected direct-QK logical-head varlen GDN failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(directReferenceState),
+                        ToFloatVector(directSelectedState),
+                        2e-3f, 2e-3f,
+                        "direct-QK logical-head varlen GDN state");
+        ExpectFloatNear(ToFloatVector(directReferenceOutput),
+                        ToFloatVector(directSelectedOutput),
+                        3e-3f, 3e-3f,
+                        "direct-QK logical-head varlen GDN output");
+        std::cout << "CUDA logical-head varlen chunk GDN regression: PASS\n";
+    }
+
+    void RunCudaDeepSeekV4TokenTiledWoARegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int groups = 2;
+        constexpr int heads = 8;
+        constexpr int headDim = 1024;
+        constexpr int hidden = (heads / groups) * headDim;
+        constexpr int outRank = 128;
+
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::FP8_E4M3;
+        weight.UpdateUnitSize();
+        weight.Resize({groups * outRank, hidden});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = 128;
+        weight.blockM = 128;
+        weight.Allocate(false);
+        uint8_t *weightBytes = reinterpret_cast<uint8_t*>(weight.cpuData);
+        for (uint64_t i = 0; i < weight.GetBytes(); i++) {
+            weightBytes[i] = static_cast<uint8_t>(
+                ((i * 29 + i / 97 + 0x11) & 0x7e) |
+                (((i / 43) & 1) << 7));
+        }
+        const int scaleRows = groups * outRank / weight.blockK;
+        const int scaleCols = hidden / weight.blockM;
+        weight.scales.resize((size_t)scaleRows * scaleCols);
+        for (size_t i = 0; i < weight.scales.size(); i++) {
+            weight.scales[i] = 1.0f / (float)(16 << (i % 4));
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+
+        const char *savedDisable = std::getenv(
+            "FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+        const bool hadDisable = savedDisable != nullptr;
+        const std::string disableValue = hadDisable ? savedDisable : "";
+        const char *savedTile = std::getenv(
+            "FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK");
+        const bool hadTile = savedTile != nullptr;
+        const std::string tileValue = hadTile ? savedTile : "";
+        const char *savedRowTile = std::getenv(
+            "FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
+        const bool hadRowTile = savedRowTile != nullptr;
+        const std::string rowTileValue = hadRowTile ? savedRowTile : "";
+
+        const std::vector<std::pair<int, int>> tiles = {
+            {2, 4}, {4, 4}, {8, 4}, {2, 8}, {4, 8}, {8, 8}};
+        const std::vector<fastllm::DataType> inputTypes = {
+            fastllm::DataType::BFLOAT16,
+            fastllm::DataType::FLOAT16,
+            fastllm::DataType::FLOAT32};
+
+        for (const std::pair<int, int> shape : {
+                 std::pair<int, int>{1, 2}, {1, 7}, {1, 8}, {1, 9}, {2, 5}}) {
+            const int bsz = shape.first;
+            const int seqlen = shape.second;
+            const int tokens = bsz * seqlen;
+            std::vector<float> inputValues(
+                (size_t)tokens * heads * headDim);
+            for (size_t i = 0; i < inputValues.size(); i++) {
+                inputValues[i] =
+                    (float)((int)((i * 17 + i / 31) % 257) - 128) /
+                    64.0f;
+            }
+            for (const fastllm::DataType inputType : inputTypes) {
+                fastllm::Data input = MakeCudaTensor(
+                    inputType, {bsz, seqlen, heads, headDim}, inputValues);
+
+                setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE", "1", 1);
+                fastllm::Data reference;
+                Expect(FastllmCudaDeepSeekV4WoA(
+                           input, weight, groups, outRank, reference, false),
+                       "one-token DeepSeek-V4 WoA reference rejected input");
+                reference.ToDevice(fastllm::DataDevice::CPU);
+                for (const auto &tile : tiles) {
+                    unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+                    setenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK",
+                           std::to_string(tile.first).c_str(), 1);
+                    setenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK",
+                           std::to_string(tile.second).c_str(), 1);
+                    fastllm::Data actual;
+                    Expect(FastllmCudaDeepSeekV4WoA(
+                               input, weight, groups, outRank, actual, false),
+                           "token-tiled DeepSeek-V4 WoA rejected input");
+                    actual.ToDevice(fastllm::DataDevice::CPU);
+                    Expect(reference.dataType == fastllm::DataType::BFLOAT16 &&
+                               actual.dataType == fastllm::DataType::BFLOAT16 &&
+                               reference.GetBytes() == actual.GetBytes(),
+                           "token-tiled DeepSeek-V4 WoA output metadata mismatch");
+                    Expect(std::memcmp(reference.cpuData, actual.cpuData,
+                                       reference.GetBytes()) == 0,
+                           "token-tiled DeepSeek-V4 WoA changed BF16 output bits at "
+                           "input_type=" + std::to_string((int)inputType) +
+                           " batch=" + std::to_string(bsz) +
+                           " tokens=" + std::to_string(seqlen) +
+                           " tile=" + std::to_string(tile.first) + "x" +
+                           std::to_string(tile.second));
+                }
+            }
+        }
+
+        if (hadDisable) {
+            setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE",
+                   disableValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+        }
+        if (hadTile) {
+            setenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK",
+                   tileValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK");
+        }
+        if (hadRowTile) {
+            setenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK",
+                   rowTileValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
+        }
+        std::cout << "DeepSeek-V4 CUDA token-tiled WoA regression: PASS "
+                  << "(BF16 output bitwise, BF16/FP16/FP32 inputs, K=4096, "
+                     "tiles=2/4/8 x rows=4/8)\n";
+    }
+
+    void RunCudaDeepSeekV4TokenTiledWoABenchmark() {
+        FastllmCudaSetDevice(0);
+        constexpr int groups = 8;
+        constexpr int heads = 64;
+        constexpr int headDim = 512;
+        constexpr int hidden = (heads / groups) * headDim;
+        constexpr int outRank = 1024;
+
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::FP8_E4M3;
+        weight.UpdateUnitSize();
+        weight.Resize({groups * outRank, hidden});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = 128;
+        weight.blockM = 128;
+        weight.Allocate(false);
+        uint8_t *weightBytes = reinterpret_cast<uint8_t*>(weight.cpuData);
+        for (uint64_t i = 0; i < weight.GetBytes(); i++) {
+            weightBytes[i] = static_cast<uint8_t>(
+                0x18 + ((i * 13 + i / 127) & 0x3f));
+        }
+        const int scaleRows = groups * outRank / weight.blockK;
+        const int scaleCols = hidden / weight.blockM;
+        weight.scales.resize((size_t)scaleRows * scaleCols);
+        for (size_t i = 0; i < weight.scales.size(); i++) {
+            weight.scales[i] = 1.0f / (float)(32 << (i % 3));
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+
+        const char *benchTokens = std::getenv(
+            "FASTLLM_DSV4_WOA_BENCH_TOKENS");
+        const int tokens = benchTokens == nullptr ? 2048 :
+            std::max(1, std::atoi(benchTokens));
+        fastllm::Data input(
+            fastllm::DataType::BFLOAT16,
+            {1, tokens, heads, headDim});
+        input.Allocate(false);
+        uint16_t *inputBits = reinterpret_cast<uint16_t*>(input.cpuData);
+        for (uint64_t i = 0; i < input.Count(0); i++) {
+            const float value =
+                (float)((int)((i * 17 + i / 31) % 257) - 128) / 64.0f;
+            inputBits[i] = fastllm::Float32ToBFloat16RNEBits(value);
+        }
+        input.ToDevice(fastllm::DataDevice::CUDA);
+
+        auto measure = [&](const char *label, int tokenTile, int rowTile,
+                           bool disabled) {
+            if (disabled) {
+                setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE", "1", 1);
+            } else {
+                unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+                setenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK",
+                       std::to_string(tokenTile).c_str(), 1);
+                setenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK",
+                       std::to_string(rowTile).c_str(), 1);
+            }
+            fastllm::Data output;
+            for (int i = 0; i < 2; i++) {
+                Expect(FastllmCudaDeepSeekV4WoA(
+                           input, weight, groups, outRank, output, false),
+                       "DeepSeek-V4 WoA benchmark launch failed");
+            }
+            ForceDeviceSync();
+            constexpr int iterations = 5;
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                Expect(FastllmCudaDeepSeekV4WoA(
+                           input, weight, groups, outRank, output, false),
+                       "DeepSeek-V4 WoA benchmark launch failed");
+            }
+            ForceDeviceSync();
+            const double milliseconds = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count() / iterations;
+            std::cout << "woa tokens=" << tokens << " " << label
+                      << " ms=" << milliseconds << "\n";
+        };
+
+        measure("one-token", 1, 4, true);
+        measure("tile=2x4", 2, 4, false);
+        measure("tile=4x4", 4, 4, false);
+        measure("tile=8x4", 8, 4, false);
+        measure("tile=2x8", 2, 8, false);
+        measure("tile=4x8", 4, 8, false);
+        measure("tile=8x8", 8, 8, false);
+        unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE");
+        unsetenv("FASTLLM_DSV4_CUDA_WOA_TOKENS_PER_BLOCK");
+        unsetenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
+    }
+
     void RunCudaDeepSeekV4TritonWoARegression() {
         bool tritonEnabled = fastllm::GetFastllmEnv().cudaTriton &&
             RegressionEnvFlagDefaultEnabled(
@@ -5045,10 +7989,6 @@ namespace {
         constexpr int headDim = 64;
         constexpr int hidden = (heads / groups) * headDim;
         constexpr int outRank = 128;
-
-        std::vector<float> inputValues(heads * headDim, 1.0f);
-        fastllm::Data input = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, heads, headDim}, inputValues);
 
         fastllm::Data weight;
         weight.dataType = fastllm::DataType::FP8_E4M3;
@@ -5065,28 +8005,40 @@ namespace {
         weight.scales = {1.0f / 64.0f, 1.0f / 32.0f};
         weight.ToDevice(fastllm::DataDevice::CUDA);
 
-        fastllm::Data reference;
-        Expect(FastllmCudaDeepSeekV4WoA(
-                   input, weight, groups, outRank, reference, false),
-               "built-in DeepSeek-V4 WoA reference rejected its test input");
+        for (int tokens : {1, 8}) {
+            std::vector<float> inputValues(
+                (size_t)tokens * heads * headDim, 1.0f);
+            fastllm::Data input = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, tokens, heads, headDim}, inputValues);
 
-        fastllm::Data actual = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, groups * outRank},
-            std::vector<float>(groups * outRank, 0.0f));
-        bool usedTriton = fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
-            input, weight, groups, outRank, actual);
-        if (tritonEnabled) {
-            Expect(usedTriton,
-                   "Triton DeepSeek-V4 WoA rejected its supported test input");
-        } else {
-            Expect(!usedTriton,
-                   "DeepSeek-V4 WoA ignored its disabled Triton gate");
+            fastllm::Data reference;
             Expect(FastllmCudaDeepSeekV4WoA(
-                       input, weight, groups, outRank, actual),
-                   "built-in DeepSeek-V4 WoA fallback rejected its test input");
+                       input, weight, groups, outRank, reference, false),
+                   "built-in DeepSeek-V4 WoA reference rejected its test input");
+
+            fastllm::Data actual = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, tokens, groups * outRank},
+                std::vector<float>((size_t)tokens * groups * outRank, 0.0f));
+            bool usedTriton = fastllm::FastllmCudaTryTritonDeepSeekV4WoA(
+                input, weight, groups, outRank, actual);
+            if (tritonEnabled) {
+                Expect(usedTriton,
+                       "Triton DeepSeek-V4 WoA rejected its supported test input");
+            } else {
+                Expect(!usedTriton,
+                       "DeepSeek-V4 WoA ignored its disabled Triton gate");
+                Expect(FastllmCudaDeepSeekV4WoA(
+                           input, weight, groups, outRank, actual),
+                       "built-in DeepSeek-V4 WoA fallback rejected its test input");
+            }
+            ExpectFloatNear(
+                ToFloatVector(reference), ToFloatVector(actual),
+                2e-2f, 2e-3f,
+                "DeepSeek-V4 Triton WoA output rows=" +
+                    std::to_string(tokens));
         }
-        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
-                        2e-2f, 2e-3f, "DeepSeek-V4 Triton WoA output");
         std::cout << "DeepSeek-V4 Triton WoA regression: PASS ("
                   << (tritonEnabled ? "Triton" : "disabled-gate fallback")
                   << ")\n";
@@ -5126,7 +8078,8 @@ namespace {
         for (int compressRatio : compressRatios) {
             fastllm::Data reference;
             Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
-                       q, windowKV, compressedKV, sink, windowSize, compressRatio,
+                       q, windowKV, compressedKV, nullptr, nullptr, sink,
+                       windowSize, compressRatio,
                        decodeMetaPtr, ropeDim, 10000.0f, 4096, 8.0f, 32, 1,
                        softmaxScale, reference, false),
                    "built-in DeepSeek-V4 sparse decode rejected ratio=" +
@@ -5153,7 +8106,8 @@ namespace {
             // Compare final outputs through the production wrapper, which
             // applies the rotary cast after either Triton or native fallback.
             Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
-                       q, windowKV, compressedKV, sink, windowSize, compressRatio,
+                       q, windowKV, compressedKV, nullptr, nullptr, sink,
+                       windowSize, compressRatio,
                        decodeMetaPtr, ropeDim, 10000.0f, 4096, 8.0f, 32, 1,
                        softmaxScale, actual),
                    "DeepSeek-V4 sparse decode wrapper rejected ratio=" +
@@ -5195,12 +8149,14 @@ namespace {
         float smSoftmaxScale = 1.0f / std::sqrt((float)smHeadDim);
         fastllm::Data smReference, smActual;
         Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
-                   smQ, smWindowKV, smCompressedKV, smSink, smWindowSize, 4,
+                   smQ, smWindowKV, smCompressedKV, nullptr, nullptr, smSink,
+                   smWindowSize, 4,
                    smDecodeMetaPtr, 64, 10000.0f, 4096, 8.0f, 32, 1,
                    smSoftmaxScale, smReference, false),
                "built-in DeepSeek-V4 sparse decode rejected SM120 shape");
         Expect(FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
-                   smQ, smWindowKV, smCompressedKV, smSink, smWindowSize, 4,
+                   smQ, smWindowKV, smCompressedKV, nullptr, nullptr, smSink,
+                   smWindowSize, 4,
                    smDecodeMetaPtr, 64, 10000.0f, 4096, 8.0f, 32, 1,
                    smSoftmaxScale, smActual),
                "DeepSeek-V4 Triton sparse decode rejected SM120 shape");
@@ -5210,6 +8166,161 @@ namespace {
         std::cout << "DeepSeek-V4 Triton sparse decode regression: PASS ("
                   << (tritonEnabled ? "Triton" : "disabled-gate fallback")
                   << ")\n";
+    }
+
+    void RunCudaDeepSeekV4IndexerRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int heads = 64;
+        constexpr int headDim = 128;
+        constexpr int topk = 512;
+        constexpr int compressedRows = 640;
+        constexpr int startPos = compressedRows * 4 - 1;
+
+        fastllm::Data q = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, heads, headDim},
+            MakeRegressionValues(heads * headDim, 0.271f, 0.37f));
+        fastllm::Data weights = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, heads},
+            MakeRegressionValues(heads, 0.613f, 0.29f));
+        fastllm::Data compressedKV = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, compressedRows, headDim},
+            MakeRegressionValues(compressedRows * headDim, 0.947f, 0.41f));
+        fastllm::Data decodeMeta =
+            MakeIntTensor({2}, {startPos, 123});
+        decodeMeta.ToDevice(fastllm::DataDevice::CUDA);
+        const int32_t *decodeMetaPtr =
+            reinterpret_cast<const int32_t *>(decodeMeta.cudaData);
+
+        fastllm::Data optimizedIndices, optimizedLengths;
+        Expect(FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
+                   q, weights, compressedKV, decodeMetaPtr, 4,
+                   160000.0f, 65536, 16.0f, 32, 1,
+                   optimizedIndices, optimizedLengths),
+               "DeepSeek-V4 optimized indexer rejected a valid long row");
+
+        ExpectIntEqual({topk}, ToIntVector(optimizedLengths),
+                       "DeepSeek-V4 optimized indexer length");
+        std::vector<int32_t> optimized = ToIntVector(optimizedIndices);
+        auto validateSelection = [&](const std::vector<int32_t> &selection,
+                                     const std::string &name) {
+            Expect((int)selection.size() == topk,
+                   name + " returned the wrong number of indices");
+            std::vector<int32_t> sorted = selection;
+            std::sort(sorted.begin(), sorted.end());
+            Expect(sorted.front() >= 0 && sorted.back() < compressedRows,
+                   name + " returned an out-of-range index");
+            Expect(std::adjacent_find(sorted.begin(), sorted.end()) ==
+                       sorted.end(),
+                   name + " returned duplicate indices");
+            return sorted;
+        };
+        validateSelection(optimized, "DeepSeek-V4 optimized indexer");
+
+        // vLLM bypasses q/score/top-k entirely while the compressed row has no
+        // more than 512 candidates.  The public helper must preserve that exact
+        // ascending-order contract as well.
+        fastllm::Data shortMeta =
+            MakeIntTensor({2}, {127 * 4 - 1, 456});
+        shortMeta.ToDevice(fastllm::DataDevice::CUDA);
+        fastllm::Data shortIndices, shortLengths;
+        Expect(FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
+                   q, weights, compressedKV,
+                   reinterpret_cast<const int32_t *>(shortMeta.cudaData), 4,
+                   160000.0f, 65536, 16.0f, 32, 1,
+                   shortIndices, shortLengths),
+               "DeepSeek-V4 indexer rejected a valid short row");
+        ExpectIntEqual({127}, ToIntVector(shortLengths),
+                       "DeepSeek-V4 short indexer length");
+        std::vector<int32_t> shortSelection = ToIntVector(shortIndices);
+        for (int index = 0; index < topk; index++) {
+            int32_t expected = index < 127 ? index : -1;
+            Expect(shortSelection[index] == expected,
+                   "DeepSeek-V4 short indexer is not ascending");
+        }
+        std::cout << "DeepSeek-V4 learned indexer regression: PASS\n";
+    }
+
+    void RunCudaDeepSeekV4FullWindowAppendRegression() {
+        const int originalDevice = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(0);
+        constexpr int bsz = 1;
+        constexpr int windowSize = 8;
+        constexpr int appendTokens = 13;
+        constexpr int headDim = 5;
+
+        fastllm::Data source = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {bsz, appendTokens, headDim},
+            MakeRegressionValues(appendTokens * headDim, 0.37f, 0.17f));
+        const std::vector<float> sourceValues = ToFloatVector(source);
+
+        fastllm::Data longWindow = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {bsz, windowSize, headDim},
+            MakeRegressionValues(windowSize * headDim, 0.71f, 0.13f));
+        Expect(FastllmCudaDeepSeekV4AppendFullWindowKVCache(
+                   source, appendTokens, longWindow),
+               "DeepSeek-V4 full-window append rejected a long prefill chunk");
+        ForceDeviceSync();
+        const std::vector<float> expectedLong(
+            sourceValues.begin() +
+                (appendTokens - windowSize) * headDim,
+            sourceValues.end());
+        ExpectFloatNear(expectedLong, ToFloatVector(longWindow), 0.0f, 0.0f,
+                        "DeepSeek-V4 long-prefill full-window append");
+
+        constexpr int shortAppend = 3;
+        fastllm::Data shortWindow = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {bsz, windowSize, headDim},
+            MakeRegressionValues(windowSize * headDim, 0.91f, 0.11f));
+        const std::vector<float> shortWindowValues = ToFloatVector(shortWindow);
+        Expect(FastllmCudaDeepSeekV4AppendFullWindowKVCache(
+                   source, shortAppend, shortWindow),
+               "DeepSeek-V4 full-window append rejected a decode-sized suffix");
+        ForceDeviceSync();
+        std::vector<float> expectedShort(
+            shortWindowValues.begin() + shortAppend * headDim,
+            shortWindowValues.end());
+        expectedShort.insert(
+            expectedShort.end(), sourceValues.begin(),
+            sourceValues.begin() + shortAppend * headDim);
+        ExpectFloatNear(expectedShort, ToFloatVector(shortWindow), 0.0f, 0.0f,
+                        "DeepSeek-V4 decode-sized full-window append");
+        FastllmCudaSetDevice(originalDevice);
+        std::cout << "DeepSeek-V4 full-window append regression: PASS\n";
+    }
+
+    void RunCudaPeerAccessInitRegression() {
+        if (FastllmCudaGetDeviceCount() < 2) {
+            std::cout << "CUDA peer-access initialization regression: "
+                         "SKIP (two GPUs required)\n";
+            return;
+        }
+
+        int canAccess01 = 0;
+        int canAccess10 = 0;
+        cudaError_t state01 = cudaDeviceCanAccessPeer(&canAccess01, 0, 1);
+        cudaError_t state10 = cudaDeviceCanAccessPeer(&canAccess10, 1, 0);
+        if (state01 != cudaSuccess || state10 != cudaSuccess ||
+            !canAccess01 || !canAccess10) {
+            cudaGetLastError();
+            std::cout << "CUDA peer-access initialization regression: "
+                         "SKIP (bidirectional P2P unavailable)\n";
+            return;
+        }
+
+        const int originalDevice = FastllmCudaGetDevice();
+        Expect(FastllmCudaPeerAccessInit({0, 1}),
+               "CUDA peer access incorrectly depended on custom all-reduce");
+        Expect(FastllmCudaGetDevice() == originalDevice,
+               "CUDA peer-access initialization changed the current device");
+        Expect(FastllmCudaPeerAccessInit({1, 0, 1}),
+               "CUDA peer-access initialization did not reuse a canonical topology");
+        Expect(FastllmCudaGetDevice() == originalDevice,
+               "cached CUDA peer-access initialization changed the current device");
+        std::cout << "CUDA peer-access initialization regression: PASS\n";
     }
 
     void RunMultiCudaDeepSeekV4SparsePrefillRegression() {
@@ -5406,18 +8517,291 @@ namespace {
         std::cout << "DeepSeek-V4 hash route cache regression: PASS\n";
     }
 
+    void RunCudaDeepSeekV4FusedRouterRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int experts = 256;
+        constexpr int topk = 6;
+        constexpr float routeScale = 1.5f;
+
+        std::vector<float> biasValues(experts);
+        for (int expert = 0; expert < experts; expert++) {
+            biasValues[expert] =
+                ((expert * 11) % 17 - 8) * 4.0e-4f + expert * 1.0e-7f;
+        }
+        fastllm::Data gateBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {experts}, biasValues);
+
+        bool tritonGate = fastllm::GetFastllmEnv().cudaTriton &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_ROUTER", true) &&
+            RegressionEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DSV4_ROUTER_SM120", true);
+        int major = 0, minor = 0;
+#ifndef USE_ROCM
+        int device = 0;
+        bool haveArch = cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(
+                &major, cudaDevAttrComputeCapabilityMajor, device) ==
+                cudaSuccess &&
+            cudaDeviceGetAttribute(
+                &minor, cudaDevAttrComputeCapabilityMinor, device) ==
+                cudaSuccess;
+#else
+        bool haveArch = false;
+#endif
+        bool expectSm120Triton = tritonGate && haveArch &&
+            (major * 10 + minor == 120 || major * 10 + minor == 121);
+        bool expectSm120Production = haveArch &&
+            (major * 10 + minor == 120 || major * 10 + minor == 121);
+        float productionTolerance = expectSm120Triton ? 2.0e-5f : 0.0f;
+
+        for (int tokens : {1, 7, 127}) {
+            std::vector<float> logitsValues((size_t)tokens * experts);
+            for (int token = 0; token < tokens; token++) {
+                for (int expert = 0; expert < experts; expert++) {
+                    int permuted = (expert * 37 + token * 17) % 257;
+                    logitsValues[(size_t)token * experts + expert] =
+                        (permuted - 128) / 24.0f + expert * 1.0e-5f;
+                }
+                logitsValues[(size_t)token * experts] = -25.0f - token;
+                logitsValues[(size_t)token * experts + 1] = 25.0f + token;
+            }
+
+            fastllm::Data referenceLogits = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, experts}, logitsValues);
+            fastllm::Data fusedLogits = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, experts}, logitsValues);
+            fastllm::Data referenceIndex = MakeIntTensor(
+                {tokens, topk}, std::vector<int32_t>(tokens * topk, -1));
+            referenceIndex.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data referenceScore = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, topk},
+                std::vector<float>(tokens * topk, 0.0f));
+            Expect(FastllmCudaDeepSeekV4RouteScoreTransform(
+                       referenceLogits, 2),
+                   "DeepSeek-V4 legacy sqrt-softplus transform failed");
+            Expect(FastllmCudaSelectExpert(
+                       referenceLogits, &gateBias,
+                       referenceIndex, referenceScore,
+                       topk, true, routeScale),
+                   "DeepSeek-V4 legacy top-6 reference failed");
+            FastllmCudaSyncCurrentThreadStream();
+            const std::vector<int32_t> expectedIndex =
+                ToIntVector(referenceIndex);
+            const std::vector<float> expectedScore =
+                ToFloatVector(referenceScore);
+
+            fastllm::Data genericIndex, genericScore;
+            Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                       fusedLogits, gateBias, routeScale,
+                       genericIndex, genericScore, false),
+                   "generic DeepSeek-V4 fused router rejected a valid input");
+            ExpectIntEqual(expectedIndex, ToIntVector(genericIndex),
+                           "generic DeepSeek-V4 fused router indices");
+            ExpectFloatNear(expectedScore, ToFloatVector(genericScore),
+                            2.0e-6f, 2.0e-6f,
+                            "generic DeepSeek-V4 fused router scores");
+            ExpectFloatNear(logitsValues, ToFloatVector(fusedLogits),
+                            0.0f, 0.0f,
+                            "generic DeepSeek-V4 fused router input");
+
+            // Exercise the production dispatch as well. With Triton disabled
+            // this selects the native one-warp-per-row SM120 kernel; with it
+            // enabled it continues to validate the preferred Triton kernel.
+            fastllm::Data productionIndex, productionScore;
+            Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                       fusedLogits, gateBias, routeScale,
+                       productionIndex, productionScore, true),
+                   "production DeepSeek-V4 fused router rejected a valid input");
+            ExpectIntEqual(expectedIndex, ToIntVector(productionIndex),
+                           "production DeepSeek-V4 fused router indices");
+            ExpectFloatNear(expectedScore, ToFloatVector(productionScore),
+                            productionTolerance, productionTolerance,
+                            "production DeepSeek-V4 fused router scores");
+
+            for (int token = 0; token < tokens; token++) {
+                float sum = std::accumulate(
+                    expectedScore.begin() + token * topk,
+                    expectedScore.begin() + (token + 1) * topk, 0.0f);
+                Expect(std::fabs(sum - routeScale) < 2.0e-5f,
+                       "DeepSeek-V4 fused router score sum mismatch");
+            }
+
+            fastllm::Data tritonIndex = MakeIntTensor(
+                {tokens, topk}, std::vector<int32_t>(tokens * topk, -1));
+            tritonIndex.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data tritonScore = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {tokens, topk},
+                std::vector<float>(tokens * topk, 0.0f));
+            bool usedTriton =
+                fastllm::FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+                    fusedLogits, gateBias, routeScale,
+                    tritonIndex, tritonScore);
+            if (expectSm120Triton) {
+                Expect(usedTriton,
+                       "SM120 DeepSeek-V4 fused router was not selected");
+                FastllmCudaSyncCurrentThreadStream();
+                ExpectIntEqual(expectedIndex, ToIntVector(tritonIndex),
+                               "SM120 DeepSeek-V4 fused router indices");
+                ExpectFloatNear(expectedScore, ToFloatVector(tritonScore),
+                                2.0e-5f, 2.0e-5f,
+                                "SM120 DeepSeek-V4 fused router scores");
+            } else {
+                Expect(!usedTriton,
+                       "DeepSeek-V4 SM120 router ignored its architecture/gate");
+            }
+
+            if (tokens == 1) {
+                void *graph = nullptr;
+                void *graphExec = nullptr;
+                Expect(FastllmCudaGraphBeginCapture(),
+                       "generic DeepSeek-V4 router graph capture did not start");
+                Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                           fusedLogits, gateBias, routeScale,
+                           genericIndex, genericScore, false),
+                       "generic DeepSeek-V4 router failed during graph capture");
+                Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                       "generic DeepSeek-V4 router graph capture failed");
+                Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                           graphExec != nullptr,
+                       "generic DeepSeek-V4 router graph instantiate failed");
+                Expect(FastllmCudaGraphLaunch(graphExec),
+                       "generic DeepSeek-V4 router graph replay failed");
+                FastllmCudaSyncCurrentThreadStream();
+                ExpectIntEqual(expectedIndex, ToIntVector(genericIndex),
+                               "generic DeepSeek-V4 router graph indices");
+                ExpectFloatNear(expectedScore, ToFloatVector(genericScore),
+                                2.0e-6f, 2.0e-6f,
+                                "generic DeepSeek-V4 router graph scores");
+                FastllmCudaGraphExecDestroy(graphExec);
+                FastllmCudaGraphDestroy(graph);
+
+                graph = nullptr;
+                graphExec = nullptr;
+                Expect(FastllmCudaGraphBeginCapture(),
+                       "production DeepSeek-V4 router graph capture did not start");
+                Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                           fusedLogits, gateBias, routeScale,
+                           productionIndex, productionScore, true),
+                       "production DeepSeek-V4 router failed during graph capture");
+                Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                       "production DeepSeek-V4 router graph capture failed");
+                Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                           graphExec != nullptr,
+                       "production DeepSeek-V4 router graph instantiate failed");
+                Expect(FastllmCudaGraphLaunch(graphExec),
+                       "production DeepSeek-V4 router graph replay failed");
+                FastllmCudaSyncCurrentThreadStream();
+                ExpectIntEqual(expectedIndex, ToIntVector(productionIndex),
+                               "production DeepSeek-V4 router graph indices");
+                ExpectFloatNear(expectedScore, ToFloatVector(productionScore),
+                                productionTolerance, productionTolerance,
+                                "production DeepSeek-V4 router graph scores");
+                FastllmCudaGraphExecDestroy(graphExec);
+                FastllmCudaGraphDestroy(graph);
+
+                if (expectSm120Triton) {
+                    graph = nullptr;
+                    graphExec = nullptr;
+                    Expect(FastllmCudaGraphBeginCapture(),
+                           "SM120 DeepSeek-V4 router graph capture did not start");
+                    Expect(fastllm::
+                               FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+                                   fusedLogits, gateBias, routeScale,
+                                   tritonIndex, tritonScore),
+                           "SM120 DeepSeek-V4 router failed during graph capture");
+                    Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                           "SM120 DeepSeek-V4 router graph capture failed");
+                    Expect(FastllmCudaGraphInstantiate(graph, &graphExec) &&
+                               graphExec != nullptr,
+                           "SM120 DeepSeek-V4 router graph instantiate failed");
+                    Expect(FastllmCudaGraphLaunch(graphExec),
+                           "SM120 DeepSeek-V4 router graph replay failed");
+                    FastllmCudaSyncCurrentThreadStream();
+                    ExpectIntEqual(expectedIndex, ToIntVector(tritonIndex),
+                                   "SM120 DeepSeek-V4 router graph indices");
+                    ExpectFloatNear(expectedScore, ToFloatVector(tritonScore),
+                                    2.0e-5f, 2.0e-5f,
+                                    "SM120 DeepSeek-V4 router graph scores");
+                    FastllmCudaGraphExecDestroy(graphExec);
+                    FastllmCudaGraphDestroy(graph);
+                }
+            }
+        }
+
+        std::vector<float> nonFiniteValues(
+            2 * experts, std::numeric_limits<float>::quiet_NaN());
+        fastllm::Data nonFiniteLogits = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {2, experts}, nonFiniteValues);
+        fastllm::Data nonFiniteIndex, nonFiniteScore;
+        Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                   nonFiniteLogits, gateBias, routeScale,
+                   nonFiniteIndex, nonFiniteScore, false),
+               "generic DeepSeek-V4 router rejected non-finite input");
+        for (int expert : ToIntVector(nonFiniteIndex)) {
+            Expect(expert >= 0 && expert < experts,
+                   "generic DeepSeek-V4 router returned an invalid expert");
+        }
+        for (float score : ToFloatVector(nonFiniteScore)) {
+            Expect(std::isfinite(score) && score == 0.0f,
+                   "generic DeepSeek-V4 router returned a non-finite score");
+        }
+        fastllm::Data productionNonFiniteIndex, productionNonFiniteScore;
+        Expect(FastllmCudaDeepSeekV4SqrtSoftplusRouter(
+                   nonFiniteLogits, gateBias, routeScale,
+                   productionNonFiniteIndex, productionNonFiniteScore, true),
+               "production DeepSeek-V4 router rejected non-finite input");
+        for (int expert : ToIntVector(productionNonFiniteIndex)) {
+            Expect(expert >= 0 && expert < experts,
+                   "production DeepSeek-V4 router returned an invalid expert");
+        }
+        for (float score : ToFloatVector(productionNonFiniteScore)) {
+            Expect(std::isfinite(score) && score == 0.0f,
+                   "production DeepSeek-V4 router returned a non-finite score");
+        }
+        if (expectSm120Triton) {
+            fastllm::Data tritonIndex = MakeIntTensor(
+                {2, topk}, std::vector<int32_t>(2 * topk, -1));
+            tritonIndex.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data tritonScore = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {2, topk},
+                std::vector<float>(2 * topk, -1.0f));
+            Expect(fastllm::
+                       FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+                           nonFiniteLogits, gateBias, routeScale,
+                           tritonIndex, tritonScore),
+                   "SM120 DeepSeek-V4 router rejected non-finite input");
+            FastllmCudaSyncCurrentThreadStream();
+            for (int expert : ToIntVector(tritonIndex)) {
+                Expect(expert >= 0 && expert < experts,
+                       "SM120 DeepSeek-V4 router returned an invalid expert");
+            }
+            for (float score : ToFloatVector(tritonScore)) {
+                Expect(std::isfinite(score) && score == 0.0f,
+                       "SM120 DeepSeek-V4 router returned a non-finite score");
+            }
+        }
+
+        std::cout << "DeepSeek-V4 fused sqrt-softplus router regression: PASS ("
+                  << (expectSm120Triton ? "generic + SM120 Triton" :
+                      expectSm120Production ? "generic + SM120 native" :
+                                              "generic fallback")
+                  << ")\n";
+    }
+
     void RunCudaDeepSeekV4FusedHcPreNormRegression() {
         FastllmCudaSetDevice(0);
         constexpr int hcMult = 4;
         constexpr int hidden = 4096;
         constexpr int mixHc = (2 + hcMult) * hcMult;
         constexpr int flat = hcMult * hidden;
+        constexpr int tokens = 1;
         constexpr int sinkhornIters = 20;
         constexpr float eps = 1e-6f;
 
         fastllm::Data input = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, hcMult, hidden},
-            MakeRegressionValues(flat, 0.23f, 0.06f));
+            fastllm::DataType::BFLOAT16, {1, tokens, hcMult, hidden},
+            MakeRegressionValues(tokens * flat, 0.23f, 0.06f));
         fastllm::Data hcFn = MakeCudaTensor(
             fastllm::DataType::FLOAT32, {mixHc, flat},
             MakeRegressionValues(mixHc * flat, 0.67f, 0.008f));
@@ -5439,8 +8823,8 @@ namespace {
                    eps, eps, preOutput, referencePost, referenceComb),
                "built-in DeepSeek-V4 HcPre rejected fused-norm regression input");
         fastllm::Data referenceNorm = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, hidden},
-            std::vector<float>(hidden, 0.0f));
+            fastllm::DataType::BFLOAT16, {1, tokens, hidden},
+            std::vector<float>(tokens * hidden, 0.0f));
         Expect(FastllmCudaRMSNorm(preOutput, normWeight, referenceNorm, eps),
                "built-in RMSNorm rejected fused HcPre regression input");
 
@@ -5457,21 +8841,19 @@ namespace {
                         2e-5f, 2e-5f, "DeepSeek-V4 fused HcPreNorm comb mix");
 
         fastllm::Data layerOutput = MakeCudaTensor(
-            fastllm::DataType::BFLOAT16, {1, 1, hidden},
-            MakeRegressionValues(hidden, 0.91f, 0.09f));
+            fastllm::DataType::BFLOAT16, {1, tokens, hidden},
+            MakeRegressionValues(tokens * hidden, 0.91f, 0.09f));
         fastllm::Data previousPost = MakeCudaTensor(
-            fastllm::DataType::FLOAT32, {1, 1, hcMult},
-            {0.62f, 0.48f, 0.71f, 0.55f});
+            fastllm::DataType::FLOAT32, {1, tokens, hcMult},
+            MakeRegressionValues(tokens * hcMult, 0.62f, 0.08f));
         fastllm::Data previousComb = MakeCudaTensor(
-            fastllm::DataType::FLOAT32, {1, 1, hcMult, hcMult},
-            {0.70f, 0.12f, 0.09f, 0.09f,
-             0.10f, 0.72f, 0.08f, 0.10f,
-             0.08f, 0.11f, 0.73f, 0.08f,
-             0.12f, 0.07f, 0.10f, 0.71f});
+            fastllm::DataType::FLOAT32,
+            {1, tokens, hcMult, hcMult},
+            MakeRegressionValues(tokens * hcMult * hcMult, 0.70f, 0.05f));
         fastllm::Data referenceResidual;
         Expect(FastllmCudaDeepSeekV4HcPostCudaMix(
                    layerOutput, input, previousPost, previousComb,
-                   1, 1, hcMult, hidden, referenceResidual),
+                   1, tokens, hcMult, hidden, referenceResidual),
                "built-in DeepSeek-V4 HcPost rejected transition regression input");
         fastllm::Data transitionReferenceNorm;
         fastllm::Data transitionReferencePost;
@@ -5504,6 +8886,108 @@ namespace {
         ExpectFloatNear(ToFloatVector(transitionReferenceComb),
                         ToFloatVector(transitionComb), 2e-3f, 2e-3f,
                         "DeepSeek-V4 fused HcPostPreNorm comb mix");
+
+        // DSpark-7 verifies eight target rows in one graph replay.  Exercise
+        // that production shape against the established operator-composed
+        // path; every row must preserve the same BF16 tensor boundaries.
+        constexpr int dsparkRows = 8;
+        fastllm::Data dsparkInput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, dsparkRows, hcMult, hidden},
+            MakeRegressionValues(dsparkRows * flat, 0.29f, 0.055f));
+        fastllm::Data dsparkPre, dsparkReferencePost, dsparkReferenceComb;
+        Expect(FastllmCudaDeepSeekV4HcPre(
+                   dsparkInput, hcFn, hcScale, hcBase, hcMult,
+                   sinkhornIters, eps, eps, dsparkPre,
+                   dsparkReferencePost, dsparkReferenceComb),
+               "built-in DeepSeek-V4 HcPre rejected DSpark rows");
+        fastllm::Data dsparkReferenceNorm = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, dsparkRows, hidden},
+            std::vector<float>(dsparkRows * hidden, 0.0f));
+        Expect(FastllmCudaRMSNorm(
+                   dsparkPre, normWeight, dsparkReferenceNorm, eps),
+               "built-in RMSNorm rejected DSpark HcPre rows");
+
+        fastllm::Data dsparkNorm, dsparkPost, dsparkComb;
+        Expect(FastllmCudaDeepSeekV4HcPreNorm(
+                   dsparkInput, hcFn, hcScale, hcBase, normWeight,
+                   hcMult, sinkhornIters, eps, eps, dsparkNorm,
+                   dsparkPost, dsparkComb),
+               "fused DeepSeek-V4 HcPreNorm rejected DSpark rows");
+        ExpectFloatNear(ToFloatVector(dsparkReferenceNorm),
+                        ToFloatVector(dsparkNorm), 0.0f, 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPreNorm output");
+        ExpectFloatNear(ToFloatVector(dsparkReferencePost),
+                        ToFloatVector(dsparkPost), 0.0f, 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPreNorm post mix");
+        ExpectFloatNear(ToFloatVector(dsparkReferenceComb),
+                        ToFloatVector(dsparkComb), 0.0f, 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPreNorm comb mix");
+
+        fastllm::Data dsparkLayerOutput = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, dsparkRows, hidden},
+            MakeRegressionValues(dsparkRows * hidden, 0.87f, 0.085f));
+        fastllm::Data dsparkPreviousPost = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {1, dsparkRows, hcMult},
+            MakeRegressionValues(dsparkRows * hcMult, 0.59f, 0.075f));
+        fastllm::Data dsparkPreviousComb = MakeCudaTensor(
+            fastllm::DataType::FLOAT32,
+            {1, dsparkRows, hcMult, hcMult},
+            MakeRegressionValues(dsparkRows * hcMult * hcMult,
+                                 0.73f, 0.045f));
+        fastllm::Data dsparkReferenceResidual;
+        Expect(FastllmCudaDeepSeekV4HcPostCudaMix(
+                   dsparkLayerOutput, dsparkInput, dsparkPreviousPost,
+                   dsparkPreviousComb, 1, dsparkRows, hcMult, hidden,
+                   dsparkReferenceResidual),
+               "built-in DeepSeek-V4 HcPost rejected DSpark rows");
+        fastllm::Data dsparkTransitionPre;
+        fastllm::Data dsparkTransitionReferencePost;
+        fastllm::Data dsparkTransitionReferenceComb;
+        Expect(FastllmCudaDeepSeekV4HcPre(
+                   dsparkReferenceResidual, hcFn, hcScale, hcBase,
+                   hcMult, sinkhornIters, eps, eps, dsparkTransitionPre,
+                   dsparkTransitionReferencePost,
+                   dsparkTransitionReferenceComb),
+               "built-in DeepSeek-V4 HcPre rejected DSpark transition");
+        fastllm::Data dsparkTransitionReferenceNorm = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, dsparkRows, hidden},
+            std::vector<float>(dsparkRows * hidden, 0.0f));
+        Expect(FastllmCudaRMSNorm(
+                   dsparkTransitionPre, normWeight,
+                   dsparkTransitionReferenceNorm, eps),
+               "built-in RMSNorm rejected DSpark transition");
+
+        fastllm::Data dsparkTransitionResidual;
+        fastllm::Data dsparkTransitionNorm;
+        fastllm::Data dsparkTransitionPost;
+        fastllm::Data dsparkTransitionComb;
+        Expect(FastllmCudaDeepSeekV4HcPostPreNorm(
+                   dsparkLayerOutput, dsparkInput, dsparkPreviousPost,
+                   dsparkPreviousComb, hcFn, hcScale, hcBase, normWeight,
+                   hcMult, sinkhornIters, eps, eps,
+                   dsparkTransitionResidual, dsparkTransitionNorm,
+                   dsparkTransitionPost, dsparkTransitionComb),
+               "fused DeepSeek-V4 HcPostPreNorm rejected DSpark rows");
+        // SM120 automatically selects vLLM's float-transition, split-K4
+        // schedule.  Older architectures retain the bit-exact generic path.
+        const bool sm120 = FastllmCudaRuntimeArch() >= 120;
+        ExpectFloatNear(ToFloatVector(dsparkReferenceResidual),
+                        ToFloatVector(dsparkTransitionResidual),
+                        sm120 ? 4e-3f : 0.0f, sm120 ? 2e-3f : 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPostPreNorm residual");
+        ExpectFloatNear(ToFloatVector(dsparkTransitionReferenceNorm),
+                        ToFloatVector(dsparkTransitionNorm),
+                        sm120 ? 3e-2f : 0.0f, sm120 ? 4e-3f : 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPostPreNorm norm output");
+        ExpectFloatNear(ToFloatVector(dsparkTransitionReferencePost),
+                        ToFloatVector(dsparkTransitionPost),
+                        sm120 ? 2e-3f : 0.0f, sm120 ? 2e-3f : 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPostPreNorm post mix");
+        ExpectFloatNear(ToFloatVector(dsparkTransitionReferenceComb),
+                        ToFloatVector(dsparkTransitionComb),
+                        sm120 ? 2e-3f : 0.0f, sm120 ? 2e-3f : 0.0f,
+                        "DeepSeek-V4 DSpark fused HcPostPreNorm comb mix");
 
         std::cout << "DeepSeek-V4 fused HcPreNorm regression: PASS\n";
     }
@@ -5881,6 +9365,226 @@ namespace {
         std::cout << "DeepSeek-V4 restored raw-cache append regression: PASS\n";
     }
 
+    void RunCudaDeepSeekV4CompressedKvMaintenanceRegression() {
+        auto toLogicalBFloat16Bits = [](fastllm::Data data) {
+            const int count = std::accumulate(
+                data.dims.begin(), data.dims.end(), 1,
+                std::multiplies<int>());
+            Expect(data.dataType == fastllm::DataType::BFLOAT16,
+                   "Expected a BFLOAT16 tensor.");
+            data.ToDevice(fastllm::DataDevice::CPU);
+            std::vector<uint16_t> values(count);
+            if (count > 0) {
+                Expect(data.cpuData != nullptr,
+                       "BFLOAT16 tensor has no CPU buffer.");
+                std::memcpy(values.data(), data.cpuData,
+                            (size_t) count * sizeof(uint16_t));
+            }
+            return values;
+        };
+        auto toLogicalFloatVector = [](fastllm::Data data) {
+            const int count = std::accumulate(
+                data.dims.begin(), data.dims.end(), 1,
+                std::multiplies<int>());
+            Expect(data.dataType == fastllm::DataType::FLOAT32,
+                   "Expected a FLOAT32 tensor.");
+            data.ToDevice(fastllm::DataDevice::CPU);
+            std::vector<float> values(count);
+            if (count > 0) {
+                Expect(data.cpuData != nullptr,
+                       "FLOAT32 tensor has no CPU buffer.");
+                std::memcpy(values.data(), data.cpuData,
+                            (size_t) count * sizeof(float));
+            }
+            return values;
+        };
+        const char *oldDisable = std::getenv(
+            "FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV");
+        const bool hadOldDisable = oldDisable != nullptr;
+        const std::string oldDisableValue =
+            oldDisable == nullptr ? std::string() : std::string(oldDisable);
+
+        auto runFinalizeCase = [&](int headDim, int ropeDim, bool indexer) {
+            constexpr int bsz = 1;
+            constexpr int compressRatio = 4;
+            constexpr int blockStart = 2;
+            constexpr int blockCount = 2;
+            constexpr int rawTokenBase = 4;
+            constexpr int rawLen = 24;
+            const int wideDim = 2 * headDim;
+
+            std::vector<float> kvValues = MakeRegressionValues(
+                (uint64_t)bsz * rawLen * wideDim, 0.43f, 0.013f);
+            std::vector<float> scoreValues = MakeRegressionValues(
+                (uint64_t)bsz * rawLen * wideDim, 0.19f, 0.007f);
+            std::vector<float> apeValues = MakeRegressionValues(
+                (uint64_t)compressRatio * wideDim, 0.11f, 0.009f);
+            std::vector<float> normValues = MakeRegressionValues(
+                headDim, 0.03f, 0.001f);
+            for (float &value : normValues) {
+                value += 0.75f;
+            }
+            std::vector<float> cacheValues = MakeRegressionValues(
+                (uint64_t)bsz * blockStart * headDim, 0.71f, 0.005f);
+
+            fastllm::Data kv(fastllm::DataType::FLOAT32,
+                              {bsz, rawLen, wideDim}, kvValues);
+            fastllm::Data score(fastllm::DataType::FLOAT32,
+                                 {bsz, rawLen, wideDim}, scoreValues);
+            fastllm::Data ape(fastllm::DataType::FLOAT32,
+                               {compressRatio, wideDim}, apeValues);
+            fastllm::Data norm(fastllm::DataType::FLOAT32,
+                                {headDim}, normValues);
+            fastllm::Data referenceCache(fastllm::DataType::BFLOAT16,
+                                          {bsz, blockStart, headDim},
+                                          cacheValues);
+            fastllm::Data fusedCache(fastllm::DataType::BFLOAT16,
+                                      {bsz, blockStart, headDim},
+                                      cacheValues);
+            FastllmCudaSetDevice(0);
+            for (fastllm::Data *data :
+                 {&kv, &score, &ape, &norm, &referenceCache, &fusedCache}) {
+                data->ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+            }
+
+            setenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV", "1", 1);
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                    kv, score, ape, norm, rawTokenBase, rawLen,
+                    blockStart, blockCount, compressRatio, headDim,
+                    ropeDim, 10000.0f, 1.0f, 32, 1, 4096,
+                    true, true, referenceCache, indexer);
+            }
+            unsetenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV");
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                    kv, score, ape, norm, rawTokenBase, rawLen,
+                    blockStart, blockCount, compressRatio, headDim,
+                    ropeDim, 10000.0f, 1.0f, 32, 1, 4096,
+                    true, true, fusedCache, indexer);
+            }
+            ForceDeviceSync();
+
+            Expect(referenceCache.dims == fusedCache.dims &&
+                       fusedCache.dims == std::vector<int>(
+                           {bsz, blockStart + blockCount, headDim}),
+                   "DeepSeek-V4 fused compressed finalize returned the wrong shape");
+            Expect(fusedCache.strides.size() == 3 &&
+                       fusedCache.strides[0] ==
+                           fusedCache.dims[1] * headDim &&
+                       fusedCache.expansionDims.empty() &&
+                       fusedCache.expansionSize >=
+                           (uint64_t)bsz * 64 * headDim,
+                   "DeepSeek-V4 fused compressed finalize exposed reserve rows");
+            const std::vector<uint16_t> referenceBits =
+                toLogicalBFloat16Bits(referenceCache);
+            const std::vector<uint16_t> fusedBits =
+                toLogicalBFloat16Bits(fusedCache);
+            if (referenceBits != fusedBits) {
+                size_t first = 0;
+                while (first < referenceBits.size() &&
+                       referenceBits[first] == fusedBits[first]) {
+                    first++;
+                }
+                std::cerr << "DeepSeek-V4 finalize mismatch: headDim="
+                          << headDim << " first=" << first
+                          << " reference="
+                          << (first < referenceBits.size()
+                                  ? referenceBits[first] : 0)
+                          << " fused="
+                          << (first < fusedBits.size()
+                                  ? fusedBits[first] : 0)
+                          << "\n";
+            }
+            Expect(referenceBits == fusedBits,
+                   "DeepSeek-V4 fused compressed finalize changed BF16 bits");
+
+            void *reservedPointer = fusedCache.cudaData;
+            setenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV", "1", 1);
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                    kv, score, ape, norm, rawTokenBase, rawLen,
+                    blockStart + blockCount, blockCount, compressRatio,
+                    headDim, ropeDim, 10000.0f, 1.0f, 32, 1, 4096,
+                    true, true, referenceCache, indexer);
+            }
+            unsetenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV");
+            {
+                ScopedFirstDevice device("cuda:0");
+                fastllm::DeepSeekV4BuildCompressedKVFromRaw(
+                    kv, score, ape, norm, rawTokenBase, rawLen,
+                    blockStart + blockCount, blockCount, compressRatio,
+                    headDim, ropeDim, 10000.0f, 1.0f, 32, 1, 4096,
+                    true, true, fusedCache, indexer);
+            }
+            ForceDeviceSync();
+            Expect(fusedCache.cudaData == reservedPointer &&
+                       fusedCache.dims == std::vector<int>(
+                           {bsz, blockStart + 2 * blockCount, headDim}) &&
+                       fusedCache.strides[0] ==
+                           fusedCache.dims[1] * headDim &&
+                       fusedCache.expansionDims.empty(),
+                   "DeepSeek-V4 fused compressed append did not reuse its hidden reserve");
+            Expect(toLogicalBFloat16Bits(referenceCache) ==
+                       toLogicalBFloat16Bits(fusedCache),
+                   "DeepSeek-V4 repeated fused append changed BF16 bits");
+        };
+
+        runFinalizeCase(512, 64, false);
+        runFinalizeCase(128, 64, true);
+
+        constexpr int bsz = 1;
+        constexpr int oldLen = 8;
+        constexpr int wideDim = 32;
+        std::vector<float> rawKvValues = MakeRegressionValues(
+            (uint64_t)bsz * oldLen * wideDim, 0.37f, 0.017f);
+        std::vector<float> rawScoreValues = MakeRegressionValues(
+            (uint64_t)bsz * oldLen * wideDim, 0.61f, 0.011f);
+        std::vector<float> expectedKv(
+            rawKvValues.begin() + 4 * wideDim, rawKvValues.end());
+        std::vector<float> expectedScore(
+            rawScoreValues.begin() + 4 * wideDim, rawScoreValues.end());
+        fastllm::Data rawKv(fastllm::DataType::FLOAT32,
+                             {bsz, oldLen, wideDim}, rawKvValues);
+        fastllm::Data rawScore(fastllm::DataType::FLOAT32,
+                                {bsz, oldLen, wideDim}, rawScoreValues);
+        rawKv.ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+        rawScore.ToDevice(fastllm::DataDevice::CUDA, {0}, true);
+        rawKv.Expansion({bsz, 128, wideDim});
+        rawScore.Expansion({bsz, 128, wideDim});
+        void *kvPointer = rawKv.cudaData;
+        void *scorePointer = rawScore.cudaData;
+        int rawTokenBase = 0;
+        fastllm::DeepSeekV4TrimCompressorRawForTest(
+            bsz, oldLen, 4, wideDim, 2,
+            rawKv, rawScore, rawTokenBase);
+        ForceDeviceSync();
+        Expect(rawTokenBase == 4 &&
+                   rawKv.dims == std::vector<int>({bsz, 4, wideDim}) &&
+                   rawScore.dims == rawKv.dims &&
+                   rawKv.expansionDims ==
+                       std::vector<int>({bsz, 128, wideDim}) &&
+                   rawScore.expansionDims == rawKv.expansionDims &&
+                   rawKv.cudaData == kvPointer &&
+                   rawScore.cudaData == scorePointer,
+               "DeepSeek-V4 raw compressor compaction changed its reserve");
+        ExpectFloatNear(expectedKv, toLogicalFloatVector(rawKv), 0.0f, 0.0f,
+                        "DeepSeek-V4 raw KV in-place compaction");
+        ExpectFloatNear(expectedScore, toLogicalFloatVector(rawScore), 0.0f, 0.0f,
+                        "DeepSeek-V4 raw score in-place compaction");
+
+        if (hadOldDisable) {
+            setenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV",
+                   oldDisableValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV");
+        }
+        std::cout << "DeepSeek-V4 compressed-KV maintenance regression: PASS\n";
+    }
+
     void RunMultiCudaDeepSeekV4CompressedCacheAppendRegression() {
         if (FastllmCudaGetDeviceCount() < 2) {
             std::cout << "DeepSeek-V4 restored compressed-cache append regression: "
@@ -6026,16 +9730,15 @@ namespace {
                "DeepSeek-V4 prefix snapshot leaked its last CUDA device");
         Expect(snapshot.windowKV.dataDevice == fastllm::DataDevice::CPU &&
                    !snapshot.windowKV.multiDeviceData &&
-                   snapshot.windowKV.expansionDims ==
-                       source.windowKV.multiDeviceDatas.at(0)->expansionDims &&
-                   snapshot.windowKV.strides ==
-                       source.windowKV.multiDeviceDatas.at(0)->strides &&
+                   snapshot.windowKV.expansionDims.empty() &&
                    snapshot.windowKV.expansionBytes >=
-                       source.windowKV.multiDeviceDatas.at(0)->GetBytes(),
-               "DeepSeek-V4 expanded prefix snapshot did not retain one CPU cache copy");
+                       snapshot.windowKV.GetBytes() &&
+                   snapshot.windowKV.expansionBytes <
+                       source.windowKV.multiDeviceDatas.at(0)->expansionBytes,
+               "DeepSeek-V4 prefix snapshot retained CUDA graph reserve capacity");
         FastllmCudaSetDevice(0);
-        ExpectFloatNear(ToFloatVector(*source.windowKV.multiDeviceDatas.at(0)),
-                        ToFloatVector(snapshot.windowKV), 0.0f, 0.0f,
+        ExpectFloatNear(values, ToFloatVector(snapshot.windowKV),
+                        0.0f, 0.0f,
                         "DeepSeek-V4 expanded prefix snapshot payload");
 
         // A restored CPU snapshot has one physical GPU allocation but retains
@@ -6227,6 +9930,89 @@ namespace {
         fastllm::Data kvNormWeight = MakeCudaTensor(
             fastllm::DataType::FLOAT32, {headDim}, weightValues);
 
+        // CUDA graphs keep the decode position in a stable device-side metadata
+        // buffer.  Its dynamic-position kernels must remain bit-identical to
+        // the ordinary scalar-position path for every speculative row, not just
+        // the first row.  In particular, DSpark KV RoPE advances once per draft
+        // token; using a zero position step makes later draft logits diverge.
+        {
+            constexpr int draftTokens = 7;
+            constexpr int localHeads = 8;
+            const std::vector<float> draftQValues = MakeRegressionValues(
+                draftTokens * localHeads * headDim, 0.73f, 0.41f);
+            fastllm::Data staticQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, localHeads, headDim}, draftQValues);
+            fastllm::Data dynamicQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, localHeads, headDim}, draftQValues);
+            Expect(FastllmCudaDeepSeekV4ScaleQRotary(
+                       staticQ, ropeDim, 160000.0f, position,
+                       0, 16.0f, 32, 1, eps),
+                   "static DeepSeek-V4 draft Q rotary rejected its input");
+            Expect(FastllmCudaDeepSeekV4ScaleQRotaryGraph(
+                       dynamicQ, ropeDim, 160000.0f, decodeMetaPtr,
+                       0, 16.0f, 32, 1, eps),
+                   "dynamic DeepSeek-V4 draft Q rotary rejected its input");
+            ExpectFloatNear(ToFloatVector(staticQ), ToFloatVector(dynamicQ),
+                            0.0f, 0.0f,
+                            "DeepSeek-V4 dynamic draft Q rotary");
+
+            const std::vector<float> draftKVValues = MakeRegressionValues(
+                draftTokens * headDim, 1.17f, 0.37f);
+            fastllm::Data staticKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, 1, headDim}, draftKVValues);
+            fastllm::Data dynamicKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, 1, headDim}, draftKVValues);
+            Expect(FastllmCudaDeepSeekV4RotaryQuant(
+                       staticKV, ropeDim, 160000.0f, position,
+                       0, 16.0f, 32, 1, headDim - ropeDim, 64, 1),
+                   "static DeepSeek-V4 draft KV rotary rejected its input");
+            Expect(FastllmCudaDeepSeekV4RotaryQuantGraph(
+                       dynamicKV, ropeDim, 160000.0f, decodeMetaPtr,
+                       0, 16.0f, 32, 1, headDim - ropeDim, 64, 1),
+                   "dynamic DeepSeek-V4 draft KV rotary rejected its input");
+            ExpectFloatNear(ToFloatVector(staticKV), ToFloatVector(dynamicKV),
+                            0.0f, 0.0f,
+                            "DeepSeek-V4 dynamic draft KV rotary");
+
+            const std::vector<float> attentionQValues = MakeRegressionValues(
+                draftTokens * localHeads * headDim, 0.39f, 0.53f);
+            const std::vector<float> attentionKVValues = MakeRegressionValues(
+                (windowSize + draftTokens) * headDim, 0.97f, 0.43f);
+            const std::vector<float> attentionSinkValues =
+                MakeRegressionValues(localHeads, 1.23f, 0.17f);
+            fastllm::Data attentionQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, draftTokens, localHeads, headDim}, attentionQValues);
+            fastllm::Data attentionKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, windowSize + draftTokens, headDim}, attentionKVValues);
+            fastllm::Data attentionSink = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {localHeads},
+                attentionSinkValues);
+            fastllm::Data staticAttention, dynamicAttention;
+            Expect(FastllmCudaDeepSeekV4SparseAttentionPrefill(
+                       attentionQ, attentionKV, attentionSink,
+                       windowSize, position, 0, ropeDim, 160000.0f,
+                       0, 16.0f, 32, 1,
+                       1.0f / std::sqrt((float)headDim), staticAttention,
+                       windowSize, true, nullptr),
+                   "static DeepSeek-V4 draft sparse attention rejected its input");
+            Expect(FastllmCudaDeepSeekV4SparseAttentionPrefill(
+                       attentionQ, attentionKV, attentionSink,
+                       windowSize, position, 0, ropeDim, 160000.0f,
+                       0, 16.0f, 32, 1,
+                       1.0f / std::sqrt((float)headDim), dynamicAttention,
+                       windowSize, true, decodeMetaPtr),
+                   "dynamic DeepSeek-V4 draft sparse attention rejected its input");
+            ExpectFloatNear(ToFloatVector(staticAttention),
+                            ToFloatVector(dynamicAttention), 0.0f, 0.0f,
+                            "DeepSeek-V4 dynamic draft sparse attention");
+        }
+
         fastllm::Data referenceQ = MakeCudaTensor(
             fastllm::DataType::BFLOAT16, {1, 1, heads, headDim}, qValues);
         fastllm::Data referenceKVInput = MakeCudaTensor(
@@ -6264,11 +10050,11 @@ namespace {
                "fused DeepSeek-V4 QKV rope/cache rejected its decode shape");
 
         ExpectFloatNear(ToFloatVector(referenceQ), ToFloatVector(actualQ),
-                        3e-2f, 3e-3f, "DeepSeek-V4 fused Q output");
+                        0.0f, 0.0f, "DeepSeek-V4 fused Q output");
         ExpectFloatNear(ToFloatVector(referenceKV), ToFloatVector(actualKV),
-                        3e-2f, 3e-3f, "DeepSeek-V4 fused KV output");
+                        0.0f, 0.0f, "DeepSeek-V4 fused KV output");
         ExpectFloatNear(ToFloatVector(referenceCache), ToFloatVector(actualCache),
-                        3e-2f, 3e-3f, "DeepSeek-V4 fused window cache");
+                        0.0f, 0.0f, "DeepSeek-V4 fused window cache");
 
         // TP8 shards the model's 64 global query heads into eight local heads.
         // Keep this shape covered so the fused path cannot silently fall back to
@@ -6321,16 +10107,84 @@ namespace {
                    "fused DeepSeek-V4 QKV rope/cache rejected TP8 local heads");
             ExpectFloatNear(ToFloatVector(localReferenceQ),
                             ToFloatVector(localActualQ),
-                            3e-2f, 3e-3f,
+                            0.0f, 0.0f,
                             "DeepSeek-V4 TP8 fused Q output");
             ExpectFloatNear(ToFloatVector(localReferenceKV),
                             ToFloatVector(localActualKV),
-                            3e-2f, 3e-3f,
+                            0.0f, 0.0f,
                             "DeepSeek-V4 TP8 fused KV output");
             ExpectFloatNear(ToFloatVector(localReferenceCache),
                             ToFloatVector(localActualCache),
-                            3e-2f, 3e-3f,
+                            0.0f, 0.0f,
                             "DeepSeek-V4 TP8 fused window cache");
+        }
+
+        // DSpark-7 verifies eight target rows at once.  This is the production
+        // TP8 shape that used to miss the single-row fusion and execute four
+        // separate Q/KV preparation kernels per layer.
+        if (FastllmCudaRuntimeArch() >= 120) {
+            constexpr int targetTokens = 8;
+            constexpr int localHeads = 8;
+            std::vector<float> targetQValues = MakeRegressionValues(
+                targetTokens * localHeads * headDim, 1.07f, 0.54f);
+            std::vector<float> targetKVValues = MakeRegressionValues(
+                targetTokens * headDim, 1.41f, 0.69f);
+
+            fastllm::Data targetReferenceQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, localHeads, headDim}, targetQValues);
+            fastllm::Data targetReferenceKVInput = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, 1, headDim}, targetKVValues);
+            fastllm::Data targetReferenceKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, 1, headDim},
+                std::vector<float>(targetTokens * headDim, 0.0f));
+            Expect(FastllmCudaRMSNorm(
+                       targetReferenceKVInput, kvNormWeight,
+                       targetReferenceKV, eps),
+                   "built-in RMSNorm rejected DSpark target QKV input");
+            Expect(FastllmCudaDeepSeekV4ScaleQRotaryGraph(
+                       targetReferenceQ, ropeDim, 160000.0f, decodeMetaPtr,
+                       4096, 4.0f, 32, 1, eps),
+                   "built-in Q rotary rejected DSpark target QKV input");
+            Expect(FastllmCudaDeepSeekV4RotaryQuantGraph(
+                       targetReferenceKV, ropeDim, 160000.0f, decodeMetaPtr,
+                       4096, 4.0f, 32, 1, headDim - ropeDim, 64, 1),
+                   "built-in KV rotary rejected DSpark target QKV input");
+            targetReferenceKV.Reshape({1, targetTokens, headDim});
+            fastllm::Data targetReferenceCache = MakeCudaTensor(
+                fastllm::DataType::FLOAT32,
+                {1, windowSize, headDim}, cacheValues);
+            Expect(FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(
+                       targetReferenceKV, decodeMetaPtr,
+                       windowSize, targetReferenceCache),
+                   "built-in cache update rejected DSpark target QKV input");
+
+            fastllm::Data targetActualQ = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, localHeads, headDim}, targetQValues);
+            fastllm::Data targetActualKV = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {1, targetTokens, 1, headDim}, targetKVValues);
+            fastllm::Data targetActualCache = MakeCudaTensor(
+                fastllm::DataType::FLOAT32,
+                {1, windowSize, headDim}, cacheValues);
+            Expect(FastllmCudaDeepSeekV4FusedQKVRopeCacheGraph(
+                       targetActualQ, targetActualKV, kvNormWeight,
+                       decodeMetaPtr, ropeDim, 160000.0f, 4096, 4.0f,
+                       32, 1, eps, headDim - ropeDim, 64, windowSize,
+                       targetActualCache),
+                   "fused DeepSeek-V4 QKV rope/cache rejected DSpark target rows");
+            ExpectFloatNear(ToFloatVector(targetReferenceQ),
+                            ToFloatVector(targetActualQ), 0.0f, 0.0f,
+                            "DeepSeek-V4 DSpark target fused Q output");
+            ExpectFloatNear(ToFloatVector(targetReferenceKV),
+                            ToFloatVector(targetActualKV), 0.0f, 0.0f,
+                            "DeepSeek-V4 DSpark target fused KV output");
+            ExpectFloatNear(ToFloatVector(targetReferenceCache),
+                            ToFloatVector(targetActualCache), 0.0f, 0.0f,
+                            "DeepSeek-V4 DSpark target fused window cache");
         }
 
         std::cout << "DeepSeek-V4 fused QKV rope/cache regression: PASS\n";
@@ -12093,6 +15947,699 @@ namespace {
         Expect(numasWeights.routedDown.cpuData == nullptr, "routed down CPU buffer should be released after NUMA registration.");
     }
 
+    fastllm::Data MakeDeepSeekV4Fp8MoeWeight(
+            int outputDim, int inputDim, float seed,
+            const std::string &name) {
+        constexpr int block = 128;
+        Expect(outputDim % block == 0 && inputDim % block == 0,
+               "DeepSeek-V4 FP8 NUMA regression requires block-aligned weights.");
+        fastllm::Data weight(
+            fastllm::DataType::FP8_E4M3, {outputDim, inputDim});
+        weight.name = name;
+        weight.blockK = block;
+        weight.blockM = block;
+        weight.scales.resize(
+            (size_t)(outputDim / block) * (inputDim / block));
+        for (size_t i = 0; i < weight.scales.size(); i++) {
+            weight.scales[i] =
+                0.0125f * (float)(1 + ((int)i + (int)(seed * 10)) % 5);
+        }
+        weight.Allocate(true);
+        int seedValue = (int)std::lround(seed * 100.0f);
+        for (size_t i = 0; i < (size_t)outputDim * inputDim; i++) {
+            int exponent = 3 + (int)((i + seedValue) % 6);
+            int mantissa = (int)((i * 7 + seedValue) & 7);
+            uint8_t value = (uint8_t)((exponent << 3) | mantissa);
+            if ((i + seedValue) & 1) {
+                value |= 0x80;
+            }
+            weight.cpuData[i] = value;
+        }
+        return weight;
+    }
+
+    fastllm::Data MakeDeepSeekV4Nvfp4MoeWeight(
+            int outputDim, int inputDim, int seed,
+            const std::string &name) {
+        constexpr int block = 32;
+        Expect(outputDim > 0 && inputDim % block == 0,
+               "DeepSeek-V4 NVFP4 NUMA regression requires block-aligned weights.");
+        fastllm::Data weight(
+            fastllm::DataType::NVFP4, {outputDim, inputDim});
+        weight.name = name;
+        weight.blockK = 1;
+        weight.blockM = block;
+        weight.Allocate(false);
+
+        const size_t packedBytes = fastllm::GetNVFP4WeightBytes(
+            outputDim, inputDim);
+        for (size_t i = 0; i < packedBytes; i++) {
+            const uint8_t low = (uint8_t)((i * 5 + seed) & 0xf);
+            const uint8_t high =
+                (uint8_t)((i * 11 + seed * 3 + 1) & 0xf);
+            weight.cpuData[i] = low | (high << 4);
+        }
+        uint8_t *scales = fastllm::GetNVFP4ScaleData(weight);
+        Expect(scales != nullptr,
+               "DeepSeek-V4 NVFP4 NUMA regression scale storage is missing.");
+        const size_t scaleBytes = fastllm::GetNVFP4ScaleBytes(
+            outputDim, inputDim, weight.blockK, weight.blockM);
+        for (size_t i = 0; i < scaleBytes; i++) {
+            scales[i] = (uint8_t)(119 + ((i + seed) % 7));
+        }
+        return weight;
+    }
+
+#ifdef USE_NUMAS
+    void RunNumasDeepSeekV4Nvfp4MoeBenchmark() {
+        auto readPositiveEnv = [](const char *name, int fallback) {
+            const char *value = std::getenv(name);
+            int parsed = value == nullptr ? 0 : std::atoi(value);
+            return parsed > 0 ? parsed : fallback;
+        };
+        const int batch = readPositiveEnv(
+            "FASTLLM_DSV4_NUMAS_MOE_BENCH_BATCH", 8);
+        const int threads = readPositiveEnv(
+            "FASTLLM_DSV4_NUMAS_MOE_BENCH_THREADS", 24);
+        const int iterations = readPositiveEnv(
+            "FASTLLM_DSV4_NUMAS_MOE_BENCH_ITERATIONS", 40);
+        constexpr int topk = 6;
+        constexpr int expertCount = 24;
+        constexpr int inputDim = 4096;
+        constexpr int interDim = 2048;
+        constexpr int outputDim = 4096;
+
+        fastllm::SetThreads(threads);
+        fastllm::Data input = MakeTensor(
+            fastllm::DataType::BFLOAT16, {batch, inputDim}, 0.73f);
+        std::vector<int32_t> indices((size_t)batch * topk);
+        std::vector<float> scores((size_t)batch * topk);
+        for (int row = 0; row < batch; row++) {
+            for (int slot = 0; slot < topk; slot++) {
+                indices[(size_t)row * topk + slot] =
+                    (row * 3 + slot * 4) % expertCount;
+                scores[(size_t)row * topk + slot] =
+                    0.125f + 0.03125f * (float)slot;
+            }
+        }
+        fastllm::Data index = MakeIntTensor({batch, topk}, indices);
+        fastllm::Data score(
+            fastllm::DataType::FLOAT32, {batch, topk}, scores);
+
+        std::vector<fastllm::Data> gateWeights;
+        std::vector<fastllm::Data> downWeights;
+        gateWeights.reserve(expertCount);
+        downWeights.reserve(expertCount);
+        auto initializeWeight = [](fastllm::Data &weight,
+                                   int outputChannels, int inputChannels,
+                                   int seed, const std::string &name) {
+            weight.name = name;
+            weight.blockK = 1;
+            weight.blockM = 32;
+            weight.Allocate(false);
+            const size_t packedBytes = fastllm::GetNVFP4WeightBytes(
+                outputChannels, inputChannels);
+            for (size_t i = 0; i < packedBytes; i++) {
+                const uint8_t low = (uint8_t)((i * 5 + seed) & 0xf);
+                const uint8_t high =
+                    (uint8_t)((i * 11 + seed * 3 + 1) & 0xf);
+                weight.cpuData[i] = low | (high << 4);
+            }
+            uint8_t *scaleData = fastllm::GetNVFP4ScaleData(weight);
+            Expect(scaleData != nullptr,
+                   "NUMA MoE benchmark NVFP4 scale storage is missing.");
+            const size_t scaleBytes = fastllm::GetNVFP4ScaleBytes(
+                outputChannels, inputChannels,
+                weight.blockK, weight.blockM);
+            for (size_t i = 0; i < scaleBytes; i++) {
+                scaleData[i] = (uint8_t)(120 + (((i + seed) % 3) != 0));
+            }
+        };
+        for (int expert = 0; expert < expertCount; expert++) {
+            gateWeights.emplace_back(
+                fastllm::DataType::NVFP4,
+                std::vector<int>{interDim * 2, inputDim});
+            initializeWeight(
+                gateWeights.back(), interDim * 2, inputDim,
+                101 + expert * 7,
+                "bench.dsv4_nvfp4_gate." + std::to_string(expert));
+            downWeights.emplace_back(
+                fastllm::DataType::NVFP4,
+                std::vector<int>{outputDim, interDim});
+            initializeWeight(
+                downWeights.back(), outputDim, interDim,
+                211 + expert * 11,
+                "bench.dsv4_nvfp4_down." + std::to_string(expert));
+        }
+        std::vector<fastllm::Data*> weights(
+            (expertCount + 1) * 2, nullptr);
+        for (int expert = 0; expert < expertCount; expert++) {
+            weights[(expert + 1) * 2] = &gateWeights[expert];
+            weights[(expert + 1) * 2 + 1] = &downWeights[expert];
+        }
+        std::vector<fastllm::Data*> biass(weights.size(), nullptr);
+        fastllm::Data output(
+            fastllm::DataType::BFLOAT16, {batch, outputDim});
+        fastllm::Data w1, w2, w3, curInput, curOutput;
+        auto run = [&]() {
+            fastllm::MergeMOE(
+                input, index, score, weights, biass,
+                w1, w2, w3, curInput, curOutput,
+                0.0f, output, 0, fastllm::MoeGateSwiglu,
+                false, 7.0f, true);
+        };
+
+        std::vector<double> samples;
+        samples.reserve(iterations);
+        {
+            ScopedFirstDevice guard("numa");
+            for (int warmup = 0; warmup < 4; warmup++) {
+                run();
+            }
+            for (int iteration = 0; iteration < iterations; iteration++) {
+                const auto begin = std::chrono::steady_clock::now();
+                run();
+                samples.push_back(
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - begin).count());
+            }
+        }
+        uint64_t hash = 1469598103934665603ull;
+        const uint16_t *outputBits = (const uint16_t*)output.cpuData;
+        for (size_t i = 0; i < (size_t)batch * outputDim; i++) {
+            hash ^= outputBits[i];
+            hash *= 1099511628211ull;
+        }
+        std::sort(samples.begin(), samples.end());
+        const double mean = std::accumulate(
+            samples.begin(), samples.end(), 0.0) / samples.size();
+        std::cout << "threads=" << threads << " rows=" << batch << " routes="
+                  << batch * topk << " unique_experts=" << expertCount
+                  << " iterations=" << iterations
+                  << " min_ms=" << samples.front()
+                  << " median_ms=" << samples[samples.size() / 2]
+                  << " mean_ms=" << mean
+                  << " hash=" << std::hex << hash << std::dec << "\n";
+    }
+#endif
+
+    void RunNumasLinearRegression() {
+        constexpr int prefillTokens = 37;
+        constexpr int inputDim = 256;
+        constexpr int outputDim = 256;
+
+        fastllm::Data input = MakeTensor(
+            fastllm::DataType::BFLOAT16,
+            {prefillTokens, inputDim}, 0.37f);
+        fastllm::Data cpuWeight = MakeDeepSeekV4Fp8MoeWeight(
+            outputDim, inputDim, 1.9f, "test.cpu_linear_fp8");
+        fastllm::Data numaWeight = MakeDeepSeekV4Fp8MoeWeight(
+            outputDim, inputDim, 1.9f, "test.numa_linear_fp8");
+        fastllm::Data emptyBias;
+        fastllm::Data expected, actual;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(input, cpuWeight, emptyBias, expected);
+        }
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::Linear(input, numaWeight, emptyBias, actual);
+        }
+        Expect(expected.dataType == fastllm::DataType::BFLOAT16 &&
+                   actual.dataType == fastllm::DataType::BFLOAT16,
+               "NUMA FP8 Linear output dtype mismatch.");
+        Expect(expected.GetBytes() == actual.GetBytes() &&
+                   memcmp(expected.cpuData, actual.cpuData,
+                          expected.GetBytes()) == 0,
+               "NUMA FP8 Linear prefill differs bitwise from CPU Linear.");
+        Expect(!numaWeight.numasData.empty() &&
+                   numaWeight.cpuData == nullptr,
+               "NUMA FP8 Linear weight was not moved to node-local shards.");
+
+        // A registered prefill weight is reused by subsequent one-token
+        // decode calls, so cover the packed small-batch kernel as well.
+        fastllm::Data decodeInput = MakeTensor(
+            fastllm::DataType::BFLOAT16, {1, inputDim}, 0.53f);
+        fastllm::Data decodeExpected, decodeActual;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(
+                decodeInput, cpuWeight, emptyBias, decodeExpected);
+        }
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::Linear(
+                decodeInput, numaWeight, emptyBias, decodeActual);
+        }
+        Expect(decodeExpected.GetBytes() == decodeActual.GetBytes() &&
+                   memcmp(decodeExpected.cpuData, decodeActual.cpuData,
+                          decodeExpected.GetBytes()) == 0,
+               "NUMA FP8 Linear decode differs bitwise from CPU Linear.");
+
+        // Compressor, router and LM-head projections enter Linear as FLOAT32
+        // activations with BF16 weights.  The CPU path first rounds the input
+        // to BF16, then accumulates to FP32; NUMA must preserve that boundary.
+        fastllm::Data floatInput = MakeTensor(
+            fastllm::DataType::FLOAT32,
+            {prefillTokens, inputDim}, 0.71f);
+        fastllm::Data cpuBfloatWeight = MakeTensor(
+            fastllm::DataType::BFLOAT16,
+            {outputDim, inputDim}, 0.83f);
+        fastllm::Data numaBfloatWeight = MakeTensor(
+            fastllm::DataType::BFLOAT16,
+            {outputDim, inputDim}, 0.83f);
+        fastllm::Data floatExpected, floatActual;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(
+                floatInput, cpuBfloatWeight, emptyBias, floatExpected);
+        }
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::Linear(
+                floatInput, numaBfloatWeight, emptyBias, floatActual);
+        }
+        Expect(floatExpected.dataType == fastllm::DataType::FLOAT32 &&
+                   floatActual.dataType == fastllm::DataType::FLOAT32 &&
+                   floatExpected.GetBytes() == floatActual.GetBytes() &&
+                   memcmp(floatExpected.cpuData, floatActual.cpuData,
+                          floatExpected.GetBytes()) == 0,
+               "NUMA FLOAT32 x BF16 Linear differs bitwise from CPU Linear.");
+
+        // DeepSeek-V4 keeps compressor and router projections as FP16.  Their
+        // FLOAT32-input path must retain the original FP32 x FP16 accumulation
+        // order (including bias), while BF16 input is expanded to FP32 first.
+        fastllm::Data cpuHalfWeight = MakeTensor(
+            fastllm::DataType::FLOAT16,
+            {outputDim, inputDim}, 0.91f);
+        fastllm::Data numaHalfWeight = MakeTensor(
+            fastllm::DataType::FLOAT16,
+            {outputDim, inputDim}, 0.91f);
+        fastllm::Data cpuBias = MakeTensor(
+            fastllm::DataType::FLOAT32, {outputDim}, 0.11f);
+        fastllm::Data numaBias = MakeTensor(
+            fastllm::DataType::FLOAT32, {outputDim}, 0.11f);
+        fastllm::Data halfFloatExpected, halfFloatActual;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(
+                floatInput, cpuHalfWeight, cpuBias, halfFloatExpected);
+        }
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::Linear(
+                floatInput, numaHalfWeight, numaBias, halfFloatActual);
+        }
+        Expect(halfFloatExpected.GetBytes() == halfFloatActual.GetBytes() &&
+                   memcmp(halfFloatExpected.cpuData, halfFloatActual.cpuData,
+                          halfFloatExpected.GetBytes()) == 0,
+               "NUMA FLOAT32 x FLOAT16 Linear differs bitwise from CPU "
+               "Linear.");
+
+        fastllm::Data halfBfloatExpected, halfBfloatActual;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(
+                input, cpuHalfWeight, cpuBias, halfBfloatExpected);
+        }
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::Linear(
+                input, numaHalfWeight, numaBias, halfBfloatActual);
+        }
+        Expect(halfBfloatExpected.GetBytes() == halfBfloatActual.GetBytes() &&
+                   memcmp(halfBfloatExpected.cpuData, halfBfloatActual.cpuData,
+                          halfBfloatExpected.GetBytes()) == 0,
+               "NUMA BFLOAT16 x FLOAT16 Linear differs bitwise from CPU "
+               "Linear.");
+
+        // The one-token path expands BF16 directly in the AVX512 dot-product
+        // kernel instead of materializing an FP32 input row.  Its FMA and
+        // reduction order must remain identical to the CPU reference.
+        fastllm::Data halfDecodeExpected, halfDecodeActual;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(
+                decodeInput, cpuHalfWeight, cpuBias,
+                halfDecodeExpected);
+        }
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::Linear(
+                decodeInput, numaHalfWeight, numaBias,
+                halfDecodeActual);
+        }
+        Expect(halfDecodeExpected.GetBytes() ==
+                   halfDecodeActual.GetBytes() &&
+                   memcmp(halfDecodeExpected.cpuData,
+                          halfDecodeActual.cpuData,
+                          halfDecodeExpected.GetBytes()) == 0,
+               "NUMA BFLOAT16 x FLOAT16 decode differs bitwise from CPU "
+               "Linear.");
+
+        // Also cover native FP32 weights and their bias accumulation order.
+        fastllm::Data cpuFloatWeight = MakeTensor(
+            fastllm::DataType::FLOAT32,
+            {outputDim, inputDim}, 0.97f);
+        fastllm::Data numaFloatWeight = MakeTensor(
+            fastllm::DataType::FLOAT32,
+            {outputDim, inputDim}, 0.97f);
+        fastllm::Data nativeExpected, nativeActual;
+        {
+            ScopedFirstDevice guard("cpu");
+            fastllm::Linear(
+                floatInput, cpuFloatWeight, cpuBias, nativeExpected);
+        }
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::Linear(
+                floatInput, numaFloatWeight, numaBias, nativeActual);
+        }
+        Expect(nativeExpected.GetBytes() == nativeActual.GetBytes() &&
+                   memcmp(nativeExpected.cpuData, nativeActual.cpuData,
+                          nativeExpected.GetBytes()) == 0,
+               "NUMA FLOAT32 x FLOAT32 Linear differs bitwise from CPU "
+               "Linear.");
+    }
+
+    std::vector<uint16_t> RunNumasDeepSeekV4LargeMoeCase(
+            MoeWeights &weights, int batch,
+            fastllm::DataDevice *mergeOutputDevice = nullptr,
+            bool keepCudaInputMirror = false) {
+        const int inputDim = weights.routedGate.dims[1];
+        const int outputDim = weights.routedDown.dims[0];
+        fastllm::Data input = MakeTensor(
+            fastllm::DataType::BFLOAT16, {batch, inputDim}, 0.73f);
+#ifdef USE_CUDA
+        if (keepCudaInputMirror) {
+            input.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            input.ToDevice(
+                fastllm::DataDevice::CPU, std::vector<int>{0}, true);
+            Expect(input.cudaData != nullptr &&
+                       input.dataDevice == fastllm::DataDevice::CPU,
+                   "failed to retain the DeepSeek-V4 mixed-inference CUDA mirror.");
+        }
+#else
+        Expect(!keepCudaInputMirror,
+               "CUDA input mirror requested in a non-CUDA build.");
+#endif
+        fastllm::Data index = MakeIntTensor(
+            {batch, 1}, std::vector<int32_t>(batch, 0));
+        std::vector<float> routeScores(batch);
+        for (int i = 0; i < batch; i++) {
+            routeScores[i] = 0.25f + (float)(i % 7) * 0.0625f;
+        }
+        fastllm::Data score(
+            fastllm::DataType::FLOAT32, {batch, 1}, routeScores);
+        fastllm::Data output(
+            fastllm::DataType::BFLOAT16, {batch, outputDim});
+        fastllm::Data w1, w2, w3, curInput, curOutput;
+        std::vector<fastllm::Data*> weightPtrs = {
+            nullptr, nullptr, &weights.routedGate, &weights.routedDown
+        };
+        std::vector<fastllm::Data*> biasPtrs(4, nullptr);
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::MergeMOE(
+                input, index, score, weightPtrs, biasPtrs,
+                w1, w2, w3, curInput, curOutput,
+                0.0f, output, 0, fastllm::MoeGateSwiglu,
+                false, 7.0f, true);
+        }
+        Expect(output.dataType == fastllm::DataType::BFLOAT16,
+               "DeepSeek-V4 NUMA MergeMOE output dtype mismatch.");
+#ifdef USE_CUDA
+        if (mergeOutputDevice != nullptr) {
+            *mergeOutputDevice = output.dataDevice;
+        }
+        if (output.dataDevice == fastllm::DataDevice::CUDA) {
+            output.ToDevice(
+                fastllm::DataDevice::CPU, output.dataDeviceIds, true);
+        }
+#else
+        if (mergeOutputDevice != nullptr) {
+            *mergeOutputDevice = output.dataDevice;
+        }
+#endif
+        const uint16_t *data = (const uint16_t*)output.cpuData;
+        return std::vector<uint16_t>(
+            data, data + (size_t)batch * outputDim);
+    }
+
+    void RunNumasDeepSeekV4LargeMoeRegression() {
+        constexpr int batch = 32;
+        constexpr int inputDim = 128;
+        constexpr int interDim = 256;
+        constexpr int outputDim = 128;
+        auto makeWeights = []() {
+            return MoeWeights {
+                MakeDeepSeekV4Fp8MoeWeight(
+                    interDim * 2, inputDim, 1.3f,
+                    "test.dsv4_fp8_routed_gate"),
+                MakeDeepSeekV4Fp8MoeWeight(
+                    outputDim, interDim, 2.1f,
+                    "test.dsv4_fp8_routed_down")
+            };
+        };
+        auto makeNvfp4Weights = []() {
+            return MoeWeights {
+                MakeDeepSeekV4Nvfp4MoeWeight(
+                    interDim * 2, inputDim, 13,
+                    "test.dsv4_nvfp4_routed_gate"),
+                MakeDeepSeekV4Nvfp4MoeWeight(
+                    outputDim, interDim, 29,
+                    "test.dsv4_nvfp4_routed_down")
+            };
+        };
+
+        // DSpark verification groups repeated expert routes into 2-8 row
+        // NVFP4 GEMMs.  Compare every fused row count against the established
+        // row-at-a-time path before exercising the large prefill path below.
+        const char *savedGroupedDecodeDisable = std::getenv(
+            "FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
+        const bool hadGroupedDecodeDisable =
+            savedGroupedDecodeDisable != nullptr;
+        const std::string savedGroupedDecodeDisableValue =
+            hadGroupedDecodeDisable ? savedGroupedDecodeDisable : "";
+        MoeWeights groupedDecodeWeights = makeNvfp4Weights();
+        for (int smallBatch = 2; smallBatch <= 8; smallBatch++) {
+            setenv(
+                "FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE", "1", 1);
+            std::vector<uint16_t> rowMajor =
+                RunNumasDeepSeekV4LargeMoeCase(
+                    groupedDecodeWeights, smallBatch);
+            unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
+            std::vector<uint16_t> expertMajor =
+                RunNumasDeepSeekV4LargeMoeCase(
+                    groupedDecodeWeights, smallBatch);
+            Expect(rowMajor == expertMajor,
+                   "DeepSeek-V4 NUMA grouped decode changed BF16 output "
+                   "bits at batch " + std::to_string(smallBatch) + ".");
+        }
+        if (hadGroupedDecodeDisable) {
+            setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE",
+                   savedGroupedDecodeDisableValue.c_str(), 1);
+        } else {
+            unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
+        }
+
+        MoeWeights referenceWeights = makeWeights();
+        setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST", "1", 1);
+        std::vector<uint16_t> expected =
+            RunNumasDeepSeekV4LargeMoeCase(referenceWeights, batch);
+        unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST");
+
+        MoeWeights optimizedWeights = makeWeights();
+        std::vector<uint16_t> actual =
+            RunNumasDeepSeekV4LargeMoeCase(optimizedWeights, batch);
+        Expect(expected == actual,
+               "DeepSeek-V4 NUMA large-batch MergeMOE fast path changed BF16 output bits.");
+
+#ifdef USE_CUDA
+        if (FastllmCudaGetDeviceCount() > 0) {
+            std::vector<int> savedDevices;
+            std::map<int, int> savedRatios;
+            FastllmGetMulticudaDeviceAndRatio(
+                savedDevices, savedRatios, false);
+            FastllmMultiCudaSetDevice({0});
+
+            MoeWeights cpuOnlyWeights = makeWeights();
+            fastllm::DataDevice mergeOutputDevice =
+                fastllm::DataDevice::CUDA;
+            std::vector<uint16_t> cpuOnlyOutput =
+                RunNumasDeepSeekV4LargeMoeCase(
+                    cpuOnlyWeights, 128, &mergeOutputDevice);
+            Expect(mergeOutputDevice == fastllm::DataDevice::CPU,
+                   "CPU-only DeepSeek-V4 NUMA input was staged to a stale "
+                   "MultiCUDA device.");
+
+            MoeWeights mixedWeights = makeWeights();
+            fastllm::DataDevice mixedOutputDevice =
+                fastllm::DataDevice::CPU;
+            std::vector<uint16_t> mixedOutput =
+                RunNumasDeepSeekV4LargeMoeCase(
+                    mixedWeights, 128, &mixedOutputDevice, true);
+            Expect(mixedOutputDevice == fastllm::DataDevice::CUDA,
+                   "DeepSeek-V4 mixed input with a valid CUDA mirror did not "
+                   "use NUMA GPU-prefill.");
+            std::vector<float> cpuOnlyFloat(cpuOnlyOutput.size());
+            std::vector<float> mixedFloat(mixedOutput.size());
+            for (size_t i = 0; i < cpuOnlyOutput.size(); i++) {
+                cpuOnlyFloat[i] = fastllm::BFloat16BitsToFloat32(
+                    cpuOnlyOutput[i]);
+                mixedFloat[i] = fastllm::BFloat16BitsToFloat32(
+                    mixedOutput[i]);
+            }
+            ExpectFloatNear(
+                cpuOnlyFloat, mixedFloat, 2.0f, 0.05f,
+                "DeepSeek-V4 NUMA mixed CPU/GPU MergeMOE output");
+
+            FastllmMultiCudaSetDevice(savedDevices);
+        }
+#endif
+    }
+
+#ifdef USE_CUDA
+    void RunDeepSeekV4CudaToCpuMirrorRegression() {
+        if (FastllmCudaGetDeviceCount() < 1) {
+            return;
+        }
+        std::vector<float> values = {
+            0.25f, -1.5f, 3.0f, 0.0625f,
+            -0.75f, 2.25f, 0.0f, -4.0f
+        };
+        fastllm::Data source(
+            fastllm::DataType::BFLOAT16, {2, 4});
+        source.Allocate();
+        uint16_t *sourceBits = (uint16_t*)source.cpuData;
+        std::vector<uint16_t> expected(values.size());
+        for (size_t i = 0; i < values.size(); i++) {
+            expected[i] = fastllm::Float32ToBFloat16RNEBits(values[i]);
+            sourceBits[i] = expected[i];
+        }
+        source.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        void *sourceCudaData = source.cudaData;
+
+        fastllm::Data destination;
+        Expect(fastllm::DeepSeekV4CopyCudaTensorToCpuForTest(
+                   source, destination),
+               "DeepSeek-V4 mixed-inference CUDA-to-CPU copy failed.");
+        Expect(destination.dataDevice == fastllm::DataDevice::CPU &&
+                   destination.cpuData != nullptr,
+               "DeepSeek-V4 mixed-inference copy did not produce CPU data.");
+        Expect(destination.cudaData == sourceCudaData &&
+                   destination.cudaDataBorrowed,
+               "DeepSeek-V4 mixed-inference copy lost its borrowed CUDA mirror.");
+        Expect(destination.dataDeviceIds == std::vector<int>{0},
+               "DeepSeek-V4 mixed-inference copy recorded the wrong CUDA device.");
+        const uint16_t *actual = (const uint16_t*)destination.cpuData;
+        Expect(std::equal(expected.begin(), expected.end(), actual),
+               "DeepSeek-V4 mixed-inference CUDA-to-CPU copy changed BF16 data.");
+
+        constexpr int quantizedElements = 256;
+        std::vector<uint16_t> rawQuantizedInput(quantizedElements);
+        std::vector<uint16_t> quantizedExpected(quantizedElements);
+        for (int i = 0; i < quantizedElements; i++) {
+            float value = ((i * 37) % 257 - 128) * 0.03125f;
+            rawQuantizedInput[i] =
+                fastllm::Float32ToBFloat16RNEBits(value);
+        }
+        fastllm::RunCpuDeepSeekV4ActivationQuantization(
+            rawQuantizedInput.data(), quantizedExpected.data(),
+            quantizedElements);
+        fastllm::Data quantizedActivation(
+            fastllm::DataType::BFLOAT16, {2, 128});
+        quantizedActivation.Allocate(false);
+        memcpy(quantizedActivation.cpuData, quantizedExpected.data(),
+               quantizedActivation.GetBytes());
+        Expect(fastllm::DeepSeekV4AddQuantizedCudaReplicaForTest(
+                   quantizedActivation, 0),
+               "DeepSeek-V4 failed to add a quantized CUDA activation replica.");
+        Expect(quantizedActivation.dataDevice == fastllm::DataDevice::CPU &&
+                   quantizedActivation.cpuData != nullptr &&
+                   quantizedActivation.cudaData != nullptr &&
+                   !quantizedActivation.cudaDataBorrowed,
+               "DeepSeek-V4 quantized activation is not CPU/CUDA dual-resident.");
+        std::vector<uint16_t> quantizedRoundTrip(quantizedElements);
+        FastllmCudaCopyFromDeviceToHost(
+            quantizedRoundTrip.data(), quantizedActivation.cudaData,
+            quantizedActivation.GetBytes());
+        Expect(quantizedExpected == quantizedRoundTrip,
+               "DeepSeek-V4 quantized CUDA activation replica changed BF16 bits.");
+
+        constexpr int moeRows = 2;
+        constexpr int moeIntermediate = 256;
+        std::vector<uint16_t> gateUpBits(
+            (size_t)moeRows * moeIntermediate * 2);
+        for (int row = 0; row < moeRows; row++) {
+            for (int d = 0; d < moeIntermediate; d++) {
+                float gate =
+                    (((d * 13 + row * 5) % 41) - 20) * 0.625f;
+                float up =
+                    (((d * 17 + row * 3) % 37) - 18) * 0.75f;
+                gateUpBits[((size_t)row * moeIntermediate + d) * 2] =
+                    fastllm::Float32ToBFloat16RNEBits(gate);
+                gateUpBits[((size_t)row * moeIntermediate + d) * 2 + 1] =
+                    fastllm::Float32ToBFloat16RNEBits(up);
+            }
+        }
+        // This pair lands on opposite sides of a BF16 tie if route, SiLU and
+        // up are reassociated.  It locks the official (SiLU * up) * route
+        // boundary used by the CPU expert path.
+        gateUpBits[0] = fastllm::Float32ToBFloat16RNEBits(-4.546875f);
+        gateUpBits[1] = fastllm::Float32ToBFloat16RNEBits(-1.453125f);
+        fastllm::Data gateUp(
+            fastllm::DataType::BFLOAT16,
+            {moeRows, moeIntermediate * 2});
+        gateUp.Allocate(false);
+        memcpy(gateUp.cpuData, gateUpBits.data(), gateUp.GetBytes());
+        gateUp.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        std::vector<float> routeScaleValues = {1.85298490524292f, 1.25f};
+        fastllm::Data routeScales(
+            fastllm::DataType::FLOAT32, {moeRows}, routeScaleValues);
+        routeScales.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        fastllm::Data cudaDownInput;
+        Expect(FastllmCudaDeepSeekV4PrepareMoeDownInput(
+                   gateUp, cudaDownInput,
+                   (const float*)routeScales.cudaData, 10.0f, true),
+               "DeepSeek-V4 CUDA MoE down-input preparation failed.");
+
+        std::vector<uint16_t> preQuantized(
+            (size_t)moeRows * moeIntermediate);
+        for (int row = 0; row < moeRows; row++) {
+            for (int d = 0; d < moeIntermediate; d++) {
+                size_t gateUpOffset =
+                    ((size_t)row * moeIntermediate + d) * 2;
+                float gate = fastllm::BFloat16BitsToFloat32(
+                    gateUpBits[gateUpOffset]);
+                float up = fastllm::BFloat16BitsToFloat32(
+                    gateUpBits[gateUpOffset + 1]);
+                gate = std::min(gate, 10.0f);
+                up = std::max(-10.0f, std::min(up, 10.0f));
+                float h = (gate / (1.0f + std::exp(-gate))) * up;
+                float value = routeScaleValues[row] * h;
+                preQuantized[(size_t)row * moeIntermediate + d] =
+                    fastllm::Float32ToBFloat16RNEBits(value);
+            }
+        }
+        std::vector<uint16_t> expectedDownInput(preQuantized.size());
+        fastllm::RunCpuDeepSeekV4ActivationQuantization(
+            preQuantized.data(), expectedDownInput.data(),
+            expectedDownInput.size());
+        std::vector<uint16_t> actualDownInput(expectedDownInput.size());
+        FastllmCudaCopyFromDeviceToHost(
+            actualDownInput.data(), cudaDownInput.cudaData,
+            cudaDownInput.GetBytes());
+        Expect(expectedDownInput == actualDownInput,
+               "DeepSeek-V4 CUDA MoE down input differs from the CPU "
+               "clip/SwiGLU/route/UE8M0 reference.");
+    }
+#endif
+
     void RunNumaMoeWarmupRegistrationRegression() {
         MoeAtypeConfigTestModel model;
         model.block_cnt = 1;
@@ -12190,7 +16737,7 @@ namespace {
 #endif
 }
 
-int main() {
+int main(int argc, char **argv) {
     try {
         const char *only = std::getenv("FASTLLM_REGRESSION_ONLY");
         if (only != nullptr && std::string(only) == "gguf_dequant") {
@@ -12422,6 +16969,101 @@ int main() {
                 "response_context_cpu_swap regression requires a CUDA build.");
 #endif
         }
+#ifdef USE_CUDA
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-dsv4-compressed-kv") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "DeepSeek-V4 compressed-KV regression requires CUDA.");
+            RunCudaDeepSeekV4CompressedKvMaintenanceRegression();
+            RunMultiCudaDeepSeekV4CompressedCacheAppendRegression();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--cuda-dsv4-woa") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "DeepSeek-V4 WoA regression requires CUDA.");
+            RunCudaDeepSeekV4TokenTiledWoARegression();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--bench-cuda-dsv4-woa") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "DeepSeek-V4 WoA benchmark requires CUDA.");
+            RunCudaDeepSeekV4TokenTiledWoABenchmark();
+            return 0;
+        }
+#endif
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cpu-dsv4-preprocess") {
+            RunCpuDeepSeekV4PreprocessRegression();
+            std::cout << "DeepSeek-V4 CPU preprocessing bitwise regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cpu-dsv4-scale-qratory") {
+            RunCpuDeepSeekV4ScaleQRatoryRegression();
+            std::cout << "DeepSeek-V4 CPU ScaleQRatory bitwise regression: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            (std::string(argv[1]) == "--cpu-dsv4-woa" ||
+             std::string(argv[1]) == "--numas-dsv4-woa")) {
+            RunCpuDeepSeekV4WoARegression();
+            std::cout << "DeepSeek-V4 CPU/NUMA WoA bitwise regression: PASS\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--cpu-dsv4-sparse") {
+            RunCpuDeepSeekV4SparseAttentionRegression();
+            RunCpuDeepSeekV4SparseDecodeCachedRegression();
+            std::cout << "DeepSeek-V4 CPU sparse bitwise regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--bench-cpu-dsv4-sparse") {
+            RunCpuDeepSeekV4SparseDecodeCachedBenchmark();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--cpu-dsv4-hcpre") {
+            RunCpuDeepSeekV4HcPreRegression();
+            std::cout << "DeepSeek-V4 CPU HcPre bitwise regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--bench-cpu-dsv4-hcpre") {
+            RunCpuDeepSeekV4HcPreDecodeBenchmark();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--numas-linear") {
+            Expect(fastllm::HasDeviceType("numa"),
+                   "NUMA Linear regression requires a NUMA device.");
+            RunNumasLinearRegression();
+            std::cout << "NUMA Linear bitwise regression: PASS\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--numas-dsv4-moe") {
+            Expect(fastllm::HasDeviceType("numa"),
+                   "DeepSeek-V4 MoE regression requires a NUMA device.");
+            RunNumasDeepSeekV4LargeMoeRegression();
+            std::cout << "DeepSeek-V4 NUMA MoE bitwise regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--bench-cpu-dsv4-nvfp4-block32") {
+            RunCpuDeepSeekV4Nvfp4Block32Benchmark();
+            return 0;
+        }
+#ifdef USE_NUMAS
+        if (argc == 2 &&
+            std::string(argv[1]) == "--bench-numas-dsv4-nvfp4-moe") {
+            RunNumasDeepSeekV4Nvfp4MoeBenchmark();
+            return 0;
+        }
+#endif
+        const char *indexerBenchmark = std::getenv(
+            "FASTLLM_DSV4_CPU_INDEXER_BENCH_LENGTH");
+        if (indexerBenchmark != nullptr) {
+            RunCpuDeepSeekV4IndexerBenchmark(std::atoi(indexerBenchmark));
+            return 0;
+        }
         bool ranAny = false;
         if (only != nullptr && std::string(only) == "mtp9_snapshots") {
 #ifdef USE_CUDA
@@ -12488,6 +17130,33 @@ int main() {
         RunPerRequestMinOutputLengthRegression();
         std::cout << "per-request minimum output length regression: PASS\n";
 
+        RunDeepSeekV4DsparkPrefixSelectionRegression();
+        std::cout << "DeepSeek-V4 DSpark prefix selection regression: PASS\n";
+
+        if (fastllm::HasDeviceType("cpu")) {
+            RunCpuDeepSeekV4HcPreRegression();
+            std::cout << "DeepSeek-V4 CPU HcPre token-parallel regression: PASS\n";
+            RunCpuDeepSeekV4WindowKVUpdateRegression();
+            std::cout << "DeepSeek-V4 CPU window KV update regression: PASS\n";
+            RunCpuDeepSeekV4SparseAttentionRegression();
+            std::cout << "DeepSeek-V4 CPU sparse attention regression: PASS\n";
+            RunCpuDeepSeekV4SparseDecodeCachedRegression();
+            std::cout << "DeepSeek-V4 CPU cached sparse decode regression: PASS\n";
+        }
+
+#ifdef USE_CUDA
+        if (fastllm::HasDeviceType("cuda")) {
+            RunDeepSeekV4CudaToCpuMirrorRegression();
+            std::cout << "DeepSeek-V4 mixed CUDA/CPU mirror regression: PASS\n";
+        }
+#endif
+
+        if (fastllm::HasDeviceType("numa") &&
+            !fastllm::GetFastllmEnv().activateNuma) {
+            RunNumasDeepSeekV4LargeMoeRegression();
+            std::cout << "DeepSeek-V4 NUMA large-batch MergeMOE regression: PASS\n";
+        }
+
         RunYarnRopeEncodingRegression();
         std::cout << "direct YaRN RoPE cached-reference regression: PASS\n";
 
@@ -12497,6 +17166,8 @@ int main() {
             std::cout << "cuda local expert range mask regression: PASS\n";
             RunCudaGreedyTieBreakRegression();
             std::cout << "cuda greedy tie-break regression: PASS\n";
+            RunCudaHandoffSamplingRegression();
+            std::cout << "cuda handoff sampling regression: PASS\n";
         }
 #endif
 
@@ -12507,6 +17178,12 @@ int main() {
             std::cout << "cpu AWQ-style INT4_GROUP linear regression: PASS\n";
             RunCpuPackedInt4Group32KernelRegression();
             std::cout << "cpu packed INT4_GROUP(32) kernel regression: PASS\n";
+            RunCpuDeepSeekV4ScaleQRatoryRegression();
+            std::cout << "DeepSeek-V4 CPU ScaleQRatory bitwise regression: PASS\n";
+            RunCpuDeepSeekV4PreprocessRegression();
+            std::cout << "DeepSeek-V4 CPU preprocessing bitwise regressions: PASS\n";
+            RunCpuDeepSeekV4WoARegression();
+            std::cout << "DeepSeek-V4 CPU WoA bitwise regression: PASS\n";
             ranAny = true;
         }
 
@@ -12519,6 +17196,7 @@ int main() {
         if (fastllm::HasDeviceType("cuda")) {
 #ifdef USE_CUDA
 #ifndef USE_ROCM
+            RunCudaNVFP4MarlinRegression();
             RunCudaBFloat16Hidden3072RMSNormRegression();
             std::cout << "cuda BF16 hidden-3072 RMSNorm regression: PASS\n";
 #endif
@@ -12527,14 +17205,23 @@ int main() {
             Expect(FastllmCudaGraphQwen35MoeSelfTest(),
                    "Qwen3.5 CUDA graph shared/routed MoE parallelization/fallback self-test failed");
             RunCudaTritonChunkGdnPrefillRegression();
+            RunCudaRaggedGdnLogicalPrepRegression();
+            RunCudaVarlenChunkGdnPrefillRegression();
+            RunCudaVarlenChunkGdnHeadMappingRegression();
+            RunCudaDeepSeekV4TokenTiledWoARegression();
             RunCudaDeepSeekV4TritonWoARegression();
             RunCudaDeepSeekV4TritonSparseDecodeRegression();
+            RunCudaDeepSeekV4IndexerRegression();
+            RunCudaDeepSeekV4FullWindowAppendRegression();
+            RunCudaPeerAccessInitRegression();
             RunMultiCudaDeepSeekV4SparsePrefillRegression();
             RunCudaDeepSeekV4HashRouteCacheRegression();
+            RunCudaDeepSeekV4FusedRouterRegression();
             RunCudaDeepSeekV4FusedHcPreNormRegression();
             RunMultiCudaDeepSeekV4HcPrePrefillRegression();
             RunMultiCudaDeepSeekV4RouterLinearResizeRegression();
             RunMultiCudaDeepSeekV4RawCacheAppendRegression();
+            RunCudaDeepSeekV4CompressedKvMaintenanceRegression();
             RunMultiCudaDeepSeekV4CompressedCacheAppendRegression();
             RunMultiCudaDeepSeekV4ExpandedSnapshotRegression();
             RunCudaDeepSeekV4FusedQKVRopeCacheRegression();
@@ -12590,6 +17277,8 @@ int main() {
         }
 
         if (fastllm::HasDeviceType("numa") && !fastllm::GetFastllmEnv().activateNuma) {
+            RunNumasLinearRegression();
+            std::cout << "numa Linear bitwise regression: PASS\n";
             RunNumaMoeWarmupRegistrationRegression();
             std::cout << "numa MoE full warmup registration regression: PASS\n";
             RunNumasMergeMoeRegression();

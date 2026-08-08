@@ -905,6 +905,95 @@ namespace fastllm {
                 A, lda, B, ldb, C, ldc, n, m, k, st, end);
     }
 
+    template <int ROWS, bool useLookup>
+    static bool FastllmGemmBFloat16NVFP4Block16E8M0MultiRow_AVX512BF16_Run(
+        const void *A, long lda,
+        const void *B, long ldb,
+        void *C, long ldc,
+        int m, int st, int end
+    ) {
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        static_assert(ROWS >= 2 && ROWS <= 8,
+                      "DeepSeek-V4 NVFP4 multi-row kernel supports 2-8 rows.");
+        const __m512 magicVec = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
+        const __m512i bf16Lookup =
+            NVFP4BFloat16Lookup_AVX512BF16();
+        const int blocks = (m - 1) / 16 + 1;
+        for (int j = st; j < end; j++) {
+            const uint8_t *rowStart =
+                (const uint8_t*)B + (size_t)j * ldb;
+            __m512 scaledSums[ROWS];
+            for (int row = 0; row < ROWS; row++) {
+                scaledSums[row] = _mm512_setzero_ps();
+            }
+            int block = 0;
+            while (block < blocks) {
+                const uint8_t *blockStart = rowStart + block * 9;
+                const uint8_t scaleByte = blockStart[8];
+                const float scale =
+                    NVFP4E8M0ScaleToFloatFast(scaleByte);
+                const __m512 scaleVec = _mm512_set1_ps(scale);
+                const int l = block * 16;
+
+                if (block + 1 < blocks && l + 31 < m) {
+                    const uint8_t *nextBlockStart =
+                        rowStart + (block + 1) * 9;
+                    if (scaleByte == nextBlockStart[8]) {
+                        const __m512bh vw =
+                            NVFP4TwoBlock16ToBFloat16_AVX512BF16<
+                                useLookup>(
+                                blockStart, nextBlockStart,
+                                bf16Lookup);
+                        for (int row = 0; row < ROWS; row++) {
+                            const uint16_t *input =
+                                (const uint16_t*)((const uint8_t*)A +
+                                    (size_t)row * lda);
+                            const __m512bh vi = (__m512bh)
+                                _mm512_loadu_si512(
+                                    (const __m512i*)(input + l));
+                            const __m512 sum = _mm512_dpbf16_ps(
+                                _mm512_setzero_ps(), vi, vw);
+                            scaledSums[row] = _mm512_fmadd_ps(
+                                _mm512_mul_ps(sum, magicVec),
+                                scaleVec, scaledSums[row]);
+                        }
+                        block += 2;
+                        continue;
+                    }
+                }
+
+                const int blockElems = std::min(16, m - l);
+                const __mmask32 mask =
+                    (__mmask32)((1u << blockElems) - 1u);
+                const __m512bh vw =
+                    NVFP4Block16ToBFloat16_AVX512BF16<useLookup>(
+                        blockStart, bf16Lookup);
+                for (int row = 0; row < ROWS; row++) {
+                    const uint16_t *input =
+                        (const uint16_t*)((const uint8_t*)A +
+                            (size_t)row * lda);
+                    const __m512bh vi = (__m512bh)
+                        _mm512_maskz_loadu_epi16(mask, input + l);
+                    const __m512 sum = _mm512_dpbf16_ps(
+                        _mm512_setzero_ps(), vi, vw);
+                    scaledSums[row] = _mm512_fmadd_ps(
+                        _mm512_mul_ps(sum, magicVec),
+                        scaleVec, scaledSums[row]);
+                }
+                block++;
+            }
+            for (int row = 0; row < ROWS; row++) {
+                float *output =
+                    (float*)((uint8_t*)C + (size_t)row * ldc);
+                output[j] = _mm512_reduce_add_ps(scaledSums[row]);
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
     template <bool useLookup>
     static bool FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16_Run(
         const void *A, long lda,
@@ -913,6 +1002,31 @@ namespace fastllm {
         int n, int m, int k, int st, int end
     ) {
 #if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        switch (n) {
+            case 2:
+                return FastllmGemmBFloat16NVFP4Block16E8M0MultiRow_AVX512BF16_Run<2, useLookup>(
+                    A, lda, B, ldb, C, ldc, m, st, end);
+            case 3:
+                return FastllmGemmBFloat16NVFP4Block16E8M0MultiRow_AVX512BF16_Run<3, useLookup>(
+                    A, lda, B, ldb, C, ldc, m, st, end);
+            case 4:
+                return FastllmGemmBFloat16NVFP4Block16E8M0MultiRow_AVX512BF16_Run<4, useLookup>(
+                    A, lda, B, ldb, C, ldc, m, st, end);
+            case 5:
+                return FastllmGemmBFloat16NVFP4Block16E8M0MultiRow_AVX512BF16_Run<5, useLookup>(
+                    A, lda, B, ldb, C, ldc, m, st, end);
+            case 6:
+                return FastllmGemmBFloat16NVFP4Block16E8M0MultiRow_AVX512BF16_Run<6, useLookup>(
+                    A, lda, B, ldb, C, ldc, m, st, end);
+            case 7:
+                return FastllmGemmBFloat16NVFP4Block16E8M0MultiRow_AVX512BF16_Run<7, useLookup>(
+                    A, lda, B, ldb, C, ldc, m, st, end);
+            case 8:
+                return FastllmGemmBFloat16NVFP4Block16E8M0MultiRow_AVX512BF16_Run<8, useLookup>(
+                    A, lda, B, ldb, C, ldc, m, st, end);
+            default:
+                break;
+        }
         const __m512 magicVec = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
         const __m512i bf16Lookup =
             NVFP4BFloat16Lookup_AVX512BF16();
@@ -981,6 +1095,118 @@ namespace fastllm {
             FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16_Run<
                 false>(
                 A, lda, B, ldb, C, ldc, n, m, k, st, end);
+    }
+
+    template <int ROWS, bool useLookup>
+    static bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run(
+        const void *A, long lda,
+        const void *B, long ldb,
+        void *C, long ldc,
+        int m, int st, int end
+    ) {
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        static_assert(ROWS >= 1 && ROWS <= 8,
+                      "NVFP4 block32 kernel supports 1-8 rows.");
+        const __m512 magicVec = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
+        const __m512i bf16Lookup =
+            NVFP4BFloat16Lookup_AVX512BF16();
+        const int blocks = (m + 31) / 32;
+        for (int j = st; j < end; j++) {
+            const uint8_t *rowStart =
+                (const uint8_t*)B + (size_t)j * ldb;
+            __m512 scaledSums[ROWS];
+            for (int row = 0; row < ROWS; row++) {
+                scaledSums[row] = _mm512_setzero_ps();
+            }
+            for (int block = 0; block < blocks; block++) {
+                const uint8_t *blockStart = rowStart + block * 17;
+                const uint8_t scaleByte = blockStart[16];
+                const bool fuseMagicScale = scaleByte <= 190;
+                __m512 scaleVec;
+                if (fuseMagicScale) {
+                    // Both E8M0 and the internal magic compensation are
+                    // powers of two.  In this exponent range their product
+                    // is finite, so fold them into one exact scale and
+                    // remove a vector multiply from every block.
+                    const uint32_t combinedBits =
+                        (uint32_t)(scaleByte == 0 ? 64 :
+                            scaleByte + 64) << 23;
+                    float combinedScale;
+                    memcpy(&combinedScale, &combinedBits,
+                           sizeof(combinedScale));
+                    scaleVec = _mm512_set1_ps(combinedScale);
+                } else {
+                    scaleVec = _mm512_set1_ps(
+                        NVFP4E8M0ScaleToFloatFast(scaleByte));
+                }
+                const int l = block * 32;
+                const int blockElems = std::min(32, m - l);
+                const __m512bh vw =
+                    NVFP4ToBFloat16Linear_AVX512BF16<useLookup>(
+                        blockStart, bf16Lookup);
+                for (int row = 0; row < ROWS; row++) {
+                    const uint16_t *input =
+                        (const uint16_t*)((const uint8_t*)A +
+                            (size_t)row * lda);
+                    const __m512bh vi = blockElems == 32 ?
+                        (__m512bh)_mm512_loadu_si512(
+                            (const __m512i*)(input + l)) :
+                        (__m512bh)_mm512_maskz_loadu_epi16(
+                            (__mmask32)((1u << blockElems) - 1u),
+                            input + l);
+                    const __m512 sum = _mm512_dpbf16_ps(
+                        _mm512_setzero_ps(), vi, vw);
+                    const __m512 adjustedSum = fuseMagicScale ?
+                        sum : _mm512_mul_ps(sum, magicVec);
+                    scaledSums[row] = _mm512_fmadd_ps(
+                        adjustedSum, scaleVec, scaledSums[row]);
+                }
+            }
+            for (int row = 0; row < ROWS; row++) {
+                float *output =
+                    (float*)((uint8_t*)C + (size_t)row * ldc);
+                output[j] = _mm512_reduce_add_ps(scaledSums[row]);
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+        const void *A, long lda,
+        const void *B, long ldb,
+        void *C, long ldc,
+        int n, int m, int k, int st, int end
+    ) {
+#define FASTLLM_RUN_NVFP4_BLOCK32(ROWS) \
+        return FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run<ROWS, true>( \
+                A, lda, B, ldb, C, ldc, m, st, end)
+        switch (n) {
+            case 1: FASTLLM_RUN_NVFP4_BLOCK32(1);
+            case 2: FASTLLM_RUN_NVFP4_BLOCK32(2);
+            case 3: FASTLLM_RUN_NVFP4_BLOCK32(3);
+            case 4: FASTLLM_RUN_NVFP4_BLOCK32(4);
+            case 5: FASTLLM_RUN_NVFP4_BLOCK32(5);
+            case 6: FASTLLM_RUN_NVFP4_BLOCK32(6);
+            case 7: FASTLLM_RUN_NVFP4_BLOCK32(7);
+            case 8: FASTLLM_RUN_NVFP4_BLOCK32(8);
+            default: break;
+        }
+#undef FASTLLM_RUN_NVFP4_BLOCK32
+        for (int row = 0; row < n; row++) {
+            bool ok =
+                FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run<1, true>(
+                    (const uint8_t*)A + (size_t)row * lda, lda,
+                    B, ldb, (uint8_t*)C + (size_t)row * ldc, ldc,
+                    m, st, end);
+            if (!ok) {
+                return false;
+            }
+        }
+        (void)k;
+        return true;
     }
 
     template <bool useLookup>

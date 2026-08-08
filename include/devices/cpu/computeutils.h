@@ -48,6 +48,7 @@ namespace fastllm {
         int n, m, k;              // k = interDim * 2
         int st, end;              // GEMM 列范围 [st, end), 在当前 NUMA 分片内的局部偏移
         int globalColOffset;      // 当前 NUMA 分片在全局 k 维度的起始列
+        bool skipCrossSwiglu;     // 只保留 GEMM 结果，由模型精确激活后处理
 
         MultiThreadGemmAndCrossSwigluOp(
             uint8_t *inputData, DataType inputDataType,
@@ -55,13 +56,15 @@ namespace fastllm {
             uint8_t *gateUpOutputData, DataType gateUpOutputDataType,
             float *swigluOutputData,
             int n, int m, int k, int st, int end, int globalColOffset,
-            uint8_t *dstOutputData = nullptr, DataType dstOutputDataType = DataType::FLOAT32) :
+            uint8_t *dstOutputData = nullptr, DataType dstOutputDataType = DataType::FLOAT32,
+            bool skipCrossSwiglu = false) :
             inputData(inputData), inputDataType(inputDataType),
             weightData(weightData), weightDataType(weightDataType),
             gateUpOutputData(gateUpOutputData), gateUpOutputDataType(gateUpOutputDataType),
             swigluOutputData(swigluOutputData),
             dstOutputData(dstOutputData), dstOutputDataType(dstOutputDataType),
-            n(n), m(m), k(k), st(st), end(end), globalColOffset(globalColOffset) {}
+            n(n), m(m), k(k), st(st), end(end), globalColOffset(globalColOffset),
+            skipCrossSwiglu(skipCrossSwiglu) {}
         void Run();
     };
 
@@ -135,6 +138,15 @@ namespace fastllm {
     void ConvertFromBFloat16(void *dstData, DataType dstDataType,
                              const uint16_t *bfloat16Data, size_t rows,
                              size_t columns);
+
+    // DeepSeek-V4 CPU preprocessing kernels.  Both routines preserve the
+    // scalar reference's operation order within a block/row while scheduling
+    // independent blocks/rows across the alive thread pool.
+    void RunCpuDeepSeekV4ActivationQuantization(
+        const uint16_t *input, uint16_t *output, uint64_t count);
+    void RunCpuDeepSeekV4RMSNormBFloat16(
+        const uint16_t *input, const float *weight, uint16_t *output,
+        int rows, int channels, float eps);
 
     struct MultiThreadConvertFromBFloat16Op : MultiThreadBaseOp {
         void *dstData;

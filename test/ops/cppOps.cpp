@@ -838,6 +838,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct RmsNormSpecializedBenchState {
         std::string kind;
         std::string path;
@@ -959,6 +960,7 @@ namespace {
             }
         }
     };
+#endif
 
     static BenchmarkResult BenchmarkRmsNormSpecializedCuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {
@@ -1024,6 +1026,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct RecurrentFromConvFp16BenchState {
         std::string path;
         int tileV = 8;
@@ -1118,6 +1121,7 @@ namespace {
             }
         }
     };
+#endif
 
     static BenchmarkResult BenchmarkRecurrentFromConvFp16Cuda(
             const OpTestParams &params, const std::string &device,
@@ -1429,6 +1433,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct LinearFp8Block128BenchState {
         int batch = 16;
         int in = 4096;
@@ -1492,6 +1497,32 @@ namespace {
             }
         }
 
+        static void InitPerChannelWeight(
+                fastllm::Data &weight, int out, int in, float seed) {
+            if ((in % 16) != 0 || (out % 4) != 0) {
+                throw std::runtime_error(
+                    "linear_fp8 per-channel layout requires in aligned to 16 and out aligned to 4");
+            }
+            weight.dataType = fastllm::DataType::FP8_E4M3;
+            weight.UpdateUnitSize();
+            weight.Resize({out, in});
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.blockK = 1;
+            weight.blockM = in;
+            weight.Allocate(false);
+
+            uint8_t *ptr = reinterpret_cast<uint8_t*>(weight.cpuData);
+            for (uint64_t i = 0; i < weight.GetBytes(); ++i) {
+                ptr[i] = static_cast<uint8_t>(
+                    0x20 + ((i * 17 + (uint64_t)(seed * 11.0f)) & 0x1f));
+            }
+            weight.scales.resize(out);
+            for (int row = 0; row < out; ++row) {
+                weight.scales[row] =
+                    0.006f + 0.00015f * (float)((row + (int)seed) % 17);
+            }
+        }
+
         static void MakeBlockyInput(fastllm::Data &input, int batch, int in, int block) {
             float *ptr = reinterpret_cast<float*>(input.cpuData);
             int groups = (in + block - 1) / block;
@@ -1534,8 +1565,11 @@ namespace {
                 InitPackedWeight(weight, out, in, block, 0.7f);
             } else if (weightLayout == "separate") {
                 InitSeparateScaleWeight(weight, out, in, block, 0.7f);
+            } else if (weightLayout == "perchannel") {
+                InitPerChannelWeight(weight, out, in, 0.7f);
             } else {
-                throw std::runtime_error("weight_layout must be packed or separate");
+                throw std::runtime_error(
+                    "weight_layout must be packed, separate or perchannel");
             }
             weight.ToDevice(fastllm::DataDevice::CUDA);
 
@@ -1597,6 +1631,10 @@ namespace {
     static void PrintLinearFp8Block128CheckStats(const std::vector<float> &expected,
                                                  const std::vector<float> &actual,
                                                  int batch, int out) {
+        if (expected.empty() || expected.size() != actual.size()) {
+            throw std::runtime_error(
+                "linear FP8 check received empty or mismatched output vectors");
+        }
         float maxAbsDiff = 0.0f;
         float maxRelDiff = 0.0f;
         size_t maxIndex = 0;
@@ -1635,6 +1673,39 @@ namespace {
         std::cout << "  abs_diff>1e-2: " << over1e2
                   << ", >1e-1: " << over1e1
                   << ", >1: " << over1e0 << "\n";
+    }
+
+    static void CheckLinearFp8Near(const std::vector<float> &expected,
+                                   const std::vector<float> &actual,
+                                   float atol, float rtol,
+                                   const std::string &label) {
+        if (expected.size() != actual.size()) {
+            throw std::runtime_error(
+                label + " output size mismatch: " +
+                std::to_string(expected.size()) + " vs " +
+                std::to_string(actual.size()));
+        }
+        size_t mismatches = 0;
+        float maxExcess = 0.0f;
+        size_t maxIndex = 0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            float tolerance = atol + rtol * std::fabs(expected[i]);
+            float diff = std::fabs(expected[i] - actual[i]);
+            if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) ||
+                diff > tolerance) {
+                mismatches++;
+                float excess = std::isfinite(diff) ? diff - tolerance : INFINITY;
+                if (excess > maxExcess) {
+                    maxExcess = excess;
+                    maxIndex = i;
+                }
+            }
+        }
+        if (mismatches != 0) {
+            throw std::runtime_error(
+                label + " mismatch count: " + std::to_string(mismatches) +
+                ", worst index: " + std::to_string(maxIndex));
+        }
     }
 
     static void CheckLinearFp8Block128Cuda(const OpTestParams &params) {
@@ -1685,6 +1756,47 @@ namespace {
             ref32.Print("linear_fp8_check.ref.float32");
             cutlass32.Print("linear_fp8_check.cutlass.float32");
         }
+    }
+
+    static void CheckLinearFp8PerChannelCuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "perchannel") {
+            throw std::runtime_error(
+                "per-channel CUTLASS check requires weight_layout=perchannel");
+        }
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+        fastllm::Data reference = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+        fastllm::Data cutlass = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+
+        bool ok = state->input.dataType == fastllm::DataType::FLOAT16
+            ? FastllmCudaHalfMatMulFloatFP8E4M3(
+                  state->input, state->weight, state->bias, reference,
+                  state->batch, state->in, state->out)
+            : FastllmCudaBFloat16MatMulFP8E4M3(
+                  state->input, state->weight, state->bias, reference,
+                  state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("native per-channel FP8 linear failed");
+        }
+        ForceDeviceSync();
+        ok = FastllmCudaCutlassLinearFP8E4M3PerChannel(
+            state->input, state->weight, state->bias, cutlass,
+            state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("CUTLASS per-channel FP8 linear failed");
+        }
+        ForceDeviceSync();
+
+        std::vector<float> refVec = ToFloatVector(ConvertToFloat32Data(reference));
+        std::vector<float> cutlassVec = ToFloatVector(ConvertToFloat32Data(cutlass));
+        PrintLinearFp8Block128CheckStats(
+            refVec, cutlassVec, state->batch, state->out);
+        const float atol = state->input.dataType == fastllm::DataType::FLOAT16
+            ? 2.0e-3f : 8.0e-3f;
+        CheckLinearFp8Near(refVec, cutlassVec, atol, 2.0e-3f,
+                           "CUTLASS per-channel FP8 linear");
     }
 
     static void CheckLinearFp8RawBatchOneCuda(const OpTestParams &params) {
@@ -1997,6 +2109,7 @@ namespace {
             fused32.Print("linear_fp8_swiglu_check.fused.float32");
         }
     }
+#endif
 
     static BenchmarkResult BenchmarkLinearFp8Block128Cuda(const OpTestParams &params,
                                                           const std::string &device,
@@ -2017,6 +2130,9 @@ namespace {
             return BenchmarkResult();
         } else if (params.GetInt("check") == 5) {
             CheckLinearFp8LayoutSafetyCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 6) {
+            CheckLinearFp8PerChannelCuda(params);
             return BenchmarkResult();
         }
 
@@ -2088,12 +2204,13 @@ namespace {
                 params.Add("block", "128", "FP8 scale block size");
                 params.Add("input_type", "bf16", "fp16 or bf16");
                 params.Add("input_pattern", "blocky", "smooth or blocky");
-                params.Add("weight_layout", "packed", "packed or separate");
+                params.Add("weight_layout", "packed", "packed, separate or perchannel");
                 params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
                 params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
                 params.Add("check", "0",
                            "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail, "
-                           "4 raw batch-one, 5 Marlin/CUTLASS layout safety");
+                           "4 raw batch-one, 5 Marlin/CUTLASS layout safety, "
+                           "6 per-channel CUTLASS scaled-mm");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },
@@ -2372,6 +2489,7 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct FusedMoeFp8BenchState {
         int batch = 1;
         int topk = 8;
@@ -2525,6 +2643,7 @@ namespace {
             }
         }
     };
+#endif
 
     static BenchmarkResult BenchmarkFusedMoeFp8Cuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {
@@ -2595,43 +2714,163 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
     struct RouterLinearFp16BenchState {
+        int batch = 8;
+        int inputDim = 5120;
+        int outputDim = 48;
+        bool withBias = false;
         std::string path;
+        FastllmCudaLinearFp16Path selectedPath =
+            FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO;
+        FastllmCudaLinearFp16Path resolvedAutoPath =
+            FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS;
         fastllm::Data input, weight, bias;
-        fastllm::Data legacyOutput, fastOutput;
+        fastllm::Data autoOutput, nativeOutput, cublasOutput;
 
-        static void PrepareOutput(fastllm::Data &data) {
+        void PrepareOutput(fastllm::Data &data) const {
             data.dataType = fastllm::DataType::FLOAT16;
             data.UpdateUnitSize();
-            data.Resize({1, 256});
+            data.Resize({batch, outputDim});
             data.Allocate(false);
             data.ToDevice(fastllm::DataDevice::CUDA);
         }
 
-        void RunOne(fastllm::Data &output, bool allowSpecialization) {
-            bool ok = FastllmCudaHalfMatMulFloat16WithRouterSpecialization(
-                input, weight, bias, output, 1, 2048, 256, false,
-                allowSpecialization);
+        static FastllmCudaLinearFp16Path ParsePath(
+                const std::string &value) {
+            if (value == "auto" || value == "fast") {
+                return FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO;
+            }
+            if (value == "native") {
+                return FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE;
+            }
+            if (value == "cublas" || value == "legacy") {
+                return FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS;
+            }
+            throw std::runtime_error(
+                "path must be auto, native, or cublas");
+        }
+
+        static void CheckAutoPath(
+                int n, int m, int k, bool addTo, bool hasBias,
+                FastllmCudaLinearFp16Path expected) {
+            if (FastllmCudaResolveLinearFp16AutoPath(
+                    n, m, k, addTo, hasBias) != expected) {
+                throw std::runtime_error(
+                    "FP16 AUTO dispatch policy regression");
+            }
+        }
+
+        static void CheckAutoDispatchPolicy() {
+            CheckAutoPath(7, 2048, 256, false, false,
+                          FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE);
+            CheckAutoPath(8, 5120, 48, false, false,
+                          FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE);
+            CheckAutoPath(8, 5120, 48, true, false,
+                          FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS);
+            CheckAutoPath(8, 5120, 48, false, true,
+                          FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS);
+            CheckAutoPath(8, 2048, 256, false, false,
+                          FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS);
+            CheckAutoPath(9, 5120, 48, false, false,
+                          FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS);
+        }
+
+        void RunOne(fastllm::Data &output,
+                    FastllmCudaLinearFp16Path selected) {
+            bool ok = FastllmCudaHalfMatMulFloat16WithPath(
+                input, weight, bias, output,
+                batch, inputDim, outputDim, false,
+                true, selected);
             if (!ok) {
-                throw std::runtime_error("FP16 router GEMV launch failed");
+                throw std::runtime_error(
+                    "FP16 small-batch linear path rejected the test shape");
             }
         }
 
         void Check() {
-            RunOne(legacyOutput, false);
-            RunOne(fastOutput, true);
+            RunOne(cublasOutput, FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS);
+            RunOne(autoOutput, FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO);
+            if (batch <= 8) {
+                RunOne(nativeOutput, FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE);
+            }
             ForceDeviceSync();
-            std::vector<float> expected = ToFloatVector(ConvertToFloat32Data(legacyOutput));
-            std::vector<float> actual = ToFloatVector(ConvertToFloat32Data(fastOutput));
-            if (expected != actual) {
-                for (size_t i = 0; i < expected.size(); i++) {
-                    if (expected[i] != actual[i]) {
-                        std::ostringstream os;
-                        os << "FP16 router GEMV mismatch at " << i
-                           << ": expected=" << expected[i]
-                           << " actual=" << actual[i];
-                        throw std::runtime_error(os.str());
+
+            const fastllm::Data &expectedAutoOutput =
+                resolvedAutoPath == FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE
+                    ? nativeOutput
+                    : cublasOutput;
+            std::vector<float> autoValues =
+                ToFloatVector(ConvertToFloat32Data(autoOutput));
+            std::vector<float> expectedAutoValues =
+                ToFloatVector(ConvertToFloat32Data(expectedAutoOutput));
+            if (autoValues != expectedAutoValues) {
+                throw std::runtime_error(
+                    "FP16 AUTO output does not match its resolved path");
+            }
+
+            // Native and cuBLAS do not use the same accumulation order. Check
+            // every selectable path independently against an FP64 host
+            // reference instead of comparing two aliases of AUTO.
+            int64_t referenceOps =
+                (int64_t)batch * inputDim * outputDim;
+            if (referenceOps <= 100LL * 1024 * 1024) {
+                std::vector<float> inputValues =
+                    ToFloatVector(ConvertToFloat32Data(input));
+                std::vector<float> weightValues =
+                    ToFloatVector(ConvertToFloat32Data(weight));
+                std::vector<float> biasValues;
+                if (withBias) {
+                    biasValues = ToFloatVector(ConvertToFloat32Data(bias));
+                }
+                std::vector<double> reference(
+                    (size_t)batch * outputDim, 0.0);
+                for (int row = 0; row < batch; ++row) {
+                    for (int column = 0; column < outputDim; ++column) {
+                        double value =
+                            withBias ? (double)biasValues[column] : 0.0;
+                        for (int inner = 0; inner < inputDim; ++inner) {
+                            value +=
+                                (double)inputValues[(size_t)row * inputDim + inner] *
+                                (double)weightValues[(size_t)column * inputDim + inner];
+                        }
+                        reference[(size_t)row * outputDim + column] = value;
                     }
+                }
+
+                auto validate = [&](const fastllm::Data &output,
+                                    const char *label) {
+                    std::vector<float> actual =
+                        ToFloatVector(ConvertToFloat32Data(output));
+                    for (size_t index = 0; index < actual.size(); ++index) {
+                        // Both paths accumulate in FP16 but use different
+                        // reduction trees. Scale the bound with the reduction
+                        // length rather than the number of output columns.
+                        float relativeTolerance =
+                            inputDim >= 4096 ? 5.0e-3f : 2.0e-3f;
+                        float absoluteTolerance =
+                            inputDim >= 4096 ? 0.25f : 0.125f;
+                        float tolerance =
+                            absoluteTolerance + relativeTolerance *
+                                                    std::fabs(
+                                                        (float)reference[index]);
+                        if (!std::isfinite(actual[index]) ||
+                            std::fabs(actual[index] -
+                                      (float)reference[index]) >
+                                tolerance) {
+                            std::ostringstream os;
+                            os << "FP16 " << label << " path mismatch at "
+                               << index << ": reference=" << reference[index]
+                               << " actual=" << actual[index]
+                               << " tolerance=" << tolerance;
+                            throw std::runtime_error(os.str());
+                        }
+                    }
+                };
+                validate(cublasOutput, "cublas");
+                validate(autoOutput, "auto");
+                if (batch <= 8) {
+                    validate(nativeOutput, "native");
                 }
             }
         }
@@ -2639,15 +2878,49 @@ namespace {
         void Init(const OpTestParams &params) {
 #ifdef USE_CUDA
             FastllmCudaSetDevice(0);
+            CheckAutoDispatchPolicy();
+            batch = params.GetInt("batch");
+            inputDim = params.GetInt("in");
+            outputDim = params.GetInt("out");
+            withBias = params.GetInt("bias") != 0;
+            if (batch <= 0 || inputDim <= 0 || outputDim <= 0) {
+                throw std::runtime_error(
+                    "batch, in and out must all be positive");
+            }
             path = params.GetString("path");
-            input.CopyFrom(MakeTensor({1, 2048}, 0.271f, 0.25f));
+            selectedPath = ParsePath(path);
+            resolvedAutoPath = FastllmCudaResolveLinearFp16AutoPath(
+                batch, inputDim, outputDim, false, withBias);
+            const bool qwen36GdnB8 =
+                batch == 8 && inputDim == 5120 && outputDim == 48 &&
+                !withBias;
+            FastllmCudaLinearFp16Path expectedAutoPath =
+                (batch >= 1 && batch < 8) || qwen36GdnB8
+                    ? FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE
+                    : FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS;
+            if (resolvedAutoPath != expectedAutoPath) {
+                throw std::runtime_error(
+                    "FP16 AUTO resolved an unexpected production path");
+            }
+            if (selectedPath == FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE &&
+                batch > 8) {
+                throw std::runtime_error(
+                    "native FP16 path supports batch 1 through 8");
+            }
+            input.CopyFrom(MakeTensor({batch, inputDim}, 0.271f, 0.25f));
             fastllm::ToDataType(input, fastllm::DataType::FLOAT16);
             input.ToDevice(fastllm::DataDevice::CUDA);
-            weight.CopyFrom(MakeTensor({256, 2048}, 0.619f, 0.125f));
+            weight.CopyFrom(
+                MakeTensor({outputDim, inputDim}, 0.619f, 0.125f));
             fastllm::ToDataType(weight, fastllm::DataType::FLOAT16);
             weight.ToDevice(fastllm::DataDevice::CUDA);
-            PrepareOutput(legacyOutput);
-            PrepareOutput(fastOutput);
+            if (withBias) {
+                bias.CopyFrom(MakeTensor({outputDim}, 0.887f, 0.03125f));
+                bias.ToDevice(fastllm::DataDevice::CUDA);
+            }
+            PrepareOutput(autoOutput);
+            PrepareOutput(nativeOutput);
+            PrepareOutput(cublasOutput);
             Check();
 #else
             (void)params;
@@ -2656,31 +2929,68 @@ namespace {
         }
 
         void Run() {
-            if (path == "fast") {
-                RunOne(fastOutput, true);
-            } else if (path == "legacy") {
-                RunOne(legacyOutput, false);
+            if (selectedPath == FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO) {
+                RunOne(autoOutput, selectedPath);
+            } else if (selectedPath ==
+                       FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE) {
+                RunOne(nativeOutput, selectedPath);
             } else {
-                throw std::runtime_error("path must be legacy or fast");
+                RunOne(cublasOutput, selectedPath);
             }
         }
     };
+#endif
     static BenchmarkResult BenchmarkRouterLinearFp16Cuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {
 #ifdef USE_CUDA
         ScopedFirstDevice guard(device);
         auto state = std::make_shared<RouterLinearFp16BenchState>();
         state->Init(params);
-        for (int i = 0; i < warmup; i++) {
+        bool graphMode = params.GetInt("graph") != 0;
+        void *graph = nullptr;
+        void *graphExec = nullptr;
+        if (graphMode) {
+            if (!FastllmCudaGraphBeginCapture()) {
+                throw std::runtime_error(
+                    "FP16 small-batch linear graph capture did not start");
+            }
             state->Run();
+            if (!FastllmCudaGraphEndCapture(&graph) || graph == nullptr ||
+                !FastllmCudaGraphInstantiate(graph, &graphExec) ||
+                graphExec == nullptr) {
+                if (graph != nullptr) {
+                    FastllmCudaGraphDestroy(graph);
+                }
+                throw std::runtime_error(
+                    "FP16 small-batch linear graph creation failed");
+            }
+        }
+        auto run = [&]() {
+            if (graphMode) {
+                if (!FastllmCudaGraphLaunch(graphExec)) {
+                    throw std::runtime_error(
+                        "FP16 small-batch linear graph replay failed");
+                }
+            } else {
+                state->Run();
+            }
+        };
+        for (int i = 0; i < warmup; i++) {
+            run();
         }
         ForceDeviceSync();
         auto begin = Clock::now();
         for (int i = 0; i < iters; i++) {
-            state->Run();
+            run();
         }
         ForceDeviceSync();
         auto end = Clock::now();
+        if (graphExec != nullptr) {
+            FastllmCudaGraphExecDestroy(graphExec);
+        }
+        if (graph != nullptr) {
+            FastllmCudaGraphDestroy(graph);
+        }
         BenchmarkResult result;
         result.avgMs = std::chrono::duration<double, std::milli>(end - begin).count() /
                        std::max(iters, 1);
@@ -2697,10 +3007,15 @@ namespace {
     static OpCase MakeRouterLinearFp16Case() {
         return {
             "router_linear_fp16",
-            "benchmark and validate Qwen3.5 batch-1 FP16 router GEMV",
+            "benchmark and validate Qwen3.6 B8 GDN FP16 linear",
             []() {
                 OpTestParams params;
-                params.Add("path", "fast", "legacy or fast");
+                params.Add("path", "auto", "auto, native, or cublas");
+                params.Add("batch", "8", "token batch size");
+                params.Add("in", "5120", "input features");
+                params.Add("out", "48", "output features");
+                params.Add("bias", "0", "use an FP32 bias (0 or 1)");
+                params.Add("graph", "0", "benchmark CUDA Graph replay (0 or 1)");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {
@@ -2712,16 +3027,22 @@ namespace {
                 return marker;
             },
             BenchmarkRouterLinearFp16Cuda,
-            [](const OpTestParams&) {
-                return (double)(2048 + 256 * 2048 + 256) * 2.0;
+            [](const OpTestParams &params) {
+                int batch = params.GetInt("batch");
+                int in = params.GetInt("in");
+                int out = params.GetInt("out");
+                return ((double)batch * in + (double)out * in +
+                        (double)batch * out) * 2.0;
             },
-            [](const OpTestParams&) {
-                return 2.0 * 2048.0 * 256.0;
+            [](const OpTestParams &params) {
+                return 2.0 * params.GetInt("batch") * params.GetInt("in") *
+                       params.GetInt("out");
             },
             true
         };
     }
 
+#ifdef USE_CUDA
     struct FusedRouterTopKBenchState {
         int batch = 1;
         int topk = 8;
@@ -2909,6 +3230,7 @@ namespace {
             }
         }
     };
+#endif
 
     static BenchmarkResult BenchmarkFusedRouterTopKCuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {

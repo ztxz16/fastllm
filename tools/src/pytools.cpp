@@ -7,9 +7,15 @@
 #include <cstring>
 #include <csignal>
 #include <cstdint>
+#include <exception>
+#include <string>
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#endif
+
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
 #endif
 
 #ifdef WIN32
@@ -32,6 +38,8 @@ struct FASTLLM_PYTOOLS_INIT {
         std::signal(SIGINT, signal_handler);
     }
 } fastllm_pytools_init;
+
+static thread_local std::string fastllmPytoolsWarmupError;
 
 extern "C" {
     typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
@@ -181,6 +189,15 @@ extern "C" {
             auto ret = models[handle].get();
             locker.unlock();
             return ret;
+        }
+
+        std::unique_ptr<fastllm::basellm> TakeModel(int handle) {
+            std::lock_guard<std::mutex> guard(locker);
+            auto it = models.find(handle);
+            if (it == models.end()) {
+                return nullptr;
+            }
+            return std::move(it->second);
         }
     };
 
@@ -488,8 +505,14 @@ extern "C" {
     }
 
     DLL_EXPORT void release_memory(int modelId) {
-        auto model = models.GetModel(modelId);
-        model->weight.ReleaseWeight();
+        // release_memory is terminal.  Destroy the model while the CUDA runtime
+        // and process-wide caches are still alive instead of deferring it to
+        // ModelManager's static destruction during interpreter shutdown.
+        auto model = models.TakeModel(modelId);
+        model.reset();
+#ifdef USE_NUMAS
+        fastllm::ClearNumasMoeRuntimeCache();
+#endif
         return;
     }
 
@@ -598,10 +621,24 @@ extern "C" {
         return;
     }
 
-    DLL_EXPORT void warmup_llm_model(int modelId) {
-        auto model = models.GetModel(modelId);
-        model->AutoWarmup();
-        return;
+    DLL_EXPORT const char *warmup_llm_model(int modelId) {
+        fastllmPytoolsWarmupError.clear();
+        try {
+            auto model = models.GetModel(modelId);
+            model->AutoWarmup();
+            return nullptr;
+        } catch (const std::exception &error) {
+            fastllmPytoolsWarmupError = error.what();
+        } catch (const char *error) {
+            fastllmPytoolsWarmupError = error == nullptr ?
+                "unknown FastLLM warmup error" : error;
+        } catch (...) {
+            fastllmPytoolsWarmupError = "unknown FastLLM warmup error";
+        }
+        fprintf(stderr, "[Fastllm] Model warmup failed: %s\n",
+                fastllmPytoolsWarmupError.c_str());
+        fflush(stderr);
+        return fastllmPytoolsWarmupError.c_str();
     }
 
     DLL_EXPORT void save_llm_model(int modelId, char *path) {
@@ -968,6 +1005,13 @@ extern "C" {
     DLL_EXPORT int fetch_response_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         return model->FetchResponseTokens(handleId);
+    }
+
+    DLL_EXPORT int fetch_response_tokens_batch_llm_model(
+            int modelId, int handleId, int *output, int maxTokens) {
+        auto model = models.GetModel(modelId);
+        return model->FetchResponseTokensBatch(
+            handleId, output, maxTokens);
     }
 
     DLL_EXPORT int fetch_response_logits_llm_model(int modelId, int handleId, float *logits) {

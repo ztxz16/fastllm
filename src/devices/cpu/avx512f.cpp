@@ -139,6 +139,99 @@ namespace fastllm {
         return true;
     }
 
+    template <int OutputRows>
+    void LinearBFloat16Float16Decode_AVX512F_Block(
+            const uint16_t *inputData, const uint16_t *weightData,
+            float *outputData, int m) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        constexpr int width = 16;
+        __m512 accumulators[OutputRows];
+        for (int row = 0; row < OutputRows; row++) {
+            accumulators[row] = _mm512_setzero_ps();
+        }
+
+        int offset = 0;
+        for (; offset + width <= m; offset += width) {
+            __m256i inputBFloat = _mm256_loadu_si256(
+                (const __m256i*)(inputData + offset));
+            __m512 input = _mm512_castsi512_ps(
+                _mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(inputBFloat), 16));
+            for (int row = 0; row < OutputRows; row++) {
+                __m256i weightFloat16 = _mm256_loadu_si256(
+                    (const __m256i*)(weightData + (size_t)row * m +
+                                     offset));
+                __m512 weight = _mm512_cvtph_ps(weightFloat16);
+                accumulators[row] = _mm512_fmadd_ps(
+                    weight, input, accumulators[row]);
+            }
+        }
+        if (offset < m) {
+            __mmask16 mask = (__mmask16)((1u << (m - offset)) - 1u);
+            __m256i inputBFloat = _mm256_maskz_loadu_epi16(
+                mask, inputData + offset);
+            __m512 input = _mm512_castsi512_ps(
+                _mm512_slli_epi32(
+                    _mm512_cvtepu16_epi32(inputBFloat), 16));
+            for (int row = 0; row < OutputRows; row++) {
+                __m256i weightFloat16 = _mm256_maskz_loadu_epi16(
+                    mask, weightData + (size_t)row * m + offset);
+                __m512 weight = _mm512_cvtph_ps(weightFloat16);
+                accumulators[row] = _mm512_fmadd_ps(
+                    weight, input, accumulators[row]);
+            }
+        }
+
+        for (int row = 0; row < OutputRows; row++) {
+            outputData[row] = _mm512_reduce_add_ps(accumulators[row]);
+        }
+#endif
+    }
+
+    bool LinearBFloat16Float16Decode_AVX512F_Kernel(
+            uint16_t *inputData, uint16_t *weightData,
+            float *biasData, float *outputData,
+            int n, int m, int k, int st, int end) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        if (n != 1) {
+            return false;
+        }
+        int column = st;
+        for (; column + 4 < end; column += 5) {
+            LinearBFloat16Float16Decode_AVX512F_Block<5>(
+                inputData, weightData + (size_t)column * m,
+                outputData + column, m);
+        }
+        switch (end - column) {
+            case 0: break;
+            case 1:
+                LinearBFloat16Float16Decode_AVX512F_Block<1>(
+                    inputData, weightData + (size_t)column * m,
+                    outputData + column, m);
+                break;
+            case 2:
+                LinearBFloat16Float16Decode_AVX512F_Block<2>(
+                    inputData, weightData + (size_t)column * m,
+                    outputData + column, m);
+                break;
+            case 3:
+                LinearBFloat16Float16Decode_AVX512F_Block<3>(
+                    inputData, weightData + (size_t)column * m,
+                    outputData + column, m);
+                break;
+            case 4:
+                LinearBFloat16Float16Decode_AVX512F_Block<4>(
+                    inputData, weightData + (size_t)column * m,
+                    outputData + column, m);
+                break;
+        }
+        AddBiasAVX512(outputData, biasData, 1, k, st, end);
+        return true;
+#else
+        return false;
+#endif
+    }
+
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
     static inline __m512 NVFP4ToFloat32_AVX512(const uint8_t *packed) {
         __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(packed));

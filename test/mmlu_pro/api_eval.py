@@ -256,9 +256,26 @@ def build_payload(args: argparse.Namespace, prompt: str, extra_body: Dict[str, A
     return payload
 
 
-def extract_answer(text: str, labels: str) -> Optional[str]:
+def extract_answer(
+    text: str,
+    labels: str,
+    *,
+    thinking: bool = False,
+    finish_reason: Optional[str] = None,
+) -> Optional[str]:
     if not text:
         return None
+    if thinking and finish_reason == "length":
+        return None
+    lowered = text.lower()
+    last_think_open = lowered.rfind("<think>")
+    last_think_close = lowered.rfind("</think>")
+    if last_think_open > last_think_close:
+        return None
+    if last_think_close >= 0:
+        text = text[last_think_close + len("</think>") :]
+        if not text.strip():
+            return None
     escaped = re.escape(labels)
     patterns = [
         rf"\\boxed\s*{{\s*([{escaped}])\s*}}",
@@ -353,7 +370,17 @@ def evaluate_one(
 ) -> Dict[str, Any]:
     prompt = build_prompt(example, args.cot)
     api_result = post_chat_completion(args, example, prompt, extra_body)
-    prediction = extract_answer(api_result.get("raw_output", ""), example["labels"])
+    chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
+    thinking = (
+        isinstance(chat_template_kwargs, dict)
+        and chat_template_kwargs.get("enable_thinking") is True
+    )
+    prediction = extract_answer(
+        api_result.get("raw_output", ""),
+        example["labels"],
+        thinking=thinking,
+        finish_reason=api_result.get("finish_reason"),
+    )
     correct = prediction == example["answer"] if prediction else False
     usage = api_result.get("usage") or {}
     return {

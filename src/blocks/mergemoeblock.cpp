@@ -1,5 +1,6 @@
 #include "baseblock.h"
 #include "fastllm.h"
+#include "utils.h"
 
 namespace fastllm {
     static void ClearStaleReplicatedView(Data *output) {
@@ -37,21 +38,26 @@ namespace fastllm {
         Data *moeInputTemp, Data *moeOutputTemp,
         MoeGateType gateType, bool expertParallel,
         float swigluLimit, bool deepSeekV4Mode,
-        const Data *allowedExpertMask
+        const Data *allowedExpertMask,
+        Data *pairedReduceInput
     ) {
         if (dataType == moeAtype) {
             MergeMOE(*input, *expertIndex, *expertScore,
                      *weights, *biass,
                      *w1, *w2, *w3, *tempInput, *tempOutput,
                      sharedScale, *output, layer, gateType, expertParallel,
-                     swigluLimit, deepSeekV4Mode, allowedExpertMask);
+                     swigluLimit, deepSeekV4Mode, allowedExpertMask,
+                     pairedReduceInput);
         } else {
+            AssertInFastLLM(
+                pairedReduceInput == nullptr,
+                "Paired MoE reduction requires matching model/MoE activation types.\n");
             ToDataType(*input, *moeInputTemp, moeAtype);
             MergeMOE(*moeInputTemp, *expertIndex, *expertScore,
                      *weights, *biass,
                      *w1, *w2, *w3, *tempInput, *tempOutput,
                      sharedScale, *moeOutputTemp, layer, gateType, expertParallel,
-                     swigluLimit, deepSeekV4Mode, allowedExpertMask);
+                     swigluLimit, deepSeekV4Mode, allowedExpertMask, nullptr);
             ToDataType(*moeOutputTemp, *output, dataType);
         }
         ClearStaleReplicatedView(output);

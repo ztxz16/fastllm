@@ -30,6 +30,13 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class NumasDeepSeekV4WoAOp : public CpuDeepSeekV4WoAOp {
+    protected:
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams,
+                 const IntDict &intParams) override;
+    };
+
     class NumasFusedMOE : BaseOperator {
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
@@ -46,6 +53,10 @@ namespace fastllm {
     void RegisterNumasLinearWeightBatch(const std::vector<Data*> &weights);
     bool IsNumasLinearWeightSupported(const Data *weight);
     bool IsNumasLinearWeightRegistered(const Data *weight);
+
+    // NUMA MoE keeps reusable host/CUDA staging buffers outside the model.
+    // Release them explicitly while the CUDA allocator is still alive.
+    void ClearNumasMoeRuntimeCache();
 
     class NumasKimiK3RoutedExpertsOp : BaseOperator {
         bool CanRun(const std::string &opType, const DataDict &datas,

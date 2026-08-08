@@ -283,11 +283,12 @@ if (USE_CUDA)
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cuda/linear/marlin_dense_fp8)
     set(FASTLLM_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
     set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED OFF)
+    set(FASTLLM_CUTLASS_FP8_SM89_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM120_ENABLED OFF)
     set(FASTLLM_CUTLASS_FP8_SM121_ENABLED OFF)
     foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
-        if (FASTLLM_CUDA_ARCH STREQUAL "120f" OR FASTLLM_CUDA_ARCH STREQUAL "121f")
-            set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+        if (FASTLLM_CUDA_ARCH STREQUAL "89")
+            set(FASTLLM_CUTLASS_FP8_SM89_ENABLED ON)
         endif()
         if (FASTLLM_CUDA_ARCH STREQUAL "120f")
             set(FASTLLM_CUTLASS_FP8_SM120_ENABLED ON)
@@ -295,18 +296,32 @@ if (USE_CUDA)
             set(FASTLLM_CUTLASS_FP8_SM121_ENABLED ON)
         endif()
     endforeach()
+    if (FASTLLM_CUTLASS_FP8_SM89_ENABLED AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.4)
+        set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+    endif()
+    if ((FASTLLM_CUTLASS_FP8_SM120_ENABLED OR FASTLLM_CUTLASS_FP8_SM121_ENABLED) AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
+    endif()
     if (NOT FASTLLM_CUTLASS_DIR STREQUAL "" AND EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
-        FASTLLM_CUTLASS_FP8_ARCH_ENABLED AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        FASTLLM_CUTLASS_FP8_ARCH_ENABLED)
         message(STATUS "CUTLASS FP8 kernels: ON (${FASTLLM_CUTLASS_DIR})")
         include_directories("${FASTLLM_CUTLASS_DIR}/include")
         if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include")
             include_directories("${FASTLLM_CUTLASS_DIR}/tools/util/include")
         endif()
         add_compile_definitions(FASTLLM_ENABLE_CUTLASS_FP8)
-        if (FASTLLM_CUTLASS_FP8_SM120_ENABLED)
+        if (FASTLLM_CUTLASS_FP8_SM89_ENABLED AND
+            CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.4)
+            add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM89)
+        endif()
+        if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND
+            CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
             add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
         endif()
-        if (FASTLLM_CUTLASS_FP8_SM121_ENABLED)
+        if (FASTLLM_CUTLASS_FP8_SM121_ENABLED AND
+            CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
             add_compile_definitions(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
         endif()
     else()
@@ -327,8 +342,10 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-bf16.cu
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
+        src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
+        src/devices/cuda/linear/fastllm-linear-fp8-cutlass-sm89.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
@@ -337,6 +354,41 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/deepseekv4-kernels.cu)
+
+    # FlashInfer's DeepSeek-V4 sparse MLA decode kernel uses SM120-only
+    # block-scaled FP8 MMA instructions.  Compile it as a separate fatbin so a
+    # multi-architecture FastLLM build keeps the generic sparse-attention path
+    # for older GPUs instead of embedding unsupported PTX in their code.
+    if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        include_directories(
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm/include")
+        set(FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE
+            src/devices/cuda/models/fastllm-deepseekv4-sparse-mla-sm120.cu)
+        set(FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE
+            src/devices/cuda/moe/fastllm-moe-deepgemm-sm120.cu)
+        set(FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE
+            src/devices/cuda/models/fastllm-deepseekv4-woa-deepgemm-sm120.cu)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
+            ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE})
+        set_source_files_properties(
+            ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
+            ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
+            PROPERTIES CUDA_ARCHITECTURES "120f")
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_SPARSE_MLA_SM120)
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120)
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120)
+        message(STATUS "DeepSeek-V4 SM120 sparse MLA kernel: ON")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM MoE kernel: ON")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: ON")
+    else()
+        message(STATUS "DeepSeek-V4 SM120 sparse MLA kernel: OFF")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM MoE kernel: OFF")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF")
+    endif()
 
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
     # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
@@ -579,12 +631,54 @@ if (UNIT_TEST)
     target_compile_definitions(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
     target_link_libraries(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_LIBS})
 
+    add_executable(testDeepSeekV4GGUFAdapter
+        test/gguf/deepseek4AdapterTest.cpp)
+    target_link_libraries(testDeepSeekV4GGUFAdapter fastllm)
+
+    add_executable(testDeepSeekV4ExpertAllowList
+        test/models/deepseek4ExpertAllowListTest.cpp)
+    target_link_libraries(testDeepSeekV4ExpertAllowList fastllm)
+
+    add_executable(testDeepSeekV4QuantizedDiskMoe
+        test/gguf/deepseek4QuantizedDiskMoeTest.cpp)
+    target_link_libraries(testDeepSeekV4QuantizedDiskMoe fastllm)
+
+    add_executable(testDeepSeekV4DiskExpertCache
+        test/gguf/deepseek4DiskExpertCacheTest.cpp)
+    target_link_libraries(testDeepSeekV4DiskExpertCache fastllm)
+
+    add_executable(testDeepSeekV4RouteSeam
+        test/models/deepseek4RouteSeamTest.cpp)
+    target_link_libraries(testDeepSeekV4RouteSeam fastllm)
+
+    # These tests use assert(), so keep assertions enabled even when the
+    # surrounding build adds -DNDEBUG for optimized binaries.
+    if (MSVC)
+        target_compile_options(testApiServerSocket PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4ExpertAllowList PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4RouteSeam PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(testApiServerSocket PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4ExpertAllowList PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4RouteSeam PRIVATE -UNDEBUG)
+    endif()
+
     if (USE_CUDA AND NOT USE_ROCM)
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(cudaGraphPoolMissRegression PRIVATE fastllm)
+
+        add_executable(customAllReduceRegression test/ops/customAllReduceRegression.cpp)
+        target_link_libraries(customAllReduceRegression fastllm)
+        target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
-    endif()
+endif()
 
 add_executable(webui example/webui/webui.cpp)
 target_link_libraries(webui fastllm)

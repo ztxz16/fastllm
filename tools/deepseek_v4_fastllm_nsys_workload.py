@@ -129,7 +129,7 @@ def main() -> None:
                 "tp": args.tp,
                 "device": args.device,
                 "kv_cache_dtype": args.kv_cache_dtype,
-                "dspark": False,
+                "dspark": int(args.dspark or 0),
             },
         }
         Path(args.result).write_text(
