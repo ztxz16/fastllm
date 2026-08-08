@@ -7047,6 +7047,8 @@ namespace fastllm {
             "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
             "ffn_norm.weight",
             "ffn.gate.weight",
+            // 官方 0731 的 MoE router 带 bias（backbone MoE 层同样有）。
+            "ffn.gate.bias",
             "ffn.shared_experts.w1.weight",
             "ffn.shared_experts.w2.weight",
             "ffn.shared_experts.w3.weight",
