@@ -264,6 +264,10 @@ namespace fastllm {
         virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
                 GetTensorMap(const std::vector <std::string> &tensorNames);
 
+        // 外部权重（如 DSpark safetensors 叠加）导入前的严格命名校验。
+        // 默认宽松接受，避免回归既有整份 safetensors 加载路径。
+        virtual bool IsRecognizedWeightName(const std::string &weightName) const { return true; }
+
         // 所有权重占位创建完成、实际读入前，允许模型提前规划加载策略。
         virtual void OnWeightsCreated(const std::set<std::string> &allWeightNames) {}
 

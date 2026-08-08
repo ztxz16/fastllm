@@ -16,8 +16,11 @@
 //   4. MoE：前 num_hash_layers 个 MoE 层使用 hash 路由（gate.tid2eid 决定专家），
 //      其余使用打分函数 sqrtsoftplus + noaux_tc top-k；num_experts_per_tok 个路由专家
 //      + n_shared_experts 个共享专家，激活带 swiglu_limit。
-//   5. 多 Token 预测（MTP）：在主 N 层之外再额外维护 num_nextn_predict_layers 层，
-//      复用 embed / head，但有独立 e_proj / h_proj / enorm / hnorm / norm。
+//   5. 内置 DSpark（官方 0731 namespace）：3 个 stage（mtp.0/1/2，target layers
+//      {40,41,42}），每 stage 有独立 MLA attention + MoE；另有 stage-0 main_proj、
+//      各 stage HC/enorm/hnorm、final norm + HC head、Markov head 与 confidence
+//      head。GGUF 只含 backbone 时，mtp.* 权重由 FASTLLM_DSPARK_MODEL_PATH 指向的
+//      官方 safetensors 分片（46–48）混合加载（见 model.cpp 的 hybrid loader）。
 //   6. 量化：权重以 FP8_E4M3 + ue8m0 scale 存储，部分 expert 使用 FP4_E2M1FN_X2。
 //
 // 当前文件先给出类骨架与数据成员定义，便于后续逐步实现。
@@ -358,6 +361,10 @@ namespace fastllm {
                          std::vector<std::pair<std::string, DataType> > >
                 GetTensorMap(
                     const std::vector<std::string> &tensorNames) override;
+
+        // mtp.* 命名必须与官方 0731 namespace 精确匹配；backbone 名称一律放行。
+        virtual bool IsRecognizedWeightName(
+                const std::string &weightName) const override;
 
         virtual std::string SelectSpecialWeightDevice(
                 const std::string &weightName, int layerId) const override;

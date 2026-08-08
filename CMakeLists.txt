@@ -651,6 +651,10 @@ if (UNIT_TEST)
         test/models/deepseek4RouteSeamTest.cpp)
     target_link_libraries(testDeepSeekV4RouteSeam fastllm)
 
+    add_executable(testDeepSeekV4DsparkHybridLoader
+        test/gguf/deepseek4DsparkHybridLoaderTest.cpp)
+    target_link_libraries(testDeepSeekV4DsparkHybridLoader fastllm)
+
     # These tests use assert(), so keep assertions enabled even when the
     # surrounding build adds -DNDEBUG for optimized binaries.
     if (MSVC)
@@ -660,6 +664,7 @@ if (UNIT_TEST)
         target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE /UNDEBUG)
         target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE /UNDEBUG)
         target_compile_options(testDeepSeekV4RouteSeam PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4DsparkHybridLoader PRIVATE /UNDEBUG)
     else()
         target_compile_options(testApiServerSocket PRIVATE -UNDEBUG)
         target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE -UNDEBUG)
@@ -667,6 +672,7 @@ if (UNIT_TEST)
         target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE -UNDEBUG)
         target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE -UNDEBUG)
         target_compile_options(testDeepSeekV4RouteSeam PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4DsparkHybridLoader PRIVATE -UNDEBUG)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
