@@ -1884,6 +1884,14 @@ void FastllmCudaPagedCacheCopy(
     int inputOffset,
     int copyLen,
     int pageOffset) {
+    if (fastllm::IsPackedKVCacheDataType(dstType)) {
+        if (!FastllmCudaPackedKVCacheCopy(
+                pagedData, pageIdx, pageLen, numHeads, headDim, dstType,
+                inputData, srcType, seqLen, inputOffset, copyLen, pageOffset)) {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: packed KV cache copy failed.\n");
+        }
+        return;
+    }
     if (srcType == fastllm::DataType::FLOAT32) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyTyped<float, float>(pagedData, pageIdx, pageLen, numHeads, headDim,
@@ -2231,6 +2239,14 @@ void FastllmCudaPagedCacheCopyBatch(
     uint8_t *inputData,
     fastllm::DataType srcType,
     bool sync) {
+    if (fastllm::IsPackedKVCacheDataType(dstType)) {
+        if (!FastllmCudaPackedKVCacheCopyBatch(
+                pagedData, pageIdxArray, pageOffsetArray, pageLen, batch,
+                numHeads, headDim, dstType, inputData, srcType, sync)) {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: packed KV cache copy failed.\n");
+        }
+        return;
+    }
     if (srcType == fastllm::DataType::FLOAT32) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<float, float>(pagedData, pageIdxArray, pageOffsetArray,
@@ -2579,6 +2595,11 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         printf("DoCudaAttentionPaged: pagedKVCacheData is nullptr\n");
         exit(0);
     }
+    if (fastllm::IsPackedKVCacheDataType(pagedKVCacheK->dataType) ||
+        fastllm::IsPackedKVCacheDataType(pagedKVCacheV->dataType)) {
+        return FastllmCudaHalfPagedAttentionFastllmFallback(
+            q, k, v, output, group, scale);
+    }
     
     int pageLen = k.pageLen;
     int numHeads = pagedKVCacheK->dims[2];  // [maxPages, pageLen, numHeads, headDim]
@@ -2813,9 +2834,9 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
 namespace {
 
 // FlashInfer's host PrefillPlan builds these arrays from qo_indptr and
-// kv_indptr.  In CUDA graph decode both indptr buffers are stable, but their
+// kv_indptr. In CUDA graph decode both indptr buffers are stable, but their
 // contents (most importantly the per-request page counts) can change between
-// replays.  Keep the graph topology and workspace layout fixed and rebuild only
+// replays. Keep the graph topology and workspace layout fixed and rebuild only
 // the device-resident schedule before the attention nodes consume it.
 struct FastllmFlashInferDecodePlanParams {
     const uint32_t *qoIndptr;
@@ -2861,7 +2882,7 @@ __global__ void FastllmFlashInferUpdateDecodePlanKernel(
         return;
     }
 
-    // Start from a fail-closed schedule.  If metadata is malformed or the
+    // Start from a fail-closed schedule. If metadata is malformed or the
     // fixed graph capacity is exceeded, every attention CTA is masked before
     // any request/tile index can be consumed.
     *params.totalNumRows = 0;
@@ -2910,7 +2931,7 @@ __global__ void FastllmFlashInferUpdateDecodePlanKernel(
         maxEffectiveKvLen = max(maxEffectiveKvLen, effectiveKvLen);
     }
 
-    // Match PrefillBinarySearchKVChunkSize exactly.  The graph-mode planner
+    // Match PrefillBinarySearchKVChunkSize exactly. The graph-mode planner
     // always uses split-KV; paddedBatchSize is fixed by the captured shape.
     uint64_t low = max(uint64_t(128 / params.pageSize), uint64_t(1));
     uint64_t high = maxEffectiveKvLen;
@@ -2919,7 +2940,7 @@ __global__ void FastllmFlashInferUpdateDecodePlanKernel(
         uint64_t newBatchSize = 0;
         for (uint32_t request = 0; request < params.batchSize; ++request) {
             uint64_t qoLen = uint64_t(params.qoIndptr[request + 1] -
-                                       params.qoIndptr[request]);
+                                      params.qoIndptr[request]);
             uint64_t packedQoLen = qoLen * params.groupSize;
             uint64_t numTilesQ = FastllmFlashInferCeilDivU64(
                 packedQoLen, params.ctaTileQ);
@@ -2950,7 +2971,8 @@ __global__ void FastllmFlashInferUpdateDecodePlanKernel(
     params.mergeIndptr[0] = 0;
     params.oIndptr[0] = 0;
     for (uint32_t request = 0; request < params.batchSize; ++request) {
-        uint32_t qoLen = params.qoIndptr[request + 1] - params.qoIndptr[request];
+        uint32_t qoLen =
+            params.qoIndptr[request + 1] - params.qoIndptr[request];
         uint64_t packedQoLen = uint64_t(qoLen) * params.groupSize;
         uint64_t numTilesQ = FastllmFlashInferCeilDivU64(
             packedQoLen, params.ctaTileQ);
@@ -2961,7 +2983,8 @@ __global__ void FastllmFlashInferUpdateDecodePlanKernel(
         uint64_t numChunksKv = FastllmFlashInferCeilDivU64(
             max(effectiveKvLen, uint64_t(1)), low);
 
-        if (scheduleOffset + numTilesQ * numChunksKv > params.paddedBatchSize ||
+        if (scheduleOffset + numTilesQ * numChunksKv >
+                params.paddedBatchSize ||
             uint64_t(rowOffset) + qoLen > params.maxTotalNumRows ||
             outputOffset + uint64_t(qoLen) * numChunksKv > UINT32_MAX) {
             // The arrays were initialized to a fully masked schedule above.
@@ -3029,7 +3052,36 @@ void FastllmFlashInferAppendPointerKey(std::vector<uint32_t> &key,
 } // namespace
 #endif
 
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph, int windowLeft) {
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q,
+                                        fastllm::Data &kCaches,
+                                        fastllm::Data &vCaches,
+                                        fastllm::Data &qSizes,
+                                        fastllm::Data &pageSizes,
+                                        fastllm::Data &pageIndexs,
+                                        fastllm::Data &lastPageLens,
+                                        fastllm::Data &output,
+                                        int group, float scale,
+                                        int attentionType, bool inited,
+                                        bool sync, bool enableCudaGraph,
+                                        int flashInferCudaGraph,
+                                        int windowLeft) {
+    if (FastllmCudaTrySm70PagedAttentionDecode(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType)) {
+        if (sync) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        return true;
+    }
+    if (FastllmCudaTrySm70FlashAttentionPrefill(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType)) {
+        if (sync) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        return true;
+    }
+
 #ifndef FASTLLM_ENABLE_FLASHINFER
     fastllm::AssertInFastLLM(windowLeft < 0,
                              "Sliding-window paged attention requires FlashInfer.\n");

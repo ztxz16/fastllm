@@ -31,7 +31,7 @@ def _normalize_mtp_arg(value) -> int:
         value = int(value)
     except Exception:
         value = 0
-    return max(0, value)
+    return min(9, max(0, value))
 
 def _total_memory_gib() -> float:
     try:
@@ -485,7 +485,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或turbo3（Qwen3.5/3.6需FASTLLM_QWEN35_TURBO3_KV=1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
@@ -515,9 +515,13 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
-    parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大9")
     parser.add_argument("--dspark", type = int, default = 0,
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
+    parser.add_argument("--dspark_checkpoint_path", "--dspark-checkpoint-path",
+                        dest = "dspark_checkpoint_path", type = str, default = "",
+                        help = "GGUF backbone 叠加官方 DeepSeek-V4 safetensors DSpark（mtp.*）"
+                             "时使用的官方 checkpoint 目录；必须与 --dspark N 同时启用，默认关闭")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
                         help = "投机解码算法；当前支持 dspark")
@@ -551,6 +555,10 @@ def add_server_args(parser):
     parser.add_argument("--max_context_length", "--max-context-length", dest = "max_context_length",
                         type = _positive_int, default = -1,
                         help = "限制单会话输入和输出合计的最大token数；默认取模型上限和KV Cache总容量的较小值")
+    parser.add_argument("--default_max_tokens", "--default-max-tokens",
+                        dest = "default_max_tokens", type = _positive_int,
+                        default = 16384,
+                        help = "请求省略max_tokens时的默认输出token上限（默认16384）")
     parser.add_argument("--temperature", type = float, default = None, help = "覆盖服务端默认 temperature，未指定则使用模型默认值")
     parser.add_argument("--top_p", type = float, default = None, help = "覆盖服务端默认 top_p，未指定则使用模型默认值")
     parser.add_argument("--top_k", type = int, default = None, help = "覆盖服务端默认 top_k，未指定则使用模型默认值")
@@ -603,9 +611,19 @@ def make_normal_llm_model(args, startup_progress = None):
         getattr(args, "speculative_algorithm", "") or "").strip().lower()
     speculative_draft_path = str(
         getattr(args, "speculative_draft_model_path", "") or "").strip()
+    dspark_checkpoint_path = str(
+        getattr(args, "dspark_checkpoint_path", "") or "").strip()
     dspark_tokens = int(getattr(args, "dspark", 0) or 0)
     if dspark_tokens < 0:
         raise ValueError("--dspark must be >= 0")
+    if speculative_draft_path and dspark_checkpoint_path:
+        raise ValueError(
+            "--speculative_draft_model_path and --dspark_checkpoint_path "
+            "are mutually exclusive")
+    if dspark_checkpoint_path and dspark_tokens <= 0:
+        raise ValueError(
+            "--dspark_checkpoint_path requires --dspark N to enable the "
+            "embedded DSpark runtime")
     if dspark_tokens > 0 and not speculative_algorithm:
         speculative_algorithm = "dspark"
     if speculative_draft_path and not speculative_algorithm:
@@ -655,6 +673,23 @@ def make_normal_llm_model(args, startup_progress = None):
         args.speculative_algorithm = "dspark"
     else:
         os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
+        if dspark_checkpoint_path:
+            dspark_checkpoint_path = os.path.abspath(
+                os.path.expanduser(dspark_checkpoint_path))
+            if not os.path.isdir(dspark_checkpoint_path):
+                raise ValueError(
+                    "DSpark checkpoint directory does not exist: %s" %
+                    dspark_checkpoint_path)
+            has_index = os.path.isfile(os.path.join(
+                dspark_checkpoint_path, "model.safetensors.index.json"))
+            has_single = os.path.isfile(os.path.join(
+                dspark_checkpoint_path, "model.safetensors"))
+            if not has_index and not has_single:
+                raise ValueError(
+                    "DSpark checkpoint has no model.safetensors(.index.json): %s" %
+                    dspark_checkpoint_path)
+            os.environ["FASTLLM_DSPARK_MODEL_PATH"] = dspark_checkpoint_path
+            args.dspark_checkpoint_path = dspark_checkpoint_path
         if dspark_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(dspark_tokens)
             confidence_threshold = float(getattr(

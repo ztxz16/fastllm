@@ -1489,6 +1489,13 @@ typedef struct {
 } block_q8_K;
 static_assert(sizeof(block_q8_K) == 2*sizeof(float) + QK_K + QK_K/16*sizeof(int16_t), "wrong q8_K block size/padding");
 
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e; // E8M0 scale
+    uint8_t qs[QK_MXFP4/2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
 // (Almost) "true" 2-bit quantization.
 // Due to the need to use blocks as per ggml design, it ends up using
 // 2.0625 bpw because of the 16-bit scale for each block of 256.
@@ -1787,6 +1794,10 @@ enum ggml_type {
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
+        GGML_TYPE_MXFP4   = 39,
+        // GGML_TYPE_NVFP4 = 40,
+        // GGML_TYPE_Q1_0  = 41,
+        // GGML_TYPE_Q2_0  = 42,
         //
         // So we are able to consume MS BitNet I2_S quants
         //
@@ -1962,6 +1973,7 @@ GGML_API void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GG
 GGML_API void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 //GGML_API void dequantize_row_q8_1(const block_q8_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 GGML_API void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
@@ -2125,6 +2137,8 @@ namespace fastllm {
 
         void ReadBytes(uint8_t *buffer, uint64_t bytes);
 
+        void SkipBytes(uint64_t bytes);
+
         ~GGUFBuffer();
     };
 
@@ -2133,18 +2147,32 @@ namespace fastllm {
             GGUFWeightReplaceDirect = 0, // 直接替换
             GGUFWeightReplacePacked = 1, // 拆包替换，例如[128, 2048, 2048]的矩阵替换为128个 2048 * 2048，常见于moe
             GGUFWeightReplaceForceFP32 = 2, // 强行转为FP32, 主要是Embedding
-            GGUFWeightReplaceForceFP16 = 3 // 强行转为FP16
+            GGUFWeightReplaceForceFP16 = 3, // 强行转为FP16
+            GGUFWeightReplaceNegLogFP32 = 4, // 转为FP32并取log(-x)，用于Qwen3.5 ssm_a → A_log
+            // Qwen3.5/3.6 GGUF V-head tiled→grouped inverse permutation.
+            // Copies whole raw quant rows byte-exact; operates before merges.
+            // untileComposeNegLog additionally applies log(-x) after perm (for A_log).
+            GGUFWeightReplaceUntileVHeads = 5
         };
 
         GGUFWeightReplaceType type;
         std::regex pattern;
         std::vector <std::string> names;
 
+        // V-head untile params (used when type == GGUFWeightReplaceUntileVHeads).
+        // Filled from model config at load time; 0 means "not set / fall back to Direct".
+        int untileNumKHeads = 0;     // H = num_k_heads
+        int untileNumVHeads = 0;     // Hv = num_v_heads (R = Hv / H)
+        int untileVRowStart = 0;     // first V-indexed row in dim[0]
+        bool untileComposeNegLog = false; // apply log(-x) after perm (A_log)
+
         GGUFWeightReplaceRule (std::regex pattern, const std::string &name, 
-                                GGUFWeightReplaceType type = GGUFWeightReplaceDirect) {
+                                GGUFWeightReplaceType type = GGUFWeightReplaceDirect,
+                                bool untileComposeNegLog = false) {
             this->type = type;
             this->pattern = pattern;
             this->names = {name};
+            this->untileComposeNegLog = untileComposeNegLog;
         }
 
         GGUFWeightReplaceRule (std::regex pattern, const std::vector <std::string> &names, 
@@ -2166,6 +2194,13 @@ namespace fastllm {
 
         GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType;
 
+        // V-head untile params (forwarded from GGUFWeightReplaceRule; H/Hv/vRowStart
+        // are injected from model config after AppendGGUFTasks).
+        int untileNumKHeads = 0;
+        int untileNumVHeads = 0;
+        int untileVRowStart = 0;
+        bool untileComposeNegLog = false;
+
         ReadGGUFTask (std::string &name, Data *weight, ggml_tensor tensor, std::string fileName, uint64_t offset, 
                         GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType = GGUFWeightReplaceRule::GGUFWeightReplaceType::GGUFWeightReplaceDirect) {
             this->name = name;
@@ -2178,7 +2213,9 @@ namespace fastllm {
     };
 
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
-                                GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType = GGUFWeightReplaceRule::GGUFWeightReplaceType::GGUFWeightReplaceDirect);
+                                GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType = GGUFWeightReplaceRule::GGUFWeightReplaceType::GGUFWeightReplaceDirect,
+                                int untileNumKHeads = 0, int untileNumVHeads = 0,
+                                int untileVRowStart = 0, bool untileComposeNegLog = false);
 
     void ReadGGUFMetaData(const std::string &fileName, json11::Json &config);
 

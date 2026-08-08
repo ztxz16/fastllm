@@ -2,6 +2,7 @@ import argparse
 from .util import make_normal_parser
 import readline
 import os
+import sys
 
 def save_defaults_to_json(parser, filename):
     # 获取所有参数的默认值
@@ -87,6 +88,11 @@ def args_parser():
     export_parser_ = subparsers.add_parser('export', parents = [shared_parser], help = '创建配置文件')
     export_parser_.add_argument('-o', '--output', type = str, required = True, help = '导出路径')
 
+    from ftllm.profile import add_profile_subparsers
+    profile_parser = subparsers.add_parser(
+        'profile', help = '命名部署 profile 生命周期管理')
+    add_profile_subparsers(profile_parser)
+
     parser.add_argument('-v', '--version', action='store_true', help='输出版本号并退出')
 
     return parser
@@ -154,6 +160,13 @@ def main():
     elif args.command in ('server', 'serve'):
         from ftllm.server import fastllm_server
         fastllm_server(args)
+    elif args.command == 'profile':
+        from ftllm.profile import ProfileError, profile_main
+        try:
+            return profile_main(args)
+        except ProfileError as exc:
+            print(f"profile error: {exc}", file = sys.stderr)
+            return 1
     elif args.command == 'export':
         from ftllm import llm
         if (args.path == '' or args.path is None):

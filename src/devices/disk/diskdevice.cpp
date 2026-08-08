@@ -1,4 +1,5 @@
 #include "devices/disk/diskdevice.h"
+#include "devices/disk/disk_expert_cache.h"
 #include "blocks/baseblock.h"
 #include "gguf.h"
 #include "utils.h"
@@ -16,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -38,6 +40,7 @@ namespace fastllm {
                                       bool isCrossSwiglu, MoeGateType gateType,
                                       bool deepSeekV4Mode = false,
                                       float swigluLimit = 0.0f);
+    static void ReleaseDiskTempWeightCudaExtras(Data *weight);
 #endif
 
     DiskDevice::DiskDevice() {
@@ -426,6 +429,166 @@ namespace fastllm {
             }
         }
         ErrorInFastLLM("Disk MoE unsupported weight dtype conversion.\n");
+    }
+
+    // Temporary disk weights own a heap copy of the GGUF descriptor (LoadDiskWeight),
+    // but Data::~Data never frees ggmlTensor: model-weight descriptors are long-lived
+    // and RunDiskLinearChunk borrows a stack one behind isFake. Release the owned copy
+    // here so per-call temps do not leak one descriptor each.
+    static void ReleaseOwnedGGUFDescriptor(Data *weight) {
+        if (weight != nullptr && !weight->isFake && weight->ggmlTensor != nullptr) {
+            delete (ggml_tensor*)weight->ggmlTensor;
+            weight->ggmlTensor = nullptr;
+        }
+    }
+
+    void ReleaseDiskExpertWeight(Data *weight) {
+        if (weight == nullptr) {
+            return;
+        }
+#ifdef USE_CUDA
+        ReleaseDiskTempWeightCudaExtras(weight);
+#endif
+        ReleaseOwnedGGUFDescriptor(weight);
+        delete weight;
+    }
+
+    using DiskTempWeightPtr = std::unique_ptr<Data, DiskExpertWeightDeleter>;
+
+    // Stable identity for a disk expert weight: its logical name plus type,
+    // shape, and the first payload part's file/offset. Name alone identifies an
+    // expert projection; the trailing fields guard against same-name reuse
+    // across scopes (e.g. backbone vs MTP) or rematerialized splits.
+    std::string MakeDiskWeightCacheKey(const Data *weight) {
+        std::string key = weight->name;
+        key += "|dt=" + std::to_string((int)weight->dataType);
+        key += "|gt=" + std::to_string(weight->ggmlType);
+        for (int dim : weight->dims) {
+            key += "x" + std::to_string(dim);
+        }
+        for (const auto &part : weight->diskWeightParts) {
+            if (!part.isScalePart) {
+                key += "|" + part.fileName + "@" + std::to_string(part.fileOffset);
+                break;
+            }
+        }
+        return key;
+    }
+
+    DiskExpertWeightCache &DiskExpertWeightCache::Get() {
+        static DiskExpertWeightCache cache;
+        return cache;
+    }
+
+    bool DiskExpertWeightCache::Enabled() {
+        std::lock_guard<std::mutex> guard(locker);
+        return CapacityBytesLocked() > 0;
+    }
+
+    Data *DiskExpertWeightCache::Lookup(const std::string &key) {
+        std::lock_guard<std::mutex> guard(locker);
+        auto it = table.find(key);
+        if (it == table.end()) {
+            misses++;
+            return nullptr;
+        }
+        hits++;
+        order.splice(order.begin(), order, it->second.orderIt);
+        return it->second.weight;
+    }
+
+    Data *DiskExpertWeightCache::Insert(const std::string &key, Data *weight,
+                                        uint64_t bytes, bool &cachedOut) {
+        std::unique_ptr<Data, DiskExpertWeightDeleter> incoming(weight);
+        std::vector<std::unique_ptr<Data, DiskExpertWeightDeleter>> evicted;
+        Data *result = nullptr;
+        bool cached = false;
+        {
+            std::lock_guard<std::mutex> guard(locker);
+            auto it = table.find(key);
+            if (it != table.end()) {
+                order.splice(order.begin(), order, it->second.orderIt);
+                result = it->second.weight;
+                cached = true;
+            } else {
+                uint64_t cap = CapacityBytesLocked();
+                while (usedBytes + bytes > cap && !order.empty()) {
+                    evicted.push_back(EvictOneLocked());
+                }
+                if (bytes <= cap && usedBytes + bytes <= cap) {
+                    order.push_front(key);
+                    Entry entry;
+                    entry.weight = incoming.get();
+                    entry.bytes = bytes;
+                    entry.orderIt = order.begin();
+                    table[key] = entry;
+                    usedBytes += bytes;
+                    result = incoming.release();
+                    cached = true;
+                } else {
+                    result = incoming.release();
+                    cached = false;
+                }
+            }
+        }
+        cachedOut = cached;
+        return result;
+    }
+
+    void DiskExpertWeightCache::Clear() {
+        std::vector<std::unique_ptr<Data, DiskExpertWeightDeleter>> evicted;
+        {
+            std::lock_guard<std::mutex> guard(locker);
+            for (auto &kv : table) {
+                evicted.emplace_back(kv.second.weight);
+            }
+            table.clear();
+            order.clear();
+            usedBytes = 0;
+        }
+    }
+
+    DiskExpertCacheStats DiskExpertWeightCache::GetStats() {
+        std::lock_guard<std::mutex> guard(locker);
+        DiskExpertCacheStats stats;
+        stats.enabled = CapacityBytesLocked() > 0;
+        stats.hits = hits;
+        stats.misses = misses;
+        stats.evictions = evictions;
+        stats.entries = table.size();
+        stats.usedBytes = usedBytes;
+        stats.capacityBytes = CapacityBytesLocked();
+        return stats;
+    }
+
+    void DiskExpertWeightCache::ConfigureForTesting(uint64_t bytes) {
+        std::lock_guard<std::mutex> guard(locker);
+        capacityBytes = bytes;
+        capacityResolved = true;
+    }
+
+    uint64_t DiskExpertWeightCache::CapacityBytesLocked() {
+        if (!capacityResolved) {
+            const char *env = std::getenv("FASTLLM_DISK_EXPERT_CACHE_BYTES");
+            if (env != nullptr && env[0] != '\0') {
+                capacityBytes = std::strtoull(env, nullptr, 10);
+            } else {
+                capacityBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+            }
+            capacityResolved = true;
+        }
+        return capacityBytes;
+    }
+
+    std::unique_ptr<Data, DiskExpertWeightDeleter> DiskExpertWeightCache::EvictOneLocked() {
+        std::string victimKey = order.back();
+        order.pop_back();
+        auto it = table.find(victimKey);
+        std::unique_ptr<Data, DiskExpertWeightDeleter> victim(it->second.weight);
+        usedBytes -= it->second.bytes;
+        table.erase(it);
+        evictions++;
+        return victim;
     }
 
     static Data *LoadDiskWeight(const Data *weight) {
@@ -840,13 +1003,13 @@ namespace fastllm {
             // weight is materialized only for this call and released as soon
             // as the Linear finishes. Decode continues through the bounded
             // chunked path below.
-            std::unique_ptr<Data> loaded(LoadDiskWeight(&weight));
+            DiskTempWeightPtr loaded(LoadDiskWeight(&weight));
             DoCpuLinear(input, *loaded, bias, output);
             return;
         }
 
         if (!CanStreamDiskLinear(weight)) {
-            std::unique_ptr<Data> loaded(LoadDiskWeight(&weight));
+            DiskTempWeightPtr loaded(LoadDiskWeight(&weight));
             DoCpuLinear(input, *loaded, bias, output);
             return;
         }
@@ -1594,7 +1757,7 @@ namespace fastllm {
         LoadDiskWeightsInParallel(
             sourceWeights.data(), loadedWeights, loadIndices);
 
-        std::vector<std::unique_ptr<Data>> ownedWeights;
+        std::vector<DiskTempWeightPtr> ownedWeights;
         ownedWeights.reserve(loadedWeights.size());
         std::vector<Data*> tempW1s(w1s, w1s + expertCount);
         std::vector<Data*> tempW2s(w2s, w2s + expertCount);
@@ -1717,8 +1880,29 @@ namespace fastllm {
         std::set<int> selectedExperts;
         int32_t *indexData = (int32_t*)index.cpuData;
         int routedExpertCount = std::max(0, weightsBatch / 2 - 1);
+        const int32_t *allowedExpertMask = nullptr;
+        auto allowedMaskIt = datas.find("allowedExpertMask");
+        if (allowedMaskIt != datas.end() && allowedMaskIt->second != nullptr) {
+            const Data &mask = *allowedMaskIt->second;
+            if ((mask.dataType != DataType::INT32 &&
+                 mask.dataType != DataType::INT32PARAM) ||
+                mask.cpuData == nullptr || mask.dims.size() != 1 ||
+                mask.Count(0) != (uint64_t)routedExpertCount) {
+                throw std::runtime_error(
+                    "Disk MoE received an invalid expert allow-list mask.");
+            }
+            allowedExpertMask = (const int32_t*)mask.cpuData;
+        }
         for (int i = 0; i < index.dims[0] * topk; i++) {
-            int expertIdx = routedExpertCount <= 0 ? 0 : std::max(0, std::min(indexData[i], routedExpertCount - 1));
+            const int rawExpert = indexData[i];
+            if (allowedExpertMask != nullptr &&
+                (rawExpert < 0 || rawExpert >= routedExpertCount ||
+                 allowedExpertMask[rawExpert] == 0)) {
+                throw std::runtime_error(
+                    "Disk MoE refused to stage a disallowed physical expert ID.");
+            }
+            int expertIdx = routedExpertCount <= 0 ? 0 :
+                std::max(0, std::min(rawExpert, routedExpertCount - 1));
             selectedExperts.insert(expertIdx + 1);
         }
         if (weights[0] != nullptr) {
@@ -1744,20 +1928,47 @@ namespace fastllm {
                 loadIndices.push_back(down);
             }
         }
-        if (loadIndices.size() > 0) {
-            LoadDiskWeightsInParallel(weights, tempWeights, loadIndices);
-            for (int index : loadIndices) {
-                ownedWeights.push_back(tempWeights[index]);
+        // Only GGUF-format weights are cached: they never take the in-place
+        // CUDA prepare path (CudaSupportsDiskMoeWeight rejects DATA_GGUF_FORMAT),
+        // so a cached copy stays valid across prefill and decode. FP8/NVFP4/float
+        // weights are freshly loaded and released per call, as before.
+        DiskExpertWeightCache &expertCache = DiskExpertWeightCache::Get();
+        const bool cacheEnabled = expertCache.Enabled();
+        std::vector<int> toLoadIndices;
+        for (int index : loadIndices) {
+            if (cacheEnabled &&
+                weights[index]->dataType == DataType::DATA_GGUF_FORMAT) {
+                Data *hit = expertCache.Lookup(MakeDiskWeightCacheKey(weights[index]));
+                if (hit != nullptr) {
+                    tempWeights[index] = hit;
+                    continue;
+                }
+            }
+            toLoadIndices.push_back(index);
+        }
+        if (!toLoadIndices.empty()) {
+            LoadDiskWeightsInParallel(weights, tempWeights, toLoadIndices);
+            for (int index : toLoadIndices) {
+                Data *loaded = tempWeights[index];
+                if (cacheEnabled &&
+                    weights[index]->dataType == DataType::DATA_GGUF_FORMAT) {
+                    bool cached = false;
+                    tempWeights[index] = expertCache.Insert(
+                        MakeDiskWeightCacheKey(weights[index]), loaded,
+                        loaded != nullptr ? loaded->expansionBytes : 0, cached);
+                    if (!cached) {
+                        ownedWeights.push_back(tempWeights[index]);
+                    }
+                } else {
+                    ownedWeights.push_back(loaded);
+                }
             }
         }
         auto releaseOwnedWeights = [&]() {
             std::set<Data*> releasedWeights;
             for (auto *weight : ownedWeights) {
                 if (releasedWeights.insert(weight).second) {
-#ifdef USE_CUDA
-                    ReleaseDiskTempWeightCudaExtras(weight);
-#endif
-                    delete weight;
+                    ReleaseDiskExpertWeight(weight);
                 }
             }
         };

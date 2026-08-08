@@ -1,6 +1,6 @@
 # fastllm
 
-| [快速开始](#快速开始) | [部署DeepSeek](docs/deepseek.md) | [部署Qwen3](docs/qwen3.md) | [版本日志](docs/version.md) | [English Document](README_EN.md)
+| [快速开始](#快速开始) | [部署DeepSeek](docs/deepseek.md) | [部署Qwen3](docs/qwen3.md) | [Qwen3.5/3.6 V100分层部署](docs/qwen35_v100_local_stack.md) | [版本日志](docs/version.md) | [English Document](README_EN.md)
 
 # 引用说明
 

@@ -16,6 +16,23 @@
 #include <thread>
 #include <algorithm>
 #include <queue>
+#include <cstdio>
+#include <cerrno>
+#include <fstream>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <limits>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
+
+#ifdef FASTLLM_USE_ZSTD
+#include <zstd.h>
+#endif
 
 #ifdef USE_MMAP
 #include <sys/mman.h>
@@ -533,7 +550,9 @@ namespace fastllm {
         {DataType::INT8, {"int8"}}, {DataType::INT4, {"int4o"}}, {DataType::INT2, {"int2"}}, {DataType::BIT, {"bit"}}, 
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
         {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
-        {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}}, {DataType::INT32PARAM, {"int32param"}},
+        {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}},
+        {DataType::Q8_0_KV, {"q8_0_kv"}}, {DataType::TURBO3_KV, {"turbo3", "turbo3_kv"}},
+        {DataType::INT32PARAM, {"int32param"}},
         {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
@@ -604,9 +623,34 @@ namespace fastllm {
         return data.cpuData + weightBytes;
     }
 
+    bool IsPackedKVCacheDataType(DataType type) {
+        return type == DataType::Q8_0_KV || type == DataType::TURBO3_KV;
+    }
+
+    size_t GetKVCacheRowBytes(DataType type, size_t columns) {
+        if (columns == 0) {
+            return 0;
+        }
+        if (type == DataType::Q8_0_KV) {
+            constexpr size_t blockValues = 32;
+            constexpr size_t blockBytes = sizeof(uint16_t) + blockValues;
+            return ((columns + blockValues - 1) / blockValues) * blockBytes;
+        }
+        if (type == DataType::TURBO3_KV) {
+            constexpr size_t blockValues = 128;
+            constexpr size_t blockBytes = sizeof(uint16_t) + blockValues / 4 + blockValues / 8;
+            static_assert(blockBytes == 50, "Turbo3 KV block must be 50 bytes per 128 values");
+            return ((columns + blockValues - 1) / blockValues) * blockBytes;
+        }
+        return GetDataBytes(type, 1, columns);
+    }
+
     size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
         if (rows == 0 || columns == 0) {
             return 0;
+        }
+        if (IsPackedKVCacheDataType(type)) {
+            return rows * GetKVCacheRowBytes(type, columns);
         }
         if (type == DataType::FLOAT32) {
             return rows * columns * sizeof(float);
@@ -1607,7 +1651,8 @@ namespace fastllm {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
-                   this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                   this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                   IsPackedKVCacheDataType(this->dataType)) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::NVFP4) {
@@ -1646,7 +1691,8 @@ namespace fastllm {
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
-             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -1871,7 +1917,8 @@ namespace fastllm {
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
-             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             return GetDataBytes(this->dataType, rows, columns);
@@ -1890,7 +1937,8 @@ namespace fastllm {
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
-             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -3899,10 +3947,11 @@ namespace fastllm {
              {"biass___batch", (int)biass.size()}});
     }
 
-    void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
+    void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass,
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer, MoeGateType gateType,
                 bool expertParallel, float swigluLimit, bool deepSeekV4Mode,
+                const Data *allowedExpertMask,
                 Data *pairedReduceInput) {
         DataDict datas = {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
@@ -3911,15 +3960,18 @@ namespace fastllm {
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
         };
+        if (allowedExpertMask != nullptr) {
+            datas["allowedExpertMask"] = (Data*)allowedExpertMask;
+        }
         if (pairedReduceInput != nullptr) {
             datas["pairedReduceInput"] = pairedReduceInput;
         }
         curExecutor->Run("MergeMOE", datas,
-                                        {{"sharedScale", sharedScale}, {"swigluLimit", swigluLimit}},
-                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
-                                         {"layer", layer}, {"gateType", (int)gateType},
-                                         {"expertParallel", expertParallel ? 1 : 0},
-                                         {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0}});
+                         {{"sharedScale", sharedScale}, {"swigluLimit", swigluLimit}},
+                         {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
+                          {"layer", layer}, {"gateType", (int)gateType},
+                          {"expertParallel", expertParallel ? 1 : 0},
+                          {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0}});
     }
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
@@ -4537,6 +4589,28 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void GatedDeltaRulePrepareAttn(const Data &at, const Data &decayMask,
+                                   Data &attn) {
+        curExecutor->Run("GatedDeltaRulePrepareAttn", {
+            {"at", (Data*)&at}, {"decay_mask", (Data*)&decayMask},
+            {"attn", &attn}
+        }, {}, {});
+    }
+
+    void GatedDeltaRuleBuildDecay(Data &g, Data &decayMask) {
+        curExecutor->Run("GatedDeltaRuleBuildDecay", {
+            {"g", &g}, {"decay_mask", &decayMask}
+        }, {}, {});
+    }
+
+    void GatedDeltaRuleApplyDecayMask(Data &attn,
+                                      const Data &decayMask,
+                                      int causalBase) {
+        curExecutor->Run("GatedDeltaRuleApplyDecayMask", {
+            {"attn", &attn}, {"decay_mask", (Data*)&decayMask}
+        }, {}, {{"causal_base", causalBase}});
+    }
+
     void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
                                 Data &last_recurrent_state, Data &core_attn_out, float qScale) {
         curExecutor->Run("RecurrentGatedDeltaRule", {
@@ -5000,6 +5074,875 @@ namespace fastllm {
         layerPagedCacheManagers.clear();
     }
 
+    static void SetPagedCacheSnapshotError(
+            std::string *error, const std::string &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+    }
+
+    CacheSnapshotMetadata CaptureCacheSnapshotMetadata(
+            const Data &cache) {
+        CacheSnapshotMetadata metadata;
+        metadata.cacheUid = cache.cacheUid;
+        metadata.isKVCache = cache.isKVCache;
+        metadata.isLinearAttention = cache.isLinearAttention;
+        metadata.isLinearAttentionTransposed =
+            cache.isLinearAttentionTransposed;
+        metadata.pageLen = cache.pageLen;
+        metadata.lastPageLen = cache.lastPageLen;
+        metadata.dataType = cache.dataType;
+        metadata.dims = cache.dims;
+        metadata.strides = cache.strides;
+        metadata.expansionSize = cache.expansionSize;
+        metadata.expansionBytes = cache.expansionBytes;
+        metadata.expansionDims = cache.expansionDims;
+        metadata.dataDevice = cache.dataDevice;
+        metadata.dataDeviceIds = cache.dataDeviceIds;
+        metadata.tpLayout = cache.tpLayout;
+        metadata.tpAxis = cache.tpAxis;
+        metadata.tpGlobalDims = cache.tpGlobalDims;
+        metadata.tpRanges = cache.tpRanges;
+        metadata.tpLinearType = cache.tpLinearType;
+        metadata.tpPackType = cache.tpPackType;
+        metadata.tpQHeads = cache.tpQHeads;
+        metadata.tpKVHeads = cache.tpKVHeads;
+        metadata.tpHeadDim = cache.tpHeadDim;
+        return metadata;
+    }
+
+    bool SnapshotPagedCacheToCpu(
+            const Data &cache,
+            PagedCacheCpuSnapshot &snapshot,
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        if (cache.multiDeviceData || !cache.multiDeviceDatas.empty()) {
+            SetPagedCacheSnapshotError(
+                error,
+                "multi-device paged cache snapshots are not supported");
+            return false;
+        }
+        if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+            SetPagedCacheSnapshotError(error, "cache is not paged");
+            return false;
+        }
+
+        PagedCacheManager *manager = cache.pagedKVCacheData;
+        if (manager->maxPages <= 0 || manager->dims.size() != 4 ||
+            manager->dims[0] != manager->maxPages ||
+            manager->pageLen != cache.pageLen ||
+            manager->dataType != cache.dataType) {
+            SetPagedCacheSnapshotError(
+                error, "paged cache manager geometry does not match cache");
+            return false;
+        }
+        const uint64_t managerBytes = manager->GetBytes();
+        if (managerBytes == 0 ||
+            managerBytes % (uint64_t)manager->maxPages != 0) {
+            SetPagedCacheSnapshotError(
+                error, "paged cache manager has invalid physical byte size");
+            return false;
+        }
+        const size_t pageBytes =
+            (size_t)(managerBytes / (uint64_t)manager->maxPages);
+        if ((!cache.pageIndex.empty() &&
+             (cache.lastPageLen <= 0 ||
+              cache.lastPageLen > cache.pageLen)) ||
+            (cache.pageIndex.empty() && cache.lastPageLen != 0)) {
+            SetPagedCacheSnapshotError(
+                error, "paged cache has invalid final-page length");
+            return false;
+        }
+        for (int page : cache.pageIndex) {
+            if (page < 0 || page >= manager->maxPages) {
+                SetPagedCacheSnapshotError(
+                    error, "paged cache contains an invalid physical page");
+                return false;
+            }
+        }
+        if (cache.pageIndex.size() >
+            std::numeric_limits<size_t>::max() / pageBytes) {
+            SetPagedCacheSnapshotError(
+                error, "paged cache snapshot byte size overflow");
+            return false;
+        }
+
+        PagedCacheCpuSnapshot prepared;
+        prepared.multiDeviceData = false;
+        prepared.single.metadata = CaptureCacheSnapshotMetadata(cache);
+        prepared.single.manager = manager;
+        prepared.single.pageCount = (int)cache.pageIndex.size();
+        prepared.single.pageBytes = pageBytes;
+        prepared.single.uncompressedBytes =
+            cache.pageIndex.size() * pageBytes;
+        try {
+            prepared.single.bytes.resize(
+                cache.pageIndex.size() * pageBytes);
+        } catch (const std::exception &exc) {
+            SetPagedCacheSnapshotError(
+                error,
+                std::string("failed to allocate paged CPU snapshot: ") +
+                    exc.what());
+            return false;
+        }
+
+        int previousDevice = -1;
+        try {
+            if (manager->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                if (manager->cudaData == nullptr) {
+                    throw std::runtime_error(
+                        "paged CUDA manager has no physical storage");
+                }
+                previousDevice = FastllmCudaGetDevice();
+                if (!manager->dataDeviceIds.empty()) {
+                    FastllmCudaSetDevice(manager->dataDeviceIds[0]);
+                }
+                for (size_t i = 0; i < cache.pageIndex.size(); i++) {
+                    const size_t sourceOffset =
+                        (size_t)cache.pageIndex[i] * pageBytes;
+                    FastllmCudaCopyFromDeviceToHost(
+                        prepared.single.bytes.data() + i * pageBytes,
+                        (uint8_t*)manager->cudaData + sourceOffset,
+                        pageBytes);
+                }
+#else
+                throw std::runtime_error(
+                    "CUDA paged cache snapshot requires a CUDA build");
+#endif
+            } else if (manager->dataDevice == DataDevice::CPU) {
+                if (manager->cpuData == nullptr) {
+                    throw std::runtime_error(
+                        "paged CPU manager has no physical storage");
+                }
+                for (size_t i = 0; i < cache.pageIndex.size(); i++) {
+                    const size_t sourceOffset =
+                        (size_t)cache.pageIndex[i] * pageBytes;
+                    memcpy(prepared.single.bytes.data() + i * pageBytes,
+                           manager->cpuData + sourceOffset, pageBytes);
+                }
+            } else {
+                throw std::runtime_error(
+                    "paged cache snapshot does not support this device");
+            }
+        } catch (const std::exception &exc) {
+#ifdef USE_CUDA
+            if (previousDevice >= 0) {
+                FastllmCudaSetDevice(previousDevice);
+            }
+#endif
+            SetPagedCacheSnapshotError(error, exc.what());
+            return false;
+        }
+#ifdef USE_CUDA
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
+#endif
+        prepared.single.valid = true;
+        prepared.valid = true;
+        snapshot = std::move(prepared);
+        return true;
+    }
+
+    PagedCacheCpuSnapshotDiskFile::~PagedCacheCpuSnapshotDiskFile() {
+        if (ownsPath && !path.empty()) {
+            std::remove(path.c_str());
+        }
+    }
+
+    static uint64_t PagedCacheCpuSnapshotChecksum(
+            const uint8_t *bytes, size_t size) {
+        uint64_t checksum = UINT64_C(14695981039346656037);
+        for (size_t i = 0; i < size; i++) {
+            checksum ^= bytes[i];
+            checksum *= UINT64_C(1099511628211);
+        }
+        return checksum;
+    }
+
+    bool SpillPagedCacheCpuSnapshotPartToDisk(
+            PagedCacheCpuSnapshotPart &part,
+            const std::string &path,
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        if (!part.valid || path.empty() || part.diskFile != nullptr) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot part is not spillable");
+            return false;
+        }
+        if (part.pageCount < 0 ||
+            (part.pageBytes != 0 &&
+             (size_t)part.pageCount >
+                 std::numeric_limits<size_t>::max() / part.pageBytes)) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot byte size overflow");
+            return false;
+        }
+        const std::vector<uint8_t> *storedBytes = nullptr;
+        if (part.zstdCompressed) {
+            if (!part.zstdContentChecksum || !part.bytes.empty() ||
+                part.compressedBytes.empty()) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "paged CPU snapshot has inconsistent compressed bytes");
+                return false;
+            }
+            storedBytes = &part.compressedBytes;
+        } else {
+            const size_t expectedBytes =
+                (size_t)part.pageCount * part.pageBytes;
+            if (part.zstdContentChecksum ||
+                !part.compressedBytes.empty() ||
+                part.bytes.empty() ||
+                part.bytes.size() != expectedBytes) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "paged CPU snapshot has inconsistent raw bytes");
+                return false;
+            }
+            storedBytes = &part.bytes;
+        }
+
+        std::shared_ptr<PagedCacheCpuSnapshotDiskFile> diskFile;
+        try {
+            diskFile.reset(new PagedCacheCpuSnapshotDiskFile());
+            diskFile->path = path;
+            diskFile->bytes = storedBytes->size();
+            diskFile->checksum = PagedCacheCpuSnapshotChecksum(
+                storedBytes->data(), storedBytes->size());
+        } catch (const std::exception &exc) {
+            SetPagedCacheSnapshotError(
+                error,
+                std::string("failed to prepare paged CPU snapshot spill: ") +
+                    exc.what());
+            return false;
+        }
+
+        const std::string temporaryPath = path + ".tmp";
+        std::remove(temporaryPath.c_str());
+        bool writeSucceeded = false;
+        try {
+            std::ofstream output(
+                temporaryPath,
+                std::ios::out | std::ios::binary | std::ios::trunc);
+            constexpr size_t chunkBytes = 64ULL * 1024ULL * 1024ULL;
+            size_t offset = 0;
+            while (output.good() && offset < storedBytes->size()) {
+                const size_t current =
+                    std::min(chunkBytes, storedBytes->size() - offset);
+                output.write(
+                    reinterpret_cast<const char*>(
+                        storedBytes->data() + offset),
+                    (std::streamsize)current);
+                offset += current;
+            }
+            output.flush();
+            writeSucceeded =
+                output.good() && offset == storedBytes->size();
+            output.close();
+            writeSucceeded = writeSucceeded && !output.fail();
+        } catch (const std::exception &exc) {
+            SetPagedCacheSnapshotError(
+                error,
+                std::string("failed to write paged CPU snapshot spill: ") +
+                    exc.what());
+        }
+        if (!writeSucceeded) {
+            std::remove(temporaryPath.c_str());
+            if (error != nullptr && error->empty()) {
+                *error = "failed to write paged CPU snapshot spill";
+            }
+            return false;
+        }
+        if (std::rename(temporaryPath.c_str(), path.c_str()) != 0) {
+            const std::string message =
+                std::string("failed to publish paged CPU snapshot spill: ") +
+                std::strerror(errno);
+            std::remove(temporaryPath.c_str());
+            SetPagedCacheSnapshotError(error, message);
+            return false;
+        }
+
+        diskFile->ownsPath = true;
+        part.diskFile = std::move(diskFile);
+        std::vector<uint8_t>().swap(part.bytes);
+        std::vector<uint8_t>().swap(part.compressedBytes);
+        return true;
+    }
+
+    bool LoadPagedCacheCpuSnapshotPartFromDisk(
+            const PagedCacheCpuSnapshotPart &part,
+            std::vector<uint8_t> &storedBytes,
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        if (part.pageCount < 0 ||
+            (part.pageBytes != 0 &&
+             (size_t)part.pageCount >
+                 std::numeric_limits<size_t>::max() / part.pageBytes)) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot byte size overflow");
+            return false;
+        }
+        const std::shared_ptr<PagedCacheCpuSnapshotDiskFile> diskFile =
+            part.diskFile;
+        if (!part.valid || diskFile == nullptr ||
+            diskFile->path.empty() || diskFile->bytes == 0 ||
+            !part.bytes.empty() || !part.compressedBytes.empty()) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot part has no valid disk spill");
+            return false;
+        }
+        const size_t expectedRawBytes =
+            (size_t)part.pageCount * part.pageBytes;
+        if ((!part.zstdCompressed &&
+             diskFile->bytes != expectedRawBytes) ||
+            (part.zstdCompressed &&
+             (!part.zstdContentChecksum ||
+              diskFile->bytes >= expectedRawBytes))) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot disk byte size is inconsistent");
+            return false;
+        }
+
+        std::vector<uint8_t> loaded;
+        try {
+            std::ifstream input(
+                diskFile->path, std::ios::in | std::ios::binary | std::ios::ate);
+            if (!input.good() ||
+                input.tellg() != (std::streamoff)diskFile->bytes) {
+                SetPagedCacheSnapshotError(
+                    error, "paged CPU snapshot spill has an invalid file size");
+                return false;
+            }
+            input.seekg(0);
+            loaded.resize(diskFile->bytes);
+            constexpr size_t chunkBytes = 64ULL * 1024ULL * 1024ULL;
+            size_t offset = 0;
+            while (input.good() && offset < loaded.size()) {
+                const size_t current =
+                    std::min(chunkBytes, loaded.size() - offset);
+                input.read(
+                    reinterpret_cast<char*>(loaded.data() + offset),
+                    (std::streamsize)current);
+                offset += current;
+            }
+            if (offset != loaded.size() ||
+                (input.fail() && !input.eof())) {
+                SetPagedCacheSnapshotError(
+                    error, "failed to read paged CPU snapshot spill");
+                return false;
+            }
+        } catch (const std::exception &exc) {
+            SetPagedCacheSnapshotError(
+                error,
+                std::string("failed to load paged CPU snapshot spill: ") +
+                    exc.what());
+            return false;
+        }
+        if (PagedCacheCpuSnapshotChecksum(
+                loaded.data(), loaded.size()) != diskFile->checksum) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot spill checksum mismatch");
+            return false;
+        }
+        storedBytes.swap(loaded);
+        return true;
+    }
+
+    static std::atomic<uint64_t> pagedCacheZstdCompressCalls{0};
+    static std::atomic<uint64_t> pagedCacheZstdCompressInputBytes{0};
+    static std::atomic<uint64_t> pagedCacheZstdCompressOutputBytes{0};
+    static std::atomic<uint64_t> pagedCacheZstdCompressNanoseconds{0};
+    static std::atomic<uint64_t> pagedCacheZstdDecompressCalls{0};
+    static std::atomic<uint64_t> pagedCacheZstdDecompressInputBytes{0};
+    static std::atomic<uint64_t> pagedCacheZstdDecompressOutputBytes{0};
+    static std::atomic<uint64_t> pagedCacheZstdDecompressNanoseconds{0};
+
+    PagedCacheCpuSnapshotZstdMetrics
+            GetPagedCacheCpuSnapshotZstdMetrics() {
+        PagedCacheCpuSnapshotZstdMetrics metrics;
+        metrics.compressCalls = pagedCacheZstdCompressCalls.load();
+        metrics.compressInputBytes =
+            pagedCacheZstdCompressInputBytes.load();
+        metrics.compressOutputBytes =
+            pagedCacheZstdCompressOutputBytes.load();
+        metrics.compressNanoseconds =
+            pagedCacheZstdCompressNanoseconds.load();
+        metrics.decompressCalls =
+            pagedCacheZstdDecompressCalls.load();
+        metrics.decompressInputBytes =
+            pagedCacheZstdDecompressInputBytes.load();
+        metrics.decompressOutputBytes =
+            pagedCacheZstdDecompressOutputBytes.load();
+        metrics.decompressNanoseconds =
+            pagedCacheZstdDecompressNanoseconds.load();
+        return metrics;
+    }
+
+    bool PagedCacheCpuSnapshotZstdAvailable() {
+#ifdef FASTLLM_USE_ZSTD
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    size_t GetPagedCacheCpuSnapshotStoredBytes(
+            const PagedCacheCpuSnapshot &snapshot) {
+        if (!snapshot.valid || snapshot.multiDeviceData ||
+            !snapshot.single.valid) {
+            return 0;
+        }
+        if (snapshot.single.diskFile != nullptr) {
+            return snapshot.single.diskFile->bytes;
+        }
+        return snapshot.single.zstdCompressed ?
+            snapshot.single.compressedBytes.size() :
+            snapshot.single.bytes.size();
+    }
+
+    bool TryCompressPagedCacheCpuSnapshot(
+            PagedCacheCpuSnapshot &snapshot,
+            int compressionLevel,
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        if (!snapshot.valid || snapshot.multiDeviceData ||
+            !snapshot.single.valid) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot is not compressible");
+            return false;
+        }
+        if (snapshot.single.diskFile != nullptr) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot is already spilled to disk");
+            return false;
+        }
+        PagedCacheCpuSnapshotPart &part = snapshot.single;
+        if (part.zstdCompressed) {
+            return false;
+        }
+        if (part.pageCount < 0 ||
+            (part.pageBytes != 0 &&
+             (size_t)part.pageCount >
+                 std::numeric_limits<size_t>::max() /
+                     part.pageBytes)) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot byte size overflow");
+            return false;
+        }
+        const size_t expectedBytes =
+            (size_t)part.pageCount * part.pageBytes;
+        if (expectedBytes == 0 || part.bytes.size() != expectedBytes ||
+            !part.compressedBytes.empty() ||
+            part.zstdContentChecksum) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot has inconsistent raw bytes");
+            return false;
+        }
+        part.uncompressedBytes = expectedBytes;
+#ifdef FASTLLM_USE_ZSTD
+        std::vector<uint8_t> compressed;
+        try {
+            const size_t bound = ZSTD_compressBound(expectedBytes);
+            if (ZSTD_isError(bound)) {
+                SetPagedCacheSnapshotError(
+                    error, ZSTD_getErrorName(bound));
+                return false;
+            }
+            std::unique_ptr<ZSTD_CCtx, size_t (*)(ZSTD_CCtx*)> cctx(
+                ZSTD_createCCtx(), ZSTD_freeCCtx);
+            if (cctx == nullptr) {
+                SetPagedCacheSnapshotError(
+                    error, "failed to allocate zstd compression context");
+                return false;
+            }
+            size_t status = ZSTD_CCtx_setParameter(
+                cctx.get(),
+                ZSTD_c_compressionLevel,
+                compressionLevel);
+            if (!ZSTD_isError(status)) {
+                status = ZSTD_CCtx_setParameter(
+                    cctx.get(), ZSTD_c_checksumFlag, 1);
+            }
+            if (ZSTD_isError(status)) {
+                SetPagedCacheSnapshotError(
+                    error, ZSTD_getErrorName(status));
+                return false;
+            }
+            compressed.resize(bound);
+            const auto compressStarted =
+                std::chrono::steady_clock::now();
+            const size_t compressedBytes = ZSTD_compress2(
+                cctx.get(),
+                compressed.data(), compressed.size(),
+                part.bytes.data(), part.bytes.size());
+            const auto compressElapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() -
+                    compressStarted).count();
+            pagedCacheZstdCompressCalls.fetch_add(1);
+            pagedCacheZstdCompressInputBytes.fetch_add(expectedBytes);
+            pagedCacheZstdCompressNanoseconds.fetch_add(
+                (uint64_t)std::max<int64_t>(0, compressElapsed));
+            if (!ZSTD_isError(compressedBytes)) {
+                pagedCacheZstdCompressOutputBytes.fetch_add(
+                    compressedBytes);
+            }
+            if (ZSTD_isError(compressedBytes)) {
+                SetPagedCacheSnapshotError(
+                    error, ZSTD_getErrorName(compressedBytes));
+                return false;
+            }
+            if (compressedBytes >= expectedBytes) {
+                return false;
+            }
+            compressed.resize(compressedBytes);
+        } catch (const std::exception &exc) {
+            SetPagedCacheSnapshotError(
+                error,
+                std::string("failed to compress paged CPU snapshot: ") +
+                    exc.what());
+            return false;
+        }
+        part.compressedBytes.swap(compressed);
+        std::vector<uint8_t>().swap(part.bytes);
+        part.zstdCompressed = true;
+        part.zstdContentChecksum = true;
+        try {
+            part.compressedBytes.shrink_to_fit();
+        } catch (const std::exception &) {
+        }
+        return true;
+#else
+        (void)compressionLevel;
+        SetPagedCacheSnapshotError(
+            error, "zstd support is not available in this build");
+        return false;
+#endif
+    }
+
+    static void InstallPagedCacheSnapshotMetadata(
+            const CacheSnapshotMetadata &metadata,
+            PagedCacheManager *manager,
+            std::vector<int> &&pages,
+            Data &cache) {
+        cache.isFake = false;
+        cache.cacheUid = metadata.cacheUid;
+        cache.isKVCache = metadata.isKVCache;
+        cache.isLinearAttention = metadata.isLinearAttention;
+        cache.isLinearAttentionTransposed =
+            metadata.isLinearAttentionTransposed;
+        cache.isPagedKVCache = true;
+        cache.pageLen = metadata.pageLen;
+        cache.pagedKVCacheData = manager;
+        cache.pageIndex = std::move(pages);
+        cache.lastPageLen = metadata.lastPageLen;
+        cache.dataType = metadata.dataType;
+        cache.UpdateUnitSize();
+        cache.dims = metadata.dims;
+        cache.strides = metadata.strides;
+        cache.expansionSize = metadata.expansionSize;
+        cache.expansionBytes = metadata.expansionBytes;
+        cache.expansionDims = metadata.expansionDims;
+        cache.cpuData = nullptr;
+        cache.cudaData = nullptr;
+        cache.cudaDataBorrowed = false;
+        cache.deviceData = nullptr;
+        cache.dataDevice = metadata.dataDevice;
+        cache.dataDeviceIds = metadata.dataDeviceIds;
+        cache.multiDeviceData = false;
+        cache.multiDeviceDatas.clear();
+        cache.tpLayout = metadata.tpLayout;
+        cache.tpAxis = metadata.tpAxis;
+        cache.tpGlobalDims = metadata.tpGlobalDims;
+        cache.tpRanges = metadata.tpRanges;
+        cache.tpLinearType = metadata.tpLinearType;
+        cache.tpPackType = metadata.tpPackType;
+        cache.tpQHeads = metadata.tpQHeads;
+        cache.tpKVHeads = metadata.tpKVHeads;
+        cache.tpHeadDim = metadata.tpHeadDim;
+        cache.directMemory = false;
+        if (metadata.isLinearAttention &&
+            cache.pageIndex.size() == 1 &&
+            manager->dataDevice == DataDevice::CUDA &&
+            manager->cudaData != nullptr) {
+            const size_t pageBytes =
+                (size_t)(manager->GetBytes() /
+                         (uint64_t)manager->maxPages);
+            cache.cudaData =
+                (uint8_t*)manager->cudaData +
+                (size_t)cache.pageIndex[0] * pageBytes;
+            cache.cudaDataBorrowed = true;
+        }
+    }
+
+    bool RestorePagedCacheFromCpu(
+            const PagedCacheCpuSnapshot &snapshot,
+            Data &cache,
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        if (!snapshot.valid || snapshot.multiDeviceData ||
+            !snapshot.single.valid) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot is not restorable");
+            return false;
+        }
+        if (cache.isPagedKVCache || cache.cpuData != nullptr ||
+            cache.cudaData != nullptr || cache.multiDeviceData ||
+            !cache.multiDeviceDatas.empty() || !cache.dims.empty()) {
+            SetPagedCacheSnapshotError(
+                error, "paged cache restore destination owns live storage");
+            return false;
+        }
+
+        const PagedCacheCpuSnapshotPart &part = snapshot.single;
+        if (part.pageCount < 0 ||
+            (part.pageBytes != 0 &&
+             (size_t)part.pageCount >
+                 std::numeric_limits<size_t>::max() /
+                     part.pageBytes)) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot byte size overflow");
+            return false;
+        }
+        const size_t expectedBytes =
+            (size_t)part.pageCount * part.pageBytes;
+        if (part.uncompressedBytes != 0 &&
+            part.uncompressedBytes != expectedBytes) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot raw byte size changed");
+            return false;
+        }
+        std::vector<uint8_t> diskStoredBytes;
+        const std::vector<uint8_t> *storedBytes = nullptr;
+        if (part.diskFile != nullptr) {
+            if (!LoadPagedCacheCpuSnapshotPartFromDisk(
+                    part, diskStoredBytes, error)) {
+                return false;
+            }
+            storedBytes = &diskStoredBytes;
+        } else {
+            storedBytes = part.zstdCompressed
+                ? &part.compressedBytes
+                : &part.bytes;
+        }
+
+        std::vector<uint8_t> decompressedBytes;
+        const uint8_t *sourceBytes = nullptr;
+        if (part.zstdCompressed) {
+            if (!part.zstdContentChecksum || !part.bytes.empty() ||
+                storedBytes->empty()) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "paged CPU snapshot has inconsistent compressed bytes");
+                return false;
+            }
+#ifdef FASTLLM_USE_ZSTD
+            try {
+                decompressedBytes.resize(expectedBytes);
+            } catch (const std::exception &exc) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    std::string(
+                        "failed to allocate paged CPU decompression: ") +
+                        exc.what());
+                return false;
+            }
+            const auto decompressStarted =
+                std::chrono::steady_clock::now();
+            const size_t decompressedSize = ZSTD_decompress(
+                decompressedBytes.data(), decompressedBytes.size(),
+                storedBytes->data(), storedBytes->size());
+            const auto decompressElapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() -
+                    decompressStarted).count();
+            pagedCacheZstdDecompressCalls.fetch_add(1);
+            pagedCacheZstdDecompressInputBytes.fetch_add(
+                storedBytes->size());
+            pagedCacheZstdDecompressNanoseconds.fetch_add(
+                (uint64_t)std::max<int64_t>(0, decompressElapsed));
+            if (!ZSTD_isError(decompressedSize)) {
+                pagedCacheZstdDecompressOutputBytes.fetch_add(
+                    decompressedSize);
+            }
+            if (ZSTD_isError(decompressedSize) ||
+                decompressedSize != expectedBytes) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    ZSTD_isError(decompressedSize) ?
+                        ZSTD_getErrorName(decompressedSize) :
+                        "zstd output byte size mismatch");
+                return false;
+            }
+            sourceBytes = decompressedBytes.data();
+#else
+            SetPagedCacheSnapshotError(
+                error,
+                "compressed paged CPU snapshot requires zstd support");
+            return false;
+#endif
+        } else {
+            if (part.zstdContentChecksum ||
+                !part.compressedBytes.empty() ||
+                storedBytes->size() != expectedBytes) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "paged CPU snapshot has inconsistent raw bytes");
+                return false;
+            }
+            sourceBytes = storedBytes->data();
+        }
+        PagedCacheManager *manager = part.manager;
+        if (manager == nullptr || manager->maxPages <= 0 ||
+            manager->dims.size() != 4 ||
+            manager->dims[0] != manager->maxPages ||
+            manager->pageLen != part.metadata.pageLen ||
+            manager->dataType != part.metadata.dataType ||
+            manager->GetBytes() % (uint64_t)manager->maxPages != 0 ||
+            manager->GetBytes() / (uint64_t)manager->maxPages !=
+                part.pageBytes) {
+            SetPagedCacheSnapshotError(
+                error, "paged CPU snapshot no longer matches its manager");
+            return false;
+        }
+
+        std::vector<int> pages;
+        pages.reserve((size_t)part.pageCount);
+        try {
+            for (int i = 0; i < part.pageCount; i++) {
+                pages.push_back(manager->GetUnusedPageIndex(true));
+            }
+        } catch (const std::exception &exc) {
+            if (!pages.empty()) {
+                manager->ReleasePageIndices(pages);
+            }
+            SetPagedCacheSnapshotError(
+                error,
+                std::string("failed to reserve paged cache restore pages: ") +
+                    exc.what());
+            return false;
+        }
+
+        int previousDevice = -1;
+        try {
+            if (manager->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                if (manager->cudaData == nullptr) {
+                    throw std::runtime_error(
+                        "paged CUDA manager has no physical storage");
+                }
+                previousDevice = FastllmCudaGetDevice();
+                if (!manager->dataDeviceIds.empty()) {
+                    FastllmCudaSetDevice(manager->dataDeviceIds[0]);
+                }
+                for (int i = 0; i < part.pageCount; i++) {
+                    const size_t destinationOffset =
+                        (size_t)pages[i] * part.pageBytes;
+                    FastllmCudaCopyFromHostToDevice(
+                        (uint8_t*)manager->cudaData + destinationOffset,
+                        (void*)(sourceBytes +
+                                (size_t)i * part.pageBytes),
+                        part.pageBytes);
+                }
+#else
+                throw std::runtime_error(
+                    "CUDA paged cache restore requires a CUDA build");
+#endif
+            } else if (manager->dataDevice == DataDevice::CPU) {
+                if (manager->cpuData == nullptr) {
+                    throw std::runtime_error(
+                        "paged CPU manager has no physical storage");
+                }
+                for (int i = 0; i < part.pageCount; i++) {
+                    const size_t destinationOffset =
+                        (size_t)pages[i] * part.pageBytes;
+                    memcpy(manager->cpuData + destinationOffset,
+                           sourceBytes +
+                               (size_t)i * part.pageBytes,
+                           part.pageBytes);
+                }
+            } else {
+                throw std::runtime_error(
+                    "paged cache restore does not support this device");
+            }
+        } catch (const std::exception &exc) {
+#ifdef USE_CUDA
+            if (previousDevice >= 0) {
+                FastllmCudaSetDevice(previousDevice);
+            }
+#endif
+            if (!pages.empty()) {
+                manager->ReleasePageIndices(pages);
+            }
+            SetPagedCacheSnapshotError(error, exc.what());
+            return false;
+        }
+#ifdef USE_CUDA
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
+#endif
+        InstallPagedCacheSnapshotMetadata(
+            part.metadata, manager, std::move(pages), cache);
+        return true;
+    }
+
+    void ReleasePagedCacheStorage(Data &cache) {
+        std::set<std::pair<PagedCacheManager*, int> > released;
+        auto releaseOne = [&](Data &item) {
+            if (item.isPagedKVCache &&
+                item.pagedKVCacheData != nullptr) {
+                std::vector<int> uniquePages;
+                for (int page : item.pageIndex) {
+                    auto key =
+                        std::make_pair(item.pagedKVCacheData, page);
+                    if (released.insert(key).second) {
+                        uniquePages.push_back(page);
+                    }
+                }
+                if (!uniquePages.empty()) {
+                    item.pagedKVCacheData->ReleasePageIndices(
+                        uniquePages);
+                }
+            }
+            item.isPagedKVCache = false;
+            item.pagedKVCacheData = nullptr;
+            item.pageIndex.clear();
+            item.lastPageLen = 0;
+            item.FreeSpace();
+            item.dims.clear();
+            item.strides.clear();
+            item.expansionDims.clear();
+            item.expansionSize = 0;
+            item.expansionBytes = 0;
+        };
+
+        for (auto &it : cache.multiDeviceDatas) {
+            if (it.second != nullptr) {
+                releaseOne(*it.second);
+            }
+        }
+        releaseOne(cache);
+        for (auto &it : cache.multiDeviceDatas) {
+            delete it.second;
+        }
+        cache.multiDeviceDatas.clear();
+        cache.multiDeviceData = false;
+        cache.ClearTensorParallelLayout();
+    }
+
     void AppendPagedCache(PagedCacheManager &pagedCacheManager, Data &cache, const Data &input) {
         curExecutor->Run("AppendPagedCache", {
                 {"pagedCacheManager", (Data*)&pagedCacheManager}, {"cache", &cache}, {"input", (Data*)&input}
@@ -5235,8 +6178,675 @@ namespace fastllm {
         return defaultMoeDeviceLayers;
     }
 
+    namespace {
+        std::atomic<uint64_t> pagedPrefixCacheCpuTierBytes{0};
+        std::atomic<uint64_t> pagedPrefixCacheGpuHitPages{0};
+        std::atomic<uint64_t> pagedPrefixCacheCpuHitPages{0};
+        std::atomic<uint64_t> pagedPrefixCacheDiskWriteBytes{0};
+        std::atomic<uint64_t> pagedPrefixCacheDiskLiveBytes{0};
+        std::atomic<uint64_t> pagedPrefixCacheDiskReadBytes{0};
+        std::atomic<uint64_t> pagedPrefixCacheDiskHits{0};
+        std::atomic<double> pagedPrefixCacheDiskReadMiBPerSecond{0.0};
+        std::atomic<double>
+            pagedPrefixCacheRecomputeTokensPerSecond{0.0};
+        std::atomic<double>
+            pagedPrefixCacheZstdDecompressMiBPerSecond{0.0};
+        std::atomic<uint64_t> pagedPrefixCacheZstdCompressCalls{0};
+        std::atomic<uint64_t> pagedPrefixCacheZstdCompressInputBytes{0};
+        std::atomic<uint64_t> pagedPrefixCacheZstdCompressOutputBytes{0};
+        std::atomic<uint64_t> pagedPrefixCacheZstdCompressNanoseconds{0};
+        std::atomic<uint64_t> pagedPrefixCacheZstdDecompressCalls{0};
+        std::atomic<uint64_t> pagedPrefixCacheZstdDecompressInputBytes{0};
+        std::atomic<uint64_t> pagedPrefixCacheZstdDecompressOutputBytes{0};
+        std::atomic<uint64_t> pagedPrefixCacheZstdDecompressNanoseconds{0};
+
+        bool PrefixCacheEnvEnabled(const char *name, bool defaultValue) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == 0) {
+                return defaultValue;
+            }
+            std::string lowered(value);
+            std::transform(
+                lowered.begin(), lowered.end(), lowered.begin(),
+                [](unsigned char c) {
+                    return (char)std::tolower(c);
+                });
+            return lowered == "1" || lowered == "true" ||
+                   lowered == "yes" || lowered == "on";
+        }
+
+        uint64_t PrefixCacheEnvBytes(
+                const char *name,
+                uint64_t defaultValue) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == 0) {
+                return defaultValue;
+            }
+            errno = 0;
+            char *end = nullptr;
+            unsigned long long parsed =
+                std::strtoull(value, &end, 10);
+            if (errno != 0 || end == value || *end != 0) {
+                return defaultValue;
+            }
+            return (uint64_t)parsed;
+        }
+
+        double PrefixCacheEnvDouble(
+                const char *name,
+                double defaultValue) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == 0) {
+                return defaultValue;
+            }
+            errno = 0;
+            char *end = nullptr;
+            const double parsed = std::strtod(value, &end);
+            if (errno != 0 || end == value || *end != 0 ||
+                !std::isfinite(parsed) || parsed <= 0.0) {
+                return defaultValue;
+            }
+            return parsed;
+        }
+
+        void ObservePrefixCacheRate(
+                std::atomic<double> &metric,
+                double sample) {
+            if (!std::isfinite(sample) || sample <= 0.0) {
+                return;
+            }
+            double current = metric.load(std::memory_order_relaxed);
+            for (;;) {
+                const double updated = current > 0.0
+                    ? current * 0.8 + sample * 0.2
+                    : sample;
+                if (metric.compare_exchange_weak(
+                        current, updated,
+                        std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    return;
+                }
+            }
+        }
+
+        uint64_t PrefixCacheTierChecksum(
+                const uint8_t *bytes,
+                size_t size) {
+            uint64_t checksum = UINT64_C(14695981039346656037);
+            for (size_t i = 0; i < size; i++) {
+                checksum ^= bytes[i];
+                checksum *= UINT64_C(1099511628211);
+            }
+            return checksum;
+        }
+
+        class PagedPrefixCacheDiskStore {
+        public:
+            ~PagedPrefixCacheDiskStore() {
+                std::lock_guard<std::mutex> guard(locker);
+                if (stream.is_open()) {
+                    stream.close();
+                }
+                if (!sessionDirectory.empty()) {
+                    std::error_code error;
+                    std::filesystem::remove_all(
+                        sessionDirectory, error);
+                }
+#ifndef _WIN32
+                if (sessionLockFd >= 0) {
+                    flock(sessionLockFd, LOCK_UN);
+                    close(sessionLockFd);
+                    sessionLockFd = -1;
+                }
+#endif
+            }
+
+            bool Append(
+                    const std::vector<uint8_t> &bytes,
+                    size_t uncompressedBytes,
+                    bool zstdCompressed,
+                    uint64_t checksum,
+                    std::shared_ptr<
+                        PagedPrefixCacheTierDiskRef> &reference) {
+                std::lock_guard<std::mutex> guard(locker);
+                if (bytes.empty() || !EnsureOpen()) {
+                    return false;
+                }
+
+                auto freeIt = freeRanges.end();
+                for (auto it = freeRanges.begin();
+                     it != freeRanges.end(); ++it) {
+                    if (it->second >= bytes.size()) {
+                        freeIt = it;
+                        break;
+                    }
+                }
+                const bool extendsFile = freeIt == freeRanges.end();
+                const uint64_t offset = extendsFile
+                    ? currentBytes
+                    : freeIt->first;
+                if (extendsFile) {
+                    const uint64_t maxBytes = PrefixCacheEnvBytes(
+                        "FASTLLM_PREFIX_CACHE_DISK_MAX_BYTES",
+                        UINT64_C(68719476736));
+                    if (maxBytes != 0 &&
+                        (currentBytes > maxBytes ||
+                         bytes.size() > maxBytes - currentBytes)) {
+                        return false;
+                    }
+                    std::error_code spaceError;
+                    const std::filesystem::space_info space =
+                        std::filesystem::space(
+                            sessionDirectory, spaceError);
+                    const uint64_t minFreeBytes = PrefixCacheEnvBytes(
+                        "FASTLLM_PREFIX_CACHE_DISK_MIN_FREE_BYTES",
+                        UINT64_C(17179869184));
+                    if (spaceError ||
+                        space.available < bytes.size() ||
+                        space.available - bytes.size() < minFreeBytes) {
+                        return false;
+                    }
+                }
+
+                stream.clear();
+                stream.seekp(
+                    (std::streamoff)offset,
+                    std::ios::beg);
+                stream.write(
+                    reinterpret_cast<const char*>(bytes.data()),
+                    (std::streamsize)bytes.size());
+                stream.flush();
+                if (!stream.good()) {
+                    return false;
+                }
+                if (extendsFile) {
+                    currentBytes += bytes.size();
+                } else {
+                    const uint64_t freeOffset = freeIt->first;
+                    const size_t freeBytes = freeIt->second;
+                    freeRanges.erase(freeIt);
+                    if (freeBytes > bytes.size()) {
+                        freeRanges.emplace(
+                            freeOffset + bytes.size(),
+                            freeBytes - bytes.size());
+                    }
+                }
+
+                std::shared_ptr<PagedPrefixCacheTierDiskRef> prepared(
+                    new PagedPrefixCacheTierDiskRef());
+                prepared->offset = offset;
+                prepared->storedBytes = bytes.size();
+                prepared->uncompressedBytes = uncompressedBytes;
+                prepared->zstdCompressed = zstdCompressed;
+                prepared->checksum = checksum;
+                pagedPrefixCacheDiskLiveBytes.fetch_add(bytes.size());
+                pagedPrefixCacheDiskWriteBytes.fetch_add(bytes.size());
+                reference = std::move(prepared);
+                return true;
+            }
+            void Release(uint64_t offset, size_t bytes) {
+                if (bytes == 0) {
+                    return;
+                }
+                std::lock_guard<std::mutex> guard(locker);
+                if (offset > currentBytes ||
+                    bytes > currentBytes - offset) {
+                    return;
+                }
+                const uint64_t endOffset = offset + bytes;
+                auto next = freeRanges.lower_bound(offset);
+                if ((next != freeRanges.end() &&
+                     next->first < endOffset) ||
+                    (next != freeRanges.begin() &&
+                     std::prev(next)->first +
+                         std::prev(next)->second > offset)) {
+                    return;
+                }
+
+                uint64_t mergedOffset = offset;
+                size_t mergedBytes = bytes;
+                if (next != freeRanges.begin()) {
+                    auto previous = std::prev(next);
+                    if (previous->first + previous->second == offset) {
+                        mergedOffset = previous->first;
+                        mergedBytes += previous->second;
+                        freeRanges.erase(previous);
+                    }
+                }
+                next = freeRanges.lower_bound(endOffset);
+                if (next != freeRanges.end() &&
+                    next->first == endOffset) {
+                    mergedBytes += next->second;
+                    freeRanges.erase(next);
+                }
+                freeRanges.emplace(mergedOffset, mergedBytes);
+                pagedPrefixCacheDiskLiveBytes.fetch_sub(bytes);
+
+                auto tail = std::prev(freeRanges.end());
+                if (tail->first + tail->second == currentBytes) {
+                    currentBytes = tail->first;
+                    freeRanges.erase(tail);
+                    stream.flush();
+                    std::error_code resizeError;
+                    std::filesystem::resize_file(
+                        dataPath, currentBytes, resizeError);
+                    stream.clear();
+                }
+            }
+
+            bool Read(
+                    const PagedPrefixCacheTierDiskRef &reference,
+                    std::vector<uint8_t> &storedBytes) {
+                const auto started =
+                    std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> guard(locker);
+                    if (!EnsureOpen() ||
+                        reference.storedBytes == 0 ||
+                        reference.offset > currentBytes ||
+                        reference.storedBytes >
+                            currentBytes - reference.offset) {
+                        return false;
+                    }
+                    try {
+                        storedBytes.resize(reference.storedBytes);
+                    } catch (...) {
+                        return false;
+                    }
+                    stream.clear();
+                    stream.seekg(
+                        (std::streamoff)reference.offset,
+                        std::ios::beg);
+                    stream.read(
+                        reinterpret_cast<char*>(storedBytes.data()),
+                        (std::streamsize)storedBytes.size());
+                    if (!stream.good() ||
+                        PrefixCacheTierChecksum(
+                            storedBytes.data(),
+                            storedBytes.size()) !=
+                            reference.checksum) {
+                        storedBytes.clear();
+                        return false;
+                    }
+                }
+                const double elapsed =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() -
+                        started).count();
+                if (elapsed > 0.0) {
+                    const double observed =
+                        (double)reference.storedBytes /
+                        (1024.0 * 1024.0 * elapsed);
+                    const double previous =
+                        pagedPrefixCacheDiskReadMiBPerSecond.load();
+                    pagedPrefixCacheDiskReadMiBPerSecond.store(
+                        previous > 0.0
+                            ? previous * 0.8 + observed * 0.2
+                            : observed);
+                }
+                pagedPrefixCacheDiskReadBytes.fetch_add(
+                    reference.storedBytes);
+                pagedPrefixCacheDiskHits.fetch_add(1);
+                return true;
+            }
+
+        private:
+            bool EnsureOpen() {
+                if (stream.is_open()) {
+                    return true;
+                }
+                if (openAttempted) {
+                    return false;
+                }
+                openAttempted = true;
+                const char *configured = std::getenv(
+                    "FASTLLM_PREFIX_CACHE_DISK_DIR");
+                if (configured == nullptr || configured[0] == 0) {
+                    return false;
+                }
+                std::error_code filesystemError;
+                const std::filesystem::path baseDirectory(
+                    configured);
+                std::filesystem::create_directories(
+                    baseDirectory, filesystemError);
+                if (filesystemError) {
+                    return false;
+                }
+#ifndef _WIN32
+                std::filesystem::directory_iterator iterator(
+                    baseDirectory,
+                    std::filesystem::directory_options::
+                        skip_permission_denied,
+                    filesystemError);
+                const std::filesystem::directory_iterator end;
+                while (!filesystemError && iterator != end) {
+                    std::error_code typeError;
+                    const std::filesystem::directory_entry entry =
+                        *iterator;
+                    const std::string name =
+                        entry.path().filename().string();
+                    if (entry.is_directory(typeError) &&
+                        !typeError &&
+                        name.rfind("fastllm-prefix-", 0) == 0) {
+                        const std::filesystem::path lockPath =
+                            entry.path() / ".lock";
+                        const int staleFd = open(
+                            lockPath.c_str(),
+                            O_CREAT | O_RDWR | O_CLOEXEC,
+                            0600);
+                        if (staleFd >= 0) {
+                            if (flock(
+                                    staleFd,
+                                    LOCK_EX | LOCK_NB) == 0) {
+                                std::error_code cleanupError;
+                                std::filesystem::remove_all(
+                                    entry.path(), cleanupError);
+                                flock(staleFd, LOCK_UN);
+                            }
+                            close(staleFd);
+                        }
+                    }
+                    iterator.increment(filesystemError);
+                }
+#endif
+                uint64_t nonce = (uint64_t)
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().
+                                time_since_epoch()).count();
+                nonce ^= (uint64_t)(uintptr_t)this;
+                std::filesystem::path candidate;
+                for (int attempt = 0; attempt < 100; attempt++) {
+                    candidate =
+                        baseDirectory /
+                        ("fastllm-prefix-" +
+                         std::to_string(nonce) + "-" +
+                         std::to_string(attempt));
+                    filesystemError.clear();
+                    if (std::filesystem::create_directory(
+                            candidate, filesystemError)) {
+                        break;
+                    }
+                    candidate.clear();
+                    if (filesystemError) {
+                        return false;
+                    }
+                }
+                if (candidate.empty()) {
+                    return false;
+                }
+#ifndef _WIN32
+                const std::filesystem::path lockPath =
+                    candidate / ".lock";
+                sessionLockFd = open(
+                    lockPath.c_str(),
+                    O_CREAT | O_RDWR | O_CLOEXEC,
+                    0600);
+                if (sessionLockFd < 0 ||
+                    flock(
+                        sessionLockFd,
+                        LOCK_EX | LOCK_NB) != 0) {
+                    if (sessionLockFd >= 0) {
+                        close(sessionLockFd);
+                        sessionLockFd = -1;
+                    }
+                    std::filesystem::remove_all(
+                        candidate, filesystemError);
+                    return false;
+                }
+#endif
+                const std::filesystem::path dataPath =
+                    candidate / "pages.bin";
+                {
+                    std::ofstream create(
+                        dataPath,
+                        std::ios::binary | std::ios::trunc);
+                    if (!create.good()) {
+                        std::filesystem::remove_all(
+                            candidate, filesystemError);
+                        return false;
+                    }
+                }
+                stream.open(
+                    dataPath,
+                    std::ios::binary |
+                    std::ios::in |
+                    std::ios::out);
+                if (!stream.is_open()) {
+                    std::filesystem::remove_all(
+                        candidate, filesystemError);
+                    return false;
+                }
+                sessionDirectory = candidate.string();
+                this->dataPath = dataPath.string();
+                return true;
+            }
+
+            std::mutex locker;
+            bool openAttempted = false;
+            uint64_t currentBytes = 0;
+            std::map<uint64_t, size_t> freeRanges;
+            std::string dataPath;
+            std::string sessionDirectory;
+            std::fstream stream;
+            int sessionLockFd = -1;
+        };
+
+        PagedPrefixCacheDiskStore &GetPagedPrefixCacheDiskStore() {
+            static PagedPrefixCacheDiskStore store;
+            return store;
+        }
+
+        void ReleasePagedPrefixCacheDiskReference(
+                std::shared_ptr<
+                    PagedPrefixCacheTierDiskRef> &reference) {
+            if (reference == nullptr) {
+                return;
+            }
+            const uint64_t offset = reference->offset;
+            const size_t bytes = reference->storedBytes;
+            reference->storedBytes = 0;
+            reference.reset();
+            GetPagedPrefixCacheDiskStore().Release(offset, bytes);
+        }
+
+        double EffectivePagedPrefixCacheDiskReadMiBPerSecond() {
+            const double measured =
+                pagedPrefixCacheDiskReadMiBPerSecond.load();
+            return measured > 0.0
+                ? measured
+                : PrefixCacheEnvDouble(
+                    "FASTLLM_PREFIX_CACHE_DISK_READ_MBPS",
+                    300.0);
+        }
+
+        double EffectivePagedPrefixCacheRecomputeTokensPerSecond() {
+            const char *configured = std::getenv(
+                "FASTLLM_PREFIX_CACHE_RECOMPUTE_TPS");
+            if (configured != nullptr && configured[0] != 0) {
+                return PrefixCacheEnvDouble(
+                    "FASTLLM_PREFIX_CACHE_RECOMPUTE_TPS", 800.0);
+            }
+            const double measured =
+                pagedPrefixCacheRecomputeTokensPerSecond.load(
+                    std::memory_order_relaxed);
+            return measured > 0.0 ? measured : 800.0;
+        }
+
+        bool PagedPrefixCacheStorageWins(
+                size_t storedBytes,
+                size_t uncompressedBytes,
+                bool zstdCompressed,
+                size_t recomputeTokens,
+                bool fromDisk) {
+            const double readRate = fromDisk
+                ? EffectivePagedPrefixCacheDiskReadMiBPerSecond()
+                : PrefixCacheEnvDouble(
+                    "FASTLLM_PREFIX_CACHE_CPU_READ_MBPS", 10000.0);
+            double restoreSeconds =
+                (double)storedBytes /
+                (1024.0 * 1024.0 * readRate);
+            if (zstdCompressed) {
+                const double decompressRate =
+                    pagedPrefixCacheZstdDecompressMiBPerSecond.load(
+                        std::memory_order_relaxed);
+                const double effectiveDecompressRate =
+                    decompressRate > 0.0
+                        ? decompressRate
+                        : PrefixCacheEnvDouble(
+                            "FASTLLM_PREFIX_CACHE_ZSTD_DECOMPRESS_MBPS",
+                            1000.0);
+                restoreSeconds +=
+                    (double)uncompressedBytes /
+                    (1024.0 * 1024.0 *
+                     effectiveDecompressRate);
+            }
+            const double recomputeSeconds =
+                (double)recomputeTokens /
+                EffectivePagedPrefixCacheRecomputeTokensPerSecond();
+            return restoreSeconds < recomputeSeconds;
+        }
+    }
+
+    bool PagedPrefixCacheCpuTierEnabled() {
+        return PrefixCacheEnvEnabled(
+            "FASTLLM_PREFIX_CACHE_CPU_TIER", false);
+    }
+
+    bool PagedPrefixCacheDiskTierEnabled() {
+#ifdef _WIN32
+        return false;
+#else
+        const char *directory = std::getenv(
+            "FASTLLM_PREFIX_CACHE_DISK_DIR");
+        return PagedPrefixCacheCpuTierEnabled() &&
+               directory != nullptr && directory[0] != 0;
+#endif
+    }
+
+    uint64_t GetPagedPrefixCacheCpuTierBytes() {
+        return pagedPrefixCacheCpuTierBytes.load();
+    }
+
+    uint64_t GetPagedPrefixCacheGpuHitPages() {
+        return pagedPrefixCacheGpuHitPages.load(
+            std::memory_order_relaxed);
+    }
+
+    uint64_t GetPagedPrefixCacheCpuHitPages() {
+        return pagedPrefixCacheCpuHitPages.load(
+            std::memory_order_relaxed);
+    }
+
+    uint64_t GetPagedPrefixCacheDiskWriteBytes() {
+        return pagedPrefixCacheDiskWriteBytes.load();
+    }
+
+    uint64_t GetPagedPrefixCacheDiskLiveBytes() {
+        return pagedPrefixCacheDiskLiveBytes.load();
+    }
+
+    uint64_t GetPagedPrefixCacheDiskReadBytes() {
+        return pagedPrefixCacheDiskReadBytes.load();
+    }
+
+    uint64_t GetPagedPrefixCacheDiskHitCount() {
+        return pagedPrefixCacheDiskHits.load();
+    }
+
+    double GetPagedPrefixCacheDiskReadMegabytesPerSecond() {
+        return pagedPrefixCacheDiskReadMiBPerSecond.load();
+    }
+
+    void ObservePagedPrefixCacheRecompute(
+            size_t tokens, double seconds) {
+        if (tokens == 0 || !std::isfinite(seconds) ||
+            seconds <= 0.0) {
+            return;
+        }
+        ObservePrefixCacheRate(
+            pagedPrefixCacheRecomputeTokensPerSecond,
+            (double)tokens / seconds);
+    }
+
+    double GetPagedPrefixCacheRecomputeTokensPerSecond() {
+        return pagedPrefixCacheRecomputeTokensPerSecond.load(
+            std::memory_order_relaxed);
+    }
+
+    double GetPagedPrefixCacheZstdDecompressMegabytesPerSecond() {
+        return pagedPrefixCacheZstdDecompressMiBPerSecond.load(
+            std::memory_order_relaxed);
+    }
+
+    uint64_t GetPagedPrefixCacheZstdCompressCalls() {
+        return pagedPrefixCacheZstdCompressCalls.load(
+            std::memory_order_relaxed);
+    }
+
+    uint64_t GetPagedPrefixCacheZstdCompressInputBytes() {
+        return pagedPrefixCacheZstdCompressInputBytes.load(
+            std::memory_order_relaxed);
+    }
+
+    uint64_t GetPagedPrefixCacheZstdCompressOutputBytes() {
+        return pagedPrefixCacheZstdCompressOutputBytes.load(
+            std::memory_order_relaxed);
+    }
+
+    double GetPagedPrefixCacheZstdCompressSeconds() {
+        return (double)pagedPrefixCacheZstdCompressNanoseconds.load(
+            std::memory_order_relaxed) / 1.0e9;
+    }
+
+    uint64_t GetPagedPrefixCacheZstdDecompressCalls() {
+        return pagedPrefixCacheZstdDecompressCalls.load(
+            std::memory_order_relaxed);
+    }
+
+    uint64_t GetPagedPrefixCacheZstdDecompressInputBytes() {
+        return pagedPrefixCacheZstdDecompressInputBytes.load(
+            std::memory_order_relaxed);
+    }
+
+    uint64_t GetPagedPrefixCacheZstdDecompressOutputBytes() {
+        return pagedPrefixCacheZstdDecompressOutputBytes.load(
+            std::memory_order_relaxed);
+    }
+
+    double GetPagedPrefixCacheZstdDecompressSeconds() {
+        return (double)pagedPrefixCacheZstdDecompressNanoseconds.load(
+            std::memory_order_relaxed) / 1.0e9;
+    }
+
+    PagedPrefixCacheTierPayload::~PagedPrefixCacheTierPayload() {
+        if (accounted) {
+            pagedPrefixCacheCpuTierBytes.fetch_sub(bytes.size());
+        }
+    }
+
+    PagedCacheManager::~PagedCacheManager() {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        if (this->trieRoot != nullptr) {
+            for (auto &item : this->trieRoot->children) {
+                EvictTrieSubtree(item.second);
+            }
+            this->trieRoot->children.clear();
+            delete this->trieRoot;
+            this->trieRoot = nullptr;
+        }
+    }
+
     void PagedCacheManager::SetMaxPages(int maxPages) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        if (this->trieRoot != nullptr) {
+            for (auto &item : this->trieRoot->children) {
+                EvictTrieSubtree(item.second);
+            }
+            this->trieRoot->children.clear();
+            delete this->trieRoot;
+            this->trieRoot = nullptr;
+        }
         this->maxPages = maxPages;
         this->freePages.clear();
         this->triePages.clear();
@@ -5265,6 +6875,7 @@ namespace fastllm {
             node->parent->children.erase(node->edgeHash);
         }
         pageToTrieNode.erase(pageIndex);
+        ReleasePagedPrefixCacheDiskReference(node->tierDisk);
         delete node;
     }
 
@@ -5283,100 +6894,504 @@ namespace fastllm {
                 this->freePages.push_back(pid);
             }
         }
+        ReleasePagedPrefixCacheDiskReference(node->tierDisk);
         delete node;
     }
 
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        const int pageIndex =
+            GetUnusedPageIndexLocked(pick, nullptr);
+        if (pageIndex < 0) {
+            ErrorInFastLLM(
+                "PagedCacheManager::GetUnusedPageIndex: "
+                "no page can be used.\n");
+        }
+        return pageIndex;
+    }
 
-        // 尝试将 triePages 中已不在 Trie 中的 stale 条目迁移到 freePages
-        while (this->freePages.empty() && !this->triePages.empty()) {
-            int candidate = this->triePages.back();
+    int PagedCacheManager::GetUnusedPageIndexLocked(
+            bool pick,
+            const std::unordered_set<int> *protectedPages) {
+        while (this->freePages.empty() &&
+               !this->triePages.empty()) {
+            const int candidate = this->triePages.back();
             auto it = this->pageToTrieNode.find(candidate);
-            if (it == this->pageToTrieNode.end()) {
-                // 页面已不在 Trie 中，迁移到 freePages
-                this->triePages.pop_back();
-                this->triePagesSet.erase(candidate);
-                this->freePages.push_back(candidate);
-                this->freePagesSet.insert(candidate);
-            } else {
+            if (it != this->pageToTrieNode.end()) {
                 break;
             }
+            this->triePages.pop_back();
+            this->triePagesSet.erase(candidate);
+            this->freePages.push_back(candidate);
+            this->freePagesSet.insert(candidate);
         }
 
-        if (this->freePages.empty() && this->triePages.empty()) {
-            ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
-        }
-
-        int pageIndex;
         if (!this->freePages.empty()) {
-            pageIndex = this->freePages.back();
+            const int pageIndex = this->freePages.back();
             if (pick) {
                 this->freePages.pop_back();
                 this->freePagesSet.erase(pageIndex);
                 this->pageRefCount[pageIndex] = 1;
             }
-        } else {
-            if (!pick) {
-                pageIndex = this->triePages.back();
-                return pageIndex;
-            }
-
-            // pick 模式：从 triePages 中淘汰，优先选叶子节点
-            pageIndex = -1;
-            for (int i = (int)this->triePages.size() - 1; i >= 0; i--) {
-                int candidate = this->triePages[i];
-                auto it = this->pageToTrieNode.find(candidate);
-                if (it == this->pageToTrieNode.end()) {
-                    // stale 条目：页面已不在 Trie 中，直接用
-                    pageIndex = candidate;
-                    this->triePages[i] = this->triePages.back();
-                    this->triePages.pop_back();
-                    this->triePagesSet.erase(pageIndex);
-                    break;
-                }
-                if (it->second->children.empty()) {
-                    pageIndex = candidate;
-                    this->triePages[i] = this->triePages.back();
-                    this->triePages.pop_back();
-                    this->triePagesSet.erase(pageIndex);
-                    RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
-                    break;
-                }
-            }
-
-            if (pageIndex == -1) {
-                // 没有叶子可淘汰，选一个非叶子，递归清理其整个子树
-                pageIndex = this->triePages.back();
-                this->triePages.pop_back();
-                this->triePagesSet.erase(pageIndex);
-                auto it = this->pageToTrieNode.find(pageIndex);
-                if (it != this->pageToTrieNode.end()) {
-                    CacheTrieNode *node = it->second;
-                    for (auto &childKv : node->children) {
-                        EvictTrieSubtree(childKv.second);
-                    }
-                    node->children.clear();
-                    if (node->parent) {
-                        node->parent->children.erase(node->edgeHash);
-                    }
-                    this->pageToTrieNode.erase(it);
-                    delete node;
-                }
-                // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
-                // 过滤 triePages 中已不在 triePagesSet 的脏条目
-                int w = 0;
-                for (int i = 0; i < (int)this->triePages.size(); i++) {
-                    if (this->triePagesSet.count(this->triePages[i])) {
-                        this->triePages[w++] = this->triePages[i];
-                    }
-                }
-                this->triePages.resize(w);
-            }
-
-            this->pageRefCount[pageIndex] = 1;
+            return pageIndex;
         }
+        if (this->triePages.empty()) {
+            return -1;
+        }
+        if (!pick) {
+            for (int pageIndex : this->triePages) {
+                if (protectedPages == nullptr ||
+                    protectedPages->count(pageIndex) == 0) {
+                    return pageIndex;
+                }
+            }
+            return -1;
+        }
+
+        int pageIndex = -1;
+        int candidatePosition = -1;
+        CacheTrieNode *candidateNode = nullptr;
+        auto lessValuable = [](const CacheTrieNode *left,
+                              const CacheTrieNode *right) {
+            if (right == nullptr) {
+                return true;
+            }
+            if (left->accessCount != right->accessCount) {
+                return left->accessCount < right->accessCount;
+            }
+            return left->lastAccessTimestamp <
+                   right->lastAccessTimestamp;
+        };
+        for (int i = 0; i < (int)this->triePages.size(); i++) {
+            const int candidate = this->triePages[i];
+            if (protectedPages != nullptr &&
+                protectedPages->count(candidate) != 0) {
+                continue;
+            }
+            auto it = this->pageToTrieNode.find(candidate);
+            if (it == this->pageToTrieNode.end()) {
+                pageIndex = candidate;
+                candidatePosition = i;
+                break;
+            }
+            if (it->second->children.empty() &&
+                lessValuable(it->second, candidateNode)) {
+                pageIndex = candidate;
+                candidatePosition = i;
+                candidateNode = it->second;
+            }
+        }
+
+        if (pageIndex < 0) {
+            for (int i = 0; i < (int)this->triePages.size(); i++) {
+                const int candidate = this->triePages[i];
+                if (protectedPages != nullptr &&
+                    protectedPages->count(candidate) != 0) {
+                    continue;
+                }
+                auto it = this->pageToTrieNode.find(candidate);
+                if (it != this->pageToTrieNode.end() &&
+                    lessValuable(it->second, candidateNode)) {
+                    pageIndex = candidate;
+                    candidatePosition = i;
+                    candidateNode = it->second;
+                }
+            }
+        }
+        if (pageIndex < 0 || candidatePosition < 0) {
+            return -1;
+        }
+
+        this->triePages[candidatePosition] =
+            this->triePages.back();
+        this->triePages.pop_back();
+        this->triePagesSet.erase(pageIndex);
+        if (candidateNode != nullptr &&
+            PageOutTrieNode(candidateNode)) {
+            this->pageToTrieNode.erase(pageIndex);
+            candidateNode->pageId = -1;
+            candidateNode->timestamp = 0;
+        } else if (candidateNode != nullptr &&
+                   candidateNode->children.empty()) {
+            RemoveTrieLeaf(
+                candidateNode,
+                pageIndex,
+                this->pageToTrieNode);
+        } else if (candidateNode != nullptr) {
+            for (auto &childKv : candidateNode->children) {
+                EvictTrieSubtree(childKv.second);
+            }
+            candidateNode->children.clear();
+            if (candidateNode->parent) {
+                candidateNode->parent->children.erase(
+                    candidateNode->edgeHash);
+            }
+            this->pageToTrieNode.erase(pageIndex);
+            ReleasePagedPrefixCacheDiskReference(
+                candidateNode->tierDisk);
+            delete candidateNode;
+            int write = 0;
+            for (int page : this->triePages) {
+                if (this->triePagesSet.count(page)) {
+                    this->triePages[write++] = page;
+                }
+            }
+            this->triePages.resize(write);
+        }
+        this->pageRefCount[pageIndex] = 1;
         return pageIndex;
+    }
+    bool PagedCacheManager::PageOutTrieNode(
+            CacheTrieNode *node) {
+        if (node == nullptr || node->pageId < 0) {
+            return false;
+        }
+        if (node->tierPayload != nullptr ||
+            node->tierDisk != nullptr) {
+            return true;
+        }
+        if (!PagedPrefixCacheCpuTierEnabled() ||
+            this->maxPages <= 0) {
+            return false;
+        }
+        const size_t prefixTokens =
+            (size_t)std::max(
+                node->depthPages,
+                node->maxPrefixDepthPages) *
+            (size_t)std::max(1, this->pageLen);
+        const uint64_t minHits = PrefixCacheEnvBytes(
+            "FASTLLM_PREFIX_CACHE_MIN_HITS", 2);
+        const uint64_t minTokens = PrefixCacheEnvBytes(
+            "FASTLLM_PREFIX_CACHE_MIN_TOKENS", 65536);
+        if (node->accessCount < minHits &&
+            prefixTokens < minTokens) {
+            return false;
+        }
+        const size_t managerBytes = this->GetBytes();
+        if (managerBytes == 0 ||
+            managerBytes % (size_t)this->maxPages != 0) {
+            return false;
+        }
+        const size_t pageBytes =
+            managerBytes / (size_t)this->maxPages;
+        if (pageBytes == 0 ||
+            (size_t)node->pageId >
+                std::numeric_limits<size_t>::max() / pageBytes) {
+            return false;
+        }
+        std::vector<uint8_t> storedBytes;
+        try {
+            storedBytes.resize(pageBytes);
+        } catch (...) {
+            return false;
+        }
+        const size_t offset =
+            (size_t)node->pageId * pageBytes;
+        if (this->dataDevice == DataDevice::CPU &&
+            this->cpuData != nullptr) {
+            std::memcpy(
+                storedBytes.data(),
+                this->cpuData + offset,
+                pageBytes);
+#ifdef USE_CUDA
+        } else if (this->dataDevice == DataDevice::CUDA &&
+                   this->cudaData != nullptr) {
+            const int originalDevice = FastllmCudaGetDevice();
+            int targetDevice = originalDevice;
+            if (!this->dataDeviceIds.empty()) {
+                targetDevice = this->dataDeviceIds[0];
+            }
+            FastllmCudaSetDevice(targetDevice);
+            FastllmCudaCopyFromDeviceToHost(
+                storedBytes.data(),
+                (uint8_t*)this->cudaData + offset,
+                pageBytes);
+            FastllmCudaSetDevice(originalDevice);
+#endif
+        } else {
+            return false;
+        }
+
+        bool zstdCompressed = false;
+#ifdef FASTLLM_USE_ZSTD
+        if (PrefixCacheEnvEnabled(
+                "FASTLLM_PREFIX_CACHE_ZSTD", true)) {
+            try {
+                std::vector<uint8_t> compressed(
+                    ZSTD_compressBound(pageBytes));
+                const int level = (int)PrefixCacheEnvBytes(
+                    "FASTLLM_PREFIX_CACHE_ZSTD_LEVEL", 1);
+                const size_t inputBytes = storedBytes.size();
+                const auto compressStarted =
+                    std::chrono::steady_clock::now();
+                const size_t compressedSize = ZSTD_compress(
+                    compressed.data(),
+                    compressed.size(),
+                    storedBytes.data(),
+                    inputBytes,
+                    level);
+                const auto compressNanoseconds =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() -
+                        compressStarted).count();
+                const bool useCompressed =
+                    !ZSTD_isError(compressedSize) &&
+                    compressedSize < inputBytes;
+                pagedPrefixCacheZstdCompressCalls.fetch_add(
+                    1, std::memory_order_relaxed);
+                pagedPrefixCacheZstdCompressInputBytes.fetch_add(
+                    inputBytes, std::memory_order_relaxed);
+                pagedPrefixCacheZstdCompressOutputBytes.fetch_add(
+                    useCompressed ? compressedSize : inputBytes,
+                    std::memory_order_relaxed);
+                if (compressNanoseconds > 0) {
+                    pagedPrefixCacheZstdCompressNanoseconds.fetch_add(
+                        (uint64_t)compressNanoseconds,
+                        std::memory_order_relaxed);
+                }
+                if (useCompressed) {
+                    compressed.resize(compressedSize);
+                    storedBytes.swap(compressed);
+                    zstdCompressed = true;
+                }
+            } catch (...) {
+            }
+        }
+#endif
+        const uint64_t checksum = PrefixCacheTierChecksum(
+            storedBytes.data(), storedBytes.size());
+        const uint64_t diskMinHits = PrefixCacheEnvBytes(
+            "FASTLLM_PREFIX_CACHE_DISK_MIN_HITS", 2);
+        const uint64_t diskMinTokens = PrefixCacheEnvBytes(
+            "FASTLLM_PREFIX_CACHE_DISK_MIN_TOKENS", 65536);
+        if (PagedPrefixCacheDiskTierEnabled() &&
+            node->accessCount >= diskMinHits &&
+            prefixTokens >= diskMinTokens &&
+            PagedPrefixCacheStorageWins(
+                storedBytes.size(),
+                pageBytes,
+                zstdCompressed,
+                (size_t)std::max(1, this->pageLen),
+                true) &&
+            GetPagedPrefixCacheDiskStore().Append(
+                storedBytes,
+                pageBytes,
+                zstdCompressed,
+                checksum,
+                node->tierDisk)) {
+            return true;
+        }
+
+        const uint64_t maxCpuBytes = PrefixCacheEnvBytes(
+            "FASTLLM_PREFIX_CACHE_CPU_MAX_BYTES",
+            UINT64_C(4294967296));
+        uint64_t current =
+            pagedPrefixCacheCpuTierBytes.load();
+        while (maxCpuBytes == 0 ||
+               (current <= maxCpuBytes &&
+                storedBytes.size() <= maxCpuBytes - current)) {
+            if (pagedPrefixCacheCpuTierBytes.
+                    compare_exchange_weak(
+                        current,
+                        current + storedBytes.size())) {
+                try {
+                    std::shared_ptr<PagedPrefixCacheTierPayload>
+                        payload(new PagedPrefixCacheTierPayload());
+                    payload->bytes = std::move(storedBytes);
+                    payload->uncompressedBytes = pageBytes;
+                    payload->zstdCompressed = zstdCompressed;
+                    payload->checksum = checksum;
+                    payload->accounted = true;
+                    node->tierPayload = std::move(payload);
+                    return true;
+                } catch (...) {
+                    pagedPrefixCacheCpuTierBytes.fetch_sub(
+                        storedBytes.size());
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool PagedCacheManager::MaterializeTrieNode(
+            CacheTrieNode *node,
+            const std::unordered_set<int> &protectedPages) {
+        if (node == nullptr || node->pageId >= 0 ||
+            (node->tierPayload == nullptr &&
+             node->tierDisk == nullptr)) {
+            return node != nullptr && node->pageId >= 0;
+        }
+        std::vector<uint8_t> diskStoredBytes;
+        const std::vector<uint8_t> *storedBytes = nullptr;
+        size_t uncompressedBytes = 0;
+        bool zstdCompressed = false;
+        uint64_t checksum = 0;
+        if (node->tierPayload != nullptr) {
+            storedBytes = &node->tierPayload->bytes;
+            uncompressedBytes =
+                node->tierPayload->uncompressedBytes;
+            zstdCompressed =
+                node->tierPayload->zstdCompressed;
+            checksum = node->tierPayload->checksum;
+            if (!PagedPrefixCacheStorageWins(
+                    storedBytes->size(),
+                    uncompressedBytes,
+                    zstdCompressed,
+                    (size_t)std::max(1, this->pageLen),
+                    false)) {
+                return false;
+            }
+        } else {
+            if (!PagedPrefixCacheStorageWins(
+                    node->tierDisk->storedBytes,
+                    node->tierDisk->uncompressedBytes,
+                    node->tierDisk->zstdCompressed,
+                    (size_t)std::max(1, this->pageLen),
+                    true)) {
+                return false;
+            }
+            uncompressedBytes =
+                node->tierDisk->uncompressedBytes;
+            zstdCompressed =
+                node->tierDisk->zstdCompressed;
+            checksum = node->tierDisk->checksum;
+            if (!GetPagedPrefixCacheDiskStore().Read(
+                    *node->tierDisk,
+                    diskStoredBytes)) {
+                ReleasePagedPrefixCacheDiskReference(
+                    node->tierDisk);
+                return false;
+            }
+            storedBytes = &diskStoredBytes;
+        }
+        if (storedBytes == nullptr ||
+            storedBytes->empty() ||
+            PrefixCacheTierChecksum(
+                storedBytes->data(),
+                storedBytes->size()) != checksum) {
+            node->tierPayload.reset();
+            ReleasePagedPrefixCacheDiskReference(
+                node->tierDisk);
+            return false;
+        }
+
+        std::vector<uint8_t> decompressed;
+        const uint8_t *source = storedBytes->data();
+        size_t sourceBytes = storedBytes->size();
+        if (zstdCompressed) {
+#ifdef FASTLLM_USE_ZSTD
+            try {
+                decompressed.resize(uncompressedBytes);
+            } catch (...) {
+                return false;
+            }
+            const auto decompressStarted =
+                std::chrono::steady_clock::now();
+            const size_t result = ZSTD_decompress(
+                decompressed.data(),
+                decompressed.size(),
+                storedBytes->data(),
+                storedBytes->size());
+            const auto decompressFinished =
+                std::chrono::steady_clock::now();
+            const auto decompressElapsed =
+                std::chrono::duration<double>(
+                    decompressFinished -
+                    decompressStarted).count();
+            const auto decompressNanoseconds =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    decompressFinished -
+                    decompressStarted).count();
+            pagedPrefixCacheZstdDecompressCalls.fetch_add(
+                1, std::memory_order_relaxed);
+            pagedPrefixCacheZstdDecompressInputBytes.fetch_add(
+                storedBytes->size(), std::memory_order_relaxed);
+            if (!ZSTD_isError(result)) {
+                pagedPrefixCacheZstdDecompressOutputBytes.fetch_add(
+                    result, std::memory_order_relaxed);
+            }
+            if (decompressNanoseconds > 0) {
+                pagedPrefixCacheZstdDecompressNanoseconds.fetch_add(
+                    (uint64_t)decompressNanoseconds,
+                    std::memory_order_relaxed);
+            }
+            if (ZSTD_isError(result) ||
+                result != uncompressedBytes) {
+                node->tierPayload.reset();
+                ReleasePagedPrefixCacheDiskReference(
+                    node->tierDisk);
+                return false;
+            }
+            if (decompressElapsed > 0.0) {
+                ObservePrefixCacheRate(
+                    pagedPrefixCacheZstdDecompressMiBPerSecond,
+                    (double)uncompressedBytes /
+                    (1024.0 * 1024.0 *
+                     decompressElapsed));
+            }
+            source = decompressed.data();
+            sourceBytes = decompressed.size();
+#else
+            return false;
+#endif
+        }
+        if (this->maxPages <= 0 ||
+            this->GetBytes() % (size_t)this->maxPages != 0 ||
+            sourceBytes !=
+                this->GetBytes() / (size_t)this->maxPages) {
+            return false;
+        }
+
+        const int pageIndex = GetUnusedPageIndexLocked(
+            true, &protectedPages);
+        if (pageIndex < 0) {
+            return false;
+        }
+        const size_t offset =
+            (size_t)pageIndex * sourceBytes;
+        bool copied = false;
+        if (this->dataDevice == DataDevice::CPU &&
+            this->cpuData != nullptr) {
+            std::memcpy(
+                this->cpuData + offset,
+                source,
+                sourceBytes);
+            copied = true;
+#ifdef USE_CUDA
+        } else if (this->dataDevice == DataDevice::CUDA &&
+                   this->cudaData != nullptr) {
+            const int originalDevice = FastllmCudaGetDevice();
+            int targetDevice = originalDevice;
+            if (!this->dataDeviceIds.empty()) {
+                targetDevice = this->dataDeviceIds[0];
+            }
+            FastllmCudaSetDevice(targetDevice);
+            FastllmCudaCopyFromHostToDevice(
+                (uint8_t*)this->cudaData + offset,
+                const_cast<uint8_t*>(source),
+                sourceBytes);
+            FastllmCudaSetDevice(originalDevice);
+            copied = true;
+#endif
+        }
+        if (!copied) {
+            this->pageRefCount[pageIndex] = 0;
+            if (this->freePagesSet.insert(pageIndex).second) {
+                this->freePages.push_back(pageIndex);
+            }
+            return false;
+        }
+
+        this->pageRefCount[pageIndex] = 0;
+        if (this->triePagesSet.insert(pageIndex).second) {
+            this->triePages.push_back(pageIndex);
+        }
+        node->pageId = pageIndex;
+        node->timestamp = ++this->currentTimestamp;
+        this->pageTimestamp[pageIndex] = node->timestamp;
+        this->pageToTrieNode[pageIndex] = node;
+        return true;
     }
 
     void PagedCacheManager::ReleasePageIndex(int pageIndex) {
@@ -5475,14 +7490,31 @@ namespace fastllm {
             int pid = pages[i];
 
             auto it = cur->children.find(h);
-            CacheTrieNode *child;
-            if (it == cur->children.end()) {
+            CacheTrieNode *child = nullptr;
+            const int *pageTokens =
+                tokens.data() + i * this->pageLen;
+            if (it != cur->children.end()) {
+                child = it->second;
+                if ((int)child->edgeTokens.size() != this->pageLen ||
+                    !std::equal(
+                        child->edgeTokens.begin(),
+                        child->edgeTokens.end(),
+                        pageTokens)) {
+                    cur->children.erase(it);
+                    EvictTrieSubtree(child);
+                    child = nullptr;
+                }
+            }
+            if (child == nullptr) {
                 child = new CacheTrieNode();
                 child->parent = cur;
+                child->depthPages = i + 1;
                 child->edgeHash = h;
+                child->edgeTokens.assign(
+                    pageTokens,
+                    pageTokens + this->pageLen);
                 cur->children[h] = child;
             } else {
-                child = it->second;
                 if (child->pageId != -1 && child->pageId != pid) {
                     int oldPid = child->pageId;
                     this->pageToTrieNode.erase(oldPid);
@@ -5518,6 +7550,10 @@ namespace fastllm {
                 }
             }
 
+            child->maxPrefixDepthPages = std::max(
+                child->maxPrefixDepthPages, numPages);
+            child->accessCount++;
+            child->lastAccessTimestamp = ts;
             child->pageId = pid;
             child->timestamp = ts;
             this->pageTimestamp[pid] = ts;
@@ -5530,9 +7566,11 @@ namespace fastllm {
     void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         cachedPageIds.clear();
+        const long long accessTimestamp = ++this->currentTimestamp;
 
         int numPages = (int)tokens.size() / this->pageLen;
         CacheTrieNode *cur = this->trieRoot;
+        std::unordered_set<int> protectedPages;
 
         for (int i = 0; i < numPages; i++) {
             uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
@@ -5543,16 +7581,44 @@ namespace fastllm {
             }
 
             CacheTrieNode *child = it->second;
-            if (child->pageId == -1) {
+            const int *pageTokens =
+                tokens.data() + i * this->pageLen;
+            if ((int)child->edgeTokens.size() != this->pageLen ||
+                !std::equal(
+                    child->edgeTokens.begin(),
+                    child->edgeTokens.end(),
+                    pageTokens)) {
+                break;
+            }
+            const bool residentHit = child->pageId >= 0;
+            const bool cpuTierHit =
+                child->pageId < 0 &&
+                child->tierPayload != nullptr;
+            if (child->pageId == -1 &&
+                !MaterializeTrieNode(
+                    child, protectedPages)) {
                 break;
             }
 
-            // 验证时间戳：页面未被覆盖
-            if (this->pageTimestamp[child->pageId] != child->timestamp) {
+            // Verify both the physical-page generation and bounds before
+            // reusing it.
+            if (child->pageId < 0 ||
+                child->pageId >= (int)this->pageTimestamp.size() ||
+                this->pageTimestamp[child->pageId] != child->timestamp) {
                 break;
             }
 
+            if (residentHit) {
+                pagedPrefixCacheGpuHitPages.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else if (cpuTierHit) {
+                pagedPrefixCacheCpuHitPages.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            child->accessCount++;
+            child->lastAccessTimestamp = accessTimestamp;
             cachedPageIds.push_back(child->pageId);
+            protectedPages.insert(child->pageId);
             cur = child;
         }
     }

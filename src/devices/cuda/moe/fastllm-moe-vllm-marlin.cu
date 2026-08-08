@@ -575,18 +575,24 @@ __device__ __forceinline__ half2 AwqDecodeZeroHalf2(int zero) {
 __device__ __forceinline__ void AwqMarlinAccumulatePackedPair(
         uint32_t packed, half2 inputLow, half2 inputHigh,
         half2 zero0, half2 zero1, half2 &sum0, half2 &sum1) {
-    half2 quant0[2];
-    half2 quant1[2];
-    marlin_kernel::dequant<
-        half2, marlin_types::kU4.id(), true>(
-            (int)packed, quant0);
-    marlin_kernel::dequant<
-        half2, marlin_types::kU4.id(), true>(
-            (int)(packed >> 8), quant1);
-    sum0 = __hfma2(inputLow, __hsub2(quant0[0], zero0), sum0);
-    sum0 = __hfma2(inputHigh, __hsub2(quant0[1], zero0), sum0);
-    sum1 = __hfma2(inputLow, __hsub2(quant1[0], zero1), sum1);
-    sum1 = __hfma2(inputHigh, __hsub2(quant1[1], zero1), sum1);
+    // Marlin's generic dequant helper is intentionally unavailable below
+    // SM75. Recreate its U4 skip-flop representation with SM70-safe integer
+    // operations: each nibble is added to the FP16 1024.0 bit pattern, then
+    // AwqDecodeZeroHalf2 removes the matching biased zero point.
+    constexpr uint32_t nibbleMask = 0x000f000fU;
+    constexpr uint32_t halfBias = 0x64006400U;
+    uint32_t quant0LowBits = (packed & nibbleMask) | halfBias;
+    uint32_t quant0HighBits = ((packed >> 4) & nibbleMask) | halfBias;
+    uint32_t quant1LowBits = ((packed >> 8) & nibbleMask) | halfBias;
+    uint32_t quant1HighBits = ((packed >> 12) & nibbleMask) | halfBias;
+    half2 quant0Low = *reinterpret_cast<const half2 *>(&quant0LowBits);
+    half2 quant0High = *reinterpret_cast<const half2 *>(&quant0HighBits);
+    half2 quant1Low = *reinterpret_cast<const half2 *>(&quant1LowBits);
+    half2 quant1High = *reinterpret_cast<const half2 *>(&quant1HighBits);
+    sum0 = __hfma2(inputLow, __hsub2(quant0Low, zero0), sum0);
+    sum0 = __hfma2(inputHigh, __hsub2(quant0High, zero0), sum0);
+    sum1 = __hfma2(inputLow, __hsub2(quant1Low, zero1), sum1);
+    sum1 = __hfma2(inputHigh, __hsub2(quant1High, zero1), sum1);
 }
 
 __device__ __forceinline__ float AwqHorizontalHalf2(half2 value) {
