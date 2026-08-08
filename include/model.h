@@ -24,6 +24,11 @@ namespace fastllm {
     void ApplyDeepSeekV4GGUFMetadata(basellm *model, const json11::Json &params,
                                      const std::string &arch);
 
+    // 纯 GGUF 路径下，从 FASTLLM_DSPARK_MODEL_PATH 指向的官方 checkpoint
+    // config.json 注入内置 DSpark 门控所需的 dspark_* 词条（--ori 路径已由
+    // AddDictRecursion 覆盖，此函数对已存在的键为 no-op）。
+    void InjectDeepSeekV4DSparkConfig(basellm *model);
+
     // DeepSeek-V4 GGUF backbone 只含 43 层 target 权重；DSpark 的 mtp.*
     // 权重需要单独从官方 safetensors 分片（46–48）叠加。下面的结构描述
     // 一次通过校验的 DSpark 分片计划。

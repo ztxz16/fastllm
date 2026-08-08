@@ -2715,6 +2715,55 @@ namespace fastllm {
         }
     }
 
+    // GGUF backbone 的元数据里没有 dspark_* 词条，而内置 DSpark 的 InitParams
+    // 门控（deepseekv4.cpp）从 weight.dicts 读取 dspark_noise_token_id /
+    // dspark_markov_rank / dspark_block_size / dspark_target_layer_ids。
+    // --ori 路径经 AddDictRecursion 注入官方 config.json，天然带这些键；
+    // 纯 GGUF 路径则需要从 FASTLLM_DSPARK_MODEL_PATH 指向的官方 checkpoint
+    // config.json 补齐。只在内置 DSpark 被启用且键尚缺时注入，绝不覆盖
+    // 已有值。
+    void InjectDeepSeekV4DSparkConfig(basellm *model) {
+        AssertInFastLLM(model != nullptr,
+                        "DeepSeek V4 DSpark config injection requires a model.\n");
+        const char *tokensEnv = std::getenv("FASTLLM_DSPARK_TOKENS");
+        const int dsparkTokens = tokensEnv != nullptr ? std::atoi(tokensEnv) : 0;
+        if (dsparkTokens <= 0) {
+            return;
+        }
+        if (model->weight.dicts.find("dspark_noise_token_id") !=
+            model->weight.dicts.end()) {
+            return;
+        }
+        const char *pathEnv = std::getenv("FASTLLM_DSPARK_MODEL_PATH");
+        AssertInFastLLM(pathEnv != nullptr && pathEnv[0] != '\0',
+                        "Embedded DSpark is enabled but FASTLLM_DSPARK_MODEL_PATH "
+                        "is not set; pass --dspark_checkpoint_path.");
+        std::string path = pathEnv;
+        if (path.back() != '/' && path.back() != '\\') {
+            path += "/";
+        }
+        const std::string configFile = path + "config.json";
+        AssertInFastLLM(FileExists(configFile),
+                        "DSpark checkpoint has no config.json: " + configFile);
+        std::string configError;
+        auto config = json11::Json::parse(ReadAllFile(configFile), configError);
+        AssertInFastLLM(configError.empty(),
+                        "Failed to parse DSpark config.json: " + configFile);
+        auto addIntKey = [&](const std::string &key) {
+            const auto &value = config[key];
+            AssertInFastLLM(value.is_number(),
+                            "DSpark config.json is missing numeric key: " + key);
+            model->weight.AddDict(key, std::to_string(value.int_value()));
+        };
+        addIntKey("dspark_noise_token_id");
+        addIntKey("dspark_markov_rank");
+        addIntKey("dspark_block_size");
+        const auto &targetLayerIds = config["dspark_target_layer_ids"];
+        AssertInFastLLM(targetLayerIds.is_array(),
+                        "DSpark config.json is missing dspark_target_layer_ids.");
+        model->weight.AddDict("dspark_target_layer_ids", targetLayerIds.dump());
+    }
+
     static int GetGLMDSAGGUFMainLayerCount(const json11::Json &params,
                                            const std::string &arch,
                                            const basellm *model) {
@@ -2876,6 +2925,11 @@ namespace fastllm {
         if (item.dtype == "F8_E4M3") {
             return DataType::FP8_E4M3;
         }
+        // MXFP4 routed experts: two fp4 e2m1 values per byte plus a separate
+        // F8_E8M0 scale tensor, matching the NVFP4 storage convention.
+        if (IsPackedFP4StorageDType(item.dtype)) {
+            return DataType::NVFP4;
+        }
         ErrorInFastLLM("DSpark hybrid loader unsupported safetensors dtype: " +
                        item.tensorName + " (" + item.dtype + ")\n");
         return DataType::FLOAT32;
@@ -2951,15 +3005,26 @@ namespace fastllm {
                 FindSafeTensorScaleTensorName(safeTensors, sourceName);
             SafeTensorItem *scaleTensor = nullptr;
             if (!scaleTensorName.empty()) {
-                AssertInFastLLM(diskDataType == DataType::FP8_E4M3,
+                AssertInFastLLM(diskDataType == DataType::FP8_E4M3 ||
+                                diskDataType == DataType::NVFP4,
                                 "DSpark disk weight scales are only supported for "
-                                "F8_E4M3 tensors: " + weightName);
+                                "F8_E4M3 or packed FP4 tensors: " + weightName);
                 scaleTensor = &safeTensors.itmeDict[scaleTensorName];
-                AssertInFastLLM(scaleTensor->dtype == "F32" ||
-                                scaleTensor->dtype == "BF16",
-                                "DSpark disk weight scale dtype should be F32 or BF16: " +
-                                scaleTensorName);
-                scaleTensor->CreateBuffer(DataType::FLOAT32);
+                if (diskDataType == DataType::NVFP4) {
+                    AssertInFastLLM(scaleTensor->dtype == "F8_E8M0" ||
+                                    scaleTensor->dtype == "U8",
+                                    "DSpark disk NVFP4 weight scale should be F8_E8M0: " +
+                                    scaleTensorName);
+                    // Compact NVFP4 keeps the raw E8M0 scale bytes as a second
+                    // disk part; SetDiskWeightMeta reads them without buffering.
+                } else {
+                    AssertInFastLLM(scaleTensor->dtype == "F32" ||
+                                    scaleTensor->dtype == "BF16" ||
+                                    scaleTensor->dtype == "F8_E8M0",
+                                    "DSpark disk weight scale dtype should be F32, BF16 "
+                                    "or F8_E8M0: " + scaleTensorName);
+                    scaleTensor->CreateBuffer(DataType::FLOAT32);
+                }
             }
             SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType,
                               scaleTensor, diskLazyWeightType);
@@ -2975,17 +3040,30 @@ namespace fastllm {
         if (scaleTensorName.empty()) {
             AssertInFastLLM(oriDataType != DataType::FP8_E4M3,
                             "DSpark F8_E4M3 tensor is missing its scale: " + weightName);
+            AssertInFastLLM(oriDataType != DataType::NVFP4,
+                            "DSpark packed FP4 tensor is missing its scale: " + weightName);
             tensor.CreateBuffer(oriDataType);
         } else {
-            AssertInFastLLM(oriDataType == DataType::FP8_E4M3,
-                            "DSpark scaled tensor must be F8_E4M3: " + weightName);
             auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-            AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16",
-                            "DSpark weight scale dtype should be F32 or BF16: " +
-                            scaleTensorName);
-            scaleTensor.CreateBuffer(DataType::FLOAT32);
-            tensor.CreateBufferWithScale(oriDataType, scaleTensor, nullptr);
-            scaleTensor.ClearBuffer();
+            if (oriDataType == DataType::NVFP4) {
+                AssertInFastLLM(scaleTensor.dtype == "F8_E8M0" ||
+                                scaleTensor.dtype == "U8",
+                                "DSpark packed FP4 weight scale should be F8_E8M0: " +
+                                scaleTensorName);
+                tensor.CreateBufferWithScale(DataType::NVFP4, scaleTensor, nullptr);
+            } else {
+                AssertInFastLLM(oriDataType == DataType::FP8_E4M3,
+                                "DSpark scaled tensor must be F8_E4M3 or packed FP4: " +
+                                weightName);
+                AssertInFastLLM(scaleTensor.dtype == "F32" ||
+                                scaleTensor.dtype == "BF16" ||
+                                scaleTensor.dtype == "F8_E8M0",
+                                "DSpark weight scale dtype should be F32, BF16 or "
+                                "F8_E8M0: " + scaleTensorName);
+                scaleTensor.CreateBuffer(DataType::FLOAT32);
+                tensor.CreateBufferWithScale(oriDataType, scaleTensor, nullptr);
+                scaleTensor.ClearBuffer();
+            }
         }
         model->weight[weightName].CreateFromOriData(
             WeightType::AUTO, oriDataType, tensor.buffer, tensor.minsBuffer,
@@ -3011,8 +3089,16 @@ namespace fastllm {
                             "DSpark mtp tensor collides with an existing weight: " +
                             name);
             auto &item = safeTensors.itmeDict[name];
-            model->weight.AddEmptyWeight(name, item.intShape,
-                                         DeepSeekV4DSparkSourceDataType(item));
+            DataType sourceDataType = DeepSeekV4DSparkSourceDataType(item);
+            std::vector <int> weightDims = item.intShape;
+            if (sourceDataType == DataType::NVFP4) {
+                AssertInFastLLM(!weightDims.empty(),
+                                "DSpark packed FP4 tensor has no shape: " + name);
+                // safetensors stores MXFP4 weights packed two values per byte;
+                // FastLLM NVFP4 dims are the logical element counts.
+                weightDims.back() *= 2;
+            }
+            model->weight.AddEmptyWeight(name, weightDims, sourceDataType);
             ImportDeepSeekV4DSparkTensor(model, safeTensors, name, name);
         }
     }
@@ -3379,6 +3465,10 @@ namespace fastllm {
         arch = ConvertGGUFTypeToFastllmType(sourceArch);
         int ggufMainLayerCount = GetGLMDSAGGUFMainLayerCount(params, arch, model);
 
+        if (sourceDeepSeek4GGUF) {
+            InjectDeepSeekV4DSparkConfig(model);
+        }
+
         // 3.0 更新模型信息
         model->InitParams();
 
@@ -3500,8 +3590,15 @@ namespace fastllm {
             auto &item = dsparkTensors->itmeDict[sourceName];
             tensors.push_back(weightName);
             allWeightNames.insert(weightName);
-            model->weight.AddEmptyWeight(weightName, item.intShape,
-                                         DeepSeekV4DSparkSourceDataType(item));
+            DataType dsparkSourceDataType = DeepSeekV4DSparkSourceDataType(item);
+            std::vector <int> dsparkDims = item.intShape;
+            if (dsparkSourceDataType == DataType::NVFP4) {
+                AssertInFastLLM(!dsparkDims.empty(),
+                                "DSpark packed FP4 tensor has no shape: " + weightName);
+                dsparkDims.back() *= 2;
+            }
+            model->weight.AddEmptyWeight(weightName, dsparkDims,
+                                         dsparkSourceDataType);
             totalLoadBytes += item.bytes;
         }
         model->OnWeightsCreated(allWeightNames);

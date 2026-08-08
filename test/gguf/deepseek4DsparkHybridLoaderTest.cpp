@@ -86,6 +86,29 @@ namespace {
         return tensor;
     }
 
+    // MXFP4 storage: two fp4 e2m1 values per byte, logical columns = 2x.
+    FixtureTensor MakePackedFp4Tensor(const std::string &name,
+                                      const std::vector<int> &shape,
+                                      const std::vector<uint8_t> &encoded) {
+        FixtureTensor tensor;
+        tensor.name = name;
+        tensor.dtype = "I8";
+        tensor.shape = shape;
+        tensor.bytes = encoded;
+        return tensor;
+    }
+
+    FixtureTensor MakeE8M0Tensor(const std::string &name,
+                                 const std::vector<int> &shape,
+                                 const std::vector<uint8_t> &encoded) {
+        FixtureTensor tensor;
+        tensor.name = name;
+        tensor.dtype = "F8_E8M0";
+        tensor.shape = shape;
+        tensor.bytes = encoded;
+        return tensor;
+    }
+
     struct ShardLayoutEntry {
         const FixtureTensor *tensor;
         uint64_t absoluteOffset;
@@ -524,6 +547,157 @@ namespace {
         assert(part.dims == std::vector<int>({2, 2}));
         std::cout << "Disk MoE metadata for DSpark experts: passed.\n";
     }
+
+    void TestMxfp4EagerImport() {
+        ScopedTempDir dir("mxfp4Eager");
+        // Packed [2, 2] bytes = logical [2, 4] fp4 values; one E8M0 scale
+        // per row (blockK = 1, blockM = 4). 0x7F = 2^0, 0x80 = 2^1.
+        WriteSafetensorsShard(dir.path / "model.safetensors", {
+            MakePackedFp4Tensor("mtp.1.attn.wq_a.weight", {2, 2},
+                                {0x12, 0x34, 0x56, 0x78}),
+            MakeE8M0Tensor("mtp.1.attn.wq_a.scale", {2, 1},
+                           {0x7F, 0x80}),
+        });
+        auto plan = fastllm::PlanDeepSeekV4DSparkShards(dir.path.string());
+        assert(plan.tensorNames.size() == 2);
+        auto model = MakeModel();
+        fastllm::ImportDeepSeekV4DSparkWeights(model.get(), plan);
+
+        auto it = model->weight.weight.find("mtp.1.attn.wq_a.weight");
+        assert(it != model->weight.weight.end());
+        auto &weight = it->second;
+        assert(weight.dataType == DataType::NVFP4);
+        assert(weight.dims == std::vector<int>({2, 4}));
+        assert(weight.blockK == 1 && weight.blockM == 4);
+        assert(weight.scales.empty());
+        assert(weight.GetBytes() == 6);
+        const uint8_t expected[6] = {0x12, 0x34, 0x56, 0x78, 0x7F, 0x80};
+        assert(weight.cpuData != nullptr);
+        assert(std::memcmp(weight.cpuData, expected, 6) == 0);
+        assert(model->weight.weight.find("mtp.1.attn.wq_a.scale") ==
+               model->weight.weight.end());
+        std::cout << "MXFP4 eager import keeps inline E8M0 scales: passed.\n";
+    }
+
+    void TestMxfp8EagerImport() {
+        ScopedTempDir dir("mxfp8Eager");
+        // FP8 E4M3 encodings for 1, 2, 0.5, 4, -1, -2, 0.25, 3 with a single
+        // 2D E8M0 scale block (0x80 = 2^1).
+        WriteSafetensorsShard(dir.path / "model.safetensors", {
+            MakeF8Tensor("mtp.1.attn.wq_a.weight", {2, 4},
+                         {0x38, 0x40, 0x30, 0x48,
+                          0xB8, 0xC0, 0x28, 0x44}),
+            MakeE8M0Tensor("mtp.1.attn.wq_a.scale", {1, 1}, {0x80}),
+        });
+        auto plan = fastllm::PlanDeepSeekV4DSparkShards(dir.path.string());
+        auto model = MakeModel();
+        fastllm::ImportDeepSeekV4DSparkWeights(model.get(), plan);
+
+        auto it = model->weight.weight.find("mtp.1.attn.wq_a.weight");
+        assert(it != model->weight.weight.end());
+        auto &weight = it->second;
+        assert(weight.dataType == DataType::FP8_E4M3);
+        assert(weight.dims == std::vector<int>({2, 4}));
+        assert(weight.blockK == 2 && weight.blockM == 4);
+        assert(weight.scales.size() == 1);
+        assert(weight.scales[0] == 2.0f);
+        const uint8_t expected[8] = {0x38, 0x40, 0x30, 0x48,
+                                     0xB8, 0xC0, 0x28, 0x44};
+        assert(std::memcmp(weight.cpuData, expected, 8) == 0);
+        std::cout << "MXFP8 eager import converts E8M0 scales: passed.\n";
+    }
+
+    void TestMxfp4DiskLazy() {
+        ScopedTempDir dir("mxfp4Disk");
+        const std::string w1Name = "mtp.0.ffn.experts.7.w1.weight";
+        const std::string w3Name = "mtp.0.ffn.experts.7.w3.weight";
+        const std::string downName = "mtp.0.ffn.experts.7.w2.weight";
+        const std::string gateupName = "mtp.0.ffn.experts.7.gateup.weight";
+        auto offsets = WriteSafetensorsShard(dir.path / "model.safetensors", {
+            MakePackedFp4Tensor(w1Name, {2, 2}, {0x12, 0x34, 0x56, 0x78}),
+            MakeE8M0Tensor(w1Name + "_scale", {2, 1}, {0x7F, 0x80}),
+        });
+
+        auto model = MakeModel();
+        model->moeLinears.insert(w1Name);
+        model->moeLinears.insert(w3Name);
+        model->moeLinears.insert(downName);
+        model->weightMergeRules.push_back(WeightMergeRule({
+            WeightMergeRuleSingle({w1Name, w3Name}, gateupName,
+                                  std::string("linearSwiglu"))}));
+        model->AddSpecialWeight(gateupName, "linearSwiglu", 0);
+        model->AddSpecialWeight(downName, "linearColumn", 0);
+        model->moeDeviceMap["disk"] = 1;
+
+        auto plan = fastllm::PlanDeepSeekV4DSparkShards(dir.path.string());
+        fastllm::ImportDeepSeekV4DSparkWeights(model.get(), plan);
+
+        auto it = model->weight.weight.find(w1Name);
+        assert(it != model->weight.weight.end());
+        auto &weight = it->second;
+        assert(weight.isDiskWeight);
+        assert(weight.cpuData == nullptr);
+        assert(weight.dataType == DataType::NVFP4);
+        assert(weight.dims == std::vector<int>({2, 4}));
+        assert(weight.blockK == 1 && weight.blockM == 4);
+        assert(weight.scales.empty());
+        assert(weight.diskWeightParts.size() == 2);
+        const auto &part = weight.diskWeightParts[0];
+        assert(!part.isScalePart);
+        assert(part.fileName == (dir.path / "model.safetensors").string());
+        assert(part.fileOffset == (long long)offsets[w1Name]);
+        assert(part.bytes == 4);
+        assert(part.sourceDataType == DataType::NVFP4);
+        assert(part.dims == std::vector<int>({2, 4}));
+        const auto &scalePart = weight.diskWeightParts[1];
+        assert(scalePart.isScalePart);
+        assert(scalePart.fileOffset == (long long)offsets[w1Name + "_scale"]);
+        assert(scalePart.bytes == 2);
+        assert(scalePart.sourceDataType == DataType::INT8);
+        std::cout << "Disk MoE metadata for MXFP4 experts: passed.\n";
+    }
+
+    void TestMxfp8DiskLazy() {
+        ScopedTempDir dir("mxfp8Disk");
+        const std::string w1Name = "mtp.0.ffn.experts.9.w1.weight";
+        const std::string w3Name = "mtp.0.ffn.experts.9.w3.weight";
+        const std::string downName = "mtp.0.ffn.experts.9.w2.weight";
+        const std::string gateupName = "mtp.0.ffn.experts.9.gateup.weight";
+        WriteSafetensorsShard(dir.path / "model.safetensors", {
+            MakeF8Tensor(w1Name, {2, 4},
+                         {0x38, 0x40, 0x30, 0x48,
+                          0xB8, 0xC0, 0x28, 0x44}),
+            MakeE8M0Tensor(w1Name + "_scale", {1, 1}, {0x80}),
+        });
+
+        auto model = MakeModel();
+        model->moeLinears.insert(w1Name);
+        model->moeLinears.insert(w3Name);
+        model->moeLinears.insert(downName);
+        model->weightMergeRules.push_back(WeightMergeRule({
+            WeightMergeRuleSingle({w1Name, w3Name}, gateupName,
+                                  std::string("linearSwiglu"))}));
+        model->AddSpecialWeight(gateupName, "linearSwiglu", 0);
+        model->AddSpecialWeight(downName, "linearColumn", 0);
+        model->moeDeviceMap["disk"] = 1;
+
+        auto plan = fastllm::PlanDeepSeekV4DSparkShards(dir.path.string());
+        fastllm::ImportDeepSeekV4DSparkWeights(model.get(), plan);
+
+        auto it = model->weight.weight.find(w1Name);
+        assert(it != model->weight.weight.end());
+        auto &weight = it->second;
+        assert(weight.isDiskWeight);
+        assert(weight.cpuData == nullptr);
+        assert(weight.dataType == DataType::FP8_E4M3);
+        assert(weight.dims == std::vector<int>({2, 4}));
+        assert(weight.blockK == 2 && weight.blockM == 4);
+        assert(weight.scales.size() == 1);
+        assert(weight.scales[0] == 2.0f);
+        assert(weight.diskWeightParts.size() == 1);
+        assert(weight.diskWeightParts.front().bytes == 8);
+        std::cout << "Disk MoE metadata for MXFP8 experts: passed.\n";
+    }
 }
 
 int main() {
@@ -536,6 +710,10 @@ int main() {
     TestImportRejectionPaths();
     TestFp8ScalePairing();
     TestDiskLazyMetadata();
+    TestMxfp4EagerImport();
+    TestMxfp8EagerImport();
+    TestMxfp4DiskLazy();
+    TestMxfp8DiskLazy();
     std::cout << "DeepSeek V4 DSpark hybrid loader tests passed.\n";
     return 0;
 }
