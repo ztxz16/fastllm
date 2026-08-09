@@ -313,6 +313,8 @@ bool FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size);
 bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
     void *dst, const void *src, size_t size);
+bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+    void *const *dsts, const void *const *srcs, const size_t *sizes, int count);
 
 void *FastllmCudaHostMalloc(size_t size);
 void FastllmCudaHostFree(void *ptr);

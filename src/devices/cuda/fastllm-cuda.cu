@@ -5383,6 +5383,77 @@ bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
                            cudaStreamPerThread) == cudaSuccess;
 }
 
+namespace {
+    constexpr int FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS = 128;
+    constexpr int FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT = 4;
+
+    struct FastllmCudaBatchCopyParams {
+        const uint8_t *srcs[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
+        uint8_t *dsts[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
+        size_t sizes[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
+        int count;
+    };
+
+    __global__ void FastllmCudaBatchCopyKernel(FastllmCudaBatchCopyParams params) {
+        int segment = blockIdx.x / FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
+        int segmentBlock = blockIdx.x % FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
+        if (segment >= params.count) {
+            return;
+        }
+
+        const uint8_t *src = params.srcs[segment];
+        uint8_t *dst = params.dsts[segment];
+        size_t bytes = params.sizes[segment];
+        size_t first = (size_t)segmentBlock * blockDim.x + threadIdx.x;
+        size_t stride = (size_t)FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT * blockDim.x;
+        bool vectorAligned = (((uintptr_t)src | (uintptr_t)dst | bytes) & 15) == 0;
+        if (vectorAligned) {
+            const uint4 *vectorSrc = reinterpret_cast<const uint4*>(src);
+            uint4 *vectorDst = reinterpret_cast<uint4*>(dst);
+            size_t vectors = bytes / sizeof(uint4);
+            for (size_t i = first; i < vectors; i += stride) {
+                vectorDst[i] = vectorSrc[i];
+            }
+        } else {
+            for (size_t i = first; i < bytes; i += stride) {
+                dst[i] = src[i];
+            }
+        }
+    }
+}
+
+bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+        void *const *dsts, const void *const *srcs, const size_t *sizes, int count) {
+    if (count < 0 || count > FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS ||
+        (count > 0 && (dsts == nullptr || srcs == nullptr || sizes == nullptr))) {
+        return false;
+    }
+
+    FastllmCudaBatchCopyParams params;
+    params.count = 0;
+    for (int i = 0; i < count; i++) {
+        if (sizes[i] == 0 || dsts[i] == srcs[i]) {
+            continue;
+        }
+        if (dsts[i] == nullptr || srcs[i] == nullptr) {
+            return false;
+        }
+        int index = params.count++;
+        params.srcs[index] = reinterpret_cast<const uint8_t*>(srcs[i]);
+        params.dsts[index] = reinterpret_cast<uint8_t*>(dsts[i]);
+        params.sizes[index] = sizes[i];
+    }
+    if (params.count == 0) {
+        return true;
+    }
+
+    int blocks = params.count * FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
+    FastllmCudaBatchCopyKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(params);
+    cudaError_t state = cudaGetLastError();
+    checkCudaErrors("Error: CUDA error when launching batched device copy!", state);
+    return state == cudaSuccess;
+}
+
 void *FastllmCudaHostMalloc(size_t size) {
     void *ptr = nullptr;
     cudaError_t state = cudaHostAlloc(&ptr, size, cudaHostAllocDefault);

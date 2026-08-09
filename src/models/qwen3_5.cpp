@@ -13504,6 +13504,17 @@ namespace fastllm {
             }
         };
 
+        auto copyTensorMetaIntoExistingStorage = [&](Data &dst, const Data &src) {
+            dst.isKVCache = src.isKVCache;
+            dst.isLinearAttention = src.isLinearAttention;
+            dst.isLinearAttentionTransposed = src.isLinearAttentionTransposed;
+            dst.cacheUid = src.cacheUid;
+            dst.strides = src.strides;
+            dst.expansionDims = src.expansionDims;
+            dst.expansionSize = src.expansionSize;
+            dst.expansionBytes = src.expansionBytes;
+        };
+
         auto adoptTensorIntoExistingStorage = [&](Data &dst, Data &src) {
             if (dst.isFake || src.isFake ||
                 dst.multiDeviceData || src.multiDeviceData ||
@@ -13995,13 +14006,15 @@ namespace fastllm {
                     }
                     localKey->dataDeviceIds = {localDevice};
                     localValue->dataDeviceIds = {localDevice};
-                    int oldDevice = FastllmCudaGetDevice();
-                    FastllmCudaSetDevice(localDevice);
-                    if (!Qwen35EnsureCudaLinearAttnStateTransposed(*localValue)) {
+                    if (!localValue->isLinearAttentionTransposed) {
+                        int oldDevice = FastllmCudaGetDevice();
+                        FastllmCudaSetDevice(localDevice);
+                        if (!Qwen35EnsureCudaLinearAttnStateTransposed(*localValue)) {
+                            FastllmCudaSetDevice(oldDevice);
+                            return false;
+                        }
                         FastllmCudaSetDevice(oldDevice);
-                        return false;
                     }
-                    FastllmCudaSetDevice(oldDevice);
                 }
             }
             return true;
@@ -14150,6 +14163,16 @@ namespace fastllm {
             std::vector<std::exception_ptr> linearBackupErrors(devices.size());
             threadTpWorkerGroup.Run(devices, [&](int deviceIndex) {
                 int localDevice = devices[deviceIndex];
+                FastllmCudaSetDevice(localDevice);
+                thread_local std::vector<void*> linearBackupDsts;
+                thread_local std::vector<const void*> linearBackupSrcs;
+                thread_local std::vector<size_t> linearBackupSizes;
+                linearBackupDsts.clear();
+                linearBackupSrcs.clear();
+                linearBackupSizes.clear();
+                linearBackupDsts.reserve(block_cnt * 2);
+                linearBackupSrcs.reserve(block_cnt * 2);
+                linearBackupSizes.reserve(block_cnt * 2);
                 for (int i = 0; i < block_cnt; i++) {
                     if (isAttentionLayerAt(i)) {
                         continue;
@@ -14178,7 +14201,10 @@ namespace fastllm {
                             backup.dims == real.dims &&
                             backup.GetBytes() == real.GetBytes();
                         if (reusable) {
-                            copyTensorIntoExistingStorage(backup, real);
+                            linearBackupDsts.push_back(backup.cudaData);
+                            linearBackupSrcs.push_back(real.cudaData);
+                            linearBackupSizes.push_back(real.GetBytes());
+                            copyTensorMetaIntoExistingStorage(backup, real);
                         } else {
                             copyTensorForValidationLocal(backup, real, localDevice);
                         }
@@ -14186,7 +14212,16 @@ namespace fastllm {
                     backupLinearState(*backupKey, *realKey);
                     backupLinearState(*backupValue, *realValue);
                 }
-                FastllmCudaSetDevice(localDevice);
+                if (!linearBackupDsts.empty() &&
+                    !FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                        linearBackupDsts.data(), linearBackupSrcs.data(),
+                        linearBackupSizes.data(), (int)linearBackupDsts.size())) {
+                    for (int i = 0; i < (int)linearBackupDsts.size(); i++) {
+                        FastllmCudaCopyFromDeviceToDevice(
+                            linearBackupDsts[i], (void*)linearBackupSrcs[i],
+                            linearBackupSizes[i]);
+                    }
+                }
                 ForceDeviceSync();
             }, linearBackupErrors);
             for (auto &error : linearBackupErrors) {
