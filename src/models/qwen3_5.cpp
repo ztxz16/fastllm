@@ -5219,6 +5219,7 @@ namespace fastllm {
             size_t packedRankBytes = (size_t)batch * 2 * sizeof(int);
             if (handoffSampling) {
                 int rootDevice = devices.front();
+                FastllmCudaSetDevice(rootDevice);
                 Data &cudaGather =
                     Qwen35ThreadLocalCudaShardedGreedyGather();
                 Qwen3CudaPrepareLocalOutput(cudaGather, rootDevice);
@@ -5311,6 +5312,12 @@ namespace fastllm {
                                 handoffGatherBase != nullptr,
                                 "Qwen3.5 CUDA greedy shard gather is missing.\n");
 
+                // The shard loop leaves the scheduler thread on the last TP
+                // device. Data::Allocate uses the current CUDA device rather
+                // than Data::dataDeviceIds, so switch back before allocating
+                // root-only merge outputs. Otherwise a non-P2P topology gives
+                // the root merge kernel a pointer owned by the last rank.
+                FastllmCudaSetDevice(rootDevice);
                 Data &cudaOutput = Qwen35ThreadLocalCudaSamplingOutput();
                 Qwen3CudaPrepareLocalOutput(cudaOutput, rootDevice);
                 cudaOutput.dataType = DataType::INT32;
