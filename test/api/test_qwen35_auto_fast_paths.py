@@ -40,7 +40,7 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
 
             self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
             self.assertEqual(
-                os.environ["FASTLLM_QWEN35_GPU_TOKEN_HANDOFF"], "1")
+                os.environ["FASTLLM_GPU_TOKEN_HANDOFF"], "1")
             self.assertEqual(
                 os.environ["FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH"], "64")
             self.assertTrue(args.cuda_embedding)
@@ -62,8 +62,7 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
             args = _configure_qwen35_auto_fast_paths(
                 _args(), is_qwen35_model=True, mtp=0)
 
-            self.assertNotIn(
-                "FASTLLM_QWEN35_GPU_TOKEN_HANDOFF", os.environ)
+            self.assertEqual(os.environ["FASTLLM_GPU_TOKEN_HANDOFF"], "0")
             self.assertNotIn(
                 "FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH", os.environ)
             self.assertFalse(args.cuda_embedding)
@@ -75,7 +74,7 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
 
             self.assertNotIn("FASTLLM_CUDA_GRAPH", os.environ)
             self.assertNotIn(
-                "FASTLLM_QWEN35_GPU_TOKEN_HANDOFF", os.environ)
+                "FASTLLM_GPU_TOKEN_HANDOFF", os.environ)
             self.assertFalse(args.cuda_embedding)
 
     def test_does_not_change_other_models(self):

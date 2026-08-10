@@ -361,18 +361,12 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
     if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
         os.environ["FASTLLM_CUDA_GRAPH"] = "1"
 
-    handoff_envs = (
-        "FASTLLM_QWEN35_GPU_TOKEN_HANDOFF",
-        "FASTLLM_GPU_TOKEN_HANDOFF",
-    )
-    if eligible and not any(name in os.environ for name in handoff_envs):
-        os.environ["FASTLLM_QWEN35_GPU_TOKEN_HANDOFF"] = "1"
+    handoff_env = "FASTLLM_GPU_TOKEN_HANDOFF"
+    if eligible and handoff_env not in os.environ:
+        os.environ[handoff_env] = "1"
 
     graph_enabled = _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")
-    handoff_enabled = _fastllm_env_flag_enabled(
-        "FASTLLM_QWEN35_GPU_TOKEN_HANDOFF",
-        "FASTLLM_GPU_TOKEN_HANDOFF",
-    )
+    handoff_enabled = _fastllm_env_flag_enabled(handoff_env)
     if is_qwen35_model and (graph_enabled or handoff_enabled):
         # Qwen3.5 handoff keeps sampled tokens on device, and graph replay also
         # benefits from avoiding a host embedding round trip.

@@ -874,10 +874,7 @@ namespace fastllm {
 
         static bool Qwen35GpuTokenHandoffEnabled() {
             const char *value =
-                std::getenv("FASTLLM_QWEN35_GPU_TOKEN_HANDOFF");
-            if (value == nullptr) {
-                value = std::getenv("FASTLLM_GPU_TOKEN_HANDOFF");
-            }
+                std::getenv("FASTLLM_GPU_TOKEN_HANDOFF");
             return value != nullptr && Qwen35MoeIsTrueString(value);
         }
 
