@@ -17300,6 +17300,8 @@ namespace fastllm {
                 }
                 return a.handle < b.handle;
             });
+            bool gpuTokenHandoffHasWaitingPrefill =
+                gpuTokenHandoffPending && hasPrefill;
             if (!forcedGpuTokenHandoffHandles.empty()) {
                 std::vector<DecodeOrder> forcedOrders;
                 forcedOrders.reserve(forcedGpuTokenHandoffHandles.size());
@@ -17383,6 +17385,14 @@ namespace fastllm {
             bool selectingGpuTokenHandoffPending =
                 gpuTokenHandoffPending &&
                 !forcedGpuTokenHandoffHandles.empty();
+            // A pending handoff has already advanced the current decode batch.
+            // Consume it first, but leave the next launch to the scheduler when
+            // a waiting prefill can occupy a free lane.  The following
+            // iteration will prefill the newcomer, rebuild the decode batch,
+            // and then resume handoff without starving request admission.
+            bool yieldGpuTokenHandoffToPrefill =
+                selectingGpuTokenHandoffPending &&
+                gpuTokenHandoffHasWaitingPrefill && canAddPrefill;
             if (!forcedGpuTokenHandoffHandles.empty()) {
                 canAddPrefill = false;
                 hasPrefill = false;
@@ -17662,6 +17672,7 @@ namespace fastllm {
                         oldTokensReady = true;
                     }
                     if (oldCanChain && unchangedBatch &&
+                        !yieldGpuTokenHandoffToPrefill &&
                         gpuTokenHandoffAllRunnable &&
                         canPrelaunchGpuTokenBatch(tokenContexts)) {
                         int nextDeviceSlot = 1 - oldDeviceSlot;
