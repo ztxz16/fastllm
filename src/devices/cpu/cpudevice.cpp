@@ -41,6 +41,9 @@ namespace fastllm {
     extern bool FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end);
+    extern bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
     extern bool FastllmGemmFloat32NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end);
@@ -316,6 +319,10 @@ namespace fastllm {
         this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CpuDeepSeekV4HcPostOp());
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CpuScaleQRatoryOp());
         this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CpuDeepSeekV4RotaryQuantOp());
+        this->ops["DeepSeekV4SparseAttention"] = (BaseOperator*)(new CpuDeepSeekV4SparseAttentionOp());
+        this->ops["DeepSeekV4SparseAttentionDecodeCached"] =
+            (BaseOperator*)(new CpuDeepSeekV4SparseAttentionDecodeCachedOp());
+        this->ops["DeepSeekV4IndexerTopK"] = (BaseOperator*)(new CpuDeepSeekV4IndexerTopKOp());
         this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CpuDeepSeekV4WoAOp());
         this->ops["DeepSeekV4BuildCompressedKVFromRaw"] = (BaseOperator*)(new CpuDeepSeekV4BuildCompressedKVFromRawOp());
         this->ops["DeepSeekV4StoreWindowKVCache"] = (BaseOperator*)(new CpuDeepSeekV4StoreWindowKVCacheOp());
@@ -360,6 +367,7 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CpuLlamaRotatePosition2DPartOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new CpuRopeEncodingOp());
         this->ops["Llama3RopeEncoding"] = (BaseOperator*)(new CpuLlama3RopeEncodingOp());
+        this->ops["YarnRopeEncoding"] = (BaseOperator*)(new CpuYarnRopeEncodingOp());
         this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new CpuQwen35InterleavedRopeOp());
         this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CpuQKVRMSNormRopeOp());
         this->ops["QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CpuQKVRMSNormRopeSplitAppendPagedCacheOp());
@@ -540,6 +548,48 @@ namespace fastllm {
                     uint8_t packed = blockStart[offset >> 1];
                     uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
                     dstRow[l] = FloatToBFloat16Trunc(scale * NVFP4E2M1ToFloat(fp4));
+                }
+            }
+        }
+    }
+
+    static void NVFP4Block32RowsToBFloat16(
+        const void *B, long ldb, uint16_t *bf16B,
+        int m, int st, int end
+    ) {
+        const int blockSize = 32;
+        const int packedBlockBytes = 16 + (int)sizeof(uint8_t);
+        const int blocks = (m - 1) / blockSize + 1;
+        for (int row = st; row < end; row++) {
+            const uint8_t *rowStart =
+                (const uint8_t*)B + (size_t)row * ldb;
+            uint16_t *dstRow = bf16B + (size_t)(row - st) * m;
+            for (int block = 0; block < blocks; block++) {
+                const uint8_t *blockStart =
+                    rowStart + block * packedBlockBytes;
+                const float scale =
+                    NVFP4E8M0ScaleToFloat(blockStart[16]);
+                const int begin = block * blockSize;
+                const int blockElems = std::min(blockSize, m - begin);
+#ifdef __AVX2__
+                if (cpuInstructInfo.hasAVX2) {
+                    const int first = std::min(16, blockElems);
+                    NVFP4Block16ToBFloat16_AVX2(
+                        blockStart, dstRow + begin, scale, first);
+                    if (blockElems > 16) {
+                        NVFP4Block16ToBFloat16_AVX2(
+                            blockStart + 8, dstRow + begin + 16,
+                            scale, blockElems - 16);
+                    }
+                    continue;
+                }
+#endif
+                for (int offset = 0; offset < blockElems; offset++) {
+                    const uint8_t packed = blockStart[offset >> 1];
+                    const uint8_t fp4 = (offset & 1) ?
+                        (packed >> 4) : (packed & 0xF);
+                    dstRow[begin + offset] = FloatToBFloat16Trunc(
+                        scale * NVFP4E2M1ToFloat(fp4));
                 }
             }
         }
@@ -1678,6 +1728,32 @@ namespace fastllm {
                         }
                     }
                     finish = true;
+                } else if (BType == DataType::NVFP4_BLOCK_32_E8M0) {
+                    // This compact layout is internal to the NUMA BF16
+                    // decode path. Keep the generic FP32 entry correct by
+                    // converting through BF16 when it is called directly.
+                    std::vector<uint16_t> bf16A_temp((size_t)n * m);
+                    for (int i = 0; i < n; i++) {
+                        Float32ToBFloat16(
+                            (float*)((uint8_t*)A + (size_t)i * lda),
+                            bf16A_temp.data() + (size_t)i * m, m);
+                    }
+                    if (n <= 31 && cpuInstructInfo.hasAVX512BF16 &&
+                        FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+                            bf16A_temp.data(), m * (long)sizeof(uint16_t),
+                            B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    std::vector<uint16_t> bf16B_temp(
+                        (size_t)(end - st) * m);
+                    NVFP4Block32RowsToBFloat16(
+                        B, ldb, bf16B_temp.data(), m, st, end);
+                    MultiThreadLinearBFloat16BFloat16Op(
+                        bf16A_temp.data(), bf16B_temp.data(), nullptr,
+                        ((float*)C) + st, n, m, ldc / sizeof(float),
+                        0, end - st).Run();
+                    finish = true;
                 } else if (BType == DataType::NVFP4_BLOCK_16 ||
                            BType == DataType::NVFP4_BLOCK_16_E8M0) {
                     bool scaleE8M0 = BType == DataType::NVFP4_BLOCK_16_E8M0;
@@ -1840,6 +1916,23 @@ namespace fastllm {
                         LinearBFloat16_FP8E4M3PERCHANNEL_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                         finish = true;
                     }
+                } else if (BType == NVFP4_BLOCK_32_E8M0) {
+                    if (n <= 31 && cpuInstructInfo.hasAVX512BF16 &&
+                        FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+                            A, lda, B, ldb, C, ldc,
+                            n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    std::vector<uint16_t> bf16B_temp(
+                        (size_t)(end - st) * m);
+                    NVFP4Block32RowsToBFloat16(
+                        B, ldb, bf16B_temp.data(), m, st, end);
+                    MultiThreadLinearBFloat16BFloat16Op(
+                        (uint16_t*)A, bf16B_temp.data(), nullptr,
+                        ((float*)C) + st, n, m, ldc / sizeof(float),
+                        0, end - st).Run();
+                    finish = true;
                 } else if (BType == NVFP4_BLOCK_16 ||
                            BType == NVFP4_BLOCK_16_E8M0) {
                     bool scaleE8M0 = BType == DataType::NVFP4_BLOCK_16_E8M0;
@@ -2044,6 +2137,10 @@ namespace fastllm {
                 st, end,
                 inputDataType, weightDataType, gateUpOutputDataType
             );
+
+            if (skipCrossSwiglu) {
+                return;
+            }
 
             // 2. 对 GEMM 刚写出的列做 CrossSwiglu
             //    gateUpOutputData 指向 gateUpOutput[..., globalColOffset]
@@ -4512,6 +4609,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &peCachePaged = *(datas.find("peCachePaged")->second);
         Data &output = *(datas.find("output")->second);
         float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;
+        int requestedKvLen = intParams.find("kvLen") != intParams.end() ?
+            intParams.find("kvLen")->second : -1;
 
         AssertInFastLLM(kvCachePaged.isPagedKVCache && peCachePaged.isPagedKVCache,
             "CpuMergeMLAPaged: kvCachePaged and peCachePaged must be paged KV cache (isPagedKVCache=true).\n");
@@ -4532,7 +4631,14 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
         int numPages = (int)kvCachePaged.pageIndex.size();
         int pageLen = kvCachePaged.pageLen;
-        int kvLen = (numPages > 0) ? (numPages - 1) * pageLen + kvCachePaged.lastPageLen : 0;
+        int fullKvLen = (numPages > 0) ?
+            (numPages - 1) * pageLen + kvCachePaged.lastPageLen : 0;
+        int kvLen = requestedKvLen > 0 ? requestedKvLen : fullKvLen;
+        AssertInFastLLM(
+            kvLen > 0 && kvLen <= fullKvLen && kvLen >= s,
+            "CpuMergeMLAPaged: requested KV length is invalid.\n");
+        numPages = (kvLen + pageLen - 1) / pageLen;
+        int lastPageLen = (kvLen - 1) % pageLen + 1;
 
         output.Allocate();
 
@@ -4559,7 +4665,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             int posInPage = kvPos % pageLen;
             if (pi >= numPages) return nullptr;
             int actualPage = peCachePaged.pageIndex[pi];
-            if (pi == numPages - 1 && posInPage >= peCachePaged.lastPageLen) return nullptr;
+            if (pi == numPages - 1 && posInPage >= lastPageLen) return nullptr;
             return ckvData + (size_t)actualPage * ckvPageStride + (size_t)posInPage * ckvPosStride;
         };
         auto getKpeAt = [&](int kvPos) -> const uint8_t* {
@@ -4568,7 +4674,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             int posInPage = kvPos % pageLen;
             if (pi >= numPages) return nullptr;
             int actualPage = kvCachePaged.pageIndex[pi];
-            if (pi == numPages - 1 && posInPage >= kvCachePaged.lastPageLen) return nullptr;
+            if (pi == numPages - 1 && posInPage >= lastPageLen) return nullptr;
             return kpeData + (size_t)actualPage * kpePageStride + (size_t)posInPage * kpePosStride;
         };
 
@@ -9547,6 +9653,58 @@ ops += (long long)lines * inputDim * interDim * 2;
             ((uint16_t*)data.cpuData)[index] = float_to_half(value);
         } else {
             Float32ToBFloat16(&value, ((uint16_t*)data.cpuData) + index, 1);
+        }
+    }
+
+    void CpuYarnRopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float factor = floatParams.find("factor") != floatParams.end() ? floatParams.find("factor")->second : 1.0f;
+        float attentionFactor = floatParams.find("attentionFactor") != floatParams.end() ? floatParams.find("attentionFactor")->second : 1.0f;
+        float correctionLow = floatParams.find("correctionLow") != floatParams.end() ? floatParams.find("correctionLow")->second : 0.0f;
+        float correctionHigh = floatParams.find("correctionHigh") != floatParams.end() ? floatParams.find("correctionHigh")->second : 1.0f;
+
+        AssertInFastLLM(data.dims.size() == 4,
+                        "YaRN RoPE expects [batch, seq, heads, dim] input.");
+        AssertInFastLLM(positionIds.dataType == DataType::FLOAT32,
+                        "YaRN RoPE expects FLOAT32 position ids.");
+        AssertInFastLLM(data.dataType == DataType::FLOAT32 ||
+                        data.dataType == DataType::FLOAT16 ||
+                        data.dataType == DataType::BFLOAT16,
+                        "YaRN RoPE supports FLOAT32, FLOAT16 and BFLOAT16 input.");
+        AssertInFastLLM(rotaryDim <= data.dims[3],
+                        "YaRN rotary_dim exceeds the input head dimension.");
+
+        int bs = data.dims[0], len = data.dims[1], n = data.dims[2], m = data.dims[3];
+        int spatial = data.Count(2), half = rotaryDim / 2, posStride = positionIds.dims.back();
+        for (int batch = 0; batch < bs; batch++) {
+            for (int token = 0; token < len; token++) {
+                float position = (float)(int)((float*)positionIds.cpuData)[batch * posStride + token];
+                int tokenOffset = (batch * len + token) * spatial;
+                for (int j = 0; j < half; j++) {
+                    float posFreq = powf(ropeTheta, (float)(2 * j) / rotaryDim);
+                    float extrapolation = 1.0f / posFreq;
+                    float interpolation = 1.0f / (factor * posFreq);
+                    float ramp = std::max(0.0f, std::min(1.0f,
+                        (j - correctionLow) / (correctionHigh - correctionLow)));
+                    float extrapolationFactor = 1.0f - ramp;
+                    float invFreq = interpolation * (1.0f - extrapolationFactor) +
+                                    extrapolation * extrapolationFactor;
+                    float angle = position * invFreq;
+                    float curSin = sinf(angle) * attentionFactor;
+                    float curCos = cosf(angle) * attentionFactor;
+                    for (int h = 0; h < n; h++) {
+                        int headOffset = tokenOffset + h * m;
+                        float a = CpuRopeRead(data, headOffset + j);
+                        float b = CpuRopeRead(data, headOffset + j + half);
+                        CpuRopeWrite(data, headOffset + j, a * curCos - b * curSin);
+                        CpuRopeWrite(data, headOffset + j + half, a * curSin + b * curCos);
+                    }
+                }
+            }
         }
     }
 

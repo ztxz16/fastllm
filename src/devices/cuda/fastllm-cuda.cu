@@ -13,9 +13,11 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <map>
@@ -31,6 +33,12 @@ extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
                                           int srcDevice, const void *src,
                                           size_t bytes);
 
+static bool FastllmCudaDataHasDenseStrides(const fastllm::Data &data);
+static bool FastllmCudaResolveDataDeviceId(const fastllm::Data &data,
+                                           int &device);
+static bool FastllmCudaDataCanShareDevice(const fastllm::Data &reference,
+                                          const fastllm::Data &other);
+
 #if defined(__linux__) || defined(__APPLE__)
 #include <execinfo.h>
 #endif
@@ -42,6 +50,43 @@ static thread_local bool fastllmCudaThreadErrorFlag = false;
 // GPU.  A thread-local flag alone loses failures raised by worker-side cuBLAS,
 // NCCL, or custom kernels, so retain a capture-epoch aggregate as well.
 static std::atomic<bool> fastllmCudaGraphErrorFlag(false);
+
+namespace {
+    // A pool miss must not unwind one tensor-parallel rank while its peers are
+    // still recording NCCL collectives. CUDA capture records kernel arguments
+    // without executing them, so a small, process-lifetime address can carry the
+    // failed rank to the common post-body abort barrier. Managed whole-step
+    // callers check the graph error flag before instantiation, guaranteeing
+    // that a graph containing this address is never launched.
+    static std::mutex fastllmCudaGraphAllocationFailurePlaceholderMutex;
+    static std::map<int, void*>
+        fastllmCudaGraphAllocationFailurePlaceholders;
+
+    static cudaError_t FastllmCudaGraphPrepareAllocationFailurePlaceholder() {
+        int device = -1;
+        cudaError_t state = cudaGetDevice(&device);
+        if (state != cudaSuccess) {
+            return state;
+        }
+        std::lock_guard<std::mutex> guard(
+            fastllmCudaGraphAllocationFailurePlaceholderMutex);
+        if (fastllmCudaGraphAllocationFailurePlaceholders.find(device) !=
+                fastllmCudaGraphAllocationFailurePlaceholders.end()) {
+            return cudaSuccess;
+        }
+        // Keep one tiny process-lifetime allocation per device. It is resolved
+        // before stream capture and intentionally stays outside FastLLM's
+        // reusable pool, so a failed Data owner can mark it borrowed without
+        // affecting allocator ownership. This also works on the ROCm build,
+        // where runtime symbol-address lookup is unavailable.
+        void *ptr = nullptr;
+        state = FastllmCudaCheckedMalloc(&ptr, 256, __FILE__, __LINE__);
+        if (state == cudaSuccess && ptr != nullptr) {
+            fastllmCudaGraphAllocationFailurePlaceholders[device] = ptr;
+        }
+        return state;
+    }
+}
 
 void FastllmCudaClearThreadError() {
     fastllmCudaThreadErrorFlag = false;
@@ -76,6 +121,7 @@ void showError(cudaError_t result, char const* const message, const char* const 
 }
 
 static std::atomic<bool> fastllmCudaMallocDisabled(false);
+static std::atomic<int> fastllmCudaMallocRejectLogCount(0);
 static std::mutex fastllmCudaMallocCheckMutex;
 
 // A graph keeps raw kernel arguments after host-side Data temporaries have been
@@ -252,15 +298,24 @@ static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line,
 }
 
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
-    if (fastllm::GetFastllmEnv().cudaMemCheck) {
-        bool rejected = fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
+    bool rejected = fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
+    int rejectLogIndex = rejected ?
+        fastllmCudaMallocRejectLogCount.fetch_add(1, std::memory_order_relaxed) : -1;
+    // A rejected post-startup allocation is always actionable.  Print the first
+    // few call stacks even when the verbose startup allocation audit is off, so
+    // a frozen server can identify the missing warmup path without flooding the
+    // log after the first failure cascades through concurrent requests.
+    if (fastllm::GetFastllmEnv().cudaMemCheck ||
+        (rejected && rejectLogIndex < 4)) {
         FastllmCudaPrintMallocStack(size, file, line, rejected);
-        if (rejected) {
-            if (ret != nullptr) {
-                *ret = nullptr;
-            }
-            return cudaErrorMemoryAllocation;
+    }
+    // The serving frontend arms this freeze only when
+    // FASTLLM_CUDA_MEM_CHECK is enabled.
+    if (rejected) {
+        if (ret != nullptr) {
+            *ret = nullptr;
         }
+        return cudaErrorMemoryAllocation;
     }
     if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
         // 真实 cudaMalloc 前排空在途 NCCL 集合通信，避免与 cudaMalloc 争用 CUDA 驱动锁导致跨 rank 死锁。
@@ -270,9 +325,14 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
 }
 
 void DisableCudaMalloc() {
-    fastllmCudaMallocDisabled.store(true, std::memory_order_relaxed);
-    if (fastllm::GetFastllmEnv().cudaMemCheck) {
-        fprintf(stderr, "[FASTLLM_CUDA_MEM_CHECK] cudaMalloc disabled.\n");
+    if (!fastllm::GetFastllmEnv().cudaMemCheck) {
+        return;
+    }
+    bool wasDisabled = fastllmCudaMallocDisabled.exchange(
+        true, std::memory_order_acq_rel);
+    if (!wasDisabled) {
+        fprintf(stderr,
+                "[Fastllm] CUDA allocation frozen; future pool misses will be rejected.\n");
         fflush(stderr);
     }
 }
@@ -369,6 +429,13 @@ std::vector <long long> FastllmCudaGetFreeSizes() {
     }
     cudaSetDevice(id);
     return ret;
+}
+
+long long FastllmCudaGetFreeSize() {
+    size_t freeBytes = 0;
+    size_t totalBytes = 0;
+    const cudaError_t error = cudaMemGetInfo(&freeBytes, &totalBytes);
+    return error == cudaSuccess ? (long long)freeBytes : 0;
 }
 
 std::vector <long long> FastllmCudaGetTotalSizes() {
@@ -481,6 +548,26 @@ bool FastllmCudaFlashInferSupported() {
     return supported;
 }
 
+bool FastllmCudaFlashInferDataTypeSupported(fastllm::DataType dataType) {
+    if (!FastllmCudaFlashInferSupported()) {
+        return false;
+    }
+    if (dataType == fastllm::DataType::FLOAT16) {
+        return true;
+    }
+    if (dataType != fastllm::DataType::BFLOAT16) {
+        return false;
+    }
+
+    int dev = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        return false;
+    }
+    return major * 10 + minor >= 80;
+}
+
 void DeviceSync() {
     if (fastllm::GetFastllmEnv().cudaSync) {
         cudaDeviceSynchronize();
@@ -579,13 +666,30 @@ static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
 }
 
 bool FastllmCudaGraphBeginCapture() {
-    cudaError_t state = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+    cudaError_t state = cudaSuccess;
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
+        // Allocate the process-lifetime failure address before capture; even a
+        // tiny cudaMalloc is forbidden once stream capture has begun.
+        state = FastllmCudaGraphPrepareAllocationFailurePlaceholder();
+        if (state != cudaSuccess) {
+            return FastllmCudaGraphSetError(
+                "prepare allocation-failure placeholder", state);
+        }
+    }
+    state = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
     bool ok = FastllmCudaGraphSetError("cudaStreamBeginCapture", state);
     if (ok && fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
                   FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
         FastllmCudaGraphRegisterCurrentCapture();
     }
     return ok;
+}
+
+bool FastllmCudaGraphPrepareCaptureDevice() {
+    return FastllmCudaGraphSetError(
+        "prepare allocation-failure placeholder",
+        FastllmCudaGraphPrepareAllocationFailurePlaceholder());
 }
 
 // 检查当前线程的捕获是否已被 invalidate（捕获体内任何算子报错都会导致失效）。
@@ -609,6 +713,31 @@ bool FastllmCudaGraphIsCapturing() {
         return false;
     }
     return captureStatus != cudaStreamCaptureStatusNone;
+}
+
+bool FastllmCudaGraphGetAllocationFailurePlaceholder(void **ptr) {
+    if (ptr == nullptr) {
+        return false;
+    }
+    *ptr = nullptr;
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) !=
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING ||
+        !FastllmCudaGetThreadError() || !FastllmCudaGraphIsCapturing()) {
+        return false;
+    }
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(
+        fastllmCudaGraphAllocationFailurePlaceholderMutex);
+    auto it = fastllmCudaGraphAllocationFailurePlaceholders.find(device);
+    if (it == fastllmCudaGraphAllocationFailurePlaceholders.end()) {
+        return false;
+    }
+    *ptr = it->second;
+    return *ptr != nullptr;
 }
 
 namespace {
@@ -1245,6 +1374,41 @@ __global__ void FastllmCudaFloatEmbeddingKernel(float *input, T *weight, T *outp
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void FastllmCudaFloatEmbeddingVectorKernel(
+        const float *input, const uint4 *weight, uint4 *output,
+        int vectorsPerRow) {
+    int row = blockIdx.x;
+    int token = (int)(input[row] + 1e-5f);
+    const uint4 *src = weight + (int64_t)token * vectorsPerRow;
+    uint4 *dst = output + (int64_t)row * vectorsPerRow;
+    int vector = blockIdx.y * THREAD_PER_BLOCK + threadIdx.x;
+    int stride = gridDim.y * THREAD_PER_BLOCK;
+    for (; vector < vectorsPerRow; vector += stride) {
+        dst[vector] = src[vector];
+    }
+}
+
+template <typename T>
+static bool FastllmLaunchFloatEmbeddingVector(
+        const float *input, const T *weight, T *output,
+        uint64_t inputLen, int embSize) {
+    size_t rowBytes = (size_t)embSize * sizeof(T);
+    if (inputLen == 0 || rowBytes == 0 ||
+        rowBytes % sizeof(uint4) != 0 ||
+        ((uintptr_t)weight % alignof(uint4)) != 0 ||
+        ((uintptr_t)output % alignof(uint4)) != 0) {
+        return false;
+    }
+    int vectorsPerRow = (int)(rowBytes / sizeof(uint4));
+    int blocksPerRow = std::min(
+        8, (vectorsPerRow + 128 - 1) / 128);
+    dim3 grid((unsigned int)inputLen, (unsigned int)blocksPerRow);
+    FastllmCudaFloatEmbeddingVectorKernel<128><<<grid, 128>>>(
+        input, (const uint4*)weight, (uint4*)output, vectorsPerRow);
+    return true;
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmCudaBFloat16EmbeddingToFloatKernel(
         const float *input, const __nv_bfloat16 *weight, float *output,
         int embSize) {
@@ -1427,6 +1591,35 @@ __global__ void FastllmSigmoidKernel(__nv_bfloat16* a,
     }
 }
 
+__global__ void FastllmSigmoidMulToKernel(float *input, const float *gate,
+                                          int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        input[idx] *= 1.0f / (1.0f + expf(-gate[idx]));
+    }
+}
+
+__global__ void FastllmSigmoidMulToKernel(half *input, const half *gate,
+                                          int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __half2float(gate[idx]);
+        float value = __half2float(input[idx]);
+        input[idx] = __float2half_rn(value / (1.0f + expf(-x)));
+    }
+}
+
+__global__ void FastllmSigmoidMulToKernel(__nv_bfloat16 *input,
+                                          const __nv_bfloat16 *gate,
+                                          int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __bfloat162float(gate[idx]);
+        float value = __bfloat162float(input[idx]);
+        input[idx] = __float2bfloat16_rn(value / (1.0f + expf(-x)));
+    }
+}
+
 __device__ float softplus(float x) {
     return  x > 20.0f ? x : log1p(expf(x));
 }
@@ -1441,17 +1634,17 @@ __device__ __forceinline__ float softplus_fast(float x) {
     return __logf(1.0f + __expf(x));
 }
 
-__global__ void FastllmMambaSoftplusKernel(float* inputData, float *outputData, float *aLog, float *dtBias, int channels) {
+__global__ void FastllmMambaSoftplusKernel(float* inputData, float *outputData, float *aLog, float *dtBias, int channels, float outputScale) {
     int o = blockIdx.x;
     for (int i = threadIdx.x; i < channels; i += blockDim.x) {
-        outputData[o * channels + i] = -expf((double)aLog[i]) * softplus(inputData[o * channels + i] + dtBias[i]);
+        outputData[o * channels + i] = outputScale * -expf((double)aLog[i]) * softplus(inputData[o * channels + i] + dtBias[i]);
     }
 }
 
-__global__ void FastllmMambaSoftplusKernel(half* inputData, half *outputData, float *aLog, float *dtBias, int channels) {
+__global__ void FastllmMambaSoftplusKernel(half* inputData, half *outputData, float *aLog, float *dtBias, int channels, float outputScale) {
     int o = blockIdx.x;
     for (int i = threadIdx.x; i < channels; i += blockDim.x) {
-        outputData[o * channels + i] = __float2half(-exp((double)aLog[i]) * softplus(__half2float(inputData[o * channels + i]) + dtBias[i]));
+        outputData[o * channels + i] = __float2half(outputScale * -exp((double)aLog[i]) * softplus(__half2float(inputData[o * channels + i]) + dtBias[i]));
     }
 }
 
@@ -1479,6 +1672,32 @@ __global__ void FastllmSigmoidMambaSoftplusKernel(half *sigmoidData, const half 
         sigmoidData[idx] = __hdiv(__float2half(1.0f), __hadd(__float2half(1.0f), hexp(-x)));
 #endif
         softplusOutputData[idx] = __float2half(-exp((double)aLog[i]) * softplus(__half2float(softplusInputData[idx]) + dtBias[i]));
+    }
+}
+
+__global__ void FastllmSigmoidMambaSoftplusCombinedHalfKernel(
+        const half *inputData, half *sigmoidOutputData,
+        half *softplusOutputData, const float *aLog,
+        const float *dtBias, int inputChannels,
+        int baOffset, int channels) {
+    int o = blockIdx.x;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        int inputIdx = o * inputChannels + baOffset + i;
+        int outputIdx = o * channels + i;
+#ifdef CUDA_NO_TENSOR_CORE
+        float x = __half2float(inputData[inputIdx]);
+        sigmoidOutputData[outputIdx] =
+            __float2half(1.0f / (1.0f + expf(-x)));
+#else
+        half x = inputData[inputIdx];
+        sigmoidOutputData[outputIdx] =
+            __hdiv(__float2half(1.0f),
+                   __hadd(__float2half(1.0f), hexp(-x)));
+#endif
+        softplusOutputData[outputIdx] = __float2half(
+            -exp((double)aLog[i]) *
+            softplus(__half2float(inputData[inputIdx + channels]) +
+                     dtBias[i]));
     }
 }
 
@@ -1743,6 +1962,124 @@ __global__ void FastllmMulSingleToKernel(__nv_bfloat16* a,
     if (idx < len) {
         a[idx] = __float2bfloat16_rn(
             __bfloat162float(a[idx]) * __bfloat162float(b[0]) * alpha);
+    }
+}
+
+template <bool HAS_GATE, bool ADD_RESIDUAL>
+__global__ void FastllmCudaQwen35FusedMoeJoinHalfKernel(
+        half *destination,
+        const half *routedOutput,
+        const half *sharedOutput,
+        const half *sharedGate,
+        int rows, int hidden, bool broadcastGate,
+        bool sharedGateAlreadySigmoid) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    __shared__ half computedGateValue;
+    half gateValue;
+    if (HAS_GATE) {
+        if (sharedGateAlreadySigmoid) {
+            // The fused router/shared-gate GEMV has already rounded the
+            // linear result to FP16 and applied the exact legacy sigmoid.
+            // A uniform cached load is cheaper here than a block barrier.
+            gateValue = sharedGate[broadcastGate ? 0 : row];
+        } else {
+            if (threadIdx.x == 0) {
+                const half inputGate =
+                    sharedGate[broadcastGate ? 0 : row];
+#ifdef CUDA_NO_TENSOR_CORE
+                computedGateValue = __float2half(
+                    1.0f / (1.0f + expf(-__half2float(inputGate))));
+#else
+                // Match FastllmSigmoidKernel(half) exactly. In particular,
+                // keep the sigmoid result in FP16 before multiplying
+                // sharedOutput.
+                computedGateValue = __hdiv(
+                    1.0, __hadd(__float2half(1.0), hexp(-inputGate)));
+#endif
+            }
+            __syncthreads();
+            gateValue = computedGateValue;
+        }
+    }
+
+    const int base = row * hidden;
+    const half one = __float2half_rn(1.0f);
+#ifndef CUDA_NO_TENSOR_CORE
+    const uintptr_t pointerBits =
+        (uintptr_t)destination | (uintptr_t)routedOutput |
+        (uintptr_t)sharedOutput;
+    if ((hidden & 1) == 0 &&
+        (pointerBits & (alignof(half2) - 1)) == 0) {
+        const int packedHidden = hidden / 2;
+        const int packedBase = row * packedHidden;
+        half2 *destination2 = reinterpret_cast<half2*>(destination);
+        const half2 *routed2 =
+            reinterpret_cast<const half2*>(routedOutput);
+        const half2 *shared2 =
+            reinterpret_cast<const half2*>(sharedOutput);
+        const half2 one2 = __half2half2(one);
+        half2 gate2;
+        if (HAS_GATE) {
+            gate2 = __half2half2(
+                (half)((float)gateValue * 1.0f));
+        }
+        for (int column = threadIdx.x;
+             column < packedHidden; column += blockDim.x) {
+            const int index = packedBase + column;
+            half2 shared = shared2[index];
+            if (HAS_GATE) {
+                shared = __hmul2_rn(shared, gate2);
+            }
+            half2 merged = __hadd2_rn(
+                routed2[index], __hmul2_rn(shared, one2));
+            if (ADD_RESIDUAL) {
+                merged = __hadd2_rn(
+                    destination2[index], __hmul2_rn(merged, one2));
+            }
+            destination2[index] = merged;
+        }
+        return;
+    }
+#endif
+    for (int column = threadIdx.x; column < hidden; column += blockDim.x) {
+        const int index = base + column;
+        half shared = sharedOutput[index];
+        if (HAS_GATE) {
+#ifdef CUDA_NO_TENSOR_CORE
+            shared = __float2half(
+                __half2float(gateValue) * __half2float(shared));
+#else
+            // Match FastllmMulSingleToKernel(half), including its FP16
+            // conversion of the scalar multiplier. The _rn intrinsic is
+            // important here: without it nvcc may contract this multiply with
+            // the following add, removing the legacy kernel boundary's FP16
+            // rounding point.
+            shared = __hmul_rn(
+                shared, (half)((float)gateValue * 1.0f));
+#endif
+        }
+#ifdef CUDA_NO_TENSOR_CORE
+        half merged = __float2half(
+            __half2float(routedOutput[index]) + __half2float(shared));
+        if (ADD_RESIDUAL) {
+            merged = __float2half(
+                __half2float(destination[index]) + __half2float(merged));
+        }
+#else
+        // Preserve both AddTo rounding points even though the operations now
+        // execute in one kernel.
+        half merged = __hadd_rn(
+            routedOutput[index], __hmul_rn(shared, one));
+        if (ADD_RESIDUAL) {
+            merged = __hadd_rn(
+                destination[index], __hmul_rn(merged, one));
+        }
+#endif
+        destination[index] = merged;
     }
 }
 
@@ -2058,6 +2395,103 @@ __global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionId
     float va = __bfloat162float(d[i * m]), vb = __bfloat162float(d[i * m + half_dim]);
     d[i * m] = __float2bfloat16(va * curCos - vb * curSin);
     d[i * m + half_dim] = __float2bfloat16(va * curSin + vb * curCos);
+}
+
+__device__ __forceinline__ float FastllmYarnInvFreq(int dim, int rotateDim,
+                                                    float ropeTheta, float factor,
+                                                    float correctionLow, float correctionHigh) {
+    // CUDA powf may differ from the host result by one ULP.  Multiplying that
+    // error by a 256K position noticeably shifts the phase, so compute the
+    // power accurately and round to float at the same point as the old cache.
+    float posFreq = (float)pow((double)ropeTheta,
+                               (double)(2 * dim) / rotateDim);
+    float extrapolation = 1.0f / posFreq;
+    float interpolation = 1.0f / (factor * posFreq);
+    float ramp = fmaxf(0.0f, fminf(1.0f,
+        (dim - correctionLow) / (correctionHigh - correctionLow)));
+    float extrapolationFactor = 1.0f - ramp;
+    return interpolation * (1.0f - extrapolationFactor) +
+           extrapolation * extrapolationFactor;
+}
+
+__global__ void FastllmYarnRopeEncodingKernel(float *data, float *positionIds,
+                                               int len, int spatial, int n, int m,
+                                               int positionStride, int rotateDim,
+                                               float ropeTheta, float factor, float attentionFactor,
+                                               float correctionLow, float correctionHigh) {
+    int token = blockIdx.x;
+    int batch = token / len;
+    int localToken = token % len;
+    int dim = threadIdx.x;
+    int halfDim = rotateDim / 2;
+    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    float angle = position * FastllmYarnInvFreq(
+        dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
+    float curSin, curCos;
+    sincosf(angle, &curSin, &curCos);
+    curSin *= attentionFactor;
+    curCos *= attentionFactor;
+    float *d = data + token * spatial + dim;
+    for (int head = 0; head < n; head++) {
+        int offset = head * m;
+        float a = d[offset], b = d[offset + halfDim];
+        d[offset] = a * curCos - b * curSin;
+        d[offset + halfDim] = a * curSin + b * curCos;
+    }
+}
+
+__global__ void FastllmYarnRopeEncodingKernel(half *data, float *positionIds,
+                                               int len, int spatial, int n, int m,
+                                               int positionStride, int rotateDim,
+                                               float ropeTheta, float factor, float attentionFactor,
+                                               float correctionLow, float correctionHigh) {
+    int token = blockIdx.x;
+    int batch = token / len;
+    int localToken = token % len;
+    int dim = threadIdx.x;
+    int halfDim = rotateDim / 2;
+    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    float angle = position * FastllmYarnInvFreq(
+        dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
+    float curSin, curCos;
+    sincosf(angle, &curSin, &curCos);
+    curSin *= attentionFactor;
+    curCos *= attentionFactor;
+    half *d = data + token * spatial + dim;
+    for (int head = 0; head < n; head++) {
+        int offset = head * m;
+        float a = __half2float(d[offset]);
+        float b = __half2float(d[offset + halfDim]);
+        d[offset] = __float2half(a * curCos - b * curSin);
+        d[offset + halfDim] = __float2half(a * curSin + b * curCos);
+    }
+}
+
+__global__ void FastllmYarnRopeEncodingKernel(__nv_bfloat16 *data, float *positionIds,
+                                               int len, int spatial, int n, int m,
+                                               int positionStride, int rotateDim,
+                                               float ropeTheta, float factor, float attentionFactor,
+                                               float correctionLow, float correctionHigh) {
+    int token = blockIdx.x;
+    int batch = token / len;
+    int localToken = token % len;
+    int dim = threadIdx.x;
+    int halfDim = rotateDim / 2;
+    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    float angle = position * FastllmYarnInvFreq(
+        dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
+    float curSin, curCos;
+    sincosf(angle, &curSin, &curCos);
+    curSin *= attentionFactor;
+    curCos *= attentionFactor;
+    __nv_bfloat16 *d = data + token * spatial + dim;
+    for (int head = 0; head < n; head++) {
+        int offset = head * m;
+        float a = __bfloat162float(d[offset]);
+        float b = __bfloat162float(d[offset + halfDim]);
+        d[offset] = __float2bfloat16(a * curCos - b * curSin);
+        d[offset + halfDim] = __float2bfloat16(a * curSin + b * curCos);
+    }
 }
 
 __device__ __forceinline__ float FastllmLlama3InvFreq(float invFreq, float factor, float originalMaxPosition,
@@ -2447,6 +2881,167 @@ __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *out
     }
 }
 
+// Preserve the reduction order of the 1024-thread RMSNorm kernel while using
+// 512 physical threads. Each thread evaluates the work of virtual threads tid
+// and tid + 512 independently; their 32 warp sums are then reduced in the same
+// order as the original launch. This permits more resident blocks without
+// changing the floating-point grouping.
+__global__ __launch_bounds__(512)
+void FastllmRMSNormHalfVirtual1024Kernel(
+        half *input, float *weight, half *output,
+        int channels, float eps) {
+    constexpr int PHYSICAL_THREADS = 512;
+    constexpr int VIRTUAL_THREADS = 1024;
+    constexpr int PHYSICAL_WARPS = PHYSICAL_THREADS / 32;
+    __shared__ float warpSums[VIRTUAL_THREADS / 32];
+    __shared__ float scale;
+
+    int row = blockIdx.x;
+    input += (size_t)row * channels;
+    output += (size_t)row * channels;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int half2Channels = channels / 2;
+    const half2 *input2 = reinterpret_cast<const half2 *>(input);
+
+    float sum0 = 0.0f;
+    for (int i = tid; i < half2Channels; i += VIRTUAL_THREADS) {
+        float2 value = __half22float2(input2[i]);
+        sum0 += value.x * value.x + value.y * value.y;
+    }
+    float sum1 = 0.0f;
+    for (int i = tid + PHYSICAL_THREADS;
+         i < half2Channels; i += VIRTUAL_THREADS) {
+        float2 value = __half22float2(input2[i]);
+        sum1 += value.x * value.x + value.y * value.y;
+    }
+    if ((channels & 1) && tid == 0) {
+        float value = __half2float(input[channels - 1]);
+        sum0 += value * value;
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    if (lane == 0) {
+        warpSums[warp] = sum0;
+        warpSums[warp + PHYSICAL_WARPS] = sum1;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float value = warpSums[lane];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(value / channels + eps);
+        }
+    }
+    __syncthreads();
+
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+    float rowScale = scale;
+    for (int i = tid; i < half2Channels; i += VIRTUAL_THREADS) {
+        float2 value = __half22float2(input2[i]);
+        float2 normalized;
+        normalized.x =
+            value.x * rowScale * __ldg(weight + i * 2);
+        normalized.y =
+            value.y * rowScale * __ldg(weight + i * 2 + 1);
+        output2[i] = __float22half2_rn(normalized);
+    }
+    for (int i = tid + PHYSICAL_THREADS;
+         i < half2Channels; i += VIRTUAL_THREADS) {
+        float2 value = __half22float2(input2[i]);
+        float2 normalized;
+        normalized.x =
+            value.x * rowScale * __ldg(weight + i * 2);
+        normalized.y =
+            value.y * rowScale * __ldg(weight + i * 2 + 1);
+        output2[i] = __float22half2_rn(normalized);
+    }
+    if ((channels & 1) && tid == 0) {
+        int last = channels - 1;
+        output[last] = __float2half(
+            __half2float(input[last]) * rowScale * __ldg(weight + last));
+    }
+}
+
+union FastllmRMSNormHalf8 {
+    uint4 packed;
+    half2 values[4];
+};
+
+__global__ __launch_bounds__(512)
+void FastllmRMSNormHalf4096Kernel(
+        const half *__restrict__ input, const float *__restrict__ weight,
+        half *__restrict__ output, float eps) {
+    constexpr int CHANNELS = 4096;
+    constexpr int VALUES_PER_THREAD = 8;
+    constexpr int WARP_COUNT = 16;
+    int tid = threadIdx.x;
+    int row = blockIdx.x;
+    int offset = tid * VALUES_PER_THREAD;
+    input += (int64_t)row * CHANNELS;
+    output += (int64_t)row * CHANNELS;
+
+    FastllmRMSNormHalf8 inputPack;
+    inputPack.packed = *(const uint4*)(input + offset);
+    float2 inputValues[4];
+    float sum2 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        inputValues[i] = __half22float2(inputPack.values[i]);
+        sum2 += inputValues[i].x * inputValues[i].x +
+                inputValues[i].y * inputValues[i].y;
+    }
+
+#pragma unroll
+    for (int shift = 16; shift > 0; shift >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, shift);
+    }
+    __shared__ float warpSums[WARP_COUNT];
+    __shared__ float scale;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        warpSums[warp] = sum2;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < WARP_COUNT ? warpSums[lane] : 0.0f;
+#pragma unroll
+        for (int shift = 16; shift > 0; shift >>= 1) {
+            value += __shfl_down_sync(0xffffffff, value, shift);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(value / (float)CHANNELS + eps);
+        }
+    }
+    __syncthreads();
+
+    const float4 *weight4 = (const float4*)(weight + offset);
+    float4 weightLo = weight4[0];
+    float4 weightHi = weight4[1];
+    float weights[8] = {
+        weightLo.x, weightLo.y, weightLo.z, weightLo.w,
+        weightHi.x, weightHi.y, weightHi.z, weightHi.w
+    };
+    FastllmRMSNormHalf8 outputPack;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        outputPack.values[i] = __floats2half2_rn(
+            inputValues[i].x * scale * weights[i * 2],
+            inputValues[i].y * scale * weights[i * 2 + 1]);
+    }
+    *(uint4*)(output + offset) = outputPack.packed;
+}
+
 // The legacy hidden=128 launch uses two warps.  One physical warp can evaluate
 // both reductions independently and combine the two old warp sums in the exact
 // same final addition, avoiding block-wide shared-memory barriers.
@@ -2482,6 +3077,373 @@ __global__ __launch_bounds__(32) void FastllmRMSNormHalf128ExactKernel(
     normalized1.y = value1.y * scale * __ldg(weight + (lane + 32) * 2 + 1);
     output2[lane] = __float22half2_rn(normalized0);
     output2[lane + 32] = __float22half2_rn(normalized1);
+}
+
+// Normalize Q and K directly from the token-major combined convolution
+// output. Each Q/K row uses the same lane mapping, reduction order, rsqrt,
+// weight application, and fp16 rounding as FastllmRMSNormHalf128ExactKernel.
+__global__ __launch_bounds__(32) void FastllmRMSNormCombinedQKHalf128ExactKernel(
+        const half *qkvInput, const float *weight,
+        half *qOutput, half *kOutput,
+        int keyHeads, int valueHeads, float eps) {
+    constexpr int CHANNELS = 128;
+    int rowHead = blockIdx.x;
+    int row = rowHead / keyHeads;
+    int head = rowHead - row * keyHeads;
+    int lane = threadIdx.x;
+    size_t inputStride =
+        (size_t)(keyHeads * 2 + valueHeads) * CHANNELS;
+    const half *qInput =
+        qkvInput + (size_t)row * inputStride + head * CHANNELS;
+    const half *kInput =
+        qkvInput + (size_t)row * inputStride +
+        (keyHeads + head) * CHANNELS;
+    qOutput += (size_t)rowHead * CHANNELS;
+    kOutput += (size_t)rowHead * CHANNELS;
+
+    const half2 *qInput2 = reinterpret_cast<const half2 *>(qInput);
+    const half2 *kInput2 = reinterpret_cast<const half2 *>(kInput);
+    float2 qValue0 = __half22float2(qInput2[lane]);
+    float2 qValue1 = __half22float2(qInput2[lane + 32]);
+    float2 kValue0 = __half22float2(kInput2[lane]);
+    float2 kValue1 = __half22float2(kInput2[lane + 32]);
+    float qSum0 = qValue0.x * qValue0.x + qValue0.y * qValue0.y;
+    float qSum1 = qValue1.x * qValue1.x + qValue1.y * qValue1.y;
+    float kSum0 = kValue0.x * kValue0.x + kValue0.y * kValue0.y;
+    float kSum1 = kValue1.x * kValue1.x + kValue1.y * kValue1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum0 += __shfl_down_sync(0xffffffffu, qSum0, offset);
+        qSum1 += __shfl_down_sync(0xffffffffu, qSum1, offset);
+        kSum0 += __shfl_down_sync(0xffffffffu, kSum0, offset);
+        kSum1 += __shfl_down_sync(0xffffffffu, kSum1, offset);
+    }
+    float qScale = 0.0f;
+    float kScale = 0.0f;
+    if (lane == 0) {
+        qScale = rsqrtf((qSum0 + qSum1) / CHANNELS + eps);
+        kScale = rsqrtf((kSum0 + kSum1) / CHANNELS + eps);
+    }
+    qScale = __shfl_sync(0xffffffffu, qScale, 0);
+    kScale = __shfl_sync(0xffffffffu, kScale, 0);
+
+    float weights[4] = {
+        __ldg(weight + lane * 2),
+        __ldg(weight + lane * 2 + 1),
+        __ldg(weight + (lane + 32) * 2),
+        __ldg(weight + (lane + 32) * 2 + 1)
+    };
+    float2 qNormalized0, qNormalized1;
+    float2 kNormalized0, kNormalized1;
+    qNormalized0.x = qValue0.x * qScale * weights[0];
+    qNormalized0.y = qValue0.y * qScale * weights[1];
+    qNormalized1.x = qValue1.x * qScale * weights[2];
+    qNormalized1.y = qValue1.y * qScale * weights[3];
+    kNormalized0.x = kValue0.x * kScale * weights[0];
+    kNormalized0.y = kValue0.y * kScale * weights[1];
+    kNormalized1.x = kValue1.x * kScale * weights[2];
+    kNormalized1.y = kValue1.y * kScale * weights[3];
+
+    half2 *qOutput2 = reinterpret_cast<half2 *>(qOutput);
+    half2 *kOutput2 = reinterpret_cast<half2 *>(kOutput);
+    qOutput2[lane] = __float22half2_rn(qNormalized0);
+    qOutput2[lane + 32] = __float22half2_rn(qNormalized1);
+    kOutput2[lane] = __float22half2_rn(kNormalized0);
+    kOutput2[lane + 32] = __float22half2_rn(kNormalized1);
+}
+
+template <bool WRITE_DEAD_OUTPUTS>
+__global__ __launch_bounds__(32)
+void FastllmQwen35GdnPostConvExactHalf128Kernel(
+        const half *qkvInput, const float *weight,
+        const half *gInput, const half *betaInput,
+        half *qOutput, half *kOutput, half *vOutput,
+        half *gOutput, half *betaOutput,
+        half *kBetaOutput, half *vBetaOutput,
+        int seqLen, int paddedSeqLen,
+        int keyHeads, int valueHeads, float eps, half qScale) {
+    constexpr int CHANNELS = 128;
+    int rowHead = blockIdx.x;
+    int paddedRow = rowHead / keyHeads;
+    int head = rowHead - paddedRow * keyHeads;
+    int batchIndex = paddedRow / paddedSeqLen;
+    int token = paddedRow - batchIndex * paddedSeqLen;
+    int lane = threadIdx.x;
+    int headGroup = valueHeads / keyHeads;
+    if (token >= seqLen) {
+        if (lane == 0) {
+            for (int group = 0; group < headGroup; group++) {
+                int valueHead = head * headGroup + group;
+                size_t outputRow =
+                    ((size_t)batchIndex * valueHeads + valueHead) *
+                        paddedSeqLen + token;
+                gOutput[outputRow] = __float2half(0.0f);
+                if constexpr (WRITE_DEAD_OUTPUTS) {
+                    betaOutput[outputRow] = __float2half(0.0f);
+                }
+            }
+        }
+        return;
+    }
+    int row = batchIndex * seqLen + token;
+    size_t inputStride =
+        (size_t)(keyHeads * 2 + valueHeads) * CHANNELS;
+    const half *qInput =
+        qkvInput + (size_t)row * inputStride + head * CHANNELS;
+    const half *kInput =
+        qkvInput + (size_t)row * inputStride +
+        (keyHeads + head) * CHANNELS;
+
+    const half2 *qInput2 = reinterpret_cast<const half2 *>(qInput);
+    const half2 *kInput2 = reinterpret_cast<const half2 *>(kInput);
+    float2 qValue0 = __half22float2(qInput2[lane]);
+    float2 qValue1 = __half22float2(qInput2[lane + 32]);
+    float2 kValue0 = __half22float2(kInput2[lane]);
+    float2 kValue1 = __half22float2(kInput2[lane + 32]);
+    float qSum0 = qValue0.x * qValue0.x + qValue0.y * qValue0.y;
+    float qSum1 = qValue1.x * qValue1.x + qValue1.y * qValue1.y;
+    float kSum0 = kValue0.x * kValue0.x + kValue0.y * kValue0.y;
+    float kSum1 = kValue1.x * kValue1.x + kValue1.y * kValue1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum0 += __shfl_down_sync(0xffffffffu, qSum0, offset);
+        qSum1 += __shfl_down_sync(0xffffffffu, qSum1, offset);
+        kSum0 += __shfl_down_sync(0xffffffffu, kSum0, offset);
+        kSum1 += __shfl_down_sync(0xffffffffu, kSum1, offset);
+    }
+    float qNormScale = 0.0f;
+    float kNormScale = 0.0f;
+    if (lane == 0) {
+        qNormScale = rsqrtf((qSum0 + qSum1) / CHANNELS + eps);
+        kNormScale = rsqrtf((kSum0 + kSum1) / CHANNELS + eps);
+    }
+    qNormScale = __shfl_sync(0xffffffffu, qNormScale, 0);
+    kNormScale = __shfl_sync(0xffffffffu, kNormScale, 0);
+
+    float weights[4] = {
+        __ldg(weight + lane * 2),
+        __ldg(weight + lane * 2 + 1),
+        __ldg(weight + (lane + 32) * 2),
+        __ldg(weight + (lane + 32) * 2 + 1)
+    };
+    float2 qNormalized0, qNormalized1;
+    float2 kNormalized0, kNormalized1;
+    qNormalized0.x = qValue0.x * qNormScale * weights[0];
+    qNormalized0.y = qValue0.y * qNormScale * weights[1];
+    qNormalized1.x = qValue1.x * qNormScale * weights[2];
+    qNormalized1.y = qValue1.y * qNormScale * weights[3];
+    kNormalized0.x = kValue0.x * kNormScale * weights[0];
+    kNormalized0.y = kValue0.y * kNormScale * weights[1];
+    kNormalized1.x = kValue1.x * kNormScale * weights[2];
+    kNormalized1.y = kValue1.y * kNormScale * weights[3];
+    half2 qNormalizedHalf0 = __float22half2_rn(qNormalized0);
+    half2 qNormalizedHalf1 = __float22half2_rn(qNormalized1);
+    half2 kNormalizedHalf0 = __float22half2_rn(kNormalized0);
+    half2 kNormalizedHalf1 = __float22half2_rn(kNormalized1);
+    half2 qScale2 = __halves2half2(qScale, qScale);
+
+    for (int group = 0; group < headGroup; group++) {
+        int valueHead = head * headGroup + group;
+        size_t scalarInputIndex =
+            (size_t)row * valueHeads + valueHead;
+        half betaValue = betaInput[scalarInputIndex];
+        half2 beta2 = __halves2half2(betaValue, betaValue);
+        size_t outputRow =
+            ((size_t)batchIndex * valueHeads + valueHead) *
+                paddedSeqLen + token;
+        size_t outputBase = outputRow * CHANNELS;
+        half2 *qOutput2 =
+            reinterpret_cast<half2 *>(qOutput + outputBase);
+        half2 *kOutput2 =
+            reinterpret_cast<half2 *>(kOutput + outputBase);
+        half2 *vOutput2 =
+            reinterpret_cast<half2 *>(vOutput + outputBase);
+        half2 *kBetaOutput2 =
+            reinterpret_cast<half2 *>(kBetaOutput + outputBase);
+        half2 *vBetaOutput2 =
+            reinterpret_cast<half2 *>(vBetaOutput + outputBase);
+        const half *vInput =
+            qkvInput + (size_t)row * inputStride +
+            (keyHeads * 2 + valueHead) * CHANNELS;
+        const half2 *vInput2 = reinterpret_cast<const half2 *>(vInput);
+        half2 vValue0 = vInput2[lane];
+        half2 vValue1 = vInput2[lane + 32];
+
+        qOutput2[lane] = __hmul2(qNormalizedHalf0, qScale2);
+        qOutput2[lane + 32] = __hmul2(qNormalizedHalf1, qScale2);
+        kOutput2[lane] = kNormalizedHalf0;
+        kOutput2[lane + 32] = kNormalizedHalf1;
+        if constexpr (WRITE_DEAD_OUTPUTS) {
+            vOutput2[lane] = vValue0;
+            vOutput2[lane + 32] = vValue1;
+        }
+        kBetaOutput2[lane] = __hmul2(kNormalizedHalf0, beta2);
+        kBetaOutput2[lane + 32] = __hmul2(kNormalizedHalf1, beta2);
+        vBetaOutput2[lane] = __hmul2(vValue0, beta2);
+        vBetaOutput2[lane + 32] = __hmul2(vValue1, beta2);
+        if (lane == 0) {
+            gOutput[outputRow] = gInput[scalarInputIndex];
+            if constexpr (WRITE_DEAD_OUTPUTS) {
+                betaOutput[outputRow] = betaValue;
+            }
+        }
+    }
+}
+
+// Exact ragged counterpart of the uniform post-conv kernel.  Q/K remain in
+// their native key-head cardinality; value-head expansion is performed only
+// for beta-dependent K and V.  This preserves the legacy half rounding while
+// avoiding split, repeat, RMSNorm, and five independent pack launches.
+__global__ __launch_bounds__(32)
+void FastllmQwen35GdnPostConvRaggedExactHalf128Kernel(
+        const half *qkvInput, const float *weight,
+        const half *combinedBaInput, const float *aLog,
+        const float *dtBias, const int *chunkTokenBases,
+        const int *chunkValidTokens,
+        half *qOutput, half *kOutput, half *gOutput,
+        half *kBetaOutput, half *vBetaOutput,
+        int totalChunks, int baChannels, int baOffset,
+        int keyHeads, int valueHeads, float eps, float qScale) {
+    constexpr int CHANNELS = 128;
+    constexpr int CHUNK_SIZE = 64;
+    int rowHead = blockIdx.x;
+    int packedRow = rowHead / keyHeads;
+    int keyHead = rowHead - packedRow * keyHeads;
+    int chunk = packedRow / CHUNK_SIZE;
+    int tokenInChunk = packedRow - chunk * CHUNK_SIZE;
+    int lane = threadIdx.x;
+    int headGroup = valueHeads / keyHeads;
+    int validTokens = chunkValidTokens[chunk];
+    size_t keyOutputBase =
+        ((size_t)keyHead * totalChunks * CHUNK_SIZE + packedRow) * CHANNELS;
+    half2 *qOutput2 = reinterpret_cast<half2 *>(qOutput + keyOutputBase);
+    half2 *kOutput2 = reinterpret_cast<half2 *>(kOutput + keyOutputBase);
+
+    if (tokenInChunk >= validTokens) {
+        half2 zero2 = __float2half2_rn(0.0f);
+        qOutput2[lane] = zero2;
+        qOutput2[lane + 32] = zero2;
+        kOutput2[lane] = zero2;
+        kOutput2[lane + 32] = zero2;
+        for (int group = 0; group < headGroup; group++) {
+            int valueHead = keyHead * headGroup + group;
+            size_t valueRow =
+                (size_t)valueHead * totalChunks * CHUNK_SIZE + packedRow;
+            half2 *kBetaOutput2 = reinterpret_cast<half2 *>(
+                kBetaOutput + valueRow * CHANNELS);
+            half2 *vBetaOutput2 = reinterpret_cast<half2 *>(
+                vBetaOutput + valueRow * CHANNELS);
+            kBetaOutput2[lane] = zero2;
+            kBetaOutput2[lane + 32] = zero2;
+            vBetaOutput2[lane] = zero2;
+            vBetaOutput2[lane + 32] = zero2;
+            if (lane == 0) {
+                gOutput[valueRow] = __float2half(0.0f);
+            }
+        }
+        return;
+    }
+
+    int row = chunkTokenBases[chunk] + tokenInChunk;
+    size_t qkvStride =
+        (size_t)(keyHeads * 2 + valueHeads) * CHANNELS;
+    const half *qInput =
+        qkvInput + (size_t)row * qkvStride + keyHead * CHANNELS;
+    const half *kInput =
+        qkvInput + (size_t)row * qkvStride +
+        (keyHeads + keyHead) * CHANNELS;
+    const half2 *qInput2 = reinterpret_cast<const half2 *>(qInput);
+    const half2 *kInput2 = reinterpret_cast<const half2 *>(kInput);
+    float2 qValue0 = __half22float2(qInput2[lane]);
+    float2 qValue1 = __half22float2(qInput2[lane + 32]);
+    float2 kValue0 = __half22float2(kInput2[lane]);
+    float2 kValue1 = __half22float2(kInput2[lane + 32]);
+    float qSum0 = qValue0.x * qValue0.x + qValue0.y * qValue0.y;
+    float qSum1 = qValue1.x * qValue1.x + qValue1.y * qValue1.y;
+    float kSum0 = kValue0.x * kValue0.x + kValue0.y * kValue0.y;
+    float kSum1 = kValue1.x * kValue1.x + kValue1.y * kValue1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum0 += __shfl_down_sync(0xffffffffu, qSum0, offset);
+        qSum1 += __shfl_down_sync(0xffffffffu, qSum1, offset);
+        kSum0 += __shfl_down_sync(0xffffffffu, kSum0, offset);
+        kSum1 += __shfl_down_sync(0xffffffffu, kSum1, offset);
+    }
+    float qNormScale = 0.0f;
+    float kNormScale = 0.0f;
+    if (lane == 0) {
+        qNormScale = rsqrtf((qSum0 + qSum1) / CHANNELS + eps);
+        kNormScale = rsqrtf((kSum0 + kSum1) / CHANNELS + eps);
+    }
+    qNormScale = __shfl_sync(0xffffffffu, qNormScale, 0);
+    kNormScale = __shfl_sync(0xffffffffu, kNormScale, 0);
+
+    float weights[4] = {
+        __ldg(weight + lane * 2),
+        __ldg(weight + lane * 2 + 1),
+        __ldg(weight + (lane + 32) * 2),
+        __ldg(weight + (lane + 32) * 2 + 1)
+    };
+    half2 qNormalized0 = __floats2half2_rn(
+        qValue0.x * qNormScale * weights[0],
+        qValue0.y * qNormScale * weights[1]);
+    half2 qNormalized1 = __floats2half2_rn(
+        qValue1.x * qNormScale * weights[2],
+        qValue1.y * qNormScale * weights[3]);
+    half2 kNormalized0 = __floats2half2_rn(
+        kValue0.x * kNormScale * weights[0],
+        kValue0.y * kNormScale * weights[1]);
+    half2 kNormalized1 = __floats2half2_rn(
+        kValue1.x * kNormScale * weights[2],
+        kValue1.y * kNormScale * weights[3]);
+    float2 qNormalizedFloat0 = __half22float2(qNormalized0);
+    float2 qNormalizedFloat1 = __half22float2(qNormalized1);
+    qOutput2[lane] = __floats2half2_rn(
+        qNormalizedFloat0.x * qScale,
+        qNormalizedFloat0.y * qScale);
+    qOutput2[lane + 32] = __floats2half2_rn(
+        qNormalizedFloat1.x * qScale,
+        qNormalizedFloat1.y * qScale);
+    kOutput2[lane] = kNormalized0;
+    kOutput2[lane + 32] = kNormalized1;
+
+    const half *baRow = combinedBaInput + (size_t)row * baChannels;
+    for (int group = 0; group < headGroup; group++) {
+        int valueHead = keyHead * headGroup + group;
+        half betaRaw = baRow[baOffset + valueHead];
+#ifdef CUDA_NO_TENSOR_CORE
+        half betaValue = __float2half(
+            1.0f / (1.0f + expf(-__half2float(betaRaw))));
+#else
+        half betaValue = __hdiv(
+            __float2half(1.0f),
+            __hadd(__float2half(1.0f), hexp(-betaRaw)));
+#endif
+        half gateValue = __float2half(
+            -exp((double)aLog[valueHead]) *
+            softplus(__half2float(
+                baRow[baOffset + valueHeads + valueHead]) +
+                dtBias[valueHead]));
+        half2 beta2 = __halves2half2(betaValue, betaValue);
+        size_t valueRow =
+            (size_t)valueHead * totalChunks * CHUNK_SIZE + packedRow;
+        half2 *kBetaOutput2 = reinterpret_cast<half2 *>(
+            kBetaOutput + valueRow * CHANNELS);
+        half2 *vBetaOutput2 = reinterpret_cast<half2 *>(
+            vBetaOutput + valueRow * CHANNELS);
+        const half *vInput =
+            qkvInput + (size_t)row * qkvStride +
+            (keyHeads * 2 + valueHead) * CHANNELS;
+        const half2 *vInput2 = reinterpret_cast<const half2 *>(vInput);
+        kBetaOutput2[lane] = __hmul2(kNormalized0, beta2);
+        kBetaOutput2[lane + 32] = __hmul2(kNormalized1, beta2);
+        vBetaOutput2[lane] = __hmul2(vInput2[lane], beta2);
+        vBetaOutput2[lane + 32] =
+            __hmul2(vInput2[lane + 32], beta2);
+        if (lane == 0) {
+            gOutput[valueRow] = gateValue;
+        }
+    }
 }
 
 template <int THREAD_PER_BLOCK>
@@ -2556,6 +3518,107 @@ __global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, 
         output[last] = __float2bfloat16_rn(__bfloat162float(input[last]) * s * __ldg(&weight[last]));
     }
 }
+
+#ifndef USE_ROCM
+// hidden=3072 uses three bfloat162 values per thread in the legacy 512-thread
+// kernel.  A physical thread evaluates two independent legacy thread lanes and
+// keeps all six packed values in registers until the scale is available.  The
+// two warp reductions are stored in the same 16 slots and combined in the same
+// order as the legacy kernel, so this removes the second input read without
+// changing the reduction tree.
+__global__ __launch_bounds__(256) void FastllmRMSNormBFloat16Hidden3072ExactKernel(
+        const __nv_bfloat16 *input, const float *weight,
+        __nv_bfloat16 *output, float eps) {
+    constexpr int CHANNELS = 3072;
+    constexpr int BF16_PAIRS = CHANNELS / 2;
+    constexpr int LEGACY_THREADS = 512;
+    constexpr int PHYSICAL_THREADS = 256;
+    constexpr int PHYSICAL_WARPS = PHYSICAL_THREADS / 32;
+    constexpr int LEGACY_WARPS = LEGACY_THREADS / 32;
+    constexpr int PAIRS_PER_LEGACY_THREAD = BF16_PAIRS / LEGACY_THREADS;
+    static_assert(LEGACY_THREADS == PHYSICAL_THREADS * 2,
+                  "each physical thread must emulate two legacy threads");
+    static_assert(BF16_PAIRS % LEGACY_THREADS == 0,
+                  "BF16 pairs must divide evenly across legacy threads");
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    input += (size_t)row * CHANNELS;
+    output += (size_t)row * CHANNELS;
+
+    const __nv_bfloat162 *input2 =
+        reinterpret_cast<const __nv_bfloat162 *>(input);
+    __nv_bfloat162 values0[PAIRS_PER_LEGACY_THREAD];
+    __nv_bfloat162 values1[PAIRS_PER_LEGACY_THREAD];
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < PAIRS_PER_LEGACY_THREAD; i++) {
+        int pair0 = tid + i * LEGACY_THREADS;
+        int pair1 = pair0 + PHYSICAL_THREADS;
+        values0[i] = input2[pair0];
+        values1[i] = input2[pair1];
+        float lo0 = __bfloat162float(values0[i].x);
+        float hi0 = __bfloat162float(values0[i].y);
+        float lo1 = __bfloat162float(values1[i].x);
+        float hi1 = __bfloat162float(values1[i].y);
+        sum0 += lo0 * lo0 + hi0 * hi0;
+        sum1 += lo1 * lo1 + hi1 * hi1;
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+
+    __shared__ float warpSums[LEGACY_WARPS];
+    __shared__ float scale;
+    if (lane == 0) {
+        warpSums[warp] = sum0;
+        warpSums[warp + PHYSICAL_WARPS] = sum1;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float total = lane < LEGACY_WARPS ? warpSums[lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(total / CHANNELS + eps);
+        }
+    }
+    __syncthreads();
+
+    __nv_bfloat162 *output2 = reinterpret_cast<__nv_bfloat162 *>(output);
+    float rowScale = scale;
+#pragma unroll
+    for (int i = 0; i < PAIRS_PER_LEGACY_THREAD; i++) {
+        int pair0 = tid + i * LEGACY_THREADS;
+        int pair1 = pair0 + PHYSICAL_THREADS;
+        float lo0 = __bfloat162float(values0[i].x);
+        float hi0 = __bfloat162float(values0[i].y);
+        float lo1 = __bfloat162float(values1[i].x);
+        float hi1 = __bfloat162float(values1[i].y);
+        __nv_bfloat162 normalized0;
+        __nv_bfloat162 normalized1;
+        normalized0.x = __float2bfloat16_rn(
+            lo0 * rowScale * __ldg(weight + pair0 * 2));
+        normalized0.y = __float2bfloat16_rn(
+            hi0 * rowScale * __ldg(weight + pair0 * 2 + 1));
+        normalized1.x = __float2bfloat16_rn(
+            lo1 * rowScale * __ldg(weight + pair1 * 2));
+        normalized1.y = __float2bfloat16_rn(
+            hi1 * rowScale * __ldg(weight + pair1 * 2 + 1));
+        output2[pair0] = normalized0;
+        output2[pair1] = normalized1;
+    }
+}
+#endif
 
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *beta, float *output, int outer, int channels) {
@@ -2817,12 +3880,42 @@ struct CudaMemoryBuffer {
     size_t size;
     bool busy;
     int graphPins;
+    cudaEvent_t reuseReadyEvent;
+    bool reusePending;
 
-    CudaMemoryBuffer () : data(nullptr), size(0), busy(false), graphPins(0) {}
+    CudaMemoryBuffer () : data(nullptr), size(0), busy(false), graphPins(0),
+            reuseReadyEvent(nullptr), reusePending(false) {}
 
     CudaMemoryBuffer (void *data, size_t size, bool busy) :
-            data(data), size(size), busy(busy), graphPins(0) {}
+            data(data), size(size), busy(busy), graphPins(0),
+            reuseReadyEvent(nullptr), reusePending(false) {}
 };
+
+static bool FastllmCudaBufferReadyForReuseLocked(CudaMemoryBuffer &buffer) {
+    if (!buffer.reusePending) {
+        return true;
+    }
+    cudaError_t state = cudaEventQuery(buffer.reuseReadyEvent);
+    if (state == cudaSuccess) {
+        buffer.reusePending = false;
+        return true;
+    }
+    if (state == cudaErrorNotReady) {
+        return false;
+    }
+    checkCudaErrors("Error: CUDA error when checking deferred pool reuse!", state);
+    return false;
+}
+
+static void FastllmCudaDestroyReuseEventLocked(CudaMemoryBuffer &buffer) {
+    if (buffer.reuseReadyEvent == nullptr) {
+        return;
+    }
+    cudaError_t state = cudaEventDestroy(buffer.reuseReadyEvent);
+    buffer.reuseReadyEvent = nullptr;
+    buffer.reusePending = false;
+    checkCudaErrors("Error: CUDA error when destroying deferred pool event!", state);
+}
 std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
 std::map<int, int> cudaBuffersMinId; // 最小的空闲id
 std::map<int, size_t> noBusyCnt;
@@ -2923,10 +4016,11 @@ static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMem
         cudaDeviceSynchronize();
     }
     for (auto &buffer : bigBuffers) {
-        if (buffer.busy) {
+        if (buffer.busy || !FastllmCudaBufferReadyForReuseLocked(buffer)) {
             keep.push_back(buffer);
             continue;
         }
+        FastllmCudaDestroyReuseEventLocked(buffer);
         state = cudaFree(buffer.data);
         if (cudaSuccess == state) {
             released += buffer.size;
@@ -2965,6 +4059,7 @@ struct FastllmCudaWeightSlab {
     size_t size = 0;
     size_t used = 0;
     int activeBlocks = 0;
+    std::string group;
 };
 
 struct FastllmCudaWeightSlabPtr {
@@ -2990,7 +4085,22 @@ static size_t FastllmCudaAlignBytes(size_t size, size_t align) {
     return ((size + align - 1) / align) * align;
 }
 
-void *FastllmCudaMallocModelWeight(size_t size) {
+static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
+    // Expert-parallel source tensors are consolidated and released one layer
+    // at a time during the first ForwardGPU call.  Do not mix different layers
+    // in the same slab, otherwise one live tensor from a later layer pins all
+    // already-consumed blocks and makes the repack peak grow every layer.
+    const char *markers[] = {".moe.experts.", ".ffn.experts."};
+    for (const char *marker : markers) {
+        size_t pos = name.find(marker);
+        if (pos != std::string::npos) {
+            return name.substr(0, pos + std::strlen(marker));
+        }
+    }
+    return "";
+}
+
+void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
     size_t slabBytes = FastllmCudaGetWeightSlabBytes();
     if (slabBytes == 0 || size == 0 || size > slabBytes / 2) {
         return FastllmCudaMalloc(size);
@@ -3002,12 +4112,14 @@ void *FastllmCudaMallocModelWeight(size_t size) {
 
     const size_t align = 256;
     size_t aligned = FastllmCudaAlignBytes(size, align);
+    std::string group = FastllmCudaWeightSlabGroup(name);
     std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
 
     auto &slabs = fastllmCudaWeightSlabs[id];
     int slabId = -1;
     for (int i = 0; i < slabs.size(); i++) {
-        if (slabs[i].size >= slabs[i].used && slabs[i].size - slabs[i].used >= aligned) {
+        if (slabs[i].group == group && slabs[i].size >= slabs[i].used &&
+            slabs[i].size - slabs[i].used >= aligned) {
             slabId = i;
             break;
         }
@@ -3015,7 +4127,18 @@ void *FastllmCudaMallocModelWeight(size_t size) {
 
     if (slabId < 0) {
         void *base = nullptr;
-        state = FastllmCudaCheckedMalloc(&base, slabBytes, __FILE__, __LINE__);
+        // Weight preparation can run after temporary CUDA buffers have already
+        // warmed the regular allocator pool.  Near the capacity limit (for
+        // example, Laguna FP8 on four 32 GB GPUs), those idle buffers can make
+        // a new weight slab fail even though they are immediately reclaimable.
+        // Match the retry policy used by ordinary and direct CUDA allocations
+        // before reporting a real model-weight OOM.
+        FastllmCudaMemPoolView poolView = FastllmGetCudaMemPoolView(id);
+        {
+            std::lock_guard<std::mutex> poolLock(*poolView.lock);
+            state = FastllmCudaCheckedMallocWithIdlePoolRetry(
+                &base, slabBytes, id, poolView, __FILE__, __LINE__);
+        }
         if (cudaSuccess != state) {
             printf("Error: CUDA error when allocating model weight slab %lu MB memory! maybe there's no enough memory left on device.",
                    slabBytes >> 20);
@@ -3027,6 +4150,7 @@ void *FastllmCudaMallocModelWeight(size_t size) {
         slab.size = slabBytes;
         slab.used = 0;
         slab.activeBlocks = 0;
+        slab.group = group;
         slabs.push_back(slab);
         slabId = (int)slabs.size() - 1;
     }
@@ -3283,6 +4407,10 @@ static void CudaMemDebugRemove(void *ptr) {
 #endif // CUDA_MEM_DEBUG
 
 void * FastllmCudaDirectMalloc(size_t size) {
+    if (FastllmCudaGraphIsCapturing()) {
+        FastllmCudaSetThreadError();
+        return nullptr;
+    }
     void * ret = nullptr;
     int id = -1;
     cudaError_t state = cudaGetDevice(&id);
@@ -3361,7 +4489,9 @@ static bool FastllmCudaCanReusePooledBigBuffer(size_t bufferSize, size_t request
 static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
                                                   std::vector<CudaMemoryBuffer> *bigBuffersPtr,
                                                   std::vector<CudaMemoryBuffer> *smallBuffersPtr) {
-    if (!fastllm::GetFastllmEnv().cudaMemCheck) {
+    if (!fastllm::GetFastllmEnv().cudaMemCheck &&
+        (!fastllmCudaMallocDisabled.load(std::memory_order_relaxed) ||
+         fastllmCudaMallocRejectLogCount.load(std::memory_order_relaxed) >= 4)) {
         return;
     }
     fprintf(stderr, "[FASTLLM_CUDA_MEM_CHECK] pooled buffers on device %d before rejecting %.2f MB:\n",
@@ -3412,9 +4542,11 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         busyBuffers.reserve(bigBuffers.size());
         for (auto &buffer : bigBuffers) {
             if (buffer.busy || buffer.graphPins > 0 ||
+                !FastllmCudaBufferReadyForReuseLocked(buffer) ||
                 FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
                 busyBuffers.push_back(buffer);
             } else {
+                FastllmCudaDestroyReuseEventLocked(buffer);
                 state = cudaFree(buffer.data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when releasing idle big buffer on device %d!", id);
@@ -3432,9 +4564,11 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         busyBuffers.reserve(cudaBuffers.size());
         for (auto &buffer : cudaBuffers) {
             if (buffer.busy || buffer.graphPins > 0 ||
+                !FastllmCudaBufferReadyForReuseLocked(buffer) ||
                 FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
                 busyBuffers.push_back(buffer);
             } else {
+                FastllmCudaDestroyReuseEventLocked(buffer);
                 state = cudaFree(buffer.data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when releasing idle buffer on device %d!", id);
@@ -3449,6 +4583,19 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
 }
 
 static bool FastllmCudaRetryMallocAfterReleasingIdle(size_t size, void **ret, int id, const char *file, int line) {
+    // cudaFree is forbidden while a stream is being captured. A capture-time
+    // pool miss must be reported to the graph path instead of trying the
+    // ordinary OOM recovery, which would invalidate every participating rank.
+    if (FastllmCudaGraphIsCapturing()) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    // Once serving has frozen allocations, idle blocks are the reserve that
+    // future requests must reuse.  Releasing them cannot make a forbidden
+    // allocation succeed and would only destroy the warmed pool.
+    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
     cudaGetLastError();
     FastllmCudaReleaseIdleCachedBuffersForDevice(id);
     cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
@@ -3599,12 +4746,17 @@ void * FastllmCudaMalloc(size_t size) {
     FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
+    const bool capturePoolOnly = captureIdentity.valid ||
+        FastllmCudaGraphIsCapturing();
+    const bool useAnyFittingPooledBuffer = capturePoolOnly ||
+        fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(*view.lock);
     if (size > 1024 * 1024) {
         auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
                 FastllmCudaGraphPoolPointerReusableLocked(
                     bigBuffers[i].data, captureIdentity) &&
                 FastllmCudaCanReusePooledBigBuffer(bigBuffers[i].size, size)) {
@@ -3622,9 +4774,10 @@ void * FastllmCudaMalloc(size_t size) {
 #endif
             return bigBuffers[selId].data;
         }
-        if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        if (useAnyFittingPooledBuffer) {
             for (int i = 0; i < bigBuffers.size(); i++) {
                 if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                    FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
                     bigBuffers[i].size >= size &&
                     FastllmCudaGraphPoolPointerReusableLocked(
                         bigBuffers[i].data, captureIdentity)) {
@@ -3645,8 +4798,12 @@ void * FastllmCudaMalloc(size_t size) {
         }
 
         void * ret = nullptr;
-        if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        if (useAnyFittingPooledBuffer) {
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
+        }
+        if (capturePoolOnly) {
+            FastllmCudaSetThreadError();
+            return nullptr;
         }
         state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
         if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
@@ -3673,6 +4830,7 @@ void * FastllmCudaMalloc(size_t size) {
     for (int i = *view.minId; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy &&
             cudaBuffers[i].graphPins == 0 &&
+            FastllmCudaBufferReadyForReuseLocked(cudaBuffers[i]) &&
             FastllmCudaGraphPoolPointerReusableLocked(
                 cudaBuffers[i].data, captureIdentity)) {
             cudaBuffers[i].busy = true;
@@ -3690,11 +4848,12 @@ void * FastllmCudaMalloc(size_t size) {
             return cudaBuffers[i].data;
         }
     }
-    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (useAnyFittingPooledBuffer) {
         auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
                 bigBuffers[i].size >= size &&
                 FastllmCudaGraphPoolPointerReusableLocked(
                     bigBuffers[i].data, captureIdentity)) {
@@ -3714,8 +4873,12 @@ void * FastllmCudaMalloc(size_t size) {
         }
     }
     void * ret = nullptr;
-    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (useAnyFittingPooledBuffer) {
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
+    }
+    if (capturePoolOnly) {
+        FastllmCudaSetThreadError();
+        return nullptr;
     }
     state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
     if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
@@ -3770,6 +4933,7 @@ void FastllmCudaForceFree(void *ret) {
                     return;
                 }
                 state = cudaSetDevice(view.device);
+                FastllmCudaDestroyReuseEventLocked(cudaBuffers[i]);
                 state = cudaFree(cudaBuffers[i].data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when force releasing memory on device %d!", view.device);
@@ -3803,6 +4967,7 @@ void FastllmCudaForceFree(void *ret) {
                     return;
                 }
                 state = cudaSetDevice(view.device);
+                FastllmCudaDestroyReuseEventLocked(bigBuffers[i]);
                 state = cudaFree(bigBuffers[i].data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when force releasing big memory on device %d!", view.device);
@@ -3823,6 +4988,68 @@ void FastllmCudaForceFree(void *ret) {
     state = cudaFree(ret);
     FastllmCudaSetDevice(oriId);
     checkCudaErrors("CUDA error when force releasing uncached memory!", state);
+}
+
+bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
+    if (ret == nullptr) {
+        return true;
+    }
+    FastllmCudaGraphCaptureIdentity captureIdentity =
+        FastllmCudaGraphCurrentCaptureIdentity();
+    if (captureIdentity.valid || FastllmCudaGraphIsCapturing()) {
+        return false;
+    }
+
+    int device = FastllmCudaGetDevice();
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(device);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    auto deferBuffer = [&](CudaMemoryBuffer &buffer, int smallIndex) {
+        if (!buffer.busy || buffer.reusePending ||
+            !FastllmCudaGraphPoolBeforeFreeLocked(ret, captureIdentity)) {
+            return false;
+        }
+        if (buffer.reuseReadyEvent == nullptr) {
+            cudaError_t createState = cudaEventCreateWithFlags(
+                &buffer.reuseReadyEvent, cudaEventDisableTiming);
+            if (createState != cudaSuccess) {
+                checkCudaErrors(
+                    "Error: CUDA error when creating deferred pool event!",
+                    createState);
+                return false;
+            }
+        }
+        cudaError_t recordState = cudaEventRecord(
+            buffer.reuseReadyEvent, cudaStreamPerThread);
+        if (recordState != cudaSuccess) {
+            checkCudaErrors(
+                "Error: CUDA error when recording deferred pool event!",
+                recordState);
+            return false;
+        }
+        buffer.reusePending = true;
+        buffer.busy = false;
+        if (smallIndex >= 0 && buffer.graphPins == 0) {
+            *view.noBusy += buffer.size;
+            *view.minId = std::min(*view.minId, smallIndex);
+        }
+#ifdef CUDA_MEM_DEBUG
+        CudaMemDebugRemove(ret);
+#endif
+        return true;
+    };
+
+    for (int i = 0; i < (int)view.smallBuffers->size(); ++i) {
+        CudaMemoryBuffer &buffer = (*view.smallBuffers)[i];
+        if (buffer.data == ret) {
+            return deferBuffer(buffer, i);
+        }
+    }
+    for (CudaMemoryBuffer &buffer : *view.bigBuffers) {
+        if (buffer.data == ret) {
+            return deferBuffer(buffer, -1);
+        }
+    }
+    return false;
 }
 
 void FastllmCudaFree(void *ret) {
@@ -3961,6 +5188,62 @@ void FastllmCudaFree(void *ret) {
     checkCudaErrors("CUDA error when restoring device after release!", restoreState);
 }
 
+int FastllmCudaTryMallocBigBuffers(size_t size, int count) {
+    if (size == 0 || count <= 0) {
+        return 0;
+    }
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    if (state != cudaSuccess || id < 0) {
+        checkCudaErrors("Error: CUDA error when finding device for reserve allocation!", state);
+        return 0;
+    }
+
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    auto &bigBuffers = *view.bigBuffers;
+    int allocated = 0;
+    for (; allocated < count; allocated++) {
+        void *ret = nullptr;
+        // A reserve is itself reusable idle-pool capacity.  Do not use the
+        // ordinary OOM retry here: that retry releases existing idle blocks and
+        // could turn a partially successful reserve into one final block while
+        // still reporting success to the caller.
+        state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+        if (state == cudaSuccess && ret == nullptr) {
+            state = cudaErrorMemoryAllocation;
+        }
+        if (state != cudaSuccess || ret == nullptr) {
+            if (ret != nullptr) {
+                cudaFree(ret);
+                ret = nullptr;
+            }
+            size_t freeMem = 0, totalMem = 0;
+            cudaMemGetInfo(&freeMem, &totalMem);
+            fprintf(stderr,
+                    "[Fastllm] CUDA reserve allocation stopped on device %d: "
+                    "%d/%d blocks of %.0f MB allocated, gpuFree %.0f/%.0f MB, "
+                    "error=%s. Existing pool blocks were preserved.\n",
+                    id, allocated, count, size / 1048576.0,
+                    freeMem / 1048576.0, totalMem / 1048576.0,
+                    cudaGetErrorString(state));
+            fflush(stderr);
+            // Capacity failures are handled by the return value.  Clear the
+            // runtime's last-error slot without setting FastLLM's capture-wide
+            // error flags; callers that require the full reserve will abort.
+            cudaGetLastError();
+            if (state != cudaErrorMemoryAllocation) {
+                checkCudaErrors(
+                    "Error: unexpected CUDA failure during reserve allocation!",
+                    state);
+            }
+            break;
+        }
+        bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
+    }
+    return allocated;
+}
+
 void FastllmCudaMallocBigBuffer(size_t size) {
     void * ret = nullptr;
     int id = -1;
@@ -3991,13 +5274,18 @@ void FastllmCudaClearBigBuffer() {
     // 不会同时持有多把设备锁，避免跨设备阻塞。
     for (auto &view : views) {
         std::lock_guard<std::mutex> lock(*view.lock);
+        state = cudaSetDevice(view.device);
+        checkCudaErrors(
+            "Error: CUDA error when switching device to clear big buffers!",
+            state);
         auto &bigBuffers = *view.bigBuffers;
         std::vector <CudaMemoryBuffer> temp;
         long long littleMemSum = 0;        
         long long littleMemSumLimit = 300 * 1024 * 1024; // 留一小部分复用  
         std::vector <std::pair <std::size_t, int > > v;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0) {
+            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i])) {
                 v.push_back(std::make_pair(bigBuffers[i].size, i));
             }
         }
@@ -4012,10 +5300,12 @@ void FastllmCudaClearBigBuffer() {
         }
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
                 littleMemIds.find(i) == littleMemIds.end() &&
                 !FastllmCudaGraphPoolPointerProtectedLocked(
                     bigBuffers[i].data)) {
                 state = cudaSetDevice(view.device);
+                FastllmCudaDestroyReuseEventLocked(bigBuffers[i]);
                 state = cudaFree(bigBuffers[i].data);
                 if (cudaSuccess != state)
                     printf("Error: CUDA error when release memory on device %d!", view.device);
@@ -4057,6 +5347,15 @@ void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
     //cudaDeviceSynchronize();
 }
 
+bool FastllmCudaCopyFromDeviceToPinnedHostAsync(
+        void *dst, const void *src, size_t size, void *stream) {
+    if (size == 0) {
+        return true;
+    }
+    return cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
+                           (cudaStream_t)stream) == cudaSuccess;
+}
+
 bool FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
         void *dst, const void *src, size_t size) {
     if (size == 0) {
@@ -4082,6 +5381,77 @@ bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
     }
     return cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice,
                            cudaStreamPerThread) == cudaSuccess;
+}
+
+namespace {
+    constexpr int FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS = 128;
+    constexpr int FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT = 4;
+
+    struct FastllmCudaBatchCopyParams {
+        const uint8_t *srcs[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
+        uint8_t *dsts[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
+        size_t sizes[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
+        int count;
+    };
+
+    __global__ void FastllmCudaBatchCopyKernel(FastllmCudaBatchCopyParams params) {
+        int segment = blockIdx.x / FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
+        int segmentBlock = blockIdx.x % FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
+        if (segment >= params.count) {
+            return;
+        }
+
+        const uint8_t *src = params.srcs[segment];
+        uint8_t *dst = params.dsts[segment];
+        size_t bytes = params.sizes[segment];
+        size_t first = (size_t)segmentBlock * blockDim.x + threadIdx.x;
+        size_t stride = (size_t)FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT * blockDim.x;
+        bool vectorAligned = (((uintptr_t)src | (uintptr_t)dst | bytes) & 15) == 0;
+        if (vectorAligned) {
+            const uint4 *vectorSrc = reinterpret_cast<const uint4*>(src);
+            uint4 *vectorDst = reinterpret_cast<uint4*>(dst);
+            size_t vectors = bytes / sizeof(uint4);
+            for (size_t i = first; i < vectors; i += stride) {
+                vectorDst[i] = vectorSrc[i];
+            }
+        } else {
+            for (size_t i = first; i < bytes; i += stride) {
+                dst[i] = src[i];
+            }
+        }
+    }
+}
+
+bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+        void *const *dsts, const void *const *srcs, const size_t *sizes, int count) {
+    if (count < 0 || count > FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS ||
+        (count > 0 && (dsts == nullptr || srcs == nullptr || sizes == nullptr))) {
+        return false;
+    }
+
+    FastllmCudaBatchCopyParams params;
+    params.count = 0;
+    for (int i = 0; i < count; i++) {
+        if (sizes[i] == 0 || dsts[i] == srcs[i]) {
+            continue;
+        }
+        if (dsts[i] == nullptr || srcs[i] == nullptr) {
+            return false;
+        }
+        int index = params.count++;
+        params.srcs[index] = reinterpret_cast<const uint8_t*>(srcs[i]);
+        params.dsts[index] = reinterpret_cast<uint8_t*>(dsts[i]);
+        params.sizes[index] = sizes[i];
+    }
+    if (params.count == 0) {
+        return true;
+    }
+
+    int blocks = params.count * FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
+    FastllmCudaBatchCopyKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(params);
+    cudaError_t state = cudaGetLastError();
+    checkCudaErrors("Error: CUDA error when launching batched device copy!", state);
+    return state == cudaSuccess;
 }
 
 void *FastllmCudaHostMalloc(size_t size) {
@@ -4131,6 +5501,30 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
     checkCudaErrors("Error: CUDA error when copy on GPU!", state);
     //cudaDeviceSynchronize();
+}
+
+bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
+                                     int expectedDevice) {
+    if (ptr == nullptr) {
+        return bytes == 0;
+    }
+
+    int originalDevice = FastllmCudaGetDevice();
+    cudaError_t state = cudaSetDevice(expectedDevice);
+    CUdeviceptr base = 0;
+    size_t allocation = 0;
+    CUresult rangeState = CUDA_ERROR_INVALID_VALUE;
+    if (state == cudaSuccess) {
+        rangeState = cuMemGetAddressRange(&base, &allocation,
+                                          (CUdeviceptr)ptr);
+    }
+    cudaSetDevice(originalDevice);
+    if (state != cudaSuccess || rangeState != CUDA_SUCCESS || base == 0) {
+        cudaGetLastError();
+        return false;
+    }
+    size_t offset = (size_t)((CUdeviceptr)ptr - base);
+    return offset <= allocation && bytes <= allocation - offset;
 }
 
 void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size) {
@@ -4224,8 +5618,16 @@ bool FastllmCudaMemcpyPeerAsyncCurrentThread(
         return FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
             dst, src, size);
     }
-    return cudaMemcpyPeerAsync(dst, dstId, src, srcId, size,
-                               cudaStreamPerThread) == cudaSuccess;
+    cudaError_t state = cudaMemcpyPeerAsync(dst, dstId, src, srcId, size,
+                                            cudaStreamPerThread);
+    if (state != cudaSuccess) {
+        // Callers may deliberately fall back to a staged synchronous copy.
+        // Consume the sticky runtime error before that fallback issues more
+        // CUDA work.
+        cudaGetLastError();
+        return false;
+    }
+    return true;
 }
 
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
@@ -4456,7 +5858,38 @@ bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
-bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData) {
+bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
+                             const fastllm::Data &gate) {
+    if (input.dataType != gate.dataType || input.dims != gate.dims ||
+        input.Count(0) <= 0) {
+        return false;
+    }
+    int len = input.Count(0);
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *gateData = FastllmCudaPrepareInput(gate);
+    int threads = std::min(256, len);
+    int blocks = (len + threads - 1) / threads;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            (float*)inputData, (const float*)gateData, len);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            (half*)inputData, (const half*)gateData, len);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            (__nv_bfloat16*)inputData,
+            (const __nv_bfloat16*)gateData, len);
+    } else {
+        FastllmCudaFinishInput(gate, gateData);
+        FastllmCudaFinishOutput(input, inputData);
+        return false;
+    }
+    FastllmCudaFinishInput(gate, gateData);
+    FastllmCudaFinishOutput(input, inputData);
+    return true;
+}
+
+bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale) {
     int dimsLen = input.dims.size();
     int outer = input.Count(0) / input.Count(dimsLen - 1);
     int channels = input.dims[dimsLen - 1];
@@ -4468,9 +5901,9 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
 
     int threadPerBlock = std::min(64, channels);
     if (input.dataType == fastllm::DataType::FLOAT32) {
-        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> (cudaInput, cudaOutput, aLog, dtBias, channels);
+        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> (cudaInput, cudaOutput, aLog, dtBias, channels, outputScale);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> ((half*)cudaInput, (half*)cudaOutput, aLog, dtBias, channels);
+        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> ((half*)cudaInput, (half*)cudaOutput, aLog, dtBias, channels, outputScale);
     }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishInput(aLogData, aLog);
@@ -4505,6 +5938,78 @@ bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fa
         return false;
     }
     checkCudaErrors("Error: CUDA error in FastllmCudaSigmoidMambaSoftplus.", cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaSigmoidMambaSoftplusCombinedFloat16(
+        const fastllm::Data &input,
+        const fastllm::Data &aLogData,
+        const fastllm::Data &dtBiasData,
+        int batch, int seqLen, int inputChannels,
+        int baOffset, int channels,
+        fastllm::Data &sigmoidOutput,
+        fastllm::Data &softplusOutput) {
+    auto isDense = [](const fastllm::Data &data) {
+        if (data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (batch <= 0 || seqLen <= 0 || inputChannels <= 0 ||
+        baOffset < 0 || channels <= 0 ||
+        baOffset + channels * 2 > inputChannels ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        input.cudaData == nullptr || !isDense(input) ||
+        input.dims.back() != inputChannels ||
+        input.Count(0) !=
+            (uint64_t)batch * seqLen * inputChannels ||
+        aLogData.dataDevice != fastllm::DataDevice::CUDA ||
+        aLogData.dataType != fastllm::DataType::FLOAT32 ||
+        aLogData.cudaData == nullptr || !isDense(aLogData) ||
+        aLogData.Count(0) != (uint64_t)channels ||
+        dtBiasData.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBiasData.dataType != fastllm::DataType::FLOAT32 ||
+        dtBiasData.cudaData == nullptr || !isDense(dtBiasData) ||
+        dtBiasData.Count(0) != (uint64_t)channels) {
+        return false;
+    }
+
+    auto prepareOutput = [&](fastllm::Data &output) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.dataDevice = input.dataDevice;
+        output.dataDeviceIds = input.dataDeviceIds;
+        output.Resize({batch, seqLen, channels});
+        output.Allocate(false);
+        return output.cudaData != nullptr;
+    };
+    if (!prepareOutput(sigmoidOutput) ||
+        !prepareOutput(softplusOutput)) {
+        return false;
+    }
+
+    int outer = batch * seqLen;
+    int threadPerBlock = std::min(64, channels);
+    FastllmSigmoidMambaSoftplusCombinedHalfKernel
+        <<<outer, threadPerBlock>>>(
+            (const half *)input.cudaData,
+            (half *)sigmoidOutput.cudaData,
+            (half *)softplusOutput.cudaData,
+            (const float *)aLogData.cudaData,
+            (const float *)dtBiasData.cudaData,
+            inputChannels, baOffset, channels);
+    checkCudaErrors(
+        "Error: CUDA error in "
+        "FastllmCudaSigmoidMambaSoftplusCombinedFloat16.",
+        cudaGetLastError());
     return true;
 }
 
@@ -4679,6 +6184,255 @@ bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     }
     FastllmCudaFinishInput(input1, input1Data);
     FastllmCudaFinishOutput(input0, cudaData);
+    return true;
+}
+
+__device__ inline float FastllmMulToCausalMaskValue(
+        float a, float b, float alpha) {
+    return a * (b * alpha);
+}
+
+__device__ inline half FastllmMulToCausalMaskValue(
+        half a, half b, float alpha) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return __float2half(__half2float(b) * alpha * __half2float(a));
+#else
+    return __hmul(a, (half)((float)b * alpha));
+#endif
+}
+
+__device__ inline __nv_bfloat16 FastllmMulToCausalMaskValue(
+        __nv_bfloat16 a, __nv_bfloat16 b, float alpha) {
+    return __float2bfloat16_rn(
+        __bfloat162float(a) * __bfloat162float(b) * alpha);
+}
+
+template <typename T>
+__global__ void FastllmMulToCausalMaskKernel(
+        T *data, const T *scale, float alpha, int len,
+        int n, int m, int base, T maskValue) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    int remainder = idx % (n * m);
+    int i = remainder / m;
+    int j = remainder % m;
+    if (j >= i + base) {
+        data[idx] = maskValue;
+    } else {
+        data[idx] =
+            FastllmMulToCausalMaskValue(data[idx], scale[idx], alpha);
+    }
+}
+
+template <typename T>
+__global__ void FastllmMulCausalMaskKernel(
+        const T *input, const T *scale, T *output,
+        float alpha, int len, int n, int m, int base, T maskValue) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    int remainder = idx % (n * m);
+    int i = remainder / m;
+    int j = remainder % m;
+    if (j >= i + base) {
+        output[idx] = maskValue;
+    } else {
+        output[idx] =
+            FastllmMulToCausalMaskValue(input[idx], scale[idx], alpha);
+    }
+}
+
+bool FastllmCudaMulToCausalMask(
+        fastllm::Data &input0,
+        const fastllm::Data &input1,
+        float alpha,
+        int base,
+        float maskValue) {
+    if (input0.dims.size() < 2 || input0.dims != input1.dims ||
+        input0.dataType != input1.dataType) {
+        return false;
+    }
+    if (input0.dataType != fastllm::DataType::FLOAT32 &&
+        input0.dataType != fastllm::DataType::FLOAT16 &&
+        input0.dataType != fastllm::DataType::BFLOAT16) {
+        return false;
+    }
+
+    int len = input0.Count(0);
+    if (len <= 0) {
+        return true;
+    }
+    void *input0Data = FastllmCudaPrepareInput(input0);
+    void *input1Data = FastllmCudaPrepareInput(input1);
+    int dimsLen = input0.dims.size();
+    int n = input0.dims[dimsLen - 2];
+    int m = input0.dims[dimsLen - 1];
+    int blockSize = std::min(256, len);
+    int gridSize = (len + blockSize - 1) / blockSize;
+
+    if (input0.dataType == fastllm::DataType::FLOAT32) {
+        FastllmMulToCausalMaskKernel<float><<<gridSize, blockSize>>>(
+            (float*)input0Data, (const float*)input1Data, alpha,
+            len, n, m, base, maskValue);
+    } else if (input0.dataType == fastllm::DataType::FLOAT16) {
+        FastllmMulToCausalMaskKernel<half><<<gridSize, blockSize>>>(
+            (half*)input0Data, (const half*)input1Data, alpha,
+            len, n, m, base, __float2half(maskValue));
+    } else {
+        FastllmMulToCausalMaskKernel<__nv_bfloat16>
+            <<<gridSize, blockSize>>>(
+                (__nv_bfloat16*)input0Data,
+                (const __nv_bfloat16*)input1Data, alpha,
+                len, n, m, base, __float2bfloat16_rn(maskValue));
+    }
+
+    DeviceSync();
+    FastllmCudaFinishInput(input1, input1Data);
+    FastllmCudaFinishOutput(input0, input0Data);
+    return true;
+}
+
+bool FastllmCudaMulCausalMask(
+        const fastllm::Data &input0,
+        const fastllm::Data &input1,
+        fastllm::Data &output,
+        float alpha,
+        int base,
+        float maskValue) {
+    if (input0.dims.size() < 2 || input0.dims != input1.dims ||
+        output.dims != input0.dims ||
+        input0.dataType != input1.dataType ||
+        output.dataType != input0.dataType ||
+        input0.dataDevice != fastllm::DataDevice::CUDA ||
+        input1.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input0.cudaData == nullptr || input1.cudaData == nullptr ||
+        output.cudaData == nullptr) {
+        return false;
+    }
+    if (input0.dataType != fastllm::DataType::FLOAT32 &&
+        input0.dataType != fastllm::DataType::FLOAT16 &&
+        input0.dataType != fastllm::DataType::BFLOAT16) {
+        return false;
+    }
+
+    int len = input0.Count(0);
+    if (len <= 0) {
+        return true;
+    }
+    void *input0Data = FastllmCudaPrepareInput(input0);
+    void *input1Data = FastllmCudaPrepareInput(input1);
+    void *outputData = FastllmCudaPrepareOutput(output);
+    if (input0Data == nullptr || input1Data == nullptr ||
+        outputData == nullptr) {
+        FastllmCudaFinishInput(input0, input0Data);
+        FastllmCudaFinishInput(input1, input1Data);
+        FastllmCudaFinishOutput(output, outputData);
+        return false;
+    }
+    int dimsLen = input0.dims.size();
+    int n = input0.dims[dimsLen - 2];
+    int m = input0.dims[dimsLen - 1];
+    int blockSize = std::min(256, len);
+    int gridSize = (len + blockSize - 1) / blockSize;
+
+    if (input0.dataType == fastllm::DataType::FLOAT32) {
+        FastllmMulCausalMaskKernel<float><<<gridSize, blockSize>>>(
+            (const float*)input0Data, (const float*)input1Data,
+            (float*)outputData, alpha, len, n, m, base, maskValue);
+    } else if (input0.dataType == fastllm::DataType::FLOAT16) {
+        FastllmMulCausalMaskKernel<half><<<gridSize, blockSize>>>(
+            (const half*)input0Data, (const half*)input1Data,
+            (half*)outputData, alpha, len, n, m, base,
+            __float2half(maskValue));
+    } else {
+        FastllmMulCausalMaskKernel<__nv_bfloat16>
+            <<<gridSize, blockSize>>>(
+                (const __nv_bfloat16*)input0Data,
+                (const __nv_bfloat16*)input1Data,
+                (__nv_bfloat16*)outputData, alpha, len, n, m, base,
+                __float2bfloat16_rn(maskValue));
+    }
+
+    DeviceSync();
+    FastllmCudaFinishInput(input0, input0Data);
+    FastllmCudaFinishInput(input1, input1Data);
+    FastllmCudaFinishOutput(output, outputData);
+    return true;
+}
+
+bool FastllmCudaQwen35FusedMoeJoin(
+        fastllm::Data &destination,
+        const fastllm::Data &routedOutput,
+        const fastllm::Data &sharedOutput,
+        const fastllm::Data *sharedGate,
+        bool addResidual,
+        bool sharedGateAlreadySigmoid) {
+    const int len = destination.Count(0);
+    if (len <= 0 ||
+        destination.dataDevice != fastllm::DataDevice::CUDA ||
+        routedOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        sharedOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        destination.cudaData == nullptr ||
+        routedOutput.cudaData == nullptr ||
+        sharedOutput.cudaData == nullptr ||
+        destination.dataType != fastllm::DataType::FLOAT16 ||
+        routedOutput.dataType != destination.dataType ||
+        sharedOutput.dataType != destination.dataType ||
+        routedOutput.Count(0) != len ||
+        sharedOutput.Count(0) != len ||
+        sharedOutput.dims.empty()) {
+        return false;
+    }
+
+    const int hidden = sharedOutput.dims.back();
+    if (hidden <= 0 || len % hidden != 0) {
+        return false;
+    }
+    const int rows = len / hidden;
+    bool broadcastGate = false;
+    const half *gateData = nullptr;
+    if (sharedGate != nullptr) {
+        if (sharedGate->dataDevice != fastllm::DataDevice::CUDA ||
+            sharedGate->cudaData == nullptr ||
+            sharedGate->dataType != destination.dataType ||
+            (sharedGate->Count(0) != rows && sharedGate->Count(0) != 1)) {
+            return false;
+        }
+        broadcastGate = sharedGate->Count(0) == 1;
+        gateData = (const half*)sharedGate->cudaData;
+    }
+
+    const int threads = std::min(1024, hidden);
+    half *destinationData = (half*)destination.cudaData;
+    const half *routedData = (const half*)routedOutput.cudaData;
+    const half *sharedData = (const half*)sharedOutput.cudaData;
+    if (gateData != nullptr) {
+        if (addResidual) {
+            FastllmCudaQwen35FusedMoeJoinHalfKernel<true, true>
+                <<<rows, threads>>>(destinationData, routedData, sharedData,
+                                    gateData, rows, hidden, broadcastGate,
+                                    sharedGateAlreadySigmoid);
+        } else {
+            FastllmCudaQwen35FusedMoeJoinHalfKernel<true, false>
+                <<<rows, threads>>>(destinationData, routedData, sharedData,
+                                    gateData, rows, hidden, broadcastGate,
+                                    sharedGateAlreadySigmoid);
+        }
+    } else if (addResidual) {
+        FastllmCudaQwen35FusedMoeJoinHalfKernel<false, true>
+            <<<rows, threads>>>(destinationData, routedData, sharedData,
+                                nullptr, rows, hidden, false, false);
+    } else {
+        FastllmCudaQwen35FusedMoeJoinHalfKernel<false, false>
+            <<<rows, threads>>>(destinationData, routedData, sharedData,
+                                nullptr, rows, hidden, false, false);
+    }
+    checkCudaErrors("Error: CUDA error in FastllmCudaQwen35FusedMoeJoin.",
+                    cudaGetLastError());
     return true;
 }
 
@@ -5113,6 +6867,197 @@ bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
+template<typename T>
+__global__ void CumSumLastDimMakeDecayMaskKernel(
+        T *input, T *output, int dim, int outer) {
+    int o = blockIdx.x;
+    if (o >= outer) {
+        return;
+    }
+    T *row = input + (size_t)o * dim;
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < dim; j++) {
+            float sum = FastllmCudaValueToFloat(row[j]) +
+                        FastllmCudaValueToFloat(row[j - 1]);
+            row[j] = FastllmCudaFloatToValue<T>(sum);
+        }
+    }
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        T *out = output + (size_t)o * dim * dim;
+        if (j <= i) {
+            float valI = FastllmCudaValueToFloat(row[i]);
+            float valJ = FastllmCudaValueToFloat(row[j]);
+            out[idx] = FastllmCudaFloatToValue<T>(expf(valI - valJ));
+        } else {
+            out[idx] = FastllmCudaFloatToValue<T>(0.0f);
+        }
+    }
+}
+
+template<typename T>
+__global__ void CumSumDecayMaskNegMulCausalKernel(
+        T *input, const T *matrix, T *decayMask, T *output,
+        int dim, int outer) {
+    int o = blockIdx.x;
+    if (o >= outer) {
+        return;
+    }
+    T *row = input + (size_t)o * dim;
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < dim; j++) {
+            float sum = FastllmCudaValueToFloat(row[j]) +
+                        FastllmCudaValueToFloat(row[j - 1]);
+            row[j] = FastllmCudaFloatToValue<T>(sum);
+        }
+    }
+    __syncthreads();
+
+    const T *matrixRow = matrix + (size_t)o * dim * dim;
+    T *decayRow = decayMask + (size_t)o * dim * dim;
+    T *outputRow = output + (size_t)o * dim * dim;
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        if (j <= i) {
+            float valI = FastllmCudaValueToFloat(row[i]);
+            float valJ = FastllmCudaValueToFloat(row[j]);
+            T decay = FastllmCudaFloatToValue<T>(expf(valI - valJ));
+            decayRow[idx] = decay;
+            if (j < i) {
+                outputRow[idx] = FastllmMulToCausalMaskValue(
+                    matrixRow[idx], decay, -1.0f);
+            } else {
+                outputRow[idx] = FastllmCudaFloatToValue<T>(0.0f);
+            }
+        } else {
+            decayRow[idx] = FastllmCudaFloatToValue<T>(0.0f);
+            outputRow[idx] = FastllmCudaFloatToValue<T>(0.0f);
+        }
+    }
+}
+
+bool FastllmCudaCumSumLastDimMakeDecayMask(
+        fastllm::Data &input, fastllm::Data &output) {
+    if (input.dataType != output.dataType ||
+        (input.dataType != fastllm::DataType::FLOAT32 &&
+         input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16) ||
+        input.dims.empty() || input.dims.back() <= 0 ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || output.cudaData == nullptr) {
+        return false;
+    }
+    std::vector<int> expectedOutputDims = input.dims;
+    expectedOutputDims.push_back(input.dims.back());
+    if (output.dims != expectedOutputDims) {
+        return false;
+    }
+
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *outputData = FastllmCudaPrepareInput(output);
+    int dim = input.dims.back();
+    int outer = input.Count(0) / dim;
+    if (outer <= 0) {
+        FastllmCudaFinishOutput(input, inputData);
+        FastllmCudaFinishOutput(output, outputData);
+        return true;
+    }
+
+    int blockSize = 256;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        CumSumLastDimMakeDecayMaskKernel<float>
+            <<<outer, blockSize>>>(
+                (float*)inputData, (float*)outputData, dim, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        CumSumLastDimMakeDecayMaskKernel<half>
+            <<<outer, blockSize>>>(
+                (half*)inputData, (half*)outputData, dim, outer);
+    } else {
+        CumSumLastDimMakeDecayMaskKernel<__nv_bfloat16>
+            <<<outer, blockSize>>>(
+                (__nv_bfloat16*)inputData,
+                (__nv_bfloat16*)outputData, dim, outer);
+    }
+
+    DeviceSync();
+    FastllmCudaFinishOutput(input, inputData);
+    FastllmCudaFinishOutput(output, outputData);
+    return true;
+}
+
+bool FastllmCudaCumSumDecayMaskNegMulCausal(
+        fastllm::Data &input, const fastllm::Data &matrix,
+        fastllm::Data &decayMask, fastllm::Data &output) {
+    if (input.dataType != matrix.dataType ||
+        input.dataType != decayMask.dataType ||
+        input.dataType != output.dataType ||
+        (input.dataType != fastllm::DataType::FLOAT32 &&
+         input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16) ||
+        input.dims.empty() || input.dims.back() <= 0 ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        matrix.dataDevice != fastllm::DataDevice::CUDA ||
+        decayMask.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || matrix.cudaData == nullptr ||
+        decayMask.cudaData == nullptr || output.cudaData == nullptr) {
+        return false;
+    }
+    std::vector<int> expectedMatrixDims = input.dims;
+    expectedMatrixDims.push_back(input.dims.back());
+    if (matrix.dims != expectedMatrixDims ||
+        decayMask.dims != expectedMatrixDims ||
+        output.dims != expectedMatrixDims) {
+        return false;
+    }
+
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *matrixData = FastllmCudaPrepareInput(matrix);
+    void *decayData = FastllmCudaPrepareOutput(decayMask);
+    void *outputData = FastllmCudaPrepareOutput(output);
+    int dim = input.dims.back();
+    int outer = input.Count(0) / dim;
+    if (outer <= 0) {
+        FastllmCudaFinishOutput(input, inputData);
+        FastllmCudaFinishInput(matrix, matrixData);
+        FastllmCudaFinishOutput(decayMask, decayData);
+        FastllmCudaFinishOutput(output, outputData);
+        return true;
+    }
+
+    int blockSize = 256;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        CumSumDecayMaskNegMulCausalKernel<float>
+            <<<outer, blockSize>>>(
+                (float*)inputData, (const float*)matrixData,
+                (float*)decayData, (float*)outputData, dim, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        CumSumDecayMaskNegMulCausalKernel<half>
+            <<<outer, blockSize>>>(
+                (half*)inputData, (const half*)matrixData,
+                (half*)decayData, (half*)outputData, dim, outer);
+    } else {
+        CumSumDecayMaskNegMulCausalKernel<__nv_bfloat16>
+            <<<outer, blockSize>>>(
+                (__nv_bfloat16*)inputData,
+                (const __nv_bfloat16*)matrixData,
+                (__nv_bfloat16*)decayData,
+                (__nv_bfloat16*)outputData, dim, outer);
+    }
+
+    DeviceSync();
+    FastllmCudaFinishOutput(input, inputData);
+    FastllmCudaFinishInput(matrix, matrixData);
+    FastllmCudaFinishOutput(decayMask, decayData);
+    FastllmCudaFinishOutput(output, outputData);
+    return true;
+}
+
 static bool LaunchFastllmRMSNormFloat16(
         const half *input, const float *weight, half *output,
         int outer, int channels, float eps, int threadCount) {
@@ -5127,12 +7072,61 @@ static bool LaunchFastllmRMSNormFloat16(
     if (channels < 512) {
         FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
             (half*)input, (float*)weight, output, outer, channels, eps);
+        return true;
     } else if (channels < 4096) {
         FastllmRMSNormKernelInner1<512><<<outer, 512>>>(
             (half*)input, (float*)weight, output, outer, channels, eps);
+        return true;
+    }
+
+    // A 4096-wide decode row maps exactly one aligned 16-byte vector to each
+    // of 512 threads. Other shapes retain the generic launch.
+    if (channels == 4096 &&
+        ((uintptr_t)input % alignof(uint4)) == 0 &&
+        ((uintptr_t)output % alignof(uint4)) == 0 &&
+        ((uintptr_t)weight % alignof(float4)) == 0) {
+        FastllmRMSNormHalf4096Kernel<<<outer, 512>>>(
+            input, weight, output, eps);
+        return true;
+    }
+    const char *virtualThreadsEnv = std::getenv(
+        "FASTLLM_CUDA_RMSNORM_VIRTUAL_1024");
+    bool useVirtualThreads =
+        virtualThreadsEnv == nullptr || virtualThreadsEnv[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_RMSNORM_VIRTUAL_1024");
+    if (useVirtualThreads && channels == 5120 && outer >= 64) {
+        FastllmRMSNormHalfVirtual1024Kernel<<<outer, 512>>>(
+            (half*)input, (float*)weight, output, channels, eps);
+        return true;
+    }
+    FastllmRMSNormKernelInner1<1024><<<outer, 1024>>>(
+        (half*)input, (float*)weight, output, outer, channels, eps);
+    return true;
+}
+
+static bool LaunchFastllmRMSNormBFloat16(
+        __nv_bfloat16 *input, float *weight, __nv_bfloat16 *output,
+        int outer, int channels, float eps, int threadCount) {
+#ifndef USE_ROCM
+    if (channels == 3072 && threadCount == 256) {
+        FastllmRMSNormBFloat16Hidden3072ExactKernel<<<outer, 256>>>(
+            input, weight, output, eps);
+        return true;
+    }
+#endif
+    if (threadCount != 0) {
+        return false;
+    }
+    if (channels < 512) {
+        FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
+            input, weight, output, outer, channels, eps);
+    } else if (channels < 4096) {
+        FastllmRMSNormKernelInner1<512><<<outer, 512>>>(
+            input, weight, output, outer, channels, eps);
     } else {
         FastllmRMSNormKernelInner1<1024><<<outer, 1024>>>(
-            (half*)input, (float*)weight, output, outer, channels, eps);
+            input, weight, output, outer, channels, eps);
     }
     return true;
 }
@@ -5160,6 +7154,31 @@ bool FastllmCudaRMSNormFloat16WithThreadCount(
     return LaunchFastllmRMSNormFloat16(
         (const half*)input.cudaData, (const float*)weight.cudaData,
         (half*)output.cudaData, outer, channels, eps, threadCount);
+}
+
+bool FastllmCudaRMSNormBFloat16WithThreadCount(
+        const fastllm::Data &input, fastllm::Data &weight,
+        fastllm::Data &output, float eps, int threadCount) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::BFLOAT16 ||
+        output.dataType != fastllm::DataType::BFLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        input.dims.empty() || input.dims != output.dims ||
+        input.strides.empty() || output.strides.empty() ||
+        input.strides.back() != 1 || output.strides.back() != 1 ||
+        weight.dims.size() != 1 || weight.dims[0] != input.dims.back() ||
+        input.cudaData == nullptr || output.cudaData == nullptr ||
+        weight.cudaData == nullptr) {
+        return false;
+    }
+    int axis = (int)input.dims.size() - 1;
+    int outer = input.Count(0) / input.Count(axis);
+    int channels = input.dims[axis];
+    return LaunchFastllmRMSNormBFloat16(
+        (__nv_bfloat16*)input.cudaData, (float*)weight.cudaData,
+        (__nv_bfloat16*)output.cudaData, outer, channels, eps, threadCount);
 }
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
@@ -5190,20 +7209,308 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
             (half*)cudaInput, (float*)weight.cudaData, (half*)cudaOutput,
             outer, channels, eps, channels == 128 ? 32 : 0);
     } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-        if (channels < 512) {
-            FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
-                                                              channels, eps);
-        } else if (channels < 4096) {
-            FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
-                                                                channels, eps);
-        } else {
-            FastllmRMSNormKernelInner1<1024> <<< outer, 1024 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
-                                                                  channels, eps);
-        }
+        int threadCount = 0;
+#ifndef USE_ROCM
+        threadCount = channels == 3072 ? 256 : 0;
+#endif
+        LaunchFastllmRMSNormBFloat16(
+            (__nv_bfloat16*)cudaInput, (float*)weight.cudaData,
+            (__nv_bfloat16*)cudaOutput, outer, channels, eps, threadCount);
     }
 
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaRMSNormCombinedQKFloat16(
+        const fastllm::Data &qkvInput, const fastllm::Data &weight,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float eps,
+        fastllm::Data &q, fastllm::Data &k) {
+    auto isDense = [](const fastllm::Data &data) {
+        if (data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (batch <= 0 || seqLen <= 0 ||
+        keyHeads <= 0 || valueHeads < keyHeads ||
+        kDim != 128 || vDim != 128 ||
+        !std::isfinite(eps) || eps < 0.0f ||
+        qkvInput.dataDevice != fastllm::DataDevice::CUDA ||
+        qkvInput.dataType != fastllm::DataType::FLOAT16 ||
+        qkvInput.cudaData == nullptr || !isDense(qkvInput) ||
+        qkvInput.Count(0) !=
+            (uint64_t)batch * seqLen *
+            (keyHeads * kDim * 2 + valueHeads * vDim) ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        weight.cudaData == nullptr || !isDense(weight) ||
+        weight.Count(0) != (uint64_t)kDim) {
+        return false;
+    }
+
+    auto prepareOutput = [&](fastllm::Data &output) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.dataDevice = qkvInput.dataDevice;
+        output.dataDeviceIds = qkvInput.dataDeviceIds;
+        output.Resize({batch, seqLen, keyHeads, kDim});
+        output.Allocate(false);
+        return output.cudaData != nullptr;
+    };
+    if (!prepareOutput(q) || !prepareOutput(k)) {
+        return false;
+    }
+
+    int rows = batch * seqLen;
+    FastllmRMSNormCombinedQKHalf128ExactKernel<<<rows * keyHeads, 32>>>(
+        (const half *)qkvInput.cudaData,
+        (const float *)weight.cudaData,
+        (half *)q.cudaData, (half *)k.cudaData,
+        keyHeads, valueHeads, eps);
+    checkCudaErrors(
+        "Error: CUDA error in FastllmCudaRMSNormCombinedQKFloat16.",
+        cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaQwen35GdnPostConvExactFloat16(
+        const fastllm::Data &qkvInput,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &gInput,
+        const fastllm::Data &betaInput,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float normEps, float qScale,
+        fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+        fastllm::Data &g, fastllm::Data &beta,
+        fastllm::Data &kBeta, fastllm::Data &vBeta) {
+    auto isDenseCuda = [](const fastllm::Data &data) {
+        if (data.dataDevice != fastllm::DataDevice::CUDA ||
+            data.cudaData == nullptr || data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (batch <= 0 || seqLen <= 0 || seqLen % 64 != 0 ||
+        keyHeads <= 0 || valueHeads < keyHeads ||
+        valueHeads % keyHeads != 0 ||
+        kDim != 128 || vDim != 128 ||
+        !std::isfinite(normEps) || normEps < 0.0f ||
+        !std::isfinite(qScale) ||
+        qkvInput.dataType != fastllm::DataType::FLOAT16 ||
+        gInput.dataType != fastllm::DataType::FLOAT16 ||
+        betaInput.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        !isDenseCuda(qkvInput) || !isDenseCuda(gInput) ||
+        !isDenseCuda(betaInput) || !isDenseCuda(normWeight) ||
+        qkvInput.Count(0) !=
+            (uint64_t)batch * seqLen *
+            (keyHeads * kDim * 2 + valueHeads * vDim) ||
+        gInput.Count(0) !=
+            (uint64_t)batch * seqLen * valueHeads ||
+        betaInput.Count(0) !=
+            (uint64_t)batch * seqLen * valueHeads ||
+        normWeight.Count(0) != (uint64_t)kDim) {
+        return false;
+    }
+
+    int paddedSeqLen = ((seqLen + 63) / 64) * 64;
+    auto prepareOutput = [&](fastllm::Data &output,
+                             const std::vector<int> &dims) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.dataDevice = qkvInput.dataDevice;
+        output.dataDeviceIds = qkvInput.dataDeviceIds;
+        output.Resize(dims);
+        output.Allocate(false);
+        return output.cudaData != nullptr;
+    };
+    if (!prepareOutput(q, {batch, valueHeads, paddedSeqLen, kDim}) ||
+        !prepareOutput(k, {batch, valueHeads, paddedSeqLen, kDim}) ||
+        !prepareOutput(v, {batch, valueHeads, paddedSeqLen, vDim}) ||
+        !prepareOutput(g, {batch, valueHeads, paddedSeqLen}) ||
+        !prepareOutput(beta, {batch, valueHeads, paddedSeqLen}) ||
+        !prepareOutput(kBeta, {batch, valueHeads, paddedSeqLen, kDim}) ||
+        !prepareOutput(vBeta, {batch, valueHeads, paddedSeqLen, vDim})) {
+        return false;
+    }
+
+    int rows = batch * paddedSeqLen;
+    const char *skipDeadOutputsEnv = std::getenv(
+        "FASTLLM_CUDA_QWEN35_GDN_SKIP_DEAD_POSTCONV_OUTPUTS");
+    bool skipDeadOutputs =
+        skipDeadOutputsEnv == nullptr || skipDeadOutputsEnv[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_QWEN35_GDN_SKIP_DEAD_POSTCONV_OUTPUTS");
+    if (skipDeadOutputs) {
+        FastllmQwen35GdnPostConvExactHalf128Kernel<false>
+            <<<rows * keyHeads, 32>>>(
+            (const half *)qkvInput.cudaData,
+            (const float *)normWeight.cudaData,
+            (const half *)gInput.cudaData,
+            (const half *)betaInput.cudaData,
+            (half *)q.cudaData, (half *)k.cudaData,
+            (half *)v.cudaData, (half *)g.cudaData,
+            (half *)beta.cudaData, (half *)kBeta.cudaData,
+            (half *)vBeta.cudaData,
+            seqLen, paddedSeqLen, keyHeads, valueHeads,
+            normEps, __float2half(qScale));
+    } else {
+        FastllmQwen35GdnPostConvExactHalf128Kernel<true>
+            <<<rows * keyHeads, 32>>>(
+            (const half *)qkvInput.cudaData,
+            (const float *)normWeight.cudaData,
+            (const half *)gInput.cudaData,
+            (const half *)betaInput.cudaData,
+            (half *)q.cudaData, (half *)k.cudaData,
+            (half *)v.cudaData, (half *)g.cudaData,
+            (half *)beta.cudaData, (half *)kBeta.cudaData,
+            (half *)vBeta.cudaData,
+            seqLen, paddedSeqLen, keyHeads, valueHeads,
+            normEps, __float2half(qScale));
+    }
+    checkCudaErrors(
+        "Error: CUDA error in "
+        "FastllmCudaQwen35GdnPostConvExactFloat16.",
+        cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaQwen35GdnPostConvRaggedExactFloat16(
+        const fastllm::Data &qkvInput,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &combinedBaInput,
+        const fastllm::Data &aLog,
+        const fastllm::Data &dtBias,
+        int baOffset, const std::vector<int> &seqLens,
+        int chunkSize, int keyHeads, int valueHeads,
+        int kDim, int vDim, float normEps, float qScale,
+        fastllm::Data &q, fastllm::Data &k,
+        fastllm::Data &g, fastllm::Data &kBeta,
+        fastllm::Data &vBeta) {
+    auto isDenseCuda = [](const fastllm::Data &data) {
+        if (data.dataDevice != fastllm::DataDevice::CUDA ||
+            data.cudaData == nullptr || data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (seqLens.size() <= 1 || chunkSize != 64 ||
+        keyHeads <= 0 || valueHeads <= keyHeads ||
+        valueHeads % keyHeads != 0 || kDim != 128 || vDim != 128 ||
+        baOffset < 0 || !std::isfinite(normEps) || normEps < 0.0f ||
+        !std::isfinite(qScale) ||
+        qkvInput.dataType != fastllm::DataType::FLOAT16 ||
+        combinedBaInput.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        aLog.dataType != fastllm::DataType::FLOAT32 ||
+        dtBias.dataType != fastllm::DataType::FLOAT32 ||
+        !isDenseCuda(qkvInput) || !isDenseCuda(combinedBaInput) ||
+        !isDenseCuda(normWeight) || !isDenseCuda(aLog) ||
+        !isDenseCuda(dtBias) ||
+        normWeight.Count(0) != (uint64_t)kDim ||
+        aLog.Count(0) != (uint64_t)valueHeads ||
+        dtBias.Count(0) != (uint64_t)valueHeads) {
+        return false;
+    }
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(
+            seqLens, chunkSize, metadata)) {
+        return false;
+    }
+    const int totalTokens = metadata.totalTokens;
+    const int totalChunks = metadata.totalChunks;
+    const int qkvChannels =
+        keyHeads * kDim * 2 + valueHeads * vDim;
+    const int baChannels = combinedBaInput.dims.back();
+    if (totalTokens <= 0 || totalChunks <= 0 ||
+        baOffset + valueHeads * 2 > baChannels ||
+        qkvInput.dims.back() != qkvChannels ||
+        qkvInput.Count(0) !=
+            (uint64_t)totalTokens * qkvChannels ||
+        combinedBaInput.Count(0) !=
+            (uint64_t)totalTokens * baChannels) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(qkvInput, device) ||
+        FastllmCudaGetDevice() != device ||
+        !FastllmCudaDataCanShareDevice(qkvInput, combinedBaInput) ||
+        !FastllmCudaDataCanShareDevice(qkvInput, normWeight) ||
+        !FastllmCudaDataCanShareDevice(qkvInput, aLog) ||
+        !FastllmCudaDataCanShareDevice(qkvInput, dtBias)) {
+        return false;
+    }
+    std::set<fastllm::Data*> outputs = {&q, &k, &g, &kBeta, &vBeta};
+    if (outputs.size() != 5) {
+        return false;
+    }
+    const int packedTokens = totalChunks * chunkSize;
+    auto prepareOutput = [&](fastllm::Data &output,
+                             const std::vector<int> &dims) {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.Resize(dims);
+        output.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{device});
+        output.Allocate(false);
+        output.isKVCache = false;
+        output.isLinearAttention = false;
+        output.isLinearAttentionTransposed = false;
+        return output.cudaData != nullptr &&
+               FastllmCudaDataHasDenseStrides(output) &&
+               FastllmCudaDataCanShareDevice(qkvInput, output);
+    };
+    if (!prepareOutput(q, {1, keyHeads, packedTokens, kDim}) ||
+        !prepareOutput(k, {1, keyHeads, packedTokens, kDim}) ||
+        !prepareOutput(g, {1, valueHeads, packedTokens}) ||
+        !prepareOutput(kBeta, {1, valueHeads, packedTokens, kDim}) ||
+        !prepareOutput(vBeta, {1, valueHeads, packedTokens, vDim})) {
+        return false;
+    }
+
+    int rows = packedTokens * keyHeads;
+    FastllmQwen35GdnPostConvRaggedExactHalf128Kernel<<<rows, 32>>>(
+        (const half *)qkvInput.cudaData,
+        (const float *)normWeight.cudaData,
+        (const half *)combinedBaInput.cudaData,
+        (const float *)aLog.cudaData,
+        (const float *)dtBias.cudaData,
+        metadata.chunkTokenBases, metadata.chunkValidTokens,
+        (half *)q.cudaData, (half *)k.cudaData,
+        (half *)g.cudaData, (half *)kBeta.cudaData,
+        (half *)vBeta.cudaData, totalChunks, baChannels, baOffset,
+        keyHeads, valueHeads, normEps, qScale);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in ragged exact GDN post-conv.",
+            launchState);
+        return false;
+    }
     return true;
 }
 
@@ -5803,7 +8110,7 @@ bool FastllmCudaKimiK3RecurrentKDA(
         const fastllm::Data &dtBias, fastllm::Data &state,
         fastllm::Data &output, fastllm::Data &decay,
         fastllm::Data &beta, float lowerBound, bool initializeState,
-        int tokenLimit, bool stateOnly) {
+        int tokenLimit, bool stateOnly, bool outputAux) {
     if (!KimiK3CudaDataReady(q, fastllm::DataType::BFLOAT16) ||
         !KimiK3CudaDataReady(k, fastllm::DataType::BFLOAT16) ||
         !KimiK3CudaDataReady(v, fastllm::DataType::BFLOAT16) ||
@@ -5831,13 +8138,18 @@ bool FastllmCudaKimiK3RecurrentKDA(
         dtBias.Count(0) != (uint64_t)heads * dimension) {
         return false;
     }
-    if (!stateOnly &&
-        (!KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
-         !KimiK3CudaDataReady(decay, fastllm::DataType::FLOAT32) ||
-         !KimiK3CudaDataReady(beta, fastllm::DataType::FLOAT32) ||
-         output.dims != q.dims || decay.dims != q.dims ||
-         beta.dims != std::vector<int>({batch, sequence, heads}))) {
-        return false;
+    if (!stateOnly) {
+        if (!KimiK3CudaDataReady(output, fastllm::DataType::BFLOAT16) ||
+            output.dims != q.dims) {
+            return false;
+        }
+        if (outputAux &&
+            (!KimiK3CudaDataReady(decay, fastllm::DataType::FLOAT32) ||
+             !KimiK3CudaDataReady(beta, fastllm::DataType::FLOAT32) ||
+             decay.dims != q.dims ||
+             beta.dims != std::vector<int>({batch, sequence, heads}))) {
+            return false;
+        }
     }
     if (initializeState) {
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
@@ -5856,8 +8168,8 @@ bool FastllmCudaKimiK3RecurrentKDA(
         (const float*)dtBias.cudaData,
         (float*)state.cudaData,
         stateOnly ? nullptr : (__nv_bfloat16*)output.cudaData,
-        stateOnly ? nullptr : (float*)decay.cudaData,
-        stateOnly ? nullptr : (float*)beta.cudaData,
+        stateOnly || !outputAux ? nullptr : (float*)decay.cudaData,
+        stateOnly || !outputAux ? nullptr : (float*)beta.cudaData,
         batch, sequence, tokens, heads, dimension,
         (int)aLog.Count(0), lowerBound);
     return KimiK3CudaLastError("KimiK3RecurrentKDA CUDA kernel failed.");
@@ -6240,6 +8552,160 @@ __global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128ExactKernel(
     }
 }
 
+// Keep the exact 128-channel RMSNorm and SiLU arithmetic above, but read the
+// gate from one slice of a wider token-major projection.  Each logical input
+// row is one value head, while combinedGateInput advances once per token.
+__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128CombinedGateExactKernel(
+        const half *input, const float *weight,
+        const half *combinedGateInput, half *output,
+        int gateStride, int gateOffset, int gateHeads, float eps) {
+    constexpr int CHANNELS = 128;
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    int token = row / gateHeads;
+    int head = row - token * gateHeads;
+    input += (size_t)row * CHANNELS;
+    combinedGateInput +=
+        (size_t)token * gateStride + gateOffset + head * CHANNELS;
+    output += (size_t)row * CHANNELS;
+    const half2 *input2 = reinterpret_cast<const half2 *>(input);
+    const half2 *gate2 =
+        reinterpret_cast<const half2 *>(combinedGateInput);
+
+    float2 value0 = __half22float2(input2[lane]);
+    float2 value1 = __half22float2(input2[lane + 32]);
+    float sum0 = value0.x * value0.x + value0.y * value0.y;
+    float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+        scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+    }
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+
+    float2 inputValues[2] = {value0, value1};
+    half2 gateValues[2] = {gate2[lane], gate2[lane + 32]};
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+#pragma unroll
+    for (int part = 0; part < 2; part++) {
+        int index = lane + part * 32;
+        float2 value = inputValues[part];
+        half gate0In = __low2half(gateValues[part]);
+        half gate1In = __high2half(gateValues[part]);
+#ifdef CUDA_NO_TENSOR_CORE
+        float gate0Float = __half2float(gate0In);
+        float gate1Float = __half2float(gate1In);
+        half gate0 =
+            __float2half(gate0Float / (1.0f + expf(-gate0Float)));
+        half gate1 =
+            __float2half(gate1Float / (1.0f + expf(-gate1Float)));
+#else
+        half gate0 =
+            __hdiv(gate0In, __hadd(__float2half(1.0f), hexp(-gate0In)));
+        half gate1 =
+            __hdiv(gate1In, __hadd(__float2half(1.0f), hexp(-gate1In)));
+#endif
+        half rms0 = __float2half_rn(
+            value.x * scale * __ldg(weight + index * 2));
+        half rms1 = __float2half_rn(
+            value.y * scale * __ldg(weight + index * 2 + 1));
+#ifdef CUDA_NO_TENSOR_CORE
+        half out0 =
+            __float2half(__half2float(rms0) * __half2float(gate0));
+        half out1 =
+            __float2half(__half2float(rms1) * __half2float(gate1));
+#else
+        half out0 = __hmul(rms0, gate0);
+        half out1 = __hmul(rms1, gate1);
+#endif
+        output2[index] = __halves2half2(out0, out1);
+    }
+}
+
+// Fuse [batch, heads, paddedSeq, 128] -> [batch, seq, heads, 128]
+// with the exact output RMSNorm and z gate.  This avoids the temporary copy
+// required by an in-place head/sequence transpose.
+__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel(
+        const half *headMajorInput, const float *weight,
+        const half *combinedGateInput, half *output,
+        int seqLen, int paddedSeqLen,
+        int gateStride, int gateOffset, int gateHeads, float eps) {
+    constexpr int CHANNELS = 128;
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    int token = row / gateHeads;
+    int head = row - token * gateHeads;
+    int batch = token / seqLen;
+    int tokenInBatch = token - batch * seqLen;
+    headMajorInput +=
+        (((size_t)batch * gateHeads + head) * paddedSeqLen +
+         tokenInBatch) * CHANNELS;
+    combinedGateInput +=
+        (size_t)token * gateStride + gateOffset + head * CHANNELS;
+    output += (size_t)row * CHANNELS;
+    const half2 *input2 =
+        reinterpret_cast<const half2 *>(headMajorInput);
+    const half2 *gate2 =
+        reinterpret_cast<const half2 *>(combinedGateInput);
+
+    float2 value0 = __half22float2(input2[lane]);
+    float2 value1 = __half22float2(input2[lane + 32]);
+    float sum0 = value0.x * value0.x + value0.y * value0.y;
+    float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+        scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+    }
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+
+    float2 inputValues[2] = {value0, value1};
+    half2 gateValues[2] = {gate2[lane], gate2[lane + 32]};
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+#pragma unroll
+    for (int part = 0; part < 2; part++) {
+        int index = lane + part * 32;
+        float2 value = inputValues[part];
+        half gate0In = __low2half(gateValues[part]);
+        half gate1In = __high2half(gateValues[part]);
+#ifdef CUDA_NO_TENSOR_CORE
+        float gate0Float = __half2float(gate0In);
+        float gate1Float = __half2float(gate1In);
+        half gate0 =
+            __float2half(gate0Float / (1.0f + expf(-gate0Float)));
+        half gate1 =
+            __float2half(gate1Float / (1.0f + expf(-gate1Float)));
+#else
+        half gate0 =
+            __hdiv(gate0In, __hadd(__float2half(1.0f), hexp(-gate0In)));
+        half gate1 =
+            __hdiv(gate1In, __hadd(__float2half(1.0f), hexp(-gate1In)));
+#endif
+        half rms0 = __float2half_rn(
+            value.x * scale * __ldg(weight + index * 2));
+        half rms1 = __float2half_rn(
+            value.y * scale * __ldg(weight + index * 2 + 1));
+#ifdef CUDA_NO_TENSOR_CORE
+        half out0 =
+            __float2half(__half2float(rms0) * __half2float(gate0));
+        half out1 =
+            __float2half(__half2float(rms1) * __half2float(gate1));
+#else
+        half out0 = __hmul(rms0, gate0);
+        half out1 = __hmul(rms1, gate1);
+#endif
+        output2[index] = __halves2half2(out0, out1);
+    }
+}
+
 static bool LaunchFastllmRMSNormSiluMulFloat16(
         const half *input, const float *weight, const half *gateInput,
         half *output, int outer, int channels, float eps, int threadCount) {
@@ -6305,6 +8771,153 @@ bool FastllmCudaRMSNormSiluMulFloat16(
     return FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
         input, weight, gateInput, output, eps,
         !input.dims.empty() && input.dims.back() == 128 ? 32 : 0);
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16CombinedGate(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &combinedGateInput,
+        int gateOffset, int gateHeads,
+        fastllm::Data &output, float eps) {
+    auto isDense = [](const fastllm::Data &data) {
+        if (data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        combinedGateInput.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        combinedGateInput.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        input.cudaData == nullptr || combinedGateInput.cudaData == nullptr ||
+        output.cudaData == nullptr || weight.cudaData == nullptr ||
+        !isDense(input) || !isDense(combinedGateInput) ||
+        !isDense(output) || input.dims != output.dims ||
+        input.dims.back() != 128 || weight.dims.size() != 1 ||
+        weight.dims[0] != 128 || gateHeads <= 0 || gateOffset < 0 ||
+        !std::isfinite(eps) || eps < 0.0f) {
+        return false;
+    }
+
+    int gateStride = combinedGateInput.dims.back();
+    if (gateOffset > gateStride ||
+        (int64_t)gateHeads * 128 > gateStride - gateOffset) {
+        return false;
+    }
+    int64_t inputCount = input.Count(0);
+    int64_t combinedCount = combinedGateInput.Count(0);
+    if (inputCount <= 0 || inputCount % 128 != 0 ||
+        combinedCount <= 0 || combinedCount % gateStride != 0) {
+        return false;
+    }
+    int64_t outer64 = inputCount / 128;
+    int64_t tokens64 = combinedCount / gateStride;
+    if (outer64 != tokens64 * gateHeads ||
+        outer64 > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    FastllmRMSNormSiluMulHalf128CombinedGateExactKernel<<<
+        (int)outer64, 32>>>(
+        (const half *)input.cudaData,
+        (const float *)weight.cudaData,
+        (const half *)combinedGateInput.cudaData,
+        (half *)output.cudaData,
+        gateStride, gateOffset, gateHeads, eps);
+    checkCudaErrors(
+        "Error: CUDA error in "
+        "FastllmCudaRMSNormSiluMulFloat16CombinedGate.",
+        cudaGetLastError());
+    return true;
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate(
+        const fastllm::Data &headMajorInput, fastllm::Data &weight,
+        const fastllm::Data &combinedGateInput,
+        int batch, int seqLen,
+        int gateOffset, int gateHeads,
+        fastllm::Data &output, float eps) {
+    auto isDense = [](const fastllm::Data &data) {
+        if (data.dims.empty() ||
+            data.strides.size() != data.dims.size()) {
+            return false;
+        }
+        uint64_t expected = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+            if (data.strides[i] != expected) {
+                return false;
+            }
+            expected *= (uint64_t)data.dims[i];
+        }
+        return true;
+    };
+    if (batch <= 0 || seqLen <= 0 || gateHeads <= 0 ||
+        gateOffset < 0 || !std::isfinite(eps) || eps < 0.0f ||
+        headMajorInput.dataDevice != fastllm::DataDevice::CUDA ||
+        combinedGateInput.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        headMajorInput.dataType != fastllm::DataType::FLOAT16 ||
+        combinedGateInput.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        headMajorInput.cudaData == nullptr ||
+        combinedGateInput.cudaData == nullptr ||
+        weight.cudaData == nullptr ||
+        !isDense(headMajorInput) || !isDense(combinedGateInput) ||
+        headMajorInput.dims.size() != 4 ||
+        headMajorInput.dims[0] != batch ||
+        headMajorInput.dims[1] != gateHeads ||
+        headMajorInput.dims[2] < seqLen ||
+        headMajorInput.dims[3] != 128 ||
+        weight.dims.size() != 1 || weight.dims[0] != 128) {
+        return false;
+    }
+
+    int paddedSeqLen = headMajorInput.dims[2];
+    int gateStride = combinedGateInput.dims.back();
+    if (gateOffset > gateStride ||
+        (int64_t)gateHeads * 128 > gateStride - gateOffset ||
+        combinedGateInput.Count(0) !=
+            (uint64_t)batch * seqLen * gateStride) {
+        return false;
+    }
+    int64_t outer64 = (int64_t)batch * seqLen * gateHeads;
+    if (outer64 <= 0 || outer64 > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    output.dataType = fastllm::DataType::FLOAT16;
+    output.dataDevice = headMajorInput.dataDevice;
+    output.dataDeviceIds = headMajorInput.dataDeviceIds;
+    output.Resize({batch, seqLen, gateHeads, 128});
+    output.Allocate(false);
+    if (output.cudaData == nullptr || !isDense(output)) {
+        return false;
+    }
+
+    FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<<<(
+        int)outer64, 32>>>(
+        (const half *)headMajorInput.cudaData,
+        (const float *)weight.cudaData,
+        (const half *)combinedGateInput.cudaData,
+        (half *)output.cudaData,
+        seqLen, paddedSeqLen,
+        gateStride, gateOffset, gateHeads, eps);
+    checkCudaErrors(
+        "Error: CUDA error in "
+        "FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate.",
+        cudaGetLastError());
+    return true;
 }
 
 template <int THREAD_PER_BLOCK>
@@ -6918,6 +9531,76 @@ __device__ __forceinline__ float FastllmRouterLogitToFloat(__nv_bfloat16 value) 
     return __bfloat162float(value);
 }
 
+#ifndef USE_ROCM
+template <typename T>
+__device__ __forceinline__ void FastllmRouterLoad8(
+        const T *source, float (&values)[8]) {
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        values[i] = FastllmRouterLogitToFloat(source[i]);
+    }
+}
+
+template <>
+__device__ __forceinline__ void FastllmRouterLoad8<float>(
+        const float *source, float (&values)[8]) {
+    float4 lo = reinterpret_cast<const float4*>(source)[0];
+    float4 hi = reinterpret_cast<const float4*>(source)[1];
+    values[0] = lo.x;
+    values[1] = lo.y;
+    values[2] = lo.z;
+    values[3] = lo.w;
+    values[4] = hi.x;
+    values[5] = hi.y;
+    values[6] = hi.z;
+    values[7] = hi.w;
+}
+
+template <>
+__device__ __forceinline__ void FastllmRouterLoad8<half>(
+        const half *source, float (&values)[8]) {
+    uint4 packed = *reinterpret_cast<const uint4*>(source);
+    half2 pair0 = *reinterpret_cast<half2*>(&packed.x);
+    half2 pair1 = *reinterpret_cast<half2*>(&packed.y);
+    half2 pair2 = *reinterpret_cast<half2*>(&packed.z);
+    half2 pair3 = *reinterpret_cast<half2*>(&packed.w);
+    float2 value0 = __half22float2(pair0);
+    float2 value1 = __half22float2(pair1);
+    float2 value2 = __half22float2(pair2);
+    float2 value3 = __half22float2(pair3);
+    values[0] = value0.x;
+    values[1] = value0.y;
+    values[2] = value1.x;
+    values[3] = value1.y;
+    values[4] = value2.x;
+    values[5] = value2.y;
+    values[6] = value3.x;
+    values[7] = value3.y;
+}
+
+template <>
+__device__ __forceinline__ void FastllmRouterLoad8<__nv_bfloat16>(
+        const __nv_bfloat16 *source, float (&values)[8]) {
+    uint4 packed = *reinterpret_cast<const uint4*>(source);
+    __nv_bfloat162 pair0 = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
+    __nv_bfloat162 pair1 = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
+    __nv_bfloat162 pair2 = *reinterpret_cast<__nv_bfloat162*>(&packed.z);
+    __nv_bfloat162 pair3 = *reinterpret_cast<__nv_bfloat162*>(&packed.w);
+    float2 value0 = __bfloat1622float2(pair0);
+    float2 value1 = __bfloat1622float2(pair1);
+    float2 value2 = __bfloat1622float2(pair2);
+    float2 value3 = __bfloat1622float2(pair3);
+    values[0] = value0.x;
+    values[1] = value0.y;
+    values[2] = value1.x;
+    values[3] = value1.y;
+    values[4] = value2.x;
+    values[5] = value2.y;
+    values[6] = value3.x;
+    values[7] = value3.y;
+}
+#endif
+
 __device__ __forceinline__ float FastllmRouterBiasToFloat(
         const void *bias, int biasType, int expert) {
     if (biasType == 1) {
@@ -6954,10 +9637,790 @@ __device__ __forceinline__ void FastllmRouterCandidateCompareSwap(
     }
 }
 
-// The 256-expert router keeps probabilities in shared memory, so the FP32
-// scoring intermediate never reaches global memory. Ranking deliberately uses
-// probability + correction bias while output scores use the unbiased
-// probabilities, matching SelectExpert's existing semantics.
+#ifndef USE_ROCM
+// Laguna's sigmoid router has a fixed 256-expert, top-10 shape. Keep the
+// transformed row and the TopK scan in one warp so the normal decode path does
+// not need shared-memory staging or block-wide synchronization. Exact ties are
+// uncommon for model logits; when they occur, reproduce the legacy 64-thread
+// merge order below so expert ordering remains compatible.
+template <typename T>
+__global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
+        const T *logits, const void *bias, int32_t *index, float *score,
+        int tokens, int hasBias, int biasType, int needNorm, float routeScale) {
+    constexpr int EXPERTS = 256;
+    constexpr int TOPK = 10;
+    constexpr int LEGACY_THREADS = 64;
+    constexpr float NEG_INF = -1.0e30f;
+    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+
+    __shared__ float selectedKeys[TOPK];
+    __shared__ int selectedIds[TOPK];
+    __shared__ float selectedProb[TOPK];
+    __shared__ float legacyKeys[LEGACY_THREADS][TOPK];
+    __shared__ float legacyIds[LEGACY_THREADS][TOPK];
+
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    int lane = threadIdx.x;
+    int firstExpert = lane * 8;
+    const T *tokenLogits = logits + (size_t)token * EXPERTS;
+
+    float rawLogits[8];
+    float probabilities[8];
+    float choiceKeys[8];
+    float correctionBias[8];
+    FastllmRouterLoad8(tokenLogits + firstExpert, rawLogits);
+    if (hasBias) {
+        if (biasType == 1) {
+            FastllmRouterLoad8((const half*)bias + firstExpert, correctionBias);
+        } else if (biasType == 2) {
+            FastllmRouterLoad8((const __nv_bfloat16*)bias + firstExpert, correctionBias);
+        } else {
+            FastllmRouterLoad8((const float*)bias + firstExpert, correctionBias);
+        }
+    } else {
+#pragma unroll
+        for (int part = 0; part < 8; part++) {
+            correctionBias[part] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (int part = 0; part < 8; part++) {
+        float probability = 1.0f / (1.0f + __expf(-rawLogits[part]));
+        probabilities[part] = probability;
+        choiceKeys[part] = probability + correctionBias[part];
+    }
+
+#pragma unroll
+    for (int rank = 0; rank < TOPK; rank++) {
+        FastllmRouterCandidate best = {choiceKeys[0], firstExpert};
+#pragma unroll
+        for (int part = 1; part < 8; part++) {
+            FastllmRouterCandidate candidate = {choiceKeys[part], firstExpert + part};
+            if (FastllmRouterCandidateBetter(candidate, best)) {
+                best = candidate;
+            }
+        }
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            FastllmRouterCandidate other;
+            other.key = __shfl_xor_sync(FULL_WARP_MASK, best.key, mask);
+            other.id = __shfl_xor_sync(FULL_WARP_MASK, best.id, mask);
+            if (FastllmRouterCandidateBetter(other, best)) {
+                best = other;
+            }
+        }
+
+        int owner = best.id >> 3;
+        int ownerPart = best.id & 7;
+        float probability = probabilities[ownerPart];
+        probability = __shfl_sync(FULL_WARP_MASK, probability, owner);
+        if (lane == 0) {
+            selectedKeys[rank] = best.key;
+            selectedIds[rank] = best.id;
+            selectedProb[rank] = probability;
+        }
+
+        if (lane == owner) {
+#pragma unroll
+            for (int part = 0; part < 8; part++) {
+                if (part == ownerPart) {
+                    choiceKeys[part] = NEG_INF;
+                }
+            }
+        }
+    }
+
+    __syncwarp(FULL_WARP_MASK);
+    float cutoff = lane == 0 ? selectedKeys[TOPK - 1] : 0.0f;
+    cutoff = __shfl_sync(FULL_WARP_MASK, cutoff, 0);
+    int useLegacyMerge = 0;
+#pragma unroll
+    for (int part = 0; part < 8; part++) {
+        useLegacyMerge |= choiceKeys[part] == cutoff;
+    }
+    useLegacyMerge = __any_sync(FULL_WARP_MASK, useLegacyMerge);
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 1; i < TOPK; i++) {
+            useLegacyMerge |= selectedKeys[i] == selectedKeys[i - 1];
+        }
+    }
+    useLegacyMerge = __shfl_sync(FULL_WARP_MASK, useLegacyMerge, 0);
+
+    if (!useLegacyMerge) {
+        if (lane == 0) {
+            float selectedSum = 1.0f;
+            if (needNorm) {
+                selectedSum = 0.0f;
+#pragma unroll
+                for (int rank = 0; rank < TOPK; rank++) {
+                    selectedSum += selectedProb[rank];
+                }
+            }
+            int32_t *tokenIndex = index + (size_t)token * TOPK;
+            float *tokenScore = score + (size_t)token * TOPK;
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                tokenIndex[rank] = selectedIds[rank];
+                tokenScore[rank] = selectedProb[rank] / selectedSum * routeScale;
+            }
+        }
+        return;
+    }
+
+    // The fast scan marks winners as consumed in choiceKeys. Restore those
+    // entries before constructing the exact legacy lists.
+#pragma unroll
+    for (int rank = 0; rank < TOPK; rank++) {
+        int expert = lane == 0 ? selectedIds[rank] : 0;
+        float key = lane == 0 ? selectedKeys[rank] : 0.0f;
+        expert = __shfl_sync(FULL_WARP_MASK, expert, 0);
+        key = __shfl_sync(FULL_WARP_MASK, key, 0);
+        int owner = expert >> 3;
+        int ownerPart = expert & 7;
+        if (lane == owner) {
+#pragma unroll
+            for (int part = 0; part < 8; part++) {
+                if (part == ownerPart) {
+                    choiceKeys[part] = key;
+                }
+            }
+        }
+    }
+
+    // Populate the same 64 virtual lists as FastllmSelectExpertKernel. One
+    // physical warp handles two virtual threads per lane; this path is only
+    // taken for exact ranking-key ties.
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+        int virtualTid = lane + half * 32;
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            legacyKeys[virtualTid][rank] = -1.0e100;
+            legacyIds[virtualTid][rank] = -1.0f;
+        }
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            int expert = virtualTid + part * LEGACY_THREADS;
+            int owner = expert >> 3;
+            int ownerPart = expert & 7;
+            float key = NEG_INF;
+#pragma unroll
+            for (int sourcePart = 0; sourcePart < 8; sourcePart++) {
+                float candidate = __shfl_sync(
+                    FULL_WARP_MASK, choiceKeys[sourcePart], owner);
+                if (sourcePart == ownerPart) {
+                    key = candidate;
+                }
+            }
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                if (key > legacyKeys[virtualTid][rank]) {
+#pragma unroll
+                    for (int shift = TOPK - 1; shift > rank; shift--) {
+                        legacyKeys[virtualTid][shift] = legacyKeys[virtualTid][shift - 1];
+                        legacyIds[virtualTid][shift] = legacyIds[virtualTid][shift - 1];
+                    }
+                    legacyKeys[virtualTid][rank] = key;
+                    legacyIds[virtualTid][rank] = (float)expert;
+                    break;
+                }
+            }
+        }
+    }
+    __syncwarp(FULL_WARP_MASK);
+
+    for (int stride = 32; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            int pos0 = 0;
+            int pos1 = 0;
+            while (pos0 + pos1 < TOPK) {
+                if (legacyKeys[lane][pos0] > legacyKeys[lane + stride][pos1]) {
+                    pos0++;
+                } else {
+                    pos1++;
+                }
+            }
+            pos0--;
+            pos1--;
+            for (int pos = TOPK - 1; pos >= 0; pos--) {
+                if (pos1 < 0 ||
+                    (pos0 >= 0 && legacyKeys[lane][pos0] < legacyKeys[lane + stride][pos1])) {
+                    legacyKeys[lane][pos] = legacyKeys[lane][pos0];
+                    legacyIds[lane][pos] = legacyIds[lane][pos0];
+                    pos0--;
+                } else {
+                    legacyKeys[lane][pos] = legacyKeys[lane + stride][pos1];
+                    legacyIds[lane][pos] = legacyIds[lane + stride][pos1];
+                    pos1--;
+                }
+            }
+        }
+        __syncwarp(FULL_WARP_MASK);
+    }
+
+#pragma unroll
+    for (int rank = 0; rank < TOPK; rank++) {
+        int expert = lane == 0 ? (int)legacyIds[0][rank] : 0;
+        expert = __shfl_sync(FULL_WARP_MASK, expert, 0);
+        int owner = expert >> 3;
+        int ownerPart = expert & 7;
+        float probability = probabilities[ownerPart];
+        probability = __shfl_sync(FULL_WARP_MASK, probability, owner);
+        if (lane == 0) {
+            selectedIds[rank] = expert;
+            selectedProb[rank] = probability;
+        }
+    }
+
+    if (lane == 0) {
+        float selectedSum = 1.0f;
+        if (needNorm) {
+            selectedSum = 0.0f;
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                selectedSum += selectedProb[rank];
+            }
+        }
+        int32_t *tokenIndex = index + (size_t)token * TOPK;
+        float *tokenScore = score + (size_t)token * TOPK;
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            tokenIndex[rank] = selectedIds[rank];
+            tokenScore[rank] = selectedProb[rank] / selectedSum * routeScale;
+        }
+    }
+}
+#endif
+
+__device__ __forceinline__ void FastllmWriteNormalizedLogitsTop8(
+        float key, int expert, int lane,
+        int32_t *tokenIndex, float *tokenScore, float routeScale) {
+    constexpr int TOPK = 8;
+    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+    float maxKey = __shfl_sync(FULL_WARP_MASK, key, 0);
+    float selected = lane < TOPK ? expf(key - maxKey) : 0.0f;
+    float selectedSum = selected;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        selectedSum +=
+            __shfl_down_sync(FULL_WARP_MASK, selectedSum, offset);
+    }
+    selectedSum =
+        __shfl_sync(FULL_WARP_MASK, selectedSum, 0);
+    if (lane < TOPK) {
+        tokenIndex[lane] = expert;
+        tokenScore[lane] = selected / selectedSum * routeScale;
+    }
+}
+
+// Reproduce the original 64-thread SelectExpert merge tree with one physical
+// warp.  This is only needed when equal routing keys make a fixed total-order
+// comparator insufficient: the legacy tie order depends on how candidates are
+// distributed across the merge tree.
+template <typename T>
+__device__ __forceinline__ void FastllmWriteLegacyNormalizedLogitsTop8(
+        const T *tokenLogits, int lane,
+        float *legacyKeys, int *legacyIds,
+        int32_t *tokenIndex, float *tokenScore, float routeScale) {
+    constexpr int THREADS = 64;
+    constexpr int TOPK = 8;
+    constexpr float NEG_INF = -1.0e30f;
+    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+
+    // Each physical lane initializes the two logical selector threads that
+    // occupied the same lane in the original two-warp implementation.
+#pragma unroll
+    for (int logicalThread = lane; logicalThread < THREADS;
+         logicalThread += 32) {
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            legacyKeys[logicalThread * TOPK + rank] = -1.0e100;
+            legacyIds[logicalThread * TOPK + rank] = -1;
+        }
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            int expert = logicalThread + part * THREADS;
+            float key = FastllmRouterLogitToFloat(tokenLogits[expert]);
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                int offset = logicalThread * TOPK + rank;
+                if (key > legacyKeys[offset]) {
+#pragma unroll
+                    for (int shift = TOPK - 1; shift > rank; shift--) {
+                        int dst = logicalThread * TOPK + shift;
+                        legacyKeys[dst] = legacyKeys[dst - 1];
+                        legacyIds[dst] = legacyIds[dst - 1];
+                    }
+                    legacyKeys[offset] = key;
+                    legacyIds[offset] = expert;
+                    break;
+                }
+            }
+        }
+    }
+    __syncwarp(FULL_WARP_MASK);
+
+    int row0 = lane * TOPK;
+    int row1 = (lane + 32) * TOPK;
+    int pos0 = 0;
+    int pos1 = 0;
+    while (pos0 + pos1 < TOPK) {
+        if (legacyKeys[row0 + pos0] > legacyKeys[row1 + pos1]) {
+            pos0++;
+        } else {
+            pos1++;
+        }
+    }
+    pos0--;
+    pos1--;
+    for (int pos = TOPK - 1; pos >= 0; pos--) {
+        if (pos1 < 0 ||
+            (pos0 >= 0 && legacyKeys[row0 + pos0] < legacyKeys[row1 + pos1])) {
+            legacyKeys[row0 + pos] = legacyKeys[row0 + pos0];
+            legacyIds[row0 + pos] = legacyIds[row0 + pos0];
+            pos0--;
+        } else {
+            legacyKeys[row0 + pos] = legacyKeys[row1 + pos1];
+            legacyIds[row0 + pos] = legacyIds[row1 + pos1];
+            pos1--;
+        }
+    }
+    __syncwarp(FULL_WARP_MASK);
+
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            row0 = lane * TOPK;
+            row1 = (lane + stride) * TOPK;
+            pos0 = 0;
+            pos1 = 0;
+            while (pos0 + pos1 < TOPK) {
+                if (legacyKeys[row0 + pos0] > legacyKeys[row1 + pos1]) {
+                    pos0++;
+                } else {
+                    pos1++;
+                }
+            }
+            pos0--;
+            pos1--;
+            for (int pos = TOPK - 1; pos >= 0; pos--) {
+                if (pos1 < 0 ||
+                    (pos0 >= 0 &&
+                     legacyKeys[row0 + pos0] < legacyKeys[row1 + pos1])) {
+                    legacyKeys[row0 + pos] = legacyKeys[row0 + pos0];
+                    legacyIds[row0 + pos] = legacyIds[row0 + pos0];
+                    pos0--;
+                } else {
+                    legacyKeys[row0 + pos] = legacyKeys[row1 + pos1];
+                    legacyIds[row0 + pos] = legacyIds[row1 + pos1];
+                    pos1--;
+                }
+            }
+        }
+        __syncwarp(FULL_WARP_MASK);
+    }
+
+    int expert = lane < TOPK ? legacyIds[lane] : -1;
+    float key = lane < TOPK ?
+        FastllmRouterLogitToFloat(tokenLogits[expert]) : NEG_INF;
+    FastllmWriteNormalizedLogitsTop8(
+        key, expert, lane, tokenIndex, tokenScore, routeScale);
+}
+
+// Pack a finite FP16 logit and a deterministic equal-key priority into one
+// sortable integer. Ambiguous top-k ties are detected and sent through the
+// exact legacy merge path below.
+__device__ __forceinline__ uint32_t FastllmPackFp16RouterCandidate(
+        half key, int expert) {
+    uint32_t bits = __half_as_ushort(key);
+    // The float comparator treats +0 and -0 as equal.
+    if ((bits & 0x7fffu) == 0) {
+        bits = 0;
+    }
+    uint32_t ordered =
+        (bits & 0x8000u) ? (~bits & 0xffffu) : (bits ^ 0x8000u);
+    int selectorThread = expert & 63;
+    int reversedThread =
+        __brev((unsigned int)selectorThread) >> 26;
+    int selectorPart = expert >> 6;
+    uint32_t tiePriority =
+        (uint32_t)((reversedThread << 2) | (3 - selectorPart));
+    return (ordered << 16) | (tiePriority << 8) |
+           (uint32_t)expert;
+}
+
+__device__ __forceinline__ void FastllmPackedRouterCompareSwap(
+        uint32_t &a, uint32_t &b) {
+    if (b > a) {
+        uint32_t temp = a;
+        a = b;
+        b = temp;
+    }
+}
+
+// FP16 no-bias Qwen3.5 router specialization.  One warp owns one token and
+// ranks all 256 logits in registers.  Distinct top-k values avoid the generic
+// two-warp merge; ambiguous ties use the exact legacy merge in the same block.
+// The kernel has no cross-CTA state, so it remains safe under CUDA Graph replay
+// and concurrent tokens.
+__global__ __launch_bounds__(32)
+void FastllmFusedSoftmaxSelectExpertFp16Packed256Top8Kernel(
+        const half *logits, int32_t *index, float *score,
+        int tokens, float routeScale) {
+    constexpr int EXPERTS = 256;
+    constexpr int TOPK = 8;
+    constexpr float NEG_INF = -1.0e30f;
+    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+
+    __shared__ float legacyKeys[64][TOPK];
+    __shared__ int legacyIds[64][TOPK];
+
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    int lane = threadIdx.x;
+    const half *tokenLogits = logits + (size_t)token * EXPERTS;
+
+    uint32_t local[8];
+#pragma unroll
+    for (int part = 0; part < 8; part++) {
+        int expert = lane + part * 32;
+        local[part] =
+            FastllmPackFp16RouterCandidate(tokenLogits[expert], expert);
+    }
+
+    // Sort each lane's eight candidates in descending order.
+    FastllmPackedRouterCompareSwap(local[0], local[1]);
+    FastllmPackedRouterCompareSwap(local[2], local[3]);
+    FastllmPackedRouterCompareSwap(local[4], local[5]);
+    FastllmPackedRouterCompareSwap(local[6], local[7]);
+    FastllmPackedRouterCompareSwap(local[0], local[2]);
+    FastllmPackedRouterCompareSwap(local[1], local[3]);
+    FastllmPackedRouterCompareSwap(local[4], local[6]);
+    FastllmPackedRouterCompareSwap(local[5], local[7]);
+    FastllmPackedRouterCompareSwap(local[1], local[2]);
+    FastllmPackedRouterCompareSwap(local[5], local[6]);
+    FastllmPackedRouterCompareSwap(local[0], local[4]);
+    FastllmPackedRouterCompareSwap(local[3], local[7]);
+    FastllmPackedRouterCompareSwap(local[1], local[5]);
+    FastllmPackedRouterCompareSwap(local[2], local[6]);
+    FastllmPackedRouterCompareSwap(local[1], local[4]);
+    FastllmPackedRouterCompareSwap(local[3], local[6]);
+    FastllmPackedRouterCompareSwap(local[2], local[4]);
+    FastllmPackedRouterCompareSwap(local[3], local[5]);
+    FastllmPackedRouterCompareSwap(local[3], local[4]);
+
+    int selectedExpert = -1;
+    float selectedKey = NEG_INF;
+#pragma unroll
+    for (int rank = 0; rank < TOPK + 1; rank++) {
+        uint32_t best = local[0];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            uint32_t other =
+                __shfl_down_sync(FULL_WARP_MASK, best, offset);
+            if (lane + offset < 32 && other > best) {
+                best = other;
+            }
+        }
+        uint32_t winner =
+            __shfl_sync(FULL_WARP_MASK, best, 0);
+        int winnerExpert = (int)(winner & 0xffu);
+        if (lane == rank) {
+            selectedExpert = winnerExpert;
+            selectedKey =
+                FastllmRouterLogitToFloat(tokenLogits[winnerExpert]);
+        }
+        if (local[0] == winner) {
+#pragma unroll
+            for (int part = 0; part < 7; part++) {
+                local[part] = local[part + 1];
+            }
+            local[7] = 0;
+        }
+    }
+
+    bool ambiguous = false;
+#pragma unroll
+    for (int i = 1; i < TOPK; i++) {
+        float keyI = __shfl_sync(FULL_WARP_MASK, selectedKey, i);
+#pragma unroll
+        for (int j = 0; j < i; j++) {
+            float keyJ = __shfl_sync(FULL_WARP_MASK, selectedKey, j);
+            ambiguous |= keyI == keyJ;
+        }
+    }
+    ambiguous |=
+        __shfl_sync(FULL_WARP_MASK, selectedKey, TOPK) ==
+        __shfl_sync(FULL_WARP_MASK, selectedKey, TOPK - 1);
+
+    int32_t *tokenIndex = index + (size_t)token * TOPK;
+    float *tokenScore = score + (size_t)token * TOPK;
+    if (ambiguous) {
+        FastllmWriteLegacyNormalizedLogitsTop8(
+            tokenLogits, lane, &legacyKeys[0][0], &legacyIds[0][0],
+            tokenIndex, tokenScore, routeScale);
+    } else {
+        FastllmWriteNormalizedLogitsTop8(
+            selectedKey, selectedExpert, lane,
+            tokenIndex, tokenScore, routeScale);
+    }
+}
+
+// Qwen3.5 batch-1 decode specialization for 256 experts and top-8.  The
+// correction-bias path retains the full shared-memory softmax.  Without a bias,
+// ranking can use logits directly; when selected scores are normalized, the
+// global softmax denominator cancels, so only the winning eight need expf.
+// Equal-key ordering follows the original 64-thread SelectExpert merge tree.
+template <typename T, int BLOCK_THREADS, bool NORMALIZE_SELECTED_LOGITS>
+__global__ __launch_bounds__(BLOCK_THREADS)
+void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
+        const T *logits, const float *bias, int32_t *index, float *score,
+        int tokens, int hasBias, int needNorm, float routeScale) {
+    constexpr int THREADS = 64;
+    constexpr int EXPERTS = 256;
+    constexpr int TOPK = 8;
+    constexpr int CANDIDATES = TOPK + 1;
+    constexpr float NEG_INF = -1.0e30f;
+    static_assert(BLOCK_THREADS >= THREADS &&
+                      BLOCK_THREADS <= EXPERTS &&
+                      EXPERTS % BLOCK_THREADS == 0,
+                  "router block width must divide 256 and cover 64 selectors");
+
+    __shared__ float reduceData[THREADS];
+    __shared__ float probabilities[EXPERTS];
+    __shared__ float maxValue;
+    __shared__ float sumValue;
+    __shared__ float warpTopKeys[2][CANDIDATES];
+    __shared__ int warpTopIds[2][CANDIDATES];
+    __shared__ float standardTopKeys[CANDIDATES];
+    __shared__ int standardTopIds[CANDIDATES];
+    __shared__ float legacyKeys[THREADS][TOPK];
+    __shared__ int legacyIds[THREADS][TOPK];
+    __shared__ int useLegacyMerge;
+
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    const T *tokenLogits = logits + (size_t)token * EXPERTS;
+
+    // Use all 256 threads for the expensive exponential while preserving the
+    // old 64-thread softmax reduction tree exactly.  Each of the first 64
+    // threads still combines experts tid + {0, 64, 128, 192} in the original
+    // order, so scores and close correction-bias boundaries remain unchanged.
+#pragma unroll
+    for (int expert = tid; expert < EXPERTS; expert += BLOCK_THREADS) {
+        probabilities[expert] =
+            FastllmRouterLogitToFloat(tokenLogits[expert]);
+    }
+    __syncthreads();
+
+    float localMax = NEG_INF;
+    if constexpr (!NORMALIZE_SELECTED_LOGITS) {
+        if (tid < THREADS) {
+#pragma unroll
+            for (int part = 0; part < 4; part++) {
+                int expert = tid + part * THREADS;
+                localMax = fmaxf(localMax, probabilities[expert]);
+            }
+            reduceData[tid] = localMax;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            float reducedMax = fmaxf(localMax, reduceData[lane + 32]);
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float other =
+                    __shfl_down_sync(0xffffffffu, reducedMax, offset);
+                if (lane < offset) {
+                    reducedMax = fmaxf(reducedMax, other);
+                }
+            }
+            if (lane == 0) {
+                maxValue = reducedMax;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int expert = tid; expert < EXPERTS;
+             expert += BLOCK_THREADS) {
+            probabilities[expert] =
+                expf(probabilities[expert] - maxValue);
+        }
+        __syncthreads();
+
+        float localSum = 0.0f;
+        if (tid < THREADS) {
+#pragma unroll
+            for (int part = 0; part < 4; part++) {
+                localSum += probabilities[tid + part * THREADS];
+            }
+            reduceData[tid] = localSum;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            float reducedSum = localSum + reduceData[lane + 32];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float other =
+                    __shfl_down_sync(0xffffffffu, reducedSum, offset);
+                if (lane < offset) {
+                    reducedSum += other;
+                }
+            }
+            if (lane == 0) {
+                sumValue =
+                    fabsf(reducedSum) < 1.0e-6f ? 1.0e-4f : reducedSum;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int expert = tid; expert < EXPERTS;
+             expert += BLOCK_THREADS) {
+            probabilities[expert] /= sumValue;
+        }
+        __syncthreads();
+    }
+
+    FastllmRouterCandidate local[4];
+    if (tid < THREADS) {
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            int expert = tid + part * THREADS;
+            if constexpr (NORMALIZE_SELECTED_LOGITS) {
+                local[part].key = probabilities[expert];
+            } else {
+                local[part].key =
+                    probabilities[expert] +
+                    (hasBias ? bias[expert] : 0.0f);
+            }
+            local[part].id = expert;
+        }
+
+        FastllmRouterCandidateCompareSwap(local[0], local[1]);
+        FastllmRouterCandidateCompareSwap(local[2], local[3]);
+        FastllmRouterCandidateCompareSwap(local[0], local[2]);
+        FastllmRouterCandidateCompareSwap(local[1], local[3]);
+        FastllmRouterCandidateCompareSwap(local[1], local[2]);
+
+        unsigned int warpMask = 0xffffffffu;
+        int cursor = 0;
+#pragma unroll
+        for (int rank = 0; rank < CANDIDATES; rank++) {
+            FastllmRouterCandidate best = cursor < 4 ?
+                local[cursor] :
+                FastllmRouterCandidate{NEG_INF, -1};
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                FastllmRouterCandidate other;
+                other.key =
+                    __shfl_down_sync(warpMask, best.key, offset);
+                other.id =
+                    __shfl_down_sync(warpMask, best.id, offset);
+                if (lane + offset < 32 &&
+                    FastllmRouterCandidateBetter(other, best)) {
+                    best = other;
+                }
+            }
+            int winner = __shfl_sync(warpMask, best.id, 0);
+            if (lane == 0) {
+                warpTopKeys[warp][rank] = best.key;
+                warpTopIds[warp][rank] = best.id;
+            }
+            if (cursor < 4 && local[cursor].id == winner) {
+                cursor++;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int positions[2] = {0, 0};
+#pragma unroll
+        for (int rank = 0; rank < CANDIDATES; rank++) {
+            FastllmRouterCandidate first = positions[0] < CANDIDATES ?
+                FastllmRouterCandidate{warpTopKeys[0][positions[0]], warpTopIds[0][positions[0]]} :
+                FastllmRouterCandidate{NEG_INF, -1};
+            FastllmRouterCandidate second = positions[1] < CANDIDATES ?
+                FastllmRouterCandidate{warpTopKeys[1][positions[1]], warpTopIds[1][positions[1]]} :
+                FastllmRouterCandidate{NEG_INF, -1};
+            bool takeFirst = FastllmRouterCandidateBetter(first, second);
+            FastllmRouterCandidate chosen = takeFirst ? first : second;
+            positions[takeFirst ? 0 : 1]++;
+            standardTopKeys[rank] = chosen.key;
+            standardTopIds[rank] = chosen.id;
+        }
+        if constexpr (NORMALIZE_SELECTED_LOGITS) {
+            bool ambiguous = false;
+#pragma unroll
+            for (int i = 1; i < TOPK; i++) {
+#pragma unroll
+                for (int j = 0; j < i; j++) {
+                    ambiguous |= standardTopKeys[i] == standardTopKeys[j];
+                }
+            }
+            useLegacyMerge = ambiguous ||
+                standardTopKeys[TOPK] == standardTopKeys[TOPK - 1];
+        } else {
+            useLegacyMerge = 0;
+        }
+    }
+    __syncthreads();
+
+    if constexpr (NORMALIZE_SELECTED_LOGITS) {
+        if (useLegacyMerge) {
+            if (warp == 0) {
+                FastllmWriteLegacyNormalizedLogitsTop8(
+                    tokenLogits, lane,
+                    &legacyKeys[0][0], &legacyIds[0][0],
+                    index + (size_t)token * TOPK,
+                    score + (size_t)token * TOPK,
+                    routeScale);
+            }
+        } else if (warp == 0) {
+            float key =
+                lane < TOPK ? standardTopKeys[lane] : NEG_INF;
+            int expert =
+                lane < TOPK ? standardTopIds[lane] : -1;
+            FastllmWriteNormalizedLogitsTop8(
+                key, expert, lane,
+                index + (size_t)token * TOPK,
+                score + (size_t)token * TOPK,
+                routeScale);
+        }
+    } else if (tid == 0) {
+        float selectedSum = 1.0f;
+        if (needNorm) {
+            selectedSum = 0.0f;
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                selectedSum += probabilities[standardTopIds[rank]];
+            }
+        }
+        int32_t *tokenIndex = index + (size_t)token * TOPK;
+        float *tokenScore = score + (size_t)token * TOPK;
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            int expert = standardTopIds[rank];
+            tokenIndex[rank] = expert;
+            tokenScore[rank] = probabilities[expert] / selectedSum * routeScale;
+        }
+    }
+}
+
+// General 256-expert router used by both the softmax/top-8 and
+// sigmoid/top-10 entry points.  Keep this path feature-complete for Laguna and
+// for bias types that the Qwen3.5 no-bias specializations do not handle.
 template <typename T, int ROUTER_TOPK, bool ROUTER_SIGMOID>
 __global__ void FastllmFusedSelectExpert256Kernel(
         const T *logits, const void *bias, int32_t *index, float *score,
@@ -7273,18 +10736,70 @@ static bool FastllmCudaFusedSelectExpert256(
     int tokens = logits.Count(0) / 256;
     int biasType = !hasBias || gateBias->dataType == fastllm::DataType::FLOAT32 ? 0 :
                    (gateBias->dataType == fastllm::DataType::FLOAT16 ? 1 : 2);
+#ifndef USE_ROCM
+    if constexpr (ROUTER_SIGMOID) {
+        if (logits.dataType == fastllm::DataType::FLOAT16) {
+            FastllmFusedSigmoidSelectExpert256Top10Kernel<half><<<tokens, 32>>>(
+                (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                tokens, hasBias ? 1 : 0, biasType,
+                needNorm ? 1 : 0, routeScale);
+        } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
+            FastllmFusedSigmoidSelectExpert256Top10Kernel<__nv_bfloat16>
+                <<<tokens, 32>>>(
+                    (const __nv_bfloat16*)cudaLogits, cudaBias,
+                    cudaIndex, cudaScore, tokens, hasBias ? 1 : 0,
+                    biasType, needNorm ? 1 : 0, routeScale);
+        } else {
+            FastllmFusedSigmoidSelectExpert256Top10Kernel<float><<<tokens, 32>>>(
+                (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                tokens, hasBias ? 1 : 0, biasType,
+                needNorm ? 1 : 0, routeScale);
+        }
+    } else
+#endif
+    {
+    bool useSelectedLogitFastPath =
+        !ROUTER_SIGMOID && ROUTER_TOPK == 8 && !hasBias && needNorm;
     if (logits.dataType == fastllm::DataType::FLOAT16) {
-        FastllmFusedSelectExpert256Kernel<half, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-            (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        if (useSelectedLogitFastPath) {
+            FastllmFusedSoftmaxSelectExpertFp16Packed256Top8Kernel
+                <<<tokens, 32>>>(
+                    (const half*)cudaLogits, cudaIndex, cudaScore,
+                    tokens, routeScale);
+        } else {
+            FastllmFusedSelectExpert256Kernel<
+                half, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                    (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                    tokens, hasBias ? 1 : 0, biasType,
+                    needNorm ? 1 : 0, routeScale);
+        }
     } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmFusedSelectExpert256Kernel<__nv_bfloat16, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-            (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        if (useSelectedLogitFastPath) {
+            FastllmFusedSoftmaxSelectExpert256Top8Kernel<
+                __nv_bfloat16, 64, true><<<tokens, 64>>>(
+                    (const __nv_bfloat16*)cudaLogits, nullptr,
+                    cudaIndex, cudaScore, tokens, 0, 1, routeScale);
+        } else {
+            FastllmFusedSelectExpert256Kernel<
+                __nv_bfloat16, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                    (const __nv_bfloat16*)cudaLogits, cudaBias,
+                    cudaIndex, cudaScore, tokens, hasBias ? 1 : 0, biasType,
+                    needNorm ? 1 : 0, routeScale);
+        }
     } else {
-        FastllmFusedSelectExpert256Kernel<float, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
-            (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
-            tokens, hasBias ? 1 : 0, biasType, needNorm ? 1 : 0, routeScale);
+        if (useSelectedLogitFastPath) {
+            FastllmFusedSoftmaxSelectExpert256Top8Kernel<float, 64, true>
+                <<<tokens, 64>>>(
+                    (const float*)cudaLogits, nullptr,
+                    cudaIndex, cudaScore, tokens, 0, 1, routeScale);
+        } else {
+            FastllmFusedSelectExpert256Kernel<
+                float, ROUTER_TOPK, ROUTER_SIGMOID><<<tokens, 256>>>(
+                    (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+                    tokens, hasBias ? 1 : 0, biasType,
+                    needNorm ? 1 : 0, routeScale);
+        }
+    }
     }
 
     cudaError_t state = cudaGetLastError();
@@ -7369,6 +10884,13 @@ __global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *i
         if (hasBias) {
             cur += bias[j];
         }
+        // A non-finite router value used to leave idData at -1.  The writeback
+        // below would then read inputData[-1], turning a numerical issue into an
+        // illegal CUDA access and poisoning the entire device context.  Rank a
+        // non-finite value last while retaining a valid expert id instead.
+        if (!isfinite(cur)) {
+            cur = -FLT_MAX;
+        }
         
         for (int l = 0; l < topk; l++) {
             if (cur > maxData[tid][l]) {
@@ -7422,23 +10944,43 @@ __global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *i
             sum = 0.0f;
             for (int i = 0; i < topk; i++) {
                 int expertIdx = idData[0][i];
-                sum += inputData[expertIdx];
+                if (expertIdx >= 0 && expertIdx < numExperts &&
+                    isfinite(inputData[expertIdx])) {
+                    sum += inputData[expertIdx];
+                }
+            }
+            if (!isfinite(sum) || fabsf(sum) < 1.0e-20f) {
+                sum = 1.0f;
             }
         }
         
         // Write index and score
         for (int i = 0; i < topk; i++) {
             int expertIdx = idData[0][i];
+            if (expertIdx < 0 || expertIdx >= numExperts) {
+                expertIdx = 0;
+            }
+            float expertScore = inputData[expertIdx];
+            if (!isfinite(expertScore)) {
+                expertScore = 0.0f;
+            }
             outputIndex[i] = expertIdx;
-            outputScore[i] = inputData[expertIdx] / sum * routeScale;
+            outputScore[i] = expertScore / sum * routeScale;
         }
     }
 }
 
 bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias, 
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale) {
-    if (topk > 50) {
-        printf("SelectExpert: unsupport topk > 50, falling back to CPU implementation.\n");
+    if (logits.dims.empty() || logits.dataType != fastllm::DataType::FLOAT32) {
+        return false;
+    }
+    int dimsLen = logits.dims.size();
+    int numExperts = logits.dims[dimsLen - 1]; // number of experts
+    int n = numExperts > 0 ? logits.Count(0) / numExperts : 0; // number of tokens
+    if (topk <= 0 || topk > 50 || topk > numExperts || n <= 0) {
+        printf("SelectExpert: unsupported shape or topk (tokens=%d, experts=%d, topk=%d), "
+               "falling back to CPU implementation.\n", n, numExperts, topk);
         return false; // 返回 false 表示不支持，应该回退到 CPU
     }
     
@@ -7449,13 +10991,17 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         cudaBias = (float *) FastllmCudaPrepareInput(*gateBias);
         hasBias = 1;
     }
-    int32_t *cudaIndex = (int32_t *) FastllmCudaPrepareInput(index);
-    float *cudaScore = (float *) FastllmCudaPrepareInput(score);
-    
-    int dimsLen = logits.dims.size();
-    int n = logits.Count(0) / logits.dims[dimsLen - 1]; // number of tokens
-    int numExperts = logits.dims[dimsLen - 1]; // number of experts
-    
+    int32_t *cudaIndex = (int32_t *) FastllmCudaPrepareOutput(index);
+    float *cudaScore = (float *) FastllmCudaPrepareOutput(score);
+    if (cudaLogits == nullptr || cudaIndex == nullptr || cudaScore == nullptr ||
+        (hasBias && cudaBias == nullptr)) {
+        FastllmCudaFinishInput(logits, cudaLogits);
+        if (hasBias) {
+            FastllmCudaFinishInput(*gateBias, cudaBias);
+        }
+        return false;
+    }
+
     // Use 64 threads to stay within shared memory limit (64*50*4*2 = 25KB < 48KB)
 #ifdef USE_ROCM
     FastllmSelectExpertKernel<64, 50> <<< n, 64 >>> 
@@ -7484,7 +11030,10 @@ __global__ void FastllmCudaMaskAndRemapExpertsKernel(int32_t *index, float *scor
     if (expert >= expertStart && expert < expertEnd) {
         index[tid] = expert - expertStart;
     } else {
-        index[tid] = 0;
+        // All fused local-expert backends treat a negative id as an inactive
+        // route.  Keeping expert 0 here would still run its full gate/up and
+        // down projections before the zero score discarded the result.
+        index[tid] = -1;
         score[tid] = 0.0f;
     }
 }
@@ -7709,11 +11258,19 @@ bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weigh
     if (weight.dataType == fastllm::DataType::FLOAT32) {
         float *outputData = (float *) dstOutputData;
         float *weightData = (float *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     } else if (weight.dataType == fastllm::DataType::FLOAT16) {
         half *outputData = (half *) dstOutputData;
         half *weightData = (half *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     } else if (weight.dataType == fastllm::DataType::BFLOAT16) {
         float *outputData = (float *) dstOutputData;
         __nv_bfloat16 *weightData = (__nv_bfloat16 *) weight.cudaData;
@@ -7736,15 +11293,27 @@ bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data 
     if (weight.dataType == fastllm::DataType::FLOAT32) {
         float *outputData = (float *) output.cudaData;
         float *weightData = (float *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     } else if (weight.dataType == fastllm::DataType::FLOAT16) {
         half *outputData = (half *) output.cudaData;
         half *weightData = (half *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     } else if (weight.dataType == fastllm::DataType::BFLOAT16) {
         __nv_bfloat16 *outputData = (__nv_bfloat16 *) output.cudaData;
         __nv_bfloat16 *weightData = (__nv_bfloat16 *) weight.cudaData;
-        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+        if (!FastllmLaunchFloatEmbeddingVector(
+                inputData, weightData, outputData, inputLen, embSize)) {
+            FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
+                inputData, weightData, outputData, embSize);
+        }
     }
 
     DeviceSync();
@@ -7866,6 +11435,207 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
     FastllmCudaFinishInput(input0, cudaInput0);
     FastllmCudaFinishInput(input1, cudaInput1);
     FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+__global__ void FastllmMappedGdnKktPointerKernel(
+        const half *input0, const half *input1, half *output,
+        const half **input0Pointers, const half **input1Pointers,
+        half **outputPointers, int totalChunks, int keyHeads,
+        int valueHeads, int matrixElements, int outputElements) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = valueHeads * totalChunks;
+    if (index >= count) {
+        return;
+    }
+    int valueHead = index / totalChunks;
+    int chunk = index - valueHead * totalChunks;
+    int keyHead = valueHead / (valueHeads / keyHeads);
+    input0Pointers[index] =
+        input0 + ((size_t)valueHead * totalChunks + chunk) * matrixElements;
+    input1Pointers[index] =
+        input1 + ((size_t)keyHead * totalChunks + chunk) * matrixElements;
+    outputPointers[index] =
+        output + ((size_t)valueHead * totalChunks + chunk) * outputElements;
+}
+
+static cublasStatus_t FastllmRunRepeatedHeadGdnKkt(
+        cublasHandle_t handle,
+        const half *input0, const half *input1, half *output,
+        int totalChunks, int keyHeads, int valueHeads,
+        int rows, int columns, int inner, float alpha) {
+    if (handle == nullptr || input0 == nullptr || input1 == nullptr ||
+        output == nullptr || totalChunks <= 0 || keyHeads <= 0 ||
+        valueHeads <= keyHeads || valueHeads % keyHeads != 0) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    const int headGroup = valueHeads / keyHeads;
+    const long long input0MatrixElements = (long long)rows * inner;
+    const long long input1MatrixElements = (long long)columns * inner;
+    const long long outputMatrixElements = (long long)rows * columns;
+    half hAlpha = __float2half(alpha);
+    half hBeta = __float2half(0.0f);
+    for (int valueHead = 0; valueHead < valueHeads; valueHead++) {
+        int keyHead = valueHead / headGroup;
+        cublasStatus_t status = cublasHgemmStridedBatched(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            columns, rows, inner, &hAlpha,
+            input1 + (long long)keyHead * totalChunks * input1MatrixElements,
+            inner, input1MatrixElements,
+            input0 + (long long)valueHead * totalChunks * input0MatrixElements,
+            inner, input0MatrixElements, &hBeta,
+            output + (long long)valueHead * totalChunks * outputMatrixElements,
+            columns, outputMatrixElements, totalChunks);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+bool FastllmCudaBatchMatMulTransBHeadMapped(
+        const fastllm::Data &input0, const fastllm::Data &input1,
+        fastllm::Data &output, int headGroup, float alpha) {
+    if (headGroup <= 1 || !std::isfinite(alpha) ||
+        input0.dataDevice != fastllm::DataDevice::CUDA ||
+        input1.dataDevice != fastllm::DataDevice::CUDA ||
+        input0.dataType != fastllm::DataType::FLOAT16 ||
+        input1.dataType != fastllm::DataType::FLOAT16 ||
+        input0.cudaData == nullptr || input1.cudaData == nullptr ||
+        input0.dims.size() != 5 || input1.dims.size() != 5 ||
+        input0.dims[0] != 1 || input1.dims[0] != 1 ||
+        input0.dims[1] != input1.dims[1] * headGroup ||
+        input0.dims[2] != input1.dims[2] ||
+        input0.dims[3] != input1.dims[3] ||
+        input0.dims[4] != input1.dims[4] ||
+        input0.dims[3] != 64 || input0.dims[4] != 128 ||
+        !FastllmCudaDataHasDenseStrides(input0) ||
+        !FastllmCudaDataHasDenseStrides(input1) ||
+        !FastllmCudaDataCanShareDevice(input0, input1)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(input0, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+    const int valueHeads = input0.dims[1];
+    const int keyHeads = input1.dims[1];
+    const int totalChunks = input0.dims[2];
+    const int rows = input0.dims[3];
+    const int inner = input0.dims[4];
+    const int columns = input1.dims[3];
+    const int batch = valueHeads * totalChunks;
+    if (batch <= 0) {
+        return false;
+    }
+    output.dataType = fastllm::DataType::FLOAT16;
+    output.Resize({1, valueHeads, totalChunks, rows, columns});
+    output.ToDevice(
+        fastllm::DataDevice::CUDA, std::vector<int>{device});
+    output.Allocate(false);
+    if (output.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(input0, output)) {
+        return false;
+    }
+
+    auto runRepeatedHeadFallback = [&](const char *reason,
+                                       int mappedStatus) -> bool {
+        static bool warned = false;
+        if (reason != nullptr && !warned) {
+            printf("FastLLM CUDA: mapped ragged GDN KKT %s (%d); "
+                   "falling back to strided repeated-head GEMMs.\n",
+                   reason, mappedStatus);
+            warned = true;
+        }
+        cublasStatus_t fallbackStatus = FastllmRunRepeatedHeadGdnKkt(
+            getFastllmCublasHandle(),
+            (const half *)input0.cudaData,
+            (const half *)input1.cudaData,
+            (half *)output.cudaData,
+            totalChunks, keyHeads, valueHeads,
+            rows, columns, inner, alpha);
+        if (fallbackStatus != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: repeated-head GDN KKT fallback failed (%d).\n",
+                   (int)fallbackStatus);
+            return false;
+        }
+        return true;
+    };
+
+    const char *pointerMode =
+        std::getenv("FASTLLM_CUDA_GDN_MAPPED_KKT_BATCHED_POINTERS");
+    bool useMappedPointers = pointerMode == nullptr || pointerMode[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_GDN_MAPPED_KKT_BATCHED_POINTERS");
+    if (!useMappedPointers) {
+        return runRepeatedHeadFallback(nullptr, 0);
+    }
+
+    struct PointerScratch {
+        void *data = nullptr;
+        size_t capacity = 0;
+        int device = -1;
+        ~PointerScratch() {
+            if (data == nullptr || device < 0) {
+                return;
+            }
+            int oldDevice = 0;
+            cudaGetDevice(&oldDevice);
+            cudaSetDevice(device);
+            FastllmCudaFree(data);
+            cudaSetDevice(oldDevice);
+        }
+    };
+    static thread_local PointerScratch scratch;
+    size_t pointerBytes = (size_t)batch * sizeof(half*);
+    size_t needBytes = pointerBytes * 3;
+    if (scratch.device != device || scratch.capacity < needBytes) {
+        if (scratch.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(scratch.data);
+        }
+        scratch.data = FastllmCudaMalloc(needBytes);
+        if (scratch.data == nullptr) {
+            scratch.capacity = 0;
+            scratch.device = -1;
+            return runRepeatedHeadFallback("pointer scratch allocation failed", 0);
+        }
+        scratch.capacity = needBytes;
+        scratch.device = device;
+    }
+    const half **input0Pointers = (const half **)scratch.data;
+    const half **input1Pointers = (const half **)(
+        (uint8_t*)scratch.data + pointerBytes);
+    half **outputPointers = (half **)(
+        (uint8_t*)scratch.data + pointerBytes * 2);
+    int threads = 256;
+    FastllmMappedGdnKktPointerKernel<<<
+        (batch + threads - 1) / threads, threads>>>(
+        (const half *)input0.cudaData,
+        (const half *)input1.cudaData,
+        (half *)output.cudaData,
+        input0Pointers, input1Pointers, outputPointers,
+        totalChunks, keyHeads, valueHeads, rows * inner,
+        rows * columns);
+    cudaError_t pointerState = cudaGetLastError();
+    if (pointerState != cudaSuccess) {
+        return runRepeatedHeadFallback(
+            "pointer setup failed", (int)pointerState);
+    }
+
+    half hAlpha = __float2half(alpha);
+    half hBeta = __float2half(0.0f);
+    cublasStatus_t status = cublasHgemmBatched(
+        getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        columns, rows, inner, &hAlpha,
+        input1Pointers, inner,
+        input0Pointers, inner, &hBeta,
+        outputPointers, columns, batch);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return runRepeatedHeadFallback("batched GEMM failed", (int)status);
+    }
     return true;
 }
 
@@ -8520,7 +12290,12 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     float llama3Factor,
     float llama3OriginalMaxPosition,
     float llama3LowFreqFactor,
-    float llama3HighFreqFactor
+    float llama3HighFreqFactor,
+    int useYarn,
+    float yarnFactor,
+    float yarnAttentionFactor,
+    float yarnCorrectionLow,
+    float yarnCorrectionHigh
 ) {
     int total_heads = q_heads + k_heads + v_heads;
     int block_id = blockIdx.x;
@@ -8620,7 +12395,13 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
             float rawPosition = positionIds[positionOffset];
             float invFreq = 1.0f / powf(ropeTheta, (float)(2 * j) / rotateDim);
             float freq;
-            if (useLlama3) {
+            if (useYarn) {
+                invFreq = FastllmYarnInvFreq(j, rotateDim, ropeTheta,
+                                              yarnFactor,
+                                              yarnCorrectionLow,
+                                              yarnCorrectionHigh);
+                freq = (float)((int)rawPosition) * invFreq;
+            } else if (useLlama3) {
                 invFreq = FastllmLlama3InvFreq(invFreq, llama3Factor,
                                                 llama3OriginalMaxPosition,
                                                 llama3LowFreqFactor,
@@ -8632,6 +12413,10 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
             }
             float curSin = sinf(freq);
             float curCos = cosf(freq);
+            if (useYarn) {
+                curSin *= yarnAttentionFactor;
+                curCos *= yarnAttentionFactor;
+            }
 
             float va = (float)base[j];
             float vb = (float)base[j + half_rotate];
@@ -8698,7 +12483,11 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int useLlama3, float llama3Factor,
     float llama3OriginalMaxPosition,
     float llama3LowFreqFactor,
-    float llama3HighFreqFactor
+    float llama3HighFreqFactor,
+    int useYarn, float yarnFactor,
+    float yarnAttentionFactor,
+    float yarnCorrectionLow,
+    float yarnCorrectionHigh
 ) {
     float *cudaQKV = (float *) FastllmCudaPrepareInput(qkv);
     float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
@@ -8725,7 +12514,9 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
             outer, total_dim, q_heads, k_heads, v_heads, head_dim,
             bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, maxPages, batch, doQKNorm,
             useLlama3, llama3Factor, llama3OriginalMaxPosition,
-            llama3LowFreqFactor, llama3HighFreqFactor);
+            llama3LowFreqFactor, llama3HighFreqFactor,
+            useYarn, yarnFactor, yarnAttentionFactor,
+            yarnCorrectionLow, yarnCorrectionHigh);
     };
 
     auto launchByPagedType = [&](auto TPB, auto *qkvPtr, auto *qOutputPtr) {
@@ -8766,6 +12557,249 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
         return false;
     }
     // 注意: 不需要 FinishOutput qkv，因为 qkv 内容已经不再需要
+    return true;
+}
+
+template <int HEAD_DIM>
+__global__ void FastllmQwen35QGateKVPrefillHalfKernel(
+    const half *qgatekvData,
+    const float *qNormWeight,
+    const float *kNormWeight,
+    const float *positionIds,
+    half *qOutputData,
+    half *gateOutputData,
+    half *kOutputData,
+    half *vOutputData,
+    int totalDim,
+    int qHeads,
+    int kHeads,
+    int seqlen,
+    int positionStride,
+    int rotaryDim,
+    int sectionH,
+    int sectionW,
+    int useInterleavedRope,
+    float eps,
+    float ropeTheta,
+    float ropeScale) {
+    constexpr int WARP_SIZE = 32;
+    constexpr int RMS_THREADS = 64;
+    constexpr int NUM_WARPS = RMS_THREADS / WARP_SIZE;
+    __shared__ float warpSums[NUM_WARPS];
+    __shared__ float normScale;
+
+    int totalHeads = qHeads + kHeads + kHeads;
+    int tokenId = blockIdx.x / totalHeads;
+    int headId = blockIdx.x - tokenId * totalHeads;
+    int tid = threadIdx.x;
+    int qGateDim = qHeads * HEAD_DIM * 2;
+    const half *tokenBase = qgatekvData + (size_t)tokenId * totalDim;
+
+    if (headId >= qHeads + kHeads) {
+        int vHead = headId - qHeads - kHeads;
+        const half2 *src = reinterpret_cast<const half2 *>(
+            tokenBase + qGateDim + kHeads * HEAD_DIM +
+            vHead * HEAD_DIM);
+        half2 *dst = reinterpret_cast<half2 *>(
+            vOutputData +
+            ((size_t)vHead * seqlen + tokenId) * HEAD_DIM);
+        for (int i = tid; i < HEAD_DIM / 2; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+
+    bool isQ = headId < qHeads;
+    int localHead = isQ ? headId : headId - qHeads;
+    const half *srcBase = isQ
+        ? tokenBase + localHead * HEAD_DIM * 2
+        : tokenBase + qGateDim + localHead * HEAD_DIM;
+    const float *normWeight = isQ ? qNormWeight : kNormWeight;
+    const half2 *src2 = reinterpret_cast<const half2 *>(srcBase);
+    float sum2 = 0.0f;
+    if (tid < RMS_THREADS) {
+        for (int i = tid; i < HEAD_DIM / 2;
+             i += RMS_THREADS) {
+            float2 value = __half22float2(src2[i]);
+            sum2 +=
+                value.x * value.x + value.y * value.y;
+        }
+    }
+
+    int laneId = tid & (WARP_SIZE - 1);
+    int warpId = tid / WARP_SIZE;
+    if (tid < RMS_THREADS) {
+        for (int offset = WARP_SIZE / 2;
+             offset > 0; offset >>= 1) {
+            sum2 += __shfl_down_sync(
+                0xffffffff, sum2, offset);
+        }
+        if (laneId == 0) {
+            warpSums[warpId] = sum2;
+        }
+    }
+    __syncthreads();
+    if (tid < WARP_SIZE) {
+        float val = laneId < NUM_WARPS ? warpSums[laneId] : 0.0f;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (laneId == 0) {
+            normScale = rsqrtf(val / HEAD_DIM + eps);
+        }
+    }
+    __syncthreads();
+
+    half *outputBase = isQ
+        ? qOutputData +
+            ((size_t)localHead * seqlen + tokenId) * HEAD_DIM
+        : kOutputData +
+            ((size_t)localHead * seqlen + tokenId) * HEAD_DIM;
+    half2 *output2 = reinterpret_cast<half2 *>(outputBase);
+    if (tid < RMS_THREADS) {
+        float scale = normScale;
+        for (int i = tid; i < HEAD_DIM / 2;
+             i += RMS_THREADS) {
+            float2 value = __half22float2(src2[i]);
+            float2 normalized;
+            normalized.x =
+                value.x * scale *
+                __ldg(normWeight + i * 2);
+            normalized.y =
+                value.y * scale *
+                __ldg(normWeight + i * 2 + 1);
+            output2[i] = __float22half2_rn(normalized);
+        }
+    }
+
+    if (isQ) {
+        const half2 *gateSrc = reinterpret_cast<const half2 *>(
+            srcBase + HEAD_DIM);
+        half2 *gateDst = reinterpret_cast<half2 *>(
+            gateOutputData +
+            ((size_t)tokenId * qHeads + localHead) * HEAD_DIM);
+        for (int i = tid; i < HEAD_DIM / 2; i += blockDim.x) {
+            gateDst[i] = gateSrc[i];
+        }
+    }
+    __syncthreads();
+
+    int halfRotary = rotaryDim / 2;
+    if (tid < halfRotary) {
+        int row = 0;
+        float position;
+        if (useInterleavedRope) {
+            if (tid % 3 == 1 && tid < sectionH * 3) {
+                row = 1;
+            } else if (tid % 3 == 2 && tid < sectionW * 3) {
+                row = 2;
+            }
+            position =
+                positionIds[row * positionStride + tokenId] /
+                ropeScale;
+        } else {
+            int index = (int)positionIds[tokenId];
+            position = (float)index / ropeScale;
+        }
+        float freq =
+            position /
+            powf(ropeTheta, (float)(2 * tid) / rotaryDim);
+        float curSin = sinf(freq);
+        float curCos = cosf(freq);
+        float va = __half2float(outputBase[tid]);
+        float vb =
+            __half2float(outputBase[tid + halfRotary]);
+        outputBase[tid] =
+            __float2half(va * curCos - vb * curSin);
+        outputBase[tid + halfRotary] =
+            __float2half(va * curSin + vb * curCos);
+    }
+}
+
+bool FastllmCudaQwen35QGateKVPrefill(
+    const fastllm::Data &qgatekv,
+    const fastllm::Data &qNormWeight,
+    const fastllm::Data &kNormWeight,
+    const fastllm::Data &positionIds,
+    fastllm::Data &qOutput,
+    fastllm::Data &gateOutput,
+    fastllm::Data &kOutput,
+    fastllm::Data &vOutput,
+    int qHeads, int kHeads, int headDim,
+    int rotaryDim, int sectionT, int sectionH, int sectionW,
+    float eps, float ropeTheta, float ropeScale) {
+    if (qgatekv.dataType != fastllm::DataType::FLOAT16 ||
+        qNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        kNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        qgatekv.dims.size() != 3 || qgatekv.dims[0] != 1 ||
+        (headDim != 128 && headDim != 256) ||
+        rotaryDim <= 0 || rotaryDim > headDim ||
+        (rotaryDim % 2) != 0 ||
+        qHeads <= 0 || kHeads <= 0 ||
+        qgatekv.dims[2] !=
+            qHeads * headDim * 2 + kHeads * headDim * 2 ||
+        qNormWeight.Count(0) != headDim ||
+        kNormWeight.Count(0) != headDim ||
+        qOutput.cudaData == nullptr ||
+        gateOutput.cudaData == nullptr ||
+        kOutput.cudaData == nullptr ||
+        vOutput.cudaData == nullptr) {
+        return false;
+    }
+    int seqlen = qgatekv.dims[1];
+    bool useInterleavedRope =
+        positionIds.dims.size() == 2 && positionIds.dims[0] == 3;
+    if (useInterleavedRope &&
+        sectionT + sectionH + sectionW != rotaryDim / 2) {
+        return false;
+    }
+    if ((!useInterleavedRope &&
+         (positionIds.dims.empty() ||
+          positionIds.dims.back() < seqlen)) ||
+        (useInterleavedRope &&
+         positionIds.dims.back() < seqlen)) {
+        return false;
+    }
+
+    void *qgatekvData = FastllmCudaPrepareInput(qgatekv);
+    void *positionData = FastllmCudaPrepareInput(positionIds);
+    if (qgatekvData == nullptr || positionData == nullptr) {
+        FastllmCudaFinishInput(qgatekv, qgatekvData);
+        FastllmCudaFinishInput(positionIds, positionData);
+        return false;
+    }
+    int totalHeads = qHeads + kHeads + kHeads;
+    auto launch = [&](auto HeadDim) {
+        FastllmQwen35QGateKVPrefillHalfKernel<
+            decltype(HeadDim)::value>
+            <<<(size_t)seqlen * totalHeads, 128, 0,
+               cudaStreamPerThread>>>(
+            (const half*)qgatekvData,
+            (const float*)qNormWeight.cudaData,
+            (const float*)kNormWeight.cudaData,
+            (const float*)positionData,
+            (half*)qOutput.cudaData,
+            (half*)gateOutput.cudaData,
+            (half*)kOutput.cudaData,
+            (half*)vOutput.cudaData,
+            qgatekv.dims[2], qHeads, kHeads, seqlen,
+            (int)positionIds.dims.back(), rotaryDim,
+            sectionH, sectionW,
+            useInterleavedRope ? 1 : 0,
+            eps, ropeTheta, ropeScale);
+    };
+    if (headDim == 128) {
+        launch(std::integral_constant<int, 128>{});
+    } else {
+        launch(std::integral_constant<int, 256>{});
+    }
+    FastllmCudaFinishInput(qgatekv, qgatekvData);
+    FastllmCudaFinishInput(positionIds, positionData);
+    cudaError_t launchError = cudaGetLastError();
+    if (launchError != cudaSuccess) {
+        return false;
+    }
     return true;
 }
 
@@ -9127,6 +13161,47 @@ bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionI
     return true;
 }
 
+bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
+                                 float ropeTheta, float factor, float attentionFactor,
+                                 float correctionLow, float correctionHigh) {
+    fastllm::AssertInFastLLM(data.dims.size() == 4,
+                             "YaRN RoPE expects [batch, seq, heads, dim] input.");
+    fastllm::AssertInFastLLM(positionIds.dataType == fastllm::DataType::FLOAT32,
+                             "YaRN RoPE expects FLOAT32 position ids.");
+    fastllm::AssertInFastLLM(rotaryDim > 0 && rotaryDim % 2 == 0 &&
+                             rotaryDim <= data.dims[3] && rotaryDim / 2 <= 1024,
+                             "Invalid YaRN rotary_dim for CUDA input.");
+    fastllm::AssertInFastLLM(data.dataType == fastllm::DataType::FLOAT32 ||
+                             data.dataType == fastllm::DataType::FLOAT16 ||
+                             data.dataType == fastllm::DataType::BFLOAT16,
+                             "CUDA YaRN RoPE supports FLOAT32, FLOAT16 and BFLOAT16 input.");
+
+    float *cudaData = (float *)FastllmCudaPrepareInput(data);
+    float *cudaPositionIds = (float *)FastllmCudaPrepareInput(positionIds);
+    int outer = data.dims[0] * data.dims[1];
+    int spatial = data.Count(2);
+    int len = data.dims[1], n = data.dims[2], m = data.dims[3];
+    int halfDim = rotaryDim / 2;
+    int positionStride = (int)positionIds.dims.back();
+
+    if (data.dataType == fastllm::DataType::FLOAT32) {
+        FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
+            cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
+    } else if (data.dataType == fastllm::DataType::FLOAT16) {
+        FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
+            (half*)cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
+    } else {
+        FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
+            (__nv_bfloat16*)cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
+    }
+    FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    FastllmCudaFinishOutput(data, cudaData);
+    return true;
+}
+
 bool FastllmCudaLlama3RopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                    float ropeTheta, float factor, float originalMaxPosition,
                                    float lowFreqFactor, float highFreqFactor) {
@@ -9366,10 +13441,11 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     }
 
     // temperatures | top-k | top-p | sampled ids | candidates | candidate rows |
-    // recovered ids | accepted flags
+    // recovered ids | accepted flags | FlashInfer sampling-valid flags
     size_t paramBytes = batch * (sizeof(float) + sizeof(int) + sizeof(float) + sizeof(int)) +
                         actualTypicalCount * (sizeof(int) + sizeof(int) + sizeof(int) +
-                                              sizeof(unsigned char));
+                                              sizeof(unsigned char)) +
+                        batch * sizeof(bool);
     size_t alignedProbsBytes = FastllmCudaAlignBytes(probsBytes, 256);
     size_t alignedParamBytes = FastllmCudaAlignBytes(paramBytes, 256);
     size_t scratchBytes = 0;
@@ -9393,6 +13469,8 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     int   *cudaTypicalRecovered = cudaTypicalRows + actualTypicalCount;
     unsigned char *cudaTypicalAccepted =
         (unsigned char *)(cudaTypicalRecovered + actualTypicalCount);
+    bool *cudaSamplingValid =
+        (bool *)(cudaTypicalAccepted + actualTypicalCount);
 
     static thread_local std::vector<uint8_t> hostParamBuf;
     hostParamBuf.resize(batch * (sizeof(float) + sizeof(int) + sizeof(float)));
@@ -9432,11 +13510,22 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     static std::mt19937 rng(std::random_device{}());
     uint64_t seed = rng();
 
-    flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+    cudaError_t samplingState =
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
         cudaProbs, cudaTopKArr, cudaTopPArr, cudaOutput,
+        cudaSamplingValid,
         (int *)nullptr,
         (uint32_t)batch, (int)0, 0.0f,
-        (uint32_t)vocabSize, false, seed, 0, 0);
+        (uint32_t)vocabSize, false,
+        (uint64_t *)nullptr, seed,
+        (uint64_t *)nullptr, 0, 0);
+    if (samplingState != cudaSuccess) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        printf("FastllmCudaTopKTopPSampling: launch failed: %s\n",
+               cudaGetErrorString(samplingState));
+        fflush(stdout);
+        return false;
+    }
 
     FastllmCudaCopyFromDeviceToHost(output, cudaOutput, batch * sizeof(int));
     if (actualTypicalCount > 0) {
@@ -9452,6 +13541,91 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     return true;
 }
 
+template <int BLOCK_THREADS>
+__global__ void FastllmRepeatPenaltyFactorsKernel(
+        float *logits, const int *penaltyIds,
+        const float *penaltyFactors, int penaltyTokens,
+        int vocabSize) {
+    int row = blockIdx.x;
+    float *rowLogits = logits + (long long)row * vocabSize;
+    const int *rowIds = penaltyIds + (long long)row * penaltyTokens;
+    const float *rowFactors =
+        penaltyFactors + (long long)row * penaltyTokens;
+    for (int i = threadIdx.x; i < penaltyTokens; i += BLOCK_THREADS) {
+        int token = rowIds[i];
+        if (token >= 0 && token < vocabSize) {
+            float factor = rowFactors[i];
+            float value = rowLogits[token];
+            rowLogits[token] = value < 0.0f ? value * factor : value / factor;
+        }
+    }
+}
+
+__global__ void FastllmSamplingIdsToFloatKernel(
+        const int *input, float *output, int batch) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < batch) {
+        output[index] = (float)input[index];
+    }
+}
+
+bool FastllmCudaTopKTopPSamplingToDevice(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr,
+                                  float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors,
+                                  int penaltyTokens,
+                                  int *output, float *floatOutput,
+                                  int batch, int vocabSize) {
+    if (logits == nullptr || probs == nullptr || temperatures == nullptr ||
+        topKArr == nullptr || topPArr == nullptr || output == nullptr ||
+        floatOutput == nullptr || batch <= 0 || vocabSize <= 0 ||
+        penaltyTokens < 0 ||
+        (penaltyTokens > 0 &&
+         (penaltyIds == nullptr || penaltyFactors == nullptr))) {
+        return false;
+    }
+
+    if (penaltyTokens > 0) {
+        FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
+            logits, penaltyIds, penaltyFactors,
+            penaltyTokens, vocabSize);
+    }
+    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(
+        logits, probs, temperatures, vocabSize);
+
+    static thread_local std::mt19937 rng(std::random_device{}());
+    uint64_t seed = rng();
+    cudaError_t samplingState =
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        probs, topKArr, topPArr, output,
+        (bool *)floatOutput,
+        (int *)nullptr,
+        (uint32_t)batch, (int)0, 0.0f,
+        (uint32_t)vocabSize, false,
+        (uint64_t *)nullptr, seed,
+        (uint64_t *)nullptr, 0, 0);
+    if (samplingState != cudaSuccess) {
+        printf("FastllmCudaTopKTopPSamplingToDevice: launch failed: %s\n",
+               cudaGetErrorString(samplingState));
+        fflush(stdout);
+        return false;
+    }
+
+    int threads = 256;
+    FastllmSamplingIdsToFloatKernel<<<(batch + threads - 1) / threads,
+                                      threads>>>(
+        output, floatOutput, batch);
+    cudaError_t state = cudaGetLastError();
+    if (state != cudaSuccess) {
+        printf("FastllmCudaTopKTopPSamplingToDevice: launch failed: %s\n",
+               cudaGetErrorString(state));
+        fflush(stdout);
+        return false;
+    }
+    return true;
+}
+
 bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
@@ -9461,18 +13635,32 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
         nullptr, nullptr, nullptr, nullptr, 0, 0.09f, 0.3f);
 }
 
+struct FastllmGreedyPartial {
+    float value;
+    int id;
+};
+
+__device__ __forceinline__ bool FastllmGreedyIsBetter(
+        float value, int id, float bestValue, int bestId) {
+    return value > bestValue ||
+           (value == bestValue && id < bestId);
+}
+
 template <int THREAD_PER_BLOCK>
-__global__ void FastllmGreedySamplingKernel(float *logits, int *output, int vocabSize) {
+__global__ void FastllmGreedySamplingKernel(float *logits, int *output,
+                                            float *floatOutput, int vocabSize) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     float *row = logits + (long long)b * vocabSize;
 
     __shared__ float maxData[THREAD_PER_BLOCK];
     __shared__ int idData[THREAD_PER_BLOCK];
-    float localMax = -1.0e30f;
+    float localMax = -INFINITY;
     int localId = 0;
     for (int i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
         float v = row[i];
+        // Token IDs increase monotonically in this loop, so strict greater
+        // already preserves the smallest ID for equal values in one lane.
         if (v > localMax) {
             localMax = v;
             localId = i;
@@ -9483,7 +13671,9 @@ __global__ void FastllmGreedySamplingKernel(float *logits, int *output, int voca
     __syncthreads();
 
     for (int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s && maxData[tid] < maxData[tid + s]) {
+        if (tid < s && FastllmGreedyIsBetter(
+                maxData[tid + s], idData[tid + s],
+                maxData[tid], idData[tid])) {
             maxData[tid] = maxData[tid + s];
             idData[tid] = idData[tid + s];
         }
@@ -9492,7 +13682,119 @@ __global__ void FastllmGreedySamplingKernel(float *logits, int *output, int voca
 
     if (tid == 0) {
         output[b] = idData[0];
+        if (floatOutput != nullptr) {
+            floatOutput[b] = (float)idData[0];
+        }
     }
+}
+
+__device__ __forceinline__ void FastllmGreedyWarpReduce(
+        float &value, int &id) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float otherValue = __shfl_down_sync(0xffffffff, value, offset);
+        int otherId = __shfl_down_sync(0xffffffff, id, offset);
+        if (FastllmGreedyIsBetter(otherValue, otherId, value, id)) {
+            value = otherValue;
+            id = otherId;
+        }
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGreedySamplingPartialKernel(
+        const float *logits, FastllmGreedyPartial *partials,
+        int vocabSize, int partCount) {
+    int part = blockIdx.x;
+    int batch = blockIdx.y;
+    int chunk = (vocabSize + partCount - 1) / partCount;
+    int start = part * chunk;
+    int end = min(vocabSize, start + chunk);
+    const float *row = logits + (int64_t)batch * vocabSize;
+
+    float localMax = -INFINITY;
+    int localId = start;
+    for (int i = start + threadIdx.x; i < end;
+         i += THREAD_PER_BLOCK) {
+        float value = row[i];
+        if (value > localMax) {
+            localMax = value;
+            localId = i;
+        }
+    }
+    FastllmGreedyWarpReduce(localMax, localId);
+
+    constexpr int WARP_COUNT = THREAD_PER_BLOCK / 32;
+    __shared__ float warpMax[WARP_COUNT];
+    __shared__ int warpId[WARP_COUNT];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        warpMax[warp] = localMax;
+        warpId[warp] = localId;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        localMax = lane < WARP_COUNT ? warpMax[lane] : -INFINITY;
+        localId = lane < WARP_COUNT ? warpId[lane] : vocabSize;
+        FastllmGreedyWarpReduce(localMax, localId);
+        if (lane == 0) {
+            partials[(int64_t)batch * partCount + part] =
+                {localMax, localId};
+        }
+    }
+}
+
+__global__ void FastllmGreedySamplingFinalizeKernel(
+        const FastllmGreedyPartial *partials, int *output,
+        float *floatOutput, int partCount) {
+    int batch = blockIdx.x;
+    int lane = threadIdx.x;
+    float localMax = -INFINITY;
+    int localId = 0;
+    if (lane < partCount) {
+        FastllmGreedyPartial partial =
+            partials[(int64_t)batch * partCount + lane];
+        localMax = partial.value;
+        localId = partial.id;
+    }
+    FastllmGreedyWarpReduce(localMax, localId);
+    if (lane == 0) {
+        output[batch] = localId;
+        if (floatOutput != nullptr) {
+            floatOutput[batch] = (float)localId;
+        }
+    }
+}
+
+static bool FastllmLaunchGreedySampling(
+        float *logits, int *output, float *floatOutput,
+        int batch, int vocabSize) {
+    if (vocabSize >= 32768 && batch <= 8) {
+        int partCount = std::max(4, 32 / batch);
+        size_t scratchBytes = (size_t)batch * partCount *
+                              sizeof(FastllmGreedyPartial);
+        size_t scratchCapacity = 0;
+        bool scratchOwn = false;
+        void *scratch = FastllmBorrowCudaTempBuffer(
+            scratchBytes, &scratchCapacity, &scratchOwn);
+        if (scratch != nullptr && scratchCapacity >= scratchBytes) {
+            dim3 partialGrid((unsigned int)partCount,
+                             (unsigned int)batch);
+            FastllmGreedySamplingPartialKernel<256>
+                <<<partialGrid, 256>>>(
+                    logits, (FastllmGreedyPartial*)scratch,
+                    vocabSize, partCount);
+            FastllmGreedySamplingFinalizeKernel<<<batch, 32>>>(
+                (const FastllmGreedyPartial*)scratch, output,
+                floatOutput, partCount);
+            FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+            return true;
+        }
+        FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+    }
+    FastllmGreedySamplingKernel<256><<<batch, 256>>>(
+        logits, output, floatOutput, vocabSize);
+    return true;
 }
 
 bool FastllmCudaGreedySampling(float *logits, int *output,
@@ -9504,7 +13806,11 @@ bool FastllmCudaGreedySampling(float *logits, int *output,
         fastllm::ErrorInFastLLM("FastllmCudaGreedySampling: invalid input.\n");
         return false;
     }
-    FastllmGreedySamplingKernel<256><<<batch, 256>>>(logits, output, vocabSize);
+    // Keep the public host-output path independent from the shared temporary
+    // workspace.  The multi-CTA reduction below is reserved for the serialized
+    // GPU token-handoff path, where the next decode step consumes floatOutput.
+    FastllmGreedySamplingKernel<256><<<batch, 256>>>(
+        logits, output, nullptr, vocabSize);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         printf("FastllmCudaGreedySampling: kernel launch failed: %s\n",
@@ -9514,16 +13820,49 @@ bool FastllmCudaGreedySampling(float *logits, int *output,
     return true;
 }
 
+bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
+                                              float *floatOutput,
+                                              int batch, int vocabSize) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (logits == nullptr || output == nullptr || floatOutput == nullptr ||
+        vocabSize <= 0) {
+        fastllm::ErrorInFastLLM(
+            "FastllmCudaGreedySamplingWithFloatOutput: invalid input.\n");
+        return false;
+    }
+    FastllmLaunchGreedySampling(logits, output, floatOutput,
+                                batch, vocabSize);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaGreedySamplingWithFloatOutput: kernel launch failed: %s\n",
+               cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+struct FastllmGreedyCandidate {
+    int id;
+    float score;
+};
+
+static_assert(sizeof(FastllmGreedyCandidate) == 2 * sizeof(int),
+              "greedy candidate must stay compact for peer copies");
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmGreedySamplingWithScoresKernel(float *logits, int *output,
-                                                      float *scores, int vocabSize) {
+                                                      float *scores,
+                                                      FastllmGreedyCandidate *packed,
+                                                      int vocabSize, int idOffset) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     float *row = logits + (long long)b * vocabSize;
 
     __shared__ float maxData[THREAD_PER_BLOCK];
     __shared__ int idData[THREAD_PER_BLOCK];
-    float localMax = -1.0e30f;
+    float localMax = -INFINITY;
     int localId = 0;
     for (int i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
         float v = row[i];
@@ -9540,8 +13879,8 @@ __global__ void FastllmGreedySamplingWithScoresKernel(float *logits, int *output
         if (tid < s) {
             float other = maxData[tid + s];
             int otherId = idData[tid + s];
-            if (maxData[tid] < other ||
-                (maxData[tid] == other && idData[tid] > otherId)) {
+            if (FastllmGreedyIsBetter(other, otherId,
+                                      maxData[tid], idData[tid])) {
                 maxData[tid] = other;
                 idData[tid] = otherId;
             }
@@ -9550,8 +13889,13 @@ __global__ void FastllmGreedySamplingWithScoresKernel(float *logits, int *output
     }
 
     if (tid == 0) {
-        output[b] = idData[0];
-        scores[b] = maxData[0];
+        int id = idData[0] + idOffset;
+        if (packed != nullptr) {
+            packed[b] = {id, maxData[0]};
+        } else {
+            output[b] = id;
+            scores[b] = maxData[0];
+        }
     }
 }
 
@@ -9567,11 +13911,85 @@ bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
         return false;
     }
     FastllmGreedySamplingWithScoresKernel<256><<<batch, 256>>>(
-        logits, output, scores, vocabSize);
+        logits, output, scores, nullptr, vocabSize, 0);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         printf("FastllmCudaGreedySamplingWithScores: kernel launch failed: %s\n",
                cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaGreedySamplingPackedCandidateWithIdOffset(
+        float *logits, void *packedCandidates, int batch,
+        int vocabSize, int idOffset) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (logits == nullptr || packedCandidates == nullptr ||
+        vocabSize <= 0 || idOffset < 0) {
+        fastllm::ErrorInFastLLM(
+            "FastllmCudaGreedySamplingPackedCandidateWithIdOffset: invalid input.\n");
+        return false;
+    }
+    FastllmGreedySamplingWithScoresKernel<256><<<batch, 256>>>(
+        logits, nullptr, nullptr,
+        (FastllmGreedyCandidate*)packedCandidates,
+        vocabSize, idOffset);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaGreedySamplingPackedCandidateWithIdOffset: "
+               "kernel launch failed: %s\n", cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+__global__ void FastllmMergeShardedGreedyCandidatesKernel(
+        const FastllmGreedyCandidate *candidates,
+        int *output, float *floatOutput, int ranks, int batch) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) {
+        return;
+    }
+    int bestId = 0;
+    float bestScore = -INFINITY;
+    for (int r = 0; r < ranks; r++) {
+        int index = r * batch + b;
+        int id = candidates[index].id;
+        float score = candidates[index].score;
+        if (r == 0 || score > bestScore ||
+            (score == bestScore && id < bestId)) {
+            bestId = id;
+            bestScore = score;
+        }
+    }
+    output[b] = bestId;
+    floatOutput[b] = (float)bestId;
+}
+
+bool FastllmCudaMergeShardedGreedyCandidates(
+        const void *packedCandidates,
+        int *output, float *floatOutput, int ranks, int batch) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (packedCandidates == nullptr ||
+        output == nullptr || floatOutput == nullptr || ranks <= 0) {
+        fastllm::ErrorInFastLLM(
+            "FastllmCudaMergeShardedGreedyCandidates: invalid input.\n");
+        return false;
+    }
+    int threads = 128;
+    int blocks = (batch + threads - 1) / threads;
+    FastllmMergeShardedGreedyCandidatesKernel<<<blocks, threads>>>(
+        (const FastllmGreedyCandidate*)packedCandidates,
+        output, floatOutput, ranks, batch);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaMergeShardedGreedyCandidates: "
+               "kernel launch failed: %s\n", cudaGetErrorString(status));
         return false;
     }
     return true;
@@ -10113,6 +14531,121 @@ static void **FastllmCudaStagePointers(const std::vector<void*> &pointers) {
     return (void**)scratch.data;
 }
 
+bool FastllmCudaGetRaggedGdnMetadata(
+        const std::vector<int> &seqLens, int chunkSize,
+        FastllmCudaRaggedGdnMetadataView &view) {
+    struct RaggedMetadataCache {
+        int *data = nullptr;
+        size_t capacity = 0;
+        int device = -1;
+        int chunkSize = 0;
+        std::vector<int> seqLens;
+        FastllmCudaRaggedGdnMetadataView view;
+
+        ~RaggedMetadataCache() {
+            if (data == nullptr || device < 0) {
+                return;
+            }
+            int oldDevice = 0;
+            cudaGetDevice(&oldDevice);
+            cudaSetDevice(device);
+            FastllmCudaFree(data);
+            cudaSetDevice(oldDevice);
+        }
+    };
+    static thread_local RaggedMetadataCache cache;
+    view = FastllmCudaRaggedGdnMetadataView();
+    if (seqLens.empty() || chunkSize <= 0) {
+        return false;
+    }
+    int device = FastllmCudaGetDevice();
+    if (cache.data != nullptr && cache.device == device &&
+        cache.chunkSize == chunkSize && cache.seqLens == seqLens) {
+        view = cache.view;
+        return true;
+    }
+
+    const int batch = (int)seqLens.size();
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    std::vector<int> chunkOffsets(batch + 1, 0);
+    int maxChunks = 0;
+    int maxPaddedTokens = 0;
+    for (int request = 0; request < batch; request++) {
+        const int len = seqLens[request];
+        if (len <= 0 || tokenOffsets[request] >
+                std::numeric_limits<int>::max() - len) {
+            return false;
+        }
+        const int chunks = (len + chunkSize - 1) / chunkSize;
+        if (chunkOffsets[request] >
+                std::numeric_limits<int>::max() - chunks) {
+            return false;
+        }
+        tokenOffsets[request + 1] = tokenOffsets[request] + len;
+        chunkOffsets[request + 1] = chunkOffsets[request] + chunks;
+        maxChunks = std::max(maxChunks, chunks);
+        maxPaddedTokens = std::max(maxPaddedTokens, chunks * chunkSize);
+    }
+    const int totalChunks = chunkOffsets.back();
+    std::vector<int> metadata;
+    metadata.reserve((batch + 1) * 2 + totalChunks * 2);
+    metadata.insert(metadata.end(), tokenOffsets.begin(), tokenOffsets.end());
+    metadata.insert(metadata.end(), chunkOffsets.begin(), chunkOffsets.end());
+    for (int request = 0; request < batch; request++) {
+        int token = tokenOffsets[request];
+        for (int chunk = chunkOffsets[request];
+             chunk < chunkOffsets[request + 1]; chunk++) {
+            metadata.push_back(token);
+            token += chunkSize;
+        }
+    }
+    for (int request = 0; request < batch; request++) {
+        int remaining = seqLens[request];
+        for (int chunk = chunkOffsets[request];
+             chunk < chunkOffsets[request + 1]; chunk++) {
+            metadata.push_back(std::min(chunkSize, remaining));
+            remaining -= chunkSize;
+        }
+    }
+
+    const size_t bytes = metadata.size() * sizeof(int);
+    if (cache.device != device || cache.capacity < bytes) {
+        if (cache.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(cache.data);
+        }
+        cache.data = (int*)FastllmCudaMalloc(bytes);
+        if (cache.data == nullptr) {
+            cache = RaggedMetadataCache();
+            return false;
+        }
+        cache.capacity = bytes;
+        cache.device = device;
+    }
+    cudaError_t copyState = cudaMemcpyAsync(
+        cache.data, metadata.data(), bytes, cudaMemcpyHostToDevice,
+        cudaStreamPerThread);
+    if (copyState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error caching ragged GDN metadata.", copyState);
+        return false;
+    }
+    cache.chunkSize = chunkSize;
+    cache.seqLens = seqLens;
+    cache.view.tokenOffsets = cache.data;
+    cache.view.chunkOffsets = cache.data + batch + 1;
+    cache.view.chunkTokenBases = cache.data + (batch + 1) * 2;
+    cache.view.chunkValidTokens =
+        cache.view.chunkTokenBases + totalChunks;
+    cache.view.batch = batch;
+    cache.view.totalTokens = tokenOffsets.back();
+    cache.view.totalChunks = totalChunks;
+    cache.view.maxChunks = maxChunks;
+    cache.view.maxPaddedTokens = maxPaddedTokens;
+    view = cache.view;
+    return true;
+}
+
 // 处理最多6个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
 // 把当时的滑窗状态写入对应快照 (用于MTP验证的逐token状态回滚)。
 __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
@@ -10302,7 +14835,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelPrefillCacheHalfPointerKernel(
 __global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerKernel(
     half **pointers, const half *newTokens, const float *weight,
     const float *bias, half *output, int channels, int numTokens,
-    size_t totalElements) {
+    int inputStride, int inputOffset, size_t totalElements) {
     size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= totalElements) {
         return;
@@ -10324,7 +14857,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPoint
             ? cacheRow[sourceToken + 4]
             : newTokens[
                 ((size_t)batchIndex * numTokens + sourceToken) *
-                    channels + channel];
+                    inputStride + inputOffset + channel];
         value += __half2float(source) * curWeight[kernelIndex];
     }
 
@@ -10338,8 +14871,65 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPoint
 #endif
 }
 
+template <int TOKENS_PER_GROUP>
+__global__ void FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerGroupedKernel(
+    half **pointers, const half *__restrict__ newTokens,
+    const float *__restrict__ weight, const float *__restrict__ bias,
+    half *__restrict__ output, int channels, int numTokens,
+    int inputStride, int inputOffset, size_t totalGroups) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= totalGroups) {
+        return;
+    }
+
+    int channel = index % channels;
+    size_t groupRow = index / channels;
+    int tokenGroup = groupRow % (numTokens / TOKENS_PER_GROUP);
+    int batchIndex = groupRow / (numTokens / TOKENS_PER_GROUP);
+    int tokenBase = tokenGroup * TOKENS_PER_GROUP;
+    const half *cacheRow =
+        pointers[batchIndex] + (size_t)channel * 4;
+    const float *curWeight = weight + (size_t)channel * 4;
+
+    half source[TOKENS_PER_GROUP + 3];
+#pragma unroll
+    for (int sourceIndex = 0;
+         sourceIndex < TOKENS_PER_GROUP + 3; sourceIndex++) {
+        int sourceToken = tokenBase + sourceIndex - 3;
+        source[sourceIndex] = sourceToken < 0
+            ? cacheRow[sourceToken + 4]
+            : newTokens[
+                ((size_t)batchIndex * numTokens + sourceToken) *
+                    inputStride + inputOffset + channel];
+    }
+
+    float biasValue = bias == nullptr ? 0.0f : bias[channel];
+#pragma unroll
+    for (int tokenOffset = 0;
+         tokenOffset < TOKENS_PER_GROUP; tokenOffset++) {
+        float value = biasValue;
+#pragma unroll
+        for (int kernelIndex = 0; kernelIndex < 4; kernelIndex++) {
+            value += __half2float(source[tokenOffset + kernelIndex]) *
+                     curWeight[kernelIndex];
+        }
+        half conv = __float2half_rn(value);
+        size_t outputIndex =
+            ((size_t)batchIndex * numTokens + tokenBase + tokenOffset) *
+                channels + channel;
+#ifdef CUDA_NO_TENSOR_CORE
+        float x = __half2float(conv);
+        output[outputIndex] = __float2half(x / (1.0f + expf(-x)));
+#else
+        output[outputIndex] =
+            __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+    }
+}
+
 __global__ void FastllmShiftAppendConv1DPerChannelPrefillCacheTokenMajorHalfPointerKernel(
-    half **pointers, const half *newTokens, int channels, int numTokens,
+    half **pointers, const half *newTokens, int channels,
+    int numTokens, int inputStride, int inputOffset,
     size_t totalRows) {
     size_t row = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= totalRows) {
@@ -10359,8 +14949,182 @@ __global__ void FastllmShiftAppendConv1DPerChannelPrefillCacheTokenMajorHalfPoin
             ? oldCache[sourceToken + 4]
             : newTokens[
                 ((size_t)batchIndex * numTokens + sourceToken) *
-                    channels + channel];
+                    inputStride + inputOffset + channel];
     }
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelSiluRaggedPrefillHalfPointerKernel(
+    half **pointers, const int *tokenOffsets, const half *newTokens,
+    const float *weight, const float *bias, half *output,
+    int channels) {
+    int batchIndex = blockIdx.y;
+    int begin = tokenOffsets[batchIndex];
+    int numTokens = tokenOffsets[batchIndex + 1] - begin;
+    size_t localIndex = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t localElements = (size_t)numTokens * channels;
+    if (localIndex >= localElements) {
+        return;
+    }
+
+    int channel = localIndex % channels;
+    int token = localIndex / channels;
+    const half *cacheRow = pointers[batchIndex] + (size_t)channel * 4;
+    const float *curWeight = weight + (size_t)channel * 4;
+
+    float value = bias == nullptr ? 0.0f : bias[channel];
+#pragma unroll
+    for (int kernelIndex = 0; kernelIndex < 4; kernelIndex++) {
+        int sourceToken = token + kernelIndex - 3;
+        half source = sourceToken < 0
+            ? cacheRow[sourceToken + 4]
+            : newTokens[((size_t)begin + sourceToken) * channels + channel];
+        value += __half2float(source) * curWeight[kernelIndex];
+    }
+
+    half conv = __float2half_rn(value);
+    size_t outputIndex = ((size_t)begin + token) * channels + channel;
+#ifdef CUDA_NO_TENSOR_CORE
+    float x = __half2float(conv);
+    output[outputIndex] = __float2half(x / (1.0f + expf(-x)));
+#else
+    output[outputIndex] =
+        __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelRaggedPrefillCacheHalfPointerKernel(
+    half **pointers, const int *tokenOffsets, const half *newTokens,
+    int channels) {
+    int batchIndex = blockIdx.y;
+    int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) {
+        return;
+    }
+
+    int begin = tokenOffsets[batchIndex];
+    int numTokens = tokenOffsets[batchIndex + 1] - begin;
+    half *cacheRow = pointers[batchIndex] + (size_t)channel * 4;
+    half oldCache[4] = {
+        cacheRow[0], cacheRow[1], cacheRow[2], cacheRow[3]
+    };
+#pragma unroll
+    for (int cacheIndex = 0; cacheIndex < 4; cacheIndex++) {
+        int sourceToken = numTokens - 4 + cacheIndex;
+        cacheRow[cacheIndex] = sourceToken < 0
+            ? oldCache[sourceToken + 4]
+            : newTokens[((size_t)begin + sourceToken) * channels + channel];
+    }
+}
+
+__global__ void FastllmPackRaggedGdnHalfKernel(
+    const half *input, const int *tokenOffsets, half *output,
+    int heads, int dim, int paddedSeqLen, float scale) {
+    int batchIndex = blockIdx.y;
+    int begin = tokenOffsets[batchIndex];
+    int numTokens = tokenOffsets[batchIndex + 1] - begin;
+    size_t localIndex = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t paddedElements = (size_t)heads * paddedSeqLen * dim;
+    if (localIndex >= paddedElements) {
+        return;
+    }
+
+    int d = localIndex % dim;
+    size_t row = localIndex / dim;
+    int token = row % paddedSeqLen;
+    int head = row / paddedSeqLen;
+    half value = __float2half(0.0f);
+    if (token < numTokens) {
+        size_t inputIndex =
+            (((size_t)begin + token) * heads + head) * dim + d;
+        value = input[inputIndex];
+        if (scale != 1.0f) {
+            value = __float2half_rn(__half2float(value) * scale);
+        }
+    }
+    output[((size_t)batchIndex * paddedElements) + localIndex] = value;
+}
+
+__global__ void FastllmUnpackRaggedGdnHalfKernel(
+    const half *input, const int *tokenOffsets, half *output,
+    int heads, int dim, int paddedSeqLen) {
+    int batchIndex = blockIdx.y;
+    int begin = tokenOffsets[batchIndex];
+    int numTokens = tokenOffsets[batchIndex + 1] - begin;
+    size_t localIndex = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t requestElements = (size_t)numTokens * heads * dim;
+    if (localIndex >= requestElements) {
+        return;
+    }
+
+    int d = localIndex % dim;
+    size_t row = localIndex / dim;
+    int head = row % heads;
+    int token = row / heads;
+    size_t inputIndex =
+        (((size_t)batchIndex * heads + head) * paddedSeqLen + token) * dim + d;
+    size_t outputIndex =
+        (((size_t)begin + token) * heads + head) * dim + d;
+    output[outputIndex] = input[inputIndex];
+}
+
+__global__ void FastllmPackRaggedGdnChunksHalfKernel(
+    const half *input, const int *tokenOffsets, const int *chunkOffsets,
+    half *output, int totalChunks, int heads, int dim, int chunkSize,
+    float scale) {
+    int batchIndex = blockIdx.y;
+    int tokenBegin = tokenOffsets[batchIndex];
+    int numTokens = tokenOffsets[batchIndex + 1] - tokenBegin;
+    int chunkBegin = chunkOffsets[batchIndex];
+    int paddedTokens =
+        (chunkOffsets[batchIndex + 1] - chunkBegin) * chunkSize;
+    size_t localIndex = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t requestElements = (size_t)heads * paddedTokens * dim;
+    if (localIndex >= requestElements) {
+        return;
+    }
+
+    int d = localIndex % dim;
+    size_t row = localIndex / dim;
+    int token = row % paddedTokens;
+    int head = row / paddedTokens;
+    half value = __float2half(0.0f);
+    if (token < numTokens) {
+        size_t inputIndex =
+            (((size_t)tokenBegin + token) * heads + head) * dim + d;
+        value = input[inputIndex];
+        if (scale != 1.0f) {
+            value = __float2half_rn(__half2float(value) * scale);
+        }
+    }
+    size_t packedToken = (size_t)chunkBegin * chunkSize + token;
+    size_t outputIndex =
+        ((size_t)head * totalChunks * chunkSize + packedToken) * dim + d;
+    output[outputIndex] = value;
+}
+
+__global__ void FastllmUnpackRaggedGdnChunksHalfKernel(
+    const half *input, const int *tokenOffsets, const int *chunkOffsets,
+    half *output, int totalChunks, int heads, int dim, int chunkSize) {
+    int batchIndex = blockIdx.y;
+    int tokenBegin = tokenOffsets[batchIndex];
+    int numTokens = tokenOffsets[batchIndex + 1] - tokenBegin;
+    int chunkBegin = chunkOffsets[batchIndex];
+    size_t localIndex = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t requestElements = (size_t)numTokens * heads * dim;
+    if (localIndex >= requestElements) {
+        return;
+    }
+
+    int d = localIndex % dim;
+    size_t row = localIndex / dim;
+    int head = row % heads;
+    int token = row / heads;
+    size_t packedToken = (size_t)chunkBegin * chunkSize + token;
+    size_t inputIndex =
+        ((size_t)head * totalChunks * chunkSize + packedToken) * dim + d;
+    size_t outputIndex =
+        (((size_t)tokenBegin + token) * heads + head) * dim + d;
+    output[outputIndex] = input[inputIndex];
 }
 
 __global__ void FastllmShiftAppendConv1DPerChannelSiluSingleTokenHalfPointerKernel(
@@ -10704,8 +15468,10 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     const std::vector<fastllm::Data*> &caches,
     const fastllm::Data &newTokens,
     fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output,
-    const std::vector<fastllm::Data*> &tokenCaches, int numTokenCaches) {
-    if (caches.empty() || caches[0] == nullptr || numTokenCaches < 0 ||
+    const std::vector<fastllm::Data*> &tokenCaches, int numTokenCaches,
+    int tokenMajorInputOffset) {
+    if (caches.empty() || caches[0] == nullptr ||
+        tokenMajorInputOffset < 0 || numTokenCaches < 0 ||
         numTokenCaches > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
         tokenCaches.size() != caches.size() * (size_t)numTokenCaches ||
         output.isFake || output.cudaDataBorrowed || output.isPagedKVCache ||
@@ -10742,10 +15508,11 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     int channels = first.dims[1];
     bool tokenMajorPrefill =
         numTokenCaches == 0 &&
-        newTokens.dims[2] == channels &&
+        tokenMajorInputOffset + channels <= newTokens.dims[2] &&
         newTokens.dims[1] > 1 &&
         newTokens.dims[1] <= FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX;
     bool channelMajor =
+        tokenMajorInputOffset == 0 &&
         newTokens.dims[1] == channels &&
         newTokens.dims[2] > 1 &&
         newTokens.dims[2] <= (numTokenCaches == 0 ?
@@ -10830,17 +15597,86 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
             (int)((totalElements + threads - 1) / threads);
         int cacheBlocks = (total + threads - 1) / threads;
         if (tokenMajorPrefill) {
-            FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerKernel
-                <<<elementBlocks, threads>>>(
-                    (half**)devicePointers, (const half*)newTokens.cudaData,
-                    (const float*)weight.cudaData,
-                    bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
-                    (half*)output.cudaData, channels, numTokens,
-                    totalElements);
+            const char *token16Env = std::getenv(
+                "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN16");
+            bool useToken16 =
+                (token16Env == nullptr || token16Env[0] == '\0' ||
+                 FastllmCudaEnvFlagEnabled(
+                     "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN16")) &&
+                numTokens >= 16 && numTokens % 16 == 0;
+            const char *token8Env = std::getenv(
+                "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN8");
+            bool useToken8 =
+                (token8Env == nullptr || token8Env[0] == '\0' ||
+                 FastllmCudaEnvFlagEnabled(
+                     "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN8")) &&
+                numTokens >= 8 && numTokens % 8 == 0;
+            const char *token4Env = std::getenv(
+                "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN4");
+            bool useToken4 =
+                (token4Env == nullptr || token4Env[0] == '\0' ||
+                 FastllmCudaEnvFlagEnabled(
+                     "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN4")) &&
+                numTokens >= 4 && numTokens % 4 == 0;
+            if (useToken16) {
+                size_t totalGroups = totalElements / 16;
+                int groupBlocks =
+                    (int)((totalGroups + threads - 1) / threads);
+                FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerGroupedKernel<16>
+                    <<<groupBlocks, threads>>>(
+                        (half**)devicePointers,
+                        (const half*)newTokens.cudaData,
+                        (const float*)weight.cudaData,
+                        bias.dims.empty() ?
+                            nullptr : (const float*)bias.cudaData,
+                        (half*)output.cudaData, channels, numTokens,
+                        newTokens.dims[2], tokenMajorInputOffset,
+                        totalGroups);
+            } else if (useToken8) {
+                size_t totalGroups = totalElements / 8;
+                int groupBlocks =
+                    (int)((totalGroups + threads - 1) / threads);
+                FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerGroupedKernel<8>
+                    <<<groupBlocks, threads>>>(
+                        (half**)devicePointers,
+                        (const half*)newTokens.cudaData,
+                        (const float*)weight.cudaData,
+                        bias.dims.empty() ?
+                            nullptr : (const float*)bias.cudaData,
+                        (half*)output.cudaData, channels, numTokens,
+                        newTokens.dims[2], tokenMajorInputOffset,
+                        totalGroups);
+            } else if (useToken4) {
+                size_t totalGroups = totalElements / 4;
+                int groupBlocks =
+                    (int)((totalGroups + threads - 1) / threads);
+                FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerGroupedKernel<4>
+                    <<<groupBlocks, threads>>>(
+                        (half**)devicePointers,
+                        (const half*)newTokens.cudaData,
+                        (const float*)weight.cudaData,
+                        bias.dims.empty() ?
+                            nullptr : (const float*)bias.cudaData,
+                        (half*)output.cudaData, channels, numTokens,
+                        newTokens.dims[2], tokenMajorInputOffset,
+                        totalGroups);
+            } else {
+                FastllmShiftAppendConv1DPerChannelSiluPrefillTokenMajorHalfPointerKernel
+                    <<<elementBlocks, threads>>>(
+                        (half**)devicePointers,
+                        (const half*)newTokens.cudaData,
+                        (const float*)weight.cudaData,
+                        bias.dims.empty() ?
+                            nullptr : (const float*)bias.cudaData,
+                        (half*)output.cudaData, channels, numTokens,
+                        newTokens.dims[2], tokenMajorInputOffset,
+                        totalElements);
+            }
             FastllmShiftAppendConv1DPerChannelPrefillCacheTokenMajorHalfPointerKernel
                 <<<cacheBlocks, threads>>>(
                     (half**)devicePointers, (const half*)newTokens.cudaData,
-                    channels, numTokens, (size_t)total);
+                    channels, numTokens, newTokens.dims[2],
+                    tokenMajorInputOffset, (size_t)total);
         } else {
             FastllmShiftAppendConv1DPerChannelSiluPrefillHalfPointerKernel
                 <<<elementBlocks, threads>>>(
@@ -10868,6 +15704,525 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     if (launchState != cudaSuccess) {
         checkCudaErrors(
             "Error: CUDA error in batched multi-token MTP conv.",
+            launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaShiftAppendConv1DPerChannelSiluRaggedPrefillFloat16BatchPointers(
+    const std::vector<fastllm::Data*> &caches,
+    const fastllm::Data &newTokens, const std::vector<int> &seqLens,
+    fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output) {
+    if (caches.empty() || caches.size() != seqLens.size() ||
+        caches[0] == nullptr || output.isFake || output.cudaDataBorrowed ||
+        output.isPagedKVCache || output.multiDeviceData) {
+        return false;
+    }
+    std::set<const fastllm::Data*> tensors = {
+        &newTokens, &weight, &bias, &output
+    };
+    if (tensors.size() != 4) {
+        return false;
+    }
+
+    fastllm::Data &first = *caches[0];
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(first, device) ||
+        FastllmCudaGetDevice() != device ||
+        first.dataType != fastllm::DataType::FLOAT16 ||
+        first.dims.size() != 3 || first.dims[0] != 1 ||
+        first.dims[1] <= 0 || first.dims[2] != 4 ||
+        !FastllmCudaDataHasDenseStrides(first) ||
+        newTokens.dataType != fastllm::DataType::FLOAT16 ||
+        newTokens.dims.size() != 3 || newTokens.dims[0] != 1 ||
+        !FastllmCudaDataHasDenseStrides(newTokens) ||
+        !FastllmCudaDataCanShareDevice(first, newTokens) ||
+        !FastllmCudaDataCanShareDevice(first, weight) ||
+        (bias.dims.size() > 0 &&
+         !FastllmCudaDataCanShareDevice(first, bias)) ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        (bias.dims.size() > 0 &&
+         bias.dataType != fastllm::DataType::FLOAT32)) {
+        return false;
+    }
+
+    int batch = (int)caches.size();
+    int channels = first.dims[1];
+    if (newTokens.dims[2] != channels) {
+        return false;
+    }
+    bool validWeightShape =
+        (weight.dims.size() == 2 && weight.dims[0] == channels &&
+         weight.dims[1] == 4) ||
+        (weight.dims.size() == 3 && weight.dims[0] == channels &&
+         weight.dims[1] == 1 && weight.dims[2] == 4);
+    if (!validWeightShape || !FastllmCudaDataHasDenseStrides(weight) ||
+        (bias.dims.size() > 0 &&
+         (bias.dims.size() != 1 || bias.dims[0] != channels ||
+          !FastllmCudaDataHasDenseStrides(bias)))) {
+        return false;
+    }
+
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    int maxSeqLen = 0;
+    for (int b = 0; b < batch; b++) {
+        if (seqLens[b] <= 0 ||
+            seqLens[b] > FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX) {
+            return false;
+        }
+        tokenOffsets[b + 1] = tokenOffsets[b] + seqLens[b];
+        maxSeqLen = std::max(maxSeqLen, seqLens[b]);
+    }
+    if (tokenOffsets.back() != newTokens.dims[1]) {
+        return false;
+    }
+
+    std::vector<void*> pointers;
+    pointers.reserve(batch);
+    for (fastllm::Data *cache : caches) {
+        if (cache == nullptr || cache->dataType != first.dataType ||
+            cache->dims != first.dims ||
+            !FastllmCudaDataHasDenseStrides(*cache) ||
+            !FastllmCudaDataCanShareDevice(first, *cache) ||
+            !tensors.insert(cache).second) {
+            return false;
+        }
+        pointers.push_back(cache->cudaData);
+    }
+
+    output.dataType = first.dataType;
+    output.Resize(newTokens.dims);
+    output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
+    output.Allocate();
+    output.isKVCache = false;
+    output.isLinearAttention = false;
+    output.isLinearAttentionTransposed = false;
+    if (output.cudaData == nullptr || !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(first, output)) {
+        return false;
+    }
+
+    void **devicePointers = FastllmCudaStagePointers(pointers);
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(seqLens, 64, metadata) ||
+        metadata.totalTokens != tokenOffsets.back()) {
+        return false;
+    }
+    const int *deviceOffsets = metadata.tokenOffsets;
+    int threads = 256;
+    int elementBlocks = (int)(((size_t)maxSeqLen * channels + threads - 1) /
+                              threads);
+    int cacheBlocks = (channels + threads - 1) / threads;
+    FastllmShiftAppendConv1DPerChannelSiluRaggedPrefillHalfPointerKernel
+        <<<dim3(elementBlocks, batch), threads>>>(
+            (half**)devicePointers, deviceOffsets,
+            (const half*)newTokens.cudaData, (const float*)weight.cudaData,
+            bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
+            (half*)output.cudaData, channels);
+    FastllmShiftAppendConv1DPerChannelRaggedPrefillCacheHalfPointerKernel
+        <<<dim3(cacheBlocks, batch), threads>>>(
+            (half**)devicePointers, deviceOffsets,
+            (const half*)newTokens.cudaData, channels);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in ragged batched prefill conv.",
+            launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaPackRaggedGdnPrefillFloat16(
+    const fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &b,
+    const fastllm::Data &g, const std::vector<int> &seqLens,
+    int paddedSeqLen, float qScale,
+    fastllm::Data &qPadded, fastllm::Data &kPadded,
+    fastllm::Data &vPadded, fastllm::Data &bPadded,
+    fastllm::Data &gPadded) {
+    std::set<const fastllm::Data*> inputs = {&q, &k, &v, &b, &g};
+    if (seqLens.empty() || paddedSeqLen <= 0 ||
+        inputs.size() != 5 ||
+        q.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::FLOAT16 ||
+        k.dataType != fastllm::DataType::FLOAT16 ||
+        v.dataType != fastllm::DataType::FLOAT16 ||
+        b.dataType != fastllm::DataType::FLOAT16 ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        q.dims.size() != 4 || q.dims[0] != 1 ||
+        k.dims != q.dims || v.dims.size() != 4 || v.dims[0] != 1 ||
+        b.dims.size() != 3 || b.dims[0] != 1 || g.dims != b.dims ||
+        v.dims[1] != q.dims[1] || b.dims[1] != q.dims[1] ||
+        v.dims[2] != q.dims[2] || b.dims[2] != q.dims[2] ||
+        q.cudaData == nullptr || k.cudaData == nullptr ||
+        v.cudaData == nullptr || b.cudaData == nullptr || g.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(q) ||
+        !FastllmCudaDataHasDenseStrides(k) ||
+        !FastllmCudaDataHasDenseStrides(v) ||
+        !FastllmCudaDataHasDenseStrides(b) ||
+        !FastllmCudaDataHasDenseStrides(g) ||
+        !FastllmCudaDataCanShareDevice(q, k) ||
+        !FastllmCudaDataCanShareDevice(q, v) ||
+        !FastllmCudaDataCanShareDevice(q, b) ||
+        !FastllmCudaDataCanShareDevice(q, g)) {
+        return false;
+    }
+    std::set<fastllm::Data*> outputs = {
+        &qPadded, &kPadded, &vPadded, &bPadded, &gPadded
+    };
+    if (outputs.size() != 5) {
+        return false;
+    }
+    for (fastllm::Data *output : outputs) {
+        if (inputs.count(output) != 0 || output->isFake ||
+            output->cudaDataBorrowed ||
+            output->isPagedKVCache || output->multiDeviceData) {
+            return false;
+        }
+    }
+
+    int batch = (int)seqLens.size();
+    int totalTokens = 0;
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    for (int request = 0; request < batch; request++) {
+        if (seqLens[request] <= 0 || seqLens[request] > paddedSeqLen) {
+            return false;
+        }
+        tokenOffsets[request + 1] = tokenOffsets[request] + seqLens[request];
+    }
+    totalTokens = tokenOffsets.back();
+    if (totalTokens != q.dims[1]) {
+        return false;
+    }
+
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(q, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+    int heads = q.dims[2];
+    auto prepareOutput = [&](fastllm::Data &output,
+                             const std::vector<int> &dims) -> bool {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.Resize(dims);
+        output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
+        output.Allocate(false);
+        output.isKVCache = false;
+        output.isLinearAttention = false;
+        output.isLinearAttentionTransposed = false;
+        return output.cudaData != nullptr &&
+               FastllmCudaDataHasDenseStrides(output) &&
+               FastllmCudaDataCanShareDevice(q, output);
+    };
+    if (!prepareOutput(qPadded, {batch, heads, paddedSeqLen, q.dims[3]}) ||
+        !prepareOutput(kPadded, {batch, heads, paddedSeqLen, k.dims[3]}) ||
+        !prepareOutput(vPadded, {batch, heads, paddedSeqLen, v.dims[3]}) ||
+        !prepareOutput(bPadded, {batch, heads, paddedSeqLen}) ||
+        !prepareOutput(gPadded, {batch, heads, paddedSeqLen})) {
+        return false;
+    }
+
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(seqLens, 64, metadata) ||
+        metadata.totalTokens != tokenOffsets.back()) {
+        return false;
+    }
+    const int *deviceOffsets = metadata.tokenOffsets;
+    int threads = 256;
+    auto launchPack = [&](const fastllm::Data &input,
+                          fastllm::Data &output, int dim, float scale) {
+        size_t requestElements = (size_t)heads * paddedSeqLen * dim;
+        int blocks = (int)((requestElements + threads - 1) / threads);
+        FastllmPackRaggedGdnHalfKernel<<<dim3(blocks, batch), threads>>>(
+            (const half*)input.cudaData, deviceOffsets,
+            (half*)output.cudaData, heads, dim, paddedSeqLen, scale);
+    };
+    launchPack(q, qPadded, q.dims[3], qScale);
+    launchPack(k, kPadded, k.dims[3], 1.0f);
+    launchPack(v, vPadded, v.dims[3], 1.0f);
+    launchPack(b, bPadded, 1, 1.0f);
+    launchPack(g, gPadded, 1, 1.0f);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error when packing ragged GDN prefill.",
+            launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaUnpackRaggedGdnPrefillFloat16(
+    const fastllm::Data &padded, const std::vector<int> &seqLens,
+    fastllm::Data &ragged) {
+    if (seqLens.empty() || padded.dataDevice != fastllm::DataDevice::CUDA ||
+        padded.dataType != fastllm::DataType::FLOAT16 ||
+        padded.dims.size() != 4 || padded.dims[0] != (int)seqLens.size() ||
+        padded.cudaData == nullptr || !FastllmCudaDataHasDenseStrides(padded) ||
+        ragged.isFake || ragged.cudaDataBorrowed || ragged.isPagedKVCache ||
+        ragged.multiDeviceData || &ragged == &padded) {
+        return false;
+    }
+    int batch = (int)seqLens.size();
+    int heads = padded.dims[1];
+    int paddedSeqLen = padded.dims[2];
+    int dim = padded.dims[3];
+    int maxSeqLen = 0;
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    for (int request = 0; request < batch; request++) {
+        if (seqLens[request] <= 0 || seqLens[request] > paddedSeqLen) {
+            return false;
+        }
+        tokenOffsets[request + 1] = tokenOffsets[request] + seqLens[request];
+        maxSeqLen = std::max(maxSeqLen, seqLens[request]);
+    }
+
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(padded, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+    ragged.dataType = fastllm::DataType::FLOAT16;
+    ragged.Resize({1, tokenOffsets.back(), heads, dim});
+    ragged.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
+    ragged.Allocate(false);
+    ragged.isKVCache = false;
+    ragged.isLinearAttention = false;
+    ragged.isLinearAttentionTransposed = false;
+    if (ragged.cudaData == nullptr || !FastllmCudaDataHasDenseStrides(ragged) ||
+        !FastllmCudaDataCanShareDevice(padded, ragged)) {
+        return false;
+    }
+
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(seqLens, 64, metadata) ||
+        metadata.totalTokens != tokenOffsets.back()) {
+        return false;
+    }
+    const int *deviceOffsets = metadata.tokenOffsets;
+    int threads = 256;
+    int blocks = (int)(((size_t)maxSeqLen * heads * dim + threads - 1) /
+                       threads);
+    FastllmUnpackRaggedGdnHalfKernel<<<dim3(blocks, batch), threads>>>(
+        (const half*)padded.cudaData, deviceOffsets, (half*)ragged.cudaData,
+        heads, dim, paddedSeqLen);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error when unpacking ragged GDN prefill.",
+            launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+    const fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &b,
+    const fastllm::Data &g, const std::vector<int> &seqLens,
+    int chunkSize, float qScale,
+    fastllm::Data &qPacked, fastllm::Data &kPacked,
+    fastllm::Data &vPacked, fastllm::Data &bPacked,
+    fastllm::Data &gPacked) {
+    std::set<const fastllm::Data*> inputs = {&q, &k, &v, &b, &g};
+    if (seqLens.empty() || chunkSize <= 0 || inputs.size() != 5 ||
+        q.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::FLOAT16 ||
+        k.dataType != fastllm::DataType::FLOAT16 ||
+        v.dataType != fastllm::DataType::FLOAT16 ||
+        b.dataType != fastllm::DataType::FLOAT16 ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        q.dims.size() != 4 || q.dims[0] != 1 || k.dims != q.dims ||
+        v.dims.size() != 4 || v.dims[0] != 1 ||
+        b.dims.size() != 3 || b.dims[0] != 1 || g.dims != b.dims ||
+        v.dims[1] != q.dims[1] || b.dims[1] != q.dims[1] ||
+        v.dims[2] != q.dims[2] || b.dims[2] != q.dims[2] ||
+        q.cudaData == nullptr || k.cudaData == nullptr ||
+        v.cudaData == nullptr || b.cudaData == nullptr || g.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(q) ||
+        !FastllmCudaDataHasDenseStrides(k) ||
+        !FastllmCudaDataHasDenseStrides(v) ||
+        !FastllmCudaDataHasDenseStrides(b) ||
+        !FastllmCudaDataHasDenseStrides(g) ||
+        !FastllmCudaDataCanShareDevice(q, k) ||
+        !FastllmCudaDataCanShareDevice(q, v) ||
+        !FastllmCudaDataCanShareDevice(q, b) ||
+        !FastllmCudaDataCanShareDevice(q, g)) {
+        return false;
+    }
+    std::set<fastllm::Data*> outputs = {
+        &qPacked, &kPacked, &vPacked, &bPacked, &gPacked
+    };
+    if (outputs.size() != 5) {
+        return false;
+    }
+    for (fastllm::Data *output : outputs) {
+        if (inputs.count(output) != 0 || output->isFake ||
+            output->cudaDataBorrowed || output->isPagedKVCache ||
+            output->multiDeviceData) {
+            return false;
+        }
+    }
+
+    int batch = (int)seqLens.size();
+    int maxPaddedTokens = 0;
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    std::vector<int> chunkOffsets(batch + 1, 0);
+    for (int request = 0; request < batch; request++) {
+        int len = seqLens[request];
+        if (len <= 0) {
+            return false;
+        }
+        int chunks = (len + chunkSize - 1) / chunkSize;
+        tokenOffsets[request + 1] = tokenOffsets[request] + len;
+        chunkOffsets[request + 1] = chunkOffsets[request] + chunks;
+        maxPaddedTokens = std::max(maxPaddedTokens, chunks * chunkSize);
+    }
+    int totalTokens = tokenOffsets.back();
+    int totalChunks = chunkOffsets.back();
+    if (totalTokens != q.dims[1] || totalChunks <= 0) {
+        return false;
+    }
+
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(q, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+    int heads = q.dims[2];
+    int packedTokens = totalChunks * chunkSize;
+    auto prepareOutput = [&](fastllm::Data &output,
+                             const std::vector<int> &dims) -> bool {
+        output.dataType = fastllm::DataType::FLOAT16;
+        output.Resize(dims);
+        output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
+        output.Allocate(false);
+        output.isKVCache = false;
+        output.isLinearAttention = false;
+        output.isLinearAttentionTransposed = false;
+        return output.cudaData != nullptr &&
+               FastllmCudaDataHasDenseStrides(output) &&
+               FastllmCudaDataCanShareDevice(q, output);
+    };
+    if (!prepareOutput(qPacked, {1, heads, packedTokens, q.dims[3]}) ||
+        !prepareOutput(kPacked, {1, heads, packedTokens, k.dims[3]}) ||
+        !prepareOutput(vPacked, {1, heads, packedTokens, v.dims[3]}) ||
+        !prepareOutput(bPacked, {1, heads, packedTokens}) ||
+        !prepareOutput(gPacked, {1, heads, packedTokens})) {
+        return false;
+    }
+
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(
+            seqLens, chunkSize, metadata) ||
+        metadata.totalTokens != totalTokens ||
+        metadata.totalChunks != totalChunks) {
+        return false;
+    }
+    const int *deviceTokenOffsets = metadata.tokenOffsets;
+    const int *deviceChunkOffsets = metadata.chunkOffsets;
+    int threads = 256;
+    auto launchPack = [&](const fastllm::Data &input,
+                          fastllm::Data &output, int dim, float scale) {
+        size_t requestElements = (size_t)heads * maxPaddedTokens * dim;
+        int blocks = (int)((requestElements + threads - 1) / threads);
+        FastllmPackRaggedGdnChunksHalfKernel
+            <<<dim3(blocks, batch), threads>>>(
+                (const half*)input.cudaData, deviceTokenOffsets,
+                deviceChunkOffsets, (half*)output.cudaData,
+                totalChunks, heads, dim, chunkSize, scale);
+    };
+    launchPack(q, qPacked, q.dims[3], qScale);
+    launchPack(k, kPacked, k.dims[3], 1.0f);
+    launchPack(v, vPacked, v.dims[3], 1.0f);
+    launchPack(b, bPacked, 1, 1.0f);
+    launchPack(g, gPacked, 1, 1.0f);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error when packing chunk-major ragged GDN prefill.",
+            launchState);
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaUnpackRaggedGdnPrefillChunksFloat16(
+    const fastllm::Data &packed, const std::vector<int> &seqLens,
+    int chunkSize, fastllm::Data &ragged) {
+    if (seqLens.empty() || chunkSize <= 0 ||
+        packed.dataDevice != fastllm::DataDevice::CUDA ||
+        packed.dataType != fastllm::DataType::FLOAT16 ||
+        packed.dims.size() != 4 || packed.dims[0] != 1 ||
+        packed.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(packed) ||
+        ragged.isFake || ragged.cudaDataBorrowed ||
+        ragged.isPagedKVCache || ragged.multiDeviceData ||
+        &ragged == &packed) {
+        return false;
+    }
+    int batch = (int)seqLens.size();
+    int maxSeqLen = 0;
+    std::vector<int> tokenOffsets(batch + 1, 0);
+    std::vector<int> chunkOffsets(batch + 1, 0);
+    for (int request = 0; request < batch; request++) {
+        int len = seqLens[request];
+        if (len <= 0) {
+            return false;
+        }
+        tokenOffsets[request + 1] = tokenOffsets[request] + len;
+        chunkOffsets[request + 1] =
+            chunkOffsets[request] + (len + chunkSize - 1) / chunkSize;
+        maxSeqLen = std::max(maxSeqLen, len);
+    }
+    int totalChunks = chunkOffsets.back();
+    if (packed.dims[2] != totalChunks * chunkSize) {
+        return false;
+    }
+    int heads = packed.dims[1];
+    int dim = packed.dims[3];
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(packed, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    ragged.dataType = fastllm::DataType::FLOAT16;
+    ragged.Resize({1, tokenOffsets.back(), heads, dim});
+    ragged.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
+    ragged.Allocate(false);
+    ragged.isKVCache = false;
+    ragged.isLinearAttention = false;
+    ragged.isLinearAttentionTransposed = false;
+    if (ragged.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(ragged) ||
+        !FastllmCudaDataCanShareDevice(packed, ragged)) {
+        return false;
+    }
+
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(
+            seqLens, chunkSize, metadata) ||
+        metadata.totalTokens != tokenOffsets.back() ||
+        metadata.totalChunks != totalChunks) {
+        return false;
+    }
+    const int *deviceTokenOffsets = metadata.tokenOffsets;
+    const int *deviceChunkOffsets = metadata.chunkOffsets;
+    int threads = 256;
+    int blocks = (int)(((size_t)maxSeqLen * heads * dim + threads - 1) /
+                       threads);
+    FastllmUnpackRaggedGdnChunksHalfKernel
+        <<<dim3(blocks, batch), threads>>>(
+            (const half*)packed.cudaData, deviceTokenOffsets,
+            deviceChunkOffsets, (half*)ragged.cudaData,
+            totalChunks, heads, dim, chunkSize);
+    cudaError_t launchState = cudaGetLastError();
+    if (launchState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error when unpacking chunk-major ragged GDN prefill.",
             launchState);
         return false;
     }
@@ -13759,6 +19114,480 @@ __global__ void FastllmChunkGatedDeltaRulePrefillOKernel(
             outChunk[t * vdim + lane] = FastllmCudaFloatToValue<T>(sum);
         }
     }
+}
+
+template <typename T, int BV, int BK>
+__global__ void FastllmChunkGatedDeltaRuleVarlenPrefillHKernel(
+    const T *k, const T *v, const T *g, const T *k_cumdecay,
+    const T *last_recurrent_state, T *next_recurrent_state,
+    const int *chunk_offsets, T *h_states, T *v_new_store,
+    int key_heads, int heads, int total_chunks,
+    int chunk_size, int kdim, int vdim) {
+    int vTile = blockIdx.x;
+    int bh = blockIdx.y;
+    int b = bh / heads, h = bh % heads;
+    int keyHead = h * key_heads / heads;
+    int vStart = vTile * BV;
+    if (h >= heads || vStart >= vdim) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    extern __shared__ float shared_mem[];
+    float *stateTile = shared_mem;                         // [kdim, BV]
+    float *vNewTile = stateTile + kdim * BV;              // [chunk_size, BV]
+    float *tempTile = vNewTile + chunk_size * BV;         // [chunk_size, BK]
+    float *gScale = tempTile + chunk_size * BK;           // [chunk_size]
+
+    const size_t chunkStrideK = (size_t)chunk_size * kdim;
+    const size_t chunkStrideV = (size_t)chunk_size * vdim;
+    const size_t chunkStrideG = (size_t)chunk_size;
+    const size_t headBaseK =
+        (size_t)keyHead * total_chunks * chunkStrideK;
+    const size_t headBaseKCum =
+        (size_t)h * total_chunks * chunkStrideK;
+    const size_t headBaseV = (size_t)h * total_chunks * chunkStrideV;
+    const size_t headBaseG = (size_t)h * total_chunks * chunkStrideG;
+    const size_t stateBase = (size_t)bh * kdim * vdim;
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        stateTile[idx] = vcol < vdim
+            ? FastllmCudaValueToFloat(
+                  last_recurrent_state[stateBase + (size_t)kd * vdim + vcol])
+            : 0.0f;
+    }
+    __syncthreads();
+
+    int chunkBegin = chunk_offsets[b];
+    int chunkEnd = chunk_offsets[b + 1];
+    for (int ci = chunkBegin; ci < chunkEnd; ci++) {
+        const T *kChunk = k + (size_t)ci * chunkStrideK + headBaseK;
+        const T *vChunk = v + (size_t)ci * chunkStrideV + headBaseV;
+        const T *gChunk = g + (size_t)ci * chunkStrideG + headBaseG;
+        const T *kCumChunk =
+            k_cumdecay + (size_t)ci * chunkStrideK + headBaseKCum;
+        T *hChunk = h_states +
+            ((size_t)h * total_chunks + ci) * kdim * vdim + vStart;
+        T *vNewChunk = v_new_store +
+            ((size_t)h * total_chunks + ci) * chunkStrideV + vStart;
+
+        for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+            int kd = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            if (vcol < vdim) {
+                hChunk[(size_t)kd * vdim + vo] =
+                    FastllmCudaFloatToValue<T>(stateTile[idx]);
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+            int t = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            vNewTile[idx] = vcol < vdim
+                ? FastllmCudaValueToFloat(vChunk[t * vdim + vcol])
+                : 0.0f;
+        }
+        __syncthreads();
+
+        for (int ks = 0; ks < kdim; ks += BK) {
+            int curBK = min(BK, kdim - ks);
+            for (int idx = tid; idx < chunk_size * curBK;
+                 idx += blockDim.x) {
+                int t = idx / curBK;
+                int kk = idx % curBK;
+                tempTile[t * BK + kk] = FastllmCudaValueToFloat(
+                    kCumChunk[t * kdim + ks + kk]);
+            }
+            __syncthreads();
+            for (int idx = tid; idx < chunk_size * BV;
+                 idx += blockDim.x) {
+                int t = idx / BV;
+                int vo = idx % BV;
+                float sum = 0.0f;
+#pragma unroll
+                for (int kk = 0; kk < BK; kk++) {
+                    if (kk < curBK) {
+                        sum += tempTile[t * BK + kk] *
+                               stateTile[(ks + kk) * BV + vo];
+                    }
+                }
+                vNewTile[idx] -= sum;
+            }
+            __syncthreads();
+        }
+
+        float gLast =
+            FastllmCudaValueToFloat(gChunk[chunk_size - 1]);
+        float gLastExp = expf(gLast);
+        for (int idx = tid; idx < chunk_size; idx += blockDim.x) {
+            gScale[idx] =
+                expf(gLast - FastllmCudaValueToFloat(gChunk[idx]));
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+            int t = idx / BV;
+            int vo = idx % BV;
+            int vcol = vStart + vo;
+            if (vcol < vdim) {
+                vNewChunk[t * vdim + vo] =
+                    FastllmCudaFloatToValue<T>(vNewTile[idx]);
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+            stateTile[idx] *= gLastExp;
+        }
+        __syncthreads();
+
+        for (int ks = 0; ks < kdim; ks += BK) {
+            int curBK = min(BK, kdim - ks);
+            for (int idx = tid; idx < chunk_size * curBK;
+                 idx += blockDim.x) {
+                int t = idx / curBK;
+                int kk = idx % curBK;
+                tempTile[t * BK + kk] =
+                    FastllmCudaValueToFloat(
+                        kChunk[t * kdim + ks + kk]) * gScale[t];
+            }
+            __syncthreads();
+            for (int idx = tid; idx < curBK * BV; idx += blockDim.x) {
+                int kk = idx / BV;
+                int vo = idx % BV;
+                float update = 0.0f;
+#pragma unroll
+                for (int t = 0; t < chunk_size; t++) {
+                    update += tempTile[t * BK + kk] *
+                              vNewTile[t * BV + vo];
+                }
+                stateTile[(ks + kk) * BV + vo] += update;
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        if (vcol < vdim) {
+            next_recurrent_state[stateBase + (size_t)kd * vdim + vcol] =
+                FastllmCudaFloatToValue<T>(stateTile[idx]);
+        }
+    }
+}
+
+template <typename T, int BV>
+__global__ void FastllmChunkGatedDeltaRuleVarlenPrefillOKernel(
+    const T *q, const T *g, const T *attn, const T *decay_mask,
+    const T *h_states, const T *v_new_store, T *core_attn_out,
+    const int *chunk_token_bases, const int *chunk_valid_tokens,
+    int total_tokens, int key_heads, int heads, int total_chunks,
+    int chunk_size, int kdim, int vdim, bool apply_decay_mask) {
+    int vTile = blockIdx.x;
+    int ci = blockIdx.y;
+    int h = blockIdx.z;
+    int keyHead = h * key_heads / heads;
+    int vStart = vTile * BV;
+    if (h >= heads || ci >= total_chunks || vStart >= vdim) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int warpCount = (blockDim.x + 31) >> 5;
+    const unsigned int warpMask = 0xffffffffu;
+    extern __shared__ float shared_mem[];
+    float *hTile = shared_mem;                            // [kdim, BV]
+    float *vNewTile = hTile + kdim * BV;                 // [chunk_size, BV]
+
+    const size_t chunkStrideQ = (size_t)chunk_size * kdim;
+    const size_t chunkStrideV = (size_t)chunk_size * vdim;
+    const size_t chunkStrideG = (size_t)chunk_size;
+    const size_t chunkStrideAttn = (size_t)chunk_size * chunk_size;
+    const size_t headBaseQ =
+        (size_t)keyHead * total_chunks * chunkStrideQ;
+    const size_t headBaseG = (size_t)h * total_chunks * chunkStrideG;
+    const size_t headBaseAttn =
+        (size_t)keyHead * total_chunks * chunkStrideAttn;
+    const size_t headBaseDecay =
+        (size_t)h * total_chunks * chunkStrideAttn;
+    const T *qChunk = q + (size_t)ci * chunkStrideQ + headBaseQ;
+    const T *gChunk = g + (size_t)ci * chunkStrideG + headBaseG;
+    const T *attnChunk =
+        attn + (size_t)ci * chunkStrideAttn + headBaseAttn;
+    const T *decayChunk = apply_decay_mask
+        ? decay_mask + (size_t)ci * chunkStrideAttn + headBaseDecay
+        : nullptr;
+    const T *hChunk = h_states +
+        ((size_t)h * total_chunks + ci) * kdim * vdim + vStart;
+    const T *vNewChunk = v_new_store +
+        ((size_t)h * total_chunks + ci) * chunkStrideV + vStart;
+    int tokenBase = chunk_token_bases[ci];
+    int validTokens = chunk_valid_tokens[ci];
+
+    for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
+        int kd = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        hTile[idx] = vcol < vdim
+            ? FastllmCudaValueToFloat(hChunk[(size_t)kd * vdim + vo])
+            : 0.0f;
+    }
+    for (int idx = tid; idx < chunk_size * BV; idx += blockDim.x) {
+        int t = idx / BV;
+        int vo = idx % BV;
+        int vcol = vStart + vo;
+        vNewTile[idx] = vcol < vdim
+            ? FastllmCudaValueToFloat(vNewChunk[t * vdim + vo])
+            : 0.0f;
+    }
+    __syncthreads();
+
+    for (int t = warp; t < validTokens; t += warpCount) {
+        int vcol = vStart + lane;
+        if (vcol < vdim) {
+            float gExp = 0.0f;
+            if (lane == 0) {
+                gExp = expf(FastllmCudaValueToFloat(gChunk[t]));
+            }
+            gExp = __shfl_sync(warpMask, gExp, 0);
+            float sum = 0.0f;
+            for (int kd = 0; kd < kdim; kd++) {
+                float qValue = 0.0f;
+                if (lane == 0) {
+                    qValue =
+                        FastllmCudaValueToFloat(qChunk[t * kdim + kd]);
+                }
+                qValue = __shfl_sync(warpMask, qValue, 0);
+                sum += qValue * hTile[(size_t)kd * BV + lane];
+            }
+            sum *= gExp;
+            const T *attnRow = attnChunk + (size_t)t * chunk_size;
+            for (int j = 0; j < chunk_size; j++) {
+                float attnValue = 0.0f;
+                if (lane == 0) {
+                    attnValue = FastllmCudaValueToFloat(attnRow[j]);
+                    if (apply_decay_mask) {
+                        attnValue = j <= t
+                            ? FastllmCudaValueToFloat(
+                                  FastllmCudaFloatToValue<T>(
+                                      attnValue * FastllmCudaValueToFloat(
+                                          decayChunk[(size_t)t *
+                                              chunk_size + j])))
+                            : 0.0f;
+                    }
+                }
+                attnValue = __shfl_sync(warpMask, attnValue, 0);
+                sum += attnValue * vNewTile[j * BV + lane];
+            }
+            int outputToken = tokenBase + t;
+            if (outputToken < total_tokens) {
+                core_attn_out[
+                    ((size_t)outputToken * heads + h) * vdim +
+                    vStart + lane] = FastllmCudaFloatToValue<T>(sum);
+            }
+        }
+    }
+}
+
+namespace {
+struct FastllmChunkGdnVarlenScratch {
+    void *h = nullptr;
+    void *vNew = nullptr;
+    void *nextState = nullptr;
+    size_t hBytes = 0;
+    size_t vNewBytes = 0;
+    size_t stateBytes = 0;
+};
+
+static bool FastllmEnsureChunkGdnVarlenScratch(
+    size_t hBytes, size_t vNewBytes, size_t stateBytes,
+    FastllmChunkGdnVarlenScratch *&scratch) {
+    thread_local static std::map<int, FastllmChunkGdnVarlenScratch> scratches;
+    int device = FastllmCudaGetDevice();
+    FastllmChunkGdnVarlenScratch &cached = scratches[device];
+    if (cached.hBytes < hBytes || cached.vNewBytes < vNewBytes ||
+        cached.stateBytes < stateBytes) {
+        if (cached.h != nullptr || cached.vNew != nullptr ||
+            cached.nextState != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        if (cached.h != nullptr) FastllmCudaFree(cached.h);
+        if (cached.vNew != nullptr) FastllmCudaFree(cached.vNew);
+        if (cached.nextState != nullptr) FastllmCudaFree(cached.nextState);
+        cached = FastllmChunkGdnVarlenScratch();
+        cached.h = FastllmCudaMalloc(hBytes);
+        cached.vNew = FastllmCudaMalloc(vNewBytes);
+        cached.nextState = FastllmCudaMalloc(stateBytes);
+        if (cached.h == nullptr || cached.vNew == nullptr ||
+            cached.nextState == nullptr) {
+            if (cached.h != nullptr) FastllmCudaFree(cached.h);
+            if (cached.vNew != nullptr) FastllmCudaFree(cached.vNew);
+            if (cached.nextState != nullptr) FastllmCudaFree(cached.nextState);
+            cached = FastllmChunkGdnVarlenScratch();
+            return false;
+        }
+        cached.hBytes = hBytes;
+        cached.vNewBytes = vNewBytes;
+        cached.stateBytes = stateBytes;
+    }
+    scratch = &cached;
+    return true;
+}
+}
+
+bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &k_cumdecay, fastllm::Data &last_recurrent_state,
+    const std::vector<int> &seqLens, fastllm::Data &core_attn_out,
+    const fastllm::Data *decay_mask, bool apply_decay_mask) {
+    if (seqLens.empty() || q.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::FLOAT16 ||
+        k.dataType != fastllm::DataType::FLOAT16 ||
+        v.dataType != fastllm::DataType::FLOAT16 ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        attn.dataType != fastllm::DataType::FLOAT16 ||
+        k_cumdecay.dataType != fastllm::DataType::FLOAT16 ||
+        last_recurrent_state.dataType != fastllm::DataType::FLOAT16 ||
+        (apply_decay_mask &&
+         (decay_mask == nullptr ||
+          decay_mask->dataType != fastllm::DataType::FLOAT16 ||
+          decay_mask->cudaData == nullptr)) ||
+        q.cudaData == nullptr || k.cudaData == nullptr ||
+        v.cudaData == nullptr || g.cudaData == nullptr ||
+        attn.cudaData == nullptr || k_cumdecay.cudaData == nullptr ||
+        last_recurrent_state.cudaData == nullptr ||
+        q.dims.size() != 5 || q.dims[0] != 1 || k.dims != q.dims) {
+        return false;
+    }
+    int batch = (int)seqLens.size();
+    int keyHeads = q.dims[1];
+    int heads = v.dims.size() == 5 ? v.dims[1] : 0;
+    int totalChunks = q.dims[2];
+    int chunkSize = q.dims[3];
+    int kdim = q.dims[4];
+    int vdim = v.dims.size() == 5 ? v.dims[4] : 0;
+    if (keyHeads <= 0 || heads < keyHeads || heads % keyHeads != 0 ||
+        totalChunks <= 0 || chunkSize != 64 ||
+        kdim != 128 || vdim != 128 ||
+        v.dims != std::vector<int>({1, heads, totalChunks, chunkSize, vdim}) ||
+        g.dims != std::vector<int>({1, heads, totalChunks, chunkSize}) ||
+        attn.dims !=
+            std::vector<int>({1, keyHeads, totalChunks,
+                              chunkSize, chunkSize}) ||
+        (apply_decay_mask && decay_mask->dims !=
+            std::vector<int>({1, heads, totalChunks,
+                              chunkSize, chunkSize})) ||
+        k_cumdecay.dims !=
+            std::vector<int>({1, heads, totalChunks, chunkSize, kdim}) ||
+        last_recurrent_state.dims !=
+            std::vector<int>({batch, heads, kdim, vdim})) {
+        return false;
+    }
+    FastllmCudaRaggedGdnMetadataView metadata;
+    if (!FastllmCudaGetRaggedGdnMetadata(
+            seqLens, chunkSize, metadata) ||
+        metadata.totalChunks != totalChunks) {
+        return false;
+    }
+
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(q, device) ||
+        FastllmCudaGetDevice() != device ||
+        !FastllmCudaDataCanShareDevice(q, k) ||
+        !FastllmCudaDataCanShareDevice(q, v) ||
+        !FastllmCudaDataCanShareDevice(q, g) ||
+        !FastllmCudaDataCanShareDevice(q, attn) ||
+        !FastllmCudaDataCanShareDevice(q, k_cumdecay) ||
+        !FastllmCudaDataCanShareDevice(q, last_recurrent_state) ||
+        (apply_decay_mask &&
+         !FastllmCudaDataCanShareDevice(q, *decay_mask))) {
+        return false;
+    }
+
+    core_attn_out.dataType = fastllm::DataType::FLOAT16;
+    core_attn_out.Resize({1, metadata.totalTokens, heads, vdim});
+    core_attn_out.ToDevice(
+        fastllm::DataDevice::CUDA, std::vector<int>{device});
+    core_attn_out.Allocate(false);
+    if (core_attn_out.cudaData == nullptr ||
+        !FastllmCudaDataHasDenseStrides(core_attn_out)) {
+        return false;
+    }
+
+    size_t hBytes =
+        (size_t)heads * totalChunks * kdim * vdim * sizeof(half);
+    size_t vNewBytes =
+        (size_t)heads * totalChunks * chunkSize * vdim * sizeof(half);
+    size_t stateBytes =
+        (size_t)batch * heads * kdim * vdim * sizeof(half);
+    FastllmChunkGdnVarlenScratch *scratch = nullptr;
+    if (!FastllmEnsureChunkGdnVarlenScratch(
+            hBytes, vNewBytes, stateBytes, scratch)) {
+        return false;
+    }
+    constexpr int BVH = 32;
+    constexpr int BKH = 64;
+    constexpr int BVO = 32;
+    int threadsH = 256;
+    int threadsO = 256;
+    size_t sharedH =
+        (size_t)(kdim * BVH + chunkSize * BVH +
+                 chunkSize * BKH + chunkSize) * sizeof(float);
+    size_t sharedO =
+        (size_t)(kdim * BVO + chunkSize * BVO) * sizeof(float);
+    dim3 gridH((vdim + BVH - 1) / BVH, batch * heads);
+    dim3 gridO((vdim + BVO - 1) / BVO, totalChunks, heads);
+    FastllmChunkGatedDeltaRuleVarlenPrefillHKernel<half, BVH, BKH>
+        <<<gridH, threadsH, sharedH, cudaStreamPerThread>>>(
+            (const half*)k.cudaData, (const half*)v.cudaData,
+            (const half*)g.cudaData, (const half*)k_cumdecay.cudaData,
+            (const half*)last_recurrent_state.cudaData,
+            (half*)scratch->nextState, metadata.chunkOffsets,
+            (half*)scratch->h, (half*)scratch->vNew,
+            keyHeads, heads, totalChunks, chunkSize, kdim, vdim);
+    cudaError_t hState = cudaGetLastError();
+    if (hState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in packed varlen GDN H fallback.", hState);
+        return false;
+    }
+    FastllmChunkGatedDeltaRuleVarlenPrefillOKernel<half, BVO>
+        <<<gridO, threadsO, sharedO, cudaStreamPerThread>>>(
+            (const half*)q.cudaData, (const half*)g.cudaData,
+            (const half*)attn.cudaData,
+            apply_decay_mask ? (const half*)decay_mask->cudaData : nullptr,
+            (const half*)scratch->h,
+            (const half*)scratch->vNew, (half*)core_attn_out.cudaData,
+            metadata.chunkTokenBases, metadata.chunkValidTokens,
+            metadata.totalTokens, keyHeads, heads, totalChunks,
+            chunkSize, kdim, vdim, apply_decay_mask);
+    cudaError_t oState = cudaGetLastError();
+    if (oState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error in packed varlen GDN O fallback.", oState);
+        return false;
+    }
+    cudaError_t commitState = cudaMemcpyAsync(
+        last_recurrent_state.cudaData, scratch->nextState, stateBytes,
+        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    if (commitState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error committing packed varlen GDN state.",
+            commitState);
+        return false;
+    }
+    return true;
 }
 
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,

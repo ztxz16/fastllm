@@ -171,6 +171,14 @@ namespace fastllm {
         std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
         std::vector <std::string> tool_call_parameter_name_prefixes;
         std::vector <int> tool_call_allowed_token_ids;
+        bool tool_call_content_sampling_enabled = false;
+        // Set on the per-step config after Kimi-K3 has drained DSpark's
+        // scheduler-ahead queue. DSpark then samples from its batched target
+        // verification logits while keeping target and draft caches aligned.
+        bool tool_call_content_sampling_active = false;
+        int tool_call_content_top_k = 1;
+        float tool_call_content_top_p = 1.0f;
+        float tool_call_content_temperature = 1.0f;
 
         bool IsSimpleGreedy() const {
             if (!tool_call_allowed_token_ids.empty()) {
@@ -320,6 +328,9 @@ namespace fastllm {
         // The final partial block has no padding. The implicit zero point is 8.
         INT4_GROUP32 = 1008,
         INT4_W4A8 = 1009, // independent W4A8: uint4b8 source + BF16 symmetric group=128 scales
+        // Internal NUMA layout for NVFP4 blockM=32 weights:
+        // [16 packed fp4 bytes] [one inline E8M0 scale byte].
+        NVFP4_BLOCK_32_E8M0 = 1010,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -550,6 +561,7 @@ namespace fastllm {
         int tpQHeads = 0;
         int tpKVHeads = 0;
         int tpHeadDim = 0;
+        int tpSplitUnit = 0;
 
         int weightId;
         bool isRegistered = false;
@@ -935,7 +947,8 @@ namespace fastllm {
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu,
                 bool expertParallel = false, float swigluLimit = 0.0f,
-                bool deepSeekV4Mode = false);
+                bool deepSeekV4Mode = false,
+                Data *pairedReduceInput = nullptr);
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
                 Data &gate, Data &up, Data &down, Data &w1,
@@ -944,7 +957,9 @@ namespace fastllm {
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale);
 
     // MLA with paged KV cache: kvCache (kpe) and peCache (ckv) are stored in paged form (isPagedKVCache, pageIndex, lastPageLen, pagedKVCacheData).
-    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged, Data &peCachePaged, Data &output, float softmaxScale);
+    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged,
+                       Data &peCachePaged, Data &output,
+                       float softmaxScale, int kvLen = -1);
 
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType);
@@ -990,6 +1005,15 @@ namespace fastllm {
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
             Data &state, Data &output, Data &decay, Data &beta);
+
+    // Inference only consumes the recurrent output and updated state.  Avoid
+    // materializing the full-sequence float32 decay/beta diagnostics on that
+    // path while retaining KimiK3RecurrentKDA for validation and tooling.
+    void KimiK3RecurrentKDAOutputOnly(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output);
 
     // Replays only the recurrent-state transition for the first `tokens`
     // rows of a captured verification batch.
@@ -1084,6 +1108,29 @@ namespace fastllm {
                                int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                int quantDim, int blockSize, int posStep = 1);
 
+    void DeepSeekV4SparseAttention(const Data &q, const Data &kv, Data &attnSink,
+                                   int windowSize, int ropeDim, float ropeBase,
+                                   int startPos, float softmaxScale, Data &output,
+                                   int compressRatio, int originalSeqLen,
+                                   float ropeFactor, int betaFast, int betaSlow,
+                                   int prefixLen,
+                                   const Data *compressedTopK = nullptr);
+
+    void DeepSeekV4SparseAttentionDecodeCached(
+            const Data &q, const Data &windowKV, const Data &compressedKV,
+            Data &attnSink, int windowSize, int startPos,
+            int compressedCount, int ropeDim, float ropeBase,
+            float softmaxScale, Data &output, int originalSeqLen,
+            float ropeFactor, int betaFast, int betaSlow,
+            const Data *compressedTopK = nullptr);
+
+    void DeepSeekV4IndexerTopK(const Data &q, const Data &weights,
+                               const Data &compressedKV, int topK,
+                               int compressRatio, int ropeDim, float ropeBase,
+                               int startPos, int originalSeqLen,
+                               float ropeFactor, int betaFast, int betaSlow,
+                               Data &output);
+
     void DeepSeekV4WoA(Data &o, Data &woA, int groups, int oRank, Data &output);
 
     void DeepSeekV4BuildCompressedKVFromRaw(const Data &kv, const Data &score,
@@ -1095,7 +1142,7 @@ namespace fastllm {
                                             float ropeFactor, int betaFast,
                                             int betaSlow, int originalSeqLen,
                                             bool overlap, bool preferCudaOutput,
-                                            Data &cache);
+                                            Data &cache, bool indexer = false);
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
@@ -1179,6 +1226,11 @@ namespace fastllm {
     void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
                             float factor, float originalMaxPosition,
                             float lowFreqFactor, float highFreqFactor);
+
+    // YaRN RoPE encoding computed directly from positions, without a sin/cos cache.
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor);
 
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,

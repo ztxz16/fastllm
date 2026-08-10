@@ -35,7 +35,9 @@ namespace fastllm {
                                       Data &w1, Data &w2, Data &w3,
                                       Data **weights, Data **biass, float sharedScale,
                                       bool setZero, const std::unordered_set<int> &experts,
-                                      bool isCrossSwiglu, MoeGateType gateType);
+                                      bool isCrossSwiglu, MoeGateType gateType,
+                                      bool deepSeekV4Mode = false,
+                                      float swigluLimit = 0.0f);
 #endif
 
     DiskDevice::DiskDevice() {

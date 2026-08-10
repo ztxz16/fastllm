@@ -106,14 +106,20 @@ namespace fastllm {
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
             if (data.isModelWeight && !data.directMemory) {
-                return FastllmCudaMallocModelWeight(bytes);
+                return FastllmCudaMallocModelWeight(bytes, data.name);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
 
-        static void CheckCudaMallocForData(const Data &data, void *ptr, uint64_t bytes, const char *context) {
+        static bool CheckCudaMallocForData(const Data &data, void *&ptr,
+                                           uint64_t bytes, const char *context,
+                                           bool allowGraphCapturePlaceholder = false) {
             if (ptr != nullptr) {
-                return;
+                return true;
+            }
+            if (allowGraphCapturePlaceholder &&
+                FastllmCudaGraphGetAllocationFailurePlaceholder(&ptr)) {
+                return false;
             }
             std::string msg = "Error: cuda malloc failed in " + std::string(context) +
                               ". requestBytes = " + std::to_string(bytes) +
@@ -126,7 +132,16 @@ namespace fastllm {
                 msg += ", name = " + data.name;
             }
             msg += ".\n";
-            ErrorInFastLLM(msg);
+            // Tensor-parallel ranks are worker threads in one process.  Waiting
+            // for stdin here leaves peer ranks blocked in NCCL and makes an API
+            // server look healthy while every request hangs.  Allocation
+            // failure is not recoverable at this layer, so fail the complete TP
+            // process promptly; the serving supervisor can restart it and
+            // clients receive a connection failure instead of an infinite wait.
+            fprintf(stderr, "FastLLM fatal CUDA allocation error: %s", msg.c_str());
+            fflush(stdout);
+            fflush(stderr);
+            std::_Exit(EXIT_FAILURE);
         }
 
         static void CudaFreeForData(const Data &data, void *ptr) {
@@ -526,6 +541,7 @@ namespace fastllm {
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
         {DataType::INT4_W4A8, {"int4_w4a8"}},
+        {DataType::NVFP4_BLOCK_32_E8M0, {"nvfp4_block_32_e8m0"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
@@ -614,6 +630,9 @@ namespace fastllm {
         } else if (type == DataType::NVFP4_BLOCK_16_E8M0) {
             int blocks = (columns - 1) / 16 + 1;
             return rows * blocks * (8 + sizeof(uint8_t));
+        } else if (type == DataType::NVFP4_BLOCK_32_E8M0) {
+            int blocks = (columns - 1) / 32 + 1;
+            return rows * blocks * (16 + sizeof(uint8_t));
         } else if (type == DataType::FP8_E4M3) {
             return rows * columns * sizeof(uint8_t);
         } else if (type == DataType::INT4_PERCHANNEL) {
@@ -964,6 +983,7 @@ namespace fastllm {
         this->tpQHeads = ori.tpQHeads;
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
+        this->tpSplitUnit = ori.tpSplitUnit;
         if (ori.dataType == DataType::INT4_W4A8) {
             this->group = ori.group;
             this->groupCnt = ori.groupCnt;
@@ -1409,11 +1429,20 @@ namespace fastllm {
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
              dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              dataType == DataType::INT4_GROUP32)) {
             this->blockK = blockK;
             this->blockM = blockM;
             if (dataType == DataType::NVFP4) {
                 this->scales.clear();
+            } else if (dataType == DataType::NVFP4_BLOCK_16) {
+                // NVFP4_BLOCK_16 keeps its block scales inline.  oriScales, when
+                // present, contains only the tensor-level dequant multiplier
+                // retained by the safetensors loader for Marlin preparation.
+                this->scales.clear();
+                if (oriScales != nullptr) {
+                    this->scales.push_back(oriScales[0]);
+                }
             }
             if (dataType == DataType::INT4_GROUP32) {
                 AssertInFastLLM(this->dims.size() == 2 && this->dims[1] % 32 == 0,
@@ -1701,6 +1730,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    this->dataType == DataType::INT4_GROUP32) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
@@ -1730,6 +1760,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
@@ -1959,6 +1990,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
@@ -1977,6 +2009,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
@@ -1997,7 +2030,18 @@ namespace fastllm {
 #ifdef USE_CUDA
             this->cudaData = CudaMallocForData(*this, this->expansionBytes);
             this->cudaDataBorrowed = false;
-            CheckCudaMallocForData(*this, this->cudaData, this->expansionBytes, "Data::MallocSpace");
+            bool allocated = CheckCudaMallocForData(
+                *this, this->cudaData, this->expansionBytes,
+                "Data::MallocSpace", true);
+            if (!allocated) {
+                // The placeholder keeps host-side operator setup and TP/NCCL
+                // sequencing intact until every rank reaches the common graph
+                // abort barrier. Mark it borrowed and force the next eager
+                // Allocate() to replace it with real storage.
+                this->cudaDataBorrowed = true;
+                this->expansionSize = 0;
+                return;
+            }
             if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
                 for (auto it : this->multiDeviceDatas) {
                     delete it.second;
@@ -2191,9 +2235,16 @@ namespace fastllm {
         // Retire routed-expert caches owned by this Data before its address can
         // be reused by a subsequently loaded model. These calls are no-ops for
         // weights that were never used as cache keys.
-        if (this->dataType == DataType::NVFP4 && this->isModelWeight &&
-            this->directMemory) {
-            MultiCudaReleaseMoeWeightCaches(this);
+        if (this->dataType == DataType::NVFP4 && this->isModelWeight) {
+            if (this->directMemory) {
+                MultiCudaReleaseMoeWeightCaches(this);
+                FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
+            }
+#ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
+            FastllmCudaReleaseMergeMOEDeepGemmSm120Cache(this);
+#endif
+        } else if (this->dataType == DataType::INT4_GROUP &&
+                   this->isModelWeight) {
             FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
         }
 #endif
@@ -3043,7 +3094,8 @@ namespace fastllm {
             return DataType::FLOAT32;
         } else if (this->dataType == DataType::NVFP4 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
-                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
+                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::NVFP4_BLOCK_32_E8M0) {
             return batchSize > 31 ? DataType::BFLOAT16 : DataType::FLOAT32;
         } else if (this->dataType == DataType::INT4_PERCHANNEL ||
                     this->dataType == DataType::INT8_PERCHANNEL) {
@@ -3986,14 +4038,20 @@ namespace fastllm {
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer, MoeGateType gateType,
-                bool expertParallel, float swigluLimit, bool deepSeekV4Mode) {
-        curExecutor->Run("MergeMOE", {
+                bool expertParallel, float swigluLimit, bool deepSeekV4Mode,
+                Data *pairedReduceInput) {
+        DataDict datas = {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
                 {"w1", (Data*)&w1}, {"w2", (Data*)&w2}, {"w3", (Data*)&w3},
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
-        }, {{"sharedScale", sharedScale}, {"swigluLimit", swigluLimit}},
+        };
+        if (pairedReduceInput != nullptr) {
+            datas["pairedReduceInput"] = pairedReduceInput;
+        }
+        curExecutor->Run("MergeMOE", datas,
+                                        {{"sharedScale", sharedScale}, {"swigluLimit", swigluLimit}},
                                         {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
                                          {"layer", layer}, {"gateType", (int)gateType},
                                          {"expertParallel", expertParallel ? 1 : 0},
@@ -4017,11 +4075,13 @@ namespace fastllm {
         }, {{"softmaxScale", softmaxScale}}, {});
     }
 
-    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged, Data &peCachePaged, Data &output, float softmaxScale) {
+    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged,
+                       Data &peCachePaged, Data &output,
+                       float softmaxScale, int kvLen) {
         curExecutor->Run("MergeMLAPaged", {
             {"qNope", (Data*)&qNope}, {"qPe", (Data*)&qPe}, {"kvCachePaged", (Data*)&kvCachePaged}, {"peCachePaged", (Data*)&peCachePaged},
             {"output", (Data*)&output}
-        }, {{"softmaxScale", softmaxScale}}, {});
+        }, {{"softmaxScale", softmaxScale}}, {{"kvLen", kvLen}});
     }
 
     // attentionType
@@ -4130,7 +4190,24 @@ namespace fastllm {
                 {"state", &state}, {"output", &output},
                 {"decay", &decay}, {"beta", &beta}
         }, {{"lowerBound", lowerBound}},
-        {{"tokenLimit", -1}, {"stateOnly", 0}});
+        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 1}});
+    }
+
+    void KimiK3RecurrentKDAOutputOnly(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output) {
+        Data unusedDecay, unusedBeta;
+        curExecutor->Run("KimiK3RecurrentKDA", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"rawGate", (Data*)&rawGate},
+                {"rawBeta", (Data*)&rawBeta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output},
+                {"decay", &unusedDecay}, {"beta", &unusedBeta}
+        }, {{"lowerBound", lowerBound}},
+        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 0}});
     }
 
     void KimiK3RecurrentKDAUpdateState(
@@ -4150,7 +4227,7 @@ namespace fastllm {
                 {"state", &state}, {"output", &unusedOutput},
                 {"decay", &unusedDecay}, {"beta", &unusedBeta}
         }, {{"lowerBound", lowerBound}},
-        {{"tokenLimit", tokens}, {"stateOnly", 1}});
+        {{"tokenLimit", tokens}, {"stateOnly", 1}, {"outputAux", 0}});
     }
 
     void KimiK3RMSNormSigmoidGate(
@@ -4363,6 +4440,70 @@ namespace fastllm {
             {"blockSize", blockSize}, {"posStep", posStep}});
     }
 
+    void DeepSeekV4SparseAttention(const Data &q, const Data &kv, Data &attnSink,
+                                   int windowSize, int ropeDim, float ropeBase,
+                                   int startPos, float softmaxScale, Data &output,
+                                   int compressRatio, int originalSeqLen,
+                                   float ropeFactor, int betaFast, int betaSlow,
+                                   int prefixLen,
+                                   const Data *compressedTopK) {
+        DataDict datas = {
+                {"q", (Data*)&q}, {"kv", (Data*)&kv},
+                {"attnSink", &attnSink}, {"output", &output}
+        };
+        if (compressedTopK != nullptr) {
+            datas["compressedTopK"] = (Data*)compressedTopK;
+        }
+        curExecutor->Run("DeepSeekV4SparseAttention", datas,
+           {{"ropeBase", ropeBase}, {"softmaxScale", softmaxScale},
+            {"ropeFactor", ropeFactor}},
+           {{"windowSize", windowSize}, {"ropeDim", ropeDim},
+            {"startPos", startPos}, {"compressRatio", compressRatio},
+            {"originalSeqLen", originalSeqLen}, {"betaFast", betaFast},
+            {"betaSlow", betaSlow}, {"prefixLen", prefixLen}});
+    }
+
+    void DeepSeekV4SparseAttentionDecodeCached(
+            const Data &q, const Data &windowKV, const Data &compressedKV,
+            Data &attnSink, int windowSize, int startPos,
+            int compressedCount, int ropeDim, float ropeBase,
+            float softmaxScale, Data &output, int originalSeqLen,
+            float ropeFactor, int betaFast, int betaSlow,
+            const Data *compressedTopK) {
+        DataDict datas = {
+            {"q", (Data*)&q}, {"windowKV", (Data*)&windowKV},
+            {"compressedKV", (Data*)&compressedKV},
+            {"attnSink", &attnSink}, {"output", &output}
+        };
+        if (compressedTopK != nullptr) {
+            datas["compressedTopK"] = (Data*)compressedTopK;
+        }
+        curExecutor->Run(
+            "DeepSeekV4SparseAttentionDecodeCached", datas,
+            {{"ropeBase", ropeBase}, {"softmaxScale", softmaxScale},
+             {"ropeFactor", ropeFactor}},
+            {{"windowSize", windowSize}, {"startPos", startPos},
+             {"compressedCount", compressedCount}, {"ropeDim", ropeDim},
+             {"originalSeqLen", originalSeqLen}, {"betaFast", betaFast},
+             {"betaSlow", betaSlow}});
+    }
+
+    void DeepSeekV4IndexerTopK(const Data &q, const Data &weights,
+                               const Data &compressedKV, int topK,
+                               int compressRatio, int ropeDim, float ropeBase,
+                               int startPos, int originalSeqLen,
+                               float ropeFactor, int betaFast, int betaSlow,
+                               Data &output) {
+        curExecutor->Run("DeepSeekV4IndexerTopK", {
+                {"q", (Data*)&q}, {"weights", (Data*)&weights},
+                {"compressedKV", (Data*)&compressedKV}, {"output", &output}
+        }, {{"ropeBase", ropeBase}, {"ropeFactor", ropeFactor}},
+           {{"topK", topK}, {"compressRatio", compressRatio},
+            {"ropeDim", ropeDim}, {"startPos", startPos},
+            {"originalSeqLen", originalSeqLen}, {"betaFast", betaFast},
+            {"betaSlow", betaSlow}});
+    }
+
     void DeepSeekV4WoA(Data &o, Data &woA, int groups, int oRank, Data &output) {
         curExecutor->Run("DeepSeekV4WoA", {
                 {"input", &o}, {"weight", &woA}, {"output", &output}
@@ -4378,7 +4519,7 @@ namespace fastllm {
                                             float ropeFactor, int betaFast,
                                             int betaSlow, int originalSeqLen,
                                             bool overlap, bool preferCudaOutput,
-                                            Data &cache) {
+                                            Data &cache, bool indexer) {
         curExecutor->Run("DeepSeekV4BuildCompressedKVFromRaw", {
                 {"kv", (Data*)&kv}, {"score", (Data*)&score},
                 {"ape", &ape}, {"normWeight", &normWeight}, {"cache", &cache}
@@ -4389,7 +4530,8 @@ namespace fastllm {
             {"ropeDim", ropeDim}, {"betaFast", betaFast},
             {"betaSlow", betaSlow}, {"originalSeqLen", originalSeqLen},
             {"overlap", overlap ? 1 : 0},
-            {"preferCudaOutput", preferCudaOutput ? 1 : 0}});
+            {"preferCudaOutput", preferCudaOutput ? 1 : 0},
+            {"indexer", indexer ? 1 : 0}});
     }
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
@@ -4649,6 +4791,33 @@ namespace fastllm {
         }, {{"ropeTheta", ropeTheta}, {"factor", factor},
             {"originalMaxPosition", originalMaxPosition},
             {"lowFreqFactor", lowFreqFactor}, {"highFreqFactor", highFreqFactor}},
+           {{"rotaryDim", rotaryDim}});
+    }
+
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor) {
+        AssertInFastLLM(rotaryDim > 0 && rotaryDim % 2 == 0,
+                        "YaRN rotary_dim must be a positive even number.");
+        AssertInFastLLM(ropeTheta > 0.0f && factor > 0.0f && originalMaxPosition > 0.0f &&
+                        betaFast > 0.0f && betaSlow > 0.0f,
+                        "YaRN theta, factor, original_max_position, beta_fast and beta_slow must be positive.");
+        auto findCorrectionDim = [&](float rotations) {
+            return (rotaryDim * std::log(originalMaxPosition /
+                    (rotations * 2.0f * (float)M_PI))) /
+                   (2.0f * std::log(ropeTheta));
+        };
+        float correctionLow = std::max(0.0f, std::floor(findCorrectionDim(betaFast)));
+        float correctionHigh = std::min((float)rotaryDim - 1.0f,
+                                        std::ceil(findCorrectionDim(betaSlow)));
+        if (correctionLow == correctionHigh) {
+            correctionHigh += 0.001f;
+        }
+        curExecutor->Run("YarnRopeEncoding", {
+            {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"factor", factor},
+            {"attentionFactor", attentionFactor},
+            {"correctionLow", correctionLow}, {"correctionHigh", correctionHigh}},
            {{"rotaryDim", rotaryDim}});
     }
 

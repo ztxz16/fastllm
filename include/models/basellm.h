@@ -224,6 +224,10 @@ namespace fastllm {
         // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
         virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
 
+        // special weight 默认跟随 MoE 设备映射；同时包含非 MoE TP 权重的模型可覆盖此选择。
+        virtual std::string SelectSpecialWeightDevice(const std::string &weightName,
+                                                      int layerId) const;
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,
@@ -317,6 +321,13 @@ namespace fastllm {
 
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 
 
+        // Drain several already-generated tokens under one scheduler lock.
+        // Returns the number written, -1 on normal completion, or -2 when the
+        // prompt is too long.  Speculative decoders use this to publish an
+        // accepted block without one Python/ASGI round trip per token.
+        virtual int FetchResponseTokensBatch(int handleId, int *output,
+                                             int maxTokens);
+
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
         virtual bool GetResponseStatistics(int handleId, int &cachedInputTokens,
@@ -336,6 +347,11 @@ namespace fastllm {
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
 
+        // Fixed per-device CUDA capacity that must still be available after
+        // model-specific serving high-water warmup. Unlike runtime reserve,
+        // this cost is not multiplied by the active request count.
+        virtual long long GetAutoWarmupCudaServingReserveBytes(int deviceId) const { return 0; }
+
         // AutoWarmup 最多允许 linear-attention 固定状态和模型 runtime buffer
         // 占用多少比例的可用 KV 预算。其余空间优先留给 token-growing KV cache。
         virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const { return 50; }
@@ -349,9 +365,30 @@ namespace fastllm {
             return -1;
         }
 
+        // Some direct GPU paths keep the page ids of logically bounded caches
+        // aligned with token-growing layers (for example during CUDA Graph
+        // replay).  Such caches must be charged as token-growing storage even
+        // though attention and the generic path still use a bounded tail.
+        virtual bool BoundedKVCacheUsesTokenGrowingStorage() const { return false; }
+
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
+
+        // Materialize model-specific serving scratch before the final automatic
+        // KV-cache calibration so its actual pool footprint is observable.
+        virtual void WarmupCudaServingHighWaterBuffers() {}
+
+        // Some serving resources (notably CUDA Graph objects) retain pointers
+        // into the paged KV cache and therefore cannot be materialized by the
+        // ordinary pre-calibration warmup.  Models may opt into a two-stage
+        // calibration: build those resources against a provisional KV cache,
+        // measure their real footprint, then rebuild them if KV sizing changes.
+        virtual bool MaterializeCudaServingForFinalKvCalibration() { return false; }
+
+        // Release every serving object that can retain a paged-KV address before
+        // the provisional cache is destroyed and reallocated at its final size.
+        virtual void ResetCudaServingForKvCacheResize() {}
 
         // 当前运行配置是否可以使用 ForwardGPU。
         // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
@@ -539,6 +576,10 @@ namespace fastllm {
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
+
+        // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
+        // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。
+        bool isIntermediateChunkedPrefill = false;
 
         int defaultChunkedPrefillSize = 8192;
 

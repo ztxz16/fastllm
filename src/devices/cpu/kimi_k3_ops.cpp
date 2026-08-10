@@ -424,7 +424,7 @@ namespace fastllm {
 
     void CpuKimiK3RecurrentKDAOp::Reshape(
             const std::string &, const DataDict &datas,
-            const FloatDict &, const IntDict &) {
+            const FloatDict &, const IntDict &intParams) {
         Data &q = *datas.find("q")->second;
         AssertInFastLLM(q.dims.size() == 4,
                         "KimiK3RecurrentKDA q must be [batch, sequence, heads, dim].");
@@ -432,17 +432,27 @@ namespace fastllm {
         int sequence = q.dims[1];
         int heads = q.dims[2];
         int dimension = q.dims[3];
-        KimiK3ReshapeLike(q, *datas.find("output")->second,
-                          DataType::BFLOAT16);
+        const bool stateOnly =
+            intParams.find("stateOnly") != intParams.end() &&
+            intParams.find("stateOnly")->second != 0;
+        const bool outputAux =
+            intParams.find("outputAux") == intParams.end() ||
+            intParams.find("outputAux")->second != 0;
+        if (!stateOnly) {
+            KimiK3ReshapeLike(q, *datas.find("output")->second,
+                              DataType::BFLOAT16);
+        }
         Data &state = *datas.find("state")->second;
         state.dataType = DataType::FLOAT32;
         state.Resize({batch, heads, dimension, dimension});
-        Data &decay = *datas.find("decay")->second;
-        decay.dataType = DataType::FLOAT32;
-        decay.Resize(q.dims);
-        Data &beta = *datas.find("beta")->second;
-        beta.dataType = DataType::FLOAT32;
-        beta.Resize({batch, sequence, heads});
+        if (!stateOnly && outputAux) {
+            Data &decay = *datas.find("decay")->second;
+            decay.dataType = DataType::FLOAT32;
+            decay.Resize(q.dims);
+            Data &beta = *datas.find("beta")->second;
+            beta.dataType = DataType::FLOAT32;
+            beta.Resize({batch, sequence, heads});
+        }
     }
 
     void CpuKimiK3RecurrentKDAOp::Run(
@@ -479,6 +489,9 @@ namespace fastllm {
         const bool stateOnly =
             intParams.find("stateOnly") != intParams.end() &&
             intParams.find("stateOnly")->second != 0;
+        const bool outputAux =
+            intParams.find("outputAux") == intParams.end() ||
+            intParams.find("outputAux")->second != 0;
         const int requestedTokens =
             intParams.find("tokenLimit") == intParams.end() ? -1 :
             intParams.find("tokenLimit")->second;
@@ -504,8 +517,10 @@ namespace fastllm {
         }
         if (!stateOnly) {
             output.Allocate(false);
-            decay.Allocate(false);
-            activatedBeta.Allocate(false);
+            if (outputAux) {
+                decay.Allocate(false);
+                activatedBeta.Allocate(false);
+            }
         }
 
         const uint16_t *qData = (const uint16_t*)q.cpuData;
@@ -518,8 +533,9 @@ namespace fastllm {
         float *stateData = (float*)state.cpuData;
         uint16_t *outputData = stateOnly ? nullptr :
             (uint16_t*)output.cpuData;
-        float *decayData = stateOnly ? nullptr : (float*)decay.cpuData;
-        float *activatedBetaData = stateOnly ? nullptr :
+        float *decayData = stateOnly || !outputAux ? nullptr :
+            (float*)decay.cpuData;
+        float *activatedBetaData = stateOnly || !outputAux ? nullptr :
             (float*)activatedBeta.cpuData;
         float outputScale = 1.0f / std::sqrt((float)dimension);
 
@@ -539,7 +555,7 @@ namespace fastllm {
                     uint64_t betaIndex =
                         ((uint64_t)batchIndex * sequence + token) * heads + head;
                     float beta = KimiK3Sigmoid(betaData[betaIndex]);
-                    if (!stateOnly) {
+                    if (activatedBetaData != nullptr) {
                         activatedBetaData[betaIndex] = beta;
                     }
                     for (int channel = 0; channel < dimension; channel++) {
@@ -554,7 +570,7 @@ namespace fastllm {
                         float gate = lowerBound * KimiK3Sigmoid(
                             std::exp(a) *
                             (raw + dtBiasData[(uint64_t)head * dimension + channel]));
-                        if (!stateOnly) {
+                        if (decayData != nullptr) {
                             decayData[vectorBase + channel] = gate;
                         }
                         float retention = std::exp(gate);

@@ -13,7 +13,9 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -24,8 +26,22 @@ constexpr int FP8_MARLIN_SCALES_HALF_IDX = 1;
 constexpr int FP8_GROUP_SIZE = 128;
 constexpr int FP8_MARLIN_CONVERT_MAX_M = 8;
 
+static bool Fp8MarlinEnvFlagDefaultEnabled(const char *name, bool defaultValue) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return defaultValue;
+    }
+    return std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0 &&
+           std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "OFF") != 0;
+}
+
 // Runtime gate only: SM75+ uses dense FP8 Marlin; SM70/60 still compile
-// (device stubs under __CUDA_ARCH__ < 750) and fall back to GEMV here.
+// (device stubs under __CUDA_ARCH__ < 750) and fall back to GEMV here. SM120
+// and SM121 use CUTLASS FP8 prefill kernels that require the original row-major
+// weights, so do not destructively repack them during warmup by default.
 static bool Fp8MarlinDeviceSupported() {
 #ifdef CUDA_NO_TENSOR_CORE
     return false;
@@ -36,7 +52,16 @@ static bool Fp8MarlinDeviceSupported() {
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
         return false;
     }
-    return major * 10 + minor >= 75;
+    int arch = major * 10 + minor;
+    bool defaultEnabled = true;
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
+    defaultEnabled = defaultEnabled && arch != 120;
+#endif
+#if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121)
+    defaultEnabled = defaultEnabled && arch != 121;
+#endif
+    return arch >= 75 &&
+           Fp8MarlinEnvFlagDefaultEnabled("FASTLLM_CUDA_FP8_MARLIN", defaultEnabled);
 #endif
 }
 
@@ -266,6 +291,11 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
 }
 
 }  // namespace
+
+extern "C" bool FastllmCudaHasFp8MarlinLayout(
+        const fastllm::Data &weight) {
+    return HasFp8MarlinOnDevice(weight);
+}
 
 extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
         const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,

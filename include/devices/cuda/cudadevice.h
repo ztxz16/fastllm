@@ -29,7 +29,8 @@ namespace fastllm {
         Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu, int weightsBatch = -1);
     void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
         Data &gate, Data &up, Data &down, Data &w1,
-        MoeGateType gateType = MoeGateSwiglu, float swigluLimit = 0.0f);
+        MoeGateType gateType = MoeGateSwiglu, float swigluLimit = 0.0f,
+        bool allowTriton = true);
     void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
     bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
     void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited = false);
@@ -414,7 +415,7 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
-    class CudaFusedSoftmaxSelectExpertOp : BaseOperator {
+    class CudaFusedSelectExpertOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
@@ -441,6 +442,10 @@ namespace fastllm {
     };
 
     class CudaLlama3RopeEncodingOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaYarnRopeEncodingOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

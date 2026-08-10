@@ -1379,7 +1379,8 @@ namespace fastllm {
         static bool Qwen3MoeIsNVFP4WeightType(DataType dataType) {
             return dataType == DataType::NVFP4 ||
                    dataType == DataType::NVFP4_BLOCK_16 ||
-                   dataType == DataType::NVFP4_BLOCK_16_E8M0;
+                   dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   dataType == DataType::NVFP4_BLOCK_32_E8M0;
         }
 
         struct Qwen3MoeForwardSingleBuffers {

@@ -118,6 +118,7 @@ class FunctionCallParser:
         self.stream_diagnostics: List[ToolCallDiagnostic] = []
         self.stream_tool_call_fragments: Dict[int, Dict[str, str]] = {}
         self.buffered_stream_tool_calls: Dict[int, List[Any]] = {}
+        self.stream_text = ""
         self._stream_finalized = False
 
     @classmethod
@@ -257,6 +258,7 @@ class FunctionCallParser:
         if not self.has_tools:
             return ToolCallParseResult(content=delta_text)
 
+        self.stream_text = current_text
         delta = self.parser.extract_tool_calls_streaming(
             previous_text=previous_text,
             current_text=current_text,
@@ -471,6 +473,20 @@ class FunctionCallParser:
             return []
         self._stream_finalized = True
         diagnostics: List[ToolCallDiagnostic] = []
+        if (self.has_tool_call(self.stream_text)
+                and not self.valid_stream_tool_indices
+                and not self.invalid_stream_tool_indices):
+            extracted = self.parser.extract_tool_calls(
+                self.stream_text, self._request)
+            if not extracted.tool_calls:
+                diagnostics.append(
+                    ToolCallDiagnostic(
+                        code="malformed_tool_block",
+                        message=(
+                            "tool call markup was detected but the stream "
+                            "ended before a complete tool call was parsed"
+                        ),
+                    ))
         if self._requires_tool_call() and not self.has_valid_streamed_tool_calls:
             diagnostics.append(
                 ToolCallDiagnostic(

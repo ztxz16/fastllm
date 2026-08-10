@@ -299,6 +299,179 @@ class FastLLmCompletion:
           return tool_choice.dict(exclude_none=True)
       return tool_choice
 
+  def _with_effective_tool_choice(
+      self,
+      request: ChatCompletionRequest,
+      tool_choice: Any,
+  ) -> ChatCompletionRequest:
+      """Return a request whose generation and parsing tool choices agree."""
+      if self._serialize_tool_choice(request.tool_choice) == tool_choice:
+          return request
+      model_copy = getattr(request, "model_copy", None)
+      if callable(model_copy):
+          return model_copy(update={"tool_choice": tool_choice})
+      return request.copy(update={"tool_choice": tool_choice})
+
+  def _resolve_kimi_k3_auto_tool_choice(
+      self,
+      messages: List[Dict[str, Any]],
+      tools: Optional[List[Dict[str, Any]]],
+      tool_choice: Any,
+  ) -> Any:
+      """Promote explicit workspace actions to K3's native required mode."""
+      if (not self._is_kimi_k3_model() or not tools
+              or tool_choice not in (None, "auto")):
+          return tool_choice
+
+      tool_names = {
+          str((tool.get("function") or {}).get("name", "")).lower()
+          for tool in tools if isinstance(tool, dict)
+      }
+      action_tools = {
+          "write", "edit", "apply_patch", "bash", "shell", "execute",
+          "run_command", "read", "delete", "remove", "move", "rename",
+      }
+      if not tool_names.intersection(action_tools):
+          return tool_choice
+
+      # Stop an agent loop after the client has rejected two tool calls for
+      # schema/argument errors in the same user turn. K3's `required` hint is
+      # advisory, and low-bit models can otherwise repeat the identical
+      # malformed call indefinitely.
+      recent_tool_errors = 0
+      for message in reversed(messages):
+          role = message.get("role")
+          if role == "user":
+              break
+          if role != "tool":
+              continue
+          content = message.get("content")
+          if not isinstance(content, str):
+              continue
+          if re.search(
+                  r"(?:schemaerror|invalid arguments|missing key)",
+                  content, re.IGNORECASE):
+              recent_tool_errors += 1
+      if recent_tool_errors >= 2:
+          return "none"
+
+      # Only promote a fresh user turn. Once a tool result is appended, the
+      # model must be free to finish, inspect, or make a deliberate follow-up
+      # call; repeatedly forcing `required` can turn one successful write into
+      # an endless sequence of unnecessary overwrites.
+      current_message = next(
+          (message for message in reversed(messages)
+           if message.get("role") not in {"system", "developer"}),
+          None,
+      )
+      if current_message is None or current_message.get("role") != "user":
+          return tool_choice
+
+      latest_user = ""
+      content = current_message.get("content")
+      if isinstance(content, str):
+          latest_user = content
+      elif isinstance(content, list):
+          latest_user = "\n".join(
+              str(part.get("text", ""))
+              for part in content
+              if isinstance(part, dict) and part.get("type") == "text")
+      if not latest_user.strip():
+          return tool_choice
+
+      # Avoid turning explanatory questions into actions merely because they
+      # mention "write", "run", or another operational verb.
+      explanatory_question = re.search(
+          r"(?:如何|怎么|怎样|为什么|请解释|教程|原理|区别|"
+          r"\bhow\s+(?:do|can|should|would)\b|\bwhat\s+is\b|"
+          r"\bwhy\b|\bexplain\b)",
+          latest_user, re.IGNORECASE)
+      if explanatory_question:
+          return tool_choice
+
+      artifact = re.search(
+          r"(?:文件|网页|页面|代码|脚本|项目|程序|测试|命令|"
+          r"\bfile\b|html|css|javascript|\bcode\b|"
+          r"\bscript\b|\bproject\b|\bprogram\b|\btest\b|\bcommand\b)",
+          latest_user, re.IGNORECASE)
+      if not artifact:
+          return tool_choice
+
+      chinese_request = re.search(
+          r"(?:(?:帮我|请(?:你)?|麻烦|给我|替我|直接).{0,16}|^\s*)"
+          r"(?:写|创建|新建|生成|实现|制作|修改|编辑|修复|删除|"
+          r"重命名|移动|运行|执行|检查)",
+          latest_user, re.IGNORECASE)
+      english_request = re.search(
+          r"(?:\bplease\b|\bcan\s+you\b|\bcould\s+you\b|"
+          r"\bwould\s+you\b|^\s*)"
+          r"(?:.{0,24}\s)?"
+          r"\b(?:create|write|edit|modify|fix|implement|build|generate|"
+          r"make|delete|remove|rename|move|run|execute|inspect|check)\b",
+          latest_user, re.IGNORECASE)
+      if chinese_request or english_request:
+          return "required"
+      return tool_choice
+
+  def _apply_kimi_k3_auto_tool_guidance(
+      self,
+      messages: List[Dict[str, Any]],
+      tools: Optional[List[Dict[str, Any]]],
+      tool_choice: Any,
+  ) -> List[Dict[str, Any]]:
+      if (not self._is_kimi_k3_model() or not tools
+              or tool_choice not in (None, "auto")):
+          return messages
+      guidance = (
+          "Kimi K3 tool-choice reminder: tool_choice is auto. Decide whether "
+          "the current request requires an external action. If completing it "
+          "requires creating or editing files, running commands, inspecting "
+          "workspace or external state, or otherwise acting beyond a plain-text "
+          "answer, call the appropriate available tools in this message. Do not "
+          "only say that you will do it. For file operations, use the exact "
+          "working directory or path supplied by the conversation and tool "
+          "results; never invent a placeholder path such as /tmp/opencode. "
+          "Write complete runnable content, preserve a successful file instead "
+          "of replacing it with a partial version, and verify code changes when "
+          "practical. After tools have completed the request, return the final "
+          "answer unless another concrete action is needed. For conversation "
+          "or questions that can be answered directly from the provided "
+          "context, respond without a tool.")
+      guided = [dict(message) for message in messages]
+      for index, message in enumerate(guided):
+          content = message.get("content")
+          if message.get("role") == "system" and isinstance(content, str):
+              if guidance not in content:
+                  guided[index]["content"] = content.rstrip() + "\n\n" + guidance
+              return guided
+      guided.insert(0, {"role": "system", "content": guidance})
+      return guided
+
+  def _apply_kimi_k3_required_tool_guidance(
+      self,
+      messages: List[Dict[str, Any]],
+      tools: Optional[List[Dict[str, Any]]],
+      tool_choice: Any,
+  ) -> List[Dict[str, Any]]:
+      if (not self._is_kimi_k3_model() or not tools
+              or tool_choice != "required"):
+          return messages
+      guidance = (
+          "\n\n系统动作要求：必须立即调用合适的工具完成上述操作；不要只说明"
+          "将要执行，也不要在信息足够时追问。纯文本回复无效。如果请求是"
+          "创建或写入文件，直接调用 write 工具，不要先用 bash 检查目录；"
+          "调用 write 时必须同时提供 filePath 和完整 content。")
+      guided = [dict(message) for message in messages]
+      for index in range(len(guided) - 1, -1, -1):
+          message = guided[index]
+          if message.get("role") != "user":
+              continue
+          content = message.get("content")
+          if isinstance(content, str) and guidance not in content:
+              guided[index]["content"] = content.rstrip() + guidance
+          break
+      return guided
+
   def _normalize_model_delta(self, text: str) -> str:
       if text == "[unused16]":
           return "<think>"
@@ -1068,7 +1241,26 @@ class FastLLmCompletion:
           return None
       from .toolcall_constraints import compile_tool_call_constraint
       spec = compile_tool_call_constraint(descriptor)
-      return spec.to_dict() if spec is not None else None
+      if spec is None:
+          return None
+      payload = spec.to_dict()
+      if (self._is_kimi_k3_model()
+              and request.temperature is None
+              and request.top_p is None
+              and request.top_k is None):
+          # K3's greedy path is reliable for tool and parameter structure, but
+          # long content-like string values can degenerate and never close
+          # their XTML tags. Keep structure deterministic and apply a mild
+          # repetition penalty only after an argument grows beyond the backend
+          # threshold.
+          payload["content_sampling"] = {
+              "type": "tool_content_sampling",
+              "format": "kimi_k3_xtml",
+              "top_k": 1,
+              "top_p": 1.0,
+              "temperature": 1.0,
+          }
+      return payload
 
   def _model_supports_tool_call_constraint(self) -> bool:
       launch_fn = getattr(self.model, "launch_stream_response", None)
@@ -1598,8 +1790,18 @@ class FastLLmCompletion:
       fallback_output_tokens: int,
   ) -> Tuple[int, int, int, int]:
       statistics = dict(response_statistics or {})
+      # FetchResponseTokens removes a finished context, and handle ids are
+      # reused immediately.  The streaming adapter captures the terminal
+      # counters before that removal, so a complete captured snapshot is more
+      # authoritative than a later lookup by handle.  Looking the handle up
+      # again can otherwise read counters from an unrelated, newly launched
+      # request (the classic handle ABA problem).
+      has_captured_statistics = all(
+          key in statistics for key in (
+              "cached_input_tokens", "missed_input_tokens", "output_tokens"))
       get_statistics = getattr(self.model, "get_response_statistics", None)
-      if handle is not None and callable(get_statistics):
+      if (not has_captured_statistics and handle is not None
+              and callable(get_statistics)):
           latest = get_statistics(handle)
           if latest is not None:
               statistics.update(latest)
@@ -2466,6 +2668,14 @@ class FastLLmCompletion:
       model_videos = media.videos if media.videos else None
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
+      messages = self._apply_kimi_k3_auto_tool_guidance(
+          messages, tools, tool_choice)
+      tool_choice = self._resolve_kimi_k3_auto_tool_choice(
+          messages, tools, tool_choice)
+      messages = self._apply_kimi_k3_required_tool_guidance(
+          messages, tools, tool_choice)
+      effective_request = self._with_effective_tool_choice(
+          request, tool_choice)
 
       launch_kwargs = {
           "max_length": max_length,
@@ -2489,7 +2699,7 @@ class FastLLmCompletion:
               "chat_template_kwargs": request.chat_template_kwargs,
           })
       self._attach_tool_call_constraint_if_supported(
-          launch_kwargs, request)
+          launch_kwargs, effective_request)
 
       def prepare_and_launch_text_request():
           # Token counting and launch both apply the chat template.  Keep them
@@ -2533,7 +2743,7 @@ class FastLLmCompletion:
       # Streaming response
       if request.stream:
           return (self.chat_completion_stream_generator(
-              request, raw_request, result_generator, request_id,
+              effective_request, raw_request, result_generator, request_id,
               input_token_len, think = need_think_prefix,
               emit_reasoning_content = emit_reasoning_content,
               handle = handle, response_statistics = response_statistics),
@@ -2541,25 +2751,39 @@ class FastLLmCompletion:
       else:
           try:
               return await self.chat_completion_full_generator(
-                  request, raw_request, handle, result_generator, request_id,
+                  effective_request, raw_request, handle, result_generator,
+                  request_id,
                   input_token_len, think = need_think_prefix,
                   emit_reasoning_content = emit_reasoning_content,
                   response_statistics = response_statistics)
           except ValueError as e:
               return self.create_error_response(str(e))
 
-  async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # 进入BackgroundTask之后，说明流式请求已经断开了，那么这里直接abort
+  def _release_conversation_handle(
+      self, request_id: str, handle: Optional[int]
+  ) -> bool:
+    if handle is None or self.conversation_handles.get(request_id) != handle:
+      return False
+    self.conversation_handles.pop(request_id, None)
+    return True
+
+  def _abort_conversation_handle(
+      self, request_id: str, handle: Optional[int]
+  ) -> bool:
+    if not self._release_conversation_handle(request_id, handle):
+      return False
     self.model.abort_handle(handle)
-    logging.info(f"Abort request: {request_id}")
-    return
-  
-    while True:
-      if await raw_request.is_disconnected():
-        self.model.abort_handle(handle)
-        logging.info(f"Abort request: {request_id}")
-        return
-      await asyncio.sleep(1)  # 检查间隔
+    return True
+
+  async def check_disconnect(self, raw_request: Request, request_id, handle: int):
+    # Starlette runs a StreamingResponse BackgroundTask after both a normal
+    # completion and a client disconnect.  A naturally exhausted generator
+    # releases ownership before its terminal SSE is yielded.  Only an
+    # interrupted generator remains active here, so abort it while the
+    # request_id still owns the integer handle.
+    if not self._abort_conversation_handle(request_id, handle):
+      return
+    logging.info(f"Abort disconnected request: {request_id}")
       
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
@@ -2751,6 +2975,7 @@ class FastLLmCompletion:
             "content_done": False,
         }
 
+        stream_exhausted = False
         async for res in result_generator:
             res = self._normalize_model_delta(res)
             completion_tokens += 1
@@ -2852,6 +3077,18 @@ class FastLLmCompletion:
             if stopped_by_stop_string:
                 break
             #await asyncio.sleep(0)
+        else:
+            stream_exhausted = True
+
+        # FetchResponseTokens removes a terminal backend context, so its
+        # integer handle can be reused immediately.  Drop request ownership in
+        # the same event-loop turn, before yielding any final content/usage
+        # event.  An early server-side stop has not exhausted the backend and
+        # must be aborted explicitly before ownership is released.
+        if stream_exhausted:
+            self._release_conversation_handle(request_id, handle)
+        elif self._abort_conversation_handle(request_id, handle):
+            logging.info(f"Abort early-terminated request: {request_id}")
 
         if (not request.tools) and not stopped_by_stop_string:
             delta_text = self._flush_stop_buffer(stop_strings, stop_filter_state)
@@ -2917,6 +3154,15 @@ class FastLLmCompletion:
                     final_diagnostics)
                 logging.warning("Invalid stream tool call final state: %s",
                                 diagnostics)
+                if os.environ.get(
+                        "FT_TOOLCALL_DEBUG_OUTPUT", "").strip().upper() in (
+                            "1", "ON", "TRUE", "YES"):
+                    logging.warning(
+                        "Invalid stream raw output: chars=%d head=%r tail=%r",
+                        len(current_text),
+                        current_text[:2048],
+                        current_text[-2048:],
+                    )
                 final_stream_error_data = self.create_streaming_error_response(
                     f"Invalid tool call: {diagnostics}",
                     err_type = "invalid_tool_call",
@@ -2976,15 +3222,12 @@ class FastLLmCompletion:
                 yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
+        if self._abort_conversation_handle(request_id, handle):
+          logging.info(f"Abort failed streaming request: {request_id}")
         data = self.create_streaming_error_response(str(e))
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
-      
-      # After completion, remove the conversation from tracking dictionary
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
-          # logging.info(f"Removed completed stream conversation from tracking: {request_id}")
-      
+
       yield "data: [DONE]\n\n"
       await asyncio.sleep(0)
 
@@ -3181,6 +3424,11 @@ class FastLLmCompletion:
                                   partial_json = tool_delta.function.arguments),
                           ))
 
+          # Release the terminal handle before any closing SSE is yielded.  A
+          # client cancellation after message_delta/message_stop must not let
+          # the old BackgroundTask abort a newly recycled numeric handle.
+          self._release_conversation_handle(request_id, handle)
+
           if text_block_index is not None:
               yield self._create_anthropic_sse_event(
                   "content_block_stop",
@@ -3208,6 +3456,8 @@ class FastLLmCompletion:
               "message_stop",
               MessageStopEvent())
       except ValueError as e:
+          if self._abort_conversation_handle(request_id, handle):
+              logging.info(f"Abort failed Anthropic streaming request: {request_id}")
           error_data = json.dumps({
               "type": "error",
               "error": {
@@ -3217,9 +3467,6 @@ class FastLLmCompletion:
           })
           yield f"event: error\ndata: {error_data}\n\n"
           await asyncio.sleep(0)
-
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
 
       await asyncio.sleep(0)
       

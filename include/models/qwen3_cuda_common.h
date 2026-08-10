@@ -316,6 +316,114 @@ namespace fastllm {
         return (int)value;
     }
 
+    inline bool Qwen3CudaTryRMSNormLinearFp8(
+            Qwen3CudaDirectRunner &runner,
+            Data &input, Data &normWeight, float eps,
+            Data &weight, const Data &bias, Data &output) {
+        if (GetFastllmEnv().cudaGraph ||
+            input.dims.empty() || weight.dims.size() != 2 ||
+            input.cudaData == nullptr || normWeight.cudaData == nullptr ||
+            weight.cudaData == nullptr ||
+            input.dataType != DataType::FLOAT16 ||
+            normWeight.dataType != DataType::FLOAT32 ||
+            weight.dataType != DataType::FP8_E4M3 ||
+            weight.blockM != 128 || weight.blockK != 128 ||
+            weight.scales.empty() ||
+            (bias.dims.size() > 0 &&
+             bias.dataType != DataType::FLOAT32)) {
+            return false;
+        }
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back();
+        int k = weight.dims[0];
+        if (n < 64 || m != 5120 || k <= 0 || (k % 128) != 0 ||
+            weight.dims[1] != m ||
+            normWeight.Count(0) != m) {
+            return false;
+        }
+        std::vector<int> outputDims = input.dims;
+        outputDims.back() = k;
+        output.dataType = input.dataType;
+        Qwen3CudaPrepareLocalOutput(output, runner.DeviceId());
+        output.Resize(outputDims);
+        output.Allocate(false);
+        return FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNorm(
+            input, normWeight, eps, weight, bias, output, n, m, k);
+    }
+
+    inline bool Qwen3CudaTryRMSNormLinearFp8Materialize(
+            Qwen3CudaDirectRunner &runner,
+            Data &input, Data &normWeight, float eps,
+            Data &normOutput,
+            Data &weight, const Data &bias, Data &output) {
+        if (GetFastllmEnv().cudaGraph ||
+            input.dims.empty() || weight.dims.size() != 2 ||
+            input.cudaData == nullptr || normWeight.cudaData == nullptr ||
+            weight.cudaData == nullptr ||
+            input.dataType != DataType::FLOAT16 ||
+            normWeight.dataType != DataType::FLOAT32 ||
+            weight.dataType != DataType::FP8_E4M3 ||
+            weight.blockM != 128 || weight.blockK != 128 ||
+            weight.scales.empty() ||
+            (bias.dims.size() > 0 &&
+             bias.dataType != DataType::FLOAT32)) {
+            return false;
+        }
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back();
+        int k = weight.dims[0];
+        if (n < 64 || m != 5120 || k <= 0 || (k % 128) != 0 ||
+            weight.dims[1] != m ||
+            normWeight.Count(0) != m) {
+            return false;
+        }
+
+        normOutput.dataType = input.dataType;
+        Qwen3CudaPrepareLocalOutput(normOutput, runner.DeviceId());
+        normOutput.Resize(input.dims);
+        normOutput.Allocate(false);
+
+        std::vector<int> outputDims = input.dims;
+        outputDims.back() = k;
+        output.dataType = input.dataType;
+        Qwen3CudaPrepareLocalOutput(output, runner.DeviceId());
+        output.Resize(outputDims);
+        output.Allocate(false);
+        return FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNormMaterialize(
+            input, normWeight, eps, normOutput,
+            weight, bias, output, n, m, k);
+    }
+
+    inline bool Qwen3CudaCanUseTpFp8ExactResidual(
+            const Data &input, const Data &weight, const Data &bias,
+            const Data &hiddenStates, int gpuId,
+            bool inputIsGateUp = false) {
+        if (!Qwen3CudaEnvDefaultEnabled(
+                "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_EXACT_RESIDUAL_TP") ||
+            input.dims.empty() || weight.dims.size() != 2 ||
+            hiddenStates.dims.empty() || !bias.dims.empty() ||
+            input.dataType != DataType::FLOAT16 ||
+            hiddenStates.dataType != DataType::FLOAT16 ||
+            weight.dataType != DataType::FP8_E4M3 ||
+            weight.blockM != 128 || weight.blockK != 128 ||
+            weight.scales.empty() ||
+            input.dims.back() !=
+                weight.dims[1] * (inputIsGateUp ? 2 : 1) ||
+            hiddenStates.dims.back() != weight.dims[0] ||
+            (weight.dims[0] % 128) != 0 ||
+            (weight.dims[1] % 128) != 0) {
+            return false;
+        }
+        int tokens = input.Count(0) / input.dims.back();
+        int minTokens = Qwen3CudaEnvInt(
+            "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_EXACT_RESIDUAL_TP_MIN_BATCH",
+            128);
+        return tokens >= minTokens &&
+               !FastllmCanUseTP2P2PAllReduceAdd(
+                   hiddenStates.Count(0),
+                   (int)hiddenStates.dataType, gpuId);
+    }
+
     inline bool Qwen3CudaCanUseSwigluLinearAdd(
             const Data &input, const Data &gateUp, const Data &down,
             const Data &downBias, const Data &hiddenStates, bool tensorParallel) {
@@ -372,6 +480,204 @@ namespace fastllm {
             return true;
         }
         FastllmCudaAddTo(hiddenStates, middle, 1.0f);
+        return true;
+    }
+
+    inline bool Qwen3CudaTryTpSwigluLinearResidualReduce(
+            Qwen3CudaDirectRunner &runner,
+            Data &input, Data &gateUp, Data &gateUpBias,
+            Data &down, Data &downBias,
+            Data &gateUpResult, Data &middle,
+            Data &hiddenStates,
+            bool tensorParallel, bool firstTensorParallelRank,
+            int gpuId, Data *preRmsWeight = nullptr,
+            float preRmsEps = 0.0f) {
+        if (!tensorParallel ||
+            !Qwen3CudaEnvDefaultEnabled(
+                "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT_TP") ||
+            !Qwen3CudaCanUseSwigluLinearAdd(
+                input, gateUp, down, downBias,
+                hiddenStates, false)) {
+            return false;
+        }
+        int tokens = input.Count(0) / input.dims.back();
+        int minTokens = Qwen3CudaEnvInt(
+            "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT_TP_MIN_BATCH",
+            128);
+        if (tokens < minTokens) {
+            return false;
+        }
+
+        if (preRmsWeight != nullptr) {
+            if (!Qwen3CudaEnvDefaultEnabled(
+                    "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_RMSNORM_QUANT_TP")) {
+                return false;
+            }
+            if (!Qwen3CudaTryRMSNormLinearFp8(
+                    runner, input, *preRmsWeight, preRmsEps,
+                    gateUp, gateUpBias, gateUpResult)) {
+                return false;
+            }
+        } else {
+            Qwen3CudaLinear(
+                runner, input, gateUp, gateUpBias, gateUpResult);
+        }
+        std::vector<int> dims = gateUpResult.dims;
+        dims.back() = down.dims[0];
+        middle.dataType = gateUpResult.dataType;
+        Qwen3CudaPrepareLocalOutput(middle, runner.DeviceId());
+        middle.Resize(dims);
+        middle.Allocate(false);
+        int n = gateUpResult.Count(0) / gateUpResult.dims.back();
+        int m = gateUpResult.dims.back() / 2;
+        int k = down.dims[0];
+        bool useP2P = FastllmCanUseTP2P2PAllReduceAdd(
+                hiddenStates.Count(0),
+                (int)hiddenStates.dataType, gpuId);
+        bool directPartialOutput =
+            !firstTensorParallelRank && !useP2P &&
+            Qwen3CudaEnvDefaultEnabled(
+                "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_TP_DIRECT_OUTPUT");
+        bool exactResidual = false;
+        if (firstTensorParallelRank && !useP2P &&
+            Qwen3CudaCanUseTpFp8ExactResidual(
+                gateUpResult, down, downBias, hiddenStates, gpuId, true)) {
+            exactResidual =
+                FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAdd(
+                    gateUpResult, down, downBias,
+                    hiddenStates, n, m, k);
+        }
+        if (!exactResidual &&
+            !FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(
+                gateUpResult, down, downBias,
+                directPartialOutput ? hiddenStates : middle,
+                n, m, k)) {
+            return false;
+        }
+
+        if (useP2P &&
+            FastllmTryTP2P2PAllReduceAdd(
+                middle.cudaData, hiddenStates.cudaData,
+                hiddenStates.Count(0),
+                (int)hiddenStates.dataType, gpuId)) {
+            return true;
+        }
+        if (firstTensorParallelRank) {
+            if (!exactResidual) {
+                FastllmCudaAddTo(hiddenStates, middle, 1.0f);
+            }
+        } else if (!directPartialOutput) {
+            FastllmCudaCopyFromDeviceToDevice(
+                hiddenStates.cudaData, middle.cudaData,
+                hiddenStates.GetBytes());
+        }
+        FastllmNcclAllReduce(
+            hiddenStates.cudaData, hiddenStates.cudaData,
+            hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+        return true;
+    }
+
+    inline bool Qwen3CudaTryTpGdnOutputGateLinearResidualReduce(
+            Qwen3CudaDirectRunner &runner,
+            const Data &headMajorInput, Data &normWeight,
+            const Data &combinedGateInput,
+            int batch, int seqLen, int gateOffset,
+            int gateHeads, float eps,
+            Data &weight, Data &bias,
+            Data &middle, Data &hiddenStates,
+            bool tensorParallel, bool firstTensorParallelRank,
+            int gpuId) {
+        if (GetFastllmEnv().cudaGraph ||
+            !GetFastllmEnv().cudaTriton ||
+            !tensorParallel ||
+            !Qwen3CudaEnvDefaultEnabled(
+                "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_GDN_OUTPUT_GATE_QUANT_TP") ||
+            batch <= 0 || seqLen <= 0 ||
+            gateOffset < 0 || gateHeads <= 0 ||
+            headMajorInput.dataType != DataType::FLOAT16 ||
+            normWeight.dataType != DataType::FLOAT32 ||
+            combinedGateInput.dataType != DataType::FLOAT16 ||
+            hiddenStates.dataType != DataType::FLOAT16 ||
+            weight.dataType != DataType::FP8_E4M3 ||
+            weight.blockM != 128 || weight.blockK != 128 ||
+            weight.scales.empty() ||
+            weight.dims.size() != 2 ||
+            hiddenStates.dims.empty() ||
+            !bias.dims.empty()) {
+            return false;
+        }
+
+        int n = batch * seqLen;
+        int m = gateHeads * 128;
+        int k = weight.dims[0];
+        int minTokens = Qwen3CudaEnvInt(
+            "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_GDN_OUTPUT_GATE_QUANT_TP_MIN_BATCH",
+            128);
+        if (n < minTokens || m <= 0 || k <= 0 ||
+            (m % 128) != 0 || (k % 128) != 0 ||
+            weight.dims[1] != m ||
+            hiddenStates.dims.back() != k ||
+            hiddenStates.Count(0) != (uint64_t)n * k ||
+            normWeight.Count(0) != 128) {
+            return false;
+        }
+
+        middle.dataType = hiddenStates.dataType;
+        Qwen3CudaPrepareLocalOutput(middle, runner.DeviceId());
+        middle.Resize(hiddenStates.dims);
+        middle.Allocate(false);
+
+        bool useP2P = FastllmCanUseTP2P2PAllReduceAdd(
+            hiddenStates.Count(0),
+            (int)hiddenStates.dataType, gpuId);
+        bool directPartialOutput =
+            !firstTensorParallelRank && !useP2P &&
+            Qwen3CudaEnvDefaultEnabled(
+                "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_TP_DIRECT_OUTPUT");
+        int exactMinTokens = Qwen3CudaEnvInt(
+            "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_EXACT_RESIDUAL_TP_MIN_BATCH",
+            128);
+        bool exactResidual = false;
+        if (firstTensorParallelRank && !useP2P &&
+            n >= exactMinTokens &&
+            Qwen3CudaEnvDefaultEnabled(
+                "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_EXACT_RESIDUAL_TP")) {
+            exactResidual =
+                FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGateAdd(
+                    headMajorInput, normWeight, combinedGateInput,
+                    batch, seqLen, gateOffset, gateHeads, eps,
+                    weight, bias, hiddenStates, n, m, k);
+        }
+        if (!exactResidual &&
+            !FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGate(
+                headMajorInput, normWeight, combinedGateInput,
+                batch, seqLen, gateOffset, gateHeads, eps,
+                weight, bias,
+                directPartialOutput ? hiddenStates : middle,
+                n, m, k)) {
+            return false;
+        }
+
+        if (useP2P &&
+            FastllmTryTP2P2PAllReduceAdd(
+                middle.cudaData, hiddenStates.cudaData,
+                hiddenStates.Count(0),
+                (int)hiddenStates.dataType, gpuId)) {
+            return true;
+        }
+        if (firstTensorParallelRank) {
+            if (!exactResidual) {
+                FastllmCudaAddTo(hiddenStates, middle, 1.0f);
+            }
+        } else if (!directPartialOutput) {
+            FastllmCudaCopyFromDeviceToDevice(
+                hiddenStates.cudaData, middle.cudaData,
+                hiddenStates.GetBytes());
+        }
+        FastllmNcclAllReduce(
+            hiddenStates.cudaData, hiddenStates.cudaData,
+            hiddenStates.Count(0), hiddenStates.dataType,
+            gpuId);
         return true;
     }
 
@@ -511,6 +817,34 @@ namespace fastllm {
         return true;
     }
 
+    inline bool Qwen3CudaTryFusedSigmoidSelectExpert(
+            Qwen3CudaDirectRunner &runner, const Data &logits,
+            Data &index, Data &score, int topk, bool needNorm,
+            float routeScale, const Data *gateBias) {
+        if (logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 || topk != 10 ||
+            (logits.dataType != DataType::FLOAT16 &&
+             logits.dataType != DataType::BFLOAT16 &&
+             logits.dataType != DataType::FLOAT32)) {
+            return false;
+        }
+        if (gateBias != nullptr && !gateBias->dims.empty() &&
+            ((gateBias->dataType != DataType::FLOAT32 &&
+              gateBias->dataType != DataType::FLOAT16 &&
+              gateBias->dataType != DataType::BFLOAT16) ||
+             gateBias->Count(0) != 256)) {
+            return false;
+        }
+        DataDict datas = {{"logits", (Data*)&logits}, {"index", &index}, {"score", &score}};
+        if (gateBias != nullptr) {
+            datas["gateBias"] = (Data*)gateBias;
+        }
+        runner.Run("FusedSigmoidSelectExpert", datas,
+                   FloatDict{{"routeScale", routeScale}},
+                   IntDict{{"topk", topk}, {"needNorm", needNorm ? 1 : 0}},
+                   {"index", "score"});
+        return true;
+    }
+
     inline void Qwen3CudaToDataType(Qwen3CudaDirectRunner &runner, Data &input, DataType dataType) {
         if (input.dataType == dataType) {
             return;
@@ -531,7 +865,8 @@ namespace fastllm {
             Data &input, Data &weight, Data &bias,
             Data &middle, Data &hiddenStates,
             bool tensorParallel, bool firstTensorParallelRank,
-            int gpuId, bool enableTP2P2PAllReduce = false) {
+            int gpuId, bool enableTP2P2PAllReduce = false,
+            bool forceNativeNccl = false) {
         DataType residualType = hiddenStates.dataType;
         bool canAddDirectly = input.dataType == residualType;
 
@@ -542,6 +877,22 @@ namespace fastllm {
             Qwen3CudaToDataType(runner, middle, residualType);
             if (Qwen3CudaTryTP2P2PAllReduceAddResidual(
                     middle, hiddenStates, gpuId)) {
+                return;
+            }
+        }
+
+        if (tensorParallel && firstTensorParallelRank &&
+            Qwen3CudaCanUseTpFp8ExactResidual(
+                input, weight, bias, hiddenStates, gpuId)) {
+            int n = input.Count(0) / input.dims.back();
+            int m = input.dims.back();
+            int k = weight.dims[0];
+            if (FastllmCudaCutlassLinearFP8E4M3Block128Add(
+                    input, weight, bias, hiddenStates, n, m, k)) {
+                FastllmNcclAllReduce(
+                    hiddenStates.cudaData, hiddenStates.cudaData,
+                    hiddenStates.Count(0), hiddenStates.dataType,
+                    gpuId);
                 return;
             }
         }
@@ -560,9 +911,15 @@ namespace fastllm {
                 Qwen3CudaLinear(runner, input, weight, bias, hiddenStates);
                 Qwen3CudaToDataType(runner, hiddenStates, residualType);
             }
-            FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
-                                 hiddenStates.Count(0), hiddenStates.dataType,
-                                 gpuId);
+            if (forceNativeNccl) {
+                FastllmNcclAllReduceNoCustom(
+                    hiddenStates.cudaData, hiddenStates.cudaData,
+                    hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+            } else {
+                FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
+                                     hiddenStates.Count(0), hiddenStates.dataType,
+                                     gpuId);
+            }
             return;
         }
 
@@ -738,7 +1095,8 @@ namespace fastllm {
             int attentionType,
             bool inited,
             bool enableCudaGraph = false,
-            int flashInferCudaGraph = -1) {
+            int flashInferCudaGraph = -1,
+            int windowLeft = -1) {
         runner.Run("AttentionPagedBatch",
                    DataDict{{"q", &q}, {"kCaches", &kCaches}, {"vCaches", &vCaches},
                             {"output", &output}, {"qSizes", &qSizes}, {"pageSizes", &pageSizes},
@@ -746,7 +1104,8 @@ namespace fastllm {
                    FloatDict{{"scale", scale}},
                    IntDict{{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited},
                            {"sync", 0}, {"enableCudaGraph", (int)enableCudaGraph},
-                           {"flashInferCudaGraph", flashInferCudaGraph}},
+                           {"flashInferCudaGraph", flashInferCudaGraph},
+                           {"windowLeft", windowLeft}},
                    {"output"});
     }
 

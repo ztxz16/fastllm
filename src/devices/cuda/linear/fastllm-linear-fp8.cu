@@ -136,7 +136,7 @@ bool FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
         state = cudaDeviceSynchronize();
     }
     if (state != cudaSuccess) {
-        printf("Error: FP8 draft lm_head quantization failed on cuda:%d (%s).\n",
+        printf("Error: FP8 block128 weight quantization failed on cuda:%d (%s).\n",
                device, cudaGetErrorString(state));
         output.FreeSpace();
         return false;
@@ -465,11 +465,12 @@ FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128(const half * __restrict__ A, co
         const int i = g << 4;
         const int scaleCol = i >> 7;
         half2 Bv[ROWS][8];
-        float sc[ROWS];
+        // st0 is ROWS-aligned and every instantiated ROWS divides blockM=128,
+        // so all rows owned by this warp share the same block scale.
+        const float sc = scales[(st0 >> 7) * ms + scaleCol] * 256.0f;
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             if (r >= nValid) continue;
-            sc[r] = scales[((st0 + r) >> 7) * ms + scaleCol] * 256.0f;
             FastllmDequantFp8E4M3x16(bw[r], Bv[r]);
         }
 
@@ -500,7 +501,7 @@ FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128(const half * __restrict__ A, co
                                       __hmul2(ah[wi * 2 + 1], Bv[r][wi * 2 + 1]));
                     gsum += __half2float(p.x) + __half2float(p.y);
                 }
-                acc[x][r] += gsum * sc[r];
+                acc[x][r] += gsum * sc;
             }
         }
     }
@@ -574,6 +575,22 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
     constexpr int ROWS = 4;
     const int grid = (k + W * ROWS - 1) / (W * ROWS);
     const bool useBlock128 = (blockM == 128 && blockK == 128 && (m & 127) == 0);
+
+    // Small batch-one projections do not expose enough warps when each warp
+    // owns four rows (2048 outputs only launch four warps/SM on AD102).  The
+    // activation is cache-resident, so using two rows per warp improves DRAM
+    // latency hiding; keep ROWS=4 for larger outputs and multi-token calls to
+    // limit repeated activation work.
+    if (n == 1 && useBlock128 && k <= 2048) {
+        constexpr int SMALL_W = 2;
+        constexpr int SMALL_ROWS = 2;
+        const int smallGrid =
+            (k + SMALL_W * SMALL_ROWS - 1) / (SMALL_W * SMALL_ROWS);
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
+            <SMALL_W, 1, SMALL_ROWS> <<< smallGrid, SMALL_W * 32 >>>(
+                input, weight, output, bias, scales, m, k);
+        return;
+    }
 
 #define FASTLLM_FP8_WARP_LAUNCH(PARTVAL, AOFF, COFF) do { \
     if (useBlock128) { \
@@ -2071,7 +2088,8 @@ __global__ void FastllmGemvNVFP4Kernel1MultiRow(InputT *A, uint8_t *packedWeight
     }
 }
 
-template <int THREAD_PER_BLOCK, int PART, bool SCALE_E8M0, typename InputT, typename OutputT, typename BiasT>
+template <int THREAD_PER_BLOCK, int PART, bool SCALE_E8M0,
+          bool BLOCK32, typename InputT, typename OutputT, typename BiasT>
 __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, OutputT *C,
                                                        BiasT *bias, int m, int k, int perRow) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
@@ -2082,13 +2100,17 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0.0f;
 
     const uint8_t *rowData = B + (size_t)row * perRow;
-    const int blockBytes = SCALE_E8M0 ? 9 : (8 + (int)sizeof(float));
+    const int blockSize = BLOCK32 ? 32 : 16;
+    const int blockShift = BLOCK32 ? 5 : 4;
+    const int scaleOffset = BLOCK32 ? 16 : 8;
+    const int blockBytes = BLOCK32 ? 17 :
+        (SCALE_E8M0 ? 9 : (8 + (int)sizeof(float)));
     for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
-        int block = i >> 4;
-        int blockStart = block * 16;
-        int blockEnd = min(blockStart + 16, m);
+        int block = i >> blockShift;
+        int blockStart = block * blockSize;
+        int blockEnd = min(blockStart + blockSize, m);
         const uint8_t *blockData = rowData + block * blockBytes;
-        float scaleMagic = SCALE_E8M0 ? FastllmCudaNVFP4E8M0ToMagicScale(blockData[8])
+        float scaleMagic = SCALE_E8M0 ? FastllmCudaNVFP4E8M0ToMagicScale(blockData[scaleOffset])
                                       : (*(float*)(blockData + 8)) * FastllmCudaNVFP4MagicScale();
         int local = i - blockStart;
         int remaining = min(4, blockEnd - i);
@@ -2282,7 +2304,8 @@ static void LaunchFastllmGemmNVFP4(InputT *input, uint8_t *packedWeight, uint8_t
 #undef FASTLLM_LAUNCH_NVFP4_GEMV
 }
 
-template <bool SCALE_E8M0, typename InputT, typename OutputT, typename BiasT>
+template <bool SCALE_E8M0, bool BLOCK32 = false,
+          typename InputT, typename OutputT, typename BiasT>
 static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, OutputT *output,
                                           BiasT *bias, int n, int m, int k, int perRow) {
     if (n == 1) {
@@ -2297,12 +2320,12 @@ static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, Output
             }
             return;
         }
-        FastllmGemvNVFP4Block16Kernel1MultiRow<64, 1, SCALE_E8M0> <<< k, 64 >>>(
+        FastllmGemvNVFP4Block16Kernel1MultiRow<64, 1, SCALE_E8M0, BLOCK32> <<< k, 64 >>>(
                 input, weight, output, bias, m, k, perRow);
         return;
     }
 #define FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(PART, IN, OUT) \
-    FastllmGemvNVFP4Block16Kernel1MultiRow<64, PART, SCALE_E8M0> <<< k, 64 >>>(IN, weight, OUT, bias, m, k, perRow)
+    FastllmGemvNVFP4Block16Kernel1MultiRow<64, PART, SCALE_E8M0, BLOCK32> <<< k, 64 >>>(IN, weight, OUT, bias, m, k, perRow)
     if (n == 2) {
         FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(2, input, output);
     } else if (n == 3) {
@@ -2643,34 +2666,43 @@ __global__ void FastllmCudaNVFP4Block162BFloat16Kernel(uint8_t *a, __nv_bfloat16
     }
 }
 
-__global__ void FastllmCudaNVFP4Block16E8M02HalfKernel(uint8_t *a, half *b, int m, int perRow) {
+__global__ void FastllmCudaNVFP4Block16E8M02HalfKernel(
+        uint8_t *a, half *b, int m, int perRow, bool block32) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
 
     uint8_t *rowData = a + (size_t)row * perRow;
     half *rowOut = b + (size_t)row * m;
     for (int i = tid; i < m; i += blockDim.x) {
-        int block = i >> 4;
-        int offset = i & 15;
-        uint8_t *blockData = rowData + block * 9;
-        float scale = FastllmCudaNVFP4E8M0ToFloat(blockData[8]);
+        int block = block32 ? (i >> 5) : (i >> 4);
+        int offset = block32 ? (i & 31) : (i & 15);
+        int blockBytes = block32 ? 17 : 9;
+        int scaleOffset = block32 ? 16 : 8;
+        uint8_t *blockData = rowData + block * blockBytes;
+        float scale = FastllmCudaNVFP4E8M0ToFloat(
+            blockData[scaleOffset]);
         uint8_t packed = blockData[offset >> 1];
         uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
         rowOut[i] = __float2half_rn(FastllmCudaNVFP4E2M1ToFloat(fp4) * scale);
     }
 }
 
-__global__ void FastllmCudaNVFP4Block16E8M02BFloat16Kernel(uint8_t *a, __nv_bfloat16 *b, int m, int perRow) {
+__global__ void FastllmCudaNVFP4Block16E8M02BFloat16Kernel(
+        uint8_t *a, __nv_bfloat16 *b, int m, int perRow,
+        bool block32) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
 
     uint8_t *rowData = a + (size_t)row * perRow;
     __nv_bfloat16 *rowOut = b + (size_t)row * m;
     for (int i = tid; i < m; i += blockDim.x) {
-        int block = i >> 4;
-        int offset = i & 15;
-        uint8_t *blockData = rowData + block * 9;
-        float scale = FastllmCudaNVFP4E8M0ToFloat(blockData[8]);
+        int block = block32 ? (i >> 5) : (i >> 4);
+        int offset = block32 ? (i & 31) : (i & 15);
+        int blockBytes = block32 ? 17 : 9;
+        int scaleOffset = block32 ? 16 : 8;
+        uint8_t *blockData = rowData + block * blockBytes;
+        float scale = FastllmCudaNVFP4E8M0ToFloat(
+            blockData[scaleOffset]);
         uint8_t packed = blockData[offset >> 1];
         uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
         rowOut[i] = __float2bfloat16_rn(FastllmCudaNVFP4E2M1ToFloat(fp4) * scale);
@@ -2681,8 +2713,11 @@ static inline size_t FastllmCudaNVFP4Block16BytesPerRow(int m) {
     return (size_t)((m - 1) / 16 + 1) * (8 + sizeof(float));
 }
 
-static inline size_t FastllmCudaNVFP4Block16E8M0BytesPerRow(int m) {
-    return (size_t)((m - 1) / 16 + 1) * 9;
+static inline size_t FastllmCudaNVFP4Block16E8M0BytesPerRow(
+        int m, bool block32 = false) {
+    return block32 ?
+        (size_t)((m - 1) / 32 + 1) * 17 :
+        (size_t)((m - 1) / 16 + 1) * 9;
 }
 
 bool FastllmCudaMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
@@ -2765,11 +2800,21 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
+    const bool block32 =
+        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0;
+    const size_t packedBytesPerRow =
+        FastllmCudaNVFP4Block16E8M0BytesPerRow(m, block32);
     if (FastllmCudaNVFP4UseGemv(n)) {
         float *cudaBias = bias.dims.size() == 0 ? nullptr : cudaBiasData;
-        LaunchFastllmGemmNVFP4Block16<true>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
-                                            cudaBias, n, m, k, (int)packedBytesPerRow);
+        if (block32) {
+            LaunchFastllmGemmNVFP4Block16<true, true>(
+                cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                cudaBias, n, m, k, (int)packedBytesPerRow);
+        } else {
+            LaunchFastllmGemmNVFP4Block16<true>(
+                cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                cudaBias, n, m, k, (int)packedBytesPerRow);
+        }
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
         return true;
@@ -2799,7 +2844,7 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
         int kc = std::min(maxRowsPerChunk, k - kOff);
         FastllmCudaNVFP4Block16E8M02HalfKernel <<< kc, dequantThreads >>>(
             (uint8_t*)weight.cudaData + (size_t)kOff * packedBytesPerRow,
-            cudaFp16Weight, m, packedBytesPerRow);
+            cudaFp16Weight, m, packedBytesPerRow, block32);
 
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,
@@ -2833,6 +2878,11 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
 
 bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(weight, bias, k);
+
+    if (FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
+            input, weight, bias, output, n, m, k)) {
+        return true;
+    }
 
     half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
@@ -2898,10 +2948,20 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fast
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
+    const bool block32 =
+        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0;
+    const size_t packedBytesPerRow =
+        FastllmCudaNVFP4Block16E8M0BytesPerRow(m, block32);
     if (FastllmCudaNVFP4UseGemv(n)) {
-        LaunchFastllmGemmNVFP4Block16<true>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
-                                            cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        if (block32) {
+            LaunchFastllmGemmNVFP4Block16<true, true>(
+                cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        } else {
+            LaunchFastllmGemmNVFP4Block16<true>(
+                cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        }
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
         return true;
@@ -2924,7 +2984,7 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fast
         int kc = std::min(maxRowsPerChunk, k - kOff);
         FastllmCudaNVFP4Block16E8M02HalfKernel <<< kc, dequantThreads >>>(
             (uint8_t*)weight.cudaData + (size_t)kOff * packedBytesPerRow,
-            cudaFp16Weight, m, packedBytesPerRow);
+            cudaFp16Weight, m, packedBytesPerRow, block32);
 
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,
@@ -3017,10 +3077,20 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
+    const bool block32 =
+        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0;
+    const size_t packedBytesPerRow =
+        FastllmCudaNVFP4Block16E8M0BytesPerRow(m, block32);
     if (FastllmCudaNVFP4UseGemv(n)) {
-        LaunchFastllmGemmNVFP4Block16<true>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
-                                            cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        if (block32) {
+            LaunchFastllmGemmNVFP4Block16<true, true>(
+                cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        } else {
+            LaunchFastllmGemmNVFP4Block16<true>(
+                cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        }
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
         return true;
@@ -3042,7 +3112,7 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
         int kc = std::min(maxRowsPerChunk, k - kOff);
         FastllmCudaNVFP4Block16E8M02BFloat16Kernel <<< kc, dequantThreads >>>(
             (uint8_t*)weight.cudaData + (size_t)kOff * packedBytesPerRow,
-            cudaBF16Weight, m, packedBytesPerRow);
+            cudaBF16Weight, m, packedBytesPerRow, block32);
 
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,

@@ -109,11 +109,19 @@ namespace fastllm {
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
 
+        virtual long long GetAutoWarmupCudaServingReserveBytes(int deviceId) const override;
+
         virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const override;
 
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const override;
 
         virtual void WarmupCudaRuntimeBuffers(int batch) override;
+
+        virtual void WarmupCudaServingHighWaterBuffers() override;
+
+        virtual bool MaterializeCudaServingForFinalKvCalibration() override;
+
+        virtual void ResetCudaServingForKvCacheResize() override;
 
         virtual void OnResponseContextCreated(ResponseContext *context) override;
 
@@ -190,7 +198,9 @@ namespace fastllm {
                 Data &logits,
                 Data *precomputedHiddenStates = nullptr);
 
-        void PreCaptureCudaGraphAfterWarmup();
+        void PrepareMtpCudaServingWarmup();
+        void PrepareCudaServingAfterWarmup(bool highWaterOnly = false,
+                                           bool allowDuringAutoWarmup = false);
         void PreAllocateLinearSlotPoolsForCudaGraph(
                 const std::vector<int> &devices,
                 const std::map<int, int> &ratios,
@@ -294,6 +304,9 @@ namespace fastllm {
         std::atomic<bool> singleGpuWeightsPrepared{false};
         std::atomic<bool> threadTpWeightsPrepared{false};
         std::atomic<bool> cudaGraphPreCaptureRunning{false};
+        bool mtpCudaServingWarmupPrepared = false;
+        bool cudaServingHighWaterPrepared = false;
+        bool cudaServingPrepared = false;
         std::vector <int> threadTpPreparedDevices;
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpAttentionKVHeadSchemes;

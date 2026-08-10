@@ -4,6 +4,7 @@ import os
 import sys
 import subprocess
 import glob
+import math
 
 def _positive_int(value: str) -> int:
     try:
@@ -81,6 +82,142 @@ def _cuda_device_count() -> int:
     except Exception:
         return 0
 
+def _cuda_driver_device_info(device_ids):
+    """Return CUDA-ordinal SM counts and PCI bus ids without creating a context."""
+    try:
+        import ctypes
+        driver = ctypes.CDLL("libcuda.so.1")
+        driver.cuInit.argtypes = [ctypes.c_uint]
+        driver.cuInit.restype = ctypes.c_int
+        driver.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        driver.cuDeviceGet.restype = ctypes.c_int
+        driver.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int),
+                                                 ctypes.c_int, ctypes.c_int]
+        driver.cuDeviceGetAttribute.restype = ctypes.c_int
+        driver.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                                               ctypes.c_int]
+        driver.cuDeviceGetPCIBusId.restype = ctypes.c_int
+        if driver.cuInit(0) != 0:
+            return {}
+
+        # CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT.  CUDA ordinals are used
+        # deliberately: their FASTEST_FIRST order can differ from nvidia-smi.
+        multiprocessor_count = 16
+        result = {}
+        for ordinal in device_ids:
+            device = ctypes.c_int()
+            sm_count = ctypes.c_int()
+            bus_id = ctypes.create_string_buffer(32)
+            if driver.cuDeviceGet(ctypes.byref(device), ordinal) != 0:
+                return {}
+            if driver.cuDeviceGetAttribute(ctypes.byref(sm_count),
+                                           multiprocessor_count,
+                                           device.value) != 0:
+                return {}
+            pci_bus_id = ""
+            if driver.cuDeviceGetPCIBusId(bus_id, len(bus_id), device.value) == 0:
+                pci_bus_id = bus_id.value.decode("ascii", errors="ignore")
+            result[ordinal] = {
+                "sm_count": sm_count.value,
+                "pci_bus_id": pci_bus_id,
+            }
+        return result
+    except Exception:
+        return {}
+
+def _auto_balanced_cuda_spec(device_ids) -> str:
+    infos = _cuda_driver_device_info(device_ids)
+    sm_counts = [infos.get(i, {}).get("sm_count", 0) for i in device_ids]
+    if len(device_ids) <= 1 or any(count <= 0 for count in sm_counts) or \
+            len(set(sm_counts)) == 1:
+        return "cuda:" + ",".join(str(i) for i in device_ids)
+
+    divisor = 0
+    for count in sm_counts:
+        divisor = math.gcd(divisor, count)
+    divisor = max(1, divisor)
+    return "cuda:" + ",".join(
+        f"{device_id}:{sm_count // divisor}"
+        for device_id, sm_count in zip(device_ids, sm_counts)
+    )
+
+def _parse_cpu_list(value):
+    cpus = []
+    for item in str(value).strip().split(","):
+        if not item:
+            continue
+        if "-" in item:
+            first, last = item.split("-", 1)
+            cpus.extend(range(int(first), int(last) + 1))
+        else:
+            cpus.append(int(item))
+    return cpus
+
+def _thread_tp_cuda_device_ids(tp):
+    spec = _thread_tp_cuda_device_spec(tp)
+    if ":" not in spec:
+        return []
+    result = []
+    for part in spec.split(":", 1)[1].split(","):
+        device = part.strip().split(":", 1)[0].split("-", 1)[0]
+        if device.isdigit():
+            result.append(int(device))
+    return result
+
+def _configure_multicuda_worker_affinity(tp, threads):
+    """Keep GPU launch workers off the NUMA MoE worker cores when possible."""
+    if "FASTLLM_MULTICUDA_WORKER_CPU_BASE" in os.environ:
+        return
+    device_ids = _thread_tp_cuda_device_ids(tp)
+    if len(device_ids) <= 1:
+        return
+    try:
+        node_paths = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
+        if not node_paths:
+            return
+        infos = _cuda_driver_device_info(device_ids)
+        gpu_nodes = []
+        for device_id in device_ids:
+            bus_id = infos.get(device_id, {}).get("pci_bus_id", "").lower()
+            numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
+            if bus_id and os.path.exists(numa_path):
+                with open(numa_path, "r", encoding="utf-8") as f:
+                    node = int(f.read().strip())
+                if node >= 0:
+                    gpu_nodes.append(node)
+        target_node = max(set(gpu_nodes), key=gpu_nodes.count) if gpu_nodes else 0
+        target_node = min(target_node, len(node_paths) - 1)
+
+        used_cpus = set()
+        per_node_threads = max(0, int(threads) // len(node_paths))
+        for node_path in node_paths:
+            with open(os.path.join(node_path, "cpulist"), "r", encoding="utf-8") as f:
+                used_cpus.update(_parse_cpu_list(f.read())[:per_node_threads])
+
+        allowed = set(os.sched_getaffinity(0))
+        physical_cpus = []
+        for cpu_path in glob.glob(os.path.join(node_paths[target_node], "cpu[0-9]*")):
+            cpu_id = int(os.path.basename(cpu_path)[3:])
+            sibling_path = os.path.join(cpu_path, "topology", "thread_siblings_list")
+            with open(sibling_path, "r", encoding="utf-8") as f:
+                siblings = _parse_cpu_list(f.read())
+            if siblings and cpu_id == min(siblings) and cpu_id in allowed and \
+                    cpu_id not in used_cpus:
+                physical_cpus.append(cpu_id)
+        physical_cpus.sort()
+
+        worker_count = len(device_ids)
+        for end in range(len(physical_cpus), worker_count - 1, -1):
+            selected = physical_cpus[end - worker_count:end]
+            if selected == list(range(selected[0], selected[0] + worker_count)):
+                os.environ["FASTLLM_MULTICUDA_WORKER_CPU_BASE"] = str(selected[0])
+                print("[tp] MultiCuda launch workers use reserved CPU(s): " +
+                      ",".join(str(cpu) for cpu in selected))
+                return
+    except Exception:
+        # Unbound C++ workers remain the safe fallback on unusual topologies.
+        return
+
 def _first_thread_tp_cuda_device(tp) -> str:
     spec = str(tp or "").strip()
     lower = spec.lower()
@@ -113,7 +250,7 @@ def _thread_tp_cuda_device_spec(tp) -> str:
         count = _cuda_device_count()
         if count <= 1:
             return "cuda:0"
-        return "cuda:" + ",".join(str(i) for i in range(count))
+        return _auto_balanced_cuda_spec(list(range(count)))
     if lower.isdigit():
         requested = int(lower)
         if requested == 0:
@@ -121,6 +258,12 @@ def _thread_tp_cuda_device_spec(tp) -> str:
         count = _cuda_device_count()
         if count > 0:
             requested = min(requested, count)
+        # A numeric TP request means equal logical ranks. Model-specific split
+        # units (for example DeepSeek-V4's eight output groups) can quantize a
+        # small hardware ratio back to equal attention shards while leaving FFN
+        # shards asymmetric, which is slower than a consistently equal split.
+        # Explicit ratios remain available, while `--tp auto` keeps SM-count
+        # balancing for users who request topology-based weighting.
         return "cuda:" + ",".join(str(i) for i in range(requested))
 
     if lower.startswith("multicuda:") or lower.startswith("cuda:"):
@@ -128,6 +271,13 @@ def _thread_tp_cuda_device_spec(tp) -> str:
     elif lower in ["multicuda", "cuda"]:
         return "cuda:0"
     return "cuda:" + spec
+
+def _thread_tp_cuda_device_count(tp) -> int:
+    spec = _thread_tp_cuda_device_spec(tp)
+    if spec == "":
+        return 0
+    payload = spec.split(":", 1)[1] if ":" in spec else spec
+    return len([item for item in payload.split(",") if item.strip() != ""])
 
 def _normalize_thread_tp_arg(tp) -> str:
     spec = str(tp or "").strip()
@@ -186,6 +336,107 @@ def apply_prefix_cache_env(args):
             os.environ[env_name] = str(value)
     return args
 
+def _fastllm_env_flag_enabled(name: str, fallback_name: str = "") -> bool:
+    value = os.environ.get(name)
+    if value is None and fallback_name:
+        value = os.environ.get(fallback_name)
+    if value is None:
+        return False
+    return str(value).strip().lower() in ["1", "true", "on", "yes"]
+
+def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
+    """Select the tested Qwen3.5 CUDA TP fast path without deployment env vars.
+
+    Environment variables remain authoritative debugging overrides.  The
+    automatic path is deliberately limited to the configuration for which the
+    scheduler can safely fall back row-by-row: CUDA thread TP, no MTP, and no
+    low-memory mode.
+    """
+    tp_arg = getattr(args, "tp", "")
+    device = getattr(args, "device", "")
+    eligible = (is_qwen35_model and mtp == 0 and
+                not bool(getattr(args, "low", False)) and
+                _uses_thread_tp(tp_arg) and _uses_cuda_device(device))
+
+    if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
+        os.environ["FASTLLM_CUDA_GRAPH"] = "1"
+
+    handoff_env = "FASTLLM_GPU_TOKEN_HANDOFF"
+    if eligible and handoff_env not in os.environ:
+        os.environ[handoff_env] = "1"
+
+    graph_enabled = _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")
+    handoff_enabled = _fastllm_env_flag_enabled(handoff_env)
+    if is_qwen35_model and (graph_enabled or handoff_enabled):
+        # Qwen3.5 handoff keeps sampled tokens on device, and graph replay also
+        # benefits from avoiding a host embedding round trip.
+        args.cuda_embedding = True
+
+    graph_batch_env = "FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH"
+    requested_batch = int(getattr(args, "max_batch", -1) or -1)
+    if (eligible and graph_enabled and requested_batch > 0 and
+            graph_batch_env not in os.environ):
+        os.environ[graph_batch_env] = str(min(requested_batch, 64))
+
+    if eligible:
+        print(
+            "[Fastllm] Qwen3.5 auto fast paths: cuda_graph=%s, "
+            "gpu_token_handoff=%s, cuda_embedding=%s, graph_max_batch=%s."
+            % (
+                "on" if graph_enabled else "off",
+                "on" if handoff_enabled else "off",
+                "on" if bool(getattr(args, "cuda_embedding", False)) else "off",
+                os.environ.get(graph_batch_env, "default"),
+            ),
+            flush=True,
+        )
+    return args
+
+def _triton_python_works(python: str) -> bool:
+    if not python or not os.path.isfile(python) or not os.access(python, os.X_OK):
+        return False
+    try:
+        return subprocess.run(
+            [python, "-c", "import triton"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def _find_triton_python() -> str:
+    if not sys.executable:
+        return ""
+    # Keep the current virtualenv's Python path instead of resolving its
+    # symlink: resolving it may bypass pyvenv.cfg and hide installed packages.
+    current_python = os.path.abspath(os.path.expanduser(sys.executable))
+    return current_python if _triton_python_works(current_python) else ""
+
+def _configure_triton_compiler_python() -> str:
+    python_env_name = "FASTLLM_CUDA_TRITON_PYTHON"
+    triton_env_name = "FASTLLM_CUDA_TRITON"
+    detected = _find_triton_python()
+    if detected:
+        os.environ[python_env_name] = detected
+        os.environ[triton_env_name] = "1"
+        print(
+            "[Fastllm] Triton enabled with the current Python environment: %s"
+            % detected,
+            flush=True,
+        )
+    else:
+        os.environ.pop(python_env_name, None)
+        os.environ[triton_env_name] = "0"
+        current_python = sys.executable or "unknown"
+        print(
+            "[Fastllm] Triton is unavailable in the current Python "
+            "environment (%s); --triton has been disabled and built-in "
+            "CUDA will be used." % current_python,
+            flush=True,
+        )
+    return detected
+
 def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
     return (architecture in [
         "DeepseekV3ForCausalLM",
@@ -204,7 +455,19 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "MiniMaxM2ForCausalLM",
         "HYV3ForCausalLM",
         "LagunaForCausalLM",
-    ] or model_type in ["deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna"] or text_model_type == "qwen3_5_moe_text")
+        "KimiK3ForConditionalGeneration",
+    ] or model_type in [
+        "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
+        "kimi_k3",
+    ] or text_model_type == "qwen3_5_moe_text")
+
+def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
+    return (architecture == "DeepseekV4ForCausalLM" or
+            model_type == "deepseek_v4")
+
+def _prefers_laguna_hybrid_tp(architecture: str, model_type: str = "") -> bool:
+    return (architecture == "LagunaForCausalLM" or
+            model_type == "laguna")
 
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
@@ -247,6 +510,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--dspark", type = int, default = 0,
+                        help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
                         help = "投机解码算法；当前支持 dspark")
@@ -332,13 +597,22 @@ def make_normal_llm_model(args, startup_progress = None):
         getattr(args, "speculative_algorithm", "") or "").strip().lower()
     speculative_draft_path = str(
         getattr(args, "speculative_draft_model_path", "") or "").strip()
+    dspark_tokens = int(getattr(args, "dspark", 0) or 0)
+    if dspark_tokens < 0:
+        raise ValueError("--dspark must be >= 0")
+    if dspark_tokens > 0 and not speculative_algorithm:
+        speculative_algorithm = "dspark"
     if speculative_draft_path and not speculative_algorithm:
         speculative_algorithm = "dspark"
     if speculative_algorithm and speculative_algorithm != "dspark":
         raise ValueError("--speculative_algorithm currently only supports dspark")
-    if speculative_algorithm == "dspark" and not speculative_draft_path:
-        raise ValueError("DSpark requires --speculative_draft_model_path")
+    if (speculative_algorithm == "dspark" and not speculative_draft_path and
+            dspark_tokens <= 0):
+        raise ValueError(
+            "DSpark requires either --dspark N for an embedded checkpoint or "
+            "--speculative_draft_model_path")
     if speculative_draft_path:
+        os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
         draft_config_path = os.path.join(speculative_draft_path, "config.json")
@@ -356,6 +630,8 @@ def make_normal_llm_model(args, startup_progress = None):
         configured_block = int(draft_config.get("block_size", 0))
         requested_block = int(
             getattr(args, "speculative_dspark_block_size", -1))
+        if dspark_tokens > 0:
+            requested_block = dspark_tokens
         if requested_block > 0 and requested_block != configured_block:
             raise ValueError(
                 "FastLLM currently requires the DSpark runtime block size "
@@ -373,7 +649,19 @@ def make_normal_llm_model(args, startup_progress = None):
         args.speculative_algorithm = "dspark"
     else:
         os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
-        os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
+        if dspark_tokens > 0:
+            os.environ["FASTLLM_DSPARK_TOKENS"] = str(dspark_tokens)
+            confidence_threshold = float(getattr(
+                args, "speculative_dspark_confidence_threshold", 0.5))
+            if not 0.0 <= confidence_threshold <= 1.0:
+                raise ValueError(
+                    "--speculative_dspark_confidence_threshold must be in [0, 1]")
+            os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(
+                confidence_threshold)
+            args.speculative_algorithm = "dspark"
+        else:
+            os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
+            os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
 
     usenuma = False
     try:
@@ -387,7 +675,8 @@ def make_normal_llm_model(args, startup_progress = None):
         print("model can't be empty. (Example: ftllm run MODELNAME)")
         exit(0)
     if (_arg_enabled(getattr(args, "triton", False))):
-        os.environ["FASTLLM_CUDA_TRITON"] = "1"
+        if not _configure_triton_compiler_python():
+            args.triton = False
     if not(os.path.exists(args.path)):
         if (hasattr(args, "model_name") and args.model_name == ''):
             args.model_name = args.path
@@ -412,22 +701,61 @@ def make_normal_llm_model(args, startup_progress = None):
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
+    is_laguna_hybrid_tp_model = False
+    is_laguna_model = False
+    is_qwen35_model = False
     if (os.path.exists(config_path)):
         try:
             with open(config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
             architecture = config["architectures"][0]
             model_type = config.get("model_type", "")
+            is_laguna_model = (architecture == 'LagunaForCausalLM' or
+                                model_type == 'laguna')
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
-            if (speculative_algorithm == "dspark" and
-                    architecture != "KimiK3ForConditionalGeneration" and
-                    model_type != "kimi_k3"):
-                raise ValueError(
-                    "this DSpark integration currently targets Kimi-K3, got "
-                    "architecture=%s model_type=%s" %
-                    (architecture, model_type))
+            is_qwen35_model = (
+                architecture in (
+                    "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
+                ) or
+                model_type in ("qwen3_5", "qwen3_5_moe") or
+                text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
+            )
+            if speculative_algorithm == "dspark":
+                if speculative_draft_path:
+                    if (architecture != "KimiK3ForConditionalGeneration" and
+                            model_type != "kimi_k3"):
+                        raise ValueError(
+                            "external DSpark draft checkpoints currently target "
+                            "Kimi-K3, got architecture=%s model_type=%s" %
+                            (architecture, model_type))
+                else:
+                    is_deepseek_v4 = (
+                        architecture in ("DeepseekV4ForCausalLM",
+                                         "DeepSeekV4ForCausalLM") or
+                        model_type == "deepseek_v4")
+                    if not is_deepseek_v4:
+                        raise ValueError(
+                            "--dspark N requires a DeepSeek-V4 checkpoint with "
+                            "embedded mtp.* DSpark weights, got architecture=%s "
+                            "model_type=%s" % (architecture, model_type))
+                    checkpoint_block = int(config.get(
+                        "dspark_block_size", 0) or 0)
+                    target_layers = config.get("dspark_target_layer_ids", [])
+                    noise_token = int(config.get(
+                        "dspark_noise_token_id", -1) or -1)
+                    if (checkpoint_block <= 0 or not target_layers or
+                            noise_token < 0):
+                        raise ValueError(
+                            "DeepSeek-V4 checkpoint is missing embedded DSpark "
+                            "configuration")
+                    if dspark_tokens < checkpoint_block:
+                        raise ValueError(
+                            "--dspark must be at least the checkpoint training "
+                            "block size (requested=%d, checkpoint=%d)" %
+                            (dspark_tokens, checkpoint_block))
             is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)
 
             is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
@@ -477,7 +805,9 @@ def make_normal_llm_model(args, startup_progress = None):
                 is_thread_tp_moe_model = True
             if (architecture == 'MiniMaxM2ForCausalLM' or model_type == 'minimax_m2'):
                 is_thread_tp_moe_model = True
-            if (architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4'):
+            if (_prefers_laguna_hybrid_tp(architecture, model_type)):
+                is_laguna_hybrid_tp_model = True
+            if (_prefers_multicuda_tp(architecture, model_type)):
                 is_multicuda_tp_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):
@@ -520,9 +850,21 @@ def make_normal_llm_model(args, startup_progress = None):
         tp_device = _first_thread_tp_cuda_device(args.tp)
         cuda_spec = _thread_tp_cuda_device_spec(args.tp)
         if is_multicuda_tp_model:
+            target_spec = cuda_spec
+            if len(_thread_tp_cuda_device_ids(cuda_spec)) > 1:
+                target_spec = "multicuda:" + cuda_spec.split(":", 1)[1]
+            if user_set_device and str(args.device).strip().lower() != target_spec:
+                print("[tp] DeepSeek-V4 --tp overrides the main device "
+                      f"{args.device} => {target_spec}")
+            # DeepSeek-V4 executes multi-device tensor parallel through the
+            # MultiCuda executor. A one-device --tp remains a normal CUDA path.
+            args.device = target_spec
+            if (not user_set_moe_device):
+                args.moe_device = target_spec
+        elif is_laguna_hybrid_tp_model:
             multicuda_spec = "multicuda:" + cuda_spec.split(":", 1)[1]
             if (not user_set_device):
-                args.device = multicuda_spec
+                args.device = tp_device
             if (not user_set_moe_device):
                 args.moe_device = multicuda_spec
         else:
@@ -530,13 +872,20 @@ def make_normal_llm_model(args, startup_progress = None):
                 args.device = tp_device
             if (not user_set_moe_device):
                 args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
-    if is_multicuda_tp_model and _uses_multicuda_device(args.moe_device):
-        # DeepSeek-V4 has tens of thousands of routed-expert tensors.  Splitting
-        # every one into a separate allocation can exhaust the CUDA driver's
-        # allocation-count limit long before device memory is full.  Keep the
-        # simple `--tp N` path usable by packing model weights into slabs.
+    if ((is_multicuda_tp_model or is_laguna_hybrid_tp_model) and
+            _uses_multicuda_device(args.moe_device)):
+        # Large MoE checkpoints have tens of thousands of routed-expert tensors.
+        # Pack their TP shards into slabs to avoid exhausting the CUDA driver's
+        # allocation-count limit before device memory is full.
         if args.cuda_slab <= 0:
-            args.cuda_slab = 256
+            # Laguna TP=4 owns 64 experts/rank.  Its merged gate-up and down
+            # sources are 6 MiB and 3 MiB, and one layer is exactly 576 MiB per
+            # rank.  A 96 MiB slab packs both shapes and the whole layer without
+            # tail waste, which is required to fit the FP8 checkpoint on 32 GB
+            # Blackwell cards.  Other layouts retain the established default.
+            args.cuda_slab = (96 if is_laguna_hybrid_tp_model and
+                              _thread_tp_cuda_device_count(args.tp) == 4
+                              else 256)
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
@@ -565,6 +914,9 @@ def make_normal_llm_model(args, startup_progress = None):
             args.threads = max(1, min(32, available_cores - 2))
         except:
             args.threads = max(1, min(32, os.cpu_count() - 2))
+    if is_multicuda_tp_model and _uses_multicuda_device(args.device) and \
+            "numa" in str(args.moe_device).lower():
+        _configure_multicuda_worker_affinity(args.tp, args.threads)
     if ("FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ):
         os.environ["FT_THREADS"] = str(args.threads)
     atype_was_auto = (args.atype == "auto")
@@ -581,11 +933,13 @@ def make_normal_llm_model(args, startup_progress = None):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
             if (atype_was_auto):
-                args.atype = "float16"
+                args.atype = "bfloat16" if is_laguna_model else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
-        if (_uses_cuda_device(args.moe_device)):
+        if (is_laguna_model and _uses_thread_tp(tp_arg)):
+            args.moe_atype = "bfloat16"
+        elif (_uses_cuda_device(args.moe_device)):
             args.moe_atype = "float16"
         elif (_uses_thread_tp(tp_arg)):
             args.moe_atype = "bfloat16"
@@ -596,6 +950,7 @@ def make_normal_llm_model(args, startup_progress = None):
             args.device = expanded
     if (args.moe_device and args.moe_device != ""):
         args.moe_device = expand_cudapp_device(args.moe_device)
+    _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     from ftllm import llm
     llm.set_moe_device_layers(-1)
     if (args.device and args.device != ""):

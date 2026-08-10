@@ -111,12 +111,15 @@ namespace fastllm {
                     (cache.expansionDims.size() < 2 ||
                      cache.dims[1] + appendTokens >
                          cache.expansionDims[1]))) {
-                std::vector<int> expanded = cache.dims.empty() ?
-                    std::vector<int>({
-                        current.dims[0],
-                        ((appendTokens - 1) / allocationUnit + 1) *
-                            allocationUnit,
-                        current.dims[2]}) : cache.expansionDims;
+                std::vector<int> expanded =
+                    cache.dims.empty() ?
+                        std::vector<int>({
+                            current.dims[0],
+                            ((appendTokens - 1) / allocationUnit + 1) *
+                                allocationUnit,
+                            current.dims[2]}) :
+                        (cache.expansionDims.size() == cache.dims.size() ?
+                             cache.expansionDims : cache.dims);
                 if (!cache.dims.empty()) {
                     expanded[1] +=
                         ((appendTokens - 1) / allocationUnit + 1) *
@@ -810,9 +813,8 @@ namespace fastllm {
             std::cout << "[Kimi-K3] DSpark enabled: 5-layer BF16 draft, "
                       << "block=" << dsparkBlockSize
                       << ", target hidden layers=[7,23,51,67,83].\n";
-            std::cout << "[Kimi-K3] Reusable history cache is disabled: "
-                      << "the generic cache does not contain DSpark draft "
-                      << "KV/state.\n";
+            std::cout << "[Kimi-K3] Reusable history cache uses aligned "
+                      << "target + DSpark prefill snapshots.\n";
         }
     }
 
@@ -921,6 +923,7 @@ namespace fastllm {
         // calculation lazily on the first request, so clients are briefly
         // told that the full architectural context window is available.
         const auto freeSizes = FastllmCudaGetFreeSizes();
+        const auto totalSizes = FastllmCudaGetTotalSizes();
         std::set<int> deviceIds;
         std::map<int, int> ratios;
         for (const auto &item : deviceMap) {
@@ -972,11 +975,53 @@ namespace fastllm {
         }
 
         long long capacity = max_positions;
+        const int prefillChunkSize = GetChunkedPrefillSize();
+        const int extraPrefillTokens = std::max(
+            0, prefillChunkSize - defaultChunkedPrefillSize);
+        const long long activationBytesPerExtraToken =
+            (long long)GetDataBytes(
+                dataType, 1, embed_dim) * 9;
+        const long long linearPrefillReserve =
+            (long long)extraPrefillTokens *
+            activationBytesPerExtraToken;
+        // Larger chunks also grow direct CUDA workspaces and leave a less
+        // reusable mix of pooled buffers.  That high-water mark is not fully
+        // described by the live hidden-state rows above: a 4096-token Kimi
+        // prefill still exhausted the generic allocator headroom late in a
+        // long request.  Keep one allocator-growth margin whenever the chunk
+        // exceeds the default; explicit context/KV limits remain untouched.
+        const long long allocatorGrowthMargin =
+            extraPrefillTokens > 0 ? (768LL << 20) : 0;
+        const long long prefillRuntimeReserve =
+            linearPrefillReserve + allocatorGrowthMargin;
+        if (prefillRuntimeReserve > 0 && kvCacheLimit <= 0 &&
+            GetMaxTokens() <= 0) {
+            std::cout << "[Kimi-K3] Auto context reserves "
+                      << std::fixed << std::setprecision(2)
+                      << (double)prefillRuntimeReserve /
+                             (1024.0 * 1024.0)
+                      << " MiB per GPU for chunked prefill "
+                      << prefillChunkSize << ".\n";
+        }
         for (int deviceId : deviceIds) {
             if (deviceId >= 0 && deviceId < (int)freeSizes.size()) {
-                const long long usable = std::max(
+                long long usable = std::max(
                     freeSizes[deviceId] * 3 / 4,
                     freeSizes[deviceId] - (2LL << 30));
+                if (kvCacheLimit <= 0 && GetMaxTokens() <= 0) {
+                    if (deviceId < (int)totalSizes.size()) {
+                        const long long ratioReserve = (long long)(
+                            totalSizes[deviceId] *
+                            (1.0 - GetGpuMemRatio()));
+                        usable = std::min(
+                            usable,
+                            std::max(
+                                0LL,
+                                freeSizes[deviceId] - ratioReserve));
+                    }
+                    usable = std::max(
+                        0LL, usable - prefillRuntimeReserve);
+                }
                 auto bytes = cacheBytesPerToken.find(deviceId);
                 if (bytes != cacheBytesPerToken.end() && bytes->second > 0) {
                     capacity = std::min(capacity, usable / bytes->second);
@@ -1004,6 +1049,151 @@ namespace fastllm {
 #endif
     }
 
+    void KimiK3Model::RunKdaAttentionImpl(
+            int layerIndex, Data &normalized, int sequence,
+            std::vector<std::pair<Data, Data>> *pastKeyValues,
+            TargetRunCapture *capture, Data &attention) {
+        AssertInFastLLM(
+            normalized.dims.size() >= 2 &&
+            normalized.dims[normalized.dims.size() - 2] == sequence,
+            "Kimi-K3 KDA input has an invalid sequence dimension.");
+        const std::string layer = languagePrefix + "layers." +
+            std::to_string(layerIndex) + ".";
+
+        Data qCache, kCache, vCache;
+        if (pastKeyValues != nullptr) {
+            UnpackKdaConvCache(
+                (*pastKeyValues)[layerIndex].first,
+                shortConvKernel - 1, kdaHeads * kdaHeadDim,
+                qCache, kCache, vCache);
+        }
+        Data localState;
+        Data &state = pastKeyValues == nullptr ?
+            localState : (*pastKeyValues)[layerIndex].second;
+
+        auto runChunk = [&](Data &chunkInput, int chunkSequence,
+                            Data &chunkAttention) {
+            Data qProjected, kProjected, vProjected;
+            Linear(chunkInput, weight[layer + "self_attn.q_proj.weight"],
+                   Data(), qProjected);
+            Linear(chunkInput, weight[layer + "self_attn.k_proj.weight"],
+                   Data(), kProjected);
+            Linear(chunkInput, weight[layer + "self_attn.v_proj.weight"],
+                   Data(), vProjected);
+            if (capture != nullptr && capture->captureKda) {
+                capture->kda[layerIndex].qProjected.CopyFrom(qProjected);
+                capture->kda[layerIndex].kProjected.CopyFrom(kProjected);
+                capture->kda[layerIndex].vProjected.CopyFrom(vProjected);
+            }
+
+            Data qConv, kConv, vConv;
+            if (pastKeyValues != nullptr) {
+                KimiK3CausalConv1D(
+                    qProjected,
+                    weight[layer + "self_attn.q_conv1d.weight"],
+                    shortConvKernel, qCache, qConv);
+                KimiK3CausalConv1D(
+                    kProjected,
+                    weight[layer + "self_attn.k_conv1d.weight"],
+                    shortConvKernel, kCache, kConv);
+                KimiK3CausalConv1D(
+                    vProjected,
+                    weight[layer + "self_attn.v_conv1d.weight"],
+                    shortConvKernel, vCache, vConv);
+            } else {
+                KimiK3CausalConv1D(
+                    qProjected,
+                    weight[layer + "self_attn.q_conv1d.weight"],
+                    shortConvKernel, qConv);
+                KimiK3CausalConv1D(
+                    kProjected,
+                    weight[layer + "self_attn.k_conv1d.weight"],
+                    shortConvKernel, kConv);
+                KimiK3CausalConv1D(
+                    vProjected,
+                    weight[layer + "self_attn.v_conv1d.weight"],
+                    shortConvKernel, vConv);
+            }
+            qConv.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
+            kConv.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
+            vConv.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
+            Data q, k;
+            KimiK3L2Norm(qConv, 1e-6f, q);
+            KimiK3L2Norm(kConv, 1e-6f, k);
+
+            Data gateLowRank, rawGate;
+            Linear(chunkInput, weight[layer + "self_attn.f_a_proj.weight"],
+                   Data(), gateLowRank);
+            Linear(gateLowRank, weight[layer + "self_attn.f_b_proj.weight"],
+                   Data(), rawGate);
+            rawGate.Reshape(
+                {1, chunkSequence, kdaHeads, kdaHeadDim});
+            Data rawBetaBf16, rawBeta;
+            Linear(chunkInput, weight[layer + "self_attn.b_proj.weight"],
+                   Data(), rawBetaBf16);
+            ToDataType(rawBetaBf16, rawBeta, DataType::FLOAT32);
+            if (capture != nullptr && capture->captureKda) {
+                capture->kda[layerIndex].k.CopyFrom(k);
+                capture->kda[layerIndex].v.CopyFrom(vConv);
+                capture->kda[layerIndex].rawGate.CopyFrom(rawGate);
+                capture->kda[layerIndex].rawBeta.CopyFrom(rawBeta);
+            }
+
+            Data kdaOutput;
+            KimiK3RecurrentKDAOutputOnly(
+                q, k, vConv, rawGate, rawBeta,
+                weight[layer + "self_attn.A_log"],
+                weight[layer + "self_attn.dt_bias"], gateLowerBound,
+                state, kdaOutput);
+
+            Data outputGate;
+            Linear(chunkInput, weight[layer + "self_attn.g_proj.weight"],
+                   Data(), outputGate);
+            outputGate.Reshape(
+                {1, chunkSequence, kdaHeads, kdaHeadDim});
+            Data gatedAttention;
+            KimiK3RMSNormSigmoidGate(
+                kdaOutput, outputGate,
+                weight[layer + "self_attn.o_norm.weight"],
+                rms_norm_eps, gatedAttention);
+            gatedAttention.Reshape(
+                {1, chunkSequence, kdaHeads * kdaHeadDim});
+            Linear(gatedAttention, weight[layer + "self_attn.o_proj.weight"],
+                   Data(), chunkAttention);
+        };
+
+        const int sequenceAxis = (int)normalized.dims.size() - 2;
+        const int kdaChunkSize = 1024;
+        const bool chunkPrefill =
+            normalized.dataDevice == DataDevice::CUDA &&
+            pastKeyValues != nullptr &&
+            (capture == nullptr || !capture->captureKda) &&
+            sequence > kdaChunkSize;
+        if (!chunkPrefill) {
+            runChunk(normalized, sequence, attention);
+        } else {
+            for (int start = 0; start < sequence; start += kdaChunkSize) {
+                const int end = std::min(sequence, start + kdaChunkSize);
+                Data chunkInput, chunkAttention;
+                Split(normalized, sequenceAxis, start, end, chunkInput);
+                runChunk(chunkInput, end - start, chunkAttention);
+                if (start == 0) {
+                    Copy(chunkAttention, attention);
+                    attention.Expansion(normalized.dims);
+                } else {
+                    CatDirect(attention, chunkAttention, sequenceAxis);
+                }
+            }
+            attention.expansionDims.clear();
+        }
+
+        if (pastKeyValues != nullptr) {
+            PackKdaConvCache(
+                qCache, kCache, vCache,
+                (*pastKeyValues)[layerIndex].first);
+        }
+    }
+
     Data KimiK3Model::RunFirstLayerImpl(
             const std::vector<int> &tokenIds,
             std::vector<std::pair<Data, Data>> *pastKeyValues,
@@ -1027,94 +1217,9 @@ namespace fastllm {
             embedding, weight[layer + "input_layernorm.weight"],
             rms_norm_eps, normalized);
 
-        Data qProjected, kProjected, vProjected;
-        Linear(normalized, weight[layer + "self_attn.q_proj.weight"],
-               Data(), qProjected);
-        Linear(normalized, weight[layer + "self_attn.k_proj.weight"],
-               Data(), kProjected);
-        Linear(normalized, weight[layer + "self_attn.v_proj.weight"],
-               Data(), vProjected);
-        if (capture != nullptr && capture->captureKda) {
-            capture->kda[0].qProjected.CopyFrom(qProjected);
-            capture->kda[0].kProjected.CopyFrom(kProjected);
-            capture->kda[0].vProjected.CopyFrom(vProjected);
-        }
-
-        Data qConv, kConv, vConv;
-        Data qCache, kCache, vCache;
-        if (pastKeyValues != nullptr) {
-            UnpackKdaConvCache(
-                (*pastKeyValues)[0].first, shortConvKernel - 1,
-                kdaHeads * kdaHeadDim, qCache, kCache, vCache);
-            KimiK3CausalConv1D(
-                qProjected, weight[layer + "self_attn.q_conv1d.weight"],
-                shortConvKernel, qCache, qConv);
-            KimiK3CausalConv1D(
-                kProjected, weight[layer + "self_attn.k_conv1d.weight"],
-                shortConvKernel, kCache, kConv);
-            KimiK3CausalConv1D(
-                vProjected, weight[layer + "self_attn.v_conv1d.weight"],
-                shortConvKernel, vCache, vConv);
-            PackKdaConvCache(
-                qCache, kCache, vCache, (*pastKeyValues)[0].first);
-        } else {
-            KimiK3CausalConv1D(
-                qProjected, weight[layer + "self_attn.q_conv1d.weight"],
-                shortConvKernel, qConv);
-            KimiK3CausalConv1D(
-                kProjected, weight[layer + "self_attn.k_conv1d.weight"],
-                shortConvKernel, kConv);
-            KimiK3CausalConv1D(
-                vProjected, weight[layer + "self_attn.v_conv1d.weight"],
-                shortConvKernel, vConv);
-        }
-
-        qConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        kConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        vConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        Data q, k;
-        KimiK3L2Norm(qConv, 1e-6f, q);
-        KimiK3L2Norm(kConv, 1e-6f, k);
-
-        Data gateLowRank, rawGate;
-        Linear(normalized, weight[layer + "self_attn.f_a_proj.weight"],
-               Data(), gateLowRank);
-        Linear(gateLowRank, weight[layer + "self_attn.f_b_proj.weight"],
-               Data(), rawGate);
-        rawGate.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        Data rawBetaBf16, rawBeta;
-        Linear(normalized, weight[layer + "self_attn.b_proj.weight"],
-               Data(), rawBetaBf16);
-        ToDataType(rawBetaBf16, rawBeta, DataType::FLOAT32);
-        if (capture != nullptr && capture->captureKda) {
-            capture->kda[0].k.CopyFrom(k);
-            capture->kda[0].v.CopyFrom(vConv);
-            capture->kda[0].rawGate.CopyFrom(rawGate);
-            capture->kda[0].rawBeta.CopyFrom(rawBeta);
-        }
-
-        Data localKdaState, kdaOutput, kdaDecay, kdaBeta;
-        Data &kdaState = pastKeyValues == nullptr ?
-            localKdaState : (*pastKeyValues)[0].second;
-        KimiK3RecurrentKDA(
-            q, k, vConv, rawGate, rawBeta,
-            weight[layer + "self_attn.A_log"],
-            weight[layer + "self_attn.dt_bias"], gateLowerBound,
-            kdaState, kdaOutput, kdaDecay, kdaBeta);
-
-        Data outputGate;
-        Linear(normalized, weight[layer + "self_attn.g_proj.weight"],
-               Data(), outputGate);
-        outputGate.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-        Data gatedAttention;
-        KimiK3RMSNormSigmoidGate(
-            kdaOutput, outputGate,
-            weight[layer + "self_attn.o_norm.weight"],
-            rms_norm_eps, gatedAttention);
-        gatedAttention.Reshape({1, sequence, kdaHeads * kdaHeadDim});
         Data attention;
-        Linear(gatedAttention, weight[layer + "self_attn.o_proj.weight"],
-               Data(), attention);
+        RunKdaAttentionImpl(
+            0, normalized, sequence, pastKeyValues, capture, attention);
 
         Data mlpInput;
         embedding.Reshape({sequence, 1, embed_dim});
@@ -1214,97 +1319,9 @@ namespace fastllm {
 
         auto runKdaAttention = [&](int layerIndex, Data &normalized,
                                    Data &attention) {
-            const std::string layer = languagePrefix + "layers." +
-                std::to_string(layerIndex) + ".";
-            Data qProjected, kProjected, vProjected;
-            Linear(normalized, weight[layer + "self_attn.q_proj.weight"],
-                   Data(), qProjected);
-            Linear(normalized, weight[layer + "self_attn.k_proj.weight"],
-                   Data(), kProjected);
-            Linear(normalized, weight[layer + "self_attn.v_proj.weight"],
-                   Data(), vProjected);
-            if (capture != nullptr && capture->captureKda) {
-                capture->kda[layerIndex].qProjected.CopyFrom(qProjected);
-                capture->kda[layerIndex].kProjected.CopyFrom(kProjected);
-                capture->kda[layerIndex].vProjected.CopyFrom(vProjected);
-            }
-
-            Data qConv, kConv, vConv;
-            Data qCache, kCache, vCache;
-            if (pastKeyValues != nullptr) {
-                UnpackKdaConvCache(
-                    (*pastKeyValues)[layerIndex].first,
-                    shortConvKernel - 1, kdaHeads * kdaHeadDim,
-                    qCache, kCache, vCache);
-                KimiK3CausalConv1D(
-                    qProjected, weight[layer + "self_attn.q_conv1d.weight"],
-                    shortConvKernel, qCache, qConv);
-                KimiK3CausalConv1D(
-                    kProjected, weight[layer + "self_attn.k_conv1d.weight"],
-                    shortConvKernel, kCache, kConv);
-                KimiK3CausalConv1D(
-                    vProjected, weight[layer + "self_attn.v_conv1d.weight"],
-                    shortConvKernel, vCache, vConv);
-                PackKdaConvCache(
-                    qCache, kCache, vCache,
-                    (*pastKeyValues)[layerIndex].first);
-            } else {
-                KimiK3CausalConv1D(
-                    qProjected, weight[layer + "self_attn.q_conv1d.weight"],
-                    shortConvKernel, qConv);
-                KimiK3CausalConv1D(
-                    kProjected, weight[layer + "self_attn.k_conv1d.weight"],
-                    shortConvKernel, kConv);
-                KimiK3CausalConv1D(
-                    vProjected, weight[layer + "self_attn.v_conv1d.weight"],
-                    shortConvKernel, vConv);
-            }
-            qConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            kConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            vConv.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            Data q, k;
-            KimiK3L2Norm(qConv, 1e-6f, q);
-            KimiK3L2Norm(kConv, 1e-6f, k);
-
-            Data gateLowRank, rawGate;
-            Linear(normalized, weight[layer + "self_attn.f_a_proj.weight"],
-                   Data(), gateLowRank);
-            Linear(gateLowRank, weight[layer + "self_attn.f_b_proj.weight"],
-                   Data(), rawGate);
-            rawGate.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            Data rawBetaBf16, rawBeta;
-            Linear(normalized, weight[layer + "self_attn.b_proj.weight"],
-                   Data(), rawBetaBf16);
-            ToDataType(rawBetaBf16, rawBeta, DataType::FLOAT32);
-            if (capture != nullptr && capture->captureKda) {
-                capture->kda[layerIndex].k.CopyFrom(k);
-                capture->kda[layerIndex].v.CopyFrom(vConv);
-                capture->kda[layerIndex].rawGate.CopyFrom(rawGate);
-                capture->kda[layerIndex].rawBeta.CopyFrom(rawBeta);
-            }
-
-            Data localState, kdaOutput, decay, activatedBeta;
-            Data &state = pastKeyValues == nullptr ?
-                localState : (*pastKeyValues)[layerIndex].second;
-            KimiK3RecurrentKDA(
-                q, k, vConv, rawGate, rawBeta,
-                weight[layer + "self_attn.A_log"],
-                weight[layer + "self_attn.dt_bias"], gateLowerBound,
-                state, kdaOutput, decay, activatedBeta);
-
-            Data outputGate;
-            Linear(normalized, weight[layer + "self_attn.g_proj.weight"],
-                   Data(), outputGate);
-            outputGate.Reshape({1, sequence, kdaHeads, kdaHeadDim});
-            Data gatedAttention;
-            KimiK3RMSNormSigmoidGate(
-                kdaOutput, outputGate,
-                weight[layer + "self_attn.o_norm.weight"],
-                rms_norm_eps, gatedAttention);
-            gatedAttention.Reshape(
-                {1, sequence, kdaHeads * kdaHeadDim});
-            Linear(gatedAttention, weight[layer + "self_attn.o_proj.weight"],
-                   Data(), attention);
+            RunKdaAttentionImpl(
+                layerIndex, normalized, sequence, pastKeyValues,
+                capture, attention);
         };
 
         auto runMlaAttention = [&](int layerIndex, Data &normalized,
@@ -1401,22 +1418,69 @@ namespace fastllm {
                 const int batch = qNope.dims[0];
                 const int queryLength = qNope.dims[1];
                 const int heads = qNope.dims[2];
-                PermuteSelf(qNope, {2, 0, 1, 3});
-                qNope.Reshape({heads, batch * queryLength, qkNopeHeadDim});
+                const int cacheLength = keyCache.pageIndex.empty() ? 0 :
+                    ((int)keyCache.pageIndex.size() - 1) * pageLen +
+                    keyCache.lastPageLen;
+                const int historyLength = cacheLength - queryLength;
+                AssertInFastLLM(
+                    batch == 1 && historyLength >= 0,
+                    "Kimi-K3 compressed MLA expects one contiguous request.");
 
-                Data absorbedQuery, latentAttention, attentionHeads;
-                MatMul(qNope, absorbedKeyWeight, absorbedQuery);
-                MergeMLAPaged(
-                    absorbedQuery, qRot, keyCache, valueCache,
-                    latentAttention,
-                    1.0f / std::sqrt((float)qHeadDimension));
-                MatMulTransB(
-                    latentAttention, absorbedValueWeight, attentionHeads);
-                attentionHeads.Reshape(
-                    {heads, batch, queryLength, vHeadDim});
-                PermuteSelf(attentionHeads, {1, 2, 0, 3});
-                attentionHeads.Reshape(
-                    {batch, queryLength, heads * vHeadDim});
+                Data attentionHeads;
+                const int mlaQueryChunkSize = 1024;
+                auto runMlaChunk = [&](Data &qNopeChunk,
+                                       Data &qRotChunk,
+                                       int chunkLength, int kvLength,
+                                       Data &chunkAttentionHeads) {
+                    PermuteSelf(qNopeChunk, {2, 0, 1, 3});
+                    qNopeChunk.Reshape(
+                        {heads, batch * chunkLength, qkNopeHeadDim});
+
+                    Data absorbedQuery, latentAttention;
+                    MatMul(qNopeChunk, absorbedKeyWeight, absorbedQuery);
+                    MergeMLAPaged(
+                        absorbedQuery, qRotChunk,
+                        keyCache, valueCache, latentAttention,
+                        1.0f / std::sqrt((float)qHeadDimension),
+                        kvLength);
+                    MatMulTransB(
+                        latentAttention, absorbedValueWeight,
+                        chunkAttentionHeads);
+                    chunkAttentionHeads.Reshape(
+                        {heads, batch, chunkLength, vHeadDim});
+                    PermuteSelf(chunkAttentionHeads, {1, 2, 0, 3});
+                    chunkAttentionHeads.Reshape(
+                        {batch, chunkLength, heads * vHeadDim});
+                };
+                if (queryLength <= mlaQueryChunkSize) {
+                    runMlaChunk(
+                        qNope, qRot, queryLength,
+                        cacheLength, attentionHeads);
+                } else {
+                    for (int start = 0; start < queryLength;
+                         start += mlaQueryChunkSize) {
+                        const int end = std::min(
+                            queryLength, start + mlaQueryChunkSize);
+                        const int chunkLength = end - start;
+                        Data qNopeChunk, qRotChunk;
+                        Split(qNope, 1, start, end, qNopeChunk);
+                        Split(qRot, 1, start, end, qRotChunk);
+                        Data chunkAttentionHeads;
+                        runMlaChunk(
+                            qNopeChunk, qRotChunk, chunkLength,
+                            historyLength + end, chunkAttentionHeads);
+                        if (start == 0) {
+                            Copy(chunkAttentionHeads, attentionHeads);
+                            attentionHeads.Expansion(
+                                {batch, queryLength,
+                                 heads * vHeadDim});
+                        } else {
+                            CatDirect(
+                                attentionHeads, chunkAttentionHeads, 1);
+                        }
+                    }
+                    attentionHeads.expansionDims.clear();
+                }
 
                 Data outputGate;
                 Linear(normalized,
@@ -1679,8 +1743,152 @@ namespace fastllm {
         return prefixSum;
     }
 
+    void KimiK3Model::PrepareToolCallConstraint(
+            ResponseContext *context,
+            GenerationConfig &generationConfig) {
+        basellm::PrepareToolCallConstraint(context, generationConfig);
+        if (context == nullptr ||
+            !generationConfig.tool_call_content_sampling_enabled) {
+            return;
+        }
+
+        int &samplingStarted =
+                context->intParams["kimi_k3_tool_content_sampling_started"];
+        int state = context->intParams["kimi_k3_tool_content_state"];
+        int contentTokens =
+                context->intParams["kimi_k3_tool_content_tokens"];
+        const int minContentSamplingTokens = 64;
+        bool shouldSample =
+                state == 1 && contentTokens >= minContentSamplingTokens;
+        if (samplingStarted == 0 && shouldSample) {
+            // DSpark commits accepted draft tokens into target KV before the
+            // scheduler consumes them. Switching to ordinary sampling while
+            // those tokens are pending would append one of them twice.
+            bool hasPending = false;
+            if (dsparkEnabled) {
+                std::lock_guard<std::mutex> guard(dsparkContextMutex);
+                auto it = dsparkContexts.find(&context->pastKeyValues);
+                hasPending = it != dsparkContexts.end() &&
+                             it->second != nullptr &&
+                             !it->second->pending.empty();
+            }
+            if (!hasPending) {
+                samplingStarted = 1;
+            }
+        }
+        if (samplingStarted == 0) {
+            return;
+        }
+
+        // Remember the transition for the rest of the response. ForwardDspark
+        // samples from the target logits that it already computes for a draft
+        // block, stopping at the first sampled token that differs from the
+        // draft. This preserves target sampling without falling back to slow
+        // one-token full-model steps.
+        generationConfig.tool_call_content_sampling_active = true;
+        if (shouldSample) {
+            generationConfig.do_sample = true;
+            generationConfig.top_k =
+                    generationConfig.tool_call_content_top_k;
+            generationConfig.top_p =
+                    generationConfig.tool_call_content_top_p;
+            generationConfig.temperature =
+                    generationConfig.tool_call_content_temperature;
+            // Keep code generation deterministic while gently discouraging
+            // the exact long-range loops seen with K3's pure greedy default.
+            // A top-k of one applies this penalty before selecting the token,
+            // avoiding the semantic drift caused by random code sampling.
+            generationConfig.repeat_penalty = std::max(
+                generationConfig.repeat_penalty, 1.05f);
+        }
+    }
+
+    void KimiK3Model::UpdateToolCallConstraintState(
+            ResponseContext *context, int tokenId) {
+        bool baseTracksText = context != nullptr &&
+                (context->generationConfig.tool_call_name_constraint_enabled ||
+                 context->generationConfig
+                         .tool_call_parameter_name_constraint_enabled);
+        basellm::UpdateToolCallConstraintState(context, tokenId);
+        if (context == nullptr || tokenId < 0 ||
+            !context->generationConfig
+                    .tool_call_content_sampling_enabled) {
+            return;
+        }
+
+        std::string tokenText = this->weight.tokenizer.DecodeTokens(
+                std::vector<int>{tokenId});
+        // The generic name/parameter constraint already appended this token.
+        // Without those constraints K3 still needs its own rolling text
+        // buffer in order to recognize XTML string arguments.
+        if (!baseTracksText) {
+            context->toolCallConstraintGeneratedText += tokenText;
+        }
+        std::string &text = context->toolCallConstraintGeneratedText;
+        int &state = context->intParams["kimi_k3_tool_content_state"];
+        int &contentTokens =
+                context->intParams["kimi_k3_tool_content_tokens"];
+        if (state == 1) {
+            contentTokens++;
+        }
+        if (state == 1 && tokenText.find("<|close|>") != std::string::npos) {
+            // The close marker itself is sampled as the end of the long value;
+            // render the remaining argument/call structure greedily.
+            state = 2;
+        }
+        if (state == 2) {
+            auto openPos = text.rfind("<|open|>argument");
+            auto closePos = text.rfind(
+                    "<|close|>argument<|sep|>");
+            if (closePos != std::string::npos &&
+                (openPos == std::string::npos || closePos > openPos)) {
+                state = 0;
+            }
+        }
+        if (state == 0) {
+            auto openPos = text.rfind("<|open|>argument");
+            auto closePos = text.rfind(
+                    "<|close|>argument<|sep|>");
+            if (openPos != std::string::npos &&
+                (closePos == std::string::npos || openPos > closePos)) {
+                auto headerEnd = text.find("<|sep|>", openPos);
+                if (headerEnd != std::string::npos) {
+                    std::string header = text.substr(
+                            openPos, headerEnd + 7 - openPos);
+                    bool longString =
+                            header.find("type=\"string\"") !=
+                                    std::string::npos &&
+                            (header.find("key=\"content\"") !=
+                                     std::string::npos ||
+                             header.find("key=\"patch\"") !=
+                                     std::string::npos ||
+                             header.find("key=\"command\"") !=
+                                     std::string::npos);
+                    if (longString) {
+                        state = 1;
+                        contentTokens = 0;
+                    }
+                }
+            }
+        }
+        const size_t maxTrackedBytes = 8192;
+        if (text.size() > maxTrackedBytes) {
+            text.erase(0, text.size() - maxTrackedBytes);
+        }
+    }
+
     void KimiK3Model::OnResponseContextCreated(ResponseContext *context) {
         if (context == nullptr || !dsparkEnabled) {
+            return;
+        }
+        std::shared_ptr<DsparkHistoryCacheMemory> pending;
+        {
+            std::lock_guard<std::mutex> guard(dsparkHistoryCacheMutex);
+            pending.swap(pendingDsparkHistoryCache);
+        }
+        if (pending != nullptr) {
+            std::lock_guard<std::mutex> forwardGuard(forwardLocker);
+            RestoreDsparkHistoryCache(*pending, context);
             return;
         }
         std::lock_guard<std::mutex> guard(dsparkContextMutex);
@@ -1693,6 +1901,40 @@ namespace fastllm {
         }
         std::lock_guard<std::mutex> guard(dsparkContextMutex);
         dsparkContexts.erase(&context->pastKeyValues);
+    }
+
+    bool KimiK3Model::TryRestoreHistoryCache(
+            std::vector<int> &inputTokens, int &cacheLen) {
+        if (!dsparkEnabled || !saveHistoryChat || inputTokens.size() <= 1) {
+            return false;
+        }
+        std::shared_ptr<DsparkHistoryCacheMemory> best;
+        size_t bestLength = 0;
+        {
+            std::lock_guard<std::mutex> guard(dsparkHistoryCacheMutex);
+            for (auto &item : dsparkHistoryCache) {
+                const std::vector<int> &cachedTokens = item.first;
+                if (cachedTokens.size() <= bestLength ||
+                    cachedTokens.size() >= inputTokens.size() ||
+                    !std::equal(cachedTokens.begin(), cachedTokens.end(),
+                                inputTokens.begin())) {
+                    continue;
+                }
+                best = item.second;
+                bestLength = cachedTokens.size();
+            }
+            if (best != nullptr) {
+                best->flushTime = ++dsparkHistoryCacheFlushTime;
+                pendingDsparkHistoryCache = best;
+            }
+        }
+        if (best == nullptr) {
+            return false;
+        }
+        inputTokens.erase(inputTokens.begin(),
+                          inputTokens.begin() + bestLength);
+        cacheLen = (int)bestLength;
+        return true;
     }
 
     KimiK3Model::DsparkContext &KimiK3Model::GetDsparkContext(
@@ -1708,6 +1950,308 @@ namespace fastllm {
             entry->replay.resize(block_cnt);
         }
         return *entry;
+    }
+
+    void KimiK3Model::RecordDsparkHistoryCache(
+            const std::vector<int> &inputTokens,
+            const std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const DsparkContext &context) {
+        if (!saveHistoryChat || inputTokens.size() <= 1 ||
+            context.committedTokens != (int)inputTokens.size() ||
+            !context.pending.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(dsparkHistoryCacheMutex);
+            auto existing = dsparkHistoryCache.find(inputTokens);
+            if (existing != dsparkHistoryCache.end()) {
+                existing->second->flushTime =
+                    ++dsparkHistoryCacheFlushTime;
+                return;
+            }
+        }
+
+        auto memory = std::make_shared<DsparkHistoryCacheMemory>();
+        memory->inputTokens = inputTokens;
+        memory->adaptiveDraftLimit = context.adaptiveDraftLimit;
+        const bool moveToCpu = GetHistoryCacheInCPU();
+        auto copyTensor = [&](const Data &source, Data &target) {
+            if (source.isPagedKVCache) {
+                AssertInFastLLM(
+                    source.pagedKVCacheData != nullptr &&
+                    !source.pageIndex.empty(),
+                    "DSpark paged history cache descriptor is incomplete.");
+                target.name = source.name;
+                target.cacheUid = source.cacheUid;
+                target.isKVCache = source.isKVCache;
+                target.isPagedKVCache = true;
+                target.pagedKVCacheData = source.pagedKVCacheData;
+                target.pageLen = source.pageLen;
+                target.pageIndex = source.pageIndex;
+                target.lastPageLen = source.lastPageLen;
+                target.dataType = source.dataType;
+                target.UpdateUnitSize();
+                target.dims = source.dims;
+                target.strides = source.strides;
+                target.dataDevice = source.dataDevice;
+                target.dataDeviceIds = source.dataDeviceIds;
+                target.pagedKVCacheData->Pick(target.pageIndex);
+                return;
+            }
+            if (moveToCpu) {
+                target.name = source.name;
+                target.isKVCache = source.isKVCache;
+                target.isLinearAttention = source.isLinearAttention;
+                target.isLinearAttentionTransposed =
+                    source.isLinearAttentionTransposed;
+                target.cacheUid = source.cacheUid;
+                target.dataType = source.dataType;
+                target.UpdateUnitSize();
+                if (source.dims.empty()) {
+                    target.lockInCPU = true;
+                    return;
+                }
+                target.dataDevice = DataDevice::CPU;
+                if (!source.expansionDims.empty() &&
+                    source.expansionDims != source.dims) {
+                    target.Expansion(source.expansionDims);
+                    target.Resize(source.dims);
+                    target.Allocate();
+                } else {
+                    target.Resize(source.dims);
+                    target.Allocate();
+                }
+                const size_t bytes = source.GetBytes();
+                AssertInFastLLM(
+                    target.cpuData != nullptr &&
+                    bytes <= target.expansionBytes,
+                    "DSpark CPU history cache allocation failed.");
+                if (source.dataDevice == DataDevice::CPU) {
+                    AssertInFastLLM(
+                        source.cpuData != nullptr,
+                        "DSpark history cache source has no CPU data.");
+                    std::memcpy(target.cpuData, source.cpuData, bytes);
+                } else {
+#ifdef USE_CUDA
+                    AssertInFastLLM(
+                        source.cudaData != nullptr,
+                        "DSpark history cache source has no CUDA data.");
+                    const int originalDevice = FastllmCudaGetDevice();
+                    int sourceDevice = GetPointerDeviceId(source.cudaData);
+                    if (sourceDevice < 0 &&
+                        !source.dataDeviceIds.empty()) {
+                        sourceDevice = source.dataDeviceIds[0];
+                    }
+                    AssertInFastLLM(
+                        sourceDevice >= 0,
+                        "DSpark history cache source GPU is unknown.");
+                    FastllmCudaSetDevice(sourceDevice);
+                    FastllmCudaCopyFromDeviceToHost(
+                        target.cpuData, source.cudaData, bytes);
+                    FastllmCudaSetDevice(originalDevice);
+#else
+                    ErrorInFastLLM(
+                        "DSpark CUDA cache cannot be copied in a CPU build.");
+#endif
+                }
+                target.lockInCPU = true;
+                return;
+            }
+
+#ifdef USE_CUDA
+            int originalDevice = -1;
+            if (source.dataDevice == DataDevice::CUDA &&
+                source.cudaData != nullptr) {
+                originalDevice = FastllmCudaGetDevice();
+                int sourceDevice = GetPointerDeviceId(source.cudaData);
+                if (sourceDevice < 0 && !source.dataDeviceIds.empty()) {
+                    sourceDevice = source.dataDeviceIds[0];
+                }
+                if (sourceDevice >= 0) {
+                    FastllmCudaSetDevice(sourceDevice);
+                }
+            }
+#endif
+            target.CopyFrom(source);
+#ifdef USE_CUDA
+            if (originalDevice >= 0) {
+                FastllmCudaSetDevice(originalDevice);
+            }
+#endif
+        };
+        auto copyCache = [&](const std::vector<std::pair<Data, Data>> &source,
+                             std::vector<std::pair<Data, Data>> &target) {
+            target.resize(source.size());
+            for (int index = 0; index < (int)source.size(); index++) {
+                copyTensor(source[index].first, target[index].first);
+                copyTensor(source[index].second, target[index].second);
+            }
+        };
+        copyCache(pastKeyValues, memory->targetKeyValues);
+        copyCache(context.draftKeyValues, memory->draftKeyValues);
+
+        std::lock_guard<std::mutex> guard(dsparkHistoryCacheMutex);
+        auto existing = dsparkHistoryCache.find(inputTokens);
+        if (existing != dsparkHistoryCache.end()) {
+            existing->second->flushTime = ++dsparkHistoryCacheFlushTime;
+            return;
+        }
+        while ((int)dsparkHistoryCache.size() >=
+               dsparkHistoryCacheMaxRecords) {
+            auto oldest = dsparkHistoryCache.end();
+            for (auto it = dsparkHistoryCache.begin();
+                 it != dsparkHistoryCache.end(); ++it) {
+                if (oldest == dsparkHistoryCache.end() ||
+                    it->second->flushTime < oldest->second->flushTime) {
+                    oldest = it;
+                }
+            }
+            if (oldest == dsparkHistoryCache.end()) {
+                break;
+            }
+            dsparkHistoryCache.erase(oldest);
+        }
+        memory->flushTime = ++dsparkHistoryCacheFlushTime;
+        dsparkHistoryCache[inputTokens] = std::move(memory);
+    }
+
+    void KimiK3Model::RestoreDsparkHistoryCache(
+            const DsparkHistoryCacheMemory &memory,
+            ResponseContext *responseContext) {
+        AssertInFastLLM(responseContext != nullptr &&
+                        memory.inputTokens.size() > 1 &&
+                        memory.targetKeyValues.size() ==
+                            (size_t)block_cnt &&
+                        memory.draftKeyValues.size() ==
+                            (size_t)dsparkLayers,
+                        "DSpark history cache snapshot is incomplete.");
+        responseContext->pastKeyValues.resize(block_cnt);
+        auto restoreTensor = [](const Data &source, Data &target) {
+            if (!source.isPagedKVCache) {
+#ifdef USE_CUDA
+                const int originalDevice = FastllmCudaGetDevice();
+                if (source.dataDevice == DataDevice::CUDA &&
+                    source.cudaData != nullptr) {
+                    int sourceDevice = GetPointerDeviceId(source.cudaData);
+                    if (sourceDevice < 0 &&
+                        !source.dataDeviceIds.empty()) {
+                        sourceDevice = source.dataDeviceIds[0];
+                    }
+                    AssertInFastLLM(
+                        sourceDevice >= 0,
+                        "DSpark history cache source GPU is unknown.");
+                    FastllmCudaSetDevice(sourceDevice);
+                }
+#endif
+                target.CopyFrom(source);
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(originalDevice);
+#endif
+                return;
+            }
+            AssertInFastLLM(
+                source.pagedKVCacheData != nullptr &&
+                !source.pageIndex.empty() &&
+                source.pageLen > 0 &&
+                source.lastPageLen > 0 &&
+                source.lastPageLen <= source.pageLen,
+                "DSpark paged history cache snapshot is incomplete.");
+            target.name = source.name;
+            target.cacheUid = source.cacheUid;
+            target.isKVCache = source.isKVCache;
+            target.isPagedKVCache = true;
+            target.pagedKVCacheData = source.pagedKVCacheData;
+            target.pageLen = source.pageLen;
+            target.pageIndex = source.pageIndex;
+            target.lastPageLen = source.lastPageLen;
+            target.dataType = source.dataType;
+            target.UpdateUnitSize();
+            target.dims = source.dims;
+            target.strides = source.strides;
+            target.dataDevice = source.dataDevice;
+            target.dataDeviceIds = source.dataDeviceIds;
+            target.pagedKVCacheData->Pick(target.pageIndex);
+
+            // Full pages are immutable and may be shared. The final partial
+            // page must be private because the restored request appends its
+            // uncached suffix into that page.
+            if (target.lastPageLen == target.pageLen) {
+                return;
+            }
+            PagedCacheManager *manager = target.pagedKVCacheData;
+            AssertInFastLLM(
+                !manager->dims.empty() && manager->dims[0] > 0,
+                "DSpark paged history cache manager has an invalid shape.");
+            const size_t pageBytes =
+                manager->GetBytes() / (size_t)manager->dims[0];
+            const int sharedPage = target.pageIndex.back();
+            const int privatePage = manager->GetUnusedPageIndex(true);
+            if (manager->dataDevice == DataDevice::CPU) {
+                AssertInFastLLM(
+                    manager->cpuData != nullptr,
+                    "DSpark paged history cache manager has no CPU data.");
+                std::memcpy(
+                    manager->cpuData + (size_t)privatePage * pageBytes,
+                    manager->cpuData + (size_t)sharedPage * pageBytes,
+                    pageBytes);
+            } else {
+#ifdef USE_CUDA
+                AssertInFastLLM(
+                    manager->cudaData != nullptr,
+                    "DSpark paged history cache manager has no CUDA data.");
+                const int originalDevice = FastllmCudaGetDevice();
+                int cacheDevice = GetPointerDeviceId(manager->cudaData);
+                if (cacheDevice < 0 &&
+                    !manager->dataDeviceIds.empty()) {
+                    cacheDevice = manager->dataDeviceIds[0];
+                }
+                AssertInFastLLM(
+                    cacheDevice >= 0,
+                    "DSpark paged history cache GPU is unknown.");
+                FastllmCudaSetDevice(cacheDevice);
+                FastllmCudaCopyFromDeviceToDevice(
+                    (uint8_t*)manager->cudaData +
+                        (size_t)privatePage * pageBytes,
+                    (uint8_t*)manager->cudaData +
+                        (size_t)sharedPage * pageBytes,
+                    pageBytes);
+                FastllmCudaSetDevice(originalDevice);
+#else
+                ErrorInFastLLM(
+                    "DSpark CUDA paged cache cannot be restored in a CPU build.");
+#endif
+            }
+            manager->ReleasePageIndex(sharedPage);
+            target.pageIndex.back() = privatePage;
+        };
+        for (int index = 0; index < block_cnt; index++) {
+            restoreTensor(
+                memory.targetKeyValues[index].first,
+                responseContext->pastKeyValues[index].first);
+            restoreTensor(
+                memory.targetKeyValues[index].second,
+                responseContext->pastKeyValues[index].second);
+        }
+
+        auto restored = std::make_unique<DsparkContext>();
+        restored->initialized = true;
+        restored->committedTokens = (int)memory.inputTokens.size();
+        restored->adaptiveDraftLimit = std::max(
+            1, std::min(dsparkBlockSize, memory.adaptiveDraftLimit));
+        restored->draftKeyValues.resize(dsparkLayers);
+        for (int index = 0; index < dsparkLayers; index++) {
+            restored->draftKeyValues[index].first.CopyFrom(
+                memory.draftKeyValues[index].first);
+            restored->draftKeyValues[index].second.CopyFrom(
+                memory.draftKeyValues[index].second);
+        }
+        restored->kdaSnapshots.resize(block_cnt);
+        restored->replay.resize(block_cnt);
+        restored->historyTokens = memory.inputTokens;
+
+        std::lock_guard<std::mutex> guard(dsparkContextMutex);
+        dsparkContexts[&responseContext->pastKeyValues] =
+            std::move(restored);
     }
 
     void KimiK3Model::EnsureDsparkRotary(int positions) {
@@ -2225,12 +2769,22 @@ namespace fastllm {
         }
 
         if (!context.initialized || tokenIds.size() != 1) {
+            AssertInFastLLM(
+                context.historyTokens.empty() ||
+                context.committedTokens ==
+                    (int)context.historyTokens.size(),
+                "DSpark history token state is out of sync.");
             TargetRunCapture capture;
             Data hiddenStates = RunLayersImpl(
                 tokenIds, block_cnt, &pastKeyValues, &capture);
             AppendDsparkTargetHidden(
                 capture, (int)tokenIds.size(), context);
+            context.historyTokens.insert(
+                context.historyTokens.end(),
+                tokenIds.begin(), tokenIds.end());
             context.initialized = true;
+            RecordDsparkHistoryCache(
+                context.historyTokens, pastKeyValues, context);
             return SampleTargetHidden(hiddenStates, generationConfig,
                                       lastTokens, logits);
         }
@@ -2264,36 +2818,71 @@ namespace fastllm {
         Linear(hiddenStates, weight["language_model.lm_head.weight"],
                Data(), targetLogits);
         ToDataType(targetLogits, DataType::FLOAT32);
-        Data targetTopK;
-        TopK(targetLogits, targetTopK, 1);
-        targetTopK.ToDevice(DataDevice::CPU);
-        AssertInFastLLM(
-            targetTopK.dims.size() == 3 &&
-            targetTopK.dims[1] == verifyTokens &&
-            targetTopK.dims.back() == 2,
-            "DSpark target verification TopK shape is invalid.");
-        std::vector<int> targetTokens(verifyTokens);
-        const float *topKData = (const float*)targetTopK.cpuData;
-        for (int token = 0; token < verifyTokens; token++) {
-            targetTokens[token] =
-                (int)(topKData[(size_t)token * 2] + 1e-3f);
-        }
+        const bool simpleGreedy = generationConfig.IsSimpleGreedy();
         int accepted = 0;
-        while (accepted < verifyDrafts &&
-               proposal.tokens[accepted] == targetTokens[accepted]) {
-            accepted++;
+        int nextToken = -1;
+        if (simpleGreedy) {
+            Data targetTopK;
+            TopK(targetLogits, targetTopK, 1);
+            targetTopK.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(
+                targetTopK.dims.size() == 3 &&
+                targetTopK.dims[1] == verifyTokens &&
+                targetTopK.dims.back() == 2,
+                "DSpark target verification TopK shape is invalid.");
+            const float *topKData = (const float*)targetTopK.cpuData;
+            while (accepted < verifyDrafts) {
+                int targetToken = (int)(
+                    topKData[(size_t)accepted * 2] + 1e-3f);
+                if (proposal.tokens[accepted] != targetToken) {
+                    nextToken = targetToken;
+                    break;
+                }
+                accepted++;
+            }
+            if (nextToken < 0) {
+                nextToken = (int)(
+                    topKData[(size_t)accepted * 2] + 1e-3f);
+            }
+        } else {
+            AssertInFastLLM(
+                targetLogits.dims.size() == 3 &&
+                targetLogits.dims[1] == verifyTokens,
+                "DSpark target sampling logits shape is invalid.");
+            LastTokensUnit samplingTokens;
+            if (!lastTokens.units.empty()) {
+                samplingTokens = lastTokens.units[0];
+            }
+            while (accepted < verifyDrafts) {
+                int sampled = LLMSampling(
+                    targetLogits, accepted, generationConfig,
+                    samplingTokens);
+                if (proposal.tokens[accepted] != sampled) {
+                    nextToken = sampled;
+                    break;
+                }
+                samplingTokens.Push(sampled);
+                accepted++;
+            }
+            if (nextToken < 0) {
+                nextToken = LLMSampling(
+                    targetLogits, accepted, generationConfig,
+                    samplingTokens);
+            }
         }
         const int commitTokens = accepted + 1;
         CommitTargetVerification(oldTokens, commitTokens, verifyTokens,
                                  pastKeyValues, context);
         AppendDsparkTargetHidden(capture, commitTokens, context);
-        UpdateDsparkAdaptiveLimit(verifyDrafts, accepted, context);
+        if (simpleGreedy) {
+            UpdateDsparkAdaptiveLimit(verifyDrafts, accepted, context);
+        }
 
         std::vector<int> outputs;
         outputs.reserve(commitTokens);
         outputs.insert(outputs.end(), proposal.tokens.begin(),
                        proposal.tokens.begin() + accepted);
-        outputs.push_back(targetTokens[accepted]);
+        outputs.push_back(nextToken);
         AssertInFastLLM((int)outputs.size() == commitTokens,
                         "DSpark output/commit alignment failed.");
         for (int index = 1; index < (int)outputs.size(); index++) {
@@ -2330,7 +2919,9 @@ namespace fastllm {
         for (uint64_t i = 0; i < currentIds.Count(0); i++) {
             tokenIds.push_back((int)(currentData[i] + 1e-3f));
         }
-        if (dsparkEnabled && generationConfig.IsSimpleGreedy() &&
+        if (dsparkEnabled &&
+            (generationConfig.IsSimpleGreedy() ||
+             generationConfig.tool_call_content_sampling_active) &&
             !generationConfig.output_logits) {
             return ForwardDspark(tokenIds, pastKeyValues, generationConfig,
                                  lastTokens, logits);

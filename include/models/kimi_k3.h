@@ -31,9 +31,20 @@ namespace fastllm {
 
         void OnResponseContextRemoved(ResponseContext *context) override;
 
+        bool TryRestoreHistoryCache(
+                std::vector<int> &inputTokens, int &cacheLen) override;
+
+        void PrepareToolCallConstraint(
+                ResponseContext *context,
+                GenerationConfig &generationConfig) override;
+
+        void UpdateToolCallConstraintState(
+                ResponseContext *context, int tokenId) override;
+
         // DSpark owns an additional five-layer draft KV cache derived from
         // target hidden states. FastLLM's generic history cache only stores
-        // the target caches, so restoring it would desynchronize the models.
+        // the target caches. DSpark therefore uses aligned model-specific
+        // prefill snapshots instead of the generic cache.
         bool UseGenericHistoryCache() const override {
             return !dsparkEnabled;
         }
@@ -95,12 +106,29 @@ namespace fastllm {
             std::vector<std::pair<Data, Data>> kdaSnapshots;
             std::vector<KdaReplayCapture> replay;
             std::deque<DsparkPendingStep> pending;
+            std::vector<int> historyTokens;
+        };
+
+        struct DsparkHistoryCacheMemory {
+            std::vector<int> inputTokens;
+            std::vector<std::pair<Data, Data>> targetKeyValues;
+            std::vector<std::pair<Data, Data>> draftKeyValues;
+            int adaptiveDraftLimit = 0;
+            long long flushTime = 0;
         };
 
         Data RunFirstLayerImpl(
                 const std::vector<int> &tokenIds,
                 std::vector<std::pair<Data, Data>> *pastKeyValues,
                 TargetRunCapture *capture = nullptr);
+
+        void RunKdaAttentionImpl(
+                int layerIndex,
+                Data &normalized,
+                int sequence,
+                std::vector<std::pair<Data, Data>> *pastKeyValues,
+                TargetRunCapture *capture,
+                Data &attention);
 
         Data RunLayersImpl(
                 const std::vector<int> &tokenIds,
@@ -116,6 +144,15 @@ namespace fastllm {
 
         DsparkContext &GetDsparkContext(
                 std::vector<std::pair<Data, Data>> &pastKeyValues);
+
+        void RecordDsparkHistoryCache(
+                const std::vector<int> &inputTokens,
+                const std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const DsparkContext &context);
+
+        void RestoreDsparkHistoryCache(
+                const DsparkHistoryCacheMemory &memory,
+                ResponseContext *responseContext);
 
         void EnsureDsparkRotary(int positions);
 
@@ -199,6 +236,14 @@ namespace fastllm {
             const std::vector<std::pair<Data, Data>>*,
             std::unique_ptr<DsparkContext>> dsparkContexts;
         std::mutex dsparkContextMutex;
+
+        std::map<
+            std::vector<int>,
+            std::shared_ptr<DsparkHistoryCacheMemory>> dsparkHistoryCache;
+        std::shared_ptr<DsparkHistoryCacheMemory> pendingDsparkHistoryCache;
+        std::mutex dsparkHistoryCacheMutex;
+        long long dsparkHistoryCacheFlushTime = 0;
+        int dsparkHistoryCacheMaxRecords = 5;
 
         static const std::string languagePrefix;
     };

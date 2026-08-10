@@ -361,6 +361,11 @@ fastllm_lib.add_cache_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c
 fastllm_lib.fetch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.fetch_response_llm_model.restype = ctypes.c_int
 
+fastllm_lib.fetch_response_tokens_batch_llm_model.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int
+]
+fastllm_lib.fetch_response_tokens_batch_llm_model.restype = ctypes.c_int
+
 fastllm_lib.fetch_response_logits_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
 fastllm_lib.fetch_response_logits_llm_model.restype = ctypes.c_int
 
@@ -428,6 +433,7 @@ fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 
 fastllm_lib.warmup_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.warmup_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.get_max_input_len_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
@@ -1381,6 +1387,22 @@ class model:
         except Exception:
             return False
 
+    def _uses_hf_deepseek_v4_tokenizer(self) -> bool:
+        """Use the checkpoint tokenizer after rendering the official V4 prompt.
+
+        DeepSeek-V4 ships ``encoding_dsv4.py`` instead of a Jinja chat
+        template.  Prompt rendering therefore remains model-specific, but the
+        resulting text must still be tokenized by the checkpoint's Hugging
+        Face tokenizer.  FastLLM's generic native BPE path does not currently
+        reproduce every pre-tokenizer rule in this checkpoint and can split an
+        otherwise identical prompt into a different token sequence.
+        """
+        return (
+            self._is_deepseek_v4()
+            and not self.force_chat_template
+            and self.hf_tokenizer is not None
+        )
+
     def _is_laguna(self) -> bool:
         if self._get_architecture() in {"LagunaForCausalLM", "LagunaForConditionalGeneration"}:
             return True
@@ -1672,6 +1694,28 @@ class model:
             architecture = self.config["architectures"][0]
         except:
             architecture = ""
+        if self._uses_hf_deepseek_v4_tokenizer():
+            from ftllm.encoding_dsv4 import encode_messages
+            thinking_mode = "thinking" if enable_thinking else "chat"
+            rendered_conversation = self._inject_deepseek_v4_tools(
+                copy.deepcopy(conversation), tools)
+            prompt = encode_messages(
+                rendered_conversation, thinking_mode=thinking_mode)
+            input_ids = encode_hf_prompt(self.hf_tokenizer, prompt)
+            # The OpenAI server asks for the count immediately before launching
+            # the same request.  Reuse the exact ids so count and execution can
+            # never diverge across tokenizer versions or concurrent requests.
+            self.thread_local_obj.pending_text_input_token_cache = {
+                "conversation": copy.deepcopy(conversation),
+                "add_generation_prompt": add_generation_prompt,
+                "enable_thinking": enable_thinking,
+                "tools": copy.deepcopy(tools),
+                "thinking_effort": thinking_effort,
+                "tool_choice": copy.deepcopy(tool_choice),
+                "chat_template_kwargs": copy.deepcopy(chat_template_kwargs),
+                "input_ids": list(input_ids),
+            }
+            return len(input_ids)
         if self._can_apply_hf_chat_template():
             template_conversation = self.trans_conversation(
                 copy.deepcopy(conversation))
@@ -1908,7 +1952,8 @@ class model:
         conversation = None
         if (isinstance(query, List)):
             conversation = query
-        if self._can_apply_hf_chat_template():
+        if (self._can_apply_hf_chat_template() or
+                self._uses_hf_deepseek_v4_tokenizer()):
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -1922,10 +1967,17 @@ class model:
             else:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
-                                                    add_generation_prompt = add_generation_prompt,
-                                                    tokenize = False,
-                                                    enable_thinking = self.enable_thinking)
+                    if self._uses_hf_deepseek_v4_tokenizer():
+                        from ftllm.encoding_dsv4 import encode_messages
+                        thinking_mode = (
+                            "thinking" if self.enable_thinking else "chat")
+                        prompt = encode_messages(
+                            conversation, thinking_mode=thinking_mode)
+                    else:
+                        prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
+                                                        add_generation_prompt = add_generation_prompt,
+                                                        tokenize = False,
+                                                        enable_thinking = self.enable_thinking)
                     #input = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = True)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
@@ -2223,7 +2275,8 @@ class model:
                 print("Error: can't support architectures: " + architecture)
                 exit(0)
 
-        if self._can_apply_hf_chat_template():
+        if (self._can_apply_hf_chat_template() or
+                self._uses_hf_deepseek_v4_tokenizer()):
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -2251,7 +2304,16 @@ class model:
                 if can_reuse_token_count:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
-                    if self._is_kimi_k3():
+                    if self._uses_hf_deepseek_v4_tokenizer():
+                        from ftllm.encoding_dsv4 import encode_messages
+                        thinking_mode = (
+                            "thinking" if enable_thinking else "chat")
+                        rendered_conversation = self._inject_deepseek_v4_tools(
+                            copy.deepcopy(conversation), tools)
+                        prompt = encode_messages(
+                            rendered_conversation,
+                            thinking_mode=thinking_mode)
+                    elif self._is_kimi_k3():
                         direct_template_tokens = apply_hf_chat_template(
                             tokenizer,
                             self.trans_conversation(conversation),
@@ -2365,7 +2427,8 @@ class model:
         }
     
     def stream_response_handle(self, handle):
-        if self._can_apply_hf_chat_template():
+        if (self._can_apply_hf_chat_template() or
+                self._uses_hf_deepseek_v4_tokenizer()):
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:
@@ -2437,21 +2500,37 @@ class model:
             if statistics is not None:
                 response_statistics.update(statistics)
 
-        if self._can_apply_hf_chat_template():
+        # DSpark commits at most a small speculative block per scheduler turn,
+        # but more than one block may be ready when the HTTP consumer is slow.
+        # Drain a generous bounded batch through one C call and one scheduler
+        # mutex acquisition.
+        fetch_batch_capacity = 64
+        fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)()
+
+        def fetch_ready_tokens():
+            count = fastllm_lib.fetch_response_tokens_batch_llm_model(
+                self.model, handle, fetch_batch_buffer,
+                fetch_batch_capacity)
+            if count <= 0:
+                return count, []
+            return count, [fetch_batch_buffer[i] for i in range(count)]
+
+        if (self._can_apply_hf_chat_template() or
+                self._uses_hf_deepseek_v4_tokenizer()):
             tokenizer = self.hf_tokenizer
             tokens = []
-            while True:
-                if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
+            finished = False
+            while not finished:
+                count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
+                if count == 0:
                     if (is_prefill and time.time() - start_time > 5):
                         start_time = time.time()
                         yield ""
-                    await asyncio.sleep(0)
                     continue
                 is_prefill = False
                 capture_response_statistics()
-                cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
-                if (cur <= -1):
-                    if (cur == -2):
+                if count <= -1:
+                    if count == -2:
                         yield "prompt too long"
                     if (self.save_history):
                         try:
@@ -2460,16 +2539,23 @@ class model:
                         except:
                             pass
                     break
-                tokens.append(cur)
-                ret = tokenizer.decode(tokens)
-                if (ret.encode().find(b'\xef\xbf\xbd') == -1):
-                    if (self.save_history and handle in self.current_tokenizer_cache):
-                        self.current_tokenizer_cache[handle][0].append(ret)
-                        self.current_tokenizer_cache[handle][1].append([] + tokens)
-                    tokens.clear()
-                    yield ret
-                else:
-                    yield ""
+
+                # Decode at the original token boundaries and only coalesce
+                # the yielded text. This keeps byte-fallback handling and exact
+                # output text identical to the one-token streaming path.
+                ready_text = ""
+                for token in ready_tokens:
+                    tokens.append(token)
+                    ret = tokenizer.decode(tokens)
+                    if ret.encode().find(b'\xef\xbf\xbd') == -1:
+                        if (self.save_history and
+                                handle in self.current_tokenizer_cache):
+                            self.current_tokenizer_cache[handle][0].append(ret)
+                            self.current_tokenizer_cache[handle][1].append(
+                                [] + tokens)
+                        tokens.clear()
+                        ready_text += ret
+                yield ready_text
             if len(tokens) > 0:
                 if (self.save_history and handle in self.current_tokenizer_cache):
                     self.current_tokenizer_cache[handle][0].append(tokenizer.decode(tokens))
@@ -2481,23 +2567,26 @@ class model:
             pending_tokens = []
             fail_cnt = 0
             while True:
-                if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
-                    await asyncio.sleep(0)
+                count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
+                if count == 0:
                     continue
                 capture_response_statistics()
-                if (self.save_history and handle in self.current_tokenizer_cache):
-                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
-                    if (token <= -1):
+                if count <= -1:
+                    if count == -2:
+                        yield "prompt too long"
+                    if (self.save_history and
+                            handle in self.current_tokenizer_cache):
                         try:
                             cur = self.current_tokenizer_cache.pop(handle)
                             self.tokenizer_cache.add(cur[0], cur[1])
                         except:
                             pass
-                        break
+                    break
+                for token in ready_tokens:
                     ret += self._decode_fastllm_token(token)
-                    pending_tokens.append(token)
-                else:
-                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                    if (self.save_history and
+                            handle in self.current_tokenizer_cache):
+                        pending_tokens.append(token)
                 cur = ""
                 try:
                     cur = ret.decode()
@@ -2640,7 +2729,9 @@ class model:
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
     def warmup(self):
-        fastllm_lib.warmup_llm_model(self.model)
+        error = fastllm_lib.warmup_llm_model(self.model)
+        if error:
+            raise RuntimeError(error.decode("utf-8", errors="replace"))
 
     def set_moe_experts(self, experts: int):
         fastllm_lib.set_moe_experts(self.model, experts)

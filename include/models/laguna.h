@@ -24,6 +24,7 @@ namespace fastllm {
         bool CanUseGPUForward() const override;
         bool NeedAttentionMask(int qlen, int klen) override;
         int GetKVCacheRetainedTokens(int layer) const override;
+        bool BoundedKVCacheUsesTokenGrowingStorage() const override;
         bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         int QueryPagedPrefixCacheExtra(ResponseContext *context,
                                        int maxCachedLen) const override;
@@ -34,6 +35,19 @@ namespace fastllm {
     protected:
         void PrepareMoeWeights() override;
         void PrepareRuntimeWeights() override;
+        DataType GPUForwardComputeType() const override;
+        DataType GPUForwardCacheType(int layer, DataType requestedType,
+                                     DataType computeType) const override;
+        bool GPUForwardUseYarnRope(int layer) const override;
+        void GPUForwardYarnRopeParams(int layer, float &factor,
+                                      float &attentionFactor,
+                                      float &correctionLow,
+                                      float &correctionHigh) const override;
+        int GPUForwardAttentionWindowLeft(int layer) const override;
+        int GPUForwardPagedCacheMaxPages(int layer) const override;
+        bool GPUForwardUseMambaSoftplusGate(int layer) const override;
+        Data *GPUForwardMambaSoftplusALog() override;
+        Data *GPUForwardMambaSoftplusDtBias() override;
         void ApplyStepRotary(Data &input, const Data &positionIds, int layer) override;
         void ApplyAttentionGateActivation(Data &gate, int layer) override;
         bool UsePagedAttention(int layer) const override;
@@ -54,12 +68,9 @@ namespace fastllm {
         float slidingRopeTheta = 10000.0f;
         int slidingRotaryDim = 128;
 
-        Data yarnSinData;
-        Data yarnCosData;
         Data softplusALog;
         Data softplusDtBias;
 
-        void BuildYarnCache();
         std::string MapTensorName(const std::string &name) const;
     };
 }

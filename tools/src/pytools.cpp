@@ -7,9 +7,15 @@
 #include <cstring>
 #include <csignal>
 #include <cstdint>
+#include <exception>
+#include <string>
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#endif
+
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
 #endif
 
 #ifdef WIN32
@@ -32,6 +38,8 @@ struct FASTLLM_PYTOOLS_INIT {
         std::signal(SIGINT, signal_handler);
     }
 } fastllm_pytools_init;
+
+static thread_local std::string fastllmPytoolsWarmupError;
 
 extern "C" {
     typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
@@ -182,6 +190,15 @@ extern "C" {
             locker.unlock();
             return ret;
         }
+
+        std::unique_ptr<fastllm::basellm> TakeModel(int handle) {
+            std::lock_guard<std::mutex> guard(locker);
+            auto it = models.find(handle);
+            if (it == models.end()) {
+                return nullptr;
+            }
+            return std::move(it->second);
+        }
     };
 
     static ModelManager models;
@@ -250,6 +267,24 @@ extern "C" {
         auto root = json11::Json::parse(payload, error);
         if (!error.empty() || root.is_null()) {
             return false;
+        }
+        json11::Json contentSampling = root["content_sampling"];
+        if (contentSampling.is_object() &&
+            contentSampling["type"].string_value() == "tool_content_sampling" &&
+            contentSampling["format"].string_value() == "kimi_k3_xtml") {
+            int topK = contentSampling["top_k"].int_value();
+            double topP = contentSampling["top_p"].number_value();
+            double temperature = contentSampling["temperature"].number_value();
+            if (topK <= 0 || topP <= 0.0 || topP > 1.0 ||
+                temperature <= 0.0) {
+                return false;
+            }
+            config.tool_call_content_sampling_enabled = true;
+            config.tool_call_content_top_k = topK;
+            config.tool_call_content_top_p = (float)topP;
+            config.tool_call_content_temperature = (float)temperature;
+            config.tool_call_allowed_token_ids.clear();
+            return true;
         }
         json11::Json nameConstraint = root["name_constraint"];
         if (!nameConstraint.is_object()) {
@@ -470,8 +505,14 @@ extern "C" {
     }
 
     DLL_EXPORT void release_memory(int modelId) {
-        auto model = models.GetModel(modelId);
-        model->weight.ReleaseWeight();
+        // release_memory is terminal.  Destroy the model while the CUDA runtime
+        // and process-wide caches are still alive instead of deferring it to
+        // ModelManager's static destruction during interpreter shutdown.
+        auto model = models.TakeModel(modelId);
+        model.reset();
+#ifdef USE_NUMAS
+        fastllm::ClearNumasMoeRuntimeCache();
+#endif
         return;
     }
 
@@ -578,10 +619,24 @@ extern "C" {
         return;
     }
 
-    DLL_EXPORT void warmup_llm_model(int modelId) {
-        auto model = models.GetModel(modelId);
-        model->AutoWarmup();
-        return;
+    DLL_EXPORT const char *warmup_llm_model(int modelId) {
+        fastllmPytoolsWarmupError.clear();
+        try {
+            auto model = models.GetModel(modelId);
+            model->AutoWarmup();
+            return nullptr;
+        } catch (const std::exception &error) {
+            fastllmPytoolsWarmupError = error.what();
+        } catch (const char *error) {
+            fastllmPytoolsWarmupError = error == nullptr ?
+                "unknown FastLLM warmup error" : error;
+        } catch (...) {
+            fastllmPytoolsWarmupError = "unknown FastLLM warmup error";
+        }
+        fprintf(stderr, "[Fastllm] Model warmup failed: %s\n",
+                fastllmPytoolsWarmupError.c_str());
+        fflush(stderr);
+        return fastllmPytoolsWarmupError.c_str();
     }
 
     DLL_EXPORT void save_llm_model(int modelId, char *path) {
@@ -929,6 +984,13 @@ extern "C" {
     DLL_EXPORT int fetch_response_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         return model->FetchResponseTokens(handleId);
+    }
+
+    DLL_EXPORT int fetch_response_tokens_batch_llm_model(
+            int modelId, int handleId, int *output, int maxTokens) {
+        auto model = models.GetModel(modelId);
+        return model->FetchResponseTokensBatch(
+            handleId, output, maxTokens);
     }
 
     DLL_EXPORT int fetch_response_logits_llm_model(int modelId, int handleId, float *logits) {

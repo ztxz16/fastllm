@@ -6,6 +6,7 @@
 
 #include "fastllm.h"
 
+#include <cstdint>
 #include <functional>
 
 std::vector <long long> FastllmCudaGetFreeSizes();
@@ -19,13 +20,35 @@ extern "C" {
 using DivisionScheme = std::map <int, std::vector <std::pair <int, int> > >;
 
 bool FastllmInitNccl(const std::vector<int>& devices);
+// Monotonically identifies the currently initialized global NCCL communicator
+// group. Custom collective state must match this generation before it can run.
+uint64_t FastllmGetNcclGeneration();
+// Enables and validates direct CUDA peer access for every device pair.  This
+// capability is independent of the optional custom all-reduce implementation
+// and can also be used by graph-safe peer signaling with NCCL collectives.
+bool FastllmCudaPeerAccessInit(const std::vector<int>& devices);
 // Graph-safe small-tensor all-reduce backed by direct peer reads and a GPU-side
-// barrier. It is opt-in through FASTLLM_CUDA_CUSTOM_ALLREDUCE=1; all functions
-// return false when disabled or unsupported so NCCL remains the fallback.
+// barrier. With FASTLLM_CUDA_CUSTOM_ALLREDUCE unset or set to "auto", it is
+// correctness-tested and benchmarked against NCCL on the active eager or CUDA
+// Graph path. FP16/BF16/FP32 and small/large messages are selected independently
+// for supported 2/4/6/8-GPU groups. Set the variable to 1 to
+// force-enable every supported path, or 0 to force-disable it. Unsupported or
+// disabled tensors return false so NCCL remains the fallback.
 bool FastllmCudaCustomAllReduceEnabled();
+bool FastllmCudaCustomAllReduceCanRun(int count, int dataType, int deviceId);
 bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
+// Disable the published policy, drain the old device group and release all
+// group-owned signal, scratch and pointer-registration allocations.
+void FastllmCudaCustomAllReduceReset();
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// Reduces two independent rank-local tensors, rounds each reduction to the
+// destination type, then adds the rounded values into dest.  Keeping the two
+// reduction accumulators separate preserves the result of
+// Add(allreduce(first), allreduce(second)); this is not equivalent to reducing
+// rank-local pre-added partials for FLOAT16/BFLOAT16.
+bool FastllmCudaCustomAllReducePairAdd(void* first, void* second, void* dest,
+                                      int count, int dataType, int deviceId);
 // TP=2 graph-safe fused residual path: dest = allreduce(data) + dest.
 // Returns false without modifying dest when the topology/type is unsupported.
 bool FastllmCudaCustomAllReduceAdd(void* data, void* dest, int count,
@@ -38,6 +61,10 @@ bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId);
 void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, int root, int deviceId);
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
+// Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
+// prefill tensors can be bandwidth-bound on the direct-peer implementation
+// even though it is faster for decode tensors.
+void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.
 // Callers use this preflight to preserve their existing NCCL fallback without
 // first changing the reduction's compute or accumulation order.
@@ -62,7 +89,7 @@ void BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(const std::string &wei
     int mid, bool explicitDeviceRatios = false);
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
     std::vector <int> &multiCudaCurrentDevices, DivisionScheme &divisionScheme, int splitAxis,
-    bool explicitDeviceRatios = false);
+    bool explicitDeviceRatios = false, bool directLocalMemory = false);
 bool SplitMultiCudaWeight1D(fastllm::Data &bias, std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme); // 1维的多卡切分
 bool PlaceMultiCudaWeightOnDevice(fastllm::Data &weight, std::vector <int> &multiCudaCurrentDevices, int targetDevice);
 void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool copyData);
@@ -89,6 +116,11 @@ namespace fastllm {
 
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
+    // Computes the rank-local column-linear partials without reducing them.
+    // The returned tensor temporarily uses replicated storage so a following
+    // fused collective can consume one partial from every device.
+    bool MultiCudaLinearColumnLocal(Data &input, Data &weight, Data &bias,
+                                    Data &output);
 
     // 将常驻 MultiCUDA worker 的 per-thread stream 接入/并回调用线程正在捕获的
     // 每卡 CUDA Graph。events 必须与 devices 一一对应并归属相同设备。
@@ -103,6 +135,14 @@ namespace fastllm {
     // CUDA stream 前显式等待对应 worker event。
     bool MultiCudaSetPersistentAsyncDispatch(bool enabled);
     bool MultiCudaRunDeviceCallbacks(
+        const std::vector<int> &devices,
+        const std::function<void(int, int)> &callback);
+    // Enqueue persistent-buffer work on each dedicated worker and wait only
+    // until the callbacks have submitted their CUDA work.  Unlike the generic
+    // callback path, this does not insert worker-completion waits into the
+    // caller streams.  The callback must provide its own GPU-side producer /
+    // consumer ordering and keep every referenced allocation alive.
+    bool MultiCudaRunDeviceCallbacksEnqueueOnly(
         const std::vector<int> &devices,
         const std::function<void(int, int)> &callback);
     bool MultiCudaCurrentThreadWaitForWorker(int device);
