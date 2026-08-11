@@ -1031,6 +1031,23 @@ namespace fastllm {
                             {"cache", &cache}, {"input", &input}},
                    FloatDict(), IntDict());
     }
+    inline void Qwen3CudaAppendPagedCacheBatch(
+            Qwen3CudaDirectRunner &runner,
+            PagedCacheManager &pagedCacheManager,
+            const std::vector<Data*> &currentCaches,
+            Data &input,
+            Data &insertIndexs,
+            Data &insertPositions) {
+        runner.Run("AppendPagedCacheBatch",
+                   DataDict{{"pagedCacheManager", (Data*)&pagedCacheManager},
+                            {"currentCaches", (Data*)currentCaches.data()},
+                            {"input", &input},
+                            {"insertIndexs", &insertIndexs},
+                            {"insertPositions", &insertPositions}},
+                   FloatDict(),
+                   IntDict{{"currentCaches___batch", (int)currentCaches.size()}});
+    }
+
 
     inline void Qwen3CudaGenerateAppendPagedCacheBatchParams(
             Qwen3CudaDirectRunner &runner,

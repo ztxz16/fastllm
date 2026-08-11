@@ -1929,7 +1929,8 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
                      !routedMoeWeight &&
                      FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
                      FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
-    bool useSm70Awq = !useMarlin && weight.zeros.size() == (size_t)k * group &&
+    bool useSm70Awq = !useMarlin && !routedMoeWeight &&
+                      weight.zeros.size() == (size_t)k * group &&
                       FastllmCudaInt4GroupSm70AwqEnabled(n, m, k, groupCnt) &&
                       FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k);
     if (!useMarlin && !useSm70Awq) {

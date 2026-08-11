@@ -16,6 +16,7 @@
 #include <cstring>
 #include <thread>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 #include <deque>
 #include <array>
@@ -95,12 +96,9 @@ namespace fastllm {
     static void MySleep(int t) {
         std::this_thread::sleep_for(std::chrono::seconds(t));
     }
-
     static void ErrorInFastLLM(const std::string &error) {
         printf("FastLLM Error: %s\n", error.c_str());
-        printf("Press any key to exit...\n");
-        getchar();
-        exit(0);
+        throw std::runtime_error(error);
     }
 
     static void AssertInFastLLM(bool condition, const std::string &error) {

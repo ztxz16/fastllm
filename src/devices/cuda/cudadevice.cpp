@@ -4090,6 +4090,12 @@ namespace fastllm {
         this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());
         this->ops["AlibiMask"] = (BaseOperator*)(new CudaAlibiMaskOp());
         this->ops["TransferAttn"] = (BaseOperator*)(new CudaTransferAttnOp());
+        this->ops["GatedDeltaRulePrepareAttn"] =
+                (BaseOperator*)(new CudaGatedDeltaRulePrepareAttnOp());
+        this->ops["GatedDeltaRuleBuildDecay"] =
+                (BaseOperator*)(new CudaGatedDeltaRuleBuildDecayOp());
+        this->ops["GatedDeltaRuleApplyDecayMask"] =
+                (BaseOperator*)(new CudaGatedDeltaRuleApplyDecayMaskOp());
         this->ops["ApplyChunkDecayByLastLogG"] = (BaseOperator*)(new CudaApplyChunkDecayByLastLogGOp());
         this->ops["CumSumLastDim"] = (BaseOperator*)(new CudaCumSumLastDimOp());
         this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
@@ -6371,6 +6377,82 @@ namespace fastllm {
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         FastllmCudaTransferAttn(input);
+    }
+
+    void CudaGatedDeltaRulePrepareAttnOp::Reshape(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &at = *(datas.find("at")->second);
+        Data &attn = *(datas.find("attn")->second);
+        attn.dataType = at.dataType;
+        attn.Resize(at.dims);
+    }
+
+    void CudaGatedDeltaRulePrepareAttnOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &at = *(datas.find("at")->second);
+        Data &decayMask = *(datas.find("decay_mask")->second);
+        Data &attn = *(datas.find("attn")->second);
+        AssertInFastLLM(
+            at.dataType == decayMask.dataType && at.dims == decayMask.dims,
+            "GatedDeltaRulePrepareAttn error: at and decay_mask must match.\n");
+        attn.Allocate();
+        if (FastllmCudaGatedDeltaRulePrepareAttn(at, decayMask, attn)) {
+            return;
+        }
+        FastllmCudaMul(at, -1.0f, attn);
+        FastllmCudaMulTo(attn, decayMask, 1.0f);
+        FastllmCudaCausalMask(attn, 0, 0.0f);
+        FastllmCudaTransferAttn(attn);
+    }
+
+    void CudaGatedDeltaRuleBuildDecayOp::Reshape(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &g = *(datas.find("g")->second);
+        Data &decayMask = *(datas.find("decay_mask")->second);
+        std::vector<int> dims = g.dims;
+        dims.push_back(dims.back());
+        decayMask.dataType = g.dataType;
+        decayMask.Resize(dims);
+    }
+
+    void CudaGatedDeltaRuleBuildDecayOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &g = *(datas.find("g")->second);
+        Data &decayMask = *(datas.find("decay_mask")->second);
+        decayMask.Allocate();
+        if (FastllmCudaGatedDeltaRuleBuildDecay(g, decayMask)) {
+            return;
+        }
+        FastllmCudaCumSumLastDim(g);
+        FastllmCudaMakeDecayMask(g, decayMask);
+    }
+
+    void CudaGatedDeltaRuleApplyDecayMaskOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &attn = *(datas.find("attn")->second);
+        Data &decayMask = *(datas.find("decay_mask")->second);
+        int causalBase = intParams.find("causal_base") != intParams.end()
+            ? intParams.find("causal_base")->second : 1;
+        AssertInFastLLM(
+            attn.dataType == decayMask.dataType &&
+            attn.dims == decayMask.dims,
+            "GatedDeltaRuleApplyDecayMask error: tensors must match.\n");
+        if (FastllmCudaGatedDeltaRuleApplyDecayMask(
+                attn, decayMask, causalBase)) {
+            return;
+        }
+        FastllmCudaMulTo(attn, decayMask, 1.0f);
+        FastllmCudaCausalMask(attn, causalBase, 0.0f);
     }
 
     void CudaApplyChunkDecayByLastLogGOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -8822,8 +8904,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
                         cache.dataType == DataType::FLOAT16 ||
                         cache.dataType == DataType::BFLOAT16 ||
-                        cache.dataType == DataType::FP8_E4M3,
-                        "CudaAppendPagedCacheOp's cache's type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+                        cache.dataType == DataType::FP8_E4M3 ||
+                        IsPackedKVCacheDataType(cache.dataType),
+                        "CudaAppendPagedCacheOp's cache type should be float32, float16, bfloat16, fp8_e4m3 or packed KV.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16 ||
                         input.dataType == DataType::BFLOAT16,
@@ -9033,8 +9116,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         AssertInFastLLM(((Data*)&manager)->dataType == DataType::FLOAT32 ||
                         ((Data*)&manager)->dataType == DataType::FLOAT16 ||
                         ((Data*)&manager)->dataType == DataType::BFLOAT16 ||
-                        ((Data*)&manager)->dataType == DataType::FP8_E4M3,
-                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+                        ((Data*)&manager)->dataType == DataType::FP8_E4M3 ||
+                        IsPackedKVCacheDataType(((Data*)&manager)->dataType),
+                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16, fp8_e4m3 or packed KV.\n");
         AssertInFastLLM(input.dims.size() == 3,
                         "CudaAppendPagedCacheBatchOp's input should have 3 dimensions [batch, numHeads, headDim].\n");
         AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == input.dims[0],

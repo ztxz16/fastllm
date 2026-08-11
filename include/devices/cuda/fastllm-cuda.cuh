@@ -352,6 +352,19 @@ void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, i
                                     int pageLen, int batch, int numHeads, int headDim,
                                     fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
                                     bool sync = true);
+bool FastllmCudaPackedKVCacheCopy(uint8_t *pagedData, int pageIdx, int pageLen,
+                                  int numHeads, int headDim, fastllm::DataType dstType,
+                                  uint8_t *inputData, fastllm::DataType srcType,
+                                  int seqLen, int inputOffset, int copyLen, int pageOffset);
+bool FastllmCudaPackedKVCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray,
+                                       int32_t *pageOffsetArray, int pageLen, int batch,
+                                       int numHeads, int headDim, fastllm::DataType dstType,
+                                       uint8_t *inputData, fastllm::DataType srcType,
+                                       bool sync = true);
+bool FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+        const uint8_t *pagedData, fastllm::DataType srcType,
+        const int32_t *pageIndices, int kvStart, int chunkLen,
+        int pageLen, int numHeads, int headDim, int head, void *output);
 
 bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);
@@ -423,6 +436,13 @@ bool FastllmCudaQwen35FusedMoeJoin(
 bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaTransferAttn(fastllm::Data &input);
+bool FastllmCudaGatedDeltaRulePrepareAttn(
+    const fastllm::Data &at, const fastllm::Data &decayMask,
+    fastllm::Data &attn);
+bool FastllmCudaGatedDeltaRuleBuildDecay(
+    fastllm::Data &g, fastllm::Data &decayMask);
+bool FastllmCudaGatedDeltaRuleApplyDecayMask(
+    fastllm::Data &attn, const fastllm::Data &decayMask, int causalBase);
 bool FastllmCudaCumSumLastDim(fastllm::Data &input);
 bool FastllmCudaCausalMask(fastllm::Data &input, int base, float maskValue);
 bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output);
@@ -910,6 +930,23 @@ bool FastllmCudaMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight
 bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
     const fastllm::Data &input, fastllm::Data &output);
+// SM70 (V100) IQ4_XS DP4A matrix-multiply-quantized trial path.
+// Eligibility: SM70 device only, GGML_TYPE_IQ4_XS weights, n in [8,64],
+// m % 256 == 0, supported activation/output dtype.  Returns false (leaving
+// output untouched) on any unsupported case or launch failure; the caller
+// must preserve a dequant+cuBLAS / MMVQ fallback.  Env gate:
+// FASTLLM_CUDA_SM70_IQ4XS_MMQ=0 disables.
+#ifdef USE_ROCM
+inline bool FastllmCudaSm70Iq4XsMmqSupported() { return false; }
+inline bool FastllmCudaTrySm70Iq4XsMmq(const void *, const void *, void *,
+                                       fastllm::DataType, int, int, int,
+                                       void * = nullptr) { return false; }
+#else
+bool FastllmCudaSm70Iq4XsMmqSupported();
+bool FastllmCudaTrySm70Iq4XsMmq(const void *weight, const void *input,
+                                void *output, fastllm::DataType dataType,
+                                int n, int m, int k, void *stream = nullptr);
+#endif
 bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaFloatMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                         fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
@@ -1479,14 +1516,14 @@ void FastllmResetLogitsOfEOSAll(int batch, fastllm::Data *logits, const std::vec
 void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float qScale = 1.0f);
 bool FastllmLinearAttentionStateTransposeKVToVKFloat16(fastllm::Data &last_recurrent_state);
 bool FastllmLinearAttentionStateTransposeVKToKVFloat16(fastllm::Data &last_recurrent_state);
-bool FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale = 1.0f);
-bool FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &a, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &aLog, fastllm::Data &dtBias, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale = 1.0f);
+bool FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
+bool FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &a, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &aLog, fastllm::Data &dtBias, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 // Benchmark/validation entry for the single-token transposed recurrent kernel.
 bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16WithConfig(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
@@ -1499,14 +1536,14 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     fastllm::Data **tokenStates, int numTokenStates,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
@@ -1514,7 +1551,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
     fastllm::Data &coreAttnOut,
     const std::vector<fastllm::Data*> &tokenStates, int numTokenStates,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 void FastllmRecurrentGatedDeltaRuleBatch(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out, float qScale = 1.0f);
 bool FastllmRecurrentGatedDeltaRuleBatchDevicePointers(
     fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b,
@@ -1525,34 +1562,37 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
     fastllm::Data &aLog, fastllm::Data &dtBias,
     std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
     fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
     fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
 bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     void *cudaStatePool, void *cudaSlotIds, int batch,
     fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
+    float eps, float qScale = 1.0f, bool tiledQKHeadOrder = false);
+bool FastllmCudaSm70WmmaChunkGdnPrefillSupported(
+    fastllm::DataType dataType, int chunks, int chunkSize,
+    int kDim, int vDim);
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out);

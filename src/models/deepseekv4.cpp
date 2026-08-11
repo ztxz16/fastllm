@@ -33,6 +33,8 @@
 #include <cctype>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <atomic>
@@ -3568,26 +3570,36 @@ namespace fastllm {
                                         const std::vector<int> &inputIds, int nRoutedExperts,
                                         int topk, const std::string &scoreFunc, float routeScale,
                                         Data &expertIndex, Data &expertScore,
-                                        const Data *decodeMeta = nullptr) {
+                                        const Data *decodeMeta = nullptr,
+                                        const DeepSeekV4ExpertAllowList *expertPolicy = nullptr,
+                                        Data *hashRouteTable = nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4RouteScore");
             Data xFloat, routerLogits;
             ToDataType(x, xFloat, DataType::FLOAT32);
             Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
 
 #ifdef USE_CUDA
-            bool hashRoutingForCuda = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            const bool restrictedExperts =
+                expertPolicy != nullptr && expertPolicy->configured;
+            bool hashRoutingForCuda = hashRouteTable != nullptr ||
+                weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            Data *effectiveCudaHashRouteTable = hashRouteTable;
+            if (effectiveCudaHashRouteTable == nullptr && hashRoutingForCuda) {
+                effectiveCudaHashRouteTable = &weight[prefix + ".gate.tid2eid"];
+            }
             if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && hashRoutingForCuda &&
                 routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32 &&
                 inputIds.size() >= (size_t)x.dims[0]) {
                 int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
-                if (DeepSeekV4HashRouteScoreMultiCuda(routerLogits, weight[prefix + ".gate.tid2eid"],
+                if (DeepSeekV4HashRouteScoreMultiCuda(routerLogits, *effectiveCudaHashRouteTable,
                                                       inputIds.data(), x.dims[0], topk,
                                                       scoreFuncMode, routeScale,
                                                       expertIndex, expertScore, decodeMeta)) {
                     return;
                 }
             }
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
+            if (!restrictedExperts &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
                 routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32) {
                 int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
                 Data *gateBiasData = nullptr;
@@ -3611,12 +3623,17 @@ namespace fastllm {
 #endif
             auto rawScores = ReadFloatData(routerLogits);
 
-            bool hashRouting = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            bool hashRouting = hashRouteTable != nullptr ||
+                weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            Data *effectiveHashRouteTable = hashRouteTable;
+            if (effectiveHashRouteTable == nullptr && hashRouting) {
+                effectiveHashRouteTable = &weight[prefix + ".gate.tid2eid"];
+            }
             std::shared_ptr<const std::vector<float>> tid2eidPtr, gateBiasPtr;
             const std::vector<float> *tid2eid = nullptr;
             const std::vector<float> *gateBias = nullptr;
             if (hashRouting) {
-                tid2eidPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.tid2eid"]);
+                tid2eidPtr = ReadWeightFloatDataCached(*effectiveHashRouteTable);
                 tid2eid = tid2eidPtr.get();
             } else if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
                 gateBiasPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.bias"]);
@@ -3624,9 +3641,20 @@ namespace fastllm {
             }
 
             int tokens = x.dims[0];
-            std::vector<int> indices((uint64_t)tokens * topk);
-            std::vector<float> weights((uint64_t)tokens * topk);
+            std::vector<int> indices;
+            std::vector<float> weights;
+            if (!hashRouting) {
+                SelectDeepSeekV4AllowedExperts(
+                    rawScores, tokens, nRoutedExperts, topk, scoreFunc,
+                    routeScale, gateBias, expertPolicy, indices, weights);
+                WriteIntData(indices, {tokens, topk}, expertIndex);
+                WriteFloatData(weights, {tokens, topk}, expertScore,
+                               DataType::FLOAT32);
+                return;
+            }
 
+            indices.resize((uint64_t)tokens * topk);
+            weights.resize((uint64_t)tokens * topk);
             for (int t = 0; t < tokens; t++) {
                 std::vector<float> originalScores(nRoutedExperts);
                 if (scoreFunc == "softmax") {
@@ -3646,42 +3674,42 @@ namespace fastllm {
                 } else {
                     for (int e = 0; e < nRoutedExperts; e++) {
                         float raw = rawScores[(uint64_t)t * nRoutedExperts + e];
-                        originalScores[e] = (scoreFunc == "sigmoid") ? SigmoidFloat(raw) : std::sqrt(SoftplusFloat(raw));
+                        originalScores[e] = (scoreFunc == "sigmoid")
+                            ? SigmoidFloat(raw)
+                            : std::sqrt(SoftplusFloat(raw));
                     }
                 }
 
                 std::vector<int> curIndices(topk);
-                auto selectByScore = [&]() {
-                    std::vector<float> selectScores = originalScores;
-                    if (gateBias != nullptr) {
-                        for (int e = 0; e < nRoutedExperts; e++) {
-                            selectScores[e] += (*gateBias)[e];
-                        }
-                    }
-                    for (int k = 0; k < topk; k++) {
-                        int best = 0;
-                        float bestScore = -std::numeric_limits<float>::infinity();
-                        for (int e = 0; e < nRoutedExperts; e++) {
-                            if (selectScores[e] > bestScore) {
-                                bestScore = selectScores[e];
-                                best = e;
-                            }
-                        }
-                        curIndices[k] = best;
-                        selectScores[best] = -std::numeric_limits<float>::infinity();
-                    }
-                };
-                bool useHashRow = hashRouting && inputIds.size() > (size_t)t && inputIds[t] >= 0 &&
-                                  tid2eid != nullptr &&
-                                  tid2eid->size() >= (uint64_t)(inputIds[t] + 1) * topk;
+                const bool validInputId = inputIds.size() > (size_t)t &&
+                                          inputIds[t] >= 0;
+                const uint64_t requiredRoutes = validInputId
+                    ? ((uint64_t)inputIds[t] + 1) * (uint64_t)topk
+                    : 0;
+                const bool useHashRow = validInputId && tid2eid != nullptr &&
+                                        tid2eid->size() >= requiredRoutes;
                 if (useHashRow) {
                     uint64_t routeOffset = (uint64_t)inputIds[t] * topk;
                     for (int k = 0; k < topk; k++) {
                         int expert = (int)((*tid2eid)[routeOffset + k] + 0.5f);
-                        curIndices[k] = std::max(0, std::min(expert, nRoutedExperts - 1));
+                        curIndices[k] = std::max(
+                            0, std::min(expert, nRoutedExperts - 1));
                     }
                 } else {
-                    selectByScore();
+                    std::vector<float> rowScores(
+                        rawScores.begin() + (uint64_t)t * nRoutedExperts,
+                        rawScores.begin() + (uint64_t)(t + 1) * nRoutedExperts);
+                    std::vector<int> fallbackIndices;
+                    std::vector<float> fallbackScores;
+                    SelectDeepSeekV4AllowedExperts(
+                        rowScores, 1, nRoutedExperts, topk, scoreFunc,
+                        routeScale, nullptr, expertPolicy,
+                        fallbackIndices, fallbackScores);
+                    for (int k = 0; k < topk; ++k) {
+                        indices[(uint64_t)t * topk + k] = fallbackIndices[k];
+                        weights[(uint64_t)t * topk + k] = fallbackScores[k];
+                    }
+                    continue;
                 }
 
                 float sum = 0.0f;
@@ -3689,17 +3717,19 @@ namespace fastllm {
                     sum += originalScores[curIndices[k]];
                 }
                 for (int k = 0; k < topk; k++) {
-                    float v = originalScores[curIndices[k]];
+                    float value = originalScores[curIndices[k]];
                     if (scoreFunc != "softmax") {
-                        v = v / sum;
+                        value /= sum;
                     }
                     indices[(uint64_t)t * topk + k] = curIndices[k];
-                    weights[(uint64_t)t * topk + k] = v * routeScale;
+                    weights[(uint64_t)t * topk + k] = value * routeScale;
                 }
             }
 
+            ValidateDeepSeekV4AllowedExpertIndices(indices, expertPolicy);
             WriteIntData(indices, {tokens, topk}, expertIndex);
-            WriteFloatData(weights, {tokens, topk}, expertScore, DataType::FLOAT32);
+            WriteFloatData(weights, {tokens, topk}, expertScore,
+                           DataType::FLOAT32);
         }
 
         static void HcHeadReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
@@ -6532,12 +6562,350 @@ namespace fastllm {
         }
     }
 
+    DeepSeekV4ExpertAllowList ParseDeepSeekV4ExpertAllowList(
+            const std::string &spec, int expertCount, int topk,
+            const std::string &scope) {
+        if (expertCount <= 0 || topk <= 0 || topk > expertCount) {
+            throw std::runtime_error(
+                "DeepSeek V4 " + scope +
+                " expert allow-list has invalid expert/top-k dimensions.");
+        }
+
+        DeepSeekV4ExpertAllowList policy;
+        policy.mask.assign(expertCount, 0);
+        if (spec.empty()) {
+            policy.experts.reserve(expertCount);
+            for (int expert = 0; expert < expertCount; ++expert) {
+                policy.experts.push_back(expert);
+                policy.mask[expert] = 1;
+            }
+            return policy;
+        }
+
+        std::string error;
+        const json11::Json parsed = json11::Json::parse(spec, error);
+        if (!error.empty() || !parsed.is_array()) {
+            throw std::runtime_error(
+                "DeepSeek V4 " + scope +
+                " expert allow-list must be a JSON array of physical expert IDs.");
+        }
+
+        std::vector<uint8_t> seen(expertCount, 0);
+        for (const auto &value : parsed.array_items()) {
+            if (!value.is_number()) {
+                throw std::runtime_error(
+                    "DeepSeek V4 " + scope +
+                    " expert allow-list contains a non-numeric ID.");
+            }
+            const double number = value.number_value();
+            if (!std::isfinite(number) || std::floor(number) != number ||
+                number < 0.0 || number >= expertCount) {
+                throw std::runtime_error(
+                    "DeepSeek V4 " + scope +
+                    " expert allow-list contains an out-of-range or non-integer ID.");
+            }
+            const int expert = (int)number;
+            if (seen[expert] != 0) {
+                throw std::runtime_error(
+                    "DeepSeek V4 " + scope +
+                    " expert allow-list contains a duplicate physical ID.");
+            }
+            seen[expert] = 1;
+            policy.experts.push_back(expert);
+        }
+        if ((int)policy.experts.size() < topk) {
+            throw std::runtime_error(
+                "DeepSeek V4 " + scope + " expert allow-list must contain at least " +
+                std::to_string(topk) + " physical experts.");
+        }
+
+        std::sort(policy.experts.begin(), policy.experts.end());
+        for (int expert : policy.experts) {
+            policy.mask[expert] = 1;
+        }
+        policy.configured = true;
+        return policy;
+    }
+
+    std::string DeepSeekV4ExpertAllowListJson(
+            const DeepSeekV4ExpertAllowList &policy) {
+        std::ostringstream output;
+        output << "[";
+        for (size_t i = 0; i < policy.experts.size(); ++i) {
+            if (i != 0) {
+                output << ",";
+            }
+            output << policy.experts[i];
+        }
+        output << "]";
+        return output.str();
+    }
+
+    DeepSeekV4HashRemapResult RemapDeepSeekV4HashRoutes(
+            const std::vector<float> &routerRows,
+            const std::vector<int> &routes,
+            int expertCount, int rowWidth, int topk,
+            const DeepSeekV4ExpertAllowList &policy) {
+        if (!policy.configured) {
+            return {routes, (uint64_t)routes.size(), 0};
+        }
+        if (expertCount <= 0 || rowWidth <= 0 || topk <= 0 ||
+            (int)policy.mask.size() != expertCount ||
+            (int)policy.experts.size() < topk ||
+            routes.size() % (size_t)topk != 0 ||
+            (size_t)expertCount > std::numeric_limits<size_t>::max() /
+                                  (size_t)rowWidth ||
+            routerRows.size() != (size_t)expertCount * (size_t)rowWidth) {
+            throw std::runtime_error(
+                "DeepSeek V4 hash expert remap received invalid routing metadata.");
+        }
+
+        std::vector<double> norms(expertCount, 0.0);
+        for (int expert = 0; expert < expertCount; ++expert) {
+            const float *row = routerRows.data() + (size_t)expert * rowWidth;
+            double sum = 0.0;
+            for (int column = 0; column < rowWidth; ++column) {
+                if (!std::isfinite(row[column])) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 hash expert remap contains a non-finite router row.");
+                }
+                sum += (double)row[column] * row[column];
+            }
+            norms[expert] = std::sqrt(sum);
+        }
+
+        std::vector<std::vector<int> > candidates(expertCount);
+        for (int source = 0; source < expertCount; ++source) {
+            std::vector<std::pair<double, int> > similarities;
+            similarities.reserve(policy.experts.size());
+            const float *sourceRow =
+                routerRows.data() + (size_t)source * rowWidth;
+            for (int allowed : policy.experts) {
+                const float *allowedRow =
+                    routerRows.data() + (size_t)allowed * rowWidth;
+                double dot = 0.0;
+                for (int column = 0; column < rowWidth; ++column) {
+                    dot += (double)sourceRow[column] * allowedRow[column];
+                }
+                const double divisor = norms[source] * norms[allowed];
+                const double similarity = divisor > 0.0 ? dot / divisor : 0.0;
+                similarities.emplace_back(similarity, allowed);
+            }
+            std::sort(similarities.begin(), similarities.end(),
+                      [](const std::pair<double, int> &left,
+                         const std::pair<double, int> &right) {
+                if (left.first != right.first) {
+                    return left.first > right.first;
+                }
+                return left.second < right.second;
+            });
+            for (const auto &candidate : similarities) {
+                candidates[source].push_back(candidate.second);
+            }
+        }
+
+        DeepSeekV4HashRemapResult result;
+        result.routes.resize(routes.size());
+        result.entries = routes.size();
+        for (size_t rowStart = 0; rowStart < routes.size();
+             rowStart += (size_t)topk) {
+            std::vector<uint8_t> reserved(expertCount, 0);
+            std::vector<uint8_t> used(expertCount, 0);
+            for (int slot = 0; slot < topk; ++slot) {
+                const int source = routes[rowStart + slot];
+                if (source < 0 || source >= expertCount) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 hash route table contains an out-of-range physical expert ID.");
+                }
+                if (policy.Allows(source)) {
+                    reserved[source] = 1;
+                }
+            }
+
+            for (int slot = 0; slot < topk; ++slot) {
+                const int source = routes[rowStart + slot];
+                int target = -1;
+                if (policy.Allows(source) && used[source] == 0) {
+                    target = source;
+                } else {
+                    for (int candidate : candidates[source]) {
+                        if (used[candidate] == 0 && reserved[candidate] == 0) {
+                            target = candidate;
+                            break;
+                        }
+                    }
+                    if (target < 0) {
+                        for (int candidate : candidates[source]) {
+                            if (used[candidate] == 0) {
+                                target = candidate;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (target < 0 || !policy.Allows(target) || used[target] != 0) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 hash expert remap could not produce a unique allowed top-k row.");
+                }
+                result.routes[rowStart + slot] = target;
+                used[target] = 1;
+                if (target != source) {
+                    result.remapped++;
+                }
+            }
+        }
+        return result;
+    }
+
+    void ValidateDeepSeekV4AllowedExpertIndices(
+            const std::vector<int> &indices,
+            const DeepSeekV4ExpertAllowList *policy) {
+        if (policy == nullptr || !policy->configured) {
+            return;
+        }
+        for (int expert : indices) {
+            if (!policy->Allows(expert)) {
+                throw std::runtime_error(
+                    "DeepSeek V4 routing selected a disallowed physical expert ID.");
+            }
+        }
+    }
+
+    void DeepSeekV4BuildMoERoutingDataForTesting(
+            WeightMap &weight, const std::string &prefix, const Data &x,
+            const std::vector<int> &inputIds, int nRoutedExperts, int topk,
+            const std::string &scoreFunc, float routeScale,
+            Data &expertIndex, Data &expertScore,
+            const Data *decodeMeta,
+            const DeepSeekV4ExpertAllowList *expertPolicy,
+            Data *hashRouteTable) {
+        BuildMoERoutingData(weight, prefix, x, inputIds, nRoutedExperts,
+                            topk, scoreFunc, routeScale, expertIndex,
+                            expertScore, decodeMeta, expertPolicy,
+                            hashRouteTable);
+    }
+
+    void SelectDeepSeekV4AllowedExperts(
+            const std::vector<float> &rawScores,
+            int tokens, int expertCount, int topk,
+            const std::string &scoreFunc, float routeScale,
+            const std::vector<float> *gateBias,
+            const DeepSeekV4ExpertAllowList *policy,
+            std::vector<int> &indices,
+            std::vector<float> &scores) {
+        const bool restricted = policy != nullptr && policy->configured;
+        if (tokens <= 0 || expertCount <= 0 || topk <= 0 || topk > expertCount ||
+            rawScores.size() != (size_t)tokens * expertCount ||
+            (gateBias != nullptr && gateBias->size() < (size_t)expertCount) ||
+            (restricted && ((int)policy->mask.size() != expertCount ||
+                            (int)policy->experts.size() < topk)) ||
+            (scoreFunc != "softmax" && scoreFunc != "sigmoid" &&
+             scoreFunc != "sqrtsoftplus")) {
+            throw std::runtime_error(
+                "DeepSeek V4 learned expert routing received invalid metadata.");
+        }
+
+        indices.assign((size_t)tokens * topk, 0);
+        scores.assign((size_t)tokens * topk, 0.0f);
+        for (int token = 0; token < tokens; ++token) {
+            std::vector<float> transformed(expertCount, 0.0f);
+            if (scoreFunc == "softmax") {
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (!restricted || policy->Allows(expert)) {
+                        maximum = std::max(
+                            maximum,
+                            rawScores[(size_t)token * expertCount + expert]);
+                    }
+                }
+                double sum = 0.0;
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (restricted && !policy->Allows(expert)) {
+                        continue;
+                    }
+                    const double value = std::exp(
+                        (double)rawScores[(size_t)token * expertCount + expert] -
+                        maximum);
+                    transformed[expert] = (float)value;
+                    sum += value;
+                }
+                if (!(sum > 0.0) || !std::isfinite(sum)) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 learned expert routing produced an invalid softmax sum.");
+                }
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    transformed[expert] /= (float)sum;
+                }
+            } else {
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (restricted && !policy->Allows(expert)) {
+                        continue;
+                    }
+                    const float raw =
+                        rawScores[(size_t)token * expertCount + expert];
+                    transformed[expert] = scoreFunc == "sigmoid"
+                        ? SigmoidFloat(raw)
+                        : std::sqrt(SoftplusFloat(raw));
+                }
+            }
+
+            std::vector<float> selectionScores = transformed;
+            if (gateBias != nullptr) {
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (!restricted || policy->Allows(expert)) {
+                        selectionScores[expert] += (*gateBias)[expert];
+                    }
+                }
+            }
+            for (int slot = 0; slot < topk; ++slot) {
+                int best = -1;
+                float bestScore = -std::numeric_limits<float>::infinity();
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (restricted && !policy->Allows(expert)) {
+                        continue;
+                    }
+                    if (selectionScores[expert] > bestScore) {
+                        best = expert;
+                        bestScore = selectionScores[expert];
+                    }
+                }
+                if (best < 0) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 learned expert routing ran out of allowed experts.");
+                }
+                indices[(size_t)token * topk + slot] = best;
+                selectionScores[best] = -std::numeric_limits<float>::infinity();
+            }
+
+            float selectedSum = 0.0f;
+            for (int slot = 0; slot < topk; ++slot) {
+                selectedSum += transformed[indices[(size_t)token * topk + slot]];
+            }
+            if (scoreFunc != "softmax" && !(selectedSum > 0.0f)) {
+                throw std::runtime_error(
+                    "DeepSeek V4 learned expert routing produced an invalid selected score sum.");
+            }
+            for (int slot = 0; slot < topk; ++slot) {
+                float value = transformed[indices[(size_t)token * topk + slot]];
+                if (scoreFunc != "softmax") {
+                    value /= selectedSum;
+                }
+                scores[(size_t)token * topk + slot] = value * routeScale;
+            }
+        }
+        ValidateDeepSeekV4AllowedExpertIndices(indices, policy);
+    }
+
     DeepSeekV4Model::DeepSeekV4Model() {
         this->canDoBatchForward = false;
         this->canDoConcurrentForward = true;
         this->model_type = "deepseek_v4";
         this->model_struct = "deepseek_v4";
         this->defaultChunkedPrefillSize = 4096;
+        // basellm 中这两个成员无类内初始化器；给出文档化的 V4-Flash 默认值，
+        // 保证 InitParams 之前（如 hybrid loader 的命名校验）读取是确定的。
+        this->num_experts = 256;
+        this->num_experts_per_tok = 6;
 
         // V4 推荐 thinking 模式，需配合外部 chat_template；这里给一份最小默认值
         this->pre_prompt = "";
@@ -6581,7 +6949,6 @@ namespace fastllm {
             "mtp.*.ffn.shared_experts.w1.weight",
             "mtp.*.ffn.shared_experts.w2.weight",
             "mtp.*.ffn.shared_experts.w3.weight",
-            "mtp.*.e_proj.weight", "mtp.*.h_proj.weight",
             // DeepSeek-V4 Flash 内置 DSpark 的 stage-0 主特征投影，
             // 以及 stage-2 Markov / confidence heads。
             "mtp.*.main_proj.weight",
@@ -6644,6 +7011,84 @@ namespace fastllm {
         }
 #endif
         return mapped;
+    }
+
+    // 官方 0731 safetensors 的 mtp namespace 是封闭集合；hybrid loader 在
+    // 导入前用本函数拒绝任何越界/拼写错误的名称。backbone 与其他命名不
+    // 在本函数管辖范围内，一律放行给既有加载路径。
+    bool DeepSeekV4Model::IsRecognizedWeightName(
+            const std::string &weightName) const {
+        if (weightName.rfind("mtp.", 0) != 0) {
+            return true;
+        }
+        size_t pos = 4; // strlen("mtp.")
+        size_t stageEnd = weightName.find('.', pos);
+        if (stageEnd == std::string::npos || stageEnd == pos) {
+            return false;
+        }
+        int stage = 0;
+        for (size_t i = pos; i < stageEnd; i++) {
+            if (weightName[i] < '0' || weightName[i] > '9' || stage > 100) {
+                return false;
+            }
+            stage = stage * 10 + (weightName[i] - '0');
+        }
+        const int stageCount = dsparkLayers > 0 ? dsparkLayers : 3;
+        if (stage >= stageCount) {
+            return false;
+        }
+        const std::string suffix = weightName.substr(stageEnd + 1);
+        static const std::set<std::string> commonSuffixes = {
+            "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+            "attn_norm.weight",
+            "attn.wq_a.weight", "attn.q_norm.weight", "attn.wq_b.weight",
+            "attn.wkv.weight", "attn.kv_norm.weight", "attn.attn_sink",
+            "attn.wo_a.weight", "attn.wo_b.weight",
+            "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
+            "ffn_norm.weight",
+            "ffn.gate.weight",
+            // 官方 0731 的 MoE router 带 bias（backbone MoE 层同样有）。
+            "ffn.gate.bias",
+            "ffn.shared_experts.w1.weight",
+            "ffn.shared_experts.w2.weight",
+            "ffn.shared_experts.w3.weight",
+        };
+        if (commonSuffixes.count(suffix)) {
+            return true;
+        }
+        if (suffix.rfind("ffn.experts.", 0) == 0) {
+            size_t expertEnd = suffix.find('.', 12);
+            if (expertEnd == std::string::npos || expertEnd == 12) {
+                return false;
+            }
+            int expertId = 0;
+            for (size_t i = 12; i < expertEnd; i++) {
+                if (suffix[i] < '0' || suffix[i] > '9' || expertId > 100000) {
+                    return false;
+                }
+                expertId = expertId * 10 + (suffix[i] - '0');
+            }
+            if (num_experts > 0 && expertId >= num_experts) {
+                return false;
+            }
+            const std::string part = suffix.substr(expertEnd);
+            return part == ".w1.weight" || part == ".w2.weight" ||
+                part == ".w3.weight";
+        }
+        if (stage == 0) {
+            return suffix == "main_proj.weight" ||
+                suffix == "main_norm.weight";
+        }
+        if (stage == stageCount - 1) {
+            return suffix == "norm.weight" ||
+                suffix == "hc_head_fn" ||
+                suffix == "hc_head_scale" ||
+                suffix == "hc_head_base" ||
+                suffix == "markov_head.markov_w1.weight" ||
+                suffix == "markov_head.markov_w2.weight" ||
+                suffix == "confidence_head.proj.weight";
+        }
+        return false;
     }
 
     std::string DeepSeekV4Model::SelectSpecialWeightDevice(
@@ -6859,6 +7304,48 @@ namespace fastllm {
         // -------- Hash 路由 / MTP --------
         num_hash_layers = GetIntWithFallback(this->weight, {"num_hash_layers", "n_hash_layers"}, num_hash_layers);
         num_nextn_predict_layers = GetIntWithFallback(this->weight, {"num_nextn_predict_layers", "n_mtp_layers"}, num_nextn_predict_layers);
+
+        const std::string globalAllowList = GetStringWithFallback(
+            this->weight, {"expert_allow_list"}, "");
+        std::string backboneAllowList = GetStringWithFallback(
+            this->weight, {"expert_allow_list.backbone"}, globalAllowList);
+        std::string mtpAllowList = GetStringWithFallback(
+            this->weight, {"expert_allow_list.mtp"}, globalAllowList);
+        const char *globalAllowListEnv =
+            std::getenv("FASTLLM_DSV4_EXPERT_ALLOWLIST");
+        const char *backboneAllowListEnv =
+            std::getenv("FASTLLM_DSV4_BACKBONE_EXPERT_ALLOWLIST");
+        const char *mtpAllowListEnv =
+            std::getenv("FASTLLM_DSV4_MTP_EXPERT_ALLOWLIST");
+        if (globalAllowListEnv != nullptr && globalAllowListEnv[0] != '\0') {
+            backboneAllowList = globalAllowListEnv;
+            mtpAllowList = globalAllowListEnv;
+        }
+        if (backboneAllowListEnv != nullptr && backboneAllowListEnv[0] != '\0') {
+            backboneAllowList = backboneAllowListEnv;
+        }
+        if (mtpAllowListEnv != nullptr && mtpAllowListEnv[0] != '\0') {
+            mtpAllowList = mtpAllowListEnv;
+        }
+        backboneExpertAllowList = ParseDeepSeekV4ExpertAllowList(
+            backboneAllowList, num_experts, num_experts_per_tok, "backbone");
+        mtpExpertAllowList = ParseDeepSeekV4ExpertAllowList(
+            mtpAllowList, num_experts, num_experts_per_tok, "mtp");
+        auto writeAllowMask = [](const DeepSeekV4ExpertAllowList &policy,
+                                 Data &maskData) {
+            if (!policy.configured) {
+                ResetData(maskData);
+                return;
+            }
+            std::vector<int> mask(policy.mask.begin(), policy.mask.end());
+            WriteIntData(mask, {(int)mask.size()}, maskData);
+            maskData.lockInCPU = true;
+        };
+        writeAllowMask(backboneExpertAllowList, backboneExpertAllowMaskData);
+        writeAllowMask(mtpExpertAllowList, mtpExpertAllowMaskData);
+        remappedHashRouteTables.clear();
+        hashRemapCoverage.clear();
+        UpdateExpertAllowListMetadata();
 
         dsparkTokens = std::max(0, EnvInt("FASTLLM_DSPARK_TOKENS", 0));
         dsparkEnabled = dsparkTokens > 0;
@@ -7084,6 +7571,179 @@ namespace fastllm {
         if (tensorParallelAttention) {
             this->AddSpecialWeight("head.weight", "linearRow", 0);
         }
+    }
+
+    const DeepSeekV4ExpertAllowList &
+    DeepSeekV4Model::GetExpertAllowListForPrefix(
+            const std::string &prefix) const {
+        return prefix.rfind("mtp.", 0) == 0
+            ? mtpExpertAllowList
+            : backboneExpertAllowList;
+    }
+
+    Data *DeepSeekV4Model::GetExpertAllowMaskDataForPrefix(
+            const std::string &prefix) {
+        const DeepSeekV4ExpertAllowList &policy =
+            GetExpertAllowListForPrefix(prefix);
+        if (!policy.configured) {
+            return nullptr;
+        }
+        return prefix.rfind("mtp.", 0) == 0
+            ? &mtpExpertAllowMaskData
+            : &backboneExpertAllowMaskData;
+    }
+
+    void DeepSeekV4Model::UpdateExpertAllowListMetadata() {
+        this->weight.AddDict(
+            "expert_allow_list.physical_expert_count",
+            std::to_string(num_experts));
+        this->weight.AddDict(
+            "expert_allow_list.backbone.configured",
+            backboneExpertAllowList.configured ? "true" : "false");
+        this->weight.AddDict(
+            "expert_allow_list.backbone.effective",
+            DeepSeekV4ExpertAllowListJson(backboneExpertAllowList));
+        this->weight.AddDict(
+            "expert_allow_list.mtp.configured",
+            mtpExpertAllowList.configured ? "true" : "false");
+        this->weight.AddDict(
+            "expert_allow_list.mtp.effective",
+            DeepSeekV4ExpertAllowListJson(mtpExpertAllowList));
+
+        json11::Json::object coverage;
+        uint64_t totalEntries = 0;
+        uint64_t totalRemapped = 0;
+        for (const auto &entry : hashRemapCoverage) {
+            coverage[entry.first] = json11::Json::object {
+                {"entries", (double)entry.second.first},
+                {"remapped", (double)entry.second.second},
+                {"complete", true}
+            };
+            totalEntries += entry.second.first;
+            totalRemapped += entry.second.second;
+        }
+        this->weight.AddDict(
+            "expert_allow_list.hash_remap_coverage",
+            json11::Json(coverage).dump());
+        this->weight.AddDict(
+            "expert_allow_list.hash_remap_entries",
+            std::to_string(totalEntries));
+        this->weight.AddDict(
+            "expert_allow_list.hash_remapped_entries",
+            std::to_string(totalRemapped));
+    }
+
+    Data *DeepSeekV4Model::GetEffectiveHashRouteTable(
+            const std::string &prefix) {
+        const DeepSeekV4ExpertAllowList &policy =
+            GetExpertAllowListForPrefix(prefix);
+        if (!policy.configured) {
+            return nullptr;
+        }
+
+        const std::string routeName = prefix + ".gate.tid2eid";
+        auto sourceRoute = this->weight.weight.find(routeName);
+        if (sourceRoute == this->weight.weight.end()) {
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> guard(expertAllowListMutex);
+        auto cached = remappedHashRouteTables.find(prefix);
+        if (cached != remappedHashRouteTables.end()) {
+            return cached->second.get();
+        }
+
+        const std::string gateName = prefix + ".gate.weight";
+        auto gate = this->weight.weight.find(gateName);
+        if (gate == this->weight.weight.end()) {
+            throw std::runtime_error(
+                "DeepSeek V4 hash expert remap is missing router weights for " +
+                prefix + ".");
+        }
+        if (num_experts <= 0 || num_experts_per_tok <= 0 ||
+            gate->second.Count(0) % (uint64_t)num_experts != 0) {
+            throw std::runtime_error(
+                "DeepSeek V4 hash expert remap has incompatible router dimensions for " +
+                prefix + ".");
+        }
+        const uint64_t rowWidthValue =
+            gate->second.Count(0) / (uint64_t)num_experts;
+        if (rowWidthValue == 0 ||
+            rowWidthValue > (uint64_t)std::numeric_limits<int>::max()) {
+            throw std::runtime_error(
+                "DeepSeek V4 hash expert remap has an invalid router row width for " +
+                prefix + ".");
+        }
+
+        auto routerRows = ReadWeightFloatDataCached(gate->second);
+        auto sourceRoutes = ReadWeightFloatDataCached(sourceRoute->second);
+        std::vector<int> integerRoutes;
+        integerRoutes.reserve(sourceRoutes->size());
+        for (float value : *sourceRoutes) {
+            const float rounded = std::round(value);
+            if (!std::isfinite(value) || std::fabs(value - rounded) > 1e-4f ||
+                rounded < 0.0f || rounded >= (float)num_experts) {
+                throw std::runtime_error(
+                    "DeepSeek V4 hash route table contains an invalid physical expert ID for " +
+                    prefix + ".");
+            }
+            integerRoutes.push_back((int)rounded);
+        }
+
+        const DeepSeekV4HashRemapResult remapped =
+            RemapDeepSeekV4HashRoutes(
+                *routerRows, integerRoutes, num_experts,
+                (int)rowWidthValue, num_experts_per_tok, policy);
+        auto routeTable = std::make_shared<Data>();
+        WriteIntData(remapped.routes, sourceRoute->second.dims, *routeTable);
+        remappedHashRouteTables[prefix] = routeTable;
+        hashRemapCoverage[prefix] =
+            std::make_pair(remapped.entries, remapped.remapped);
+        UpdateExpertAllowListMetadata();
+        return routeTable.get();
+    }
+
+    void DeepSeekV4Model::PrepareExpertAllowListRouting() {
+        if (!backboneExpertAllowList.configured &&
+            !mtpExpertAllowList.configured) {
+            return;
+        }
+
+        std::set<std::string> hashPrefixes;
+        if (backboneExpertAllowList.configured) {
+            for (int layer = 0; layer < num_hash_layers; ++layer) {
+                const std::string prefix =
+                    "layers." + std::to_string(layer) + ".ffn";
+                if (this->weight.weight.find(prefix + ".gate.tid2eid") ==
+                    this->weight.weight.end()) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 configured backbone expert allow-list is missing hash route table " +
+                        prefix + ".gate.tid2eid.");
+                }
+                hashPrefixes.insert(prefix);
+            }
+        }
+        const std::string suffix = ".gate.tid2eid";
+        for (const auto &entry : this->weight.weight) {
+            if (entry.first.size() <= suffix.size() ||
+                entry.first.compare(entry.first.size() - suffix.size(),
+                                    suffix.size(), suffix) != 0) {
+                continue;
+            }
+            const std::string prefix =
+                entry.first.substr(0, entry.first.size() - suffix.size());
+            if (GetExpertAllowListForPrefix(prefix).configured) {
+                hashPrefixes.insert(prefix);
+            }
+        }
+        for (const std::string &prefix : hashPrefixes) {
+            if (GetEffectiveHashRouteTable(prefix) == nullptr) {
+                throw std::runtime_error(
+                    "DeepSeek V4 failed to prepare configured hash expert allow-list for " +
+                    prefix + ".");
+            }
+        }
+        UpdateExpertAllowListMetadata();
     }
 
     std::pair<std::vector<float>, std::vector<float>> DeepSeekV4Model::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
@@ -11583,14 +12243,26 @@ namespace fastllm {
             }
             std::vector<int> ffnDims = ffnInput.dims;
             ffnInput.Reshape({bsz * seqlen, dim});
+            Data *expertAllowMaskData = nullptr;
             {
-                BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
-                                    num_experts_per_tok, scoring_func, routed_scaling_factor,
-                                    expertIndex, expertScore
+                const std::string routePrefix = pre + ".ffn";
+                const DeepSeekV4ExpertAllowList &expertPolicy =
+                    GetExpertAllowListForPrefix(routePrefix);
+                expertAllowMaskData =
+                    GetExpertAllowMaskDataForPrefix(routePrefix);
+                Data *effectiveHashRouteTable =
+                    GetEffectiveHashRouteTable(routePrefix);
+                BuildMoERoutingData(weight, routePrefix, ffnInput, tokenIds,
+                                    num_experts, num_experts_per_tok,
+                                    scoring_func, routed_scaling_factor,
+                                    expertIndex, expertScore,
 #ifdef USE_CUDA
-                                    , graphSafeDecode ? decodeMeta : nullptr
+                                    graphSafeDecode ? decodeMeta : nullptr,
+#else
+                                    nullptr,
 #endif
-                                    );
+                                    expertPolicy.configured ? &expertPolicy : nullptr,
+                                    effectiveHashRouteTable);
             }
 #ifdef USE_CUDA
             if (!graphCaptureHealthy("router", layer)) {
@@ -11745,7 +12417,7 @@ namespace fastllm {
                                   &moeInputTemp, &moeOutputTemp,
                                   MoeGateSwiglu, routedExpertParallel,
                                   swiglu_limit, true,
-                                  pairedReduceInput);
+                                  expertAllowMaskData, pairedReduceInput);
                     ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 }
 #ifdef USE_CUDA
@@ -13080,9 +13752,17 @@ namespace fastllm {
             RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
             std::vector<int> ffnDims = ffnInput.dims;
             ffnInput.Reshape({bsz * seqlen, dim});
-            BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
-                                num_experts_per_tok, scoring_func, routed_scaling_factor,
-                                expertIndex, expertScore);
+            const std::string routePrefix = pre + ".ffn";
+            const DeepSeekV4ExpertAllowList &expertPolicy =
+                GetExpertAllowListForPrefix(routePrefix);
+            Data *effectiveHashRouteTable =
+                GetEffectiveHashRouteTable(routePrefix);
+            BuildMoERoutingData(weight, routePrefix, ffnInput, tokenIds,
+                                num_experts, num_experts_per_tok,
+                                scoring_func, routed_scaling_factor,
+                                expertIndex, expertScore, nullptr,
+                                expertPolicy.configured ? &expertPolicy : nullptr,
+                                effectiveHashRouteTable);
             {
                 Data sharedExpertOut;
                 bool hasSharedExpertOut = false;
@@ -13183,7 +13863,8 @@ namespace fastllm {
                                   ffnInput.dataType, effectiveMoeAtype,
                                   &moeInputTemp, &moeOutputTemp,
                                   MoeGateSwiglu, routedExpertParallel,
-                                  swiglu_limit, true);
+                                  swiglu_limit, true,
+                                  GetExpertAllowMaskDataForPrefix(routePrefix));
                 }
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 if (hasSharedExpertOut) {
@@ -13319,6 +14000,7 @@ namespace fastllm {
 
     void DeepSeekV4Model::WarmUp() {
         printf("Warmup...\n");
+        PrepareExpertAllowListRouting();
 
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});

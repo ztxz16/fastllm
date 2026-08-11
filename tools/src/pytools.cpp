@@ -607,8 +607,10 @@ extern "C" {
             model->SetKVCacheDataType(fastllm::DataType::FLOAT32);
         } else if (dtypeStr == "fp8" || dtypeStr == "float8" || dtypeStr == "fp8_e4m3") {
             model->SetKVCacheDataType(fastllm::DataType::FP8_E4M3);
+        } else if (dtypeStr == "turbo3" || dtypeStr == "turbo3_kv") {
+            model->SetKVCacheDataType(fastllm::DataType::TURBO3_KV);
         } else {
-            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16 or fp8_e4m3.");
+            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16, fp8_e4m3 or turbo3.");
         }
         return;
     }
@@ -788,6 +790,25 @@ extern "C" {
         apply_pending_tool_call_constraint(config);
         for(int i = 0; i < stop_token_len; i++ )
         {
+            config.stop_token_ids.insert(stop_token_ids[i]);
+        }
+        config.input_token_length = input.size();
+        auto model = models.GetModel(modelId);
+        return model->LaunchResponseTokens(input, config);
+    }
+
+    DLL_EXPORT int launch_raw_prompt_llm_model(int modelId, int len, int *values,
+                                  int max_length, int min_length, bool do_sample, float top_p, int top_k,
+                                  float temperature, float repeat_penalty, bool output_logits,
+                                  int stop_token_len, int * stop_token_ids) {
+        std::vector <int> input;
+        for (int i = 0; i < len; i++) {
+            input.push_back(values[i]);
+        }
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k,
+                                  temperature, repeat_penalty, output_logits, true);
+        apply_pending_tool_call_constraint(config);
+        for (int i = 0; i < stop_token_len; i++) {
             config.stop_token_ids.insert(stop_token_ids[i]);
         }
         config.input_token_length = input.size();

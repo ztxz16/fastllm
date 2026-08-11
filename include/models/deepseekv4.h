@@ -16,8 +16,11 @@
 //   4. MoE：前 num_hash_layers 个 MoE 层使用 hash 路由（gate.tid2eid 决定专家），
 //      其余使用打分函数 sqrtsoftplus + noaux_tc top-k；num_experts_per_tok 个路由专家
 //      + n_shared_experts 个共享专家，激活带 swiglu_limit。
-//   5. 多 Token 预测（MTP）：在主 N 层之外再额外维护 num_nextn_predict_layers 层，
-//      复用 embed / head，但有独立 e_proj / h_proj / enorm / hnorm / norm。
+//   5. 内置 DSpark（官方 0731 namespace）：3 个 stage（mtp.0/1/2，target layers
+//      {40,41,42}），每 stage 有独立 MLA attention + MoE；另有 stage-0 main_proj、
+//      各 stage HC/enorm/hnorm、final norm + HC head、Markov head 与 confidence
+//      head。GGUF 只含 backbone 时，mtp.* 权重由 FASTLLM_DSPARK_MODEL_PATH 指向的
+//      官方 safetensors 分片（46–48）混合加载（见 model.cpp 的 hybrid loader）。
 //   6. 量化：权重以 FP8_E4M3 + ue8m0 scale 存储，部分 expert 使用 FP4_E2M1FN_X2。
 //
 // 当前文件先给出类骨架与数据成员定义，便于后续逐步实现。
@@ -39,6 +42,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace fastllm {
     struct DeepSeekV4DecodeLayerCache {
@@ -289,6 +294,61 @@ namespace fastllm {
         std::shared_ptr<void> cudaGraphState;
     };
 
+    struct DeepSeekV4ExpertAllowList {
+        bool configured = false;
+        std::vector<int> experts;
+        std::vector<uint8_t> mask;
+
+        bool Allows(int expert) const {
+            return expert >= 0 && expert < (int)mask.size() && mask[expert] != 0;
+        }
+    };
+
+    struct DeepSeekV4HashRemapResult {
+        std::vector<int> routes;
+        uint64_t entries = 0;
+        uint64_t remapped = 0;
+    };
+
+    DeepSeekV4ExpertAllowList ParseDeepSeekV4ExpertAllowList(
+            const std::string &spec, int expertCount, int topk,
+            const std::string &scope);
+
+    std::string DeepSeekV4ExpertAllowListJson(
+            const DeepSeekV4ExpertAllowList &policy);
+
+    DeepSeekV4HashRemapResult RemapDeepSeekV4HashRoutes(
+            const std::vector<float> &routerRows,
+            const std::vector<int> &routes,
+            int expertCount, int rowWidth, int topk,
+            const DeepSeekV4ExpertAllowList &policy);
+
+    void SelectDeepSeekV4AllowedExperts(
+            const std::vector<float> &rawScores,
+            int tokens, int expertCount, int topk,
+            const std::string &scoreFunc, float routeScale,
+            const std::vector<float> *gateBias,
+            const DeepSeekV4ExpertAllowList *policy,
+            std::vector<int> &indices,
+            std::vector<float> &scores);
+
+    void ValidateDeepSeekV4AllowedExpertIndices(
+            const std::vector<int> &indices,
+            const DeepSeekV4ExpertAllowList *policy);
+
+    // Test-only seam over the file-local MoE routing builder in
+    // deepseekv4.cpp. Lets unit tests drive learned/hash CPU and CUDA expert
+    // routing with tiny in-memory weights instead of a checkpoint. Not used by
+    // production inference paths.
+    void DeepSeekV4BuildMoERoutingDataForTesting(
+            WeightMap &weight, const std::string &prefix, const Data &x,
+            const std::vector<int> &inputIds, int nRoutedExperts, int topk,
+            const std::string &scoreFunc, float routeScale,
+            Data &expertIndex, Data &expertScore,
+            const Data *decodeMeta,
+            const DeepSeekV4ExpertAllowList *expertPolicy,
+            Data *hashRouteTable);
+
     class DeepSeekV4Model : public basellm {
     public:
         DeepSeekV4Model(); // 构造函数
@@ -301,6 +361,10 @@ namespace fastllm {
                          std::vector<std::pair<std::string, DataType> > >
                 GetTensorMap(
                     const std::vector<std::string> &tensorNames) override;
+
+        // mtp.* 命名必须与官方 0731 namespace 精确匹配；backbone 名称一律放行。
+        virtual bool IsRecognizedWeightName(
+                const std::string &weightName) const override;
 
         virtual std::string SelectSpecialWeightDevice(
                 const std::string &weightName, int layerId) const override;
@@ -437,6 +501,21 @@ namespace fastllm {
         std::string topk_method = "noaux_tc";
         float swiglu_limit = 0.f;           // SwiGLU 截断
         bool mergeSwiglu = false;
+
+        DeepSeekV4ExpertAllowList backboneExpertAllowList;
+        DeepSeekV4ExpertAllowList mtpExpertAllowList;
+        Data backboneExpertAllowMaskData;
+        Data mtpExpertAllowMaskData;
+        std::map<std::string, std::shared_ptr<Data> > remappedHashRouteTables;
+        std::map<std::string, std::pair<uint64_t, uint64_t> > hashRemapCoverage;
+        std::mutex expertAllowListMutex;
+
+        const DeepSeekV4ExpertAllowList &GetExpertAllowListForPrefix(
+                const std::string &prefix) const;
+        Data *GetExpertAllowMaskDataForPrefix(const std::string &prefix);
+        Data *GetEffectiveHashRouteTable(const std::string &prefix);
+        void PrepareExpertAllowListRouting();
+        void UpdateExpertAllowListMetadata();
 
         // -------- Hyper-Connections --------
         int hc_mult = 4;

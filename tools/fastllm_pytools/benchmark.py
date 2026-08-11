@@ -1,8 +1,11 @@
 import argparse
 import ctypes
+import json
+import os
 import statistics
 import time
 from typing import Dict, List, Optional
+from pathlib import Path
 
 from .util import make_normal_llm_model, make_normal_parser
 
@@ -28,6 +31,8 @@ def add_benchmark_args(parser: argparse.ArgumentParser):
     parser.add_argument("--repeat_penalty", "--repetition_penalty",
                         dest="repeat_penalty", type=float, default=None,
                         help="Generation repetition penalty")
+    parser.add_argument("--output-json", type=str, default="",
+                        help="Write the complete benchmark result as JSON")
 
 
 def args_parser():
@@ -135,6 +140,7 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
             "end_time": None,
             "output_tokens": 0,
             "finish_code": None,
+            "response_statistics": None,
         })
 
     pending = set(range(batch))
@@ -144,6 +150,11 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
             item = requests[request_index]
             if not fastllm_lib.can_fetch_response_llm_model(model.model, item["handle"]):
                 continue
+            get_statistics = getattr(model, "get_response_statistics", None)
+            if callable(get_statistics):
+                response_statistics = get_statistics(item["handle"])
+                if response_statistics is not None:
+                    item["response_statistics"] = response_statistics
             token = fastllm_lib.fetch_response_llm_model(model.model, item["handle"])
             now = time.perf_counter()
             progressed = True
@@ -183,6 +194,10 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
         max(item["end_time"] for item in requests) - min(first_token_times)
         if first_token_times else 0.0
     )
+    available_statistics = [
+        item["response_statistics"] for item in requests
+        if item["response_statistics"] is not None
+    ]
     return {
         "label": label,
         "input_tokens": len(input_tokens),
@@ -190,6 +205,13 @@ def _run_batch(model, input_tokens: List[int], output_tokens: int,
         "batch": batch,
         "requests": requests,
         "total_output_tokens": total_output_tokens,
+        "response_statistics_available": len(available_statistics) == len(requests),
+        "cached_input_tokens": sum(
+            item.get("cached_input_tokens", 0) for item in available_statistics),
+        "missed_input_tokens": sum(
+            item.get("missed_input_tokens", 0) for item in available_statistics),
+        "native_output_tokens": sum(
+            item.get("output_tokens", 0) for item in available_statistics),
         "total_time": batch_end - batch_start,
         "ttft_avg": statistics.mean(ttfts) if ttfts else None,
         "ttft_min": min(ttfts) if ttfts else None,
@@ -317,6 +339,21 @@ def _print_result(result: Dict[str, object]):
     print("=" * 72)
 
 
+def _write_result_json(output_path, result: Dict[str, object]):
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temp_output = Path(str(output) + ".tmp")
+    try:
+        temp_output.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_output, output)
+    finally:
+        if temp_output.exists():
+            temp_output.unlink()
+
+
 def fastllm_benchmark(args):
     _validate_args(args)
     if getattr(args, "max_batch", -1) <= 0:
@@ -339,6 +376,8 @@ def fastllm_benchmark(args):
         result = _run_batch(model, input_tokens, args.output_tokens, args.batch,
                             generation_args)
         _print_result(result)
+        if args.output_json:
+            _write_result_json(args.output_json, result)
         return result
     finally:
         model.release_memory()

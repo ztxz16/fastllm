@@ -1,8 +1,10 @@
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 import shortuuid
 import time
 from pydantic import BaseModel, Field
+
+PositiveStrictInt = Annotated[int, Field(strict=True, gt=0)]
 
 
 class AnthropicTextContentBlock(BaseModel):
@@ -39,7 +41,7 @@ class AnthropicMessageRequest(BaseModel):
     model: str
     messages: List[AnthropicInputMessage]
     system: Optional[Union[str, List[Dict[str, Any]]]] = None
-    max_tokens: int
+    max_tokens: PositiveStrictInt
     stream: bool = False
     temperature: Optional[float] = None
     top_p: Optional[float] = None

@@ -7,6 +7,7 @@
 
 #include "basellm.h"
 #include "bert.h"
+#include "json11.hpp"
 #include "xlmroberta.h"
 
 namespace fastllm {
@@ -14,9 +15,42 @@ namespace fastllm {
 
     std::unique_ptr<basellm> CreateLLMModelFromGGUF(const std::string &modelPath);
 
-    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath);
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
+        const std::string &fileName, const std::string &originalPath,
+        const std::string &multimodalProjectorPath = "");
 
-    std::unique_ptr<basellm> CreateLLMModelFromFile(const std::string &fileName);
+    std::string ConvertGGUFTypeToFastllmType(const std::string &type);
+
+    void ApplyDeepSeekV4GGUFMetadata(basellm *model, const json11::Json &params,
+                                     const std::string &arch);
+
+    // 纯 GGUF 路径下，从 FASTLLM_DSPARK_MODEL_PATH 指向的官方 checkpoint
+    // config.json 注入内置 DSpark 门控所需的 dspark_* 词条（--ori 路径已由
+    // AddDictRecursion 覆盖，此函数对已存在的键为 no-op）。
+    void InjectDeepSeekV4DSparkConfig(basellm *model);
+
+    // DeepSeek-V4 GGUF backbone 只含 43 层 target 权重；DSpark 的 mtp.*
+    // 权重需要单独从官方 safetensors 分片（46–48）叠加。下面的结构描述
+    // 一次通过校验的 DSpark 分片计划。
+    struct DeepSeekV4DSparkShardPlan {
+        std::set <std::string> shardFiles;
+        std::vector <std::string> tensorNames; // 全部以 "mtp." 开头，升序
+    };
+
+    // 解析 dsparkPath 下的 safetensors index（或单个 model.safetensors），
+    // 只接受 mtp.* 张量；任何 backbone 命名、缺失分片或空计划都直接失败。
+    DeepSeekV4DSparkShardPlan PlanDeepSeekV4DSparkShards(
+        const std::string &dsparkPath);
+
+    // 顺序加载计划中的全部 mtp.* 张量到 model->weight（含 disk-lazy 元数据
+    // 与 .weight/.weight_scale 配对）。不触发 merge；生产 GGUF 路径在并行
+    // 装载循环内逐张量调用同一导入核心，并由通用 merge 机制收尾。
+    void ImportDeepSeekV4DSparkWeights(basellm *model,
+                                       const DeepSeekV4DSparkShardPlan &plan);
+
+    std::unique_ptr<basellm> CreateLLMModelFromFile(
+        const std::string &fileName,
+        const std::string &multimodalProjectorPath = "");
 
     std::unique_ptr<basellm> CreateEmptyLLMModel(const std::string &modelType);
 

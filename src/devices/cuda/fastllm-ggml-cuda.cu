@@ -1970,6 +1970,143 @@ static void dequantize_row_q6_K_r4_cuda(const void * vx, dst_t * y, const int64_
     const int64_t nblocks = (nrows / 4) * (n_per_row / QK_K);
     dequantize_block_q6_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
 }
+// ---------------------------------------------------------------------------
+// IQ4_XS dequantization (GGML_TYPE_IQ4_XS)
+//
+// Reference: third_party/gguf/ggml-dequantize.cpp dequantize_row_iq4_xs.
+// Each block_iq4_xs covers QK_K (256) values split into QK_K/32 (8) sub-blocks.
+// For sub-block ib: ls = (scales_l[ib/2] >> 4*(ib%2)) & 0xf  |  ((scales_h >> 2*ib) & 3) << 4
+//                   dl = d * (ls - 32)
+// Each of the 16 qs bytes in the sub-block yields two values via kvalues_iq4nl:
+//   y[j+0]  = dl * kvalues_iq4nl[qs[j] & 0xf]
+//   y[j+16] = dl * kvalues_iq4nl[qs[j] >>  4]
+// One CUDA block per iq4_xs block, 256 threads (one output element each).
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq4_xs_block(
+        const block_iq4_xs * __restrict__ x,
+        dst_t * __restrict__ yy, int64_t i, int tid) {
+    const float d = __half2float(x[i].d);
+    const int ib = tid >> 5;
+    const int p = tid & 31;
+    const int j = p & 15;
+    const uint8_t qbyte = x[i].qs[ib * 16 + j];
+    const uint8_t nibble =
+        (p < 16) ? (uint8_t)(qbyte & 0x0f) : (uint8_t)(qbyte >> 4);
+    const int ls =
+        ((x[i].scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0f) |
+        (((x[i].scales_h >> (2 * ib)) & 0x3) << 4);
+    const float dl = d * (float)(ls - 32);
+    yy[i * QK_K + tid] =
+        DequantizeCast<dst_t>::cast(
+            dl * (float)kvalues_iq4nl[nibble]);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq4_xs(
+        const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    dequantize_iq4_xs_block(
+        (const block_iq4_xs *)vx, yy,
+        (int64_t)blockIdx.x, threadIdx.x);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq4_xs_grid(
+        const void * __restrict__ vx, dst_t * __restrict__ yy,
+        int64_t nblocks) {
+    const block_iq4_xs *x = (const block_iq4_xs *)vx;
+    for (int64_t i = blockIdx.x; i < nblocks; i += gridDim.x) {
+        dequantize_iq4_xs_block(x, yy, i, threadIdx.x);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_iq4_xs_cuda(
+        const void *vx, dst_t *y, const int64_t nrows,
+        const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t nblocks = nrows * n_per_row / QK_K;
+    const char *env = std::getenv("FASTLLM_CUDA_IQ4XS_GRID_DEQUANT");
+    bool useGrid = env != nullptr && env[0] != '\0' &&
+                   !(env[0] == '0' && env[1] == '\0');
+    int blocksPerSm = 8;
+    if (useGrid) {
+        char *end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= 2 && parsed <= 32) {
+            blocksPerSm = (int)parsed;
+        }
+    }
+    if (useGrid) {
+        int device = -1, smCount = 0;
+        cudaError_t deviceState = cudaGetDevice(&device);
+        cudaError_t attrState = deviceState == cudaSuccess
+            ? cudaDeviceGetAttribute(
+                  &smCount, cudaDevAttrMultiProcessorCount, device)
+            : deviceState;
+        if (attrState == cudaSuccess && smCount > 0) {
+            int grid = (int)std::min<int64_t>(
+                nblocks, (int64_t)smCount * blocksPerSm);
+            dequantize_block_iq4_xs_grid<<<grid, QK_K, 0, stream>>>(
+                vx, y, nblocks);
+            cudaError_t launchState = cudaPeekAtLastError();
+            if (launchState == cudaSuccess) {
+                static thread_local bool logged = false;
+                if (!logged) {
+                    printf("[FastLLM] IQ4_XS grid-stride dequant enabled: grid=%d, blocks_per_sm=%d.\n",
+                           grid, blocksPerSm);
+                    logged = true;
+                }
+                return;
+            }
+            cudaGetLastError();
+        } else {
+            cudaGetLastError();
+        }
+    }
+    dequantize_block_iq4_xs<<<nblocks, QK_K, 0, stream>>>(vx, y);
+}
+
+// ---------------------------------------------------------------------------
+// Q5_0 dequantization (GGML_TYPE_Q5_0)
+//
+// Reference: third_party/gguf/ggml-dequantize.cpp dequantize_row_q5_0.
+// Each block_q5_0 covers QK5_0 (32) values.  qs[16] holds low 4 bits;
+// qh[4] (uint32) holds the 5th bits.  value = d * (five_bit_q - 16).
+// Positions 0..15  use low nibbles of qs[0..15] with 5th bits qh[0..15].
+// Positions 16..31 use high nibbles            with 5th bits qh[16..31].
+// One CUDA block per q5_0 block, 32 threads (one output element each).
+template<typename dst_t>
+static __global__ void dequantize_block_q5_0(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const block_q5_0 * x = (const block_q5_0 *) vx;
+
+    const int64_t i  = blockIdx.x;
+    const int     tid = threadIdx.x;         // 0 .. 31 -> output element
+
+    const float d = __half2float(x[i].d);
+
+    uint32_t qh;
+    memcpy(&qh, x[i].qh, sizeof(qh));
+
+    const int     j       = tid & 15;        // qs byte 0 .. 15
+    const uint8_t qs_byte = x[i].qs[j];
+
+    int val;
+    if (tid < 16) {
+        const uint8_t xh = (uint8_t)(((qh >> (j + 0)) << 4) & 0x10);
+        val = ((qs_byte & 0x0f) | xh) - 16;
+    } else {
+        const uint8_t xh = (uint8_t)((qh >> (j + 12)) & 0x10);
+        val = ((qs_byte >> 4) | xh) - 16;
+    }
+
+    yy[i * QK5_0 + tid] = DequantizeCast<dst_t>::cast(d * (float)val);
+}
+
+template<typename dst_t>
+static void dequantize_row_q5_0_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int64_t nb = k / QK5_0;
+    dequantize_block_q5_0<<<nb, QK5_0, 0, stream>>>(vx, y);
+}
 
 template<typename T>
 using to_t_cuda_t = void (*)(const void * __restrict__ x, T * __restrict__ y, int64_t nrows, int64_t n_per_row, cudaStream_t stream);
@@ -2128,6 +2265,45 @@ static bool FastllmGGUFIsR4Type(ggml_type type) {
     return type == GGML_TYPE_Q2_K_R4 || type == GGML_TYPE_Q4_K_R4 ||
            type == GGML_TYPE_Q5_K_R4 || type == GGML_TYPE_Q6_K_R4;
 }
+// Environment switch to disable the new IQ4_XS / Q5_0 CUDA dequantizers so
+// callers fall back to the original chunked-MMVQ path for A/B comparison.
+// Env: FASTLLM_DISABLE_GGUF_DEQUANT_IQ4XS_Q5_0=1|on|true|yes
+static bool FastllmGGUFDequantIq4xsQ50Disabled() {
+    static const bool disabled = []{
+        const char *env = std::getenv("FASTLLM_DISABLE_GGUF_DEQUANT_IQ4XS_Q5_0");
+        if (env == nullptr || env[0] == '\0') return false;
+        const char c = (char)std::tolower((unsigned char)env[0]);
+        return c == '1' || c == 't' || c == 'y' || c == 'o';
+    }();
+    return disabled;
+}
+
+// Optional SM70 IQ4_XS prefill experiment for wide-to-narrow projections.
+// A single dequantized weight is reused across several token/N tiles.  This
+// avoids the slow full-N cuBLAS algorithm selected by some V100 shapes while
+// preserving the original full-N GEMM as the failure fallback.
+static int FastllmGGUFSm70Iq4XsWideNTile(ggml_type type,
+                                         int n, int m, int k) {
+    const char *env = std::getenv(
+        "FASTLLM_CUDA_SM70_IQ4XS_WIDE_N_TILE");
+    if (env == nullptr || env[0] == '\0' || type != GGML_TYPE_IQ4_XS ||
+        n <= 0 || m < 2 * k || FastllmCudaRuntimeArch() != 70) {
+        return 0;
+    }
+    char *end = nullptr;
+    long tile = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || tile < 256 || tile >= n ||
+        tile > INT_MAX || (tile & 127) != 0) {
+        return 0;
+    }
+    static thread_local bool logged = false;
+    if (!logged) {
+        printf("[FastLLM] SM70 IQ4_XS wide-N tiling enabled: tile=%ld.\n",
+               tile);
+        logged = true;
+    }
+    return (int)tile;
+}
 
 static size_t FastllmGGUFAlignBytes(size_t bytes) {
     const size_t align = 256;
@@ -2220,6 +2396,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q6_K_cuda;
         case GGML_TYPE_Q6_K_R4:
             return dequantize_row_q6_K_r4_cuda;
+        case GGML_TYPE_IQ4_XS:
+            return FastllmGGUFDequantIq4xsQ50Disabled() ? nullptr : dequantize_row_iq4_xs_cuda<float>;
+        case GGML_TYPE_Q5_0:
+            return FastllmGGUFDequantIq4xsQ50Disabled() ? nullptr : dequantize_row_q5_0_cuda<float>;
         default: {
             static std::set<ggml_type> warned_types;
             if (warned_types.find(type) == warned_types.end()) {
@@ -2267,6 +2447,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_Q6_K_R4:
             return dequantize_row_q6_K_r4_cuda;
         // case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ4_XS:
+            return FastllmGGUFDequantIq4xsQ50Disabled() ? nullptr : dequantize_row_iq4_xs_cuda<half>;
+        case GGML_TYPE_Q5_0:
+            return FastllmGGUFDequantIq4xsQ50Disabled() ? nullptr : dequantize_row_q5_0_cuda<half>;
         //    return dequantize_row_iq2_xxs_cuda;
         // case GGML_TYPE_IQ1_KT:
         //    return dequantize_row_iq1_kt_cuda;
@@ -2355,6 +2539,10 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_q6_K_cuda;
         case GGML_TYPE_Q6_K_R4:
             return dequantize_row_q6_K_r4_cuda;
+        case GGML_TYPE_IQ4_XS:
+            return FastllmGGUFDequantIq4xsQ50Disabled() ? nullptr : dequantize_row_iq4_xs_cuda<__nv_bfloat16>;
+        case GGML_TYPE_Q5_0:
+            return FastllmGGUFDequantIq4xsQ50Disabled() ? nullptr : dequantize_row_q5_0_cuda<__nv_bfloat16>;
         default: {
             static std::set<ggml_type> warned_types;
             if (warned_types.find(type) == warned_types.end()) {
@@ -2400,7 +2588,16 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     cudaStream_t stream = cudaStreamPerThread;
     // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
-    if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp32 != nullptr) {
+    // SM70 IQ4_XS DP4A MMQ trial path. Only attempted for IQ4_XS on SM70;
+    // on any failure the existing dequant+cuBLAS / MMVQ fallback runs.
+    bool sm70Iq4XsDone = false;
+    if (ggufType == GGML_TYPE_IQ4_XS) {
+        sm70Iq4XsDone = FastllmCudaTrySm70Iq4XsMmq(
+            weight.cudaData, cudaInput, cudaOutput,
+            fastllm::DataType::FLOAT32, n, m, k, (void *)stream);
+    }
+
+    if (!sm70Iq4XsDone && (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp32 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t wsBytes = 0;
@@ -2434,7 +2631,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                 exit(0);
             }
         }
-    } else if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp16 != nullptr) {
+    } else if (!sm70Iq4XsDone && (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp16 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t wsBytes = 0;
@@ -2477,7 +2674,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                 exit(0);
             }
         }
-    } else {
+    } else if (!sm70Iq4XsDone) {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
@@ -2557,12 +2754,66 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
     ggml_backend_cuda_context ctx;
 
-    auto dequant = ggml_get_to_fp16_cuda((ggml_type)weight.ggmlType);
-    auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+    ggml_type ggufType = (ggml_type)weight.ggmlType;
+    auto dequantFp32 = FastllmGGUFUseFp32Dequant(weight, ggufType) ? ggml_get_to_fp32_cuda(ggufType) : nullptr;
+    auto dequant = ggml_get_to_fp16_cuda(ggufType);
+    auto has_vec_dot = get_has_vec_dot_q_cuda(ggufType);
     cudaStream_t stream = cudaStreamPerThread;
-    // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
-    if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
+
+    // SM70 IQ4_XS DP4A MMQ trial path.
+    bool sm70Iq4XsDone = false;
+    if (ggufType == GGML_TYPE_IQ4_XS) {
+        sm70Iq4XsDone = FastllmCudaTrySm70Iq4XsMmq(
+            weight.cudaData, cudaInput, cudaOutput,
+            fastllm::DataType::FLOAT16, n, m, k, (void *)stream);
+    }
+
+    if (!sm70Iq4XsDone && (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp32 != nullptr) {
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+
+        size_t fp32WeightBytes = FastllmGGUFAlignBytes((size_t)k * m * sizeof(float));
+        size_t fp32InputBytes = FastllmGGUFAlignBytes((size_t)n * m * sizeof(float));
+        size_t needBytes = fp32WeightBytes + fp32InputBytes + (size_t)n * k * sizeof(float);
+        size_t wsBytes = 0;
+        float *workspace = (float *) FastllmGGUFGetDequantWorkspace(&wsBytes, weight, "half-input FP32 SGEMM");
+        bool ownScratch = false;
+        if (wsBytes < needBytes) {
+            workspace = (float *) FastllmCudaMalloc(needBytes);
+            ownScratch = true;
+        }
+
+        float *cudaFp32Weight = workspace;
+        float *cudaFp32Input = (float *)((uint8_t *)workspace + FastllmGGUFAlignBytes((size_t)k * m * sizeof(float)));
+        float *cudaFp32Output = (float *)((uint8_t *)cudaFp32Input + FastllmGGUFAlignBytes((size_t)n * m * sizeof(float)));
+
+        dequantFp32((const char *)weight.cudaData, cudaFp32Weight, k, m, stream);
+        int inputLen = n * m;
+        int outputLen = n * k;
+        int threadPerBlock = std::min(256, std::max(inputLen, outputLen));
+        FastllmCudaHalf2FloatKernel <<< (inputLen - 1) / threadPerBlock + 1, threadPerBlock, 0, stream >>>(cudaInput, cudaFp32Input, inputLen);
+
+        float h_alpha = 1.0f, h_beta = 0.0f;
+        bool pedanticSgemm = FastllmGGUFUsePedanticSgemm(weight, ggufType);
+        cublasStatus_t status = FastllmGGUFSgemmFloat(
+                fastllmCublasHandle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                k, n, m,
+                &h_alpha, cudaFp32Weight,
+                m, cudaFp32Input,
+                m, &h_beta,
+                cudaFp32Output,
+                k, pedanticSgemm);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error.\n");
+            throw("cublas error");
+            exit(0);
+        }
+        FastllmCudaFloat2HalfKernel <<< (outputLen - 1) / threadPerBlock + 1, threadPerBlock, 0, stream >>>(cudaFp32Output, cudaOutput, outputLen);
+        if (ownScratch) {
+            FastllmCudaFree(workspace);
+        }
+    } else if (!sm70Iq4XsDone && (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t needBytes = (size_t)k * m * sizeof(half);
@@ -2576,20 +2827,36 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
-        cublasStatus_t status;
+        cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
 
-        int len = k * m;
-        int threadPerBlock = std::min(256, len);
         dequant((const char *)weight.cudaData, cudaFp16Weight, k, m, stream);
 
-        status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                k, n, m,
-                                &h_alpha, cudaFp16Weight, AType,
-                                m, cudaInput, BType,
-                                m, &h_beta,
-                                cudaOutput, CType,
-                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        auto runGemm = [&](int nOffset, int nCount) {
+            return cublasGemmEx(
+                fastllmCublasHandle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                k, nCount, m,
+                &h_alpha, cudaFp16Weight, AType,
+                m, cudaInput + (size_t)nOffset * m, BType,
+                m, &h_beta,
+                cudaOutput + (size_t)nOffset * k, CType,
+                k, ComputeType,
+                static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        };
+        int nTile = FastllmGGUFSm70Iq4XsWideNTile(ggufType, n, m, k);
+        if (nTile > 0) {
+            for (int nOffset = 0; nOffset < n; nOffset += nTile) {
+                status = runGemm(nOffset, std::min(nTile, n - nOffset));
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    break;
+                }
+            }
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                status = runGemm(0, n);
+            }
+        } else {
+            status = runGemm(0, n);
+        }
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("Error: cublas error.\n");
             throw("cublas error");
@@ -2597,7 +2864,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
         }
 
         FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
-    } else {
+    } else if (!sm70Iq4XsDone) {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
@@ -2681,7 +2948,21 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
     cudaStream_t stream = cudaStreamPerThread;
 
-    if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
+    // SM70 IQ4_XS DP4A MMQ trial path.
+    bool sm70Iq4XsDone = false;
+    if ((ggml_type)weight.ggmlType == GGML_TYPE_IQ4_XS) {
+        sm70Iq4XsDone = FastllmCudaTrySm70Iq4XsMmq(
+            weight.cudaData, cudaInput, cudaOutput,
+            fastllm::DataType::BFLOAT16, n, m, k, (void *)stream);
+    }
+
+    int device = 0, major = 0;
+    bool bf16GemmSupported =
+        cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+        major >= 8;
+    if (!sm70Iq4XsDone && bf16GemmSupported &&
+        (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t needBytes = (size_t)k * m * sizeof(__nv_bfloat16);
@@ -2713,7 +2994,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
         }
 
         FastllmReleaseDequantScratch(cudaBf16Weight, ownScratch);
-    } else {
+    } else if (!sm70Iq4XsDone) {
         q8Input = (block_q8_1 *)FastllmCudaMalloc(n * m * sizeof(__nv_bfloat16));
         quantize_row_q8_1_cuda(
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream

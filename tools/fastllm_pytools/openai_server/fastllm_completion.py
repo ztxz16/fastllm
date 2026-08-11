@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -80,6 +81,8 @@ _KIMI_K3_RESPONSE_CLOSE_RE = re.compile(
 _KIMI_K3_MESSAGE_CLOSE_RE = re.compile(
     r"<\|close\|>\s*message\s*<\|sep\|>")
 
+DEFAULT_MAX_OUTPUT_TOKENS = 16384
+
 
 class ConversationMessage:
     def __init__(self, role:str, content:ConversationContent, tool_calls=None,
@@ -124,7 +127,8 @@ class FastLLmCompletion:
                model,
                think,
                hide_input,
-               enable_thinking = None):
+               enable_thinking = None,
+               default_max_tokens = DEFAULT_MAX_OUTPUT_TOKENS):
     self.model_name = model_name
     self.model = model
     self.init_fast_llm_model()
@@ -133,9 +137,101 @@ class FastLLmCompletion:
         enable_thinking = getattr(model, "enable_thinking", True)
     self.enable_thinking = enable_thinking
     self.hide_input = hide_input
+    if (isinstance(default_max_tokens, bool) or
+            not isinstance(default_max_tokens, int) or
+            default_max_tokens <= 0):
+      raise ValueError("default_max_tokens must be a positive integer")
+    self.default_max_tokens = default_max_tokens
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
+    self._conversation_lock = threading.Lock()
+    self._handle_condition = threading.Condition(self._conversation_lock)
+    self._active_handle_launches = 0
+    self._handle_owners = {}
     
+  def _ensure_handle_tracking(self):
+    if not hasattr(self, "_conversation_lock"):
+      self._conversation_lock = threading.Lock()
+    if not hasattr(self, "_handle_condition"):
+      self._handle_condition = threading.Condition(self._conversation_lock)
+    if not hasattr(self, "_active_handle_launches"):
+      self._active_handle_launches = 0
+    if not hasattr(self, "_handle_owners"):
+      self._handle_owners = {}
+
+  def _launch_owned_handle(self, request_id: str, launch):
+    self._ensure_handle_tracking()
+    with self._handle_condition:
+      self._active_handle_launches += 1
+    try:
+      handle = launch()
+    except BaseException:
+      with self._handle_condition:
+        self._active_handle_launches -= 1
+        self._handle_condition.notify_all()
+      raise
+    with self._handle_condition:
+      try:
+        previous_request = self._handle_owners.get(handle)
+        if (previous_request is not None and
+                self.conversation_handles.get(previous_request) == handle):
+          del self.conversation_handles[previous_request]
+        previous_handle = self.conversation_handles.get(request_id)
+        if (previous_handle is not None and
+                self._handle_owners.get(previous_handle) == request_id):
+          del self._handle_owners[previous_handle]
+        self.conversation_handles[request_id] = handle
+        self._handle_owners[handle] = request_id
+      finally:
+        self._active_handle_launches -= 1
+        self._handle_condition.notify_all()
+    return handle
+
+  def _request_owns_handle_locked(self, request_id: str, handle: int) -> bool:
+    owner = self._handle_owners.get(handle)
+    if owner is not None:
+      return owner == request_id
+    # Older callers and lightweight adapters may populate only the original
+    # request-to-handle map. Adopt that mapping only when it is unambiguous.
+    if any(other_request != request_id and other_handle == handle
+           for other_request, other_handle in self.conversation_handles.items()):
+      return False
+    self._handle_owners[handle] = request_id
+    return True
+
+  def _release_owned_handle(self, request_id: str,
+                            expected_handle: Optional[int] = None) -> bool:
+    self._ensure_handle_tracking()
+    with self._conversation_lock:
+      handle = self.conversation_handles.get(request_id)
+      if handle is None or (expected_handle is not None and
+                            handle != expected_handle):
+        return False
+      if not self._request_owns_handle_locked(request_id, handle):
+        del self.conversation_handles[request_id]
+        return False
+      del self.conversation_handles[request_id]
+      del self._handle_owners[handle]
+      return True
+
+  def _abort_owned_handle(self, request_id: str,
+                          expected_handle: Optional[int] = None) -> bool:
+    self._ensure_handle_tracking()
+    with self._handle_condition:
+      while self._active_handle_launches:
+        self._handle_condition.wait()
+      handle = self.conversation_handles.get(request_id)
+      if handle is None or (expected_handle is not None and
+                            handle != expected_handle):
+        return False
+      if not self._request_owns_handle_locked(request_id, handle):
+        del self.conversation_handles[request_id]
+        return False
+      self.model.abort_handle(handle)
+      del self.conversation_handles[request_id]
+      del self._handle_owners[handle]
+      return True
+
   def init_fast_llm_model(self):
     pass
   
@@ -227,6 +323,23 @@ class FastLLmCompletion:
       buffer = state.get("buffer", "")
       state["buffer"] = ""
       return buffer
+
+  def _effective_max_tokens(self, requested: Optional[int]) -> int:
+      if requested is None:
+          requested = getattr(
+              self, "default_max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
+      if (isinstance(requested, bool) or not isinstance(requested, int)
+              or requested <= 0):
+          raise ValueError("max_tokens must be a positive integer")
+      return requested
+
+  def _with_effective_max_tokens(
+      self, request: ChatCompletionRequest, max_tokens: int
+  ) -> ChatCompletionRequest:
+      model_copy = getattr(request, "model_copy", None)
+      if callable(model_copy):
+          return model_copy(update={"max_tokens": max_tokens})
+      return request.copy(update={"max_tokens": max_tokens})
 
   def _chat_finish_reason(
       self,
@@ -691,6 +804,31 @@ class FastLLmCompletion:
               delta_text, state)
       return self._consume_deepseek_v4_reasoning_delta(
           delta_text, state)
+
+  def _raw_prompt_text(self, request: ChatCompletionRequest) -> str:
+      if not request.raw_prompt:
+          raise ValueError("raw_prompt mode is not enabled")
+      if not isinstance(request.prompt, str) or request.prompt == "":
+          raise ValueError("raw_prompt requires a non-empty string prompt")
+      if request.messages not in (None, [], ""):
+          raise ValueError("raw_prompt cannot be combined with messages")
+      return request.prompt
+
+  def _raw_prompt_token_ids(self, prompt: str) -> List[int]:
+      token_ids = self.model.encode(prompt)
+      if not isinstance(token_ids, list):
+          token_ids = list(token_ids)
+      return token_ids
+
+  def _launch_raw_prompt(self, request_id: str, prompt: str,
+                         launch_kwargs: Dict[str, Any]) -> Tuple[int, int]:
+      raw_tokens = self._raw_prompt_token_ids(prompt)
+      handle = self._launch_owned_handle(
+          request_id,
+          lambda: self.model.launch_stream_response(
+              prompt, raw_prompt = True,
+              raw_prompt_tokens = raw_tokens, **launch_kwargs))
+      return len(raw_tokens), handle
 
   async def _check_model(self, request: ChatCompletionRequest):
     if request.model != self.model_name:
@@ -2503,7 +2641,7 @@ class FastLLmCompletion:
       temperature = request.temperature if request.temperature is not None else default_gen['temperature']
       do_sample, top_p, top_k, temperature = self._normalize_sampling_args(top_p, top_k, temperature)
       frequency_penalty = default_gen['repetition_penalty']
-      max_length = request.max_tokens if request.max_tokens else 32768
+      max_length = self._effective_max_tokens(request.max_tokens)
 
       if request.stop_sequences:
           logging.warning("Anthropic stop_sequences are not supported yet and will be ignored.")
@@ -2537,11 +2675,12 @@ class FastLLmCompletion:
           if parser_request is not None:
               self._attach_tool_call_constraint_if_supported(
                   launch_kwargs, parser_request)
-          handle = self.model.launch_stream_response(
-              messages, **launch_kwargs)
+          handle = self._launch_owned_handle(
+              request_id,
+              lambda: self.model.launch_stream_response(
+                  messages, **launch_kwargs))
       finally:
           self._cleanup_temp_paths(media.temp_paths)
-      self.conversation_handles[request_id] = handle
       response_statistics: Dict[str, int] = {}
       result_generator = self._stream_response_handle_with_statistics(
           handle, response_statistics)
@@ -2559,6 +2698,7 @@ class FastLLmCompletion:
                   input_token_len, parser_request,
                   response_statistics = response_statistics)
           except ValueError as e:
+              self._release_owned_handle(request_id, handle)
               return self.create_error_response(str(e))
 
   async def create_chat_completion(
@@ -2579,59 +2719,66 @@ class FastLLmCompletion:
       if error_check_ret is not None:
           return error_check_ret
       
-      query:str = ""
-      if request.prompt:
-         request.messages.append({"role": "user", "content": request.prompt})
-      try:
-          # print("request", str(request))
-          conversation: List[ConversationMessage] = []
+      raw_prompt_text = None
+      if request.raw_prompt:
+          try:
+              raw_prompt_text = self._raw_prompt_text(request)
+          except ValueError as error:
+              return self.create_error_response(str(error))
+      elif request.prompt:
+          request.messages.append({"role": "user", "content": request.prompt})
+      if raw_prompt_text is not None:
+          messages = raw_prompt_text
           media = LoadedMedia()
-          for m in request.messages:
-              messages, message_media = self._parse_chat_message_content(
-                  m["role"], m.get("content"),
-                  tool_calls=m.get("tool_calls"),
-                  tool_call_id=m.get("tool_call_id"),
-                  name=m.get("name"),
-                  reasoning_content=m.get(
-                      "reasoning_content", m.get("reasoning")))
+      else:
+          try:
+              conversation: List[ConversationMessage] = []
+              media = LoadedMedia()
+              for m in request.messages:
+                  parsed_messages, message_media = self._parse_chat_message_content(
+                      m["role"], m.get("content"),
+                      tool_calls=m.get("tool_calls"),
+                      tool_call_id=m.get("tool_call_id"),
+                      name=m.get("name"),
+                      reasoning_content=m.get(
+                          "reasoning_content", m.get("reasoning")))
+                  conversation.extend(parsed_messages)
+                  media.extend(message_media)
 
-              conversation.extend(messages)
-              media.extend(message_media)
-
-          if len(conversation) == 0:
-            raise Exception("Empty msg")
-          messages = []
-          for msg in conversation:
-            msg_dict = {"role": msg.role, "content": msg.content}
-            if msg.tool_calls is not None:
-                parsed_tool_calls = []
-                for tc in msg.tool_calls:
-                    tc_copy = dict(tc) if isinstance(tc, dict) else tc
-                    if isinstance(tc_copy, dict) and "function" in tc_copy:
-                        func = tc_copy["function"]
-                        if isinstance(func, dict) and isinstance(func.get("arguments"), str):
-                            func = dict(func)
-                            try:
-                                func["arguments"] = json.loads(func["arguments"])
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-                            tc_copy = dict(tc_copy)
-                            tc_copy["function"] = func
-                    parsed_tool_calls.append(tc_copy)
-                msg_dict["tool_calls"] = parsed_tool_calls
-            if msg.tool_call_id is not None:
-                msg_dict["tool_call_id"] = msg.tool_call_id
-            if msg.name is not None:
-                msg_dict["name"] = msg.name
-            if msg.reasoning_content is not None:
-                msg_dict["reasoning_content"] = msg.reasoning_content
-            messages.append(msg_dict)
-
-      except Exception as e:
-          logging.error("Error in applying chat template from request: %s", e)
-          traceback.print_exc()
-          self._cleanup_temp_paths(media.temp_paths if "media" in locals() else [])
-          return self.create_error_response(str(e))
+              if len(conversation) == 0:
+                raise Exception("Empty msg")
+              messages = []
+              for msg in conversation:
+                msg_dict = {"role": msg.role, "content": msg.content}
+                if msg.tool_calls is not None:
+                    parsed_tool_calls = []
+                    for tc in msg.tool_calls:
+                        tc_copy = dict(tc) if isinstance(tc, dict) else tc
+                        if isinstance(tc_copy, dict) and "function" in tc_copy:
+                            func = tc_copy["function"]
+                            if isinstance(func, dict) and isinstance(func.get("arguments"), str):
+                                func = dict(func)
+                                try:
+                                    func["arguments"] = json.loads(func["arguments"])
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+                                tc_copy = dict(tc_copy)
+                                tc_copy["function"] = func
+                        parsed_tool_calls.append(tc_copy)
+                    msg_dict["tool_calls"] = parsed_tool_calls
+                if msg.tool_call_id is not None:
+                    msg_dict["tool_call_id"] = msg.tool_call_id
+                if msg.name is not None:
+                    msg_dict["name"] = msg.name
+                if msg.reasoning_content is not None:
+                    msg_dict["reasoning_content"] = msg.reasoning_content
+                messages.append(msg_dict)
+          except Exception as e:
+              logging.error("Error in applying chat template from request: %s", e)
+              traceback.print_exc()
+              self._cleanup_temp_paths(
+                  media.temp_paths if "media" in locals() else [])
+              return self.create_error_response(str(e))
 
       request_id = f"fastllm-{self.model_name}-{random_uuid()}"
       
@@ -2644,8 +2791,8 @@ class FastLLmCompletion:
       if request.frequency_penalty and request.frequency_penalty != 0.0:
         frequency_penalty = request.frequency_penalty
 
-      max_length = request.max_tokens if request.max_tokens else 32768
-      min_length = request.min_tokens if request.min_tokens else 0
+      max_length = self._effective_max_tokens(request.max_tokens)
+      min_length = request.min_tokens if request.min_tokens is not None else 0
       stop_strings = self._normalize_stop_strings(request.stop)
       stop_token_ids = self._stop_token_ids_from_strings(stop_strings)
 
@@ -2668,14 +2815,15 @@ class FastLLmCompletion:
       model_videos = media.videos if media.videos else None
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
-      messages = self._apply_kimi_k3_auto_tool_guidance(
-          messages, tools, tool_choice)
-      tool_choice = self._resolve_kimi_k3_auto_tool_choice(
-          messages, tools, tool_choice)
-      messages = self._apply_kimi_k3_required_tool_guidance(
-          messages, tools, tool_choice)
-      effective_request = self._with_effective_tool_choice(
-          request, tool_choice)
+      if raw_prompt_text is None:
+          messages = self._apply_kimi_k3_auto_tool_guidance(
+              messages, tools, tool_choice)
+          tool_choice = self._resolve_kimi_k3_auto_tool_choice(
+              messages, tools, tool_choice)
+          messages = self._apply_kimi_k3_required_tool_guidance(
+              messages, tools, tool_choice)
+      effective_request = self._with_effective_max_tokens(
+          self._with_effective_tool_choice(request, tool_choice), max_length)
 
       launch_kwargs = {
           "max_length": max_length,
@@ -2702,10 +2850,11 @@ class FastLLmCompletion:
           launch_kwargs, effective_request)
 
       def prepare_and_launch_text_request():
-          # Token counting and launch both apply the chat template.  Keep them
-          # on one worker thread so llm.py can reuse the one-shot tokenization,
-          # while independent HTTP requests prepare concurrently instead of
-          # serializing the FastAPI event loop.
+          if raw_prompt_text is not None:
+              return self._launch_raw_prompt(
+                  request_id, raw_prompt_text, launch_kwargs)
+          # Token counting and launch both apply the chat template. Keep them
+          # on one worker thread so llm.py can reuse one-shot tokenization.
           input_len = self._compute_multimodal_input_token_len(
               messages,
               enable_thinking = enable_thinking,
@@ -2715,8 +2864,10 @@ class FastLLmCompletion:
               thinking_effort = thinking_effort,
               tool_choice = tool_choice,
               chat_template_kwargs = request.chat_template_kwargs)
-          launched_handle = self.model.launch_stream_response(
-              messages, **launch_kwargs)
+          launched_handle = self._launch_owned_handle(
+              request_id,
+              lambda: self.model.launch_stream_response(
+                  messages, **launch_kwargs))
           return input_len, launched_handle
 
       try:
@@ -2731,7 +2882,6 @@ class FastLLmCompletion:
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
-      self.conversation_handles[request_id] = handle
       # logging.info(f"Created conversation: {request_id}, handle: {handle}")
       response_statistics: Dict[str, int] = {}
       result_generator = self._stream_response_handle_with_statistics(
@@ -2757,31 +2907,23 @@ class FastLLmCompletion:
                   emit_reasoning_content = emit_reasoning_content,
                   response_statistics = response_statistics)
           except ValueError as e:
+              self._release_owned_handle(request_id, handle)
               return self.create_error_response(str(e))
 
   def _release_conversation_handle(
       self, request_id: str, handle: Optional[int]
   ) -> bool:
-    if handle is None or self.conversation_handles.get(request_id) != handle:
-      return False
-    self.conversation_handles.pop(request_id, None)
-    return True
+    return self._release_owned_handle(request_id, handle)
 
   def _abort_conversation_handle(
       self, request_id: str, handle: Optional[int]
   ) -> bool:
-    if not self._release_conversation_handle(request_id, handle):
-      return False
-    self.model.abort_handle(handle)
-    return True
+    return self._abort_owned_handle(request_id, handle)
 
   async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # Starlette runs a StreamingResponse BackgroundTask after both a normal
-    # completion and a client disconnect.  A naturally exhausted generator
-    # releases ownership before its terminal SSE is yielded.  Only an
-    # interrupted generator remains active here, so abort it while the
-    # request_id still owns the integer handle.
-    if not self._abort_conversation_handle(request_id, handle):
+    # A terminal generator releases ownership before its final SSE. Only an
+    # interrupted request can still own this exact, potentially reusable handle.
+    if not self._abort_owned_handle(request_id, handle):
       return
     logging.info(f"Abort disconnected request: {request_id}")
       
@@ -2805,7 +2947,7 @@ class FastLLmCompletion:
         completion_tokens += 1
         if await raw_request.is_disconnected():
            print("is_disconnected!!!")
-           self.model.abort_handle(handle)
+           self._abort_owned_handle(request_id, handle)
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
@@ -2830,8 +2972,7 @@ class FastLLmCompletion:
 
       tool_call_info = self._parse_non_stream_tool_calls(result, request)
       if isinstance(tool_call_info, ErrorResponse):
-          if request_id in self.conversation_handles:
-              del self.conversation_handles[request_id]
+          self._release_owned_handle(request_id, handle)
           return tool_call_info
 
       if tool_call_info.tools_called:
@@ -2856,7 +2997,7 @@ class FastLLmCompletion:
               ),
               logprobs=None,
               finish_reason=self._chat_finish_reason(
-                  output_tokens, request.max_tokens or 32768,
+                  output_tokens, request.max_tokens,
                   stopped_by_stop_string),
           )
 
@@ -2868,9 +3009,7 @@ class FastLLmCompletion:
           usage = usage,
       )
 
-      # After completion, remove the conversation from tracking dictionary
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
+      self._release_owned_handle(request_id, handle)
           # logging.info(f"Removed completed conversation from tracking: {request_id}")
 
       return response
@@ -3144,7 +3283,7 @@ class FastLLmCompletion:
         usage = self._chat_usage(
             handle, response_statistics, input_token_len, completion_tokens)
         finish_reason = self._chat_finish_reason(
-            usage.completion_tokens or 0, request.max_tokens or 32768,
+            usage.completion_tokens or 0, request.max_tokens,
             stopped_by_stop_string)
         final_stream_error_data = None
         if request.tools and tool_call_parser:
@@ -3252,7 +3391,7 @@ class FastLLmCompletion:
         completion_tokens += 1
         if await raw_request.is_disconnected():
            print("is_disconnected!!!")
-           self.model.abort_handle(handle)
+           self._abort_owned_handle(request_id, handle)
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
@@ -3276,8 +3415,7 @@ class FastLLmCompletion:
           usage = usage,
       )
 
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
+      self._release_owned_handle(request_id, handle)
 
       return response
 
@@ -3468,6 +3606,7 @@ class FastLLmCompletion:
           yield f"event: error\ndata: {error_data}\n\n"
           await asyncio.sleep(0)
 
+
       await asyncio.sleep(0)
       
   def create_streaming_error_response(
@@ -3484,26 +3623,26 @@ class FastLLmCompletion:
       return json_str
 
   def abort_conversation(self, conversation_id: str) -> bool:
-    if conversation_id in self.conversation_handles:
-      handle = self.conversation_handles[conversation_id]
-      try:
-        self.model.abort_handle(handle)
-        logging.info(f"Aborted conversation: {conversation_id}, handle: {handle}")
-        # Remove the conversation from the mapping
-        del self.conversation_handles[conversation_id]
-        return True
-      except Exception as e:
-        logging.error(f"Error aborting conversation {conversation_id}: {e}")
-        return False
-    else:
+    self._ensure_handle_tracking()
+    handle = self.conversation_handles.get(conversation_id)
+    if handle is None:
       logging.warning(f"Conversation ID not found: {conversation_id}")
+      return False
+    try:
+      if not self._abort_owned_handle(conversation_id, handle):
+        logging.warning(f"Conversation no longer owns handle: {conversation_id}")
+        return False
+      logging.info(f"Aborted conversation: {conversation_id}, handle: {handle}")
+      return True
+    except Exception as e:
+      logging.error(f"Error aborting conversation {conversation_id}: {e}")
       return False
       
   def get_active_conversations(self) -> List[Dict[str, Any]]:
-    result = []
-    for conversation_id, handle in self.conversation_handles.items():
-      result.append({
-        "conversation_id": conversation_id,
-        "handle": handle
-      })
-    return result
+    self._ensure_handle_tracking()
+    with self._conversation_lock:
+      conversations = list(self.conversation_handles.items())
+    return [
+        {"conversation_id": conversation_id, "handle": handle}
+        for conversation_id, handle in conversations
+    ]

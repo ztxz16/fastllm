@@ -15,6 +15,7 @@ option(USE_TFACC "use tfacc" OFF)
 option(PY_API "python api" OFF)
 
 option(USE_MMAP "use mmap" OFF)
+option(USE_ZSTD "Enable optional zstd compression for cold CPU request snapshots" ON)
 
 option(USE_SENTENCEPIECE "use sentencepiece" OFF)
 
@@ -331,8 +332,11 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-cuda.cu 
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
+        src/devices/cuda/fastllm-iq4xs-sm70.cu
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
+        src/devices/cuda/attention/paged/fastllm-sm70-flash-attention.cu
+        src/devices/cuda/attention/paged/fastllm-turboquant-kv.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
@@ -498,6 +502,19 @@ if(USE_ROCM)
     endif()
 endif()
 
+if (USE_ZSTD)
+    find_path(FASTLLM_ZSTD_INCLUDE_DIR zstd.h)
+    find_library(FASTLLM_ZSTD_LIBRARY NAMES zstd)
+    if (FASTLLM_ZSTD_INCLUDE_DIR AND FASTLLM_ZSTD_LIBRARY)
+        include_directories(${FASTLLM_ZSTD_INCLUDE_DIR})
+        list(APPEND FASTLLM_LINKED_LIBS ${FASTLLM_ZSTD_LIBRARY})
+        add_compile_definitions(FASTLLM_USE_ZSTD)
+        message(STATUS "Cold CPU request snapshot zstd support enabled")
+    else()
+        message(WARNING "libzstd was not found; cold CPU snapshots remain raw")
+    endif()
+endif()
+
 if (USE_IVCOREX)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cudart)
     set(CMAKE_CUDA_ARCHITECTURES ${IVCOREX_ARCH})
@@ -535,6 +552,29 @@ if (USE_TOPS) # For suiyuan
     link_directories(/opt/tops/lib)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} topsaten /opt/tops/lib/libtopsrt.so)
     #target_link_libraries(main rtcu)
+endif()
+
+find_package(PNG QUIET)
+find_package(JPEG QUIET)
+find_package(OpenSSL QUIET)
+set(FASTLLM_APISERVER_IMAGE_LIBS)
+set(FASTLLM_APISERVER_IMAGE_DEFINITIONS)
+if (PNG_FOUND AND JPEG_FOUND)
+    list(APPEND FASTLLM_APISERVER_IMAGE_LIBS PNG::PNG JPEG::JPEG)
+    list(APPEND FASTLLM_APISERVER_IMAGE_DEFINITIONS
+         FASTLLM_APISERVER_IMAGE_DECODERS)
+    message(STATUS "API server PNG/JPEG image decoding enabled")
+else()
+    message(WARNING "libpng or libjpeg was not found; API image decoding is disabled")
+endif()
+if (OpenSSL_FOUND)
+    list(APPEND FASTLLM_APISERVER_IMAGE_LIBS
+         OpenSSL::SSL OpenSSL::Crypto)
+    list(APPEND FASTLLM_APISERVER_IMAGE_DEFINITIONS
+         FASTLLM_APISERVER_OPENSSL)
+    message(STATUS "API server HTTPS image loading enabled")
+else()
+    message(WARNING "OpenSSL was not found; API image loading supports data: and HTTP URLs only")
 endif()
 
 if (PY_API)
@@ -584,10 +624,61 @@ if (UNIT_TEST)
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
 
+    add_executable(testApiServerSocket
+        test/apiserver/socketWriteTest.cpp
+        example/apiserver/image_loader.cpp
+        third_party/json11/json11.cpp)
+    target_compile_definitions(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
+    target_link_libraries(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_LIBS})
+
+    add_executable(testDeepSeekV4GGUFAdapter
+        test/gguf/deepseek4AdapterTest.cpp)
+    target_link_libraries(testDeepSeekV4GGUFAdapter fastllm)
+
+    add_executable(testDeepSeekV4ExpertAllowList
+        test/models/deepseek4ExpertAllowListTest.cpp)
+    target_link_libraries(testDeepSeekV4ExpertAllowList fastllm)
+
+    add_executable(testDeepSeekV4QuantizedDiskMoe
+        test/gguf/deepseek4QuantizedDiskMoeTest.cpp)
+    target_link_libraries(testDeepSeekV4QuantizedDiskMoe fastllm)
+
+    add_executable(testDeepSeekV4DiskExpertCache
+        test/gguf/deepseek4DiskExpertCacheTest.cpp)
+    target_link_libraries(testDeepSeekV4DiskExpertCache fastllm)
+
+    add_executable(testDeepSeekV4RouteSeam
+        test/models/deepseek4RouteSeamTest.cpp)
+    target_link_libraries(testDeepSeekV4RouteSeam fastllm)
+
+    add_executable(testDeepSeekV4DsparkHybridLoader
+        test/gguf/deepseek4DsparkHybridLoaderTest.cpp)
+    target_link_libraries(testDeepSeekV4DsparkHybridLoader fastllm)
+
+    # These tests use assert(), so keep assertions enabled even when the
+    # surrounding build adds -DNDEBUG for optimized binaries.
+    if (MSVC)
+        target_compile_options(testApiServerSocket PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4ExpertAllowList PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4RouteSeam PRIVATE /UNDEBUG)
+        target_compile_options(testDeepSeekV4DsparkHybridLoader PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(testApiServerSocket PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4GGUFAdapter PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4ExpertAllowList PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4QuantizedDiskMoe PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4DiskExpertCache PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4RouteSeam PRIVATE -UNDEBUG)
+        target_compile_options(testDeepSeekV4DsparkHybridLoader PRIVATE -UNDEBUG)
+    endif()
+
     if (USE_CUDA AND NOT USE_ROCM)
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
-        target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cudaGraphPoolMissRegression PRIVATE fastllm)
 
         add_executable(customAllReduceRegression test/ops/customAllReduceRegression.cpp)
         target_link_libraries(customAllReduceRegression fastllm)
@@ -607,8 +698,12 @@ add_custom_command(
 add_executable(benchmark example/benchmark/benchmark.cpp)
 target_link_libraries(benchmark fastllm)
 
-add_executable(apiserver example/apiserver/apiserver.cpp)
-target_link_libraries(apiserver fastllm)
+add_executable(apiserver
+    example/apiserver/apiserver.cpp
+    example/apiserver/image_loader.cpp)
+target_compile_definitions(apiserver PRIVATE
+    ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
+target_link_libraries(apiserver fastllm ${FASTLLM_APISERVER_IMAGE_LIBS})
 
 if (BUILD_CLI)
     add_executable(FastllmStudio_cli example/FastllmStudio/cli/cli.cpp example/FastllmStudio/cli/ui.cpp)

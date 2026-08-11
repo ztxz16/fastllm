@@ -348,6 +348,12 @@ fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ct
                                                   ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
+fastllm_lib.launch_raw_prompt_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                                    ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
+                                                    ctypes.c_float, ctypes.c_float, ctypes.c_bool,
+                                                    ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.launch_raw_prompt_llm_model.restype = ctypes.c_int
+
 fastllm_lib.launch_response_llm_model_multimodal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                                             ctypes.c_char_p, ctypes.c_void_p, 
                                                             ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
@@ -374,10 +380,10 @@ fastllm_lib.response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p,
                                                ctypes.c_float, ctypes.c_float, ctypes.c_bool]
 fastllm_lib.response_str_llm_model.restype = ctypes.c_char_p
 
-fastllm_lib.launch_response_str_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p,
-                                                     ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
-                                                     ctypes.c_float, ctypes.c_float, ctypes.c_bool,
-                                                     ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.launch_response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                                                      ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
+                                                      ctypes.c_float, ctypes.c_float, ctypes.c_bool,
+                                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_str_llm_model.restype = ctypes.c_int
 
 fastllm_lib.fetch_response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -1205,6 +1211,10 @@ class model:
                 exit(0)
         if config_base_path is not None:
             self.model_path = config_base_path
+        config_path = os.path.join(config_base_path, "config.json") if config_base_path else ""
+        if config_path and os.path.isfile(config_path) and not hasattr(self, "config"):
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                self.config = json.load(config_file)
 
         architecture = ""
         model_type = ""
@@ -2088,13 +2098,28 @@ class model:
                         images: List = None, videos: List = None, tools: List = None, enable_thinking = None,
                         thinking_effort = None, tool_choice = None,
                         chat_template_kwargs = None,
-                        tool_call_constraint: Optional[Dict[str, Any]] = None):
+                        tool_call_constraint: Optional[Dict[str, Any]] = None,
+                        raw_prompt: bool = False,
+                        raw_prompt_tokens: Optional[List[int]] = None):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         pending_text_input_token_cache = getattr(
             self.thread_local_obj, "pending_text_input_token_cache", None)
         self.thread_local_obj.pending_text_input_token_cache = None
         self._apply_tool_call_constraint_to_native(tool_call_constraint)
+        if raw_prompt:
+            if not isinstance(query, str):
+                raise ValueError("raw_prompt requires a string prompt")
+            if images or videos:
+                raise ValueError("raw_prompt does not support images or videos")
+            input = (list(raw_prompt_tokens) if raw_prompt_tokens is not None
+                     else self.encode(query))
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+            return fastllm_lib.launch_raw_prompt_llm_model(
+                self.model, len(input), (ctypes.c_int * len(input))(*input),
+                max_length, min_length, do_sample, top_p, top_k, temperature,
+                repeat_penalty, False, stop_token_len, stop_token_list)
+
         conversation = None
         if (isinstance(query, List)):
             conversation = query

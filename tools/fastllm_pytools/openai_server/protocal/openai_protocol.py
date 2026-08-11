@@ -1,12 +1,14 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/v0.2.36/fastchat/protocol/openai_api_protocol.py
-from typing import Literal, Optional, List, Dict, Any, Union
+from typing import Annotated, Literal, Optional, List, Dict, Any, Union
 
 import time
 import uuid
 
 import shortuuid
 from pydantic import BaseModel, Field
+
+PositiveStrictInt = Annotated[int, Field(strict=True, gt=0)]
 
 
 class ErrorResponse(BaseModel):
@@ -89,11 +91,12 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: Optional[Union[str, List[Dict[str, Any]]]] = []
     prompt: Optional[str] = ""
+    raw_prompt: bool = False
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     n: Optional[int] = 1
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[PositiveStrictInt] = None
     min_tokens: Optional[int] = 0
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
@@ -121,8 +124,8 @@ class ResponsesRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
-    max_output_tokens: Optional[int] = None
-    max_tokens: Optional[int] = None
+    max_output_tokens: Optional[PositiveStrictInt] = None
+    max_tokens: Optional[PositiveStrictInt] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
     tools: Optional[List[Dict[str, Any]]] = None
@@ -304,7 +307,7 @@ class CompletionRequest(BaseModel):
     suffix: Optional[str] = None
     temperature: Optional[float] = 0.7
     n: Optional[int] = 1
-    max_tokens: Optional[int] = 16
+    max_tokens: Optional[PositiveStrictInt] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
     top_p: Optional[float] = 1.0

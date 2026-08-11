@@ -27,6 +27,7 @@
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
+#include <mma.h>
 #include "sampling.cuh"
 
 extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
@@ -6568,6 +6569,177 @@ __global__ void TransferAttnKernelFused(T *data, int n, int m, int outer) {
         float value = matrix[idx] + (i == j ? 1.0f : 0.0f);
         batchData[idx] = FastllmCudaFloatToValue<T>(value);
     }
+}
+
+__global__ void FastllmGatedDeltaRulePrepareAttnHalfKernel(
+        const half *at, const half *decayMask, half *attn,
+        int dim, int outer) {
+    extern __shared__ float shared[];
+    int o = blockIdx.x;
+    if (o >= outer) {
+        return;
+    }
+
+    const half *atBatch = at + (size_t)o * dim * dim;
+    const half *decayBatch = decayMask + (size_t)o * dim * dim;
+    half *attnBatch = attn + (size_t)o * dim * dim;
+    float *matrix = shared;
+    float *row = shared + dim * dim;
+    const half minusOne = __float2half_rn(-1.0f);
+
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        half value = __hmul(atBatch[idx], minusOne);
+        value = __hmul(value, decayBatch[idx]);
+        matrix[idx] = j < i ? __half2float(value) : 0.0f;
+    }
+    __syncthreads();
+
+    for (int i = 1; i < dim; i++) {
+        for (int j = threadIdx.x; j < i; j += blockDim.x) {
+            row[j] = matrix[i * dim + j];
+        }
+        __syncthreads();
+        for (int j = threadIdx.x; j < i; j += blockDim.x) {
+            float sum = row[j];
+            for (int k = 0; k < i; k++) {
+                sum += row[k] * matrix[k * dim + j];
+            }
+            matrix[i * dim + j] = sum;
+        }
+        __syncthreads();
+    }
+
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        float value = matrix[idx] + (i == j ? 1.0f : 0.0f);
+        attnBatch[idx] = __float2half(value);
+    }
+}
+
+bool FastllmCudaGatedDeltaRulePrepareAttn(
+        const fastllm::Data &at, const fastllm::Data &decayMask,
+        fastllm::Data &attn) {
+    if (!FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_SM70_GDN_PRECORE") ||
+        FastllmCudaRuntimeArch() != 70 ||
+        at.dataDevice != fastllm::DataDevice::CUDA ||
+        decayMask.dataDevice != fastllm::DataDevice::CUDA ||
+        attn.dataDevice != fastllm::DataDevice::CUDA ||
+        at.dataType != fastllm::DataType::FLOAT16 ||
+        decayMask.dataType != fastllm::DataType::FLOAT16 ||
+        attn.dataType != fastllm::DataType::FLOAT16 ||
+        at.dims != decayMask.dims || at.dims != attn.dims ||
+        at.dims.size() < 2 || at.dims.back() != 64 ||
+        at.dims[at.dims.size() - 2] != 64 ||
+        at.Count(0) <= 0) {
+        return false;
+    }
+
+    const half *atData = (const half*)FastllmCudaPrepareInput(at);
+    const half *decayData =
+        (const half*)FastllmCudaPrepareInput(decayMask);
+    half *attnData = (half*)FastllmCudaPrepareOutput(attn);
+    int outer = at.Count(0) / (64 * 64);
+    size_t sharedBytes = (64 * 64 + 64) * sizeof(float);
+    FastllmGatedDeltaRulePrepareAttnHalfKernel<<<outer, 64, sharedBytes>>>(
+        atData, decayData, attnData, 64, outer);
+    FastllmCudaFinishInput(at, (void*)atData);
+    FastllmCudaFinishInput(decayMask, (void*)decayData);
+    FastllmCudaFinishOutput(attn, attnData);
+    return true;
+}
+
+__global__ void FastllmGatedDeltaRuleBuildDecayHalfKernel(
+        half *g, half *decayMask, int dim, int outer) {
+    int o = blockIdx.x;
+    if (o >= outer) {
+        return;
+    }
+    half *row = g + (size_t)o * dim;
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < dim; j++) {
+            row[j] = __float2half(
+                __half2float(row[j]) + __half2float(row[j - 1]));
+        }
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < dim * dim; idx += blockDim.x) {
+        int i = idx / dim;
+        int j = idx % dim;
+        decayMask[(size_t)o * dim * dim + idx] = j <= i
+            ? __float2half(expf(
+                __half2float(row[i]) - __half2float(row[j])))
+            : __float2half(0.0f);
+    }
+}
+
+bool FastllmCudaGatedDeltaRuleBuildDecay(
+        fastllm::Data &g, fastllm::Data &decayMask) {
+    if (!FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_SM70_GDN_PRECORE") ||
+        FastllmCudaRuntimeArch() != 70 ||
+        g.dataDevice != fastllm::DataDevice::CUDA ||
+        decayMask.dataDevice != fastllm::DataDevice::CUDA ||
+        g.dataType != fastllm::DataType::FLOAT16 ||
+        decayMask.dataType != fastllm::DataType::FLOAT16 ||
+        g.dims.empty() || g.dims.back() != 64 ||
+        decayMask.dims.size() != g.dims.size() + 1 ||
+        decayMask.dims.back() != 64 ||
+        decayMask.Count(0) != g.Count(0) * 64 || g.Count(0) <= 0) {
+        return false;
+    }
+    half *gData = (half*)FastllmCudaPrepareInput(g);
+    half *decayData = (half*)FastllmCudaPrepareOutput(decayMask);
+    int outer = g.Count(0) / 64;
+    FastllmGatedDeltaRuleBuildDecayHalfKernel<<<outer, 64>>>(
+        gData, decayData, 64, outer);
+    FastllmCudaFinishOutput(g, gData);
+    FastllmCudaFinishOutput(decayMask, decayData);
+    return true;
+}
+
+__global__ void FastllmGatedDeltaRuleApplyDecayMaskHalfKernel(
+        half *attn, const half *decayMask, int dim,
+        int outer, int causalBase) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outer * dim * dim;
+    if (idx >= total) {
+        return;
+    }
+    int matrixIdx = idx % (dim * dim);
+    int i = matrixIdx / dim;
+    int j = matrixIdx % dim;
+    half value = __hmul(attn[idx], decayMask[idx]);
+    attn[idx] = j >= i + causalBase ? __float2half(0.0f) : value;
+}
+
+bool FastllmCudaGatedDeltaRuleApplyDecayMask(
+        fastllm::Data &attn, const fastllm::Data &decayMask,
+        int causalBase) {
+    if (!FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_SM70_GDN_PRECORE") ||
+        FastllmCudaRuntimeArch() != 70 ||
+        attn.dataDevice != fastllm::DataDevice::CUDA ||
+        decayMask.dataDevice != fastllm::DataDevice::CUDA ||
+        attn.dataType != fastllm::DataType::FLOAT16 ||
+        decayMask.dataType != fastllm::DataType::FLOAT16 ||
+        attn.dims != decayMask.dims || attn.dims.size() < 2 ||
+        attn.dims.back() != 64 ||
+        attn.dims[attn.dims.size() - 2] != 64 ||
+        (causalBase != 0 && causalBase != 1) || attn.Count(0) <= 0) {
+        return false;
+    }
+    half *attnData = (half*)FastllmCudaPrepareInput(attn);
+    const half *decayData =
+        (const half*)FastllmCudaPrepareInput(decayMask);
+    int total = attn.Count(0);
+    int outer = total / (64 * 64);
+    FastllmGatedDeltaRuleApplyDecayMaskHalfKernel<<<
+        (total + 255) / 256, 256>>>(
+        attnData, decayData, 64, outer, causalBase);
+    FastllmCudaFinishInput(decayMask, (void*)decayData);
+    FastllmCudaFinishOutput(attn, attnData);
+    return true;
 }
 
 template<typename T>
@@ -14424,7 +14596,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluTwoTokenHalfKernel(
 #endif
 }
 
-static constexpr int FASTLLM_CUDA_MTP_FAST_SEQ_MAX = 6;
+static constexpr int FASTLLM_CUDA_MTP_FAST_SEQ_MAX = 10;
 static constexpr int FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX =
     FASTLLM_CUDA_MTP_FAST_SEQ_MAX - 1;
 // Ordinary batched prefill does not materialize per-token MTP snapshots.  Its
@@ -14646,37 +14818,31 @@ bool FastllmCudaGetRaggedGdnMetadata(
     return true;
 }
 
-// 处理最多6个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
-// 把当时的滑窗状态写入对应快照 (用于MTP验证的逐token状态回滚)。
-__global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
-    half *cache, const half *newTokens, const float *weight, const float *bias,
-    half *output,
-    half *snap0, half *snap1, half *snap2, half *snap3, half *snap4, half *snap5,
-    int numSnaps,
-    int batch, int channels, int numTokens) {
+__global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfContiguousKernel(
+    half *cache, half **snapshots, const half *newTokens,
+    const float *weight, const float *bias, half *output,
+    int batch, int channels, int numTokens, int numSnaps) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * channels;
     if (row >= total) {
         return;
     }
-
-    int c = row % channels;
+    int channel = row % channels;
     half *cacheRow = cache + (size_t)row * 4;
     const half *tokenRow = newTokens + (size_t)row * numTokens;
     half x0 = cacheRow[0];
     half x1 = cacheRow[1];
     half x2 = cacheRow[2];
     half x3 = cacheRow[3];
-
-    const float *curWeight = weight + (size_t)c * 4;
-    float biasVal = bias ? bias[c] : 0.0f;
+    const float *curWeight = weight + (size_t)channel * 4;
+    float biasValue = bias == nullptr ? 0.0f : bias[channel];
     half *outputRow = output + (size_t)row * numTokens;
-    for (int t = 0; t < numTokens; t++) {
+    for (int token = 0; token < numTokens; token++) {
         x0 = x1;
         x1 = x2;
         x2 = x3;
-        x3 = tokenRow[t];
-        float value = biasVal;
+        x3 = tokenRow[token];
+        float value = biasValue;
         value += __half2float(x0) * curWeight[0];
         value += __half2float(x1) * curWeight[1];
         value += __half2float(x2) * curWeight[2];
@@ -14684,31 +14850,19 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
         half conv = __float2half_rn(value);
 #ifdef CUDA_NO_TENSOR_CORE
         float y = __half2float(conv);
-        outputRow[t] = __float2half(y / (1.0f + expf(-y)));
+        outputRow[token] = __float2half(y / (1.0f + expf(-y)));
 #else
-        outputRow[t] = __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+        outputRow[token] =
+            __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
 #endif
-        half *snapBase = nullptr;
-        if (t < numSnaps) {
-            switch (t) {
-                case 0: snapBase = snap0; break;
-                case 1: snapBase = snap1; break;
-                case 2: snapBase = snap2; break;
-                case 3: snapBase = snap3; break;
-                case 4: snapBase = snap4; break;
-                case 5: snapBase = snap5; break;
-                default: break;
-            }
-        }
-        if (snapBase != nullptr) {
-            half *snapRow = snapBase + (size_t)row * 4;
-            snapRow[0] = x0;
-            snapRow[1] = x1;
-            snapRow[2] = x2;
-            snapRow[3] = x3;
+        if (token < numSnaps && snapshots[token] != nullptr) {
+            half *snapshotRow = snapshots[token] + (size_t)row * 4;
+            snapshotRow[0] = x0;
+            snapshotRow[1] = x1;
+            snapshotRow[2] = x2;
+            snapshotRow[3] = x3;
         }
     }
-
     cacheRow[0] = x0;
     cacheRow[1] = x1;
     cacheRow[2] = x2;
@@ -15439,6 +15593,12 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
         snaps[t] = (half *) snap->cudaData;
     }
 
+    std::vector<void*> pointers(numTokenCaches);
+    for (int t = 0; t < numTokenCaches; t++) {
+        pointers[t] = snaps[t];
+    }
+    void **devicePointers = FastllmCudaStagePointers(pointers);
+
     int batch = cache.dims[0];
     int channels = cache.dims[1];
     int threadsPerBlock = 256;
@@ -15448,14 +15608,11 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
         checkCudaErrors("Error: stale CUDA error before FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16.", pendingState);
         return false;
     }
-    FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel<<<blocksPerGrid, threadsPerBlock>>>(
-        (half *) cache.cudaData, (const half *) newTokens.cudaData,
-        (const float *) weight.cudaData,
-        bias.dims.size() > 0 ? (const float *) bias.cudaData : nullptr,
-        (half *) output.cudaData,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5],
-        numTokenCaches, batch, channels, numTokens
-    );
+    FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfContiguousKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        (half *)cache.cudaData, (half **)devicePointers,
+        (const half *)newTokens.cudaData, (const float *)weight.cudaData,
+        bias.dims.size() > 0 ? (const float *)bias.cudaData : nullptr,
+        (half *)output.cudaData, batch, channels, numTokens, numTokenCaches);
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors("Error: CUDA error in FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16.", launchState);
@@ -16906,7 +17063,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleNormBaTransposedHalfWarpKernel(
     const float* a_log,          // [n1]
     const float* dt_bias,        // [n1]
     half* core_attn_out,         // [n0, n1, n3]
-    int n0, int n1, int n2, int n3, int group, float eps, float qScale)
+    int n0, int n1, int n2, int n3, int group, float eps, float qScale,
+    bool tiledQKHeadOrder)
 {
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
@@ -16918,7 +17076,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleNormBaTransposedHalfWarpKernel(
     int lane_id = tid & 31;
     int base_idx = batch_idx * n1 + head_idx;
     int kv_heads = n1 / group;
-    int qk_base = (batch_idx * kv_heads + head_idx / group) * n2;
+    int qkHead = tiledQKHeadOrder ? head_idx % kv_heads : head_idx / group;
+    int qk_base = (batch_idx * kv_heads + qkHead) * n2;
     int state_base = base_idx * n2 * n3;
     int out_base = base_idx * n3;
 
@@ -17029,7 +17188,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleNormTransposedHalfWarpKernel(
     const half* q_t,             // [n0, n1 / group, n2], unnormalized
     const float* norm_weight,    // [n2]
     half* core_attn_out,         // [n0, n1, n3]
-    int n0, int n1, int n2, int n3, int group, float eps, float qScale)
+    int n0, int n1, int n2, int n3, int group, float eps, float qScale,
+    bool tiledQKHeadOrder)
 {
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
@@ -17041,7 +17201,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleNormTransposedHalfWarpKernel(
     int lane_id = tid & 31;
     int base_idx = batch_idx * n1 + head_idx;
     int kv_heads = n1 / group;
-    int qk_base = (batch_idx * kv_heads + head_idx / group) * n2;
+    int qkHead = tiledQKHeadOrder ? head_idx % kv_heads : head_idx / group;
+    int qk_base = (batch_idx * kv_heads + qkHead) * n2;
     int state_base = base_idx * n2 * n3;
     int out_base = base_idx * n3;
 
@@ -17347,7 +17508,7 @@ bool FastllmLinearAttentionStateTransposeVKToKVFloat16(fastllm::Data &last_recur
     return FastllmLinearAttentionStateTransposeFloat16(last_recurrent_state, false);
 }
 
-bool FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale) {
+bool FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale, bool tiledQKHeadOrder) {
     if (q.dataDevice != fastllm::DataDevice::CUDA ||
         k.dataDevice != fastllm::DataDevice::CUDA ||
         v.dataDevice != fastllm::DataDevice::CUDA ||
@@ -17414,13 +17575,13 @@ bool FastllmRecurrentGatedDeltaRuleNormTransposedFloat16(fastllm::Data &q, fastl
         (half*)q.cudaData,
         (float*)normWeight.cudaData,
         (half*)core_attn_out.cudaData,
-        n0, n1, n2, n3, group, eps, qScale
+        n0, n1, n2, n3, group, eps, qScale, tiledQKHeadOrder
     );
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleNormTransposedFloat16.", cudaGetLastError());
     return true;
 }
 
-bool FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &a, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &aLog, fastllm::Data &dtBias, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale) {
+bool FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &a, fastllm::Data &b, fastllm::Data &normWeight, fastllm::Data &aLog, fastllm::Data &dtBias, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float eps, float qScale, bool tiledQKHeadOrder) {
     if (q.dataDevice != fastllm::DataDevice::CUDA ||
         k.dataDevice != fastllm::DataDevice::CUDA ||
         v.dataDevice != fastllm::DataDevice::CUDA ||
@@ -17497,7 +17658,7 @@ bool FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16(fastllm::Data &q, fas
         (float*)aLog.cudaData,
         (float*)dtBias.cudaData,
         (half*)core_attn_out.cudaData,
-        n0, n1, n2, n3, group, eps, qScale
+        n0, n1, n2, n3, group, eps, qScale, tiledQKHeadOrder
     );
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleNormBaTransposedFloat16.", cudaGetLastError());
     return true;
@@ -17593,7 +17754,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel(
     half *core_attn_out,
     int batch, int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale,
-    half *statePool, const int *slotIds, int stateStride) {
+    half *statePool, const int *slotIds, int stateStride,
+    bool tiledQKHeadOrder) {
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
     if (batch_idx >= batch || head_idx >= numVHeads) return;
@@ -17603,7 +17765,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel(
     int lane_id = tid % 32;
     int numWarps = (blockDim.x + 31) / 32;
     int group = numVHeads / numKHeads;
-    int qHead = head_idx / group;
+    int qHead = tiledQKHeadOrder ? head_idx % numKHeads : head_idx / group;
     int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
     int convBase = batch_idx * qkvDim;
     int qOffset = convBase + qHead * headKDim;
@@ -17736,7 +17898,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpK
     half *core_attn_out,
     int batch, int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale,
-    half *statePool, const int *slotIds, int stateStride) {
+    half *statePool, const int *slotIds, int stateStride,
+    bool tiledQKHeadOrder) {
     int batch_idx = blockIdx.x;
     int head_idx = blockIdx.y;
     int v_base = blockIdx.z * TILE_V;
@@ -17748,7 +17911,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpK
     int warp_id = tid >> 5;
     int lane_id = tid & 31;
     int group = numVHeads / numKHeads;
-    int qHead = head_idx / group;
+    int qHead = tiledQKHeadOrder ? head_idx % numKHeads : head_idx / group;
     int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
     int convBase = batch_idx * qkvDim;
     int qOffset = convBase + qHead * headKDim;
@@ -17948,7 +18111,7 @@ static bool LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWar
     int batch, int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale,
     half *statePool, const int *slotIds, int stateStride,
-    int tileV, bool exactNorm128) {
+    int tileV, bool exactNorm128, bool tiledQKHeadOrder) {
     if (headKDim != 128 || tileV != 8) {
         return false;
     }
@@ -17963,7 +18126,7 @@ static bool LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWar
         <<<grid, threads, sharedBytes>>>( \
             lastRecurrentStates, convOutput, ba, normWeight, aLog, dtBias, \
             coreAttnOut, batch, numKHeads, numVHeads, headKDim, headVDim, \
-            eps, qScale, statePool, slotIds, stateStride)
+            eps, qScale, statePool, slotIds, stateStride, tiledQKHeadOrder)
 
     if (useTile32) {
         dim3 grid(batch, numVHeads, (headVDim + 31) / 32);
@@ -17991,7 +18154,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     int seqLen, int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale,
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4,
-    half **snapshotPointers, int numSnaps) {
+    half **snapshotPointers, int numSnaps,
+    bool tiledQKHeadOrder) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
@@ -18002,7 +18166,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     int warp_id = tid >> 5;
     int lane_id = tid & 31;
     int group = numVHeads / numKHeads;
-    int qHead = head_idx / group;
+    int qHead = tiledQKHeadOrder ? head_idx % numKHeads : head_idx / group;
     int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
     int v_col = v_base + warp_id;
     bool activeV = warp_id < TILE_V && v_col < headVDim;
@@ -18147,7 +18311,7 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
     fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
     fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     if (cudaStatePointers == nullptr || batch <= 0 ||
         convOutput.dataDevice != fastllm::DataDevice::CUDA ||
         ba.dataDevice != fastllm::DataDevice::CUDA ||
@@ -18202,7 +18366,7 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
         (const float*)dtBias.cudaData,
         (half*)core_attn_out.cudaData,
         batch, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        nullptr, nullptr, 0
+        nullptr, nullptr, 0, tiledQKHeadOrder
     );
 
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers.", cudaGetLastError());
@@ -18215,7 +18379,7 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
     fastllm::Data &first_recurrent_state, void *cudaStatePointers, int batch,
     fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     if (cudaStatePointers == nullptr || batch <= 0 ||
         convOutput.dataDevice != fastllm::DataDevice::CUDA ||
         ba.dataDevice != fastllm::DataDevice::CUDA ||
@@ -18268,7 +18432,8 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
         batch, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
         nullptr, nullptr, 0, 8,
         batch == 1 && numKHeads == 8 && numVHeads == 16 &&
-            headKDim == 128 && headVDim == 128
+            headKDim == 128 && headVDim == 128,
+        tiledQKHeadOrder
     );
 
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers.", cudaGetLastError());
@@ -18280,7 +18445,8 @@ static bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16Impl(
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale, int tileV, bool exactNorm128) {
+    float eps, float qScale, int tileV, bool exactNorm128,
+    bool tiledQKHeadOrder) {
     if (convOutput.dataDevice != fastllm::DataDevice::CUDA ||
         ba.dataDevice != fastllm::DataDevice::CUDA ||
         normWeight.dataDevice != fastllm::DataDevice::CUDA ||
@@ -18330,7 +18496,8 @@ static bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16Impl(
         (const float*)dtBias.cudaData,
         (half*)core_attn_out.cudaData,
         1, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        (half*)last_recurrent_state.cudaData, nullptr, 0, tileV, exactNorm128)) {
+        (half*)last_recurrent_state.cudaData, nullptr, 0, tileV,
+        exactNorm128, tiledQKHeadOrder)) {
         return false;
     }
 
@@ -18348,7 +18515,7 @@ bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16WithConfig(
         convOutput, ba, normWeight, aLog, dtBias,
         last_recurrent_state, core_attn_out,
         numKHeads, numVHeads, headKDim, headVDim,
-        eps, qScale, tileV, exactNorm128);
+        eps, qScale, tileV, exactNorm128, false);
 }
 
 bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
@@ -18356,14 +18523,15 @@ bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     return FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16Impl(
         convOutput, ba, normWeight, aLog, dtBias,
         last_recurrent_state, core_attn_out,
         numKHeads, numVHeads, headKDim, headVDim,
         eps, qScale, 8,
         numKHeads == 8 && numVHeads == 16 &&
-            headKDim == 128 && headVDim == 128);
+            headKDim == 128 && headVDim == 128,
+        tiledQKHeadOrder);
 }
 
 bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
@@ -18371,12 +18539,13 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     return FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         convOutput, ba, normWeight, aLog, dtBias,
         last_recurrent_state, core_attn_out,
         nullptr, 0,
-        numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
+        numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+        tiledQKHeadOrder);
 }
 
 bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
@@ -18385,7 +18554,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     fastllm::Data **tokenStates, int numTokenStates,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     if (!FastllmCudaDataCanShareDevice(last_recurrent_state, convOutput) ||
         !FastllmCudaDataCanShareDevice(last_recurrent_state, ba) ||
         !FastllmCudaDataCanShareDevice(last_recurrent_state, normWeight) ||
@@ -18517,6 +18686,12 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         snaps[t] = (half*)snap->cudaData;
     }
 
+    std::vector<void*> snapshotPointers(numTokenStates);
+    for (int t = 0; t < numTokenStates; t++) {
+        snapshotPointers[t] = snaps[t];
+    }
+    void **deviceSnapshotPointers = FastllmCudaStagePointers(snapshotPointers);
+
     constexpr int tileV = 8;
     int threadsPerBlock = tileV * 32;
     size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
@@ -18536,8 +18711,8 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         (half*)last_recurrent_state.cudaData, nullptr,
         (half*)core_attn_out.cudaData,
         seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4],
-        nullptr, numTokenStates
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        (half **)deviceSnapshotPointers, numTokenStates, tiledQKHeadOrder
     );
 
     cudaError_t launchState = cudaGetLastError();
@@ -18555,7 +18730,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
     fastllm::Data &coreAttnOut,
     const std::vector<fastllm::Data*> &tokenStates, int numTokenStates,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     if (lastRecurrentStates.empty() || lastRecurrentStates[0] == nullptr ||
         numTokenStates < 0 ||
         numTokenStates > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
@@ -18678,7 +18853,8 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             (half*)coreAttnOut.cudaData,
             seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
             nullptr, nullptr, nullptr, nullptr, nullptr,
-            (half**)(devicePointers + batch), numTokenStates);
+            (half**)(devicePointers + batch), numTokenStates,
+            tiledQKHeadOrder);
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors(
@@ -18695,7 +18871,7 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
     void *cudaStatePool, void *cudaSlotIds, int batch,
     fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     if (cudaStatePool == nullptr || cudaSlotIds == nullptr || batch <= 0 ||
         convOutput.dataDevice != fastllm::DataDevice::CUDA ||
         ba.dataDevice != fastllm::DataDevice::CUDA ||
@@ -18741,7 +18917,8 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
         batch, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
         (half*)cudaStatePool, (const int*)cudaSlotIds, stateStride, 8,
         batch == 1 && numKHeads == 8 && numVHeads == 16 &&
-            headKDim == 128 && headVDim == 128
+            headKDim == 128 && headVDim == 128,
+        tiledQKHeadOrder
     );
 
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots.", cudaGetLastError());
@@ -18753,7 +18930,7 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
     fastllm::Data &aLog, fastllm::Data &dtBias,
     std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     int batch = (int)last_recurrent_states.size();
     std::vector<void*> pointers(batch);
     for (int i = 0; i < batch; i++) {
@@ -18763,7 +18940,8 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
 
     FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
         convOutput, ba, normWeight, aLog, dtBias, *last_recurrent_states[0], cudaPointers, batch,
-        core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
+        core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+        tiledQKHeadOrder);
 }
 
 void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
@@ -18771,7 +18949,7 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
     fastllm::Data &aLog, fastllm::Data &dtBias,
     std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, bool tiledQKHeadOrder) {
     int batch = (int)last_recurrent_states.size();
     std::vector<void*> pointers(batch);
     for (int i = 0; i < batch; i++) {
@@ -18781,7 +18959,8 @@ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
 
     FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
         convOutput, ba, normWeight, aLog, dtBias, *last_recurrent_states[0], cudaPointers, batch,
-        core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale);
+        core_attn_out, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+        tiledQKHeadOrder);
 }
 
 template <typename T>
@@ -18846,6 +19025,38 @@ __global__ void FastllmChunkGatedDeltaRuleBuildKScaledTransKernel(
         size_t src = ((((size_t)bh * chunks + ci) * chunk_size + t) * kdim + kd);
         kScaledTrans[idx] = FastllmCudaFloatToValue<T>(
             FastllmCudaValueToFloat(k[src]) * gScale[(size_t)bh * chunk_size + t]);
+    }
+}
+
+template <typename T>
+__global__ void FastllmChunkGatedDeltaRuleFusedStateKPreprocessKernel(
+    const T *k, const T *g, T *state, T *kScaledTrans,
+    int chunks, int ci, int chunkSize, int kdim, int stateSize) {
+    extern __shared__ float scales[];
+    int bh = blockIdx.x;
+    int base = (bh * chunks + ci) * chunkSize;
+    float last = FastllmCudaValueToFloat(g[base + chunkSize - 1]);
+    for (int t = threadIdx.x; t < chunkSize; t += blockDim.x) {
+        scales[t] = expf(last - FastllmCudaValueToFloat(g[base + t]));
+    }
+    if (threadIdx.x == 0) {
+        scales[chunkSize] = expf(last);
+    }
+    __syncthreads();
+
+    size_t stateBase = (size_t)bh * stateSize;
+    for (int i = threadIdx.x; i < stateSize; i += blockDim.x) {
+        state[stateBase + i] = FastllmCudaFloatToValue<T>(
+            FastllmCudaValueToFloat(state[stateBase + i]) * scales[chunkSize]);
+    }
+    int kElements = kdim * chunkSize;
+    size_t kOutBase = (size_t)bh * kElements;
+    for (int i = threadIdx.x; i < kElements; i += blockDim.x) {
+        int kd = i / chunkSize;
+        int t = i % chunkSize;
+        size_t src = ((size_t)base + t) * kdim + kd;
+        kScaledTrans[kOutBase + i] = FastllmCudaFloatToValue<T>(
+            FastllmCudaValueToFloat(k[src]) * scales[t]);
     }
 }
 
@@ -19114,6 +19325,493 @@ __global__ void FastllmChunkGatedDeltaRulePrefillOKernel(
             outChunk[t * vdim + lane] = FastllmCudaFloatToValue<T>(sum);
         }
     }
+}
+namespace {
+constexpr int kFastllmSm70WmmaChunkSize = 64;
+constexpr int kFastllmSm70WmmaDim = 128;
+constexpr int kFastllmSm70WmmaThreads = 256;
+constexpr int kFastllmSm70WmmaStateElements =
+    kFastllmSm70WmmaDim * kFastllmSm70WmmaDim;
+constexpr int kFastllmSm70WmmaChunkElements =
+    kFastllmSm70WmmaChunkSize * kFastllmSm70WmmaDim;
+constexpr int kFastllmSm70WmmaIdentityElements = 16 * 16;
+constexpr int kFastllmSm70WmmaWarpTileFloats = 8 * 16 * 16;
+constexpr size_t kFastllmSm70WmmaSharedBytes =
+    (kFastllmSm70WmmaStateElements +
+     kFastllmSm70WmmaChunkElements +
+     kFastllmSm70WmmaIdentityElements) * sizeof(half) +
+    kFastllmSm70WmmaWarpTileFloats * sizeof(float);
+
+__global__ __launch_bounds__(kFastllmSm70WmmaThreads, 1)
+void FastllmChunkGatedDeltaRulePrefillSm70WmmaKernel(
+        const half *__restrict__ q,
+        const half *__restrict__ k,
+        const half *__restrict__ v,
+        const half *__restrict__ g,
+        const half *__restrict__ attn,
+        const half *__restrict__ kCumdecay,
+        const half *__restrict__ initialState,
+        half *__restrict__ finalState,
+        half *__restrict__ output,
+        int chunks) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    using MatrixA = wmma::fragment<
+        wmma::matrix_a, 16, 16, 16, half, wmma::row_major>;
+    using MatrixB = wmma::fragment<
+        wmma::matrix_b, 16, 16, 16, half, wmma::row_major>;
+    using Accumulator = wmma::fragment<
+        wmma::accumulator, 16, 16, 16, float>;
+
+    extern __shared__ half sharedHalf[];
+    half *stateTile = sharedHalf;
+    half *workTile =
+        stateTile + kFastllmSm70WmmaStateElements;
+    half *identityTile =
+        workTile + kFastllmSm70WmmaChunkElements;
+    float *warpTiles = reinterpret_cast<float *>(
+        identityTile + kFastllmSm70WmmaIdentityElements);
+
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const size_t stateBase =
+        (size_t)bh * kFastllmSm70WmmaStateElements;
+
+    for (int index = tid;
+         index < kFastllmSm70WmmaStateElements;
+         index += blockDim.x) {
+        stateTile[index] =
+            initialState[stateBase + index];
+    }
+    for (int index = tid;
+         index < kFastllmSm70WmmaIdentityElements;
+         index += blockDim.x) {
+        identityTile[index] = __float2half(
+            index / 16 == index % 16 ? 1.0f : 0.0f);
+    }
+    __syncthreads();
+
+    for (int chunk = 0; chunk < chunks; chunk++) {
+        const size_t chunkBase =
+            ((size_t)bh * chunks + chunk) *
+            kFastllmSm70WmmaChunkElements;
+        const size_t gBase =
+            ((size_t)bh * chunks + chunk) *
+            kFastllmSm70WmmaChunkSize;
+        const size_t attnBase =
+            ((size_t)bh * chunks + chunk) *
+            kFastllmSm70WmmaChunkSize *
+            kFastllmSm70WmmaChunkSize;
+        float *warpTile =
+            warpTiles + warp * 16 * 16;
+
+        if (tid < kFastllmSm70WmmaChunkSize) {
+            warpTiles[tid] =
+                expf(__half2float(g[gBase + tid]));
+        }
+        __syncthreads();
+        for (int index = tid;
+             index < kFastllmSm70WmmaChunkElements;
+             index += blockDim.x) {
+            int token =
+                index / kFastllmSm70WmmaDim;
+            workTile[index] = __float2half(
+                __half2float(q[chunkBase + index]) *
+                warpTiles[token]);
+        }
+        __syncthreads();
+
+        Accumulator outputFragments[4];
+        for (int rowTile = 0; rowTile < 4;
+             rowTile++) {
+            wmma::fill_fragment(
+                outputFragments[rowTile], 0.0f);
+            for (int innerTile = 0;
+                 innerTile < 8; innerTile++) {
+                MatrixA qFragment;
+                MatrixB stateFragment;
+                wmma::load_matrix_sync(
+                    qFragment,
+                    workTile +
+                        rowTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        innerTile * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::load_matrix_sync(
+                    stateFragment,
+                    stateTile +
+                        innerTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        warp * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::mma_sync(
+                    outputFragments[rowTile],
+                    qFragment, stateFragment,
+                    outputFragments[rowTile]);
+            }
+        }
+
+        for (int rowTile = 0; rowTile < 4;
+             rowTile++) {
+            wmma::store_matrix_sync(
+                warpTile, outputFragments[rowTile],
+                16, wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < 16 * 16;
+                 index += 32) {
+                warpTile[index] = __half2float(
+                    __float2half(warpTile[index]));
+            }
+            __syncwarp();
+            wmma::load_matrix_sync(
+                outputFragments[rowTile], warpTile,
+                16, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        for (int rowTile = 0; rowTile < 4;
+             rowTile++) {
+            Accumulator vNewFragment;
+            wmma::fill_fragment(vNewFragment, 0.0f);
+            for (int innerTile = 0;
+                 innerTile < 8; innerTile++) {
+                MatrixA kCumFragment;
+                MatrixB stateFragment;
+                wmma::load_matrix_sync(
+                    kCumFragment,
+                    kCumdecay + chunkBase +
+                        rowTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        innerTile * 16,
+                    kFastllmSm70WmmaDim);
+                for (int element = 0;
+                     element <
+                         kCumFragment.num_elements;
+                     element++) {
+                    kCumFragment.x[element] =
+                        __float2half(-__half2float(
+                            kCumFragment.x[element]));
+                }
+                wmma::load_matrix_sync(
+                    stateFragment,
+                    stateTile +
+                        innerTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        warp * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::mma_sync(
+                    vNewFragment, kCumFragment,
+                    stateFragment, vNewFragment);
+            }
+            wmma::store_matrix_sync(
+                warpTile, vNewFragment, 16,
+                wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < 16 * 16;
+                 index += 32) {
+                int row = index >> 4;
+                int column = index & 15;
+                int workIndex =
+                    (rowTile * 16 + row) *
+                        kFastllmSm70WmmaDim +
+                    warp * 16 + column;
+                workTile[workIndex] = __float2half(
+                    __half2float(
+                        v[chunkBase + workIndex]) +
+                    warpTile[index]);
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+
+        for (int rowTile = 0; rowTile < 4;
+             rowTile++) {
+            for (int innerTile = 0;
+                 innerTile < 4; innerTile++) {
+                MatrixA attnFragment;
+                MatrixB vNewFragment;
+                wmma::load_matrix_sync(
+                    attnFragment,
+                    attn + attnBase +
+                        rowTile * 16 *
+                            kFastllmSm70WmmaChunkSize +
+                        innerTile * 16,
+                    kFastllmSm70WmmaChunkSize);
+                wmma::load_matrix_sync(
+                    vNewFragment,
+                    workTile +
+                        innerTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        warp * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::mma_sync(
+                    outputFragments[rowTile],
+                    attnFragment, vNewFragment,
+                    outputFragments[rowTile]);
+            }
+            wmma::store_matrix_sync(
+                warpTile, outputFragments[rowTile],
+                16, wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < 16 * 16;
+                 index += 32) {
+                int row = index >> 4;
+                int column = index & 15;
+                int outputIndex =
+                    (rowTile * 16 + row) *
+                        kFastllmSm70WmmaDim +
+                    warp * 16 + column;
+                output[chunkBase + outputIndex] =
+                    __float2half(warpTile[index]);
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            warpTiles[0] = expf(__half2float(
+                g[gBase +
+                  kFastllmSm70WmmaChunkSize - 1]));
+        }
+        __syncthreads();
+        const float lastGate = warpTiles[0];
+        for (int index = tid;
+             index < kFastllmSm70WmmaStateElements;
+             index += blockDim.x) {
+            stateTile[index] = __float2half(
+                __half2float(stateTile[index]) *
+                lastGate);
+        }
+        __syncthreads();
+
+        half *scaledKTile =
+            reinterpret_cast<half *>(warpTiles);
+        for (int keyTile = 0; keyTile < 8;
+             keyTile++) {
+            Accumulator stateFragment;
+            MatrixA identityFragment;
+            MatrixB oldStateFragment;
+            wmma::fill_fragment(
+                stateFragment, 0.0f);
+            wmma::load_matrix_sync(
+                identityFragment, identityTile, 16);
+            wmma::load_matrix_sync(
+                oldStateFragment,
+                stateTile +
+                    keyTile * 16 *
+                        kFastllmSm70WmmaDim +
+                    warp * 16,
+                kFastllmSm70WmmaDim);
+            wmma::mma_sync(
+                stateFragment, identityFragment,
+                oldStateFragment, stateFragment);
+
+            for (int tokenTile = 0;
+                 tokenTile < 4; tokenTile++) {
+                if (tid < 16 * 16) {
+                    int keyRow = tid >> 4;
+                    int tokenColumn = tid & 15;
+                    int token =
+                        tokenTile * 16 + tokenColumn;
+                    int keyColumn =
+                        keyTile * 16 + keyRow;
+                    float scale = expf(
+                        __half2float(
+                            g[gBase +
+                              kFastllmSm70WmmaChunkSize -
+                              1]) -
+                        __half2float(g[gBase + token]));
+                    scaledKTile[tid] = __float2half(
+                        __half2float(
+                            k[chunkBase +
+                              token *
+                                  kFastllmSm70WmmaDim +
+                              keyColumn]) *
+                        scale);
+                }
+                __syncthreads();
+                MatrixA scaledKFragment;
+                MatrixB vNewFragment;
+                wmma::load_matrix_sync(
+                    scaledKFragment,
+                    scaledKTile, 16);
+                wmma::load_matrix_sync(
+                    vNewFragment,
+                    workTile +
+                        tokenTile * 16 *
+                            kFastllmSm70WmmaDim +
+                        warp * 16,
+                    kFastllmSm70WmmaDim);
+                wmma::mma_sync(
+                    stateFragment, scaledKFragment,
+                    vNewFragment, stateFragment);
+                __syncthreads();
+            }
+
+            wmma::store_matrix_sync(
+                warpTile, stateFragment, 16,
+                wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < 16 * 16;
+                 index += 32) {
+                int row = index >> 4;
+                int column = index & 15;
+                int stateIndex =
+                    (keyTile * 16 + row) *
+                        kFastllmSm70WmmaDim +
+                    warp * 16 + column;
+                stateTile[stateIndex] =
+                    __float2half(warpTile[index]);
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int index = tid;
+         index < kFastllmSm70WmmaStateElements;
+         index += blockDim.x) {
+        finalState[stateBase + index] =
+            stateTile[index];
+    }
+#endif
+}
+}
+
+bool FastllmCudaSm70WmmaChunkGdnPrefillSupported(
+        fastllm::DataType dataType, int chunks, int chunkSize,
+        int kDim, int vDim) {
+    if (dataType != fastllm::DataType::FLOAT16 || chunks <= 0 ||
+        chunkSize != kFastllmSm70WmmaChunkSize ||
+        kDim != kFastllmSm70WmmaDim ||
+        vDim != kFastllmSm70WmmaDim) {
+        return false;
+    }
+    int device = -1;
+    int major = 0;
+    int minor = 0;
+    int maxOptinShared = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(
+            &major, cudaDevAttrComputeCapabilityMajor, device) !=
+            cudaSuccess ||
+        cudaDeviceGetAttribute(
+            &minor, cudaDevAttrComputeCapabilityMinor, device) !=
+            cudaSuccess ||
+        cudaDeviceGetAttribute(
+            &maxOptinShared, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+            device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return major == 7 && minor == 0 &&
+        maxOptinShared >= (int)kFastllmSm70WmmaSharedBytes;
+}
+
+static bool FastllmCudaSm70WmmaChunkGdnPrefillEnabled(
+        fastllm::DataType dataType, int chunks, int chunkSize,
+        int kDim, int vDim) {
+    return FastllmCudaEnvFlagEnabled(
+               "FASTLLM_CUDA_SM70_WMMA_CHUNK_GDN_PREFILL") &&
+        FastllmCudaSm70WmmaChunkGdnPrefillSupported(
+            dataType, chunks, chunkSize, kDim, vDim);
+}
+
+static bool FastllmCudaTrySm70WmmaChunkGdnPrefill(
+        const half *q, const half *k, const half *v, const half *g,
+        const half *attn, const half *kCumdecay,
+        const half *initialState, half *finalState, half *output,
+        int batchHeads, int chunks, size_t stateBytes) {
+    cudaError_t status = cudaFuncSetAttribute(
+        FastllmChunkGatedDeltaRulePrefillSm70WmmaKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)kFastllmSm70WmmaSharedBytes);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaGetLastError();
+    FastllmChunkGatedDeltaRulePrefillSm70WmmaKernel<<<
+        batchHeads, kFastllmSm70WmmaThreads,
+        kFastllmSm70WmmaSharedBytes, cudaStreamPerThread>>>(
+            q, k, v, g, attn, kCumdecay, initialState, finalState,
+            output, chunks);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    status = cudaStreamSynchronize(cudaStreamPerThread);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    status = cudaMemcpyAsync(
+        const_cast<half *>(initialState), finalState, stateBytes,
+        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    int device = FastllmCudaGetDevice();
+    static thread_local std::set<int> loggedDevices;
+    if (loggedDevices.insert(device).second) {
+        printf("[FastLLM] SM70 WMMA chunk GDN prefill enabled on CUDA device %d.\n",
+               device);
+    }
+    return true;
+}
+
+static bool FastllmCudaSm70FusedChunkGdnPrefillEnabled(
+        fastllm::DataType dataType, int chunks, int chunkSize,
+        int kDim, int vDim) {
+    if (!FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_SM70_FUSED_CHUNK_GDN_PREFILL") ||
+        dataType != fastllm::DataType::FLOAT16 || chunks <= 0 ||
+        chunkSize != 64 || kDim != 128 || vDim != 128) {
+        return false;
+    }
+    int device = -1, major = 0, minor = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                               device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                               device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    bool supported = major == 7 && minor == 0;
+    if (supported) {
+        static thread_local std::set<int> loggedDevices;
+        if (loggedDevices.insert(device).second) {
+            printf("[FastLLM] SM70 fused chunk GDN prefill enabled on CUDA device %d.\n",
+                   device);
+        }
+    }
+    return supported;
+}
+
+namespace {
+struct FastllmChunkGdnPersistentScratch {
+    void *data = nullptr;
+    size_t bytes = 0;
+};
+
+static void *FastllmBorrowChunkGdnPersistentScratch(size_t bytes) {
+    thread_local static std::map<int, FastllmChunkGdnPersistentScratch> scratches;
+    int device = FastllmCudaGetDevice();
+    FastllmChunkGdnPersistentScratch &scratch = scratches[device];
+    if (scratch.bytes < bytes) {
+        if (scratch.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(scratch.data);
+        }
+        scratch.data = FastllmCudaMalloc(bytes);
+        scratch.bytes = scratch.data == nullptr ? 0 : bytes;
+    }
+    return scratch.data;
+}
 }
 
 template <typename T, int BV, int BK>
@@ -19612,14 +20310,59 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     long long qChunkStride = (long long)chunk_size * kdim;
     long long vChunkStride = (long long)chunk_size * vdim;
     long long attnChunkStride = (long long)chunk_size * chunk_size;
-    bool useBatchedGemm = q.dataType == fastllm::DataType::FLOAT32 ||
-                          q.dataType == fastllm::DataType::FLOAT16;
+    bool useSm70Wmma =
+        FastllmCudaSm70WmmaChunkGdnPrefillEnabled(
+            q.dataType, chunks, chunk_size, kdim, vdim);
+    bool useSm70Fused = !useSm70Wmma &&
+        FastllmCudaSm70FusedChunkGdnPrefillEnabled(
+            q.dataType, chunks, chunk_size, kdim, vdim);
+    bool useBatchedGemm = !useSm70Fused &&
+                          (q.dataType == fastllm::DataType::FLOAT32 ||
+                           q.dataType == fastllm::DataType::FLOAT16);
+    bool useAsyncGather = useBatchedGemm && FastllmCudaEnvFlagEnabled(
+        "FASTLLM_CUDA_CHUNK_GDN_ASYNC_GATHER");
+    bool useFusedPreprocess = useBatchedGemm && chunk_size == 64 &&
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_CHUNK_GDN_FUSED_PREPROCESS");
+    bool usePersistentScratch = useSm70Wmma ||
+        FastllmCudaEnvFlagEnabled(
+            "FASTLLM_CUDA_CHUNK_GDN_PERSISTENT_SCRATCH");
 
     size_t hElems = (size_t)batch * heads * chunks * kdim * vdim;
     size_t vNewElems = useBatchedGemm ? (size_t)bhCount * vChunkStride
                                       : (size_t)batch * heads * chunks * chunk_size * vdim;
-    void *hData = useBatchedGemm ? nullptr : FastllmCudaMalloc(hElems * unitBytes);
-    void *vNewData = FastllmCudaMalloc(vNewElems * unitBytes);
+    size_t hBytes = useBatchedGemm ? 0 :
+        FastllmCudaAlignBytes(hElems * unitBytes, 256);
+    size_t vNewBytes = FastllmCudaAlignBytes(vNewElems * unitBytes, 256);
+    size_t qScaledBytes = useBatchedGemm ? FastllmCudaAlignBytes(
+        (size_t)bhCount * qChunkStride * unitBytes, 256) : 0;
+    size_t kScaledTransBytes = useBatchedGemm ? FastllmCudaAlignBytes(
+        (size_t)bhCount * kdim * chunk_size * unitBytes, 256) : 0;
+    size_t gScaleBytes = useBatchedGemm && !useFusedPreprocess ?
+        FastllmCudaAlignBytes((size_t)bhCount * chunk_size * sizeof(float), 256) : 0;
+    size_t gLastExpBytes = useBatchedGemm && !useFusedPreprocess ?
+        FastllmCudaAlignBytes((size_t)bhCount * sizeof(float), 256) : 0;
+    size_t wmmaStateBytes = useSm70Wmma ? FastllmCudaAlignBytes(
+        (size_t)bhCount * stateStride * unitBytes, 256) : 0;
+    size_t scratchBytes = hBytes + vNewBytes + qScaledBytes +
+        kScaledTransBytes + gScaleBytes + gLastExpBytes +
+        wmmaStateBytes;
+    uint8_t *persistentScratch = usePersistentScratch ?
+        (uint8_t*)FastllmBorrowChunkGdnPersistentScratch(scratchBytes) : nullptr;
+    usePersistentScratch = persistentScratch != nullptr;
+    size_t scratchOffset = 0;
+    auto borrowScratch = [&](size_t bytes) -> void* {
+        if (!usePersistentScratch) {
+            return FastllmCudaMalloc(bytes);
+        }
+        void *result = persistentScratch + scratchOffset;
+        scratchOffset += bytes;
+        return result;
+    };
+    void *hData = useBatchedGemm ? nullptr : borrowScratch(hBytes);
+    void *vNewData = borrowScratch(vNewBytes);
+    void *wmmaStateData = useSm70Wmma ?
+        borrowScratch(wmmaStateBytes) : nullptr;
 
     void *qData = FastllmCudaPrepareInput(q);
     void *kData = FastllmCudaPrepareInput(k);
@@ -19633,15 +20376,32 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     void *kScaledTransData = nullptr;
     float *gScaleData = nullptr;
     float *gLastExpData = nullptr;
+    size_t qScaledElems = (size_t)bhCount * qChunkStride;
+    size_t stateElems = (size_t)bhCount * stateStride;
+    size_t kScaledTransElems =
+        (size_t)bhCount * kdim * chunk_size;
 
     if (useBatchedGemm) {
-        size_t qScaledElems = (size_t)bhCount * qChunkStride;
-        size_t stateElems = (size_t)bhCount * stateStride;
-        size_t kScaledTransElems = (size_t)bhCount * kdim * chunk_size;
-        qScaledData = FastllmCudaMalloc(qScaledElems * unitBytes);
-        kScaledTransData = FastllmCudaMalloc(kScaledTransElems * unitBytes);
-        gScaleData = (float*)FastllmCudaMalloc((size_t)bhCount * chunk_size * sizeof(float));
-        gLastExpData = (float*)FastllmCudaMalloc((size_t)bhCount * sizeof(float));
+        qScaledData = borrowScratch(qScaledBytes);
+        kScaledTransData = borrowScratch(kScaledTransBytes);
+        if (!useFusedPreprocess) {
+            gScaleData = (float*)borrowScratch(gScaleBytes);
+            gLastExpData = (float*)borrowScratch(gLastExpBytes);
+        }
+    }
+
+    bool wmmaCompleted = false;
+    if (useSm70Wmma && wmmaStateData != nullptr) {
+        wmmaCompleted = FastllmCudaTrySm70WmmaChunkGdnPrefill(
+            (const half *)qData, (const half *)kData,
+            (const half *)vData, (const half *)gData,
+            (const half *)attnData, (const half *)kCumData,
+            (const half *)stateData, (half *)wmmaStateData,
+            (half *)outData, (int)bhCount, chunks,
+            (size_t)bhCount * stateStride * unitBytes);
+    }
+
+    if (!wmmaCompleted && useBatchedGemm) {
 
         const int threads = 256;
         int qScaleBlocks = (int)((qScaledElems + threads - 1) / threads);
@@ -19665,10 +20425,12 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                     chunks, ci, chunk_size, kdim, qScaledElems);
             }
 
-            cudaError_t cudaState = cudaMemcpy2DAsync(vNewData, (size_t)vChunkStride * unitBytes,
-                                                      vSlice, (size_t)chunks * vChunkStride * unitBytes,
-                                                      (size_t)vChunkStride * unitBytes, bhCount,
-                                                      cudaMemcpyDeviceToDevice, 0);
+            cudaError_t cudaState = cudaMemcpy2DAsync(
+                vNewData, (size_t)vChunkStride * unitBytes,
+                vSlice, (size_t)chunks * vChunkStride * unitBytes,
+                (size_t)vChunkStride * unitBytes, bhCount,
+                cudaMemcpyDeviceToDevice,
+                useAsyncGather ? cudaStreamPerThread : (cudaStream_t)0);
             checkCudaErrors("Error: CUDA error when gathering chunk v data!", cudaState);
 
             FastllmChunkGatedDeltaRuleBatchedMatMul(
@@ -19688,8 +20450,22 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                 (int)bhCount, chunk_size, chunk_size, vdim,
                 (long long)chunks * attnChunkStride, vChunkStride, outStride,
                 1.0f, 1.0f);
-
-            if (q.dataType == fastllm::DataType::FLOAT32) {
+            if (useFusedPreprocess) {
+                size_t sharedBytes = (size_t)(chunk_size + 1) * sizeof(float);
+                if (q.dataType == fastllm::DataType::FLOAT32) {
+                    FastllmChunkGatedDeltaRuleFusedStateKPreprocessKernel<float><<<
+                        (int)bhCount, threads, sharedBytes>>>(
+                        (float*)kData, (float*)gData, (float*)stateData,
+                        (float*)kScaledTransData, chunks, ci, chunk_size,
+                        kdim, (int)stateStride);
+                } else {
+                    FastllmChunkGatedDeltaRuleFusedStateKPreprocessKernel<half><<<
+                        (int)bhCount, threads, sharedBytes>>>(
+                        (half*)kData, (half*)gData, (half*)stateData,
+                        (half*)kScaledTransData, chunks, ci, chunk_size,
+                        kdim, (int)stateStride);
+                }
+            } else if (q.dataType == fastllm::DataType::FLOAT32) {
                 FastllmChunkGatedDeltaRuleBuildChunkScaleKernel<float><<<chunkScaleBlocks, threads>>>(
                     (float*)gData, gScaleData, gLastExpData, (int)bhCount, chunks, chunk_size, ci);
                 FastllmChunkGatedDeltaRuleScaleStateKernel<float><<<stateScaleBlocks, threads>>>(
@@ -19713,7 +20489,7 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                 (long long)kdim * chunk_size, vChunkStride, stateStride,
                 1.0f, 1.0f);
         }
-    } else {
+    } else if (!wmmaCompleted) {
         const int BVHSmall = 16;
         const int BVHLarge = 32;
         const int BVO = 32;
@@ -19732,7 +20508,31 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         size_t sharedMemSizeH = useLargeBKH ? sharedMemSizeHLargeBK : sharedMemSizeHSmallBK;
         size_t sharedMemSizeO = (size_t)(kdim * BVO + chunk_size * BVO) * sizeof(float);
 
-        if (useSmallBVH) {
+        if (q.dataType == fastllm::DataType::FLOAT16) {
+            if (useSmallBVH) {
+                if (useLargeBKH) {
+                    FastllmChunkGatedDeltaRulePrefillHKernel<half, BVHSmall, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                        (half*)kData, (half*)vData, (half*)gData, (half*)kCumData,
+                        (half*)hData, (half*)vNewData, (half*)stateData,
+                        batch, heads, chunks, chunk_size, kdim, vdim);
+                } else {
+                    FastllmChunkGatedDeltaRulePrefillHKernel<half, BVHSmall, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                        (half*)kData, (half*)vData, (half*)gData, (half*)kCumData,
+                        (half*)hData, (half*)vNewData, (half*)stateData,
+                        batch, heads, chunks, chunk_size, kdim, vdim);
+                }
+            } else if (useLargeBKH) {
+                FastllmChunkGatedDeltaRulePrefillHKernel<half, BVHLarge, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                    (half*)kData, (half*)vData, (half*)gData, (half*)kCumData,
+                    (half*)hData, (half*)vNewData, (half*)stateData,
+                    batch, heads, chunks, chunk_size, kdim, vdim);
+            } else {
+                FastllmChunkGatedDeltaRulePrefillHKernel<half, BVHLarge, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                    (half*)kData, (half*)vData, (half*)gData, (half*)kCumData,
+                    (half*)hData, (half*)vNewData, (half*)stateData,
+                    batch, heads, chunks, chunk_size, kdim, vdim);
+            }
+        } else if (useSmallBVH) {
             if (useLargeBKH) {
                 FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHSmall, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
                     (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
@@ -19744,25 +20544,32 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                     (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
                     batch, heads, chunks, chunk_size, kdim, vdim);
             }
+        } else if (useLargeBKH) {
+            FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
+                (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
+                batch, heads, chunks, chunk_size, kdim, vdim);
         } else {
-            if (useLargeBKH) {
-                FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHLarge><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
-                    (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
-                    (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
-                    batch, heads, chunks, chunk_size, kdim, vdim);
-            } else {
-                FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
-                    (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
-                    (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
-                    batch, heads, chunks, chunk_size, kdim, vdim);
-            }
+            FastllmChunkGatedDeltaRulePrefillHKernel<__nv_bfloat16, BVHLarge, BKHSmall><<<gridH, threadsPerBlockH, sharedMemSizeH>>>(
+                (__nv_bfloat16*)kData, (__nv_bfloat16*)vData, (__nv_bfloat16*)gData, (__nv_bfloat16*)kCumData,
+                (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)stateData,
+                batch, heads, chunks, chunk_size, kdim, vdim);
         }
-        FastllmChunkGatedDeltaRulePrefillOKernel<__nv_bfloat16, BVO><<<gridO, threadsPerBlockO, sharedMemSizeO>>>(
-            (__nv_bfloat16*)qData, (__nv_bfloat16*)gData, (__nv_bfloat16*)attnData,
-            (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)outData,
-            batch, heads, chunks, chunk_size, kdim, vdim);
+        if (q.dataType == fastllm::DataType::FLOAT16) {
+            FastllmChunkGatedDeltaRulePrefillOKernel<half, BVO><<<gridO, threadsPerBlockO, sharedMemSizeO>>>(
+                (half*)qData, (half*)gData, (half*)attnData,
+                (half*)hData, (half*)vNewData, (half*)outData,
+                batch, heads, chunks, chunk_size, kdim, vdim);
+        } else {
+            FastllmChunkGatedDeltaRulePrefillOKernel<__nv_bfloat16, BVO><<<gridO, threadsPerBlockO, sharedMemSizeO>>>(
+                (__nv_bfloat16*)qData, (__nv_bfloat16*)gData, (__nv_bfloat16*)attnData,
+                (__nv_bfloat16*)hData, (__nv_bfloat16*)vNewData, (__nv_bfloat16*)outData,
+                batch, heads, chunks, chunk_size, kdim, vdim);
+        }
     }
 
+    checkCudaErrors("Error: CUDA error in FastllmChunkGatedDeltaRulePrefill.",
+                    cudaGetLastError());
     FastllmCudaFinishInput(q, qData);
     FastllmCudaFinishInput(k, kData);
     FastllmCudaFinishInput(v, vData);
@@ -19771,12 +20578,15 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     FastllmCudaFinishInput(k_cumdecay, kCumData);
     FastllmCudaFinishInput(last_recurrent_state, stateData);
     FastllmCudaFinishOutput(core_attn_out, outData);
-    if (qScaledData != nullptr) FastllmCudaFree(qScaledData);
-    if (kScaledTransData != nullptr) FastllmCudaFree(kScaledTransData);
-    if (gScaleData != nullptr) FastllmCudaFree(gScaleData);
-    if (gLastExpData != nullptr) FastllmCudaFree(gLastExpData);
-    if (hData != nullptr) FastllmCudaFree(hData);
-    if (vNewData != nullptr) FastllmCudaFree(vNewData);
+    if (!usePersistentScratch) {
+        if (qScaledData != nullptr) FastllmCudaFree(qScaledData);
+        if (kScaledTransData != nullptr) FastllmCudaFree(kScaledTransData);
+        if (gScaleData != nullptr) FastllmCudaFree(gScaleData);
+        if (gLastExpData != nullptr) FastllmCudaFree(gLastExpData);
+        if (hData != nullptr) FastllmCudaFree(hData);
+        if (vNewData != nullptr) FastllmCudaFree(vNewData);
+        if (wmmaStateData != nullptr) FastllmCudaFree(wmmaStateData);
+    }
 }
 
 void FastllmPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex) {
