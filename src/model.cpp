@@ -873,6 +873,17 @@ namespace fastllm {
                                                       const std::string &tensorName);
     static bool IsPackedFP4Tensor(const SafeTensors &safeTensors, const std::string &name);
 
+    // Byte width of a safetensors dtype string. Returns 0 for dtypes fastllm does
+    // not size directly, so callers can skip the size check rather than guess.
+    static uint64_t SafeTensorDtypeBytes(const std::string &dtype) {
+        if (dtype == "F64" || dtype == "I64" || dtype == "U64") return 8;
+        if (dtype == "F32" || dtype == "I32" || dtype == "U32") return 4;
+        if (dtype == "F16" || dtype == "BF16" || dtype == "I16" || dtype == "U16") return 2;
+        if (dtype == "F8_E4M3" || dtype == "F8_E5M2" || dtype == "F8_E8M0" ||
+            dtype == "I8" || dtype == "U8" || dtype == "BOOL") return 1;
+        return 0;
+    }
+
     struct SafeTensorItem {
         std::string tensorName;
         std::string fileName;
@@ -907,9 +918,27 @@ namespace fastllm {
 
             len = 1;
             for (auto &it : shape) {
+                AssertInFastLLM(it == 0 || len <= UINT64_MAX / it,
+                                "SafeTensorItem: shape product overflows.");
                 len *= it;
             }
+
+            // data_offsets, shape and dtype are three independent fields of the same
+            // untrusted header. Reconcile them here, once, before any of them is used
+            // to size an allocation or a read length.
+            AssertInFastLLM(this->data_offsets.size() == 2,
+                            "SafeTensorItem: data_offsets must have exactly 2 elements.");
+            AssertInFastLLM(this->data_offsets[1] >= this->data_offsets[0],
+                            "SafeTensorItem: data_offsets end is before begin.");
             bytes = this->data_offsets[1] - this->data_offsets[0];
+
+            uint64_t elemBytes = SafeTensorDtypeBytes(this->dtype);
+            if (elemBytes > 0) {
+                AssertInFastLLM(len == 0 || len <= UINT64_MAX / elemBytes,
+                                "SafeTensorItem: shape times dtype size overflows.");
+                AssertInFastLLM(bytes == len * elemBytes,
+                                "SafeTensorItem: data_offsets span does not match shape and dtype.");
+            }
         }
 
         struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
@@ -1428,8 +1457,20 @@ namespace fastllm {
             this->fileNames = fileNames;
             for (auto &fileName : fileNames) {
                 FILE *f = fopen(fileName.c_str(), "rb");
+                AssertInFastLLM(f != nullptr, "SafeTensors: cannot open " + fileName);
+                // The header length is the first attacker-controlled value in the file.
+                // Bound it against the real file size before it is used as an allocation
+                // size or a read length: configBytes + 5 wraps for values near UINT64_MAX,
+                // which produced a tiny allocation and an unbounded fread into it.
+                fseek(f, 0, SEEK_END);
+                long long fileSize = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                AssertInFastLLM(fileSize >= 8, "SafeTensors: " + fileName + " is too short to hold a header length.");
                 uint64_t configBytes;
                 int ret = fread(&configBytes, 8, 1, f);
+                AssertInFastLLM(ret == 1, "SafeTensors: cannot read the header length of " + fileName);
+                AssertInFastLLM(configBytes <= (uint64_t)fileSize - 8,
+                                "SafeTensors: header length exceeds the file size of " + fileName);
                 char *configString = new char[configBytes + 5];
                 ret = fread(configString, 1, configBytes, f);
                 configString[configBytes] = 0;
