@@ -12,6 +12,7 @@ namespace fastllm {
         npu::FastllmAclInit();
         this->ops["Linear"] = new AscendLinearOp();
         this->ops["Split"] = new AscendSplitOp();
+        this->ops["LayerNorm"] = new AscendLayerNormOp();
         this->ops["SoftMax"] = new AscendSoftMaxOp();
         this->ops["Sigmoid"] = new AscendSigmoidOp();
         this->ops["Silu"] = new AscendSiluOp();
@@ -22,6 +23,7 @@ namespace fastllm {
         this->ops["MulTo"] = new AscendMulToOp();
         this->ops["Swiglu"] = new AscendSwigluOp();
         this->ops["AddTo"] = new AscendAddToOp();
+        this->ops["PermuteSelf"] = new AscendPermuteSelfOp();
     }
 
     AscendNpuDevice::~AscendNpuDevice() {
@@ -525,6 +527,165 @@ namespace fastllm {
         dynamicShapes["x2"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
         dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
         deviceOk = CompileAndRunSingleOp(this->name, {{"x1", &input0}, {"x2", &input1}}, {{"y", &input0}}, dynamicShapes, floatParams, {}, {});
+    }
+
+    AscendLayerNormOp::AscendLayerNormOp() :
+        BaseAscendOperator("LayerNorm") {}
+
+    bool AscendLayerNormOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!BaseAscendOperator::CanRun(opType, datas, floatParams, intParams))
+            return false;
+        Data &input = *(datas.find("input")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        int inner = input.strides[axis];
+        return inner == 1;
+    }
+
+    void AscendLayerNormOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &gamma = *(datas.find("gamma")->second);
+        Data &beta = *(datas.find("beta")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "LayerNorm error: input's data type should be float32 or float16.\n");
+        AssertInFastLLM(gamma.dataType == DataType::FLOAT32 || gamma.dataType == DataType::FLOAT16,
+                        "LayerNorm error: gamma's data type should be float32 or float16.\n");
+        AssertInFastLLM(beta.dataType == DataType::FLOAT32 || beta.dataType == DataType::FLOAT16,
+                        "LayerNorm error: beta's data type should be float32 or float16.\n");
+
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        output.Allocate();
+
+        // LayerNorm 强制输出 y、mean、variance，其中 mean/variance 形状为
+        // [dims[0], ..., dims[axis - 1], 1, ..., 1]，数据类型与 x 一致
+        std::vector<int> meanDims = input.dims;
+        for (int i = axis; i < dimsLen; i++) {
+            meanDims[i] = 1;
+        }
+        Data tempMean(input.dataType, meanDims);
+        Data tempVariance(input.dataType, meanDims);
+        tempMean.Allocate();
+        tempVariance.Allocate();
+        tempMean.ToDevice(input.dataDevice);
+        tempVariance.ToDevice(input.dataDevice);
+
+        // 准备输入数据映射
+        OrderedData orderedInputData;
+        orderedInputData.push_back(std::make_pair("x", &input));
+        orderedInputData.push_back(std::make_pair("gamma", &gamma));
+        orderedInputData.push_back(std::make_pair("beta", &beta));
+
+        // 构建动态形状信息（用于warmup模式），mean/variance 与 x 共享相同的动态维度
+        DynamicShapeDict dynamicShapes;
+        if (warmUpMode && dimsLen >= 2) {
+            std::vector<std::vector<int64_t>> shapeRanges = {{1L, 128L}, {1L, 2048L}};
+            dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), shapeRanges);
+            dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), shapeRanges);
+            dynamicShapes["mean"] = std::make_pair(std::vector<int32_t>({0, 1}), shapeRanges);
+            dynamicShapes["variance"] = std::make_pair(std::vector<int32_t>({0, 1}), shapeRanges);
+        }
+
+        // LayerNorm 属性：begin_norm_axis / begin_params_axis / epsilon。
+        // 注意不能把 fastllm 的 "axis" 传给 ACL，否则会因属性不匹配导致编译失败。
+        float eps = 1e-10f;
+        IntDict aclIntParams = {{"begin_norm_axis", axis}, {"begin_params_axis", axis}};
+
+        deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, {{"y", &output}, {"mean", &tempMean}, {"variance", &tempVariance}},
+                                         dynamicShapes, {{"epsilon", eps}}, aclIntParams, {});
+    }
+
+    AscendPermuteSelfOp::AscendPermuteSelfOp() :
+        BaseAscendOperator("Transpose") {}
+
+    bool AscendPermuteSelfOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!BaseAscendOperator::CanRun(opType, datas, floatParams, intParams))
+            return false;
+        Data *input = datas.find("input")->second;
+        if (input->dataDevice != DataDevice::NPU)
+            return false;
+
+        // 检查数据类型
+        if (input->dataType != DataType::FLOAT32 && input->dataType != DataType::FLOAT16) {
+            return false;
+        }
+
+        // 检查维度匹配
+        Data *axisData = datas.find("axis")->second;
+        std::vector<int> axis;
+        for (int i = 0; i < axisData->Count(0); i++) {
+            axis.push_back(((int32_t *)axisData->cpuData)[i]);
+        }
+        
+        if (axis.size() != input->dims.size()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    void AscendPermuteSelfOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &axisData = *(datas.find("axis")->second);
+
+        std::vector<int> axis;
+        for (int i = 0; i < axisData.Count(0); i++) {
+            axis.push_back(((int32_t *)axisData.cpuData)[i]);
+        }
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "PermuteSelf error: input's data type should be float32 or float16.\n");
+        AssertInFastLLM(axis.size() == input.dims.size(),
+                        "PermuteSelf error: axis's size should be equal to input's dims size.\n");
+
+        std::vector<int> newDims;
+        for (int i = 0; i < axis.size(); i++) {
+            newDims.push_back(input.dims[axis[i]]);
+        }
+
+        // 构建 perm 数据，作为 Transpose 的输入
+        Data permData;
+        permData.CopyFrom(axisData);
+        permData.dataType = DataType::FLOAT32;
+        permData.ToDevice(input.dataDevice);
+        permData.dataType = DataType::INT32PARAM;
+
+        // 临时输出，转置完成后拷回 input 的设备内存实现原地 permute
+        Data tmpData(input.dataType, newDims);
+        tmpData.Allocate();
+        tmpData.ToDevice(input.dataDevice);
+
+        // 构建动态形状信息（用于warmup模式），y 的动态维度随 perm 交换而改变
+        DynamicShapeDict dynamicShapes;
+        if (warmUpMode && input.dims.size() >= 2) {
+            std::vector<int> xDynamicDims = {0, 1};
+            std::vector<std::vector<int64_t>> shapeRanges = {{1L, 128L}, {1L, 2048L}};
+            std::vector<int> yDynamicDims;
+            for (int i = 0; i < axis.size(); i++) {
+                if (std::find(xDynamicDims.begin(), xDynamicDims.end(), axis[i]) != xDynamicDims.end()) {
+                    yDynamicDims.push_back(i);
+                }
+            }
+            dynamicShapes["x"] = std::make_pair(xDynamicDims, shapeRanges);
+            dynamicShapes["y"] = std::make_pair(yDynamicDims, shapeRanges);
+        }
+
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x", &input}, {"perm", &permData}},
+                                        {{"y", &tmpData}}, dynamicShapes, {}, {}, {});
+
+        // 把转置结果拷回 input 的设备内存，并更新 shape
+        if (deviceOk) {
+            npu::FastllmAclCopyFromDeviceToDevice(input.deviceData, tmpData.deviceData, input.GetBytes());
+            input.Resize(newDims);
+        }
     }
 
 }

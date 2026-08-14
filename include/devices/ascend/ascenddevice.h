@@ -129,6 +129,20 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class AscendLayerNormOp : public BaseAscendOperator {
+    public:
+        AscendLayerNormOp();
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class AscendPermuteSelfOp : public BaseAscendOperator {
+    public:
+        AscendPermuteSelfOp();
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
 }
 
 #endif // FASTLLM_ASCEND_DEVICE_H
