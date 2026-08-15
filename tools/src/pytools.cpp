@@ -8,7 +8,7 @@
 #include <csignal>
 
 #ifdef WIN32
-#define DLL_EXPORT _declspec(dllexport)
+#define DLL_EXPORT __declspec(dllexport)
 #else
 #define DLL_EXPORT
 #endif
@@ -589,7 +589,7 @@ extern "C" {
         return fvalue;
     }
 
-    DLL_EXPORT float* reranker_compute_score(int modelId, int batch, int *seqLens, int *tokens) {
+    DLL_EXPORT float* reranker_compute_score(int modelId, int batch, int *seqLens, int *tokens, bool normalize) {
         fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
         std::vector <std::vector <int> > inputIds;
         inputIds.resize(batch);
@@ -599,7 +599,7 @@ extern "C" {
                 inputIds[i].push_back(tokens[pos++]);
             }
         }
-        auto ret = model->ComputeScore(inputIds);
+        auto ret = model->ComputeScore(inputIds, normalize);
         float *fvalue = new float[batch];
         for (int i = 0; i < batch; i++) {
             fvalue[i] = ret[i];

@@ -45,7 +45,7 @@ namespace fastllm {
         // 计算相似分数
         // tokens: 输入tokens， tokens[i]代表第i个输入的token序列
         // ret: ret[i]代表第i个输入的相似度
-        std::vector <float> ComputeScore(std::vector <std::vector <int> > tokens);
+        std::vector <float> ComputeScore(std::vector <std::vector <int> > tokens, bool normalize);
 
         std::vector <float> EmbeddingSentence(const std::vector <int> &tokens, bool normalize);
 

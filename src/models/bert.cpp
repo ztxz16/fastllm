@@ -169,13 +169,22 @@ namespace fastllm {
         positionIds.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, position_ids));
     }
 
-    std::vector <float> BertModel::ComputeScore(std::vector <std::vector <int> > tokens) {
+    std::vector <float> BertModel::ComputeScore(std::vector <std::vector <int> > tokens, bool normalize) {
         fastllm::Data inputIds, attentionMask, tokenTypeIds, positionIds;
         FillBertInputsBatch(tokens, inputIds, attentionMask, tokenTypeIds, positionIds);
         auto ret = ForwardAll(inputIds, attentionMask, tokenTypeIds, positionIds, false);
         std::vector <float> lastRet;
         for (int i = 0; i < ret.size(); i++) {
             lastRet.push_back(ret[i][0]);
+        }
+        if (normalize) {
+            Data scores(DataType::FLOAT32, {(int) lastRet.size()}, lastRet);
+            scores.lockInCPU = true;
+            Data normalized;
+            Sigmoid(scores, normalized);
+            normalized.ToDevice(DataDevice::CPU);
+            for (int i=0; i<ret.size(); i++)
+                lastRet[i] = (((float *) normalized.cpuData)[i]);
         }
         return lastRet;
     }

@@ -145,7 +145,7 @@ fastllm_lib.embedding_sentence.restype = ctypes.POINTER(ctypes.c_float)
 fastllm_lib.embedding_tokens.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_bool, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.embedding_tokens.restype = ctypes.POINTER(ctypes.c_float)
 
-fastllm_lib.reranker_compute_score.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.reranker_compute_score.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_bool]
 fastllm_lib.reranker_compute_score.restype = ctypes.POINTER(ctypes.c_float)
 
 fastllm_lib.t2s_decode.argtypes = [ctypes.c_char_p,
@@ -1515,7 +1515,7 @@ class model:
             #print("{:.7f}".format(embedding[i]), end=" ")
         return embedding
     
-    def reranker_compute_score(self, pairs: List):
+    def reranker_compute_score(self, pairs: List, normalize=False):
         batch = len(pairs)
         seq_lens = []
         tokens = []
@@ -1523,7 +1523,7 @@ class model:
             input_ids = self.hf_tokenizer(pairs[i : i + 1], padding = True, truncation = True)['input_ids'][0]
             seq_lens.append(len(input_ids))
             tokens += input_ids
-        ret_c = fastllm_lib.reranker_compute_score(self.model, batch, (ctypes.c_int * len(seq_lens))(*seq_lens), (ctypes.c_int * len(tokens))(*tokens))
+        ret_c = fastllm_lib.reranker_compute_score(self.model, batch, (ctypes.c_int * len(seq_lens))(*seq_lens), (ctypes.c_int * len(tokens))(*tokens), normalize)
         ret = []
         for i in range(batch):
             ret.append(ret_c[i])
