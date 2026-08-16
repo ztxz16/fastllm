@@ -6221,8 +6221,9 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, 
-                        "Silu error: Data's type should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Silu error: Data's type should be float32, float16 or bfloat16.\n");
         FastllmCudaSilu(input, output);
     }
 
@@ -6296,8 +6297,9 @@ namespace fastllm {
 
         float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, 
-                        "Mul error: Data's type should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Mul error: Data's type should be float32, float16 or bfloat16.\n");
         FastllmCudaMul(input, v, output);
     }
 

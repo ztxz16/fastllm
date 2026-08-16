@@ -456,9 +456,10 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "HYV3ForCausalLM",
         "LagunaForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "Dots3NoteForCausalLM",
     ] or model_type in [
         "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
-        "kimi_k3",
+        "kimi_k3", "dots3_note",
     ] or text_model_type == "qwen3_5_moe_text")
 
 def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
@@ -704,6 +705,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
     is_qwen35_model = False
+    is_dots3_note_model = False
     if (os.path.exists(config_path)):
         try:
             with open(config_path, "r", encoding="utf-8") as file:
@@ -712,6 +714,15 @@ def make_normal_llm_model(args, startup_progress = None):
             model_type = config.get("model_type", "")
             is_laguna_model = (architecture == 'LagunaForCausalLM' or
                                 model_type == 'laguna')
+            is_dots3_note_model = (
+                architecture == 'Dots3NoteForCausalLM' or
+                model_type == 'dots3_note')
+            if is_dots3_note_model:
+                # Keep long prompts in the numerically validated prefill
+                # shape. Full-attention KV grows with the context while SWA KV
+                # is compacted to a bounded tail by the model backend.
+                if args.chunked_prefill_size <= 0:
+                    args.chunked_prefill_size = 127
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
@@ -925,6 +936,17 @@ def make_normal_llm_model(args, startup_progress = None):
             args.atype = "float32"
     if (args.moe_device == ""):
         args.moe_device = args.device
+    if (is_dots3_note_model and
+            str(args.moe_device).strip().lower() == "cpu"):
+        os.environ.setdefault("FASTLLM_CPU_FP8_DECODE_ROW_TILE", "4")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_PREFILL_FUSED", "1")
+        os.environ.setdefault("FASTLLM_CPU_FP8_SMALL_BATCH", "1")
+        os.environ.setdefault(
+            "FASTLLM_DOTS3_NOTE_PREFILL_MAX_EXPERT_BATCH", "5")
+        os.environ.setdefault(
+            "FASTLLM_DOTS3_NOTE_PREFILL_LPT_SCHEDULE", "1")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_PREFETCH_WEIGHTS", "1")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_CPU_LM_HEAD", "1")
     raw_main_device = str(args.device or "").strip()
     os.environ["FASTLLM_CUDAPP_SERIAL"] = "1" if raw_main_device.lower().startswith("cudapp=") else "0"
 
@@ -938,6 +960,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
         if (is_laguna_model and _uses_thread_tp(tp_arg)):
+            args.moe_atype = "bfloat16"
+        elif (architecture == "Dots3NoteForCausalLM" or model_type == "dots3_note"):
             args.moe_atype = "bfloat16"
         elif (_uses_cuda_device(args.moe_device)):
             args.moe_atype = "float16"

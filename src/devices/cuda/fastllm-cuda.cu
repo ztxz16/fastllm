@@ -1561,6 +1561,15 @@ __global__ void FastllmSiluKernel(half* a, half *b, int len) {
     }
 }
 
+__global__ void FastllmSiluKernel(__nv_bfloat16 *a, __nv_bfloat16 *b,
+                                  int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __bfloat162float(a[idx]);
+        b[idx] = __float2bfloat16_rn(x / (1.0f + expf(-x)));
+    }
+}
+
 __global__ void FastllmSigmoidKernel(float* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1839,6 +1848,15 @@ __global__ void FastllmMulKernel(half* a, half *b, half v, int len) {
 #else
         b[idx] = __hmul(a[idx], v);
 #endif
+    }
+}
+
+__global__ void FastllmMulKernel(__nv_bfloat16 *a, __nv_bfloat16 *b,
+                                 __nv_bfloat16 v, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = __float2bfloat16_rn(
+            __bfloat162float(a[idx]) * __bfloat162float(v));
     }
 }
 
@@ -2709,6 +2727,28 @@ __global__ void FastllmNearlyRotatePosition2DKernel(half *data, float *positionI
     float va = __half2float(d[i * m]), vb = __half2float(d[i * m + 1]);
     d[i * m] = __float2half(va * curCos - vb * curSin);
     d[i * m + 1] = __float2half(va * curSin + vb * curCos);
+}
+
+__global__ void FastllmNearlyRotatePosition2DKernel(__nv_bfloat16 *data, float *positionIds, float *sin, float *cos,
+                                                    int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
+    int o = (blockIdx.x / n);
+    int l = o / bs;
+    int b = o % bs;
+    int j = threadIdx.x;
+    int index = (int) (positionIds[b * partStride + l]);
+
+    float curSin = sin[index * sinCosStride + j];
+    float curCos = cos[index * sinCosStride + j];
+    __nv_bfloat16 *d = data + o * spatial + j * 2;
+    int i = blockIdx.x % n;
+    float va = __bfloat162float(d[i * m]);
+    float vb = __bfloat162float(d[i * m + 1]);
+    float ac = __bfloat162float(__float2bfloat16_rn(va * curCos));
+    float pairSin = __bfloat162float(__float2bfloat16_rn(vb * curSin));
+    float as = __bfloat162float(__float2bfloat16_rn(va * curSin));
+    float pairCos = __bfloat162float(__float2bfloat16_rn(vb * curCos));
+    d[i * m] = __float2bfloat16_rn(ac - pairSin);
+    d[i * m + 1] = __float2bfloat16_rn(as + pairCos);
 }
 
 __global__ void FastllmRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
@@ -5835,6 +5875,9 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
         FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+            (__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len);
     }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -6094,8 +6137,12 @@ bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output) 
 
     if (input.dataType == fastllm::DataType::FLOAT32) {
         FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, v, len);
-    } else {
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, __float2half_rn(v), len);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+            (__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput,
+            __float2bfloat16_rn(v), len);
     }
 
     FastllmCudaFinishInput(input, cudaInput);
@@ -11799,6 +11846,10 @@ bool FastllmCudaNearlyRotatePosition2D(fastllm::Data &data, const fastllm::Data 
                                                                                     positionStride, (int)sinData.dims[1], rotaryDim);
     } else if (data.dataType == fastllm::DataType::FLOAT16) {
         FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((half*)cudaData, cudaPositionIds, cudaSin, cudaCos,
+                                                                                    len, bs, spatial, n, m,
+                                                                                    positionStride, (int)sinData.dims[1], rotaryDim);
+    } else if (data.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((__nv_bfloat16*)cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                     len, bs, spatial, n, m,
                                                                                     positionStride, (int)sinData.dims[1], rotaryDim);
     }

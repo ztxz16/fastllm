@@ -161,6 +161,52 @@ namespace fastllm {
         }
     };
 
+    struct MultiThreadDots3NotePrefillExpertBatchOp : MultiThreadBaseOp {
+        uint16_t *input;
+        int batch;
+        int expertRouteCount;
+        Data *gateUpWeight;
+        Data *downWeight;
+        float *gateUpOutput;
+        float *swigluOutput;
+        uint16_t *downInput;
+        float *downOutput;
+
+        MultiThreadDots3NotePrefillExpertBatchOp(
+            uint16_t *input, int batch, int expertRouteCount,
+            Data *gateUpWeight, Data *downWeight,
+            float *gateUpOutput, float *swigluOutput,
+            uint16_t *downInput, float *downOutput
+        ) : input(input), batch(batch),
+            expertRouteCount(expertRouteCount), gateUpWeight(gateUpWeight),
+            downWeight(downWeight), gateUpOutput(gateUpOutput),
+            swigluOutput(swigluOutput), downInput(downInput),
+            downOutput(downOutput) {}
+
+        void Run() override {
+            const int inputColumns = gateUpWeight->dims[1];
+            const int gateUpRows = gateUpWeight->dims[0];
+            const int intermediate = gateUpRows / 2;
+            const int outputRows = downWeight->dims[0];
+
+            MultiThreadLinearBFloat16FP8E4M3Op(
+                input, gateUpWeight->cpuData, nullptr, gateUpOutput,
+                batch, inputColumns, gateUpRows, 0, gateUpRows,
+                gateUpWeight->scales.data(), gateUpWeight->blockK,
+                gateUpWeight->blockM).Run();
+            MultiThreadSwigluOp(
+                gateUpOutput, intermediate, intermediate, swigluOutput,
+                batch, gateUpRows, intermediate).Run();
+            Float32ToBFloat16(
+                swigluOutput, downInput, batch * intermediate);
+            MultiThreadLinearBFloat16FP8E4M3Op(
+                downInput, downWeight->cpuData, nullptr, downOutput,
+                batch, intermediate, outputRows, 0, outputRows,
+                downWeight->scales.data(), downWeight->blockK,
+                downWeight->blockM).Run();
+        }
+    };
+
     static void ScheduleDeepSeekV4MoeTasks(
         std::vector<MultiThreadBaseOp*> &tasks,
         bool deleteTasks = true
@@ -1615,6 +1661,8 @@ namespace fastllm {
     struct FastllmMoeDataManager {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
+            std::vector <float, alignedAllocator<float, 64> > dots3GateUpOutput, dots3SwigluOutput, dots3DownOutput, dots3ReduceOutput;
+            std::vector <uint16_t, alignedAllocator<uint16_t, 64> > dots3GatheredInput, dots3DownInput;
     } fastllmMoeDataManager;
 
     void FastllmGemm (int n, int m, int k, 
@@ -3658,6 +3706,200 @@ namespace fastllm {
             float *floatInput = input.dataType == DataType::FLOAT32 ? (float*)input.cpuData : nullptr;
             output.Allocate(0.0f);
 
+            const char *dots3PrefillEnv = std::getenv(
+                "FASTLLM_DOTS3_NOTE_PREFILL_FUSED");
+            const bool dots3PrefillEnabled = dots3PrefillEnv != nullptr &&
+                dots3PrefillEnv[0] != '\0' &&
+                std::strcmp(dots3PrefillEnv, "0") != 0 &&
+                std::strcmp(dots3PrefillEnv, "false") != 0 &&
+                std::strcmp(dots3PrefillEnv, "off") != 0;
+            const bool useDots3PrefillFused =
+                dots3PrefillEnabled && outer > 1 && topk == 8 &&
+                input.dataType == DataType::BFLOAT16 &&
+                output.dataType == DataType::BFLOAT16 &&
+                input.dims.size() == 2 && input.dims[1] == 5120 &&
+                !deepSeekV4Mode && !useGeglu &&
+                cpuInstructInfo.hasAVX512BF16 &&
+                weights[0] == nullptr && weights[1] == nullptr &&
+                weights[2] != nullptr && weights[3] != nullptr &&
+                weights[2]->dataType == DataType::FP8_E4M3 &&
+                weights[3]->dataType == DataType::FP8_E4M3 &&
+                weights[2]->dims.size() == 2 &&
+                weights[2]->dims[0] == 3072 &&
+                weights[2]->dims[1] == 5120 &&
+                weights[3]->dims.size() == 2 &&
+                weights[3]->dims[0] == 5120 &&
+                weights[3]->dims[1] == 1536 &&
+                weights[2]->blockK == 128 &&
+                weights[2]->blockM == 128 &&
+                weights[3]->blockK == 128 &&
+                weights[3]->blockM == 128;
+            if (useDots3PrefillFused) {
+                const double fusedStart = profileDetail ? CpuProfileNowMs() : 0.0;
+                const int routeCount = outer * topk;
+                constexpr int gateUpRows = 3072;
+                constexpr int intermediate = 1536;
+                constexpr int outputRows = 5120;
+                std::vector<int> expertIds(routeCount);
+                std::vector<float> routeScores(routeCount);
+                auto &gatheredInputs =
+                    fastllmMoeDataManager.dots3GatheredInput;
+                auto &gateUpOutputs =
+                    fastllmMoeDataManager.dots3GateUpOutput;
+                auto &swigluOutputs =
+                    fastllmMoeDataManager.dots3SwigluOutput;
+                auto &downInputs = fastllmMoeDataManager.dots3DownInput;
+                auto &downOutputs =
+                    fastllmMoeDataManager.dots3DownOutput;
+                gatheredInputs.resize((size_t)routeCount * outputRows);
+                gateUpOutputs.resize((size_t)routeCount * gateUpRows);
+                swigluOutputs.resize((size_t)routeCount * intermediate);
+                downInputs.resize((size_t)routeCount * intermediate);
+                downOutputs.resize((size_t)routeCount * outputRows);
+
+                std::vector<MultiThreadDots3NotePrefillExpertBatchOp>
+                    taskStorage;
+                std::vector<MultiThreadBaseOp*> tasks;
+                taskStorage.reserve(routeCount);
+                tasks.reserve(routeCount);
+                uint16_t *inputData = (uint16_t*)input.cpuData;
+                for (int o = 0; o < outer; o++) {
+                    for (int j = 0; j < topk; j++) {
+                        const int route = o * topk + j;
+                        const int expertIdx = normalizeExpertIdx(
+                            indexData[route]) + 1;
+                        expertIds[route] = expertIdx;
+                        routeScores[route] = scoreData[route];
+                    }
+                }
+                std::vector<int> routeOrder(routeCount);
+                for (int route = 0; route < routeCount; route++) {
+                    routeOrder[route] = route;
+                }
+                std::stable_sort(
+                    routeOrder.begin(), routeOrder.end(),
+                    [&](int left, int right) {
+                        return expertIds[left] < expertIds[right];
+                    });
+                std::vector<int> routeToSlot(routeCount);
+                for (int slot = 0; slot < routeCount; slot++) {
+                    const int route = routeOrder[slot];
+                    const int token = route / topk;
+                    routeToSlot[route] = slot;
+                    memcpy(
+                        gatheredInputs.data() + (size_t)slot * outputRows,
+                        inputData + (size_t)token * outputRows,
+                        (size_t)outputRows * sizeof(uint16_t));
+                }
+                int maxExpertBatch = 5;
+                const char *maxExpertBatchEnv = std::getenv(
+                    "FASTLLM_DOTS3_NOTE_PREFILL_MAX_EXPERT_BATCH");
+                if (maxExpertBatchEnv != nullptr &&
+                    maxExpertBatchEnv[0] != '\0') {
+                    maxExpertBatch = std::max(
+                        1, std::min(5, std::atoi(maxExpertBatchEnv)));
+                }
+                for (int begin = 0; begin < routeCount;) {
+                    const int expertIdx = expertIds[routeOrder[begin]];
+                    int expertEnd = begin + 1;
+                    while (expertEnd < routeCount &&
+                           expertIds[routeOrder[expertEnd]] == expertIdx) {
+                        expertEnd++;
+                    }
+                    for (int batchBegin = begin; batchBegin < expertEnd;
+                         batchBegin += maxExpertBatch) {
+                        const int batch = std::min(
+                            maxExpertBatch, expertEnd - batchBegin);
+                        taskStorage.emplace_back(
+                            gatheredInputs.data() +
+                                (size_t)batchBegin * outputRows,
+                            batch,
+                            expertEnd - begin,
+                            weights[expertIdx * 2],
+                            weights[expertIdx * 2 + 1],
+                            gateUpOutputs.data() +
+                                (size_t)batchBegin * gateUpRows,
+                            swigluOutputs.data() +
+                                (size_t)batchBegin * intermediate,
+                            downInputs.data() +
+                                (size_t)batchBegin * intermediate,
+                            downOutputs.data() +
+                                (size_t)batchBegin * outputRows);
+                    }
+                    begin = expertEnd;
+                }
+                for (auto &task : taskStorage) {
+                    tasks.push_back(&task);
+                }
+                const char *scheduleEnv = std::getenv(
+                    "FASTLLM_DOTS3_NOTE_PREFILL_LPT_SCHEDULE");
+                if (scheduleEnv != nullptr && scheduleEnv[0] != '\0' &&
+                    std::strcmp(scheduleEnv, "0") != 0 &&
+                    std::strcmp(scheduleEnv, "false") != 0 &&
+                    std::strcmp(scheduleEnv, "off") != 0) {
+                    std::stable_sort(
+                        tasks.begin(), tasks.end(),
+                        [](MultiThreadBaseOp *left,
+                           MultiThreadBaseOp *right) {
+                            auto *leftTask = static_cast<
+                                MultiThreadDots3NotePrefillExpertBatchOp *>(
+                                    left);
+                            auto *rightTask = static_cast<
+                                MultiThreadDots3NotePrefillExpertBatchOp *>(
+                                    right);
+                            return leftTask->expertRouteCount >
+                                   rightTask->expertRouteCount;
+                        });
+                }
+                const double prepareEnd = profileDetail ? CpuProfileNowMs() : 0.0;
+                ScheduleDeepSeekV4MoeTasks(tasks, false);
+                const double expertsEnd = profileDetail ? CpuProfileNowMs() : 0.0;
+
+                auto &reduced = fastllmMoeDataManager.dots3ReduceOutput;
+                reduced.resize((size_t)outer * outputRows);
+                std::fill(reduced.begin(), reduced.end(), 0.0f);
+                for (int o = 0; o < outer; o++) {
+                    float *dst = reduced.data() + (size_t)o * outputRows;
+                    for (int j = 0; j < topk; j++) {
+                        const int route = o * topk + j;
+                        const int slot = routeToSlot[route];
+                        const float *src = downOutputs.data() +
+                            (size_t)slot * outputRows;
+                        int d = 0;
+#ifdef __AVX2__
+                        const __m256 score = _mm256_set1_ps(
+                            routeScores[route]);
+                        for (; d + 7 < outputRows; d += 8) {
+                            const __m256 value = _mm256_loadu_ps(src + d);
+                            __m256 sum = _mm256_loadu_ps(dst + d);
+                            sum = _mm256_add_ps(
+                                sum, _mm256_mul_ps(value, score));
+                            _mm256_storeu_ps(dst + d, sum);
+                        }
+#endif
+                        for (; d < outputRows; d++) {
+                            dst[d] += src[d] * routeScores[route];
+                        }
+                    }
+                    Float32ToBFloat16(
+                        dst,
+                        (uint16_t*)output.cpuData +
+                            (size_t)o * outputRows,
+                        outputRows);
+                }
+                if (profileDetail) {
+                    const double reduceEnd = CpuProfileNowMs();
+                    printf("[fastllm-profile-cpu-moe] dots3_prefill_fused outer=%d topk=%d routes=%d prepare=%.3f experts=%.3f reduce_output=%.3f total=%.3f\n",
+                           outer, topk, routeCount,
+                           prepareEnd - fusedStart,
+                           expertsEnd - prepareEnd,
+                           reduceEnd - expertsEnd,
+                           reduceEnd - fusedStart);
+                    fflush(stdout);
+                }
+                return;
+            }
+
             for (int o = 0; o < outer; o++) {
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
@@ -3693,7 +3935,6 @@ namespace fastllm {
                     Float32ToBFloat16(inputData, bf16Input.data(), m);
                     bf16InputData = bf16Input.data();
                 }
-                
                 auto &middles = moeFloatSingleVarManager.middles;
                 auto &swigluResults = moeFloatSingleVarManager.swigluResults;
                 auto &results = moeFloatSingleVarManager.results;
@@ -3712,7 +3953,30 @@ namespace fastllm {
                 int threads = pool->curActivateThreadInterval.second -
                               pool->curActivateThreadInterval.first;
                 ops.resize(threads);
-
+                const bool dots3NoteDecodeShape =
+                    outer == 1 && topk == 8 && input.dims[1] == 5120 &&
+                    weights[0] == nullptr && weights[1] == nullptr &&
+                    weights[2] != nullptr && weights[3] != nullptr &&
+                    weights[2]->dims.size() == 2 &&
+                    weights[2]->dims[0] == 3072 &&
+                    weights[2]->dims[1] == 5120 &&
+                    weights[3]->dims.size() == 2 &&
+                    weights[3]->dims[0] == 5120 &&
+                    weights[3]->dims[1] == 1536 &&
+                    weights[2]->blockK == 128 &&
+                    weights[2]->blockM == 128 &&
+                    weights[3]->blockK == 128 &&
+                    weights[3]->blockM == 128;
+                int maxParallelExperts = dots3NoteDecodeShape ?
+                    std::min(4, (int)v.size()) : (int)v.size();
+                const char *parallelExpertsEnv = std::getenv(
+                    "FASTLLM_CPU_MOE_PARALLEL_EXPERTS");
+                if (parallelExpertsEnv != nullptr &&
+                    parallelExpertsEnv[0] != '\0') {
+                    maxParallelExperts = std::max(
+                        1, std::min((int)v.size(),
+                                   std::atoi(parallelExpertsEnv)));
+                }
                 bool useDeepSeekV4MoeFast =
                     deepSeekV4Mode && !useGeglu && cpuInstructInfo.hasAVX512BF16 &&
                     std::getenv("FASTLLM_DSV4_DISABLE_CPU_MOE_FAST") == nullptr;
@@ -3810,7 +4074,8 @@ namespace fastllm {
                             break;
                         }
                         curSum += (curK / k);
-                        if (threads % curSum == 0) {
+                        if (curSum <= maxParallelExperts &&
+                            threads % curSum == 0) {
                             end = l;
                             selSum = curSum;
                         }
@@ -3825,7 +4090,9 @@ namespace fastllm {
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
                         if (weight->dataType == DataType::FP8_E4M3) {
-                            LaunchLinearBFloat16FP8E4M3(bf16InputData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                            LaunchLinearBFloat16FP8E4M3(
+                                bf16InputData, *weight, outputData, biasData,
+                                1, m, curK, ops, pool, threadSt, curThread);
                         } else if (weight->dataType == DataType::NVFP4) {
                             if (cpuInstructInfo.hasAVX512BF16) {
                                 LaunchLinearBFloat16NVFP4(bf16InputData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
@@ -3933,7 +4200,10 @@ namespace fastllm {
                         Data *weightDown = weights[idx * 2 + 1];
                         int curThread = (curK / k) * base;
                         if (weightDown->dataType == DataType::FP8_E4M3) {
-                            LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                            LaunchLinearBFloat16FP8E4M3(
+                                (uint16_t*)middles[l].data(), *weightDown,
+                                results[l].data(), nullptr, 1, mid, m,
+                                ops, pool, threadSt, curThread);
                         } else if (weightDown->dataType == DataType::NVFP4) {
                             if (cpuInstructInfo.hasAVX512BF16) {
                                 LaunchLinearBFloat16NVFP4((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
@@ -7628,8 +7898,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &output = *(datas.find("output")->second);
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, 
-                        "Silu error: Data's type should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Silu error: Data's type should be float32, float16 or bfloat16.\n");
         int len = input.Count(0);
 
         if (input.dataType == DataType::FLOAT16) {
@@ -7637,6 +7908,14 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint16_t *outputData = (uint16_t*)output.cpuData;
             for (int i = 0; i < len; i++) {
                 outputData[i] = fp16SiluManager.dict[inputData[i]];
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            uint16_t *inputData = (uint16_t*)input.cpuData;
+            uint16_t *outputData = (uint16_t*)output.cpuData;
+            for (int i = 0; i < len; i++) {
+                float value = BFloat16BitsToFloat32(inputData[i]);
+                outputData[i] = Float32ToBFloat16RNEBits(
+                    value / (1.0f + std::exp(-value)));
             }
         } else {
             float *inputData = (float*)input.cpuData;
@@ -8158,8 +8437,10 @@ ops += (long long)lines * inputDim * interDim * 2;
         output.Allocate();
 
         float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
-                        "Mul error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Mul error: Data's type should be float32, float16 or bfloat16.\n");
 
         int len = input.Count(0);
 
@@ -8174,6 +8455,13 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint16_t *outputData = (uint16_t *) output.cpuData;
             for (int i = 0; i < len; i++) {
                 outputData[i] = float_to_half(fp16tofp32.dict[inputData[i]] * v);
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            uint16_t *inputData = (uint16_t *) input.cpuData;
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+            for (int i = 0; i < len; i++) {
+                outputData[i] = Float32ToBFloat16RNEBits(
+                    BFloat16BitsToFloat32(inputData[i]) * v);
             }
         }
     }
@@ -9320,6 +9608,29 @@ ops += (long long)lines * inputDim * interDim * 2;
                             float a = fp16tofp32.dict[d[j]], b = fp16tofp32.dict[d[j + 1]];
                             d[j] = float_to_half(a * cos[j / 2] - b * sin[j / 2]);
                             d[j + 1] = float_to_half(a * sin[j / 2] + b * cos[j / 2]);
+                        }
+                        d += m;
+                    }
+                } else if (data.dataType == DataType::BFLOAT16) {
+                    int index = (int) ((float *) positionIds.cpuData)[b * positionStride + l];
+                    float *sin = ((float*)sinData.cpuData) + stride * index;
+                    float *cos = ((float*)cosData.cpuData) + stride * index;
+
+                    uint16_t *d = (uint16_t *) data.cpuData + (l * bs + b) * spatial;
+                    for (int i = 0; i < n; i++) {
+                        int j = 0;
+                        for (; j < rotaryDim; j += 2) {
+                            float a = BFloat16BitsToFloat32(d[j]);
+                            float pair = BFloat16BitsToFloat32(d[j + 1]);
+                            // PyTorch evaluates each BF16 elementwise multiply
+                            // before the add/subtract in apply_rotary_interleaved.
+                            // Preserve those observable rounding boundaries.
+                            float ac = RoundFloat32ToBFloat16RNE(a * cos[j / 2]);
+                            float ps = RoundFloat32ToBFloat16RNE(pair * sin[j / 2]);
+                            float as = RoundFloat32ToBFloat16RNE(a * sin[j / 2]);
+                            float pc = RoundFloat32ToBFloat16RNE(pair * cos[j / 2]);
+                            d[j] = Float32ToBFloat16RNEBits(ac - ps);
+                            d[j + 1] = Float32ToBFloat16RNEBits(as + pc);
                         }
                         d += m;
                     }

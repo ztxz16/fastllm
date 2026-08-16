@@ -35,6 +35,7 @@
 #include "hunyuan.h"
 #include "deepseekv2.h"
 #include "deepseekv4.h"
+#include "dots3_note.h"
 #include "glm5_moe_dsa.h"
 #include "qwen.h"
 #include "glm.h"
@@ -768,6 +769,8 @@ namespace fastllm {
         } else if (modelType == "deepseek_v4") {
             model = (basellm*)(new DeepSeekV4Model());
             model->model_type = modelType;
+        } else if (modelType == "dots3_note") {
+            model = (basellm*)(new Dots3NoteModel());
         } else if (modelType == "qwen2") {
             model = (basellm*)(new Qwen2Model());
             model->model_type = "qwen2";

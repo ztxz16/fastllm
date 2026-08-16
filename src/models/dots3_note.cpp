@@ -1,0 +1,1229 @@
+#include "dots3_note.h"
+
+#include "executor.h"
+#include "utils.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+
+namespace fastllm {
+    namespace {
+        int GetIntConfig(const WeightMap &weight, const std::string &name, int fallback) {
+            auto it = weight.dicts.find(name);
+            return it == weight.dicts.end() ? fallback : atoi(it->second.c_str());
+        }
+
+        float GetFloatConfig(const WeightMap &weight, const std::string &name, float fallback) {
+            auto it = weight.dicts.find(name);
+            return it == weight.dicts.end() ? fallback : atof(it->second.c_str());
+        }
+
+        bool StartsWith(const std::string &value, const std::string &prefix) {
+            return value.size() >= prefix.size() &&
+                   value.compare(0, prefix.size(), prefix) == 0;
+        }
+
+        bool HistoryCacheDebugEnabled() {
+            const char *value = std::getenv(
+                "FASTLLM_DOTS3_NOTE_HISTORY_DEBUG");
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "off") != 0;
+        }
+
+    }
+
+    Dots3NoteModel::Dots3NoteModel() {
+        this->model_type = "dots3_note";
+        this->model_struct = "dots3_note";
+        this->canDoBatchForward = false;
+        this->defaultChunkedPrefillSize = shortContextLimit;
+
+        this->pre_prompt = "";
+        this->user_role = "";
+        this->bot_role = "";
+        this->history_sep = "";
+
+        weight.embeddingNames.insert("model.embed_tokens.weight");
+        weight.linearNames = {
+            "lm_head.weight",
+            "model.layers.*.self_attn.q_a_proj.weight",
+            "model.layers.*.self_attn.q_b_proj.weight",
+            "model.layers.*.self_attn.kv_a_proj_with_mqa.weight",
+            "model.layers.*.self_attn.kv_b_proj.weight",
+            "model.layers.*.self_attn.g_proj.weight",
+            "model.layers.*.self_attn.o_proj.weight",
+            "model.layers.*.mlp.gate.weight",
+            "model.layers.*.mlp*gate_proj.weight",
+            "model.layers.*.mlp*up_proj.weight",
+            "model.layers.*.mlp*down_proj.weight"
+        };
+    }
+
+    Dots3NoteModel::~Dots3NoteModel() {
+        ShutdownRuntime();
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            pendingHistoryCache.reset();
+            historyCache.clear();
+        }
+        {
+            std::lock_guard<std::mutex> guard(responseContextsMutex);
+            responseContexts.clear();
+        }
+    }
+
+    std::map<std::string, std::vector<std::pair<std::string, DataType>>>
+    Dots3NoteModel::GetTensorMap(const std::vector<std::string> &tensorNames) {
+        auto ret = basellm::GetTensorMap(tensorNames);
+        for (const std::string &name : tensorNames) {
+            bool skip = StartsWith(name, "vision_encoder.") ||
+                        StartsWith(name, "audio_encoder.") ||
+                        StartsWith(name, "model.layers.46.") ||
+                        StartsWith(name, "model.mtp.") ||
+                        name.find(".self_attn.indexer.") != std::string::npos;
+            if (skip) {
+                ret[name].clear();
+            }
+        }
+        return ret;
+    }
+
+    void Dots3NoteModel::InitParams() {
+        basellm::InitParams();
+
+        AssertInFastLLM(block_cnt == 46,
+                        "FastLLM Dots3-Note currently expects 46 text layers.\n");
+
+        rms_norm_eps = GetFloatConfig(weight, "rms_norm_eps", 1.0e-5f);
+        num_experts = GetIntConfig(weight, "n_routed_experts", 256);
+        n_shared_experts = GetIntConfig(weight, "n_shared_experts", 1);
+        num_experts_per_tok = GetIntConfig(weight, "num_experts_per_tok", 8);
+        routed_scaling_factor = GetFloatConfig(weight, "routed_scaling_factor", 1.0f);
+        norm_topk_prob = true;
+
+        fullNumHeads = GetIntConfig(weight, "num_attention_heads", 128);
+        fullQLoraRank = GetIntConfig(weight, "q_lora_rank", 1024);
+        fullKVLoraRank = GetIntConfig(weight, "kv_lora_rank", 512);
+        fullQKNopeHeadDim = GetIntConfig(weight, "qk_nope_head_dim", 128);
+        fullQKRopeHeadDim = GetIntConfig(weight, "qk_rope_head_dim", 64);
+        fullVHeadDim = GetIntConfig(weight, "v_head_dim", 128);
+        fullRopeTheta = GetFloatConfig(weight, "rope_theta", 80000000.0f);
+
+        swaNumHeads = GetIntConfig(weight, "swa_num_attention_heads", 64);
+        swaQLoraRank = GetIntConfig(weight, "swa_q_lora_rank", 1024);
+        swaKVLoraRank = GetIntConfig(weight, "swa_kv_lora_rank", 1024);
+        swaQKNopeHeadDim = GetIntConfig(weight, "swa_qk_nope_head_dim", 192);
+        swaQKRopeHeadDim = GetIntConfig(weight, "swa_qk_rope_head_dim", 64);
+        swaVHeadDim = GetIntConfig(weight, "swa_v_head_dim", 128);
+        swaRopeTheta = GetFloatConfig(weight, "swa_rope_theta", 50000.0f);
+
+        shortContextLimit = GetIntConfig(weight, "sliding_window_size", 513);
+        AssertInFastLLM(shortContextLimit > 0,
+                        "FastLLM Dots3-Note requires a positive sliding window.\n");
+        // This basic correctness path intentionally skips the DSA indexer and
+        // evaluates full-attention layers densely.  Dense attention is exactly
+        // equivalent while every causal key fits in index_topk; beyond that the
+        // checkpoint selects only the indexed keys, so do not advertise the
+        // native 524K context until the indexer is implemented here.
+        int configuredMaxPositions =
+            GetIntConfig(weight, "max_position_embeddings", 524288);
+        int denseAttentionLimit = GetIntConfig(weight, "index_topk", 2048);
+        max_positions = std::min(configuredMaxPositions, denseAttentionLimit);
+        AssertInFastLLM(max_positions >= shortContextLimit,
+                        "FastLLM Dots3-Note max positions must cover its sliding window.\n");
+        defaultChunkedPrefillSize = std::min(127, shortContextLimit);
+
+        AssertInFastLLM(fullQKRopeHeadDim == swaQKRopeHeadDim,
+                        "FastLLM Dots3-Note requires matching full/SWA RoPE dimensions.\n");
+        rotary_dim = fullQKRopeHeadDim;
+
+        EnsureRotaryTableCapacity(std::min(shortContextLimit, max_positions));
+
+        // The checkpoint and the Transformers reference both use BF16 activations
+        // for the routed experts.  The CLI may still override this explicitly.
+        if (!useCustomMoeAtype) {
+            moeAtype = DataType::BFLOAT16;
+        }
+
+        for (int layer = 1; layer < block_cnt; layer++) {
+            for (int expert = -1; expert < num_experts; expert++) {
+                std::string base = "model.layers." + std::to_string(layer) + ".mlp.";
+                if (expert < 0) {
+                    base += "shared_experts.";
+                } else {
+                    base += "experts." + std::to_string(expert) + ".";
+                }
+
+                std::string gate = base + "gate_proj.weight";
+                std::string up = base + "up_proj.weight";
+                std::string gateUp = base + "gateup_proj.weight";
+                std::string down = base + "down_proj.weight";
+
+                weightMergeRules.push_back(WeightMergeRule({
+                    WeightMergeRuleSingle({gate, up}, gateUp, "linearSwiglu")
+                }));
+                if (expert >= 0 || !GetCudaSharedExpert()) {
+                    AddSpecialWeight(gateUp, "linearSwiglu", layer);
+                    AddSpecialWeight(down, "linearColumn", layer);
+                }
+
+                moeLinears.insert(gate);
+                moeLinears.insert(up);
+                moeLinears.insert(down);
+            }
+        }
+    }
+
+    Dots3NoteModel::AttentionConfig
+    Dots3NoteModel::GetAttentionConfig(int layer) const {
+        // The checkpoint's layer_types are:
+        // 0, 1, 5, 9, ... 45 = full_attention; all other layers = sliding_attention.
+        bool full = layer == 0 || layer % 4 == 1;
+        if (full) {
+            return {fullNumHeads, fullQLoraRank, fullKVLoraRank,
+                    fullQKNopeHeadDim, fullQKRopeHeadDim,
+                    fullVHeadDim, fullRopeTheta};
+        }
+        return {swaNumHeads, swaQLoraRank, swaKVLoraRank,
+                swaQKNopeHeadDim, swaQKRopeHeadDim,
+                swaVHeadDim, swaRopeTheta};
+    }
+
+    bool Dots3NoteModel::IsFullAttentionLayer(int layer) const {
+        return layer == 0 || layer % 4 == 1;
+    }
+
+    void Dots3NoteModel::BuildRotaryTable(float theta, int positions,
+                                          Data &sinTable, Data &cosTable) {
+        int tableWidth = rotary_dim / 2;
+        std::vector<float> sinValues((size_t)positions * tableWidth);
+        std::vector<float> cosValues((size_t)positions * tableWidth);
+        for (int position = 0; position < positions; position++) {
+            for (int i = 0; i < tableWidth; i++) {
+                float exponent = (float)(2 * i) / (float)rotary_dim;
+                float inverseFrequency = 1.0f / std::pow(theta, exponent);
+                float angle = (float)position * inverseFrequency;
+                sinValues[position * tableWidth + i] =
+                    RoundFloat32ToBFloat16RNE(std::sin(angle));
+                cosValues[position * tableWidth + i] =
+                    RoundFloat32ToBFloat16RNE(std::cos(angle));
+            }
+        }
+        sinTable.CopyFrom(Data(DataType::FLOAT32,
+                               {positions, tableWidth}, sinValues));
+        cosTable.CopyFrom(Data(DataType::FLOAT32,
+                               {positions, tableWidth}, cosValues));
+    }
+
+    void Dots3NoteModel::EnsureRotaryTableCapacity(int positions) {
+        AssertInFastLLM(positions > 0 && positions <= max_positions,
+                        "FastLLM Dots3-Note RoPE position is out of range.\n");
+        if (positions <= rotaryCapacity) {
+            return;
+        }
+        int newCapacity = std::max(1, rotaryCapacity);
+        while (newCapacity < positions) {
+            newCapacity = std::min(max_positions, newCapacity * 2);
+        }
+        BuildRotaryTable(fullRopeTheta, newCapacity,
+                         fullSinData, fullCosData);
+        BuildRotaryTable(swaRopeTheta, newCapacity,
+                         swaSinData, swaCosData);
+        deviceFullSinData.clear();
+        deviceFullCosData.clear();
+        deviceSwaSinData.clear();
+        deviceSwaCosData.clear();
+        rotaryCapacity = newCapacity;
+    }
+
+    void Dots3NoteModel::GetRotaryTableForDevice(bool fullAttention,
+                                                  const std::string &device,
+                                                  Data *&sinTable,
+                                                  Data *&cosTable) {
+        Data &sourceSin = fullAttention ? fullSinData : swaSinData;
+        Data &sourceCos = fullAttention ? fullCosData : swaCosData;
+        auto &sinMap = fullAttention ? deviceFullSinData : deviceSwaSinData;
+        auto &cosMap = fullAttention ? deviceFullCosData : deviceSwaCosData;
+        Data &deviceSin = sinMap[device];
+        Data &deviceCos = cosMap[device];
+        if (deviceSin.dims.empty()) {
+            Mul(sourceSin, 1.0f, deviceSin);
+            Mul(sourceCos, 1.0f, deviceCos);
+        }
+        sinTable = &deviceSin;
+        cosTable = &deviceCos;
+    }
+
+    void Dots3NoteModel::InitMoeWeightViews() {
+        if (!moeWeights.empty()) {
+            return;
+        }
+        moeWeights.resize(block_cnt);
+        moeBiass.resize(block_cnt);
+        for (int layer = 1; layer < block_cnt; layer++) {
+            std::string shared = "model.layers." + std::to_string(layer) +
+                                 ".mlp.shared_experts.";
+            moeWeights[layer].push_back(&weight[shared + "gateup_proj.weight"]);
+            moeWeights[layer].push_back(&weight[shared + "down_proj.weight"]);
+            moeBiass[layer].push_back(nullptr);
+            moeBiass[layer].push_back(nullptr);
+            for (int expert = 0; expert < num_experts; expert++) {
+                std::string base = "model.layers." + std::to_string(layer) +
+                                   ".mlp.experts." + std::to_string(expert) + ".";
+                moeWeights[layer].push_back(&weight[base + "gateup_proj.weight"]);
+                moeWeights[layer].push_back(&weight[base + "down_proj.weight"]);
+                moeBiass[layer].push_back(nullptr);
+                moeBiass[layer].push_back(nullptr);
+            }
+        }
+    }
+
+    int Dots3NoteModel::Forward(
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *retLogits) {
+        (void)attentionMask;
+        AssertInFastLLM(dataType == DataType::BFLOAT16,
+                        "FastLLM Dots3-Note correctness path requires BF16 activations. "
+                        "Use --atype bfloat16 (auto selects it for this model).\n");
+        AssertInFastLLM(kvCacheDataType == DataType::BFLOAT16,
+                        "FastLLM Dots3-Note correctness path requires a BF16 KV cache.\n");
+        AssertInFastLLM(inputIds.dims.size() == 2 && inputIds.dims[0] == 1,
+                        "FastLLM Dots3-Note currently supports batch size 1.\n");
+        AssertInFastLLM((int)pastKeyValues.size() >= block_cnt,
+                        "FastLLM Dots3-Note received an incomplete KV cache.\n");
+
+        int seqlen = inputIds.dims[1];
+        int sequencePastLen = pastKeyValues[0].first.dims.size() > 1
+                                  ? pastKeyValues[0].first.dims[1]
+                                  : 0;
+        if (HistoryCacheDebugEnabled()) {
+            int slidingPastLen = pastKeyValues.size() > 2 &&
+                                 pastKeyValues[2].first.dims.size() > 1
+                                     ? pastKeyValues[2].first.dims[1] : 0;
+            fprintf(stderr,
+                    "[dots-history] forward q=%d full_past=%d sliding_past=%d\n",
+                    seqlen, sequencePastLen, slidingPastLen);
+        }
+        AssertInFastLLM(sequencePastLen + seqlen <= max_positions,
+                        "FastLLM Dots3-Note input exceeds the model context window.\n");
+        EnsureRotaryTableCapacity(sequencePastLen + seqlen);
+
+        Executor &executor = *((Executor *)GetExecutor());
+        InitMoeWeightViews();
+
+        Data hiddenStates, attenInput;
+        Data qa, q, qNope, qPe;
+        Data compressedKvAll, compressedKv, kPe, normalizedKv;
+        Data kv, kNope, value, kPeRepeat, key;
+        Data attentionScores, attentionProbFloat, attentionProb;
+        Data slidingAttentionMask;
+        int slidingMaskPastLen = -1;
+        int slidingMaskKeyLen = -1;
+        Data attentionOutput, attentionGate, expandedGate, attentionProjected;
+        Data w1, w2, w3;
+        Data routerLogits, expertIndex, expertScore;
+        Data moeOutput, moeOutputCopy, moeInputTemp, moeOutputTemp;
+        Data moeW1, moeW2, moeW3, moeCurInput, moeCurOutput;
+        Data sharedGateUp, sharedGate, sharedUp, sharedOutput, combinedMoe;
+        bool cudaSharedExpert = GetCudaSharedExpert();
+        const char *cpuLmHeadEnv = std::getenv(
+            "FASTLLM_DOTS3_NOTE_CPU_LM_HEAD");
+        const bool useCpuLmHead = cpuLmHeadEnv != nullptr &&
+            cpuLmHeadEnv[0] != '\0' &&
+            std::strcmp(cpuLmHeadEnv, "0") != 0 &&
+            std::strcmp(cpuLmHeadEnv, "false") != 0 &&
+            std::strcmp(cpuLmHeadEnv, "off") != 0;
+        const char *prefetchEnv = std::getenv(
+            "FASTLLM_DOTS3_NOTE_PREFETCH_WEIGHTS");
+        const bool prefetchCudaWeights = seqlen > 1 &&
+            prefetchEnv != nullptr && prefetchEnv[0] != '\0' &&
+            std::strcmp(prefetchEnv, "0") != 0 &&
+            std::strcmp(prefetchEnv, "false") != 0 &&
+            std::strcmp(prefetchEnv, "off") != 0;
+        const bool profilePrefetch = std::getenv(
+            "FASTLLM_PROFILE_DOTS3_NOTE_PREFETCH") != nullptr;
+        int lmHeadPrefetchLayer = block_cnt - 2;
+        const char *lmHeadPrefetchLayerEnv = std::getenv(
+            "FASTLLM_DOTS3_NOTE_PREFETCH_LM_HEAD_LAYER");
+        if (lmHeadPrefetchLayerEnv != nullptr &&
+            lmHeadPrefetchLayerEnv[0] != '\0') {
+            lmHeadPrefetchLayer = std::max(
+                1, std::min(block_cnt - 1,
+                            std::atoi(lmHeadPrefetchLayerEnv)));
+        }
+
+        auto collectCudaPrefetchWeights = [&](int nextLayer) {
+            std::vector<Data *> ret;
+            auto append = [&](const std::string &name) {
+                auto it = weight.weight.find(name);
+                if (it != weight.weight.end()) {
+                    ret.push_back(&it->second);
+                }
+            };
+            if (nextLayer >= block_cnt) {
+                append("model.norm.weight");
+                append("lm_head.weight");
+                return ret;
+            }
+
+            std::string prefix = "model.layers." +
+                                 std::to_string(nextLayer);
+            std::string attentionPrefix = prefix + ".self_attn.";
+            append(prefix + ".input_layernorm.weight");
+            append(attentionPrefix + "q_a_proj.weight");
+            append(attentionPrefix + "q_a_layernorm.weight");
+            append(attentionPrefix + "q_b_proj.weight");
+            append(attentionPrefix + "kv_a_proj_with_mqa.weight");
+            append(attentionPrefix + "kv_a_layernorm.weight");
+            append(attentionPrefix + "k_rope_only_layernorm.weight");
+            append(attentionPrefix + "kv_b_proj.weight");
+            append(attentionPrefix + "g_proj.weight");
+            append(attentionPrefix + "o_proj.weight");
+            append(prefix + ".post_attention_layernorm.weight");
+            append(prefix + ".mlp.gate.weight");
+            append(prefix + ".mlp.gate.e_score_correction_bias");
+            if (cudaSharedExpert) {
+                append(prefix + ".mlp.shared_experts.gateup_proj.weight");
+                append(prefix + ".mlp.shared_experts.down_proj.weight");
+            }
+            return ret;
+        };
+
+        Embedding(inputIds, weight["model.embed_tokens.weight"], hiddenStates);
+        ToDataType(hiddenStates, DataType::BFLOAT16);
+
+        std::thread lmHeadPrefetchThread;
+        bool lmHeadPrefetchStarted = false;
+        auto lmHeadPrefetchStart = std::chrono::system_clock::now();
+        for (int layer = 0; layer < block_cnt; layer++) {
+            ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+
+            AttentionConfig config = GetAttentionConfig(layer);
+            bool fullAttention = IsFullAttentionLayer(layer);
+            Data *sinTable = nullptr, *cosTable = nullptr;
+            GetRotaryTableForDevice(fullAttention, executor.firstDevice,
+                                    sinTable, cosTable);
+
+            std::string prefix = "model.layers." + std::to_string(layer);
+            std::string attentionPrefix = prefix + ".self_attn.";
+
+            RMSNorm(hiddenStates, weight[prefix + ".input_layernorm.weight"],
+                    rms_norm_eps, attenInput);
+            ToDataType(attenInput, DataType::BFLOAT16);
+
+            Linear(attenInput, weight[attentionPrefix + "q_a_proj.weight"],
+                   Data(), qa);
+            RMSNorm(qa, weight[attentionPrefix + "q_a_layernorm.weight"],
+                    rms_norm_eps, qa);
+            Mul(qa, std::sqrt((float)embed_dim / (float)config.qLoraRank), qa);
+            Linear(qa, weight[attentionPrefix + "q_b_proj.weight"], Data(), q);
+
+            q.Reshape({1, seqlen, config.numHeads,
+                       config.qkNopeHeadDim + config.qkRopeHeadDim});
+            PermuteSelf(q, {0, 2, 1, 3});
+            Split(q, -1, 0, config.qkNopeHeadDim, qNope);
+            Split(q, -1, config.qkNopeHeadDim,
+                  config.qkNopeHeadDim + config.qkRopeHeadDim, qPe);
+
+            Linear(attenInput,
+                   weight[attentionPrefix + "kv_a_proj_with_mqa.weight"],
+                   Data(), compressedKvAll);
+            Split(compressedKvAll, -1, 0, config.kvLoraRank, compressedKv);
+            Split(compressedKvAll, -1, config.kvLoraRank,
+                  config.kvLoraRank + config.qkRopeHeadDim, kPe);
+            RMSNorm(compressedKv,
+                    weight[attentionPrefix + "kv_a_layernorm.weight"],
+                    rms_norm_eps, normalizedKv);
+            Mul(normalizedKv,
+                std::sqrt((float)embed_dim / (float)config.kvLoraRank),
+                normalizedKv);
+            RMSNorm(kPe,
+                    weight[attentionPrefix + "k_rope_only_layernorm.weight"],
+                    rms_norm_eps, kPe);
+            Linear(normalizedKv, weight[attentionPrefix + "kv_b_proj.weight"],
+                   Data(), kv);
+            kv.Reshape({1, seqlen, config.numHeads,
+                        config.qkNopeHeadDim + config.vHeadDim});
+            PermuteSelf(kv, {0, 2, 1, 3});
+            Split(kv, -1, 0, config.qkNopeHeadDim, kNope);
+            Split(kv, -1, config.qkNopeHeadDim,
+                  config.qkNopeHeadDim + config.vHeadDim, value);
+
+            PermuteSelf(qPe, {0, 2, 1, 3});
+            PermuteSelf(qPe, {1, 0, 2, 3});
+            NearlyRotatePosition2D(qPe, positionIds, *sinTable, *cosTable,
+                                   config.qkRopeHeadDim);
+            PermuteSelf(qPe, {1, 0, 2, 3});
+            PermuteSelf(qPe, {0, 2, 1, 3});
+
+            kPe.Reshape({1, seqlen, 1, config.qkRopeHeadDim});
+            PermuteSelf(kPe, {1, 0, 2, 3});
+            NearlyRotatePosition2D(kPe, positionIds, *sinTable, *cosTable,
+                                   config.qkRopeHeadDim);
+            PermuteSelf(kPe, {1, 0, 2, 3});
+            PermuteSelf(kPe, {0, 2, 1, 3});
+
+            Cat(qNope, qPe, -1, q);
+            Repeat(kPe, 1, config.numHeads, kPeRepeat);
+            Cat(kNope, kPeRepeat, -1, key);
+
+            int qHeadDim = config.qkNopeHeadDim + config.qkRopeHeadDim;
+            q.Reshape({config.numHeads, seqlen, qHeadDim});
+            key.Reshape({config.numHeads, seqlen, qHeadDim});
+            value.Reshape({config.numHeads, seqlen, config.vHeadDim});
+
+            Data &pastKey = pastKeyValues[layer].first;
+            Data &pastValue = pastKeyValues[layer].second;
+            int layerPastLen = pastKey.dims.size() > 1 ? pastKey.dims[1] : 0;
+            if (GetKVCacheInCPU()) {
+                pastKey.lockInCPU = true;
+                pastValue.lockInCPU = true;
+            } else {
+                pastKey.ToDevice(key.dataDevice);
+                pastValue.ToDevice(value.dataDevice);
+            }
+
+            const int cacheBlock = 128;
+            while ((pastKey.dims.empty() &&
+                    (pastKey.expansionDims.empty() ||
+                     key.dims[1] > pastKey.expansionDims[1])) ||
+                   (!pastKey.dims.empty() &&
+                    pastKey.dims[1] + key.dims[1] >
+                        pastKey.expansionDims[1])) {
+                std::vector<int> dims;
+                if (pastKey.dims.empty() || pastKey.Count(0) == 0) {
+                    dims = {key.dims[0],
+                            ((key.dims[1] - 1) / cacheBlock + 1) * cacheBlock,
+                            key.dims[2]};
+                } else {
+                    dims = pastKey.dims;
+                    dims[1] += ((key.dims[1] - 1) / cacheBlock + 1) * cacheBlock;
+                }
+                pastKey.Expansion(dims);
+            }
+            while ((pastValue.dims.empty() &&
+                    (pastValue.expansionDims.empty() ||
+                     value.dims[1] > pastValue.expansionDims[1])) ||
+                   (!pastValue.dims.empty() &&
+                    pastValue.dims[1] + value.dims[1] >
+                        pastValue.expansionDims[1])) {
+                std::vector<int> dims;
+                if (pastValue.dims.empty() || pastValue.Count(0) == 0) {
+                    dims = {value.dims[0],
+                            ((value.dims[1] - 1) / cacheBlock + 1) * cacheBlock,
+                            value.dims[2]};
+                } else {
+                    dims = pastValue.dims;
+                    dims[1] += ((value.dims[1] - 1) / cacheBlock + 1) * cacheBlock;
+                }
+                pastValue.Expansion(dims);
+            }
+            CatDirect(pastKey, key, 1);
+            CatDirect(pastValue, value, 1);
+
+            MatMulTransB(q, pastKey, attentionScores);
+            Mul(attentionScores, 1.0f / std::sqrt((float)qHeadDim),
+                attentionScores);
+            CausalMask(attentionScores, layerPastLen + 1, -10000.0f);
+            ToDataType(attentionScores, attentionProbFloat, DataType::FLOAT32);
+            int keyLen = pastKey.dims[1];
+            if (!fullAttention && keyLen > shortContextLimit) {
+                if (slidingMaskPastLen != layerPastLen ||
+                    slidingMaskKeyLen != keyLen) {
+                    std::vector<float> mask((size_t)seqlen * keyLen, 0.0f);
+                    for (int query = 0; query < seqlen; query++) {
+                        int absoluteQuery = layerPastLen + query;
+                        int firstVisible = std::max(
+                            0, absoluteQuery - shortContextLimit + 1);
+                        for (int keyIndex = 0;
+                             keyIndex < firstVisible; keyIndex++) {
+                            mask[(size_t)query * keyLen + keyIndex] = 1.0f;
+                        }
+                    }
+                    slidingAttentionMask.CopyFrom(Data(
+                        DataType::FLOAT32, {1, seqlen, keyLen}, mask));
+                    slidingMaskPastLen = layerPastLen;
+                    slidingMaskKeyLen = keyLen;
+                }
+                attentionProbFloat.Reshape(
+                    {1, config.numHeads, seqlen, keyLen});
+                AttentionMask(attentionProbFloat, slidingAttentionMask,
+                              -10000.0f);
+                attentionProbFloat.Reshape(
+                    {config.numHeads, seqlen, keyLen});
+            }
+            Softmax(attentionProbFloat, attentionProbFloat, -1);
+            ToDataType(attentionProbFloat, attentionProb, DataType::BFLOAT16);
+            MatMul(attentionProb, pastValue, attentionOutput);
+
+            if (!fullAttention) {
+                int cachedTokens = pastKey.dims[1];
+                int compactThreshold = shortContextLimit + cacheBlock;
+                if (cachedTokens >= compactThreshold) {
+                    int start = cachedTokens - shortContextLimit;
+                    Data compactKey, compactValue;
+                    Split(pastKey, 1, start, cachedTokens, compactKey);
+                    Split(pastValue, 1, start, cachedTokens, compactValue);
+                    pastKey.CopyFrom(compactKey);
+                    pastValue.CopyFrom(compactValue);
+                    // CopyFrom intentionally drops the source's spare
+                    // capacity.  CatDirect requires expansionDims to describe
+                    // writable storage, otherwise the first token appended
+                    // after compaction writes past the compact allocation.
+                    // Recreate one cache block of headroom here so both a
+                    // chunked prefill and single-token decode remain bounded.
+                    std::vector<int> keyCapacity = pastKey.dims;
+                    std::vector<int> valueCapacity = pastValue.dims;
+                    keyCapacity[1] = compactThreshold;
+                    valueCapacity[1] = compactThreshold;
+                    pastKey.Expansion(keyCapacity);
+                    pastValue.Expansion(valueCapacity);
+                    pastKey.SetKVCache();
+                    pastValue.SetKVCache();
+                }
+            }
+
+            attentionOutput.Reshape(
+                {1, config.numHeads, seqlen, config.vHeadDim});
+            PermuteSelf(attentionOutput, {0, 2, 1, 3});
+
+            Linear(attenInput, weight[attentionPrefix + "g_proj.weight"],
+                   Data(), attentionGate);
+            Sigmoid(attentionGate, attentionGate);
+            attentionGate.Reshape({1, seqlen, config.numHeads, 1});
+            Repeat(attentionGate, 3, config.vHeadDim, expandedGate);
+            MulTo(attentionOutput, expandedGate);
+            attentionOutput.Reshape(
+                {1, seqlen, config.numHeads * config.vHeadDim});
+            Linear(attentionOutput, weight[attentionPrefix + "o_proj.weight"],
+                   Data(), attentionProjected);
+            AddTo(hiddenStates, attentionProjected);
+
+            RMSNorm(hiddenStates,
+                    weight[prefix + ".post_attention_layernorm.weight"],
+                    rms_norm_eps, attenInput);
+            ToDataType(attenInput, DataType::BFLOAT16);
+
+            if (layer == 0) {
+                Linear(attenInput, weight[prefix + ".mlp.gate_proj.weight"],
+                       Data(), w1);
+                Silu(w1, w1);
+                Linear(attenInput, weight[prefix + ".mlp.up_proj.weight"],
+                       Data(), w3);
+                MulTo(w1, w3);
+                Linear(w1, weight[prefix + ".mlp.down_proj.weight"],
+                       Data(), w2);
+                AddTo(hiddenStates, w2);
+            } else {
+                int tokens = attenInput.Count(0) / attenInput.dims.back();
+                attenInput.Reshape({tokens, embed_dim});
+                std::string gateName = prefix + ".mlp.gate.weight";
+                std::string gateBiasName =
+                    prefix + ".mlp.gate.e_score_correction_bias";
+
+                Linear(attenInput, weight[gateName], Data(), routerLogits);
+                Sigmoid(routerLogits, routerLogits);
+                ToDataType(routerLogits, DataType::FLOAT32);
+                Data *gateBias = weight.weight.find(gateBiasName) !=
+                                         weight.weight.end()
+                                     ? &weight[gateBiasName]
+                                     : nullptr;
+                SelectExpert(routerLogits, expertIndex, expertScore,
+                             num_experts_per_tok, true,
+                             routed_scaling_factor, gateBias);
+
+                std::thread weightPrefetchThread;
+                bool weightPrefetchStarted = false;
+                size_t prefetchBytes = 0;
+
+                if (cudaSharedExpert) {
+                    std::string sharedPrefix =
+                        prefix + ".mlp.shared_experts.";
+                    Linear(attenInput,
+                           weight[sharedPrefix + "gateup_proj.weight"],
+                           Data(), sharedGateUp);
+                    int sharedIntermediate = sharedGateUp.dims.back() / 2;
+                    Split(sharedGateUp, -1, 0, sharedIntermediate,
+                          sharedGate);
+                    Split(sharedGateUp, -1, sharedIntermediate,
+                          sharedIntermediate * 2, sharedUp);
+                    Silu(sharedGate, sharedGate);
+                    MulTo(sharedGate, sharedUp);
+                    Linear(sharedGate,
+                           weight[sharedPrefix + "down_proj.weight"],
+                           Data(), sharedOutput);
+                    moeWeights[layer][0] = nullptr;
+                    moeWeights[layer][1] = nullptr;
+                }
+
+                auto prefetchStart = std::chrono::system_clock::now();
+                if (prefetchCudaWeights &&
+                    layer + 1 < block_cnt &&
+                    attenInput.dataDevice == DataDevice::CUDA) {
+                    std::vector<Data *> prefetchWeights =
+                        collectCudaPrefetchWeights(layer + 1);
+                    for (Data *data : prefetchWeights) {
+                        if (data->dataDevice != DataDevice::CUDA) {
+                            prefetchBytes += data->GetBytes();
+                        }
+                    }
+                    std::vector<int> prefetchDeviceIds =
+                        attenInput.dataDeviceIds;
+                    weightPrefetchThread = std::thread(
+                        [prefetchWeights = std::move(prefetchWeights),
+                         prefetchDeviceIds = std::move(prefetchDeviceIds)]() {
+                            for (Data *data : prefetchWeights) {
+                                data->ToDevice(DataDevice::CUDA,
+                                               prefetchDeviceIds);
+                            }
+                        });
+                    weightPrefetchStarted = true;
+                }
+
+                ApplyMoeDeviceMapForLayer(layer);
+                AssertInFastLLM(CanRunMergeMOE(attenInput,
+                                               moeWeights[layer],
+                                               moeBiass[layer]),
+                                "FastLLM Dots3-Note requires MergeMOE "
+                                "support on the selected MoE device.\n");
+                MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
+                              &moeWeights[layer], &moeBiass[layer],
+                              &moeW1, &moeW2, &moeW3,
+                              &moeCurInput, &moeCurOutput,
+                              1.0f, &moeOutput, layer,
+                              attenInput.dataType, moeAtype,
+                              &moeInputTemp, &moeOutputTemp,
+                              MoeGateSwiglu, false, 0.0f, false,
+                              nullptr);
+                auto prefetchJoinStart = std::chrono::system_clock::now();
+                if (weightPrefetchThread.joinable()) {
+                    weightPrefetchThread.join();
+                }
+                if (profilePrefetch && weightPrefetchStarted) {
+                    auto prefetchEnd = std::chrono::system_clock::now();
+                    printf("[fastllm-profile-dots3-prefetch] layer=%d bytes=%zu elapsed_ms=%.3f join_ms=%.3f\n",
+                           layer, prefetchBytes,
+                           GetSpan(prefetchStart, prefetchEnd) * 1000.0,
+                           GetSpan(prefetchJoinStart, prefetchEnd) * 1000.0);
+                    fflush(stdout);
+                }
+                if (prefetchCudaWeights && !useCpuLmHead &&
+                    layer == lmHeadPrefetchLayer) {
+                    std::vector<Data *> finalWeights =
+                        collectCudaPrefetchWeights(block_cnt);
+                    std::vector<int> prefetchDeviceIds =
+                        moeOutput.dataDeviceIds;
+                    if (prefetchDeviceIds.empty()) {
+                        prefetchDeviceIds = attenInput.dataDeviceIds;
+                    }
+                    lmHeadPrefetchStart = std::chrono::system_clock::now();
+                    lmHeadPrefetchThread = std::thread(
+                        [finalWeights = std::move(finalWeights),
+                         prefetchDeviceIds = std::move(prefetchDeviceIds)]() {
+                            for (Data *data : finalWeights) {
+                                data->ToDevice(DataDevice::CUDA,
+                                               prefetchDeviceIds);
+                            }
+                        });
+                    lmHeadPrefetchStarted = true;
+                }
+                moeOutput.Reshape(hiddenStates.dims);
+                moeOutputCopy.CopyFrom(moeOutput);
+                ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+                if (cudaSharedExpert) {
+                    sharedOutput.Reshape(hiddenStates.dims);
+                    combinedMoe.CopyFrom(sharedOutput);
+                    AddTo(combinedMoe, moeOutputCopy);
+                } else {
+                    combinedMoe.CopyFrom(moeOutputCopy);
+                }
+                AddTo(hiddenStates, combinedMoe);
+            }
+        }
+
+        auto lmHeadPrefetchJoinStart = std::chrono::system_clock::now();
+        if (lmHeadPrefetchThread.joinable()) {
+            lmHeadPrefetchThread.join();
+        }
+        if (profilePrefetch && lmHeadPrefetchStarted) {
+            auto lmHeadPrefetchEnd = std::chrono::system_clock::now();
+            printf("[fastllm-profile-dots3-prefetch-head] layer=%d elapsed_ms=%.3f join_ms=%.3f\n",
+                   lmHeadPrefetchLayer,
+                   GetSpan(lmHeadPrefetchStart,
+                           lmHeadPrefetchEnd) * 1000.0,
+                   GetSpan(lmHeadPrefetchJoinStart,
+                           lmHeadPrefetchEnd) * 1000.0);
+            fflush(stdout);
+        }
+
+        MaybeRecordPromptHistoryCache(pastKeyValues);
+
+        Data lastHiddenStates, logits, topk;
+        if (seqlen > 1) {
+            Split(hiddenStates, 1, seqlen - 1, seqlen, lastHiddenStates);
+        } else {
+            lastHiddenStates.CopyFrom(hiddenStates);
+        }
+        if (useCpuLmHead) {
+            executor.SetFirstDevice("cpu");
+        }
+        RMSNorm(lastHiddenStates, weight["model.norm.weight"],
+                rms_norm_eps, lastHiddenStates);
+        Linear(lastHiddenStates, weight["lm_head.weight"], Data(), logits);
+        ToDataType(logits, DataType::FLOAT32);
+
+        if (generationConfig.output_logits && retLogits != nullptr) {
+            int size = logits.dims.back();
+            logits.ToDevice(DataDevice::CPU);
+            retLogits->resize(size);
+            memcpy(retLogits->data(),
+                   ((float *)logits.cpuData) +
+                       (logits.Count(0) / size - 1) * size,
+                   size * sizeof(float));
+        }
+
+        ResetLogitsOfEOS(1, &logits, pastKeyValues, generationConfig);
+        if (generationConfig.IsSimpleGreedy()) {
+            TopK(logits, topk, 1);
+            topk.ToDevice(DataDevice::CPU);
+            int token = (int)(((float *)topk.cpuData)[0] + 1.0e-3f);
+            if (HistoryCacheDebugEnabled()) {
+                fprintf(stderr,
+                        "[dots-history] next_token=%d full_cache=%d sliding_cache=%d\n",
+                        token,
+                        pastKeyValues[0].first.dims.size() > 1
+                            ? pastKeyValues[0].first.dims[1] : 0,
+                        pastKeyValues[2].first.dims.size() > 1
+                            ? pastKeyValues[2].first.dims[1] : 0);
+            }
+            return token;
+        }
+
+        LastTokensUnit emptyLastTokens;
+        const LastTokensUnit &last = lastTokens.units.empty()
+                                         ? emptyLastTokens
+                                         : lastTokens.units[0];
+        return LLMSampling(logits, logits.Count(0) / logits.dims.back() - 1,
+                           generationConfig, last);
+    }
+
+    bool Dots3NoteModel::NeedAttentionMask(int qlen, int klen) {
+        (void)qlen;
+        (void)klen;
+        return false;
+    }
+
+    int Dots3NoteModel::GetKVCacheRetainedTokens(int layer) const {
+        return IsFullAttentionLayer(layer) ? -1 : shortContextLimit;
+    }
+
+    void Dots3NoteModel::WarmUp() {
+        printf("Warmup Dots3-Note...\n");
+        Data inputIds(DataType::FLOAT32, {1, 1}, {1.0f});
+        Data positionIds(DataType::FLOAT32, {1, 1}, {0.0f});
+        std::vector<std::pair<Data, Data>> pastKeyValues;
+        pastKeyValues.reserve(block_cnt);
+        for (int layer = 0; layer < block_cnt; layer++) {
+            pastKeyValues.push_back({Data(kvCacheDataType),
+                                     Data(kvCacheDataType)});
+        }
+        Forward(inputIds, Data(), positionIds, pastKeyValues);
+
+        elementsInKVCachePerToken = 0;
+        for (int layer = 0; layer < (int)pastKeyValues.size(); layer++) {
+            if (!IsFullAttentionLayer(layer)) {
+                continue;
+            }
+            const auto &cache = pastKeyValues[layer];
+            if (cache.first.dims.size() == 3) {
+                elementsInKVCachePerToken +=
+                    (long long)cache.first.dims[0] * cache.first.dims[2];
+            }
+            if (cache.second.dims.size() == 3) {
+                elementsInKVCachePerToken +=
+                    (long long)cache.second.dims[0] * cache.second.dims[2];
+            }
+        }
+        printf("finish.\n");
+    }
+
+    void Dots3NoteModel::OnResponseContextCreated(ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        std::shared_ptr<HistoryCacheMemory> pending;
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            pending.swap(pendingHistoryCache);
+        }
+        if (pending != nullptr) {
+            std::lock_guard<std::mutex> forwardGuard(forwardLocker);
+            RestoreHistoryCache(*pending, context->cacheLen, context);
+            // A restored non-paged cache is already an active sequence.  The
+            // legacy scheduler otherwise counts its allocated KV as occupying
+            // maxBatch while still classifying it as an unscheduled prefill
+            // (preTokens == 0), and terminates it without calling Forward.
+            // Seed the normal decode bookkeeping so the uncached suffix is
+            // evaluated at the same absolute positions as a full prefill.
+            context->preTokens = context->cacheLen;
+            context->intParams["add_special_tokens"] = 0;
+            context->intParams["promptLen"] =
+                context->cacheLen + (int)context->currentTokens.size();
+            context->intParams["index"] = -1;
+        }
+        std::lock_guard<std::mutex> guard(responseContextsMutex);
+        responseContexts[&context->pastKeyValues] = context;
+    }
+
+    void Dots3NoteModel::OnResponseContextRemoved(ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(responseContextsMutex);
+        responseContexts.erase(&context->pastKeyValues);
+    }
+
+    bool Dots3NoteModel::TryRestoreHistoryCache(
+            std::vector<int> &inputTokens, int &cacheLen) {
+        if (!saveHistoryChat || inputTokens.size() <= 1) {
+            return false;
+        }
+        std::shared_ptr<HistoryCacheMemory> best;
+        int bestRestoreLength = 0;
+        size_t recordCount = 0;
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            pendingHistoryCache.reset();
+            recordCount = historyCache.size();
+            for (auto &item : historyCache) {
+                const std::vector<int> &cachedTokens = item.first;
+                if (cachedTokens.empty() ||
+                    cachedTokens.size() > inputTokens.size() ||
+                    !std::equal(cachedTokens.begin(), cachedTokens.end(),
+                                inputTokens.begin())) {
+                    continue;
+                }
+                int restoreLength = (int)cachedTokens.size();
+                if (cachedTokens.size() == inputTokens.size()) {
+                    restoreLength--;
+                }
+                if (restoreLength <= bestRestoreLength ||
+                    !CanRestoreHistoryCache(*item.second, restoreLength)) {
+                    continue;
+                }
+                best = item.second;
+                bestRestoreLength = restoreLength;
+            }
+            if (best != nullptr) {
+                best->flushTime = ++historyCacheFlushTime;
+                pendingHistoryCache = best;
+            }
+        }
+        if (best == nullptr || bestRestoreLength <= 0) {
+            if (HistoryCacheDebugEnabled()) {
+                fprintf(stderr,
+                        "[dots-history] miss input=%zu records=%zu\n",
+                        inputTokens.size(), recordCount);
+            }
+            return false;
+        }
+        if (HistoryCacheDebugEnabled()) {
+            fprintf(stderr,
+                    "[dots-history] hit input=%zu snapshot=%d restore=%d\n",
+                    inputTokens.size(), best->sequenceLength,
+                    bestRestoreLength);
+        }
+        inputTokens.erase(inputTokens.begin(),
+                          inputTokens.begin() + bestRestoreLength);
+        cacheLen = bestRestoreLength;
+        return true;
+    }
+
+    void Dots3NoteModel::TryRecordResponseContext(ResponseContext *context) {
+        if (context == nullptr || !saveHistoryChat ||
+            context->pastKeyValues.empty() || context->allTokens.empty()) {
+            return;
+        }
+        int sequenceLength =
+            context->pastKeyValues[0].first.dims.size() > 1
+                ? context->pastKeyValues[0].first.dims[1] : 0;
+        if (sequenceLength <= 0 ||
+            sequenceLength > (int)context->allTokens.size()) {
+            return;
+        }
+        std::vector<int> tokens(context->allTokens.begin(),
+                                context->allTokens.begin() + sequenceLength);
+        RecordHistoryCache(tokens, context->pastKeyValues, sequenceLength);
+    }
+
+    void Dots3NoteModel::MaybeRecordPromptHistoryCache(
+            std::vector<std::pair<Data, Data>> &pastKeyValues) {
+        if (!saveHistoryChat || pastKeyValues.empty()) {
+            return;
+        }
+        ResponseContext *context = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(responseContextsMutex);
+            auto it = responseContexts.find(&pastKeyValues);
+            if (it != responseContexts.end()) {
+                context = it->second;
+            }
+        }
+        if (context == nullptr) {
+            return;
+        }
+        int sequenceLength = pastKeyValues[0].first.dims.size() > 1
+                                 ? pastKeyValues[0].first.dims[1] : 0;
+        if (sequenceLength <= 0 ||
+            sequenceLength != context->inputTokens ||
+            sequenceLength > (int)context->allTokens.size()) {
+            return;
+        }
+        std::vector<int> tokens(context->allTokens.begin(),
+                                context->allTokens.begin() + sequenceLength);
+        RecordHistoryCache(tokens, pastKeyValues, sequenceLength);
+    }
+
+    void Dots3NoteModel::RecordHistoryCache(
+            const std::vector<int> &tokens,
+            const std::vector<std::pair<Data, Data>> &pastKeyValues,
+            int sequenceLength) {
+        if (!saveHistoryChat || sequenceLength <= 0 ||
+            sequenceLength != (int)tokens.size() ||
+            (int)pastKeyValues.size() < block_cnt) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            auto existing = historyCache.find(tokens);
+            if (existing != historyCache.end()) {
+                existing->second->flushTime = ++historyCacheFlushTime;
+                return;
+            }
+        }
+
+        auto memory = std::make_shared<HistoryCacheMemory>();
+        memory->tokens = tokens;
+        memory->sequenceLength = sequenceLength;
+        memory->pastKeyValues.resize(block_cnt);
+        const bool moveToCpu = GetHistoryCacheInCPU();
+        auto copyTensor = [&](const Data &source, Data &target) {
+            AssertInFastLLM(!source.multiDeviceData &&
+                            source.multiDeviceDatas.empty() &&
+                            !source.isPagedKVCache,
+                            "Dots3-Note history cache expects a contiguous tensor.\n");
+            if (!moveToCpu || source.dataDevice == DataDevice::CPU) {
+                target.CopyFrom(source);
+                if (moveToCpu) {
+                    target.lockInCPU = true;
+                }
+                return;
+            }
+
+            target.name = source.name;
+            target.isKVCache = source.isKVCache;
+            target.cacheUid = source.cacheUid;
+            target.dataType = source.dataType;
+            target.UpdateUnitSize();
+            target.dataDevice = DataDevice::CPU;
+            if (source.dims.empty()) {
+                target.lockInCPU = true;
+                return;
+            }
+            if (!source.expansionDims.empty() &&
+                source.expansionDims != source.dims) {
+                target.Expansion(source.expansionDims);
+                target.Resize(source.dims);
+                target.Allocate();
+            } else {
+                target.Resize(source.dims);
+                target.Allocate();
+            }
+            const size_t bytes = source.GetBytes();
+            AssertInFastLLM(target.cpuData != nullptr &&
+                            bytes <= target.expansionBytes,
+                            "Dots3-Note CPU history cache allocation failed.\n");
+#ifdef USE_CUDA
+            AssertInFastLLM(source.cudaData != nullptr,
+                            "Dots3-Note history cache source has no CUDA data.\n");
+            int originalDevice = FastllmCudaGetDevice();
+            int sourceDevice = GetPointerDeviceId(source.cudaData);
+            if (sourceDevice < 0 && !source.dataDeviceIds.empty()) {
+                sourceDevice = source.dataDeviceIds[0];
+            }
+            AssertInFastLLM(sourceDevice >= 0,
+                            "Dots3-Note history cache source GPU is unknown.\n");
+            FastllmCudaSetDevice(sourceDevice);
+            FastllmCudaCopyFromDeviceToHost(
+                target.cpuData, source.cudaData, bytes);
+            FastllmCudaSetDevice(originalDevice);
+#else
+            ErrorInFastLLM(
+                "Dots3-Note CUDA cache cannot be copied in a CPU build.\n");
+#endif
+            target.lockInCPU = true;
+        };
+
+        for (int layer = 0; layer < block_cnt; layer++) {
+            copyTensor(pastKeyValues[layer].first,
+                       memory->pastKeyValues[layer].first);
+            copyTensor(pastKeyValues[layer].second,
+                       memory->pastKeyValues[layer].second);
+        }
+
+        std::lock_guard<std::mutex> guard(historyCacheMutex);
+        auto existing = historyCache.find(tokens);
+        if (existing != historyCache.end()) {
+            existing->second->flushTime = ++historyCacheFlushTime;
+            return;
+        }
+        while ((int)historyCache.size() >= historyCacheMaxRecords) {
+            auto oldest = historyCache.end();
+            for (auto it = historyCache.begin();
+                 it != historyCache.end(); ++it) {
+                if (oldest == historyCache.end() ||
+                    it->second->flushTime < oldest->second->flushTime) {
+                    oldest = it;
+                }
+            }
+            if (oldest == historyCache.end()) {
+                break;
+            }
+            historyCache.erase(oldest);
+        }
+        memory->flushTime = ++historyCacheFlushTime;
+        historyCache[tokens] = std::move(memory);
+        if (HistoryCacheDebugEnabled()) {
+            const auto &stored = historyCache[tokens];
+            fprintf(stderr,
+                    "[dots-history] record tokens=%zu full=%d sliding=%d records=%zu\n",
+                    tokens.size(),
+                    stored->pastKeyValues[0].first.dims[1],
+                    stored->pastKeyValues[2].first.dims[1],
+                    historyCache.size());
+        }
+    }
+
+    bool Dots3NoteModel::CanRestoreHistoryCache(
+            const HistoryCacheMemory &memory, int restoreLength) const {
+        if (restoreLength <= 0 ||
+            restoreLength > memory.sequenceLength ||
+            memory.sequenceLength != (int)memory.tokens.size() ||
+            (int)memory.pastKeyValues.size() < block_cnt) {
+            return false;
+        }
+        for (int layer = 0; layer < block_cnt; layer++) {
+            const Data &key = memory.pastKeyValues[layer].first;
+            const Data &value = memory.pastKeyValues[layer].second;
+            if (key.dims.size() != 3 || value.dims.size() != 3 ||
+                key.dims[1] != value.dims[1]) {
+                return false;
+            }
+            int sourceLength = key.dims[1];
+            if (IsFullAttentionLayer(layer)) {
+                if (sourceLength < restoreLength) {
+                    return false;
+                }
+                continue;
+            }
+            int desiredLength = std::min(
+                restoreLength, std::max(0, shortContextLimit - 1));
+            int desiredStart = restoreLength - desiredLength;
+            int sourceStart = memory.sequenceLength - sourceLength;
+            if (sourceStart > desiredStart ||
+                desiredStart + desiredLength >
+                    sourceStart + sourceLength) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void Dots3NoteModel::RestoreHistoryCache(
+            const HistoryCacheMemory &memory, int restoreLength,
+            ResponseContext *context) {
+        AssertInFastLLM(context != nullptr &&
+                        CanRestoreHistoryCache(memory, restoreLength),
+                        "Dots3-Note history cache snapshot is incomplete.\n");
+        context->pastKeyValues.resize(block_cnt);
+        for (int layer = 0; layer < block_cnt; layer++) {
+            const Data &sourceKey = memory.pastKeyValues[layer].first;
+            const Data &sourceValue = memory.pastKeyValues[layer].second;
+            int start = 0;
+            int end = restoreLength;
+            if (!IsFullAttentionLayer(layer)) {
+                int desiredLength = std::min(
+                    restoreLength, std::max(0, shortContextLimit - 1));
+                int desiredStart = restoreLength - desiredLength;
+                int sourceStart = memory.sequenceLength - sourceKey.dims[1];
+                start = desiredStart - sourceStart;
+                end = start + desiredLength;
+            }
+            Data &targetKey = context->pastKeyValues[layer].first;
+            Data &targetValue = context->pastKeyValues[layer].second;
+            Split(sourceKey, 1, start, end, targetKey);
+            Split(sourceValue, 1, start, end, targetValue);
+            targetKey.SetKVCache();
+            targetValue.SetKVCache();
+            if (targetKey.dims.size() == 3 && targetKey.dims[1] > 0) {
+                std::vector<int> keyCapacity = targetKey.dims;
+                std::vector<int> valueCapacity = targetValue.dims;
+                // Expansion needs a strictly larger shape.  An exact history
+                // hit restores window_size - 1 tokens (512 for this model),
+                // which is already a multiple of the cache block; rounding
+                // up to the same value leaves Expansion without a valid
+                // growth axis.  Always reserve the following block.
+                keyCapacity[1] = (keyCapacity[1] / 128 + 1) * 128;
+                valueCapacity[1] = (valueCapacity[1] / 128 + 1) * 128;
+                targetKey.Expansion(keyCapacity);
+                targetValue.Expansion(valueCapacity);
+                targetKey.SetKVCache();
+                targetValue.SetKVCache();
+            }
+        }
+        if (HistoryCacheDebugEnabled()) {
+            fprintf(stderr,
+                    "[dots-history] restored=%d full=%d sliding=%d\n",
+                    restoreLength,
+                    context->pastKeyValues[0].first.dims[1],
+                    context->pastKeyValues[2].first.dims[1]);
+        }
+    }
+
+    std::string Dots3NoteModel::MakeInput(const std::string &history,
+                                           int round,
+                                           const std::string &input) {
+        const std::string prefix = round == 0
+            ? "<|system|>You are a helpful assistant.<|endofsystem|>"
+            : history;
+        const std::string noThink =
+            input.size() >= 10 &&
+            input.compare(input.size() - 10, 10, "<no_think>") == 0
+                ? ""
+                : "<no_think>";
+        return prefix + "<|user|>" + input + noThink +
+               "<|endofuser|><|assistant|><think>\n\n</think>\n\n";
+    }
+
+    std::string Dots3NoteModel::MakeHistory(const std::string &history,
+                                             int round,
+                                             const std::string &input,
+                                             const std::string &output) {
+        return MakeInput(history, round, input) + output +
+               "<|endofassistant|>";
+    }
+}

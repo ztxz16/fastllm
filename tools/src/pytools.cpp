@@ -553,12 +553,13 @@ extern "C" {
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
             if (model->model_type == "laguna" ||
-                model->model_type == "kimi_k3") {
+                model->model_type == "kimi_k3" ||
+                model->model_type == "dots3_note") {
                 // Laguna's late-layer activations exceed the finite FP16
-                // range, while Kimi-K3's dedicated CUDA kernels consume
-                // BF16.  Preserve BF16 for both models in auto mode; this
-                // also keeps Kimi-K3's KV capacity accounting consistent
-                // with the cache tensors created by its attention path.
+                // range, while Kimi-K3's dedicated CUDA kernels and the
+                // Dots3-Note reference path consume BF16. Preserve BF16 in
+                // auto mode; this also keeps Kimi-K3's KV accounting
+                // consistent with its attention cache tensors.
                 model->SetDataType(fastllm::DataType::BFLOAT16);
             } else if (model->model_type == "glm_moe_dsa") {
                 model->SetDataType(fastllm::DataType::FLOAT32);

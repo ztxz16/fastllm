@@ -285,6 +285,184 @@ namespace fastllm {
         return true;
     }
 
+#ifdef __AVX512BF16__
+    static inline __m512bh FP8E4M3ToMagicBFloat16_AVX512BF16(
+            const uint8_t *weightData) {
+        const __m256i bytes = _mm256_loadu_si256(
+            (const __m256i*)weightData);
+        const __m512i words = _mm512_cvtepu8_epi16(bytes);
+        const __m512i shifted = _mm512_slli_epi16(words, 4);
+        // Shifting the raw byte by four puts the FP8 sign in bit 11.
+        // For negative values, xor bits 11 and 15 to move that sign to
+        // the BF16 sign position.  The remaining bits are the same magic-
+        // exponent representation used by the scalar-row fallback below.
+        const __mmask32 negative = _mm512_test_epi16_mask(
+            words, _mm512_set1_epi16(0x80));
+        const __m512i signFixed = _mm512_xor_si512(
+            shifted, _mm512_set1_epi16((short)0x8800));
+        return (__m512bh)_mm512_mask_blend_epi16(
+            negative, shifted, signFixed);
+    }
+
+    template <int rows>
+    static inline void LinearBFloat16FP8E4M3DecodeRows_AVX512BF16(
+            const uint16_t *inputData,
+            const uint8_t *weightData,
+            const float *biasData,
+            float *outputData,
+            int m, int k, int rowStart,
+            int blockK, int blockM, const float *scales,
+            int ms, float magicScale) {
+        __m512 sums[rows];
+        for (int row = 0; row < rows; row++) {
+            sums[row] = _mm512_setzero_ps();
+        }
+
+        for (int midx = 0; midx < ms; midx++) {
+            __m512 blockSums[rows];
+            for (int row = 0; row < rows; row++) {
+                blockSums[row] = _mm512_setzero_ps();
+            }
+
+            int l = midx * blockM;
+            const int blockEnd = std::min(m, l + blockM);
+            for (; l + 31 < blockEnd; l += 32) {
+                const __m512bh input = (__m512bh)_mm512_loadu_si512(
+                    (const __m512i*)(inputData + l));
+                for (int row = 0; row < rows; row++) {
+                    const __m512bh weight =
+                        FP8E4M3ToMagicBFloat16_AVX512BF16(
+                            weightData + (size_t)(rowStart + row) * m + l);
+                    blockSums[row] = _mm512_dpbf16_ps(
+                        blockSums[row], input, weight);
+                }
+            }
+
+            for (int row = 0; row < rows; row++) {
+                const float scale = scales[
+                    (rowStart + row) / blockK * ms + midx];
+                sums[row] = _mm512_fmadd_ps(
+                    blockSums[row], _mm512_set1_ps(scale), sums[row]);
+            }
+        }
+
+        for (int row = 0; row < rows; row++) {
+            const int outputRow = rowStart + row;
+            const float bias = biasData == nullptr ? 0.0f : biasData[outputRow];
+            outputData[outputRow] =
+                bias + _mm512_reduce_add_ps(sums[row]) * magicScale;
+        }
+        (void)k;
+    }
+
+    template <int inputRows, int weightRows>
+    static inline void LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16(
+            const uint16_t *inputData,
+            const uint8_t *weightData,
+            const float *biasData,
+            float *outputData,
+            int m, int k, int rowStart,
+            int blockK, int blockM, const float *scales,
+            int ms, float magicScale) {
+        __m512 sums[inputRows][weightRows];
+        for (int inputRow = 0; inputRow < inputRows; inputRow++) {
+            for (int weightRow = 0; weightRow < weightRows; weightRow++) {
+                sums[inputRow][weightRow] = _mm512_setzero_ps();
+            }
+        }
+
+        for (int midx = 0; midx < ms; midx++) {
+            __m512 blockSums[inputRows][weightRows];
+            for (int inputRow = 0; inputRow < inputRows; inputRow++) {
+                for (int weightRow = 0; weightRow < weightRows;
+                     weightRow++) {
+                    blockSums[inputRow][weightRow] = _mm512_setzero_ps();
+                }
+            }
+
+            int l = midx * blockM;
+            const int blockEnd = std::min(m, l + blockM);
+            for (; l + 31 < blockEnd; l += 32) {
+                __m512bh inputs[inputRows];
+                for (int inputRow = 0; inputRow < inputRows; inputRow++) {
+                    inputs[inputRow] = (__m512bh)_mm512_loadu_si512(
+                        (const __m512i*)(inputData +
+                            (size_t)inputRow * m + l));
+                }
+                for (int weightRow = 0; weightRow < weightRows;
+                     weightRow++) {
+                    const __m512bh weight =
+                        FP8E4M3ToMagicBFloat16_AVX512BF16(
+                            weightData +
+                            (size_t)(rowStart + weightRow) * m + l);
+                    for (int inputRow = 0; inputRow < inputRows;
+                         inputRow++) {
+                        blockSums[inputRow][weightRow] =
+                            _mm512_dpbf16_ps(
+                                blockSums[inputRow][weightRow],
+                                inputs[inputRow], weight);
+                    }
+                }
+            }
+
+            for (int weightRow = 0; weightRow < weightRows;
+                 weightRow++) {
+                const float scale = scales[
+                    (rowStart + weightRow) / blockK * ms + midx];
+                const __m512 scaleVector = _mm512_set1_ps(scale);
+                for (int inputRow = 0; inputRow < inputRows;
+                     inputRow++) {
+                    sums[inputRow][weightRow] = _mm512_fmadd_ps(
+                        blockSums[inputRow][weightRow], scaleVector,
+                        sums[inputRow][weightRow]);
+                }
+            }
+        }
+
+        for (int inputRow = 0; inputRow < inputRows; inputRow++) {
+            for (int weightRow = 0; weightRow < weightRows;
+                 weightRow++) {
+                const int outputRow = rowStart + weightRow;
+                const float bias = biasData == nullptr ?
+                    0.0f : biasData[outputRow];
+                outputData[(size_t)inputRow * k + outputRow] =
+                    bias + _mm512_reduce_add_ps(
+                        sums[inputRow][weightRow]) * magicScale;
+            }
+        }
+    }
+
+    static int GetFP8DecodeRowTile_AVX512BF16() {
+        // Read this once so the GEMV hot path remains a simple, predictable
+        // row loop.  Model setup may select four rows, while an explicit value
+        // of one provides an independent fallback on another CPU.
+        static const int tile = []() {
+            const char *value = std::getenv(
+                "FASTLLM_CPU_FP8_DECODE_ROW_TILE");
+            if (value == nullptr || value[0] == '\0') {
+                return 1;
+            }
+            const int requested = std::atoi(value);
+            return requested >= 8 ? 8 : requested >= 4 ? 4 :
+                   requested >= 2 ? 2 : 1;
+        }();
+        return tile;
+    }
+
+    static bool GetFP8SmallBatchEnabled_AVX512BF16() {
+        static const bool enabled = []() {
+            const char *value = std::getenv(
+                "FASTLLM_CPU_FP8_SMALL_BATCH");
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "off") != 0;
+        }();
+        return enabled;
+    }
+
+#endif
+
     bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, 
                         int ks, int ms, float magicScale) {
@@ -309,6 +487,69 @@ namespace fastllm {
             }
             return LinearBFloat16BFloat16_AVX512BF16_Kernel(inputData, tempBF16.data(), biasData ? biasData + st : nullptr, 
                 outputData + st, n, m, k, 0, end - st);
+        }
+
+        if (n >= 2 && n <= 5 && GetFP8SmallBatchEnabled_AVX512BF16()) {
+            int row = st;
+            if (n == 2) {
+                for (; row + 4 <= end; row += 4) {
+                    LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<2, 4>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            } else if (n == 3) {
+                for (; row + 2 <= end; row += 2) {
+                    LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<3, 2>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            } else if (n == 4) {
+                for (; row + 2 <= end; row += 2) {
+                    LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<4, 2>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            } else {
+                for (; row + 2 <= end; row += 2) {
+                    LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<5, 2>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            }
+            if (row == end) {
+                return true;
+            }
+            st = row;
+        }
+
+        if (n == 1) {
+            int row = st;
+            const int tile = GetFP8DecodeRowTile_AVX512BF16();
+            if (tile >= 8) {
+                for (; row + 8 <= end; row += 8) {
+                    LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<8>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            }
+            if (tile >= 4) {
+                for (; row + 4 <= end; row += 4) {
+                    LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<4>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            }
+            if (tile >= 2) {
+                for (; row + 2 <= end; row += 2) {
+                    LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<2>(
+                        inputData, weightData, biasData, outputData,
+                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                }
+            }
+            if (row == end) {
+                return true;
+            }
+            st = row;
         }
 
         for (int i = 0; i < n; i++) {

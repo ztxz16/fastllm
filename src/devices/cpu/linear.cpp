@@ -833,10 +833,10 @@ namespace fastllm {
         static float magicScale = pow(2, 120);
         int ks = (k - 1) / blockK + 1;
         int ms = (m - 1) / blockM + 1;
-
         if (cpuInstructInfo.hasAVX512BF16) {
             if (LinearBFloat16FP8E4M3_AVX512BF16_Kernel(
-                inputData, weightData, biasData, outputData, n, m, k, st, end, blockK, blockM, scales, ks, ms, magicScale
+                inputData, weightData, biasData, outputData, n, m, k, st, end,
+                blockK, blockM, scales, ks, ms, magicScale
             )) {
                 return;
             }
@@ -2053,7 +2053,8 @@ namespace fastllm {
                 end = k;
             }
             ops[startTid + i] = new MultiThreadLinearBFloat16FP8E4M3Op(inputData, weight.cpuData, biasData, outputData,
-                                    n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM);
+                                    n, m, k, cur, end, weight.scales.data(),
+                                    weight.blockK, weight.blockM);
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
