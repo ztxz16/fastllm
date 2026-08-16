@@ -2101,7 +2101,9 @@ namespace fastllm {
         // Hash-route tables keep per-device CUDA replicas while the owning
         // Data is alive. Retire them before either this object or its CPU
         // allocation can be reused by a subsequently loaded model.
-        FastllmCudaReleaseDeepSeekV4RouteTableCache(this);
+        if (this->hasDeepSeekV4RouteTableCache) {
+            FastllmCudaReleaseDeepSeekV4RouteTableCache(this);
+        }
 
         // Retire routed-expert caches owned by this Data before its address can
         // be reused by a subsequently loaded model. These calls are no-ops for

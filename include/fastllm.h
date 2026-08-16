@@ -479,6 +479,10 @@ namespace fastllm {
 
 	    void *cudaData = nullptr;
         bool cudaDataBorrowed = false; // cudaData points into another owner and should not be freed directly
+        // Set only when this object owns entries in the DeepSeek-V4 CUDA
+        // route-table registry, so ordinary temporary tensors can skip the
+        // registry mutex in their destructor.
+        bool hasDeepSeekV4RouteTableCache = false;
         std::vector <void*> extraCudaData;
         std::vector <void*> extraCudaHalfData;
 

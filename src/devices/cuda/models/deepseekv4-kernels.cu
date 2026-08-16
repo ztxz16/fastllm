@@ -484,6 +484,7 @@ const void *DeepSeekV4GetCudaRouteTable(fastllm::Data &routeTable) {
     int device = FastllmCudaGetDevice();
 
     std::lock_guard<std::mutex> guard(DeepSeekV4RouteTableCacheMutex());
+    routeTable.hasDeepSeekV4RouteTableCache = true;
     DeepSeekV4RouteTableCacheEntry &entry =
         DeepSeekV4RouteTableCaches()[&routeTable][device];
     bool matches = entry.cudaData != nullptr &&
