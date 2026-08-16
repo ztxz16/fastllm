@@ -4243,6 +4243,123 @@ __global__ void DeepSeekV4SparseAttentionDecodeCachedBlockKernel(const QT *q, co
 }
 
 template <typename QT, typename CT>
+__global__ void DeepSeekV4SparseAttentionDecodeCachedGraphWarpKernel(
+        const QT *q, const float *windowKV, const CT *compressedKV,
+        const float *sink, float *output, int bsz, int seqlen, int heads,
+        int dim, int windowSize, int compressedStride,
+        int scoreCapacity, const int32_t *compressedIndices,
+        const int *compressedLengths, float softmaxScale,
+        const int32_t *decodeMeta, int compressRatio) {
+    extern __shared__ float scores[];
+    __shared__ float mxShared;
+    __shared__ float denomShared;
+
+    int bsh = blockIdx.x;
+    int h = bsh % heads;
+    int bs = bsh / heads;
+    int s = bs % seqlen;
+    int b = bs / seqlen;
+    int startPos = decodeMeta[0] + s;
+    int compressedCount = compressRatio > 0 ?
+        min((startPos + 1) / compressRatio, compressedStride) : 0;
+    int selectedCompressedCount = compressedIndices != nullptr &&
+                                  compressedLengths != nullptr ?
+                                  min(max(compressedLengths[s], 0),
+                                      kDeepSeekV4IndexerTopK) :
+                                  compressedCount;
+    int liveWindow = min(startPos + 1, windowSize);
+    int idxCount = liveWindow + selectedCompressedCount;
+    if (idxCount <= 0 || idxCount > scoreCapacity ||
+        idxCount > kDeepSeekV4SparseDecodeMaxKeys) {
+        return;
+    }
+
+    const QT *qrow = q +
+        (((uint64_t)b * seqlen + s) * heads + h) * dim;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int ringPos = startPos % windowSize;
+    const bool ringFull = startPos >= windowSize - 1;
+    for (int base = 0; base < idxCount; base += warps) {
+        int k = base + warp;
+        float dot = 0.0f;
+        if (k < idxCount) {
+            int idx;
+            if (k < liveWindow) {
+                idx = ringFull ? (ringPos + 1 + k) % windowSize : k;
+            } else {
+                int compressedOffset = k - liveWindow;
+                idx = windowSize + (compressedIndices != nullptr ?
+                    compressedIndices[(uint64_t)s *
+                        kDeepSeekV4IndexerTopK + compressedOffset] :
+                    compressedOffset);
+            }
+            for (int d = lane; d < dim; d += 32) {
+                float kv = idx < windowSize ?
+                    windowKV[((uint64_t)b * windowSize + idx) * dim + d] :
+                    Dsv4ToFloat(compressedKV[
+                        ((uint64_t)b * compressedStride +
+                         idx - windowSize) * dim + d]);
+                dot += Dsv4ToFloat(qrow[d]) * kv;
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0 && k < idxCount) {
+            scores[k] = dot * softmaxScale;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float mx = -INFINITY;
+        for (int k = 0; k < idxCount; k++) {
+            mx = fmaxf(mx, scores[k]);
+        }
+        mxShared = isfinite(mx) ? mx : 0.0f;
+        float denom = expf(sink[h] - mxShared);
+        for (int k = 0; k < idxCount; k++) {
+            denom += expf(scores[k] - mxShared);
+        }
+        denomShared = fmaxf(denom, 1e-30f);
+    }
+    __syncthreads();
+
+    for (int k = threadIdx.x; k < idxCount; k += blockDim.x) {
+        scores[k] = expf(scores[k] - mxShared) / denomShared;
+    }
+    __syncthreads();
+
+    float *orow = output +
+        (((uint64_t)b * seqlen + s) * heads + h) * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float value = 0.0f;
+        for (int k = 0; k < idxCount; k++) {
+            int idx;
+            if (k < liveWindow) {
+                idx = ringFull ? (ringPos + 1 + k) % windowSize : k;
+            } else {
+                int compressedOffset = k - liveWindow;
+                idx = windowSize + (compressedIndices != nullptr ?
+                    compressedIndices[(uint64_t)s *
+                        kDeepSeekV4IndexerTopK + compressedOffset] :
+                    compressedOffset);
+            }
+            float kv = idx < windowSize ?
+                windowKV[((uint64_t)b * windowSize + idx) * dim + d] :
+                Dsv4ToFloat(compressedKV[
+                    ((uint64_t)b * compressedStride +
+                     idx - windowSize) * dim + d]);
+            value += scores[k] * kv;
+        }
+        orow[d] = value;
+    }
+}
+
+template <typename QT, typename CT>
 __global__ void DeepSeekV4SparseAttentionDecodeCachedOnlineKernel(const QT *q, const float *windowKV,
                                                                   const CT *compressedKV, const float *sink,
                                                                   float *output, int bsz, int seqlen,
@@ -9222,6 +9339,75 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraph(
             q, windowKV, compressedKV, attnSink, windowSize, compressRatio,
             decodeMeta, softmaxScale, cudaTemp);
     int blocks = bsz * seqlen * heads;
+    bool useGraphWarp = std::getenv(
+        "FASTLLM_DSV4_DISABLE_GRAPH_WARP_SPARSE_DECODE") == nullptr;
+    int graphWarpThreads = dim >= 512 ? 512 : 256;
+    int scoreCapacity = windowSize + (hasIndexerIndices ?
+        kDeepSeekV4IndexerTopK : compressedCapacity);
+    size_t scoreBytes = (size_t)scoreCapacity * sizeof(float);
+    if (!ok && useGraphWarp && scoreCapacity > 0) {
+        if (q.dataType == fastllm::DataType::BFLOAT16 &&
+            compressedKV.dataType == fastllm::DataType::BFLOAT16) {
+            auto kernel =
+                DeepSeekV4SparseAttentionDecodeCachedGraphWarpKernel<
+                    __nv_bfloat16, __nv_bfloat16>;
+            if (DeepSeekV4EnsureDynamicSharedMemory(kernel, scoreBytes)) {
+                kernel<<<blocks, graphWarpThreads, scoreBytes>>>(
+                    (const __nv_bfloat16 *)q.cudaData,
+                    (const float *)windowKV.cudaData,
+                    (const __nv_bfloat16 *)compressedKV.cudaData,
+                    (const float *)attnSink.cudaData, cudaTemp,
+                    bsz, seqlen, heads, dim, windowSize,
+                    compressedCapacity, scoreCapacity,
+                    hasIndexerIndices ?
+                        (const int32_t *)compressedIndices->cudaData : nullptr,
+                    hasIndexerIndices ?
+                        (const int *)compressedLengths->cudaData : nullptr,
+                    softmaxScale, decodeMeta, compressRatio);
+                ok = true;
+            }
+        } else if (q.dataType == fastllm::DataType::FLOAT16 &&
+                   compressedKV.dataType == fastllm::DataType::BFLOAT16) {
+            auto kernel =
+                DeepSeekV4SparseAttentionDecodeCachedGraphWarpKernel<
+                    half, __nv_bfloat16>;
+            if (DeepSeekV4EnsureDynamicSharedMemory(kernel, scoreBytes)) {
+                kernel<<<blocks, graphWarpThreads, scoreBytes>>>(
+                    (const half *)q.cudaData,
+                    (const float *)windowKV.cudaData,
+                    (const __nv_bfloat16 *)compressedKV.cudaData,
+                    (const float *)attnSink.cudaData, cudaTemp,
+                    bsz, seqlen, heads, dim, windowSize,
+                    compressedCapacity, scoreCapacity,
+                    hasIndexerIndices ?
+                        (const int32_t *)compressedIndices->cudaData : nullptr,
+                    hasIndexerIndices ?
+                        (const int *)compressedLengths->cudaData : nullptr,
+                    softmaxScale, decodeMeta, compressRatio);
+                ok = true;
+            }
+        } else if (q.dataType == fastllm::DataType::FLOAT32 &&
+                   compressedKV.dataType == fastllm::DataType::BFLOAT16) {
+            auto kernel =
+                DeepSeekV4SparseAttentionDecodeCachedGraphWarpKernel<
+                    float, __nv_bfloat16>;
+            if (DeepSeekV4EnsureDynamicSharedMemory(kernel, scoreBytes)) {
+                kernel<<<blocks, graphWarpThreads, scoreBytes>>>(
+                    (const float *)q.cudaData,
+                    (const float *)windowKV.cudaData,
+                    (const __nv_bfloat16 *)compressedKV.cudaData,
+                    (const float *)attnSink.cudaData, cudaTemp,
+                    bsz, seqlen, heads, dim, windowSize,
+                    compressedCapacity, scoreCapacity,
+                    hasIndexerIndices ?
+                        (const int32_t *)compressedIndices->cudaData : nullptr,
+                    hasIndexerIndices ?
+                        (const int *)compressedLengths->cudaData : nullptr,
+                    softmaxScale, decodeMeta, compressRatio);
+                ok = true;
+            }
+        }
+    }
     if (!ok) {
         if (q.dataType == fastllm::DataType::BFLOAT16 &&
             compressedKV.dataType == fastllm::DataType::BFLOAT16) {
