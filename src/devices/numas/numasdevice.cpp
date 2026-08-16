@@ -711,6 +711,8 @@ namespace fastllm {
         int m, k, kPer;
         int rowsPerTask;
         int chunksPerExpert;
+        bool useNvfp4FullBlocks;
+        bool useNvfp4ScaleLookup;
 
         DeepSeekV4NumasGemmQueueContext(
             const std::vector<std::pair<int, float>> *experts,
@@ -727,7 +729,15 @@ namespace fastllm {
             weightOffset(weightOffset), nid(nid),
             m(m), k(k), kPer(kPer), rowsPerTask(rowsPerTask),
             chunksPerExpert(
-                (kPer + rowsPerTask - 1) / rowsPerTask) {}
+                (kPer + rowsPerTask - 1) / rowsPerTask),
+            useNvfp4FullBlocks(
+                std::getenv(
+                    "FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_FULL_BLOCKS") ==
+                nullptr),
+            useNvfp4ScaleLookup(
+                std::getenv(
+                    "FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_SCALE_LUT") ==
+                nullptr) {}
 
         int TaskCount() const {
             return (int)experts->size() * chunksPerExpert;
@@ -764,19 +774,35 @@ namespace fastllm {
                 context->outputData +
                 (size_t)expertIdx * context->k +
                 (size_t)context->nid * context->kPer);
-            FastllmGemm(
-                1, context->m, context->k,
-                input,
-                GetDataBytes(
-                    context->inputDataType, 1, context->m),
-                weight->numasData[context->nid],
-                GetDataBytes(
-                    weight->GetDataType(), 1, context->m),
-                output,
-                GetDataBytes(DataType::FLOAT32, 1, context->k),
-                st, end,
-                context->inputDataType, weight->GetDataType(),
-                DataType::FLOAT32);
+            const long inputStride = GetDataBytes(
+                context->inputDataType, 1, context->m);
+            const long weightStride = GetDataBytes(
+                weight->GetDataType(), 1, context->m);
+            const long outputStride = GetDataBytes(
+                DataType::FLOAT32, 1, context->k);
+            bool fullBlocks = false;
+            if (context->useNvfp4FullBlocks &&
+                context->inputDataType == DataType::BFLOAT16 &&
+                weight->GetDataType() ==
+                    DataType::NVFP4_BLOCK_32_E8M0 &&
+                (context->m & 31) == 0) {
+                fullBlocks =
+                    FastllmGemmBFloat16NVFP4Block32E8M0FullBlocks_AVX512BF16(
+                        input, inputStride,
+                        weight->numasData[context->nid], weightStride,
+                        output, outputStride,
+                        1, context->m, context->k, st, end,
+                        context->useNvfp4ScaleLookup);
+            }
+            if (!fullBlocks) {
+                FastllmGemm(
+                    1, context->m, context->k,
+                    input, inputStride,
+                    weight->numasData[context->nid], weightStride,
+                    output, outputStride, st, end,
+                    context->inputDataType, weight->GetDataType(),
+                    DataType::FLOAT32);
+            }
         }
 
         void Run() override {

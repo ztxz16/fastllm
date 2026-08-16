@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <array>
 #include <vector>
 #include <cstring>
 #include <algorithm>
@@ -857,6 +858,18 @@ namespace fastllm {
         return ret;
     }
 
+    alignas(64) static const std::array<float, 256>
+    NVFP4_E8M0_COMBINED_SCALE_LOOKUP = []() {
+        std::array<float, 256> values{};
+        for (int value = 0; value < 256; value++) {
+            uint32_t bits = value <= 190 ?
+                (uint32_t)(value == 0 ? 64 : value + 64) << 23 :
+                (uint32_t)value << 23;
+            memcpy(&values[value], &bits, sizeof(bits));
+        }
+        return values;
+    }();
+
     static inline float GetNVFP4ScaleValue(const float *scales, const uint8_t *scaleBytes, size_t idx) {
         return scales != nullptr ? scales[idx] : NVFP4E8M0ScaleToFloatFast(scaleBytes[idx]);
     }
@@ -1338,7 +1351,8 @@ namespace fastllm {
                 A, lda, B, ldb, C, ldc, n, m, k, st, end);
     }
 
-    template <int ROWS, bool useLookup>
+    template <int ROWS, bool useLookup, bool fullBlocks = false,
+              bool useScaleLookup = false>
     static bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run(
         const void *A, long lda,
         const void *B, long ldb,
@@ -1351,7 +1365,9 @@ namespace fastllm {
         const __m512 magicVec = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
         const __m512i bf16Lookup =
             NVFP4BFloat16Lookup_AVX512BF16();
-        const int blocks = (m + 31) / 32;
+        const float *combinedScaleLookup = useScaleLookup ?
+            NVFP4_E8M0_COMBINED_SCALE_LOOKUP.data() : nullptr;
+        const int blocks = fullBlocks ? m / 32 : (m + 31) / 32;
         for (int j = st; j < end; j++) {
             const uint8_t *rowStart =
                 (const uint8_t*)B + (size_t)j * ldb;
@@ -1364,7 +1380,10 @@ namespace fastllm {
                 const uint8_t scaleByte = blockStart[16];
                 const bool fuseMagicScale = scaleByte <= 190;
                 __m512 scaleVec;
-                if (fuseMagicScale) {
+                if constexpr (useScaleLookup) {
+                    scaleVec = _mm512_set1_ps(
+                        combinedScaleLookup[scaleByte]);
+                } else if (fuseMagicScale) {
                     // Both E8M0 and the internal magic compensation are
                     // powers of two.  In this exponent range their product
                     // is finite, so fold them into one exact scale and
@@ -1381,7 +1400,6 @@ namespace fastllm {
                         NVFP4E8M0ScaleToFloatFast(scaleByte));
                 }
                 const int l = block * 32;
-                const int blockElems = std::min(32, m - l);
                 const __m512bh vw =
                     NVFP4ToBFloat16Linear_AVX512BF16<useLookup>(
                         blockStart, bf16Lookup);
@@ -1389,12 +1407,19 @@ namespace fastllm {
                     const uint16_t *input =
                         (const uint16_t*)((const uint8_t*)A +
                             (size_t)row * lda);
-                    const __m512bh vi = blockElems == 32 ?
-                        (__m512bh)_mm512_loadu_si512(
-                            (const __m512i*)(input + l)) :
-                        (__m512bh)_mm512_maskz_loadu_epi16(
-                            (__mmask32)((1u << blockElems) - 1u),
-                            input + l);
+                    __m512bh vi;
+                    if constexpr (fullBlocks) {
+                        vi = (__m512bh)_mm512_loadu_si512(
+                            (const __m512i*)(input + l));
+                    } else {
+                        const int blockElems = std::min(32, m - l);
+                        vi = blockElems == 32 ?
+                            (__m512bh)_mm512_loadu_si512(
+                                (const __m512i*)(input + l)) :
+                            (__m512bh)_mm512_maskz_loadu_epi16(
+                                (__mmask32)((1u << blockElems) - 1u),
+                                input + l);
+                    }
                     const __m512 sum = _mm512_dpbf16_ps(
                         _mm512_setzero_ps(), vi, vw);
                     const __m512 adjustedSum = fuseMagicScale ?
@@ -1413,6 +1438,41 @@ namespace fastllm {
 #else
         return false;
 #endif
+    }
+
+    bool FastllmGemmBFloat16NVFP4Block32E8M0FullBlocks_AVX512BF16(
+        const void *A, long lda,
+        const void *B, long ldb,
+        void *C, long ldc,
+        int n, int m, int k, int st, int end,
+        bool useScaleLookup
+    ) {
+        if ((m & 31) != 0) {
+            return false;
+        }
+#define FASTLLM_RUN_NVFP4_BLOCK32_FULL(ROWS) \
+        if (useScaleLookup) { \
+            return FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run< \
+                ROWS, true, true, true>( \
+                A, lda, B, ldb, C, ldc, m, st, end); \
+        } \
+        return FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run< \
+            ROWS, true, true, false>( \
+            A, lda, B, ldb, C, ldc, m, st, end)
+        switch (n) {
+            case 1: FASTLLM_RUN_NVFP4_BLOCK32_FULL(1);
+            case 2: FASTLLM_RUN_NVFP4_BLOCK32_FULL(2);
+            case 3: FASTLLM_RUN_NVFP4_BLOCK32_FULL(3);
+            case 4: FASTLLM_RUN_NVFP4_BLOCK32_FULL(4);
+            case 5: FASTLLM_RUN_NVFP4_BLOCK32_FULL(5);
+            case 6: FASTLLM_RUN_NVFP4_BLOCK32_FULL(6);
+            case 7: FASTLLM_RUN_NVFP4_BLOCK32_FULL(7);
+            case 8: FASTLLM_RUN_NVFP4_BLOCK32_FULL(8);
+            default: break;
+        }
+#undef FASTLLM_RUN_NVFP4_BLOCK32_FULL
+        (void)k;
+        return false;
     }
 
     bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
