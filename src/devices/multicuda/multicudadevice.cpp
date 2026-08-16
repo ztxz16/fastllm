@@ -4068,6 +4068,150 @@ namespace fastllm {
         data.tpGlobalDims = data.dims;
     }
 
+    struct MultiCudaAsyncMLPHandle {
+        std::vector<std::unique_ptr<MultiThreadBaseOp> > ownedOps;
+        std::vector<MultiCudaDedicatedWorker*> workers;
+        std::vector<uint64_t> targetIds;
+        std::vector<int> devices;
+        Data *output = nullptr;
+        bool finished = false;
+
+        ~MultiCudaAsyncMLPHandle() {
+            if (finished || workers.empty()) {
+                return;
+            }
+            // An exception between begin and finish must not release tensor
+            // arguments while worker-stream kernels can still reference them.
+            WaitMultiCudaDeviceOps(workers, targetIds);
+            int originalDevice = FastllmCudaGetDevice();
+            for (int device : devices) {
+                FastllmCudaSyncDevice(device);
+            }
+            FastllmCudaSetDevice(originalDevice);
+        }
+    };
+
+    std::shared_ptr<MultiCudaAsyncMLPHandle>
+    MultiCudaBeginMLPKeepReplicated(
+            Data &input, Data &gateupWeight, Data &downWeight,
+            Data &gateupOutput, Data &swigluOutput, Data &output) {
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || currentMultiCudaDedicatedWorker != nullptr ||
+            !input.multiDeviceData || !input.IsTensorParallelReplicated()) {
+            return nullptr;
+        }
+
+        AssertInFastLLM(
+            gateupWeight.dims.size() == 2 && downWeight.dims.size() == 2,
+            "Asynchronous MultiCUDA MLP weights should be 2D.\n");
+        AssertInFastLLM(
+            !input.dims.empty() &&
+                input.dims.back() == gateupWeight.dims[1] &&
+                gateupWeight.dims[0] / 2 == downWeight.dims[1],
+            "Asynchronous MultiCUDA MLP weight shape mismatch.\n");
+        AssertInFastLLM(
+            gateupWeight.dataType == downWeight.dataType,
+            "Asynchronous MultiCUDA MLP weight type mismatch.\n");
+
+        gateupWeight.weightType = WeightType::LINEAR;
+        downWeight.weightType = WeightType::LINEAR;
+        std::vector<int> outputDims = input.dims;
+        outputDims.back() = downWeight.dims[0];
+        output.dataType = input.dataType;
+        output.Resize(outputDims);
+        output.Allocate();
+
+        const int mid = gateupWeight.dims[0] / 2;
+        const int unit = GetMultiCudaSplitUnit(gateupWeight, downWeight);
+        AssertInFastLLM(
+            (!IsGGUFTensor(gateupWeight) && !IsGGUFTensor(downWeight)) ||
+                mid % unit == 0,
+            "GGUF asynchronous MultiCUDA MLP requires aligned split unit " +
+                std::to_string(unit) + ".\n");
+        std::vector<int> points = FastllmMultiCudaGetSplitPoints(
+            devices, ratios, mid, unit);
+        if (points.size() != devices.size() + 1 ||
+            !FastllmInitNccl(devices)) {
+            return nullptr;
+        }
+
+        DivisionScheme gateupDivision, downDivision;
+        for (int i = 0; i < (int)devices.size(); i++) {
+            const int st = points[i];
+            const int end = points[i + 1];
+            gateupDivision[devices[i]].push_back({st, end});
+            gateupDivision[devices[i]].push_back({mid + st, mid + end});
+            downDivision[devices[i]].push_back({st, end});
+        }
+        Data emptyBias;
+        if (!SplitMultiCudaWeight(
+                gateupWeight, emptyBias, devices, gateupDivision, 0) ||
+            !SplitMultiCudaWeight(
+                downWeight, emptyBias, devices, downDivision, 1)) {
+            return nullptr;
+        }
+
+        CopyToMultiDevices(gateupOutput, devices, false);
+        CopyToMultiDevices(swigluOutput, devices, false);
+        EnsureReplicatedMultiCudaTensor(input, devices, true);
+        output.dataDevice = input.dataDevice;
+        EnsureReplicatedMultiCudaTensor(output, devices, false);
+
+        auto handle = std::make_shared<MultiCudaAsyncMLPHandle>();
+        handle->devices = devices;
+        handle->output = &output;
+        std::vector<MultiThreadBaseOp*> ops;
+        ops.reserve(devices.size());
+        handle->ownedOps.reserve(devices.size());
+        for (int device : devices) {
+            handle->ownedOps.emplace_back(new MultiCudaDoMergeMLPOp(
+                (uint8_t*)input.cudaData, (uint8_t*)input.cudaData,
+                input.multiDeviceDatas.at(device),
+                gateupWeight.multiDeviceDatas.at(device), nullptr,
+                downWeight.multiDeviceDatas.at(device), nullptr,
+                swigluOutput.multiDeviceDatas.at(device),
+                // MultiCudaDoMergeMLPOp retains this legacy scratch argument
+                // but does not access it; alias the gateup workspace.
+                gateupOutput.multiDeviceDatas.at(device),
+                gateupOutput.multiDeviceDatas.at(device),
+                output.multiDeviceDatas.at(device), device));
+            ops.push_back(handle->ownedOps.back().get());
+        }
+
+        if (!SubmitOrderedMultiCudaDeviceOps(
+                devices, ops, handle->workers, handle->targetIds)) {
+            return nullptr;
+        }
+        return handle;
+    }
+
+    bool MultiCudaFinishMLPKeepReplicated(
+            std::shared_ptr<MultiCudaAsyncMLPHandle> &handle) {
+        if (handle == nullptr || handle->finished || handle->output == nullptr ||
+            handle->workers.size() != handle->devices.size()) {
+            return false;
+        }
+        WaitMultiCudaDeviceOps(handle->workers, handle->targetIds);
+        int originalDevice = FastllmCudaGetDevice();
+        for (int i = 0; i < (int)handle->devices.size(); ++i) {
+            FastllmCudaSetDevice(handle->devices[i]);
+            // NUMA MoE is normally substantially longer than this shared
+            // expert, so the event is already complete here.  Make that
+            // lifetime boundary explicit instead of leaving a reusable
+            // worker event pending on a later caller-stream handoff.
+            FastllmCudaEventSynchronize(
+                handle->workers[i]->GetCompletionEvent());
+        }
+        FastllmCudaSetDevice(originalDevice);
+        SyncReplicatedRootMetaFromDevice0(
+            *handle->output, handle->devices);
+        handle->finished = true;
+        handle.reset();
+        return true;
+    }
+
     struct MultiCudaRepeatBroadcastOp : MultiThreadBaseOp {
         Data *rootInput;
         Data *localInput;

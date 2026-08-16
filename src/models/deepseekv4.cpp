@@ -39,6 +39,7 @@
 #include <condition_variable>
 #include <functional>
 #include <cstdio>
+#include <optional>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -223,6 +224,12 @@ namespace fastllm {
                                    const std::vector<int> &dims,
                                    Data &output, DataType dtype);
 
+        struct DeepSeekV4NumasMoeCpuInputWorkspace {
+            Data input;
+            Data index;
+            Data score;
+        };
+
 #ifdef USE_CUDA
         static int GetTensorCudaDevice(const Data &data) {
             if (data.cudaData != nullptr) {
@@ -265,47 +272,162 @@ namespace fastllm {
             return GetTensorCudaReplica(const_cast<Data&>(data), device);
         }
 
-        static bool CopyDeepSeekV4CudaTensorToCpu(
-            const Data &source, Data &destination
+        static DeepSeekV4NumasMoeCpuInputWorkspace &
+        GetDeepSeekV4NumasMoeCpuInputWorkspace() {
+            static thread_local DeepSeekV4NumasMoeCpuInputWorkspace
+                workspace;
+            return workspace;
+        }
+
+        static bool CopyDeepSeekV4CudaTensorsToCpu(
+            const std::vector<const Data*> &sources,
+            const std::vector<Data*> &destinations
         ) {
-            int device = GetTensorCudaDevice(source);
-            if (device < 0) {
+            if (sources.empty() || sources.size() != destinations.size()) {
                 return false;
             }
-            const Data *replica =
-                GetTensorCudaReplica(source, device);
-            if (replica == nullptr || replica->cudaData == nullptr ||
-                replica->dataType != source.dataType ||
-                replica->dims != source.dims) {
-                return false;
+
+            int device = -1;
+            std::vector<const Data*> replicas;
+            replicas.reserve(sources.size());
+            for (int i = 0; i < (int)sources.size(); i++) {
+                const Data *source = sources[i];
+                Data *destination = destinations[i];
+                if (source == nullptr || destination == nullptr) {
+                    return false;
+                }
+                int sourceDevice = GetTensorCudaDevice(*source);
+                if (sourceDevice < 0 ||
+                    (device >= 0 && sourceDevice != device)) {
+                    return false;
+                }
+                device = sourceDevice;
+                const Data *replica =
+                    GetTensorCudaReplica(*source, device);
+                if (replica == nullptr || replica->cudaData == nullptr ||
+                    replica->dataType != source->dataType ||
+                    replica->dims != source->dims) {
+                    return false;
+                }
+                destination->dataType = source->dataType;
+                destination->Resize(source->dims);
+                destination->Allocate(false);
+                replicas.push_back(replica);
             }
-            destination.dataType = source.dataType;
-            destination.Resize(source.dims);
-            destination.Allocate(false);
+
             FastllmCudaSetDevice(device);
+            const bool useAsyncPrecopy =
+                !sources[0]->dims.empty() &&
+                sources[0]->Count(0) ==
+                    sources[0]->dims.back() &&
+                std::getenv(
+                    "FASTLLM_DSV4_DISABLE_NUMAS_MOE_ASYNC_PRECOPY") ==
+                    nullptr;
+            if (useAsyncPrecopy) {
+                struct PinnedPrecopyWorkspace {
+                    void *data = nullptr;
+                    size_t bytes = 0;
+
+                    ~PinnedPrecopyWorkspace() {
+                        if (data != nullptr) {
+                            FastllmCudaHostFree(data);
+                        }
+                    }
+
+                    bool Ensure(size_t required) {
+                        if (data != nullptr && bytes >= required) {
+                            return true;
+                        }
+                        if (data != nullptr) {
+                            FastllmCudaHostFree(data);
+                            data = nullptr;
+                            bytes = 0;
+                        }
+                        data = FastllmCudaHostMalloc(required);
+                        if (data == nullptr) {
+                            return false;
+                        }
+                        bytes = required;
+                        return true;
+                    }
+                };
+                static thread_local PinnedPrecopyWorkspace workspace;
+                size_t totalBytes = 0;
+                for (const Data *replica : replicas) {
+                    totalBytes += replica->GetBytes();
+                }
+                if (workspace.Ensure(totalBytes)) {
+                    bool workerOrdered =
+                        MultiCudaCurrentThreadWaitForWorker(device);
+                    if (!workerOrdered) {
+                        FastllmCudaSyncDevice(device);
+                    }
+                    bool queued = true;
+                    size_t offset = 0;
+                    for (const Data *replica : replicas) {
+                        const size_t bytes = replica->GetBytes();
+                        queued &=
+                            FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
+                                (uint8_t*)workspace.data + offset,
+                                replica->cudaData, bytes);
+                        offset += bytes;
+                    }
+                    FastllmCudaSyncCurrentThreadStream();
+                    if (queued) {
+                        offset = 0;
+                        for (int i = 0;
+                             i < (int)replicas.size(); i++) {
+                            const size_t bytes =
+                                replicas[i]->GetBytes();
+                            memcpy(
+                                destinations[i]->cpuData,
+                                (uint8_t*)workspace.data + offset,
+                                bytes);
+                            destinations[i]->cudaData =
+                                replicas[i]->cudaData;
+                            destinations[i]->cudaDataBorrowed = true;
+                            destinations[i]->dataDeviceIds = {device};
+                            offset += bytes;
+                        }
+                        return true;
+                    }
+                }
+            }
             // Persistent tensor-parallel operators publish their results from
             // per-device worker streams.  RunMultiCudaDeviceOps wires those
             // completion events into the caller's per-thread stream, but the
-            // synchronous cudaMemcpy used below runs on CUDA's legacy copy
-            // path and does not reliably observe that stream dependency.
-            // Finish the caller stream explicitly before handing routing data
-            // to the NUMA MoE implementation.
+            // synchronous cudaMemcpy calls below run on CUDA's legacy copy
+            // path and do not reliably observe that stream dependency.
+            // All routing tensors are ordered on the same worker stream, so a
+            // single ready barrier covers the whole group.  This removes two
+            // stream synchronizations per MoE layer without changing the NUMA
+            // allocation or host-copy semantics.
             if (MultiCudaCurrentThreadWaitForWorker(device)) {
                 FastllmCudaSyncCurrentThreadStream();
             } else {
                 FastllmCudaSyncDevice(device);
             }
-            FastllmCudaCopyFromDeviceToHost(
-                destination.cpuData, replica->cudaData,
-                destination.GetBytes());
-            // Keep the source allocation as a non-owning mirror.  NUMA MoE
-            // uses the CPU copy for its local experts, while mixed inference
-            // can still recognize that this tensor genuinely came from CUDA
-            // and reuse the existing replica instead of staging it again.
-            destination.cudaData = replica->cudaData;
-            destination.cudaDataBorrowed = true;
-            destination.dataDeviceIds = {device};
+            for (int i = 0; i < (int)replicas.size(); i++) {
+                Data *destination = destinations[i];
+                const Data *replica = replicas[i];
+                FastllmCudaCopyFromDeviceToHost(
+                    destination->cpuData, replica->cudaData,
+                    destination->GetBytes());
+                // Keep the source allocation as a non-owning mirror.  NUMA
+                // MoE uses the CPU copy for its local experts, while mixed
+                // inference can still reuse the genuine CUDA replica.
+                destination->cudaData = replica->cudaData;
+                destination->cudaDataBorrowed = true;
+                destination->dataDeviceIds = {device};
+            }
             return true;
+        }
+
+        static bool CopyDeepSeekV4CudaTensorToCpu(
+            const Data &source, Data &destination
+        ) {
+            return CopyDeepSeekV4CudaTensorsToCpu(
+                {&source}, {&destination});
         }
 
         static bool DeepSeekV4NumasGpuPrefillEnabled() {
@@ -11913,16 +12035,39 @@ namespace fastllm {
                 // MOE
                 bool hasSharedExpertOut = false;
                 bool fuseSharedExpert = false;
+                bool parallelNumasSharedExpert = false;
+#ifdef USE_CUDA
+                std::shared_ptr<MultiCudaAsyncMLPHandle>
+                    sharedExpertAsync;
+#endif
                 Data *pairedReduceInput = nullptr;
                 std::vector<Data*> moeWeights = weights[layer];
                 auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
                 auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
-                Data preCopiedMoeInput;
-                Data preCopiedExpertIndex;
-                Data preCopiedExpertScore;
+                std::optional<DeepSeekV4NumasMoeCpuInputWorkspace>
+                    localPreCopyWorkspace;
+                DeepSeekV4NumasMoeCpuInputWorkspace *preCopyWorkspace =
+                    nullptr;
                 Data *routedMoeInput = &ffnInput;
                 Data *routedExpertIndex = &expertIndex;
                 Data *routedExpertScore = &expertScore;
+#ifdef USE_CUDA
+                if (std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_INPUT_WORKSPACE") ==
+                        nullptr &&
+                    !ffnInput.dims.empty() &&
+                    ffnInput.Count(0) == ffnInput.dims.back()) {
+                    preCopyWorkspace =
+                        &GetDeepSeekV4NumasMoeCpuInputWorkspace();
+                }
+#endif
+                if (preCopyWorkspace == nullptr) {
+                    localPreCopyWorkspace.emplace();
+                    preCopyWorkspace = &*localPreCopyWorkspace;
+                }
+                Data *preCopiedMoeInput = &preCopyWorkspace->input;
+                Data *preCopiedExpertIndex = &preCopyWorkspace->index;
+                Data *preCopiedExpertScore = &preCopyWorkspace->score;
 #ifdef USE_CUDA
                 bool preCopiedNumasMoeInputs = false;
                 bool canPreCopyNumasMoeInputs =
@@ -11949,18 +12094,16 @@ namespace fastllm {
                 }
                 if (canPreCopyNumasMoeInputs) {
                     preCopiedNumasMoeInputs =
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            ffnInput, preCopiedMoeInput) &&
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            expertIndex, preCopiedExpertIndex) &&
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            expertScore, preCopiedExpertScore);
+                        CopyDeepSeekV4CudaTensorsToCpu(
+                            {&ffnInput, &expertIndex, &expertScore},
+                            {preCopiedMoeInput, preCopiedExpertIndex,
+                             preCopiedExpertScore});
                     AssertInFastLLM(
                         preCopiedNumasMoeInputs,
                         "DeepSeek-V4 failed to copy tensor-parallel MoE inputs to NUMA.");
-                    routedMoeInput = &preCopiedMoeInput;
-                    routedExpertIndex = &preCopiedExpertIndex;
-                    routedExpertScore = &preCopiedExpertScore;
+                    routedMoeInput = preCopiedMoeInput;
+                    routedExpertIndex = preCopiedExpertIndex;
+                    routedExpertScore = preCopiedExpertScore;
                 }
 #endif
                 const bool routedTensorParallel =
@@ -11994,31 +12137,59 @@ namespace fastllm {
                         fuseSharedExpert =
                             routedExpertParallel && fuseSharedExpertRows;
                         if (!fuseSharedExpert) {
-                            Data sharedInput;
-                            Data *sharedInputPtr = &ffnInput;
-                            if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
-                                IsDeepSeekV4QuantizedLinearWeight(sharedGateupIt->second)) {
-                                DeepSeekV4QuantizeLinearActivationCpu(ffnInput, sharedInput);
-                                sharedInputPtr = &sharedInput;
-                            }
-                            LinearSwigluBlock(sharedInputPtr, &sharedGateupIt->second, GetEmptyData(),
-                                              &sharedW3, &sharedW1);
-                            const bool pairSharedReduction =
-                                routedTensorParallel &&
-                                dsparkGraphVerification &&
-                                DeepSeekV4PairedAllReduceEnabled();
-                            if (pairSharedReduction) {
+#ifdef USE_CUDA
+                            parallelNumasSharedExpert =
+                                !dsparkGraphVerification &&
+                                !EnvFlagEnabled(
+                                    "FASTLLM_DSV4_DISABLE_NUMAS_SHARED_"
+                                    "EXPERT_OVERLAP") &&
+                                preCopiedNumasMoeInputs &&
+                                ffnInput.dims.size() > 0 &&
+                                ffnInput.dims[0] == 1 &&
+                                ffnInput.multiDeviceData &&
+                                ffnInput.IsTensorParallelReplicated() &&
+                                GetReplicatedCudaDevices(ffnInput).size() > 1;
+#endif
+#ifdef USE_CUDA
+                            if (parallelNumasSharedExpert) {
+                                sharedExpertAsync =
+                                    MultiCudaBeginMLPKeepReplicated(
+                                        ffnInput, sharedGateupIt->second,
+                                        sharedDownIt->second, sharedW3,
+                                        sharedW1, sharedExpertOut);
                                 AssertInFastLLM(
-                                    DeepSeekV4LinearColumnLocal(
-                                        sharedW1, sharedDownIt->second,
-                                        *GetEmptyData(), sharedExpertOut),
-                                    "DeepSeek-V4 failed to defer the shared-expert TP reduction.\n");
-                                pairedReduceInput = &sharedExpertOut;
-                            } else {
-                                DeepSeekV4Linear(
-                                    sharedW1, sharedDownIt->second,
-                                    *GetEmptyData(), sharedExpertOut);
+                                    sharedExpertAsync != nullptr,
+                                    "DeepSeek-V4 failed to enqueue its MultiCUDA shared expert before NUMA MoE.\n");
                                 hasSharedExpertOut = true;
+                            } else
+#endif
+                            {
+                                Data sharedInput;
+                                Data *sharedInputPtr = &ffnInput;
+                                if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
+                                    IsDeepSeekV4QuantizedLinearWeight(sharedGateupIt->second)) {
+                                    DeepSeekV4QuantizeLinearActivationCpu(ffnInput, sharedInput);
+                                    sharedInputPtr = &sharedInput;
+                                }
+                                LinearSwigluBlock(sharedInputPtr, &sharedGateupIt->second, GetEmptyData(),
+                                                  &sharedW3, &sharedW1);
+                                const bool pairSharedReduction =
+                                    routedTensorParallel &&
+                                    dsparkGraphVerification &&
+                                    DeepSeekV4PairedAllReduceEnabled();
+                                if (pairSharedReduction) {
+                                    AssertInFastLLM(
+                                        DeepSeekV4LinearColumnLocal(
+                                            sharedW1, sharedDownIt->second,
+                                            *GetEmptyData(), sharedExpertOut),
+                                        "DeepSeek-V4 failed to defer the shared-expert TP reduction.\n");
+                                    pairedReduceInput = &sharedExpertOut;
+                                } else {
+                                    DeepSeekV4Linear(
+                                        sharedW1, sharedDownIt->second,
+                                        *GetEmptyData(), sharedExpertOut);
+                                    hasSharedExpertOut = true;
+                                }
                             }
                             moeWeights[0] = moeWeights[1] = nullptr;
                         }
@@ -12026,38 +12197,49 @@ namespace fastllm {
                 }
                 {
                     this->ApplyMoeDeviceMapForLayer(layer);
-                    DataType effectiveMoeAtype = ffnInput.dataType;
-                    Data moeQuantizedInput;
-                    Data *moeInput = routedMoeInput;
-                    if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
-                        moeWeights.size() > 2 && moeWeights[2] != nullptr &&
-                        IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
+                    auto runRoutedMoe = [&]() {
+                        DataType effectiveMoeAtype = ffnInput.dataType;
+                        Data moeQuantizedInput;
+                        Data *moeInput = routedMoeInput;
+                        if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
+                            moeWeights.size() > 2 && moeWeights[2] != nullptr &&
+                            IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
 #ifdef USE_CUDA
-                        int moeInputCudaDevice = GetTensorCudaDevice(*moeInput);
+                            int moeInputCudaDevice = GetTensorCudaDevice(*moeInput);
 #endif
-                        DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
+                            DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
 #ifdef USE_CUDA
-                        if (moeInputCudaDevice >= 0 &&
-                            moeQuantizedInput.dims.size() > 0 &&
-                            moeQuantizedInput.dims[0] >= 32 &&
-                            DeepSeekV4NumasGpuPrefillEnabled()) {
-                            AssertInFastLLM(
-                                AddDeepSeekV4QuantizedCudaReplica(
-                                    moeQuantizedInput, moeInputCudaDevice),
-                                "DeepSeek-V4 failed to stage its quantized NUMA MoE activation on CUDA.");
+                            if (moeInputCudaDevice >= 0 &&
+                                moeQuantizedInput.dims.size() > 0 &&
+                                moeQuantizedInput.dims[0] >= 32 &&
+                                DeepSeekV4NumasGpuPrefillEnabled()) {
+                                AssertInFastLLM(
+                                    AddDeepSeekV4QuantizedCudaReplica(
+                                        moeQuantizedInput, moeInputCudaDevice),
+                                    "DeepSeek-V4 failed to stage its quantized NUMA MoE activation on CUDA.");
+                            }
+#endif
+                            moeInput = &moeQuantizedInput;
                         }
-#endif
-                        moeInput = &moeQuantizedInput;
+                        MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
+                                      &moeWeights, &biass[layer],
+                                      &w1, &w2, &w3, &tempInput, &tempOutput,
+                                      1.0f, &ffnOut, layer,
+                                      ffnInput.dataType, effectiveMoeAtype,
+                                      &moeInputTemp, &moeOutputTemp,
+                                      MoeGateSwiglu, routedExpertParallel,
+                                      swiglu_limit, true,
+                                      pairedReduceInput);
+                    };
+                    runRoutedMoe();
+#ifdef USE_CUDA
+                    if (sharedExpertAsync != nullptr) {
+                        AssertInFastLLM(
+                            MultiCudaFinishMLPKeepReplicated(
+                                sharedExpertAsync),
+                            "DeepSeek-V4 failed to finish its asynchronous MultiCUDA shared expert.\n");
                     }
-                    MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
-                                  &moeWeights, &biass[layer],
-                                  &w1, &w2, &w3, &tempInput, &tempOutput,
-                                  1.0f, &ffnOut, layer,
-                                  ffnInput.dataType, effectiveMoeAtype,
-                                  &moeInputTemp, &moeOutputTemp,
-                                  MoeGateSwiglu, routedExpertParallel,
-                                  swiglu_limit, true,
-                                  pairedReduceInput);
+#endif
                     ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 }
 #ifdef USE_CUDA
@@ -12067,6 +12249,25 @@ namespace fastllm {
 #endif
                 {
                     if (hasSharedExpertOut) {
+#ifdef USE_CUDA
+                        if (std::getenv(
+                                "FASTLLM_DSV4_DISABLE_NUMAS_MOE_"
+                                "DIRECT_TP_REPLICA") == nullptr &&
+                            ffnOut.dataDevice == DataDevice::CPU &&
+                            ffnOut.cpuData != nullptr &&
+                            !ffnOut.dims.empty() &&
+                            ffnOut.Count(0) == ffnOut.dims.back() &&
+                            sharedExpertOut.multiDeviceData &&
+                            sharedExpertOut.IsTensorParallelReplicated()) {
+                            std::vector<int> replicaDevices =
+                                GetReplicatedCudaDevices(
+                                    sharedExpertOut);
+                            if (replicaDevices.size() > 1) {
+                                PrepareMultiCudaReplicatedData(
+                                    ffnOut, replicaDevices, true);
+                            }
+                        }
+#endif
                         if (!(ffnOut.multiDeviceData && sharedExpertOut.multiDeviceData)) {
                             ffnOut.ToDevice(sharedExpertOut.dataDevice);
                         }
@@ -13536,12 +13737,30 @@ namespace fastllm {
                 std::vector<Data*> moeWeights = weights[layer];
                 auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
                 auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
-                Data preCopiedMoeInput;
-                Data preCopiedExpertIndex;
-                Data preCopiedExpertScore;
+                std::optional<DeepSeekV4NumasMoeCpuInputWorkspace>
+                    localPreCopyWorkspace;
+                DeepSeekV4NumasMoeCpuInputWorkspace *preCopyWorkspace =
+                    nullptr;
                 Data *routedMoeInput = &ffnInput;
                 Data *routedExpertIndex = &expertIndex;
                 Data *routedExpertScore = &expertScore;
+#ifdef USE_CUDA
+                if (std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_INPUT_WORKSPACE") ==
+                        nullptr &&
+                    !ffnInput.dims.empty() &&
+                    ffnInput.Count(0) == ffnInput.dims.back()) {
+                    preCopyWorkspace =
+                        &GetDeepSeekV4NumasMoeCpuInputWorkspace();
+                }
+#endif
+                if (preCopyWorkspace == nullptr) {
+                    localPreCopyWorkspace.emplace();
+                    preCopyWorkspace = &*localPreCopyWorkspace;
+                }
+                Data *preCopiedMoeInput = &preCopyWorkspace->input;
+                Data *preCopiedExpertIndex = &preCopyWorkspace->index;
+                Data *preCopiedExpertScore = &preCopyWorkspace->score;
 #ifdef USE_CUDA
                 bool canPreCopyNumasMoeInputs =
                     std::getenv(
@@ -13555,18 +13774,16 @@ namespace fastllm {
                         this->SelectMoeDeviceForLayer(layer), "numa");
                 if (canPreCopyNumasMoeInputs) {
                     bool copied =
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            ffnInput, preCopiedMoeInput) &&
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            expertIndex, preCopiedExpertIndex) &&
-                        CopyDeepSeekV4CudaTensorToCpu(
-                            expertScore, preCopiedExpertScore);
+                        CopyDeepSeekV4CudaTensorsToCpu(
+                            {&ffnInput, &expertIndex, &expertScore},
+                            {preCopiedMoeInput, preCopiedExpertIndex,
+                             preCopiedExpertScore});
                     AssertInFastLLM(
                         copied,
                         "DeepSeek-V4 failed to copy batched tensor-parallel MoE inputs to NUMA.");
-                    routedMoeInput = &preCopiedMoeInput;
-                    routedExpertIndex = &preCopiedExpertIndex;
-                    routedExpertScore = &preCopiedExpertScore;
+                    routedMoeInput = preCopiedMoeInput;
+                    routedExpertIndex = preCopiedExpertIndex;
+                    routedExpertScore = preCopiedExpertScore;
                 }
 #endif
                 const bool routedTensorParallel =

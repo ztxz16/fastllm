@@ -116,6 +116,17 @@ namespace fastllm {
 
     bool MultiCudaLinearRow(Data &input, Data &weight, Data &bias, Data &output);
     bool MultiCudaLinearColumn(Data &input, Data &weight, Data &bias, Data &output);
+    struct MultiCudaAsyncMLPHandle;
+    // Submit gateup -> SwiGLU -> down as one asynchronous task per rank and
+    // retain the all-reduced result on every rank.  The caller may run CPU
+    // work between begin and finish; finish joins the worker streams back to
+    // the caller streams before the result is consumed.
+    std::shared_ptr<MultiCudaAsyncMLPHandle>
+    MultiCudaBeginMLPKeepReplicated(
+        Data &input, Data &gateupWeight, Data &downWeight,
+        Data &gateupOutput, Data &swigluOutput, Data &output);
+    bool MultiCudaFinishMLPKeepReplicated(
+        std::shared_ptr<MultiCudaAsyncMLPHandle> &handle);
     // Computes the rank-local column-linear partials without reducing them.
     // The returned tensor temporarily uses replicated storage so a following
     // fused collective can consume one partial from every device.

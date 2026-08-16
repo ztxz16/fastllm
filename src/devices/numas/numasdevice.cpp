@@ -102,6 +102,83 @@ namespace fastllm {
         void *cudaData = nullptr;
     };
 
+    static int GetNumasMoePreferredCudaDevice(const Data &input) {
+        if (input.cudaData != nullptr) {
+            int deviceId = GetPointerDeviceId(input.cudaData);
+            if (deviceId >= 0) {
+                return deviceId;
+            }
+        }
+        if (!input.dataDeviceIds.empty() && input.dataDeviceIds[0] >= 0) {
+            return input.dataDeviceIds[0];
+        }
+        return -1;
+    }
+
+    static void SortNumasMoeCudaInputReplicas(
+            std::vector<NumasMoeCudaInputReplica> &replicas,
+            int preferredDevice) {
+        std::sort(
+            replicas.begin(), replicas.end(),
+            [preferredDevice](const NumasMoeCudaInputReplica &a,
+                              const NumasMoeCudaInputReplica &b) {
+                const bool aPreferred = a.deviceId == preferredDevice;
+                const bool bPreferred = b.deviceId == preferredDevice;
+                if (aPreferred != bPreferred) {
+                    return aPreferred;
+                }
+                return a.deviceId < b.deviceId;
+            });
+    }
+
+    static std::vector<int> GetNumasMoeCudaAssistDevices() {
+        std::vector<int> devices;
+        std::set<int> seen;
+        auto appendDevice = [&](int device) {
+            // ParseDeviceIds uses 99999 as the CPU sentinel in mixed specs.
+            if (device >= 0 && device != 99999 && seen.insert(device).second) {
+                devices.push_back(device);
+            }
+        };
+
+        // Preserve the established tensor-parallel path.
+        std::vector<int> tpDevices;
+        std::map<int, int> tpRatios;
+        FastllmGetMulticudaDeviceAndRatio(tpDevices, tpRatios, true);
+        for (int device : tpDevices) {
+            appendDevice(device);
+        }
+
+        // A serial CUDA device map (for example cudapp=2, expanded to
+        // {'cuda:0': 1, 'cuda:1': 1}) does not populate MultiCUDA's rank set.
+        // NUMA GPU-prefill can nevertheless use every CUDA device as an
+        // independent expert worker because expert weights are streamed from
+        // host memory rather than tensor-parallel shards.
+        for (const auto &entry : GetDeviceMap()) {
+            if (entry.second <= 0) {
+                continue;
+            }
+            std::string deviceSpec = entry.first;
+            std::transform(
+                deviceSpec.begin(), deviceSpec.end(), deviceSpec.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            if (deviceSpec == "cuda") {
+                appendDevice(0);
+                continue;
+            }
+            if (deviceSpec.rfind("cuda:", 0) != 0) {
+                continue;
+            }
+            std::map<int, int> ratios;
+            for (int device : ParseDeviceIds(entry.first, "cuda", ratios)) {
+                appendDevice(device);
+            }
+        }
+
+        std::sort(devices.begin(), devices.end());
+        return devices;
+    }
+
     static std::vector<NumasMoeCudaInputReplica>
     GetNumasMoeCudaInputReplicas(const Data &input) {
         std::vector<NumasMoeCudaInputReplica> replicas;
@@ -126,12 +203,8 @@ namespace fastllm {
                 replicas.push_back({deviceId, input.cudaData});
             }
         }
-        std::sort(
-            replicas.begin(), replicas.end(),
-            [](const NumasMoeCudaInputReplica &a,
-               const NumasMoeCudaInputReplica &b) {
-                return a.deviceId < b.deviceId;
-            });
+        SortNumasMoeCudaInputReplicas(
+            replicas, GetNumasMoePreferredCudaDevice(input));
         return replicas;
     }
 #endif
@@ -6588,21 +6661,22 @@ namespace fastllm {
 #ifdef USE_CUDA
             std::vector<NumasMoeCudaInputReplica> cudaInputReplicas =
                 GetNumasMoeCudaInputReplicas(input);
-            // Supplement missing TP replicas only when the input already owns
-            // at least one valid CUDA mirror.  A CPU-only tensor must not be
-            // promoted to GPU merely because process-global MultiCUDA state
-            // still contains device ids from an earlier op.
+            // Supplement missing TP or serial-device-map replicas only when
+            // the input already owns at least one valid CUDA mirror.  A
+            // CPU-only tensor must not be promoted to GPU merely because
+            // process-global CUDA device state still contains ids from an
+            // earlier op.
             if (gpuPrefill && input.cpuData != nullptr &&
                 !cudaInputReplicas.empty()) {
-                std::vector<int> tpDevices;
-                std::map<int, int> tpRatios;
-                FastllmGetMulticudaDeviceAndRatio(
-                    tpDevices, tpRatios, true);
+                const int preferredDevice =
+                    GetNumasMoePreferredCudaDevice(input);
+                std::vector<int> assistDevices =
+                    GetNumasMoeCudaAssistDevices();
                 std::unordered_set<int> presentDevices;
                 for (const auto &replica : cudaInputReplicas) {
                     presentDevices.insert(replica.deviceId);
                 }
-                for (int device : tpDevices) {
+                for (int device : assistDevices) {
                     if (presentDevices.count(device) != 0) {
                         continue;
                     }
@@ -6612,13 +6686,12 @@ namespace fastllm {
                         {device, staged->cudaData});
                     presentDevices.insert(device);
                 }
-                std::sort(
-                    cudaInputReplicas.begin(),
-                    cudaInputReplicas.end(),
-                    [](const NumasMoeCudaInputReplica &a,
-                       const NumasMoeCudaInputReplica &b) {
-                        return a.deviceId < b.deviceId;
-                    });
+                // The first replica owns the final partial output.  Keep it on
+                // the CUDA device that produced this layer's activation so a
+                // serial layer on cuda:1 does not reduce to cuda:0 and then
+                // immediately copy the result back.
+                SortNumasMoeCudaInputReplicas(
+                    cudaInputReplicas, preferredDevice);
             }
             if (cudaInputReplicas.empty()) {
                 gpuPrefill = false;
