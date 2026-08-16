@@ -1612,10 +1612,43 @@ class model:
             return ctypes.c_int(len(stop_token_ids)), (ctypes.c_int * len(stop_token_ids))(*stop_token_ids)
     
     def trans_conversation(self, conversation: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        if (self.get_struct() in ["minimax", "minimax_m2"]):
+        model_struct = self.get_struct()
+        if (model_struct in ["minimax", "minimax_m2"]):
             for i in range(len(conversation)):
                 if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
+        elif (model_struct == "dots3_note"):
+            # The Dots chat template iterates over argument objects, while the
+            # OpenAI wire protocol stores function.arguments as a JSON string.
+            # Normalize assistant tool-call history before rendering so a
+            # tool-result round trip can be fed back into the model.
+            conversation = copy.deepcopy(conversation)
+            for message in conversation:
+                if (not isinstance(message, dict) or
+                        message.get("role") != "assistant"):
+                    continue
+                for tool_call in message.get("tool_calls") or []:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function", tool_call)
+                    if not isinstance(function, dict):
+                        continue
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = (json.loads(arguments)
+                                         if arguments.strip() else {})
+                        except json.JSONDecodeError as error:
+                            raise ValueError(
+                                "Dots3-Note tool-call history contains "
+                                "invalid JSON arguments") from error
+                    elif arguments is None:
+                        arguments = {}
+                    if not isinstance(arguments, dict):
+                        raise ValueError(
+                            "Dots3-Note tool-call arguments must decode to "
+                            "a JSON object")
+                    function["arguments"] = arguments
         return conversation
 
     def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True,

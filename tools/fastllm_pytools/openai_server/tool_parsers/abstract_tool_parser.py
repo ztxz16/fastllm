@@ -225,6 +225,8 @@ class ToolParserManager:
             target = ""
             if ("<｜DSML｜tool_calls>" in chat_template):
                 target = "deepseek_v4"
+            elif ("<dots_function_call>" in chat_template):
+                target = "dots"
             elif ("<｜tool▁calls▁begin｜>" in chat_template):
                 target = "deepseek_v31"
             elif ("<minimax:tool_call>" in chat_template):
@@ -249,7 +251,14 @@ class ToolParserManager:
             print("Auto tool parse detect type: " + target)
             return cls.get_tool_parser(target)
 
-        if model_type == 'laguna':
+        if "<dots_function_call>" in chat_template:
+            target = 'dots'
+            print("Auto tool parse detect type: " + target)
+            return cls.get_tool_parser(target)
+
+        if model_type == 'dots3_note':
+            target = 'dots'
+        elif model_type == 'laguna':
             target = 'poolside_v1'
         elif (model_type == 'qwen3' or model_type == 'qwen2' or model_type == 'qwen3_moe'
             or model_type == "qwen3_next" or model_type == "qwen3_5"

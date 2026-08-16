@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .abstract_tool_parser import ToolParser, ToolParserManager
+from .dots_tool_parser import DotsToolParser
 from .deepseekv3_tool_parser import DeepSeekV3ToolParser
 from .deepseekv31_tool_parser import DeepSeekV31ToolParser
 from .deepseekv4_tool_parser import DeepSeekV4ToolParser
@@ -30,6 +31,7 @@ from .qwen3coder_tool_parser import Qwen3CoderToolParser
 __all__ = [
     "ToolParser",
     "ToolParserManager",
+    "DotsToolParser",
     #"Granite20bFCToolParser",
     #"GraniteToolParser",
     "Hermes2ProToolParser",
