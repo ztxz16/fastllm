@@ -11,7 +11,7 @@ namespace fastllm {
     // 支持Embedding，生成token序列的向量
     class BertModel: public basellm {
     public:
-        BertModel() {};
+        BertModel();
 
         ~BertModel() {
             this->weight.ReleaseWeight();

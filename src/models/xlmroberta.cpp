@@ -12,9 +12,6 @@ namespace fastllm {
         this->model_struct = "xlmroberta";
         this->model_type = "xlmroberta";
 
-        weight.embeddingNames.insert("embeddings.word_embeddings.weight");
-        weight.embeddingNames.insert("embeddings.position_embeddings.weight");
-        weight.embeddingNames.insert("embeddings.token_type_embeddings.weight");
         weight.embeddingNames.insert("roberta.embeddings.word_embeddings.weight");
         weight.embeddingNames.insert("roberta.embeddings.position_embeddings.weight");
         weight.embeddingNames.insert("roberta.embeddings.token_type_embeddings.weight");
@@ -83,6 +80,8 @@ namespace fastllm {
         ApplyDeviceMap(this->deviceMap, 0, this->block_cnt);
         AddTo(inputEmbeddings, tokenTypeEmbeddings);
         AddTo(inputEmbeddings, positionIdEmbeddings);
+        ToDataType(inputEmbeddings, this->dataType);
+
         Data hiddenStates, firstStates;
         LayerNorm(inputEmbeddings, this->weight[this->weightPrefix + "embeddings.LayerNorm.weight"], this->weight[this->weightPrefix + "embeddings.LayerNorm.bias"], -1, hiddenStates);
         int bsz = hiddenStates.dims[0], seqlen = hiddenStates.dims[1];
@@ -163,6 +162,7 @@ namespace fastllm {
         } else {
             Mul(firstStates, 1.0f, logits);
         }
+        ToDataType(logits, DataType::FLOAT32);
 
         logits.ToDevice(DataDevice::CPU);
         float *fret = (float*)logits.cpuData;

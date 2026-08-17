@@ -145,6 +145,9 @@ fastllm_lib.embedding_sentence.restype = ctypes.POINTER(ctypes.c_float)
 fastllm_lib.embedding_tokens.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_bool, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.embedding_tokens.restype = ctypes.POINTER(ctypes.c_float)
 
+fastllm_lib.embedding_tokens_batch.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_bool, ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.embedding_tokens_batch.restype = ctypes.POINTER(ctypes.c_float)
+
 fastllm_lib.reranker_compute_score.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_bool]
 fastllm_lib.reranker_compute_score.restype = ctypes.POINTER(ctypes.c_float)
 
@@ -1502,13 +1505,35 @@ class model:
     def get_type(self):
         return fastllm_lib.get_type_llm_model(self.model).decode()
 
+    def embedding_tokens(self, input_ids: List[int], normalize = True):
+        # 直接输入token ids计算embedding，绕过分词器，便于与HF侧输出对照
+        embedding_len = ctypes.c_int(0)
+        c_ids = (ctypes.c_int * len(input_ids))(*input_ids)
+        embedding_c_float = fastllm_lib.embedding_tokens(self.model, len(input_ids), c_ids,
+                                                         ctypes.c_bool(normalize), embedding_len)
+        return [embedding_c_float[i] for i in range(embedding_len.value)]
+
+    def embedding_tokens_batch(self, input_ids_list: List[List[int]], normalize = True):
+        # 批量输入token ids计算embedding，返回List[List[float]]，每行为一个向量
+        batch = len(input_ids_list)
+        seq_lens = [len(ids) for ids in input_ids_list]
+        tokens = [t for ids in input_ids_list for t in ids]
+        if (batch == 0):
+            return []
+        embedding_len = ctypes.c_int(0)
+        ret_c = fastllm_lib.embedding_tokens_batch(self.model, batch,
+                                                   (ctypes.c_int * len(seq_lens))(*seq_lens),
+                                                   (ctypes.c_int * len(tokens))(*tokens),
+                                                   ctypes.c_bool(normalize), embedding_len)
+        dim = embedding_len.value
+        return [[ret_c[i * dim + j] for j in range(dim)] for i in range(batch)]
+
     def embedding_sentence(self, input: str, normalize = True):
         embedding_len = ctypes.c_int(0)
         if (self.hf_tokenizer != None):
             input_ids = self.hf_tokenizer(input,  padding = True, truncation = True)['input_ids']
-            embedding_c_float = fastllm_lib.embedding_tokens(self.model, len(input_ids), (ctypes.c_int * len(input_ids))(*input_ids), normalize, embedding_len)
-        else:
-            embedding_c_float = fastllm_lib.embedding_sentence(self.model, input.encode(), normalize, embedding_len)
+            return self.embedding_tokens(input_ids, normalize)
+        embedding_c_float = fastllm_lib.embedding_sentence(self.model, input.encode(), normalize, embedding_len)
         embedding = []
         for i in range(embedding_len.value):
             embedding.append(embedding_c_float[i])

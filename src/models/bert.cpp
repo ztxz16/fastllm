@@ -8,6 +8,20 @@
 #include <cstring>
 
 namespace fastllm {
+
+    BertModel::BertModel() {
+        this->model_struct = "bert";
+        this->model_type = "bert";
+
+        weight.embeddingNames.insert("embeddings.word_embeddings.weight");
+        weight.embeddingNames.insert("embeddings.position_embeddings.weight");
+        weight.embeddingNames.insert("embeddings.token_type_embeddings.weight");
+        weight.linearNames = {
+                "*.attention.self.query.weight", "*.attention.self.key.weight", "*.attention.self.value.weight",
+                "*.attention.output.dense.weight", "*.output.dense.weight", "*.intermediate.dense.weight"
+        };
+    }
+
     void BertModel::LoadFromFile(const std::string &fileName) {
         this->weight.LoadFromFile(fileName);
         InitParams();
@@ -29,6 +43,7 @@ namespace fastllm {
             num_attention_heads = atoi(this->weight.dicts["num_attention_heads"].c_str());
         }
         this->head_dim = embed_dim / num_attention_heads;
+        this->deviceMap = GetDeviceMap();
     }
 
     void BertModel::Normalize(float *data, int dataLen) {
@@ -57,8 +72,10 @@ namespace fastllm {
         Embedding(inputIds, this->weight["embeddings.word_embeddings.weight"], inputEmbeddings);
         Embedding(tokenTypeIds, this->weight["embeddings.token_type_embeddings.weight"], tokenTypeEmbeddings);
         Embedding(positionIds, this->weight["embeddings.position_embeddings.weight"], positionIdEmbeddings);
+        ApplyDeviceMap(this->deviceMap, 0, this->block_cnt);
         AddTo(inputEmbeddings, tokenTypeEmbeddings);
         AddTo(inputEmbeddings, positionIdEmbeddings);
+        ToDataType(inputEmbeddings, this->dataType);
 
         Data hiddenStates, firstStates;
         LayerNorm(inputEmbeddings, this->weight["embeddings.LayerNorm.weight"], this->weight["embeddings.LayerNorm.bias"], -1, hiddenStates);
@@ -66,6 +83,7 @@ namespace fastllm {
         Data q, k, v, qk, qkv, attnOutput, inter, pooler;
 
         for (int i = 0; i < this->block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             std::string queryWeightName = "encoder.layer." + std::to_string(i) + ".attention.self.query.weight";
             std::string queryBiasName = "encoder.layer." + std::to_string(i) + ".attention.self.query.bias";
             std::string keyWeightName = "encoder.layer." + std::to_string(i) + ".attention.self.key.weight";
@@ -127,6 +145,7 @@ namespace fastllm {
         Linear(firstStates, this->weight["pooler.dense.weight"], this->weight["pooler.dense.bias"], pooler);
         TanH(pooler, pooler);
 
+        ToDataType(firstStates, DataType::FLOAT32);
         firstStates.ToDevice(DataDevice::CPU);
         float *fret = (float*)firstStates.cpuData;
         int batch = firstStates.dims[0], outputDim = firstStates.dims[1];
@@ -240,7 +259,7 @@ namespace fastllm {
         fastllm::Data tokenTypeIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, token_type_ids);
         fastllm::Data positionIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, position_ids);
         ForwardAll(inputIds, attentionMask, tokenTypeIds, positionIds, true);
-	    printf("finish.\n");
+        printf("finish.\n");
     }
 
     int BertModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
