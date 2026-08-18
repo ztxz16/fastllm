@@ -10,6 +10,7 @@ only for the duration of its layer's grouped-MM call.
 from __future__ import annotations
 
 import argparse
+import functools
 import gc
 import json
 import time
@@ -25,7 +26,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-ids", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--hidden-output")
+    parser.add_argument(
+        "--indexer-output",
+        help="save only each DSA layer's final-query TopK indices",
+    )
     parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument(
+        "--repeat-to",
+        type=int,
+        default=0,
+        help="repeat the supplied input-id pattern to this prompt length",
+    )
+    parser.add_argument(
+        "--disable-dsa",
+        action="store_true",
+        help="disable DSA only for a <=2048 dense-equivalence baseline",
+    )
+    parser.add_argument("--indexer-query-chunk-size", type=int, default=128)
+    parser.add_argument("--sparse-query-chunk-size", type=int, default=8)
+    parser.add_argument("--sparse-head-chunk-size", type=int, default=4)
+    parser.add_argument("--dense-query-chunk-size", type=int, default=256)
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=0,
+        help="feed the initial prompt through the cache in bounded chunks",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--experts-implementation",
@@ -156,6 +182,20 @@ def main() -> None:
     args = parse_args()
     if args.steps <= 0:
         raise ValueError("--steps must be positive")
+    if args.repeat_to < 0:
+        raise ValueError("--repeat-to must be non-negative")
+    if args.prefill_chunk_size < 0:
+        raise ValueError("--prefill-chunk-size must be non-negative")
+    if args.disable_dsa and args.indexer_output:
+        raise ValueError("--indexer-output requires DSA")
+    for name in (
+        "indexer_query_chunk_size",
+        "sparse_query_chunk_size",
+        "sparse_head_chunk_size",
+        "dense_query_chunk_size",
+    ):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
 
     import torch
     from transformers import Dots3NoteConfig
@@ -168,6 +208,13 @@ def main() -> None:
         raise RuntimeError("this reference runner requires CUDA")
     device = torch.device(args.device)
     input_ids = read_input_ids(args.input_ids)
+    if args.repeat_to > 0:
+        input_ids = [
+            input_ids[index % len(input_ids)]
+            for index in range(args.repeat_to)
+        ]
+    if args.disable_dsa and len(input_ids) > 2048:
+        raise ValueError("--disable-dsa supports at most 2048 prompt tokens")
     model_path = str(Path(args.model).expanduser().resolve())
 
     torch.manual_seed(0)
@@ -175,11 +222,88 @@ def main() -> None:
     config = Dots3NoteConfig.from_pretrained(
         model_path, local_files_only=True
     )
-    # At <= 513 tokens the released DSA top-k (2048) and sliding window (513)
-    # both contain the complete causal prefix.  Disabling the indexer therefore
-    # preserves attention math while avoiding unrelated multimodal/DSA weights.
-    config.use_dsa = False
+    config.use_dsa = not args.disable_dsa
     config.use_cache = True
+
+    # The reference implementation intentionally favors readability.  Smaller
+    # query/head tiles keep its temporary gathers bounded on a 24 GiB GPU while
+    # preserving the exact DSA equations.
+    if config.use_dsa:
+        from transformers.models.dots3_note import modeling_dots3_note
+
+        original_eager_attention = (
+            modeling_dots3_note.eager_attention_forward
+        )
+        original_sparse_attention = (
+            modeling_dots3_note.dsa_sparse_attention_forward
+        )
+
+        @functools.wraps(original_eager_attention)
+        def bounded_eager_attention(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            *call_args,
+            **call_kwargs,
+        ):
+            query_length = query.shape[2]
+            if query_length <= args.dense_query_chunk_size:
+                return original_eager_attention(
+                    module,
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    *call_args,
+                    **call_kwargs,
+                )
+            output_chunks = []
+            weight_chunks = []
+            keep_weights = bool(
+                call_kwargs.get("output_attentions", False)
+            )
+            for start in range(0, query_length, args.dense_query_chunk_size):
+                stop = min(start + args.dense_query_chunk_size, query_length)
+                mask_chunk = (
+                    None
+                    if attention_mask is None
+                    else attention_mask[:, :, start:stop]
+                )
+                output_chunk, weight_chunk = original_eager_attention(
+                    module,
+                    query[:, :, start:stop],
+                    key,
+                    value,
+                    mask_chunk,
+                    *call_args,
+                    **call_kwargs,
+                )
+                output_chunks.append(output_chunk)
+                if keep_weights:
+                    weight_chunks.append(weight_chunk)
+            return (
+                torch.cat(output_chunks, dim=1),
+                torch.cat(weight_chunks, dim=2) if keep_weights else None,
+            )
+
+        @functools.wraps(original_sparse_attention)
+        def bounded_sparse_attention(*call_args, **call_kwargs):
+            call_kwargs.setdefault(
+                "query_chunk_size", args.sparse_query_chunk_size
+            )
+            call_kwargs.setdefault(
+                "head_chunk_size", args.sparse_head_chunk_size
+            )
+            return original_sparse_attention(*call_args, **call_kwargs)
+
+        modeling_dots3_note.dsa_sparse_attention_forward = (
+            bounded_sparse_attention
+        )
+        modeling_dots3_note.eager_attention_forward = (
+            bounded_eager_attention
+        )
 
     print("[transformers] loading native FP8 text weights on CPU", flush=True)
     load_started = time.monotonic()
@@ -194,6 +318,11 @@ def main() -> None:
         experts_implementation=args.experts_implementation,
     )
     model.eval()
+    if config.use_dsa:
+        for decoder_layer in model.model.layers:
+            indexer = getattr(decoder_layer.self_attn, "indexer", None)
+            if indexer is not None:
+                indexer.query_chunk_size = args.indexer_query_chunk_size
     print(
         f"[transformers] loaded in {time.monotonic() - load_started:.2f}s",
         flush=True,
@@ -221,6 +350,7 @@ def main() -> None:
     )
 
     hidden_records: dict[str, np.ndarray] = {}
+    indexer_records: dict[str, np.ndarray] = {}
     active_step = [-1]
     hook_handles = []
     if args.hidden_output:
@@ -255,6 +385,22 @@ def main() -> None:
                     capture(f"{prefix}_attention")
                 )
             )
+            indexer = getattr(decoder_layer.self_attn, "indexer", None)
+            if indexer is not None:
+                def capture_indexer(name):
+                    def hook(_module, _inputs, output):
+                        hidden_records[
+                            f"step_{active_step[0]}_{name}_last_topk"
+                        ] = output[:, -1].detach().to(
+                            torch.int32
+                        ).cpu().numpy()
+                    return hook
+
+                hook_handles.append(
+                    indexer.register_forward_hook(
+                        capture_indexer(f"{prefix}_indexer")
+                    )
+                )
             hook_handles.append(
                 decoder_layer.mlp.register_forward_hook(
                     capture(f"{prefix}_mlp")
@@ -272,38 +418,68 @@ def main() -> None:
                 )
             )
 
+    if args.indexer_output:
+        def capture_indexer_only(name):
+            def hook(_module, _inputs, output):
+                indexer_records[
+                    f"step_{active_step[0]}_{name}_last_topk"
+                ] = output[:, -1].detach().to(
+                    torch.int32
+                ).cpu().numpy()
+            return hook
+
+        for layer, decoder_layer in enumerate(model.model.layers):
+            indexer = getattr(decoder_layer.self_attn, "indexer", None)
+            if indexer is not None:
+                hook_handles.append(
+                    indexer.register_forward_hook(
+                        capture_indexer_only(f"layer_{layer:02d}_indexer")
+                    )
+                )
+
     logits_steps: list[np.ndarray] = []
     output_ids: list[int] = []
     current_ids = torch.tensor([input_ids], dtype=torch.long, device=device)
-    attention_mask = torch.ones_like(current_ids)
+    attention_mask = torch.empty(
+        (1, 0), dtype=torch.long, device=device
+    )
     past_key_values = None
 
     with torch.inference_mode():
         for step in range(args.steps):
             active_step[0] = step
-            outputs = model(
-                input_ids=current_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
-                return_dict=True,
-            )
+            if step == 0 and args.prefill_chunk_size > 0:
+                input_chunks = current_ids.split(
+                    args.prefill_chunk_size, dim=1
+                )
+            else:
+                input_chunks = (current_ids,)
+            for input_chunk in input_chunks:
+                attention_mask = torch.cat(
+                    [
+                        attention_mask,
+                        torch.ones(
+                            (attention_mask.shape[0], input_chunk.shape[1]),
+                            dtype=attention_mask.dtype,
+                            device=device,
+                        ),
+                    ],
+                    dim=1,
+                )
+                outputs = model(
+                    input_ids=input_chunk,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = outputs.past_key_values
             step_logits = outputs.logits[0, -1].float()
             token_id = int(torch.argmax(step_logits).item())
             logits_steps.append(step_logits.cpu().numpy())
             output_ids.append(token_id)
-            past_key_values = outputs.past_key_values
-            current_ids = torch.tensor([[token_id]], dtype=torch.long, device=device)
-            attention_mask = torch.cat(
-                [
-                    attention_mask,
-                    torch.ones(
-                        (attention_mask.shape[0], 1),
-                        dtype=attention_mask.dtype,
-                        device=device,
-                    ),
-                ],
-                dim=1,
+            current_ids = torch.tensor(
+                [[token_id]], dtype=torch.long, device=device
             )
             print(
                 f"[transformers] step {step}: token={token_id}", flush=True
@@ -328,7 +504,21 @@ def main() -> None:
                     "checkpoint_quantization": "fp8_e4m3_block128",
                     "attn_implementation": "eager",
                     "experts_implementation": args.experts_implementation,
-                    "use_dsa": False,
+                    "use_dsa": config.use_dsa,
+                    "prompt_tokens": len(input_ids),
+                    "indexer_query_chunk_size": (
+                        args.indexer_query_chunk_size
+                    ),
+                    "sparse_query_chunk_size": (
+                        args.sparse_query_chunk_size
+                    ),
+                    "sparse_head_chunk_size": (
+                        args.sparse_head_chunk_size
+                    ),
+                    "dense_query_chunk_size": (
+                        args.dense_query_chunk_size
+                    ),
+                    "prefill_chunk_size": args.prefill_chunk_size,
                     "steps": args.steps,
                 }
             )
@@ -338,8 +528,12 @@ def main() -> None:
         hidden_output_path = Path(args.hidden_output)
         hidden_output_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(hidden_output_path, **hidden_records)
-        for handle in hook_handles:
-            handle.remove()
+    if args.indexer_output:
+        indexer_output_path = Path(args.indexer_output)
+        indexer_output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(indexer_output_path, **indexer_records)
+    for handle in hook_handles:
+        handle.remove()
     print(
         json.dumps(
             {

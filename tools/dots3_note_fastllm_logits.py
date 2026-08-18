@@ -19,6 +19,12 @@ def parse_args():
     parser.add_argument("--input-ids", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument(
+        "--repeat-to",
+        type=int,
+        default=0,
+        help="repeat the supplied input-id pattern to this prompt length",
+    )
     return parser.parse_args()
 
 
@@ -35,17 +41,26 @@ def main() -> None:
     args = parse_args()
     if args.steps <= 0:
         raise ValueError("--steps must be positive")
+    if args.repeat_to < 0:
+        raise ValueError("--repeat-to must be non-negative")
     os.environ.setdefault("FASTLLM_SKIP_WARMUP", "1")
     if args.max_batch <= 0:
         args.max_batch = 1
-    if args.tokens <= 0:
-        args.tokens = 513
     if args.kv_cache_dtype == "auto":
         args.kv_cache_dtype = "bfloat16"
     if args.moe_atype in ("", "auto"):
         args.moe_atype = "bfloat16"
 
     input_ids = read_input_ids(args.input_ids)
+    if args.repeat_to > 0:
+        input_ids = [
+            input_ids[index % len(input_ids)]
+            for index in range(args.repeat_to)
+        ]
+    if args.tokens <= 0:
+        args.tokens = len(input_ids) + args.steps + 16
+    else:
+        args.tokens = max(args.tokens, len(input_ids) + args.steps + 1)
     load_started = time.perf_counter()
     model = make_normal_llm_model(args)
     load_seconds = time.perf_counter() - load_started
@@ -149,7 +164,9 @@ def main() -> None:
                         "kv_cache_dtype": args.kv_cache_dtype,
                         "cuda_shared_expert": args.cuda_shared_expert,
                         "steps": args.steps,
-                        "use_dsa": False,
+                        "use_dsa": True,
+                        "prompt_tokens": len(input_ids),
+                        "chunked_prefill_size": args.chunked_prefill_size,
                     }
                 )
             ),

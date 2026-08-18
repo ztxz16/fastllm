@@ -146,7 +146,10 @@ namespace {
         return result;
     }
 
-    static fastllm::Data MakeTensor(const std::vector<int> &dims, float seed = 0.0f, float scale = 1.0f) {
+    static fastllm::Data MakeTensor(const std::vector<int> &dims,
+                                    float seed = 0.0f,
+                                    float scale = 1.0f,
+                                    float bias = 0.0f) {
         int count = 1;
         for (int dim : dims) {
             count *= dim;
@@ -154,7 +157,7 @@ namespace {
         std::vector<float> data(count);
         for (int i = 0; i < count; i++) {
             float v = std::sin((i + 1) * 0.37f + seed) + std::cos((i + 3) * 0.19f + seed * 0.5f);
-            data[i] = v * scale;
+            data[i] = v * scale + bias;
         }
         return fastllm::Data(fastllm::DataType::FLOAT32, dims, data);
     }
@@ -3279,6 +3282,317 @@ namespace {
         };
     }
 
+#ifdef USE_CUDA
+    struct Dots3NoteIndexerBenchState {
+        int queryTokens = 1;
+        int totalTokens = 2049;
+        int startPos = 2048;
+        fastllm::Data indexQ, indexKPe, indexKNope, indexK, indexWeights;
+        fastllm::Data qFp8, foldedWeights, kFp8, kScales, indices;
+        fastllm::Data cachedKFp8{fastllm::DataType::INT8};
+        fastllm::Data cachedKScales{fastllm::DataType::FLOAT32};
+        fastllm::Data mainQ, mainK, mainV, sparseOutput;
+
+        static std::vector<uint8_t> ToBytes(const fastllm::Data &data) {
+            fastllm::Data host;
+            host.CopyFrom(data);
+            host.ToDevice(fastllm::DataDevice::CPU);
+            return std::vector<uint8_t>(host.cpuData,
+                                        host.cpuData + host.GetBytes());
+        }
+
+        void ValidateTopK() {
+            const fastllm::FP8E4M3ToFP32Manager fp8;
+            std::vector<uint8_t> qRaw = ToBytes(qFp8);
+            std::vector<uint8_t> kRaw = ToBytes(kFp8);
+            std::vector<float> weights =
+                ToFloatVector(ConvertToFloat32Data(foldedWeights));
+            std::vector<float> scales =
+                ToFloatVector(ConvertToFloat32Data(kScales));
+            std::vector<int32_t> actual = ToInt32Vector(indices);
+
+            std::vector<int> tokensToCheck = {0};
+            if (queryTokens > 1) {
+                tokensToCheck.push_back(queryTokens - 1);
+            }
+            for (int token : tokensToCheck) {
+                int rowEnd = std::min(totalTokens, startPos + token + 1);
+                int selectedCount = std::min(2048, rowEnd);
+                std::vector<std::pair<float, int>> scores;
+                scores.reserve(rowEnd);
+                for (int key = 0; key < rowEnd; ++key) {
+                    float score = 0.0f;
+                    for (int head = 0; head < 64; ++head) {
+                        float dot = 0.0f;
+                        size_t qBase =
+                            ((size_t)token * 64 + head) * 128;
+                        size_t kBase = (size_t)key * 128;
+                        for (int d = 0; d < 128; ++d) {
+                            dot += fp8.dict[qRaw[qBase + d]] *
+                                   fp8.dict[kRaw[kBase + d]];
+                        }
+                        score += std::max(dot, 0.0f) *
+                                 weights[(size_t)token * 64 + head];
+                    }
+                    scores.push_back({score * scales[key], key});
+                }
+                std::partial_sort(
+                    scores.begin(), scores.begin() + selectedCount,
+                    scores.end(),
+                    [](const auto &a, const auto &b) {
+                        return a.first > b.first ||
+                               (a.first == b.first && a.second < b.second);
+                    });
+                std::vector<int> expectedSet(selectedCount);
+                std::vector<int> actualSet(selectedCount);
+                for (int i = 0; i < selectedCount; ++i) {
+                    expectedSet[i] = scores[i].second;
+                    actualSet[i] = actual[(size_t)token * 2048 + i];
+                }
+                std::sort(expectedSet.begin(), expectedSet.end());
+                std::sort(actualSet.begin(), actualSet.end());
+                if (expectedSet != actualSet) {
+                    int missing = -1, unexpected = -1;
+                    for (int value : expectedSet) {
+                        if (!std::binary_search(actualSet.begin(),
+                                                actualSet.end(), value)) {
+                            missing = value;
+                            break;
+                        }
+                    }
+                    for (int value : actualSet) {
+                        if (!std::binary_search(expectedSet.begin(),
+                                                expectedSet.end(), value)) {
+                            unexpected = value;
+                            break;
+                        }
+                    }
+                    std::ostringstream os;
+                    os << "Dots indexer Top-2048 mismatch: missing="
+                       << missing << " unexpected=" << unexpected;
+                    throw std::runtime_error(os.str());
+                }
+            }
+        }
+
+        void ValidateSparseAttention() {
+            std::vector<float> qValues =
+                ToFloatVector(ConvertToFloat32Data(mainQ));
+            std::vector<float> kValues =
+                ToFloatVector(ConvertToFloat32Data(mainK));
+            std::vector<float> vValues =
+                ToFloatVector(ConvertToFloat32Data(mainV));
+            std::vector<int32_t> selected = ToInt32Vector(indices);
+            std::vector<float> actual =
+                ToFloatVector(ConvertToFloat32Data(sparseOutput));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!std::isfinite(actual[i])) {
+                    std::ostringstream os;
+                    os << "Dots sparse attention produced a non-finite value "
+                       << "at element " << i;
+                    throw std::runtime_error(os.str());
+                }
+            }
+            constexpr float scale = 0.07216878364870322f; // rsqrt(192)
+
+            // One complete head/query is enough to validate indexed gathers,
+            // the BF16 dot boundary, FP32 softmax, and V accumulation.
+            int token = queryTokens - 1;
+            int head = 0;
+            int length = std::min(2048, startPos + token + 1);
+            std::vector<float> scores(length);
+            float maximum = -INFINITY;
+            for (int i = 0; i < length; ++i) {
+                int key = selected[(size_t)token * 2048 + i];
+                float dot = 0.0f;
+                size_t qBase = ((size_t)head * queryTokens + token) * 192;
+                size_t kBase = ((size_t)head * totalTokens + key) * 192;
+                for (int d = 0; d < 192; ++d) {
+                    dot += qValues[qBase + d] * kValues[kBase + d];
+                }
+                uint16_t roundedBits =
+                    fastllm::Float32ToBFloat16RNEBits(dot);
+                scores[i] =
+                    fastllm::BFloat16BitsToFloat32(roundedBits) * scale;
+                maximum = std::max(maximum, scores[i]);
+            }
+            float denominator = 0.0f;
+            for (float &score : scores) {
+                score = std::exp(score - maximum);
+                denominator += score;
+            }
+            float maxAbsDiff = 0.0f;
+            for (int d = 0; d < 128; ++d) {
+                float expected = 0.0f;
+                for (int i = 0; i < length; ++i) {
+                    int key = selected[(size_t)token * 2048 + i];
+                    size_t vOffset =
+                        ((size_t)head * totalTokens + key) * 128 + d;
+                    uint16_t probabilityBits =
+                        fastllm::Float32ToBFloat16RNEBits(
+                            scores[i] / denominator);
+                    float probability =
+                        fastllm::BFloat16BitsToFloat32(probabilityBits);
+                    expected += probability * vValues[vOffset];
+                }
+                size_t outOffset =
+                    ((size_t)head * queryTokens + token) * 128 + d;
+                maxAbsDiff = std::max(
+                    maxAbsDiff, std::fabs(expected - actual[outOffset]));
+            }
+            if (maxAbsDiff > 2.0e-2f) {
+                std::ostringstream os;
+                os << "Dots sparse attention mismatch: max_abs_diff="
+                   << maxAbsDiff;
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        void Init(const OpTestParams &params) {
+            FastllmCudaSetDevice(0);
+            queryTokens = params.GetInt("queries");
+            totalTokens = params.GetInt("keys");
+            if (queryTokens <= 0 || totalTokens <= 2048 ||
+                queryTokens > totalTokens) {
+                throw std::runtime_error(
+                    "Dots indexer requires 0 < queries <= keys and keys > 2048");
+            }
+            startPos = totalTokens - queryTokens;
+
+            indexQ.CopyFrom(MakeTensor(
+                {1, queryTokens, 64, 128}, 0.173f, 0.25f));
+            indexKPe.CopyFrom(MakeTensor(
+                {1, totalTokens, 1, 64}, 0.419f, 0.25f));
+            indexKNope.CopyFrom(MakeTensor(
+                {1, totalTokens, 1, 64}, 0.613f, 0.25f));
+            indexWeights.CopyFrom(MakeTensor(
+                {1, queryTokens, 64}, 0.733f, 0.5f));
+            fastllm::ToDataType(indexWeights,
+                                fastllm::DataType::BFLOAT16);
+            indexQ.ToDevice(fastllm::DataDevice::CUDA);
+            indexKPe.ToDevice(fastllm::DataDevice::CUDA);
+            indexKNope.ToDevice(fastllm::DataDevice::CUDA);
+            indexWeights.ToDevice(fastllm::DataDevice::CUDA);
+            if (!FastllmCudaDots3NotePackIndexerKey(
+                    indexKPe, indexKNope, indexK) ||
+                !FastllmCudaDots3NoteQuantizeIndexer(
+                    indexQ, indexK, indexWeights, qFp8, foldedWeights,
+                    kFp8, kScales)) {
+                throw std::runtime_error("Dots indexer CUDA launch failed");
+            }
+            auto appendCache = [](fastllm::Data &target,
+                                  fastllm::Data &current) {
+                target.ToDevice(current.dataDevice);
+                if (target.dims.empty()) {
+                    std::vector<int> capacity = current.dims;
+                    capacity[1] = 128;
+                    target.Expansion(capacity);
+                }
+                while (!target.dims.empty() &&
+                       target.dims[1] + current.dims[1] >
+                           target.expansionDims[1]) {
+                    std::vector<int> capacity = target.dims;
+                    capacity[1] = target.expansionDims[1] + 128;
+                    target.Expansion(capacity);
+                }
+                fastllm::CatDirect(target, current, 1);
+            };
+            for (int start = 0; start < totalTokens; start += 128) {
+                int end = std::min(totalTokens, start + 128);
+                fastllm::Data keyPart, scalePart;
+                fastllm::Split(kFp8, 1, start, end, keyPart);
+                fastllm::Split(kScales, 1, start, end, scalePart);
+                appendCache(cachedKFp8, keyPart);
+                appendCache(cachedKScales, scalePart);
+            }
+            if (!FastllmCudaDots3NoteIndexerTopK(
+                    qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                    startPos, 2048, indices)) {
+                throw std::runtime_error("Dots indexer CUDA launch failed");
+            }
+            ValidateTopK();
+
+            mainQ.CopyFrom(MakeTensor(
+                {128, queryTokens, 192}, 0.291f, 0.125f));
+            mainK.CopyFrom(MakeTensor(
+                {128, totalTokens, 192}, 0.527f, 0.125f));
+            mainV.CopyFrom(MakeTensor(
+                {128, totalTokens, 128}, 0.811f, 0.125f, 1.0f));
+            fastllm::ToDataType(mainQ, fastllm::DataType::BFLOAT16);
+            fastllm::ToDataType(mainK, fastllm::DataType::BFLOAT16);
+            fastllm::ToDataType(mainV, fastllm::DataType::BFLOAT16);
+            mainQ.ToDevice(fastllm::DataDevice::CUDA);
+            mainK.ToDevice(fastllm::DataDevice::CUDA);
+            mainV.ToDevice(fastllm::DataDevice::CUDA);
+            if (!FastllmCudaDots3NoteSparseAttention(
+                    mainQ, mainK, mainV, indices, startPos,
+                    1.0f / std::sqrt(192.0f), sparseOutput)) {
+                throw std::runtime_error(
+                    "Dots sparse attention CUDA launch failed");
+            }
+            ForceDeviceSync();
+            ValidateSparseAttention();
+        }
+
+        void Run() {
+            if (!FastllmCudaDots3NoteIndexerTopK(
+                    qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                    startPos, 2048, indices)) {
+                throw std::runtime_error("Dots indexer replay failed");
+            }
+        }
+    };
+#endif
+
+    static BenchmarkResult BenchmarkDots3NoteIndexerCuda(
+            const OpTestParams &params, const std::string &device,
+            int warmup, int iters) {
+#ifdef USE_CUDA
+        ScopedFirstDevice guard(device);
+        auto state = std::make_shared<Dots3NoteIndexerBenchState>();
+        state->Init(params);
+        for (int i = 0; i < warmup; ++i) state->Run();
+        ForceDeviceSync();
+        auto begin = Clock::now();
+        for (int i = 0; i < iters; ++i) state->Run();
+        ForceDeviceSync();
+        auto end = Clock::now();
+        BenchmarkResult result;
+        result.avgMs =
+            std::chrono::duration<double, std::milli>(end - begin).count() /
+            std::max(iters, 1);
+        return result;
+#else
+        (void)params; (void)device; (void)warmup; (void)iters;
+        throw std::runtime_error("Dots indexer requires USE_CUDA");
+#endif
+    }
+
+    static OpCase MakeDots3NoteIndexerCase() {
+        return {
+            "dots3_note_indexer",
+            "validate Dots3-Note E4M3 indexer Top-2048 and sparse MLA",
+            []() {
+                OpTestParams params;
+                params.Add("queries", "1", "number of tail query tokens");
+                params.Add("keys", "2049", "total cached key tokens");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams&, const std::string&) {
+                fastllm::Data marker(fastllm::DataType::FLOAT32, {1});
+                marker.Allocate(0.0f);
+                return marker;
+            },
+            BenchmarkDots3NoteIndexerCuda,
+            [](const OpTestParams&) { return 0.0; },
+            [](const OpTestParams&) { return 0.0; },
+            true
+        };
+    }
+
     static std::vector<OpCase> BuildRegistry() {
         return {
             MakeAddToCase(),
@@ -3301,7 +3615,8 @@ namespace {
             MakeMergeMoeFp8Case(),
             MakeFusedMoeFp8Case(),
             MakeRouterLinearFp16Case(),
-            MakeFusedRouterTopKCase()
+            MakeFusedRouterTopKCase(),
+            MakeDots3NoteIndexerCase()
         };
     }
 
