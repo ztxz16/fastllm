@@ -733,6 +733,28 @@ bool FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
                                                       int betaSlow,
                                                       fastllm::Data &indices,
                                                       fastllm::Data &lengths);
+// Dots3-Note DSA indexer. Q is FP32 after leading-RoPE, K is BF16 after
+// LayerNorm + leading-RoPE, and weights are the 64 projected coefficients.
+// Quantized Q/K tensors use INT8 storage for raw E4M3 bytes; K scales are
+// carried separately as FP32.
+bool FastllmCudaDots3NotePackIndexerKey(
+        const fastllm::Data &rope, const fastllm::Data &nope,
+        fastllm::Data &output);
+
+bool FastllmCudaDots3NoteQuantizeIndexer(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &weights, fastllm::Data &qFp8,
+        fastllm::Data &foldedWeights, fastllm::Data &kFp8,
+        fastllm::Data &kScales);
+bool FastllmCudaDots3NoteIndexerTopK(
+        const fastllm::Data &qFp8,
+        const fastllm::Data &foldedWeights,
+        const fastllm::Data &kFp8, const fastllm::Data &kScales,
+        int startPos, int topK, fastllm::Data &indices);
+bool FastllmCudaDots3NoteSparseAttention(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indices,
+        int startPos, float scale, fastllm::Data &output);
 size_t FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
                                                       int seqlen, int heads,
                                                       int compressRatio);

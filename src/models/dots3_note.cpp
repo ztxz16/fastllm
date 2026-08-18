@@ -30,6 +30,18 @@ namespace fastllm {
                    value.compare(0, prefix.size(), prefix) == 0;
         }
 
+        bool UsesCudaIndexer(const Executor &executor) {
+#ifdef USE_CUDA
+            return executor.firstDevice == "cuda" ||
+                   executor.firstDevice.rfind("cuda:", 0) == 0 ||
+                   executor.firstDevice == "multicuda" ||
+                   executor.firstDevice.rfind("multicuda:", 0) == 0;
+#else
+            (void)executor;
+            return false;
+#endif
+        }
+
         bool HistoryCacheDebugEnabled() {
             const char *value = std::getenv(
                 "FASTLLM_DOTS3_NOTE_HISTORY_DEBUG");
@@ -61,6 +73,9 @@ namespace fastllm {
             "model.layers.*.self_attn.kv_b_proj.weight",
             "model.layers.*.self_attn.g_proj.weight",
             "model.layers.*.self_attn.o_proj.weight",
+            "model.layers.*.self_attn.indexer.wq_b.weight",
+            "model.layers.*.self_attn.indexer.wk.weight",
+            "model.layers.*.self_attn.indexer.weights_proj.weight",
             "model.layers.*.mlp.gate.weight",
             "model.layers.*.mlp*gate_proj.weight",
             "model.layers.*.mlp*up_proj.weight",
@@ -79,6 +94,10 @@ namespace fastllm {
             std::lock_guard<std::mutex> guard(responseContextsMutex);
             responseContexts.clear();
         }
+        {
+            std::lock_guard<std::mutex> guard(indexerCacheMutex);
+            indexerCaches.clear();
+        }
     }
 
     std::map<std::string, std::vector<std::pair<std::string, DataType>>>
@@ -88,10 +107,14 @@ namespace fastllm {
             bool skip = StartsWith(name, "vision_encoder.") ||
                         StartsWith(name, "audio_encoder.") ||
                         StartsWith(name, "model.layers.46.") ||
-                        StartsWith(name, "model.mtp.") ||
-                        name.find(".self_attn.indexer.") != std::string::npos;
+                        StartsWith(name, "model.mtp.");
             if (skip) {
                 ret[name].clear();
+            } else if (name.find(".self_attn.indexer.k_norm.") !=
+                       std::string::npos) {
+                // Transformers promotes both affine parameters to FP32 before
+                // the index-key LayerNorm.
+                ret[name] = {{name, DataType::FLOAT32}};
             }
         }
         return ret;
@@ -129,18 +152,19 @@ namespace fastllm {
         shortContextLimit = GetIntConfig(weight, "sliding_window_size", 513);
         AssertInFastLLM(shortContextLimit > 0,
                         "FastLLM Dots3-Note requires a positive sliding window.\n");
-        // This basic correctness path intentionally skips the DSA indexer and
-        // evaluates full-attention layers densely.  Dense attention is exactly
-        // equivalent while every causal key fits in index_topk; beyond that the
-        // checkpoint selects only the indexed keys, so do not advertise the
-        // native 524K context until the indexer is implemented here.
+        indexHeads = GetIntConfig(weight, "index_n_heads", 64);
+        indexHeadDim = GetIntConfig(weight, "index_head_dim", 128);
+        indexTopK = GetIntConfig(weight, "index_topk", 2048);
+        AssertInFastLLM(indexHeads == 64 && indexHeadDim == 128 &&
+                        indexTopK == 2048,
+                        "FastLLM Dots3-Note currently expects a 64x128 "
+                        "Top-2048 DSA indexer.\n");
         int configuredMaxPositions =
             GetIntConfig(weight, "max_position_embeddings", 524288);
-        int denseAttentionLimit = GetIntConfig(weight, "index_topk", 2048);
-        max_positions = std::min(configuredMaxPositions, denseAttentionLimit);
+        max_positions = configuredMaxPositions;
         AssertInFastLLM(max_positions >= shortContextLimit,
                         "FastLLM Dots3-Note max positions must cover its sliding window.\n");
-        defaultChunkedPrefillSize = std::min(127, shortContextLimit);
+        defaultChunkedPrefillSize = std::min(512, shortContextLimit);
 
         AssertInFastLLM(fullQKRopeHeadDim == swaQKRopeHeadDim,
                         "FastLLM Dots3-Note requires matching full/SWA RoPE dimensions.\n");
@@ -212,10 +236,11 @@ namespace fastllm {
                 float exponent = (float)(2 * i) / (float)rotary_dim;
                 float inverseFrequency = 1.0f / std::pow(theta, exponent);
                 float angle = (float)position * inverseFrequency;
-                sinValues[position * tableWidth + i] =
-                    RoundFloat32ToBFloat16RNE(std::sin(angle));
-                cosValues[position * tableWidth + i] =
-                    RoundFloat32ToBFloat16RNE(std::cos(angle));
+                // With DSA enabled Transformers builds RoPE tables from an
+                // FP32 rotary input.  Main attention rounds only after the
+                // rotation; the indexer Q path stays FP32 through quantization.
+                sinValues[position * tableWidth + i] = std::sin(angle);
+                cosValues[position * tableWidth + i] = std::cos(angle);
             }
         }
         sinTable.CopyFrom(Data(DataType::FLOAT32,
@@ -287,6 +312,18 @@ namespace fastllm {
         }
     }
 
+    std::shared_ptr<Dots3NoteModel::IndexerCacheMemory>
+    Dots3NoteModel::GetOrCreateIndexerCache(
+            const std::vector<std::pair<Data, Data>> *pastKeyValues) {
+        std::lock_guard<std::mutex> guard(indexerCacheMutex);
+        auto &cache = indexerCaches[pastKeyValues];
+        if (cache == nullptr) {
+            cache = std::make_shared<IndexerCacheMemory>();
+            cache->layers.resize(block_cnt);
+        }
+        return cache;
+    }
+
     int Dots3NoteModel::Forward(
             const Data &inputIds,
             const Data &attentionMask,
@@ -324,9 +361,25 @@ namespace fastllm {
 
         Executor &executor = *((Executor *)GetExecutor());
         InitMoeWeightViews();
+        std::shared_ptr<IndexerCacheMemory> indexerCache =
+            GetOrCreateIndexerCache(&pastKeyValues);
+        if (sequencePastLen == 0) {
+            auto fresh = std::make_shared<IndexerCacheMemory>();
+            fresh->layers.resize(block_cnt);
+            {
+                std::lock_guard<std::mutex> guard(indexerCacheMutex);
+                indexerCaches[&pastKeyValues] = fresh;
+            }
+            indexerCache = std::move(fresh);
+        }
 
         Data hiddenStates, attenInput;
         Data qa, q, qNope, qPe;
+        Data indexQ, indexQFloat, indexQPe, indexQNope, indexQPrepared;
+        Data indexK, indexKFloat, indexKNorm, indexKPe, indexKNope;
+        Data indexKPrepared, indexWeights;
+        Data indexQFp8, indexFoldedWeights, indexKFp8, indexKScales;
+        Data indexTopKIndices;
         Data compressedKvAll, compressedKv, kPe, normalizedKv;
         Data kv, kNope, value, kPeRepeat, key;
         Data attentionScores, attentionProbFloat, attentionProb;
@@ -393,6 +446,11 @@ namespace fastllm {
             append(attentionPrefix + "kv_b_proj.weight");
             append(attentionPrefix + "g_proj.weight");
             append(attentionPrefix + "o_proj.weight");
+            append(attentionPrefix + "indexer.wq_b.weight");
+            append(attentionPrefix + "indexer.wk.weight");
+            append(attentionPrefix + "indexer.k_norm.weight");
+            append(attentionPrefix + "indexer.k_norm.bias");
+            append(attentionPrefix + "indexer.weights_proj.weight");
             append(prefix + ".post_attention_layernorm.weight");
             append(prefix + ".mlp.gate.weight");
             append(prefix + ".mlp.gate.e_score_correction_bias");
@@ -430,6 +488,121 @@ namespace fastllm {
             RMSNorm(qa, weight[attentionPrefix + "q_a_layernorm.weight"],
                     rms_norm_eps, qa);
             Mul(qa, std::sqrt((float)embed_dim / (float)config.qLoraRank), qa);
+
+            if (fullAttention) {
+#ifdef USE_CUDA
+                const bool useCudaIndexer = UsesCudaIndexer(executor);
+                if (useCudaIndexer) {
+                    const std::string indexerPrefix =
+                        attentionPrefix + "indexer.";
+                    Linear(qa, weight[indexerPrefix + "wq_b.weight"], Data(),
+                           indexQ);
+                    indexQ.Reshape({1, seqlen, indexHeads, indexHeadDim});
+                    ToDataType(indexQ, indexQFloat, DataType::FLOAT32);
+                    Split(indexQFloat, -1, 0, config.qkRopeHeadDim,
+                          indexQPe);
+                    Split(indexQFloat, -1, config.qkRopeHeadDim,
+                          indexHeadDim, indexQNope);
+                    // NearlyRotatePosition2D consumes a sequence-major tensor.
+                    PermuteSelf(indexQPe, {1, 0, 2, 3});
+                    NearlyRotatePosition2D(indexQPe, positionIds,
+                                           *sinTable, *cosTable,
+                                           config.qkRopeHeadDim);
+                    PermuteSelf(indexQPe, {1, 0, 2, 3});
+                    Cat(indexQPe, indexQNope, -1, indexQPrepared);
+
+                    Linear(attenInput, weight[indexerPrefix + "wk.weight"],
+                           Data(), indexK);
+                    ToDataType(indexK, indexKFloat, DataType::FLOAT32);
+                    LayerNorm(indexKFloat,
+                              weight[indexerPrefix + "k_norm.weight"],
+                              weight[indexerPrefix + "k_norm.bias"], -1,
+                              indexKNorm);
+                    indexKNorm.Reshape({1, seqlen, 1, indexHeadDim});
+                    Split(indexKNorm, -1, 0, config.qkRopeHeadDim,
+                          indexKPe);
+                    Split(indexKNorm, -1, config.qkRopeHeadDim,
+                          indexHeadDim, indexKNope);
+                    PermuteSelf(indexKPe, {1, 0, 2, 3});
+                    NearlyRotatePosition2D(indexKPe, positionIds,
+                                           *sinTable, *cosTable,
+                                           config.qkRopeHeadDim);
+                    PermuteSelf(indexKPe, {1, 0, 2, 3});
+                    // The fused reference rounds K once after FP32 LayerNorm and
+                    // RoPE, immediately before the dynamic E4M3 quantizer.
+                    AssertInFastLLM(
+                        FastllmCudaDots3NotePackIndexerKey(
+                            indexKPe, indexKNope, indexKPrepared),
+                        "FastLLM Dots3-Note failed to pack the index K tensor.\n");
+
+                    Linear(attenInput,
+                           weight[indexerPrefix + "weights_proj.weight"],
+                           Data(), indexWeights);
+                    indexWeights.Reshape({1, seqlen, indexHeads});
+                    AssertInFastLLM(
+                        FastllmCudaDots3NoteQuantizeIndexer(
+                            indexQPrepared, indexKPrepared, indexWeights,
+                            indexQFp8, indexFoldedWeights, indexKFp8,
+                            indexKScales),
+                        "FastLLM Dots3-Note failed to quantize the DSA indexer.\n");
+
+                    IndexerLayerCache &cache = indexerCache->layers[layer];
+                    int cachedLength = cache.keys.dims.size() == 3
+                                           ? cache.keys.dims[1] : 0;
+                    AssertInFastLLM(
+                        cachedLength == sequencePastLen,
+                        "FastLLM Dots3-Note index-key cache is out of sync.\n");
+                    auto appendIndexer = [&](Data &target,
+                                             const Data &current) {
+                        target.ToDevice(current.dataDevice);
+                        const int cacheBlock = 128;
+                        while ((target.dims.empty() &&
+                                (target.expansionDims.empty() ||
+                                 current.dims[1] >
+                                     target.expansionDims[1])) ||
+                               (!target.dims.empty() &&
+                                target.dims[1] + current.dims[1] >
+                                    target.expansionDims[1])) {
+                            std::vector<int> dims;
+                            if (target.dims.empty() || target.Count(0) == 0) {
+                                dims = current.dims;
+                                dims[1] =
+                                    ((current.dims[1] - 1) / cacheBlock + 1) *
+                                    cacheBlock;
+                            } else {
+                                dims = target.dims;
+                                dims[1] +=
+                                    ((current.dims[1] - 1) / cacheBlock + 1) *
+                                    cacheBlock;
+                            }
+                            target.Expansion(dims);
+                        }
+                        CatDirect(target, current, 1);
+                        target.SetKVCache();
+                    };
+                    appendIndexer(cache.keys, indexKFp8);
+                    appendIndexer(cache.scales, indexKScales);
+                    if (sequencePastLen + seqlen > indexTopK) {
+                        AssertInFastLLM(
+                            FastllmCudaDots3NoteIndexerTopK(
+                                indexQFp8, indexFoldedWeights,
+                                cache.keys, cache.scales,
+                                sequencePastLen, indexTopK,
+                                indexTopKIndices),
+                            "FastLLM Dots3-Note DSA Top-2048 failed.\n");
+                    }
+                } else {
+                    AssertInFastLLM(
+                        sequencePastLen + seqlen <= indexTopK,
+                        "Dots3-Note contexts above 2048 tokens require "
+                        "a CUDA DSA indexer.\n");
+                }
+#else
+                AssertInFastLLM(sequencePastLen + seqlen <= indexTopK,
+                                "Dots3-Note contexts above 2048 tokens "
+                                "require a CUDA DSA indexer.\n");
+#endif
+            }
             Linear(qa, weight[attentionPrefix + "q_b_proj.weight"], Data(), q);
 
             q.Reshape({1, seqlen, config.numHeads,
@@ -535,40 +708,58 @@ namespace fastllm {
             CatDirect(pastKey, key, 1);
             CatDirect(pastValue, value, 1);
 
-            MatMulTransB(q, pastKey, attentionScores);
-            Mul(attentionScores, 1.0f / std::sqrt((float)qHeadDim),
-                attentionScores);
-            CausalMask(attentionScores, layerPastLen + 1, -10000.0f);
-            ToDataType(attentionScores, attentionProbFloat, DataType::FLOAT32);
             int keyLen = pastKey.dims[1];
-            if (!fullAttention && keyLen > shortContextLimit) {
-                if (slidingMaskPastLen != layerPastLen ||
-                    slidingMaskKeyLen != keyLen) {
-                    std::vector<float> mask((size_t)seqlen * keyLen, 0.0f);
-                    for (int query = 0; query < seqlen; query++) {
-                        int absoluteQuery = layerPastLen + query;
-                        int firstVisible = std::max(
-                            0, absoluteQuery - shortContextLimit + 1);
-                        for (int keyIndex = 0;
-                             keyIndex < firstVisible; keyIndex++) {
-                            mask[(size_t)query * keyLen + keyIndex] = 1.0f;
+            if (fullAttention && keyLen > indexTopK) {
+#ifdef USE_CUDA
+                AssertInFastLLM(
+                    FastllmCudaDots3NoteSparseAttention(
+                        q, pastKey, pastValue, indexTopKIndices,
+                        layerPastLen,
+                        1.0f / std::sqrt((float)qHeadDim),
+                        attentionOutput),
+                    "FastLLM Dots3-Note sparse MLA failed.\n");
+#else
+                ErrorInFastLLM(
+                    "Dots3-Note sparse MLA requires a CUDA build.\n");
+#endif
+            } else {
+                MatMulTransB(q, pastKey, attentionScores);
+                Mul(attentionScores, 1.0f / std::sqrt((float)qHeadDim),
+                    attentionScores);
+                CausalMask(attentionScores, layerPastLen + 1, -10000.0f);
+                ToDataType(attentionScores, attentionProbFloat,
+                           DataType::FLOAT32);
+                if (!fullAttention && keyLen > shortContextLimit) {
+                    if (slidingMaskPastLen != layerPastLen ||
+                        slidingMaskKeyLen != keyLen) {
+                        std::vector<float> mask(
+                            (size_t)seqlen * keyLen, 0.0f);
+                        for (int query = 0; query < seqlen; query++) {
+                            int absoluteQuery = layerPastLen + query;
+                            int firstVisible = std::max(
+                                0, absoluteQuery - shortContextLimit + 1);
+                            for (int keyIndex = 0;
+                                 keyIndex < firstVisible; keyIndex++) {
+                                mask[(size_t)query * keyLen + keyIndex] = 1.0f;
+                            }
                         }
+                        slidingAttentionMask.CopyFrom(Data(
+                            DataType::FLOAT32, {1, seqlen, keyLen}, mask));
+                        slidingMaskPastLen = layerPastLen;
+                        slidingMaskKeyLen = keyLen;
                     }
-                    slidingAttentionMask.CopyFrom(Data(
-                        DataType::FLOAT32, {1, seqlen, keyLen}, mask));
-                    slidingMaskPastLen = layerPastLen;
-                    slidingMaskKeyLen = keyLen;
+                    attentionProbFloat.Reshape(
+                        {1, config.numHeads, seqlen, keyLen});
+                    AttentionMask(attentionProbFloat, slidingAttentionMask,
+                                  -10000.0f);
+                    attentionProbFloat.Reshape(
+                        {config.numHeads, seqlen, keyLen});
                 }
-                attentionProbFloat.Reshape(
-                    {1, config.numHeads, seqlen, keyLen});
-                AttentionMask(attentionProbFloat, slidingAttentionMask,
-                              -10000.0f);
-                attentionProbFloat.Reshape(
-                    {config.numHeads, seqlen, keyLen});
+                Softmax(attentionProbFloat, attentionProbFloat, -1);
+                ToDataType(attentionProbFloat, attentionProb,
+                           DataType::BFLOAT16);
+                MatMul(attentionProb, pastValue, attentionOutput);
             }
-            Softmax(attentionProbFloat, attentionProbFloat, -1);
-            ToDataType(attentionProbFloat, attentionProb, DataType::BFLOAT16);
-            MatMul(attentionProb, pastValue, attentionOutput);
 
             if (!fullAttention) {
                 int cachedTokens = pastKey.dims[1];
@@ -842,6 +1033,10 @@ namespace fastllm {
                                      Data(kvCacheDataType)});
         }
         Forward(inputIds, Data(), positionIds, pastKeyValues);
+        {
+            std::lock_guard<std::mutex> guard(indexerCacheMutex);
+            indexerCaches.erase(&pastKeyValues);
+        }
 
         elementsInKVCachePerToken = 0;
         for (int layer = 0; layer < (int)pastKeyValues.size(); layer++) {
@@ -893,8 +1088,14 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
-        std::lock_guard<std::mutex> guard(responseContextsMutex);
-        responseContexts.erase(&context->pastKeyValues);
+        {
+            std::lock_guard<std::mutex> guard(responseContextsMutex);
+            responseContexts.erase(&context->pastKeyValues);
+        }
+        {
+            std::lock_guard<std::mutex> guard(indexerCacheMutex);
+            indexerCaches.erase(&context->pastKeyValues);
+        }
     }
 
     bool Dots3NoteModel::TryRestoreHistoryCache(
@@ -1020,6 +1221,14 @@ namespace fastllm {
         memory->tokens = tokens;
         memory->sequenceLength = sequenceLength;
         memory->pastKeyValues.resize(block_cnt);
+        std::shared_ptr<IndexerCacheMemory> activeIndexerCache;
+        {
+            std::lock_guard<std::mutex> guard(indexerCacheMutex);
+            auto it = indexerCaches.find(&pastKeyValues);
+            if (it != indexerCaches.end()) {
+                activeIndexerCache = it->second;
+            }
+        }
         const bool moveToCpu = GetHistoryCacheInCPU();
         auto copyTensor = [&](const Data &source, Data &target) {
             AssertInFastLLM(!source.multiDeviceData &&
@@ -1084,6 +1293,21 @@ namespace fastllm {
             copyTensor(pastKeyValues[layer].second,
                        memory->pastKeyValues[layer].second);
         }
+        Executor &executor = *((Executor *)GetExecutor());
+        if (UsesCudaIndexer(executor) && activeIndexerCache != nullptr &&
+            (int)activeIndexerCache->layers.size() >= block_cnt) {
+            memory->indexerCache = std::make_shared<IndexerCacheMemory>();
+            memory->indexerCache->layers.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; layer++) {
+                if (!IsFullAttentionLayer(layer)) {
+                    continue;
+                }
+                copyTensor(activeIndexerCache->layers[layer].keys,
+                           memory->indexerCache->layers[layer].keys);
+                copyTensor(activeIndexerCache->layers[layer].scales,
+                           memory->indexerCache->layers[layer].scales);
+            }
+        }
 
         std::lock_guard<std::mutex> guard(historyCacheMutex);
         auto existing = historyCache.find(tokens);
@@ -1120,10 +1344,15 @@ namespace fastllm {
 
     bool Dots3NoteModel::CanRestoreHistoryCache(
             const HistoryCacheMemory &memory, int restoreLength) const {
+        Executor &executor = *((Executor *)GetExecutor());
+        const bool requiresIndexerCache = UsesCudaIndexer(executor);
         if (restoreLength <= 0 ||
             restoreLength > memory.sequenceLength ||
             memory.sequenceLength != (int)memory.tokens.size() ||
-            (int)memory.pastKeyValues.size() < block_cnt) {
+            (int)memory.pastKeyValues.size() < block_cnt ||
+            (requiresIndexerCache &&
+             (memory.indexerCache == nullptr ||
+              (int)memory.indexerCache->layers.size() < block_cnt))) {
             return false;
         }
         for (int layer = 0; layer < block_cnt; layer++) {
@@ -1137,6 +1366,16 @@ namespace fastllm {
             if (IsFullAttentionLayer(layer)) {
                 if (sourceLength < restoreLength) {
                     return false;
+                }
+                if (requiresIndexerCache) {
+                    const IndexerLayerCache &indexer =
+                        memory.indexerCache->layers[layer];
+                    if (indexer.keys.dims.size() != 3 ||
+                        indexer.scales.dims.size() != 3 ||
+                        indexer.keys.dims[1] < restoreLength ||
+                        indexer.scales.dims[1] < restoreLength) {
+                        return false;
+                    }
                 }
                 continue;
             }
@@ -1193,6 +1432,33 @@ namespace fastllm {
                 targetValue.Expansion(valueCapacity);
                 targetKey.SetKVCache();
                 targetValue.SetKVCache();
+            }
+        }
+        Executor &executor = *((Executor *)GetExecutor());
+        if (UsesCudaIndexer(executor)) {
+            auto restoredIndexer = std::make_shared<IndexerCacheMemory>();
+            restoredIndexer->layers.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; layer++) {
+                if (!IsFullAttentionLayer(layer)) {
+                    continue;
+                }
+                const IndexerLayerCache &source =
+                    memory.indexerCache->layers[layer];
+                IndexerLayerCache &target = restoredIndexer->layers[layer];
+                Split(source.keys, 1, 0, restoreLength, target.keys);
+                Split(source.scales, 1, 0, restoreLength, target.scales);
+                std::vector<int> keyCapacity = target.keys.dims;
+                std::vector<int> scaleCapacity = target.scales.dims;
+                keyCapacity[1] = (restoreLength / 128 + 1) * 128;
+                scaleCapacity[1] = keyCapacity[1];
+                target.keys.Expansion(keyCapacity);
+                target.scales.Expansion(scaleCapacity);
+                target.keys.SetKVCache();
+                target.scales.SetKVCache();
+            }
+            {
+                std::lock_guard<std::mutex> guard(indexerCacheMutex);
+                indexerCaches[&context->pastKeyValues] = restoredIndexer;
             }
         }
         if (HistoryCacheDebugEnabled()) {

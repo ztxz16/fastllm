@@ -61,9 +61,24 @@ namespace fastllm {
             float ropeTheta;
         };
 
+        struct IndexerLayerCache {
+            // Raw E4M3 payload bytes; dynamic per-token scales are stored
+            // independently in scales.
+            Data keys;
+            Data scales;
+
+            IndexerLayerCache() : keys(DataType::INT8),
+                                  scales(DataType::FLOAT32) {}
+        };
+
+        struct IndexerCacheMemory {
+            std::vector<IndexerLayerCache> layers;
+        };
+
         struct HistoryCacheMemory {
             std::vector<int> tokens;
             std::vector<std::pair<Data, Data>> pastKeyValues;
+            std::shared_ptr<IndexerCacheMemory> indexerCache;
             int sequenceLength = 0;
             long long flushTime = 0;
         };
@@ -77,6 +92,8 @@ namespace fastllm {
                                      const std::string &device,
                                      Data *&sinTable, Data *&cosTable);
         void InitMoeWeightViews();
+        std::shared_ptr<IndexerCacheMemory> GetOrCreateIndexerCache(
+            const std::vector<std::pair<Data, Data>> *pastKeyValues);
 
         void MaybeRecordPromptHistoryCache(
                 std::vector<std::pair<Data, Data>> &pastKeyValues);
@@ -107,6 +124,9 @@ namespace fastllm {
         float swaRopeTheta = 50000.0f;
 
         int shortContextLimit = 513;
+        int indexHeads = 64;
+        int indexHeadDim = 128;
+        int indexTopK = 2048;
         int rotaryCapacity = 0;
 
         Data fullSinData, fullCosData;
@@ -122,8 +142,11 @@ namespace fastllm {
         std::shared_ptr<HistoryCacheMemory> pendingHistoryCache;
         std::map<const std::vector<std::pair<Data, Data>> *, ResponseContext *>
             responseContexts;
+        std::map<const std::vector<std::pair<Data, Data>> *,
+                 std::shared_ptr<IndexerCacheMemory>> indexerCaches;
         std::mutex historyCacheMutex;
         std::mutex responseContextsMutex;
+        std::mutex indexerCacheMutex;
         long long historyCacheFlushTime = 0;
         int historyCacheMaxRecords = 5;
     };

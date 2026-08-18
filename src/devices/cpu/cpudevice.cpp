@@ -7155,10 +7155,12 @@ ops += (long long)lines * inputDim * interDim * 2;
     }
 
     void DoCpuCatDirect(Data &input0, Data &input1, int axis) {
-        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
-                        (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16),
-                        "CatDirect's input's type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input0.dataType == input1.dataType &&
+                        (input0.dataType == DataType::FLOAT32 ||
+                         input0.dataType == DataType::FLOAT16 ||
+                         input0.dataType == DataType::BFLOAT16 ||
+                         input0.dataType == DataType::INT8),
+                        "CatDirect's inputs should have the same float or int8 type.\n");
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "CatDirect error: inputs should use same device.\n");
 
         if (input0.dims.size() == 0) {
