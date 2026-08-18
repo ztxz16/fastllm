@@ -8,7 +8,7 @@
 #include <csignal>
 
 #ifdef WIN32
-#define DLL_EXPORT _declspec(dllexport)
+#define DLL_EXPORT __declspec(dllexport)
 #else
 #define DLL_EXPORT
 #endif
@@ -590,7 +590,28 @@ extern "C" {
         return fvalue;
     }
 
-    DLL_EXPORT float* reranker_compute_score(int modelId, int batch, int *seqLens, int *tokens) {
+    // 批量embedding，tokens为按seqLens顺序拼接的所有序列，embeddingLen输出每个向量的维度，返回batch*dim个float
+    DLL_EXPORT float* embedding_tokens_batch(int modelId, int batch, int *seqLens, int *input, bool normalize, int *embeddingLen) {
+        fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
+        std::vector <std::vector <int> > inputIds;
+        inputIds.resize(batch);
+        int pos = 0;
+        for (int i = 0; i < batch; i++) {
+            for (int j = 0; j < seqLens[i]; j++) {
+                inputIds[i].push_back(input[pos++]);
+            }
+        }
+        std::vector <std::vector <float> > ret = model->EmbeddingSentenceBatch(inputIds, normalize);
+        int dim = ret[0].size();
+        *embeddingLen = dim;
+        float *fvalue = new float[batch * dim];
+        for (int i = 0; i < batch; i++) {
+            memcpy(fvalue + i * dim, ret[i].data(), dim * sizeof(float));
+        }
+        return fvalue;
+    }
+
+    DLL_EXPORT float* reranker_compute_score(int modelId, int batch, int *seqLens, int *tokens, bool normalize) {
         fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
         std::vector <std::vector <int> > inputIds;
         inputIds.resize(batch);
@@ -600,7 +621,7 @@ extern "C" {
                 inputIds[i].push_back(tokens[pos++]);
             }
         }
-        auto ret = model->ComputeScore(inputIds);
+        auto ret = model->ComputeScore(inputIds, normalize);
         float *fvalue = new float[batch];
         for (int i = 0; i < batch; i++) {
             fvalue[i] = ret[i];

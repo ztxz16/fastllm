@@ -38,6 +38,7 @@ namespace fastllm {
             num_attention_heads = atoi(this->weight.dicts["num_attention_heads"].c_str());
         }
         this->head_dim = embed_dim / num_attention_heads;
+        this->deviceMap = GetDeviceMap();
     }
 
     void XlmRobertaModel::FillBertInputsBatch(const std::vector <std::vector <int> > &tokens,
@@ -73,32 +74,36 @@ namespace fastllm {
                 const Data &positionIds,
                 bool normalize) {
         Data inputEmbeddings, tokenTypeEmbeddings, positionIdEmbeddings;
-        Embedding(inputIds, this->weight["roberta.embeddings.word_embeddings.weight"], inputEmbeddings);
-        Embedding(tokenTypeIds, this->weight["roberta.embeddings.token_type_embeddings.weight"], tokenTypeEmbeddings);
-        Embedding(positionIds, this->weight["roberta.embeddings.position_embeddings.weight"], positionIdEmbeddings);
+        Embedding(inputIds, this->weight[this->weightPrefix + "embeddings.word_embeddings.weight"], inputEmbeddings);
+        Embedding(tokenTypeIds, this->weight[this->weightPrefix + "embeddings.token_type_embeddings.weight"], tokenTypeEmbeddings);
+        Embedding(positionIds, this->weight[this->weightPrefix + "embeddings.position_embeddings.weight"], positionIdEmbeddings);
+        ApplyDeviceMap(this->deviceMap, 0, this->block_cnt);
         AddTo(inputEmbeddings, tokenTypeEmbeddings);
         AddTo(inputEmbeddings, positionIdEmbeddings);
+        ToDataType(inputEmbeddings, this->dataType);
+
         Data hiddenStates, firstStates;
-        LayerNorm(inputEmbeddings, this->weight["roberta.embeddings.LayerNorm.weight"], this->weight["roberta.embeddings.LayerNorm.bias"], -1, hiddenStates);
+        LayerNorm(inputEmbeddings, this->weight[this->weightPrefix + "embeddings.LayerNorm.weight"], this->weight[this->weightPrefix + "embeddings.LayerNorm.bias"], -1, hiddenStates);
         int bsz = hiddenStates.dims[0], seqlen = hiddenStates.dims[1];
         Data q, k, v, qk, qkv, attnOutput, inter, pooler, logits;
         for (int i = 0; i < this->block_cnt; i++) {
-            std::string queryWeightName = "roberta.encoder.layer." + std::to_string(i) + ".attention.self.query.weight";
-            std::string queryBiasName = "roberta.encoder.layer." + std::to_string(i) + ".attention.self.query.bias";
-            std::string keyWeightName = "roberta.encoder.layer." + std::to_string(i) + ".attention.self.key.weight";
-            std::string keyBiasName = "roberta.encoder.layer." + std::to_string(i) + ".attention.self.key.bias";
-            std::string valueWeightName = "roberta.encoder.layer." + std::to_string(i) + ".attention.self.value.weight";
-            std::string valueBiasName = "roberta.encoder.layer." + std::to_string(i) + ".attention.self.value.bias";
-            std::string attnOutputWeightName = "roberta.encoder.layer." + std::to_string(i) + ".attention.output.dense.weight";
-            std::string attnOutputbiasName = "roberta.encoder.layer." + std::to_string(i) + ".attention.output.dense.bias";
-            std::string attnLNWeightName = "roberta.encoder.layer." + std::to_string(i) + ".attention.output.LayerNorm.weight";
-            std::string attnLNbiasName = "roberta.encoder.layer." + std::to_string(i) + ".attention.output.LayerNorm.bias";
-            std::string interDenseWeightName = "roberta.encoder.layer." + std::to_string(i) + ".intermediate.dense.weight";
-            std::string interDenseBiasName = "roberta.encoder.layer." + std::to_string(i) + ".intermediate.dense.bias";
-            std::string outputWeightName = "roberta.encoder.layer." + std::to_string(i) + ".output.dense.weight";
-            std::string outputbiasName = "roberta.encoder.layer." + std::to_string(i) + ".output.dense.bias";
-            std::string outputLNWeightName = "roberta.encoder.layer." + std::to_string(i) + ".output.LayerNorm.weight";
-            std::string outputLNbiasName = "roberta.encoder.layer." + std::to_string(i) + ".output.LayerNorm.bias";
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            std::string queryWeightName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.self.query.weight";
+            std::string queryBiasName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.self.query.bias";
+            std::string keyWeightName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.self.key.weight";
+            std::string keyBiasName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.self.key.bias";
+            std::string valueWeightName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.self.value.weight";
+            std::string valueBiasName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.self.value.bias";
+            std::string attnOutputWeightName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.output.dense.weight";
+            std::string attnOutputbiasName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.output.dense.bias";
+            std::string attnLNWeightName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.output.LayerNorm.weight";
+            std::string attnLNbiasName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".attention.output.LayerNorm.bias";
+            std::string interDenseWeightName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".intermediate.dense.weight";
+            std::string interDenseBiasName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".intermediate.dense.bias";
+            std::string outputWeightName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".output.dense.weight";
+            std::string outputbiasName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".output.dense.bias";
+            std::string outputLNWeightName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".output.LayerNorm.weight";
+            std::string outputLNbiasName = this->weightPrefix + "encoder.layer." + std::to_string(i) + ".output.LayerNorm.bias";
 
             Linear(hiddenStates, this->weight[queryWeightName], this->weight[queryBiasName], q);
             Linear(hiddenStates, this->weight[keyWeightName], this->weight[keyBiasName], k);
@@ -157,6 +162,7 @@ namespace fastllm {
         } else {
             Mul(firstStates, 1.0f, logits);
         }
+        ToDataType(logits, DataType::FLOAT32);
 
         logits.ToDevice(DataDevice::CPU);
         float *fret = (float*)logits.cpuData;
@@ -170,5 +176,12 @@ namespace fastllm {
             memcpy(ret[i].data(), fret + i * outputDim, outputDim * sizeof(float));
         }
         return ret;
+    }
+
+    void XlmRobertaModel::WarmUp() {
+        if (this->weight.weight.find("roberta.embeddings.word_embeddings.weight") == this->weight.weight.end()) {
+            this->weightPrefix = "";
+        }
+        BertModel::WarmUp();
     }
 }

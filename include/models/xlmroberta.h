@@ -17,6 +17,8 @@ namespace fastllm {
 
         void InitParams(); // 初始化参数信息 
 
+        void WarmUp(); // 预热（在权重就绪后判断 weightPrefix） 
+
         void FillBertInputsBatch(const std::vector <std::vector <int> > &tokens,
                                 Data &inputIds, Data &attentionMask, Data &tokenTypeIds, Data &positionIds);
 
@@ -29,6 +31,8 @@ namespace fastllm {
                 bool normalize);
 
         std::string model_type;
+
+        std::string weightPrefix = "roberta.";
 
         float layer_norm_eps = 1e-12;
 
