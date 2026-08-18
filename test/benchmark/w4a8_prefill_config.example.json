@@ -1,0 +1,31 @@
+{
+  "defaults": {
+    "path": "/path/to/compressed-tensors-w4a8-model",
+    "host": "127.0.0.1",
+    "port": 18080,
+    "api_key": "no-key",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "atype": "bfloat16",
+    "max_batch": 1,
+    "startup_timeout": 600,
+    "request_timeout": 3600,
+    "warmup_max_tokens": 1,
+    "max_tokens": 1,
+    "skip_warmup": false
+  },
+  "cases": [
+    {
+      "name": "w4a8-prefill-128",
+      "prefill_length": 128
+    },
+    {
+      "name": "w4a8-prefill-1024",
+      "prefill_length": 1024
+    },
+    {
+      "name": "w4a8-prefill-4096",
+      "prefill_length": 4096
+    }
+  ]
+}

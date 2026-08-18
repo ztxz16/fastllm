@@ -373,12 +373,35 @@ namespace fastllm {
         AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
         AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
                         "Attention: q, k, v's datatype should be same.\n");
-        AssertInFastLLM(q.dataType == DataType::FLOAT32 || q.dataType == DataType::FLOAT16, 
-                    "Attention's input's type should be float32 or float16.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32 ||
+                        q.dataType == DataType::FLOAT16 ||
+                        q.dataType == DataType::BFLOAT16,
+                    "Attention's input's type should be float32, float16 or bfloat16.\n");
         DoCudaAttentionBatchReshape(qs, vs, outputs, batch);
     }
 
     void DoCudaAttentionBatch(Data **qs, Data **ks, Data **vs, Data **masks, Data **outputs, int group, float scale, int batch) {
+        if (qs[0]->dataType == DataType::BFLOAT16) {
+            for (int i = 0; i < batch; i++) {
+                outputs[i]->Allocate();
+                Data q32, k32, v32, mask32, output32;
+                ToDataType(*qs[i], q32, DataType::FLOAT32);
+                ToDataType(*ks[i], k32, DataType::FLOAT32);
+                ToDataType(*vs[i], v32, DataType::FLOAT32);
+                output32.dataType = DataType::FLOAT32;
+                output32.UpdateUnitSize();
+                output32.Resize(outputs[i]->dims);
+                output32.ToDevice(outputs[i]->dataDevice, false);
+                output32.Allocate();
+                if (masks != nullptr && masks[i] != nullptr && !masks[i]->dims.empty()) {
+                    ToDataType(*masks[i], mask32, DataType::FLOAT32);
+                }
+                FastllmCudaAttention(q32, k32, v32, mask32, output32,
+                                     group, scale, 0);
+                ToDataType(output32, *outputs[i], DataType::BFLOAT16);
+            }
+            return;
+        }
         long long aveLen = 0;
         for (int i = 0; i < batch; i++) {
             aveLen += ks[i]->dims[1];

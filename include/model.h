@@ -10,6 +10,21 @@
 #include "xlmroberta.h"
 
 namespace fastllm {
+    struct CompressedW4A8LinearProbe {
+        std::string tensorPrefix;
+        std::vector<int> logicalShape;
+        std::vector<int> packedShape;
+        std::vector<int> scaleShape;
+        std::vector<uint8_t> packedWeight;
+        std::vector<uint16_t> groupScales;
+        bool lmHeadBfloat16 = false;
+    };
+
+    bool InspectCompressedW4A8Linear(const std::string &modelPath,
+                                     const std::string &tensorPrefix,
+                                     CompressedW4A8LinearProbe &probe,
+                                     std::string &error);
+
     std::unique_ptr<BertModel> CreateEmbeddingModelFromFile(const std::string &fileName);
 
     std::unique_ptr<basellm> CreateLLMModelFromGGUF(const std::string &modelPath);

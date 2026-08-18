@@ -107,8 +107,10 @@ namespace {
     };
 
     struct ComparisonStats {
+        bool passed = true;
         float maxAbsDiff = 0.0f;
         float maxRelDiff = 0.0f;
+        float maxToleranceExcess = 0.0f;
         size_t mismatchIndex = 0;
         float expected = 0.0f;
         float actual = 0.0f;
@@ -237,6 +239,658 @@ namespace {
         throw std::runtime_error("unsupported linear weight_type: " + weightType);
     }
 
+    static uint16_t FloatToBFloat16(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return uint16_t(bits >> 16);
+    }
+
+    static uint16_t FloatToBFloat16RoundToNearest(float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        uint32_t roundingBias = 0x7fffU + ((bits >> 16) & 1U);
+        return uint16_t((bits + roundingBias) >> 16);
+    }
+
+    static float BFloat16ToFloat(uint16_t value) {
+        uint32_t bits = uint32_t(value) << 16;
+        float result;
+        std::memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+
+    static float RoundFp8E4M3(float value) {
+        if (!std::isfinite(value)) {
+            return std::copysign(448.0f, value);
+        }
+        bool negative = std::signbit(value);
+        float absolute = std::min(std::fabs(value), 448.0f);
+        float best = 0.0f;
+        float bestError = absolute;
+        int bestEncoding = 0;
+        for (int encoding = 1; encoding <= 0x7e; ++encoding) {
+            int exponent = encoding >> 3;
+            int mantissa = encoding & 7;
+            float candidate;
+            if (exponent == 0) {
+                candidate = std::ldexp(float(mantissa), -9);
+            } else {
+                candidate = std::ldexp(1.0f + float(mantissa) / 8.0f,
+                                       exponent - 7);
+            }
+            float error = std::fabs(candidate - absolute);
+            if (error < bestError ||
+                (error == bestError && (encoding & 1) == 0 &&
+                 (bestEncoding & 1) != 0)) {
+                best = candidate;
+                bestError = error;
+                bestEncoding = encoding;
+            }
+        }
+        return negative ? -best : best;
+    }
+
+    static float DecodeFp8E4M3(uint8_t value) {
+        bool negative = (value & 0x80U) != 0;
+        int exponent = (value >> 3) & 0xf;
+        int mantissa = value & 7;
+        float decoded;
+        if (exponent == 0) {
+            decoded = std::ldexp(float(mantissa), -9);
+        } else {
+            decoded = std::ldexp(1.0f + float(mantissa) / 8.0f,
+                                 exponent - 7);
+        }
+        return negative ? -decoded : decoded;
+    }
+
+    static constexpr float W4A8Fp8Max = 448.0f;
+    static constexpr float W4A8Fp8MinScale =
+        1.0f / (W4A8Fp8Max * 512.0f);
+
+    struct W4A8ActivationQuantFixture {
+        int tokens = 0;
+        int hidden = 0;
+        fastllm::DataType inputType = fastllm::DataType::BFLOAT16;
+        std::vector<float> inputValues;
+
+        explicit W4A8ActivationQuantFixture(const OpTestParams &params) {
+            tokens = params.GetInt("tokens");
+            hidden = params.GetInt("hidden");
+            if (tokens <= 0 || hidden <= 0) {
+                throw std::runtime_error(
+                    "w4a8_activation_quant requires positive tokens and hidden");
+            }
+
+            std::string dtype = params.GetString("dtype");
+            if (dtype == "bfloat16") {
+                inputType = fastllm::DataType::BFLOAT16;
+            } else if (dtype == "float16") {
+                inputType = fastllm::DataType::FLOAT16;
+            } else {
+                throw std::runtime_error(
+                    "w4a8_activation_quant dtype must be bfloat16 or float16");
+            }
+
+            std::vector<float> source((size_t)tokens * hidden);
+            for (int token = 0; token < tokens; ++token) {
+                for (int col = 0; col < hidden; ++col) {
+                    float value = 0.0f;
+                    if (token != 0) {
+                        value =
+                            0.75f * std::sin(float(token * hidden + col + 1) * 0.013f) +
+                            0.25f * std::cos(float(col + 3) * 0.031f);
+                        if (token == 1) {
+                            value *= 1.0e-5f;
+                        }
+                    }
+                    source[(size_t)token * hidden + col] = value;
+                }
+            }
+
+            fastllm::Data typed(inputType, {tokens, hidden}, source);
+            fastllm::Data normalized;
+            fastllm::ToDataType(typed, normalized, fastllm::DataType::FLOAT32);
+            normalized.ToDevice(fastllm::DataDevice::CPU);
+            const float *ptr = (const float*)normalized.cpuData;
+            inputValues.assign(ptr, ptr + source.size());
+        }
+
+        fastllm::Data MakeInput() const {
+            return fastllm::Data(inputType, {tokens, hidden}, inputValues);
+        }
+
+        fastllm::Data CpuReference() const {
+            std::vector<float> result((size_t)tokens * (hidden + 1));
+            for (int token = 0; token < tokens; ++token) {
+                size_t inputOffset = (size_t)token * hidden;
+                size_t outputOffset = (size_t)token * (hidden + 1);
+                float absoluteMax = 0.0f;
+                for (int col = 0; col < hidden; ++col) {
+                    absoluteMax = std::max(
+                        absoluteMax, std::fabs(inputValues[inputOffset + col]));
+                }
+                float scale = std::max(
+                    absoluteMax / W4A8Fp8Max, W4A8Fp8MinScale);
+                result[outputOffset] = scale;
+                for (int col = 0; col < hidden; ++col) {
+                    float value = inputValues[inputOffset + col] / scale;
+                    value = std::max(
+                        -W4A8Fp8Max, std::min(W4A8Fp8Max, value));
+                    result[outputOffset + col + 1] =
+                        RoundFp8E4M3(value) * scale;
+                }
+            }
+            return fastllm::Data(
+                fastllm::DataType::FLOAT32, {tokens, hidden + 1}, result);
+        }
+
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+        fastllm::Data CudaResult() const {
+            fastllm::Data input = MakeInput();
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            std::vector<uint8_t> fp8Bytes;
+            std::vector<float> tokenScales;
+            if (!FastllmCudaInspectW4A8Activation(
+                    input, tokens, hidden, fp8Bytes, tokenScales)) {
+                throw std::runtime_error(
+                    "FastllmCudaInspectW4A8Activation failed");
+            }
+
+            std::vector<float> result((size_t)tokens * (hidden + 1));
+            for (int token = 0; token < tokens; ++token) {
+                size_t inputOffset = (size_t)token * hidden;
+                size_t outputOffset = (size_t)token * (hidden + 1);
+                float scale = tokenScales[token];
+                result[outputOffset] = scale;
+                for (int col = 0; col < hidden; ++col) {
+                    result[outputOffset + col + 1] =
+                        DecodeFp8E4M3(fp8Bytes[inputOffset + col]) * scale;
+                }
+            }
+            return fastllm::Data(
+                fastllm::DataType::FLOAT32, {tokens, hidden + 1}, result);
+        }
+#endif
+    };
+
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+    struct W4A8ActivationQuantBenchmarkState {
+        fastllm::Data input;
+        int tokens = 0;
+        int hidden = 0;
+        void *fp8 = nullptr;
+        float *scales = nullptr;
+
+        explicit W4A8ActivationQuantBenchmarkState(
+            const W4A8ActivationQuantFixture &fixture)
+            : input(fixture.MakeInput()),
+              tokens(fixture.tokens),
+              hidden(fixture.hidden) {
+            input.ToDevice(fastllm::DataDevice::CUDA);
+            fp8 = FastllmCudaMalloc((size_t)tokens * hidden);
+            scales = (float*)FastllmCudaMalloc((size_t)tokens * sizeof(float));
+            if (fp8 == nullptr || scales == nullptr) {
+                if (fp8 != nullptr) {
+                    FastllmCudaFree(fp8);
+                }
+                if (scales != nullptr) {
+                    FastllmCudaFree(scales);
+                }
+                throw std::runtime_error(
+                    "failed to allocate W4A8 activation quant buffers");
+            }
+        }
+
+        ~W4A8ActivationQuantBenchmarkState() {
+            FastllmCudaFree(fp8);
+            FastllmCudaFree(scales);
+        }
+
+        void Run() {
+            if (!FastllmCudaW4A8QuantizeActivationPerToken(
+                    input, tokens, hidden, fp8, scales)) {
+                throw std::runtime_error(
+                    "W4A8 activation quantization launch failed");
+            }
+        }
+    };
+#endif
+
+    struct LinearW4A8Fixture {
+        int batch = 0;
+        int in = 0;
+        int out = 0;
+        int groups = 0;
+        int seed = 0;
+        std::vector<float> inputValues;
+        std::vector<uint8_t> packedWeights;
+        std::vector<uint16_t> bf16Scales;
+        std::vector<float> sourceScales;
+        std::vector<float> biasValues;
+
+        explicit LinearW4A8Fixture(const OpTestParams &params) {
+            batch = params.GetInt("batch");
+            in = params.GetInt("in");
+            out = params.GetInt("out");
+            seed = params.Has("seed") ? params.GetInt("seed") : 0;
+            if (batch <= 0 || in <= 0 || out <= 0 ||
+                in % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0 ||
+                out % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0) {
+                throw std::runtime_error(
+                    "linear weight_type=int4_w4a8 requires positive batch "
+                    "and 128-aligned in/out");
+            }
+
+            groups = in / fastllm::COMPRESSED_W4A8_GROUP_SIZE;
+            inputValues.resize((size_t)batch * in);
+            for (size_t i = 0; i < inputValues.size(); ++i) {
+                float value = 0.5f * std::sin(float(i + 1) * 0.013f) +
+                              0.25f * std::cos(float(i + 3) * 0.007f);
+                inputValues[i] = BFloat16ToFloat(FloatToBFloat16(value));
+            }
+
+            packedWeights.assign((size_t)out * in / 2, 0);
+            sourceScales.resize((size_t)out * groups);
+            bf16Scales.resize(sourceScales.size());
+            for (int row = 0; row < out; ++row) {
+                for (int group = 0; group < groups; ++group) {
+                    float scale =
+                        0.001f * float(
+                            1 + ((row * 7 + group * 3 + seed * 5) % 19));
+                    size_t index = (size_t)row * groups + group;
+                    bf16Scales[index] = FloatToBFloat16(scale);
+                    sourceScales[index] =
+                        BFloat16ToFloat(bf16Scales[index]);
+                }
+                for (int col = 0; col < in; ++col) {
+                    int signedValue =
+                        ((row * 11 + col * 5 + seed * 7 + 3) % 16) - 8;
+                    uint8_t nibble = uint8_t(signedValue + 8);
+                    size_t index = (size_t)row * (in / 2) + col / 2;
+                    if ((col & 1) == 0) {
+                        packedWeights[index] =
+                            (packedWeights[index] & 0xf0U) | nibble;
+                    } else {
+                        packedWeights[index] =
+                            (packedWeights[index] & 0x0fU) |
+                            uint8_t(nibble << 4);
+                    }
+                }
+            }
+
+            biasValues.resize(out);
+            for (int i = 0; i < out; ++i) {
+                biasValues[i] = float((i % 17) - 8) * 0.001f;
+            }
+        }
+
+        std::vector<float> ReferenceValues(
+                const std::vector<float> &values, int tokens,
+                bool addBias = false) const {
+            if (values.size() != (size_t)tokens * in) {
+                throw std::runtime_error("invalid W4A8 reference input size");
+            }
+            std::vector<float> quantizedInput(values.size());
+            for (int token = 0; token < tokens; ++token) {
+                size_t offset = (size_t)token * in;
+                float absoluteMax = 0.0f;
+                for (int col = 0; col < in; ++col) {
+                    absoluteMax = std::max(
+                        absoluteMax, std::fabs(values[offset + col]));
+                }
+                float tokenScale = std::max(
+                    absoluteMax / W4A8Fp8Max, W4A8Fp8MinScale);
+                for (int col = 0; col < in; ++col) {
+                    float value = values[offset + col] / tokenScale;
+                    value = std::max(-448.0f, std::min(448.0f, value));
+                    quantizedInput[offset + col] =
+                        RoundFp8E4M3(value) * tokenScale;
+                }
+            }
+
+            std::vector<float> decodedScales(sourceScales.size());
+            for (int row = 0; row < out; ++row) {
+                size_t offset = (size_t)row * groups;
+                float absoluteMax = 0.0f;
+                for (int group = 0; group < groups; ++group) {
+                    absoluteMax = std::max(
+                        absoluteMax,
+                        std::fabs(sourceScales[offset + group]));
+                }
+                float channelScale =
+                    std::max(absoluteMax, 1.0e-10f) / 56.0f;
+                for (int group = 0; group < groups; ++group) {
+                    decodedScales[offset + group] =
+                        RoundFp8E4M3(
+                            sourceScales[offset + group] / channelScale) *
+                        channelScale;
+                }
+            }
+
+            std::vector<float> result((size_t)tokens * out);
+            for (int token = 0; token < tokens; ++token) {
+                for (int row = 0; row < out; ++row) {
+                    float value = 0.0f;
+                    for (int col = 0; col < in; ++col) {
+                        uint8_t packed =
+                            packedWeights[(size_t)row * (in / 2) + col / 2];
+                        int q =
+                            int((packed >> ((col & 1) * 4)) & 0xfU) - 8;
+                        value +=
+                            quantizedInput[(size_t)token * in + col] *
+                            float(q) *
+                            decodedScales[(size_t)row * groups +
+                                          col /
+                                              fastllm::COMPRESSED_W4A8_GROUP_SIZE];
+                    }
+                    value = BFloat16ToFloat(
+                        FloatToBFloat16RoundToNearest(value));
+                    if (addBias) {
+                        value = BFloat16ToFloat(
+                            FloatToBFloat16RoundToNearest(
+                                value + biasValues[row]));
+                    }
+                    result[(size_t)token * out + row] = value;
+                }
+            }
+            return result;
+        }
+
+        fastllm::Data CpuReference() const {
+            std::vector<float> quantizedInput(inputValues.size());
+            for (int token = 0; token < batch; ++token) {
+                size_t offset = (size_t)token * in;
+                float absoluteMax = 0.0f;
+                for (int col = 0; col < in; ++col) {
+                    absoluteMax = std::max(
+                        absoluteMax, std::fabs(inputValues[offset + col]));
+                }
+                float tokenScale = std::max(
+                    absoluteMax / W4A8Fp8Max, W4A8Fp8MinScale);
+                for (int col = 0; col < in; ++col) {
+                    float value = inputValues[offset + col] / tokenScale;
+                    value = std::max(-448.0f, std::min(448.0f, value));
+                    quantizedInput[offset + col] =
+                        RoundFp8E4M3(value) * tokenScale;
+                }
+            }
+
+            std::vector<float> decodedScales(sourceScales.size());
+            for (int row = 0; row < out; ++row) {
+                size_t offset = (size_t)row * groups;
+                float absoluteMax = 0.0f;
+                for (int group = 0; group < groups; ++group) {
+                    absoluteMax = std::max(
+                        absoluteMax,
+                        std::fabs(sourceScales[offset + group]));
+                }
+                float channelScale =
+                    std::max(absoluteMax, 1.0e-10f) / 56.0f;
+                for (int group = 0; group < groups; ++group) {
+                    decodedScales[offset + group] =
+                        RoundFp8E4M3(
+                            sourceScales[offset + group] / channelScale) *
+                        channelScale;
+                }
+            }
+
+            std::vector<float> expected((size_t)batch * out);
+            for (int token = 0; token < batch; ++token) {
+                for (int row = 0; row < out; ++row) {
+                    float value = 0.0f;
+                    for (int col = 0; col < in; ++col) {
+                        uint8_t packed =
+                            packedWeights[(size_t)row * (in / 2) + col / 2];
+                        int q =
+                            int((packed >> ((col & 1) * 4)) & 0xfU) - 8;
+                        value +=
+                            quantizedInput[(size_t)token * in + col] *
+                            float(q) *
+                            decodedScales[(size_t)row * groups +
+                                          col /
+                                              fastllm::COMPRESSED_W4A8_GROUP_SIZE];
+                    }
+                    value = BFloat16ToFloat(
+                        FloatToBFloat16RoundToNearest(value));
+                    expected[(size_t)token * out + row] =
+                        BFloat16ToFloat(FloatToBFloat16RoundToNearest(
+                            value + biasValues[row]));
+                }
+            }
+            return fastllm::Data(
+                fastllm::DataType::FLOAT32, {batch, out}, expected);
+        }
+
+        void InitDeviceWeight(fastllm::Data &weight) const {
+            weight.dataType = fastllm::DataType::INT4_W4A8;
+            weight.UpdateUnitSize();
+            weight.Resize({out, in});
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.InitW4A8Weight(
+                fastllm::W4A8WeightEncoding::COMPRESSED_TENSORS_UINT4B8);
+            weight.SetW4A8GroupScales(
+                bf16Scales.data(), bf16Scales.size());
+            weight.Allocate(false);
+            std::memcpy(
+                weight.cpuData, packedWeights.data(), packedWeights.size());
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+        }
+
+        void InitDeviceData(fastllm::Data &input,
+                            fastllm::Data &weight,
+                            fastllm::Data &bias,
+                            fastllm::Data &output) const {
+            fastllm::Data inputSource(
+                fastllm::DataType::BFLOAT16, {batch, in}, inputValues);
+            input.CopyFrom(inputSource);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+
+            InitDeviceWeight(weight);
+
+            fastllm::Data biasSource(
+                fastllm::DataType::FLOAT32, {out}, biasValues);
+            bias.CopyFrom(biasSource);
+            bias.ToDevice(fastllm::DataDevice::CUDA);
+
+            output.dataType = fastllm::DataType::BFLOAT16;
+            output.UpdateUnitSize();
+            output.Resize({batch, out});
+            output.Allocate(false);
+            output.ToDevice(fastllm::DataDevice::CUDA, false);
+        }
+    };
+
+    struct MergeMoeW4A8Fixture {
+        int batch = 0;
+        int hidden = 0;
+        int inter = 0;
+        int experts = 0;
+        int topk = 0;
+        std::vector<float> inputValues;
+        std::vector<int> routeRows;
+        std::vector<float> routeScales;
+        std::vector<int> routePositions;
+        std::vector<int> expertStarts;
+        std::vector<int> expertCounts;
+        std::vector<std::shared_ptr<LinearW4A8Fixture>> gateFixtures;
+        std::vector<std::shared_ptr<LinearW4A8Fixture>> downFixtures;
+
+        explicit MergeMoeW4A8Fixture(const OpTestParams &params) {
+            batch = params.GetInt("batch");
+            hidden = params.GetInt("hidden");
+            inter = params.GetInt("inter");
+            experts = params.GetInt("experts");
+            topk = params.GetInt("topk");
+            if (batch <= 0 || hidden <= 0 || inter <= 0 || experts <= 0 ||
+                topk <= 0 || topk > experts ||
+                hidden % 256 != 0 || inter % 256 != 0) {
+                throw std::runtime_error(
+                    "mergemoe_w4a8 requires positive batch/experts, "
+                    "topk <= experts and 256-aligned hidden/inter");
+            }
+
+            inputValues.resize((size_t)batch * hidden);
+            for (size_t i = 0; i < inputValues.size(); ++i) {
+                float value =
+                    0.35f * std::sin(float(i + 1) * 0.017f) +
+                    0.15f * std::cos(float(i + 5) * 0.011f);
+                inputValues[i] =
+                    BFloat16ToFloat(FloatToBFloat16RoundToNearest(value));
+            }
+
+            std::vector<int> routeExperts((size_t)batch * topk);
+            std::vector<float> originalScales((size_t)batch * topk);
+            expertCounts.assign(experts, 0);
+            for (int token = 0; token < batch; ++token) {
+                float denominator = float(topk * (topk + 1)) * 0.5f;
+                for (int slot = 0; slot < topk; ++slot) {
+                    int route = token * topk + slot;
+                    int expert = (token * 3 + slot) % experts;
+                    routeExperts[route] = expert;
+                    originalScales[route] = float(topk - slot) / denominator;
+                    expertCounts[expert]++;
+                }
+            }
+            expertStarts.resize(experts);
+            int totalTasks = 0;
+            for (int expert = 0; expert < experts; ++expert) {
+                expertStarts[expert] = totalTasks;
+                totalTasks += expertCounts[expert];
+            }
+            std::vector<int> offsets = expertStarts;
+            routeRows.resize(totalTasks);
+            routeScales.resize(totalTasks);
+            routePositions.resize(totalTasks);
+            for (int token = 0; token < batch; ++token) {
+                for (int slot = 0; slot < topk; ++slot) {
+                    int route = token * topk + slot;
+                    int position = offsets[routeExperts[route]]++;
+                    routeRows[position] = token;
+                    routeScales[position] = originalScales[route];
+                    routePositions[route] = position;
+                }
+            }
+
+            for (int expert = 0; expert < experts; ++expert) {
+                OpTestParams gateParams;
+                gateParams.Override("batch", std::to_string(batch * topk));
+                gateParams.Override("in", std::to_string(hidden));
+                gateParams.Override("out", std::to_string(inter * 2));
+                gateParams.Override("seed", std::to_string(expert * 2 + 1));
+                gateFixtures.push_back(
+                    std::make_shared<LinearW4A8Fixture>(gateParams));
+
+                OpTestParams downParams;
+                downParams.Override("batch", std::to_string(batch * topk));
+                downParams.Override("in", std::to_string(inter));
+                downParams.Override("out", std::to_string(hidden));
+                downParams.Override("seed", std::to_string(expert * 2 + 2));
+                downFixtures.push_back(
+                    std::make_shared<LinearW4A8Fixture>(downParams));
+            }
+        }
+
+        fastllm::Data CpuReference() const {
+            std::vector<float> result((size_t)batch * hidden, 0.0f);
+            for (int expert = 0; expert < experts; ++expert) {
+                int count = expertCounts[expert];
+                if (count == 0) {
+                    continue;
+                }
+                std::vector<float> expertInput((size_t)count * hidden);
+                for (int local = 0; local < count; ++local) {
+                    int route = expertStarts[expert] + local;
+                    int token = routeRows[route];
+                    std::copy_n(
+                        inputValues.data() + (size_t)token * hidden, hidden,
+                        expertInput.data() + (size_t)local * hidden);
+                }
+                std::vector<float> gate =
+                    gateFixtures[expert]->ReferenceValues(
+                        expertInput, count, false);
+                std::vector<float> activated((size_t)count * inter);
+                for (int row = 0; row < count; ++row) {
+                    for (int col = 0; col < inter; ++col) {
+                        float x = gate[(size_t)row * inter * 2 + col];
+                        float y =
+                            gate[(size_t)row * inter * 2 + inter + col];
+                        activated[(size_t)row * inter + col] =
+                            BFloat16ToFloat(FloatToBFloat16RoundToNearest(
+                                (x / (1.0f + std::exp(-x))) * y));
+                    }
+                }
+                std::vector<float> down =
+                    downFixtures[expert]->ReferenceValues(
+                        activated, count, false);
+                for (int local = 0; local < count; ++local) {
+                    int route = expertStarts[expert] + local;
+                    int token = routeRows[route];
+                    float scale = routeScales[route];
+                    for (int col = 0; col < hidden; ++col) {
+                        result[(size_t)token * hidden + col] +=
+                            down[(size_t)local * hidden + col] * scale;
+                    }
+                }
+            }
+            for (float &value : result) {
+                value = BFloat16ToFloat(
+                    FloatToBFloat16RoundToNearest(value));
+            }
+            return fastllm::Data(
+                fastllm::DataType::FLOAT32, {batch, hidden}, result);
+        }
+    };
+
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+    struct MergeMoeW4A8BenchmarkState {
+        std::shared_ptr<MergeMoeW4A8Fixture> fixture;
+        fastllm::Data input, w1, w2, output;
+        std::vector<std::shared_ptr<fastllm::Data>> ownedWeights;
+        std::vector<fastllm::Data*> weights;
+
+        explicit MergeMoeW4A8BenchmarkState(
+                std::shared_ptr<MergeMoeW4A8Fixture> fixture)
+            : fixture(std::move(fixture)) {
+            fastllm::Data inputSource(
+                fastllm::DataType::BFLOAT16,
+                {this->fixture->batch, this->fixture->hidden},
+                this->fixture->inputValues);
+            input.CopyFrom(inputSource);
+            input.ToDevice(fastllm::DataDevice::CUDA);
+
+            weights.assign((size_t)(this->fixture->experts + 1) * 2, nullptr);
+            for (int expert = 0; expert < this->fixture->experts; ++expert) {
+                auto gateWeight = std::make_shared<fastllm::Data>();
+                auto downWeight = std::make_shared<fastllm::Data>();
+                fastllm::Data unusedInput, unusedBias, unusedOutput;
+                this->fixture->gateFixtures[expert]->InitDeviceData(
+                    unusedInput, *gateWeight, unusedBias, unusedOutput);
+                this->fixture->downFixtures[expert]->InitDeviceData(
+                    unusedInput, *downWeight, unusedBias, unusedOutput);
+                weights[(expert + 1) * 2] = gateWeight.get();
+                weights[(expert + 1) * 2 + 1] = downWeight.get();
+                ownedWeights.push_back(std::move(gateWeight));
+                ownedWeights.push_back(std::move(downWeight));
+            }
+        }
+
+        void Run() {
+            if (!FastllmCudaBFloat16MergeMOEW4A8GroupedIndexed(
+                    input, w1, w2, output, weights.data(),
+                    static_cast<int>(weights.size()),
+                    fixture->routeRows.data(), fixture->routeScales.data(),
+                    fixture->routePositions.data(),
+                    fixture->expertStarts.data(),
+                    fixture->expertCounts.data(), fixture->batch,
+                    fixture->topk, fixture->batch * fixture->topk,
+                    fixture->hidden, fixture->inter)) {
+                throw std::runtime_error("W4A8 grouped MoE launch failed");
+            }
+        }
+    };
+#endif
+
     static int CountElements(const std::vector<int> &dims) {
         int count = 1;
         for (int dim : dims) {
@@ -300,6 +954,109 @@ namespace {
         return output;
     }
 
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+    static fastllm::Data MergeMoeW4A8DenseReference(
+            const MergeMoeW4A8Fixture &fixture) {
+        const int totalTasks = fixture.batch * fixture.topk;
+        std::vector<float> routedValues(
+            (size_t)totalTasks * fixture.hidden, 0.0f);
+        fastllm::Data emptyBias;
+
+        for (int expert = 0; expert < fixture.experts; ++expert) {
+            int count = fixture.expertCounts[expert];
+            if (count == 0) {
+                continue;
+            }
+
+            std::vector<float> expertValues((size_t)count * fixture.hidden);
+            for (int local = 0; local < count; ++local) {
+                int route = fixture.expertStarts[expert] + local;
+                int token = fixture.routeRows[route];
+                std::copy_n(
+                    fixture.inputValues.data() + (size_t)token * fixture.hidden,
+                    fixture.hidden,
+                    expertValues.data() + (size_t)local * fixture.hidden);
+            }
+
+            fastllm::Data expertSource(
+                fastllm::DataType::BFLOAT16, {count, fixture.hidden},
+                expertValues);
+            fastllm::Data expertInput;
+            expertInput.CopyFrom(expertSource);
+            expertInput.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data gateWeight, gateOutput, activated;
+            fixture.gateFixtures[expert]->InitDeviceWeight(gateWeight);
+            gateOutput.dataType = fastllm::DataType::BFLOAT16;
+            gateOutput.UpdateUnitSize();
+            gateOutput.Resize({count, fixture.inter * 2});
+            gateOutput.Allocate(false);
+            gateOutput.ToDevice(fastllm::DataDevice::CUDA, false);
+            if (!TryCudaCutlassW4A8(
+                    expertInput, gateWeight, emptyBias, gateOutput,
+                    count, fixture.hidden, fixture.inter * 2)) {
+                throw std::runtime_error(
+                    "W4A8 dense gate reference launch failed");
+            }
+
+            activated.dataType = fastllm::DataType::BFLOAT16;
+            activated.UpdateUnitSize();
+            activated.Resize({count, fixture.inter});
+            activated.Allocate(false);
+            activated.ToDevice(fastllm::DataDevice::CUDA, false);
+            if (!FastllmCudaSwiglu(gateOutput, activated)) {
+                throw std::runtime_error(
+                    "W4A8 dense reference SwiGLU launch failed");
+            }
+
+            fastllm::Data downWeight, routeOutput;
+            fixture.downFixtures[expert]->InitDeviceWeight(downWeight);
+            routeOutput.dataType = fastllm::DataType::BFLOAT16;
+            routeOutput.UpdateUnitSize();
+            routeOutput.Resize({count, fixture.hidden});
+            routeOutput.Allocate(false);
+            routeOutput.ToDevice(fastllm::DataDevice::CUDA, false);
+            if (!TryCudaCutlassW4A8(
+                    activated, downWeight, emptyBias, routeOutput,
+                    count, fixture.inter, fixture.hidden)) {
+                throw std::runtime_error(
+                    "W4A8 dense down reference launch failed");
+            }
+
+            std::vector<float> routeValues =
+                ToFloatVector(ConvertToFloat32Data(routeOutput));
+            for (int local = 0; local < count; ++local) {
+                int route = fixture.expertStarts[expert] + local;
+                std::copy_n(
+                    routeValues.data() + (size_t)local * fixture.hidden,
+                    fixture.hidden,
+                    routedValues.data() + (size_t)route * fixture.hidden);
+            }
+        }
+
+        std::vector<float> result(
+            (size_t)fixture.batch * fixture.hidden, 0.0f);
+        for (int token = 0; token < fixture.batch; ++token) {
+            for (int col = 0; col < fixture.hidden; ++col) {
+                float value = 0.0f;
+                for (int slot = 0; slot < fixture.topk; ++slot) {
+                    int route =
+                        fixture.routePositions[token * fixture.topk + slot];
+                    value +=
+                        routedValues[(size_t)route * fixture.hidden + col] *
+                        fixture.routeScales[route];
+                }
+                result[(size_t)token * fixture.hidden + col] =
+                    BFloat16ToFloat(
+                        FloatToBFloat16RoundToNearest(value));
+            }
+        }
+        return fastllm::Data(
+            fastllm::DataType::FLOAT32,
+            {fixture.batch, fixture.hidden}, result);
+    }
+#endif
+
     static ComparisonStats CompareData(const fastllm::Data &expectedData, const fastllm::Data &actualData,
                                        float atol, float rtol) {
         fastllm::Data expected(expectedData);
@@ -316,15 +1073,16 @@ namespace {
         for (size_t i = 0; i < expectedVec.size(); i++) {
             float absDiff = std::fabs(expectedVec[i] - actualVec[i]);
             float relDiff = absDiff / std::max(std::fabs(expectedVec[i]), 1e-6f);
-            if (absDiff > stats.maxAbsDiff) {
-                stats.maxAbsDiff = absDiff;
-                stats.maxRelDiff = relDiff;
+            stats.maxAbsDiff = std::max(stats.maxAbsDiff, absDiff);
+            stats.maxRelDiff = std::max(stats.maxRelDiff, relDiff);
+            float toleranceExcess =
+                absDiff - (atol + rtol * std::fabs(expectedVec[i]));
+            if (toleranceExcess > stats.maxToleranceExcess) {
+                stats.passed = false;
+                stats.maxToleranceExcess = toleranceExcess;
                 stats.mismatchIndex = i;
                 stats.expected = expectedVec[i];
                 stats.actual = actualVec[i];
-            }
-            if (absDiff > atol + rtol * std::fabs(expectedVec[i])) {
-                return stats;
             }
         }
         return stats;
@@ -359,6 +1117,8 @@ namespace {
         std::function<BenchmarkResult(const OpTestParams&, const std::string&, int, int)> benchmarkOverride = nullptr;
         std::function<double(const OpTestParams&)> GetIOBytes = nullptr;
         std::function<double(const OpTestParams&)> GetComputeOps = nullptr;
+        std::function<fastllm::Data(
+            const OpTestParams&, const std::string&)> runReference = nullptr;
         bool benchmarkOnly = false;
 
         OpCase() = default;
@@ -1200,11 +1960,35 @@ namespace {
                 params.Add("batch", "4", "batch size");
                 params.Add("in", "8", "input features");
                 params.Add("out", "6", "output features");
-                params.Add("weight_type", "float32", "weight datatype: float32, int4group, or int4group32");
+                params.Add("weight_type", "float32",
+                           "weight datatype: float32, int4group, int4group32 or int4_w4a8");
                 params.Add("group_cnt", "128", "group size used by int4group quantization");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
+                if (params.GetString("weight_type") == "int4_w4a8") {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                    int batch = params.GetInt("batch");
+                    int in = params.GetInt("in");
+                    int out = params.GetInt("out");
+                    if (batch <= 0 || in <= 0 || out <= 0 ||
+                        in % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0 ||
+                        out % fastllm::COMPRESSED_W4A8_GROUP_SIZE != 0) {
+                        throw std::runtime_error(
+                            "linear weight_type=int4_w4a8 requires positive "
+                            "batch and 128-aligned in/out");
+                    }
+                    if (device.rfind("cuda:", 0) != 0) {
+                        return false;
+                    }
+                    ScopedFirstDevice guard(device);
+                    return FastllmCudaRuntimeArch() == 90;
+#else
+                    (void)params;
+                    (void)device;
+                    return false;
+#endif
+                }
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 fastllm::Data input = MakeTensor({batch, in}, 0.2f);
                 fastllm::Data weight;
@@ -1215,6 +1999,22 @@ namespace {
                                       {}, {});
             },
             [](const OpTestParams &params, const std::string &device) {
+                if (params.GetString("weight_type") == "int4_w4a8") {
+                    LinearW4A8Fixture fixture(params);
+                    if (device == "cpu") {
+                        return fixture.CpuReference();
+                    }
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                    ScopedFirstDevice guard(device);
+                    fastllm::Data input, weight, bias, output;
+                    fixture.InitDeviceData(input, weight, bias, output);
+                    fastllm::Linear(input, weight, bias, output);
+                    return ConvertToFloat32Data(output);
+#else
+                    throw std::runtime_error(
+                        "int4_w4a8 linear requires CUDA SM90 CUTLASS build");
+#endif
+                }
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 fastllm::Data input = MakeTensor({batch, in}, 0.2f);
                 fastllm::Data weight;
@@ -1226,7 +2026,30 @@ namespace {
                 output.ToDevice(fastllm::DataDevice::CPU);
                 return output;
             },
-            [](const OpTestParams &params, const std::string &device) {
+            [](const OpTestParams &params, const std::string &device)
+                -> std::function<void()> {
+                if (params.GetString("weight_type") == "int4_w4a8") {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                    auto fixture =
+                        std::make_shared<LinearW4A8Fixture>(params);
+                    auto input = std::make_shared<fastllm::Data>();
+                    auto weight = std::make_shared<fastllm::Data>();
+                    auto bias = std::make_shared<fastllm::Data>();
+                    auto output = std::make_shared<fastllm::Data>();
+                    {
+                        ScopedFirstDevice guard(device);
+                        fixture->InitDeviceData(
+                            *input, *weight, *bias, *output);
+                    }
+                    return [device, input, weight, bias, output]() {
+                        ScopedFirstDevice guard(device);
+                        fastllm::Linear(*input, *weight, *bias, *output);
+                    };
+#else
+                    throw std::runtime_error(
+                        "int4_w4a8 linear requires CUDA SM90 CUTLASS build");
+#endif
+                }
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 auto input = std::make_shared<fastllm::Data>(MakeTensor({batch, in}, 0.2f));
                 auto weight = std::make_shared<fastllm::Data>();
@@ -1241,6 +2064,14 @@ namespace {
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 double weightBytes = FloatBytes({out, in});
+                if (params.GetString("weight_type") == "int4_w4a8") {
+                    int groups = in / fastllm::COMPRESSED_W4A8_GROUP_SIZE;
+                    return (double)batch * in * 2.0 +
+                           (double)out * in * 0.5 +
+                           (double)out * groups * 2.0 +
+                           (double)out * sizeof(float) +
+                           (double)batch * out * 2.0;
+                }
                 if (params.GetString("weight_type") == "int4group32") {
                     weightBytes = (double)fastllm::GetDataBytes(
                         fastllm::DataType::INT4_GROUP32, out, in);
@@ -1253,6 +2084,168 @@ namespace {
                 return 2.0 * batch * in * out + (double) batch * out;
             }
         };
+    }
+
+    static OpCase MakeW4A8ActivationQuantCase() {
+        return {
+            "w4a8_activation_quant",
+            "dynamic per-token FP8 E4M3 activation quantization for W4A8",
+            []() {
+                OpTestParams params;
+                params.Add("tokens", "16", "number of flattened tokens");
+                params.Add("hidden", "4096", "hidden size per token");
+                params.Add("dtype", "bfloat16",
+                           "input datatype: bfloat16 or float16");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                W4A8ActivationQuantFixture fixture(params);
+                (void)fixture;
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                if (device.rfind("cuda:", 0) != 0) {
+                    return false;
+                }
+                ScopedFirstDevice guard(device);
+                return FastllmCudaRuntimeArch() == 90;
+#else
+                (void)device;
+                return false;
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                W4A8ActivationQuantFixture fixture(params);
+                if (device == "cpu") {
+                    return fixture.CpuReference();
+                }
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                ScopedFirstDevice guard(device);
+                return fixture.CudaResult();
+#else
+                throw std::runtime_error(
+                    "w4a8_activation_quant requires CUDA SM90 CUTLASS build");
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device)
+                -> std::function<void()> {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                ScopedFirstDevice guard(device);
+                W4A8ActivationQuantFixture fixture(params);
+                auto state =
+                    std::make_shared<W4A8ActivationQuantBenchmarkState>(fixture);
+                return [device, state]() {
+                    ScopedFirstDevice runGuard(device);
+                    state->Run();
+                };
+#else
+                (void)params;
+                (void)device;
+                throw std::runtime_error(
+                    "w4a8_activation_quant requires CUDA SM90 CUTLASS build");
+#endif
+            },
+            [](const OpTestParams &params) {
+                double tokens = params.GetInt("tokens");
+                double hidden = params.GetInt("hidden");
+                return tokens * hidden * 2.0 +
+                       tokens * hidden +
+                       tokens * sizeof(float);
+            },
+            [](const OpTestParams&) {
+                return 0.0;
+            }
+        };
+    }
+
+    static OpCase MakeMergeMoeW4A8Case() {
+        OpCase result = {
+            "mergemoe_w4a8",
+            "CUTLASS grouped W4A8 MoE with routed SwiGLU experts",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "16", "token batch size");
+                params.Add("hidden", "256", "model hidden size");
+                params.Add("inter", "256", "expert intermediate size");
+                params.Add("experts", "4", "number of routed experts");
+                params.Add("topk", "2", "experts selected per token");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                MergeMoeW4A8Fixture fixture(params);
+                (void)fixture;
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                if (device.rfind("cuda:", 0) != 0) {
+                    return false;
+                }
+                ScopedFirstDevice guard(device);
+                return FastllmCudaRuntimeArch() == 90;
+#else
+                (void)device;
+                return false;
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                auto fixture =
+                    std::make_shared<MergeMoeW4A8Fixture>(params);
+                if (device == "cpu") {
+                    return fixture->CpuReference();
+                }
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                ScopedFirstDevice guard(device);
+                MergeMoeW4A8BenchmarkState state(fixture);
+                state.Run();
+                return ConvertToFloat32Data(state.output);
+#else
+                throw std::runtime_error(
+                    "mergemoe_w4a8 requires CUDA SM90 CUTLASS build");
+#endif
+            },
+            [](const OpTestParams &params, const std::string &device)
+                -> std::function<void()> {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+                ScopedFirstDevice guard(device);
+                auto fixture =
+                    std::make_shared<MergeMoeW4A8Fixture>(params);
+                auto state =
+                    std::make_shared<MergeMoeW4A8BenchmarkState>(fixture);
+                return [device, state]() {
+                    ScopedFirstDevice runGuard(device);
+                    state->Run();
+                };
+#else
+                (void)params;
+                (void)device;
+                throw std::runtime_error(
+                    "mergemoe_w4a8 requires CUDA SM90 CUTLASS build");
+#endif
+            },
+            [](const OpTestParams &params) {
+                double batch = params.GetInt("batch");
+                double hidden = params.GetInt("hidden");
+                double inter = params.GetInt("inter");
+                double experts = params.GetInt("experts");
+                double topk = params.GetInt("topk");
+                return batch * hidden * 2.0 +
+                       experts * (2.0 * inter * hidden +
+                                  hidden * inter) * 0.5 +
+                       batch * topk * (2.0 * inter + hidden) * 2.0;
+            },
+            [](const OpTestParams &params) {
+                double batch = params.GetInt("batch");
+                double hidden = params.GetInt("hidden");
+                double inter = params.GetInt("inter");
+                double topk = params.GetInt("topk");
+                return batch * topk * 6.0 * hidden * inter;
+            }
+        };
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_CUTLASS_W4A8)
+        result.runReference = [](
+                const OpTestParams &params, const std::string &device) {
+            ScopedFirstDevice guard(device);
+            MergeMoeW4A8Fixture fixture(params);
+            return MergeMoeW4A8DenseReference(fixture);
+        };
+#endif
+        return result;
     }
 
     static OpCase MakeSiluCase() {
@@ -3303,7 +4296,9 @@ namespace {
             MakeMatMulCase(),
             MakeLayerNormCase(),
             MakeRmsNormCase(),
+            MakeW4A8ActivationQuantCase(),
             MakeLinearCase(),
+            MakeMergeMoeW4A8Case(),
             MakeSiluCase(),
             MakeSoftmaxCase(),
             MakeGeluNewCase(),
@@ -3432,8 +4427,6 @@ namespace {
             return ran;
         }
 
-        fastllm::Data baseline = opCase.run(params, "cpu");
-        baseline.ToDevice(fastllm::DataDevice::CPU);
         bool ok = true;
 
         for (const auto &device : devices) {
@@ -3445,10 +4438,14 @@ namespace {
                 continue;
             }
 
+            fastllm::Data baseline = opCase.runReference
+                ? opCase.runReference(params, device)
+                : opCase.run(params, "cpu");
+            baseline.ToDevice(fastllm::DataDevice::CPU);
             fastllm::Data output = opCase.run(params, device);
             output.ToDevice(fastllm::DataDevice::CPU);
             ComparisonStats stats = CompareData(baseline, output, config.atol, config.rtol);
-            bool pass = stats.maxAbsDiff <= config.atol + config.rtol * std::fabs(stats.expected);
+            bool pass = stats.passed;
             BenchmarkResult bench = Benchmark(opCase, params, device, config.warmup, config.iters);
 
             std::cout << "  [" << device << "] " << (pass ? "PASS" : "FAIL") << "\n";

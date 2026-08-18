@@ -326,6 +326,31 @@ if (USE_CUDA)
     else()
         message(STATUS "CUTLASS FP8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
     endif()
+
+    set(FASTLLM_CUTLASS_W4A8_ARCH_ENABLED OFF)
+    foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if (FASTLLM_CUDA_ARCH STREQUAL "90a" OR
+            FASTLLM_CUDA_ARCH STREQUAL "90" OR
+            FASTLLM_CUDA_ARCH STREQUAL "9.0a")
+            set(FASTLLM_CUTLASS_W4A8_ARCH_ENABLED ON)
+        endif()
+    endforeach()
+    set(FASTLLM_CUTLASS_W4A8_ENABLED OFF)
+    if (NOT FASTLLM_CUTLASS_DIR STREQUAL "" AND
+        EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h" AND
+        FASTLLM_CUTLASS_W4A8_ARCH_ENABLED AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
+        set(FASTLLM_CUTLASS_W4A8_ENABLED ON)
+        include_directories("${FASTLLM_CUTLASS_DIR}/include")
+        if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include")
+            include_directories("${FASTLLM_CUTLASS_DIR}/tools/util/include")
+        endif()
+        add_compile_definitions(FASTLLM_ENABLE_CUTLASS_W4A8)
+        message(STATUS "CUTLASS W4A8 kernels: ON (${FASTLLM_CUTLASS_DIR})")
+    else()
+        message(STATUS "CUTLASS W4A8 kernels: OFF (${FASTLLM_CUTLASS_DIR})")
+    endif()
+
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
         src/devices/cuda/fastllm-cuda.cu 
@@ -350,6 +375,15 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/deepseekv4-kernels.cu)
+
+    if(FASTLLM_CUTLASS_W4A8_ENABLED)
+        include_directories(src)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/linear/fastllm-linear-w4a8-cutlass.cu
+            src/devices/cuda/linear/fastllm-w4a8-utils.cu
+            src/devices/cuda/moe/fastllm-moe-w4a8-cutlass.cu
+        )
+    endif()
 
     # FlashInfer's DeepSeek-V4 sparse MLA decode kernel uses SM120-only
     # block-scaled FP8 MMA instructions.  Compile it as a separate fatbin so a

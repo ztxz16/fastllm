@@ -327,15 +327,43 @@ namespace fastllm {
         // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
         // The final partial block has no padding. The implicit zero point is 8.
         INT4_GROUP32 = 1008,
+        INT4_W4A8 = 1009, // independent W4A8: uint4b8 source + BF16 symmetric group=128 scales
         // Internal NUMA layout for NVFP4 blockM=32 weights:
         // [16 packed fp4 bytes] [one inline E8M0 scale byte].
-        NVFP4_BLOCK_32_E8M0 = 1009,
+        NVFP4_BLOCK_32_E8M0 = 1010,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
         DATA_GGUF_FORMAT = 9999, DATA_GGUF_FORMAT_END = 19999, // [DATA_GGUF_FORMAT, DATA_GGUF_FORMAT_END]之间为GGUF格式的数据，ggml_type = type - DATA_FFUF_FORMAT
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV,
         DATA_AUTO_SOURCE // auto keeps scaled FP8 source weights, otherwise uses FLOAT16
+    };
+
+    enum class W4A8WeightEncoding {
+        NONE = 0,
+        COMPRESSED_TENSORS_UINT4B8 = 1
+    };
+
+    constexpr int COMPRESSED_W4A8_GROUP_SIZE = 128;
+
+    struct W4A8CudaWeightCache {
+        uint64_t magic = 0;
+        int deviceId = -1;
+        DataType sourceType = DataType::FLOAT32;
+        W4A8WeightEncoding sourceEncoding = W4A8WeightEncoding::NONE;
+        int inChannels = 0;
+        int outChannels = 0;
+        int groupCnt = 0;
+        int group = 0;
+        size_t packedWeightBytes = 0;
+        size_t packedGroupScaleBytes = 0;
+        size_t channelScaleBytes = 0;
+        const void *sourceCudaData = nullptr;
+        const void *hostScales = nullptr;
+        size_t scaleCount = 0;
+        void *packedWeight = nullptr;
+        void *packedGroupScales = nullptr;
+        void *channelScales = nullptr;
     };
 
     std::string GetDataTypeName(DataType type);
@@ -509,6 +537,11 @@ namespace fastllm {
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 
         std::vector <uint16_t> halfScales; // 某些量化方式使用float16的scales
+        // Row-major uint4b8 source data and its BF16 group scales. CUTLASS reorder
+        // results belong to a CUDA-side cache instead of this logical weight.
+        W4A8WeightEncoding w4a8WeightEncoding = W4A8WeightEncoding::NONE;
+        std::vector <uint16_t> w4a8GroupScales;
+        std::map <int, W4A8CudaWeightCache> w4a8CudaCaches;
 
         bool isModelWeight = false; // 是否是模型权重
         std::string name; // weightName
@@ -571,6 +604,12 @@ namespace fastllm {
                 int groupCnt = -1, int blockK = -1, int blockM = -1); // 从oriData中创建
 
         void CopyFrom(const Data &ori); // 复制
+
+        void InitW4A8Weight(W4A8WeightEncoding encoding);
+
+        void SetW4A8GroupScales(const uint16_t *groupScales, size_t count);
+
+        bool ValidateW4A8Weight(std::string *reason = nullptr) const;
 
         void FakeFrom(const Data &ori, size_t offset); // 将data指针指向ori的data + offset，delete时不销毁
 
