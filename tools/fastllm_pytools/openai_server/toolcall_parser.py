@@ -1,6 +1,7 @@
 import copy
 import difflib
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
@@ -10,6 +11,10 @@ from .protocal.openai_protocol import (
     ExtractedToolCallInformation,
 )
 from .tool_parsers import ToolParserManager
+
+
+def _reject_non_finite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
 
 
 @dataclass(frozen=True)
@@ -637,8 +642,11 @@ class FunctionCallParser:
             ]
 
         try:
-            parsed_arguments = json.loads(arguments)
-        except (json.JSONDecodeError, TypeError) as exc:
+            parsed_arguments = json.loads(
+                arguments,
+                parse_constant=_reject_non_finite_json_constant,
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
             return [
                 ToolCallDiagnostic(
                     code="malformed_arguments_json",
@@ -860,9 +868,11 @@ def _matches_json_schema_type(value: Any, expected_type: Any) -> bool:
     if expected_type == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if expected_type == "number":
-        return (
-            isinstance(value, int) or isinstance(value, float)
-        ) and not isinstance(value, bool)
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return True
+        return isinstance(value, float) and math.isfinite(value)
     if expected_type == "boolean":
         return isinstance(value, bool)
     if expected_type == "array":

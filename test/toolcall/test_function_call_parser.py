@@ -424,6 +424,27 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(result.diagnostics[0].code,
                          "malformed_arguments_json")
 
+    def test_strict_schema_rejects_non_finite_json_constants(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                arguments = (
+                    '{"city":"北京","days":' + constant + "}"
+                )
+                result = parser.validate_tool_calls([
+                    _tool_call_dict("get_weather", arguments)
+                ])
+
+                self.assertFalse(result.valid)
+                self.assertEqual(result.valid_tool_calls, [])
+                self.assertEqual(len(result.invalid_tool_calls), 1)
+                self.assertEqual(
+                    result.diagnostics[0].code,
+                    "malformed_arguments_json",
+                )
+
     def test_strict_schema_arguments_must_be_object(self):
         parser = FunctionCallParser.from_request(
             _request(tools=[_strict_weather_tool()]))

@@ -4,6 +4,7 @@
 
 import json
 import logging
+import math
 from collections.abc import Sequence
 from typing import Any, Optional, Union
 
@@ -26,6 +27,17 @@ from ..protocal.openai_protocol import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_non_finite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
+
+
+def _load_strict_json(value: str) -> Any:
+    return json.loads(
+        value,
+        parse_constant=_reject_non_finite_json_constant,
+    )
 
 
 def _get_value(value: Any, key: str, default: Any = None) -> Any:
@@ -92,9 +104,6 @@ class DotsToolParser(ToolParser):
 
     @staticmethod
     def _convert_param_value(value: str, param_type: Any) -> Any:
-        if value.lower() == "null":
-            return None
-
         if isinstance(param_type, list):
             param_type = next(
                 (item for item in param_type if item != "null"), "string")
@@ -104,6 +113,8 @@ class DotsToolParser(ToolParser):
 
         if param_type in {"string", "str", "text"}:
             return value
+        if value.lower() == "null":
+            return None
         if param_type in {"integer", "int"}:
             try:
                 return int(value)
@@ -112,13 +123,20 @@ class DotsToolParser(ToolParser):
         if param_type in {"number", "float"}:
             try:
                 number = float(value)
+                if not math.isfinite(number):
+                    return value
                 return int(number) if number.is_integer() else number
             except (TypeError, ValueError):
                 return value
         if param_type in {"boolean", "bool"}:
-            return value.lower() in {"true", "1"}
+            lowered = value.lower()
+            if lowered in {"true", "1"}:
+                return True
+            if lowered in {"false", "0"}:
+                return False
+            return value
         try:
-            return json.loads(value)
+            return _load_strict_json(value)
         except (json.JSONDecodeError, TypeError, ValueError):
             return value
 
@@ -212,7 +230,7 @@ class DotsToolParser(ToolParser):
                 raise ValueError("Dots tool-call block contains no invoke")
             return calls
 
-        parsed = json.loads(content)
+        parsed = _load_strict_json(content)
         if not isinstance(parsed, dict):
             raise TypeError("Dots JSON tool call must be an object")
         return [parsed]
@@ -240,8 +258,9 @@ class DotsToolParser(ToolParser):
                 content=model_output,
             )
 
+        blocks = list(self._block_regex.finditer(model_output))
         tool_calls: list[ToolCall] = []
-        for block in self._block_regex.finditer(model_output):
+        for block in blocks:
             try:
                 parsed_calls = self._parse_block(block.group(1), request.tools)
                 for parsed in parsed_calls:
@@ -250,7 +269,10 @@ class DotsToolParser(ToolParser):
                         ToolCall(function=FunctionCall(
                             name=name,
                             arguments=json.dumps(
-                                arguments, ensure_ascii=False),
+                                arguments,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            ),
                         )))
             except (json.JSONDecodeError, TypeError, ValueError) as error:
                 logger.warning("Failed to parse Dots tool call: %s", error)
@@ -269,11 +291,20 @@ class DotsToolParser(ToolParser):
             }
             for call in tool_calls
         ]
-        normal_text = model_output[:marker_index].strip()
+        normal_parts: list[str] = []
+        previous_end = 0
+        for block in blocks:
+            normal_parts.append(model_output[previous_end:block.start()])
+            previous_end = block.end()
+        normal_parts.append(model_output[previous_end:])
+        normal_text = "".join(normal_parts)
+        unmatched_marker_index = normal_text.find(self.tool_call_start_token)
+        if unmatched_marker_index != -1:
+            normal_text = normal_text[:unmatched_marker_index]
         return ExtractedToolCallInformation(
             tools_called=True,
             tool_calls=tool_calls,
-            content=normal_text or None,
+            content=normal_text if normal_text.strip() else None,
         )
 
     def _append_stream_call(
@@ -282,8 +313,12 @@ class DotsToolParser(ToolParser):
         arguments: dict[str, Any],
         tool_calls: list[DeltaToolCall],
     ) -> None:
+        serialized = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
         self.current_tool_id += 1
-        serialized = json.dumps(arguments, ensure_ascii=False)
         self.prev_tool_call_arr.append({
             "name": name,
             "arguments": serialized,
