@@ -760,6 +760,10 @@ bool FastllmCudaDots3NoteSparseAttentionPrefill(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &indices,
         int startPos, float scale, fastllm::Data &output);
+bool FastllmCudaDots3NoteSlidingAttentionPrefill(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, int startPos, int windowSize,
+        float scale, fastllm::Data &output);
 size_t FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
                                                       int seqlen, int heads,
                                                       int compressRatio);

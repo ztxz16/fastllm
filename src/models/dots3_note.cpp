@@ -744,7 +744,25 @@ namespace fastllm {
             CatDirect(pastValue, value, 1);
 
             int keyLen = pastKey.dims[1];
-            if (fullAttention && keyLen > indexTopK) {
+            bool usedSlidingPrefill = false;
+#ifdef USE_CUDA
+            if (!fullAttention && seqlen >= 16 &&
+                keyLen > shortContextLimit &&
+                q.dataDevice == DataDevice::CUDA) {
+                ScopedExecutorProfiler slidingProfile(
+                    "Dots3NoteSlidingAttention");
+                usedSlidingPrefill =
+                    FastllmCudaDots3NoteSlidingAttentionPrefill(
+                        q, pastKey, pastValue, layerPastLen,
+                        shortContextLimit,
+                        1.0f / std::sqrt((float)qHeadDim),
+                        attentionOutput);
+                AssertInFastLLM(
+                    usedSlidingPrefill,
+                    "FastLLM Dots3-Note sliding attention failed.\n");
+            }
+#endif
+            if (!usedSlidingPrefill && fullAttention && keyLen > indexTopK) {
 #ifdef USE_CUDA
                 ScopedExecutorProfiler sparseProfile(
                     "Dots3NoteSparseAttention");
@@ -779,7 +797,7 @@ namespace fastllm {
                 ErrorInFastLLM(
                     "Dots3-Note sparse MLA requires a CUDA build.\n");
 #endif
-            } else {
+            } else if (!usedSlidingPrefill) {
                 MatMulTransB(q, pastKey, attentionScores);
                 Mul(attentionScores, 1.0f / std::sqrt((float)qHeadDim),
                     attentionScores);

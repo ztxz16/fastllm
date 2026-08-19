@@ -3294,6 +3294,7 @@ namespace {
         fastllm::Data cachedKScales{fastllm::DataType::FLOAT32};
         fastllm::Data mainQ, mainK, mainV;
         fastllm::Data sparseOutput, sparsePrefillOutput;
+        fastllm::Data slidingPrefillOutput;
 
         static std::vector<uint8_t> ToBytes(const fastllm::Data &data) {
             fastllm::Data host;
@@ -3473,6 +3474,88 @@ namespace {
             }
         }
 
+        void ValidateSlidingAttention() {
+            std::vector<float> qValues =
+                ToFloatVector(ConvertToFloat32Data(mainQ));
+            std::vector<float> kValues =
+                ToFloatVector(ConvertToFloat32Data(mainK));
+            std::vector<float> vValues =
+                ToFloatVector(ConvertToFloat32Data(mainV));
+            std::vector<float> actual =
+                ToFloatVector(ConvertToFloat32Data(slidingPrefillOutput));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!std::isfinite(actual[i])) {
+                    std::ostringstream os;
+                    os << "Dots sliding prefill produced a non-finite value "
+                       << "at element " << i;
+                    throw std::runtime_error(os.str());
+                }
+            }
+
+            constexpr int windowSize = 513;
+            constexpr float scale = 0.07216878364870322f; // rsqrt(192)
+            std::vector<int> tokensToCheck = {0};
+            if (queryTokens > 2) {
+                tokensToCheck.push_back(queryTokens / 2);
+            }
+            if (queryTokens > 1) {
+                tokensToCheck.push_back(queryTokens - 1);
+            }
+            float maxAbsDiff = 0.0f;
+            for (int token : tokensToCheck) {
+                int queryPosition = startPos + token;
+                int firstKey = std::max(
+                    0, queryPosition - windowSize + 1);
+                int lastKey = std::min(totalTokens, queryPosition + 1);
+                int length = lastKey - firstKey;
+                std::vector<float> scores(length);
+                float maximum = -INFINITY;
+                for (int i = 0; i < length; ++i) {
+                    int key = firstKey + i;
+                    float dot = 0.0f;
+                    size_t qBase = (size_t)token * 192;
+                    size_t kBase = (size_t)key * 192;
+                    for (int d = 0; d < 192; ++d) {
+                        dot += qValues[qBase + d] * kValues[kBase + d];
+                    }
+                    uint16_t roundedBits =
+                        fastllm::Float32ToBFloat16RNEBits(dot);
+                    scores[i] =
+                        fastllm::BFloat16BitsToFloat32(roundedBits) * scale;
+                    maximum = std::max(maximum, scores[i]);
+                }
+                float denominator = 0.0f;
+                for (float &score : scores) {
+                    score = std::exp(score - maximum);
+                    denominator += score;
+                }
+                for (int d = 0; d < 128; ++d) {
+                    float expected = 0.0f;
+                    for (int i = 0; i < length; ++i) {
+                        int key = firstKey + i;
+                        uint16_t probabilityBits =
+                            fastllm::Float32ToBFloat16RNEBits(
+                                scores[i] / denominator);
+                        float probability =
+                            fastllm::BFloat16BitsToFloat32(
+                                probabilityBits);
+                        size_t vOffset = (size_t)key * 128 + d;
+                        expected += probability * vValues[vOffset];
+                    }
+                    size_t outOffset = (size_t)token * 128 + d;
+                    maxAbsDiff = std::max(
+                        maxAbsDiff,
+                        std::fabs(expected - actual[outOffset]));
+                }
+            }
+            if (maxAbsDiff > 2.0e-2f) {
+                std::ostringstream os;
+                os << "Dots sliding prefill mismatch: max_abs_diff="
+                   << maxAbsDiff;
+                throw std::runtime_error(os.str());
+            }
+        }
+
         void Init(const OpTestParams &params) {
             FastllmCudaSetDevice(0);
             queryTokens = params.GetInt("queries");
@@ -3484,9 +3567,10 @@ namespace {
                     "Dots indexer requires 0 < queries <= keys and keys > 2048");
             }
             if (path != "indexer" && path != "sparse" &&
-                path != "sparse_prefill") {
+                path != "sparse_prefill" && path != "sliding_prefill") {
                 throw std::runtime_error(
-                    "Dots benchmark path must be indexer, sparse or sparse_prefill");
+                    "Dots benchmark path must be indexer, sparse, "
+                    "sparse_prefill or sliding_prefill");
             }
             startPos = totalTokens - queryTokens;
 
@@ -3567,11 +3651,18 @@ namespace {
                 throw std::runtime_error(
                     "Dots sparse prefill CUDA launch failed");
             }
+            if (!FastllmCudaDots3NoteSlidingAttentionPrefill(
+                    mainQ, mainK, mainV, startPos, 513,
+                    1.0f / std::sqrt(192.0f), slidingPrefillOutput)) {
+                throw std::runtime_error(
+                    "Dots sliding prefill CUDA launch failed");
+            }
             ForceDeviceSync();
             ValidateSparseAttention(sparseOutput, "Dots sparse attention");
             ValidateSparseAttention(sparsePrefillOutput,
                                     "Dots sparse prefill");
             ValidateSparseAttentionAgreement();
+            ValidateSlidingAttention();
         }
 
         void Run() {
@@ -3584,10 +3675,14 @@ namespace {
                 ok = FastllmCudaDots3NoteSparseAttention(
                     mainQ, mainK, mainV, indices, startPos,
                     1.0f / std::sqrt(192.0f), sparseOutput);
-            } else {
+            } else if (path == "sparse_prefill") {
                 ok = FastllmCudaDots3NoteSparseAttentionPrefill(
                     mainQ, mainK, mainV, indices, startPos,
                     1.0f / std::sqrt(192.0f), sparsePrefillOutput);
+            } else {
+                ok = FastllmCudaDots3NoteSlidingAttentionPrefill(
+                    mainQ, mainK, mainV, startPos, 513,
+                    1.0f / std::sqrt(192.0f), slidingPrefillOutput);
             }
             if (!ok) {
                 throw std::runtime_error("Dots CUDA replay failed");
@@ -3623,13 +3718,13 @@ namespace {
     static OpCase MakeDots3NoteIndexerCase() {
         return {
             "dots3_note_indexer",
-            "validate Dots3-Note E4M3 indexer Top-2048 and sparse MLA",
+            "validate Dots3-Note E4M3 indexer and bounded attention prefill",
             []() {
                 OpTestParams params;
                 params.Add("queries", "1", "number of tail query tokens");
                 params.Add("keys", "2049", "total cached key tokens");
                 params.Add("path", "indexer",
-                           "indexer, sparse or sparse_prefill");
+                           "indexer, sparse, sparse_prefill or sliding_prefill");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {

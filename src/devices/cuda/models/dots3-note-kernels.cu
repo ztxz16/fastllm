@@ -408,6 +408,88 @@ __global__ void SparseAttentionPrefillSoftmaxKernel(
     }
 }
 
+__global__ void SlidingAttentionPrefillSoftmaxKernel(
+        __nv_bfloat16 *scores, int queryOffset, int queryChunk,
+        int keyStart, int keyCount, int startPos, int windowSize,
+        float scale) {
+    constexpr int warps = 8;
+    int row = blockIdx.x;
+    int token = queryOffset + row % queryChunk;
+    int queryPosition = startPos + token;
+    int firstKey = max(keyStart, queryPosition - windowSize + 1);
+    int lastKey = min(keyStart + keyCount, queryPosition + 1);
+    int visible = lastKey - firstKey;
+    int visibleOffset = firstKey - keyStart;
+    __nv_bfloat16 *rowScores = scores + (uint64_t)row * keyCount;
+    extern __shared__ float probabilities[];
+    __shared__ float warpValues[warps];
+    __shared__ float rowMaximum;
+    __shared__ float rowSum;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    float localMaximum = -FLT_MAX;
+    for (int i = threadIdx.x; i < visible; i += blockDim.x) {
+        float value =
+            __bfloat162float(rowScores[visibleOffset + i]) * scale;
+        probabilities[i] = value;
+        localMaximum = fmaxf(localMaximum, value);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localMaximum = fmaxf(
+            localMaximum,
+            __shfl_down_sync(0xffffffffu, localMaximum, offset));
+    }
+    if (lane == 0) {
+        warpValues[warp] = localMaximum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < warps ? warpValues[lane] : -FLT_MAX;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value = fmaxf(
+                value, __shfl_down_sync(0xffffffffu, value, offset));
+        }
+        if (lane == 0) {
+            rowMaximum = value;
+        }
+    }
+    __syncthreads();
+
+    float localSum = 0.0f;
+    for (int i = threadIdx.x; i < visible; i += blockDim.x) {
+        float value = expf(probabilities[i] - rowMaximum);
+        probabilities[i] = value;
+        localSum += value;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localSum += __shfl_down_sync(0xffffffffu, localSum, offset);
+    }
+    if (lane == 0) {
+        warpValues[warp] = localSum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < warps ? warpValues[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) {
+            rowSum = value;
+        }
+    }
+    __syncthreads();
+
+    for (int key = threadIdx.x; key < keyCount; key += blockDim.x) {
+        rowScores[key] = __float2bfloat16_rn(0.0f);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < visible; i += blockDim.x) {
+        rowScores[visibleOffset + i] = __float2bfloat16_rn(
+            probabilities[i] / rowSum);
+    }
+}
+
 } // namespace
 
 bool FastllmCudaDots3NotePackIndexerKey(
@@ -791,6 +873,152 @@ bool FastllmCudaDots3NoteSparseAttentionPrefill(
             (long long)current * totalLen, &beta,
             outputChunk, CUDA_R_16BF, kAttentionVDim,
             (long long)output.strides[0], kAttentionHeads,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        ok = status == CUBLAS_STATUS_SUCCESS;
+    }
+    cudaError_t launchState = cudaGetLastError();
+    DeviceSync();
+    FastllmCudaFree(scores);
+    return ok && launchState == cudaSuccess;
+}
+
+bool FastllmCudaDots3NoteSlidingAttentionPrefill(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, int startPos, int windowSize,
+        float scale, fastllm::Data &output) {
+    if (startPos < 0 || windowSize <= 0 || windowSize > 4096 ||
+        q.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::BFLOAT16 ||
+        q.cudaData == nullptr || q.dims.size() != 3 ||
+        q.dims[0] <= 0 || q.dims[1] <= 0 || q.dims[2] <= 0 ||
+        q.strides[2] != 1 ||
+        k.dataDevice != fastllm::DataDevice::CUDA ||
+        k.dataType != fastllm::DataType::BFLOAT16 ||
+        k.cudaData == nullptr || k.dims.size() != 3 ||
+        k.dims[0] != q.dims[0] || k.dims[2] != q.dims[2] ||
+        k.strides[2] != 1 ||
+        v.dataDevice != fastllm::DataDevice::CUDA ||
+        v.dataType != fastllm::DataType::BFLOAT16 ||
+        v.cudaData == nullptr || v.dims.size() != 3 ||
+        v.dims[0] != q.dims[0] || v.dims[1] != k.dims[1] ||
+        v.dims[2] <= 0 || v.strides[2] != 1 ||
+        startPos + q.dims[1] > k.dims[1]) {
+        return false;
+    }
+    int device = GetPointerDeviceId(q.cudaData);
+    if (device < 0 || GetPointerDeviceId(k.cudaData) != device ||
+        GetPointerDeviceId(v.cudaData) != device) {
+        return false;
+    }
+    FastllmCudaSetDevice(device);
+    int heads = q.dims[0];
+    int seqlen = q.dims[1];
+    int qkDim = q.dims[2];
+    int totalLen = k.dims[1];
+    int valueDim = v.dims[2];
+    if (!PrepareOutput(output, fastllm::DataType::BFLOAT16,
+                       {heads, seqlen, valueDim})) {
+        return false;
+    }
+
+    size_t scratchLimit = 64ULL * 1024ULL * 1024ULL;
+    if (const char *env = std::getenv(
+            "FASTLLM_DOTS3_NOTE_SLIDING_PREFILL_TEMP_MB")) {
+        int megabytes = std::atoi(env);
+        if (megabytes > 0) {
+            scratchLimit = (size_t)megabytes * 1024ULL * 1024ULL;
+        }
+    }
+    int queryChunk = std::min(seqlen, 1024);
+    size_t scratchBytes = 0;
+    while (queryChunk > 0) {
+        int maxKeyCount = std::min(
+            totalLen, windowSize + queryChunk - 1);
+        scratchBytes = (size_t)heads * queryChunk * maxKeyCount *
+                       sizeof(__nv_bfloat16);
+        if (scratchBytes <= scratchLimit || queryChunk == 1) {
+            break;
+        }
+        queryChunk = (queryChunk + 1) / 2;
+    }
+    if (queryChunk <= 0 || scratchBytes > scratchLimit) {
+        return false;
+    }
+    __nv_bfloat16 *scores =
+        (__nv_bfloat16 *)FastllmCudaMalloc(scratchBytes);
+    if (scores == nullptr) {
+        return false;
+    }
+
+    const __nv_bfloat16 *qData =
+        (const __nv_bfloat16 *)q.cudaData;
+    const __nv_bfloat16 *kData =
+        (const __nv_bfloat16 *)k.cudaData;
+    const __nv_bfloat16 *vData =
+        (const __nv_bfloat16 *)v.cudaData;
+    __nv_bfloat16 *outputData =
+        (__nv_bfloat16 *)output.cudaData;
+    cublasHandle_t handle = getFastllmCublasHandle();
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    bool ok = true;
+    for (int queryOffset = 0; queryOffset < seqlen && ok;
+         queryOffset += queryChunk) {
+        int current = std::min(queryChunk, seqlen - queryOffset);
+        int firstQueryPosition = startPos + queryOffset;
+        int keyStart = std::max(
+            0, firstQueryPosition - windowSize + 1);
+        int keyEnd = std::min(
+            totalLen, startPos + queryOffset + current);
+        int keyCount = keyEnd - keyStart;
+        if (keyCount <= 0) {
+            ok = false;
+            break;
+        }
+
+        const __nv_bfloat16 *qChunk =
+            qData + (uint64_t)queryOffset * q.strides[1];
+        const __nv_bfloat16 *kChunk =
+            kData + (uint64_t)keyStart * k.strides[1];
+        cublasStatus_t status = cublasGemmStridedBatchedEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            keyCount, current, qkDim, &alpha,
+            kChunk, CUDA_R_16BF, (int)k.strides[1],
+            (long long)k.strides[0],
+            qChunk, CUDA_R_16BF, (int)q.strides[1],
+            (long long)q.strides[0], &beta,
+            scores, CUDA_R_16BF, keyCount,
+            (long long)current * keyCount, heads,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            ok = false;
+            break;
+        }
+
+        SlidingAttentionPrefillSoftmaxKernel<<<
+            current * heads, 256,
+            (size_t)windowSize * sizeof(float),
+            cudaStreamPerThread>>>(
+                scores, queryOffset, current, keyStart, keyCount,
+                startPos, windowSize, scale);
+        if (cudaGetLastError() != cudaSuccess) {
+            ok = false;
+            break;
+        }
+
+        const __nv_bfloat16 *vChunk =
+            vData + (uint64_t)keyStart * v.strides[1];
+        __nv_bfloat16 *outputChunk =
+            outputData + (uint64_t)queryOffset * output.strides[1];
+        status = cublasGemmStridedBatchedEx(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            valueDim, current, keyCount, &alpha,
+            vChunk, CUDA_R_16BF, (int)v.strides[1],
+            (long long)v.strides[0],
+            scores, CUDA_R_16BF, keyCount,
+            (long long)current * keyCount, &beta,
+            outputChunk, CUDA_R_16BF, valueDim,
+            (long long)output.strides[0], heads,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         ok = status == CUBLAS_STATUS_SUCCESS;
     }
