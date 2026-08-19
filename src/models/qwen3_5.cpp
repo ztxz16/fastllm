@@ -20691,6 +20691,38 @@ namespace fastllm {
                 move(prefix + "mlp.up_proj.weight");
             }
         }
+        if (fusedKvQkvIt != weight.weight.end() &&
+            Qwen35EnvDefaultEnabled(
+                "FASTLLM_CUDA_DFLASH_FUSED_KV_MATERIALIZE")) {
+            Data &allKNorm = weight["dflash.all_k_norm.weight"];
+            ::fastllm::Qwen3CudaPrepareLocalOutput(allKNorm, device);
+            allKNorm.dataType = DataType::FLOAT32;
+            allKNorm.UpdateUnitSize();
+            allKNorm.Resize({dflashLayers, dflashHeadDim});
+            allKNorm.Allocate(false);
+            const size_t layerBytes =
+                (size_t)dflashHeadDim * sizeof(float);
+            for (int layerIndex = 0; layerIndex < dflashLayers;
+                 layerIndex++) {
+                const std::string name = "dflash.layers." +
+                    std::to_string(layerIndex) +
+                    ".self_attn.k_norm.weight";
+                Data &layerNorm = weight[name];
+                AssertInFastLLM(
+                    layerNorm.dataDevice == DataDevice::CUDA &&
+                        layerNorm.dataType == DataType::FLOAT32 &&
+                        layerNorm.dims ==
+                            std::vector<int>({dflashHeadDim}) &&
+                        layerNorm.cudaData != nullptr,
+                    "DFlash K norm weight shape is invalid.\n");
+                FastllmCudaCopyFromDeviceToDevice(
+                    (uint8_t*)allKNorm.cudaData +
+                        (size_t)layerIndex * layerBytes,
+                    layerNorm.cudaData, layerBytes);
+            }
+            allKNorm.name = "dflash.all_k_norm.weight";
+            allKNorm.isModelWeight = true;
+        }
         // Selector codebooks deliberately stay on the host. Only B * K rows
         // are consumed per proposal, while replicating both tables would add
         // roughly 250 MiB to the root GPU working set.
@@ -20836,66 +20868,108 @@ namespace fastllm {
             Linear(projectedContextHidden, allKvWeightIt->second,
                    *GetEmptyData(), projectedAllKv);
         }
+        Data materializedKv;
+        bool fusedKvMaterialized = false;
+        auto allKNormIt = weight.weight.find("dflash.all_k_norm.weight");
+        if (!projectedAllKv.dims.empty() &&
+            allKNormIt != weight.weight.end() &&
+            ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                "FASTLLM_CUDA_DFLASH_FUSED_KV_MATERIALIZE")) {
+            ::fastllm::Qwen3CudaPrepareLocalOutput(materializedKv, device);
+            materializedKv.dataType = DataType::FLOAT16;
+            materializedKv.UpdateUnitSize();
+            materializedKv.Resize({dflashLayers, 2, dflashKvHeads,
+                                   tokens, dflashHeadDim});
+            materializedKv.Allocate(false);
+            fusedKvMaterialized = FastllmCudaDFlashMaterializeKV(
+                projectedAllKv, allKNormIt->second, positions,
+                dflashSinData, dflashCosData, materializedKv,
+                dflashLayers, tokens, dflashKvHeads, dflashHeadDim,
+                dflashRmsNormEps);
+        }
         for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
             const std::string prefix = "dflash.layers." +
                 std::to_string(layerIndex) + ".";
-            Data projectedKey, projectedValue, key, value;
-            const int kvRows = dflashKvHeads * dflashHeadDim;
-            if (!projectedAllKv.dims.empty()) {
-                const int layerOffset = layerIndex * 2 * kvRows;
-                Split(projectedAllKv, -1, layerOffset,
-                      layerOffset + kvRows, projectedKey);
-                Split(projectedAllKv, -1, layerOffset + kvRows,
-                      layerOffset + 2 * kvRows, projectedValue);
-            } else if (auto mergedQkvIt = weight.weight.find(
-                           prefix + "self_attn.mergeqkv.weight");
-                       mergedQkvIt != weight.weight.end()) {
-                Data &mergedQkvWeight = mergedQkvIt->second;
-                const int qRows = dflashHeads * dflashHeadDim;
-                AssertInFastLLM(
-                    mergedQkvWeight.dims.size() == 2 &&
-                        mergedQkvWeight.dims[0] == qRows + 2 * kvRows &&
-                        mergedQkvWeight.dims[1] == embed_dim,
-                    "DFlash merged QKV weight shape is invalid.\n");
-                const size_t rowBytes =
-                    mergedQkvWeight.GetBytes() / mergedQkvWeight.dims[0];
-                Data kvWeight;
-                kvWeight.FakeFrom(mergedQkvWeight, qRows * rowBytes);
-                kvWeight.Resize({2 * kvRows, embed_dim});
-                kvWeight.dataDeviceIds = mergedQkvWeight.dataDeviceIds;
-                Data projectedKv;
-                Linear(projectedContextHidden, kvWeight,
-                       *GetEmptyData(), projectedKv);
-                Split(projectedKv, -1, 0, kvRows, projectedKey);
-                Split(projectedKv, -1, kvRows, 2 * kvRows,
-                      projectedValue);
+            Data key, value;
+            if (fusedKvMaterialized) {
+                const size_t tensorBytes =
+                    (size_t)dflashKvHeads * tokens * dflashHeadDim *
+                    sizeof(uint16_t);
+                key.FakeFrom(
+                    materializedKv,
+                    (size_t)(layerIndex * 2) * tensorBytes);
+                value.FakeFrom(
+                    materializedKv,
+                    (size_t)(layerIndex * 2 + 1) * tensorBytes);
+                key.Resize({dflashKvHeads, tokens, dflashHeadDim});
+                value.Resize({dflashKvHeads, tokens, dflashHeadDim});
+                key.dataDeviceIds = materializedKv.dataDeviceIds;
+                value.dataDeviceIds = materializedKv.dataDeviceIds;
             } else {
-                Linear(projectedContextHidden,
-                       weight[prefix + "self_attn.k_proj.weight"],
-                       *GetEmptyData(), projectedKey);
-                Linear(projectedContextHidden,
-                       weight[prefix + "self_attn.v_proj.weight"],
-                       *GetEmptyData(), projectedValue);
+                Data projectedKey, projectedValue;
+                const int kvRows = dflashKvHeads * dflashHeadDim;
+                if (!projectedAllKv.dims.empty()) {
+                    const int layerOffset = layerIndex * 2 * kvRows;
+                    Split(projectedAllKv, -1, layerOffset,
+                          layerOffset + kvRows, projectedKey);
+                    Split(projectedAllKv, -1, layerOffset + kvRows,
+                          layerOffset + 2 * kvRows, projectedValue);
+                } else if (auto mergedQkvIt = weight.weight.find(
+                               prefix + "self_attn.mergeqkv.weight");
+                           mergedQkvIt != weight.weight.end()) {
+                    Data &mergedQkvWeight = mergedQkvIt->second;
+                    const int qRows = dflashHeads * dflashHeadDim;
+                    AssertInFastLLM(
+                        mergedQkvWeight.dims.size() == 2 &&
+                            mergedQkvWeight.dims[0] ==
+                                qRows + 2 * kvRows &&
+                            mergedQkvWeight.dims[1] == embed_dim,
+                        "DFlash merged QKV weight shape is invalid.\n");
+                    const size_t rowBytes = mergedQkvWeight.GetBytes() /
+                        mergedQkvWeight.dims[0];
+                    Data kvWeight;
+                    kvWeight.FakeFrom(
+                        mergedQkvWeight, qRows * rowBytes);
+                    kvWeight.Resize({2 * kvRows, embed_dim});
+                    kvWeight.dataDeviceIds =
+                        mergedQkvWeight.dataDeviceIds;
+                    Data projectedKv;
+                    Linear(projectedContextHidden, kvWeight,
+                           *GetEmptyData(), projectedKv);
+                    Split(projectedKv, -1, 0, kvRows, projectedKey);
+                    Split(projectedKv, -1, kvRows, 2 * kvRows,
+                          projectedValue);
+                } else {
+                    Linear(projectedContextHidden,
+                           weight[prefix + "self_attn.k_proj.weight"],
+                           *GetEmptyData(), projectedKey);
+                    Linear(projectedContextHidden,
+                           weight[prefix + "self_attn.v_proj.weight"],
+                           *GetEmptyData(), projectedValue);
+                }
+                if (projectionTokens == tokens) {
+                    Copy(projectedKey, key);
+                    Copy(projectedValue, value);
+                } else {
+                    Split(projectedKey, 1, 0, tokens, key);
+                    Split(projectedValue, 1, 0, tokens, value);
+                }
+                key.Reshape(
+                    {1, tokens, dflashKvHeads, dflashHeadDim});
+                value.Reshape(
+                    {1, tokens, dflashKvHeads, dflashHeadDim});
+                RMSNorm(key,
+                        weight[prefix + "self_attn.k_norm.weight"],
+                        dflashRmsNormEps, key);
+                LlamaRotatePosition2D(key, positions, dflashSinData,
+                                      dflashCosData, dflashHeadDim);
+                PermuteSelf(key, {0, 2, 1, 3});
+                PermuteSelf(value, {0, 2, 1, 3});
+                key.Reshape({dflashKvHeads, tokens, dflashHeadDim});
+                value.Reshape({dflashKvHeads, tokens, dflashHeadDim});
+                ToDataType(key, DataType::FLOAT16);
+                ToDataType(value, DataType::FLOAT16);
             }
-            if (projectionTokens == tokens) {
-                Copy(projectedKey, key);
-                Copy(projectedValue, value);
-            } else {
-                Split(projectedKey, 1, 0, tokens, key);
-                Split(projectedValue, 1, 0, tokens, value);
-            }
-            key.Reshape({1, tokens, dflashKvHeads, dflashHeadDim});
-            value.Reshape({1, tokens, dflashKvHeads, dflashHeadDim});
-            RMSNorm(key, weight[prefix + "self_attn.k_norm.weight"],
-                    dflashRmsNormEps, key);
-            LlamaRotatePosition2D(key, positions, dflashSinData,
-                                  dflashCosData, dflashHeadDim);
-            PermuteSelf(key, {0, 2, 1, 3});
-            PermuteSelf(value, {0, 2, 1, 3});
-            key.Reshape({dflashKvHeads, tokens, dflashHeadDim});
-            value.Reshape({dflashKvHeads, tokens, dflashHeadDim});
-            ToDataType(key, DataType::FLOAT16);
-            ToDataType(value, DataType::FLOAT16);
             Qwen35AppendDraftSequenceCache(
                 context.draftKeyValues[layerIndex].first, key);
             Qwen35AppendDraftSequenceCache(

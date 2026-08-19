@@ -1084,6 +1084,15 @@ bool FastllmCudaDFlashDynamicConv(
                                   int side, int blockSize,
                                   int hiddenSize, int groupSize,
                                   int kernelSize);
+bool FastllmCudaDFlashMaterializeKV(
+                                  const fastllm::Data &projectedKv,
+                                  const fastllm::Data &kNormWeights,
+                                  const fastllm::Data &positionIds,
+                                  const fastllm::Data &sinData,
+                                  const fastllm::Data &cosData,
+                                  fastllm::Data &output,
+                                  int layers, int tokens,
+                                  int kvHeads, int headDim, float eps);
 size_t FastllmCudaDFlashTopKScratchBytes(int rows);
 bool FastllmCudaDFlashTopK(
                                   const fastllm::Data &logits,
