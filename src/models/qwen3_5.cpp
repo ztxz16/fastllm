@@ -21351,27 +21351,50 @@ namespace fastllm {
             dynamicConvolve(
                 normalized, mlpDynamic,
                 weight[prefix + "mlp_conv.base_kernel"], 0, mlpInput);
-            Data gate, up;
+            Data gate, up, gateup;
+            bool fusedGateupPrepared = false;
             auto gateupIt = weight.weight.find(
                 prefix + "mlp.gateup_proj.weight");
             if (gateupIt != weight.weight.end()) {
-                Data gateup;
                 Linear(mlpInput, gateupIt->second,
                        *GetEmptyData(), gateup);
-                Split(gateup, -1, 0, dflashIntermediateSize, gate);
-                Split(gateup, -1, dflashIntermediateSize,
-                      2 * dflashIntermediateSize, up);
+                if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                        "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
+                    ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
+                    gate.dataType = DataType::BFLOAT16;
+                    gate.UpdateUnitSize();
+                    gate.Resize(
+                        {1, blockSize, dflashIntermediateSize});
+                    gate.Allocate(false);
+                    fusedGateupPrepared =
+                        FastllmCudaDFlashPrepareGateup(
+                            gateup, gate, blockSize,
+                            dflashIntermediateSize);
+                    if (!fusedGateupPrepared) {
+                        gate.FreeSpace();
+                        gate.dims.clear();
+                        gate.strides.clear();
+                        gate.expansionDims.clear();
+                    }
+                }
+                if (!fusedGateupPrepared) {
+                    Split(gateup, -1, 0, dflashIntermediateSize, gate);
+                    Split(gateup, -1, dflashIntermediateSize,
+                          2 * dflashIntermediateSize, up);
+                }
             } else {
                 Linear(mlpInput, weight[prefix + "mlp.gate_proj.weight"],
                        *GetEmptyData(), gate);
                 Linear(mlpInput, weight[prefix + "mlp.up_proj.weight"],
                        *GetEmptyData(), up);
             }
-            ToDataType(gate, DataType::FLOAT16);
-            ToDataType(up, DataType::FLOAT16);
-            Silu(gate, gate);
-            MulTo(gate, up);
-            ToDataType(gate, DataType::BFLOAT16);
+            if (!fusedGateupPrepared) {
+                ToDataType(gate, DataType::FLOAT16);
+                ToDataType(up, DataType::FLOAT16);
+                Silu(gate, gate);
+                MulTo(gate, up);
+                ToDataType(gate, DataType::BFLOAT16);
+            }
             Data mlpOutput, convolvedMlp;
             Linear(gate, weight[prefix + "mlp.down_proj.weight"],
                    *GetEmptyData(), mlpOutput);

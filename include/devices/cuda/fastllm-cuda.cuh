@@ -1096,6 +1096,10 @@ bool FastllmCudaDFlashPrepareQKV(
                                   fastllm::Data &value,
                                   int tokens, int queryHeads,
                                   int kvHeads, int headDim, float eps);
+bool FastllmCudaDFlashPrepareGateup(
+                                  const fastllm::Data &gateup,
+                                  fastllm::Data &output,
+                                  int tokens, int intermediateSize);
 bool FastllmCudaDFlashMaterializeKV(
                                   const fastllm::Data &projectedKv,
                                   const fastllm::Data &kNormWeights,

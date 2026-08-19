@@ -13886,6 +13886,71 @@ bool FastllmCudaDFlashPrepareQKV(
     return true;
 }
 
+__global__ void FastllmDFlashPrepareGateupBf16Kernel(
+        const __nv_bfloat16 *__restrict__ gateup,
+        __nv_bfloat16 *__restrict__ output,
+        int tokens, int intermediateSize) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = tokens * intermediateSize;
+    if (index >= total) {
+        return;
+    }
+
+    int token = index / intermediateSize;
+    int channel = index - token * intermediateSize;
+    const __nv_bfloat16 *row = gateup +
+        (size_t)token * 2 * intermediateSize;
+    half gate = __float2half_rz(__bfloat162float(row[channel]));
+    half up = __float2half_rz(
+        __bfloat162float(row[intermediateSize + channel]));
+#ifdef CUDA_NO_TENSOR_CORE
+    float gateFloat = __half2float(gate);
+    gate = __float2half(gateFloat / (1.0 + expf(-gateFloat)));
+    gate = __float2half(
+        __half2float(up) * 1.0f * __half2float(gate));
+#else
+    gate = __hdiv(gate, __hadd(__float2half(1.0), hexp(-gate)));
+    gate *= (half)((float)up * 1.0f);
+#endif
+    output[index] = __float2bfloat16_rn(__half2float(gate));
+}
+
+bool FastllmCudaDFlashPrepareGateup(
+        const fastllm::Data &gateup,
+        fastllm::Data &output,
+        int tokens, int intermediateSize) {
+    if (tokens <= 0 || intermediateSize <= 0 ||
+        gateup.dataType != fastllm::DataType::BFLOAT16 ||
+        output.dataType != fastllm::DataType::BFLOAT16 ||
+        gateup.dims !=
+            std::vector<int>({1, tokens, 2 * intermediateSize}) ||
+        output.dims !=
+            std::vector<int>({1, tokens, intermediateSize}) ||
+        !FastllmCudaDataHasDenseStrides(gateup) ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(gateup, output)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(gateup, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    int total = tokens * intermediateSize;
+    FastllmDFlashPrepareGateupBf16Kernel<<<
+        (total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)gateup.cudaData,
+            (__nv_bfloat16 *)output.cudaData,
+            tokens, intermediateSize);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 struct FastllmDFlashKvCacheOutput {
     half *pointers[10];
     size_t headStride;
