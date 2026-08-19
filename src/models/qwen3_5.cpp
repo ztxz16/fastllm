@@ -18863,6 +18863,24 @@ namespace fastllm {
                      "dflash.candidate_selector.hidden_projection.weight"}) {
                 this->weight.linearNames.insert(name);
             }
+            const bool fuseDflashLinear = Qwen35EnvDefaultEnabled(
+                "FASTLLM_CUDA_DFLASH_FUSED_LINEAR");
+            const bool fuseDflashKvProjection = fuseDflashLinear &&
+                Qwen35EnvDefaultEnabled(
+                    "FASTLLM_CUDA_DFLASH_FUSED_KV_PROJECTION");
+            std::vector<std::string> fusedDflashKvQkvInputs;
+            if (fuseDflashKvProjection) {
+                fusedDflashKvQkvInputs.reserve(5 * dflashLayers);
+                for (int layerIndex = 0; layerIndex < dflashLayers;
+                     layerIndex++) {
+                    const std::string prefix = "dflash.layers." +
+                        std::to_string(layerIndex) + ".self_attn.";
+                    fusedDflashKvQkvInputs.push_back(
+                        prefix + "k_proj.weight");
+                    fusedDflashKvQkvInputs.push_back(
+                        prefix + "v_proj.weight");
+                }
+            }
             for (int layerIndex = 0; layerIndex < dflashLayers;
                  layerIndex++) {
                 const std::string prefix = "dflash.layers." +
@@ -18879,8 +18897,7 @@ namespace fastllm {
                          "mlp_conv.kernel_projection.weight"}) {
                     this->weight.linearNames.insert(prefix + suffix);
                 }
-                if (Qwen35EnvDefaultEnabled(
-                        "FASTLLM_CUDA_DFLASH_FUSED_LINEAR")) {
+                if (fuseDflashLinear) {
                     const std::string qWeightName =
                         prefix + "self_attn.q_proj.weight";
                     const std::string kWeightName =
@@ -18897,15 +18914,31 @@ namespace fastllm {
                         prefix + "mlp.gateup_proj.weight";
                     this->weight.linearNames.insert(mergeQkvWeightName);
                     this->weight.linearNames.insert(gateupWeightName);
-                    this->weightMergeRules.push_back(WeightMergeRule({
-                        WeightMergeRuleSingle(
-                            {qWeightName, kWeightName, vWeightName},
-                            mergeQkvWeightName, std::string("linear"))}));
+                    if (fuseDflashKvProjection) {
+                        fusedDflashKvQkvInputs.push_back(qWeightName);
+                        fusedDflashKvQkvInputs.push_back(kWeightName);
+                        fusedDflashKvQkvInputs.push_back(vWeightName);
+                    } else {
+                        this->weightMergeRules.push_back(WeightMergeRule({
+                            WeightMergeRuleSingle(
+                                {qWeightName, kWeightName, vWeightName},
+                                mergeQkvWeightName,
+                                std::string("linear"))}));
+                    }
                     this->weightMergeRules.push_back(WeightMergeRule({
                         WeightMergeRuleSingle(
                             {gateWeightName, upWeightName},
                             gateupWeightName, std::string("linear"))}));
                 }
+            }
+            if (fuseDflashKvProjection) {
+                const std::string fusedWeightName =
+                    "dflash.fused_kv_qkv.weight";
+                this->weight.linearNames.insert(fusedWeightName);
+                this->weightMergeRules.push_back(WeightMergeRule({
+                    WeightMergeRuleSingle(
+                        fusedDflashKvQkvInputs, fusedWeightName,
+                        std::string("linear"))}));
             }
             // DFlash owns its own draft model; ignore an embedded target MTP
             // even when the Qwen checkpoint contains mtp.safetensors.
@@ -20525,6 +20558,8 @@ namespace fastllm {
                 return false;
             }
         }
+        const bool hasFusedKvQkv =
+            has("dflash.fused_kv_qkv.weight");
         for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
             const std::string prefix =
                 "dflash.layers." + std::to_string(layerIndex) + ".";
@@ -20554,7 +20589,7 @@ namespace fastllm {
             const bool hasSeparateGateup =
                 has(prefix + "mlp.gate_proj.weight") &&
                 has(prefix + "mlp.up_proj.weight");
-            if ((!hasMergedQkv && !hasSeparateQkv) ||
+            if ((!hasFusedKvQkv && !hasMergedQkv && !hasSeparateQkv) ||
                 (!hasMergedGateup && !hasSeparateGateup)) {
                 return false;
             }
@@ -20585,6 +20620,45 @@ namespace fastllm {
         move("dflash.hidden_norm.weight");
         move("dflash.norm.weight");
         move("dflash.candidate_selector.hidden_projection.weight");
+        auto fusedKvQkvIt = weight.weight.find(
+            "dflash.fused_kv_qkv.weight");
+        if (fusedKvQkvIt != weight.weight.end()) {
+            move("dflash.fused_kv_qkv.weight");
+            Data &fusedWeight = fusedKvQkvIt->second;
+            const int qRows = dflashHeads * dflashHeadDim;
+            const int kvRows = dflashKvHeads * dflashHeadDim;
+            const int allKvRows = dflashLayers * 2 * kvRows;
+            const int qkvRows = qRows + 2 * kvRows;
+            AssertInFastLLM(
+                fusedWeight.dims.size() == 2 &&
+                    fusedWeight.dims[0] ==
+                        allKvRows + dflashLayers * qkvRows &&
+                    fusedWeight.dims[1] == embed_dim,
+                "DFlash fused KV/QKV weight shape is invalid.\n");
+            const size_t rowBytes =
+                fusedWeight.GetBytes() / fusedWeight.dims[0];
+            Data &allKvWeight = weight["dflash.all_kv.weight"];
+            allKvWeight.FakeFrom(fusedWeight, 0);
+            allKvWeight.Resize({allKvRows, embed_dim});
+            allKvWeight.dataDeviceIds = fusedWeight.dataDeviceIds;
+            allKvWeight.name = "dflash.all_kv.weight";
+            allKvWeight.isModelWeight = true;
+            for (int layerIndex = 0; layerIndex < dflashLayers;
+                 layerIndex++) {
+                const std::string name = "dflash.layers." +
+                    std::to_string(layerIndex) +
+                    ".self_attn.mergeqkv.weight";
+                Data &layerWeight = weight[name];
+                const size_t offsetRows = (size_t)allKvRows +
+                    (size_t)layerIndex * qkvRows;
+                layerWeight.FakeFrom(
+                    fusedWeight, offsetRows * rowBytes);
+                layerWeight.Resize({qkvRows, embed_dim});
+                layerWeight.dataDeviceIds = fusedWeight.dataDeviceIds;
+                layerWeight.name = name;
+                layerWeight.isModelWeight = true;
+            }
+        }
         for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
             const std::string prefix =
                 "dflash.layers." + std::to_string(layerIndex) + ".";
@@ -20749,16 +20823,35 @@ namespace fastllm {
             context.draftKeyValues.clear();
             context.draftKeyValues.resize(dflashLayers);
         }
+        Data projectedAllKv;
+        auto allKvWeightIt = weight.weight.find("dflash.all_kv.weight");
+        if (allKvWeightIt != weight.weight.end()) {
+            const int kvRows = dflashKvHeads * dflashHeadDim;
+            AssertInFastLLM(
+                allKvWeightIt->second.dims.size() == 2 &&
+                    allKvWeightIt->second.dims[0] ==
+                        dflashLayers * 2 * kvRows &&
+                    allKvWeightIt->second.dims[1] == embed_dim,
+                "DFlash fused KV projection weight shape is invalid.\n");
+            Linear(projectedContextHidden, allKvWeightIt->second,
+                   *GetEmptyData(), projectedAllKv);
+        }
         for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
             const std::string prefix = "dflash.layers." +
                 std::to_string(layerIndex) + ".";
             Data projectedKey, projectedValue, key, value;
-            auto mergedQkvIt = weight.weight.find(
-                prefix + "self_attn.mergeqkv.weight");
-            if (mergedQkvIt != weight.weight.end()) {
+            const int kvRows = dflashKvHeads * dflashHeadDim;
+            if (!projectedAllKv.dims.empty()) {
+                const int layerOffset = layerIndex * 2 * kvRows;
+                Split(projectedAllKv, -1, layerOffset,
+                      layerOffset + kvRows, projectedKey);
+                Split(projectedAllKv, -1, layerOffset + kvRows,
+                      layerOffset + 2 * kvRows, projectedValue);
+            } else if (auto mergedQkvIt = weight.weight.find(
+                           prefix + "self_attn.mergeqkv.weight");
+                       mergedQkvIt != weight.weight.end()) {
                 Data &mergedQkvWeight = mergedQkvIt->second;
                 const int qRows = dflashHeads * dflashHeadDim;
-                const int kvRows = dflashKvHeads * dflashHeadDim;
                 AssertInFastLLM(
                     mergedQkvWeight.dims.size() == 2 &&
                         mergedQkvWeight.dims[0] == qRows + 2 * kvRows &&
