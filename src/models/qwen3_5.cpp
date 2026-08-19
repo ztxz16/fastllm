@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -21138,27 +21139,41 @@ namespace fastllm {
         int cachedTokens = context.draftKeyValues[0].first.dims.size() == 3 ?
             context.draftKeyValues[0].first.dims[1] : 0;
         int cacheStart = context.committedTokens - cachedTokens;
-        const int totalKeys = cachedTokens + blockSize;
-        std::vector<float> maskValues((size_t)blockSize * totalKeys, 0.0f);
-        for (int query = 0; query < blockSize; query++) {
-            int queryPosition = context.committedTokens + query;
-            for (int keyIndex = 0; keyIndex < totalKeys; keyIndex++) {
-                int keyPosition = keyIndex < cachedTokens ?
-                    cacheStart + keyIndex :
-                    context.committedTokens + keyIndex - cachedTokens;
-                bool paddedDraftKey =
-                    keyIndex >= cachedTokens + runtimeBlockSize;
-                if (paddedDraftKey ||
-                    std::abs(queryPosition - keyPosition) >=
-                        dflashSlidingWindow) {
-                    maskValues[(size_t)query * totalKeys + keyIndex] = 1.0f;
+        std::optional<Data> attentionMask;
+        auto ensureAttentionMask = [&]() {
+            if (attentionMask.has_value()) {
+                return;
+            }
+            const int totalKeys = cachedTokens + blockSize;
+            std::vector<float> maskValues(
+                (size_t)blockSize * totalKeys, 0.0f);
+            for (int query = 0; query < blockSize; query++) {
+                int queryPosition = context.committedTokens + query;
+                for (int keyIndex = 0; keyIndex < totalKeys; keyIndex++) {
+                    int keyPosition = keyIndex < cachedTokens ?
+                        cacheStart + keyIndex :
+                        context.committedTokens + keyIndex - cachedTokens;
+                    bool paddedDraftKey =
+                        keyIndex >= cachedTokens + runtimeBlockSize;
+                    if (paddedDraftKey ||
+                        std::abs(queryPosition - keyPosition) >=
+                            dflashSlidingWindow) {
+                        maskValues[(size_t)query * totalKeys + keyIndex] =
+                            1.0f;
+                    }
                 }
             }
+            attentionMask.emplace(
+                DataType::FLOAT32, std::vector<int>{1, blockSize, totalKeys},
+                maskValues);
+            ToDataType(*attentionMask, DataType::FLOAT16);
+            attentionMask->ToDevice(DataDevice::CUDA, {device}, true);
+        };
+        const bool useImplicitAttention = Qwen35EnvDefaultEnabled(
+            "FASTLLM_CUDA_DFLASH_IMPLICIT_ATTENTION");
+        if (!useImplicitAttention) {
+            ensureAttentionMask();
         }
-        Data attentionMask(
-            DataType::FLOAT32, {1, blockSize, totalKeys}, maskValues);
-        ToDataType(attentionMask, DataType::FLOAT16);
-        attentionMask.ToDevice(DataDevice::CUDA, {device}, true);
 
         auto dynamicConvolve = [&](const Data &source,
                                    Data &dynamicProjection,
@@ -21340,9 +21355,33 @@ namespace fastllm {
             Qwen35AppendDraftSequenceCache(keyCache, key);
             Qwen35AppendDraftSequenceCache(valueCache, value);
             Data attentionHeads;
-            Attention(query, keyCache, valueCache, attentionMask,
-                      attentionHeads, dflashHeads / dflashKvHeads,
-                      1.0f / std::sqrt((float)dflashHeadDim), 2);
+            bool implicitAttention = false;
+            if (useImplicitAttention) {
+                ::fastllm::Qwen3CudaPrepareLocalOutput(
+                    attentionHeads, device);
+                attentionHeads.dataType = DataType::FLOAT16;
+                attentionHeads.UpdateUnitSize();
+                attentionHeads.Resize(
+                    {dflashHeads, blockSize, dflashHeadDim});
+                attentionHeads.Allocate(false);
+                implicitAttention = FastllmCudaDFlashAttention(
+                    query, keyCache, valueCache, attentionHeads,
+                    dflashHeads / dflashKvHeads,
+                    1.0f / std::sqrt((float)dflashHeadDim),
+                    runtimeBlockSize, dflashSlidingWindow);
+                if (!implicitAttention) {
+                    attentionHeads.FreeSpace();
+                    attentionHeads.dims.clear();
+                    attentionHeads.strides.clear();
+                    attentionHeads.expansionDims.clear();
+                }
+            }
+            if (!implicitAttention) {
+                ensureAttentionMask();
+                Attention(query, keyCache, valueCache, *attentionMask,
+                          attentionHeads, dflashHeads / dflashKvHeads,
+                          1.0f / std::sqrt((float)dflashHeadDim), 2);
+            }
             Qwen35ResizeDraftSequenceCache(keyCache, oldKeyTokens);
             Qwen35ResizeDraftSequenceCache(valueCache, oldValueTokens);
             PermuteSelf(attentionHeads, {1, 0, 2});

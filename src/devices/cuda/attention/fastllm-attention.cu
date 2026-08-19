@@ -1319,6 +1319,146 @@ printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
     return true;
 }
 
+__global__ void FastllmDFlashImplicitAttentionMaskKernel(
+        half *scores, int heads, int queries, int keys, int cachedTokens,
+        int runtimeBlockSize, int slidingWindow) {
+    int head = blockIdx.x;
+    if (head >= heads) {
+        return;
+    }
+    half *headScores = scores + (size_t)head * queries * keys;
+    for (int query = 0; query < queries; query++) {
+        // Cached key positions are [committed-cached, committed). The dense
+        // reference masks distance >= window, so the masked prefix includes
+        // cached + query - window itself.
+        int prefix = max(0, cachedTokens + query - slidingWindow + 1);
+        for (int key = threadIdx.x; key < prefix; key += blockDim.x) {
+            headScores[(size_t)query * keys + key] =
+                __float2half_rn(-10000.0f);
+        }
+        for (int key = cachedTokens + runtimeBlockSize + threadIdx.x;
+             key < keys; key += blockDim.x) {
+            headScores[(size_t)query * keys + key] =
+                __float2half_rn(-10000.0f);
+        }
+    }
+}
+
+bool FastllmCudaDFlashAttention(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, fastllm::Data &output,
+        int group, float scale, int runtimeBlockSize, int slidingWindow) {
+    if (q.dataType != fastllm::DataType::FLOAT16 ||
+        k.dataType != fastllm::DataType::FLOAT16 ||
+        v.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT16 ||
+        q.dataDevice != fastllm::DataDevice::CUDA ||
+        k.dataDevice != fastllm::DataDevice::CUDA ||
+        v.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        q.cudaData == nullptr || k.cudaData == nullptr ||
+        v.cudaData == nullptr || output.cudaData == nullptr ||
+        q.dims.size() != 3 || k.dims.size() != 3 ||
+        v.dims.size() != 3 || output.dims.size() != 3 ||
+        group <= 0 || runtimeBlockSize <= 0 ||
+        runtimeBlockSize > q.dims[1] || slidingWindow <= 0 ||
+        q.dims[0] != k.dims[0] * group ||
+        k.dims[0] != v.dims[0] || k.dims[1] != v.dims[1] ||
+        q.dims[2] != 128 || k.dims[2] != 128 || v.dims[2] != 128 ||
+        k.dims[1] < q.dims[1] ||
+        output.dims !=
+            std::vector<int>({q.dims[0], q.dims[1], v.dims[2]}) ||
+        q.strides.size() != 3 || k.strides.size() != 3 ||
+        v.strides.size() != 3 || output.strides.size() != 3 ||
+        q.strides[2] != 1 || k.strides[2] != 1 ||
+        v.strides[2] != 1 || output.strides[2] != 1 ||
+        q.strides[1] != 128 || k.strides[1] != 128 ||
+        v.strides[1] != 128 || output.strides[1] != 128 ||
+        q.strides[0] != (uint64_t)q.dims[1] * 128 ||
+        output.strides[0] != (uint64_t)output.dims[1] * 128) {
+        return false;
+    }
+    int device = FastllmCudaGetDevice();
+    auto onCurrentDevice = [device](const fastllm::Data &data) {
+        return !data.dataDeviceIds.empty() &&
+            data.dataDeviceIds[0] == device;
+    };
+    if (!onCurrentDevice(q) || !onCurrentDevice(k) ||
+        !onCurrentDevice(v) || !onCurrentDevice(output)) {
+        return false;
+    }
+
+    const int heads = q.dims[0];
+    const int queries = q.dims[1];
+    const int keys = k.dims[1];
+    const int headDim = q.dims[2];
+    const int valueDim = v.dims[2];
+    const int cachedTokens = keys - queries;
+    const size_t scoreElements = (size_t)heads * queries * keys;
+    const size_t scratchBytes = scoreElements * sizeof(half) * 2;
+    size_t availableBytes = 0;
+    bool scratchOwn = false;
+    half *scratch = (half *)FastllmBorrowCudaTempBuffer(
+        scratchBytes, &availableBytes, &scratchOwn);
+    if (scratch == nullptr || availableBytes < scratchBytes) {
+        FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+        return false;
+    }
+    half *scores = scratch;
+    half *probabilities = scratch + scoreElements;
+
+    half zero = __float2half_rn(0.0f);
+    half one = __float2half_rn(1.0f);
+    half halfScale = __float2half_rn(scale);
+    cublasHandle_t handle = getFastllmCublasHandle();
+    cublasStatus_t cublasState = cublasHgemmStridedBatched(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        keys, queries * group, headDim, &halfScale,
+        (const half *)k.cudaData, k.strides[1], k.Count(1),
+        (const half *)q.cudaData, q.strides[1], q.Count(1) * group,
+        &zero, scores, keys, (long long)keys * queries * group,
+        heads / group);
+    if (cublasState == CUBLAS_STATUS_SUCCESS) {
+        FastllmDFlashImplicitAttentionMaskKernel<<<
+            heads, 256, 0, cudaStreamPerThread>>>(
+                scores, heads, queries, keys, cachedTokens,
+                runtimeBlockSize, slidingWindow);
+        if (keys < 8) {
+            FastllmSoftmaxKernelInner1<1><<<
+                heads * queries, 1, 0, cudaStreamPerThread>>>(
+                    scores, probabilities, heads * queries, keys);
+        } else if (keys < 64) {
+            FastllmSoftmaxKernelInner1<8><<<
+                heads * queries, 8, 0, cudaStreamPerThread>>>(
+                    scores, probabilities, heads * queries, keys);
+        } else if (keys < 512) {
+            FastllmSoftmaxKernelInner1<64><<<
+                heads * queries, 64, 0, cudaStreamPerThread>>>(
+                    scores, probabilities, heads * queries, keys);
+        } else {
+            FastllmSoftmaxKernelInner1<256><<<
+                heads * queries, 256, 0, cudaStreamPerThread>>>(
+                    scores, probabilities, heads * queries, keys);
+        }
+        cublasState = cublasHgemmStridedBatched(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            valueDim, queries * group, keys, &one,
+            (const half *)v.cudaData, v.strides[1], v.Count(1),
+            probabilities, keys, (long long)keys * queries * group,
+            &zero, (half *)output.cudaData, valueDim,
+            (long long)valueDim * queries * group, heads / group);
+    }
+    cudaError_t cudaState = cudaPeekAtLastError();
+    FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+    if (cublasState != CUBLAS_STATUS_SUCCESS || cudaState != cudaSuccess) {
+        if (cudaState != cudaSuccess) {
+            cudaGetLastError();
+        }
+        return false;
+    }
+    return true;
+}
+
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType) {
     int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
