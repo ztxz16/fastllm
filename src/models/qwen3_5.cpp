@@ -142,7 +142,7 @@ namespace fastllm {
 
     static constexpr int QWEN35_MTP_LOG_INTERVAL = 64;
     static constexpr int QWEN35_MTP_MAX_DRAFTS = 8;
-    static constexpr int QWEN35_MTP_FAST_SEQ_MAX = 6;
+    static constexpr int QWEN35_MTP_FAST_SEQ_MAX = 8;
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_MAX =

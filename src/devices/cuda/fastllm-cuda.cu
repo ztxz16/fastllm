@@ -15592,7 +15592,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluTwoTokenHalfKernel(
 #endif
 }
 
-static constexpr int FASTLLM_CUDA_MTP_FAST_SEQ_MAX = 6;
+static constexpr int FASTLLM_CUDA_MTP_FAST_SEQ_MAX = 8;
 static constexpr int FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX =
     FASTLLM_CUDA_MTP_FAST_SEQ_MAX - 1;
 // Ordinary batched prefill does not materialize per-token MTP snapshots.  Its
@@ -15814,12 +15814,13 @@ bool FastllmCudaGetRaggedGdnMetadata(
     return true;
 }
 
-// 处理最多6个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
+// 处理最多8个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
 // 把当时的滑窗状态写入对应快照 (用于MTP验证的逐token状态回滚)。
 __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
     half *cache, const half *newTokens, const float *weight, const float *bias,
     half *output,
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4, half *snap5,
+    half *snap6,
     int numSnaps,
     int batch, int channels, int numTokens) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -15865,6 +15866,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
                 case 3: snapBase = snap3; break;
                 case 4: snapBase = snap4; break;
                 case 5: snapBase = snap5; break;
+                case 6: snapBase = snap6; break;
                 default: break;
             }
         }
@@ -16621,7 +16623,7 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
         (const float *) weight.cudaData,
         bias.dims.size() > 0 ? (const float *) bias.cudaData : nullptr,
         (half *) output.cudaData,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5],
+        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5], snaps[6],
         numTokenCaches, batch, channels, numTokens
     );
     cudaError_t launchState = cudaGetLastError();
@@ -19159,6 +19161,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     int seqLen, int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale,
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4,
+    half *snap5, half *snap6,
     half **snapshotPointers, int numSnaps) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
@@ -19284,6 +19287,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
                     case 2: snapBase = snap2; break;
                     case 3: snapBase = snap3; break;
                     case 4: snapBase = snap4; break;
+                    case 5: snapBase = snap5; break;
+                    case 6: snapBase = snap6; break;
                     default: break;
                 }
             }
@@ -19704,7 +19709,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         (half*)last_recurrent_state.cudaData, nullptr,
         (half*)core_attn_out.cudaData,
         seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4],
+        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5], snaps[6],
         nullptr, numTokenStates
     );
 
@@ -19845,7 +19850,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             nullptr, (half**)devicePointers,
             (half*)coreAttnOut.cudaData,
             seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-            nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             (half**)(devicePointers + batch), numTokenStates);
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
