@@ -1084,6 +1084,18 @@ bool FastllmCudaDFlashDynamicConv(
                                   int side, int blockSize,
                                   int hiddenSize, int groupSize,
                                   int kernelSize);
+size_t FastllmCudaDFlashTopKScratchBytes(int rows);
+bool FastllmCudaDFlashTopK(
+                                  const fastllm::Data &logits,
+                                  fastllm::Data &packedCandidates,
+                                  fastllm::Data &scratch,
+                                  int topk, int globalIdOffset);
+bool FastllmCudaDFlashMergeTopK(
+                                  const fastllm::Data &packedCandidates,
+                                  fastllm::Data &output,
+                                  int ranks, int localRows,
+                                  int firstRow, int outputRows,
+                                  int topk);
 bool FastllmCudaTopKTopPSamplingToDevice(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,

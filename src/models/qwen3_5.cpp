@@ -21071,6 +21071,157 @@ namespace fastllm {
             Data &lmHead = weight["lm_head.weight"];
             Data &lmHeadBias =
                 GetThreadTensorParallelBias("lm_head.weight.tp_bias");
+            auto tryCudaFastTopK = [&]() -> bool {
+                if (!::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                        "FASTLLM_CUDA_DFLASH_FAST_TOPK")) {
+                    return false;
+                }
+                const int tpSize = (int)draftDevices.size();
+                std::vector<int> globalOffsets(tpSize, -1);
+                for (int rank = 0; rank < tpSize; rank++) {
+                    int localDevice = draftDevices[rank];
+                    auto schemeIt =
+                        threadTpLmHeadScheme.find(localDevice);
+                    auto weightIt =
+                        lmHead.multiDeviceDatas.find(localDevice);
+                    if (schemeIt == threadTpLmHeadScheme.end() ||
+                        schemeIt->second.size() != 1 ||
+                        weightIt == lmHead.multiDeviceDatas.end() ||
+                        weightIt->second == nullptr ||
+                        weightIt->second->dims.empty() ||
+                        weightIt->second->dims[0] !=
+                            schemeIt->second[0].second -
+                                schemeIt->second[0].first) {
+                        return false;
+                    }
+                    globalOffsets[rank] = schemeIt->second[0].first;
+                }
+
+                std::vector<Data> localPacked(tpSize);
+                std::vector<Data> localScratch(tpSize);
+                std::vector<int> ready(tpSize, 0);
+                std::vector<std::exception_ptr> fastErrors(tpSize);
+                threadTpWorkerGroup.Run(draftDevices, [&](int rank) {
+                    int localDevice = draftDevices[rank];
+                    auto hiddenIt =
+                        replicatedHidden.multiDeviceDatas.find(localDevice);
+                    auto weightIt =
+                        lmHead.multiDeviceDatas.find(localDevice);
+                    auto biasIt =
+                        lmHeadBias.multiDeviceDatas.find(localDevice);
+                    AssertInFastLLM(
+                        hiddenIt != replicatedHidden.multiDeviceDatas.end() &&
+                            hiddenIt->second != nullptr &&
+                            weightIt != lmHead.multiDeviceDatas.end() &&
+                            weightIt->second != nullptr &&
+                            biasIt != lmHeadBias.multiDeviceDatas.end() &&
+                            biasIt->second != nullptr,
+                        "DFlash fast top-k is missing local lm_head data.\n");
+                    FastllmCudaSetDevice(localDevice);
+                    Qwen3CudaDirectRunner runner(localDevice);
+                    Data localLogits;
+                    qwen3cuda::Qwen3CudaLinear(
+                        runner, *hiddenIt->second, *weightIt->second,
+                        *biasIt->second, localLogits);
+                    qwen3cuda::Qwen3CudaToDataType(
+                        runner, localLogits, DataType::FLOAT32);
+
+                    ::fastllm::Qwen3CudaPrepareLocalOutput(
+                        localPacked[rank], localDevice);
+                    localPacked[rank].dataType = DataType::INT32;
+                    localPacked[rank].UpdateUnitSize();
+                    localPacked[rank].Resize(
+                        {2 * lmHeadRows * dflashSelectorTopK});
+                    localPacked[rank].Allocate(false);
+
+                    size_t scratchBytes =
+                        FastllmCudaDFlashTopKScratchBytes(lmHeadRows);
+                    ::fastllm::Qwen3CudaPrepareLocalOutput(
+                        localScratch[rank], localDevice);
+                    localScratch[rank].dataType = DataType::INT8;
+                    localScratch[rank].UpdateUnitSize();
+                    localScratch[rank].Resize({(int)scratchBytes});
+                    localScratch[rank].Allocate(false);
+
+                    bool selected = FastllmCudaDFlashTopK(
+                        localLogits, localPacked[rank], localScratch[rank],
+                        dflashSelectorTopK, globalOffsets[rank]);
+                    FastllmCudaSyncCurrentThreadStream();
+                    ready[rank] = selected ? 1 : 0;
+                }, fastErrors);
+                for (auto &error : fastErrors) {
+                    if (error) {
+                        std::rethrow_exception(error);
+                    }
+                }
+                for (int rank = 0; rank < tpSize; rank++) {
+                    if (ready[rank] == 0) {
+                        return false;
+                    }
+                }
+
+                const size_t packedBytes =
+                    (size_t)2 * lmHeadRows * dflashSelectorTopK *
+                    sizeof(int);
+                FastllmCudaSetDevice(device);
+                Data gathered;
+                ::fastllm::Qwen3CudaPrepareLocalOutput(gathered, device);
+                gathered.dataType = DataType::INT32;
+                gathered.UpdateUnitSize();
+                gathered.Resize(
+                    {tpSize, 2 * lmHeadRows * dflashSelectorTopK});
+                gathered.Allocate(false);
+
+                std::vector<int> copied(tpSize, 0);
+                for (int rank = 0; rank < tpSize; rank++) {
+                    copied[rank] = FastllmCudaMemcpyPeerAsyncCurrentThread(
+                        device,
+                        (uint8_t*)gathered.cudaData +
+                            (size_t)rank * packedBytes,
+                        draftDevices[rank], localPacked[rank].cudaData,
+                        packedBytes) ? 1 : 0;
+                }
+                bool needCopyFallback = false;
+                for (int rank = 0; rank < tpSize; rank++) {
+                    needCopyFallback =
+                        needCopyFallback || copied[rank] == 0;
+                }
+                if (needCopyFallback) {
+                    FastllmCudaSyncCurrentThreadStream();
+                    for (int rank = 0; rank < tpSize; rank++) {
+                        if (copied[rank] == 0) {
+                            FastllmCudaMemcpyBetweenDevices(
+                                device,
+                                (uint8_t*)gathered.cudaData +
+                                    (size_t)rank * packedBytes,
+                                draftDevices[rank],
+                                localPacked[rank].cudaData,
+                                packedBytes);
+                        }
+                    }
+                    FastllmCudaSetDevice(device);
+                }
+
+                ::fastllm::Qwen3CudaPrepareLocalOutput(
+                    candidateTopK, device);
+                candidateTopK.dataType = DataType::FLOAT32;
+                candidateTopK.UpdateUnitSize();
+                candidateTopK.Resize(
+                    {slots, dflashSelectorTopK * 2});
+                candidateTopK.Allocate(false);
+                if (!FastllmCudaDFlashMergeTopK(
+                        gathered, candidateTopK, tpSize, lmHeadRows,
+                        1, slots, dflashSelectorTopK)) {
+                    FastllmCudaSyncCurrentThreadStream();
+                    return false;
+                }
+                FastllmCudaSyncCurrentThreadStream();
+                candidateTopK.ToDevice(DataDevice::CPU);
+                return candidateTopK.cpuData != nullptr;
+            };
+
+            bool usedCudaFastTopK = tryCudaFastTopK();
+            if (!usedCudaFastTopK) {
             std::vector<Data> localTopKs(draftDevices.size());
             std::vector<std::vector<float> > hostTopKs(
                 draftDevices.size(),
@@ -21167,6 +21318,7 @@ namespace fastllm {
             candidateTopK.CopyFrom(Data(
                 DataType::FLOAT32,
                 {slots, dflashSelectorTopK * 2}, mergedTopK));
+            }
         }
         Data selectorHidden;
         Linear(slotHidden,

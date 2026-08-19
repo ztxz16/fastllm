@@ -13700,6 +13700,169 @@ bool FastllmCudaDFlashDynamicConv(
     return true;
 }
 
+size_t FastllmCudaDFlashTopKScratchBytes(int rows) {
+    if (rows <= 0) {
+        return 0;
+    }
+    return (size_t)rows *
+        (sizeof(flashinfer::sampling::RadixRowState) +
+         sizeof(flashinfer::sampling::RadixDeterministicCollectScratch));
+}
+
+__global__ void FastllmDFlashOffsetTopKIdsKernel(
+        int *ids, int count, int globalIdOffset) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        ids[index] += globalIdOffset;
+    }
+}
+
+bool FastllmCudaDFlashTopK(
+        const fastllm::Data &logits,
+        fastllm::Data &packedCandidates,
+        fastllm::Data &scratch,
+        int topk, int globalIdOffset) {
+    if (logits.dims.empty() || topk <= 0 || topk > 50 ||
+        globalIdOffset < 0 ||
+        logits.dataType != fastllm::DataType::FLOAT32 ||
+        packedCandidates.dataType != fastllm::DataType::INT32 ||
+        scratch.dataType != fastllm::DataType::INT8 ||
+        !FastllmCudaDataHasDenseStrides(logits) ||
+        !FastllmCudaDataHasDenseStrides(packedCandidates) ||
+        !FastllmCudaDataHasDenseStrides(scratch) ||
+        !FastllmCudaDataCanShareDevice(logits, packedCandidates) ||
+        !FastllmCudaDataCanShareDevice(logits, scratch)) {
+        return false;
+    }
+    const int channels = logits.dims.back();
+    const int rows = channels > 0 ?
+        (int)(logits.Count(0) / (uint64_t)channels) : 0;
+    const size_t scratchBytes = FastllmCudaDFlashTopKScratchBytes(rows);
+    if (rows <= 0 || topk > channels ||
+        packedCandidates.Count(0) != (uint64_t)rows * topk * 2 ||
+        scratch.Count(0) < scratchBytes) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(logits, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    int *candidateIds = (int*)packedCandidates.cudaData;
+    float *candidateScores = (float*)(candidateIds + (size_t)rows * topk);
+    auto *rowStates =
+        (flashinfer::sampling::RadixRowState*)scratch.cudaData;
+    cudaError_t state = cudaMemsetAsync(
+        scratch.cudaData, 0, scratchBytes, cudaStreamPerThread);
+    if (state == cudaSuccess) {
+        state = flashinfer::sampling::TopKDispatch<float, int>(
+            (float*)logits.cudaData, candidateIds, candidateScores,
+            (uint32_t)rows, (uint32_t)topk, (uint32_t)channels,
+            rowStates, true, true,
+            flashinfer::sampling::TopKTieBreak::None,
+            cudaStreamPerThread);
+    }
+    if (state == cudaSuccess && globalIdOffset != 0) {
+        const int count = rows * topk;
+        FastllmDFlashOffsetTopKIdsKernel<<<
+            (count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                candidateIds, count, globalIdOffset);
+        state = cudaPeekAtLastError();
+    }
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+__global__ void FastllmDFlashMergeTopKKernel(
+        const int *packedCandidates, float *output,
+        int ranks, int localRows, int firstRow,
+        int outputRows, int topk) {
+    int outputRow = blockIdx.x;
+    if (outputRow >= outputRows || threadIdx.x != 0) {
+        return;
+    }
+
+    constexpr int MAX_TOPK = 50;
+    float bestScores[MAX_TOPK];
+    int bestIds[MAX_TOPK];
+    for (int i = 0; i < topk; i++) {
+        bestScores[i] = -1.0e30f;
+        bestIds[i] = 0x7fffffff;
+    }
+    int sourceRow = firstRow + outputRow;
+    size_t rankStride = (size_t)localRows * topk * 2;
+    size_t planeSize = (size_t)localRows * topk;
+    for (int rank = 0; rank < ranks; rank++) {
+        const int *rankBase = packedCandidates + (size_t)rank * rankStride;
+        const int *rankIds = rankBase;
+        const float *rankScores = (const float*)(rankBase + planeSize);
+        for (int candidate = 0; candidate < topk; candidate++) {
+            size_t offset = (size_t)sourceRow * topk + candidate;
+            int id = rankIds[offset];
+            float score = rankScores[offset];
+            for (int position = 0; position < topk; position++) {
+                if (score > bestScores[position] ||
+                    (score == bestScores[position] &&
+                     id < bestIds[position])) {
+                    for (int move = topk - 1; move > position; move--) {
+                        bestScores[move] = bestScores[move - 1];
+                        bestIds[move] = bestIds[move - 1];
+                    }
+                    bestScores[position] = score;
+                    bestIds[position] = id;
+                    break;
+                }
+            }
+        }
+    }
+    float *rowOutput = output + (size_t)outputRow * topk * 2;
+    for (int candidate = 0; candidate < topk; candidate++) {
+        rowOutput[candidate * 2] = (float)bestIds[candidate];
+        rowOutput[candidate * 2 + 1] = bestScores[candidate];
+    }
+}
+
+bool FastllmCudaDFlashMergeTopK(
+        const fastllm::Data &packedCandidates,
+        fastllm::Data &output,
+        int ranks, int localRows,
+        int firstRow, int outputRows,
+        int topk) {
+    if (ranks <= 0 || localRows <= 0 || firstRow < 0 ||
+        outputRows <= 0 || firstRow + outputRows > localRows ||
+        topk <= 0 || topk > 50 ||
+        packedCandidates.dataType != fastllm::DataType::INT32 ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        packedCandidates.Count(0) !=
+            (uint64_t)ranks * localRows * topk * 2 ||
+        output.Count(0) != (uint64_t)outputRows * topk * 2 ||
+        !FastllmCudaDataHasDenseStrides(packedCandidates) ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(packedCandidates, output)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(packedCandidates, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+    FastllmDFlashMergeTopKKernel<<<
+        outputRows, 32, 0, cudaStreamPerThread>>>(
+            (const int*)packedCandidates.cudaData,
+            (float*)output.cudaData,
+            ranks, localRows, firstRow, outputRows, topk);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 bool FastllmCudaDFlashRejectionSampling(
                                   float *logits,
                                   const float *temperatures,
