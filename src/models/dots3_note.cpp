@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,40 @@ namespace fastllm {
                    std::strcmp(value, "false") != 0 &&
                    std::strcmp(value, "off") != 0;
         }
+
+        double ProfileNowMs() {
+            using Clock = std::chrono::steady_clock;
+            return std::chrono::duration<double, std::milli>(
+                Clock::now().time_since_epoch()).count();
+        }
+
+        struct ScopedExecutorProfiler {
+            std::string opType;
+            double startMs;
+            float startProfile;
+            Executor *executor;
+
+            explicit ScopedExecutorProfiler(const std::string &opType)
+                : opType(opType), startMs(ProfileNowMs()),
+                  startProfile(0.0f),
+                  executor((Executor *)GetExecutor()) {
+                if (executor != nullptr) {
+                    startProfile = executor->GetProfilerTotal();
+                }
+            }
+
+            ~ScopedExecutorProfiler() {
+                if (executor == nullptr) {
+                    return;
+                }
+                float elapsed =
+                    (float)((ProfileNowMs() - startMs) * 0.001);
+                float nested = executor->GetProfilerTotal() - startProfile;
+                if (elapsed - nested > 1.0e-7f) {
+                    executor->AddProfiler(opType, elapsed - nested);
+                }
+            }
+        };
 
     }
 
@@ -711,13 +746,35 @@ namespace fastllm {
             int keyLen = pastKey.dims[1];
             if (fullAttention && keyLen > indexTopK) {
 #ifdef USE_CUDA
-                AssertInFastLLM(
-                    FastllmCudaDots3NoteSparseAttention(
+                ScopedExecutorProfiler sparseProfile(
+                    "Dots3NoteSparseAttention");
+                int cublasMaxKeys = 16384;
+                if (const char *env = std::getenv(
+                        "FASTLLM_DOTS3_NOTE_SPARSE_PREFILL_MAX_KEYS")) {
+                    cublasMaxKeys = std::max(1, std::atoi(env));
+                }
+                // Small decode-shaped calls remain on the row kernel; bounded
+                // prefill blocks amortize the dense Tensor Core QK/AV path.
+                bool useCublasPrefill =
+                    seqlen >= 16 && keyLen <= cublasMaxKeys &&
+                    std::getenv(
+                        "FASTLLM_DOTS3_NOTE_DISABLE_CUBLAS_SPARSE_PREFILL") ==
+                        nullptr;
+                bool sparseOk = useCublasPrefill &&
+                    FastllmCudaDots3NoteSparseAttentionPrefill(
                         q, pastKey, pastValue, indexTopKIndices,
                         layerPastLen,
                         1.0f / std::sqrt((float)qHeadDim),
-                        attentionOutput),
-                    "FastLLM Dots3-Note sparse MLA failed.\n");
+                        attentionOutput);
+                if (!sparseOk) {
+                    sparseOk = FastllmCudaDots3NoteSparseAttention(
+                        q, pastKey, pastValue, indexTopKIndices,
+                        layerPastLen,
+                        1.0f / std::sqrt((float)qHeadDim),
+                        attentionOutput);
+                }
+                AssertInFastLLM(sparseOk,
+                                "FastLLM Dots3-Note sparse MLA failed.\n");
 #else
                 ErrorInFastLLM(
                     "Dots3-Note sparse MLA requires a CUDA build.\n");

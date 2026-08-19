@@ -3287,11 +3287,13 @@ namespace {
         int queryTokens = 1;
         int totalTokens = 2049;
         int startPos = 2048;
+        std::string path = "indexer";
         fastllm::Data indexQ, indexKPe, indexKNope, indexK, indexWeights;
         fastllm::Data qFp8, foldedWeights, kFp8, kScales, indices;
         fastllm::Data cachedKFp8{fastllm::DataType::INT8};
         fastllm::Data cachedKScales{fastllm::DataType::FLOAT32};
-        fastllm::Data mainQ, mainK, mainV, sparseOutput;
+        fastllm::Data mainQ, mainK, mainV;
+        fastllm::Data sparseOutput, sparsePrefillOutput;
 
         static std::vector<uint8_t> ToBytes(const fastllm::Data &data) {
             fastllm::Data host;
@@ -3375,7 +3377,8 @@ namespace {
             }
         }
 
-        void ValidateSparseAttention() {
+        void ValidateSparseAttention(const fastllm::Data &output,
+                                     const std::string &name) {
             std::vector<float> qValues =
                 ToFloatVector(ConvertToFloat32Data(mainQ));
             std::vector<float> kValues =
@@ -3384,11 +3387,11 @@ namespace {
                 ToFloatVector(ConvertToFloat32Data(mainV));
             std::vector<int32_t> selected = ToInt32Vector(indices);
             std::vector<float> actual =
-                ToFloatVector(ConvertToFloat32Data(sparseOutput));
+                ToFloatVector(ConvertToFloat32Data(output));
             for (size_t i = 0; i < actual.size(); ++i) {
                 if (!std::isfinite(actual[i])) {
                     std::ostringstream os;
-                    os << "Dots sparse attention produced a non-finite value "
+                    os << name << " produced a non-finite value "
                        << "at element " << i;
                     throw std::runtime_error(os.str());
                 }
@@ -3442,8 +3445,30 @@ namespace {
             }
             if (maxAbsDiff > 2.0e-2f) {
                 std::ostringstream os;
-                os << "Dots sparse attention mismatch: max_abs_diff="
+                os << name << " mismatch: max_abs_diff="
                    << maxAbsDiff;
+                throw std::runtime_error(os.str());
+            }
+        }
+
+        void ValidateSparseAttentionAgreement() {
+            std::vector<float> sparse =
+                ToFloatVector(ConvertToFloat32Data(sparseOutput));
+            std::vector<float> prefill =
+                ToFloatVector(ConvertToFloat32Data(sparsePrefillOutput));
+            if (sparse.size() != prefill.size()) {
+                throw std::runtime_error(
+                    "Dots sparse attention output sizes differ");
+            }
+            float maxAbsDiff = 0.0f;
+            for (size_t i = 0; i < sparse.size(); ++i) {
+                maxAbsDiff = std::max(
+                    maxAbsDiff, std::fabs(sparse[i] - prefill[i]));
+            }
+            if (maxAbsDiff > 1.0e-2f) {
+                std::ostringstream os;
+                os << "Dots sparse prefill disagrees with the row kernel: "
+                   << "max_abs_diff=" << maxAbsDiff;
                 throw std::runtime_error(os.str());
             }
         }
@@ -3452,10 +3477,16 @@ namespace {
             FastllmCudaSetDevice(0);
             queryTokens = params.GetInt("queries");
             totalTokens = params.GetInt("keys");
+            path = params.GetString("path");
             if (queryTokens <= 0 || totalTokens <= 2048 ||
                 queryTokens > totalTokens) {
                 throw std::runtime_error(
                     "Dots indexer requires 0 < queries <= keys and keys > 2048");
+            }
+            if (path != "indexer" && path != "sparse" &&
+                path != "sparse_prefill") {
+                throw std::runtime_error(
+                    "Dots benchmark path must be indexer, sparse or sparse_prefill");
             }
             startPos = totalTokens - queryTokens;
 
@@ -3530,15 +3561,36 @@ namespace {
                 throw std::runtime_error(
                     "Dots sparse attention CUDA launch failed");
             }
+            if (!FastllmCudaDots3NoteSparseAttentionPrefill(
+                    mainQ, mainK, mainV, indices, startPos,
+                    1.0f / std::sqrt(192.0f), sparsePrefillOutput)) {
+                throw std::runtime_error(
+                    "Dots sparse prefill CUDA launch failed");
+            }
             ForceDeviceSync();
-            ValidateSparseAttention();
+            ValidateSparseAttention(sparseOutput, "Dots sparse attention");
+            ValidateSparseAttention(sparsePrefillOutput,
+                                    "Dots sparse prefill");
+            ValidateSparseAttentionAgreement();
         }
 
         void Run() {
-            if (!FastllmCudaDots3NoteIndexerTopK(
+            bool ok = false;
+            if (path == "indexer") {
+                ok = FastllmCudaDots3NoteIndexerTopK(
                     qFp8, foldedWeights, cachedKFp8, cachedKScales,
-                    startPos, 2048, indices)) {
-                throw std::runtime_error("Dots indexer replay failed");
+                    startPos, 2048, indices);
+            } else if (path == "sparse") {
+                ok = FastllmCudaDots3NoteSparseAttention(
+                    mainQ, mainK, mainV, indices, startPos,
+                    1.0f / std::sqrt(192.0f), sparseOutput);
+            } else {
+                ok = FastllmCudaDots3NoteSparseAttentionPrefill(
+                    mainQ, mainK, mainV, indices, startPos,
+                    1.0f / std::sqrt(192.0f), sparsePrefillOutput);
+            }
+            if (!ok) {
+                throw std::runtime_error("Dots CUDA replay failed");
             }
         }
     };
@@ -3576,6 +3628,8 @@ namespace {
                 OpTestParams params;
                 params.Add("queries", "1", "number of tail query tokens");
                 params.Add("keys", "2049", "total cached key tokens");
+                params.Add("path", "indexer",
+                           "indexer, sparse or sparse_prefill");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {

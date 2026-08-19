@@ -1,9 +1,11 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -214,6 +216,12 @@ __global__ void SparseAttentionKernel(
         q + (uint64_t)head * qHeadStride +
         (uint64_t)token * qTokenStride;
 
+    __shared__ float warpMax[warps];
+    __shared__ float warpSum[warps];
+    __shared__ float unnormalized[kIndexerTopK];
+    __shared__ float warpOutput[warps][kAttentionVDim];
+    __shared__ float rowMax;
+    __shared__ float rowSum;
     float localMax = -FLT_MAX;
     for (int selected = warp; selected < length; selected += warps) {
         int keyIndex =
@@ -235,15 +243,10 @@ __global__ void SparseAttentionKernel(
             // the FP32 attention scale and softmax.
             float score =
                 __bfloat162float(__float2bfloat16_rn(dot)) * scale;
+            unnormalized[selected] = score;
             localMax = fmaxf(localMax, score);
         }
     }
-    __shared__ float warpMax[warps];
-    __shared__ float warpSum[warps];
-    __shared__ float unnormalized[kIndexerTopK];
-    __shared__ float warpOutput[warps][kAttentionVDim];
-    __shared__ float rowMax;
-    __shared__ float rowSum;
     if (lane == 0) {
         warpMax[warp] = localMax;
     }
@@ -260,24 +263,12 @@ __global__ void SparseAttentionKernel(
 
     float localSum = 0.0f;
     for (int selected = warp; selected < length; selected += warps) {
-        int keyIndex =
-            indices[(uint64_t)token * kIndexerTopK + selected];
-        const __nv_bfloat16 *kRow =
-            k + (uint64_t)head * kHeadStride +
-            (uint64_t)keyIndex * kTokenStride;
-        float dot = 0.0f;
-#pragma unroll
-        for (int d = lane; d < kAttentionQkDim; d += 32) {
-            dot += __bfloat162float(qRow[d]) * __bfloat162float(kRow[d]);
-        }
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        float score = 0.0f;
+        if (lane == 0) {
+            score = unnormalized[selected];
         }
         float probability = 0.0f;
         if (lane == 0) {
-            float score =
-                __bfloat162float(__float2bfloat16_rn(dot)) * scale;
             probability = expf(score - rowMax);
             unnormalized[selected] = probability;
             localSum += probability;
@@ -333,6 +324,87 @@ __global__ void SparseAttentionKernel(
         output[((uint64_t)head * seqlen + token) *
                    kAttentionVDim + threadIdx.x] =
             __float2bfloat16_rn(numerator);
+    }
+}
+
+__global__ void SparseAttentionPrefillSoftmaxKernel(
+        __nv_bfloat16 *scores, const int32_t *indices,
+        uint64_t indexTokenStride, int queryOffset, int queryChunk,
+        int totalLen, int startPos, float scale) {
+    constexpr int warps = 8;
+    int row = blockIdx.x;
+    int tokenInChunk = row % queryChunk;
+    int token = queryOffset + tokenInChunk;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int length = min(kIndexerTopK, min(totalLen, startPos + token + 1));
+    __nv_bfloat16 *rowScores =
+        scores + (uint64_t)row * totalLen;
+    const int32_t *rowIndices =
+        indices + (uint64_t)token * indexTokenStride;
+
+    __shared__ float selectedProbabilities[kIndexerTopK];
+    __shared__ float warpMax[warps];
+    __shared__ float warpSum[warps];
+    __shared__ float rowMax;
+    __shared__ float rowSum;
+
+    float localMax = -FLT_MAX;
+    for (int selected = warp; selected < length; selected += warps) {
+        if (lane == 0) {
+            int keyIndex = rowIndices[selected];
+            float score = __bfloat162float(rowScores[keyIndex]) * scale;
+            selectedProbabilities[selected] = score;
+            localMax = fmaxf(localMax, score);
+        }
+    }
+    if (lane == 0) {
+        warpMax[warp] = localMax;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float maximum = warpMax[0];
+#pragma unroll
+        for (int i = 1; i < warps; ++i) {
+            maximum = fmaxf(maximum, warpMax[i]);
+        }
+        rowMax = maximum;
+    }
+    __syncthreads();
+
+    float localSum = 0.0f;
+    for (int selected = warp; selected < length; selected += warps) {
+        if (lane == 0) {
+            float probability =
+                expf(selectedProbabilities[selected] - rowMax);
+            selectedProbabilities[selected] = probability;
+            localSum += probability;
+        }
+    }
+    if (lane == 0) {
+        warpSum[warp] = localSum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < warps; ++i) {
+            sum += warpSum[i];
+        }
+        rowSum = sum;
+    }
+    __syncthreads();
+
+    for (int keyIndex = threadIdx.x; keyIndex < totalLen;
+         keyIndex += blockDim.x) {
+        rowScores[keyIndex] = __float2bfloat16_rn(0.0f);
+    }
+    __syncthreads();
+    for (int selected = threadIdx.x; selected < length;
+         selected += blockDim.x) {
+        int keyIndex = rowIndices[selected];
+        rowScores[keyIndex] = __float2bfloat16_rn(
+            selectedProbabilities[selected] / rowSum);
     }
 }
 
@@ -596,5 +668,134 @@ bool FastllmCudaDots3NoteSparseAttention(
         (const int32_t *)indices.cudaData,
         (__nv_bfloat16 *)output.cudaData, seqlen, k.dims[1],
         startPos, scale);
-    return cudaGetLastError() == cudaSuccess;
+    cudaError_t launchState = cudaGetLastError();
+    DeviceSync();
+    return launchState == cudaSuccess;
+}
+
+bool FastllmCudaDots3NoteSparseAttentionPrefill(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indices,
+        int startPos, float scale, fastllm::Data &output) {
+    if (startPos < 0 || q.dataDevice != fastllm::DataDevice::CUDA ||
+        q.dataType != fastllm::DataType::BFLOAT16 || q.cudaData == nullptr ||
+        q.dims.size() != 3 || q.dims[0] != kAttentionHeads ||
+        q.dims[2] != kAttentionQkDim || q.strides[2] != 1 ||
+        k.dataDevice != fastllm::DataDevice::CUDA ||
+        k.dataType != fastllm::DataType::BFLOAT16 || k.cudaData == nullptr ||
+        k.dims.size() != 3 || k.dims[0] != kAttentionHeads ||
+        k.dims[2] != kAttentionQkDim || k.strides[2] != 1 ||
+        v.dataDevice != fastllm::DataDevice::CUDA ||
+        v.dataType != fastllm::DataType::BFLOAT16 || v.cudaData == nullptr ||
+        v.dims.size() != 3 || v.dims[0] != kAttentionHeads ||
+        v.dims[1] != k.dims[1] || v.dims[2] != kAttentionVDim ||
+        v.strides[2] != 1 ||
+        indices.dataDevice != fastllm::DataDevice::CUDA ||
+        indices.dataType != fastllm::DataType::INT32 ||
+        indices.cudaData == nullptr || indices.dims.size() != 2 ||
+        indices.dims[0] != q.dims[1] ||
+        indices.dims[1] != kIndexerTopK || indices.strides[1] != 1 ||
+        startPos + q.dims[1] > k.dims[1]) {
+        return false;
+    }
+    int device = GetPointerDeviceId(q.cudaData);
+    if (device < 0 || GetPointerDeviceId(k.cudaData) != device ||
+        GetPointerDeviceId(v.cudaData) != device ||
+        GetPointerDeviceId(indices.cudaData) != device) {
+        return false;
+    }
+    FastllmCudaSetDevice(device);
+    int seqlen = q.dims[1];
+    int totalLen = k.dims[1];
+    if (seqlen <= 0 || totalLen <= kIndexerTopK ||
+        !PrepareOutput(output, fastllm::DataType::BFLOAT16,
+                       {kAttentionHeads, seqlen, kAttentionVDim})) {
+        return false;
+    }
+
+    // Reuse the DeepSeek-V4 prefill strategy: bound the dense score scratch,
+    // run QK and AV on Tensor Cores, and apply the sparse selection in-place
+    // between the two GEMMs. Dots shares one index row across all heads, so no
+    // per-head index expansion is needed.
+    size_t scratchLimit = 128ULL * 1024ULL * 1024ULL;
+    if (const char *env = std::getenv(
+            "FASTLLM_DOTS3_NOTE_SPARSE_PREFILL_TEMP_MB")) {
+        int megabytes = std::atoi(env);
+        if (megabytes > 0) {
+            scratchLimit = (size_t)megabytes * 1024ULL * 1024ULL;
+        }
+    }
+    size_t bytesPerQuery =
+        (size_t)kAttentionHeads * totalLen * sizeof(__nv_bfloat16);
+    int queryChunk = (int)std::max<size_t>(1, scratchLimit / bytesPerQuery);
+    queryChunk = std::min(queryChunk, seqlen);
+    size_t scratchBytes =
+        (size_t)queryChunk * bytesPerQuery;
+    __nv_bfloat16 *scores =
+        (__nv_bfloat16 *)FastllmCudaMalloc(scratchBytes);
+    if (scores == nullptr) {
+        return false;
+    }
+
+    const __nv_bfloat16 *qData =
+        (const __nv_bfloat16 *)q.cudaData;
+    const __nv_bfloat16 *kData =
+        (const __nv_bfloat16 *)k.cudaData;
+    const __nv_bfloat16 *vData =
+        (const __nv_bfloat16 *)v.cudaData;
+    __nv_bfloat16 *outputData =
+        (__nv_bfloat16 *)output.cudaData;
+    const int32_t *indexData =
+        (const int32_t *)indices.cudaData;
+    cublasHandle_t handle = getFastllmCublasHandle();
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    bool ok = true;
+    for (int queryOffset = 0; queryOffset < seqlen && ok;
+         queryOffset += queryChunk) {
+        int current = std::min(queryChunk, seqlen - queryOffset);
+        const __nv_bfloat16 *qChunk =
+            qData + (uint64_t)queryOffset * q.strides[1];
+        cublasStatus_t status = cublasGemmStridedBatchedEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            totalLen, current, kAttentionQkDim, &alpha,
+            kData, CUDA_R_16BF, (int)k.strides[1],
+            (long long)k.strides[0],
+            qChunk, CUDA_R_16BF, (int)q.strides[1],
+            (long long)q.strides[0], &beta,
+            scores, CUDA_R_16BF, totalLen,
+            (long long)current * totalLen, kAttentionHeads,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            ok = false;
+            break;
+        }
+
+        SparseAttentionPrefillSoftmaxKernel<<<
+            current * kAttentionHeads, 256, 0, cudaStreamPerThread>>>(
+                scores, indexData, indices.strides[0], queryOffset,
+                current, totalLen, startPos, scale);
+        if (cudaGetLastError() != cudaSuccess) {
+            ok = false;
+            break;
+        }
+
+        __nv_bfloat16 *outputChunk =
+            outputData + (uint64_t)queryOffset * output.strides[1];
+        status = cublasGemmStridedBatchedEx(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            kAttentionVDim, current, totalLen, &alpha,
+            vData, CUDA_R_16BF, (int)v.strides[1],
+            (long long)v.strides[0],
+            scores, CUDA_R_16BF, totalLen,
+            (long long)current * totalLen, &beta,
+            outputChunk, CUDA_R_16BF, kAttentionVDim,
+            (long long)output.strides[0], kAttentionHeads,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        ok = status == CUBLAS_STATUS_SUCCESS;
+    }
+    cudaError_t launchState = cudaGetLastError();
+    DeviceSync();
+    FastllmCudaFree(scores);
+    return ok && launchState == cudaSuccess;
 }
