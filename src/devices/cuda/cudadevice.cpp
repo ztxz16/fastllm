@@ -7228,6 +7228,8 @@ namespace fastllm {
                 return false;
             }
             bool hasGpuExpert = false;
+            int gateUpDim = -1;
+            int outputDim = -1;
             for (int i = 0; i < (int)expertTasks.size(); i++) {
                 if (expertTasks[i].empty() ||
                     experts.find(i) == experts.end() ||
@@ -7240,15 +7242,50 @@ namespace fastllm {
                     weights[i * 2 + 1]->dims.size() != 2 ||
                     weights[i * 2]->dims[1] % 128 != 0 ||
                     weights[i * 2 + 1]->dims[1] % 128 != 0 ||
+                    weights[i * 2]->dims[0] % 2 != 0 ||
                     weights[i * 2]->dataType !=
                         DataType::FP8_E4M3_BLOCK_128 ||
                     weights[i * 2 + 1]->dataType !=
                         DataType::FP8_E4M3_BLOCK_128) {
                     return false;
                 }
+                if (gateUpDim < 0) {
+                    gateUpDim = weights[i * 2]->dims[0];
+                    outputDim = weights[i * 2 + 1]->dims[0];
+                } else if (weights[i * 2]->dims[0] != gateUpDim ||
+                           weights[i * 2 + 1]->dims[0] != outputDim) {
+                    return false;
+                }
             }
             return hasGpuExpert;
         }();
+
+        auto isValidExpert = [&](int idx) {
+            return idx >= 0 && idx < (int)expertTasks.size() &&
+                   expertTasks[idx].size() > 0 &&
+                   experts.find(idx) != experts.end() &&
+                   weights[idx * 2] != nullptr;
+        };
+        auto findNextValidExpert = [&](int after) {
+            for (int j = after + 1; j < (int)expertTasks.size(); j++) {
+                if (isValidExpert(j)) return j;
+            }
+            return -1;
+        };
+
+        int accurateWorkspaceBatch = 0;
+        int accurateWorkspaceExpert = -1;
+        if (accurateFp8Moe) {
+            accurateWorkspaceExpert = findNextValidExpert(-1);
+            for (int i = accurateWorkspaceExpert; i >= 0;
+                 i = findNextValidExpert(i)) {
+                accurateWorkspaceBatch = std::max(
+                    accurateWorkspaceBatch, (int)expertTasks[i].size());
+            }
+            AssertInFastLLM(
+                accurateWorkspaceExpert >= 0 && accurateWorkspaceBatch > 0,
+                "CUDA NUMA MoE has no valid FP8 expert workspace.");
+        }
 
         std::vector <int> indexVec;
         std::vector <float> scales;
@@ -7277,46 +7314,42 @@ namespace fastllm {
                 cudaUnitScales, unitScales.data(),
                 unitScales.size() * sizeof(float));
         }
-        tempInput.Resize(input.dims);
+        tempInput.Resize(
+            accurateFp8Moe
+                ? std::vector<int>{accurateWorkspaceBatch, input.dims[1]}
+                : input.dims);
         tempInput.dataType = input.dataType;
         tempInput.ToDevice(
             input.dataDevice, std::vector<int>{curDeviceId}, false);
         tempInput.Allocate();
 
-        tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
-        tempMiddle.dataType = input.dataType;
-        tempMiddle.ToDevice(
-            input.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempMiddle.Allocate();
-
-        tempSwiglu.Resize({input.dims[0], weights[2]->dims[0] / 2});
-        tempSwiglu.dataType = input.dataType;
-        tempSwiglu.ToDevice(
-            input.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempSwiglu.Allocate();
-
-        tempOutput.Resize(output.dims);
-        tempOutput.dataType = input.dataType;
-        tempOutput.ToDevice(
-            output.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempOutput.Allocate();
         if (accurateFp8Moe) {
+            int gateUpDim = weights[accurateWorkspaceExpert * 2]->dims[0];
+
+            tempSwiglu.Resize(
+                {accurateWorkspaceBatch, gateUpDim / 2});
+            tempSwiglu.dataType = input.dataType;
+            tempSwiglu.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempSwiglu.Allocate();
+
             tempFloatMiddle.dataType = DataType::FLOAT32;
             tempFloatMiddle.Resize(
-                {input.dims[0], weights[2]->dims[0]});
+                {accurateWorkspaceBatch, gateUpDim});
             tempFloatMiddle.ToDevice(
                 input.dataDevice, std::vector<int>{curDeviceId}, false);
             tempFloatMiddle.Allocate();
 
             tempFloatSwiglu.dataType = DataType::FLOAT32;
             tempFloatSwiglu.Resize(
-                {input.dims[0], weights[2]->dims[0] / 2});
+                {accurateWorkspaceBatch, gateUpDim / 2});
             tempFloatSwiglu.ToDevice(
                 input.dataDevice, std::vector<int>{curDeviceId}, false);
             tempFloatSwiglu.Allocate();
 
             tempFloatOutput.dataType = DataType::FLOAT32;
-            tempFloatOutput.Resize(output.dims);
+            tempFloatOutput.Resize(
+                {accurateWorkspaceBatch, output.dims[1]});
             tempFloatOutput.ToDevice(
                 output.dataDevice, std::vector<int>{curDeviceId}, false);
             tempFloatOutput.Allocate();
@@ -7328,20 +7361,26 @@ namespace fastllm {
             floatOutput.Allocate();
             FastllmCudaMemset0(
                 floatOutput.cudaData, floatOutput.GetBytes());
-        }
+        } else {
+            tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
+            tempMiddle.dataType = input.dataType;
+            tempMiddle.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempMiddle.Allocate();
 
-        auto isValidExpert = [&](int idx) {
-            return idx >= 0 && idx < (int)expertTasks.size() &&
-                   expertTasks[idx].size() > 0 &&
-                   experts.find(idx) != experts.end() &&
-                   weights[idx * 2] != nullptr;
-        };
-        auto findNextValidExpert = [&](int after) {
-            for (int j = after + 1; j < (int)expertTasks.size(); j++) {
-                if (isValidExpert(j)) return j;
-            }
-            return -1;
-        };
+            tempSwiglu.Resize(
+                {input.dims[0], weights[2]->dims[0] / 2});
+            tempSwiglu.dataType = input.dataType;
+            tempSwiglu.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempSwiglu.Allocate();
+
+            tempOutput.Resize(output.dims);
+            tempOutput.dataType = input.dataType;
+            tempOutput.ToDevice(
+                output.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempOutput.Allocate();
+        }
 
         void *copyStream = FastllmCudaStreamCreate(true);
         void *computeDoneEvent = FastllmCudaEventCreate();
