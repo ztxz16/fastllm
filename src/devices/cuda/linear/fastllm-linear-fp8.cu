@@ -576,6 +576,22 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
     const int grid = (k + W * ROWS - 1) / (W * ROWS);
     const bool useBlock128 = (blockM == 128 && blockK == 128 && (m & 127) == 0);
 
+    // Six-token speculative verification is the dominant FP8 shape on the
+    // target model.  Two output rows per warp expose twice as many blocks and
+    // hide weight-load latency better than the generic four-row launch.
+    const char *n6Rows2Env = std::getenv("FASTLLM_CUDA_FP8_N6_ROWS2");
+    const bool n6Rows2 = n6Rows2Env == nullptr || std::atoi(n6Rows2Env) != 0;
+    if (n == 6 && useBlock128 && n6Rows2) {
+        constexpr int N6_W = 2;
+        constexpr int N6_ROWS = 2;
+        const int n6Grid =
+            (k + N6_W * N6_ROWS - 1) / (N6_W * N6_ROWS);
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
+            <N6_W, 6, N6_ROWS><<<n6Grid, N6_W * 32>>>(
+                input, weight, output, bias, scales, m, k);
+        return;
+    }
+
     // Small batch-one projections do not expose enough warps when each warp
     // owns four rows (2048 outputs only launch four warps/SM on AD102).  The
     // activation is cache-resident, so using two rows per warp improves DRAM
