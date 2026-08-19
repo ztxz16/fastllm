@@ -1084,6 +1084,18 @@ bool FastllmCudaDFlashDynamicConv(
                                   int side, int blockSize,
                                   int hiddenSize, int groupSize,
                                   int kernelSize);
+bool FastllmCudaDFlashPrepareQKV(
+                                  const fastllm::Data &qkv,
+                                  const fastllm::Data &qNormWeight,
+                                  const fastllm::Data &kNormWeight,
+                                  const fastllm::Data &positionIds,
+                                  const fastllm::Data &sinData,
+                                  const fastllm::Data &cosData,
+                                  fastllm::Data &query,
+                                  fastllm::Data &key,
+                                  fastllm::Data &value,
+                                  int tokens, int queryHeads,
+                                  int kvHeads, int headDim, float eps);
 bool FastllmCudaDFlashMaterializeKV(
                                   const fastllm::Data &projectedKv,
                                   const fastllm::Data &kNormWeights,

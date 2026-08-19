@@ -13700,6 +13700,192 @@ bool FastllmCudaDFlashDynamicConv(
     return true;
 }
 
+__global__ void FastllmDFlashPrepareQkvBf16Kernel(
+        const __nv_bfloat16 *__restrict__ qkv,
+        const float *__restrict__ qNormWeight,
+        const float *__restrict__ kNormWeight,
+        const float *__restrict__ positionIds,
+        const float *__restrict__ sinData,
+        const float *__restrict__ cosData,
+        half *__restrict__ query,
+        half *__restrict__ key,
+        half *__restrict__ value,
+        int tokens, int projectionStride, int queryHeads,
+        int kvHeads, int headDim, int sinCosStride, float eps) {
+    const int outputHead = blockIdx.x / tokens;
+    const int token = blockIdx.x % tokens;
+    int kind;
+    int head;
+    if (outputHead < queryHeads) {
+        kind = 0;
+        head = outputHead;
+    } else if (outputHead < queryHeads + kvHeads) {
+        kind = 1;
+        head = outputHead - queryHeads;
+    } else {
+        kind = 2;
+        head = outputHead - queryHeads - kvHeads;
+    }
+
+    const int sourceHead = kind == 0 ? head :
+        (kind == 1 ? queryHeads + head : queryHeads + kvHeads + head);
+    const __nv_bfloat16 *source = qkv +
+        (size_t)token * projectionStride + (size_t)sourceHead * headDim;
+    half *destination = (kind == 0 ? query : (kind == 1 ? key : value)) +
+        (size_t)(head * tokens + token) * headDim;
+    const int tid = threadIdx.x;
+
+    if (kind == 2) {
+        for (int channel = tid; channel < headDim; channel += blockDim.x) {
+            destination[channel] = __float2half_rz(
+                __bfloat162float(source[channel]));
+        }
+        return;
+    }
+
+    __shared__ float warpSums[2];
+    __shared__ float scale;
+    __shared__ __nv_bfloat16 normalized[128];
+    const __nv_bfloat162 *source2 =
+        reinterpret_cast<const __nv_bfloat162 *>(source);
+    float sum2 = 0.0f;
+    for (int channel = tid; channel < headDim / 2;
+         channel += blockDim.x) {
+        __nv_bfloat162 pair = source2[channel];
+        const float low = __bfloat162float(pair.x);
+        const float high = __bfloat162float(pair.y);
+        sum2 += low * low + high * high;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) {
+        warpSums[warp] = sum2;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float sum = lane < 2 ? warpSums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(sum / headDim + eps);
+        }
+    }
+    __syncthreads();
+
+    const float *normWeight = kind == 0 ? qNormWeight : kNormWeight;
+    for (int channel = tid; channel < headDim / 2;
+         channel += blockDim.x) {
+        __nv_bfloat162 pair = source2[channel];
+        normalized[channel * 2] = __float2bfloat16_rn(
+            __bfloat162float(pair.x) * scale *
+                __ldg(normWeight + channel * 2));
+        normalized[channel * 2 + 1] = __float2bfloat16_rn(
+            __bfloat162float(pair.y) * scale *
+                __ldg(normWeight + channel * 2 + 1));
+    }
+    __syncthreads();
+
+    const int halfHeadDim = headDim / 2;
+    if (tid < halfHeadDim) {
+        const int position = (int)positionIds[token];
+        const float sine = sinData[(size_t)position * sinCosStride + tid];
+        const float cosine =
+            cosData[(size_t)position * sinCosStride + tid];
+        const float first = __bfloat162float(normalized[tid]);
+        const float second =
+            __bfloat162float(normalized[tid + halfHeadDim]);
+        const __nv_bfloat16 rotatedFirst = __float2bfloat16_rn(
+            first * cosine - second * sine);
+        const __nv_bfloat16 rotatedSecond = __float2bfloat16_rn(
+            first * sine + second * cosine);
+        destination[tid] = __float2half_rz(
+            __bfloat162float(rotatedFirst));
+        destination[tid + halfHeadDim] = __float2half_rz(
+            __bfloat162float(rotatedSecond));
+    }
+}
+
+bool FastllmCudaDFlashPrepareQKV(
+        const fastllm::Data &qkv,
+        const fastllm::Data &qNormWeight,
+        const fastllm::Data &kNormWeight,
+        const fastllm::Data &positionIds,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        fastllm::Data &query,
+        fastllm::Data &key,
+        fastllm::Data &value,
+        int tokens, int queryHeads, int kvHeads, int headDim, float eps) {
+    if (tokens <= 0 || queryHeads <= 0 || kvHeads <= 0 || headDim != 128 ||
+        qkv.dataType != fastllm::DataType::BFLOAT16 ||
+        qNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        kNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        sinData.dataType != fastllm::DataType::FLOAT32 ||
+        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        query.dataType != fastllm::DataType::FLOAT16 ||
+        key.dataType != fastllm::DataType::FLOAT16 ||
+        value.dataType != fastllm::DataType::FLOAT16 ||
+        qkv.dims != std::vector<int>({1, tokens,
+            (queryHeads + 2 * kvHeads) * headDim}) ||
+        qNormWeight.dims != std::vector<int>({headDim}) ||
+        kNormWeight.dims != std::vector<int>({headDim}) ||
+        positionIds.dims != std::vector<int>({1, tokens}) ||
+        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
+        sinData.dims[1] < headDim ||
+        query.dims != std::vector<int>({queryHeads, tokens, headDim}) ||
+        key.dims != std::vector<int>({kvHeads, tokens, headDim}) ||
+        value.dims != std::vector<int>({kvHeads, tokens, headDim}) ||
+        !FastllmCudaDataHasDenseStrides(qkv) ||
+        !FastllmCudaDataHasDenseStrides(qNormWeight) ||
+        !FastllmCudaDataHasDenseStrides(kNormWeight) ||
+        !FastllmCudaDataHasDenseStrides(positionIds) ||
+        !FastllmCudaDataHasDenseStrides(sinData) ||
+        !FastllmCudaDataHasDenseStrides(cosData) ||
+        !FastllmCudaDataHasDenseStrides(query) ||
+        !FastllmCudaDataHasDenseStrides(key) ||
+        !FastllmCudaDataHasDenseStrides(value) ||
+        !FastllmCudaDataCanShareDevice(qkv, qNormWeight) ||
+        !FastllmCudaDataCanShareDevice(qkv, kNormWeight) ||
+        !FastllmCudaDataCanShareDevice(qkv, positionIds) ||
+        !FastllmCudaDataCanShareDevice(qkv, sinData) ||
+        !FastllmCudaDataCanShareDevice(qkv, cosData) ||
+        !FastllmCudaDataCanShareDevice(qkv, query) ||
+        !FastllmCudaDataCanShareDevice(qkv, key) ||
+        !FastllmCudaDataCanShareDevice(qkv, value)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(qkv, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    const int blocks = tokens * (queryHeads + 2 * kvHeads);
+    FastllmDFlashPrepareQkvBf16Kernel<<<
+        blocks, 64, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)qkv.cudaData,
+            (const float *)qNormWeight.cudaData,
+            (const float *)kNormWeight.cudaData,
+            (const float *)positionIds.cudaData,
+            (const float *)sinData.cudaData,
+            (const float *)cosData.cudaData,
+            (half *)query.cudaData, (half *)key.cudaData,
+            (half *)value.cudaData,
+            tokens, qkv.dims[2], queryHeads, kvHeads, headDim,
+            sinData.dims[1], eps);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 struct FastllmDFlashKvCacheOutput {
     half *pointers[10];
     size_t headStride;

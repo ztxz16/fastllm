@@ -21222,20 +21222,52 @@ namespace fastllm {
                 weight[prefix + "attention_conv.base_kernel"], 0,
                 attentionInput);
 
-            Data query, key, value;
+            Data query, key, value, mergedQkv;
+            bool fusedQkvPrepared = false;
             auto mergedQkvIt = weight.weight.find(
                 prefix + "self_attn.mergeqkv.weight");
             if (mergedQkvIt != weight.weight.end()) {
                 const int qChannels = dflashHeads * dflashHeadDim;
                 const int kvChannels = dflashKvHeads * dflashHeadDim;
-                Data qkv;
                 Linear(attentionInput, mergedQkvIt->second,
-                       *GetEmptyData(), qkv);
-                Split(qkv, -1, 0, qChannels, query);
-                Split(qkv, -1, qChannels,
-                      qChannels + kvChannels, key);
-                Split(qkv, -1, qChannels + kvChannels,
-                      qChannels + 2 * kvChannels, value);
+                       *GetEmptyData(), mergedQkv);
+                if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                        "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
+                    for (auto item : {
+                             std::make_pair(&query, dflashHeads),
+                             std::make_pair(&key, dflashKvHeads),
+                             std::make_pair(&value, dflashKvHeads)}) {
+                        ::fastllm::Qwen3CudaPrepareLocalOutput(
+                            *item.first, device);
+                        item.first->dataType = DataType::FLOAT16;
+                        item.first->UpdateUnitSize();
+                        item.first->Resize(
+                            {item.second, blockSize, dflashHeadDim});
+                        item.first->Allocate(false);
+                    }
+                    fusedQkvPrepared = FastllmCudaDFlashPrepareQKV(
+                        mergedQkv,
+                        weight[prefix + "self_attn.q_norm.weight"],
+                        weight[prefix + "self_attn.k_norm.weight"],
+                        positions, dflashSinData, dflashCosData,
+                        query, key, value, blockSize, dflashHeads,
+                        dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
+                    if (!fusedQkvPrepared) {
+                        for (Data *output : {&query, &key, &value}) {
+                            output->FreeSpace();
+                            output->dims.clear();
+                            output->strides.clear();
+                            output->expansionDims.clear();
+                        }
+                    }
+                }
+                if (!fusedQkvPrepared) {
+                    Split(mergedQkv, -1, 0, qChannels, query);
+                    Split(mergedQkv, -1, qChannels,
+                          qChannels + kvChannels, key);
+                    Split(mergedQkv, -1, qChannels + kvChannels,
+                          qChannels + 2 * kvChannels, value);
+                }
             } else {
                 Linear(attentionInput,
                        weight[prefix + "self_attn.q_proj.weight"],
@@ -21247,29 +21279,36 @@ namespace fastllm {
                        weight[prefix + "self_attn.v_proj.weight"],
                        *GetEmptyData(), value);
             }
-            query.Reshape(
-                {1, blockSize, dflashHeads, dflashHeadDim});
-            key.Reshape(
-                {1, blockSize, dflashKvHeads, dflashHeadDim});
-            value.Reshape(
-                {1, blockSize, dflashKvHeads, dflashHeadDim});
-            RMSNorm(query, weight[prefix + "self_attn.q_norm.weight"],
-                    dflashRmsNormEps, query);
-            RMSNorm(key, weight[prefix + "self_attn.k_norm.weight"],
-                    dflashRmsNormEps, key);
-            LlamaRotatePosition2D(query, positions, dflashSinData,
-                                  dflashCosData, dflashHeadDim);
-            LlamaRotatePosition2D(key, positions, dflashSinData,
-                                  dflashCosData, dflashHeadDim);
-            PermuteSelf(query, {0, 2, 1, 3});
-            PermuteSelf(key, {0, 2, 1, 3});
-            PermuteSelf(value, {0, 2, 1, 3});
-            query.Reshape({dflashHeads, blockSize, dflashHeadDim});
-            key.Reshape({dflashKvHeads, blockSize, dflashHeadDim});
-            value.Reshape({dflashKvHeads, blockSize, dflashHeadDim});
-            ToDataType(query, DataType::FLOAT16);
-            ToDataType(key, DataType::FLOAT16);
-            ToDataType(value, DataType::FLOAT16);
+            if (!fusedQkvPrepared) {
+                query.Reshape(
+                    {1, blockSize, dflashHeads, dflashHeadDim});
+                key.Reshape(
+                    {1, blockSize, dflashKvHeads, dflashHeadDim});
+                value.Reshape(
+                    {1, blockSize, dflashKvHeads, dflashHeadDim});
+                RMSNorm(query,
+                        weight[prefix + "self_attn.q_norm.weight"],
+                        dflashRmsNormEps, query);
+                RMSNorm(key,
+                        weight[prefix + "self_attn.k_norm.weight"],
+                        dflashRmsNormEps, key);
+                LlamaRotatePosition2D(query, positions, dflashSinData,
+                                      dflashCosData, dflashHeadDim);
+                LlamaRotatePosition2D(key, positions, dflashSinData,
+                                      dflashCosData, dflashHeadDim);
+                PermuteSelf(query, {0, 2, 1, 3});
+                PermuteSelf(key, {0, 2, 1, 3});
+                PermuteSelf(value, {0, 2, 1, 3});
+                query.Reshape(
+                    {dflashHeads, blockSize, dflashHeadDim});
+                key.Reshape(
+                    {dflashKvHeads, blockSize, dflashHeadDim});
+                value.Reshape(
+                    {dflashKvHeads, blockSize, dflashHeadDim});
+                ToDataType(query, DataType::FLOAT16);
+                ToDataType(key, DataType::FLOAT16);
+                ToDataType(value, DataType::FLOAT16);
+            }
 
             Data &keyCache = context.draftKeyValues[layerIndex].first;
             Data &valueCache = context.draftKeyValues[layerIndex].second;
