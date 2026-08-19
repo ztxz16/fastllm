@@ -20844,6 +20844,25 @@ namespace fastllm {
                                    int side,
                                    Data &output) {
             const int groups = embed_dim / dflashConvGroupSize;
+            if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                    "FASTLLM_CUDA_DFLASH_FUSED_CONV") &&
+                source.dataDevice == DataDevice::CUDA &&
+                dynamicProjection.dataDevice == DataDevice::CUDA &&
+                baseKernel.dataDevice == DataDevice::CUDA &&
+                source.dataType == DataType::BFLOAT16 &&
+                dynamicProjection.dataType == DataType::BFLOAT16 &&
+                baseKernel.dataType == DataType::BFLOAT16) {
+                ::fastllm::Qwen3CudaPrepareLocalOutput(output, device);
+                output.dataType = source.dataType;
+                output.Resize(source.dims);
+                output.Allocate(false);
+                if (FastllmCudaDFlashDynamicConv(
+                        source, dynamicProjection, baseKernel, output,
+                        side, blockSize, embed_dim,
+                        dflashConvGroupSize, dflashConvKernelSize)) {
+                    return;
+                }
+            }
             dynamicProjection.Reshape(
                 {1, blockSize, 2, dflashConvKernelSize, groups});
             Data sideDynamic;

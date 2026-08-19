@@ -13609,6 +13609,97 @@ __global__ void FastllmDFlashScatterDraftProbsKernel(
     }
 }
 
+__global__ void FastllmDFlashDynamicConvBf16Kernel(
+        const __nv_bfloat16 *__restrict__ source,
+        const __nv_bfloat16 *__restrict__ dynamicProjection,
+        const __nv_bfloat16 *__restrict__ baseKernel,
+        __nv_bfloat16 *__restrict__ output,
+        int side, int blockSize, int hiddenSize,
+        int groupSize, int kernelSize) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = blockSize * hiddenSize;
+    if (index >= total) {
+        return;
+    }
+
+    int token = index / hiddenSize;
+    int channel = index - token * hiddenSize;
+    int group = channel / groupSize;
+    int groups = hiddenSize / groupSize;
+    __nv_bfloat16 accumulated = __float2bfloat16_rn(0.0f);
+    for (int tap = 0; tap < kernelSize && tap <= token; tap++) {
+        size_t dynamicIndex =
+            (((size_t)token * 2 + side) * kernelSize + tap) * groups + group;
+        size_t baseIndex =
+            ((size_t)side * kernelSize + tap) * hiddenSize + channel;
+        __nv_bfloat16 coefficient = __float2bfloat16_rn(
+            __bfloat162float(dynamicProjection[dynamicIndex]) +
+            __bfloat162float(baseKernel[baseIndex]));
+        __nv_bfloat16 product = __float2bfloat16_rn(
+            __bfloat162float(source[(token - tap) * hiddenSize + channel]) *
+            __bfloat162float(coefficient));
+        if (tap == 0) {
+            accumulated = product;
+        } else {
+            accumulated = __float2bfloat16_rn(
+                __bfloat162float(accumulated) + __bfloat162float(product));
+        }
+    }
+    output[index] = accumulated;
+}
+
+bool FastllmCudaDFlashDynamicConv(
+        const fastllm::Data &source,
+        const fastllm::Data &dynamicProjection,
+        const fastllm::Data &baseKernel,
+        fastllm::Data &output,
+        int side, int blockSize, int hiddenSize,
+        int groupSize, int kernelSize) {
+    if (side < 0 || side >= 2 || blockSize <= 0 || hiddenSize <= 0 ||
+        groupSize <= 0 || kernelSize <= 0 ||
+        hiddenSize % groupSize != 0 ||
+        source.dataType != fastllm::DataType::BFLOAT16 ||
+        dynamicProjection.dataType != fastllm::DataType::BFLOAT16 ||
+        baseKernel.dataType != fastllm::DataType::BFLOAT16 ||
+        output.dataType != fastllm::DataType::BFLOAT16 ||
+        source.Count(0) != (uint64_t)blockSize * hiddenSize ||
+        dynamicProjection.Count(0) !=
+            (uint64_t)blockSize * 2 * kernelSize *
+                (hiddenSize / groupSize) ||
+        baseKernel.Count(0) !=
+            (uint64_t)2 * kernelSize * hiddenSize ||
+        output.Count(0) != (uint64_t)blockSize * hiddenSize ||
+        !FastllmCudaDataHasDenseStrides(source) ||
+        !FastllmCudaDataHasDenseStrides(dynamicProjection) ||
+        !FastllmCudaDataHasDenseStrides(baseKernel) ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(source, dynamicProjection) ||
+        !FastllmCudaDataCanShareDevice(source, baseKernel) ||
+        !FastllmCudaDataCanShareDevice(source, output)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(source, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    const int total = blockSize * hiddenSize;
+    FastllmDFlashDynamicConvBf16Kernel<<<
+        (total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)source.cudaData,
+            (const __nv_bfloat16 *)dynamicProjection.cudaData,
+            (const __nv_bfloat16 *)baseKernel.cudaData,
+            (__nv_bfloat16 *)output.cudaData,
+            side, blockSize, hiddenSize, groupSize, kernelSize);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 bool FastllmCudaDFlashRejectionSampling(
                                   float *logits,
                                   const float *temperatures,

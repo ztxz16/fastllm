@@ -1076,6 +1076,14 @@ bool FastllmCudaDFlashRejectionSampling(
                                   int *acceptedDraftTokens,
                                   int batch, int draftTokens,
                                   int selectorTopK, int vocabSize);
+bool FastllmCudaDFlashDynamicConv(
+                                  const fastllm::Data &source,
+                                  const fastllm::Data &dynamicProjection,
+                                  const fastllm::Data &baseKernel,
+                                  fastllm::Data &output,
+                                  int side, int blockSize,
+                                  int hiddenSize, int groupSize,
+                                  int kernelSize);
 bool FastllmCudaTopKTopPSamplingToDevice(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,
