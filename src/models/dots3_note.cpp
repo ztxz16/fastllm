@@ -421,7 +421,7 @@ namespace fastllm {
         Data slidingAttentionMask;
         int slidingMaskPastLen = -1;
         int slidingMaskKeyLen = -1;
-        Data attentionOutput, attentionGate, expandedGate, attentionProjected;
+        Data attentionOutput, attentionGate, attentionProjected;
         Data w1, w2, w3;
         Data routerLogits, expertIndex, expertScore;
         Data moeOutput, moeOutputCopy, moeInputTemp, moeOutputTemp;
@@ -853,8 +853,7 @@ namespace fastllm {
                    Data(), attentionGate);
             Sigmoid(attentionGate, attentionGate);
             attentionGate.Reshape({1, seqlen, config.numHeads, 1});
-            Repeat(attentionGate, 3, config.vHeadDim, expandedGate);
-            MulTo(attentionOutput, expandedGate);
+            MulTo(attentionOutput, attentionGate);
             attentionOutput.Reshape(
                 {1, seqlen, config.numHeads * config.vHeadDim});
             Linear(attentionOutput, weight[attentionPrefix + "o_proj.weight"],
