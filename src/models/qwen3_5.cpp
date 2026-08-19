@@ -150,6 +150,30 @@ namespace fastllm {
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
     static constexpr int QWEN35_BATCH_PREFILL_SEQ_MAX = 4096;
 
+    static int Qwen35DFlashCacheTrimThreshold(int slidingWindow) {
+        const int keepTokens = std::max(1, slidingWindow - 1);
+        if (Qwen35EnvDefaultEnabled(
+                "FASTLLM_CUDA_DFLASH_FUSED_KV_COMPACT")) {
+            return keepTokens + std::max(256, slidingWindow / 4);
+        }
+        return std::max(4096, slidingWindow * 2);
+    }
+
+    static int Qwen35DFlashCacheAllocationUnit(
+            int slidingWindow, int checkpointBlockSize) {
+        if (!Qwen35EnvDefaultEnabled(
+                "FASTLLM_CUDA_DFLASH_PREALLOCATE_KV_CACHE")) {
+            return 64;
+        }
+        // Grow in coarse window-relative chunks. This removes most of the
+        // repeated copies without reserving the whole sliding window for a
+        // short request or every concurrent response up front. One draft
+        // block of headroom per chunk also keeps the fifth allocation close
+        // to the fused compaction boundary instead of rounding up to a sixth.
+        return std::max(256, slidingWindow / 4) +
+            std::max(1, checkpointBlockSize);
+    }
+
     static void Qwen35EnsureDraftSequenceCacheCapacity(
             Data &cache, const Data &current, int allocationUnit = 64) {
         AssertInFastLLM(current.dims.size() == 3,
@@ -20804,6 +20828,9 @@ namespace fastllm {
         Qwen35ScopedGenericExecutor executor(
             "cuda:" + std::to_string(device));
         FastllmCudaSetDevice(device);
+        const int cacheAllocationUnit =
+            Qwen35DFlashCacheAllocationUnit(
+                dflashSlidingWindow, dflashCheckpointBlockSize);
 
         Data combined;
         for (int feature = 0;
@@ -20900,9 +20927,9 @@ namespace fastllm {
                 Data &valueCache =
                     context.draftKeyValues[layerIndex].second;
                 Qwen35EnsureDraftSequenceCacheCapacity(
-                    keyCache, cacheSlice);
+                    keyCache, cacheSlice, cacheAllocationUnit);
                 Qwen35EnsureDraftSequenceCacheCapacity(
-                    valueCache, cacheSlice);
+                    valueCache, cacheSlice, cacheAllocationUnit);
                 caches.push_back(&keyCache);
                 caches.push_back(&valueCache);
             }
@@ -21023,9 +21050,11 @@ namespace fastllm {
                 ToDataType(value, DataType::FLOAT16);
             }
             Qwen35AppendDraftSequenceCache(
-                context.draftKeyValues[layerIndex].first, key);
+                context.draftKeyValues[layerIndex].first, key,
+                cacheAllocationUnit);
             Qwen35AppendDraftSequenceCache(
-                context.draftKeyValues[layerIndex].second, value);
+                context.draftKeyValues[layerIndex].second, value,
+                cacheAllocationUnit);
         }
         context.committedTokens += tokens;
 
@@ -21035,10 +21064,8 @@ namespace fastllm {
         // ten generic Split/CopyFrom operations or repeated cache growth.
         const bool useFusedKvCompact = Qwen35EnvDefaultEnabled(
             "FASTLLM_CUDA_DFLASH_FUSED_KV_COMPACT");
-        const int trimSlack = std::max(256, dflashSlidingWindow / 4);
-        const int trimThreshold = useFusedKvCompact ?
-            keepTokens + trimSlack :
-            std::max(4096, dflashSlidingWindow * 2);
+        const int trimThreshold =
+            Qwen35DFlashCacheTrimThreshold(dflashSlidingWindow);
         if (!context.draftKeyValues.empty() &&
             context.draftKeyValues[0].first.dims.size() == 3 &&
             context.draftKeyValues[0].first.dims[1] > trimThreshold) {
@@ -21093,6 +21120,9 @@ namespace fastllm {
         // GEMM path while leaving the visible prefix mathematically identical.
         const int blockSize = dflashCheckpointBlockSize;
         const int slots = runtimeBlockSize - 1;
+        const int cacheAllocationUnit =
+            Qwen35DFlashCacheAllocationUnit(
+                dflashSlidingWindow, blockSize);
         EnsureDFlashRotary(context.committedTokens + blockSize, device);
 
         std::vector<float> tokenValues(blockSize,
@@ -21352,8 +21382,10 @@ namespace fastllm {
                             "DFlash draft KV cache is out of sync.\n");
             int oldKeyTokens = keyCache.dims[1];
             int oldValueTokens = valueCache.dims[1];
-            Qwen35AppendDraftSequenceCache(keyCache, key);
-            Qwen35AppendDraftSequenceCache(valueCache, value);
+            Qwen35AppendDraftSequenceCache(
+                keyCache, key, cacheAllocationUnit);
+            Qwen35AppendDraftSequenceCache(
+                valueCache, value, cacheAllocationUnit);
             Data attentionHeads;
             bool implicitAttention = false;
             if (useImplicitAttention) {
