@@ -41,6 +41,20 @@ namespace fastllm {
     extern void RegisterNumas(fastllm::Data *data, std::string weightType);
 #endif
 
+    static bool Qwen35EnvDefaultEnabled(const char *name) {
+        const char *env = std::getenv(name);
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "FALSE") != 0 &&
+               std::strcmp(env, "off") != 0 &&
+               std::strcmp(env, "OFF") != 0 &&
+               std::strcmp(env, "no") != 0 &&
+               std::strcmp(env, "NO") != 0;
+    }
+
     static std::string Qwen35MoeExpertPrefix(int layer, int expert) {
         return Qwen3_5Model::language_prefix + "layers." + std::to_string(layer) +
                ".mlp.experts." + std::to_string(expert) + ".";
@@ -18865,6 +18879,33 @@ namespace fastllm {
                          "mlp_conv.kernel_projection.weight"}) {
                     this->weight.linearNames.insert(prefix + suffix);
                 }
+                if (Qwen35EnvDefaultEnabled(
+                        "FASTLLM_CUDA_DFLASH_FUSED_LINEAR")) {
+                    const std::string qWeightName =
+                        prefix + "self_attn.q_proj.weight";
+                    const std::string kWeightName =
+                        prefix + "self_attn.k_proj.weight";
+                    const std::string vWeightName =
+                        prefix + "self_attn.v_proj.weight";
+                    const std::string mergeQkvWeightName =
+                        prefix + "self_attn.mergeqkv.weight";
+                    const std::string gateWeightName =
+                        prefix + "mlp.gate_proj.weight";
+                    const std::string upWeightName =
+                        prefix + "mlp.up_proj.weight";
+                    const std::string gateupWeightName =
+                        prefix + "mlp.gateup_proj.weight";
+                    this->weight.linearNames.insert(mergeQkvWeightName);
+                    this->weight.linearNames.insert(gateupWeightName);
+                    this->weightMergeRules.push_back(WeightMergeRule({
+                        WeightMergeRuleSingle(
+                            {qWeightName, kWeightName, vWeightName},
+                            mergeQkvWeightName, std::string("linear"))}));
+                    this->weightMergeRules.push_back(WeightMergeRule({
+                        WeightMergeRuleSingle(
+                            {gateWeightName, upWeightName},
+                            gateupWeightName, std::string("linear"))}));
+                }
             }
             // DFlash owns its own draft model; ignore an embedded target MTP
             // even when the Qwen checkpoint contains mtp.safetensors.
@@ -20490,14 +20531,9 @@ namespace fastllm {
             for (const std::string &suffix : {
                      "input_layernorm.weight",
                      "post_attention_layernorm.weight",
-                     "self_attn.q_proj.weight",
-                     "self_attn.k_proj.weight",
-                     "self_attn.v_proj.weight",
                      "self_attn.o_proj.weight",
                      "self_attn.q_norm.weight",
                      "self_attn.k_norm.weight",
-                     "mlp.gate_proj.weight",
-                     "mlp.up_proj.weight",
                      "mlp.down_proj.weight",
                      "attention_conv.base_kernel",
                      "attention_conv.kernel_projection.weight",
@@ -20506,6 +20542,21 @@ namespace fastllm {
                 if (!has(prefix + suffix)) {
                     return false;
                 }
+            }
+            const bool hasMergedQkv =
+                has(prefix + "self_attn.mergeqkv.weight");
+            const bool hasSeparateQkv =
+                has(prefix + "self_attn.q_proj.weight") &&
+                has(prefix + "self_attn.k_proj.weight") &&
+                has(prefix + "self_attn.v_proj.weight");
+            const bool hasMergedGateup =
+                has(prefix + "mlp.gateup_proj.weight");
+            const bool hasSeparateGateup =
+                has(prefix + "mlp.gate_proj.weight") &&
+                has(prefix + "mlp.up_proj.weight");
+            if ((!hasMergedQkv && !hasSeparateQkv) ||
+                (!hasMergedGateup && !hasSeparateGateup)) {
+                return false;
             }
         }
         return has(language_prefix + "embed_tokens.weight") &&
@@ -20540,20 +20591,30 @@ namespace fastllm {
             for (const std::string &suffix : {
                      "input_layernorm.weight",
                      "post_attention_layernorm.weight",
-                     "self_attn.q_proj.weight",
-                     "self_attn.k_proj.weight",
-                     "self_attn.v_proj.weight",
                      "self_attn.o_proj.weight",
                      "self_attn.q_norm.weight",
                      "self_attn.k_norm.weight",
-                     "mlp.gate_proj.weight",
-                     "mlp.up_proj.weight",
                      "mlp.down_proj.weight",
                      "attention_conv.base_kernel",
                      "attention_conv.kernel_projection.weight",
                      "mlp_conv.base_kernel",
                      "mlp_conv.kernel_projection.weight"}) {
                 move(prefix + suffix);
+            }
+            if (weight.weight.find(prefix + "self_attn.mergeqkv.weight") !=
+                weight.weight.end()) {
+                move(prefix + "self_attn.mergeqkv.weight");
+            } else {
+                move(prefix + "self_attn.q_proj.weight");
+                move(prefix + "self_attn.k_proj.weight");
+                move(prefix + "self_attn.v_proj.weight");
+            }
+            if (weight.weight.find(prefix + "mlp.gateup_proj.weight") !=
+                weight.weight.end()) {
+                move(prefix + "mlp.gateup_proj.weight");
+            } else {
+                move(prefix + "mlp.gate_proj.weight");
+                move(prefix + "mlp.up_proj.weight");
             }
         }
         // Selector codebooks deliberately stay on the host. Only B * K rows
@@ -20692,12 +20753,37 @@ namespace fastllm {
             const std::string prefix = "dflash.layers." +
                 std::to_string(layerIndex) + ".";
             Data projectedKey, projectedValue, key, value;
-            Linear(projectedContextHidden,
-                   weight[prefix + "self_attn.k_proj.weight"],
-                   *GetEmptyData(), projectedKey);
-            Linear(projectedContextHidden,
-                   weight[prefix + "self_attn.v_proj.weight"],
-                   *GetEmptyData(), projectedValue);
+            auto mergedQkvIt = weight.weight.find(
+                prefix + "self_attn.mergeqkv.weight");
+            if (mergedQkvIt != weight.weight.end()) {
+                Data &mergedQkvWeight = mergedQkvIt->second;
+                const int qRows = dflashHeads * dflashHeadDim;
+                const int kvRows = dflashKvHeads * dflashHeadDim;
+                AssertInFastLLM(
+                    mergedQkvWeight.dims.size() == 2 &&
+                        mergedQkvWeight.dims[0] == qRows + 2 * kvRows &&
+                        mergedQkvWeight.dims[1] == embed_dim,
+                    "DFlash merged QKV weight shape is invalid.\n");
+                const size_t rowBytes =
+                    mergedQkvWeight.GetBytes() / mergedQkvWeight.dims[0];
+                Data kvWeight;
+                kvWeight.FakeFrom(mergedQkvWeight, qRows * rowBytes);
+                kvWeight.Resize({2 * kvRows, embed_dim});
+                kvWeight.dataDeviceIds = mergedQkvWeight.dataDeviceIds;
+                Data projectedKv;
+                Linear(projectedContextHidden, kvWeight,
+                       *GetEmptyData(), projectedKv);
+                Split(projectedKv, -1, 0, kvRows, projectedKey);
+                Split(projectedKv, -1, kvRows, 2 * kvRows,
+                      projectedValue);
+            } else {
+                Linear(projectedContextHidden,
+                       weight[prefix + "self_attn.k_proj.weight"],
+                       *GetEmptyData(), projectedKey);
+                Linear(projectedContextHidden,
+                       weight[prefix + "self_attn.v_proj.weight"],
+                       *GetEmptyData(), projectedValue);
+            }
             if (projectionTokens == tokens) {
                 Copy(projectedKey, key);
                 Copy(projectedValue, value);
@@ -20919,15 +21005,30 @@ namespace fastllm {
                 attentionInput);
 
             Data query, key, value;
-            Linear(attentionInput,
-                   weight[prefix + "self_attn.q_proj.weight"],
-                   *GetEmptyData(), query);
-            Linear(attentionInput,
-                   weight[prefix + "self_attn.k_proj.weight"],
-                   *GetEmptyData(), key);
-            Linear(attentionInput,
-                   weight[prefix + "self_attn.v_proj.weight"],
-                   *GetEmptyData(), value);
+            auto mergedQkvIt = weight.weight.find(
+                prefix + "self_attn.mergeqkv.weight");
+            if (mergedQkvIt != weight.weight.end()) {
+                const int qChannels = dflashHeads * dflashHeadDim;
+                const int kvChannels = dflashKvHeads * dflashHeadDim;
+                Data qkv;
+                Linear(attentionInput, mergedQkvIt->second,
+                       *GetEmptyData(), qkv);
+                Split(qkv, -1, 0, qChannels, query);
+                Split(qkv, -1, qChannels,
+                      qChannels + kvChannels, key);
+                Split(qkv, -1, qChannels + kvChannels,
+                      qChannels + 2 * kvChannels, value);
+            } else {
+                Linear(attentionInput,
+                       weight[prefix + "self_attn.q_proj.weight"],
+                       *GetEmptyData(), query);
+                Linear(attentionInput,
+                       weight[prefix + "self_attn.k_proj.weight"],
+                       *GetEmptyData(), key);
+                Linear(attentionInput,
+                       weight[prefix + "self_attn.v_proj.weight"],
+                       *GetEmptyData(), value);
+            }
             query.Reshape(
                 {1, blockSize, dflashHeads, dflashHeadDim});
             key.Reshape(
@@ -20994,10 +21095,21 @@ namespace fastllm {
                 normalized, mlpDynamic,
                 weight[prefix + "mlp_conv.base_kernel"], 0, mlpInput);
             Data gate, up;
-            Linear(mlpInput, weight[prefix + "mlp.gate_proj.weight"],
-                   *GetEmptyData(), gate);
-            Linear(mlpInput, weight[prefix + "mlp.up_proj.weight"],
-                   *GetEmptyData(), up);
+            auto gateupIt = weight.weight.find(
+                prefix + "mlp.gateup_proj.weight");
+            if (gateupIt != weight.weight.end()) {
+                Data gateup;
+                Linear(mlpInput, gateupIt->second,
+                       *GetEmptyData(), gateup);
+                Split(gateup, -1, 0, dflashIntermediateSize, gate);
+                Split(gateup, -1, dflashIntermediateSize,
+                      2 * dflashIntermediateSize, up);
+            } else {
+                Linear(mlpInput, weight[prefix + "mlp.gate_proj.weight"],
+                       *GetEmptyData(), gate);
+                Linear(mlpInput, weight[prefix + "mlp.up_proj.weight"],
+                       *GetEmptyData(), up);
+            }
             ToDataType(gate, DataType::FLOAT16);
             ToDataType(up, DataType::FLOAT16);
             Silu(gate, gate);
