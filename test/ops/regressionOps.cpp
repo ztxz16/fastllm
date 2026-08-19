@@ -11186,6 +11186,149 @@ namespace {
     }
 
 #ifdef USE_CUDA
+    std::vector<uint16_t> RunNumasCudaFp8HybridMoeCase(
+            std::vector<std::unique_ptr<MoeWeights> > &expertWeights,
+            bool keepCudaInputMirror,
+            fastllm::DataDevice &mergeOutputDevice) {
+        constexpr int batch = 1024;
+        constexpr int topk = 8;
+        constexpr int inputDim = 5120;
+        constexpr int outputDim = 5120;
+        const int expertCount = (int)expertWeights.size();
+        Expect(expertCount > 9,
+               "generic FP8 hybrid MoE has invalid expert weights.");
+
+        fastllm::Data input = MakeTensor(
+            fastllm::DataType::BFLOAT16, {batch, inputDim}, 0.73f);
+        if (keepCudaInputMirror) {
+            input.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            input.ToDevice(
+                fastllm::DataDevice::CPU, std::vector<int>{0}, true);
+        }
+
+        std::vector<int32_t> indices((size_t)batch * topk);
+        std::vector<float> scores((size_t)batch * topk);
+        for (int token = 0; token < batch; token++) {
+            for (int slot = 0; slot < topk - 1; slot++) {
+                indices[(size_t)token * topk + slot] = slot;
+                scores[(size_t)token * topk + slot] = 0.1f;
+            }
+            if (token < 30) {
+                indices[(size_t)token * topk + topk - 1] = 7;
+            } else if (token < 40) {
+                indices[(size_t)token * topk + topk - 1] = 8;
+            } else {
+                indices[(size_t)token * topk + topk - 1] =
+                    9 + (token - 40) % (expertCount - 9);
+            }
+            scores[(size_t)token * topk + topk - 1] = 0.3f;
+        }
+        fastllm::Data index = MakeIntTensor({batch, topk}, indices);
+        fastllm::Data score(
+            fastllm::DataType::FLOAT32, {batch, topk}, scores);
+        fastllm::Data output(
+            fastllm::DataType::BFLOAT16, {batch, outputDim});
+        fastllm::Data w1, w2, w3, curInput, curOutput;
+        std::vector<fastllm::Data*> weights(
+            (expertCount + 1) * 2, nullptr);
+        for (int expert = 0; expert < expertCount; expert++) {
+            weights[(expert + 1) * 2] =
+                &expertWeights[expert]->routedGate;
+            weights[(expert + 1) * 2 + 1] =
+                &expertWeights[expert]->routedDown;
+        }
+        std::vector<fastllm::Data*> biass(weights.size(), nullptr);
+        {
+            ScopedFirstDevice guard("numa");
+            fastllm::MergeMOE(
+                input, index, score, weights, biass,
+                w1, w2, w3, curInput, curOutput,
+                0.0f, output, 0, fastllm::MoeGateSwiglu,
+                false, 7.0f, false);
+        }
+        mergeOutputDevice = output.dataDevice;
+        if (output.dataDevice == fastllm::DataDevice::CUDA) {
+            output.ToDevice(
+                fastllm::DataDevice::CPU, output.dataDeviceIds, true);
+        }
+        const uint16_t *data = (const uint16_t*)output.cpuData;
+        return std::vector<uint16_t>(
+            data, data + (size_t)batch * outputDim);
+    }
+
+    void RunNumasCudaFp8HybridMergeMoeRegression() {
+        constexpr int expertCount = 17;
+        constexpr int inputDim = 5120;
+        constexpr int interDim = 1536;
+        constexpr int outputDim = 5120;
+        std::vector<std::unique_ptr<MoeWeights> > expertWeights;
+        expertWeights.reserve(expertCount);
+        for (int expert = 0; expert < expertCount; expert++) {
+            expertWeights.emplace_back(new MoeWeights {
+                MakeDeepSeekV4Fp8MoeWeight(
+                    interDim * 2, inputDim,
+                    1.3f + expert * 0.17f,
+                    "test.generic_fp8_hybrid_gate." +
+                        std::to_string(expert)),
+                MakeDeepSeekV4Fp8MoeWeight(
+                    outputDim, interDim,
+                    2.1f + expert * 0.19f,
+                    "test.generic_fp8_hybrid_down." +
+                        std::to_string(expert))
+            });
+            expertWeights.back()->routedGate.isModelWeight = true;
+            expertWeights.back()->routedDown.isModelWeight = true;
+        }
+
+        // This is the Dots3-Note routed-expert shape.  With
+        // FT_EXPERT_LIMIT=28, expert 7 exercises the 30-row CUDA kernel,
+        // expert 8 remains on CPU with ten routes, and all others use the
+        // large-batch CUDA kernel.
+        fastllm::DataDevice cpuOutputDevice = fastllm::DataDevice::CUDA;
+        std::vector<uint16_t> expected = RunNumasCudaFp8HybridMoeCase(
+            expertWeights, false, cpuOutputDevice);
+        Expect(cpuOutputDevice == fastllm::DataDevice::CPU,
+               "generic FP8 hybrid reference unexpectedly used CUDA.");
+
+        fastllm::DataDevice hybridOutputDevice = fastllm::DataDevice::CPU;
+        std::vector<uint16_t> actual = RunNumasCudaFp8HybridMoeCase(
+            expertWeights, true, hybridOutputDevice);
+        Expect(hybridOutputDevice == fastllm::DataDevice::CUDA,
+               "generic FP8 hybrid prefill did not use CUDA.");
+
+        double absoluteError = 0.0;
+        double squaredError = 0.0;
+        double squaredReference = 0.0;
+        float maxError = 0.0f;
+        for (size_t i = 0; i < expected.size(); i++) {
+            float expectedValue =
+                fastllm::BFloat16BitsToFloat32(expected[i]);
+            float actualValue =
+                fastllm::BFloat16BitsToFloat32(actual[i]);
+            Expect(std::isfinite(expectedValue) &&
+                       std::isfinite(actualValue),
+                   "generic FP8 NUMA hybrid MoE produced a non-finite value.");
+            float error = std::fabs(expectedValue - actualValue);
+            absoluteError += error;
+            squaredError += (double)error * error;
+            squaredReference +=
+                (double)expectedValue * expectedValue;
+            maxError = std::max(maxError, error);
+        }
+        double meanAbsoluteError = absoluteError / expected.size();
+        double normalizedRmse = std::sqrt(
+            squaredError / std::max(squaredReference, 1.0e-30));
+        Expect(maxError <= 0.1f && meanAbsoluteError <= 0.0065 &&
+                   normalizedRmse <= 0.0047,
+               "generic FP8 NUMA CPU/CUDA hybrid MergeMOE error is too "
+               "large: mae=" + std::to_string(meanAbsoluteError) +
+               ", nrmse=" + std::to_string(normalizedRmse) +
+               ", max=" + std::to_string(maxError));
+    }
+#endif
+
+#ifdef USE_CUDA
     void RunDeepSeekV4CudaToCpuMirrorRegression() {
         if (FastllmCudaGetDeviceCount() < 1) {
             return;
@@ -11501,6 +11644,17 @@ int main(int argc, char **argv) {
             std::cout << "DeepSeek-V4 NUMA MoE bitwise regressions: PASS\n";
             return 0;
         }
+#ifdef USE_CUDA
+        if (argc == 2 &&
+            std::string(argv[1]) == "--numas-cuda-fp8-moe-hybrid") {
+            Expect(fastllm::HasDeviceType("numa") &&
+                       FastllmCudaGetDeviceCount() > 0,
+                   "generic FP8 NUMA hybrid MoE regression requires NUMA and CUDA.");
+            RunNumasCudaFp8HybridMergeMoeRegression();
+            std::cout << "generic FP8 NUMA CPU/CUDA hybrid MergeMOE regression: PASS\n";
+            return 0;
+        }
+#endif
         if (argc == 2 &&
             std::string(argv[1]) == "--bench-cpu-dsv4-nvfp4-block32") {
             RunCpuDeepSeekV4Nvfp4Block32Benchmark();

@@ -21036,7 +21036,7 @@ __global__ void FastllmPickOutputKernel(float *partOutput, float *output, int ro
     }
 }
 // Host 调用函数
-void FastllmCudaPickOutput(float *partOutput, float *output, int rows, int cols, int *index, float *scales) {
+void FastllmCudaPickOutputFloat(float *partOutput, float *output, int rows, int cols, int *index, float *scales) {
     // 设定 Block 大小：使用 256 作为通用高性能值
     dim3 block(256);
     

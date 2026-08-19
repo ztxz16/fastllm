@@ -1713,9 +1713,19 @@ __global__ void FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow(__nv_bfloat16 *A, 
 // 优化版本: 每个 warp 负责一行输出。一个 128 大小的量化 block 恰好由 32 个 lane 各处理 4 个
 // FP8 权重 (uint32), 完全利用整个 warp。使用 warp shuffle 归约, 去除 shared memory 与
 // __syncthreads。V100(sm_70) 无原生 bf16 运算, 解码后转 float 累加。
-template <int WARPS_PER_BLOCK, int PART>
+__device__ __forceinline__ void FastllmStoreBF16FP8Block128Result(
+        __nv_bfloat16 *output, size_t index, float value) {
+    output[index] = __float2bfloat16_rn(value);
+}
+
+__device__ __forceinline__ void FastllmStoreBF16FP8Block128Result(
+        float *output, size_t index, float value) {
+    output[index] = value;
+}
+
+template <int WARPS_PER_BLOCK, int PART, typename OutputType>
 __global__ void FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow(
-        const __nv_bfloat16 * __restrict__ A, const uint8_t * __restrict__ B, __nv_bfloat16 * __restrict__ C,
+        const __nv_bfloat16 * __restrict__ A, const uint8_t * __restrict__ B, OutputType * __restrict__ C,
         const __nv_bfloat16 * __restrict__ bias, int m, int k, int perRow) {
     const int warpId = threadIdx.x >> 5;
     const int laneId = threadIdx.x & 31;
@@ -1786,12 +1796,16 @@ __global__ void FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow(
         for (int x = 0; x < PART; x++) {
             float r = acc[x] * magicScaleConstant;
             if (bias != nullptr) r += __bfloat162float(bias[st]);
-            C[st + (size_t)k * x] = __float2bfloat16_rn(r);
+            FastllmStoreBF16FP8Block128Result(
+                C, st + (size_t)k * x, r);
         }
     }
 }
 
-void LaunchFastllmGemmBF16FP8E4M3Block128(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k, int perRow) {
+template <typename OutputType>
+void LaunchFastllmGemmBF16FP8E4M3Block128(
+        __nv_bfloat16 *input, uint8_t *weight, OutputType *output,
+        __nv_bfloat16 *bias, int n, int m, int k, int perRow) {
     constexpr int W = 8; // 每个 block 8 个 warp (256 线程)
     const int grid = (k + W - 1) / W;
 #define FASTLLM_BF16_FP8_B128_WARP_LAUNCH(PARTVAL, AOFF, COFF) \
@@ -1883,6 +1897,30 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastll
         LaunchFastllmGemmBF16FP8E4M3Block128(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBF16Bias, n, m, k, perRow);
     }
 
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    if (input.dataType != fastllm::DataType::BFLOAT16 ||
+        weight.dataType != fastllm::DataType::FP8_E4M3_BLOCK_128 ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        !bias.dims.empty() || m % 128 != 0) {
+        return false;
+    }
+
+    __nv_bfloat16 *cudaInput =
+        (__nv_bfloat16*)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+    const size_t perRow =
+        m + ((m - 1) / 128 + 1) * sizeof(float);
+    LaunchFastllmGemmBF16FP8E4M3Block128(
+        cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+        nullptr, n, m, k, perRow);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
