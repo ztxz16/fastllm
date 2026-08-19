@@ -14221,6 +14221,134 @@ bool FastllmCudaDFlashMaterializeKVToCache(
     return true;
 }
 
+struct FastllmDFlashKvCacheView {
+    half *pointers[10];
+    size_t headStrides[10];
+};
+
+__global__ void FastllmDFlashGatherKvCacheTailKernel(
+        FastllmDFlashKvCacheView caches, uint4 *__restrict__ scratch,
+        int heads, int oldTokens, int keepTokens) {
+    constexpr int vectorsPerToken = 16;
+    int item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= keepTokens * vectorsPerToken) {
+        return;
+    }
+    int vectorInToken = item & (vectorsPerToken - 1);
+    int token = item >> 4;
+    int head = blockIdx.y;
+    int cache = blockIdx.z;
+    size_t scratchIndex =
+        ((size_t)(cache * heads + head) * keepTokens + token) *
+            vectorsPerToken + vectorInToken;
+    const half *source = caches.pointers[cache] +
+        (size_t)head * caches.headStrides[cache] +
+        (size_t)(oldTokens - keepTokens + token) *
+            vectorsPerToken * 8;
+    scratch[scratchIndex] =
+        reinterpret_cast<const uint4 *>(source)[vectorInToken];
+}
+
+__global__ void FastllmDFlashScatterKvCacheTailKernel(
+        const uint4 *__restrict__ scratch, FastllmDFlashKvCacheView caches,
+        int heads, int keepTokens) {
+    constexpr int vectorsPerToken = 16;
+    int item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= keepTokens * vectorsPerToken) {
+        return;
+    }
+    int vectorInToken = item & (vectorsPerToken - 1);
+    int token = item >> 4;
+    int head = blockIdx.y;
+    int cache = blockIdx.z;
+    size_t scratchIndex =
+        ((size_t)(cache * heads + head) * keepTokens + token) *
+            vectorsPerToken + vectorInToken;
+    half *destination = caches.pointers[cache] +
+        (size_t)head * caches.headStrides[cache] +
+        (size_t)token * vectorsPerToken * 8;
+    reinterpret_cast<uint4 *>(destination)[vectorInToken] =
+        scratch[scratchIndex];
+}
+
+bool FastllmCudaDFlashCompactKVCache(
+        const std::vector<fastllm::Data*> &caches, int keepTokens) {
+    if (caches.empty() || caches.size() > 10 || keepTokens <= 0) {
+        return false;
+    }
+    const fastllm::Data *reference = caches[0];
+    int device = -1;
+    if (reference == nullptr ||
+        !FastllmCudaResolveDataDeviceId(*reference, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    FastllmDFlashKvCacheView cacheView = {};
+    int oldTokens = -1;
+    int heads = -1;
+    int headDim = -1;
+    for (size_t index = 0; index < caches.size(); index++) {
+        const fastllm::Data *cache = caches[index];
+        if (cache == nullptr || cache->dataType != fastllm::DataType::FLOAT16 ||
+            cache->dataDevice != fastllm::DataDevice::CUDA ||
+            cache->cudaData == nullptr || cache->dims.size() != 3 ||
+            cache->dims[1] <= keepTokens || cache->dims[2] != 128 ||
+            cache->expansionDims.size() != 3 ||
+            cache->expansionDims[0] != cache->dims[0] ||
+            cache->expansionDims[1] < cache->dims[1] ||
+            cache->expansionDims[2] != cache->dims[2] ||
+            cache->strides.size() != 3 || cache->strides[2] != 1 ||
+            cache->strides[1] != (uint64_t)cache->dims[2] ||
+            cache->strides[0] !=
+                (uint64_t)cache->expansionDims[1] * cache->dims[2] ||
+            !FastllmCudaDataCanShareDevice(*reference, *cache) ||
+            (oldTokens >= 0 && cache->dims[1] != oldTokens) ||
+            (heads >= 0 && cache->dims[0] != heads) ||
+            (headDim >= 0 && cache->dims[2] != headDim)) {
+            return false;
+        }
+        oldTokens = cache->dims[1];
+        heads = cache->dims[0];
+        headDim = cache->dims[2];
+        cacheView.pointers[index] = (half *)cache->cudaData;
+        cacheView.headStrides[index] = cache->strides[0];
+    }
+
+    constexpr int vectorsPerToken = 16;
+    const size_t vectors = caches.size() * (size_t)heads * keepTokens *
+        vectorsPerToken;
+    const size_t scratchBytes = vectors * sizeof(uint4);
+    size_t availableBytes = 0;
+    bool scratchOwn = false;
+    void *scratch = FastllmBorrowCudaTempBuffer(
+        scratchBytes, &availableBytes, &scratchOwn);
+    if (scratch == nullptr || availableBytes < scratchBytes) {
+        FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+        return false;
+    }
+
+    const int threads = 256;
+    dim3 blocks((keepTokens * vectorsPerToken + threads - 1) / threads,
+                heads, caches.size());
+    FastllmDFlashGatherKvCacheTailKernel<<<
+        blocks, threads, 0, cudaStreamPerThread>>>(
+            cacheView, (uint4 *)scratch, heads, oldTokens, keepTokens);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state == cudaSuccess) {
+        FastllmDFlashScatterKvCacheTailKernel<<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+                (const uint4 *)scratch, cacheView, heads, keepTokens);
+        state = cudaPeekAtLastError();
+    }
+    FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 size_t FastllmCudaDFlashTopKScratchBytes(int rows) {
     if (rows <= 0) {
         return 0;

@@ -21028,19 +21028,37 @@ namespace fastllm {
         }
         context.committedTokens += tokens;
 
-        // Keep an amortized sliding-window tail. Trimming only after the
-        // cache grows to roughly 2x the useful window avoids copying it on
-        // every accepted block.
-        const int trimThreshold = std::max(4096, dflashSlidingWindow * 2);
         const int keepTokens = std::max(1, dflashSlidingWindow - 1);
+        // The fused path keeps the existing allocation and compacts every
+        // quarter-window. This reduces masked attention work without paying
+        // ten generic Split/CopyFrom operations or repeated cache growth.
+        const bool useFusedKvCompact = Qwen35EnvDefaultEnabled(
+            "FASTLLM_CUDA_DFLASH_FUSED_KV_COMPACT");
+        const int trimSlack = std::max(256, dflashSlidingWindow / 4);
+        const int trimThreshold = useFusedKvCompact ?
+            keepTokens + trimSlack :
+            std::max(4096, dflashSlidingWindow * 2);
         if (!context.draftKeyValues.empty() &&
             context.draftKeyValues[0].first.dims.size() == 3 &&
             context.draftKeyValues[0].first.dims[1] > trimThreshold) {
+            std::vector<Data*> caches;
+            caches.reserve(context.draftKeyValues.size() * 2);
             for (auto &layerCache : context.draftKeyValues) {
-                for (Data *cache : {&layerCache.first, &layerCache.second}) {
+                caches.push_back(&layerCache.first);
+                caches.push_back(&layerCache.second);
+            }
+            bool compacted = useFusedKvCompact &&
+                FastllmCudaDFlashCompactKVCache(caches, keepTokens);
+            if (compacted) {
+                for (Data *cache : caches) {
+                    Qwen35ResizeDraftSequenceCache(*cache, keepTokens);
+                }
+            } else {
+                for (Data *cache : caches) {
                     int oldTokens = cache->dims[1];
                     Data tail;
-                    Split(*cache, 1, oldTokens - keepTokens, oldTokens, tail);
+                    Split(*cache, 1, oldTokens - keepTokens, oldTokens,
+                          tail);
                     cache->CopyFrom(tail);
                 }
             }

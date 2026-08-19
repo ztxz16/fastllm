@@ -1118,6 +1118,9 @@ bool FastllmCudaDFlashMaterializeKVToCache(
                                   const std::vector<fastllm::Data*> &caches,
                                   int layers, int tokens,
                                   int kvHeads, int headDim, float eps);
+bool FastllmCudaDFlashCompactKVCache(
+                                  const std::vector<fastllm::Data*> &caches,
+                                  int keepTokens);
 size_t FastllmCudaDFlashTopKScratchBytes(int rows);
 bool FastllmCudaDFlashTopK(
                                   const fastllm::Data &logits,
