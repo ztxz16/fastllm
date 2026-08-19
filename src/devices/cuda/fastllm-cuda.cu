@@ -13700,6 +13700,12 @@ bool FastllmCudaDFlashDynamicConv(
     return true;
 }
 
+struct FastllmDFlashKvCacheOutput {
+    half *pointers[10];
+    size_t headStride;
+    int tokenOffset;
+};
+
 __global__ void FastllmDFlashMaterializeKvBf16Kernel(
         const __nv_bfloat16 *__restrict__ projectedKv,
         const float *__restrict__ kNormWeights,
@@ -13707,6 +13713,7 @@ __global__ void FastllmDFlashMaterializeKvBf16Kernel(
         const float *__restrict__ sinData,
         const float *__restrict__ cosData,
         half *__restrict__ output,
+        FastllmDFlashKvCacheOutput cacheOutput,
         int tokens, int projectionStride, int kvHeads,
         int headDim, int sinCosStride, float eps) {
     int item = blockIdx.x;
@@ -13721,9 +13728,16 @@ __global__ void FastllmDFlashMaterializeKvBf16Kernel(
         ((layer * 2 + kind) * kvHeads + head) * headDim;
     const __nv_bfloat16 *source =
         projectedKv + (size_t)token * projectionStride + sourceChannel;
-    half *destination = output +
-        (size_t)(((layer * 2 + kind) * kvHeads + head) * tokens + token) *
-            headDim;
+    half *destination;
+    if (output != nullptr) {
+        destination = output +
+            (size_t)(((layer * 2 + kind) * kvHeads + head) * tokens +
+                     token) * headDim;
+    } else {
+        destination = cacheOutput.pointers[layer * 2 + kind] +
+            (size_t)head * cacheOutput.headStride +
+            (size_t)(cacheOutput.tokenOffset + token) * headDim;
+    }
     const int tid = threadIdx.x;
 
     if (kind != 0) {
@@ -13844,6 +13858,7 @@ bool FastllmCudaDFlashMaterializeKV(
     }
 
     const int blocks = layers * tokens * kvHeads * 2;
+    FastllmDFlashKvCacheOutput cacheOutput = {};
     FastllmDFlashMaterializeKvBf16Kernel<<<
         blocks, 64, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)projectedKv.cudaData,
@@ -13851,7 +13866,100 @@ bool FastllmCudaDFlashMaterializeKV(
             (const float *)positionIds.cudaData,
             (const float *)sinData.cudaData,
             (const float *)cosData.cudaData,
-            (half *)output.cudaData,
+            (half *)output.cudaData, cacheOutput,
+            tokens, projectedKv.dims[2], kvHeads, headDim,
+            sinData.dims[1], eps);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaDFlashMaterializeKVToCache(
+        const fastllm::Data &projectedKv,
+        const fastllm::Data &kNormWeights,
+        const fastllm::Data &positionIds,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        const std::vector<fastllm::Data*> &caches,
+        int layers, int tokens, int kvHeads, int headDim, float eps) {
+    if (layers != 5 || tokens <= 0 || kvHeads <= 0 || headDim != 128 ||
+        caches.size() != (size_t)layers * 2 ||
+        projectedKv.dataType != fastllm::DataType::BFLOAT16 ||
+        kNormWeights.dataType != fastllm::DataType::FLOAT32 ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        sinData.dataType != fastllm::DataType::FLOAT32 ||
+        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        projectedKv.dims.size() != 3 || projectedKv.dims[0] != 1 ||
+        projectedKv.dims[1] < tokens ||
+        projectedKv.dims[2] != layers * 2 * kvHeads * headDim ||
+        kNormWeights.dims != std::vector<int>({layers, headDim}) ||
+        positionIds.dims.size() != 2 || positionIds.dims[0] != 1 ||
+        positionIds.dims[1] < tokens ||
+        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
+        sinData.dims[1] < headDim ||
+        !FastllmCudaDataHasDenseStrides(projectedKv) ||
+        !FastllmCudaDataHasDenseStrides(kNormWeights) ||
+        !FastllmCudaDataHasDenseStrides(positionIds) ||
+        !FastllmCudaDataHasDenseStrides(sinData) ||
+        !FastllmCudaDataHasDenseStrides(cosData)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(projectedKv, device) ||
+        FastllmCudaGetDevice() != device ||
+        !FastllmCudaDataCanShareDevice(projectedKv, kNormWeights) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, positionIds) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, sinData) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, cosData)) {
+        return false;
+    }
+
+    FastllmDFlashKvCacheOutput cacheOutput = {};
+    int cacheTokens = -1;
+    for (size_t index = 0; index < caches.size(); index++) {
+        const fastllm::Data *cache = caches[index];
+        const int currentTokens =
+            cache != nullptr && cache->dims.size() == 3 ?
+                cache->dims[1] : 0;
+        if (cache == nullptr ||
+            cache->dataType != fastllm::DataType::FLOAT16 ||
+            cache->dataDevice != fastllm::DataDevice::CUDA ||
+            cache->cudaData == nullptr ||
+            (!cache->dims.empty() &&
+             (cache->dims.size() != 3 ||
+              cache->dims != std::vector<int>({kvHeads, currentTokens,
+                                                headDim}))) ||
+            cache->expansionDims.size() != 3 ||
+            cache->expansionDims[0] != kvHeads ||
+            cache->expansionDims[1] < currentTokens + tokens ||
+            cache->expansionDims[2] != headDim ||
+            cache->strides.size() != 3 || cache->strides[2] != 1 ||
+            cache->strides[1] != (uint64_t)headDim ||
+            cache->strides[0] !=
+                (uint64_t)cache->expansionDims[1] * headDim ||
+            !FastllmCudaDataCanShareDevice(projectedKv, *cache) ||
+            (cacheTokens >= 0 && currentTokens != cacheTokens) ||
+            (index > 0 && cache->strides[0] != cacheOutput.headStride)) {
+            return false;
+        }
+        cacheTokens = currentTokens;
+        cacheOutput.pointers[index] = (half *)cache->cudaData;
+        cacheOutput.headStride = cache->strides[0];
+    }
+    cacheOutput.tokenOffset = cacheTokens;
+
+    const int blocks = layers * tokens * kvHeads * 2;
+    FastllmDFlashMaterializeKvBf16Kernel<<<
+        blocks, 64, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)projectedKv.cudaData,
+            (const float *)kNormWeights.cudaData,
+            (const float *)positionIds.cudaData,
+            (const float *)sinData.cudaData,
+            (const float *)cosData.cudaData,
+            nullptr, cacheOutput,
             tokens, projectedKv.dims[2], kvHeads, headDim,
             sinData.dims[1], eps);
     cudaError_t state = cudaPeekAtLastError();

@@ -1093,6 +1093,15 @@ bool FastllmCudaDFlashMaterializeKV(
                                   fastllm::Data &output,
                                   int layers, int tokens,
                                   int kvHeads, int headDim, float eps);
+bool FastllmCudaDFlashMaterializeKVToCache(
+                                  const fastllm::Data &projectedKv,
+                                  const fastllm::Data &kNormWeights,
+                                  const fastllm::Data &positionIds,
+                                  const fastllm::Data &sinData,
+                                  const fastllm::Data &cosData,
+                                  const std::vector<fastllm::Data*> &caches,
+                                  int layers, int tokens,
+                                  int kvHeads, int headDim, float eps);
 size_t FastllmCudaDFlashTopKScratchBytes(int rows);
 bool FastllmCudaDFlashTopK(
                                   const fastllm::Data &logits,

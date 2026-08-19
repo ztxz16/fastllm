@@ -149,9 +149,8 @@ namespace fastllm {
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
     static constexpr int QWEN35_BATCH_PREFILL_SEQ_MAX = 4096;
 
-    static void Qwen35AppendDraftSequenceCache(Data &cache,
-                                                const Data &current,
-                                                int allocationUnit = 64) {
+    static void Qwen35EnsureDraftSequenceCacheCapacity(
+            Data &cache, const Data &current, int allocationUnit = 64) {
         AssertInFastLLM(current.dims.size() == 3,
                         "Draft sequence cache input must be [heads, tokens, dim].\n");
         if (cache.dims.empty() && cache.expansionDims.empty()) {
@@ -182,6 +181,13 @@ namespace fastllm {
             }
             cache.Expansion(expanded);
         }
+    }
+
+    static void Qwen35AppendDraftSequenceCache(Data &cache,
+                                                const Data &current,
+                                                int allocationUnit = 64) {
+        Qwen35EnsureDraftSequenceCacheCapacity(
+            cache, current, allocationUnit);
         CatDirect(cache, current, 1);
     }
 
@@ -20868,13 +20874,56 @@ namespace fastllm {
             Linear(projectedContextHidden, allKvWeightIt->second,
                    *GetEmptyData(), projectedAllKv);
         }
-        Data materializedKv;
-        bool fusedKvMaterialized = false;
         auto allKNormIt = weight.weight.find("dflash.all_k_norm.weight");
-        if (!projectedAllKv.dims.empty() &&
+        const bool canFuseKvMaterialization =
+            !projectedAllKv.dims.empty() &&
             allKNormIt != weight.weight.end() &&
             ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                "FASTLLM_CUDA_DFLASH_FUSED_KV_MATERIALIZE")) {
+                "FASTLLM_CUDA_DFLASH_FUSED_KV_MATERIALIZE");
+        bool directKvMaterialized = false;
+        if (canFuseKvMaterialization &&
+            Qwen35EnvDefaultEnabled(
+                "FASTLLM_CUDA_DFLASH_DIRECT_KV_CACHE")) {
+            Data cacheSlice;
+            ::fastllm::Qwen3CudaPrepareLocalOutput(cacheSlice, device);
+            cacheSlice.dataType = DataType::FLOAT16;
+            cacheSlice.UpdateUnitSize();
+            cacheSlice.Resize(
+                {dflashKvHeads, tokens, dflashHeadDim});
+            std::vector<Data*> caches;
+            caches.reserve((size_t)dflashLayers * 2);
+            for (int layerIndex = 0; layerIndex < dflashLayers;
+                 layerIndex++) {
+                Data &keyCache =
+                    context.draftKeyValues[layerIndex].first;
+                Data &valueCache =
+                    context.draftKeyValues[layerIndex].second;
+                Qwen35EnsureDraftSequenceCacheCapacity(
+                    keyCache, cacheSlice);
+                Qwen35EnsureDraftSequenceCacheCapacity(
+                    valueCache, cacheSlice);
+                caches.push_back(&keyCache);
+                caches.push_back(&valueCache);
+            }
+            directKvMaterialized =
+                FastllmCudaDFlashMaterializeKVToCache(
+                    projectedAllKv, allKNormIt->second, positions,
+                    dflashSinData, dflashCosData, caches,
+                    dflashLayers, tokens, dflashKvHeads,
+                    dflashHeadDim, dflashRmsNormEps);
+            if (directKvMaterialized) {
+                for (Data *cache : caches) {
+                    const int oldTokens = cache->dims.empty() ?
+                        0 : cache->dims[1];
+                    cache->Resize({dflashKvHeads, oldTokens + tokens,
+                                   dflashHeadDim});
+                }
+            }
+        }
+
+        Data materializedKv;
+        bool fusedKvMaterialized = false;
+        if (!directKvMaterialized && canFuseKvMaterialization) {
             ::fastllm::Qwen3CudaPrepareLocalOutput(materializedKv, device);
             materializedKv.dataType = DataType::FLOAT16;
             materializedKv.UpdateUnitSize();
@@ -20887,7 +20936,9 @@ namespace fastllm {
                 dflashLayers, tokens, dflashKvHeads, dflashHeadDim,
                 dflashRmsNormEps);
         }
-        for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
+        for (int layerIndex = 0;
+             !directKvMaterialized && layerIndex < dflashLayers;
+             layerIndex++) {
             const std::string prefix = "dflash.layers." +
                 std::to_string(layerIndex) + ".";
             Data key, value;
