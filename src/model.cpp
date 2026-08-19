@@ -3252,6 +3252,16 @@ namespace fastllm {
                 dsparkPath += "/";
             }
         }
+        std::string dflashPath;
+        const char *dflashPathEnv = std::getenv("FASTLLM_DFLASH_MODEL_PATH");
+        if (dflashPathEnv != nullptr && dflashPathEnv[0] != '\0') {
+            dflashPath = dflashPathEnv;
+            if (dflashPath.back() != '/' && dflashPath.back() != '\\') {
+                dflashPath += "/";
+            }
+        }
+        AssertInFastLLM(dsparkPath.empty() || dflashPath.empty(),
+                        "DSpark and DFlash cannot be enabled together.");
 
         // 1. 检查是否有 model.safetensors.index.json,如果有就读取
         std::set <std::string> stFiles;
@@ -3283,6 +3293,27 @@ namespace fastllm {
                                 "Failed to parse DSpark safetensors index.");
                 for (auto it : dsparkIndex.object_items()) {
                     stFiles.insert(dsparkPath + it.second.string_value());
+                }
+            }
+        }
+        if (!dflashPath.empty()) {
+            std::string dflashIndexFile =
+                dflashPath + "model.safetensors.index.json";
+            if (!FileExists(dflashIndexFile)) {
+                AssertInFastLLM(
+                    FileExists(dflashPath + "model.safetensors"),
+                    "DFlash checkpoint has no model.safetensors: " +
+                    dflashPath);
+                stFiles.insert(dflashPath + "model.safetensors");
+            } else {
+                std::string dflashIndexError;
+                auto dflashIndex = json11::Json::parse(
+                    ReadAllFile(dflashIndexFile),
+                    dflashIndexError)["weight_map"];
+                AssertInFastLLM(dflashIndexError.empty(),
+                                "Failed to parse DFlash safetensors index.");
+                for (auto it : dflashIndex.object_items()) {
+                    stFiles.insert(dflashPath + it.second.string_value());
                 }
             }
         }
@@ -3353,6 +3384,27 @@ namespace fastllm {
                             "The draft checkpoint is not DSparkDraftModel.");
             AddDictRecursion(model, "dspark.", dsparkConfig);
             model->weight.AddDict("dspark.model_path", dsparkPath);
+        }
+        if (!dflashPath.empty()) {
+            AssertInFastLLM(
+                model->model_struct == "qwen3_5" || modelType == "qwen3_5",
+                "The current DFlash integration requires a Qwen3.5 target model.");
+            std::string dflashConfigError;
+            auto dflashConfig = json11::Json::parse(
+                ReadAllFile(dflashPath + "config.json"),
+                dflashConfigError);
+            AssertInFastLLM(dflashConfigError.empty(),
+                            "Failed to parse DFlash config.json.");
+            bool dflashArchitecture = false;
+            for (const auto &architecture :
+                 dflashConfig["architectures"].array_items()) {
+                dflashArchitecture |=
+                    architecture.string_value() == "DFlash2DraftModel";
+            }
+            AssertInFastLLM(dflashArchitecture,
+                            "The draft checkpoint is not DFlash2DraftModel.");
+            AddDictRecursion(model, "dflash.", dflashConfig);
+            model->weight.AddDict("dflash.model_path", dflashPath);
         }
         // 设置eos_token_id
         if (config["eos_token_id"].is_null()) {

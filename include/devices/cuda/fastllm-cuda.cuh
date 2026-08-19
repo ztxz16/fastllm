@@ -1064,6 +1064,18 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int typicalCount,
                                   float typicalPosteriorThreshold,
                                   float typicalPosteriorAlpha);
+bool FastllmCudaDFlashRejectionSampling(
+                                  float *logits,
+                                  const float *temperatures,
+                                  const int *topKArr,
+                                  const float *topPArr,
+                                  const int *draftTokenIds,
+                                  const int *draftCandidateIds,
+                                  const float *draftCandidateProbs,
+                                  int *outputTokenIds,
+                                  int *acceptedDraftTokens,
+                                  int batch, int draftTokens,
+                                  int selectorTopK, int vocabSize);
 bool FastllmCudaTopKTopPSamplingToDevice(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,

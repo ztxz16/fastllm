@@ -25,6 +25,9 @@ namespace fastllm {
 
         virtual void InitParams(); // 初始化参数信息
 
+        virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
+        GetTensorMap(const std::vector <std::string> &tensorNames) override;
+
         virtual void OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) override;
 
         virtual void OnWeightsCreated(const std::set<std::string> &allWeightNames) override;
@@ -230,6 +233,13 @@ namespace fastllm {
             Data value;
             int tokens = 0;
         };
+        struct DFlashContext {
+            int committedTokens = 0;
+            std::vector <std::pair <Data, Data> > draftKeyValues;
+            std::vector <int> proposalTokens;
+            std::vector <int> proposalCandidateIds;
+            std::vector <float> proposalCandidateProbs;
+        };
         bool mtpWeightsPrepared = false;
         bool mtpSharedWeightsPrepared = false;
         int mtpWeightsPreparedDevice = -1;
@@ -237,9 +247,13 @@ namespace fastllm {
         std::vector <Data*> mtpMoeBiass;
         bool speculativeCollectAllLogits = false;
         bool speculativeCaptureAllHiddenStates = false;
+        bool speculativeCaptureDFlashHiddenStates = false;
         bool speculativeCacheOnlyForward = false;
         Data speculativeHiddenStates;
+        std::vector <Data> speculativeDFlashHiddenStates;
         std::vector<unsigned char> speculativeTypicalAccepted;
+        DFlashContext *speculativeDFlashSamplingContext = nullptr;
+        std::vector<unsigned char> speculativeDFlashAccepted;
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
@@ -247,6 +261,7 @@ namespace fastllm {
         std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
         std::vector<int> speculativeFirstTokenLinearCaptureMask;
         mutable std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
+        mutable std::unordered_map<ResponseContext*, DFlashContext> dflashContexts;
         mutable std::mutex mtpCacheMutex;
         std::atomic<bool> mtpLogPrinted{false};
         std::atomic<bool> mtpSkipLogPrinted{false};
@@ -318,6 +333,29 @@ namespace fastllm {
         std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
         PersistentWorkerGroup threadTpWorkerGroup;
 
+        bool dflashEnabled = false;
+        bool dflashWeightsPrepared = false;
+        int dflashWeightsPreparedDevice = -1;
+        int dflashCheckpointBlockSize = 0;
+        int dflashRuntimeBlockSize = 0;
+        int dflashLayers = 0;
+        int dflashHeads = 0;
+        int dflashKvHeads = 0;
+        int dflashHeadDim = 0;
+        int dflashIntermediateSize = 0;
+        int dflashMaskTokenId = -1;
+        int dflashConvGroupSize = 0;
+        int dflashConvKernelSize = 0;
+        int dflashSelectorRank = 0;
+        int dflashSelectorTopK = 0;
+        int dflashSlidingWindow = 0;
+        float dflashRmsNormEps = 1e-6f;
+        float dflashRopeTheta = 10000000.0f;
+        std::vector <int> dflashTargetLayerIds;
+        Data dflashSinData;
+        Data dflashCosData;
+        int dflashRotaryCapacity = 0;
+
         void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
         void PrepareMoeWeights();
         bool TryConsumeFusedMoeSourceWeight(const std::string &weightName);
@@ -359,6 +397,17 @@ namespace fastllm {
                                         const Data &mropePositionDelta,
                                         Data &adjustedPositionIds);
         bool HasMtpWeights() const;
+        bool HasDFlashWeights() const;
+        int DFlashDraftsPerStep() const;
+        void PrepareDFlashWeightsForDevice(int device);
+        void EnsureDFlashRotary(int positions, int device);
+        void AppendDFlashTargetHidden(int device, int tokens,
+                                      DFlashContext &context);
+        std::vector<int> RunDFlashDraft(int device,
+                                       const std::vector<int> &devices,
+                                       int anchorToken,
+                                       const GenerationConfig &generationConfig,
+                                       DFlashContext &context);
         bool HasMtpMoeWeights() const;
         bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
         bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
