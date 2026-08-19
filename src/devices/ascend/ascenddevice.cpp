@@ -310,7 +310,7 @@ namespace fastllm {
         BaseAscendOperator("SoftmaxV2") {}
 
     void AscendSoftMaxOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data *input = datas.find("input")->second;
         Data *output = datas.find("output")->second;
         output->Allocate();
@@ -328,7 +328,7 @@ namespace fastllm {
         BaseAscendOperator("Sigmoid") {}
 
     void AscendSigmoidOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data *input = datas.find("input")->second;
         Data *output = datas.find("output")->second;
         output->Allocate();
@@ -346,7 +346,7 @@ namespace fastllm {
         BaseAscendOperator("Tanh") {}
 
     void AscendTanHOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data *input = datas.find("input")->second;
         Data *output = datas.find("output")->second;
         DynamicShapeDict dynamicShapes;
@@ -359,7 +359,7 @@ namespace fastllm {
         BaseAscendOperator("Relu") {}
 
     void AscendReluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data *input = datas.find("input")->second;
         Data *output = datas.find("output")->second;
         DynamicShapeDict dynamicShapes;
@@ -372,7 +372,7 @@ namespace fastllm {
         BaseAscendOperator("GeluV2") {}
 
     void AscendGeluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data *input = datas.find("input")->second;
         Data *output = datas.find("output")->second;
         DynamicShapeDict dynamicShapes;
@@ -385,7 +385,7 @@ namespace fastllm {
         BaseAscendOperator("Gelu") {}
 
     void AscendGeluNewOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data *input = datas.find("input")->second;
         Data *output = datas.find("output")->second;
         DynamicShapeDict dynamicShapes;
@@ -398,7 +398,7 @@ namespace fastllm {
         BaseAscendOperator("Swish") {}
 
     void AscendSiluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data *input = datas.find("input")->second;
         Data *output = datas.find("output")->second;
         DynamicShapeDict dynamicShapes;
@@ -411,7 +411,7 @@ namespace fastllm {
         BaseAscendOperator("Mul") {}
 
     bool AscendMulToOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
-                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         if (!BaseAscendOperator::CanRun(opType, datas, floatParams, intParams))
             return false;
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
@@ -419,7 +419,7 @@ namespace fastllm {
     }
 
     void AscendMulToOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input0 = *(datas.find("input0")->second);
         Data &input1 = *(datas.find("input1")->second);
 
@@ -496,12 +496,12 @@ namespace fastllm {
         DynamicShapeDict dynamicShapes;
         dynamicShapes["x"] = std::make_pair(shapeRangeDims, shapeRanges);
         dynamicShapes["y"] = std::make_pair(shapeRangeDims, shapeRanges);
-		deviceOk = CompileAndRunSingleOp("Slice", {{"x", &input}, {"offsets", &swishOffsets}, {"size", &swishSizes}}, {{"y", &output}}, dynamicShapes, {}, {}, {});
+        deviceOk = CompileAndRunSingleOp("Slice", {{"x", &input}, {"offsets", &swishOffsets}, {"size", &swishSizes}}, {{"y", &output}}, dynamicShapes, {}, {}, {});
 
-		deviceOk = CompileAndRunSingleOp("Swish", {{"x", &output}}, {{"y", &output}}, dynamicShapes, {{"scale", 1.0}}, {}, {});
+        deviceOk = CompileAndRunSingleOp("Swish", {{"x", &output}}, {{"y", &output}}, dynamicShapes, {{"scale", 1.0}}, {}, {});
 
-		deviceOk = CompileAndRunSingleOp("Slice", {{"x", &input}, {"offsets", &mulOffsets}, {"size", &mulSizes}}, {{"y", &mulHalf}}, dynamicShapes, {}, {}, {});
-		dynamicShapes.clear();
+        deviceOk = CompileAndRunSingleOp("Slice", {{"x", &input}, {"offsets", &mulOffsets}, {"size", &mulSizes}}, {{"y", &mulHalf}}, dynamicShapes, {}, {}, {});
+        dynamicShapes.clear();
         dynamicShapes["x1"] = std::make_pair(shapeRangeDims, shapeRanges);
         dynamicShapes["x2"] = std::make_pair(shapeRangeDims, shapeRanges);
         dynamicShapes["y"] = std::make_pair(shapeRangeDims, shapeRanges);
@@ -545,7 +545,7 @@ namespace fastllm {
     }
 
     void AscendLayerNormOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &gamma = *(datas.find("gamma")->second);
@@ -663,11 +663,14 @@ namespace fastllm {
         tmpData.Allocate();
         tmpData.ToDevice(input.dataDevice);
 
-        // 构建动态形状信息（用于warmup模式），y 的动态维度随 perm 交换而改变
+        // 构建动态形状信息 (用于warmup模式)
+        // {0, 2, 1, 3}:
+        // q/k/v [batch, len, num_head, head_dim]
+        // qkv   [batch, num_head, len, head_dim]
         DynamicShapeDict dynamicShapes;
         if (warmUpMode && input.dims.size() >= 2) {
-            std::vector<int> xDynamicDims = {0, 1};
-            std::vector<std::vector<int64_t>> shapeRanges = {{1L, 128L}, {1L, 2048L}};
+            std::vector<int> xDynamicDims = {0, 1, 2};
+            std::vector<std::vector<int64_t>> shapeRanges = {{1L, 128L}, {1L, 2048L}, {1L, 2048L}};
             std::vector<int> yDynamicDims;
             for (int i = 0; i < axis.size(); i++) {
                 if (std::find(xDynamicDims.begin(), xDynamicDims.end(), axis[i]) != xDynamicDims.end()) {
