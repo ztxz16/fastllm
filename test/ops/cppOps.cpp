@@ -274,8 +274,18 @@ namespace {
     static std::vector<int32_t> ToInt32Vector(fastllm::Data data) {
         data.ToDevice(fastllm::DataDevice::CPU);
         size_t count = data.Count(0);
+        if (data.dataType == fastllm::DataType::INT16) {
+            const int16_t *ptr =
+                reinterpret_cast<const int16_t*>(data.cpuData);
+            std::vector<int32_t> result(count);
+            for (size_t i = 0; i < count; ++i) {
+                result[i] = ptr[i];
+            }
+            return result;
+        }
         if (data.dataType != fastllm::DataType::INT32) {
-            throw std::runtime_error("only INT32 index outputs are supported");
+            throw std::runtime_error(
+                "only INT16/INT32 index outputs are supported");
         }
         const int32_t *ptr = reinterpret_cast<const int32_t*>(data.cpuData);
         return std::vector<int32_t>(ptr, ptr + count);
@@ -3295,6 +3305,9 @@ namespace {
         fastllm::Data mainQ, mainK, mainV;
         fastllm::Data sparseOutput, sparsePrefillOutput;
         fastllm::Data slidingPrefillOutput;
+        fastllm::Data sparsePrefillBacking;
+        size_t sparseOutputBytes = 0;
+        size_t sparseScratchBytes = 0;
 
         static std::vector<uint8_t> ToBytes(const fastllm::Data &data) {
             fastllm::Data host;
@@ -3302,6 +3315,74 @@ namespace {
             host.ToDevice(fastllm::DataDevice::CPU);
             return std::vector<uint8_t>(host.cpuData,
                                         host.cpuData + host.GetBytes());
+        }
+
+        void ValidateAttentionKeyPacking() {
+            constexpr int heads = 2;
+            constexpr int tokens = 3;
+            constexpr int capacity = 5;
+            constexpr int nopeDim = 3;
+            constexpr int ropeDim = 2;
+            constexpr int kvDim = 5;
+            constexpr int qkDim = nopeDim + ropeDim;
+
+            fastllm::Data kv = MakeTensor(
+                {heads, tokens, kvDim}, 0.137f, 0.5f);
+            fastllm::Data rope = MakeTensor(
+                {tokens, ropeDim}, 0.823f, 0.5f);
+            fastllm::ToDataType(kv, fastllm::DataType::BFLOAT16);
+            fastllm::ToDataType(rope, fastllm::DataType::BFLOAT16);
+            std::vector<float> kvValues =
+                ToFloatVector(ConvertToFloat32Data(kv));
+            std::vector<float> ropeValues =
+                ToFloatVector(ConvertToFloat32Data(rope));
+            kv.ToDevice(fastllm::DataDevice::CUDA);
+            rope.ToDevice(fastllm::DataDevice::CUDA);
+
+            // Deliberately retain a padded token stride. Fresh Dots KV caches
+            // use the same layout whenever sequence length is not a multiple
+            // of the 128-token cache block.
+            fastllm::Data packed(fastllm::DataType::BFLOAT16);
+            packed.ToDevice(fastllm::DataDevice::CUDA, {0}, false);
+            packed.Expansion({heads, capacity, qkDim});
+            packed.Resize({heads, tokens, qkDim});
+            if (!FastllmCudaDots3NotePackAttentionKey(
+                    kv, rope, nopeDim, packed)) {
+                throw std::runtime_error(
+                    "Dots attention-key packing CUDA launch failed");
+            }
+            ForceDeviceSync();
+            std::vector<uint8_t> packedBytes = ToBytes(packed);
+            for (int head = 0; head < heads; ++head) {
+                for (int token = 0; token < tokens; ++token) {
+                    for (int d = 0; d < qkDim; ++d) {
+                        size_t outputOffset =
+                            ((size_t)head * tokens + token) * qkDim + d;
+                        size_t physicalOffset =
+                            (size_t)head * packed.strides[0] +
+                            (size_t)token * packed.strides[1] + d;
+                        uint16_t actualBits;
+                        std::memcpy(&actualBits,
+                                    packedBytes.data() +
+                                        physicalOffset * sizeof(actualBits),
+                                    sizeof(actualBits));
+                        float actual =
+                            fastllm::BFloat16BitsToFloat32(actualBits);
+                        float expected = d < nopeDim
+                            ? kvValues[((size_t)head * tokens + token) *
+                                       kvDim + d]
+                            : ropeValues[(size_t)token * ropeDim +
+                                         d - nopeDim];
+                        if (actual != expected) {
+                            std::ostringstream os;
+                            os << "Dots attention-key packing mismatch at "
+                               << outputOffset << ": expected=" << expected
+                               << " actual=" << actual;
+                            throw std::runtime_error(os.str());
+                        }
+                    }
+                }
+            }
         }
 
         void ValidateTopK() {
@@ -3314,10 +3395,21 @@ namespace {
                 ToFloatVector(ConvertToFloat32Data(kScales));
             std::vector<int32_t> actual = ToInt32Vector(indices);
 
-            std::vector<int> tokensToCheck = {0};
-            if (queryTokens > 1) {
-                tokensToCheck.push_back(queryTokens - 1);
-            }
+            std::vector<int> tokensToCheck;
+            auto addToken = [&](int token) {
+                if (token >= 0 && token < queryTokens &&
+                    std::find(tokensToCheck.begin(), tokensToCheck.end(),
+                              token) == tokensToCheck.end()) {
+                    tokensToCheck.push_back(token);
+                }
+            };
+            addToken(0);
+            addToken(queryTokens / 2);
+            addToken(255);
+            addToken(256);
+            addToken(1023);
+            addToken(1024);
+            addToken(queryTokens - 1);
             for (int token : tokensToCheck) {
                 int rowEnd = std::min(totalTokens, startPos + token + 1);
                 int selectedCount = std::min(2048, rowEnd);
@@ -3558,6 +3650,7 @@ namespace {
 
         void Init(const OpTestParams &params) {
             FastllmCudaSetDevice(0);
+            ValidateAttentionKeyPacking();
             queryTokens = params.GetInt("queries");
             totalTokens = params.GetInt("keys");
             path = params.GetString("path");
@@ -3588,11 +3681,14 @@ namespace {
             indexKPe.ToDevice(fastllm::DataDevice::CUDA);
             indexKNope.ToDevice(fastllm::DataDevice::CUDA);
             indexWeights.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data indexQPe, indexQNope;
+            fastllm::Split(indexQ, -1, 0, 64, indexQPe);
+            fastllm::Split(indexQ, -1, 64, 128, indexQNope);
             if (!FastllmCudaDots3NotePackIndexerKey(
                     indexKPe, indexKNope, indexK) ||
                 !FastllmCudaDots3NoteQuantizeIndexer(
-                    indexQ, indexK, indexWeights, qFp8, foldedWeights,
-                    kFp8, kScales)) {
+                    indexQPe, indexQNope, indexK, indexWeights, qFp8,
+                    foldedWeights, kFp8, kScales)) {
                 throw std::runtime_error("Dots indexer CUDA launch failed");
             }
             auto appendCache = [](fastllm::Data &target,
@@ -3645,9 +3741,40 @@ namespace {
                 throw std::runtime_error(
                     "Dots sparse attention CUDA launch failed");
             }
+            sparseOutputBytes =
+                (size_t)128 * queryTokens * 128 * sizeof(uint16_t);
+            size_t bytesPerQuery =
+                (size_t)128 * totalTokens * sizeof(uint16_t);
+            // Fresh Dots prefill borrows the unused half of the KV projection.
+            // Its size matches the attention output (128 value channels), so
+            // mirror that capacity here instead of artificially capping the
+            // 8K benchmark at 128 MiB.
+            size_t scratchLimit = std::max<size_t>(
+                128ULL * 1024ULL * 1024ULL, sparseOutputBytes);
+            int sparseQueryChunk = std::min(
+                queryTokens,
+                (int)std::max<size_t>(1, scratchLimit / bytesPerQuery));
+            sparseScratchBytes =
+                (size_t)sparseQueryChunk * bytesPerQuery;
+            sparsePrefillBacking.dataType =
+                fastllm::DataType::BFLOAT16;
+            sparsePrefillBacking.Resize(
+                {(int)((sparseOutputBytes + sparseScratchBytes) /
+                       sizeof(uint16_t))});
+            sparsePrefillBacking.ToDevice(
+                fastllm::DataDevice::CUDA, {0}, false);
+            sparsePrefillBacking.Allocate(false);
+            sparsePrefillOutput.FakeFrom(sparsePrefillBacking, 0);
+            sparsePrefillOutput.Resize(
+                {128, queryTokens, 128});
             if (!FastllmCudaDots3NoteSparseAttentionPrefill(
                     mainQ, mainK, mainV, indices, startPos,
-                    1.0f / std::sqrt(192.0f), sparsePrefillOutput)) {
+                    1.0f / std::sqrt(192.0f), sparsePrefillOutput,
+                    sparsePrefillBacking.cudaData == nullptr
+                        ? nullptr
+                        : (uint8_t *)sparsePrefillBacking.cudaData +
+                              sparseOutputBytes,
+                    sparseScratchBytes)) {
                 throw std::runtime_error(
                     "Dots sparse prefill CUDA launch failed");
             }
@@ -3678,7 +3805,12 @@ namespace {
             } else if (path == "sparse_prefill") {
                 ok = FastllmCudaDots3NoteSparseAttentionPrefill(
                     mainQ, mainK, mainV, indices, startPos,
-                    1.0f / std::sqrt(192.0f), sparsePrefillOutput);
+                    1.0f / std::sqrt(192.0f), sparsePrefillOutput,
+                    sparsePrefillBacking.cudaData == nullptr
+                        ? nullptr
+                        : (uint8_t *)sparsePrefillBacking.cudaData +
+                              sparseOutputBytes,
+                    sparseScratchBytes);
             } else {
                 ok = FastllmCudaDots3NoteSlidingAttentionPrefill(
                     mainQ, mainK, mainV, startPos, 513,

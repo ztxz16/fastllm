@@ -396,6 +396,61 @@ namespace fastllm {
 
         Executor &executor = *((Executor *)GetExecutor());
         InitMoeWeightViews();
+        bool rotateLongFullKvCache = false;
+        bool parkFreshSlidingCaches = false;
+#ifdef USE_CUDA
+        bool fullKvIsCuda = !pastKeyValues.empty() &&
+            pastKeyValues[0].first.dataDevice == DataDevice::CUDA &&
+            pastKeyValues[0].first.cudaData != nullptr &&
+            !pastKeyValues[0].first.multiDeviceData;
+        bool fullKvWasStaged = !GetKVCacheInCPU() &&
+            !pastKeyValues.empty() &&
+            pastKeyValues[0].first.dataDevice == DataDevice::CPU &&
+            pastKeyValues[0].first.isKVCache &&
+            pastKeyValues[0].first.cpuData != nullptr &&
+            !pastKeyValues[0].first.dataDeviceIds.empty() &&
+            !pastKeyValues[0].first.multiDeviceData;
+        bool longPrefillAppend =
+            sequencePastLen >= 8192 && seqlen > 1;
+        bool longDecode =
+            sequencePastLen >= 16384 && seqlen == 1;
+        if ((longPrefillAppend || longDecode) &&
+            (fullKvIsCuda || fullKvWasStaged)) {
+            std::vector<long long> totalSizes =
+                FastllmCudaGetTotalSizes();
+            int deviceId = pastKeyValues[0].first.dataDeviceIds.empty()
+                ? FastllmCudaGetDevice()
+                : pastKeyValues[0].first.dataDeviceIds[0];
+            if (deviceId >= 0 && deviceId < (int)totalSizes.size()) {
+                rotateLongFullKvCache =
+                    totalSizes[deviceId] <=
+                    32LL * 1024LL * 1024LL * 1024LL;
+            }
+            const char *keepFullKvEnv = std::getenv(
+                "FASTLLM_DOTS3_NOTE_KEEP_FULL_KV_GPU");
+            if (keepFullKvEnv != nullptr &&
+                keepFullKvEnv[0] != '\0' &&
+                std::strcmp(keepFullKvEnv, "0") != 0 &&
+                std::strcmp(keepFullKvEnv, "false") != 0 &&
+                std::strcmp(keepFullKvEnv, "off") != 0) {
+                rotateLongFullKvCache = false;
+            }
+        }
+        if (HistoryCacheDebugEnabled()) {
+            fprintf(stderr, "[dots-history] rotate_full_kv=%d\n",
+                    rotateLongFullKvCache ? 1 : 0);
+        }
+        if (sequencePastLen == 0 && seqlen > indexTopK &&
+            !GetKVCacheInCPU()) {
+            std::vector<long long> totalSizes =
+                FastllmCudaGetTotalSizes();
+            int deviceId = FastllmCudaGetDevice();
+            parkFreshSlidingCaches =
+                deviceId >= 0 && deviceId < (int)totalSizes.size() &&
+                totalSizes[deviceId] <=
+                    32LL * 1024LL * 1024LL * 1024LL;
+        }
+#endif
         std::shared_ptr<IndexerCacheMemory> indexerCache =
             GetOrCreateIndexerCache(&pastKeyValues);
         if (sequencePastLen == 0) {
@@ -407,26 +462,30 @@ namespace fastllm {
             }
             indexerCache = std::move(fresh);
         }
+#ifdef USE_CUDA
+        if (rotateLongFullKvCache) {
+            // Full-attention KV dominates the 16K footprint (1.25 GiB per
+            // layer in BF16). Only the active layer consumes its cache, so
+            // stage the 12 caches through NUMA memory for prefill appends past
+            // 8K instead of keeping all of them resident at once. At 16K this
+            // also applies to decode, whose one-token cache growth can
+            // otherwise duplicate a 1.25 GiB full-attention layer near the
+            // limit. Shorter decode keeps its existing all-GPU fast path.
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (IsFullAttentionLayer(layer)) {
+                    pastKeyValues[layer].first.ToDevice(DataDevice::CPU);
+                    pastKeyValues[layer].second.ToDevice(DataDevice::CPU);
+                }
+            }
+            FastllmCudaClearBigBuffer();
+        }
+#endif
 
-        Data hiddenStates, attenInput;
-        Data qa, q, qNope, qPe;
-        Data indexQ, indexQFloat, indexQPe, indexQNope, indexQPrepared;
-        Data indexK, indexKFloat, indexKNorm, indexKPe, indexKNope;
-        Data indexKPrepared, indexWeights;
-        Data indexQFp8, indexFoldedWeights, indexKFp8, indexKScales;
-        Data indexTopKIndices;
-        Data compressedKvAll, compressedKv, kPe, normalizedKv;
-        Data kv, kNope, value, kPeRepeat, key;
-        Data attentionScores, attentionProbFloat, attentionProb;
-        Data slidingAttentionMask;
-        int slidingMaskPastLen = -1;
-        int slidingMaskKeyLen = -1;
-        Data attentionOutput, attentionGate, attentionProjected;
-        Data w1, w2, w3;
-        Data routerLogits, expertIndex, expertScore;
-        Data moeOutput, moeOutputCopy, moeInputTemp, moeOutputTemp;
+        Data hiddenStates;
+        // MergeMOE reuses these NUMA-side workspaces across layers; keep them
+        // outside the loop while releasing the CUDA activation tensors below.
+        Data moeInputTemp, moeOutputTemp;
         Data moeW1, moeW2, moeW3, moeCurInput, moeCurOutput;
-        Data sharedGateUp, sharedGate, sharedUp, sharedOutput, combinedMoe;
         bool cudaSharedExpert = GetCudaSharedExpert();
         const char *cpuLmHeadEnv = std::getenv(
             "FASTLLM_DOTS3_NOTE_CPU_LM_HEAD");
@@ -505,6 +564,27 @@ namespace fastllm {
         for (int layer = 0; layer < block_cnt; layer++) {
             ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
 
+            // These tensors are consumed entirely within one transformer
+            // layer.  Releasing them at the iteration boundary makes their
+            // CUDA buffers available to the next layer instead of pinning the
+            // peak allocation of every distinct intermediate for all 46
+            // layers of a long prefill.
+            Data attenInput;
+            Data qa, q, qNope, qPe;
+            Data indexTopKIndices;
+            Data compressedKvAll, compressedKv, kPe, normalizedKv;
+            Data kv, kNope, value, kPeRepeat, key;
+            Data attentionScores, attentionProbFloat, attentionProb;
+            Data slidingAttentionMask;
+            int slidingMaskPastLen = -1;
+            int slidingMaskKeyLen = -1;
+            Data attentionOutput, attentionGate, attentionProjected;
+            Data w1, w2, w3;
+            Data routerLogits, expertIndex, expertScore;
+            Data moeOutput, moeOutputCopy;
+            Data sharedGateUp, sharedGate, sharedUp, sharedOutput;
+            Data combinedMoe;
+
             AttentionConfig config = GetAttentionConfig(layer);
             bool fullAttention = IsFullAttentionLayer(layer);
             Data *sinTable = nullptr, *cosTable = nullptr;
@@ -528,58 +608,101 @@ namespace fastllm {
 #ifdef USE_CUDA
                 const bool useCudaIndexer = UsesCudaIndexer(executor);
                 if (useCudaIndexer) {
+                    // Keep only the compact FP8 tensors alive for cache append
+                    // and TopK. Split Q while it is still BF16, then convert
+                    // each half independently; this avoids a full 256 MiB FP32
+                    // Q tensor at 8K. Ending each stage's scope also lets the
+                    // quantizer and TopK reuse the retired buffers.
+                    Data indexQFp8, indexFoldedWeights;
+                    Data indexKFp8, indexKScales;
                     const std::string indexerPrefix =
                         attentionPrefix + "indexer.";
-                    Linear(qa, weight[indexerPrefix + "wq_b.weight"], Data(),
-                           indexQ);
-                    indexQ.Reshape({1, seqlen, indexHeads, indexHeadDim});
-                    ToDataType(indexQ, indexQFloat, DataType::FLOAT32);
-                    Split(indexQFloat, -1, 0, config.qkRopeHeadDim,
-                          indexQPe);
-                    Split(indexQFloat, -1, config.qkRopeHeadDim,
-                          indexHeadDim, indexQNope);
-                    // NearlyRotatePosition2D consumes a sequence-major tensor.
-                    PermuteSelf(indexQPe, {1, 0, 2, 3});
-                    NearlyRotatePosition2D(indexQPe, positionIds,
-                                           *sinTable, *cosTable,
-                                           config.qkRopeHeadDim);
-                    PermuteSelf(indexQPe, {1, 0, 2, 3});
-                    Cat(indexQPe, indexQNope, -1, indexQPrepared);
+                    {
+                        Data indexQPe, indexQNope;
+                        {
+                            {
+                                Data indexQPeBf16, indexQNopeBf16;
+                                {
+                                    Data indexQ;
+                                    Linear(
+                                        qa,
+                                        weight[indexerPrefix + "wq_b.weight"],
+                                        Data(), indexQ);
+                                    indexQ.Reshape(
+                                        {1, seqlen, indexHeads,
+                                         indexHeadDim});
+                                    Split(indexQ, -1, 0,
+                                          config.qkRopeHeadDim,
+                                          indexQPeBf16);
+                                    Split(indexQ, -1,
+                                          config.qkRopeHeadDim,
+                                          indexHeadDim, indexQNopeBf16);
+                                }
+                                ToDataType(indexQPeBf16, indexQPe,
+                                           DataType::FLOAT32);
+                                ToDataType(indexQNopeBf16, indexQNope,
+                                           DataType::FLOAT32);
+                            }
+                            // NearlyRotatePosition2D consumes a
+                            // sequence-major tensor.
+                            PermuteSelf(indexQPe, {1, 0, 2, 3});
+                            NearlyRotatePosition2D(
+                                indexQPe, positionIds, *sinTable, *cosTable,
+                                config.qkRopeHeadDim);
+                            PermuteSelf(indexQPe, {1, 0, 2, 3});
+                        }
 
-                    Linear(attenInput, weight[indexerPrefix + "wk.weight"],
-                           Data(), indexK);
-                    ToDataType(indexK, indexKFloat, DataType::FLOAT32);
-                    LayerNorm(indexKFloat,
-                              weight[indexerPrefix + "k_norm.weight"],
-                              weight[indexerPrefix + "k_norm.bias"], -1,
-                              indexKNorm);
-                    indexKNorm.Reshape({1, seqlen, 1, indexHeadDim});
-                    Split(indexKNorm, -1, 0, config.qkRopeHeadDim,
-                          indexKPe);
-                    Split(indexKNorm, -1, config.qkRopeHeadDim,
-                          indexHeadDim, indexKNope);
-                    PermuteSelf(indexKPe, {1, 0, 2, 3});
-                    NearlyRotatePosition2D(indexKPe, positionIds,
-                                           *sinTable, *cosTable,
-                                           config.qkRopeHeadDim);
-                    PermuteSelf(indexKPe, {1, 0, 2, 3});
-                    // The fused reference rounds K once after FP32 LayerNorm and
-                    // RoPE, immediately before the dynamic E4M3 quantizer.
-                    AssertInFastLLM(
-                        FastllmCudaDots3NotePackIndexerKey(
-                            indexKPe, indexKNope, indexKPrepared),
-                        "FastLLM Dots3-Note failed to pack the index K tensor.\n");
+                        Data indexKPrepared;
+                        {
+                            Data indexK, indexKFloat, indexKNorm;
+                            Data indexKPe, indexKNope;
+                            Linear(attenInput,
+                                   weight[indexerPrefix + "wk.weight"],
+                                   Data(), indexK);
+                            ToDataType(indexK, indexKFloat,
+                                       DataType::FLOAT32);
+                            LayerNorm(
+                                indexKFloat,
+                                weight[indexerPrefix + "k_norm.weight"],
+                                weight[indexerPrefix + "k_norm.bias"], -1,
+                                indexKNorm);
+                            indexKNorm.Reshape(
+                                {1, seqlen, 1, indexHeadDim});
+                            Split(indexKNorm, -1, 0,
+                                  config.qkRopeHeadDim, indexKPe);
+                            Split(indexKNorm, -1,
+                                  config.qkRopeHeadDim, indexHeadDim,
+                                  indexKNope);
+                            PermuteSelf(indexKPe, {1, 0, 2, 3});
+                            NearlyRotatePosition2D(
+                                indexKPe, positionIds, *sinTable, *cosTable,
+                                config.qkRopeHeadDim);
+                            PermuteSelf(indexKPe, {1, 0, 2, 3});
+                            // The fused reference rounds K once after FP32
+                            // LayerNorm and RoPE, immediately before the
+                            // dynamic E4M3 quantizer.
+                            AssertInFastLLM(
+                                FastllmCudaDots3NotePackIndexerKey(
+                                    indexKPe, indexKNope,
+                                    indexKPrepared),
+                                "FastLLM Dots3-Note failed to pack the index K tensor.\n");
+                        }
 
-                    Linear(attenInput,
-                           weight[indexerPrefix + "weights_proj.weight"],
-                           Data(), indexWeights);
-                    indexWeights.Reshape({1, seqlen, indexHeads});
-                    AssertInFastLLM(
-                        FastllmCudaDots3NoteQuantizeIndexer(
-                            indexQPrepared, indexKPrepared, indexWeights,
-                            indexQFp8, indexFoldedWeights, indexKFp8,
-                            indexKScales),
-                        "FastLLM Dots3-Note failed to quantize the DSA indexer.\n");
+                        Data indexWeights;
+                        Linear(
+                            attenInput,
+                            weight[indexerPrefix + "weights_proj.weight"],
+                            Data(), indexWeights);
+                        indexWeights.Reshape(
+                            {1, seqlen, indexHeads});
+                        AssertInFastLLM(
+                            FastllmCudaDots3NoteQuantizeIndexer(
+                                indexQPe, indexQNope, indexKPrepared,
+                                indexWeights, indexQFp8,
+                                indexFoldedWeights, indexKFp8,
+                                indexKScales),
+                            "FastLLM Dots3-Note failed to quantize the DSA indexer.\n");
+                    }
 
                     IndexerLayerCache &cache = indexerCache->layers[layer];
                     int cachedLength = cache.keys.dims.size() == 3
@@ -638,7 +761,58 @@ namespace fastllm {
                                 "require a CUDA DSA indexer.\n");
 #endif
             }
+
+            Data &pastKey = pastKeyValues[layer].first;
+            Data &pastValue = pastKeyValues[layer].second;
+            int layerPastLen = pastKey.dims.size() > 1
+                                   ? pastKey.dims[1] : 0;
+            if (GetKVCacheInCPU()) {
+                pastKey.lockInCPU = true;
+                pastValue.lockInCPU = true;
+            } else {
+                pastKey.ToDevice(attenInput.dataDevice);
+                pastValue.ToDevice(attenInput.dataDevice);
+            }
+
+            bool directFreshFullPrefill = false;
+#ifdef USE_CUDA
+            directFreshFullPrefill =
+                fullAttention && !GetKVCacheInCPU() &&
+                layerPastLen == 0 && seqlen >= 16 &&
+                attenInput.dataDevice == DataDevice::CUDA;
+#endif
+
+            auto prepareFreshPooledCache = [](
+                    Data &cache, const std::vector<int> &dims,
+                    const std::vector<int> &capacity) {
+                cache.FreeSpace();
+                cache.directMemory = false;
+                cache.expansionDims.clear();
+                cache.Resize(capacity);
+                cache.Allocate(false);
+                cache.expansionDims = capacity;
+                cache.Resize(dims);
+            };
+
+            // KV-A is small enough to keep while Q is built. Once both low-rank
+            // projections have consumed attenInput, retire that 80 MiB 8K
+            // activation at the Q allocation high-watermark. The identical
+            // input RMSNorm is recomputed below immediately before g_proj.
+            Linear(attenInput,
+                   weight[attentionPrefix + "kv_a_proj_with_mqa.weight"],
+                   Data(), compressedKvAll);
+            Split(compressedKvAll, -1, 0, config.kvLoraRank, compressedKv);
+            Split(compressedKvAll, -1, config.kvLoraRank,
+                  config.kvLoraRank + config.qkRopeHeadDim, kPe);
+            compressedKvAll.FreeSpace();
+            bool recomputeAttentionInput =
+                sequencePastLen == 0 && seqlen > indexTopK;
+            if (recomputeAttentionInput) {
+                attenInput.FreeSpace();
+            }
+
             Linear(qa, weight[attentionPrefix + "q_b_proj.weight"], Data(), q);
+            qa.FreeSpace();
 
             q.Reshape({1, seqlen, config.numHeads,
                        config.qkNopeHeadDim + config.qkRopeHeadDim});
@@ -647,15 +821,21 @@ namespace fastllm {
             Split(q, -1, config.qkNopeHeadDim,
                   config.qkNopeHeadDim + config.qkRopeHeadDim, qPe);
 
-            Linear(attenInput,
-                   weight[attentionPrefix + "kv_a_proj_with_mqa.weight"],
-                   Data(), compressedKvAll);
-            Split(compressedKvAll, -1, 0, config.kvLoraRank, compressedKv);
-            Split(compressedKvAll, -1, config.kvLoraRank,
-                  config.kvLoraRank + config.qkRopeHeadDim, kPe);
+            PermuteSelf(qPe, {0, 2, 1, 3});
+            PermuteSelf(qPe, {1, 0, 2, 3});
+            NearlyRotatePosition2D(qPe, positionIds, *sinTable, *cosTable,
+                                   config.qkRopeHeadDim);
+            PermuteSelf(qPe, {1, 0, 2, 3});
+            PermuteSelf(qPe, {0, 2, 1, 3});
+
+            Cat(qNope, qPe, -1, q);
+            qNope.FreeSpace();
+            qPe.FreeSpace();
+
             RMSNorm(compressedKv,
                     weight[attentionPrefix + "kv_a_layernorm.weight"],
                     rms_norm_eps, normalizedKv);
+            compressedKv.FreeSpace();
             Mul(normalizedKv,
                 std::sqrt((float)embed_dim / (float)config.kvLoraRank),
                 normalizedKv);
@@ -664,19 +844,28 @@ namespace fastllm {
                     rms_norm_eps, kPe);
             Linear(normalizedKv, weight[attentionPrefix + "kv_b_proj.weight"],
                    Data(), kv);
+            normalizedKv.FreeSpace();
             kv.Reshape({1, seqlen, config.numHeads,
                         config.qkNopeHeadDim + config.vHeadDim});
             PermuteSelf(kv, {0, 2, 1, 3});
-            Split(kv, -1, 0, config.qkNopeHeadDim, kNope);
+            kv.Reshape({config.numHeads, seqlen,
+                        config.qkNopeHeadDim + config.vHeadDim});
+            Data &currentValue = directFreshFullPrefill
+                                     ? pastValue : value;
+            if (directFreshFullPrefill) {
+                int capacity = ((seqlen - 1) / 128 + 1) * 128;
+                prepareFreshPooledCache(
+                    pastValue,
+                    {config.numHeads, seqlen, config.vHeadDim},
+                    {config.numHeads, capacity, config.vHeadDim});
+            } else {
+                Split(kv, -1, 0, config.qkNopeHeadDim, kNope);
+            }
             Split(kv, -1, config.qkNopeHeadDim,
-                  config.qkNopeHeadDim + config.vHeadDim, value);
-
-            PermuteSelf(qPe, {0, 2, 1, 3});
-            PermuteSelf(qPe, {1, 0, 2, 3});
-            NearlyRotatePosition2D(qPe, positionIds, *sinTable, *cosTable,
-                                   config.qkRopeHeadDim);
-            PermuteSelf(qPe, {1, 0, 2, 3});
-            PermuteSelf(qPe, {0, 2, 1, 3});
+                  config.qkNopeHeadDim + config.vHeadDim, currentValue);
+            if (!directFreshFullPrefill) {
+                kv.FreeSpace();
+            }
 
             kPe.Reshape({1, seqlen, 1, config.qkRopeHeadDim});
             PermuteSelf(kPe, {1, 0, 2, 3});
@@ -685,68 +874,121 @@ namespace fastllm {
             PermuteSelf(kPe, {1, 0, 2, 3});
             PermuteSelf(kPe, {0, 2, 1, 3});
 
-            Cat(qNope, qPe, -1, q);
-            Repeat(kPe, 1, config.numHeads, kPeRepeat);
-            Cat(kNope, kPeRepeat, -1, key);
+            Data &currentKey = directFreshFullPrefill ? pastKey : key;
+            bool reuseKvForSparseAttention =
+                directFreshFullPrefill && seqlen > indexTopK;
+            if (directFreshFullPrefill) {
+                int capacity = ((seqlen - 1) / 128 + 1) * 128;
+                prepareFreshPooledCache(
+                    pastKey,
+                    {config.numHeads, seqlen,
+                     config.qkNopeHeadDim + config.qkRopeHeadDim},
+                    {config.numHeads, capacity,
+                     config.qkNopeHeadDim + config.qkRopeHeadDim});
+                kPe.Reshape({seqlen, config.qkRopeHeadDim});
+#ifdef USE_CUDA
+                AssertInFastLLM(
+                    FastllmCudaDots3NotePackAttentionKey(
+                        kv, kPe, config.qkNopeHeadDim, pastKey),
+                    "FastLLM Dots3-Note failed to pack the attention K tensor.\n");
+#endif
+                if (!reuseKvForSparseAttention) {
+                    kv.FreeSpace();
+                }
+            } else {
+                Repeat(kPe, 1, config.numHeads, kPeRepeat);
+                kPeRepeat.Reshape(
+                    {config.numHeads, seqlen,
+                     config.qkRopeHeadDim});
+                Cat(kNope, kPeRepeat, -1, currentKey);
+            }
+            kPe.FreeSpace();
+            kNope.FreeSpace();
+            kPeRepeat.FreeSpace();
 
             int qHeadDim = config.qkNopeHeadDim + config.qkRopeHeadDim;
             q.Reshape({config.numHeads, seqlen, qHeadDim});
-            key.Reshape({config.numHeads, seqlen, qHeadDim});
-            value.Reshape({config.numHeads, seqlen, config.vHeadDim});
-
-            Data &pastKey = pastKeyValues[layer].first;
-            Data &pastValue = pastKeyValues[layer].second;
-            int layerPastLen = pastKey.dims.size() > 1 ? pastKey.dims[1] : 0;
-            if (GetKVCacheInCPU()) {
-                pastKey.lockInCPU = true;
-                pastValue.lockInCPU = true;
-            } else {
-                pastKey.ToDevice(key.dataDevice);
-                pastValue.ToDevice(value.dataDevice);
+            if (directFreshFullPrefill) {
+                pastKey.SetKVCache();
+                pastValue.SetKVCache();
             }
 
             const int cacheBlock = 128;
-            while ((pastKey.dims.empty() &&
-                    (pastKey.expansionDims.empty() ||
-                     key.dims[1] > pastKey.expansionDims[1])) ||
-                   (!pastKey.dims.empty() &&
-                    pastKey.dims[1] + key.dims[1] >
-                        pastKey.expansionDims[1])) {
-                std::vector<int> dims;
-                if (pastKey.dims.empty() || pastKey.Count(0) == 0) {
-                    dims = {key.dims[0],
-                            ((key.dims[1] - 1) / cacheBlock + 1) * cacheBlock,
+            bool directFreshSlidingPrefill = false;
+#ifdef USE_CUDA
+            directFreshSlidingPrefill =
+                !fullAttention && !GetKVCacheInCPU() &&
+                layerPastLen == 0 && seqlen >= 16 &&
+                seqlen > shortContextLimit &&
+                q.dataDevice == DataDevice::CUDA &&
+                key.dataDevice == DataDevice::CUDA &&
+                value.dataDevice == DataDevice::CUDA;
+#endif
+            if (!directFreshSlidingPrefill &&
+                !directFreshFullPrefill) {
+                while ((pastKey.dims.empty() &&
+                        (pastKey.expansionDims.empty() ||
+                         key.dims[1] > pastKey.expansionDims[1])) ||
+                       (!pastKey.dims.empty() &&
+                        pastKey.dims[1] + key.dims[1] >
+                            pastKey.expansionDims[1])) {
+                    std::vector<int> dims;
+                    if (pastKey.dims.empty() || pastKey.Count(0) == 0) {
+                        dims = {
+                            key.dims[0],
+                            ((key.dims[1] - 1) / cacheBlock + 1) *
+                                cacheBlock,
                             key.dims[2]};
-                } else {
-                    dims = pastKey.dims;
-                    dims[1] += ((key.dims[1] - 1) / cacheBlock + 1) * cacheBlock;
+                    } else {
+                        dims = pastKey.dims;
+                        dims[1] +=
+                            ((key.dims[1] - 1) / cacheBlock + 1) *
+                            cacheBlock;
+                    }
+                    pastKey.Expansion(dims);
                 }
-                pastKey.Expansion(dims);
-            }
-            while ((pastValue.dims.empty() &&
-                    (pastValue.expansionDims.empty() ||
-                     value.dims[1] > pastValue.expansionDims[1])) ||
-                   (!pastValue.dims.empty() &&
-                    pastValue.dims[1] + value.dims[1] >
-                        pastValue.expansionDims[1])) {
-                std::vector<int> dims;
-                if (pastValue.dims.empty() || pastValue.Count(0) == 0) {
-                    dims = {value.dims[0],
-                            ((value.dims[1] - 1) / cacheBlock + 1) * cacheBlock,
+                while ((pastValue.dims.empty() &&
+                        (pastValue.expansionDims.empty() ||
+                         value.dims[1] > pastValue.expansionDims[1])) ||
+                       (!pastValue.dims.empty() &&
+                        pastValue.dims[1] + value.dims[1] >
+                            pastValue.expansionDims[1])) {
+                    std::vector<int> dims;
+                    if (pastValue.dims.empty() ||
+                        pastValue.Count(0) == 0) {
+                        dims = {
+                            value.dims[0],
+                            ((value.dims[1] - 1) / cacheBlock + 1) *
+                                cacheBlock,
                             value.dims[2]};
-                } else {
-                    dims = pastValue.dims;
-                    dims[1] += ((value.dims[1] - 1) / cacheBlock + 1) * cacheBlock;
+                    } else {
+                        dims = pastValue.dims;
+                        dims[1] +=
+                            ((value.dims[1] - 1) / cacheBlock + 1) *
+                            cacheBlock;
+                    }
+                    pastValue.Expansion(dims);
                 }
-                pastValue.Expansion(dims);
+                CatDirect(pastKey, key, 1);
+                CatDirect(pastValue, value, 1);
             }
-            CatDirect(pastKey, key, 1);
-            CatDirect(pastValue, value, 1);
 
-            int keyLen = pastKey.dims[1];
+            int keyLen = directFreshSlidingPrefill
+                             ? key.dims[1] : pastKey.dims[1];
             bool usedSlidingPrefill = false;
 #ifdef USE_CUDA
-            if (!fullAttention && seqlen >= 16 &&
+            if (directFreshSlidingPrefill) {
+                ScopedExecutorProfiler slidingProfile(
+                    "Dots3NoteSlidingAttention");
+                usedSlidingPrefill =
+                    FastllmCudaDots3NoteSlidingAttentionPrefill(
+                        q, key, value, 0, shortContextLimit,
+                        1.0f / std::sqrt((float)qHeadDim),
+                        attentionOutput);
+                AssertInFastLLM(
+                    usedSlidingPrefill,
+                    "FastLLM Dots3-Note sliding attention failed.\n");
+            } else if (!fullAttention && seqlen >= 16 &&
                 keyLen > shortContextLimit &&
                 q.dataDevice == DataDevice::CUDA) {
                 ScopedExecutorProfiler slidingProfile(
@@ -778,12 +1020,35 @@ namespace fastllm {
                     std::getenv(
                         "FASTLLM_DOTS3_NOTE_DISABLE_CUBLAS_SPARSE_PREFILL") ==
                         nullptr;
+                void *sparseScratch = nullptr;
+                size_t sparseScratchBytes = 0;
+                if (reuseKvForSparseAttention) {
+                    size_t attentionOutputBytes =
+                        (size_t)config.numHeads * seqlen *
+                        config.vHeadDim * sizeof(uint16_t);
+                    size_t minimumScratchBytes =
+                        (size_t)config.numHeads * keyLen *
+                        sizeof(uint16_t);
+                    AssertInFastLLM(
+                        kv.expansionBytes >=
+                            attentionOutputBytes + minimumScratchBytes,
+                        "FastLLM Dots3-Note KV projection is too small to "
+                        "back sparse attention.\n");
+                    attentionOutput.FakeFrom(kv, 0);
+                    attentionOutput.Resize(
+                        {config.numHeads, seqlen, config.vHeadDim});
+                    sparseScratch =
+                        (uint8_t *)kv.cudaData + attentionOutputBytes;
+                    sparseScratchBytes =
+                        kv.expansionBytes - attentionOutputBytes;
+                }
                 bool sparseOk = useCublasPrefill &&
                     FastllmCudaDots3NoteSparseAttentionPrefill(
                         q, pastKey, pastValue, indexTopKIndices,
                         layerPastLen,
                         1.0f / std::sqrt((float)qHeadDim),
-                        attentionOutput);
+                        attentionOutput, sparseScratch,
+                        sparseScratchBytes);
                 if (!sparseOk) {
                     sparseOk = FastllmCudaDots3NoteSparseAttention(
                         q, pastKey, pastValue, indexTopKIndices,
@@ -836,37 +1101,110 @@ namespace fastllm {
                 MatMul(attentionProb, pastValue, attentionOutput);
             }
 
+            if (rotateLongFullKvCache && fullAttention) {
+                // The blocking D2H copies also order after the attention
+                // kernels that consumed these buffers. Keep the resulting
+                // CUDA allocations in the pool: the next full layer has the
+                // same old/new cache sizes and can reuse them exactly.
+                pastKey.ToDevice(DataDevice::CPU);
+                pastValue.ToDevice(DataDevice::CPU);
+            }
+
             if (!fullAttention) {
-                int cachedTokens = pastKey.dims[1];
-                int compactThreshold = shortContextLimit + cacheBlock;
-                if (cachedTokens >= compactThreshold) {
-                    int start = cachedTokens - shortContextLimit;
+                // A query with a window of N needs only the previous N - 1
+                // cached tokens; the current token supplies the final slot.
+                // Keep one append slot instead of a whole 128-token block so
+                // every sliding layer has a bounded persistent footprint.
+                int slidingCacheTokens = std::max(
+                    0, shortContextLimit - 1);
+                int slidingCacheCapacity = std::max(
+                    1, shortContextLimit);
+                if (directFreshSlidingPrefill) {
+                    int cachedTokens = key.dims[1];
+                    int start = std::max(
+                        0, cachedTokens - slidingCacheTokens);
                     Data compactKey, compactValue;
-                    Split(pastKey, 1, start, cachedTokens, compactKey);
-                    Split(pastValue, 1, start, cachedTokens, compactValue);
-                    pastKey.CopyFrom(compactKey);
-                    pastValue.CopyFrom(compactValue);
-                    // CopyFrom intentionally drops the source's spare
-                    // capacity.  CatDirect requires expansionDims to describe
-                    // writable storage, otherwise the first token appended
-                    // after compaction writes past the compact allocation.
-                    // Recreate one cache block of headroom here so both a
-                    // chunked prefill and single-token decode remain bounded.
-                    std::vector<int> keyCapacity = pastKey.dims;
-                    std::vector<int> valueCapacity = pastValue.dims;
-                    keyCapacity[1] = compactThreshold;
-                    valueCapacity[1] = compactThreshold;
-                    pastKey.Expansion(keyCapacity);
-                    pastValue.Expansion(valueCapacity);
+                    Split(key, 1, start, cachedTokens, compactKey);
+                    Split(value, 1, start, cachedTokens, compactValue);
+                    std::vector<int> keyCapacity = compactKey.dims;
+                    std::vector<int> valueCapacity = compactValue.dims;
+                    keyCapacity[1] = slidingCacheCapacity;
+                    valueCapacity[1] = slidingCacheCapacity;
+                    if (pastKey.expansionDims.empty() ||
+                        pastKey.expansionDims[1] < slidingCacheCapacity) {
+                        pastKey.Expansion(keyCapacity);
+                    }
+                    if (pastValue.expansionDims.empty() ||
+                        pastValue.expansionDims[1] < slidingCacheCapacity) {
+                        pastValue.Expansion(valueCapacity);
+                    }
+                    CatDirect(pastKey, compactKey, 1);
+                    CatDirect(pastValue, compactValue, 1);
                     pastKey.SetKVCache();
                     pastValue.SetKVCache();
+                } else {
+                    int cachedTokens = pastKey.dims[1];
+                    if (cachedTokens > slidingCacheTokens) {
+                        int start = cachedTokens - slidingCacheTokens;
+                        Data compactKey, compactValue;
+                        Split(pastKey, 1, start, cachedTokens, compactKey);
+                        Split(pastValue, 1, start, cachedTokens,
+                              compactValue);
+                        pastKey.CopyFrom(compactKey);
+                        pastValue.CopyFrom(compactValue);
+                        // CopyFrom intentionally drops the source's spare
+                        // capacity. CatDirect requires expansionDims to
+                        // describe writable storage, otherwise the first token
+                        // appended after compaction writes past the compact
+                        // allocation. Recreate one token of headroom.
+                        std::vector<int> keyCapacity = pastKey.dims;
+                        std::vector<int> valueCapacity = pastValue.dims;
+                        keyCapacity[1] = slidingCacheCapacity;
+                        valueCapacity[1] = slidingCacheCapacity;
+                        pastKey.Expansion(keyCapacity);
+                        pastValue.Expansion(valueCapacity);
+                        pastKey.SetKVCache();
+                        pastValue.SetKVCache();
+                    }
                 }
             }
+
+            if (parkFreshSlidingCaches && (layer == 2 || layer == 3)) {
+                // On 24/32 GiB cards, the final long-prefill layers otherwise
+                // miss a 384 MiB Q allocation by only a few MiB after CUDA
+                // shared-expert workspaces have warmed up. Parking two of the
+                // earliest already-bounded SWA caches moves only about 80 MiB
+                // (instead of all 7.5 GiB of full-attention KV at 8K). They
+                // are staged back automatically if this request continues
+                // into decode.
+                pastKey.ToDevice(DataDevice::CPU);
+                pastValue.ToDevice(DataDevice::CPU);
+            }
+
+            // Attention has consumed Q/K/V and any dense probability
+            // intermediates. Sliding layers have also compacted their cache by
+            // this point, so these buffers can back the gate/projection/MoE
+            // stages that follow.
+            q.FreeSpace();
+            key.FreeSpace();
+            value.FreeSpace();
+            indexTopKIndices.FreeSpace();
+            attentionScores.FreeSpace();
+            attentionProbFloat.FreeSpace();
+            attentionProb.FreeSpace();
+            slidingAttentionMask.FreeSpace();
 
             attentionOutput.Reshape(
                 {1, config.numHeads, seqlen, config.vHeadDim});
             PermuteSelf(attentionOutput, {0, 2, 1, 3});
 
+            if (recomputeAttentionInput) {
+                RMSNorm(
+                    hiddenStates,
+                    weight[prefix + ".input_layernorm.weight"],
+                    rms_norm_eps, attenInput);
+                ToDataType(attenInput, DataType::BFLOAT16);
+            }
             Linear(attenInput, weight[attentionPrefix + "g_proj.weight"],
                    Data(), attentionGate);
             Sigmoid(attentionGate, attentionGate);
@@ -877,6 +1215,10 @@ namespace fastllm {
             Linear(attentionOutput, weight[attentionPrefix + "o_proj.weight"],
                    Data(), attentionProjected);
             AddTo(hiddenStates, attentionProjected);
+            attentionOutput.FreeSpace();
+            attentionGate.FreeSpace();
+            attentionProjected.FreeSpace();
+            kv.FreeSpace();
 
             RMSNorm(hiddenStates,
                     weight[prefix + ".post_attention_layernorm.weight"],
@@ -918,19 +1260,95 @@ namespace fastllm {
                 if (cudaSharedExpert) {
                     std::string sharedPrefix =
                         prefix + ".mlp.shared_experts.";
-                    Linear(attenInput,
-                           weight[sharedPrefix + "gateup_proj.weight"],
-                           Data(), sharedGateUp);
-                    int sharedIntermediate = sharedGateUp.dims.back() / 2;
-                    Split(sharedGateUp, -1, 0, sharedIntermediate,
-                          sharedGate);
-                    Split(sharedGateUp, -1, sharedIntermediate,
-                          sharedIntermediate * 2, sharedUp);
-                    Silu(sharedGate, sharedGate);
-                    MulTo(sharedGate, sharedUp);
-                    Linear(sharedGate,
-                           weight[sharedPrefix + "down_proj.weight"],
-                           Data(), sharedOutput);
+                    bool sharedOutputReady = false;
+                    if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                        // Fuse the gate/up projection with SwiGLU so long
+                        // prefills keep only the half-width activated result.
+                        // At 8K this avoids a transient 512 MiB BF16 tensor.
+                        LinearEx(
+                            attenInput,
+                            weight[sharedPrefix + "gateup_proj.weight"],
+                            Data(), sharedGate,
+                            LinearExType::ExSwiglu);
+                    } else if (rotateLongFullKvCache && tokens > 2048) {
+                        // Appending an 8K chunk to a long cache can leave less
+                        // than the 512 MiB needed by the full-width gate/up
+                        // projection. Compute independent token rows in 2K
+                        // slices and write each down-projection directly into
+                        // its place in the final shared-expert output.
+                        const int sharedChunkTokens = 2048;
+                        sharedOutput.dataType = attenInput.dataType;
+                        sharedOutput.UpdateUnitSize();
+                        sharedOutput.dataDevice = attenInput.dataDevice;
+                        sharedOutput.dataDeviceIds =
+                            attenInput.dataDeviceIds;
+                        sharedOutput.Resize({tokens, embed_dim});
+                        sharedOutput.Allocate(false);
+                        for (int start = 0; start < tokens;
+                             start += sharedChunkTokens) {
+                            int end = std::min(
+                                tokens, start + sharedChunkTokens);
+                            int chunkTokens = end - start;
+                            Data chunkInput, chunkGateUp, chunkGate,
+                                 chunkUp, chunkOutput;
+                            chunkInput.Resize(
+                                {chunkTokens, embed_dim});
+                            chunkInput.FakeFrom(
+                                attenInput,
+                                (size_t)start * attenInput.strides[0] *
+                                    attenInput.unitSize);
+                            chunkInput.dataDeviceIds =
+                                attenInput.dataDeviceIds;
+                            Linear(
+                                chunkInput,
+                                weight[sharedPrefix +
+                                       "gateup_proj.weight"],
+                                Data(), chunkGateUp);
+                            int sharedIntermediate =
+                                chunkGateUp.dims.back() / 2;
+                            Split(chunkGateUp, -1, 0,
+                                  sharedIntermediate, chunkGate);
+                            Split(chunkGateUp, -1,
+                                  sharedIntermediate,
+                                  sharedIntermediate * 2, chunkUp);
+                            chunkGateUp.FreeSpace();
+                            Silu(chunkGate, chunkGate);
+                            MulTo(chunkGate, chunkUp);
+                            chunkUp.FreeSpace();
+                            chunkOutput.Resize(
+                                {chunkTokens, embed_dim});
+                            chunkOutput.FakeFrom(
+                                sharedOutput,
+                                (size_t)start *
+                                    sharedOutput.strides[0] *
+                                    sharedOutput.unitSize);
+                            chunkOutput.dataDeviceIds =
+                                sharedOutput.dataDeviceIds;
+                            Linear(
+                                chunkGate,
+                                weight[sharedPrefix +
+                                       "down_proj.weight"],
+                                Data(), chunkOutput);
+                        }
+                        sharedOutputReady = true;
+                    } else {
+                        Linear(attenInput,
+                               weight[sharedPrefix + "gateup_proj.weight"],
+                               Data(), sharedGateUp);
+                        int sharedIntermediate =
+                            sharedGateUp.dims.back() / 2;
+                        Split(sharedGateUp, -1, 0, sharedIntermediate,
+                              sharedGate);
+                        Split(sharedGateUp, -1, sharedIntermediate,
+                              sharedIntermediate * 2, sharedUp);
+                        Silu(sharedGate, sharedGate);
+                        MulTo(sharedGate, sharedUp);
+                    }
+                    if (!sharedOutputReady) {
+                        Linear(sharedGate,
+                               weight[sharedPrefix + "down_proj.weight"],
+                               Data(), sharedOutput);
+                    }
                     moeWeights[layer][0] = nullptr;
                     moeWeights[layer][1] = nullptr;
                 }
@@ -1043,7 +1461,25 @@ namespace fastllm {
         } else {
             lastHiddenStates.CopyFrom(hiddenStates);
         }
-        if (useCpuLmHead) {
+        bool runCpuLmHead = useCpuLmHead;
+#ifdef USE_CUDA
+        Data &lmHeadWeight = weight["lm_head.weight"];
+        if (!runCpuLmHead &&
+            lastHiddenStates.dataDevice == DataDevice::CUDA &&
+            lmHeadWeight.dataDevice != DataDevice::CUDA) {
+            // Loading the 1.45 GiB vocabulary projection after a long prefill
+            // must not turn an otherwise valid KV cache into an OOM. Keep the
+            // warmed attention workspaces in the pool for the next request,
+            // and leave the projection on CPU when genuinely free device
+            // memory cannot hold it with a safety margin.
+            const long long freeBytes = FastllmCudaGetFreeSize();
+            const long long requiredBytes =
+                (long long)lmHeadWeight.GetBytes() +
+                256LL * 1024LL * 1024LL;
+            runCpuLmHead = freeBytes > 0 && freeBytes < requiredBytes;
+        }
+#endif
+        if (runCpuLmHead) {
             executor.SetFirstDevice("cpu");
         }
         RMSNorm(lastHiddenStates, weight["model.norm.weight"],
