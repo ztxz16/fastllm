@@ -13,6 +13,8 @@ namespace fastllm {
         this->ops["Linear"] = new AscendLinearOp();
         this->ops["Split"] = new AscendSplitOp();
         this->ops["LayerNorm"] = new AscendLayerNormOp();
+        this->ops["MatMul"] = new AscendMatMulOp();
+        this->ops["MatMulTransB"] = new AscendMatMulTransBOp();
         this->ops["SoftMax"] = new AscendSoftMaxOp();
         this->ops["Sigmoid"] = new AscendSigmoidOp();
         this->ops["Silu"] = new AscendSiluOp();
@@ -303,6 +305,214 @@ namespace fastllm {
             dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
             dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
             deviceOk = CompileAndRunSingleOp(this->name, inputDict, {{"y", &output}}, dynamicShapes, {}, {}, {});
+        }
+    }
+
+    AscendMatMulOp::AscendMatMulOp() :
+        BaseAscendOperator("BatchMatMul") {}
+
+    void AscendMatMulOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMul error: inputs should use same device.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        "MatMul's input's type should be float32 or float16.\n");
+        AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
+                        "MatMul's input's shape's size should be >= 2.\n");
+        AssertInFastLLM(input0.dims.back() == input1.dims[input1.dims.size() - 2],
+                        "MatMul's shape error.\n");
+        int input0Spatial = input0.Count(input0.dims.size() - 2);
+        int input1Spatial = input1.Count(input1.dims.size() - 2);
+        int batch0 = input0.Count(0) / input0Spatial;
+        int batch1 = input1.Count(0) / input1Spatial;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        AssertInFastLLM(batch0 == batch1 * group, "MatMul: input0.dims[1] should be equal to input1.dims[0] * group.\n");
+
+        std::vector <int> dims = input0.dims;
+        dims.back() = input1.dims[input1.dims.size() - 1];
+
+        output.dataType = input0.dataType;
+        output.Resize(dims);
+    }
+
+    void AscendMatMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+
+        output.Allocate();
+
+        // out = input0 @ input1：input0 [B0, M, K]，input1 [B1, K, N]
+        int M = input0.dims[input0.dims.size() - 2];
+        int K = input0.dims.back();
+        int N = input1.dims.back();
+        int batch0 = input0.Count(0) / input0.Count(input0.dims.size() - 2);
+        int batch1 = input1.Count(0) / input1.Count(input1.dims.size() - 2);
+
+        // 准备重整形的输入和输出数据（不拷贝，仅重解释连续内存）
+        Data fakeReshapedInput0;
+        fakeReshapedInput0.dims = input0.dims;
+        fakeReshapedInput0.strides = input0.strides;
+        fakeReshapedInput0.FakeFrom(input0, 0);
+        fakeReshapedInput0.Reshape({-1, M, K});
+        Data fakeReshapedInput1;
+        fakeReshapedInput1.dims = input1.dims;
+        fakeReshapedInput1.strides = input1.strides;
+        fakeReshapedInput1.FakeFrom(input1, 0);
+        fakeReshapedInput1.Reshape({-1, K, N});
+        Data fakeReshapedOutput;
+        fakeReshapedOutput.dims = output.dims;
+        fakeReshapedOutput.strides = output.strides;
+        fakeReshapedOutput.FakeFrom(output, 0);
+        fakeReshapedOutput.Reshape({-1, M, N});
+
+        // 动态形状信息（用于warmup模式）：batch 维范围 [32, 128 * 32]，len 维范围 [1, 2048]
+        DynamicShapeDict dynamicShapes;
+        if (warmUpMode) {
+            // qk[batch, num_heads, len, len], v [batch, num_heads, len, head_dim]
+            std::vector<std::vector<int64_t>> x1Range = {{16, 128 * 32}, {1, 2048}, {1, 2048}};
+            std::vector<std::vector<int64_t>> x2Range = {{16, 128 * 32}, {1, 2048}};
+            std::vector<std::vector<int64_t>> yRange = {{16, 128 * 32}, {1, 2048}};
+            dynamicShapes["x1"] = std::make_pair(std::vector<int>({0, 1, 2}), x1Range);
+            dynamicShapes["x2"] = std::make_pair(std::vector<int>({0, 1}), x2Range);
+            dynamicShapes["y"] = std::make_pair(std::vector<int>({0, 1}), yRange);
+        }
+
+        // 构建属性参数
+        BoolDict boolParams = {{"adj_x1", false}, {"adj_x2", false}};
+        OrderedData orderedInputData({{"x1", &fakeReshapedInput0}, {"x2", &fakeReshapedInput1}});
+        if (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) {
+            deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, {{"y", &fakeReshapedOutput}},
+                                             dynamicShapes, {}, {}, boolParams);
+        } else if (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) {
+            deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, {{"y", &fakeReshapedOutput}},
+                                             dynamicShapes, {}, {}, boolParams);
+        } else {
+            ErrorInFastLLM("MatMul error: unsupport input's dataType.\n");
+        }
+
+        // alpha 缩放（BatchMatMul 无 alpha 属性，用 Muls 实现）
+        if (alpha != 1.0f) {
+            fakeReshapedOutput.Reshape({batch0, M, N});
+            DynamicShapeDict mulShapes;
+            if (warmUpMode) {
+                std::vector<std::vector<int64_t>> yRange = {{16, 128 * 32}, {1, 2048}};
+                mulShapes["x"] = std::make_pair(std::vector<int>({0, 1}), yRange);
+                mulShapes["y"] = std::make_pair(std::vector<int>({0, 1}), yRange);
+            }
+            deviceOk = CompileAndRunSingleOp("Muls", {{"x", &fakeReshapedOutput}}, {{"y", &fakeReshapedOutput}},
+                                             mulShapes, {{"value", alpha}}, {}, {});
+        }
+    }
+
+    AscendMatMulTransBOp::AscendMatMulTransBOp() :
+        BaseAscendOperator("BatchMatMul") {}
+
+    void AscendMatMulTransBOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        "MatMulTransB's input's type should be float32 or float16.\n");
+        AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
+                        "MatMulTransB's input's shape's size should be >= 2.\n");
+        AssertInFastLLM(input0.dims.back() == input1.dims.back(),
+                        "MatMulTransB's shape error.\n");
+        int input0Spatial = input0.Count(input0.dims.size() - 2);
+        int input1Spatial = input1.Count(input1.dims.size() - 2);
+        int batch0 = input0.Count(0) / input0Spatial;
+        int batch1 = input1.Count(0) / input1Spatial;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        AssertInFastLLM(batch0 == batch1 * group, "MatMulTransB: input0.dims[0] should be equal to input1.dims[0] * group.\n");
+
+        std::vector <int> dims = input0.dims;
+        dims.back() = input1.dims[input1.dims.size() - 2];
+        output.dataType = input0.dataType;
+        output.Resize(dims);
+    }
+
+    void AscendMatMulTransBOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+
+        output.Allocate();
+
+        // out = input0 @ input1^T：input0 [B0, M, K]，input1 [B1, N, K]，adj_x2 负责转置
+        int M = input0.dims[input0.dims.size() - 2];
+        int K = input0.dims.back();
+        int N = input1.dims[input1.dims.size() - 2];
+        int batch0 = input0.Count(0) / input0.Count(input0.dims.size() - 2);
+        int batch1 = input1.Count(0) / input1.Count(input1.dims.size() - 2);
+
+        // 准备重整形的输入和输出数据（不拷贝，仅重解释连续内存）
+        Data fakeReshapedInput0;
+        fakeReshapedInput0.dims = input0.dims;
+        fakeReshapedInput0.strides = input0.strides;
+        fakeReshapedInput0.FakeFrom(input0, 0);
+        fakeReshapedInput0.Reshape({-1, M, K});
+        Data fakeReshapedInput1;
+        fakeReshapedInput1.dims = input1.dims;
+        fakeReshapedInput1.strides = input1.strides;
+        fakeReshapedInput1.FakeFrom(input1, 0);
+        fakeReshapedInput1.Reshape({-1, N, K});
+        Data fakeReshapedOutput;
+        fakeReshapedOutput.dims = output.dims;
+        fakeReshapedOutput.strides = output.strides;
+        fakeReshapedOutput.FakeFrom(output, 0);
+        fakeReshapedOutput.Reshape({-1, M, N});
+
+        // 动态形状信息（用于warmup模式）：batch 维范围 [32, 128 * 32]，len 维范围 [1, 2048]
+        DynamicShapeDict dynamicShapes;
+        // qk[batch, num_heads, len, len], v [batch, num_heads, len, head_dim]
+        if (warmUpMode) {
+            std::vector<std::vector<int64_t>> x1Range = {{16, 128 * 32}, {1, 2048}};
+            std::vector<std::vector<int64_t>> x2Range = {{16, 128 * 32}, {1, 2048}};
+            std::vector<std::vector<int64_t>> yRange = {{16, 128 * 32}, {1, 2048}, {1, 2048}};
+            dynamicShapes["x1"] = std::make_pair(std::vector<int>({0, 1}), x1Range);
+            dynamicShapes["x2"] = std::make_pair(std::vector<int>({0, 1}), x2Range);
+            dynamicShapes["y"] = std::make_pair(std::vector<int>({0, 1, 2}), yRange);
+        }
+
+        // 构建属性参数：adj_x2=true 转置 input1 实现 @input1^T
+        BoolDict boolParams = {{"adj_x1", false}, {"adj_x2", true}};
+        OrderedData orderedInputData({{"x1", &fakeReshapedInput0}, {"x2", &fakeReshapedInput1}});
+        if (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) {
+            deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, {{"y", &fakeReshapedOutput}},
+                                             dynamicShapes, {}, {}, boolParams);
+        } else if (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) {
+            deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, {{"y", &fakeReshapedOutput}},
+                                             dynamicShapes, {}, {}, boolParams);
+        } else {
+            ErrorInFastLLM("MatMulTransB error: unsupport input's dataType.\n");
+        }
+
+        // alpha 缩放（BatchMatMul 无 alpha 属性，用 Muls 实现）
+        if (alpha != 1.0f) {
+            DynamicShapeDict mulShapes;
+            if (warmUpMode) {
+                std::vector<std::vector<int64_t>> attnRange = {{16, 128 * 32}, {1, 2048}, {1, 2048}};
+                mulShapes["x"] = std::make_pair(std::vector<int>({0, 1, 2}), attnRange);
+                mulShapes["y"] = std::make_pair(std::vector<int>({0, 1, 2}), attnRange);
+            }
+            deviceOk = CompileAndRunSingleOp("Muls", {{"x", &fakeReshapedOutput}}, {{"y", &fakeReshapedOutput}},
+                                             mulShapes, {{"value", alpha}}, {}, {});
         }
     }
 

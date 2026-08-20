@@ -66,6 +66,20 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class AscendMatMulOp : public BaseAscendOperator {
+    public:
+        AscendMatMulOp();
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class AscendMatMulTransBOp : public BaseAscendOperator {
+    public:
+        AscendMatMulTransBOp();
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class AscendSiluOp : public BaseAscendOperator {
     public:
         AscendSiluOp();
