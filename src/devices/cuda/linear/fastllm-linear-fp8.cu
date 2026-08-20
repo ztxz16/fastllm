@@ -1918,9 +1918,61 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
     const size_t perRow =
         m + ((m - 1) / 128 + 1) * sizeof(float);
-    LaunchFastllmGemmBF16FP8E4M3Block128(
-        cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
-        nullptr, n, m, k, perRow);
+    if (n >= 32) {
+        // The warp kernel below is tuned for GEMV-sized batches.  NUMA hybrid
+        // prefill deliberately keeps FP32 projection outputs for accuracy, so
+        // use the same dequantize-plus-GEMM strategy as the BF16-output path
+        // once enough rows are available to saturate cuBLAS.
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+
+        size_t workspaceBytes = 0;
+        bool ownScratch = false;
+        __nv_bfloat16 *cudaBF16Weight =
+            (__nv_bfloat16*)FastllmBorrowDequantScratch(
+                (size_t)k * m * sizeof(__nv_bfloat16),
+                &workspaceBytes, &ownScratch);
+        const size_t bytesPerRow =
+            (size_t)m * sizeof(__nv_bfloat16);
+        const int maxRowsPerChunk = (int)std::min<size_t>(
+            (size_t)k,
+            std::max<size_t>(1, workspaceBytes / bytesPerRow));
+        const size_t fp8BlockBytes = 128 + sizeof(float);
+        const int blocksPerRow = m / 128;
+
+        float alpha = exp2f(120.0f);
+        float beta = 0.0f;
+        for (int rowOffset = 0; rowOffset < k;
+             rowOffset += maxRowsPerChunk) {
+            int rows = std::min(maxRowsPerChunk, k - rowOffset);
+            FastllmCudaFP8E4M3BLOCK1282BF16Kernel
+                <<<rows * blocksPerRow, 128>>>(
+                    (uint8_t*)weight.cudaData +
+                        (size_t)rowOffset * blocksPerRow * fp8BlockBytes,
+                    cudaBF16Weight);
+            cublasStatus_t status = cublasGemmEx(
+                fastllmCublasHandle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                rows, n, m,
+                &alpha,
+                cudaBF16Weight, CUDA_R_16BF, m,
+                cudaInput, CUDA_R_16BF, m,
+                &beta,
+                cudaOutput + rowOffset, CUDA_R_32F, k,
+                CUBLAS_COMPUTE_32F,
+                static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                FastllmReleaseDequantScratch(
+                    cudaBF16Weight, ownScratch);
+                printf("Error: CUDA BF16 x packed FP8 FP32-output GEMM failed.\n");
+                throw("cublas error");
+            }
+        }
+        FastllmReleaseDequantScratch(cudaBF16Weight, ownScratch);
+    } else {
+        LaunchFastllmGemmBF16FP8E4M3Block128(
+            cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+            nullptr, n, m, k, perRow);
+    }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
