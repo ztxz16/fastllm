@@ -16,6 +16,8 @@
 
 namespace fastllm {
     namespace {
+        constexpr int kDefaultChunkedPrefillSize = 4096;
+
         int GetIntConfig(const WeightMap &weight, const std::string &name, int fallback) {
             auto it = weight.dicts.find(name);
             return it == weight.dicts.end() ? fallback : atoi(it->second.c_str());
@@ -92,7 +94,7 @@ namespace fastllm {
         this->model_type = "dots3_note";
         this->model_struct = "dots3_note";
         this->canDoBatchForward = false;
-        this->defaultChunkedPrefillSize = shortContextLimit;
+        this->defaultChunkedPrefillSize = kDefaultChunkedPrefillSize;
 
         this->pre_prompt = "";
         this->user_role = "";
@@ -199,8 +201,6 @@ namespace fastllm {
         max_positions = configuredMaxPositions;
         AssertInFastLLM(max_positions >= shortContextLimit,
                         "FastLLM Dots3-Note max positions must cover its sliding window.\n");
-        defaultChunkedPrefillSize = std::min(512, shortContextLimit);
-
         AssertInFastLLM(fullQKRopeHeadDim == swaQKRopeHeadDim,
                         "FastLLM Dots3-Note requires matching full/SWA RoPE dimensions.\n");
         rotary_dim = fullQKRopeHeadDim;

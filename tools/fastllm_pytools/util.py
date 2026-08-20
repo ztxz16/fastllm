@@ -760,12 +760,6 @@ def make_normal_llm_model(args, startup_progress = None):
             is_dots3_note_model = (
                 architecture == 'Dots3NoteForCausalLM' or
                 model_type == 'dots3_note')
-            if is_dots3_note_model:
-                # Keep long prompts in the numerically validated prefill
-                # shape. Full-attention KV grows with the context while SWA KV
-                # is compacted to a bounded tail by the model backend.
-                if args.chunked_prefill_size <= 0:
-                    args.chunked_prefill_size = 127
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
