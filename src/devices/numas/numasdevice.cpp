@@ -6903,6 +6903,33 @@ namespace fastllm {
                     int workerDevice = cudaInputReplicas[i].deviceId;
                     gpuThreads.emplace_back([&, i, workerDevice]() {
                         FastllmCudaSetDevice(workerDevice);
+                        // RegisterNumas converts source FP8 weights in place
+                        // to their packed representation.  Normalize CUDA
+                        // experts before their first hybrid-prefill use, so a
+                        // later one-token CPU decode cannot change the kernel
+                        // (and output) of an identical prefill.  Do this in
+                        // the existing GPU worker so its one-time packing is
+                        // overlapped with the disjoint CPU expert work.
+                        for (int e : gpuExpertSets[i]) {
+                            Data *gateUpWeight = weights[e * 2];
+                            Data *downWeight = weights[e * 2 + 1];
+                            if (gateUpWeight != nullptr &&
+                                gateUpWeight->dataType ==
+                                    DataType::FP8_E4M3 &&
+                                gateUpWeight->numasData.empty() &&
+                                gateUpWeight->cpuData != nullptr) {
+                                RegisterNumas(
+                                    gateUpWeight, "linearSwiglu");
+                            }
+                            if (downWeight != nullptr &&
+                                downWeight->dataType ==
+                                    DataType::FP8_E4M3 &&
+                                downWeight->numasData.empty() &&
+                                downWeight->cpuData != nullptr) {
+                                RegisterNumas(
+                                    downWeight, "linearColumn");
+                            }
+                        }
                         DoCudaMergeMOEFromCPU(
                             *gpuInputAliases[i], *gpuOutputPartials[i],
                             index, score, w1, w2, w3, weights, biass,

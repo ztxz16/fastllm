@@ -11189,8 +11189,8 @@ namespace {
     std::vector<uint16_t> RunNumasCudaFp8HybridMoeCase(
             std::vector<std::unique_ptr<MoeWeights> > &expertWeights,
             bool keepCudaInputMirror,
-            fastllm::DataDevice &mergeOutputDevice) {
-        constexpr int batch = 1024;
+            fastllm::DataDevice &mergeOutputDevice,
+            int batch = 1024) {
         constexpr int topk = 8;
         constexpr int inputDim = 5120;
         constexpr int outputDim = 5120;
@@ -11258,6 +11258,9 @@ namespace {
     }
 
     void RunNumasCudaFp8HybridMergeMoeRegression() {
+        // Pin the split before MoeEnvConfig is initialized so this dedicated
+        // regression always exercises the 30-route CUDA expert below.
+        setenv("FT_EXPERT_LIMIT", "28", 1);
         constexpr int expertCount = 17;
         constexpr int inputDim = 5120;
         constexpr int interDim = 1536;
@@ -11285,17 +11288,36 @@ namespace {
         // FT_EXPERT_LIMIT=28, expert 7 exercises the 30-row CUDA kernel,
         // expert 8 remains on CPU with ten routes, and all others use the
         // large-batch CUDA kernel.
+        fastllm::DataDevice hybridOutputDevice = fastllm::DataDevice::CPU;
+        std::vector<uint16_t> beforeDecode = RunNumasCudaFp8HybridMoeCase(
+            expertWeights, true, hybridOutputDevice);
+        Expect(hybridOutputDevice == fastllm::DataDevice::CUDA,
+               "generic FP8 hybrid prefill did not use CUDA.");
+
+        // The first seven experts have 1024 routes and expert 7 has 30, so
+        // all eight run on CUDA above.  A one-token NUMA decode selects those
+        // same experts.  It must not lazily change their FP8 representation
+        // and thereby change the next identical hybrid prefill.
+        fastllm::DataDevice decodeOutputDevice = fastllm::DataDevice::CUDA;
+        RunNumasCudaFp8HybridMoeCase(
+            expertWeights, false, decodeOutputDevice, 1);
+        Expect(decodeOutputDevice == fastllm::DataDevice::CPU,
+               "generic FP8 decode unexpectedly used CUDA.");
+
+        fastllm::DataDevice repeatedOutputDevice = fastllm::DataDevice::CPU;
+        std::vector<uint16_t> afterDecode = RunNumasCudaFp8HybridMoeCase(
+            expertWeights, true, repeatedOutputDevice);
+        Expect(repeatedOutputDevice == fastllm::DataDevice::CUDA,
+               "repeated generic FP8 hybrid prefill did not use CUDA.");
+        Expect(beforeDecode == afterDecode,
+               "generic FP8 hybrid prefill changed after a one-token NUMA decode.");
+
         fastllm::DataDevice cpuOutputDevice = fastllm::DataDevice::CUDA;
         std::vector<uint16_t> expected = RunNumasCudaFp8HybridMoeCase(
             expertWeights, false, cpuOutputDevice);
         Expect(cpuOutputDevice == fastllm::DataDevice::CPU,
                "generic FP8 hybrid reference unexpectedly used CUDA.");
-
-        fastllm::DataDevice hybridOutputDevice = fastllm::DataDevice::CPU;
-        std::vector<uint16_t> actual = RunNumasCudaFp8HybridMoeCase(
-            expertWeights, true, hybridOutputDevice);
-        Expect(hybridOutputDevice == fastllm::DataDevice::CUDA,
-               "generic FP8 hybrid prefill did not use CUDA.");
+        const std::vector<uint16_t> &actual = afterDecode;
 
         double absoluteError = 0.0;
         double squaredError = 0.0;
