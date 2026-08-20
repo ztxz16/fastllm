@@ -143,6 +143,12 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class AscendAttentionMaskOp : public BaseAscendOperator {
+    public:
+        AscendAttentionMaskOp();
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class AscendLayerNormOp : public BaseAscendOperator {
     public:
         AscendLayerNormOp();

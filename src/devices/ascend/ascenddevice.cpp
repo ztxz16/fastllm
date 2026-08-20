@@ -25,6 +25,7 @@ namespace fastllm {
         this->ops["MulTo"] = new AscendMulToOp();
         this->ops["Swiglu"] = new AscendSwigluOp();
         this->ops["AddTo"] = new AscendAddToOp();
+        this->ops["AttentionMask"] = new AscendAttentionMaskOp();
         this->ops["PermuteSelf"] = new AscendPermuteSelfOp();
     }
 
@@ -737,6 +738,102 @@ namespace fastllm {
         dynamicShapes["x2"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
         dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
         deviceOk = CompileAndRunSingleOp(this->name, {{"x1", &input0}, {"x2", &input1}}, {{"y", &input0}}, dynamicShapes, floatParams, {}, {});
+    }
+
+    AscendAttentionMaskOp::AscendAttentionMaskOp() :
+        BaseAscendOperator("") {}
+
+    void AscendAttentionMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &mask = *(datas.find("mask")->second);
+        float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -1e7f;
+
+        AssertInFastLLM(mask.dataType == DataType::FLOAT32 || mask.dataType == input.dataType, "AttentionMask: mask's datatype should be float32.");
+        /* mask float32 - bool */
+        Data fakeMask(mask.dataType, mask.dims);
+        fakeMask.strides = mask.strides;
+        fakeMask.FakeFrom(mask, 0);
+        fakeMask.Reshape({mask.dims[0], -1, mask.dims.back()});
+        std::vector<aclTensorDesc *> inputTensors;
+        std::vector<aclDataBuffer *> inputBuffers;
+        npu::FastllmAclToTensor(std::make_pair("x", &fakeMask), inputTensors, inputBuffers);
+
+        Data fakeBoolMask(DataType::INT8, fakeMask.dims);
+        fakeBoolMask.ToDevice(mask.dataDevice);
+        fakeBoolMask.Allocate();
+        std::vector<aclTensorDesc *> castOutputTensors;
+        std::vector<aclDataBuffer *> castOutputBuffers;
+        npu::FastllmAclMakeTensor("y", aclDataType::ACL_BOOL, fakeBoolMask.deviceData, fakeBoolMask.dims,
+                 castOutputTensors, castOutputBuffers);
+
+        aclopAttr *castAttr;
+        npu::FastllmAclToOpAttribute({}, {{"dst_type", aclDataType::ACL_BOOL}}, {}, &castAttr);
+        if (warmUpMode) {
+            std::vector<aclTensorDesc *> inputTensorsForCompile;
+            std::vector<aclTensorDesc *> castOutputTensorsForCompile;
+            std::vector<int> maskDims({0, 1, 2});
+            std::vector<std::vector<int64_t>> maskRanges({{1, 128}, {1, 2048}, {1, 2048}});
+            npu::FastllmAclCreateShape(std::make_pair("x", &fakeMask), inputTensorsForCompile, maskDims, maskRanges);
+            npu::FastllmAclAddShape("y", aclDataType::ACL_BOOL, fakeBoolMask.dims, castOutputTensorsForCompile, maskDims, maskRanges);
+            npu::FastllmAclInitOp("Cast", inputTensorsForCompile, castOutputTensorsForCompile, castAttr);
+            npu::FastllmAclDestroyShape(inputTensorsForCompile);
+            npu::FastllmAclDestroyShape(castOutputTensorsForCompile);
+        }
+        deviceOk = npu::FastllmAclExecuteAfterInit("Cast", inputTensors, inputBuffers,
+                castOutputTensors, castOutputBuffers, castAttr);
+        npu::FastllmAclDestoryTensors(inputTensors, inputBuffers, castOutputTensors, castOutputBuffers, &castAttr);
+
+        Data fakeInput(input.dataType, input.dims);
+        fakeInput.strides = input.strides;
+        fakeInput.FakeFrom(input, 0);
+        fakeMask.Reshape({fakeMask.dims[0], 1, -1, fakeMask.dims.back()});
+        fakeInput.Reshape({input.dims[0], -1, fakeMask.dims[2], input.dims.back()});
+
+        Data fakeMaskValue(input.dataType, {1, 1, 1, 1});
+        fakeMaskValue.Allocate();
+        if (input.dataType == DataType::FLOAT32) {
+            ((float *)fakeMaskValue.cpuData)[0] = maskValue;
+        } else if (input.dataType == DataType::FLOAT16) {
+            ((uint16_t *)fakeMaskValue.cpuData)[0] = float_to_half(maskValue);
+        }
+        fakeMaskValue.ToDevice(fakeInput.dataDevice);
+        Data fakeOutput(input.dataType, input.dims);
+        fakeOutput.ToDevice(input.dataDevice);
+        fakeOutput.Allocate();
+
+        // Where mask > 0.99
+        std::vector<aclTensorDesc *> selectInputTensors;
+        std::vector<aclDataBuffer *> selectInputBuffers;
+        npu::FastllmAclMakeTensor("condition", aclDataType::ACL_BOOL, fakeBoolMask.deviceData, fakeMask.dims,
+                 selectInputTensors, selectInputBuffers);
+        npu::FastllmAclToTensor(std::make_pair("then", &fakeMaskValue), selectInputTensors, selectInputBuffers);
+        npu::FastllmAclToTensor(std::make_pair("else", &fakeInput), selectInputTensors, selectInputBuffers);
+        std::vector<aclTensorDesc *> outputTensors;
+        std::vector<aclDataBuffer *> outputBuffers;
+        npu::FastllmAclToTensor(std::make_pair("result", &fakeOutput), outputTensors, outputBuffers);
+        aclopAttr *selectAttr;
+        npu::FastllmAclToOpAttribute({}, IntDict(), {}, &selectAttr);
+
+        if (warmUpMode) {
+            std::vector<aclTensorDesc *> selectInputTensorsForCompile;
+            std::vector<aclTensorDesc *> outputTensorsForCompile;
+            std::vector<int> attentionDims({0, 2, 3});
+            std::vector<std::vector<int64_t>> maskRanges({{1, 128}, {1, 2048}, {1, 2048}});
+            npu::FastllmAclAddShape("condition", aclDataType::ACL_BOOL, fakeMask.dims, selectInputTensorsForCompile, attentionDims, maskRanges);
+            npu::FastllmAclCreateShape(std::make_pair("then", &fakeMaskValue), selectInputTensorsForCompile, attentionDims, maskRanges);
+            npu::FastllmAclCreateShape(std::make_pair("else", &fakeInput), selectInputTensorsForCompile, attentionDims, maskRanges);
+            npu::FastllmAclCreateShape(std::make_pair("result", &fakeOutput), outputTensorsForCompile, attentionDims, maskRanges);
+            npu::FastllmAclInitOp("SelectV2", selectInputTensorsForCompile, outputTensorsForCompile, selectAttr);
+            npu::FastllmAclDestroyShape(selectInputTensorsForCompile);
+            npu::FastllmAclDestroyShape(outputTensorsForCompile);
+        }
+        deviceOk = npu::FastllmAclExecuteAfterInit("SelectV2", selectInputTensors, selectInputBuffers,
+                outputTensors, outputBuffers, selectAttr);
+        if (deviceOk) {
+            npu::FastllmAclCopyFromDeviceToDevice(input.deviceData, fakeOutput.deviceData, input.GetBytes());
+        }
+        npu::FastllmAclDestoryTensors(selectInputTensors, selectInputBuffers, outputTensors, outputBuffers, &selectAttr);
     }
 
     AscendLayerNormOp::AscendLayerNormOp() :

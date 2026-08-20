@@ -40,7 +40,19 @@ namespace fastllm {
                                 std::vector<aclDataBuffer *> &buffers);
 
         /**
-         * 将张量转换为Ascend CL张量信息
+         * 临时创建Ascend CL张量信息
+         * @param[in] name 张量名称
+         * @param[in] type 张量类型
+         * @param[in] data 张量数据地址
+         * @param[in] dimensions 维度
+         * @param[out] tensors Ascend CL张量shape定义
+         * @param[out] buffers Ascend CL张量内存地址
+         */
+        void FastllmAclMakeTensor(const std::string name, const aclDataType type, const void* data,
+                                  std::vector <int> &dimensions, std::vector<aclTensorDesc *> &tensors, std::vector<aclDataBuffer *> &buffers);
+
+        /**
+         * 将张量转换为Ascend CL张量信息，设置shape的动态范围
          * @param[in] datas fastllm 张量对
          * @param[out] tensors Ascend CL张量shape定义
          * @param[in] dynamicDimension 设置为动态的维度
@@ -49,6 +61,15 @@ namespace fastllm {
         void FastllmAclCreateShape(const std::pair<std::string, Data*> &data, std::vector<aclTensorDesc *> &tensors,
                                    std::vector<int> dynamicDimension = {}, std::vector<std::vector<int64_t>> dynamicRange = {});
 
+        /**
+         * 临时创建Ascend CL张量信息，设置shape的动态范围
+         * @param[in] tensor Ascend CL张量
+         * @param[in] dimensions 维度
+         * @param[in] dynamicDimension 设置为动态的维度
+         * @param[in] dynamicRange 各维度对应的动态的范围
+         */
+        void FastllmAclAddShape(const std::string name, aclDataType type, std::vector<int> dimensions, std::vector<aclTensorDesc *> &tensors,
+                                std::vector<int> dynamicDimension, std::vector<std::vector<int64_t>> dynamicRange);
 
         /**
          * 将算子属性转换为Ascend CL算子属性信息

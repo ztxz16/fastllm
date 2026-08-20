@@ -455,6 +455,22 @@ void FastllmAclToTensor(const std::pair<std::string, Data*> &data, std::vector<a
     buffers.emplace_back(buffer);
 }
 
+void FastllmAclMakeTensor(const std::string name, const aclDataType type, const void* data,
+                          std::vector <int> &dimensions, std::vector<aclTensorDesc *> &tensors, std::vector<aclDataBuffer *> &buffers) {
+    std::vector<int64_t> expandDims64(dimensions.size(), 0);
+    for (int i = 0; i < dimensions.size(); i++) {
+        expandDims64[i] = (int64_t) dimensions[i];
+    }
+    aclTensorDesc* tensor = aclCreateTensorDesc(type, expandDims64.size(),
+                                                expandDims64.data(), aclFormat::ACL_FORMAT_ND);
+    aclSetTensorDescName(tensor, name.c_str());
+    tensors.emplace_back(tensor);
+    size_t size = aclGetTensorDescSize(tensor);
+    // printf(" %ld\n", size);
+    aclDataBuffer* buffer = aclCreateDataBuffer((void *)data, size);
+    buffers.emplace_back(buffer);
+}
+
 void FastllmAclCreateShape(const std::pair<std::string, Data*> &data, std::vector<aclTensorDesc *> &tensors,
                            std::vector<int> dynamicDimension, std::vector<std::vector<int64_t>> dynamicRange) {
     std::vector<int> *dimensions = &data.second->dims;
@@ -487,6 +503,33 @@ void FastllmAclCreateShape(const std::pair<std::string, Data*> &data, std::vecto
         delete[] range_info;
     }
     tensors.emplace_back(tensor);
+}
+
+void FastllmAclAddShape(const std::string name, aclDataType type, std::vector<int> dimensions, std::vector<aclTensorDesc *> &tensors,
+                        std::vector<int> dynamicDimension, std::vector<std::vector<int64_t>> dynamicRange) {
+    std::vector<int64_t> expandDims64(dimensions.size(), 0);
+    int64_t (* range_info)[ACL_TENSOR_SHAPE_RANGE_NUM] = new int64_t[dimensions.size()][ACL_TENSOR_SHAPE_RANGE_NUM];
+    int range_pos = 0;
+    for (int i = 0; i < dimensions.size(); i++) {
+        if (range_pos < dynamicDimension.size() && i == dynamicDimension[range_pos]) {
+            expandDims64[i] = -1L;
+            range_info[i][0] = dynamicRange[range_pos][0], range_info[i][1] = dynamicRange[range_pos][1];
+            ++range_pos;
+        } else {
+            expandDims64[i] = (int64_t) dimensions[i];
+            range_info[i][0] = range_info[i][1] = expandDims64[i];
+        }
+    }
+    aclTensorDesc* newTensor = aclCreateTensorDesc(type, expandDims64.size(),
+                                                   expandDims64.data(), aclFormat::ACL_FORMAT_ND);
+    aclSetTensorDescName(newTensor, name.c_str());
+    if (dynamicDimension.size() > 0) {
+        aclError state = aclSetTensorShapeRange(newTensor, dimensions.size(), range_info);
+        checkAclError("Error: AscendCL tensor dynamic shape setting error. ", state);
+    } else {
+        delete[] range_info;
+    }
+    tensors.emplace_back(newTensor);
 }
 
 void FastllmAclToOpAttribute(const FloatDict &floatParams, const IntDict &intParams,
