@@ -1,0 +1,7 @@
+[
+    {
+        "key": "^dflash\\..*\\.weight$",
+        "dtype": "int4_group32",
+        "comment": "Quantize DFlash linear weights to compact symmetric group-32 INT4 so the target and draft models fit on one GPU."
+    }
+]

@@ -1436,6 +1436,68 @@ namespace fastllm {
             for (int i = 0; i < len; i++) {
                 a[i] = ((uint32_t*)&b[i])[0] >> 16;
             }
+        } else if ((oriDataType == DataType::FLOAT32 ||
+                    oriDataType == DataType::BFLOAT16) &&
+                   dataType == DataType::INT4_GROUP32) {
+            AssertInFastLLM(
+                data.dims.size() == 2 && data.dims[0] > 0 &&
+                    data.dims[1] > 0 && data.dims[1] % 32 == 0,
+                "INT4_GROUP32 quantization requires a 2D weight with columns divisible by 32.\n");
+            const int rows = data.dims[0];
+            const int columns = data.dims[1];
+            const int groups = columns / 32;
+            const size_t rowBytes = GetDataBytes(
+                DataType::INT4_GROUP32, 1, columns);
+            const float *floatSource = oriDataType == DataType::FLOAT32
+                ? (const float*)oriData : nullptr;
+            const uint16_t *bf16Source = oriDataType == DataType::BFLOAT16
+                ? (const uint16_t*)oriData : nullptr;
+            auto sourceValue = [&](size_t index) {
+                return floatSource != nullptr
+                    ? floatSource[index]
+                    : bf16tofp32.dict[bf16Source[index]];
+            };
+            auto quantize = [](float value, float scale) {
+                if (scale == 0.0f) {
+                    return 8;
+                }
+                return std::max(
+                    0, std::min(15, (int)std::lround(value / scale) + 8));
+            };
+
+            for (int row = 0; row < rows; row++) {
+                uint8_t *destinationRow =
+                    data.cpuData + (size_t)row * rowBytes;
+                for (int group = 0; group < groups; group++) {
+                    const size_t sourceOffset =
+                        (size_t)row * columns + (size_t)group * 32;
+                    float absMax = 0.0f;
+                    for (int column = 0; column < 32; column++) {
+                        absMax = std::max(
+                            absMax,
+                            std::fabs(sourceValue(sourceOffset + column)));
+                    }
+                    const uint16_t scaleBits = Float32ToBFloat16RNEBits(
+                        absMax == 0.0f ? 0.0f : absMax / 7.0f);
+                    memcpy(destinationRow +
+                               GetInt4Group32ScaleOffset(group, groups),
+                           &scaleBits, sizeof(scaleBits));
+                    const float scale = BFloat16BitsToFloat32(scaleBits);
+                    uint8_t *packed = destinationRow +
+                        GetInt4Group32DataOffset(group, groups);
+                    for (int column = 0; column < 32; column += 2) {
+                        const int high = quantize(
+                            sourceValue(sourceOffset + column), scale);
+                        const int low = quantize(
+                            sourceValue(sourceOffset + column + 1), scale);
+                        packed[column / 2] =
+                            (uint8_t)((high << 4) | low);
+                    }
+                }
+            }
+            data.perChannelAxis = 0;
+            data.groupCnt = 32;
+            data.group = groups;
         } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16)
                 && dataType == DataType::INT4_GROUP) {
             int bit = (dataType == DataType::INT4_GROUP) ? 4 : 8;

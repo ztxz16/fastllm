@@ -3506,6 +3506,22 @@ namespace fastllm {
             printf("[Fastllm] Qwen3.5 AWQ ARM CPU: load MoE expert weights as INT8 for stable inference.\n");
         }
 
+        auto canApplyDtypeRule = [&](const std::string &weightName,
+                                     DataType dataType) {
+            if (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) {
+                return true;
+            }
+            // Qwen3.5 maps external DFlash matrices to BF16 explicitly so
+            // the target model's FP8 --dtype does not silently change the
+            // draft.  Still let an explicit dtype_config override registered
+            // DFlash linear weights, which is useful when both models must fit
+            // on a single GPU.
+            return dataType == DataType::BFLOAT16 &&
+                   weightName.rfind("dflash.", 0) == 0 &&
+                   model->weight.linearNames.find(weightName) !=
+                       model->weight.linearNames.end();
+        };
+
         std::vector <std::pair <std::string, std::string> > dtypeRules;
         if (dtypeConfigString.size() > 0) {
             auto dtypeConfig = json11::Json::parse(dtypeConfigString, error);
@@ -3551,7 +3567,8 @@ namespace fastllm {
                 allWeightNames.insert(weightName);
                 auto dataType = it.second;
                 int ggmlType = -1;
-                if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
+                if (canApplyDtypeRule(weightName, dataType) &&
+                    dtypeRules.size() > 0) {
                     int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
 
@@ -3753,7 +3770,8 @@ namespace fastllm {
                                     ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
                                     : groupCnt;
 
-                            if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
+                            if (canApplyDtypeRule(weightName, dataType) &&
+                                dtypeRules.size() > 0) {
                                 ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
 /*
                                 printf("weight \"%s\" -> %s", weightName.c_str(), dataTypeNames[dataType][0].c_str());
@@ -3782,7 +3800,8 @@ namespace fastllm {
                             }
                             if (tensor.dtype == "BF16" &&
                                 (dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16 ||
-                                    dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
+                                    dataType == DataType::INT8 || dataType == DataType::INT4_GROUP ||
+                                    dataType == DataType::INT4_GROUP32 || dataType == DataType::INT4_NOZERO)) {
                                 oriDataType = DataType::BFLOAT16;
                             }
                             if (tensor.dtype == "F16" && 
@@ -4513,7 +4532,9 @@ namespace fastllm {
                                 oriDataType = DataType::INT32PARAM;
                             }
                             if (tensor.dtype == "BF16" &&
-                                (dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
+                                (dataType == DataType::FLOAT16 || dataType == DataType::INT8 ||
+                                 dataType == DataType::INT4_GROUP || dataType == DataType::INT4_GROUP32 ||
+                                 dataType == DataType::INT4_NOZERO)) {
                                 oriDataType = DataType::BFLOAT16;
                             }
                             if (tensor.dtype == "F16" && 

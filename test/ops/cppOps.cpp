@@ -194,44 +194,29 @@ namespace {
             if (in % groupCnt != 0) {
                 throw std::runtime_error("int4group32 input features must be divisible by 32");
             }
+            std::string sourceType = params.Has("weight_source_type")
+                ? params.GetString("weight_source_type") : "float32";
+            fastllm::DataType sourceDataType = fastllm::DataType::FLOAT32;
+            uint8_t *sourceData = fp32Weight.cpuData;
+            std::vector<uint16_t> bf16Weight;
+            if (sourceType == "bfloat16") {
+                const int elements = out * in;
+                const float *source = (const float*)fp32Weight.cpuData;
+                bf16Weight.resize(elements);
+                for (int i = 0; i < elements; i++) {
+                    bf16Weight[i] = fastllm::Float32ToBFloat16RNEBits(source[i]);
+                }
+                sourceDataType = fastllm::DataType::BFLOAT16;
+                sourceData = (uint8_t*)bf16Weight.data();
+            } else if (sourceType != "float32") {
+                throw std::runtime_error(
+                    "int4group32 weight_source_type must be float32 or bfloat16");
+            }
             weight.dataType = fastllm::DataType::INT4_GROUP32;
             weight.Resize({out, in});
-            weight.Allocate(true);
-            const int groups = in / groupCnt;
-            const size_t rowBytes = fastllm::GetDataBytes(
-                fastllm::DataType::INT4_GROUP32, 1, in);
-            const float *source = (const float*)fp32Weight.cpuData;
-            for (int row = 0; row < out; row++) {
-                uint8_t *rowData = weight.cpuData + (size_t)row * rowBytes;
-                for (int group = 0; group < groups; group++) {
-                    const float *sourceBlock = source +
-                        (size_t)row * in + group * groupCnt;
-                    float absMax = 0.0f;
-                    for (int column = 0; column < groupCnt; column++) {
-                        absMax = std::max(absMax, std::fabs(sourceBlock[column]));
-                    }
-                    uint8_t *block = rowData +
-                        fastllm::GetInt4Group32DataOffset(group, groups);
-                    const uint16_t scaleBits = fastllm::Float32ToBFloat16RNEBits(
-                        absMax == 0.0f ? 0.0f : absMax / 7.0f);
-                    std::memcpy(rowData +
-                                    fastllm::GetInt4Group32ScaleOffset(group, groups),
-                                &scaleBits, sizeof(scaleBits));
-                    const float scale = fastllm::BFloat16BitsToFloat32(scaleBits);
-                    for (int column = 0; column < groupCnt; column += 2) {
-                        auto quantize = [scale](float value) {
-                            if (scale == 0.0f) {
-                                return 8;
-                            }
-                            return std::max(0, std::min(15,
-                                (int)std::lround(value / scale) + 8));
-                        };
-                        const int high = quantize(sourceBlock[column]);
-                        const int low = quantize(sourceBlock[column + 1]);
-                        block[column / 2] = (uint8_t)((high << 4) | low);
-                    }
-                }
-            }
+            weight.CreateFromOriData(
+                fastllm::WeightType::LINEAR, sourceDataType,
+                sourceData, nullptr, nullptr, groupCnt);
             return;
         }
         throw std::runtime_error("unsupported linear weight_type: " + weightType);
@@ -1201,6 +1186,7 @@ namespace {
                 params.Add("in", "8", "input features");
                 params.Add("out", "6", "output features");
                 params.Add("weight_type", "float32", "weight datatype: float32, int4group, or int4group32");
+                params.Add("weight_source_type", "float32", "source datatype for int4group32: float32 or bfloat16");
                 params.Add("group_cnt", "128", "group size used by int4group quantization");
                 return params;
             },
