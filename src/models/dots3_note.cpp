@@ -17,6 +17,12 @@
 namespace fastllm {
     namespace {
         constexpr int kDefaultChunkedPrefillSize = 4096;
+#ifdef USE_CUDA
+        constexpr long long kLongKvFreeReserveBytes =
+            7LL * 1024LL * 1024LL * 1024LL;
+        constexpr long long kLongKvResidentBudgetBytes =
+            3LL * 1024LL * 1024LL * 1024LL;
+#endif
 
         int GetIntConfig(const WeightMap &weight, const std::string &name, int fallback) {
             auto it = weight.dicts.find(name);
@@ -53,6 +59,22 @@ namespace fastllm {
                    std::strcmp(value, "false") != 0 &&
                    std::strcmp(value, "off") != 0;
         }
+
+#ifdef USE_CUDA
+        long long GetMegabytesEnv(const char *name,
+                                  long long fallbackBytes) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == '\0') {
+                return fallbackBytes;
+            }
+            char *end = nullptr;
+            long long megabytes = std::strtoll(value, &end, 10);
+            if (end == value || *end != '\0' || megabytes < 0) {
+                return fallbackBytes;
+            }
+            return megabytes * 1024LL * 1024LL;
+        }
+#endif
 
         double ProfileNowMs() {
             using Clock = std::chrono::steady_clock;
@@ -398,6 +420,7 @@ namespace fastllm {
         InitMoeWeightViews();
         bool rotateLongFullKvCache = false;
         bool parkFreshSlidingCaches = false;
+        std::vector<uint8_t> keepFullKvOnCuda;
 #ifdef USE_CUDA
         bool fullKvIsCuda = !pastKeyValues.empty() &&
             pastKeyValues[0].first.dataDevice == DataDevice::CUDA &&
@@ -464,20 +487,110 @@ namespace fastllm {
         }
 #ifdef USE_CUDA
         if (rotateLongFullKvCache) {
-            // Full-attention KV dominates the 16K footprint (1.25 GiB per
-            // layer in BF16). Only the active layer consumes its cache, so
-            // stage the 12 caches through NUMA memory for prefill appends past
-            // 8K instead of keeping all of them resident at once. At 16K this
-            // also applies to decode, whose one-token cache growth can
-            // otherwise duplicate a 1.25 GiB full-attention layer near the
-            // limit. Shorter decode keeps its existing all-GPU fast path.
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                if (IsFullAttentionLayer(layer)) {
-                    pastKeyValues[layer].first.ToDevice(DataDevice::CPU);
-                    pastKeyValues[layer].second.ToDevice(DataDevice::CPU);
+            keepFullKvOnCuda.assign(block_cnt, 0);
+            const long long freeReserveBytes = GetMegabytesEnv(
+                "FASTLLM_DOTS3_NOTE_KV_FREE_RESERVE_MB",
+                kLongKvFreeReserveBytes);
+            const long long residentBudgetBytes = GetMegabytesEnv(
+                "FASTLLM_DOTS3_NOTE_KV_GPU_BUDGET_MB",
+                kLongKvResidentBudgetBytes);
+
+            // Keep a small suffix resident across chunks. Its projected size
+            // includes the current append, so the budget remains bounded as
+            // context grows.
+            auto projectedBytesAfterAppend = [&](const Data &cache) {
+                uint64_t bytes = cache.expansionBytes;
+                if (bytes == 0 || cache.dims.size() <= 1 ||
+                    cache.expansionDims.size() <= 1 ||
+                    cache.expansionDims[1] <= 0) {
+                    return bytes;
+                }
+                int capacity = cache.expansionDims[1];
+                int target = cache.dims[1] + seqlen;
+                int appendBlock = ((seqlen - 1) / 128 + 1) * 128;
+                int projectedCapacity = capacity;
+                while (projectedCapacity < target) {
+                    projectedCapacity += appendBlock;
+                }
+                return bytes * (uint64_t)projectedCapacity /
+                       (uint64_t)capacity;
+            };
+            uint64_t residentBytes = 0;
+            int residentLayers = 0;
+            for (int layer = block_cnt - 1; layer >= 0; --layer) {
+                if (!IsFullAttentionLayer(layer)) {
+                    continue;
+                }
+                uint64_t projectedBytes =
+                    projectedBytesAfterAppend(
+                        pastKeyValues[layer].first) +
+                    projectedBytesAfterAppend(
+                        pastKeyValues[layer].second);
+                if (projectedBytes <=
+                    (uint64_t)std::max(
+                        0LL, residentBudgetBytes -
+                        (long long)residentBytes)) {
+                    keepFullKvOnCuda[layer] = 1;
+                    residentBytes += projectedBytes;
+                    residentLayers++;
+                } else {
+                    break;
+                }
+            }
+
+            // Full-attention KV dominates the 24 GiB footprint. Previously
+            // all 13 caches were evicted once the context reached 8K, even
+            // though only part of that space is needed by the active layer.
+            // Release idle pool blocks first, then spill a suffix only until
+            // there is enough headroom for cache growth and attention scratch.
+            FastllmCudaClearBigBuffer();
+            long long freeBefore = FastllmCudaGetFreeSize();
+            uint64_t stagedBytes = 0;
+            int stagedLayers = 0;
+            {
+                ScopedExecutorProfiler kvSpillProfile(
+                    "Dots3NoteKvInitialSpill");
+                for (int layer = block_cnt - 1;
+                     layer >= 0 &&
+                     freeBefore + (long long)stagedBytes < freeReserveBytes;
+                     --layer) {
+                    if (!IsFullAttentionLayer(layer)) {
+                        continue;
+                    }
+                    Data &pastKey = pastKeyValues[layer].first;
+                    Data &pastValue = pastKeyValues[layer].second;
+                    bool keyOnCuda =
+                        pastKey.dataDevice == DataDevice::CUDA &&
+                        pastKey.cudaData != nullptr;
+                    bool valueOnCuda =
+                        pastValue.dataDevice == DataDevice::CUDA &&
+                        pastValue.cudaData != nullptr;
+                    if (!keyOnCuda && !valueOnCuda) {
+                        continue;
+                    }
+                    if (keyOnCuda) {
+                        stagedBytes += pastKey.expansionBytes;
+                        pastKey.ToDevice(DataDevice::CPU);
+                    }
+                    if (valueOnCuda) {
+                        stagedBytes += pastValue.expansionBytes;
+                        pastValue.ToDevice(DataDevice::CPU);
+                    }
+                    stagedLayers++;
                 }
             }
             FastllmCudaClearBigBuffer();
+            if (HistoryCacheDebugEnabled()) {
+                fprintf(stderr,
+                        "[dots-history] initial_spill layers=%d bytes_mb=%llu "
+                        "resident_layers=%d resident_budget_mb=%lld "
+                        "reserve_mb=%lld free_before_mb=%lld free_after_mb=%lld\n",
+                        stagedLayers,
+                        (unsigned long long)(stagedBytes >> 20),
+                        residentLayers, residentBudgetBytes >> 20,
+                        freeReserveBytes >> 20, freeBefore >> 20,
+                        FastllmCudaGetFreeSize() >> 20);
+            }
         }
 #endif
 
@@ -741,6 +854,8 @@ namespace fastllm {
                     appendIndexer(cache.keys, indexKFp8);
                     appendIndexer(cache.scales, indexKScales);
                     if (sequencePastLen + seqlen > indexTopK) {
+                        ScopedExecutorProfiler indexerProfile(
+                            "Dots3NoteIndexerTopK");
                         AssertInFastLLM(
                             FastllmCudaDots3NoteIndexerTopK(
                                 indexQFp8, indexFoldedWeights,
@@ -770,8 +885,19 @@ namespace fastllm {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
             } else {
-                pastKey.ToDevice(attenInput.dataDevice);
-                pastValue.ToDevice(attenInput.dataDevice);
+                bool needsKvStageIn = rotateLongFullKvCache &&
+                    fullAttention &&
+                    (pastKey.dataDevice != attenInput.dataDevice ||
+                     pastValue.dataDevice != attenInput.dataDevice);
+                if (needsKvStageIn) {
+                    ScopedExecutorProfiler kvStageInProfile(
+                        "Dots3NoteKvStageIn");
+                    pastKey.ToDevice(attenInput.dataDevice);
+                    pastValue.ToDevice(attenInput.dataDevice);
+                } else {
+                    pastKey.ToDevice(attenInput.dataDevice);
+                    pastValue.ToDevice(attenInput.dataDevice);
+                }
             }
 
             bool directFreshFullPrefill = false;
@@ -1101,13 +1227,17 @@ namespace fastllm {
                 MatMul(attentionProb, pastValue, attentionOutput);
             }
 
-            if (rotateLongFullKvCache && fullAttention) {
+            if (rotateLongFullKvCache && fullAttention &&
+                !keepFullKvOnCuda[layer]) {
                 // The blocking D2H copies also order after the attention
-                // kernels that consumed these buffers. Keep the resulting
-                // CUDA allocations in the pool: the next full layer has the
-                // same old/new cache sizes and can reuse them exactly.
-                pastKey.ToDevice(DataDevice::CPU);
-                pastValue.ToDevice(DataDevice::CPU);
+                // kernels that consumed these buffers. Release the active
+                // CUDA storage only after its host copy is complete.
+                {
+                    ScopedExecutorProfiler kvStageOutProfile(
+                        "Dots3NoteKvStageOut");
+                    pastKey.ToDevice(DataDevice::CPU);
+                    pastValue.ToDevice(DataDevice::CPU);
+                }
             }
 
             if (!fullAttention) {
