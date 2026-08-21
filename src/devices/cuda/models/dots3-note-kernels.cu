@@ -22,9 +22,15 @@ constexpr int kIndexerCandidateK = 2304;
 constexpr int kIndexerDefaultQueryChunk = 256;
 constexpr int kIndexerKeysPerBlock = 8;
 constexpr int kIndexerCandidateKeysPerBlock = 16;
+constexpr size_t kIndexerHeadScoreLimit =
+    1ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr int kAttentionHeads = 128;
 constexpr int kAttentionQkDim = 192;
 constexpr int kAttentionVDim = 128;
+constexpr size_t kSparsePrefillScratchLimit =
+    128ULL * 1024ULL * 1024ULL;
+constexpr size_t kSlidingPrefillScratchLimit =
+    64ULL * 1024ULL * 1024ULL;
 
 bool PrepareOutput(fastllm::Data &output, fastllm::DataType type,
                    const std::vector<int> &dims) {
@@ -1082,53 +1088,26 @@ bool FastllmCudaDots3NoteIndexerTopK(
     }
     int queryChunk = std::min(
         seqlen, std::min(kIndexerDefaultQueryChunk, maxRowsPerChunk));
-    bool queryChunkConfigured = false;
-    if (const char *env = std::getenv(
-            "FASTLLM_DOTS3_NOTE_INDEXER_QUERY_CHUNK")) {
-        char *end = nullptr;
-        long configured = std::strtol(env, &end, 10);
-        if (end != env && configured > 0) {
-            queryChunkConfigured = true;
-            queryChunk = std::min(
-                seqlen,
-                std::min(maxRowsPerChunk,
-                         (int)std::min(configured, (long)INT_MAX)));
-        }
-    }
     int scalarQueryChunk = queryChunk;
     useTensorCore = useTensorCore && seqlen >= 16 &&
                     seqlen % 16 == 0 && startPos % 16 == 0 &&
                     totalLen % 16 == 0 &&
                     totalLen >= 8192;
     if (useTensorCore) {
-        constexpr size_t headScoreLimit =
-            1ULL * 1024ULL * 1024ULL * 1024ULL;
         size_t headScoreBytesPerQuery =
             (size_t)totalLen * kIndexerHeads * sizeof(float);
         int tensorDefaultChunk = (int)std::min<size_t>(
             512, std::max<size_t>(
-                     16, headScoreLimit / headScoreBytesPerQuery));
+                     16,
+                     kIndexerHeadScoreLimit / headScoreBytesPerQuery));
         tensorDefaultChunk = tensorDefaultChunk / 16 * 16;
-        queryChunk = queryChunkConfigured
-            ? std::min(queryChunk, tensorDefaultChunk)
-            : std::min(seqlen, tensorDefaultChunk);
-        if (const char *env = std::getenv(
-                "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_QUERY_CHUNK")) {
-            char *end = nullptr;
-            long configured = std::strtol(env, &end, 10);
-            if (end != env && configured > 0) {
-                queryChunk = std::min(
-                    seqlen,
-                    std::min(maxRowsPerChunk,
-                             (int)std::min(configured, (long)INT_MAX)));
-            }
-        }
+        queryChunk = std::min(seqlen, tensorDefaultChunk);
         queryChunk = std::max(16, queryChunk / 16 * 16);
     }
     size_t bytesPerQuery = (size_t)totalLen * sizeof(float) *
         (useTensorCore ? kIndexerHeads + 1 : 1);
-    // Treat the configured chunk as an upper bound. Late transformer layers
-    // can have less free memory after their persistent KV cache is created.
+    // Treat the selected chunk as an upper bound. Late transformer layers can
+    // have less free memory after their persistent KV cache is created.
     std::vector<long long> freeSizes = FastllmCudaGetFreeSizes();
     if (device < (int)freeSizes.size() && freeSizes[device] > 0) {
         constexpr size_t reserveBytes = 16ULL * 1024ULL * 1024ULL;
@@ -1180,7 +1159,6 @@ bool FastllmCudaDots3NoteIndexerTopK(
         if (headScores) FastllmCudaDirectFree(headScores);
         if (candidateIds) FastllmCudaFree(candidateIds);
         if (candidateScores) FastllmCudaFree(candidateScores);
-        if (logits) FastllmCudaFree(logits);
         return false;
     }
     cudaError_t state = cudaSuccess;
@@ -1452,21 +1430,13 @@ bool FastllmCudaDots3NoteSparseAttentionPrefill(
     // run QK and AV on Tensor Cores, and apply the sparse selection in-place
     // between the two GEMMs. Dots shares one index row across all heads, so no
     // per-head index expansion is needed.
-    size_t scratchLimit = 128ULL * 1024ULL * 1024ULL;
-    if (const char *env = std::getenv(
-            "FASTLLM_DOTS3_NOTE_SPARSE_PREFILL_TEMP_MB")) {
-        int megabytes = std::atoi(env);
-        if (megabytes > 0) {
-            scratchLimit = (size_t)megabytes * 1024ULL * 1024ULL;
-        }
-    }
     size_t bytesPerQuery =
         (size_t)kAttentionHeads * totalLen * sizeof(__nv_bfloat16);
     // Borrowed storage is the unused tail of the already-live KV projection,
     // so using all of it does not raise peak memory. At 8K this doubles the
     // query tile from 64 to 128 and halves the number of QK/AV launch pairs.
     size_t availableScratch = borrowedScratch == nullptr
-        ? scratchLimit : borrowedScratchBytes;
+        ? kSparsePrefillScratchLimit : borrowedScratchBytes;
     if (availableScratch < bytesPerQuery) {
         return false;
     }
@@ -1602,14 +1572,6 @@ bool FastllmCudaDots3NoteSlidingAttentionPrefill(
         return false;
     }
 
-    size_t scratchLimit = 64ULL * 1024ULL * 1024ULL;
-    if (const char *env = std::getenv(
-            "FASTLLM_DOTS3_NOTE_SLIDING_PREFILL_TEMP_MB")) {
-        int megabytes = std::atoi(env);
-        if (megabytes > 0) {
-            scratchLimit = (size_t)megabytes * 1024ULL * 1024ULL;
-        }
-    }
     int queryChunk = std::min(seqlen, 1024);
     size_t scratchBytes = 0;
     while (queryChunk > 0) {
@@ -1617,12 +1579,14 @@ bool FastllmCudaDots3NoteSlidingAttentionPrefill(
             totalLen, windowSize + queryChunk - 1);
         scratchBytes = (size_t)heads * queryChunk * maxKeyCount *
                        sizeof(__nv_bfloat16);
-        if (scratchBytes <= scratchLimit || queryChunk == 1) {
+        if (scratchBytes <= kSlidingPrefillScratchLimit ||
+            queryChunk == 1) {
             break;
         }
         queryChunk = (queryChunk + 1) / 2;
     }
-    if (queryChunk <= 0 || scratchBytes > scratchLimit) {
+    if (queryChunk <= 0 ||
+        scratchBytes > kSlidingPrefillScratchLimit) {
         return false;
     }
     __nv_bfloat16 *scores =

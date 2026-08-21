@@ -22,6 +22,7 @@ namespace fastllm {
             7LL * 1024LL * 1024LL * 1024LL;
         constexpr long long kLongKvResidentBudgetBytes =
             3LL * 1024LL * 1024LL * 1024LL;
+        constexpr int kSparsePrefillMaxKeys = 16384;
 #endif
 
         int GetIntConfig(const WeightMap &weight, const std::string &name, int fallback) {
@@ -51,30 +52,19 @@ namespace fastllm {
 #endif
         }
 
-        bool HistoryCacheDebugEnabled() {
-            const char *value = std::getenv(
-                "FASTLLM_DOTS3_NOTE_HISTORY_DEBUG");
+        bool EnvFlagEnabled(const char *name) {
+            const char *value = std::getenv(name);
             return value != nullptr && value[0] != '\0' &&
                    std::strcmp(value, "0") != 0 &&
                    std::strcmp(value, "false") != 0 &&
-                   std::strcmp(value, "off") != 0;
+                   std::strcmp(value, "FALSE") != 0 &&
+                   std::strcmp(value, "off") != 0 &&
+                   std::strcmp(value, "OFF") != 0;
         }
 
-#ifdef USE_CUDA
-        long long GetMegabytesEnv(const char *name,
-                                  long long fallbackBytes) {
-            const char *value = std::getenv(name);
-            if (value == nullptr || value[0] == '\0') {
-                return fallbackBytes;
-            }
-            char *end = nullptr;
-            long long megabytes = std::strtoll(value, &end, 10);
-            if (end == value || *end != '\0' || megabytes < 0) {
-                return fallbackBytes;
-            }
-            return megabytes * 1024LL * 1024LL;
+        bool HistoryCacheDebugEnabled() {
+            return EnvFlagEnabled("FASTLLM_DOTS3_NOTE_HISTORY_DEBUG");
         }
-#endif
 
         double ProfileNowMs() {
             using Clock = std::chrono::steady_clock;
@@ -449,13 +439,8 @@ namespace fastllm {
                     totalSizes[deviceId] <=
                     32LL * 1024LL * 1024LL * 1024LL;
             }
-            const char *keepFullKvEnv = std::getenv(
-                "FASTLLM_DOTS3_NOTE_KEEP_FULL_KV_GPU");
-            if (keepFullKvEnv != nullptr &&
-                keepFullKvEnv[0] != '\0' &&
-                std::strcmp(keepFullKvEnv, "0") != 0 &&
-                std::strcmp(keepFullKvEnv, "false") != 0 &&
-                std::strcmp(keepFullKvEnv, "off") != 0) {
+            if (EnvFlagEnabled(
+                    "FASTLLM_DOTS3_NOTE_KEEP_FULL_KV_GPU")) {
                 rotateLongFullKvCache = false;
             }
         }
@@ -488,12 +473,9 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (rotateLongFullKvCache) {
             keepFullKvOnCuda.assign(block_cnt, 0);
-            const long long freeReserveBytes = GetMegabytesEnv(
-                "FASTLLM_DOTS3_NOTE_KV_FREE_RESERVE_MB",
-                kLongKvFreeReserveBytes);
-            const long long residentBudgetBytes = GetMegabytesEnv(
-                "FASTLLM_DOTS3_NOTE_KV_GPU_BUDGET_MB",
-                kLongKvResidentBudgetBytes);
+            const long long freeReserveBytes = kLongKvFreeReserveBytes;
+            const long long residentBudgetBytes =
+                kLongKvResidentBudgetBytes;
 
             // Keep a small suffix resident across chunks. Its projected size
             // includes the current append, so the budget remains bounded as
@@ -600,20 +582,10 @@ namespace fastllm {
         Data moeInputTemp, moeOutputTemp;
         Data moeW1, moeW2, moeW3, moeCurInput, moeCurOutput;
         bool cudaSharedExpert = GetCudaSharedExpert();
-        const char *cpuLmHeadEnv = std::getenv(
+        const bool useCpuLmHead = EnvFlagEnabled(
             "FASTLLM_DOTS3_NOTE_CPU_LM_HEAD");
-        const bool useCpuLmHead = cpuLmHeadEnv != nullptr &&
-            cpuLmHeadEnv[0] != '\0' &&
-            std::strcmp(cpuLmHeadEnv, "0") != 0 &&
-            std::strcmp(cpuLmHeadEnv, "false") != 0 &&
-            std::strcmp(cpuLmHeadEnv, "off") != 0;
-        const char *prefetchEnv = std::getenv(
-            "FASTLLM_DOTS3_NOTE_PREFETCH_WEIGHTS");
         const bool prefetchCudaWeights = seqlen > 1 &&
-            prefetchEnv != nullptr && prefetchEnv[0] != '\0' &&
-            std::strcmp(prefetchEnv, "0") != 0 &&
-            std::strcmp(prefetchEnv, "false") != 0 &&
-            std::strcmp(prefetchEnv, "off") != 0;
+            EnvFlagEnabled("FASTLLM_DOTS3_NOTE_PREFETCH_WEIGHTS");
         const bool profilePrefetch = std::getenv(
             "FASTLLM_PROFILE_DOTS3_NOTE_PREFETCH") != nullptr;
         int lmHeadPrefetchLayer = block_cnt - 2;
@@ -1134,18 +1106,12 @@ namespace fastllm {
 #ifdef USE_CUDA
                 ScopedExecutorProfiler sparseProfile(
                     "Dots3NoteSparseAttention");
-                int cublasMaxKeys = 16384;
-                if (const char *env = std::getenv(
-                        "FASTLLM_DOTS3_NOTE_SPARSE_PREFILL_MAX_KEYS")) {
-                    cublasMaxKeys = std::max(1, std::atoi(env));
-                }
                 // Small decode-shaped calls remain on the row kernel; bounded
                 // prefill blocks amortize the dense Tensor Core QK/AV path.
                 bool useCublasPrefill =
-                    seqlen >= 16 && keyLen <= cublasMaxKeys &&
-                    std::getenv(
-                        "FASTLLM_DOTS3_NOTE_DISABLE_CUBLAS_SPARSE_PREFILL") ==
-                        nullptr;
+                    seqlen >= 16 && keyLen <= kSparsePrefillMaxKeys &&
+                    !EnvFlagEnabled(
+                        "FASTLLM_DOTS3_NOTE_DISABLE_CUBLAS_SPARSE_PREFILL");
                 void *sparseScratch = nullptr;
                 size_t sparseScratchBytes = 0;
                 if (reuseKvForSparseAttention) {
