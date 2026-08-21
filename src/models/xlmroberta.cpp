@@ -128,9 +128,9 @@ namespace fastllm {
             } else {
                 MatMulTransB(q, k, qk, 1.0 / sqrt(this->head_dim), 1);
                 std::vector <int> dims = qk.dims;
-                qk.Reshape({dims[0], -1, dims[3]});
+                // qk.Reshape({dims[0], -1, dims[3]});
                 AttentionMask(qk, attentionMask, -1e9);
-                qk.Reshape(dims);
+                // qk.Reshape(dims);
                 Softmax(qk, qk, -1);
                 MatMul(qk, v, qkv, 1.0, 1);
                 PermuteSelf(qkv, {0, 2, 1, 3});
