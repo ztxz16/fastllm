@@ -442,7 +442,7 @@ if (USE_CUDA)
         src/devices/multicuda/fastllm-custom-allreduce.cu)
 
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas nccl cuda)
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda)
     set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
 endif()
 

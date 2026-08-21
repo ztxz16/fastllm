@@ -6,18 +6,22 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cublasLt.h>
 
 namespace {
 
 constexpr int kIndexerHeads = 64;
 constexpr int kIndexerDim = 128;
 constexpr int kIndexerTopK = 2048;
+constexpr int kIndexerCandidateK = 2304;
 constexpr int kIndexerDefaultQueryChunk = 256;
 constexpr int kIndexerKeysPerBlock = 8;
+constexpr int kIndexerCandidateKeysPerBlock = 16;
 constexpr int kAttentionHeads = 128;
 constexpr int kAttentionQkDim = 192;
 constexpr int kAttentionVDim = 128;
@@ -239,26 +243,240 @@ __global__ void IndexerLogitsTiledKernel(
     }
 }
 
+__global__ void IndexerReduceHeadScoresKernel(
+        const float *headScores, const float *kScales,
+        const float *weights, float *logits,
+        int queryOffset, int current, int keyCount,
+        int totalLen, int startPos) {
+    int key = blockIdx.x * blockDim.x + threadIdx.x;
+    int tokenInChunk = blockIdx.y;
+    if (tokenInChunk >= current || key >= keyCount) {
+        return;
+    }
+    int token = queryOffset + tokenInChunk;
+    if (key >= startPos + token + 1) {
+        logits[(uint64_t)tokenInChunk * totalLen + key] = -FLT_MAX;
+        return;
+    }
+
+    uint64_t headStride = (uint64_t)current * keyCount;
+    uint64_t scoreOffset =
+        (uint64_t)tokenInChunk * keyCount + key;
+    const float *tokenWeights =
+        weights + (uint64_t)tokenInChunk * kIndexerHeads;
+    float sum = 0.0f;
+#pragma unroll
+    for (int head = 0; head < kIndexerHeads; ++head) {
+        float score = headScores[(uint64_t)head * headStride +
+                                 scoreOffset];
+        sum += fmaxf(score, 0.0f) * tokenWeights[head];
+    }
+    logits[(uint64_t)tokenInChunk * totalLen + key] =
+        sum * kScales[key];
+}
+
+template <typename IndexT>
+__global__ void IndexerCandidateExactScoresKernel(
+        const uint8_t *q, const uint8_t *k, const float *kScales,
+        const float *weights, const IndexT *candidateIds,
+        float *candidateScores, int seqlen, int totalLen,
+        int startPos) {
+    constexpr int warps = kIndexerCandidateKeysPerBlock;
+    __shared__ uint8_t qShared[kIndexerHeads * kIndexerDim];
+    __shared__ float weightShared[kIndexerHeads];
+    __shared__ float groupSums[warps][8];
+
+    constexpr int candidateTiles =
+        (kIndexerCandidateK + kIndexerCandidateKeysPerBlock - 1) /
+        kIndexerCandidateKeysPerBlock;
+    int token = blockIdx.x / candidateTiles;
+    int candidateTile = blockIdx.x - token * candidateTiles;
+    if (token >= seqlen) return;
+    const uint8_t *qRow =
+        q + (uint64_t)token * kIndexerHeads * kIndexerDim;
+    for (int i = threadIdx.x; i < kIndexerHeads * kIndexerDim;
+         i += blockDim.x) {
+        qShared[i] = qRow[i];
+    }
+    for (int i = threadIdx.x; i < kIndexerHeads;
+         i += blockDim.x) {
+        weightShared[i] =
+            weights[(uint64_t)token * kIndexerHeads + i];
+    }
+    __syncthreads();
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int candidate = candidateTile * kIndexerCandidateKeysPerBlock + warp;
+    if (candidate >= kIndexerCandidateK) return;
+    int key = (int)candidateIds[
+        (uint64_t)token * kIndexerCandidateK + candidate];
+    int rowEnd = min(totalLen, startPos + token + 1);
+    if (key < 0 || key >= rowEnd) {
+        if (lane == 0) {
+            candidateScores[
+                (uint64_t)token * kIndexerCandidateK + candidate] =
+                -FLT_MAX;
+        }
+        return;
+    }
+
+    const uint8_t *kRow = k + (uint64_t)key * kIndexerDim;
+    float keyValues[4];
+#pragma unroll
+    for (int part = 0; part < 4; ++part) {
+        keyValues[part] = Fp8ToFloat(kRow[lane + part * 32]);
+    }
+    float groupedContribution[8] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f};
+    for (int head = 0; head < kIndexerHeads; ++head) {
+        const uint8_t *qHead = qShared + head * kIndexerDim;
+        float dot = 0.0f;
+#pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            int d = lane + part * 32;
+            dot += Fp8ToFloat(qHead[d]) * keyValues[part];
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0) {
+            groupedContribution[head & 7] +=
+                fmaxf(dot, 0.0f) * weightShared[head];
+        }
+    }
+    if (lane == 0) {
+        for (int group = 0; group < 8; ++group) {
+            groupSums[warp][group] = groupedContribution[group];
+        }
+    }
+    __syncwarp();
+    float sum = lane < 8 ? groupSums[warp][lane] : 0.0f;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+        candidateScores[
+            (uint64_t)token * kIndexerCandidateK + candidate] =
+            sum * kScales[key];
+    }
+}
+
+cublasStatus_t IndexerFp8BatchedGemm(
+        const void *k, const void *q, float *headScores,
+        int current, int keyCount) {
+    static thread_local std::vector<cublasLtHandle_t> handles;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
+        return CUBLAS_STATUS_NOT_INITIALIZED;
+    }
+    if ((int)handles.size() <= device) {
+        handles.resize(device + 1, nullptr);
+    }
+    cublasLtHandle_t &handle = handles[device];
+    if (handle == nullptr) {
+        cublasStatus_t state = cublasLtCreate(&handle);
+        if (state != CUBLAS_STATUS_SUCCESS) {
+            handle = nullptr;
+            return state;
+        }
+    }
+
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t aLayout = nullptr;
+    cublasLtMatrixLayout_t bLayout = nullptr;
+    cublasLtMatrixLayout_t cLayout = nullptr;
+    cublasStatus_t state = cublasLtMatmulDescCreate(
+        &operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasOperation_t transA = CUBLAS_OP_T;
+    cublasOperation_t transB = CUBLAS_OP_N;
+    if (state == CUBLAS_STATUS_SUCCESS) {
+        state = cublasLtMatmulDescSetAttribute(
+            operation, CUBLASLT_MATMUL_DESC_TRANSA,
+            &transA, sizeof(transA));
+    }
+    if (state == CUBLAS_STATUS_SUCCESS) {
+        state = cublasLtMatmulDescSetAttribute(
+            operation, CUBLASLT_MATMUL_DESC_TRANSB,
+            &transB, sizeof(transB));
+    }
+    if (state == CUBLAS_STATUS_SUCCESS) {
+        state = cublasLtMatrixLayoutCreate(
+            &aLayout, CUDA_R_8F_E4M3,
+            kIndexerDim, keyCount, kIndexerDim);
+    }
+    if (state == CUBLAS_STATUS_SUCCESS) {
+        state = cublasLtMatrixLayoutCreate(
+            &bLayout, CUDA_R_8F_E4M3,
+            kIndexerDim, current, kIndexerHeads * kIndexerDim);
+    }
+    if (state == CUBLAS_STATUS_SUCCESS) {
+        state = cublasLtMatrixLayoutCreate(
+            &cLayout, CUDA_R_32F,
+            keyCount, current, keyCount);
+    }
+    int batchCount = kIndexerHeads;
+    int64_t strideA = 0;
+    int64_t strideB = kIndexerDim;
+    int64_t strideC = (int64_t)current * keyCount;
+    auto setBatch = [&](cublasLtMatrixLayout_t layout,
+                        const int64_t &stride) {
+        cublasStatus_t result = cublasLtMatrixLayoutSetAttribute(
+            layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batchCount, sizeof(batchCount));
+        if (result == CUBLAS_STATUS_SUCCESS) {
+            result = cublasLtMatrixLayoutSetAttribute(
+                layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                &stride, sizeof(stride));
+        }
+        return result;
+    };
+    if (state == CUBLAS_STATUS_SUCCESS) state = setBatch(aLayout, strideA);
+    if (state == CUBLAS_STATUS_SUCCESS) state = setBatch(bLayout, strideB);
+    if (state == CUBLAS_STATUS_SUCCESS) state = setBatch(cLayout, strideC);
+
+    if (state == CUBLAS_STATUS_SUCCESS) {
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        state = cublasLtMatmul(
+            handle, operation, &alpha,
+            k, aLayout, q, bLayout, &beta,
+            headScores, cLayout, headScores, cLayout,
+            nullptr, nullptr, 0, cudaStreamPerThread);
+    }
+    if (cLayout) cublasLtMatrixLayoutDestroy(cLayout);
+    if (bLayout) cublasLtMatrixLayoutDestroy(bLayout);
+    if (aLayout) cublasLtMatrixLayoutDestroy(aLayout);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    return state;
+}
+
 __device__ __forceinline__ uint32_t OrderedFloatBits(float value) {
     uint32_t bits = __float_as_uint(value);
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-// Select the exact Top-2048 set with four radix-histogram passes instead of
-// sorting every score. Output indices are ascending, which makes equal-score
+// Select an exact Top-K set with four radix-histogram passes instead of sorting
+// every score. Output indices are ascending, which makes equal-score
 // truncation deterministic and matches the reference's smaller-key tie break.
-template <typename IndexT>
-__global__ void IndexerRadixTopKKernel(
-        const float *logits, IndexT *topkIds, int seqlen,
+template <typename IndexT, int selectedK>
+__global__ void IndexerRadixSelectKernel(
+        const float *logits, IndexT *selectedIds,
+        const IndexT *keyMap, int seqlen,
         int totalLen, int startPos) {
     int token = blockIdx.x;
     if (token >= seqlen) return;
     int rowEnd = min(totalLen, startPos + token + 1);
-    IndexT *output = topkIds + (uint64_t)token * kIndexerTopK;
-    if (rowEnd <= kIndexerTopK) {
-        for (int i = threadIdx.x; i < kIndexerTopK;
+    IndexT *output = selectedIds + (uint64_t)token * selectedK;
+    if (rowEnd <= selectedK) {
+        for (int i = threadIdx.x; i < selectedK;
              i += blockDim.x) {
-            output[i] = i;
+            output[i] = keyMap == nullptr
+                ? (IndexT)i
+                : keyMap[(uint64_t)token * totalLen + i];
         }
         return;
     }
@@ -268,7 +486,7 @@ __global__ void IndexerRadixTopKKernel(
     __shared__ uint32_t remaining;
     if (threadIdx.x == 0) {
         prefix = 0;
-        remaining = kIndexerTopK;
+        remaining = selectedK;
     }
     __syncthreads();
 
@@ -311,14 +529,18 @@ __global__ void IndexerRadixTopKKernel(
     if (threadIdx.x == 0) {
         int count = 0;
         uint32_t pivot = prefix;
-        for (int key = 0; key < rowEnd && count < kIndexerTopK; ++key) {
+        for (int key = 0; key < rowEnd && count < selectedK; ++key) {
             if (OrderedFloatBits(row[key]) > pivot) {
-                output[count++] = key;
+                output[count++] = keyMap == nullptr
+                    ? (IndexT)key
+                    : keyMap[(uint64_t)token * totalLen + key];
             }
         }
-        for (int key = 0; key < rowEnd && count < kIndexerTopK; ++key) {
+        for (int key = 0; key < rowEnd && count < selectedK; ++key) {
             if (OrderedFloatBits(row[key]) == pivot) {
-                output[count++] = key;
+                output[count++] = keyMap == nullptr
+                    ? (IndexT)key
+                    : keyMap[(uint64_t)token * totalLen + key];
             }
         }
     }
@@ -840,24 +1062,71 @@ bool FastllmCudaDots3NoteIndexerTopK(
     // across all 64 indexer heads. A four-pass radix selector then finds the
     // exact Top-2048 set without sorting every score in the row. Bounded query
     // slices keep the temporary footprint independent of the prefill size.
+    // On FP8-capable GPUs, long rows use a Tensor Core path for the 64
+    // per-head matrices, then exactly rescore a bounded candidate set before
+    // the final selection. Short rows keep the lower-overhead scalar kernel.
+    bool useTensorCore = getCudaInfos()->cudaArch >= 890 &&
+                         !FastllmCudaGraphIsCapturing();
+    if (const char *env = std::getenv(
+            "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE")) {
+        useTensorCore = useTensorCore && env[0] != '\0' &&
+                        strcmp(env, "0") != 0 &&
+                        strcmp(env, "false") != 0 &&
+                        strcmp(env, "FALSE") != 0 &&
+                        strcmp(env, "off") != 0 &&
+                        strcmp(env, "OFF") != 0;
+    }
     int maxRowsPerChunk = INT_MAX / totalLen;
     if (maxRowsPerChunk <= 0) {
         return false;
     }
     int queryChunk = std::min(
         seqlen, std::min(kIndexerDefaultQueryChunk, maxRowsPerChunk));
+    bool queryChunkConfigured = false;
     if (const char *env = std::getenv(
             "FASTLLM_DOTS3_NOTE_INDEXER_QUERY_CHUNK")) {
         char *end = nullptr;
         long configured = std::strtol(env, &end, 10);
         if (end != env && configured > 0) {
+            queryChunkConfigured = true;
             queryChunk = std::min(
                 seqlen,
                 std::min(maxRowsPerChunk,
                          (int)std::min(configured, (long)INT_MAX)));
         }
     }
-    size_t bytesPerQuery = (size_t)totalLen * sizeof(float);
+    int scalarQueryChunk = queryChunk;
+    useTensorCore = useTensorCore && seqlen >= 16 &&
+                    seqlen % 16 == 0 && startPos % 16 == 0 &&
+                    totalLen % 16 == 0 &&
+                    totalLen >= 8192;
+    if (useTensorCore) {
+        constexpr size_t headScoreLimit =
+            1ULL * 1024ULL * 1024ULL * 1024ULL;
+        size_t headScoreBytesPerQuery =
+            (size_t)totalLen * kIndexerHeads * sizeof(float);
+        int tensorDefaultChunk = (int)std::min<size_t>(
+            512, std::max<size_t>(
+                     16, headScoreLimit / headScoreBytesPerQuery));
+        tensorDefaultChunk = tensorDefaultChunk / 16 * 16;
+        queryChunk = queryChunkConfigured
+            ? std::min(queryChunk, tensorDefaultChunk)
+            : std::min(seqlen, tensorDefaultChunk);
+        if (const char *env = std::getenv(
+                "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_QUERY_CHUNK")) {
+            char *end = nullptr;
+            long configured = std::strtol(env, &end, 10);
+            if (end != env && configured > 0) {
+                queryChunk = std::min(
+                    seqlen,
+                    std::min(maxRowsPerChunk,
+                             (int)std::min(configured, (long)INT_MAX)));
+            }
+        }
+        queryChunk = std::max(16, queryChunk / 16 * 16);
+    }
+    size_t bytesPerQuery = (size_t)totalLen * sizeof(float) *
+        (useTensorCore ? kIndexerHeads + 1 : 1);
     // Treat the configured chunk as an upper bound. Late transformer layers
     // can have less free memory after their persistent KV cache is created.
     std::vector<long long> freeSizes = FastllmCudaGetFreeSizes();
@@ -872,10 +1141,45 @@ bool FastllmCudaDots3NoteIndexerTopK(
             queryChunk = (queryChunk + 1) / 2;
         }
     }
+    if (useTensorCore) {
+        queryChunk = queryChunk / 16 * 16;
+    }
+    if (useTensorCore && queryChunk < 16) {
+        useTensorCore = false;
+        queryChunk = scalarQueryChunk;
+    }
     int maxPairs = queryChunk * totalLen;
     float *logits = (float *)FastllmCudaMalloc(
         (size_t)maxPairs * sizeof(float));
+    float *headScores = useTensorCore
+        ? (float *)FastllmCudaDirectMalloc(
+              (size_t)maxPairs * kIndexerHeads * sizeof(float))
+        : nullptr;
+    size_t candidateIndexBytes = useCompactIndices
+        ? sizeof(int16_t) : sizeof(int32_t);
+    void *candidateIds = useTensorCore
+        ? FastllmCudaMalloc((size_t)queryChunk *
+                            kIndexerCandidateK * candidateIndexBytes)
+        : nullptr;
+    float *candidateScores = useTensorCore
+        ? (float *)FastllmCudaMalloc(
+              (size_t)queryChunk * kIndexerCandidateK * sizeof(float))
+        : nullptr;
+    if (useTensorCore &&
+        (headScores == nullptr || candidateIds == nullptr ||
+         candidateScores == nullptr)) {
+        if (headScores) FastllmCudaDirectFree(headScores);
+        if (candidateIds) FastllmCudaFree(candidateIds);
+        if (candidateScores) FastllmCudaFree(candidateScores);
+        headScores = nullptr;
+        candidateIds = nullptr;
+        candidateScores = nullptr;
+        useTensorCore = false;
+    }
     if (logits == nullptr) {
+        if (headScores) FastllmCudaDirectFree(headScores);
+        if (candidateIds) FastllmCudaFree(candidateIds);
+        if (candidateScores) FastllmCudaFree(candidateScores);
         if (logits) FastllmCudaFree(logits);
         return false;
     }
@@ -891,34 +1195,129 @@ bool FastllmCudaDots3NoteIndexerTopK(
                 (uint64_t)queryOffset * kIndexerHeads * kIndexerDim;
             const float *currentWeights = allWeights +
                 (uint64_t)queryOffset * kIndexerHeads;
-            int keyTiles = (totalLen + kIndexerKeysPerBlock - 1) /
-                           kIndexerKeysPerBlock;
-            IndexerLogitsTiledKernel<<<current * keyTiles, 256, 0,
-                                       cudaStreamPerThread>>>(
-                currentQ, (const uint8_t *)kFp8.cudaData,
-                (const float *)kScales.cudaData, currentWeights,
-                logits, current, totalLen,
-                startPos + queryOffset);
-            state = cudaPeekAtLastError();
+            if (useTensorCore) {
+                int keyCount = std::min(
+                    totalLen, startPos + queryOffset + current);
+                cublasStatus_t status = IndexerFp8BatchedGemm(
+                    kFp8.cudaData, currentQ, headScores,
+                    current, keyCount);
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    useTensorCore = false;
+                    int keyTiles =
+                        (totalLen + kIndexerKeysPerBlock - 1) /
+                        kIndexerKeysPerBlock;
+                    IndexerLogitsTiledKernel<<<
+                        current * keyTiles, 256, 0,
+                        cudaStreamPerThread>>>(
+                            currentQ,
+                            (const uint8_t *)kFp8.cudaData,
+                            (const float *)kScales.cudaData,
+                            currentWeights, logits, current,
+                            totalLen, startPos + queryOffset);
+                    state = cudaPeekAtLastError();
+                } else {
+                    dim3 grid((keyCount + 255) / 256, current);
+                    IndexerReduceHeadScoresKernel<<<
+                        grid, 256, 0, cudaStreamPerThread>>>(
+                            headScores,
+                            (const float *)kScales.cudaData,
+                            currentWeights, logits, queryOffset,
+                            current, keyCount, totalLen, startPos);
+                    state = cudaPeekAtLastError();
+                }
+            } else {
+                int keyTiles =
+                    (totalLen + kIndexerKeysPerBlock - 1) /
+                    kIndexerKeysPerBlock;
+                IndexerLogitsTiledKernel<<<current * keyTiles, 256, 0,
+                                           cudaStreamPerThread>>>(
+                    currentQ, (const uint8_t *)kFp8.cudaData,
+                    (const float *)kScales.cudaData, currentWeights,
+                    logits, current, totalLen,
+                    startPos + queryOffset);
+                state = cudaPeekAtLastError();
+            }
             if (state != cudaSuccess) {
                 break;
             }
-            if (useCompactIndices) {
+            if (useTensorCore && useCompactIndices) {
+                int16_t *candidates = (int16_t *)candidateIds;
                 int16_t *allIndices = (int16_t *)indices.cudaData;
-                IndexerRadixTopKKernel<int16_t><<<
-                    current, 256, 0, cudaStreamPerThread>>>(
-                        logits,
-                        allIndices +
-                            (uint64_t)queryOffset * kIndexerTopK,
-                        current, totalLen, startPos + queryOffset);
+                IndexerRadixSelectKernel<
+                    int16_t, kIndexerCandidateK><<<
+                        current, 256, 0, cudaStreamPerThread>>>(
+                            logits, candidates, nullptr,
+                            current, totalLen,
+                            startPos + queryOffset);
+                IndexerCandidateExactScoresKernel<int16_t><<<
+                    current * (kIndexerCandidateK /
+                               kIndexerCandidateKeysPerBlock),
+                    kIndexerCandidateKeysPerBlock * 32,
+                    0, cudaStreamPerThread>>>(
+                        currentQ,
+                        (const uint8_t *)kFp8.cudaData,
+                        (const float *)kScales.cudaData,
+                        currentWeights, candidates,
+                        candidateScores, current, totalLen,
+                        startPos + queryOffset);
+                IndexerRadixSelectKernel<
+                    int16_t, kIndexerTopK><<<
+                        current, 256, 0, cudaStreamPerThread>>>(
+                            candidateScores,
+                            allIndices +
+                                (uint64_t)queryOffset * kIndexerTopK,
+                            candidates, current,
+                            kIndexerCandidateK,
+                            kIndexerCandidateK);
+            } else if (useTensorCore) {
+                int32_t *candidates = (int32_t *)candidateIds;
+                int32_t *allIndices = (int32_t *)indices.cudaData;
+                IndexerRadixSelectKernel<
+                    int32_t, kIndexerCandidateK><<<
+                        current, 256, 0, cudaStreamPerThread>>>(
+                            logits, candidates, nullptr,
+                            current, totalLen,
+                            startPos + queryOffset);
+                IndexerCandidateExactScoresKernel<int32_t><<<
+                    current * (kIndexerCandidateK /
+                               kIndexerCandidateKeysPerBlock),
+                    kIndexerCandidateKeysPerBlock * 32,
+                    0, cudaStreamPerThread>>>(
+                        currentQ,
+                        (const uint8_t *)kFp8.cudaData,
+                        (const float *)kScales.cudaData,
+                        currentWeights, candidates,
+                        candidateScores, current, totalLen,
+                        startPos + queryOffset);
+                IndexerRadixSelectKernel<
+                    int32_t, kIndexerTopK><<<
+                        current, 256, 0, cudaStreamPerThread>>>(
+                            candidateScores,
+                            allIndices +
+                                (uint64_t)queryOffset * kIndexerTopK,
+                            candidates, current,
+                            kIndexerCandidateK,
+                            kIndexerCandidateK);
+            } else if (useCompactIndices) {
+                int16_t *allIndices = (int16_t *)indices.cudaData;
+                IndexerRadixSelectKernel<
+                    int16_t, kIndexerTopK><<<
+                        current, 256, 0, cudaStreamPerThread>>>(
+                            logits,
+                            allIndices +
+                                (uint64_t)queryOffset * kIndexerTopK,
+                            nullptr, current, totalLen,
+                            startPos + queryOffset);
             } else {
                 int32_t *allIndices = (int32_t *)indices.cudaData;
-                IndexerRadixTopKKernel<int32_t><<<
-                    current, 256, 0, cudaStreamPerThread>>>(
-                        logits,
-                        allIndices +
-                            (uint64_t)queryOffset * kIndexerTopK,
-                        current, totalLen, startPos + queryOffset);
+                IndexerRadixSelectKernel<
+                    int32_t, kIndexerTopK><<<
+                        current, 256, 0, cudaStreamPerThread>>>(
+                            logits,
+                            allIndices +
+                                (uint64_t)queryOffset * kIndexerTopK,
+                            nullptr, current, totalLen,
+                            startPos + queryOffset);
             }
             state = cudaPeekAtLastError();
             if (state != cudaSuccess) break;
@@ -926,6 +1325,9 @@ bool FastllmCudaDots3NoteIndexerTopK(
     }
     cudaError_t syncState = cudaStreamSynchronize(cudaStreamPerThread);
     bool ok = state == cudaSuccess && syncState == cudaSuccess;
+    if (headScores) FastllmCudaDirectFree(headScores);
+    if (candidateIds) FastllmCudaFree(candidateIds);
+    if (candidateScores) FastllmCudaFree(candidateScores);
     FastllmCudaFree(logits);
     return ok;
 }

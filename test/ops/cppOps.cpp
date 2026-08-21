@@ -3470,6 +3470,56 @@ namespace {
             }
         }
 
+        void ValidateIndexerPathAgreement() {
+            if (getCudaInfos()->cudaArch < 890 || queryTokens < 16 ||
+                queryTokens % 16 != 0 || totalTokens < 8192 ||
+                totalTokens % 16 != 0 || startPos % 16 != 0) {
+                return;
+            }
+
+            const char *name =
+                "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE";
+            const char *configured = std::getenv(name);
+            bool hadConfigured = configured != nullptr;
+            std::string original = hadConfigured ? configured : "";
+            fastllm::Data tensorIndices, scalarIndices;
+            setenv(name, "1", 1);
+            bool tensorOk = FastllmCudaDots3NoteIndexerTopK(
+                qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                startPos, 2048, tensorIndices);
+            setenv(name, "0", 1);
+            bool scalarOk = FastllmCudaDots3NoteIndexerTopK(
+                qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                startPos, 2048, scalarIndices);
+            if (hadConfigured) {
+                setenv(name, original.c_str(), 1);
+            } else {
+                unsetenv(name);
+            }
+            if (!tensorOk || !scalarOk) {
+                throw std::runtime_error(
+                    "Dots indexer path-agreement launch failed");
+            }
+            ForceDeviceSync();
+            std::vector<int32_t> tensor = ToInt32Vector(tensorIndices);
+            std::vector<int32_t> scalar = ToInt32Vector(scalarIndices);
+            if (tensor != scalar) {
+                size_t mismatch = 0;
+                while (mismatch < tensor.size() &&
+                       tensor[mismatch] == scalar[mismatch]) {
+                    ++mismatch;
+                }
+                std::ostringstream os;
+                os << "Dots Tensor Core indexer disagrees with scalar path"
+                   << " at output " << mismatch;
+                if (mismatch < tensor.size()) {
+                    os << ": tensor=" << tensor[mismatch]
+                       << " scalar=" << scalar[mismatch];
+                }
+                throw std::runtime_error(os.str());
+            }
+        }
+
         void ValidateSparseAttention(const fastllm::Data &output,
                                      const std::string &name) {
             std::vector<float> qValues =
@@ -3722,6 +3772,7 @@ namespace {
                 throw std::runtime_error("Dots indexer CUDA launch failed");
             }
             ValidateTopK();
+            ValidateIndexerPathAgreement();
 
             mainQ.CopyFrom(MakeTensor(
                 {128, queryTokens, 192}, 0.291f, 0.125f));
