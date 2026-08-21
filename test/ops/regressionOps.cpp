@@ -11190,7 +11190,8 @@ namespace {
             std::vector<std::unique_ptr<MoeWeights> > &expertWeights,
             bool keepCudaInputMirror,
             fastllm::DataDevice &mergeOutputDevice,
-            int batch = 1024) {
+            int batch = 1024,
+            bool keepCudaInputsOnDevice = false) {
         constexpr int topk = 8;
         constexpr int inputDim = 5120;
         constexpr int outputDim = 5120;
@@ -11203,8 +11204,10 @@ namespace {
         if (keepCudaInputMirror) {
             input.ToDevice(
                 fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
-            input.ToDevice(
-                fastllm::DataDevice::CPU, std::vector<int>{0}, true);
+            if (!keepCudaInputsOnDevice) {
+                input.ToDevice(
+                    fastllm::DataDevice::CPU, std::vector<int>{0}, true);
+            }
         }
 
         std::vector<int32_t> indices((size_t)batch * topk);
@@ -11227,6 +11230,12 @@ namespace {
         fastllm::Data index = MakeIntTensor({batch, topk}, indices);
         fastllm::Data score(
             fastllm::DataType::FLOAT32, {batch, topk}, scores);
+        if (keepCudaInputsOnDevice) {
+            index.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+            score.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        }
         fastllm::Data output(
             fastllm::DataType::BFLOAT16, {batch, outputDim});
         fastllm::Data w1, w2, w3, curInput, curOutput;
@@ -11290,7 +11299,7 @@ namespace {
         // large-batch CUDA kernel.
         fastllm::DataDevice hybridOutputDevice = fastllm::DataDevice::CPU;
         std::vector<uint16_t> beforeDecode = RunNumasCudaFp8HybridMoeCase(
-            expertWeights, true, hybridOutputDevice);
+            expertWeights, true, hybridOutputDevice, 1024, true);
         Expect(hybridOutputDevice == fastllm::DataDevice::CUDA,
                "generic FP8 hybrid prefill did not use CUDA.");
 

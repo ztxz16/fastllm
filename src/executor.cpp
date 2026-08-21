@@ -49,6 +49,24 @@ namespace fastllm {
         return name == "input" || name == "index" || name == "score";
     }
 
+    static bool KeepNumasMergeMoeTensorOnSource(
+            const std::string &opType, const std::string &name,
+            BaseDevice *device, const Data *data) {
+        if (opType != "MergeMOE" || device == nullptr ||
+            device->deviceType != "numa" || data == nullptr ||
+            data->dataDevice != DataDevice::CUDA ||
+            data->cudaData == nullptr || data->multiDeviceData) {
+            return false;
+        }
+        // The hybrid NUMA/CUDA implementation stages its CPU activation in a
+        // reusable pinned buffer and keeps the CUDA mirror for GPU experts.
+        // Letting the generic executor move these tensors first creates a
+        // pageable D2H allocation and discards/reallocates the reusable CUDA
+        // output once per MoE layer.
+        return name == "input" || name == "index" || name == "score" ||
+               name == "output";
+    }
+
     static bool KeepMultiCudaMergeMoeTensorOnSource(const std::string &opType,
                                                      const std::string &name,
                                                      BaseDevice *device,
@@ -307,6 +325,8 @@ namespace fastllm {
                             }
 #ifdef USE_CUDA
                             if (!KeepKimiK3NumaTensorOnSource(
+                                    opType, it.first, device, it.second) &&
+                                !KeepNumasMergeMoeTensorOnSource(
                                     opType, it.first, device, it.second) &&
                                 !KeepMultiCudaMergeMoeTensorOnSource(
                                     opType, it.first, device, it.second,
