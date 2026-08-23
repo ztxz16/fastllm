@@ -52,10 +52,15 @@ __device__ __forceinline__ float ToFloat(__nv_bfloat16 value) {
     return __bfloat162float(value);
 }
 
-__device__ __forceinline__ float Fp8ToFloat(uint8_t raw) {
-    __nv_fp8_e4m3 value;
-    value.__x = raw;
-    return static_cast<float>(value);
+template <>
+__device__ __forceinline__ float ToFloat(__half value) {
+    return __half2float(value);
+}
+
+__device__ __forceinline__ float2 Fp8x2ToFloat(const uint8_t *raw) {
+    __nv_fp8x2_e4m3 value;
+    value.__x = *reinterpret_cast<const uint16_t *>(raw);
+    return static_cast<float2>(value);
 }
 
 template <typename QT, typename WT>
@@ -206,10 +211,11 @@ __global__ void IndexerLogitsTiledKernel(
     }
 
     const uint8_t *kRow = k + (uint64_t)key * kIndexerDim;
-    float keyValues[4];
+    float2 keyValues[2];
 #pragma unroll
-    for (int part = 0; part < 4; ++part) {
-        keyValues[part] = Fp8ToFloat(kRow[lane + part * 32]);
+    for (int part = 0; part < 2; ++part) {
+        int d = lane * 2 + part * 64;
+        keyValues[part] = Fp8x2ToFloat(kRow + d);
     }
     float groupedContribution[8] = {
         0.0f, 0.0f, 0.0f, 0.0f,
@@ -219,9 +225,11 @@ __global__ void IndexerLogitsTiledKernel(
             qShared + head * kIndexerDim;
         float dot = 0.0f;
 #pragma unroll
-        for (int part = 0; part < 4; ++part) {
-            int d = lane + part * 32;
-            dot += Fp8ToFloat(qHead[d]) * keyValues[part];
+        for (int part = 0; part < 2; ++part) {
+            int d = lane * 2 + part * 64;
+            float2 queryValues = Fp8x2ToFloat(qHead + d);
+            dot += queryValues.x * keyValues[part].x;
+            dot += queryValues.y * keyValues[part].y;
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -249,8 +257,9 @@ __global__ void IndexerLogitsTiledKernel(
     }
 }
 
+template <typename ScoreT>
 __global__ void IndexerReduceHeadScoresKernel(
-        const float *headScores, const float *kScales,
+        const ScoreT *headScores, const float *kScales,
         const float *weights, float *logits,
         int queryOffset, int current, int keyCount,
         int totalLen, int startPos) {
@@ -273,8 +282,8 @@ __global__ void IndexerReduceHeadScoresKernel(
     float sum = 0.0f;
 #pragma unroll
     for (int head = 0; head < kIndexerHeads; ++head) {
-        float score = headScores[(uint64_t)head * headStride +
-                                 scoreOffset];
+        float score = ToFloat(
+            headScores[(uint64_t)head * headStride + scoreOffset]);
         sum += fmaxf(score, 0.0f) * tokenWeights[head];
     }
     logits[(uint64_t)tokenInChunk * totalLen + key] =
@@ -328,10 +337,11 @@ __global__ void IndexerCandidateExactScoresKernel(
     }
 
     const uint8_t *kRow = k + (uint64_t)key * kIndexerDim;
-    float keyValues[4];
+    float2 keyValues[2];
 #pragma unroll
-    for (int part = 0; part < 4; ++part) {
-        keyValues[part] = Fp8ToFloat(kRow[lane + part * 32]);
+    for (int part = 0; part < 2; ++part) {
+        int d = lane * 2 + part * 64;
+        keyValues[part] = Fp8x2ToFloat(kRow + d);
     }
     float groupedContribution[8] = {
         0.0f, 0.0f, 0.0f, 0.0f,
@@ -340,9 +350,11 @@ __global__ void IndexerCandidateExactScoresKernel(
         const uint8_t *qHead = qShared + head * kIndexerDim;
         float dot = 0.0f;
 #pragma unroll
-        for (int part = 0; part < 4; ++part) {
-            int d = lane + part * 32;
-            dot += Fp8ToFloat(qHead[d]) * keyValues[part];
+        for (int part = 0; part < 2; ++part) {
+            int d = lane * 2 + part * 64;
+            float2 queryValues = Fp8x2ToFloat(qHead + d);
+            dot += queryValues.x * keyValues[part].x;
+            dot += queryValues.y * keyValues[part].y;
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -372,7 +384,7 @@ __global__ void IndexerCandidateExactScoresKernel(
 }
 
 cublasStatus_t IndexerFp8BatchedGemm(
-        const void *k, const void *q, float *headScores,
+        const void *k, const void *q, void *headScores,
         int current, int keyCount) {
     static thread_local std::vector<cublasLtHandle_t> handles;
     int device = -1;
@@ -421,7 +433,7 @@ cublasStatus_t IndexerFp8BatchedGemm(
     }
     if (state == CUBLAS_STATUS_SUCCESS) {
         state = cublasLtMatrixLayoutCreate(
-            &cLayout, CUDA_R_32F,
+            &cLayout, CUDA_R_16F,
             keyCount, current, keyCount);
     }
     int batchCount = kIndexerHeads;
@@ -445,7 +457,11 @@ cublasStatus_t IndexerFp8BatchedGemm(
     if (state == CUBLAS_STATUS_SUCCESS) state = setBatch(cLayout, strideC);
 
     if (state == CUBLAS_STATUS_SUCCESS) {
-        const float alpha = 1.0f;
+        // The largest possible E4M3 dot is
+        // 448 * 448 * 128 / 512 = 50176, which fits FP16. This common
+        // positive scale preserves candidate ranking while halving the
+        // head-score workspace and retaining more precision than BF16.
+        const float alpha = 1.0f / 512.0f;
         const float beta = 0.0f;
         state = cublasLtMatmul(
             handle, operation, &alpha,
@@ -1023,8 +1039,12 @@ bool FastllmCudaDots3NoteIndexerTopK(
         const fastllm::Data &qFp8,
         const fastllm::Data &foldedWeights,
         const fastllm::Data &kFp8, const fastllm::Data &kScales,
-        int startPos, int topK, fastllm::Data &indices) {
-    if (topK != kIndexerTopK || startPos < 0 ||
+        int startPos, int topK, fastllm::Data &indices,
+        void **headScoreWorkspace,
+        size_t *headScoreWorkspaceBytes) {
+    if ((headScoreWorkspace == nullptr) !=
+            (headScoreWorkspaceBytes == nullptr) ||
+        topK != kIndexerTopK || startPos < 0 ||
         qFp8.dataDevice != fastllm::DataDevice::CUDA ||
         qFp8.dataType != fastllm::DataType::INT8 ||
         qFp8.cudaData == nullptr || qFp8.dims.size() != 4 ||
@@ -1051,6 +1071,21 @@ bool FastllmCudaDots3NoteIndexerTopK(
         return false;
     }
     FastllmCudaSetDevice(device);
+    bool canReuseWorkspace = headScoreWorkspace != nullptr &&
+                             headScoreWorkspaceBytes != nullptr;
+    if (canReuseWorkspace && *headScoreWorkspace != nullptr) {
+        int workspaceDevice = GetPointerDeviceId(*headScoreWorkspace);
+        if (workspaceDevice < 0) {
+            return false;
+        }
+        if (workspaceDevice != device) {
+            FastllmCudaSetDevice(workspaceDevice);
+            FastllmCudaDirectFree(*headScoreWorkspace);
+            FastllmCudaSetDevice(device);
+            *headScoreWorkspace = nullptr;
+            *headScoreWorkspaceBytes = 0;
+        }
+    }
     int seqlen = qFp8.dims[1];
     int totalLen = kFp8.dims[1];
     bool useCompactIndices = totalLen <= 32768;
@@ -1095,7 +1130,8 @@ bool FastllmCudaDots3NoteIndexerTopK(
                     totalLen >= 8192;
     if (useTensorCore) {
         size_t headScoreBytesPerQuery =
-            (size_t)totalLen * kIndexerHeads * sizeof(float);
+            (size_t)totalLen * kIndexerHeads *
+            sizeof(__half);
         int tensorDefaultChunk = (int)std::min<size_t>(
             512, std::max<size_t>(
                      16,
@@ -1104,8 +1140,10 @@ bool FastllmCudaDots3NoteIndexerTopK(
         queryChunk = std::min(seqlen, tensorDefaultChunk);
         queryChunk = std::max(16, queryChunk / 16 * 16);
     }
-    size_t bytesPerQuery = (size_t)totalLen * sizeof(float) *
-        (useTensorCore ? kIndexerHeads + 1 : 1);
+    size_t bytesPerQuery = (size_t)totalLen *
+        (useTensorCore
+             ? kIndexerHeads * sizeof(__half) + sizeof(float)
+             : sizeof(float));
     // Treat the selected chunk as an upper bound. Late transformer layers can
     // have less free memory after their persistent KV cache is created.
     std::vector<long long> freeSizes = FastllmCudaGetFreeSizes();
@@ -1130,10 +1168,31 @@ bool FastllmCudaDots3NoteIndexerTopK(
     int maxPairs = queryChunk * totalLen;
     float *logits = (float *)FastllmCudaMalloc(
         (size_t)maxPairs * sizeof(float));
-    float *headScores = useTensorCore
-        ? (float *)FastllmCudaDirectMalloc(
-              (size_t)maxPairs * kIndexerHeads * sizeof(float))
-        : nullptr;
+    __half *headScores = nullptr;
+    bool ownsHeadScores = false;
+    if (useTensorCore) {
+        size_t requiredHeadScoreBytes =
+            (size_t)maxPairs * kIndexerHeads *
+            sizeof(__half);
+        if (canReuseWorkspace &&
+            (*headScoreWorkspace == nullptr ||
+             *headScoreWorkspaceBytes < requiredHeadScoreBytes)) {
+            if (*headScoreWorkspace != nullptr) {
+                FastllmCudaDirectFree(*headScoreWorkspace);
+            }
+            *headScoreWorkspace =
+                FastllmCudaDirectMalloc(requiredHeadScoreBytes);
+            *headScoreWorkspaceBytes = *headScoreWorkspace == nullptr
+                ? 0 : requiredHeadScoreBytes;
+        }
+        if (canReuseWorkspace) {
+            headScores = (__half *)*headScoreWorkspace;
+        } else {
+            headScores = (__half *)FastllmCudaDirectMalloc(
+                requiredHeadScoreBytes);
+            ownsHeadScores = headScores != nullptr;
+        }
+    }
     size_t candidateIndexBytes = useCompactIndices
         ? sizeof(int16_t) : sizeof(int32_t);
     void *candidateIds = useTensorCore
@@ -1147,7 +1206,7 @@ bool FastllmCudaDots3NoteIndexerTopK(
     if (useTensorCore &&
         (headScores == nullptr || candidateIds == nullptr ||
          candidateScores == nullptr)) {
-        if (headScores) FastllmCudaDirectFree(headScores);
+        if (ownsHeadScores) FastllmCudaDirectFree(headScores);
         if (candidateIds) FastllmCudaFree(candidateIds);
         if (candidateScores) FastllmCudaFree(candidateScores);
         headScores = nullptr;
@@ -1156,7 +1215,7 @@ bool FastllmCudaDots3NoteIndexerTopK(
         useTensorCore = false;
     }
     if (logits == nullptr) {
-        if (headScores) FastllmCudaDirectFree(headScores);
+        if (ownsHeadScores) FastllmCudaDirectFree(headScores);
         if (candidateIds) FastllmCudaFree(candidateIds);
         if (candidateScores) FastllmCudaFree(candidateScores);
         return false;
@@ -1195,7 +1254,7 @@ bool FastllmCudaDots3NoteIndexerTopK(
                     state = cudaPeekAtLastError();
                 } else {
                     dim3 grid((keyCount + 255) / 256, current);
-                    IndexerReduceHeadScoresKernel<<<
+                    IndexerReduceHeadScoresKernel<__half><<<
                         grid, 256, 0, cudaStreamPerThread>>>(
                             headScores,
                             (const float *)kScales.cudaData,
@@ -1303,7 +1362,7 @@ bool FastllmCudaDots3NoteIndexerTopK(
     }
     cudaError_t syncState = cudaStreamSynchronize(cudaStreamPerThread);
     bool ok = state == cudaSuccess && syncState == cudaSuccess;
-    if (headScores) FastllmCudaDirectFree(headScores);
+    if (ownsHeadScores) FastllmCudaDirectFree(headScores);
     if (candidateIds) FastllmCudaFree(candidateIds);
     if (candidateScores) FastllmCudaFree(candidateScores);
     FastllmCudaFree(logits);

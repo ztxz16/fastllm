@@ -785,7 +785,9 @@ bool FastllmCudaDots3NoteIndexerTopK(
         const fastllm::Data &qFp8,
         const fastllm::Data &foldedWeights,
         const fastllm::Data &kFp8, const fastllm::Data &kScales,
-        int startPos, int topK, fastllm::Data &indices);
+        int startPos, int topK, fastllm::Data &indices,
+        void **headScoreWorkspace = nullptr,
+        size_t *headScoreWorkspaceBytes = nullptr);
 bool FastllmCudaDots3NoteSparseAttention(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &indices,

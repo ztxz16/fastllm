@@ -3520,6 +3520,148 @@ namespace {
             }
         }
 
+        static void CopyCudaTensorToDevice(
+                const fastllm::Data &source, int targetDevice,
+                fastllm::Data &target) {
+            int sourceDevice = GetPointerDeviceId(source.cudaData);
+            if (sourceDevice < 0) {
+                throw std::runtime_error(
+                    "Dots workspace-device test source is not on CUDA");
+            }
+            fastllm::Data host(source.dataType, source.dims);
+            host.Allocate(false);
+            FastllmCudaSetDevice(sourceDevice);
+            FastllmCudaCopyFromDeviceToHost(
+                host.cpuData, source.cudaData, source.GetBytes());
+            target.CopyFrom(host);
+            target.ToDevice(
+                fastllm::DataDevice::CUDA, {targetDevice}, true);
+            if (GetPointerDeviceId(target.cudaData) != targetDevice) {
+                throw std::runtime_error(
+                    "Dots workspace-device test CUDA copy failed");
+            }
+        }
+
+        void ValidateIndexerWorkspaceDeviceSwitch() {
+            if (FastllmCudaGetDeviceCount() < 2) {
+                throw std::runtime_error(
+                    "Dots workspace-device test requires two CUDA devices");
+            }
+            if (queryTokens < 16 || queryTokens % 16 != 0 ||
+                totalTokens < 8192 || totalTokens % 16 != 0 ||
+                startPos % 16 != 0) {
+                throw std::runtime_error(
+                    "Dots workspace-device test requires queries and keys "
+                    "that select the Tensor Core indexer path");
+            }
+
+            const int originalDevice = FastllmCudaGetDevice();
+            void *workspace = nullptr;
+            size_t workspaceBytes = 0;
+            auto releaseWorkspace = [&]() {
+                if (workspace == nullptr) {
+                    return;
+                }
+                int restoreDevice = FastllmCudaGetDevice();
+                int workspaceDevice = GetPointerDeviceId(workspace);
+                if (workspaceDevice >= 0 &&
+                    workspaceDevice != restoreDevice) {
+                    FastllmCudaSetDevice(workspaceDevice);
+                }
+                FastllmCudaDirectFree(workspace);
+                if (workspaceDevice >= 0 && restoreDevice >= 0 &&
+                    workspaceDevice != restoreDevice) {
+                    FastllmCudaSetDevice(restoreDevice);
+                }
+                workspace = nullptr;
+                workspaceBytes = 0;
+            };
+
+            const char *name =
+                "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE";
+            const char *configured = std::getenv(name);
+            bool hadConfigured = configured != nullptr;
+            std::string original = hadConfigured ? configured : "";
+            auto restoreEnvironment = [&]() {
+                if (hadConfigured) {
+                    setenv(name, original.c_str(), 1);
+                } else {
+                    unsetenv(name);
+                }
+            };
+
+            try {
+                FastllmCudaSetDevice(0);
+                if (FastllmCudaRuntimeArch() < 89) {
+                    throw std::runtime_error(
+                        "Dots workspace-device test requires SM89 or newer");
+                }
+                setenv(name, "1", 1);
+                fastllm::Data device0Indices;
+                if (!FastllmCudaDots3NoteIndexerTopK(
+                        qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                        startPos, 2048, device0Indices,
+                        &workspace, &workspaceBytes) ||
+                    workspace == nullptr || workspaceBytes == 0 ||
+                    GetPointerDeviceId(workspace) != 0) {
+                    throw std::runtime_error(
+                        "Dots indexer did not allocate workspace on device 0");
+                }
+                ForceDeviceSync();
+                device0Indices.ToDevice(fastllm::DataDevice::CPU);
+                std::vector<int32_t> expected =
+                    ToInt32Vector(device0Indices);
+                device0Indices.FreeSpace();
+
+                {
+                    fastllm::Data qFp8Device1, foldedWeightsDevice1;
+                    fastllm::Data kFp8Device1, kScalesDevice1;
+                    CopyCudaTensorToDevice(qFp8, 1, qFp8Device1);
+                    CopyCudaTensorToDevice(
+                        foldedWeights, 1, foldedWeightsDevice1);
+                    CopyCudaTensorToDevice(
+                        cachedKFp8, 1, kFp8Device1);
+                    CopyCudaTensorToDevice(
+                        cachedKScales, 1, kScalesDevice1);
+                    FastllmCudaSetDevice(1);
+                    if (FastllmCudaRuntimeArch() < 89) {
+                        throw std::runtime_error(
+                            "Dots workspace-device test requires SM89 or newer");
+                    }
+
+                    fastllm::Data device1Indices;
+                    if (!FastllmCudaDots3NoteIndexerTopK(
+                            qFp8Device1, foldedWeightsDevice1,
+                            kFp8Device1, kScalesDevice1,
+                            startPos, 2048, device1Indices,
+                            &workspace, &workspaceBytes) ||
+                        workspace == nullptr || workspaceBytes == 0 ||
+                        GetPointerDeviceId(workspace) != 1) {
+                        throw std::runtime_error(
+                            "Dots indexer did not migrate workspace to device 1");
+                    }
+                    ForceDeviceSync();
+                    device1Indices.ToDevice(fastllm::DataDevice::CPU);
+                    std::vector<int32_t> actual =
+                        ToInt32Vector(device1Indices);
+                    device1Indices.FreeSpace();
+                    if (actual != expected) {
+                        throw std::runtime_error(
+                            "Dots indexer output changed after workspace "
+                            "migrated from device 0 to device 1");
+                    }
+                    releaseWorkspace();
+                }
+                restoreEnvironment();
+                FastllmCudaSetDevice(originalDevice);
+            } catch (...) {
+                releaseWorkspace();
+                restoreEnvironment();
+                FastllmCudaSetDevice(originalDevice);
+                throw;
+            }
+        }
+
         void ValidateSparseAttention(const fastllm::Data &output,
                                      const std::string &name) {
             std::vector<float> qValues =
@@ -3773,6 +3915,9 @@ namespace {
             }
             ValidateTopK();
             ValidateIndexerPathAgreement();
+            if (params.GetInt("workspace_device_switch") != 0) {
+                ValidateIndexerWorkspaceDeviceSwitch();
+            }
 
             mainQ.CopyFrom(MakeTensor(
                 {128, queryTokens, 192}, 0.291f, 0.125f));
@@ -3908,6 +4053,8 @@ namespace {
                 params.Add("keys", "2049", "total cached key tokens");
                 params.Add("path", "indexer",
                            "indexer, sparse, sparse_prefill or sliding_prefill");
+                params.Add("workspace_device_switch", "0",
+                           "validate workspace migration between GPU 0 and 1");
                 return params;
             },
             [](const OpTestParams&, const std::string &device) {

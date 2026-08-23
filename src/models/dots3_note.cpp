@@ -659,6 +659,11 @@ namespace fastllm {
         int sequencePastLen = pastKeyValues[0].first.dims.size() > 1
                                   ? pastKeyValues[0].first.dims[1]
                                   : 0;
+#ifdef USE_CUDA
+        const bool reuseIndexerHeadScoreWorkspace =
+            !EnvFlagEnabled(
+                "FASTLLM_DOTS3_NOTE_DISABLE_INDEXER_WORKSPACE_REUSE");
+#endif
         if (HistoryCacheDebugEnabled()) {
             int slidingPastLen = pastKeyValues.size() > 2 &&
                                  pastKeyValues[2].first.dims.size() > 1
@@ -939,6 +944,13 @@ namespace fastllm {
         std::thread lmHeadPrefetchThread;
         bool lmHeadPrefetchStarted = false;
         auto lmHeadPrefetchStart = std::chrono::system_clock::now();
+#ifdef USE_CUDA
+        // The FP8 indexer needs up to 1 GiB of per-head score storage at long
+        // context. Reuse one workspace across full-attention layers in this
+        // chunk, migrating its allocation when the layer device changes, then
+        // release it before the vocabulary projection.
+        CudaDirectWorkspace indexerHeadScoreWorkspace;
+#endif
         for (int layer = 0; layer < block_cnt; layer++) {
             ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
 
@@ -1126,7 +1138,13 @@ namespace fastllm {
                                 indexQFp8, indexFoldedWeights,
                                 cache.keys, cache.scales,
                                 sequencePastLen, indexTopK,
-                                indexTopKIndices),
+                                indexTopKIndices,
+                                reuseIndexerHeadScoreWorkspace
+                                    ? &indexerHeadScoreWorkspace.data
+                                    : nullptr,
+                                reuseIndexerHeadScoreWorkspace
+                                    ? &indexerHeadScoreWorkspace.bytes
+                                    : nullptr),
                             "FastLLM Dots3-Note DSA Top-2048 failed.\n");
                     }
                 } else {
@@ -1455,6 +1473,14 @@ namespace fastllm {
                         (uint8_t *)kv.cudaData + attentionOutputBytes;
                     sparseScratchBytes =
                         kv.expansionBytes - attentionOutputBytes;
+                } else if (fullAttention &&
+                           indexerHeadScoreWorkspace.data != nullptr) {
+                    // Indexer scoring has completed synchronously, so its
+                    // large per-head FP16 buffer can back the BF16 QK scores
+                    // as well. This raises the append-prefill query tile from
+                    // 64 to roughly 256 at 8K without increasing peak memory.
+                    sparseScratch = indexerHeadScoreWorkspace.data;
+                    sparseScratchBytes = indexerHeadScoreWorkspace.bytes;
                 }
                 bool sparseOk = useCublasPrefill &&
                     FastllmCudaDots3NoteSparseAttentionPrefill(
@@ -1863,6 +1889,9 @@ namespace fastllm {
             }
         }
 
+#ifdef USE_CUDA
+        indexerHeadScoreWorkspace.Reset();
+#endif
         auto lmHeadPrefetchJoinStart = std::chrono::system_clock::now();
         if (lmHeadPrefetchThread.joinable()) {
             lmHeadPrefetchThread.join();
