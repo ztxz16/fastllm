@@ -659,6 +659,10 @@ namespace fastllm {
         int sequencePastLen = pastKeyValues[0].first.dims.size() > 1
                                   ? pastKeyValues[0].first.dims[1]
                                   : 0;
+        const bool skipIntermediateChunkHead =
+            isIntermediateChunkedPrefill &&
+            !EnvFlagEnabled(
+                "FASTLLM_DOTS3_NOTE_DISABLE_SKIP_INTERMEDIATE_CHUNK_HEAD");
 #ifdef USE_CUDA
         const bool reuseIndexerHeadScoreWorkspace =
             !EnvFlagEnabled(
@@ -1856,6 +1860,7 @@ namespace fastllm {
                     fflush(stdout);
                 }
                 if (prefetchCudaWeights && !useCpuLmHead &&
+                    !skipIntermediateChunkHead &&
                     layer == lmHeadPrefetchLayer) {
                     std::vector<Data *> finalWeights =
                         collectCudaPrefetchWeights(block_cnt);
@@ -1908,6 +1913,13 @@ namespace fastllm {
         }
 
         MaybeRecordPromptHistoryCache(pastKeyValues);
+
+        // The caller discards intermediate chunk outputs. The flag is only
+        // set for single-request greedy generation, so no logits or sampling
+        // state are required until the final chunk.
+        if (skipIntermediateChunkHead) {
+            return 0;
+        }
 
         Data lastHiddenStates, logits, topk;
         if (seqlen > 1) {
