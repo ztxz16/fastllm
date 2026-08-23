@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 namespace fastllm {
     namespace {
@@ -23,6 +24,270 @@ namespace fastllm {
         constexpr long long kLongKvResidentBudgetBytes =
             3LL * 1024LL * 1024LL * 1024LL;
         constexpr int kSparsePrefillMaxKeys = 16384;
+
+        struct CudaDirectWorkspace {
+            void *data = nullptr;
+            size_t bytes = 0;
+
+            ~CudaDirectWorkspace() {
+                Reset();
+            }
+
+            void Reset() {
+                if (data == nullptr) {
+                    bytes = 0;
+                    return;
+                }
+                int restoreDevice = FastllmCudaGetDevice();
+                int workspaceDevice = GetPointerDeviceId(data);
+                if (workspaceDevice >= 0 &&
+                    workspaceDevice != restoreDevice) {
+                    FastllmCudaSetDevice(workspaceDevice);
+                }
+                FastllmCudaDirectFree(data);
+                if (workspaceDevice >= 0 && restoreDevice >= 0 &&
+                    workspaceDevice != restoreDevice) {
+                    FastllmCudaSetDevice(restoreDevice);
+                }
+                data = nullptr;
+                bytes = 0;
+            }
+        };
+
+        struct LongKvHostShadow {
+            uint8_t *data = nullptr;
+            uint64_t bytes = 0;
+            size_t rowPitchBytes = 0;
+            size_t tokenStrideBytes = 0;
+            int heads = 0;
+            int tokens = 0;
+        };
+
+        bool EnvFlagEnabled(const char *name);
+
+        void PrefaultLongKvHostRows(
+                uint8_t *hostData, size_t hostRowPitchBytes,
+                int firstToken, int tokenCount,
+                size_t tokenStrideBytes, int heads) {
+            size_t rowBytes = (size_t)tokenCount * tokenStrideBytes;
+            size_t totalBytes = rowBytes * (size_t)heads;
+            constexpr size_t kMinimumParallelBytes = 64ULL << 20;
+            constexpr size_t kBytesPerWorker = 8ULL << 20;
+            constexpr int kMaximumWorkers = 32;
+            if (hostData == nullptr || rowBytes == 0 || heads <= 0 ||
+                totalBytes < kMinimumParallelBytes ||
+                EnvFlagEnabled(
+                    "FASTLLM_DOTS3_NOTE_DISABLE_KV_HOST_PREFAULT")) {
+                return;
+            }
+
+            int workers = std::min(
+                heads, std::min(
+                    kMaximumWorkers,
+                    std::max(1, (int)((totalBytes + kBytesPerWorker - 1) /
+                                      kBytesPerWorker))));
+            unsigned int hardwareWorkers =
+                std::thread::hardware_concurrency();
+            if (hardwareWorkers > 0) {
+                workers = std::min(workers, (int)hardwareWorkers);
+            }
+
+            size_t tokenOffset =
+                (size_t)firstToken * tokenStrideBytes;
+            std::vector<std::thread> threads;
+            threads.reserve(workers);
+            for (int worker = 0; worker < workers; ++worker) {
+                threads.emplace_back([=]() {
+                    for (int head = worker; head < heads;
+                         head += workers) {
+                        std::memset(
+                            hostData +
+                                (size_t)head * hostRowPitchBytes +
+                                tokenOffset,
+                            0, rowBytes);
+                    }
+                });
+            }
+            for (std::thread &thread : threads) {
+                thread.join();
+            }
+        }
+
+        void CopyLongKvRowsToHost(
+                const Data &cache, uint8_t *hostData,
+                size_t hostRowPitchBytes, int firstToken,
+                int tokenCount) {
+            if (tokenCount <= 0) {
+                return;
+            }
+            AssertInFastLLM(
+                cache.dataDevice == DataDevice::CUDA &&
+                    cache.cudaData != nullptr && cache.dims.size() == 3 &&
+                    cache.strides.size() == 3 && cache.unitSizeDiv == 1,
+                "Dots3-Note long KV copy requires a dense CUDA cache.\n");
+            size_t cudaRowPitchBytes =
+                (size_t)cache.strides[0] * cache.unitSize;
+            size_t tokenStrideBytes =
+                (size_t)cache.strides[1] * cache.unitSize;
+            size_t rowBytes = (size_t)tokenCount * tokenStrideBytes;
+            size_t tokenOffset = (size_t)firstToken * tokenStrideBytes;
+            const uint8_t *cudaSource =
+                (const uint8_t *)cache.cudaData + tokenOffset;
+            uint8_t *hostTarget = hostData + tokenOffset;
+
+            // cudaMemcpy to previously untouched pageable memory can be
+            // dominated by serialized page faults. Fault large row ranges in
+            // parallel before the blocking D2H copy; small decode tails skip
+            // this path to avoid thread overhead.
+            PrefaultLongKvHostRows(
+                hostData, hostRowPitchBytes, firstToken, tokenCount,
+                tokenStrideBytes, cache.dims[0]);
+
+            FastllmCudaMemcpy2DDeviceToHost(
+                hostTarget, hostRowPitchBytes, cudaSource,
+                cudaRowPitchBytes, rowBytes, cache.dims[0]);
+        }
+
+        void SpillLongKvCacheToCpu(
+                Data &cache, int futureCapacity) {
+            if (cache.dataDevice != DataDevice::CUDA ||
+                cache.cudaData == nullptr || cache.cpuData != nullptr ||
+                !cache.isKVCache || cache.dims.size() != 3 ||
+                cache.strides.size() != 3 || cache.unitSizeDiv != 1 ||
+                cache.expansionDims.size() != 3 ||
+                futureCapacity <= cache.expansionDims[1]) {
+                cache.ToDevice(DataDevice::CPU);
+                return;
+            }
+
+            size_t tokenStrideBytes =
+                (size_t)cache.strides[1] * cache.unitSize;
+            size_t futureRowPitchBytes =
+                (size_t)futureCapacity * tokenStrideBytes;
+            uint64_t futureExpansionSize =
+                (uint64_t)cache.dims[0] * futureCapacity *
+                cache.strides[1];
+            uint64_t futureExpansionBytes =
+                (futureExpansionSize * cache.unitSize - 1) /
+                    cache.unitSizeDiv + 1;
+            uint8_t *hostData = new uint8_t[futureExpansionBytes];
+            CopyLongKvRowsToHost(
+                cache, hostData, futureRowPitchBytes, 0,
+                cache.dims[1]);
+
+            cache.cpuData = hostData;
+            cache.ToDevice(DataDevice::CPU, false);
+            cache.strides[0] =
+                (uint64_t)futureCapacity * cache.strides[1];
+            cache.expansionDims[1] = futureCapacity;
+            cache.expansionSize = futureExpansionSize;
+            cache.expansionBytes = futureExpansionBytes;
+        }
+
+        LongKvHostShadow StageLongKvCacheToCuda(
+                Data &cache, DataDevice targetDevice) {
+            LongKvHostShadow shadow;
+            if (targetDevice != DataDevice::CUDA ||
+                cache.dataDevice != DataDevice::CPU ||
+                cache.cpuData == nullptr) {
+                cache.ToDevice(targetDevice);
+                return shadow;
+            }
+
+            AssertInFastLLM(
+                cache.isKVCache && cache.dims.size() == 3 &&
+                    cache.strides.size() == 3 && cache.unitSizeDiv == 1,
+                "Dots3-Note long KV staging requires a dense 3D KV cache.\n");
+            shadow.data = cache.cpuData;
+            shadow.bytes = cache.expansionBytes;
+            shadow.rowPitchBytes =
+                (size_t)cache.strides[0] * cache.unitSize;
+            shadow.tokenStrideBytes =
+                (size_t)cache.strides[1] * cache.unitSize;
+            shadow.heads = cache.dims[0];
+            shadow.tokens = cache.dims[1];
+
+            // Keep the host allocation as the authoritative prefix shadow.
+            // Only logical tokens need to cross PCIe; spare capacity is never
+            // read by attention and may remain uninitialized on CUDA.
+            cache.ToDevice(targetDevice, false);
+            AssertInFastLLM(
+                cache.cpuData == shadow.data && cache.cudaData != nullptr,
+                "Dots3-Note failed to preserve the staged KV host shadow.\n");
+            FastllmCudaMemcpy2DHostToDevice(
+                cache.cudaData, shadow.rowPitchBytes,
+                shadow.data, shadow.rowPitchBytes,
+                (size_t)shadow.tokens * shadow.tokenStrideBytes,
+                shadow.heads);
+            return shadow;
+        }
+
+        void StageLongKvCacheToCpu(
+                Data &cache, const LongKvHostShadow &shadow) {
+            if (shadow.data == nullptr ||
+                cache.dataDevice != DataDevice::CUDA ||
+                cache.cudaData == nullptr) {
+                if (shadow.data == nullptr &&
+                    cache.dataDevice == DataDevice::CUDA &&
+                    cache.cudaData != nullptr && cache.cpuData == nullptr &&
+                    cache.isKVCache && cache.dims.size() == 3 &&
+                    cache.strides.size() == 3 && cache.unitSizeDiv == 1) {
+                    cache.cpuData = new uint8_t[cache.expansionBytes];
+                    size_t rowPitchBytes =
+                        (size_t)cache.strides[0] * cache.unitSize;
+                    CopyLongKvRowsToHost(
+                        cache, cache.cpuData, rowPitchBytes, 0,
+                        cache.dims[1]);
+                    cache.ToDevice(DataDevice::CPU, false);
+                } else {
+                    cache.ToDevice(DataDevice::CPU);
+                }
+                return;
+            }
+
+            AssertInFastLLM(
+                cache.isKVCache && cache.dims.size() == 3 &&
+                    cache.strides.size() == 3 && cache.unitSizeDiv == 1 &&
+                    cache.cpuData == shadow.data &&
+                    cache.dims[0] == shadow.heads &&
+                    cache.dims[1] >= shadow.tokens,
+                "Dots3-Note long KV host shadow changed while staged.\n");
+            size_t rowPitchBytes =
+                (size_t)cache.strides[0] * cache.unitSize;
+            size_t tokenStrideBytes =
+                (size_t)cache.strides[1] * cache.unitSize;
+            AssertInFastLLM(
+                tokenStrideBytes == shadow.tokenStrideBytes,
+                "Dots3-Note long KV token layout changed while staged.\n");
+
+            if (cache.expansionBytes != shadow.bytes ||
+                rowPitchBytes != shadow.rowPitchBytes) {
+                uint8_t *expandedHost =
+                    new uint8_t[cache.expansionBytes];
+                size_t prefixBytes =
+                    (size_t)shadow.tokens * tokenStrideBytes;
+                for (int head = 0; head < shadow.heads; ++head) {
+                    std::memcpy(
+                        expandedHost + (size_t)head * rowPitchBytes,
+                        shadow.data +
+                            (size_t)head * shadow.rowPitchBytes,
+                        prefixBytes);
+                }
+                cache.cpuData = expandedHost;
+                delete[] shadow.data;
+            }
+
+            int appendedTokens = cache.dims[1] - shadow.tokens;
+            if (appendedTokens > 0) {
+                CopyLongKvRowsToHost(
+                    cache, cache.cpuData, rowPitchBytes,
+                    shadow.tokens, appendedTokens);
+            }
+
+            // The prefix already lives in the retained host shadow and the
+            // appended tail was copied above, so only release CUDA storage.
+            cache.ToDevice(DataDevice::CPU, false);
+        }
 #endif
 
         int GetIntConfig(const WeightMap &weight, const std::string &name, int fallback) {
@@ -523,8 +788,9 @@ namespace fastllm {
             // Full-attention KV dominates the 24 GiB footprint. Previously
             // all 13 caches were evicted once the context reached 8K, even
             // though only part of that space is needed by the active layer.
-            // Release idle pool blocks first, then spill a suffix only until
-            // there is enough headroom for cache growth and attention scratch.
+            // Release idle pool blocks first, then spill selected layers only
+            // until there is enough headroom for cache growth and attention
+            // scratch.
             FastllmCudaClearBigBuffer();
             long long freeBefore = FastllmCudaGetFreeSize();
             uint64_t stagedBytes = 0;
@@ -532,33 +798,60 @@ namespace fastllm {
             {
                 ScopedExecutorProfiler kvSpillProfile(
                     "Dots3NoteKvInitialSpill");
-                for (int layer = block_cnt - 1;
-                     layer >= 0 &&
+                // Prefer nonresident layers: their CPU prefix is reused by
+                // incremental StageOut. If that is not enough to meet the
+                // safety reserve, resident layers remain a correctness-safe
+                // second pass.
+                for (int pass = 0; pass < 2 &&
                      freeBefore + (long long)stagedBytes < freeReserveBytes;
-                     --layer) {
-                    if (!IsFullAttentionLayer(layer)) {
-                        continue;
+                     ++pass) {
+                    for (int layer = block_cnt - 1;
+                         layer >= 0 &&
+                         freeBefore + (long long)stagedBytes <
+                             freeReserveBytes;
+                         --layer) {
+                        if (!IsFullAttentionLayer(layer) ||
+                            (pass == 0 && keepFullKvOnCuda[layer]) ||
+                            (pass == 1 && !keepFullKvOnCuda[layer])) {
+                            continue;
+                        }
+                        Data &pastKey = pastKeyValues[layer].first;
+                        Data &pastValue = pastKeyValues[layer].second;
+                        bool keyOnCuda =
+                            pastKey.dataDevice == DataDevice::CUDA &&
+                            pastKey.cudaData != nullptr;
+                        bool valueOnCuda =
+                            pastValue.dataDevice == DataDevice::CUDA &&
+                            pastValue.cudaData != nullptr;
+                        if (!keyOnCuda && !valueOnCuda) {
+                            continue;
+                        }
+                        int appendCapacity =
+                            ((seqlen - 1) / 128 + 1) * 128;
+                        int futureAppendBlocks =
+                            keepFullKvOnCuda[layer] ? 1 : 2;
+                        auto futureCapacity = [&](const Data &cache) {
+                            int capacity =
+                                cache.expansionDims.size() > 1
+                                    ? cache.expansionDims[1] : 0;
+                            int required = cache.dims.size() > 1
+                                ? cache.dims[1] +
+                                    futureAppendBlocks * appendCapacity
+                                : capacity;
+                            return std::max(capacity, required);
+                        };
+                        if (keyOnCuda) {
+                            stagedBytes += pastKey.expansionBytes;
+                            SpillLongKvCacheToCpu(
+                                pastKey, futureCapacity(pastKey));
+                        }
+                        if (valueOnCuda) {
+                            stagedBytes += pastValue.expansionBytes;
+                            SpillLongKvCacheToCpu(
+                                pastValue, futureCapacity(pastValue));
+                        }
+                        stagedLayers++;
                     }
-                    Data &pastKey = pastKeyValues[layer].first;
-                    Data &pastValue = pastKeyValues[layer].second;
-                    bool keyOnCuda =
-                        pastKey.dataDevice == DataDevice::CUDA &&
-                        pastKey.cudaData != nullptr;
-                    bool valueOnCuda =
-                        pastValue.dataDevice == DataDevice::CUDA &&
-                        pastValue.cudaData != nullptr;
-                    if (!keyOnCuda && !valueOnCuda) {
-                        continue;
-                    }
-                    if (keyOnCuda) {
-                        stagedBytes += pastKey.expansionBytes;
-                        pastKey.ToDevice(DataDevice::CPU);
-                    }
-                    if (valueOnCuda) {
-                        stagedBytes += pastValue.expansionBytes;
-                        pastValue.ToDevice(DataDevice::CPU);
-                    }
-                    stagedLayers++;
                 }
             }
             FastllmCudaClearBigBuffer();
@@ -853,6 +1146,10 @@ namespace fastllm {
             Data &pastValue = pastKeyValues[layer].second;
             int layerPastLen = pastKey.dims.size() > 1
                                    ? pastKey.dims[1] : 0;
+#ifdef USE_CUDA
+            LongKvHostShadow keyHostShadow;
+            LongKvHostShadow valueHostShadow;
+#endif
             if (GetKVCacheInCPU()) {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
@@ -864,8 +1161,15 @@ namespace fastllm {
                 if (needsKvStageIn) {
                     ScopedExecutorProfiler kvStageInProfile(
                         "Dots3NoteKvStageIn");
+#ifdef USE_CUDA
+                    keyHostShadow = StageLongKvCacheToCuda(
+                        pastKey, attenInput.dataDevice);
+                    valueHostShadow = StageLongKvCacheToCuda(
+                        pastValue, attenInput.dataDevice);
+#else
                     pastKey.ToDevice(attenInput.dataDevice);
                     pastValue.ToDevice(attenInput.dataDevice);
+#endif
                 } else {
                     pastKey.ToDevice(attenInput.dataDevice);
                     pastValue.ToDevice(attenInput.dataDevice);
@@ -1039,9 +1343,20 @@ namespace fastllm {
                             key.dims[2]};
                     } else {
                         dims = pastKey.dims;
-                        dims[1] +=
+                        int appendCapacity =
                             ((key.dims[1] - 1) / cacheBlock + 1) *
                             cacheBlock;
+                        dims[1] += appendCapacity;
+#ifdef USE_CUDA
+                        if (rotateLongFullKvCache && fullAttention &&
+                            !keepFullKvOnCuda[layer]) {
+                            // One extra chunk keeps the host row pitch stable
+                            // on the following append, avoiding another full
+                            // CPU-prefix relayout while adding only bounded
+                            // headroom to the single active CUDA cache.
+                            dims[1] += appendCapacity;
+                        }
+#endif
                     }
                     pastKey.Expansion(dims);
                 }
@@ -1061,9 +1376,16 @@ namespace fastllm {
                             value.dims[2]};
                     } else {
                         dims = pastValue.dims;
-                        dims[1] +=
+                        int appendCapacity =
                             ((value.dims[1] - 1) / cacheBlock + 1) *
                             cacheBlock;
+                        dims[1] += appendCapacity;
+#ifdef USE_CUDA
+                        if (rotateLongFullKvCache && fullAttention &&
+                            !keepFullKvOnCuda[layer]) {
+                            dims[1] += appendCapacity;
+                        }
+#endif
                     }
                     pastValue.Expansion(dims);
                 }
@@ -1201,8 +1523,15 @@ namespace fastllm {
                 {
                     ScopedExecutorProfiler kvStageOutProfile(
                         "Dots3NoteKvStageOut");
+#ifdef USE_CUDA
+                    StageLongKvCacheToCpu(
+                        pastKey, keyHostShadow);
+                    StageLongKvCacheToCpu(
+                        pastValue, valueHostShadow);
+#else
                     pastKey.ToDevice(DataDevice::CPU);
                     pastValue.ToDevice(DataDevice::CPU);
+#endif
                 }
             }
 

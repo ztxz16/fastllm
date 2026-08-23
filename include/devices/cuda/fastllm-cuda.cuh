@@ -342,6 +342,12 @@ void FastllmCudaMemcpy2DDeviceToDeviceAuto(void * 	dst, size_t 	dpitch, const vo
     
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
                                        size_t 	spitch, size_t 	width, size_t 	height);
+void FastllmCudaMemcpy2DHostToDevice(void *dst, size_t dpitch,
+                                    const void *src, size_t spitch,
+                                    size_t width, size_t height);
+void FastllmCudaMemcpy2DDeviceToHost(void *dst, size_t dpitch,
+                                    const void *src, size_t spitch,
+                                    size_t width, size_t height);
 void FastllmCudaMemcpy2DDeviceToDeviceBatch(void ** 	dsts, size_t *	dpitchs, void ** 	srcs,
                                        size_t *	spitchs, size_t *widths, size_t *	heights,
                                        int batch);

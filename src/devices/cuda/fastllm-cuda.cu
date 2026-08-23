@@ -5828,6 +5828,28 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
     DeviceSync();
 }
 
+void FastllmCudaMemcpy2DHostToDevice(void *dst, size_t dpitch,
+                                    const void *src, size_t spitch,
+                                    size_t width, size_t height) {
+    if (width == 0 || height == 0) {
+        return;
+    }
+    cudaError_t state = cudaMemcpy2D(dst, dpitch, src, spitch, width, height,
+                                     cudaMemcpyHostToDevice);
+    checkCudaErrors("Error: CUDA error when 2D copying memory to GPU!", state);
+}
+
+void FastllmCudaMemcpy2DDeviceToHost(void *dst, size_t dpitch,
+                                    const void *src, size_t spitch,
+                                    size_t width, size_t height) {
+    if (width == 0 || height == 0) {
+        return;
+    }
+    cudaError_t state = cudaMemcpy2D(dst, dpitch, src, spitch, width, height,
+                                     cudaMemcpyDeviceToHost);
+    checkCudaErrors("Error: CUDA error when 2D copying GPU to memory!", state);
+}
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmShiftAppendWindowKernel(uint8_t *cache, const uint8_t *newToken,
                                                int channels, int window, int unitSize) {
