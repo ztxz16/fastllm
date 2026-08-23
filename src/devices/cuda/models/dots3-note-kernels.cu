@@ -568,6 +568,9 @@ __global__ void IndexerRadixSelectKernel(
     }
 }
 
+// Keep the decode-shaped path byte-for-byte equivalent to the established
+// implementation. The prefill specialization below changes CTA ordering and
+// reduction layout only when there are enough query rows to reuse KV in L2.
 template <typename IndexT>
 __global__ void SparseAttentionKernel(
         const __nv_bfloat16 *q, uint64_t qHeadStride,
@@ -614,8 +617,6 @@ __global__ void SparseAttentionKernel(
             dot += __shfl_down_sync(0xffffffffu, dot, offset);
         }
         if (lane == 0) {
-            // The reference promotes the BF16 einsum result before applying
-            // the FP32 attention scale and softmax.
             float score =
                 __bfloat162float(__float2bfloat16_rn(dot)) * scale;
             unnormalized[selected] = score;
@@ -663,8 +664,6 @@ __global__ void SparseAttentionKernel(
     }
     __syncthreads();
 
-    // Transformers converts the FP32 softmax probabilities back to the query
-    // dtype before multiplying V.  Preserve that BF16 rounding boundary.
     float localOutput[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int selected = warp; selected < length; selected += warps) {
         int keyIndex =
@@ -703,6 +702,169 @@ __global__ void SparseAttentionKernel(
 }
 
 template <typename IndexT>
+__global__ void SparseAttentionPrefillRowKernel(
+        const __nv_bfloat16 *q, uint64_t qHeadStride,
+        uint64_t qTokenStride, const __nv_bfloat16 *k,
+        uint64_t kHeadStride, uint64_t kTokenStride,
+        const __nv_bfloat16 *v, uint64_t vHeadStride,
+        uint64_t vTokenStride, const IndexT *indices,
+        __nv_bfloat16 *output, int seqlen, int totalLen,
+        int startPos, float scale) {
+    constexpr int warps = 8;
+    int row = blockIdx.x;
+    // Keep adjacent CTAs on the same attention head. Neighboring prefill
+    // queries usually select many of the same KV rows, so this ordering keeps
+    // their sparse gathers hot in L2 instead of cycling through all 128 heads
+    // before returning to the same KV cache.
+    int head = row / seqlen;
+    int token = row - head * seqlen;
+    if (token >= seqlen) {
+        return;
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int length = min(kIndexerTopK, min(totalLen, startPos + token + 1));
+    const __nv_bfloat16 *qRow =
+        q + (uint64_t)head * qHeadStride +
+        (uint64_t)token * qTokenStride;
+    float2 qValues[kAttentionQkDim / 64];
+#pragma unroll
+    for (int part = 0; part < kAttentionQkDim / 64; ++part) {
+        int d = lane * 2 + part * 64;
+        qValues[part] = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162 *>(qRow + d));
+    }
+
+    __shared__ float warpMax[warps];
+    __shared__ float warpSum[warps];
+    __shared__ float unnormalized[kIndexerTopK];
+    __shared__ float warpOutput[warps][kAttentionVDim];
+    __shared__ float rowMax;
+    __shared__ float rowSum;
+    float localMax = -FLT_MAX;
+    for (int selected = warp; selected < length; selected += warps) {
+        int keyIndex =
+            indices[(uint64_t)token * kIndexerTopK + selected];
+        const __nv_bfloat16 *kRow =
+            k + (uint64_t)head * kHeadStride +
+            (uint64_t)keyIndex * kTokenStride;
+        float dot = 0.0f;
+#pragma unroll
+        for (int part = 0; part < kAttentionQkDim / 64; ++part) {
+            int d = lane * 2 + part * 64;
+            float2 keyValues = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162 *>(kRow + d));
+            dot += qValues[part].x * keyValues.x;
+            dot += qValues[part].y * keyValues.y;
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0) {
+            // The reference promotes the BF16 einsum result before applying
+            // the FP32 attention scale and softmax.
+            float score =
+                __bfloat162float(__float2bfloat16_rn(dot)) * scale;
+            unnormalized[selected] = score;
+            localMax = fmaxf(localMax, score);
+        }
+    }
+    if (lane == 0) {
+        warpMax[warp] = localMax;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float maximum = warpMax[0];
+#pragma unroll
+        for (int i = 1; i < warps; ++i) {
+            maximum = fmaxf(maximum, warpMax[i]);
+        }
+        rowMax = maximum;
+    }
+    __syncthreads();
+
+    for (int selected = threadIdx.x; selected < length;
+         selected += blockDim.x) {
+        unnormalized[selected] =
+            expf(unnormalized[selected] - rowMax);
+    }
+    __syncthreads();
+
+    // Exponentiation and normalization reduction are independent across the
+    // selected keys. Spread both across the complete CTA now that sparse KV
+    // gathers no longer hide the lane-0 softmax serialization.
+    float localSum = 0.0f;
+    for (int selected = threadIdx.x; selected < length;
+         selected += blockDim.x) {
+        localSum += unnormalized[selected];
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localSum += __shfl_down_sync(0xffffffffu, localSum, offset);
+    }
+    if (lane == 0) {
+        warpSum[warp] = localSum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float sum = lane < warps ? warpSum[lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) {
+            rowSum = sum;
+        }
+    }
+    __syncthreads();
+
+    // Transformers converts the FP32 softmax probabilities back to the query
+    // dtype before multiplying V.  Preserve that BF16 rounding boundary.
+    float2 localOutput[2] = {
+        make_float2(0.0f, 0.0f),
+        make_float2(0.0f, 0.0f)};
+    for (int selected = warp; selected < length; selected += warps) {
+        int keyIndex =
+            indices[(uint64_t)token * kIndexerTopK + selected];
+        float probability = 0.0f;
+        if (lane == 0) {
+            probability = __bfloat162float(__float2bfloat16_rn(
+                unnormalized[selected] / rowSum));
+        }
+        probability = __shfl_sync(0xffffffffu, probability, 0);
+        const __nv_bfloat16 *vRow =
+            v + (uint64_t)head * vHeadStride +
+            (uint64_t)keyIndex * vTokenStride;
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            int d = lane * 2 + part * 64;
+            float2 values = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162 *>(vRow + d));
+            localOutput[part].x += probability * values.x;
+            localOutput[part].y += probability * values.y;
+        }
+    }
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+        int d = lane * 2 + part * 64;
+        warpOutput[warp][d] = localOutput[part].x;
+        warpOutput[warp][d + 1] = localOutput[part].y;
+    }
+    __syncthreads();
+    if (threadIdx.x < kAttentionVDim) {
+        float numerator = 0.0f;
+#pragma unroll
+        for (int i = 0; i < warps; ++i) {
+            numerator += warpOutput[i][threadIdx.x];
+        }
+        output[((uint64_t)head * seqlen + token) *
+                   kAttentionVDim + threadIdx.x] =
+            __float2bfloat16_rn(numerator);
+    }
+}
+
+template <typename IndexT>
 __global__ void SparseAttentionPrefillSoftmaxKernel(
         __nv_bfloat16 *scores, const IndexT *indices,
         uint64_t indexTokenStride, int queryOffset, int queryChunk,
@@ -726,38 +888,55 @@ __global__ void SparseAttentionPrefillSoftmaxKernel(
     __shared__ float rowSum;
 
     float localMax = -FLT_MAX;
-    for (int selected = warp; selected < length; selected += warps) {
-        if (lane == 0) {
-            int keyIndex = rowIndices[selected];
-            float score = __bfloat162float(rowScores[keyIndex]) * scale;
-            selectedProbabilities[selected] = score;
-            localMax = fmaxf(localMax, score);
-        }
+    for (int selected = threadIdx.x; selected < length;
+         selected += blockDim.x) {
+        int keyIndex = rowIndices[selected];
+        float score = __bfloat162float(rowScores[keyIndex]) * scale;
+        selectedProbabilities[selected] = score;
+        localMax = fmaxf(localMax, score);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localMax = fmaxf(
+            localMax,
+            __shfl_down_sync(0xffffffffu, localMax, offset));
     }
     if (lane == 0) {
         warpMax[warp] = localMax;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float maximum = warpMax[0];
+    if (warp == 0) {
+        float maximum = lane < warps ? warpMax[lane] : -FLT_MAX;
 #pragma unroll
-        for (int i = 1; i < warps; ++i) {
-            maximum = fmaxf(maximum, warpMax[i]);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            maximum = fmaxf(
+                maximum,
+                __shfl_down_sync(0xffffffffu, maximum, offset));
         }
-        rowMax = maximum;
+        if (lane == 0) {
+            rowMax = maximum;
+        }
     }
     __syncthreads();
 
-    float localSum = 0.0f;
-    for (int selected = warp; selected < length; selected += warps) {
-        if (lane == 0) {
-            float probability =
-                expf(selectedProbabilities[selected] - rowMax);
-            selectedProbabilities[selected] = probability;
+    for (int selected = threadIdx.x; selected < length;
+         selected += blockDim.x) {
+        selectedProbabilities[selected] =
+            expf(selectedProbabilities[selected] - rowMax);
+    }
+    __syncthreads();
+
+    // Score gathering and exponentiation dominate this kernel, so spread
+    // them across the complete block. Keep the original eight partial sums
+    // and their accumulation order to avoid changing the BF16 softmax
+    // rounding boundary.
+    if (lane == 0) {
+        float localSum = 0.0f;
+        for (int selected = warp; selected < length;
+             selected += warps) {
+            float probability = selectedProbabilities[selected];
             localSum += probability;
         }
-    }
-    if (lane == 0) {
         warpSum[warp] = localSum;
     }
     __syncthreads();
@@ -1406,7 +1585,43 @@ bool FastllmCudaDots3NoteSparseAttention(
                        {kAttentionHeads, seqlen, kAttentionVDim})) {
         return false;
     }
-    if (indices.dataType == fastllm::DataType::INT16) {
+    auto supportsVectorPairs = [](const fastllm::Data &data) {
+        return data.cudaData != nullptr && data.strides.size() == 3 &&
+               (reinterpret_cast<uintptr_t>(data.cudaData) & 3u) == 0 &&
+               (data.strides[0] & 1u) == 0 &&
+               (data.strides[1] & 1u) == 0 && data.strides[2] == 1;
+    };
+    bool optimizedPrefill = seqlen >= 16 && supportsVectorPairs(q) &&
+                            supportsVectorPairs(k) &&
+                            supportsVectorPairs(v);
+    if (indices.dataType == fastllm::DataType::INT16 && optimizedPrefill) {
+        SparseAttentionPrefillRowKernel<int16_t><<<
+            seqlen * kAttentionHeads, 256, 0,
+            cudaStreamPerThread>>>(
+                (const __nv_bfloat16 *)q.cudaData,
+                q.strides[0], q.strides[1],
+                (const __nv_bfloat16 *)k.cudaData,
+                k.strides[0], k.strides[1],
+                (const __nv_bfloat16 *)v.cudaData,
+                v.strides[0], v.strides[1],
+                (const int16_t *)indices.cudaData,
+                (__nv_bfloat16 *)output.cudaData,
+                seqlen, k.dims[1], startPos, scale);
+    } else if (indices.dataType == fastllm::DataType::INT32 &&
+               optimizedPrefill) {
+        SparseAttentionPrefillRowKernel<int32_t><<<
+            seqlen * kAttentionHeads, 256, 0,
+            cudaStreamPerThread>>>(
+                (const __nv_bfloat16 *)q.cudaData,
+                q.strides[0], q.strides[1],
+                (const __nv_bfloat16 *)k.cudaData,
+                k.strides[0], k.strides[1],
+                (const __nv_bfloat16 *)v.cudaData,
+                v.strides[0], v.strides[1],
+                (const int32_t *)indices.cudaData,
+                (__nv_bfloat16 *)output.cudaData,
+                seqlen, k.dims[1], startPos, scale);
+    } else if (indices.dataType == fastllm::DataType::INT16) {
         SparseAttentionKernel<int16_t><<<
             seqlen * kAttentionHeads, 256, 0,
             cudaStreamPerThread>>>(

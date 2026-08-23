@@ -3947,6 +3947,11 @@ namespace {
             // 8K benchmark at 128 MiB.
             size_t scratchLimit = std::max<size_t>(
                 128ULL * 1024ULL * 1024ULL, sparseOutputBytes);
+            int configuredScratchMb = params.GetInt("scratch_mb");
+            if (configuredScratchMb > 0) {
+                scratchLimit =
+                    (size_t)configuredScratchMb * 1024ULL * 1024ULL;
+            }
             int sparseQueryChunk = std::min(
                 queryTokens,
                 (int)std::max<size_t>(1, scratchLimit / bytesPerQuery));
@@ -4053,6 +4058,8 @@ namespace {
                 params.Add("keys", "2049", "total cached key tokens");
                 params.Add("path", "indexer",
                            "indexer, sparse, sparse_prefill or sliding_prefill");
+                params.Add("scratch_mb", "0",
+                           "borrowed sparse-prefill scratch size in MiB");
                 params.Add("workspace_device_switch", "0",
                            "validate workspace migration between GPU 0 and 1");
                 return params;
