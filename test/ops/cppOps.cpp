@@ -3520,6 +3520,109 @@ namespace {
             }
         }
 
+        void ValidateIndexerRadixAgreement() {
+            if (queryTokens <= 0 || totalTokens <= 2048) {
+                return;
+            }
+
+            const char *tensorName =
+                "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE";
+            const char *emitName =
+                "FASTLLM_DOTS3_NOTE_DISABLE_PARALLEL_RADIX_EMIT";
+            const char *compactName =
+                "FASTLLM_DOTS3_NOTE_DISABLE_INDEXER_RADIX_COMPACTION";
+            const char *tensorConfigured = std::getenv(tensorName);
+            const char *emitConfigured = std::getenv(emitName);
+            const char *compactConfigured = std::getenv(compactName);
+            bool hadTensor = tensorConfigured != nullptr;
+            bool hadEmit = emitConfigured != nullptr;
+            bool hadCompact = compactConfigured != nullptr;
+            std::string originalTensor =
+                hadTensor ? tensorConfigured : "";
+            std::string originalEmit = hadEmit ? emitConfigured : "";
+            std::string originalCompact =
+                hadCompact ? compactConfigured : "";
+            auto restoreEnvironment = [&]() {
+                if (hadTensor) {
+                    setenv(tensorName, originalTensor.c_str(), 1);
+                } else {
+                    unsetenv(tensorName);
+                }
+                if (hadEmit) {
+                    setenv(emitName, originalEmit.c_str(), 1);
+                } else {
+                    unsetenv(emitName);
+                }
+                if (hadCompact) {
+                    setenv(compactName, originalCompact.c_str(), 1);
+                } else {
+                    unsetenv(compactName);
+                }
+            };
+
+            auto validateMode = [&](bool tensorCore) {
+                setenv(tensorName, tensorCore ? "1" : "0", 1);
+                unsetenv(emitName);
+                unsetenv(compactName);
+                fastllm::Data optimizedIndices, legacyIndices;
+                bool optimizedOk = FastllmCudaDots3NoteIndexerTopK(
+                    qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                    startPos, 2048, optimizedIndices);
+                setenv(emitName, "1", 1);
+                setenv(compactName, "1", 1);
+                bool legacyOk = FastllmCudaDots3NoteIndexerTopK(
+                    qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                    startPos, 2048, legacyIndices);
+                if (!optimizedOk || !legacyOk) {
+                    throw std::runtime_error(
+                        std::string("Dots indexer radix-agreement ") +
+                        (tensorCore ? "Tensor Core" : "scalar") +
+                        " launch failed");
+                }
+                ForceDeviceSync();
+                std::vector<int32_t> optimized =
+                    ToInt32Vector(optimizedIndices);
+                std::vector<int32_t> legacy =
+                    ToInt32Vector(legacyIndices);
+                if (optimized != legacy) {
+                    size_t mismatch = 0;
+                    while (mismatch < optimized.size() &&
+                           optimized[mismatch] == legacy[mismatch]) {
+                        ++mismatch;
+                    }
+                    std::ostringstream os;
+                    os << "Dots "
+                       << (tensorCore ? "Tensor Core" : "scalar")
+                       << " optimized radix path disagrees with the legacy "
+                          "path at output " << mismatch;
+                    if (mismatch < optimized.size()) {
+                        os << ": optimized=" << optimized[mismatch]
+                           << " legacy=" << legacy[mismatch];
+                    }
+                    throw std::runtime_error(os.str());
+                }
+            };
+
+            try {
+                // The scalar scorer is the runtime fallback on every pre-SM89
+                // GPU, so always compare its parallel emit with the legacy
+                // serial path. On SM89+, additionally cover the FP8 Tensor
+                // Core path and its radix-prefix scratch compaction.
+                validateMode(false);
+                bool tensorCoreEligible =
+                    getCudaInfos()->cudaArch >= 890 && queryTokens >= 16 &&
+                    queryTokens % 16 == 0 && totalTokens >= 8192 &&
+                    totalTokens % 16 == 0 && startPos % 16 == 0;
+                if (tensorCoreEligible) {
+                    validateMode(true);
+                }
+                restoreEnvironment();
+            } catch (...) {
+                restoreEnvironment();
+                throw;
+            }
+        }
+
         static void CopyCudaTensorToDevice(
                 const fastllm::Data &source, int targetDevice,
                 fastllm::Data &target) {
@@ -3915,6 +4018,7 @@ namespace {
             }
             ValidateTopK();
             ValidateIndexerPathAgreement();
+            ValidateIndexerRadixAgreement();
             if (params.GetInt("workspace_device_switch") != 0) {
                 ValidateIndexerWorkspaceDeviceSwitch();
             }

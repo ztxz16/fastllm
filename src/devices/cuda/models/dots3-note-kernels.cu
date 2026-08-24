@@ -22,6 +22,10 @@ constexpr int kIndexerCandidateK = 2304;
 constexpr int kIndexerDefaultQueryChunk = 256;
 constexpr int kIndexerKeysPerBlock = 8;
 constexpr int kIndexerCandidateKeysPerBlock = 16;
+constexpr int kIndexerRadixThreads = 256;
+constexpr int kIndexerRadixWarps = kIndexerRadixThreads / 32;
+static_assert(kIndexerRadixThreads % 32 == 0,
+              "Dots3-Note radix block must contain complete warps");
 constexpr size_t kIndexerHeadScoreLimit =
     1ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr int kAttentionHeads = 128;
@@ -31,6 +35,15 @@ constexpr size_t kSparsePrefillScratchLimit =
     128ULL * 1024ULL * 1024ULL;
 constexpr size_t kSlidingPrefillScratchLimit =
     64ULL * 1024ULL * 1024ULL;
+
+bool EnvValueEnabled(const char *value) {
+    return value != nullptr && value[0] != '\0' &&
+           strcmp(value, "0") != 0 &&
+           strcmp(value, "false") != 0 &&
+           strcmp(value, "FALSE") != 0 &&
+           strcmp(value, "off") != 0 &&
+           strcmp(value, "OFF") != 0;
+}
 
 bool PrepareOutput(fastllm::Data &output, fastllm::DataType type,
                    const std::vector<int> &dims) {
@@ -488,7 +501,9 @@ template <typename IndexT, int selectedK>
 __global__ void IndexerRadixSelectKernel(
         const float *logits, IndexT *selectedIds,
         const IndexT *keyMap, int seqlen,
-        int totalLen, int startPos) {
+        int totalLen, int startPos,
+        IndexT *radixScratch, int radixScratchStride,
+        bool parallelEmit) {
     int token = blockIdx.x;
     if (token >= seqlen) return;
     int rowEnd = min(totalLen, startPos + token + 1);
@@ -506,6 +521,11 @@ __global__ void IndexerRadixSelectKernel(
     __shared__ uint32_t histogram[256];
     __shared__ uint32_t prefix;
     __shared__ uint32_t remaining;
+    __shared__ uint32_t compactCount;
+    __shared__ uint32_t emitBase;
+    __shared__ uint32_t emitTileBase;
+    __shared__ uint32_t emitWarpCounts[kIndexerRadixWarps];
+    __shared__ uint32_t emitWarpOffsets[kIndexerRadixWarps];
     if (threadIdx.x == 0) {
         prefix = 0;
         remaining = selectedK;
@@ -521,8 +541,14 @@ __global__ void IndexerRadixSelectKernel(
         uint32_t mask = round == 0
             ? 0u : (~0u << (32 - round * 8));
         uint32_t currentPrefix = prefix;
-        for (int key = threadIdx.x; key < rowEnd;
-             key += blockDim.x) {
+        bool useCompactBucket = radixScratch != nullptr && round > 1;
+        int scanCount = useCompactBucket ? (int)compactCount : rowEnd;
+        IndexT *scratchRow = radixScratch == nullptr
+            ? nullptr
+            : radixScratch + (uint64_t)token * radixScratchStride;
+        for (int i = threadIdx.x; i < scanCount;
+             i += blockDim.x) {
+            int key = useCompactBucket ? (int)scratchRow[i] : i;
             uint32_t ordered = OrderedFloatBits(row[key]);
             if ((ordered & mask) == currentPrefix) {
                 atomicAdd(&histogram[(ordered >> shift) & 0xffu], 1u);
@@ -543,27 +569,96 @@ __global__ void IndexerRadixSelectKernel(
             }
         }
         __syncthreads();
+        if (round == 1 && radixScratch != nullptr) {
+            if (threadIdx.x == 0) {
+                compactCount = 0;
+            }
+            __syncthreads();
+            uint32_t firstTwoBytePrefix = prefix;
+            for (int key = threadIdx.x; key < rowEnd;
+                 key += blockDim.x) {
+                uint32_t ordered = OrderedFloatBits(row[key]);
+                if ((ordered & 0xffff0000u) == firstTwoBytePrefix) {
+                    uint32_t position = atomicAdd(&compactCount, 1u);
+                    scratchRow[position] = (IndexT)key;
+                }
+            }
+            __syncthreads();
+        }
     }
 
-    // A single thread emits in key-id order. This pass is tiny next to the
-    // 64-head score calculation and guarantees the first rowEnd entries are
-    // valid for causal rows shorter than TopK.
-    if (threadIdx.x == 0) {
-        int count = 0;
-        uint32_t pivot = prefix;
-        for (int key = 0; key < rowEnd && count < selectedK; ++key) {
-            if (OrderedFloatBits(row[key]) > pivot) {
-                output[count++] = keyMap == nullptr
-                    ? (IndexT)key
-                    : keyMap[(uint64_t)token * totalLen + key];
+    if (!parallelEmit) {
+        if (threadIdx.x == 0) {
+            int count = 0;
+            uint32_t pivot = prefix;
+            for (int key = 0; key < rowEnd && count < selectedK; ++key) {
+                if (OrderedFloatBits(row[key]) > pivot) {
+                    output[count++] = keyMap == nullptr
+                        ? (IndexT)key
+                        : keyMap[(uint64_t)token * totalLen + key];
+                }
+            }
+            for (int key = 0; key < rowEnd && count < selectedK; ++key) {
+                if (OrderedFloatBits(row[key]) == pivot) {
+                    output[count++] = keyMap == nullptr
+                        ? (IndexT)key
+                        : keyMap[(uint64_t)token * totalLen + key];
+                }
             }
         }
-        for (int key = 0; key < rowEnd && count < selectedK; ++key) {
-            if (OrderedFloatBits(row[key]) == pivot) {
-                output[count++] = keyMap == nullptr
+        return;
+    }
+
+    // Emit in ascending key-id order with a stable CTA-wide compaction. The
+    // strict-greater pass comes first, followed by only as many pivot ties as
+    // needed, exactly matching the established smaller-key tie break.
+    if (threadIdx.x == 0) {
+        emitBase = 0;
+    }
+    __syncthreads();
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    uint32_t lowerLaneMask = lane == 0
+        ? 0u : (0xffffffffu >> (32 - lane));
+    uint32_t pivot = prefix;
+    for (int equalPass = 0; equalPass < 2; ++equalPass) {
+        for (int tile = 0; tile < rowEnd; tile += blockDim.x) {
+            if (emitBase >= selectedK) {
+                break;
+            }
+            int key = tile + threadIdx.x;
+            bool selected = false;
+            if (key < rowEnd) {
+                uint32_t ordered = OrderedFloatBits(row[key]);
+                selected = equalPass == 0
+                    ? ordered > pivot : ordered == pivot;
+            }
+            uint32_t selectedMask = __ballot_sync(
+                0xffffffffu, selected);
+            if (lane == 0) {
+                emitWarpCounts[warp] = __popc(selectedMask);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                uint32_t offset = 0;
+#pragma unroll
+                for (int emitWarp = 0;
+                     emitWarp < kIndexerRadixWarps; ++emitWarp) {
+                    emitWarpOffsets[emitWarp] = offset;
+                    offset += emitWarpCounts[emitWarp];
+                }
+                emitTileBase = emitBase;
+                emitBase += offset;
+            }
+            __syncthreads();
+            uint32_t position = emitTileBase + emitWarpOffsets[warp] +
+                __popc(selectedMask & lowerLaneMask);
+            if (selected && position < selectedK) {
+                output[position] = keyMap == nullptr
                     ? (IndexT)key
                     : keyMap[(uint64_t)token * totalLen + key];
             }
+            __syncthreads();
         }
     }
 }
@@ -1289,12 +1384,7 @@ bool FastllmCudaDots3NoteIndexerTopK(
                          !FastllmCudaGraphIsCapturingFast();
     if (const char *env = std::getenv(
             "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE")) {
-        useTensorCore = useTensorCore && env[0] != '\0' &&
-                        strcmp(env, "0") != 0 &&
-                        strcmp(env, "false") != 0 &&
-                        strcmp(env, "FALSE") != 0 &&
-                        strcmp(env, "off") != 0 &&
-                        strcmp(env, "OFF") != 0;
+        useTensorCore = useTensorCore && EnvValueEnabled(env);
     }
     int maxRowsPerChunk = INT_MAX / totalLen;
     if (maxRowsPerChunk <= 0) {
@@ -1400,6 +1490,10 @@ bool FastllmCudaDots3NoteIndexerTopK(
         return false;
     }
     cudaError_t state = cudaSuccess;
+    bool useRadixCompaction = !EnvValueEnabled(std::getenv(
+        "FASTLLM_DOTS3_NOTE_DISABLE_INDEXER_RADIX_COMPACTION"));
+    bool useParallelRadixEmit = !EnvValueEnabled(std::getenv(
+        "FASTLLM_DOTS3_NOTE_DISABLE_PARALLEL_RADIX_EMIT"));
     if (state == cudaSuccess) {
         const uint8_t *allQ = (const uint8_t *)qFp8.cudaData;
         const float *allWeights =
@@ -1456,15 +1550,22 @@ bool FastllmCudaDots3NoteIndexerTopK(
             if (state != cudaSuccess) {
                 break;
             }
+            // The reduction above has consumed every head score. Until the
+            // next query chunk, that much larger buffer can hold one compact
+            // radix bucket per query without increasing peak workspace.
             if (useTensorCore && useCompactIndices) {
                 int16_t *candidates = (int16_t *)candidateIds;
                 int16_t *allIndices = (int16_t *)indices.cudaData;
                 IndexerRadixSelectKernel<
                     int16_t, kIndexerCandidateK><<<
-                        current, 256, 0, cudaStreamPerThread>>>(
+                        current, kIndexerRadixThreads, 0,
+                        cudaStreamPerThread>>>(
                             logits, candidates, nullptr,
                             current, totalLen,
-                            startPos + queryOffset);
+                            startPos + queryOffset,
+                            useRadixCompaction
+                                ? (int16_t *)headScores : nullptr,
+                            totalLen, useParallelRadixEmit);
                 IndexerCandidateExactScoresKernel<int16_t><<<
                     current * (kIndexerCandidateK /
                                kIndexerCandidateKeysPerBlock),
@@ -1478,22 +1579,28 @@ bool FastllmCudaDots3NoteIndexerTopK(
                         startPos + queryOffset);
                 IndexerRadixSelectKernel<
                     int16_t, kIndexerTopK><<<
-                        current, 256, 0, cudaStreamPerThread>>>(
+                        current, kIndexerRadixThreads, 0,
+                        cudaStreamPerThread>>>(
                             candidateScores,
                             allIndices +
                                 (uint64_t)queryOffset * kIndexerTopK,
                             candidates, current,
                             kIndexerCandidateK,
-                            kIndexerCandidateK);
+                            kIndexerCandidateK, nullptr, 0,
+                            useParallelRadixEmit);
             } else if (useTensorCore) {
                 int32_t *candidates = (int32_t *)candidateIds;
                 int32_t *allIndices = (int32_t *)indices.cudaData;
                 IndexerRadixSelectKernel<
                     int32_t, kIndexerCandidateK><<<
-                        current, 256, 0, cudaStreamPerThread>>>(
+                        current, kIndexerRadixThreads, 0,
+                        cudaStreamPerThread>>>(
                             logits, candidates, nullptr,
                             current, totalLen,
-                            startPos + queryOffset);
+                            startPos + queryOffset,
+                            useRadixCompaction
+                                ? (int32_t *)headScores : nullptr,
+                            totalLen, useParallelRadixEmit);
                 IndexerCandidateExactScoresKernel<int32_t><<<
                     current * (kIndexerCandidateK /
                                kIndexerCandidateKeysPerBlock),
@@ -1507,33 +1614,39 @@ bool FastllmCudaDots3NoteIndexerTopK(
                         startPos + queryOffset);
                 IndexerRadixSelectKernel<
                     int32_t, kIndexerTopK><<<
-                        current, 256, 0, cudaStreamPerThread>>>(
+                        current, kIndexerRadixThreads, 0,
+                        cudaStreamPerThread>>>(
                             candidateScores,
                             allIndices +
                                 (uint64_t)queryOffset * kIndexerTopK,
                             candidates, current,
                             kIndexerCandidateK,
-                            kIndexerCandidateK);
+                            kIndexerCandidateK, nullptr, 0,
+                            useParallelRadixEmit);
             } else if (useCompactIndices) {
                 int16_t *allIndices = (int16_t *)indices.cudaData;
                 IndexerRadixSelectKernel<
                     int16_t, kIndexerTopK><<<
-                        current, 256, 0, cudaStreamPerThread>>>(
+                        current, kIndexerRadixThreads, 0,
+                        cudaStreamPerThread>>>(
                             logits,
                             allIndices +
                                 (uint64_t)queryOffset * kIndexerTopK,
                             nullptr, current, totalLen,
-                            startPos + queryOffset);
+                            startPos + queryOffset, nullptr, 0,
+                            useParallelRadixEmit);
             } else {
                 int32_t *allIndices = (int32_t *)indices.cudaData;
                 IndexerRadixSelectKernel<
                     int32_t, kIndexerTopK><<<
-                        current, 256, 0, cudaStreamPerThread>>>(
+                        current, kIndexerRadixThreads, 0,
+                        cudaStreamPerThread>>>(
                             logits,
                             allIndices +
                                 (uint64_t)queryOffset * kIndexerTopK,
                             nullptr, current, totalLen,
-                            startPos + queryOffset);
+                            startPos + queryOffset, nullptr, 0,
+                            useParallelRadixEmit);
             }
             state = cudaPeekAtLastError();
             if (state != cudaSuccess) break;
