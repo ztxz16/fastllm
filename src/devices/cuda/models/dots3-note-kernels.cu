@@ -796,7 +796,7 @@ __global__ void SparseAttentionKernel(
     }
 }
 
-template <typename IndexT>
+template <typename IndexT, bool CacheIndices>
 __global__ void SparseAttentionPrefillRowKernel(
         const __nv_bfloat16 *q, uint64_t qHeadStride,
         uint64_t qTokenStride, const __nv_bfloat16 *k,
@@ -836,10 +836,27 @@ __global__ void SparseAttentionPrefillRowKernel(
     __shared__ float warpOutput[warps][kAttentionVDim];
     __shared__ float rowMax;
     __shared__ float rowSum;
+    extern __shared__ __align__(4) uint8_t sparsePrefillShared[];
+    IndexT *selectedIndices =
+        reinterpret_cast<IndexT *>(sparsePrefillShared);
+    if constexpr (CacheIndices) {
+        const IndexT *rowIndices =
+            indices + (uint64_t)token * kIndexerTopK;
+        for (int selected = threadIdx.x; selected < length;
+             selected += blockDim.x) {
+            selectedIndices[selected] = rowIndices[selected];
+        }
+        __syncthreads();
+    }
     float localMax = -FLT_MAX;
     for (int selected = warp; selected < length; selected += warps) {
-        int keyIndex =
-            indices[(uint64_t)token * kIndexerTopK + selected];
+        int keyIndex;
+        if constexpr (CacheIndices) {
+            keyIndex = selectedIndices[selected];
+        } else {
+            keyIndex = indices[
+                (uint64_t)token * kIndexerTopK + selected];
+        }
         const __nv_bfloat16 *kRow =
             k + (uint64_t)head * kHeadStride +
             (uint64_t)keyIndex * kTokenStride;
@@ -920,8 +937,13 @@ __global__ void SparseAttentionPrefillRowKernel(
         make_float2(0.0f, 0.0f),
         make_float2(0.0f, 0.0f)};
     for (int selected = warp; selected < length; selected += warps) {
-        int keyIndex =
-            indices[(uint64_t)token * kIndexerTopK + selected];
+        int keyIndex;
+        if constexpr (CacheIndices) {
+            keyIndex = selectedIndices[selected];
+        } else {
+            keyIndex = indices[
+                (uint64_t)token * kIndexerTopK + selected];
+        }
         float probability = 0.0f;
         if (lane == 0) {
             probability = __bfloat162float(__float2bfloat16_rn(
@@ -957,6 +979,28 @@ __global__ void SparseAttentionPrefillRowKernel(
                    kAttentionVDim + threadIdx.x] =
             __float2bfloat16_rn(numerator);
     }
+}
+
+template <typename IndexT, bool CacheIndices>
+void LaunchSparseAttentionPrefillRow(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indices,
+        int startPos, float scale, fastllm::Data &output) {
+    int seqlen = q.dims[1];
+    size_t sharedBytes = CacheIndices
+        ? kIndexerTopK * sizeof(IndexT) : 0;
+    SparseAttentionPrefillRowKernel<IndexT, CacheIndices><<<
+        seqlen * kAttentionHeads, 256, sharedBytes,
+        cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)q.cudaData,
+            q.strides[0], q.strides[1],
+            (const __nv_bfloat16 *)k.cudaData,
+            k.strides[0], k.strides[1],
+            (const __nv_bfloat16 *)v.cudaData,
+            v.strides[0], v.strides[1],
+            (const IndexT *)indices.cudaData,
+            (__nv_bfloat16 *)output.cudaData,
+            seqlen, k.dims[1], startPos, scale);
 }
 
 template <typename IndexT>
@@ -1707,33 +1751,23 @@ bool FastllmCudaDots3NoteSparseAttention(
     bool optimizedPrefill = seqlen >= 16 && supportsVectorPairs(q) &&
                             supportsVectorPairs(k) &&
                             supportsVectorPairs(v);
+    bool disableCachedSparseIndices = EnvValueEnabled(std::getenv(
+        "FASTLLM_DOTS3_NOTE_DISABLE_CACHED_SPARSE_INDICES"));
+    bool cachePrefillIndices = !disableCachedSparseIndices;
     if (indices.dataType == fastllm::DataType::INT16 && optimizedPrefill) {
-        SparseAttentionPrefillRowKernel<int16_t><<<
-            seqlen * kAttentionHeads, 256, 0,
-            cudaStreamPerThread>>>(
-                (const __nv_bfloat16 *)q.cudaData,
-                q.strides[0], q.strides[1],
-                (const __nv_bfloat16 *)k.cudaData,
-                k.strides[0], k.strides[1],
-                (const __nv_bfloat16 *)v.cudaData,
-                v.strides[0], v.strides[1],
-                (const int16_t *)indices.cudaData,
-                (__nv_bfloat16 *)output.cudaData,
-                seqlen, k.dims[1], startPos, scale);
+        if (cachePrefillIndices) {
+            LaunchSparseAttentionPrefillRow<int16_t, true>(
+                q, k, v, indices, startPos, scale, output);
+        } else {
+            LaunchSparseAttentionPrefillRow<int16_t, false>(
+                q, k, v, indices, startPos, scale, output);
+        }
     } else if (indices.dataType == fastllm::DataType::INT32 &&
                optimizedPrefill) {
-        SparseAttentionPrefillRowKernel<int32_t><<<
-            seqlen * kAttentionHeads, 256, 0,
-            cudaStreamPerThread>>>(
-                (const __nv_bfloat16 *)q.cudaData,
-                q.strides[0], q.strides[1],
-                (const __nv_bfloat16 *)k.cudaData,
-                k.strides[0], k.strides[1],
-                (const __nv_bfloat16 *)v.cudaData,
-                v.strides[0], v.strides[1],
-                (const int32_t *)indices.cudaData,
-                (__nv_bfloat16 *)output.cudaData,
-                seqlen, k.dims[1], startPos, scale);
+        // INT32 indices need twice as much shared storage and reduce active
+        // CTAs on SM89, so keep their established direct-load path.
+        LaunchSparseAttentionPrefillRow<int32_t, false>(
+            q, k, v, indices, startPos, scale, output);
     } else if (indices.dataType == fastllm::DataType::INT16) {
         SparseAttentionKernel<int16_t><<<
             seqlen * kAttentionHeads, 256, 0,

@@ -23,7 +23,7 @@ namespace fastllm {
             7LL * 1024LL * 1024LL * 1024LL;
         constexpr long long kLongKvResidentBudgetBytes =
             3LL * 1024LL * 1024LL * 1024LL;
-        constexpr int kSparsePrefillMaxKeys = 16384;
+        constexpr int kSparsePrefillMaxKeys = 24576;
 
         struct CudaDirectWorkspace {
             void *data = nullptr;
