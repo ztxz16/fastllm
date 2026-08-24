@@ -148,6 +148,59 @@ namespace fastllm {
                 cudaRowPitchBytes, rowBytes, cache.dims[0]);
         }
 
+        void RelayoutLongKvHostRows(
+                uint8_t *dst, size_t dstRowPitchBytes,
+                const uint8_t *src, size_t srcRowPitchBytes,
+                size_t rowBytes, int heads) {
+            if (dst == nullptr || src == nullptr || rowBytes == 0 ||
+                heads <= 0) {
+                return;
+            }
+
+            size_t totalBytes = rowBytes * (size_t)heads;
+            constexpr size_t kMinimumParallelBytes = 64ULL << 20;
+            constexpr size_t kBytesPerWorker = 16ULL << 20;
+            constexpr int kMaximumWorkers = 32;
+            int workers = 1;
+            if (totalBytes >= kMinimumParallelBytes &&
+                !EnvFlagEnabled(
+                    "FASTLLM_DOTS3_NOTE_DISABLE_PARALLEL_KV_RELAYOUT")) {
+                workers = std::min(
+                    heads, std::min(
+                        kMaximumWorkers,
+                        std::max(
+                            1, (int)((totalBytes + kBytesPerWorker - 1) /
+                                     kBytesPerWorker))));
+                unsigned int hardwareWorkers =
+                    std::thread::hardware_concurrency();
+                if (hardwareWorkers > 0) {
+                    workers = std::min(workers, (int)hardwareWorkers);
+                }
+            }
+
+            auto copyRows = [&](int worker) {
+                for (int head = worker; head < heads; head += workers) {
+                    std::memcpy(
+                        dst + (size_t)head * dstRowPitchBytes,
+                        src + (size_t)head * srcRowPitchBytes,
+                        rowBytes);
+                }
+            };
+            if (workers == 1) {
+                copyRows(0);
+                return;
+            }
+
+            std::vector<std::thread> threads;
+            threads.reserve(workers);
+            for (int worker = 0; worker < workers; ++worker) {
+                threads.emplace_back(copyRows, worker);
+            }
+            for (std::thread &thread : threads) {
+                thread.join();
+            }
+        }
+
         void SpillLongKvCacheToCpu(
                 Data &cache, int futureCapacity) {
             if (cache.dataDevice != DataDevice::CUDA ||
@@ -266,13 +319,10 @@ namespace fastllm {
                     new uint8_t[cache.expansionBytes];
                 size_t prefixBytes =
                     (size_t)shadow.tokens * tokenStrideBytes;
-                for (int head = 0; head < shadow.heads; ++head) {
-                    std::memcpy(
-                        expandedHost + (size_t)head * rowPitchBytes,
-                        shadow.data +
-                            (size_t)head * shadow.rowPitchBytes,
-                        prefixBytes);
-                }
+                RelayoutLongKvHostRows(
+                    expandedHost, rowPitchBytes,
+                    shadow.data, shadow.rowPitchBytes,
+                    prefixBytes, shadow.heads);
                 cache.cpuData = expandedHost;
                 delete[] shadow.data;
             }
@@ -837,8 +887,16 @@ namespace fastllm {
                         }
                         int appendCapacity =
                             ((seqlen - 1) / 128 + 1) * 128;
-                        int futureAppendBlocks =
-                            keepFullKvOnCuda[layer] ? 1 : 2;
+                        // A nonresident cache is staged once per subsequent
+                        // chunk. Reserve the current append plus two following
+                        // appends so a 32K request with 8K chunks never has to
+                        // rewrite its complete CPU prefix merely to change the
+                        // per-head row pitch. Larger contexts still use the
+                        // parallel relayout path above when growth is needed.
+                        bool disableHostHeadroom = EnvFlagEnabled(
+                            "FASTLLM_DOTS3_NOTE_DISABLE_KV_HOST_HEADROOM");
+                        int futureAppendBlocks = keepFullKvOnCuda[layer]
+                            ? 1 : (disableHostHeadroom ? 2 : 3);
                         auto futureCapacity = [&](const Data &cache) {
                             int capacity =
                                 cache.expansionDims.size() > 1
