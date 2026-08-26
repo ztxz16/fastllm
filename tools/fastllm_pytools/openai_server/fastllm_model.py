@@ -13,8 +13,16 @@ class FastLLmModel:
             getattr(model, "configured_context_window_limit", None)
         )
         is_kimi_k3 = self._is_kimi_k3(model)
-        reasoning_efforts = ["low", "high", "max"] if is_kimi_k3 else []
-        default_reasoning_effort = "max" if is_kimi_k3 else None
+        is_qwen3_5 = self._is_qwen3_5(model)
+        if is_kimi_k3:
+            reasoning_efforts = ["low", "high", "max"]
+            default_reasoning_effort = "max"
+        elif is_qwen3_5:
+            reasoning_efforts = ["low", "medium", "xhigh"]
+            default_reasoning_effort = "xhigh"
+        else:
+            reasoning_efforts = []
+            default_reasoning_effort = None
 
         context_window_candidates = [
             value for value in (current_model_context_window, kv_cache_token_limit)
@@ -196,3 +204,35 @@ class FastLLmModel:
             except Exception:
                 pass
         return False
+
+    @staticmethod
+    def _is_qwen3_5(model):
+        qwen3_5_types = {
+            "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
+        }
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                if get_type() in qwen3_5_types:
+                    return True
+            except Exception:
+                pass
+
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures") or []
+        architecture = architectures[0] if architectures else ""
+        model_type = config.get("model_type", "")
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type", "")
+            if isinstance(text_config, dict) else "")
+        return (
+            architecture in {
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            }
+            or model_type in qwen3_5_types
+            or text_model_type in qwen3_5_types
+        )

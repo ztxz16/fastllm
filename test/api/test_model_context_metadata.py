@@ -92,6 +92,22 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         self.assertEqual(model["default_reasoning_effort"], "max")
         self.assertEqual(model["defaultReasoningEffort"], "max")
 
+    def test_qwen3_5_reasoning_efforts_are_discoverable(self):
+        metadata = FastLLmModel(
+            "qwen3.5",
+            _FakeModel(262144, 262144, model_type = "qwen3_5"),
+        )
+
+        model = metadata.response["data"][0]
+        self.assertEqual(
+            model["supported_reasoning_efforts"],
+            ["low", "medium", "xhigh"])
+        self.assertEqual(
+            model["supportedReasoningEfforts"],
+            ["low", "medium", "xhigh"])
+        self.assertEqual(model["default_reasoning_effort"], "xhigh")
+        self.assertEqual(model["defaultReasoningEffort"], "xhigh")
+
 
 class ServerContextArgumentTest(unittest.TestCase):
     def test_hyphenated_alias_is_parsed(self):
