@@ -3306,8 +3306,16 @@ namespace {
         fastllm::Data sparseOutput, sparsePrefillOutput;
         fastllm::Data slidingPrefillOutput;
         fastllm::Data sparsePrefillBacking;
+        void *indexerHeadScoreWorkspace = nullptr;
+        size_t indexerHeadScoreWorkspaceBytes = 0;
         size_t sparseOutputBytes = 0;
         size_t sparseScratchBytes = 0;
+
+        ~Dots3NoteIndexerBenchState() {
+            if (indexerHeadScoreWorkspace != nullptr) {
+                FastllmCudaDirectFree(indexerHeadScoreWorkspace);
+            }
+        }
 
         static std::vector<uint8_t> ToBytes(const fastllm::Data &data) {
             fastllm::Data host;
@@ -3471,7 +3479,7 @@ namespace {
         }
 
         void ValidateIndexerPathAgreement() {
-            if (getCudaInfos()->cudaArch < 890 || queryTokens < 16 ||
+            if (getCudaInfos()->cudaArch < 750 || queryTokens < 16 ||
                 queryTokens % 16 != 0 || totalTokens < 8192 ||
                 totalTokens % 16 != 0 || startPos % 16 != 0) {
                 return;
@@ -3483,14 +3491,18 @@ namespace {
             bool hadConfigured = configured != nullptr;
             std::string original = hadConfigured ? configured : "";
             fastllm::Data tensorIndices, scalarIndices;
+            bool tensorCorePathUsed = false;
+            bool scalarTensorCorePathUsed = false;
             setenv(name, "1", 1);
-            bool tensorOk = FastllmCudaDots3NoteIndexerTopK(
+            bool tensorOk = FastllmCudaDots3NoteIndexerTopKWithPathInfo(
                 qFp8, foldedWeights, cachedKFp8, cachedKScales,
-                startPos, 2048, tensorIndices);
+                startPos, 2048, tensorIndices, nullptr, nullptr,
+                &tensorCorePathUsed);
             setenv(name, "0", 1);
-            bool scalarOk = FastllmCudaDots3NoteIndexerTopK(
+            bool scalarOk = FastllmCudaDots3NoteIndexerTopKWithPathInfo(
                 qFp8, foldedWeights, cachedKFp8, cachedKScales,
-                startPos, 2048, scalarIndices);
+                startPos, 2048, scalarIndices, nullptr, nullptr,
+                &scalarTensorCorePathUsed);
             if (hadConfigured) {
                 setenv(name, original.c_str(), 1);
             } else {
@@ -3499,6 +3511,14 @@ namespace {
             if (!tensorOk || !scalarOk) {
                 throw std::runtime_error(
                     "Dots indexer path-agreement launch failed");
+            }
+            if (!tensorCorePathUsed) {
+                throw std::runtime_error(
+                    "Dots Tensor Core indexer silently fell back");
+            }
+            if (scalarTensorCorePathUsed) {
+                throw std::runtime_error(
+                    "Dots scalar indexer used the Tensor Core path");
             }
             ForceDeviceSync();
             std::vector<int32_t> tensor = ToInt32Vector(tensorIndices);
@@ -3565,19 +3585,33 @@ namespace {
                 unsetenv(emitName);
                 unsetenv(compactName);
                 fastllm::Data optimizedIndices, legacyIndices;
-                bool optimizedOk = FastllmCudaDots3NoteIndexerTopK(
-                    qFp8, foldedWeights, cachedKFp8, cachedKScales,
-                    startPos, 2048, optimizedIndices);
+                bool optimizedTensorCorePathUsed = false;
+                bool legacyTensorCorePathUsed = false;
+                bool optimizedOk =
+                    FastllmCudaDots3NoteIndexerTopKWithPathInfo(
+                        qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                        startPos, 2048, optimizedIndices, nullptr, nullptr,
+                        &optimizedTensorCorePathUsed);
                 setenv(emitName, "1", 1);
                 setenv(compactName, "1", 1);
-                bool legacyOk = FastllmCudaDots3NoteIndexerTopK(
-                    qFp8, foldedWeights, cachedKFp8, cachedKScales,
-                    startPos, 2048, legacyIndices);
+                bool legacyOk =
+                    FastllmCudaDots3NoteIndexerTopKWithPathInfo(
+                        qFp8, foldedWeights, cachedKFp8, cachedKScales,
+                        startPos, 2048, legacyIndices, nullptr, nullptr,
+                        &legacyTensorCorePathUsed);
                 if (!optimizedOk || !legacyOk) {
                     throw std::runtime_error(
                         std::string("Dots indexer radix-agreement ") +
                         (tensorCore ? "Tensor Core" : "scalar") +
                         " launch failed");
+                }
+                if (optimizedTensorCorePathUsed != tensorCore ||
+                    legacyTensorCorePathUsed != tensorCore) {
+                    throw std::runtime_error(
+                        std::string("Dots indexer radix-agreement did not ") +
+                        "use the requested " +
+                        (tensorCore ? "Tensor Core" : "scalar") +
+                        " scoring path");
                 }
                 ForceDeviceSync();
                 std::vector<int32_t> optimized =
@@ -3604,13 +3638,13 @@ namespace {
             };
 
             try {
-                // The scalar scorer is the runtime fallback on every pre-SM89
-                // GPU, so always compare its parallel emit with the legacy
-                // serial path. On SM89+, additionally cover the FP8 Tensor
-                // Core path and its radix-prefix scratch compaction.
+                // Always compare the scalar scorer's parallel emit with the
+                // legacy serial path. On SM75+, additionally cover the FP16
+                // or native-FP8 Tensor Core scorer and its radix-prefix
+                // scratch compaction.
                 validateMode(false);
                 bool tensorCoreEligible =
-                    getCudaInfos()->cudaArch >= 890 && queryTokens >= 16 &&
+                    getCudaInfos()->cudaArch >= 750 && queryTokens >= 16 &&
                     queryTokens % 16 == 0 && totalTokens >= 8192 &&
                     totalTokens % 16 == 0 && startPos % 16 == 0;
                 if (tensorCoreEligible) {
@@ -4013,7 +4047,9 @@ namespace {
             }
             if (!FastllmCudaDots3NoteIndexerTopK(
                     qFp8, foldedWeights, cachedKFp8, cachedKScales,
-                    startPos, 2048, indices)) {
+                    startPos, 2048, indices,
+                    &indexerHeadScoreWorkspace,
+                    &indexerHeadScoreWorkspaceBytes)) {
                 throw std::runtime_error("Dots indexer CUDA launch failed");
             }
             ValidateTopK();
@@ -4102,7 +4138,9 @@ namespace {
             if (path == "indexer") {
                 ok = FastllmCudaDots3NoteIndexerTopK(
                     qFp8, foldedWeights, cachedKFp8, cachedKScales,
-                    startPos, 2048, indices);
+                    startPos, 2048, indices,
+                    &indexerHeadScoreWorkspace,
+                    &indexerHeadScoreWorkspaceBytes);
             } else if (path == "sparse") {
                 ok = FastllmCudaDots3NoteSparseAttention(
                     mainQ, mainK, mainV, indices, startPos,

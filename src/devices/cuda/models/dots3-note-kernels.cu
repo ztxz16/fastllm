@@ -396,9 +396,51 @@ __global__ void IndexerCandidateExactScoresKernel(
     }
 }
 
-cublasStatus_t IndexerFp8BatchedGemm(
+__device__ __forceinline__ uint16_t IndexerFp8ToHalfBits(uint8_t bits) {
+    uint16_t sign = (uint16_t)(bits & 0x80u) << 8;
+    uint8_t magnitude = bits & 0x7fu;
+    if (magnitude == 0) {
+        return sign;
+    }
+    if (magnitude < 8) {
+        // Normalize E4M3 subnormals before they reach MMA. All nonzero E4M3
+        // values are representable as normal FP16 values, avoiding the
+        // architecture-dependent handling of FP16 subnormal MMA inputs.
+        int shift = (magnitude & 4u) ? 0 : ((magnitude & 2u) ? 1 : 2);
+        uint16_t normalized = (uint16_t)magnitude << shift;
+        uint16_t exponent = (uint16_t)(8 - shift) << 10;
+        uint16_t mantissa = (normalized & 3u) << 8;
+        return sign | exponent | mantissa;
+    }
+    if (magnitude == 0x7fu) {
+        return sign | 0x7e00u;
+    }
+    // Add the FP16/E4M3 exponent-bias difference and expand the three E4M3
+    // mantissa bits. This preserves the original finite value exactly.
+    return sign | (((uint16_t)magnitude << 7) + 0x2000u);
+}
+
+__global__ void IndexerFp8ToHalfKernel(
+        const uint8_t *input, __half *output, uint64_t packedCount) {
+    uint64_t packed = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (packed >= packedCount) {
+        return;
+    }
+    uint32_t bytes = reinterpret_cast<const uint32_t *>(input)[packed];
+    uint32_t halves01 =
+        (uint32_t)IndexerFp8ToHalfBits((uint8_t)bytes) |
+        ((uint32_t)IndexerFp8ToHalfBits((uint8_t)(bytes >> 8)) << 16);
+    uint32_t halves23 =
+        (uint32_t)IndexerFp8ToHalfBits((uint8_t)(bytes >> 16)) |
+        ((uint32_t)IndexerFp8ToHalfBits((uint8_t)(bytes >> 24)) << 16);
+    reinterpret_cast<uint32_t *>(output)[packed * 2] = halves01;
+    reinterpret_cast<uint32_t *>(output)[packed * 2 + 1] = halves23;
+}
+
+cublasStatus_t IndexerBatchedGemm(
         const void *k, const void *q, void *headScores,
-        int current, int keyCount) {
+        int current, int keyCount, cudaDataType_t inputType,
+        float alpha) {
     static thread_local std::vector<cublasLtHandle_t> handles;
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
@@ -436,12 +478,12 @@ cublasStatus_t IndexerFp8BatchedGemm(
     }
     if (state == CUBLAS_STATUS_SUCCESS) {
         state = cublasLtMatrixLayoutCreate(
-            &aLayout, CUDA_R_8F_E4M3,
+            &aLayout, inputType,
             kIndexerDim, keyCount, kIndexerDim);
     }
     if (state == CUBLAS_STATUS_SUCCESS) {
         state = cublasLtMatrixLayoutCreate(
-            &bLayout, CUDA_R_8F_E4M3,
+            &bLayout, inputType,
             kIndexerDim, current, kIndexerHeads * kIndexerDim);
     }
     if (state == CUBLAS_STATUS_SUCCESS) {
@@ -470,11 +512,6 @@ cublasStatus_t IndexerFp8BatchedGemm(
     if (state == CUBLAS_STATUS_SUCCESS) state = setBatch(cLayout, strideC);
 
     if (state == CUBLAS_STATUS_SUCCESS) {
-        // The largest possible E4M3 dot is
-        // 448 * 448 * 128 / 512 = 50176, which fits FP16. This common
-        // positive scale preserves candidate ranking while halving the
-        // head-score workspace and retaining more precision than BF16.
-        const float alpha = 1.0f / 512.0f;
         const float beta = 0.0f;
         state = cublasLtMatmul(
             handle, operation, &alpha,
@@ -487,6 +524,27 @@ cublasStatus_t IndexerFp8BatchedGemm(
     if (aLayout) cublasLtMatrixLayoutDestroy(aLayout);
     if (operation) cublasLtMatmulDescDestroy(operation);
     return state;
+}
+
+cublasStatus_t IndexerFp8BatchedGemm(
+        const void *k, const void *q, void *headScores,
+        int current, int keyCount) {
+    // The largest possible E4M3 dot is
+    // 448 * 448 * 128 / 512 = 50176, which fits FP16. This common positive
+    // scale preserves candidate ranking while halving the score workspace.
+    return IndexerBatchedGemm(
+        k, q, headScores, current, keyCount,
+        CUDA_R_8F_E4M3, 1.0f / 512.0f);
+}
+
+cublasStatus_t IndexerFp16BatchedGemm(
+        const void *k, const void *q, void *headScores,
+        int current, int keyCount) {
+    // The conversion preserves each E4M3 value exactly, so use the same score
+    // scale as the native FP8 Tensor Core path.
+    return IndexerBatchedGemm(
+        k, q, headScores, current, keyCount,
+        CUDA_R_16F, 1.0f / 512.0f);
 }
 
 __device__ __forceinline__ uint32_t OrderedFloatBits(float value) {
@@ -1353,13 +1411,17 @@ bool FastllmCudaDots3NoteQuantizeIndexer(
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool FastllmCudaDots3NoteIndexerTopK(
+static bool Dots3NoteIndexerTopKImpl(
         const fastllm::Data &qFp8,
         const fastllm::Data &foldedWeights,
         const fastllm::Data &kFp8, const fastllm::Data &kScales,
         int startPos, int topK, fastllm::Data &indices,
         void **headScoreWorkspace,
-        size_t *headScoreWorkspaceBytes) {
+        size_t *headScoreWorkspaceBytes,
+        bool *tensorCorePathUsed) {
+    if (tensorCorePathUsed != nullptr) {
+        *tensorCorePathUsed = false;
+    }
     if ((headScoreWorkspace == nullptr) !=
             (headScoreWorkspaceBytes == nullptr) ||
         topK != kIndexerTopK || startPos < 0 ||
@@ -1421,10 +1483,14 @@ bool FastllmCudaDots3NoteIndexerTopK(
     // across all 64 indexer heads. A four-pass radix selector then finds the
     // exact Top-2048 set without sorting every score in the row. Bounded query
     // slices keep the temporary footprint independent of the prefill size.
-    // On FP8-capable GPUs, long rows use a Tensor Core path for the 64
-    // per-head matrices, then exactly rescore a bounded candidate set before
-    // the final selection. Short rows keep the lower-overhead scalar kernel.
-    bool useTensorCore = getCudaInfos()->cudaArch >= 890 &&
+    // On supported Tensor Core GPUs, long rows use FP16 inputs on pre-SM89
+    // targets and native FP8 inputs on SM89+. Both paths exactly rescore a
+    // bounded candidate set before final selection. Short rows keep the
+    // lower-overhead scalar kernel.
+    int compiledArch = getCudaInfos()->cudaArch;
+    bool useFp8TensorCore = compiledArch >= 890;
+    bool useFp16TensorCore = compiledArch >= 750 && compiledArch < 890;
+    bool useTensorCore = (useFp8TensorCore || useFp16TensorCore) &&
                          !FastllmCudaGraphIsCapturingFast();
     if (const char *env = std::getenv(
             "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE")) {
@@ -1453,36 +1519,104 @@ bool FastllmCudaDots3NoteIndexerTopK(
         queryChunk = std::min(seqlen, tensorDefaultChunk);
         queryChunk = std::max(16, queryChunk / 16 * 16);
     }
-    size_t bytesPerQuery = (size_t)totalLen *
-        (useTensorCore
-             ? kIndexerHeads * sizeof(__half) + sizeof(float)
-             : sizeof(float));
+    size_t candidateIndexBytes = useCompactIndices
+        ? sizeof(int16_t) : sizeof(int32_t);
+    auto additionalWorkspaceBytes = [&](int rows) {
+        size_t bytes = (size_t)rows * totalLen * sizeof(float);
+        if (!useTensorCore) {
+            return bytes;
+        }
+        size_t requiredHeadScoreBytes =
+            (size_t)rows * totalLen * kIndexerHeads * sizeof(__half);
+        size_t reusableHeadScoreBytes =
+            canReuseWorkspace && *headScoreWorkspace != nullptr
+                ? *headScoreWorkspaceBytes : 0;
+        if (requiredHeadScoreBytes > reusableHeadScoreBytes) {
+            bytes += requiredHeadScoreBytes - reusableHeadScoreBytes;
+        }
+        bytes += (size_t)rows * kIndexerCandidateK *
+                 (candidateIndexBytes + sizeof(float));
+        if (useFp16TensorCore) {
+            bytes += (size_t)totalLen * kIndexerDim * sizeof(__half);
+            bytes += (size_t)rows * kIndexerHeads * kIndexerDim *
+                     sizeof(__half);
+        }
+        return bytes;
+    };
     // Treat the selected chunk as an upper bound. Late transformer layers can
-    // have less free memory after their persistent KV cache is created.
+    // have less free memory after their persistent KV cache is created. Count
+    // all Tensor Core-only buffers, including the fixed converted K matrix.
     std::vector<long long> freeSizes = FastllmCudaGetFreeSizes();
+    size_t budget = SIZE_MAX;
     if (device < (int)freeSizes.size() && freeSizes[device] > 0) {
         constexpr size_t reserveBytes = 16ULL * 1024ULL * 1024ULL;
         size_t freeBytes = (size_t)freeSizes[device];
-        size_t budget = freeBytes > reserveBytes * 2
-                            ? freeBytes - reserveBytes
-                            : std::max<size_t>(1, freeBytes / 2);
-        while (queryChunk > 1 &&
-               (size_t)queryChunk * bytesPerQuery > budget) {
-            queryChunk = (queryChunk + 1) / 2;
-        }
+        budget = freeBytes > reserveBytes * 2
+                     ? freeBytes - reserveBytes
+                     : std::max<size_t>(1, freeBytes / 2);
     }
     if (useTensorCore) {
-        queryChunk = queryChunk / 16 * 16;
+        while (queryChunk > 16 &&
+               additionalWorkspaceBytes(queryChunk) > budget) {
+            queryChunk -= 16;
+        }
+        if (additionalWorkspaceBytes(queryChunk) > budget) {
+            useTensorCore = false;
+            queryChunk = scalarQueryChunk;
+        }
     }
-    if (useTensorCore && queryChunk < 16) {
-        useTensorCore = false;
-        queryChunk = scalarQueryChunk;
+    if (!useTensorCore) {
+        while (queryChunk > 1 &&
+               additionalWorkspaceBytes(queryChunk) > budget) {
+            queryChunk = (queryChunk + 1) / 2;
+        }
     }
     int maxPairs = queryChunk * totalLen;
     float *logits = (float *)FastllmCudaMalloc(
         (size_t)maxPairs * sizeof(float));
+    if (logits == nullptr) {
+        return false;
+    }
     __half *headScores = nullptr;
     bool ownsHeadScores = false;
+    bool ownsReusableHeadScores = false;
+    FastllmCudaTryMallocResult tensorSetupResult =
+        FASTLLM_CUDA_TRY_MALLOC_SUCCESS;
+    void *candidateIds = nullptr;
+    float *candidateScores = nullptr;
+    __half *fp16K = nullptr;
+    __half *fp16Q = nullptr;
+    auto tryPooledAllocation = [&](void **ret, size_t bytes) {
+        if (tensorSetupResult == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            tensorSetupResult = FastllmCudaTryMalloc(ret, bytes);
+        }
+    };
+    auto tryDirectAllocation = [&](void **ret, size_t bytes) {
+        if (tensorSetupResult == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            tensorSetupResult = FastllmCudaTryDirectMalloc(ret, bytes);
+        }
+    };
+    auto releaseTensorCoreSetup = [&]() {
+        if (ownsHeadScores && headScores != nullptr) {
+            FastllmCudaDirectFree(headScores);
+        } else if (ownsReusableHeadScores &&
+                   *headScoreWorkspace != nullptr) {
+            FastllmCudaDirectFree(*headScoreWorkspace);
+            *headScoreWorkspace = nullptr;
+            *headScoreWorkspaceBytes = 0;
+        }
+        if (candidateIds != nullptr) FastllmCudaFree(candidateIds);
+        if (candidateScores != nullptr) FastllmCudaFree(candidateScores);
+        if (fp16K != nullptr) FastllmCudaFree(fp16K);
+        if (fp16Q != nullptr) FastllmCudaFree(fp16Q);
+        headScores = nullptr;
+        candidateIds = nullptr;
+        candidateScores = nullptr;
+        fp16K = nullptr;
+        fp16Q = nullptr;
+        ownsHeadScores = false;
+        ownsReusableHeadScores = false;
+    };
     if (useTensorCore) {
         size_t requiredHeadScoreBytes =
             (size_t)maxPairs * kIndexerHeads *
@@ -1493,45 +1627,82 @@ bool FastllmCudaDots3NoteIndexerTopK(
             if (*headScoreWorkspace != nullptr) {
                 FastllmCudaDirectFree(*headScoreWorkspace);
             }
-            *headScoreWorkspace =
-                FastllmCudaDirectMalloc(requiredHeadScoreBytes);
+            *headScoreWorkspace = nullptr;
+            tryDirectAllocation(
+                headScoreWorkspace, requiredHeadScoreBytes);
             *headScoreWorkspaceBytes = *headScoreWorkspace == nullptr
                 ? 0 : requiredHeadScoreBytes;
+            ownsReusableHeadScores = *headScoreWorkspace != nullptr;
         }
         if (canReuseWorkspace) {
             headScores = (__half *)*headScoreWorkspace;
         } else {
-            headScores = (__half *)FastllmCudaDirectMalloc(
-                requiredHeadScoreBytes);
+            void *allocatedHeadScores = nullptr;
+            tryDirectAllocation(
+                &allocatedHeadScores, requiredHeadScoreBytes);
+            headScores = (__half *)allocatedHeadScores;
             ownsHeadScores = headScores != nullptr;
         }
     }
-    size_t candidateIndexBytes = useCompactIndices
-        ? sizeof(int16_t) : sizeof(int32_t);
-    void *candidateIds = useTensorCore
-        ? FastllmCudaMalloc((size_t)queryChunk *
-                            kIndexerCandidateK * candidateIndexBytes)
-        : nullptr;
-    float *candidateScores = useTensorCore
-        ? (float *)FastllmCudaMalloc(
-              (size_t)queryChunk * kIndexerCandidateK * sizeof(float))
-        : nullptr;
+    if (useTensorCore &&
+        tensorSetupResult == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+        tryPooledAllocation(
+            &candidateIds,
+            (size_t)queryChunk * kIndexerCandidateK * candidateIndexBytes);
+        if (candidateIds != nullptr) {
+            void *allocatedCandidateScores = nullptr;
+            tryPooledAllocation(
+                &allocatedCandidateScores,
+                (size_t)queryChunk * kIndexerCandidateK * sizeof(float));
+            candidateScores = (float *)allocatedCandidateScores;
+        }
+    }
     if (useTensorCore &&
         (headScores == nullptr || candidateIds == nullptr ||
          candidateScores == nullptr)) {
-        if (ownsHeadScores) FastllmCudaDirectFree(headScores);
-        if (candidateIds) FastllmCudaFree(candidateIds);
-        if (candidateScores) FastllmCudaFree(candidateScores);
-        headScores = nullptr;
-        candidateIds = nullptr;
-        candidateScores = nullptr;
+        releaseTensorCoreSetup();
+        if (tensorSetupResult == FASTLLM_CUDA_TRY_MALLOC_ERROR ||
+            FastllmCudaGetThreadError()) {
+            FastllmCudaFree(logits);
+            return false;
+        }
         useTensorCore = false;
     }
-    if (logits == nullptr) {
-        if (ownsHeadScores) FastllmCudaDirectFree(headScores);
-        if (candidateIds) FastllmCudaFree(candidateIds);
-        if (candidateScores) FastllmCudaFree(candidateScores);
-        return false;
+    if (useTensorCore && useFp16TensorCore) {
+        size_t kElements = (size_t)totalLen * kIndexerDim;
+        size_t qElements = (size_t)queryChunk * kIndexerHeads *
+                           kIndexerDim;
+        void *allocatedFp16K = nullptr;
+        tryPooledAllocation(
+            &allocatedFp16K, kElements * sizeof(__half));
+        fp16K = (__half *)allocatedFp16K;
+        if (fp16K != nullptr) {
+            void *allocatedFp16Q = nullptr;
+            tryPooledAllocation(
+                &allocatedFp16Q, qElements * sizeof(__half));
+            fp16Q = (__half *)allocatedFp16Q;
+        }
+        if (fp16K != nullptr && fp16Q != nullptr) {
+            int threads = 256;
+            uint64_t packedCount = kElements / 4;
+            IndexerFp8ToHalfKernel<<<
+                (packedCount + threads - 1) / threads, threads, 0,
+                cudaStreamPerThread>>>(
+                    (const uint8_t *)kFp8.cudaData, fp16K,
+                    packedCount);
+            if (cudaGetLastError() != cudaSuccess) {
+                releaseTensorCoreSetup();
+                useTensorCore = false;
+            }
+        } else {
+            releaseTensorCoreSetup();
+            if (tensorSetupResult == FASTLLM_CUDA_TRY_MALLOC_ERROR ||
+                FastllmCudaGetThreadError()) {
+                FastllmCudaFree(logits);
+                return false;
+            }
+            useTensorCore = false;
+        }
     }
     cudaError_t state = cudaSuccess;
     bool useRadixCompaction = !EnvValueEnabled(std::getenv(
@@ -1552,10 +1723,30 @@ bool FastllmCudaDots3NoteIndexerTopK(
             if (useTensorCore) {
                 int keyCount = std::min(
                     totalLen, startPos + queryOffset + current);
-                cublasStatus_t status = IndexerFp8BatchedGemm(
-                    kFp8.cudaData, currentQ, headScores,
-                    current, keyCount);
+                cublasStatus_t status;
+                if (useFp16TensorCore) {
+                    size_t qElements = (size_t)current *
+                        kIndexerHeads * kIndexerDim;
+                    int threads = 256;
+                    uint64_t packedCount = qElements / 4;
+                    IndexerFp8ToHalfKernel<<<
+                        (packedCount + threads - 1) / threads,
+                        threads, 0, cudaStreamPerThread>>>(
+                            currentQ, fp16Q, packedCount);
+                    status = cudaGetLastError() == cudaSuccess
+                        ? IndexerFp16BatchedGemm(
+                              fp16K, fp16Q, headScores,
+                              current, keyCount)
+                        : CUBLAS_STATUS_EXECUTION_FAILED;
+                } else {
+                    status = IndexerFp8BatchedGemm(
+                        kFp8.cudaData, currentQ, headScores,
+                        current, keyCount);
+                }
                 if (status != CUBLAS_STATUS_SUCCESS) {
+                    // A trial Tensor Core path must not leave a stale runtime
+                    // error that makes the scalar launch appear to fail.
+                    cudaGetLastError();
                     useTensorCore = false;
                     int keyTiles =
                         (totalLen + kIndexerKeysPerBlock - 1) /
@@ -1701,8 +1892,38 @@ bool FastllmCudaDots3NoteIndexerTopK(
     if (ownsHeadScores) FastllmCudaDirectFree(headScores);
     if (candidateIds) FastllmCudaFree(candidateIds);
     if (candidateScores) FastllmCudaFree(candidateScores);
+    if (fp16K) FastllmCudaFree(fp16K);
+    if (fp16Q) FastllmCudaFree(fp16Q);
     FastllmCudaFree(logits);
+    if (tensorCorePathUsed != nullptr) {
+        *tensorCorePathUsed = useTensorCore && ok;
+    }
     return ok;
+}
+
+bool FastllmCudaDots3NoteIndexerTopK(
+        const fastllm::Data &qFp8,
+        const fastllm::Data &foldedWeights,
+        const fastllm::Data &kFp8, const fastllm::Data &kScales,
+        int startPos, int topK, fastllm::Data &indices,
+        void **headScoreWorkspace,
+        size_t *headScoreWorkspaceBytes) {
+    return Dots3NoteIndexerTopKImpl(
+        qFp8, foldedWeights, kFp8, kScales, startPos, topK, indices,
+        headScoreWorkspace, headScoreWorkspaceBytes, nullptr);
+}
+
+bool FastllmCudaDots3NoteIndexerTopKWithPathInfo(
+        const fastllm::Data &qFp8,
+        const fastllm::Data &foldedWeights,
+        const fastllm::Data &kFp8, const fastllm::Data &kScales,
+        int startPos, int topK, fastllm::Data &indices,
+        void **headScoreWorkspace,
+        size_t *headScoreWorkspaceBytes,
+        bool *tensorCorePathUsed) {
+    return Dots3NoteIndexerTopKImpl(
+        qFp8, foldedWeights, kFp8, kScales, startPos, topK, indices,
+        headScoreWorkspace, headScoreWorkspaceBytes, tensorCorePathUsed);
 }
 
 bool FastllmCudaDots3NoteSparseAttention(

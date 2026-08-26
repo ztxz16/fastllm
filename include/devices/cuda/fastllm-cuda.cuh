@@ -799,6 +799,16 @@ bool FastllmCudaDots3NoteIndexerTopK(
         int startPos, int topK, fastllm::Data &indices,
         void **headScoreWorkspace = nullptr,
         size_t *headScoreWorkspaceBytes = nullptr);
+// Diagnostic entry point for tests. tensorCorePathUsed is true only when the
+// complete call finishes on the Tensor Core scoring path without falling back.
+bool FastllmCudaDots3NoteIndexerTopKWithPathInfo(
+        const fastllm::Data &qFp8,
+        const fastllm::Data &foldedWeights,
+        const fastllm::Data &kFp8, const fastllm::Data &kScales,
+        int startPos, int topK, fastllm::Data &indices,
+        void **headScoreWorkspace,
+        size_t *headScoreWorkspaceBytes,
+        bool *tensorCorePathUsed);
 bool FastllmCudaDots3NoteSparseAttention(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &indices,
