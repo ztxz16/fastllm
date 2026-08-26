@@ -1,0 +1,5 @@
+datasets>=2.19.0
+httpx[socks]>=0.28.1
+modelscope>=1.39.0
+requests>=2.31.0
+tqdm>=4.66.0

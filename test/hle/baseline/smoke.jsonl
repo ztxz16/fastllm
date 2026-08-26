@@ -1,0 +1,3 @@
+{"id":"synthetic-hle-001","question":"Which of the following integers is prime?\nA. 4\nB. 6\nC. 7\nD. 9","image":"","answer":"C","answer_type":"multipleChoice","category":"Mathematics","raw_subject":"Elementary number theory"}
+{"id":"synthetic-hle-002","question":"Which chemical formula denotes water?\nA. CO2\nB. H2O\nC. O2\nD. NaCl","image":"","answer":"B","answer_type":"multipleChoice","category":"Chemistry","raw_subject":"General chemistry"}
+{"id":"synthetic-hle-003","question":"Which data structure uses first-in, first-out ordering?\nA. Stack\nB. Binary search tree\nC. Queue\nD. Heap","image":"","answer":"C","answer_type":"multipleChoice","category":"Computer Science/AI","raw_subject":"Data structures"}
