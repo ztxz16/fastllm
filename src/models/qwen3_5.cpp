@@ -132,6 +132,10 @@ namespace fastllm {
         return lowered == "true" || lowered == "1" || lowered == "yes" || lowered == "on";
     }
 
+    static bool Qwen35MoeIsTrueString(const char *value) {
+        return value != nullptr && Qwen35MoeIsTrueString(std::string(value));
+    }
+
     static bool Qwen35MoeDisableFusedMoe() {
         const char *env = std::getenv("FASTLLM_QWEN35_MOE_DISABLE_FUSED_MOE");
         if (env == nullptr) {
@@ -148,6 +152,7 @@ namespace fastllm {
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_MAX =
         QWEN35_MTP_FAST_SEQ_MAX - 1;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
+    static constexpr int QWEN35_MTP_BATCH_ATTENTION_CACHE_MAX = 4096;
     static constexpr int QWEN35_BATCH_PREFILL_SEQ_MAX = 4096;
 
     static int Qwen35DFlashCacheTrimThreshold(int slidingWindow) {
@@ -359,6 +364,51 @@ namespace fastllm {
             const char *env = std::getenv("FASTLLM_QWEN35_MTP_FUSED_LINEAR_SEQ");
             return env == nullptr || env[0] == '\0' || Qwen35MoeIsTrueString(env);
         }();
+        return enabled;
+    }
+
+    static bool Qwen35MtpBatchedStateCopyEnabled() {
+        static bool enabled = Qwen35EnvDefaultEnabled(
+            "FASTLLM_QWEN35_MTP_BATCHED_STATE_COPY");
+        return enabled;
+    }
+
+    static bool Qwen35MtpBatchedStateRestoreEnabled() {
+        static bool enabled = Qwen35EnvDefaultEnabled(
+            "FASTLLM_QWEN35_MTP_BATCHED_STATE_RESTORE");
+        return enabled;
+    }
+
+    static bool Qwen35MtpLongKvBatchAttentionEnabled() {
+        static bool enabled = Qwen35EnvDefaultEnabled(
+            "FASTLLM_QWEN35_MTP_LONG_KV_BATCH_ATTENTION");
+        return enabled;
+    }
+
+    static bool Qwen35MtpLongKvBatchExtendEnabled() {
+        static bool enabled = Qwen35EnvDefaultEnabled(
+            "FASTLLM_QWEN35_MTP_LONG_KV_BATCH_EXTEND");
+        return enabled;
+    }
+
+    static bool Qwen35MtpTokenMajorConvEnabled() {
+        static bool enabled = Qwen35EnvDefaultEnabled(
+            "FASTLLM_QWEN35_MTP_TOKEN_MAJOR_CONV");
+        return enabled;
+    }
+
+    static bool Qwen35MtpCombinedZGateEnabled() {
+        static bool enabled = Qwen35EnvDefaultEnabled(
+            "FASTLLM_QWEN35_MTP_COMBINED_Z_GATE");
+        return enabled;
+    }
+
+    static bool Qwen35MtpVerifyCudaGraphEnabled() {
+        // Keep a dedicated switch while the MTP graph path is independent of
+        // the single-token decode graph. This also provides an exact eager
+        // fallback for unsupported shapes and A/B validation.
+        static bool enabled = Qwen35EnvDefaultEnabled(
+            "FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH");
         return enabled;
     }
 
@@ -2999,6 +3049,161 @@ namespace fastllm {
             }
         };
 
+        // MTP verification has a fixed compute topology for a homogeneous
+        // (batch, verify length) shape, while token ids, positions and paged
+        // cache routing change every round. Keep those mutable values in
+        // stable device tensors and cache one graph per shape. A cache-pointer
+        // signature below invalidates the graph when the scheduler replaces
+        // the active request set, so eager execution remains the universal
+        // fallback rather than silently replaying stale state addresses.
+        struct Qwen35MtpVerifyGraphPagedLayerState {
+            Data qSizes;
+            Data pageSizes;
+            Data pageIndexs;
+            Data lastPageLens;
+            Data baseTokenLens;
+            std::vector<int> qSizesHost;
+            std::vector<int> pageSizesHost;
+            std::vector<int> pageIndexHost;
+            std::vector<int> lastPageLensHost;
+            std::vector<int> baseTokenLensHost;
+            int pageIndexCapacity = 0;
+            size_t qSizesOffset = 0;
+            size_t pageSizesOffset = 0;
+            size_t pageIndexOffset = 0;
+            size_t lastPageLensOffset = 0;
+            size_t baseTokenLensOffset = 0;
+            size_t qSizesUploadOffset = 0;
+            size_t pageSizesUploadOffset = 0;
+            size_t pageIndexUploadOffset = 0;
+            size_t lastPageLensUploadOffset = 0;
+            size_t baseTokenLensUploadOffset = 0;
+        };
+
+        struct Qwen35MtpVerifyGraphDeviceState {
+            int device = -1;
+            Data inputIds;
+            Data positionIds;
+            Data embeddingHiddenStates;
+            Data packedPagedMeta;
+            Data packedPagedMetaUpload;
+            std::vector<int> packedPagedMetaHost;
+            std::vector<std::unique_ptr<
+                Qwen35MtpVerifyGraphPagedLayerState> > pagedLayers;
+            Data logits;
+            Data hiddenStates;
+            std::vector<Data> dflashHiddenStates;
+            void *graph = nullptr;
+            void *exec = nullptr;
+            void *completionEvent = nullptr;
+            void *metadataReadyEvent = nullptr;
+            bool metadataReadyRecorded = false;
+
+            ~Qwen35MtpVerifyGraphDeviceState() {
+                if (metadataReadyEvent != nullptr) {
+                    FastllmCudaSetDevice(device);
+                    FastllmCudaEventDestroy(metadataReadyEvent);
+                    metadataReadyEvent = nullptr;
+                }
+                if (completionEvent != nullptr) {
+                    FastllmCudaSetDevice(device);
+                    FastllmCudaEventDestroy(completionEvent);
+                    completionEvent = nullptr;
+                }
+            }
+        };
+
+        struct Qwen35MtpVerifyGraphBarrier {
+            std::atomic<int> arrived{0};
+            std::atomic<int> generation{0};
+            int participants = 0;
+
+            void Reset(int count) {
+                participants = count;
+                arrived.store(0, std::memory_order_relaxed);
+                generation.store(0, std::memory_order_relaxed);
+            }
+
+            void Wait() {
+                int count = participants;
+                if (count <= 1) {
+                    return;
+                }
+                int current = generation.load(std::memory_order_acquire);
+                if (arrived.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+                    count) {
+                    arrived.store(0, std::memory_order_release);
+                    generation.fetch_add(1, std::memory_order_acq_rel);
+                    return;
+                }
+                while (generation.load(std::memory_order_acquire) == current) {
+                    std::this_thread::yield();
+                }
+            }
+        };
+
+        struct Qwen35MtpVerifyGraphState {
+            std::mutex mutex;
+            std::string signature;
+            bool warmed = false;
+            bool captured = false;
+            bool disabled = false;
+            int batch = 0;
+            int verifyLength = 0;
+            int totalTokens = 0;
+            std::vector<int> devices;
+            Data inputIds;
+            Data positionIds;
+            std::vector<std::unique_ptr<Qwen35MtpVerifyGraphDeviceState> >
+                deviceStates;
+            std::vector<void*> reservedPointers;
+            Qwen35MtpVerifyGraphBarrier barrier;
+
+            void DestroyCapturedGraph() {
+                for (auto &deviceState : deviceStates) {
+                    if (deviceState == nullptr) {
+                        continue;
+                    }
+                    FastllmCudaSetDevice(deviceState->device);
+                    if (deviceState->exec != nullptr) {
+                        FastllmCudaGraphExecDestroy(deviceState->exec);
+                        deviceState->exec = nullptr;
+                    }
+                    if (deviceState->graph != nullptr) {
+                        FastllmCudaGraphDestroy(deviceState->graph);
+                        deviceState->graph = nullptr;
+                    }
+                }
+                if (!reservedPointers.empty()) {
+                    FastllmCudaGraphMemoryPoolRelease(reservedPointers);
+                    reservedPointers.clear();
+                }
+                captured = false;
+                warmed = false;
+            }
+
+            ~Qwen35MtpVerifyGraphState() {
+                DestroyCapturedGraph();
+            }
+        };
+
+        struct Qwen35MtpVerifyGraphThreadContext {
+            Qwen35MtpVerifyGraphDeviceState *deviceState = nullptr;
+            bool externalPagedMeta = false;
+        };
+
+        static thread_local Qwen35MtpVerifyGraphThreadContext
+            *qwen35MtpVerifyGraphThreadContext = nullptr;
+
+        struct Qwen35CudaGraphPointerTableScope {
+            explicit Qwen35CudaGraphPointerTableScope(const void *owner) {
+                FastllmCudaGraphPointerTablesBegin(owner);
+            }
+            ~Qwen35CudaGraphPointerTableScope() {
+                FastllmCudaGraphPointerTablesEnd();
+            }
+        };
+
         static void Qwen35DestroyCudaGraph(Qwen35CudaGraphDecodeState &state) {
             if (state.exec != nullptr) {
                 FastllmCudaGraphExecDestroy(state.exec);
@@ -3031,6 +3236,8 @@ namespace fastllm {
 
         using Qwen35CudaGraphStateKey = std::tuple<const Qwen3_5Model*, int, int>;
         using Qwen35CudaGraphWorkspaceKey = std::pair<const Qwen3_5Model*, int>;
+        using Qwen35MtpVerifyGraphStateKey =
+            std::tuple<const Qwen3_5Model*, int, int>;
 
         static std::mutex &Qwen35CudaGraphStatesMutex() {
             static std::mutex *statesMutex = new std::mutex();
@@ -3045,6 +3252,45 @@ namespace fastllm {
         static std::map<Qwen35CudaGraphWorkspaceKey, std::unique_ptr<Qwen35CudaGraphWorkspace> > &Qwen35CudaGraphWorkspaces() {
             static auto *workspaces = new std::map<Qwen35CudaGraphWorkspaceKey, std::unique_ptr<Qwen35CudaGraphWorkspace> >();
             return *workspaces;
+        }
+
+        static std::map<Qwen35MtpVerifyGraphStateKey,
+                        std::unique_ptr<Qwen35MtpVerifyGraphState> >
+                &Qwen35MtpVerifyGraphStates() {
+            static auto *states = new std::map<
+                Qwen35MtpVerifyGraphStateKey,
+                std::unique_ptr<Qwen35MtpVerifyGraphState> >();
+            return *states;
+        }
+
+        static Qwen35MtpVerifyGraphState &GetQwen35MtpVerifyGraphState(
+                const Qwen3_5Model *model, int batch, int verifyLength) {
+            std::lock_guard<std::mutex> guard(Qwen35CudaGraphStatesMutex());
+            auto &states = Qwen35MtpVerifyGraphStates();
+            auto key = std::make_tuple(model, batch, verifyLength);
+            auto &state = states[key];
+            if (state == nullptr) {
+                state.reset(new Qwen35MtpVerifyGraphState());
+                state->batch = batch;
+                state->verifyLength = verifyLength;
+                state->totalTokens = batch * verifyLength;
+            }
+            return *state;
+        }
+
+        static bool Qwen35MtpVerifyGraphKeepsCachePointers(
+                const Qwen3_5Model *model, int batch, int verifyLength) {
+            std::lock_guard<std::mutex> statesGuard(
+                Qwen35CudaGraphStatesMutex());
+            auto &states = Qwen35MtpVerifyGraphStates();
+            auto it = states.find(std::make_tuple(
+                model, batch, verifyLength));
+            if (it == states.end() || it->second == nullptr) {
+                return false;
+            }
+            Qwen35MtpVerifyGraphState &state = *it->second;
+            std::lock_guard<std::mutex> stateGuard(state.mutex);
+            return !state.disabled && (state.warmed || state.captured);
         }
 
         static Qwen35CudaGraphDecodeState &GetQwen35CudaGraphDecodeState(const Qwen3_5Model *model, int gpuId, int batch) {
@@ -3088,6 +3334,14 @@ namespace fastllm {
             for (auto it = workspaces.begin(); it != workspaces.end();) {
                 if (it->first.first == model) {
                     it = workspaces.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            auto &mtpStates = Qwen35MtpVerifyGraphStates();
+            for (auto it = mtpStates.begin(); it != mtpStates.end();) {
+                if (std::get<0>(it->first) == model) {
+                    it = mtpStates.erase(it);
                 } else {
                     ++it;
                 }
@@ -3144,6 +3398,97 @@ namespace fastllm {
                 FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData,
                                                   src.GetBytes());
             }
+        }
+
+        static const Data *Qwen35FindCudaTensorOnDevice(
+                const Data &root, int device) {
+            auto local = root.multiDeviceDatas.find(device);
+            if (local != root.multiDeviceDatas.end() &&
+                local->second != nullptr) {
+                return local->second;
+            }
+            if (!root.multiDeviceData &&
+                root.dataDevice == DataDevice::CUDA &&
+                root.cudaData != nullptr &&
+                (root.dataDeviceIds.empty() ||
+                 root.dataDeviceIds[0] == device)) {
+                return &root;
+            }
+            return nullptr;
+        }
+
+        static bool Qwen35PrepareMtpVerifyGraphReplicatedTensor(
+                Data &dst, const Data &src,
+                const std::vector<int> &devices) {
+            if (devices.empty()) {
+                return false;
+            }
+            dst.dataType = src.dataType;
+            dst.UpdateUnitSize();
+            dst.dims = src.dims;
+            dst.strides = src.strides;
+            dst.expansionDims = src.expansionDims;
+            dst.dataDevice = DataDevice::CUDA;
+            dst.dataDeviceIds = devices;
+            dst.multiDeviceData = devices.size() > 1;
+            for (int device : devices) {
+                const Data *localSrc =
+                    Qwen35FindCudaTensorOnDevice(src, device);
+                if (localSrc == nullptr) {
+                    return false;
+                }
+                Data *localDst = nullptr;
+                if (devices.size() == 1) {
+                    localDst = &dst;
+                    dst.multiDeviceData = false;
+                } else {
+                    auto it = dst.multiDeviceDatas.find(device);
+                    if (it == dst.multiDeviceDatas.end() ||
+                        it->second == nullptr) {
+                        dst.multiDeviceDatas[device] = new Data();
+                    }
+                    localDst = dst.multiDeviceDatas[device];
+                }
+                Qwen35PrepareGraphCudaTensor(
+                    *localDst, *localSrc, device, false);
+            }
+            return true;
+        }
+
+        static bool Qwen35PrepareMtpVerifyGraphDevices(
+                Qwen35MtpVerifyGraphState &state,
+                const std::vector<int> &devices) {
+            if (state.devices == devices &&
+                state.deviceStates.size() == devices.size()) {
+                return true;
+            }
+            if (!state.devices.empty()) {
+                state.DestroyCapturedGraph();
+                state.deviceStates.clear();
+                state.inputIds.FreeSpace();
+                state.positionIds.FreeSpace();
+                for (auto &item : state.inputIds.multiDeviceDatas) {
+                    delete item.second;
+                }
+                for (auto &item : state.positionIds.multiDeviceDatas) {
+                    delete item.second;
+                }
+                state.inputIds.multiDeviceDatas.clear();
+                state.positionIds.multiDeviceDatas.clear();
+            }
+            state.devices = devices;
+            state.deviceStates.reserve(devices.size());
+            for (int device : devices) {
+                std::unique_ptr<Qwen35MtpVerifyGraphDeviceState> deviceState(
+                    new Qwen35MtpVerifyGraphDeviceState());
+                deviceState->device = device;
+                FastllmCudaSetDevice(device);
+                deviceState->completionEvent = FastllmCudaEventCreate();
+                deviceState->metadataReadyEvent = FastllmCudaEventCreate();
+                state.deviceStates.push_back(std::move(deviceState));
+            }
+            state.barrier.Reset((int)devices.size());
+            return true;
         }
 
         static void Qwen35PrepareGraphIntTensor(Data &dst, int device, const std::vector<int> &host) {
@@ -4744,6 +5089,340 @@ namespace fastllm {
             }
         }
 
+        static bool Qwen35PrepareMtpVerifyGraphPackedIntTensor(
+                Data &dst, int device, const std::vector<int> &host,
+                int capacity, bool uploadHost) {
+            if (host.empty() || capacity < (int)host.size()) {
+                return false;
+            }
+            FastllmCudaSetDevice(device);
+            bool reset = dst.isFake || dst.dataType != DataType::INT32 ||
+                dst.dataDevice != DataDevice::CUDA ||
+                (!dst.dataDeviceIds.empty() &&
+                 dst.dataDeviceIds[0] != device);
+            if (!reset && dst.cudaData != nullptr) {
+                int pointerDevice = GetPointerDeviceId(dst.cudaData);
+                reset = pointerDevice >= 0 && pointerDevice != device;
+            }
+            if (reset) {
+                if (!dst.isFake) {
+                    dst.FreeSpace();
+                } else {
+                    dst.isFake = false;
+                    dst.cpuData = nullptr;
+                    dst.cudaData = nullptr;
+                    dst.deviceData = nullptr;
+                    dst.expansionSize = 0;
+                    dst.expansionBytes = 0;
+                }
+                Qwen3CudaClearMultiDeviceState(dst);
+                dst.dataType = DataType::INT32;
+                dst.UpdateUnitSize();
+                dst.dataDevice = DataDevice::CUDA;
+                dst.dataDeviceIds = {device};
+            }
+            // Allocate the maximum packed routing workspace once. Context
+            // growth only changes the logical shape and contents until the
+            // declared model capacity is exceeded.
+            dst.expansionDims.clear();
+            dst.Resize({capacity});
+            dst.Allocate(false);
+            dst.Resize({uploadHost ? (int)host.size() : capacity});
+            if (uploadHost) {
+                FastllmCudaCopyFromHostToDevice(
+                    dst.cudaData, (void*)host.data(),
+                    host.size() * sizeof(int32_t));
+            }
+            return true;
+        }
+
+        static bool Qwen35BindMtpVerifyGraphIntView(
+                Data &view, Data &storage, int device, size_t offset,
+                const std::vector<int> &host) {
+            if (host.empty() || storage.dataType != DataType::INT32 ||
+                storage.dataDevice != DataDevice::CUDA ||
+                storage.cudaData == nullptr ||
+                offset + host.size() > storage.expansionSize) {
+                return false;
+            }
+            if (!view.isFake) {
+                view.FreeSpace();
+            }
+            view.cpuData = nullptr;
+            view.cudaData = nullptr;
+            view.deviceData = nullptr;
+            view.expansionSize = 0;
+            view.expansionBytes = 0;
+            view.expansionDims.clear();
+            view.cpuIntDatas.clear();
+            view.FakeFrom(storage, offset * sizeof(int32_t));
+            view.dataDeviceIds = {device};
+            view.Resize({(int)host.size()});
+            // FlashInfer's host-side planner keys q/kv indptr contents from
+            // Data::cpuIntDatas even though kernels consume the packed CUDA
+            // view. Preserve the original metadata contract for every view.
+            view.cpuIntDatas = host;
+            return view.cudaData ==
+                (void*)((uint8_t*)storage.cudaData +
+                        offset * sizeof(int32_t));
+        }
+
+        static bool Qwen35AdvanceMtpVerifyPagedCachePair(
+                Data &key, Data &value, int appendTokens,
+                int &baseTokens) {
+            if (appendTokens <= 0 || key.pagedKVCacheData == nullptr ||
+                value.pagedKVCacheData == nullptr || key.pageLen <= 0 ||
+                key.pageLen != value.pageLen ||
+                key.pageIndex != value.pageIndex ||
+                key.lastPageLen != value.lastPageLen) {
+                return false;
+            }
+            baseTokens = key.pageIndex.empty() ? 0 :
+                ((int)key.pageIndex.size() - 1) * key.pageLen +
+                    key.lastPageLen;
+            for (int token = 0; token < appendTokens; ++token) {
+                if (key.pageIndex.empty() ||
+                    key.lastPageLen >= key.pageLen) {
+                    int keyPage =
+                        key.pagedKVCacheData->GetUnusedPageIndex(true);
+                    int valuePage =
+                        value.pagedKVCacheData->GetUnusedPageIndex(true);
+                    if (keyPage < 0 || valuePage != keyPage) {
+                        return false;
+                    }
+                    key.pageIndex.push_back(keyPage);
+                    value.pageIndex.push_back(valuePage);
+                    key.lastPageLen = 1;
+                    value.lastPageLen = 1;
+                } else {
+                    key.lastPageLen++;
+                    value.lastPageLen++;
+                }
+            }
+            Qwen35AdvancePagedCacheLogicalTokens(key, appendTokens);
+            Qwen35AdvancePagedCacheLogicalTokens(value, appendTokens);
+            return true;
+        }
+
+        static bool Qwen35PrepareMtpVerifyGraphPagedMeta(
+                Qwen35MtpVerifyGraphDeviceState &deviceState,
+                int batch, int blockCnt, int maxPositions,
+                const std::vector<int> &seqLens,
+                const std::vector<uint8_t> &linearAttentionLayers,
+                std::vector<std::pair<Data*, Data*> > &pastKeyValues) {
+            deviceState.metadataReadyRecorded = false;
+            if (batch <= 0 || (int)seqLens.size() < batch ||
+                (int)linearAttentionLayers.size() < blockCnt ||
+                pastKeyValues.size() <
+                    (size_t)batch * (size_t)blockCnt) {
+                return false;
+            }
+            deviceState.pagedLayers.resize(blockCnt);
+            size_t packedCapacity = 0;
+            size_t packedSize = 0;
+            for (int layer = 0; layer < blockCnt; ++layer) {
+                if (linearAttentionLayers[layer] != 0) {
+                    continue;
+                }
+                if (deviceState.pagedLayers[layer] == nullptr) {
+                    deviceState.pagedLayers[layer].reset(
+                        new Qwen35MtpVerifyGraphPagedLayerState());
+                }
+                Qwen35MtpVerifyGraphPagedLayerState &meta =
+                    *deviceState.pagedLayers[layer];
+                meta.qSizesHost.assign(batch + 1, 0);
+                meta.pageSizesHost.assign(batch + 1, 0);
+                meta.pageIndexHost.clear();
+                meta.lastPageLensHost.assign(batch, 0);
+                meta.baseTokenLensHost.assign(batch, 0);
+                int pageLen = 0;
+                int pageCapacityPerRequest = 0;
+                for (int b = 0; b < batch; ++b) {
+                    Data *key = pastKeyValues[b * blockCnt + layer].first;
+                    Data *value = pastKeyValues[b * blockCnt + layer].second;
+                    if (key == nullptr || value == nullptr ||
+                        !key->isPagedKVCache || !value->isPagedKVCache ||
+                        !Qwen35AdvanceMtpVerifyPagedCachePair(
+                            *key, *value, seqLens[b],
+                            meta.baseTokenLensHost[b])) {
+                        return false;
+                    }
+                    if (pageLen == 0) {
+                        pageLen = key->pageLen;
+                        long long contextPages64 = maxPositions > 0 ?
+                            ((long long)maxPositions + pageLen - 1) / pageLen :
+                            key->pagedKVCacheData->maxPages;
+                        if (contextPages64 <= 0 ||
+                            contextPages64 > INT_MAX) {
+                            return false;
+                        }
+                        int contextPages = (int)contextPages64;
+                        pageCapacityPerRequest = std::max(
+                            (int)key->pageIndex.size(), contextPages);
+                    }
+                    if (key->pageLen != pageLen ||
+                        key->pageIndex != value->pageIndex ||
+                        key->lastPageLen != value->lastPageLen) {
+                        return false;
+                    }
+                    meta.qSizesHost[b + 1] =
+                        meta.qSizesHost[b] + seqLens[b];
+                    meta.pageSizesHost[b + 1] =
+                        meta.pageSizesHost[b] +
+                        (int)key->pageIndex.size();
+                    meta.pageIndexHost.insert(
+                        meta.pageIndexHost.end(), key->pageIndex.begin(),
+                        key->pageIndex.end());
+                    meta.lastPageLensHost[b] = key->lastPageLen;
+                }
+                size_t pageIndexCapacity = std::max(
+                    meta.pageIndexHost.size(),
+                    (size_t)batch *
+                        (size_t)std::max(1, pageCapacityPerRequest));
+                if (pageIndexCapacity > INT_MAX) {
+                    return false;
+                }
+                meta.pageIndexCapacity = (int)pageIndexCapacity;
+                packedCapacity += meta.qSizesHost.size() +
+                    meta.pageSizesHost.size() + meta.pageIndexCapacity +
+                    meta.lastPageLensHost.size() +
+                    meta.baseTokenLensHost.size();
+                packedSize += meta.qSizesHost.size() +
+                    meta.pageSizesHost.size() + meta.pageIndexHost.size() +
+                    meta.lastPageLensHost.size() +
+                    meta.baseTokenLensHost.size();
+            }
+            if (packedSize == 0) {
+                return true;
+            }
+            if (packedCapacity > INT_MAX || packedSize > packedCapacity) {
+                return false;
+            }
+
+            std::vector<int> &packedHost = deviceState.packedPagedMetaHost;
+            packedHost.clear();
+            packedHost.reserve(packedSize);
+            size_t fixedOffset = 0;
+            auto append = [&](const std::vector<int> &values,
+                              size_t capacity, size_t &offset,
+                              size_t &uploadOffset) {
+                offset = fixedOffset;
+                fixedOffset += capacity;
+                uploadOffset = packedHost.size();
+                packedHost.insert(packedHost.end(), values.begin(),
+                                  values.end());
+            };
+            for (int layer = 0; layer < blockCnt; ++layer) {
+                if (linearAttentionLayers[layer] != 0) {
+                    continue;
+                }
+                Qwen35MtpVerifyGraphPagedLayerState &meta =
+                    *deviceState.pagedLayers[layer];
+                append(meta.qSizesHost, meta.qSizesHost.size(),
+                       meta.qSizesOffset, meta.qSizesUploadOffset);
+                append(meta.pageSizesHost, meta.pageSizesHost.size(),
+                       meta.pageSizesOffset, meta.pageSizesUploadOffset);
+                append(meta.pageIndexHost, meta.pageIndexCapacity,
+                       meta.pageIndexOffset, meta.pageIndexUploadOffset);
+                append(meta.lastPageLensHost, meta.lastPageLensHost.size(),
+                       meta.lastPageLensOffset,
+                       meta.lastPageLensUploadOffset);
+                append(meta.baseTokenLensHost,
+                       meta.baseTokenLensHost.size(),
+                       meta.baseTokenLensOffset,
+                       meta.baseTokenLensUploadOffset);
+            }
+            if (fixedOffset != packedCapacity ||
+                packedHost.size() != packedSize ||
+                !Qwen35PrepareMtpVerifyGraphPackedIntTensor(
+                    deviceState.packedPagedMeta, deviceState.device,
+                    packedHost, (int)packedCapacity, false) ||
+                !Qwen35PrepareMtpVerifyGraphPackedIntTensor(
+                    deviceState.packedPagedMetaUpload,
+                    deviceState.device, packedHost,
+                    (int)packedCapacity, true)) {
+                return false;
+            }
+
+            std::vector<void*> copyDsts;
+            std::vector<const void*> copySrcs;
+            std::vector<size_t> copySizes;
+            copyDsts.reserve(blockCnt * 5);
+            copySrcs.reserve(blockCnt * 5);
+            copySizes.reserve(blockCnt * 5);
+            auto addCopy = [&](size_t dstOffset, size_t srcOffset,
+                               size_t count) {
+                if (count == 0) {
+                    return;
+                }
+                copyDsts.push_back(
+                    (uint8_t*)deviceState.packedPagedMeta.cudaData +
+                    dstOffset * sizeof(int32_t));
+                copySrcs.push_back(
+                    (const uint8_t*)deviceState.packedPagedMetaUpload.cudaData +
+                    srcOffset * sizeof(int32_t));
+                copySizes.push_back(count * sizeof(int32_t));
+            };
+            for (int layer = 0; layer < blockCnt; ++layer) {
+                if (linearAttentionLayers[layer] != 0) {
+                    continue;
+                }
+                Qwen35MtpVerifyGraphPagedLayerState &meta =
+                    *deviceState.pagedLayers[layer];
+                addCopy(meta.qSizesOffset, meta.qSizesUploadOffset,
+                        meta.qSizesHost.size());
+                addCopy(meta.pageSizesOffset, meta.pageSizesUploadOffset,
+                        meta.pageSizesHost.size());
+                addCopy(meta.pageIndexOffset, meta.pageIndexUploadOffset,
+                        meta.pageIndexHost.size());
+                addCopy(meta.lastPageLensOffset,
+                        meta.lastPageLensUploadOffset,
+                        meta.lastPageLensHost.size());
+                addCopy(meta.baseTokenLensOffset,
+                        meta.baseTokenLensUploadOffset,
+                        meta.baseTokenLensHost.size());
+            }
+            if (!FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    copyDsts.data(), copySrcs.data(), copySizes.data(),
+                    (int)copySizes.size())) {
+                return false;
+            }
+            FastllmCudaEventRecordCurrentThread(
+                deviceState.metadataReadyEvent);
+            deviceState.metadataReadyRecorded = true;
+
+            for (int layer = 0; layer < blockCnt; ++layer) {
+                if (linearAttentionLayers[layer] != 0) {
+                    continue;
+                }
+                Qwen35MtpVerifyGraphPagedLayerState &meta =
+                    *deviceState.pagedLayers[layer];
+                if (!Qwen35BindMtpVerifyGraphIntView(
+                        meta.qSizes, deviceState.packedPagedMeta,
+                        deviceState.device, meta.qSizesOffset,
+                        meta.qSizesHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        meta.pageSizes, deviceState.packedPagedMeta,
+                        deviceState.device, meta.pageSizesOffset,
+                        meta.pageSizesHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        meta.pageIndexs, deviceState.packedPagedMeta,
+                        deviceState.device, meta.pageIndexOffset,
+                        meta.pageIndexHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        meta.lastPageLens, deviceState.packedPagedMeta,
+                        deviceState.device, meta.lastPageLensOffset,
+                        meta.lastPageLensHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        meta.baseTokenLens, deviceState.packedPagedMeta,
+                        deviceState.device, meta.baseTokenLensOffset,
+                        meta.baseTokenLensHost)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         static bool Qwen35CudaTryQGateKVPrefill(
                 Qwen3CudaDirectRunner &runner,
                 const Data &qgatekv,
@@ -4833,6 +5512,8 @@ namespace fastllm {
                 bool externalDecodeMeta,
                 bool enableFlashInferCudaGraph = false,
                 int flashInferCudaGraph = -1,
+                bool externalPrefillMeta = false,
+                Data *externalAppendBaseTokenLens = nullptr,
                 Data *inputRmsWeight = nullptr) {
             using namespace qwen3cuda;
             AssertInFastLLM(attenInput != nullptr && mergeQkvWeight != nullptr &&
@@ -4955,7 +5636,58 @@ namespace fastllm {
                     v->Reshape({-1, seqlen, headDim});
                 }
 
-                if (batch == 1) {
+                if (externalPrefillMeta) {
+                    AssertInFastLLM(
+                        externalAppendBaseTokenLens != nullptr &&
+                        externalAppendBaseTokenLens->dataDevice ==
+                            DataDevice::CUDA &&
+                        externalAppendBaseTokenLens->cudaData != nullptr &&
+                        qSizes->dataDevice == DataDevice::CUDA &&
+                        pageSizes->dataDevice == DataDevice::CUDA &&
+                        pageIndexs->dataDevice == DataDevice::CUDA &&
+                        qSizes->cudaData != nullptr &&
+                        pageSizes->cudaData != nullptr &&
+                        pageIndexs->cudaData != nullptr,
+                        "Qwen3.5 graph prefill requires device paged metadata.\n");
+                    Data &pastKey = *(*batchPastKeys)[0];
+                    Data &pastValue = *(*batchPastValues)[0];
+                    AssertInFastLLM(
+                        pastKey.pagedKVCacheData != nullptr &&
+                        pastValue.pagedKVCacheData != nullptr &&
+                        pastKey.pageLen > 0 &&
+                        pastKey.pageLen == pastValue.pageLen &&
+                        k->dims.size() == 3 && v->dims.size() == 3 &&
+                        k->dims[0] == numKeyValueHeads &&
+                        v->dims[0] == numKeyValueHeads &&
+                        k->dims[1] == seqlen && v->dims[1] == seqlen,
+                        "Qwen3.5 graph prefill got incompatible packed KV.\n");
+                    bool appendedK =
+                        FastllmCudaPagedCacheAppendPackedBatch(
+                            (uint8_t*)pastKey.pagedKVCacheData->cudaData,
+                            (const int32_t*)qSizes->cudaData,
+                            (const int32_t*)pageSizes->cudaData,
+                            (const int32_t*)pageIndexs->cudaData,
+                            (const int32_t*)externalAppendBaseTokenLens->cudaData,
+                            batch, seqlen, pastKey.pageLen,
+                            numKeyValueHeads, headDim,
+                            pastKey.pagedKVCacheData->dataType,
+                            (const uint8_t*)k->cudaData, k->dataType);
+                    bool appendedV =
+                        FastllmCudaPagedCacheAppendPackedBatch(
+                            (uint8_t*)pastValue.pagedKVCacheData->cudaData,
+                            (const int32_t*)qSizes->cudaData,
+                            (const int32_t*)pageSizes->cudaData,
+                            (const int32_t*)pageIndexs->cudaData,
+                            (const int32_t*)externalAppendBaseTokenLens->cudaData,
+                            batch, seqlen, pastValue.pageLen,
+                            numKeyValueHeads, headDim,
+                            pastValue.pagedKVCacheData->dataType,
+                            (const uint8_t*)v->cudaData, v->dataType);
+                    if (!appendedK || !appendedV) {
+                        throw std::runtime_error(
+                            "Qwen3.5 graph packed KV append failed.");
+                    }
+                } else if (batch == 1) {
                     Data &pastKey = *(*batchPastKeys)[0];
                     Data &pastValue = *(*batchPastValues)[0];
                     Data kCacheDesc = makeCacheDesc(*k, pastKey.dataType);
@@ -4992,10 +5724,12 @@ namespace fastllm {
                 Data &vCaches = *(*batchPastValues)[0];
                 Data &qForAttention =
                     preparePagedAttentionQ(*q, kCaches.dataType);
-                Qwen3CudaGeneratePagedBatchParams(
-                    runner, qForAttention, *batchPastKeys, batch,
-                    *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                    seqLens);
+                if (!externalPrefillMeta) {
+                    Qwen3CudaGeneratePagedBatchParams(
+                        runner, qForAttention, *batchPastKeys, batch,
+                        *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                        seqLens);
+                }
                 Qwen3CudaAttentionPagedBatch(
                     runner, qForAttention, kCaches, vCaches,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
@@ -7505,6 +8239,24 @@ namespace fastllm {
 #endif
     }
 
+    bool Qwen3_5Model::CanUseQwen35DFlashBatchForward(
+            int draftsPerStep) const {
+#ifndef USE_CUDA
+        (void)draftsPerStep;
+        return false;
+#else
+        return draftsPerStep > 0 &&
+               HasDFlashWeights() &&
+               ResolveQwen35ThreadTpComputeType(this->dataType) == DataType::FLOAT16 &&
+               head_k_dim == 128 && head_v_dim > 0 &&
+               num_k_heads > 0 && num_v_heads > 0 &&
+               num_v_heads % num_k_heads == 0 &&
+               std::isfinite(rms_norm_eps) && rms_norm_eps >= 0.0f &&
+               inv_scale_data.dataType == DataType::FLOAT32 &&
+               inv_scale_data.dims == std::vector<int>({head_k_dim});
+#endif
+    }
+
     void Qwen3_5Model::RunModelSpecificScheduler() {
         if (UseModelSpecificScheduler()) {
             Qwen35MTPLoop();
@@ -8632,9 +9384,10 @@ namespace fastllm {
                             rms_norm_eps, rope_base, rope_factor,
                             rope_type, isPrefill,
                             &buf.hiddenStates,
-                            pagedCacheLayerOffset,
-                            true, true, true, 1,
-                            &inputRmsWeight);
+                        pagedCacheLayerOffset,
+                        true, true, true, 1,
+                        false, nullptr,
+                        &inputRmsWeight);
                         Qwen3CudaLinearResidualReduce(
                             cudaRunner, buf.attenOutput,
                             *requireLocal(weight[oWeightName], oWeightName),
@@ -9485,6 +10238,10 @@ namespace fastllm {
 
         const DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
         const DataType threadTpMoeAtype = this->useCustomMoeAtype ? this->moeAtype : computeType;
+        Qwen35MtpVerifyGraphDeviceState *mtpVerifyGraphDeviceState =
+            qwen35MtpVerifyGraphThreadContext != nullptr &&
+                    qwen35MtpVerifyGraphThreadContext->externalPagedMeta ?
+                qwen35MtpVerifyGraphThreadContext->deviceState : nullptr;
         Data localHiddenStates;
         Data *hiddenStatesPtr = nullptr;
         if (!speculativeCollectAllLogits &&
@@ -9499,12 +10256,15 @@ namespace fastllm {
         if (precomputedHiddenStates != nullptr) {
             hiddenStatesPtr = requireLocal(*precomputedHiddenStates, "precomputedHiddenStates");
         } else {
+            Data &embeddingOutput = mtpVerifyGraphDeviceState != nullptr ?
+                mtpVerifyGraphDeviceState->embeddingHiddenStates :
+                localHiddenStates;
             Qwen3CudaEmbeddingDirect(cudaRunner,
                                      *requireLocal((Data&)inputIds, "inputIds"),
                                      *requireLocal(weight[language_prefix + "embed_tokens.weight"],
                                                    language_prefix + "embed_tokens.weight"),
-                                     localHiddenStates);
-            hiddenStatesPtr = &localHiddenStates;
+                                     embeddingOutput);
+            hiddenStatesPtr = &embeddingOutput;
         }
         Data &hiddenStates = *hiddenStatesPtr;
         if (hiddenStates.dataType != computeType) {
@@ -9518,7 +10278,8 @@ namespace fastllm {
         Data routerLogits, routerLogitsTemp, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data moeFinal, sharedGate, sharedOutput;
-        Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
+        Data qSizes, pageSizes, pageIndexs, lastPageLens;
+        Data insertIndexs, insertPositions;
         Data gdnMerged, baMerged, qkvConvInput, qkvConvInputPermuted;
         Data z, b, a, g, conv, convOutput, convOutputPermuted;
         Data coreAttnOut, coreTemp, gatedCoreAttnOut;
@@ -9588,16 +10349,20 @@ namespace fastllm {
         };
         auto captureDFlashHidden = [&](int layerIndex) {
             if (!speculativeCaptureDFlashHiddenStates ||
-                !firstTensorParallelRank || batch != 1) {
+                !firstTensorParallelRank) {
                 return;
             }
             for (int feature = 0;
                  feature < (int)dflashTargetLayerIds.size(); feature++) {
                 if (dflashTargetLayerIds[feature] == layerIndex) {
+                    std::vector<Data> *captureOutputs =
+                        mtpVerifyGraphDeviceState != nullptr ?
+                            &mtpVerifyGraphDeviceState->dflashHiddenStates :
+                            &speculativeDFlashHiddenStates;
                     AssertInFastLLM(
-                        feature < (int)speculativeDFlashHiddenStates.size(),
+                        feature < (int)captureOutputs->size(),
                         "DFlash target hidden capture was not initialized.\n");
-                    speculativeDFlashHiddenStates[feature].CopyFrom(hiddenStates);
+                    (*captureOutputs)[feature].CopyFrom(hiddenStates);
                     break;
                 }
             }
@@ -9633,6 +10398,23 @@ namespace fastllm {
                                                         num_key_value_heads);
                 }
                 if (localKVHeads > 0) {
+                    Qwen35MtpVerifyGraphPagedLayerState *graphPagedLayer =
+                        mtpVerifyGraphDeviceState != nullptr &&
+                                i < (int)mtpVerifyGraphDeviceState->pagedLayers.size() ?
+                            mtpVerifyGraphDeviceState->pagedLayers[i].get() :
+                            nullptr;
+                    AssertInFastLLM(
+                        mtpVerifyGraphDeviceState == nullptr ||
+                            graphPagedLayer != nullptr,
+                        "Qwen3.5 MTP graph is missing per-layer paged metadata.\n");
+                    Data *activeQSizes = graphPagedLayer != nullptr ?
+                        &graphPagedLayer->qSizes : &qSizes;
+                    Data *activePageSizes = graphPagedLayer != nullptr ?
+                        &graphPagedLayer->pageSizes : &pageSizes;
+                    Data *activePageIndexs = graphPagedLayer != nullptr ?
+                        &graphPagedLayer->pageIndexs : &pageIndexs;
+                    Data *activeLastPageLens = graphPagedLayer != nullptr ?
+                        &graphPagedLayer->lastPageLens : &lastPageLens;
                     int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
                     Qwen35CudaAttentionPagedBlock(
                         cudaRunner,
@@ -9651,8 +10433,8 @@ namespace fastllm {
                         &attenOutput, &attenLastOutput,
                         &qForAttentionHolder,
                         &insertIndexs, &insertPositions,
-                        &qSizes, &pageSizes,
-                        &pageIndexs, &lastPageLens,
+                        activeQSizes, activePageSizes,
+                        activePageIndexs, activeLastPageLens,
                         &generatedAppendParams, &generatedDecodeParams,
                         batch, block_cnt, i, seqLens,
                         localQHeads, localKVHeads, head_dim,
@@ -9661,7 +10443,12 @@ namespace fastllm {
                         rope_type, isPrefill,
                         &hiddenStates,
                         pagedCacheLayerOffset,
-                        true, false, false, -1,
+                        true, false,
+                        mtpVerifyGraphDeviceState != nullptr,
+                        mtpVerifyGraphDeviceState != nullptr ? 1 : -1,
+                        mtpVerifyGraphDeviceState != nullptr,
+                        graphPagedLayer != nullptr ?
+                            &graphPagedLayer->baseTokenLens : nullptr,
                         &inputRmsWeight);
                     Qwen3CudaLinearResidualReduce(
                         cudaRunner, attenOutput,
@@ -9982,9 +10769,20 @@ namespace fastllm {
                 bool tokenMajorBatchPrefill =
                     (batchedPrefill || singleFusedConvPrefill) &&
                     !batchedSpeculativeSequence;
+                bool tokenMajorBatchedSpeculativeConv =
+                    batchedSpeculativeSequence &&
+                    Qwen35MtpTokenMajorConvEnabled();
+                bool tokenMajorBatchConv =
+                    tokenMajorBatchPrefill ||
+                    tokenMajorBatchedSpeculativeConv;
                 bool combinedGdnConvCandidate =
-                    uniformPrefill && tokenMajorBatchPrefill;
-                bool combinedGdnZCandidate = uniformPrefill;
+                    (uniformPrefill && tokenMajorBatchPrefill) ||
+                    tokenMajorBatchedSpeculativeConv;
+                bool mtpCombinedGdnZCandidate =
+                    tokenMajorBatchedSpeculativeConv &&
+                    Qwen35MtpCombinedZGateEnabled();
+                bool combinedGdnZCandidate =
+                    uniformPrefill || mtpCombinedGdnZCandidate;
                 if (!combinedGdnConvCandidate) {
                     ensureProjectedQkvSplit();
                 }
@@ -10073,23 +10871,38 @@ namespace fastllm {
                         gdnMerged.Reshape(
                             {batch, requestSeqLen,
                              gdnMerged.dims.back()});
-                        fused = FastllmCudaTryCombinedGdnConvInput(
-                            requestPastKeys, gdnMerged,
-                            *requireLocal(
-                                weight[conv1dWeightName],
-                                conv1dWeightName),
-                            *requireLocal(
-                                GetThreadTensorParallelBias(
+                        if (tokenMajorBatchedSpeculativeConv) {
+                            fused =
+                                FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
+                                    requestPastKeys, gdnMerged,
+                                    *requireLocal(
+                                        weight[conv1dWeightName],
+                                        conv1dWeightName),
+                                    *requireLocal(
+                                        GetThreadTensorParallelBias(
+                                            conv1dBiasName),
+                                        conv1dBiasName),
+                                    convOutput, tokenConvCaches,
+                                    captureTokens, 0);
+                        } else {
+                            fused = FastllmCudaTryCombinedGdnConvInput(
+                                requestPastKeys, gdnMerged,
+                                *requireLocal(
+                                    weight[conv1dWeightName],
+                                    conv1dWeightName),
+                                *requireLocal(
+                                    GetThreadTensorParallelBias(
+                                        conv1dBiasName),
                                     conv1dBiasName),
-                                conv1dBiasName),
-                            convOutput);
+                                convOutput);
+                        }
                     }
                     if (!fused) {
                         ensureProjectedQkvSplit();
                         qkvConvInput.Reshape(
                             {batch, requestSeqLen,
                              qkvConvInput.dims.back()});
-                        if (!tokenMajorBatchPrefill) {
+                        if (!tokenMajorBatchConv) {
                             Qwen3CudaPermuteSelf(
                                 cudaRunner, qkvConvInput,
                                 {0, 2, 1});
@@ -10125,7 +10938,7 @@ namespace fastllm {
                             }
                         }
                     }
-                    if (!tokenMajorBatchPrefill) {
+                    if (!tokenMajorBatchConv) {
                         Qwen3CudaPermuteSelf(cudaRunner, convOutput, {0, 2, 1});
                     }
                     convOutput.Reshape({1, seqlen, convOutput.dims.back()});
@@ -11288,6 +12101,19 @@ namespace fastllm {
                                     localValueHeads,
                                     coreAttnOut,
                                     rms_norm_eps);
+                            if (!fusedPostLinearAttn &&
+                                mtpCombinedGdnZCandidate) {
+                                fusedPostLinearAttn =
+                                    FastllmCudaRMSNormSiluMulFloat16CombinedGate(
+                                        coreAttnOut,
+                                        *requireLocal(
+                                            weight[outNormWeightName],
+                                            outNormWeightName),
+                                        gdnMerged, localQkvDim,
+                                        localValueHeads,
+                                        coreAttnOut,
+                                        rms_norm_eps);
+                            }
                         }
 #endif
                         if (!fusedPostLinearAttn) {
@@ -11599,7 +12425,10 @@ namespace fastllm {
                                        language_prefix + "norm.weight"),
                          rms_norm_eps, *headInput);
         if (keepAllRowsForSpeculative && (!tensorParallel || firstTensorParallelRank)) {
-            speculativeHiddenStates.CopyFrom(*headInput);
+            Data *captureOutput = mtpVerifyGraphDeviceState != nullptr ?
+                &mtpVerifyGraphDeviceState->hiddenStates :
+                &speculativeHiddenStates;
+            captureOutput->CopyFrom(*headInput);
         }
         if (!all1 && speculativeCaptureAllHiddenStates &&
             !speculativeCollectAllLogits) {
@@ -12514,7 +13343,487 @@ namespace fastllm {
             activeGpuTokenHandoff->launchActive;
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
-        if (devices.size() == 1) {
+        bool mtpVerifyGraphHandled = false;
+        bool homogeneousVerifyLength = !seqLens.empty();
+        for (int len : seqLens) {
+            homogeneousVerifyLength &= len == seqLens[0];
+        }
+        bool mtpVerifyGraphEligible =
+            Qwen35CudaGraphEnabled() &&
+            Qwen35MtpVerifyCudaGraphEnabled() &&
+            speculativeCollectAllLogits &&
+            speculativeCaptureFirstTokenLinearState &&
+            speculativeLinearStateCaptureSlots > 0 &&
+            !speculativeCacheOnlyForward &&
+            precomputedHiddenStates == nullptr &&
+            !pipelineGpuTokenHandoff &&
+            batch >= 1 && !all1 && isPrefill &&
+            homogeneousVerifyLength && seqLens[0] >= 2 &&
+            seqLens[0] <= QWEN35_MTP_FAST_SEQ_MAX &&
+            num_experts == 0;
+
+        if (mtpVerifyGraphEligible) {
+            Qwen35MtpVerifyGraphState &graphState =
+                GetQwen35MtpVerifyGraphState(this, batch, seqLens[0]);
+            std::unique_lock<std::mutex> graphGuard(graphState.mutex);
+            AssertInFastLLM(
+                Qwen35PrepareMtpVerifyGraphDevices(graphState, devices),
+                "Qwen3.5 failed to initialize MTP verify graph devices.\n");
+
+            if (!graphState.disabled) {
+                AssertInFastLLM(
+                    Qwen35PrepareMtpVerifyGraphReplicatedTensor(
+                        graphState.inputIds, gpuInputIds, devices) &&
+                    Qwen35PrepareMtpVerifyGraphReplicatedTensor(
+                        graphState.positionIds, allPositionIds, devices),
+                    "Qwen3.5 failed to stage MTP verify graph inputs.\n");
+
+                for (int r = 0; r < (int)devices.size(); ++r) {
+                    std::vector<std::pair<Data*, Data*> > &rankPast =
+                        tensorParallel ? localPastKeyValues[r] : pastKeyValues;
+                    AssertInFastLLM(
+                        Qwen35PrepareMtpVerifyGraphPagedMeta(
+                            *graphState.deviceStates[r], batch, block_cnt,
+                            max_positions, seqLens, linearAttentionLayers,
+                            rankPast),
+                        "Qwen3.5 failed to prepare dynamic MTP graph paged metadata.\n");
+                }
+
+                std::ostringstream graphSignature;
+                graphSignature << "batch=" << batch
+                               << ";verify=" << seqLens[0]
+                               << ";tp=" << devices.size()
+                               << ";dflash="
+                               << (speculativeCaptureDFlashHiddenStates ? 1 : 0)
+                               << ";captureSlots="
+                               << speculativeLinearStateCaptureSlots;
+                for (int r = 0; r < (int)devices.size(); ++r) {
+                    graphSignature << ";gpu=" << devices[r]
+                                   << ";packedMeta="
+                                   << graphState.deviceStates[r]
+                                          ->packedPagedMeta.cudaData;
+                    std::vector<std::pair<Data*, Data*> > &rankPast =
+                        tensorParallel ? localPastKeyValues[r] : pastKeyValues;
+                    for (int layer = 0; layer < block_cnt; ++layer) {
+                        Data *key = rankPast[layer].first;
+                        Data *value = rankPast[layer].second;
+                        if (linearAttentionLayers[layer] != 0) {
+                            for (int b = 0; b < batch; ++b) {
+                                key = rankPast[b * block_cnt + layer].first;
+                                value = rankPast[b * block_cnt + layer].second;
+                                graphSignature << ";l" << layer << "b" << b
+                                               << "k="
+                                               << (key == nullptr ? nullptr :
+                                                   key->cudaData)
+                                               << "v="
+                                               << (value == nullptr ? nullptr :
+                                                   value->cudaData);
+                            }
+                        } else {
+                            Qwen35MtpVerifyGraphPagedLayerState *meta =
+                                graphState.deviceStates[r]->pagedLayers[layer].get();
+                            graphSignature << ";a" << layer << "k="
+                                           << (key == nullptr ? nullptr :
+                                               key->pagedKVCacheData)
+                                           << "v="
+                                           << (value == nullptr ? nullptr :
+                                               value->pagedKVCacheData)
+                                           << "q="
+                                           << (meta == nullptr ? nullptr :
+                                               meta->qSizes.cudaData)
+                                           << "p="
+                                           << (meta == nullptr ? nullptr :
+                                               meta->pageSizes.cudaData)
+                                           << "i="
+                                           << (meta == nullptr ? nullptr :
+                                               meta->pageIndexs.cudaData)
+                                           << "n="
+                                           << (meta == nullptr ? nullptr :
+                                               meta->lastPageLens.cudaData)
+                                           << "b="
+                                           << (meta == nullptr ? nullptr :
+                                               meta->baseTokenLens.cudaData);
+                        }
+                    }
+                }
+                std::string nextSignature = graphSignature.str();
+                if (!graphState.signature.empty() &&
+                    graphState.signature != nextSignature) {
+                    graphState.DestroyCapturedGraph();
+                    graphState.disabled = false;
+                }
+                graphState.signature = nextSignature;
+
+                for (int r = 0; r < (int)devices.size(); ++r) {
+                    graphState.deviceStates[r]->dflashHiddenStates.resize(
+                        speculativeCaptureDFlashHiddenStates ?
+                            dflashTargetLayerIds.size() : 0);
+                }
+
+                auto publishGraphOutputs = [&]() {
+                    for (int r = 0; r < (int)devices.size(); ++r) {
+                        Qwen35BorrowCudaTensor(
+                            localLogits[r],
+                            graphState.deviceStates[r]->logits);
+                    }
+                    Qwen35MtpVerifyGraphDeviceState &rootGraphDevice =
+                        *graphState.deviceStates[0];
+                    Qwen35BorrowCudaTensor(
+                        speculativeHiddenStates,
+                        rootGraphDevice.hiddenStates);
+                    if (speculativeCaptureDFlashHiddenStates) {
+                        speculativeDFlashHiddenStates.resize(
+                            rootGraphDevice.dflashHiddenStates.size());
+                        for (int feature = 0;
+                             feature < (int)rootGraphDevice.dflashHiddenStates.size();
+                             ++feature) {
+                            Qwen35BorrowCudaTensor(
+                                speculativeDFlashHiddenStates[feature],
+                                rootGraphDevice.dflashHiddenStates[feature]);
+                        }
+                    }
+                };
+
+                auto markGraphLinearSnapshots = [&]() {
+                    int capturesPerRequest = std::max(0, seqLens[0] - 1);
+                    for (int layer = 0; layer < block_cnt; ++layer) {
+                        if (linearAttentionLayers[layer] == 0 ||
+                            layer >= (int)speculativeLinearStates.size()) {
+                            continue;
+                        }
+                        for (int slot = 0;
+                             slot < speculativeLinearStateCaptureSlots &&
+                             slot < (int)speculativeLinearStates[layer].size();
+                             ++slot) {
+                            int request = capturesPerRequest > 0 ?
+                                std::min(batch - 1, slot / capturesPerRequest) : 0;
+                            for (int r = 0; r < (int)devices.size(); ++r) {
+                                std::vector<std::pair<Data*, Data*> > &rankPast =
+                                    tensorParallel ? localPastKeyValues[r] :
+                                                     pastKeyValues;
+                                Data *sourceKey =
+                                    rankPast[request * block_cnt + layer].first;
+                                Data *sourceValue =
+                                    rankPast[request * block_cnt + layer].second;
+                                Data *snapshotKey = tensorParallel ?
+                                    speculativeLinearStates[layer][slot].first.
+                                        multiDeviceDatas.at(devices[r]) :
+                                    &speculativeLinearStates[layer][slot].first;
+                                Data *snapshotValue = tensorParallel ?
+                                    speculativeLinearStates[layer][slot].second.
+                                        multiDeviceDatas.at(devices[r]) :
+                                    &speculativeLinearStates[layer][slot].second;
+                                snapshotKey->cacheUid = sourceKey->cacheUid;
+                                snapshotValue->cacheUid = sourceValue->cacheUid;
+                            }
+                            if (!tensorParallel &&
+                                layer < (int)speculativeLinearCaptureMask.size() &&
+                                slot < (int)speculativeLinearCaptureMask[layer].size()) {
+                                speculativeLinearCaptureMask[layer][slot] = 3;
+                            }
+                        }
+                    }
+                };
+
+                auto runExternalEager = [&]() {
+                    errors.assign(devices.size(), nullptr);
+                    auto runRank = [&](int r) {
+                        FastllmCudaSetDevice(devices[r]);
+                        if (graphState.deviceStates[r]
+                                ->metadataReadyRecorded) {
+                            FastllmCudaCurrentThreadStreamWaitEvent(
+                                graphState.deviceStates[r]
+                                    ->metadataReadyEvent);
+                        }
+                        Qwen35ScopedGpuTokenHandoffControl handoffScope(nullptr);
+                        Qwen35CudaGraphPointerTableScope pointerTableScope(
+                            graphState.deviceStates[r].get());
+                        Qwen35MtpVerifyGraphThreadContext context;
+                        context.deviceState =
+                            graphState.deviceStates[r].get();
+                        context.externalPagedMeta = true;
+                        Qwen35MtpVerifyGraphThreadContext *oldContext =
+                            qwen35MtpVerifyGraphThreadContext;
+                        qwen35MtpVerifyGraphThreadContext = &context;
+                        try {
+                            std::vector<std::pair<Data*, Data*> > &rankPast =
+                                tensorParallel ? localPastKeyValues[r] :
+                                                 pastKeyValues;
+                            ForwardSingleGPU(
+                                devices[r], ratios, batch,
+                                graphState.inputIds,
+                                graphState.positionIds,
+                                seqLens, rankPast, all1, isPrefill,
+                                tensorParallel, r == 0,
+                                threadTpPagedCacheBase + r * block_cnt,
+                                graphState.deviceStates[r]->logits,
+                                nullptr);
+                        } catch (...) {
+                            qwen35MtpVerifyGraphThreadContext = oldContext;
+                            throw;
+                        }
+                        qwen35MtpVerifyGraphThreadContext = oldContext;
+                        FastllmCudaSetDevice(devices[r]);
+                        ForceDeviceSync();
+                    };
+                    if (devices.size() == 1) {
+                        runRank(0);
+                    } else {
+                        threadTpWorkerGroup.RunWithCaller(
+                            devices, runRank, errors);
+                    }
+                    for (auto &error : errors) {
+                        if (error) {
+                            std::rethrow_exception(error);
+                        }
+                    }
+                    publishGraphOutputs();
+                    markGraphLinearSnapshots();
+                };
+
+                auto launchGraphs = [&]() {
+                    errors.assign(devices.size(), nullptr);
+                    std::vector<int> launched(devices.size(), 0);
+                    auto launchRank = [&](int r) {
+                        FastllmCudaSetDevice(devices[r]);
+                        if (graphState.deviceStates[r]
+                                ->metadataReadyRecorded) {
+                            FastllmCudaCurrentThreadStreamWaitEvent(
+                                graphState.deviceStates[r]
+                                    ->metadataReadyEvent);
+                        }
+                        graphState.barrier.Wait();
+                        launched[r] = FastllmCudaGraphLaunch(
+                            graphState.deviceStates[r]->exec) ? 1 : 0;
+                        if (launched[r]) {
+                            FastllmCudaEventRecordCurrentThread(
+                                graphState.deviceStates[r]->completionEvent);
+                        }
+                        graphState.barrier.Wait();
+                    };
+                    if (devices.size() == 1) {
+                        launchRank(0);
+                    } else {
+                        threadTpWorkerGroup.RunWithCaller(
+                            devices, launchRank, errors);
+                    }
+                    bool ok = std::all_of(
+                        launched.begin(), launched.end(),
+                        [](int value) { return value != 0; });
+                    for (auto &error : errors) {
+                        ok &= error == nullptr;
+                    }
+                    if (ok) {
+                        // Rank 0 reuses the caller PTDS, while non-root graph
+                        // launches run on persistent worker PTDSes.  Sampling
+                        // subsequently visits every device on the caller
+                        // thread.  Queue a device-local event dependency for
+                        // that handoff instead of blocking the host with a
+                        // cudaDeviceSynchronize on every rank.
+                        for (int r = 0; r < (int)devices.size(); ++r) {
+                            FastllmCudaSetDevice(devices[r]);
+                            FastllmCudaCurrentThreadStreamWaitEvent(
+                                graphState.deviceStates[r]->completionEvent);
+                        }
+                        FastllmCudaSetDevice(devices.front());
+                        publishGraphOutputs();
+                        markGraphLinearSnapshots();
+                    } else {
+                        // One rank may have accepted its launch before another
+                        // rank failed. Drain every device before destroying
+                        // graph executables or replaying the eager fallback so
+                        // a partially launched verify cannot race cache state.
+                        int oldDevice = FastllmCudaGetDevice();
+                        for (int device : devices) {
+                            FastllmCudaSetDevice(device);
+                            ForceDeviceSync();
+                        }
+                        FastllmCudaSetDevice(oldDevice);
+                    }
+                    return ok;
+                };
+
+                if (graphState.captured) {
+                    if (!launchGraphs()) {
+                        graphState.DestroyCapturedGraph();
+                        graphState.disabled = true;
+                        runExternalEager();
+                    }
+                    mtpVerifyGraphHandled = true;
+                } else if (!graphState.warmed) {
+                    FastllmCudaClearThreadError();
+                    FastllmCudaClearGraphError();
+                    runExternalEager();
+                    if (FastllmCudaGetThreadError() ||
+                        FastllmCudaGetGraphError()) {
+                        graphState.disabled = true;
+                    } else {
+                        graphState.warmed = true;
+                    }
+                    mtpVerifyGraphHandled = true;
+                } else {
+                    for (int device : devices) {
+                        FastllmCudaSetDevice(device);
+                        ForceDeviceSync();
+                    }
+                    bool captureOk = true;
+                    const char *failureStage = nullptr;
+                    for (int device : devices) {
+                        FastllmCudaSetDevice(device);
+                        if (!FastllmCudaGraphPrepareCaptureDevice()) {
+                            captureOk = false;
+                            failureStage = "prepare capture device";
+                            break;
+                        }
+                    }
+                    if (captureOk && !FastllmCudaGraphMemoryPoolBegin()) {
+                        captureOk = false;
+                        failureStage = "reserve graph workspace";
+                    }
+
+                    std::vector<int> beginOk(devices.size(), 0);
+                    std::vector<int> bodyOk(devices.size(), 0);
+                    std::vector<int> endOk(devices.size(), 0);
+                    errors.assign(devices.size(), nullptr);
+                    if (captureOk) {
+                        FastllmCudaClearThreadError();
+                        FastllmCudaClearGraphError();
+                        auto captureRank = [&](int r) {
+                            FastllmCudaSetDevice(devices[r]);
+                            if (graphState.deviceStates[r]
+                                    ->metadataReadyRecorded) {
+                                FastllmCudaCurrentThreadStreamWaitEvent(
+                                    graphState.deviceStates[r]
+                                        ->metadataReadyEvent);
+                            }
+                            beginOk[r] =
+                                FastllmCudaGraphBeginCapture() ? 1 : 0;
+                            graphState.barrier.Wait();
+                            bool everyRankBegan = std::all_of(
+                                beginOk.begin(), beginOk.end(),
+                                [](int value) { return value != 0; });
+                            if (everyRankBegan) {
+                                Qwen35CudaGraphPointerTableScope
+                                    pointerTableScope(
+                                        graphState.deviceStates[r].get());
+                                Qwen35MtpVerifyGraphThreadContext context;
+                                context.deviceState =
+                                    graphState.deviceStates[r].get();
+                                context.externalPagedMeta = true;
+                                Qwen35MtpVerifyGraphThreadContext *oldContext =
+                                    qwen35MtpVerifyGraphThreadContext;
+                                qwen35MtpVerifyGraphThreadContext = &context;
+                                try {
+                                    std::vector<std::pair<Data*, Data*> > &rankPast =
+                                        tensorParallel ? localPastKeyValues[r] :
+                                                         pastKeyValues;
+                                    ForwardSingleGPU(
+                                        devices[r], ratios, batch,
+                                        graphState.inputIds,
+                                        graphState.positionIds,
+                                        seqLens, rankPast, all1, isPrefill,
+                                        tensorParallel, r == 0,
+                                        threadTpPagedCacheBase +
+                                            r * block_cnt,
+                                        graphState.deviceStates[r]->logits,
+                                        nullptr);
+                                    bodyOk[r] = 1;
+                                } catch (...) {
+                                    errors[r] = std::current_exception();
+                                }
+                                qwen35MtpVerifyGraphThreadContext = oldContext;
+                            }
+                            graphState.barrier.Wait();
+                            if (beginOk[r]) {
+                                void *capturedGraph = nullptr;
+                                endOk[r] =
+                                    FastllmCudaGraphEndCapture(
+                                        &capturedGraph) &&
+                                    capturedGraph != nullptr;
+                                if (endOk[r]) {
+                                    graphState.deviceStates[r]->graph =
+                                        capturedGraph;
+                                } else if (capturedGraph != nullptr) {
+                                    FastllmCudaGraphDestroy(capturedGraph);
+                                }
+                            }
+                        };
+                        if (devices.size() == 1) {
+                            captureRank(0);
+                        } else {
+                            threadTpWorkerGroup.RunWithCaller(
+                                devices, captureRank, errors);
+                        }
+                        captureOk =
+                            std::all_of(beginOk.begin(), beginOk.end(),
+                                [](int value) { return value != 0; }) &&
+                            std::all_of(bodyOk.begin(), bodyOk.end(),
+                                [](int value) { return value != 0; }) &&
+                            std::all_of(endOk.begin(), endOk.end(),
+                                [](int value) { return value != 0; }) &&
+                            !FastllmCudaGetThreadError() &&
+                            !FastllmCudaGetGraphError();
+                        if (!captureOk) {
+                            failureStage = "capture model body";
+                        }
+                    }
+
+                    if (captureOk) {
+                        captureOk = FastllmCudaGraphMemoryPoolEnd(
+                            graphState.reservedPointers);
+                        if (!captureOk) {
+                            failureStage = "pin graph workspace";
+                        }
+                    } else {
+                        FastllmCudaGraphMemoryPoolAbort();
+                    }
+                    if (captureOk) {
+                        for (auto &deviceState : graphState.deviceStates) {
+                            FastllmCudaSetDevice(deviceState->device);
+                            if (!FastllmCudaGraphInstantiate(
+                                    deviceState->graph,
+                                    &deviceState->exec) ||
+                                deviceState->exec == nullptr) {
+                                captureOk = false;
+                                failureStage = "instantiate";
+                                break;
+                            }
+                        }
+                    }
+                    if (captureOk) {
+                        graphState.captured = true;
+                        captureOk = launchGraphs();
+                        if (!captureOk) {
+                            failureStage = "first launch";
+                        }
+                    }
+                    if (!captureOk) {
+                        std::fprintf(
+                            stderr,
+                            "[Fastllm] Qwen3.5 MTP verify CUDA graph "
+                            "disabled at %s: %s\n",
+                            failureStage == nullptr ? "unknown stage" :
+                                                      failureStage,
+                            FastllmCudaGraphLastError());
+                        std::fflush(stderr);
+                        graphState.DestroyCapturedGraph();
+                        graphState.disabled = true;
+                        FastllmCudaClearThreadError();
+                        FastllmCudaClearGraphError();
+                        runExternalEager();
+                    } else {
+                        std::printf(
+                            "[Fastllm] Qwen3.5 MTP verify CUDA graph "
+                            "captured: batch=%d verify=%d tp=%zu.\n",
+                            batch, seqLens[0], devices.size());
+                        std::fflush(stdout);
+                    }
+                    mtpVerifyGraphHandled = true;
+                }
+            }
+        }
+
+        if (!mtpVerifyGraphHandled && devices.size() == 1) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
@@ -12531,7 +13840,7 @@ namespace fastllm {
                 }
                 activeGpuTokenHandoff->forwardHandoffSafe = true;
             }
-        } else {
+        } else if (!mtpVerifyGraphHandled) {
             // Keep rank 0 on the scheduler thread.  CUDA graph decode is
             // latency-sensitive and handing both ranks to condition-variable
             // workers adds a full wake-up/return round trip on every token.
@@ -12836,21 +14145,20 @@ namespace fastllm {
                 int curTopK = config.IsSimpleGreedy() ? 1 : config.top_k;
                 maxTopK = std::max(maxTopK, curTopK);
             }
-            if (speculativeDFlashSamplingContext != nullptr && !allSimple) {
+            if ((speculativeDFlashSamplingContext != nullptr ||
+                 !speculativeDFlashSamplingContexts.empty()) && !allSimple) {
+                std::vector<DFlashContext*> proposals =
+                    speculativeDFlashSamplingContexts;
+                if (proposals.empty()) {
+                    proposals.push_back(speculativeDFlashSamplingContext);
+                }
                 AssertInFastLLM(
-                    batch == 1 && seqLens.size() == 1 &&
-                        seqLens[0] == logitRows && logitRows >= 2,
-                    "DFlash rejection sampling requires one contiguous verify chain.\n");
-                const int draftTokens = logitRows - 1;
-                DFlashContext &proposal =
-                    *speculativeDFlashSamplingContext;
-                AssertInFastLLM(
-                    (int)proposal.proposalTokens.size() >= draftTokens &&
-                        (int)proposal.proposalCandidateIds.size() >=
-                            draftTokens * dflashSelectorTopK &&
-                        (int)proposal.proposalCandidateProbs.size() >=
-                            draftTokens * dflashSelectorTopK,
-                    "DFlash rejection sampling is missing selector probabilities.\n");
+                    (int)proposals.size() == batch &&
+                        (int)seqLens.size() == batch && logitRows >= 2,
+                    "DFlash rejection sampling batch shape is invalid.\n");
+                const int draftTokens = seqLens[0] - 1;
+                AssertInFastLLM(draftTokens > 0,
+                                "DFlash rejection sampling has no draft token.\n");
                 Data verifyInputCpu;
                 verifyInputCpu.CopyFrom(inputIds);
                 verifyInputCpu.ToDevice(DataDevice::CPU);
@@ -12863,11 +14171,45 @@ namespace fastllm {
                     "DFlash rejection sampling input shape mismatch.\n");
                 const float *verifyInput =
                     (const float*)verifyInputCpu.cpuData;
-                for (int token = 0; token < draftTokens; token++) {
+                std::vector<int> proposalTokens;
+                std::vector<int> proposalCandidateIds;
+                std::vector<float> proposalCandidateProbs;
+                proposalTokens.reserve(batch * draftTokens);
+                proposalCandidateIds.reserve(
+                    batch * draftTokens * dflashSelectorTopK);
+                proposalCandidateProbs.reserve(
+                    batch * draftTokens * dflashSelectorTopK);
+                int rowOffset = 0;
+                for (int b = 0; b < batch; b++) {
+                    DFlashContext *proposal = proposals[b];
                     AssertInFastLLM(
-                        proposal.proposalTokens[token] ==
-                            (int)(verifyInput[token + 1] + 1.0e-3f),
-                        "DFlash rejection sampling proposal is out of sync.\n");
+                        proposal != nullptr && seqLens[b] == draftTokens + 1 &&
+                            (int)proposal->proposalTokens.size() >= draftTokens &&
+                            (int)proposal->proposalCandidateIds.size() >=
+                                draftTokens * dflashSelectorTopK &&
+                            (int)proposal->proposalCandidateProbs.size() >=
+                                draftTokens * dflashSelectorTopK,
+                        "DFlash rejection sampling is missing selector probabilities.\n");
+                    for (int token = 0; token < draftTokens; token++) {
+                        AssertInFastLLM(
+                            proposal->proposalTokens[token] ==
+                                (int)(verifyInput[rowOffset + token + 1] +
+                                      1.0e-3f),
+                            "DFlash rejection sampling proposal is out of sync.\n");
+                        proposalTokens.push_back(
+                            proposal->proposalTokens[token]);
+                    }
+                    proposalCandidateIds.insert(
+                        proposalCandidateIds.end(),
+                        proposal->proposalCandidateIds.begin(),
+                        proposal->proposalCandidateIds.begin() +
+                            draftTokens * dflashSelectorTopK);
+                    proposalCandidateProbs.insert(
+                        proposalCandidateProbs.end(),
+                        proposal->proposalCandidateProbs.begin(),
+                        proposal->proposalCandidateProbs.begin() +
+                            draftTokens * dflashSelectorTopK);
+                    rowOffset += seqLens[b];
                 }
                 std::vector<float> temperatures(logitRows);
                 std::vector<int> topKs(logitRows);
@@ -12878,23 +14220,27 @@ namespace fastllm {
                     topPs[row] = rowConfigs[row].top_p;
                 }
                 std::vector<int> sampled(logitRows, -1);
-                int acceptedDrafts = 0;
+                std::vector<int> acceptedDrafts(batch, 0);
                 AssertInFastLLM(
                     FastllmCudaDFlashRejectionSampling(
                         (float*)sampleLogits->cudaData,
                         temperatures.data(), topKs.data(), topPs.data(),
-                        proposal.proposalTokens.data(),
-                        proposal.proposalCandidateIds.data(),
-                        proposal.proposalCandidateProbs.data(),
-                        sampled.data(), &acceptedDrafts,
-                        1, draftTokens, dflashSelectorTopK, vocabSize),
+                        proposalTokens.data(), proposalCandidateIds.data(),
+                        proposalCandidateProbs.data(), sampled.data(),
+                        acceptedDrafts.data(), batch, draftTokens,
+                        dflashSelectorTopK, vocabSize),
                     "DFlash CUDA rejection sampling failed.\n");
-                AssertInFastLLM(
-                    acceptedDrafts >= 0 && acceptedDrafts <= draftTokens,
-                    "DFlash rejection sampling returned an invalid acceptance length.\n");
                 speculativeDFlashAccepted.assign(logitRows, 0);
-                for (int token = 0; token < acceptedDrafts; token++) {
-                    speculativeDFlashAccepted[token] = 1;
+                rowOffset = 0;
+                for (int b = 0; b < batch; b++) {
+                    AssertInFastLLM(
+                        acceptedDrafts[b] >= 0 &&
+                            acceptedDrafts[b] <= draftTokens,
+                        "DFlash rejection sampling returned an invalid acceptance length.\n");
+                    for (int token = 0; token < acceptedDrafts[b]; token++) {
+                        speculativeDFlashAccepted[rowOffset + token] = 1;
+                    }
+                    rowOffset += seqLens[b];
                 }
                 mtpTargetProfileMark(mtpTargetProfileSamplingUs);
                 mtpTargetProfileRecord(logitRows);
@@ -13420,16 +14766,22 @@ namespace fastllm {
             cache.expansionBytes = meta.expansionBytes;
         };
 
-        std::vector<uint8_t> attentionLayerMask(block_cnt, 0);
-        for (int layer = 0; layer < block_cnt; layer++) {
-            std::string outputWeightName = language_prefix + "layers." +
-                std::to_string(layer) + ".self_attn.o_proj.weight";
-            attentionLayerMask[layer] =
-                weight.weight.find(outputWeightName) != weight.weight.end();
+        std::vector<uint8_t> fallbackLinearAttentionLayers;
+        const std::vector<uint8_t> *linearAttentionLayers =
+            &threadTpLinearAttentionLayers;
+        if ((int)linearAttentionLayers->size() != block_cnt) {
+            fallbackLinearAttentionLayers.assign(block_cnt, 0);
+            for (int layer = 0; layer < block_cnt; layer++) {
+                fallbackLinearAttentionLayers[layer] =
+                    weight.weight.find(
+                        language_prefix + "layers." + std::to_string(layer) +
+                        ".self_attn.o_proj.weight") == weight.weight.end();
+            }
+            linearAttentionLayers = &fallbackLinearAttentionLayers;
         }
         auto isAttentionLayerAt = [&](int layer) noexcept {
-            return layer >= 0 && layer < (int)attentionLayerMask.size() &&
-                   attentionLayerMask[layer] != 0;
+            return layer >= 0 && layer < block_cnt &&
+                   (*linearAttentionLayers)[layer] == 0;
         };
 
         auto copyPagedCacheView = [&](Data &dst, const Data &src) {
@@ -14564,7 +15916,7 @@ namespace fastllm {
             // ranks concurrently so TP does not serialize those copies across
             // devices.
             std::vector<std::exception_ptr> linearBackupErrors(devices.size());
-            threadTpWorkerGroup.Run(devices, [&](int deviceIndex) {
+            threadTpWorkerGroup.RunWithCaller(devices, [&](int deviceIndex) {
                 int localDevice = devices[deviceIndex];
                 FastllmCudaSetDevice(localDevice);
                 thread_local std::vector<void*> linearBackupDsts;
@@ -14625,8 +15977,23 @@ namespace fastllm {
                             linearBackupSizes[i]);
                     }
                 }
-                ForceDeviceSync();
             }, linearBackupErrors);
+            bool linearBackupFailed = std::any_of(
+                linearBackupErrors.begin(), linearBackupErrors.end(),
+                [](const std::exception_ptr &error) {
+                    return error != nullptr;
+                });
+            if (linearBackupFailed) {
+                // The hot path is stream ordered.  Only an exceptional exit
+                // needs to drain pending copies before scratch tensors can be
+                // released or error recovery mutates their metadata.
+                int oldDevice = FastllmCudaGetDevice();
+                for (int localDevice : devices) {
+                    FastllmCudaSetDevice(localDevice);
+                    ForceDeviceSync();
+                }
+                FastllmCudaSetDevice(oldDevice);
+            }
             for (auto &error : linearBackupErrors) {
                 if (error) {
                     std::rethrow_exception(error);
@@ -14769,6 +16136,12 @@ namespace fastllm {
             std::vector<int> committedRet = buildCommittedTokens(
                 targetRet, draftTokenCount, matchedDrafts);
             if (matchedDrafts != draftTokenCount) {
+                // The eager rollback can swap snapshot storage into the live
+                // cache. A warmed graph has baked both addresses into its
+                // nodes, so keep them stable and restore the contents instead.
+                bool keepGraphCachePointers =
+                    Qwen35MtpVerifyGraphKeepsCachePointers(
+                        this, 1, seqLen);
                 int captureSlot = commitLen - 1;
                 std::vector<CacheMeta> prefixRootKeyMetas(block_cnt), prefixRootValueMetas(block_cnt);
                 std::vector<std::map<int, CacheMeta> > prefixLocalKeyMetas(block_cnt), prefixLocalValueMetas(block_cnt);
@@ -14907,7 +16280,7 @@ namespace fastllm {
                             restoreMeta(*realKey, prefixKeyMeta->second);
                             restoreMeta(*realValue, prefixValueMeta->second);
                         }
-                    } else {
+                    } else if (!keepGraphCachePointers) {
                         for (int localDevice : devices) {
                             Data *realKey = getThreadTpLocalCache(*pastKeyValues[i].first,
                                                                    localDevice);
@@ -14926,6 +16299,68 @@ namespace fastllm {
                             }
                             adoptTensorIntoExistingStorage(*realKey, *snapshotKey);
                             adoptTensorIntoExistingStorage(*realValue, *snapshotValue);
+                        }
+                    }
+                }
+                if (keepGraphCachePointers) {
+                    std::vector<std::exception_ptr> prefixCopyErrors(
+                        devices.size());
+                    threadTpWorkerGroup.RunWithCaller(
+                        devices, [&](int deviceIndex) {
+                            int localDevice = devices[deviceIndex];
+                            FastllmCudaSetDevice(localDevice);
+                            thread_local std::vector<void*> copyDsts;
+                            thread_local std::vector<const void*> copySrcs;
+                            thread_local std::vector<size_t> copySizes;
+                            copyDsts.clear();
+                            copySrcs.clear();
+                            copySizes.clear();
+                            copyDsts.reserve(block_cnt * 2);
+                            copySrcs.reserve(block_cnt * 2);
+                            copySizes.reserve(block_cnt * 2);
+                            for (int i = 0; i < block_cnt; ++i) {
+                                if (isAttentionLayerAt(i)) {
+                                    continue;
+                                }
+                                Data *realKey = getThreadTpLocalCache(
+                                    *pastKeyValues[i].first, localDevice);
+                                Data *realValue = getThreadTpLocalCache(
+                                    *pastKeyValues[i].second, localDevice);
+                                Data *snapshotKey = getThreadTpLocalCache(
+                                    speculativeLinearStates[i][captureSlot].first,
+                                    localDevice);
+                                Data *snapshotValue = getThreadTpLocalCache(
+                                    speculativeLinearStates[i][captureSlot].second,
+                                    localDevice);
+                                Data *dsts[2] = {realKey, realValue};
+                                const Data *srcs[2] = {
+                                    snapshotKey, snapshotValue};
+                                for (int tensor = 0; tensor < 2; ++tensor) {
+                                    copyDsts.push_back(dsts[tensor]->cudaData);
+                                    copySrcs.push_back(srcs[tensor]->cudaData);
+                                    copySizes.push_back(srcs[tensor]->GetBytes());
+                                    copyTensorMetaIntoExistingStorage(
+                                        *dsts[tensor], *srcs[tensor]);
+                                }
+                            }
+                            if (!copyDsts.empty() &&
+                                !FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                                    copyDsts.data(), copySrcs.data(),
+                                    copySizes.data(), (int)copyDsts.size())) {
+                                for (int i = 0; i < (int)copyDsts.size(); ++i) {
+                                    FastllmCudaCopyFromDeviceToDevice(
+                                        copyDsts[i], (void*)copySrcs[i],
+                                        copySizes[i]);
+                                }
+                            }
+                            // The next draft/verify may be queued by another
+                            // host thread. Finish the batched restore before
+                            // publishing the committed recurrent state.
+                            ForceDeviceSync();
+                        }, prefixCopyErrors);
+                    for (auto &error : prefixCopyErrors) {
+                        if (error) {
+                            std::rethrow_exception(error);
                         }
                     }
                 }
@@ -15645,21 +17080,27 @@ namespace fastllm {
             return false;
         }
 
-        const int configuredDraftsPerStep = Qwen35MtpDraftsPerStep();
+        const bool useDFlash = HasDFlashWeights();
+        const int configuredDraftsPerStep = useDFlash ?
+            DFlashDraftsPerStep() : Qwen35MtpDraftsPerStep();
         if (configuredDraftsPerStep <= 0) {
             return false;
         }
-        if (!CanUseQwen35MTPBatchForward(configuredDraftsPerStep)) {
+        if (useDFlash ?
+                !CanUseQwen35DFlashBatchForward(configuredDraftsPerStep) :
+                !CanUseQwen35MTPBatchForward(configuredDraftsPerStep)) {
             return false;
         }
-        // The fused target-validation kernels keep at most five per-token
-        // recurrent-state snapshots. Servers configured with more drafts keep
-        // batching, but validate only the supported prefix instead of falling
-        // back to plain decode or serializing every request.
+        // The fused target-validation kernels keep a bounded per-token prefix.
+        // Servers configured with more drafts keep batching, but validate only
+        // the supported prefix instead of falling back to plain decode or
+        // serializing every request.
         const int draftsPerStep = std::min(
             configuredDraftsPerStep, QWEN35_MTP_PREFIX_SNAPSHOT_MAX);
         int totalTokens = 0;
         int captureSlots = 0;
+        bool allSimpleGreedy = true;
+        bool allSampling = true;
         for (int b = 0; b < batch; b++) {
             if (contexts[b] == nullptr || positionIds[b] == nullptr ||
                 seqLens[b] != seqLens[0] ||
@@ -15668,17 +17109,24 @@ namespace fastllm {
                 !Qwen35MtpSupportsGenerationConfig(generationConfigs[b])) {
                 return false;
             }
+            allSimpleGreedy &= generationConfigs[b].IsSimpleGreedy();
+            allSampling &= !generationConfigs[b].IsSimpleGreedy();
             totalTokens += seqLens[b];
             captureSlots += seqLens[b] - 1;
         }
-        if (captureSlots <= 0) {
+        // The DFlash CUDA rejection kernel batches homogeneous sampling rows.
+        // A mixed greedy/sampling group remains correct through the scheduler's
+        // ordinary target-only fallback.
+        if (captureSlots <= 0 ||
+            (useDFlash && !allSimpleGreedy && !allSampling)) {
             return false;
         }
 
         std::vector<int> devices;
         std::map<int, int> ratios;
         if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
-            devices.empty() || !HasMtpWeights()) {
+            devices.empty() || (useDFlash ? !HasDFlashWeights() :
+                                            !HasMtpWeights())) {
             return false;
         }
         const bool tensorParallel = devices.size() > 1;
@@ -15686,30 +17134,62 @@ namespace fastllm {
 
         std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
         std::vector<MtpKvCache*> requestMtpCaches(batch, nullptr);
+        std::vector<DFlashContext*> requestDFlashContexts(batch, nullptr);
         for (int b = 0; b < batch; b++) {
-            auto cacheIt = mtpCaches.find(contexts[b]);
             int expectedMtpTokens = contexts[b]->cacheLen +
                 contexts[b]->preTokens - seqLens[b];
-            if (cacheIt == mtpCaches.end() || expectedMtpTokens <= 0 ||
-                cacheIt->second.tokens != expectedMtpTokens ||
-                cacheIt->second.key.dims.size() < 2 ||
-                cacheIt->second.value.dims.size() < 2 ||
-                cacheIt->second.key.dims[1] != expectedMtpTokens ||
-                cacheIt->second.value.dims[1] != expectedMtpTokens) {
-                return false;
+            if (useDFlash) {
+                auto cacheIt = dflashContexts.find(contexts[b]);
+                if (cacheIt == dflashContexts.end() ||
+                    expectedMtpTokens <= 0 ||
+                    cacheIt->second.committedTokens != expectedMtpTokens ||
+                    (int)cacheIt->second.draftKeyValues.size() !=
+                        dflashLayers ||
+                    (int)cacheIt->second.proposalTokens.size() <
+                        seqLens[b] - 1) {
+                    return false;
+                }
+                for (const auto &layerCache :
+                     cacheIt->second.draftKeyValues) {
+                    if (layerCache.first.dims.size() != 3 ||
+                        layerCache.second.dims.size() != 3 ||
+                        layerCache.first.dims[1] !=
+                            layerCache.second.dims[1] ||
+                        layerCache.first.dims[1] > expectedMtpTokens) {
+                        return false;
+                    }
+                }
+                requestDFlashContexts[b] = &cacheIt->second;
+            } else {
+                auto cacheIt = mtpCaches.find(contexts[b]);
+                if (cacheIt == mtpCaches.end() || expectedMtpTokens <= 0 ||
+                    cacheIt->second.tokens != expectedMtpTokens ||
+                    cacheIt->second.key.dims.size() < 2 ||
+                    cacheIt->second.value.dims.size() < 2 ||
+                    cacheIt->second.key.dims[1] != expectedMtpTokens ||
+                    cacheIt->second.value.dims[1] != expectedMtpTokens) {
+                    return false;
+                }
+                requestMtpCaches[b] = &cacheIt->second;
             }
-            requestMtpCaches[b] = &cacheIt->second;
         }
 
-        std::vector<uint8_t> attentionLayerMask(block_cnt, 0);
-        for (int layer = 0; layer < block_cnt; layer++) {
-            std::string outputWeightName = language_prefix + "layers." +
-                std::to_string(layer) + ".self_attn.o_proj.weight";
-            attentionLayerMask[layer] =
-                weight.weight.find(outputWeightName) != weight.weight.end();
+        std::vector<uint8_t> fallbackLinearAttentionLayers;
+        const std::vector<uint8_t> *linearAttentionLayers =
+            &threadTpLinearAttentionLayers;
+        if ((int)linearAttentionLayers->size() != block_cnt) {
+            fallbackLinearAttentionLayers.assign(block_cnt, 0);
+            for (int layer = 0; layer < block_cnt; layer++) {
+                fallbackLinearAttentionLayers[layer] =
+                    weight.weight.find(
+                        language_prefix + "layers." + std::to_string(layer) +
+                        ".self_attn.o_proj.weight") == weight.weight.end();
+            }
+            linearAttentionLayers = &fallbackLinearAttentionLayers;
         }
         auto isAttentionLayerAt = [&](int layer) {
-            return layer >= 0 && layer < block_cnt && attentionLayerMask[layer] != 0;
+            return layer >= 0 && layer < block_cnt &&
+                   (*linearAttentionLayers)[layer] == 0;
         };
         auto getLocalCache = [&](Data &root, int device) -> Data* {
             if (!tensorParallel) {
@@ -15784,8 +17264,7 @@ namespace fastllm {
             uint64_t expansionSize = 0;
             uint64_t expansionBytes = 0;
         };
-        auto makeMeta = [](const Data &cache) {
-            BatchCacheMeta meta;
+        auto copyMeta = [](BatchCacheMeta &meta, const Data &cache) {
             meta.isPagedKVCache = cache.isPagedKVCache;
             meta.pageLen = cache.pageLen;
             meta.manager = cache.pagedKVCacheData;
@@ -15796,7 +17275,6 @@ namespace fastllm {
             meta.expansionDims = cache.expansionDims;
             meta.expansionSize = cache.expansionSize;
             meta.expansionBytes = cache.expansionBytes;
-            return meta;
         };
         auto assignMetaNoRelease = [](Data &cache, const BatchCacheMeta &meta) {
             cache.isPagedKVCache = meta.isPagedKVCache;
@@ -15892,14 +17370,133 @@ namespace fastllm {
             FastllmCudaSetDevice(oldDevice);
         };
 
+        struct BatchStateTensorCopy {
+            Data *dst = nullptr;
+            const Data *src = nullptr;
+            int device = -1;
+        };
+        auto copyStateTensors = [&](const std::vector<BatchStateTensorCopy> &copies) {
+            if (copies.empty()) {
+                return;
+            }
+            // This path has been validated for the rank-local TP MTP states.
+            // DFlash and single-GPU replay keep their established synchronous
+            // restore semantics until they have dedicated coverage.
+            if (!tensorParallel || useDFlash ||
+                !Qwen35MtpBatchedStateRestoreEnabled()) {
+                for (const BatchStateTensorCopy &copy : copies) {
+                    copyTensor(*copy.dst, *copy.src, copy.device);
+                }
+                return;
+            }
+
+            std::vector<std::exception_ptr> copyErrors(devices.size());
+            auto copyOnDevice = [&](int deviceIndex) {
+                const int device = devices[deviceIndex];
+                FastllmCudaSetDevice(device);
+                thread_local std::vector<void*> copyDsts;
+                thread_local std::vector<const void*> copySrcs;
+                thread_local std::vector<size_t> copySizes;
+                copyDsts.clear();
+                copySrcs.clear();
+                copySizes.clear();
+                copyDsts.reserve(copies.size());
+                copySrcs.reserve(copies.size());
+                copySizes.reserve(copies.size());
+                for (const BatchStateTensorCopy &copy : copies) {
+                    if (copy.device != device) {
+                        continue;
+                    }
+                    Data &dst = *copy.dst;
+                    const Data &src = *copy.src;
+                    bool reusable = dst.dataDevice == DataDevice::CUDA &&
+                        dst.cudaData != nullptr && src.cudaData != nullptr &&
+                        dst.dataDeviceIds.size() == 1 &&
+                        dst.dataDeviceIds[0] == device &&
+                        dst.dataType == src.dataType && dst.dims == src.dims &&
+                        dst.GetBytes() == src.GetBytes();
+                    if (!reusable) {
+                        copyTensor(dst, src, device);
+                        continue;
+                    }
+                    copyDsts.push_back(dst.cudaData);
+                    copySrcs.push_back(src.cudaData);
+                    copySizes.push_back(src.GetBytes());
+                    dst.isKVCache = src.isKVCache;
+                    dst.isLinearAttention = src.isLinearAttention;
+                    dst.isLinearAttentionTransposed =
+                        src.isLinearAttentionTransposed;
+                    dst.cacheUid = src.cacheUid;
+                    dst.strides = src.strides;
+                    dst.expansionDims = src.expansionDims;
+                    dst.expansionSize = src.expansionSize;
+                    dst.expansionBytes = src.expansionBytes;
+                }
+                if (!copyDsts.empty() &&
+                    !FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                        copyDsts.data(), copySrcs.data(), copySizes.data(),
+                        (int)copyDsts.size())) {
+                    for (int i = 0; i < (int)copyDsts.size(); i++) {
+                        FastllmCudaCopyFromDeviceToDevice(
+                            copyDsts[i], (void*)copySrcs[i], copySizes[i]);
+                    }
+                }
+                // Restored target states can be consumed on a different PTDS
+                // by the next batched verify.  One synchronization per rank
+                // replaces hundreds of synchronous tensor copies.
+                ForceDeviceSync();
+            };
+            if (tensorParallel) {
+                threadTpWorkerGroup.Run(devices, copyOnDevice, copyErrors);
+            } else {
+                try {
+                    copyOnDevice(0);
+                } catch (...) {
+                    copyErrors[0] = std::current_exception();
+                }
+            }
+            for (auto &error : copyErrors) {
+                if (error) {
+                    std::rethrow_exception(error);
+                }
+            }
+        };
+
         using MetaByLayer = std::vector<BatchCacheMeta>;
         using LocalMetaByLayer = std::vector<std::map<int, BatchCacheMeta> >;
-        std::vector<MetaByLayer> baseRootKeys(batch, MetaByLayer(block_cnt));
-        std::vector<MetaByLayer> baseRootValues(batch, MetaByLayer(block_cnt));
-        std::vector<LocalMetaByLayer> baseLocalKeys(
-            batch, LocalMetaByLayer(block_cnt));
-        std::vector<LocalMetaByLayer> baseLocalValues(
-            batch, LocalMetaByLayer(block_cnt));
+        struct BatchMetaWorkspace {
+            std::vector<BatchCacheMeta> rootKeys;
+            std::vector<BatchCacheMeta> rootValues;
+            std::vector<BatchCacheMeta> localKeys;
+            std::vector<BatchCacheMeta> localValues;
+        };
+        static thread_local BatchMetaWorkspace baseMetaWorkspace;
+        const size_t rootMetaCount = (size_t)batch * block_cnt;
+        const size_t localMetaCount = rootMetaCount * devices.size();
+        auto ensureMetaCount = [](std::vector<BatchCacheMeta> &metas,
+                                  size_t count) {
+            if (metas.size() < count) {
+                metas.resize(count);
+            }
+        };
+        ensureMetaCount(baseMetaWorkspace.rootKeys, rootMetaCount);
+        ensureMetaCount(baseMetaWorkspace.rootValues, rootMetaCount);
+        ensureMetaCount(baseMetaWorkspace.localKeys, localMetaCount);
+        ensureMetaCount(baseMetaWorkspace.localValues, localMetaCount);
+        auto rootMetaAt = [&](std::vector<BatchCacheMeta> &metas,
+                              int b, int layer) -> BatchCacheMeta& {
+            return metas[(size_t)b * block_cnt + layer];
+        };
+        auto localMetaAt = [&](std::vector<BatchCacheMeta> &metas,
+                               int b, int layer,
+                               int device) -> BatchCacheMeta& {
+            auto deviceIt = std::find(devices.begin(), devices.end(), device);
+            AssertInFastLLM(deviceIt != devices.end(),
+                            "Qwen3.5 batched MTP metadata device mismatch.\n");
+            size_t deviceIndex = deviceIt - devices.begin();
+            return metas[((size_t)b * block_cnt + layer) * devices.size() +
+                         deviceIndex];
+        };
 
         for (int b = 0; b < batch; b++) {
             for (int layer = 0; layer < block_cnt; layer++) {
@@ -15909,8 +17506,10 @@ namespace fastllm {
                     return false;
                 }
                 if (isAttentionLayerAt(layer)) {
-                    baseRootKeys[b][layer] = makeMeta(*rootKey);
-                    baseRootValues[b][layer] = makeMeta(*rootValue);
+                    copyMeta(rootMetaAt(baseMetaWorkspace.rootKeys, b, layer),
+                             *rootKey);
+                    copyMeta(rootMetaAt(baseMetaWorkspace.rootValues, b, layer),
+                             *rootValue);
                     for (int device : devices) {
                         int heads = localAttentionHeads(layer, device);
                         Data *localKey = getLocalCache(*rootKey, device);
@@ -15925,8 +17524,12 @@ namespace fastllm {
                             return false;
                         }
                         if (heads > 0) {
-                            baseLocalKeys[b][layer][device] = makeMeta(*localKey);
-                            baseLocalValues[b][layer][device] = makeMeta(*localValue);
+                            copyMeta(localMetaAt(baseMetaWorkspace.localKeys,
+                                                 b, layer, device),
+                                     *localKey);
+                            copyMeta(localMetaAt(baseMetaWorkspace.localValues,
+                                                 b, layer, device),
+                                     *localValue);
                         }
                     }
                 } else {
@@ -15964,8 +17567,9 @@ namespace fastllm {
         // are too few rejected requests to amortize a grouped replay.  Keep the
         // large-batch single-GPU path on one rollback state per request so the
         // snapshot scratch footprint stays bounded.
-        const bool useLinearPrefixSnapshots = tensorParallel ||
-            batch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX;
+        const bool useLinearPrefixSnapshots = !useDFlash &&
+            (tensorParallel ||
+             batch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX);
         const int linearCaptureSlots =
             useLinearPrefixSnapshots ? captureSlots : 0;
         const int rollbackSlotBase = linearCaptureSlots;
@@ -16051,6 +17655,18 @@ namespace fastllm {
         std::vector<std::exception_ptr> backupErrors(devices.size());
         auto backupLinearStates = [&](int deviceIndex) {
             int device = devices[deviceIndex];
+            const bool useBatchedStateCopy =
+                Qwen35MtpBatchedStateCopyEnabled();
+            FastllmCudaSetDevice(device);
+            thread_local std::vector<void*> backupDsts;
+            thread_local std::vector<const void*> backupSrcs;
+            thread_local std::vector<size_t> backupSizes;
+            backupDsts.clear();
+            backupSrcs.clear();
+            backupSizes.clear();
+            backupDsts.reserve(batch * block_cnt * 2);
+            backupSrcs.reserve(batch * block_cnt * 2);
+            backupSizes.reserve(batch * block_cnt * 2);
             for (int b = 0; b < batch; b++) {
                 int rollbackSlot = rollbackSlotBase + b;
                 for (int layer = 0; layer < block_cnt; layer++) {
@@ -16070,21 +17686,74 @@ namespace fastllm {
                         throw std::runtime_error(
                             "Qwen3.5 batched MTP cannot prepare rollback state.");
                     }
-                    copyTensor(*backupKey, *realKey, device);
-                    copyTensor(*backupValue, *realValue, device);
+                    auto queueBackup = [&](Data &backup, const Data &real) {
+                        bool reusable = useBatchedStateCopy &&
+                            backup.dataDevice == DataDevice::CUDA &&
+                            backup.cudaData != nullptr && real.cudaData != nullptr &&
+                            backup.dataDeviceIds.size() == 1 &&
+                            backup.dataDeviceIds[0] == device &&
+                            backup.dataType == real.dataType &&
+                            backup.dims == real.dims &&
+                            backup.GetBytes() == real.GetBytes();
+                        if (!reusable) {
+                            copyTensor(backup, real, device);
+                            return;
+                        }
+                        backupDsts.push_back(backup.cudaData);
+                        backupSrcs.push_back(real.cudaData);
+                        backupSizes.push_back(real.GetBytes());
+                        backup.isKVCache = real.isKVCache;
+                        backup.isLinearAttention = real.isLinearAttention;
+                        backup.isLinearAttentionTransposed =
+                            real.isLinearAttentionTransposed;
+                        backup.cacheUid = real.cacheUid;
+                        backup.strides = real.strides;
+                        backup.expansionDims = real.expansionDims;
+                        backup.expansionSize = real.expansionSize;
+                        backup.expansionBytes = real.expansionBytes;
+                    };
+                    queueBackup(*backupKey, *realKey);
+                    queueBackup(*backupValue, *realValue);
                 }
             }
-            FastllmCudaSetDevice(device);
-            ForceDeviceSync();
+            if (!backupDsts.empty() &&
+                !FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    backupDsts.data(), backupSrcs.data(), backupSizes.data(),
+                    (int)backupDsts.size())) {
+                for (int i = 0; i < (int)backupDsts.size(); i++) {
+                    FastllmCudaCopyFromDeviceToDevice(
+                        backupDsts[i], (void*)backupSrcs[i], backupSizes[i]);
+                }
+            }
         };
         if (tensorParallel) {
-            threadTpWorkerGroup.Run(devices, backupLinearStates, backupErrors);
+            // Keep each rank's state backup and target forward on the same
+            // persistent PTDS.  CUDA stream ordering then makes the backup
+            // visible before either eager kernels or a verify graph launch,
+            // without a device-wide synchronization in every decode step.
+            threadTpWorkerGroup.RunWithCaller(
+                devices, backupLinearStates, backupErrors);
         } else {
             try {
                 backupLinearStates(0);
             } catch (...) {
                 backupErrors[0] = std::current_exception();
             }
+        }
+        bool backupFailed = std::any_of(
+            backupErrors.begin(), backupErrors.end(),
+            [](const std::exception_ptr &error) {
+                return error != nullptr;
+            });
+        if (backupFailed) {
+            // Pending copies must be drained before exceptional rollback can
+            // mutate or release their source and destination tensors.
+            int oldDevice = FastllmCudaGetDevice();
+            for (int device : devices) {
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+            }
+            FastllmCudaSetDevice(oldDevice);
         }
         for (auto &error : backupErrors) {
             if (error) {
@@ -16093,9 +17762,10 @@ namespace fastllm {
         }
 
         bool rollbackArmed = true;
-        auto eraseRequestMtpCaches = [&]() {
+        auto eraseRequestDraftCaches = [&]() {
             for (ResponseContext *context : contexts) {
                 mtpCaches.erase(context);
+                dflashContexts.erase(context);
             }
         };
         auto rollbackTargetCaches = [&]() {
@@ -16115,8 +17785,12 @@ namespace fastllm {
                     Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
                     if (isAttentionLayerAt(layer)) {
                         if (!tensorParallel) {
-                            restoreMeta(*rootKey, baseRootKeys[b][layer]);
-                            restoreMeta(*rootValue, baseRootValues[b][layer]);
+                            restoreMeta(
+                                *rootKey,
+                                rootMetaAt(baseMetaWorkspace.rootKeys, b, layer));
+                            restoreMeta(
+                                *rootValue,
+                                rootMetaAt(baseMetaWorkspace.rootValues, b, layer));
                         } else {
                             for (int device : devices) {
                                 int heads = localAttentionHeads(layer, device);
@@ -16124,12 +17798,20 @@ namespace fastllm {
                                     continue;
                                 }
                                 restoreMeta(*getLocalCache(*rootKey, device),
-                                            baseLocalKeys[b][layer].at(device));
+                                            localMetaAt(
+                                                baseMetaWorkspace.localKeys,
+                                                b, layer, device));
                                 restoreMeta(*getLocalCache(*rootValue, device),
-                                            baseLocalValues[b][layer].at(device));
+                                            localMetaAt(
+                                                baseMetaWorkspace.localValues,
+                                                b, layer, device));
                             }
-                            assignMetaNoRelease(*rootKey, baseRootKeys[b][layer]);
-                            assignMetaNoRelease(*rootValue, baseRootValues[b][layer]);
+                            assignMetaNoRelease(
+                                *rootKey,
+                                rootMetaAt(baseMetaWorkspace.rootKeys, b, layer));
+                            assignMetaNoRelease(
+                                *rootValue,
+                                rootMetaAt(baseMetaWorkspace.rootValues, b, layer));
                         }
                     } else {
                         for (int device : devices) {
@@ -16150,7 +17832,7 @@ namespace fastllm {
                 }
             }
             rollbackArmed = false;
-            eraseRequestMtpCaches();
+            eraseRequestDraftCaches();
         };
         int rollbackToken = 0;
         auto rollbackDeleter = [&](int*) noexcept {
@@ -16168,10 +17850,27 @@ namespace fastllm {
 
         bool oldCollectAllLogits = speculativeCollectAllLogits;
         bool oldCaptureLinearState = speculativeCaptureFirstTokenLinearState;
+        bool oldCaptureDFlash = speculativeCaptureDFlashHiddenStates;
+        DFlashContext *oldDFlashSamplingContext =
+            speculativeDFlashSamplingContext;
+        std::vector<DFlashContext*> oldDFlashSamplingContexts =
+            speculativeDFlashSamplingContexts;
         int oldCaptureSlots = speculativeLinearStateCaptureSlots;
         speculativeCollectAllLogits = true;
         speculativeCaptureFirstTokenLinearState = true;
+        speculativeCaptureDFlashHiddenStates = useDFlash;
+        speculativeDFlashSamplingContext = nullptr;
+        speculativeDFlashSamplingContexts =
+            useDFlash && allSampling ? requestDFlashContexts :
+                                      std::vector<DFlashContext*>();
         speculativeLinearStateCaptureSlots = linearCaptureSlots;
+        speculativeTypicalAccepted.clear();
+        speculativeDFlashAccepted.clear();
+        if (useDFlash) {
+            speculativeDFlashHiddenStates.clear();
+            speculativeDFlashHiddenStates.resize(
+                dflashTargetLayerIds.size());
+        }
         speculativeHiddenStates.FreeSpace();
         speculativeHiddenStates.dims.clear();
         speculativeHiddenStates.strides.clear();
@@ -16184,17 +17883,26 @@ namespace fastllm {
         } catch (const Qwen35MtpBatchFastPathUnavailable &) {
             speculativeLinearStateCaptureSlots = oldCaptureSlots;
             speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
+            speculativeDFlashSamplingContexts = oldDFlashSamplingContexts;
+            speculativeDFlashSamplingContext = oldDFlashSamplingContext;
+            speculativeCaptureDFlashHiddenStates = oldCaptureDFlash;
             speculativeCollectAllLogits = oldCollectAllLogits;
             rollbackTargetCaches();
             return false;
         } catch (...) {
             speculativeLinearStateCaptureSlots = oldCaptureSlots;
             speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
+            speculativeDFlashSamplingContexts = oldDFlashSamplingContexts;
+            speculativeDFlashSamplingContext = oldDFlashSamplingContext;
+            speculativeCaptureDFlashHiddenStates = oldCaptureDFlash;
             speculativeCollectAllLogits = oldCollectAllLogits;
             throw;
         }
         speculativeLinearStateCaptureSlots = oldCaptureSlots;
         speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
+        speculativeDFlashSamplingContexts = oldDFlashSamplingContexts;
+        speculativeDFlashSamplingContext = oldDFlashSamplingContext;
+        speculativeCaptureDFlashHiddenStates = oldCaptureDFlash;
         speculativeCollectAllLogits = oldCollectAllLogits;
         if ((int)targetRet.size() < totalTokens) {
             rollbackTargetCaches();
@@ -16215,25 +17923,25 @@ namespace fastllm {
             tokenOffsets[b] = tokenOffsets[b - 1] + seqLens[b - 1];
             captureOffsets[b] = captureOffsets[b - 1] + seqLens[b - 1] - 1;
         }
-        bool needsTypicalAcceptance = false;
-        for (int b = 0; b < batch; b++) {
-            needsTypicalAcceptance |= !generationConfigs[b].IsSimpleGreedy();
-        }
-        if (needsTypicalAcceptance &&
-            (int)speculativeTypicalAccepted.size() < totalTokens) {
+        bool needsSamplingAcceptance = !allSimpleGreedy;
+        const std::vector<unsigned char> &samplingAccepted = useDFlash ?
+            speculativeDFlashAccepted : speculativeTypicalAccepted;
+        if (needsSamplingAcceptance &&
+            (int)samplingAccepted.size() < totalTokens) {
             rollbackTargetCaches();
             return false;
         }
         std::vector<int> matchedDrafts(batch, 0);
         std::vector<int> commitLens(batch, 0);
+        int rejectedRequests = 0;
         for (int b = 0; b < batch; b++) {
             int proposalCount = seqLens[b] - 1;
-            bool useTypicalAcceptance =
+            bool useSamplingAcceptance =
                 !generationConfigs[b].IsSimpleGreedy();
             while (matchedDrafts[b] < proposalCount) {
                 int row = tokenOffsets[b] + matchedDrafts[b];
-                bool accepted = useTypicalAcceptance ?
-                    speculativeTypicalAccepted[row] != 0 :
+                bool accepted = useSamplingAcceptance ?
+                    samplingAccepted[row] != 0 :
                     targetRet[row] ==
                         (int)(inputPtr[row + 1] + 1.0e-3f);
                 if (!accepted) {
@@ -16250,16 +17958,36 @@ namespace fastllm {
                 commitLens[b] = seqLens[b];
             } else {
                 commitLens[b] = matchedDrafts[b] + 1;
+                rejectedRequests++;
             }
         }
-        // A partial-prefix replay may reuse speculativeHiddenStates as regular
-        // forward scratch. Preserve the committed target hidden rows first;
-        // these are the inputs to the MTP draft model after cache commit.
+        // A partial-prefix replay may reuse speculative capture buffers as
+        // regular forward scratch. Preserve each committed prefix first.
         std::vector<Data> committedTargetHidden(batch);
-        for (int b = 0; b < batch; b++) {
-            Split(speculativeHiddenStates, 1, tokenOffsets[b],
-                  tokenOffsets[b] + commitLens[b],
-                  committedTargetHidden[b]);
+        std::vector<std::vector<Data> > committedDFlashHidden(batch);
+        if (useDFlash) {
+            if (speculativeDFlashHiddenStates.size() !=
+                dflashTargetLayerIds.size()) {
+                rollbackTargetCaches();
+                return false;
+            }
+            for (int b = 0; b < batch; b++) {
+                committedDFlashHidden[b].resize(
+                    speculativeDFlashHiddenStates.size());
+                for (int feature = 0;
+                     feature < (int)speculativeDFlashHiddenStates.size();
+                     feature++) {
+                    Split(speculativeDFlashHiddenStates[feature], 1,
+                          tokenOffsets[b], tokenOffsets[b] + commitLens[b],
+                          committedDFlashHidden[b][feature]);
+                }
+            }
+        } else {
+            for (int b = 0; b < batch; b++) {
+                Split(speculativeHiddenStates, 1, tokenOffsets[b],
+                      tokenOffsets[b] + commitLens[b],
+                      committedTargetHidden[b]);
+            }
         }
 
         if (useLinearPrefixSnapshots) {
@@ -16269,6 +17997,9 @@ namespace fastllm {
                 batch, LocalMetaByLayer(block_cnt));
             std::vector<LocalMetaByLayer> prefixLocalValues(
                 batch, LocalMetaByLayer(block_cnt));
+            std::vector<BatchStateTensorCopy> prefixStateRestores;
+            prefixStateRestores.reserve(
+                rejectedRequests * block_cnt * devices.size() * 2);
             for (int b = 0; b < batch; b++) {
                 if (commitLens[b] == seqLens[b]) {
                     continue;
@@ -16278,9 +18009,13 @@ namespace fastllm {
                     Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
                     Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
                     if (isAttentionLayerAt(layer)) {
-                        if (!tryPrefixMeta(baseRootKeys[b][layer], *rootKey,
+                        if (!tryPrefixMeta(
+                                rootMetaAt(baseMetaWorkspace.rootKeys, b, layer),
+                                *rootKey,
                                            commitLens[b], prefixRootKeys[b][layer]) ||
-                            !tryPrefixMeta(baseRootValues[b][layer], *rootValue,
+                            !tryPrefixMeta(
+                                rootMetaAt(baseMetaWorkspace.rootValues, b, layer),
+                                *rootValue,
                                            commitLens[b], prefixRootValues[b][layer])) {
                             rollbackTargetCaches();
                             return false;
@@ -16291,10 +18026,14 @@ namespace fastllm {
                                 continue;
                             }
                             BatchCacheMeta keyMeta, valueMeta;
-                            if (!tryPrefixMeta(baseLocalKeys[b][layer].at(device),
+                            if (!tryPrefixMeta(
+                                    localMetaAt(baseMetaWorkspace.localKeys,
+                                                b, layer, device),
                                                *getLocalCache(*rootKey, device),
                                                commitLens[b], keyMeta) ||
-                                !tryPrefixMeta(baseLocalValues[b][layer].at(device),
+                                !tryPrefixMeta(
+                                    localMetaAt(baseMetaWorkspace.localValues,
+                                                b, layer, device),
                                                *getLocalCache(*rootValue, device),
                                                commitLens[b], valueMeta)) {
                                 rollbackTargetCaches();
@@ -16363,29 +18102,31 @@ namespace fastllm {
                         }
                     } else {
                         for (int device : devices) {
-                            copyTensor(
-                                *getLocalCache(*rootKey, device),
-                                *getLocalCache(
+                            prefixStateRestores.push_back({
+                                getLocalCache(*rootKey, device),
+                                getLocalCache(
                                     speculativeLinearStates[layer][captureSlot].first,
                                     device),
-                                device);
-                            copyTensor(
-                                *getLocalCache(*rootValue, device),
-                                *getLocalCache(
+                                device});
+                            prefixStateRestores.push_back({
+                                getLocalCache(*rootValue, device),
+                                getLocalCache(
                                     speculativeLinearStates[layer][captureSlot].second,
                                     device),
-                                device);
+                                device});
                         }
                     }
                 }
             }
+            copyStateTensors(prefixStateRestores);
 
         } else {
             // Without prefix snapshots, restore every request whose validated
             // suffix is longer than its committed prefix, then replay that
-            // prefix. The single-GPU scheduler is capped to the snapshot batch
-            // limit, so this remains a defensive path rather than the normal
-            // large-batch decode path.
+            // prefix. DFlash uses this bounded-memory path at every batch size.
+            std::vector<BatchStateTensorCopy> rollbackStateRestores;
+            rollbackStateRestores.reserve(
+                rejectedRequests * block_cnt * devices.size() * 2);
             for (int b = 0; b < batch; b++) {
                 if (commitLens[b] == seqLens[b]) {
                     continue;
@@ -16395,20 +18136,54 @@ namespace fastllm {
                     Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
                     Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
                     if (isAttentionLayerAt(layer)) {
-                        restoreMeta(*rootKey, baseRootKeys[b][layer]);
-                        restoreMeta(*rootValue, baseRootValues[b][layer]);
+                        if (!tensorParallel) {
+                            restoreMeta(
+                                *rootKey,
+                                rootMetaAt(baseMetaWorkspace.rootKeys, b, layer));
+                            restoreMeta(
+                                *rootValue,
+                                rootMetaAt(baseMetaWorkspace.rootValues, b, layer));
+                        } else {
+                            for (int device : devices) {
+                                int heads = localAttentionHeads(layer, device);
+                                if (heads <= 0) {
+                                    continue;
+                                }
+                                restoreMeta(
+                                    *getLocalCache(*rootKey, device),
+                                    localMetaAt(baseMetaWorkspace.localKeys,
+                                                b, layer, device));
+                                restoreMeta(
+                                    *getLocalCache(*rootValue, device),
+                                    localMetaAt(baseMetaWorkspace.localValues,
+                                                b, layer, device));
+                            }
+                            assignMetaNoRelease(
+                                *rootKey,
+                                rootMetaAt(baseMetaWorkspace.rootKeys, b, layer));
+                            assignMetaNoRelease(
+                                *rootValue,
+                                rootMetaAt(baseMetaWorkspace.rootValues, b, layer));
+                        }
                     } else {
-                        copyTensor(
-                            *rootKey,
-                            speculativeLinearStates[layer][rollbackSlot].first,
-                            rootDevice);
-                        copyTensor(
-                            *rootValue,
-                            speculativeLinearStates[layer][rollbackSlot].second,
-                            rootDevice);
+                        for (int device : devices) {
+                            rollbackStateRestores.push_back({
+                                getLocalCache(*rootKey, device),
+                                getLocalCache(
+                                    speculativeLinearStates[layer][rollbackSlot].first,
+                                    device),
+                                device});
+                            rollbackStateRestores.push_back({
+                                getLocalCache(*rootValue, device),
+                                getLocalCache(
+                                    speculativeLinearStates[layer][rollbackSlot].second,
+                                    device),
+                                device});
+                        }
                     }
                 }
             }
+            copyStateTensors(rollbackStateRestores);
 
             // Requests with the same committed length use the same small
             // continuation shape. Run each such group in one fused forward
@@ -16536,7 +18311,43 @@ namespace fastllm {
             acceptedTokens[b].push_back(
                 targetRet[tokenOffset + matchedDrafts[b]]);
         };
-        {
+        if (useDFlash) {
+            for (int b = 0; b < batch; b++) {
+                const int commitLen = commitLens[b];
+                const int tokenOffset = tokenOffsets[b];
+                const int lastTargetToken =
+                    targetRet[tokenOffset + commitLen - 1];
+                speculativeDFlashHiddenStates =
+                    std::move(committedDFlashHidden[b]);
+                AppendDFlashTargetHidden(
+                    rootDevice, commitLen, *requestDFlashContexts[b]);
+                std::vector<int> drafts = RunDFlashDraft(
+                    rootDevice, devices, lastTargetToken,
+                    generationConfigs[b], *requestDFlashContexts[b]);
+                AssertInFastLLM(
+                    (int)drafts.size() == draftsPerStep,
+                    "Qwen3.5 batched DFlash draft returned invalid output.\n");
+
+                commitAcceptedTokens(b);
+                nextInputTokens[b].reserve(1 + drafts.size());
+                nextInputTokens[b].push_back(lastTargetToken);
+                nextInputTokens[b].insert(nextInputTokens[b].end(),
+                                          drafts.begin(), drafts.end());
+                int proposalCount = seqLens[b] - 1;
+                for (int pos = 0;
+                     pos < proposalCount && pos < QWEN35_MTP_MAX_DRAFTS;
+                     pos++) {
+                    mtpDraftPositionAttempts[pos].fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (matchedDrafts[b] > pos) {
+                        mtpDraftPositionAccepts[pos].fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                }
+                mtpValidationCount.fetch_add(1,
+                                             std::memory_order_relaxed);
+            }
+        } else {
             std::vector<Data> mtpPositionStorage(batch);
             std::vector<const Data*> hiddenInputs(batch, nullptr);
             std::vector<Data*> mtpPositionPtrs(batch, nullptr);
@@ -16667,7 +18478,8 @@ namespace fastllm {
 
         long long validations = mtpValidationCount.load(std::memory_order_relaxed);
         if (validations > 0 && validations % QWEN35_MTP_LOG_INTERVAL == 0) {
-            printf("[Qwen3.5 MTP] pos_accept_rate=[");
+            printf("[Qwen3.5 %s] pos_accept_rate=[",
+                   useDFlash ? "DFlash2" : "MTP");
             for (int pos = 0; pos < draftsPerStep; pos++) {
                 long long attempts = mtpDraftPositionAttempts[pos].load(
                     std::memory_order_relaxed);
@@ -16700,7 +18512,9 @@ namespace fastllm {
         const int mtpDraftsPerStep = schedulerUsesDFlash ?
             model->DFlashDraftsPerStep() : Qwen35MtpDraftsPerStep();
         const bool canUseMtpBatchForward =
-            model->CanUseQwen35MTPBatchForward(mtpDraftsPerStep);
+            schedulerUsesDFlash ?
+                model->CanUseQwen35DFlashBatchForward(mtpDraftsPerStep) :
+                model->CanUseQwen35MTPBatchForward(mtpDraftsPerStep);
         const int configuredMtpSchedulerLanes =
             std::max(1, model->maxBatch > 0 ? model->maxBatch : 1);
         // Configurations outside the batched target fast path remain supported
@@ -16708,15 +18522,22 @@ namespace fastllm {
         // does not discard valid draft caches and silently disable MTP.
         int mtpSchedulerLanes = 1;
         if (canUseMtpBatchForward) {
-            // The single-GPU path keeps prefix snapshots only for small batches.
-            // Larger batches would otherwise roll back and replay every accepted
-            // prefix after each validation, which can be slower than plain decode.
-            // Keep TP at the configured concurrency because every TP batch keeps
-            // its rank-local prefix snapshots.
-            mtpSchedulerLanes = model->IsThreadTensorParallelEnabled() ?
-                configuredMtpSchedulerLanes :
-                std::min(configuredMtpSchedulerLanes,
-                         QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX);
+            if (schedulerUsesDFlash) {
+                // DFlash keeps one rollback state per request and replays only
+                // rejected prefixes, so it can use every configured lane
+                // without the batch x draft prefix-snapshot footprint.
+                mtpSchedulerLanes = configuredMtpSchedulerLanes;
+            } else {
+                // The single-GPU path keeps prefix snapshots only for small
+                // batches. Larger batches would otherwise roll back and replay
+                // every accepted prefix after each validation, which can be
+                // slower than plain decode. Keep TP at the configured
+                // concurrency because every TP batch keeps rank-local snapshots.
+                mtpSchedulerLanes = model->IsThreadTensorParallelEnabled() ?
+                    configuredMtpSchedulerLanes :
+                    std::min(configuredMtpSchedulerLanes,
+                             QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX);
+            }
         } else if (mtpDraftsPerStep == 0 &&
                    Qwen35GpuTokenHandoffEnabled()) {
             // The handoff fast path itself is B1-only, but enabling it must not
@@ -22558,27 +24379,74 @@ namespace fastllm {
         attentionOutput.Allocate(false);
         bool allSingleToken = std::all_of(
             seqLens.begin(), seqLens.end(), [](int len) { return len == 1; });
-        if (allSingleToken) {
+        bool homogeneousSeqLen = std::all_of(
+            seqLens.begin(), seqLens.end(), [&](int len) {
+                return len == seqLens[0];
+            });
+        int minCacheTokens = -1;
+        int maxCacheTokens = 0;
+        for (int b = 0; b < batch; b++) {
+            if (caches[b]->key.dims.size() >= 2) {
+                int cacheTokens = caches[b]->key.dims[1];
+                minCacheTokens = minCacheTokens < 0 ? cacheTokens :
+                    std::min(minCacheTokens, cacheTokens);
+                maxCacheTokens = std::max(maxCacheTokens,
+                                          cacheTokens);
+            }
+        }
+        // Short single-token caches use the existing pointer-batched kernels.
+        // Long homogeneous sequences use grouped CUBLAS across request x
+        // KV-head matrices; multi-token draft extend additionally shares one
+        // causal softmax launch. Mixed lengths retain the per-request fallback.
+        bool useLongKvBatchAttention = batch > 1 &&
+            minCacheTokens > QWEN35_MTP_BATCH_ATTENTION_CACHE_MAX &&
+            Qwen35MtpLongKvBatchAttentionEnabled() &&
+            (allSingleToken ||
+             (homogeneousSeqLen &&
+              seqLens[0] <= QWEN35_MTP_FAST_SEQ_MAX &&
+              Qwen35MtpLongKvBatchExtendEnabled()));
+        bool useBatchAttention =
+            (allSingleToken &&
+             (batch == 1 ||
+              maxCacheTokens <= QWEN35_MTP_BATCH_ATTENTION_CACHE_MAX)) ||
+            useLongKvBatchAttention;
+        const size_t attentionRowBytes =
+            (size_t)attentionWidth * attentionOutput.unitSize /
+            attentionOutput.unitSizeDiv;
+        if (useBatchAttention) {
             std::vector<Data*> qs(batch), keys(batch), values(batch), masks(batch, nullptr),
                                contexts(batch);
             std::vector<Data> outputViews(batch);
+            std::vector<Data> batchOutputs(batch);
             for (int b = 0; b < batch; b++) {
                 qs[b] = &requestQ[b];
                 keys[b] = &caches[b]->key;
                 values[b] = &caches[b]->value;
-                outputViews[b].FakeFrom(
-                    attentionOutput,
-                    (size_t)b * attentionWidth * attentionOutput.unitSize /
-                        attentionOutput.unitSizeDiv);
-                contexts[b] = &outputViews[b];
+                if (allSingleToken) {
+                    outputViews[b].FakeFrom(
+                        attentionOutput,
+                        (size_t)tokenOffsets[b] * attentionRowBytes);
+                    contexts[b] = &outputViews[b];
+                } else {
+                    contexts[b] = &batchOutputs[b];
+                }
             }
             AttentionBatch(qs, keys, values, masks, contexts,
                            requestQ[0].dims[0] / caches[0]->key.dims[0],
                            1.0f / std::sqrt((float)this->head_dim), 1);
+            if (!allSingleToken) {
+                for (int b = 0; b < batch; b++) {
+                    PermuteSelf(batchOutputs[b], {1, 0, 2});
+                    batchOutputs[b].Reshape(
+                        {1, seqLens[b], attentionWidth});
+                    FastllmCudaCopyFromDeviceToDevice(
+                        (uint8_t*)attentionOutput.cudaData +
+                            (size_t)tokenOffsets[b] * attentionRowBytes,
+                        batchOutputs[b].cudaData,
+                        (size_t)seqLens[b] * attentionRowBytes);
+                }
+            }
         } else {
-            const size_t attentionRowBytes =
-                (size_t)attentionWidth * attentionOutput.unitSize /
-                attentionOutput.unitSizeDiv;
             for (int b = 0; b < batch; b++) {
                 Data requestOutput;
                 Attention(requestQ[b], caches[b]->key, caches[b]->value,

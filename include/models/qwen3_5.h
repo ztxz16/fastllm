@@ -253,6 +253,7 @@ namespace fastllm {
         std::vector <Data> speculativeDFlashHiddenStates;
         std::vector<unsigned char> speculativeTypicalAccepted;
         DFlashContext *speculativeDFlashSamplingContext = nullptr;
+        std::vector<DFlashContext*> speculativeDFlashSamplingContexts;
         std::vector<unsigned char> speculativeDFlashAccepted;
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
@@ -410,6 +411,7 @@ namespace fastllm {
                                        DFlashContext &context);
         bool HasMtpMoeWeights() const;
         bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
+        bool CanUseQwen35DFlashBatchForward(int draftsPerStep) const;
         bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
