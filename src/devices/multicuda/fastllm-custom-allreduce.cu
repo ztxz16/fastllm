@@ -889,6 +889,7 @@ struct CustomArState {
     int pushBlocks = 0;
     bool pushAvailable = false;
     bool pushUsePdl = false;
+    bool captureFallbackLogged = false;
     std::map<std::vector<uintptr_t>, std::vector<CustomArRankData *> > registrations;
 
     uint64_t generation = 0;
@@ -897,7 +898,7 @@ struct CustomArState {
     int pendingType = -1;
     bool pendingMismatch = false;
     bool lastRegistrationOk = false;
-    bool lastCaptureRegistrationMiss = false;
+    bool lastRegistrationMissDuringCapture = false;
     std::vector<void *> pendingInputs;
     std::vector<char> pendingCapturing;
     std::vector<CustomArRankData *> lastRankData;
@@ -1174,7 +1175,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
                 state.registrations[key] = rankDatas;
             }
         }
-        state.lastCaptureRegistrationMiss =
+        state.lastRegistrationMissDuringCapture =
             inputsValid && anyCapturing && !alreadyRegistered;
         state.lastRegistrationOk = ok;
         state.lastRankData = ok ? rankDatas :
@@ -1189,12 +1190,19 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
     }
 
     if (!state.lastRegistrationOk) {
-        if (state.lastCaptureRegistrationMiss) {
-            FastllmCudaSetThreadError();
-            if (rank == 0) {
+        if (state.lastRegistrationMissDuringCapture) {
+            // Registration allocates device metadata and copies the peer
+            // pointer tuple, so it cannot be built while a stream is being
+            // captured.  No custom kernel has launched yet, and the
+            // rendezvous above makes this miss collective across all ranks.
+            // Let the caller capture its NCCL/non-fused fallback instead of
+            // poisoning an otherwise valid graph.
+            if (rank == 0 && !state.captureFallbackLogged) {
+                state.captureFallbackLogged = true;
                 std::fprintf(stderr,
-                             "[Fastllm] custom all-reduce rejected an "
-                             "unregistered pointer tuple during capture.\n");
+                             "[Fastllm] custom all-reduce is falling back "
+                             "inside CUDA Graph for pointer tuples first "
+                             "seen during capture.\n");
                 std::fflush(stderr);
             }
         }
@@ -1987,8 +1995,8 @@ bool BenchmarkCustomArPath(const CustomArState &state,
     CustomArRankOperation measuredNccl = eagerNccl;
     float ignoredUs = 0.0f;
 
-    // Register the benchmark pointer tuple outside capture. A registration
-    // miss during capture is intentionally rejected by the production path.
+    // Register the benchmark pointer tuple outside capture so this benchmark
+    // measures the custom path instead of the graph-safe NCCL fallback.
     if (!ZeroCustomArBenchInputs(state.devices, buffers, bytes) ||
         !RunCustomArRankOperation(state.devices, 1, eagerCustom, ignoredUs)) {
         return false;
@@ -2215,7 +2223,8 @@ void FastllmCudaCustomAllReduceReset() {
         state.pendingType = -1;
         state.pendingMismatch = false;
         state.lastRegistrationOk = false;
-        state.lastCaptureRegistrationMiss = false;
+        state.lastRegistrationMissDuringCapture = false;
+        state.captureFallbackLogged = false;
         state.pendingInputs.clear();
         state.pendingCapturing.clear();
         state.lastRankData.clear();
