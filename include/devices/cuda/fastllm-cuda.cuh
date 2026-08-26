@@ -213,6 +213,17 @@ void FastllmCudaClearBigBuffer();
 #ifdef __CUDACC__
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);
 #endif
+enum FastllmCudaTryMallocResult {
+    FASTLLM_CUDA_TRY_MALLOC_SUCCESS = 0,
+    FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE = 1,
+    FASTLLM_CUDA_TRY_MALLOC_ERROR = 2,
+};
+// Optional pooled/direct allocations for acceleration workspaces. A capacity
+// failure (including a frozen allocator pool miss) leaves the CUDA thread and
+// graph error flags unchanged so the caller can use a safe fallback. Other
+// CUDA failures retain the ordinary allocator's error reporting.
+FastllmCudaTryMallocResult FastllmCudaTryMalloc(void **ret, size_t size);
+FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(void **ret, size_t size);
 void *FastllmCudaMalloc(size_t size);
 void FastllmCudaForceFree(void *ret);
 // Return a pooled allocation after all work already submitted to this host

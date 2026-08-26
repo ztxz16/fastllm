@@ -4168,7 +4168,8 @@ static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
         *ret = nullptr;
     }
     cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
-    if (cudaSuccess == state || fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (cudaSuccess == state || state != cudaErrorMemoryAllocation ||
+        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return state;
     }
     cudaGetLastError();
@@ -4557,6 +4558,62 @@ void * FastllmCudaDirectMalloc(size_t size) {
     return ret;
 }
 
+FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
+        void **ret, size_t size) {
+    if (ret == nullptr) {
+        return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+    }
+    *ret = nullptr;
+    if (FastllmCudaGetThreadError()) {
+        return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+    }
+    if (FastllmCudaGraphIsCapturing() ||
+        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        return FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+    }
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    if (state != cudaSuccess || id < 0) {
+        checkCudaErrors(
+            "Error: CUDA error when finding device for optional allocation!",
+            state);
+        if (state == cudaSuccess) {
+            FastllmCudaSetThreadError();
+        }
+        return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+    }
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    state = FastllmCudaCheckedMallocWithIdlePoolRetry(
+        ret, size, id, view, __FILE__, __LINE__);
+    if (state == cudaSuccess && *ret != nullptr &&
+        !FastllmCudaGetThreadError()) {
+#ifdef CUDA_MEM_DEBUG
+        CudaMemDebugRecord(*ret, size);
+#endif
+        return FASTLLM_CUDA_TRY_MALLOC_SUCCESS;
+    }
+    if (state == cudaErrorMemoryAllocation &&
+        !FastllmCudaGetThreadError()) {
+        // A real cudaMalloc OOM occupies the runtime last-error slot. The
+        // synthetic allocation-freeze failure above never reaches this call.
+        cudaGetLastError();
+        return FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+    }
+    if (*ret != nullptr) {
+        cudaFree(*ret);
+        *ret = nullptr;
+    }
+    if (state == cudaSuccess && !FastllmCudaGetThreadError()) {
+        FastllmCudaSetThreadError();
+    } else if (!FastllmCudaGetThreadError()) {
+        checkCudaErrors(
+            "Error: unexpected CUDA failure during optional allocation!",
+            state);
+    }
+    return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+}
+
 void FastllmCudaDirectFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
@@ -4719,7 +4776,9 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
     }
 }
 
-static bool FastllmCudaRetryMallocAfterReleasingIdle(size_t size, void **ret, int id, const char *file, int line) {
+static bool FastllmCudaRetryMallocAfterReleasingIdle(
+        size_t size, void **ret, int id, const char *file, int line,
+        cudaError_t *failureState) {
     // cudaFree is forbidden while a stream is being captured. A capture-time
     // pool miss must be reported to the graph path instead of trying the
     // ordinary OOM recovery, which would invalidate every participating rank.
@@ -4736,6 +4795,9 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(size_t size, void **ret, in
     cudaGetLastError();
     FastllmCudaReleaseIdleCachedBuffersForDevice(id);
     cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
+    if (failureState != nullptr) {
+        *failureState = state;
+    }
     return state == cudaSuccess;
 }
 
@@ -4875,11 +4937,24 @@ void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointer
     }
 }
 
-void * FastllmCudaMalloc(size_t size) {
+static void *FastllmCudaMallocImpl(
+        size_t size, FastllmCudaTryMallocResult *tryResult) {
+    if (tryResult != nullptr) {
+        *tryResult = FASTLLM_CUDA_TRY_MALLOC_ERROR;
+    }
+    auto allocationSucceeded = [&](void *ret) {
+        if (tryResult != nullptr) {
+            *tryResult = FASTLLM_CUDA_TRY_MALLOC_SUCCESS;
+        }
+        return ret;
+    };
     int id = -1;
     cudaError_t state = cudaSuccess;
     state = cudaGetDevice(&id);
     checkCudaErrors("Error: CUDA error when find device!", state);
+    if (state != cudaSuccess || id < 0) {
+        return nullptr;
+    }
     FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
@@ -4910,7 +4985,7 @@ void * FastllmCudaMalloc(size_t size) {
 #ifdef CUDA_MEM_DEBUG
             CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
-            return bigBuffers[selId].data;
+            return allocationSucceeded(bigBuffers[selId].data);
         }
         if (useAnyFittingPooledBuffer) {
             for (int i = 0; i < bigBuffers.size(); i++) {
@@ -4932,11 +5007,17 @@ void * FastllmCudaMalloc(size_t size) {
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
-                return bigBuffers[selId].data;
+                return allocationSucceeded(bigBuffers[selId].data);
             }
         }
 
         void * ret = nullptr;
+        if (tryResult != nullptr &&
+            (capturePoolOnly || fastllmCudaMallocDisabled.load(
+                                    std::memory_order_relaxed))) {
+            *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+            return nullptr;
+        }
         if (useAnyFittingPooledBuffer) {
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
         }
@@ -4945,10 +5026,19 @@ void * FastllmCudaMalloc(size_t size) {
             return nullptr;
         }
         state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
-        if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
+        if (state == cudaErrorMemoryAllocation &&
+            FastllmCudaRetryMallocAfterReleasingIdle(
+                size, &ret, id, __FILE__, __LINE__, &state)) {
             state = cudaSuccess;
         }
         if (cudaSuccess != state) {
+            if (tryResult != nullptr &&
+                state == cudaErrorMemoryAllocation &&
+                !FastllmCudaGetThreadError()) {
+                cudaGetLastError();
+                *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+                return nullptr;
+            }
             size_t freeMem = 0, totalMem = 0;
             cudaMemGetInfo(&freeMem, &totalMem);
             printf("Error: CUDA error when allocating %lu MB memory on device %d! "
@@ -4963,7 +5053,7 @@ void * FastllmCudaMalloc(size_t size) {
 #ifdef CUDA_MEM_DEBUG
         CudaMemDebugRecord(ret, size);
 #endif
-        return ret;
+        return allocationSucceeded(ret);
     }
     auto &cudaBuffers = *view.smallBuffers;
     for (int i = *view.minId; i < cudaBuffers.size(); i++) {
@@ -4985,7 +5075,7 @@ void * FastllmCudaMalloc(size_t size) {
 #ifdef CUDA_MEM_DEBUG
             CudaMemDebugRecord(cudaBuffers[i].data, size);
 #endif
-            return cudaBuffers[i].data;
+            return allocationSucceeded(cudaBuffers[i].data);
         }
     }
     if (useAnyFittingPooledBuffer) {
@@ -5010,10 +5100,16 @@ void * FastllmCudaMalloc(size_t size) {
 #ifdef CUDA_MEM_DEBUG
             CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
-            return bigBuffers[selId].data;
+            return allocationSucceeded(bigBuffers[selId].data);
         }
     }
     void * ret = nullptr;
+    if (tryResult != nullptr &&
+        (capturePoolOnly || fastllmCudaMallocDisabled.load(
+                                std::memory_order_relaxed))) {
+        *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+        return nullptr;
+    }
     if (useAnyFittingPooledBuffer) {
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
     }
@@ -5022,10 +5118,19 @@ void * FastllmCudaMalloc(size_t size) {
         return nullptr;
     }
     state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
-    if (cudaSuccess != state && FastllmCudaRetryMallocAfterReleasingIdle(size, &ret, id, __FILE__, __LINE__)) {
+    if (state == cudaErrorMemoryAllocation &&
+        FastllmCudaRetryMallocAfterReleasingIdle(
+            size, &ret, id, __FILE__, __LINE__, &state)) {
         state = cudaSuccess;
     }
     if (cudaSuccess != state) {
+        if (tryResult != nullptr &&
+            state == cudaErrorMemoryAllocation &&
+            !FastllmCudaGetThreadError()) {
+            cudaGetLastError();
+            *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+            return nullptr;
+        }
         size_t freeMem = 0, totalMem = 0;
         cudaMemGetInfo(&freeMem, &totalMem);
         printf("Error: CUDA error when allocating %lu KB memory on device %d! "
@@ -5040,7 +5145,32 @@ void * FastllmCudaMalloc(size_t size) {
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRecord(ret, size);
 #endif
-    return ret;
+    return allocationSucceeded(ret);
+}
+
+FastllmCudaTryMallocResult FastllmCudaTryMalloc(
+        void **ret, size_t size) {
+    if (ret == nullptr) {
+        return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+    }
+    *ret = nullptr;
+    if (FastllmCudaGetThreadError()) {
+        return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+    }
+    FastllmCudaTryMallocResult result = FASTLLM_CUDA_TRY_MALLOC_ERROR;
+    *ret = FastllmCudaMallocImpl(size, &result);
+    if (FastllmCudaGetThreadError()) {
+        if (*ret != nullptr) {
+            FastllmCudaFree(*ret);
+            *ret = nullptr;
+        }
+        return FASTLLM_CUDA_TRY_MALLOC_ERROR;
+    }
+    return result;
+}
+
+void * FastllmCudaMalloc(size_t size) {
+    return FastllmCudaMallocImpl(size, nullptr);
 }
 
 void FastllmCudaForceFree(void *ret) {
