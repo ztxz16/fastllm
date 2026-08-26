@@ -156,6 +156,11 @@ void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
 bool FastllmCudaGraphIsCapturing();
 bool FastllmCudaGraphCaptureInvalidated();
+// Give pointer-batched kernels a stable, bounded set of device pointer tables
+// while warming/capturing one whole-step graph. Scopes may be nested and must
+// be balanced on the same host thread.
+void FastllmCudaGraphPointerTablesBegin(const void *owner);
+void FastllmCudaGraphPointerTablesEnd();
 
 // Qwen3.5 MoE graph markers are emitted only while the per-thread stream is
 // being captured. After capture, the optimizer rewires the sequential region
@@ -345,6 +350,16 @@ bool FastllmCudaPagedCacheCopyMultiPage(uint8_t *pagedData, const int *pageIdxHo
                                         int firstPageOffset, int pageLen, int numHeads, int headDim,
                                         fastllm::DataType dstType, uint8_t *inputData,
                                         fastllm::DataType srcType, int seqLen);
+// Append a packed ragged batch laid out as [heads, totalTokens, headDim] into
+// paged KV storage. All routing metadata lives on the device, so the launch is
+// reusable from a CUDA Graph while page ids and in-page offsets change.
+bool FastllmCudaPagedCacheAppendPackedBatch(
+        uint8_t *pagedData,
+        const int32_t *qSizes, const int32_t *pageSizes,
+        const int32_t *pageIndexs, const int32_t *baseTokenLens,
+        int batch, int totalTokens, int pageLen, int numHeads, int headDim,
+        fastllm::DataType dstType, const uint8_t *inputData,
+        fastllm::DataType srcType);
 bool FastllmCudaPreparePagedBatchParamsSingle(
     int32_t *qSizes, int32_t *pageSizes, int32_t *pageIndexs,
     int32_t *lastPageLens, const int *pageIdxHost, int pageIndexCount,

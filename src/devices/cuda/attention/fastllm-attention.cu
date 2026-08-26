@@ -32,6 +32,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <cuda_fp8.h>
 #include <map>
 #include <memory>
@@ -835,6 +836,26 @@ __global__ void FastllmSoftmaxKernelBatchInner1(uint8_t** pointer, int outer) {
                                                        channels, nullptr, nullptr);
 }
 
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmSoftmaxKernelBatchInner1WithCausalMask(
+        uint8_t **pointer, int queryHeads, int queryLength) {
+    int o = blockIdx.x;
+    int rowsPerRequest = queryHeads * queryLength;
+    int request = o / rowsPerRequest;
+    int requestRow = o - request * rowsPerRequest;
+    int queryRow = requestRow % queryLength;
+    int channels = (int)((size_t)pointer[request * 2 + 1]);
+    int validChannels = channels - queryLength + queryRow + 1;
+    validChannels = max(0, min(channels, validChannels));
+    T *row = (T*)pointer[request * 2] + (size_t)requestRow * channels;
+    FastllmSoftmaxKernelInner1Func<THREAD_PER_BLOCK>(
+        row, row, validChannels, nullptr, nullptr);
+    for (int i = validChannels + threadIdx.x;
+         i < channels; i += THREAD_PER_BLOCK) {
+        row[i] = (T)0;
+    }
+}
+
 bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int axis) {
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareInput(output);
@@ -1597,6 +1618,325 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
     return true;
 }
 
+namespace {
+    constexpr int FASTLLM_LONG_KV_ATTENTION_MAX_BATCH = 32;
+    constexpr int FASTLLM_LONG_KV_ATTENTION_MAX_QUERY = 8;
+
+    struct FastllmLongKvAttentionBatchParams {
+        const half *queries[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        const half *keys[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        const half *values[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        half *outputs[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        size_t queryHeadStrides[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        size_t keyHeadStrides[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        size_t valueHeadStrides[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        size_t outputHeadStrides[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        size_t scoreOffsets[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        int kvLengths[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        int requestOrder[FASTLLM_LONG_KV_ATTENTION_MAX_BATCH];
+        int batch;
+        int kvHeads;
+        int group;
+        int queryLength;
+    };
+
+    __global__ void FastllmLongKvAttentionSetupPointersKernel(
+            FastllmLongKvAttentionBatchParams params, half *scores,
+            const half **qkKeys, const half **qkQueries, half **qkScores,
+            const half **pvValues, const half **pvScores, half **pvOutputs,
+            uint8_t **softmaxPointers) {
+        int index = blockIdx.x * blockDim.x + threadIdx.x;
+        int matrixCount = params.batch * params.kvHeads;
+        if (index < matrixCount) {
+            int orderedRequest = index / params.kvHeads;
+            int kvHead = index - orderedRequest * params.kvHeads;
+            int request = params.requestOrder[orderedRequest];
+            int kvLength = params.kvLengths[request];
+            half *requestScores = scores + params.scoreOffsets[request];
+
+            qkKeys[index] = params.keys[request] +
+                (size_t)kvHead * params.keyHeadStrides[request];
+            qkQueries[index] = params.queries[request] +
+                (size_t)kvHead * params.group *
+                    params.queryHeadStrides[request];
+            qkScores[index] = requestScores +
+                (size_t)kvHead * params.group * params.queryLength * kvLength;
+            pvValues[index] = params.values[request] +
+                (size_t)kvHead * params.valueHeadStrides[request];
+            pvScores[index] = qkScores[index];
+            pvOutputs[index] = params.outputs[request] +
+                (size_t)kvHead * params.group *
+                    params.outputHeadStrides[request];
+        }
+        if (index < params.batch) {
+            softmaxPointers[index * 2] = reinterpret_cast<uint8_t *>(
+                scores + params.scoreOffsets[index]);
+            softmaxPointers[index * 2 + 1] = reinterpret_cast<uint8_t *>(
+                static_cast<uintptr_t>(params.kvLengths[index]));
+        }
+    }
+
+    static bool FastllmLongKvAttentionBatchEnabled() {
+        const char *env = std::getenv(
+            "FASTLLM_QWEN35_MTP_LONG_KV_BATCH_ATTENTION");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "FALSE") != 0 &&
+               std::strcmp(env, "off") != 0 &&
+               std::strcmp(env, "OFF") != 0 &&
+               std::strcmp(env, "disable") != 0 &&
+               std::strcmp(env, "DISABLE") != 0;
+    }
+
+    static bool FastllmLongKvAttentionBatchExtendEnabled() {
+        const char *env = std::getenv(
+            "FASTLLM_QWEN35_MTP_LONG_KV_BATCH_EXTEND");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "FALSE") != 0 &&
+               std::strcmp(env, "off") != 0 &&
+               std::strcmp(env, "OFF") != 0 &&
+               std::strcmp(env, "disable") != 0 &&
+               std::strcmp(env, "DISABLE") != 0;
+    }
+
+    static bool TryFastllmCudaHalfLongKvAttentionBatch(
+            fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
+            fastllm::Data **mask, fastllm::Data **output,
+            int group, float scale, int batch) {
+        if (!FastllmLongKvAttentionBatchEnabled() || batch < 2 ||
+            batch > FASTLLM_LONG_KV_ATTENTION_MAX_BATCH || group <= 0 ||
+            q == nullptr || k == nullptr || v == nullptr ||
+            output == nullptr) {
+            return false;
+        }
+
+        FastllmLongKvAttentionBatchParams params{};
+        params.batch = batch;
+        params.group = group;
+        int qHeads = -1;
+        int kvHeads = -1;
+        int headDim = -1;
+        int valueDim = -1;
+        int queryLength = -1;
+        int minKvLength = -1;
+        int maxKvLength = 0;
+        size_t scoreElements = 0;
+        std::map<int, std::vector<int> > requestsByKvLength;
+        for (int b = 0; b < batch; b++) {
+            if (q[b] == nullptr || k[b] == nullptr || v[b] == nullptr ||
+                output[b] == nullptr ||
+                (mask != nullptr && mask[b] != nullptr &&
+                 !mask[b]->dims.empty()) ||
+                q[b]->dataType != fastllm::DataType::FLOAT16 ||
+                k[b]->dataType != fastllm::DataType::FLOAT16 ||
+                v[b]->dataType != fastllm::DataType::FLOAT16 ||
+                output[b]->dataType != fastllm::DataType::FLOAT16 ||
+                q[b]->dataDevice != fastllm::DataDevice::CUDA ||
+                k[b]->dataDevice != fastllm::DataDevice::CUDA ||
+                v[b]->dataDevice != fastllm::DataDevice::CUDA ||
+                output[b]->dataDevice != fastllm::DataDevice::CUDA ||
+                q[b]->cudaData == nullptr || k[b]->cudaData == nullptr ||
+                v[b]->cudaData == nullptr || output[b]->cudaData == nullptr ||
+                q[b]->dims.size() != 3 || k[b]->dims.size() != 3 ||
+                v[b]->dims.size() != 3 || output[b]->dims.size() != 3 ||
+                q[b]->dims[1] <= 0 ||
+                q[b]->dims[1] > FASTLLM_LONG_KV_ATTENTION_MAX_QUERY ||
+                k[b]->dims[1] <= 4096 ||
+                k[b]->dims[1] < q[b]->dims[1] ||
+                k[b]->dims[1] != v[b]->dims[1] ||
+                k[b]->dims[0] != v[b]->dims[0] ||
+                q[b]->dims[0] != k[b]->dims[0] * group ||
+                q[b]->dims[2] != k[b]->dims[2] ||
+                output[b]->dims[0] != q[b]->dims[0] ||
+                output[b]->dims[1] != q[b]->dims[1] ||
+                output[b]->dims[2] != v[b]->dims[2] ||
+                q[b]->strides.size() != 3 || k[b]->strides.size() != 3 ||
+                v[b]->strides.size() != 3 || output[b]->strides.size() != 3 ||
+                q[b]->strides[1] != (uint64_t)q[b]->dims[2] ||
+                k[b]->strides[1] != (uint64_t)k[b]->dims[2] ||
+                v[b]->strides[1] != (uint64_t)v[b]->dims[2] ||
+                output[b]->strides[1] != (uint64_t)output[b]->dims[2] ||
+                q[b]->strides[0] !=
+                    (uint64_t)q[b]->dims[1] * q[b]->dims[2] ||
+                output[b]->strides[0] !=
+                    (uint64_t)output[b]->dims[1] * output[b]->dims[2]) {
+                return false;
+            }
+            if (b == 0) {
+                qHeads = q[b]->dims[0];
+                kvHeads = k[b]->dims[0];
+                headDim = q[b]->dims[2];
+                valueDim = v[b]->dims[2];
+                queryLength = q[b]->dims[1];
+                minKvLength = k[b]->dims[1];
+            } else if (q[b]->dims[0] != qHeads ||
+                       k[b]->dims[0] != kvHeads ||
+                       q[b]->dims[2] != headDim ||
+                       v[b]->dims[2] != valueDim ||
+                       q[b]->dims[1] != queryLength) {
+                return false;
+            }
+            int kvLength = k[b]->dims[1];
+            minKvLength = std::min(minKvLength, kvLength);
+            maxKvLength = std::max(maxKvLength, kvLength);
+            params.queries[b] = reinterpret_cast<const half *>(q[b]->cudaData);
+            params.keys[b] = reinterpret_cast<const half *>(k[b]->cudaData);
+            params.values[b] = reinterpret_cast<const half *>(v[b]->cudaData);
+            params.outputs[b] = reinterpret_cast<half *>(output[b]->cudaData);
+            params.queryHeadStrides[b] = q[b]->strides[0];
+            params.keyHeadStrides[b] = k[b]->strides[0];
+            params.valueHeadStrides[b] = v[b]->strides[0];
+            params.outputHeadStrides[b] = output[b]->strides[0];
+            params.scoreOffsets[b] = scoreElements;
+            params.kvLengths[b] = kvLength;
+            scoreElements +=
+                (size_t)qHeads * queryLength * kvLength;
+            requestsByKvLength[kvLength].push_back(b);
+        }
+        if (minKvLength <= 4096 || kvHeads <= 0 || qHeads <= 0 ||
+            headDim <= 0 || valueDim <= 0 || qHeads != kvHeads * group) {
+            return false;
+        }
+        params.kvHeads = kvHeads;
+        params.queryLength = queryLength;
+        if (queryLength > 1 &&
+            !FastllmLongKvAttentionBatchExtendEnabled()) {
+            return false;
+        }
+
+        struct KvLengthGroup {
+            int kvLength;
+            int matrixOffset;
+            int matrixCount;
+        };
+        std::vector<KvLengthGroup> groups;
+        int orderedRequest = 0;
+        for (const auto &entry : requestsByKvLength) {
+            int requestBegin = orderedRequest;
+            for (int request : entry.second) {
+                params.requestOrder[orderedRequest++] = request;
+            }
+            groups.push_back({entry.first, requestBegin * kvHeads,
+                              (int)entry.second.size() * kvHeads});
+        }
+
+        const int matrixCount = batch * kvHeads;
+        const size_t scoreBytes = scoreElements * sizeof(half);
+        const size_t pointerOffset = (scoreBytes + 255) & ~(size_t)255;
+        const size_t pointerCount = (size_t)matrixCount * 6 + batch * 2;
+        const size_t scratchBytes = pointerOffset +
+            pointerCount * sizeof(void *);
+        size_t availableBytes = 0;
+        bool scratchOwn = false;
+        uint8_t *scratch = reinterpret_cast<uint8_t *>(
+            FastllmBorrowCudaTempBuffer(
+                scratchBytes, &availableBytes, &scratchOwn));
+        if (scratch == nullptr || availableBytes < scratchBytes) {
+            FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+            return false;
+        }
+        half *scores = reinterpret_cast<half *>(scratch);
+        half **devicePointers = reinterpret_cast<half **>(
+            scratch + pointerOffset);
+        const half **qkKeys = const_cast<const half **>(devicePointers);
+        const half **qkQueries = qkKeys + matrixCount;
+        half **qkScores = devicePointers + matrixCount * 2;
+        const half **pvValues = const_cast<const half **>(
+            devicePointers + matrixCount * 3);
+        const half **pvScores = pvValues + matrixCount;
+        half **pvOutputs = devicePointers + matrixCount * 5;
+        uint8_t **softmaxPointers = reinterpret_cast<uint8_t **>(
+            devicePointers + matrixCount * 6);
+
+        int threads = 256;
+        int setupCount = std::max(matrixCount, batch);
+        FastllmLongKvAttentionSetupPointersKernel<<<
+            (setupCount + threads - 1) / threads, threads, 0,
+            cudaStreamPerThread>>>(
+                params, scores, qkKeys, qkQueries, qkScores,
+                pvValues, pvScores, pvOutputs, softmaxPointers);
+        cudaError_t cudaState = cudaGetLastError();
+        if (cudaState != cudaSuccess) {
+            FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+            return false;
+        }
+
+        half zero = __float2half_rn(0.0f);
+        half one = __float2half_rn(1.0f);
+        half halfScale = __float2half_rn(scale);
+        cublasHandle_t handle = getFastllmCublasHandle();
+        for (const KvLengthGroup &item : groups) {
+            cublasStatus_t status = cublasHgemmBatched(
+                handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                item.kvLength, queryLength * group, headDim, &halfScale,
+                qkKeys + item.matrixOffset, headDim,
+                qkQueries + item.matrixOffset, headDim,
+                &zero, qkScores + item.matrixOffset, item.kvLength,
+                item.matrixCount);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+                return false;
+            }
+        }
+        if (queryLength == 1) {
+            FastllmSoftmaxKernelBatchInner1<half, 256><<<
+                batch * qHeads, 256, 0, cudaStreamPerThread>>>(
+                    softmaxPointers, qHeads);
+        } else {
+            FastllmSoftmaxKernelBatchInner1WithCausalMask<half, 128><<<
+                batch * qHeads * queryLength, 128, 0,
+                cudaStreamPerThread>>>(
+                    softmaxPointers, qHeads, queryLength);
+        }
+        cudaState = cudaGetLastError();
+        if (cudaState != cudaSuccess) {
+            FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+            return false;
+        }
+        for (const KvLengthGroup &item : groups) {
+            cublasStatus_t status = cublasHgemmBatched(
+                handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                valueDim, queryLength * group, item.kvLength, &one,
+                pvValues + item.matrixOffset, valueDim,
+                pvScores + item.matrixOffset, item.kvLength,
+                &zero, pvOutputs + item.matrixOffset, valueDim,
+                item.matrixCount);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+                return false;
+            }
+        }
+        cudaState = cudaPeekAtLastError();
+        FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+        if (cudaState != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+
+        static thread_local bool logged[2] = {false, false};
+        int logKind = queryLength > 1 ? 1 : 0;
+        if (!logged[logKind]) {
+            int device = -1;
+            cudaGetDevice(&device);
+            printf("[Fastllm] grouped long-KV MTP attention enabled on GPU %d "
+                   "(batch=%d, qHeads=%d, kvHeads=%d, headDim=%d, "
+                   "query=%d, kv=%d..%d).\n",
+                   device, batch, qHeads, kvHeads, headDim, queryLength,
+                   minKvLength, maxKvLength);
+            fflush(stdout);
+            logged[logKind] = true;
+        }
+        return true;
+    }
+}
+
 template <typename T>
 bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
                                fastllm::Data **mask, fastllm::Data **output, int group, float scale, int batch) {
@@ -1739,15 +2079,35 @@ bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::
     if (true) {
         int outer = q[0]->dims[0] * q[0]->dims[1];
         int maxChannels = 0;
+        bool useCausalBatch = q[0]->dims[1] > 1;
+        int queryHeads = q[0]->dims[0];
+        int queryLength = q[0]->dims[1];
         for (int b = 0; b < batch; b++) {
             int outer = q[b]->dims[0] * q[b]->dims[1];
             int channels = k[b]->dims[1];
             cpuPointers[b * 2 + 0] = (uint8_t*)(qk[b]);
             cpuPointers[b * 2 + 1] = (uint8_t*)((size_t)channels);
             maxChannels = max(maxChannels, channels);
+            useCausalBatch = useCausalBatch &&
+                q[b]->dims[0] == queryHeads &&
+                q[b]->dims[1] == queryLength &&
+                (mask == nullptr || mask[b] == nullptr ||
+                 mask[b]->dims.empty());
         }
         cudaMemcpy(pointers, cpuPointers, sizeof(uint8_t*) * batch * 2, cudaMemcpyHostToDevice);
-        if (maxChannels < 128) {
+        if (useCausalBatch && maxChannels < 128) {
+            FastllmSoftmaxKernelBatchInner1WithCausalMask<T, 32><<<
+                batch * outer, 32>>>(
+                    pointers, queryHeads, queryLength);
+        } else if (useCausalBatch && maxChannels < 512) {
+            FastllmSoftmaxKernelBatchInner1WithCausalMask<T, 64><<<
+                batch * outer, 64>>>(
+                    pointers, queryHeads, queryLength);
+        } else if (useCausalBatch) {
+            FastllmSoftmaxKernelBatchInner1WithCausalMask<T, 128><<<
+                batch * outer, 128>>>(
+                    pointers, queryHeads, queryLength);
+        } else if (maxChannels < 128) {
             FastllmSoftmaxKernelBatchInner1 <T, 32> <<<batch * outer, 32>>> (pointers, outer);
         } else if (maxChannels < 512) {
             FastllmSoftmaxKernelBatchInner1 <T, 64> <<<batch * outer, 64>>> (pointers, outer);
@@ -1793,6 +2153,10 @@ bool FastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Da
     if (q[0]->dataType == fastllm::DataType::FLOAT32) {
         return DoFastllmCudaAttentionBatch <float> (q, k, v, mask, output, group, scale, batch);
     } else if (q[0]->dataType == fastllm::DataType::FLOAT16) {
+        if (TryFastllmCudaHalfLongKvAttentionBatch(
+                q, k, v, mask, output, group, scale, batch)) {
+            return true;
+        }
         return DoFastllmCudaAttentionBatch <half> (q, k, v, mask, output, group, scale, batch);
     } else {
         printf("Error: attention datatype error.\n");
@@ -2229,6 +2593,161 @@ bool FastllmCudaPagedCacheCopyMultiPage(
 
 #undef FASTLLM_PAGED_CACHE_COPY_MULTI_DISPATCH
     return true;
+}
+
+namespace {
+    template <typename SrcT, typename DstT>
+    __global__ void FastllmPagedCacheAppendPackedBatchKernel(
+            DstT *pagedData,
+            const int32_t *qSizes, const int32_t *pageSizes,
+            const int32_t *pageIndexs, const int32_t *baseTokenLens,
+            int batch, int totalTokens, int pageLen,
+            int numHeads, int headDim, const SrcT *inputData) {
+        int64_t totalElements =
+            (int64_t)numHeads * totalTokens * headDim;
+        int64_t index =
+            (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (index >= totalElements) {
+            return;
+        }
+
+        int dim = index % headDim;
+        int64_t headToken = index / headDim;
+        int token = headToken % totalTokens;
+        int head = headToken / totalTokens;
+
+        // qSizes is monotonic and verify chains are short. Binary search keeps
+        // the same kernel practical for larger scheduler batches as well.
+        int left = 0;
+        int right = batch;
+        while (left + 1 < right) {
+            int middle = (left + right) >> 1;
+            if (token < qSizes[middle]) {
+                right = middle;
+            } else {
+                left = middle;
+            }
+        }
+        int request = left;
+        int requestToken = token - qSizes[request];
+        int absoluteToken = baseTokenLens[request] + requestToken;
+        int logicalPage = absoluteToken / pageLen;
+        int pageOffset = absoluteToken - logicalPage * pageLen;
+        int page = pageIndexs[pageSizes[request] + logicalPage];
+
+        int64_t pageStride = (int64_t)pageLen * numHeads * headDim;
+        int64_t tokenStride = (int64_t)numHeads * headDim;
+        int64_t dstIndex = (int64_t)page * pageStride +
+            (int64_t)pageOffset * tokenStride +
+            (int64_t)head * headDim + dim;
+        pagedData[dstIndex] = FastllmAttentionFloatToValue<DstT>(
+            FastllmAttentionValueToFloat<SrcT>(inputData[index]));
+    }
+
+    template <typename SrcT, typename DstT>
+    static bool FastllmCudaPagedCacheAppendPackedBatchTyped(
+            uint8_t *pagedData,
+            const int32_t *qSizes, const int32_t *pageSizes,
+            const int32_t *pageIndexs, const int32_t *baseTokenLens,
+            int batch, int totalTokens, int pageLen,
+            int numHeads, int headDim, const uint8_t *inputData) {
+        int64_t totalElements =
+            (int64_t)numHeads * totalTokens * headDim;
+        if (totalElements <= 0) {
+            return true;
+        }
+        constexpr int threads = 256;
+        int blocks = (int)((totalElements + threads - 1) / threads);
+        cudaError_t pendingState = cudaGetLastError();
+        if (pendingState != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[Fastllm] packed paged-cache append got a stale "
+                         "CUDA error before launch: cuda=%d (%s), batch=%d "
+                         "tokens=%d heads=%d dim=%d.\n",
+                         (int)pendingState, cudaGetErrorString(pendingState),
+                         batch, totalTokens, numHeads, headDim);
+            std::fflush(stderr);
+            FastllmCudaSetThreadError();
+            return false;
+        }
+        FastllmPagedCacheAppendPackedBatchKernel<SrcT, DstT>
+            <<<blocks, threads, 0, cudaStreamPerThread>>>(
+                (DstT*)pagedData, qSizes, pageSizes, pageIndexs,
+                baseTokenLens, batch, totalTokens, pageLen,
+                numHeads, headDim, (const SrcT*)inputData);
+        cudaError_t state = cudaGetLastError();
+        if (state != cudaSuccess) {
+            std::fprintf(stderr,
+                         "[Fastllm] packed paged-cache append launch failed: "
+                         "cuda=%d (%s), batch=%d tokens=%d heads=%d dim=%d.\n",
+                         (int)state, cudaGetErrorString(state), batch,
+                         totalTokens, numHeads, headDim);
+            std::fflush(stderr);
+            FastllmCudaSetThreadError();
+            return false;
+        }
+        DeviceSync();
+        return true;
+    }
+}
+
+bool FastllmCudaPagedCacheAppendPackedBatch(
+        uint8_t *pagedData,
+        const int32_t *qSizes, const int32_t *pageSizes,
+        const int32_t *pageIndexs, const int32_t *baseTokenLens,
+        int batch, int totalTokens, int pageLen, int numHeads, int headDim,
+        fastllm::DataType dstType, const uint8_t *inputData,
+        fastllm::DataType srcType) {
+    if (pagedData == nullptr || qSizes == nullptr || pageSizes == nullptr ||
+        pageIndexs == nullptr || baseTokenLens == nullptr ||
+        inputData == nullptr || batch <= 0 || totalTokens <= 0 ||
+        pageLen <= 0 || numHeads <= 0 || headDim <= 0) {
+        return false;
+    }
+
+#define FASTLLM_PAGED_PACKED_APPEND_DISPATCH(SRC_T, DST_T) \
+    return FastllmCudaPagedCacheAppendPackedBatchTyped<SRC_T, DST_T>( \
+        pagedData, qSizes, pageSizes, pageIndexs, baseTokenLens, \
+        batch, totalTokens, pageLen, numHeads, headDim, inputData)
+
+    if (srcType == fastllm::DataType::FLOAT32) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(float, float);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(float, half);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(float, __nv_bfloat16);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(float, __nv_fp8_e4m3);
+        }
+    } else if (srcType == fastllm::DataType::FLOAT16) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(half, float);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(half, half);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(half, __nv_bfloat16);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(half, __nv_fp8_e4m3);
+        }
+    } else if (srcType == fastllm::DataType::BFLOAT16) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(__nv_bfloat16, float);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(__nv_bfloat16, half);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(__nv_bfloat16, __nv_bfloat16);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FASTLLM_PAGED_PACKED_APPEND_DISPATCH(__nv_bfloat16, __nv_fp8_e4m3);
+        }
+    }
+#undef FASTLLM_PAGED_PACKED_APPEND_DISPATCH
+    std::fprintf(stderr,
+                 "[Fastllm] packed paged-cache append unsupported dtype: "
+                 "src=%d dst=%d.\n",
+                 (int)srcType, (int)dstType);
+    std::fflush(stderr);
+    return false;
 }
 
 __global__ void FastllmPreparePagedBatchParamsSingleKernel(
@@ -3310,20 +3829,21 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             return;
         }
         uint32_t total_num_rows = qSizes.cpuIntDatas[batch_size];
+        // Graph-mode paged attention has a fixed query tensor shape, but both
+        // query and KV indptr contents may change between replays.  The device
+        // planner below already handles arbitrary qo lengths; restricting it
+        // to one row per request left multi-token speculative verification with
+        // a schedule frozen at capture time.  The product check validates that
+        // the packed Q storage covers exactly the host-declared query rows,
+        // independent of whether Q is laid out as [heads, total_rows, dim] or
+        // [batch * heads, rows_per_request, dim].
         bool dynamic_decode_plan = enableCudaGraph && useFlashInferCudaGraph &&
-                                   (uint64_t)q0 * q1 ==
-                                       (uint64_t)batch_size * num_qo_heads_per_batch &&
-                                   total_num_rows == batch_size &&
+                                   total_num_rows > 0 &&
+                                   (uint64_t)q0 * (uint64_t)q1 ==
+                                       (uint64_t)total_num_rows *
+                                           num_qo_heads_per_batch &&
                                    qSizes.cpuIntDatas.size() >= batch_size + 1 &&
                                    pageSizes.cpuIntDatas.size() >= batch_size + 1;
-        if (dynamic_decode_plan) {
-            for (uint32_t i = 0; i <= batch_size; ++i) {
-                if (qSizes.cpuIntDatas[i] != int(i)) {
-                    dynamic_decode_plan = false;
-                    break;
-                }
-            }
-        }
 
         cudaStream_t stream = cudaStreamPerThread;
         static std::mutex plan_cache_mutex;

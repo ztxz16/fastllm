@@ -2536,7 +2536,13 @@ namespace fastllm {
             (this->dataDevice == DataDevice::CPU || deviceIds.size() == 0 || this->dataDeviceIds == deviceIds);
 #ifdef USE_CUDA
         if (alreadyOnTarget && this->dataDevice == DataDevice::CUDA &&
-            this->cudaData != nullptr && deviceIds.size() > 0) {
+            this->cudaData != nullptr && deviceIds.size() > 0 &&
+            !FastllmCudaGraphIsCapturing()) {
+            // Pointer-attribute queries are useful for detecting stale view
+            // metadata in eager execution, but CUDA forbids them during stream
+            // capture. A graph path must eagerly warm the identical topology
+            // first; once capture starts, placement and allocations are frozen
+            // and exact dataDeviceIds metadata is sufficient.
             int targetDevice = deviceIds.size() == 0 ? FastllmCudaGetDevice() : deviceIds[0];
             int realDevice = GetPointerDeviceId(this->cudaData);
             if (realDevice >= 0 && realDevice != targetDevice) {

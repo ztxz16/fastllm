@@ -24,6 +24,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
@@ -369,6 +370,12 @@ printf("\n");
 */
 
 static std::map<int, cublasHandle_t> s_fastllmCublasHandleMap;
+// CUDA Graph capture cannot rely on cuBLAS lazily allocating its default
+// workspace. Keep one process-lifetime workspace next to each process-lifetime
+// handle when graphs are enabled. The size is configurable for memory-tight
+// deployments, while 32 MiB covers the default workspace used by recent
+// architectures (including Blackwell).
+static std::map<int, void*> s_fastllmCublasWorkspaceMap;
 static std::mutex s_fastllmCublasHandleMapMutex;
 cublasHandle_t getFastllmCublasHandle() {
     int id = -1;
@@ -378,7 +385,13 @@ cublasHandle_t getFastllmCublasHandle() {
     std::lock_guard<std::mutex> guard(s_fastllmCublasHandleMapMutex);
     auto it = s_fastllmCublasHandleMap.find(id);
     if (it != s_fastllmCublasHandleMap.end()) {
-        cublasSetStream(it->second, cudaStreamPerThread);
+        // Every FastLLM CUDA operator uses the per-thread default stream, and
+        // the symbolic cudaStreamPerThread handle remains valid when the
+        // cublas handle is subsequently used by a persistent worker thread.
+        // Rebinding on every GEMM is redundant; more importantly,
+        // cublasSetStream resets cuBLAS workspace state and is not safe inside
+        // an already active CUDA Graph capture. Keep the handle's stream
+        // stable after creation so warmed GEMMs can be captured and replayed.
         return it->second;
     }
     cublasHandle_t handler = nullptr;
@@ -388,7 +401,39 @@ cublasHandle_t getFastllmCublasHandle() {
         printf ("Error: CUBLAS initialization failed. state %d.\n", stat);
         exit(0);
     } else {
-        cublasSetStream(handler, cudaStreamPerThread);
+        stat = cublasSetStream(handler, cudaStreamPerThread);
+        if (stat != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: CUBLAS stream initialization failed. state %d.\n", stat);
+            cublasDestroy(handler);
+            exit(0);
+        }
+        if (fastllm::GetFastllmEnv().cudaGraph) {
+            static size_t graphWorkspaceBytes = []() {
+                const char *env = std::getenv("FASTLLM_CUBLAS_GRAPH_WORKSPACE_MB");
+                int workspaceMb = env == nullptr || env[0] == '\0' ?
+                    32 : std::max(0, std::min(256, std::atoi(env)));
+                return (size_t)workspaceMb * 1024 * 1024;
+            }();
+            if (graphWorkspaceBytes > 0) {
+                void *workspace = FastllmCudaDirectMalloc(graphWorkspaceBytes);
+                if (workspace != nullptr) {
+                    stat = cublasSetWorkspace(
+                        handler, workspace, graphWorkspaceBytes);
+                    if (stat == CUBLAS_STATUS_SUCCESS) {
+                        s_fastllmCublasWorkspaceMap[id] = workspace;
+                    } else {
+                        FastllmCudaDirectFree(workspace);
+                        std::fprintf(
+                            stderr,
+                            "Warning: failed to configure the CUDA Graph "
+                            "cuBLAS workspace on device %d (state %d); "
+                            "graph callers will use their eager fallback.\n",
+                            id, stat);
+                        std::fflush(stderr);
+                    }
+                }
+            }
+        }
         s_fastllmCublasHandleMap[id] = handler;
     }
 
@@ -3931,8 +3976,19 @@ struct CudaMemoryBuffer {
             reuseReadyEvent(nullptr), reusePending(false) {}
 };
 
-static bool FastllmCudaBufferReadyForReuseLocked(CudaMemoryBuffer &buffer) {
+static bool FastllmCudaBufferReadyForReuseLocked(
+        CudaMemoryBuffer &buffer, bool synchronizedGraphCapture = false) {
     if (!buffer.reusePending) {
+        return true;
+    }
+    // Whole-step graph capture synchronizes every participating device before
+    // entering the registered graph-pool phase. Deferred events that predate
+    // capture are therefore complete. cudaEventQuery is forbidden inside
+    // stream capture, so consume the already-satisfied host-side marker here.
+    // Buffers released by the captured PTDS itself are ordered by graph nodes
+    // and FastllmCudaFree does not attach a new deferred event to them.
+    if (synchronizedGraphCapture) {
+        buffer.reusePending = false;
         return true;
     }
     cudaError_t state = cudaEventQuery(buffer.reuseReadyEvent);
@@ -4478,7 +4534,16 @@ void FastllmCudaDirectFree(void *ret) {
 }
 
 void FastllmCudaMemset0(void *ret, size_t size) {
-    cudaMemset(ret, 0, size);
+    cudaError_t state = cudaSuccess;
+    if (FastllmCudaGraphIsCapturing()) {
+        // cudaMemset is a synchronous runtime API and invalidates stream
+        // capture. Keep zero-initialization ordered with the captured kernels
+        // on the same per-thread stream without changing eager semantics.
+        state = cudaMemsetAsync(ret, 0, size, cudaStreamPerThread);
+    } else {
+        state = cudaMemset(ret, 0, size);
+    }
+    checkCudaErrors("Error: CUDA error when clearing device memory!", state);
 }
 
 void FastllmCudaMemPoolStats() {
@@ -4796,7 +4861,8 @@ void * FastllmCudaMalloc(size_t size) {
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
-                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
+                FastllmCudaBufferReadyForReuseLocked(
+                    bigBuffers[i], captureIdentity.valid) &&
                 FastllmCudaGraphPoolPointerReusableLocked(
                     bigBuffers[i].data, captureIdentity) &&
                 FastllmCudaCanReusePooledBigBuffer(bigBuffers[i].size, size)) {
@@ -4817,7 +4883,8 @@ void * FastllmCudaMalloc(size_t size) {
         if (useAnyFittingPooledBuffer) {
             for (int i = 0; i < bigBuffers.size(); i++) {
                 if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
-                    FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
+                    FastllmCudaBufferReadyForReuseLocked(
+                        bigBuffers[i], captureIdentity.valid) &&
                     bigBuffers[i].size >= size &&
                     FastllmCudaGraphPoolPointerReusableLocked(
                         bigBuffers[i].data, captureIdentity)) {
@@ -4870,7 +4937,8 @@ void * FastllmCudaMalloc(size_t size) {
     for (int i = *view.minId; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy &&
             cudaBuffers[i].graphPins == 0 &&
-            FastllmCudaBufferReadyForReuseLocked(cudaBuffers[i]) &&
+            FastllmCudaBufferReadyForReuseLocked(
+                cudaBuffers[i], captureIdentity.valid) &&
             FastllmCudaGraphPoolPointerReusableLocked(
                 cudaBuffers[i].data, captureIdentity)) {
             cudaBuffers[i].busy = true;
@@ -4893,7 +4961,8 @@ void * FastllmCudaMalloc(size_t size) {
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
-                FastllmCudaBufferReadyForReuseLocked(bigBuffers[i]) &&
+                FastllmCudaBufferReadyForReuseLocked(
+                    bigBuffers[i], captureIdentity.valid) &&
                 bigBuffers[i].size >= size &&
                 FastllmCudaGraphPoolPointerReusableLocked(
                     bigBuffers[i].data, captureIdentity)) {
@@ -5464,34 +5533,46 @@ namespace {
 
 bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
         void *const *dsts, const void *const *srcs, const size_t *sizes, int count) {
-    if (count < 0 || count > FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS ||
+    if (count < 0 ||
         (count > 0 && (dsts == nullptr || srcs == nullptr || sizes == nullptr))) {
         return false;
     }
 
-    FastllmCudaBatchCopyParams params;
-    params.count = 0;
-    for (int i = 0; i < count; i++) {
-        if (sizes[i] == 0 || dsts[i] == srcs[i]) {
+    // Keep the by-value kernel parameter bounded, but allow callers to submit
+    // an arbitrary number of independent state tensors.  Large requests are
+    // split into a few launches on the same per-thread stream, preserving
+    // ordering without falling back to one cudaMemcpy per tensor.
+    for (int begin = 0; begin < count;) {
+        int end = begin + std::min(
+            FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS, count - begin);
+        FastllmCudaBatchCopyParams params;
+        params.count = 0;
+        for (int i = begin; i < end; i++) {
+            if (sizes[i] == 0 || dsts[i] == srcs[i]) {
+                continue;
+            }
+            if (dsts[i] == nullptr || srcs[i] == nullptr) {
+                return false;
+            }
+            int index = params.count++;
+            params.srcs[index] = reinterpret_cast<const uint8_t*>(srcs[i]);
+            params.dsts[index] = reinterpret_cast<uint8_t*>(dsts[i]);
+            params.sizes[index] = sizes[i];
+        }
+        begin = end;
+        if (params.count == 0) {
             continue;
         }
-        if (dsts[i] == nullptr || srcs[i] == nullptr) {
+
+        int blocks = params.count * FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
+        FastllmCudaBatchCopyKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(params);
+        cudaError_t state = cudaGetLastError();
+        checkCudaErrors("Error: CUDA error when launching batched device copy!", state);
+        if (state != cudaSuccess) {
             return false;
         }
-        int index = params.count++;
-        params.srcs[index] = reinterpret_cast<const uint8_t*>(srcs[i]);
-        params.dsts[index] = reinterpret_cast<uint8_t*>(dsts[i]);
-        params.sizes[index] = sizes[i];
     }
-    if (params.count == 0) {
-        return true;
-    }
-
-    int blocks = params.count * FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
-    FastllmCudaBatchCopyKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(params);
-    cudaError_t state = cudaGetLastError();
-    checkCudaErrors("Error: CUDA error when launching batched device copy!", state);
-    return state == cudaSuccess;
+    return true;
 }
 
 void *FastllmCudaHostMalloc(size_t size) {
@@ -11132,7 +11213,19 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         fflush(stdout);
         return false;
     }
-    cudaMemcpy(tempData, input.cudaData, len * input.unitSize, cudaMemcpyDeviceToDevice);
+    // Permute is an asynchronous CUDA operator. A synchronous D2D copy here
+    // both serialized ordinary eager execution and invalidated an active CUDA
+    // Graph capture. Keep the copy and all following transpose kernels on the
+    // same per-thread stream so ordering is preserved without a host barrier.
+    cudaError_t copyState = cudaMemcpyAsync(
+        tempData, input.cudaData, len * input.unitSize,
+        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    if (copyState != cudaSuccess) {
+        checkCudaErrors(
+            "Error: CUDA error when staging an in-place permute!", copyState);
+        FastllmReleaseCudaTempBuffer(tempData, tempOwn);
+        return false;
+    }
 
     std::vector<int> new_dims;
     for (int i = 0; i < axis.size(); i++) {
@@ -11142,21 +11235,24 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         int n = input.dims[0];
         int m = input.dims[1];
         int k = input.dims[2];
-        FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
+        FastllmTransposeByRowKernel <256>
+                <<<n * m, 256, 0, cudaStreamPerThread>>>
                 ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
         input.Resize(new_dims);
     } else if (axis == std::vector <int> {2, 0, 1, 3}) {
         int n = input.dims[0] * input.dims[1];
         int m = input.dims[2];
         int k = input.dims[3];
-        FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
+        FastllmTransposeByRowKernel <256>
+                <<<n * m, 256, 0, cudaStreamPerThread>>>
                 ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
         input.Resize(new_dims);
     } else if (axis == std::vector <int> {1, 2, 0, 3}) {
         int n = input.dims[0];
         int m = input.dims[1] * input.dims[2];
         int k = input.dims[3];
-        FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
+        FastllmTransposeByRowKernel <256>
+                <<<n * m, 256, 0, cudaStreamPerThread>>>
                 ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
         input.Resize(new_dims);
     } else if (axis == std::vector <int> {0, 2, 1}) {
@@ -11166,7 +11262,8 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         if (!FastllmLaunchTransposeLastTwo(
                 input.cudaData, tempData, batch, n, m,
                 input.unitSize, 0)) {
-            FastllmTransposeLastTwoByBatchKernel<256><<<batch * n * m, 256>>>(
+            FastllmTransposeLastTwoByBatchKernel<256>
+                <<<batch * n * m, 256, 0, cudaStreamPerThread>>>(
                 (uint8_t*)input.cudaData, (uint8_t*)tempData,
                 batch, n, m, input.unitSize);
         }
@@ -11199,13 +11296,19 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         cudaMemcpy(cudaTemp, temp.data(), temp.size() * sizeof(int), cudaMemcpyHostToDevice);
         int threadPerBlock = std::min(256, len);
         if (input.unitSize == 4) {
-            FastllmPermuteKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(
+            FastllmPermuteKernel
+                <<<(len - 1) / threadPerBlock + 1, threadPerBlock, 0,
+                   cudaStreamPerThread>>>(
                     (float *) input.cudaData,(float *)tempData, cudaTemp,(int) axis.size(), len);
         } else if (input.unitSize == 2) {
-            FastllmPermuteKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(
+            FastllmPermuteKernel
+                <<<(len - 1) / threadPerBlock + 1, threadPerBlock, 0,
+                   cudaStreamPerThread>>>(
                     (uint16_t *) input.cudaData,(uint16_t *)tempData, cudaTemp,(int) axis.size(), len);
         } else if (input.unitSize == 1) {
-            FastllmPermuteKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(
+            FastllmPermuteKernel
+                <<<(len - 1) / threadPerBlock + 1, threadPerBlock, 0,
+                   cudaStreamPerThread>>>(
                     (uint8_t *) input.cudaData,(uint8_t *)tempData, cudaTemp,(int) axis.size(), len);
         }
 
@@ -15626,6 +15729,19 @@ static bool FastllmCudaResolveDataDeviceId(const fastllm::Data &data,
     if (data.cudaData == nullptr) {
         return false;
     }
+    // cudaPointerGetAttributes is a synchronous pointer query and invalidates
+    // an active stream capture. Whole-step graph paths run the identical
+    // topology eagerly first, where the pointer/metadata agreement below is
+    // checked. During capture allocations and device placement are frozen, so
+    // the single-device metadata is the graph-safe source of truth. Ambiguous
+    // views (no device id) still fail closed and use the eager fallback.
+    if (FastllmCudaGraphIsCapturing()) {
+        if (data.dataDeviceIds.size() != 1 || data.dataDeviceIds[0] < 0) {
+            return false;
+        }
+        deviceId = data.dataDeviceIds[0];
+        return true;
+    }
     // Fake/view tensors may omit dataDeviceIds, and a reused view may retain a
     // stale id from its previous owner.  Resolve the allocation itself and,
     // when metadata is present, require both sources to agree.
@@ -15653,20 +15769,44 @@ static bool FastllmCudaDataCanShareDevice(const fastllm::Data &reference,
            referenceDevice == otherDevice;
 }
 
+namespace {
+    struct FastllmCudaGraphPointerTableScope {
+        const void *owner = nullptr;
+        size_t nextSlot = 0;
+    };
+
+    static thread_local std::vector<FastllmCudaGraphPointerTableScope>
+        fastllmCudaGraphPointerTableScopes;
+}
+
+void FastllmCudaGraphPointerTablesBegin(const void *owner) {
+    FastllmCudaGraphPointerTableScope scope;
+    scope.owner = owner;
+    fastllmCudaGraphPointerTableScopes.push_back(scope);
+}
+
+void FastllmCudaGraphPointerTablesEnd() {
+    if (fastllmCudaGraphPointerTableScopes.empty()) {
+        FastllmCudaSetThreadError();
+        return;
+    }
+    fastllmCudaGraphPointerTableScopes.pop_back();
+}
+
 // Batched linear-attention kernels consume small arrays of request-local
-// cache pointers. Keep one device staging buffer per TP worker thread so the
-// hot decode path only enqueues a tiny H2D copy instead of allocating, copying
-// synchronously (which waits for all earlier work), and freeing on every
-// layer. The std::vector storage is pageable, so the CUDA runtime stages the
-// source before this function returns; the device copy and its consumer stay
-// ordered on cudaStreamPerThread.
+// cache pointers. Ordinary eager execution reuses one per-thread scratch and
+// updates it on the same PTDS immediately before each consumer. Whole-step
+// graph warmup instead assigns one stable table per deterministic call slot;
+// this keeps graph addresses valid without accumulating a new CUDA allocation
+// for every request's exact pointer vector.
 static void **FastllmCudaStagePointers(const std::vector<void*> &pointers) {
-    struct PointerScratch {
+    struct PointerTable {
         void *data = nullptr;
         size_t capacity = 0;
         int device = -1;
+        std::vector<void*> pointers;
 
-        ~PointerScratch() {
+        ~PointerTable() {
             if (data == nullptr || device < 0) {
                 return;
             }
@@ -15677,26 +15817,66 @@ static void **FastllmCudaStagePointers(const std::vector<void*> &pointers) {
             cudaSetDevice(oldDevice);
         }
     };
-    static thread_local PointerScratch scratch;
+    using PointerTableKey = std::tuple<const void*, int, size_t>;
+    static thread_local std::map<PointerTableKey,
+                                 std::unique_ptr<PointerTable> > graphTables;
+    static thread_local PointerTable eagerScratch;
     if (pointers.empty()) {
         return nullptr;
     }
     int device = FastllmCudaGetDevice();
     size_t bytes = pointers.size() * sizeof(void*);
-    if (scratch.device != device || scratch.capacity < bytes) {
-        if (scratch.data != nullptr) {
-            FastllmCudaSyncCurrentThreadStream();
-            FastllmCudaFree(scratch.data);
+    bool graphScoped = !fastllmCudaGraphPointerTableScopes.empty() &&
+        fastllmCudaGraphPointerTableScopes.back().owner != nullptr;
+    PointerTable *table = nullptr;
+    if (graphScoped) {
+        FastllmCudaGraphPointerTableScope &scope =
+            fastllmCudaGraphPointerTableScopes.back();
+        PointerTableKey key(scope.owner, device, scope.nextSlot++);
+        auto &entry = graphTables[key];
+        if (entry == nullptr) {
+            if (FastllmCudaGraphIsCapturing()) {
+                FastllmCudaSetThreadError();
+                return nullptr;
+            }
+            entry.reset(new PointerTable());
         }
-        scratch.data = FastllmCudaMalloc(bytes);
-        scratch.capacity = bytes;
-        scratch.device = device;
+        table = entry.get();
+    } else {
+        table = &eagerScratch;
     }
-    checkCudaErrors(
-        "Error: CUDA error when staging batched cache pointers.",
-        cudaMemcpyAsync(scratch.data, pointers.data(), bytes,
-                        cudaMemcpyHostToDevice, cudaStreamPerThread));
-    return (void**)scratch.data;
+
+    bool needAllocate = table->device != device ||
+                        table->capacity < bytes;
+    bool needUpdate = needAllocate || table->pointers != pointers;
+    if ((needAllocate || needUpdate) && FastllmCudaGraphIsCapturing()) {
+        // The warmup for this exact graph topology must create and populate
+        // every slot. A miss here means host control flow changed; finish the
+        // common TP capture protocol and discard the graph.
+        FastllmCudaSetThreadError();
+        return nullptr;
+    }
+    if (needAllocate) {
+        if (table->data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(table->data);
+        }
+        table->data = FastllmCudaMalloc(bytes);
+        table->capacity = bytes;
+        table->device = device;
+        if (table->data == nullptr) {
+            FastllmCudaSetThreadError();
+            return nullptr;
+        }
+    }
+    if (needUpdate) {
+        table->pointers = pointers;
+        checkCudaErrors(
+            "Error: CUDA error when staging batched cache pointers.",
+            cudaMemcpyAsync(table->data, table->pointers.data(), bytes,
+                            cudaMemcpyHostToDevice, cudaStreamPerThread));
+    }
+    return (void**)table->data;
 }
 
 bool FastllmCudaGetRaggedGdnMetadata(
@@ -15925,6 +16105,65 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKerne
 #endif
         if (token < numSnaps) {
             half *snapshot = pointers[batch + batchIndex * numSnaps + token];
+            if (snapshot != nullptr) {
+                half *snapshotRow = snapshot + (size_t)channel * 4;
+                snapshotRow[0] = x0;
+                snapshotRow[1] = x1;
+                snapshotRow[2] = x2;
+                snapshotRow[3] = x3;
+            }
+        }
+    }
+    cacheRow[0] = x0;
+    cacheRow[1] = x1;
+    cacheRow[2] = x2;
+    cacheRow[3] = x3;
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenMajorHalfPointerKernel(
+    half **pointers, const half *newTokens, const float *weight,
+    const float *bias, half *output, int batch, int channels,
+    int numTokens, int inputChannels, int inputOffset, int numSnaps) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (row >= total) {
+        return;
+    }
+    int batchIndex = row / channels;
+    int channel = row - batchIndex * channels;
+    half *cacheRow = pointers[batchIndex] + (size_t)channel * 4;
+    const half *tokenBatch =
+        newTokens + (size_t)batchIndex * numTokens * inputChannels;
+    half x0 = cacheRow[0];
+    half x1 = cacheRow[1];
+    half x2 = cacheRow[2];
+    half x3 = cacheRow[3];
+    const float *curWeight = weight + (size_t)channel * 4;
+    float biasValue = bias == nullptr ? 0.0f : bias[channel];
+    for (int token = 0; token < numTokens; token++) {
+        x0 = x1;
+        x1 = x2;
+        x2 = x3;
+        x3 = tokenBatch[(size_t)token * inputChannels +
+                        inputOffset + channel];
+        float value = biasValue;
+        value += __half2float(x0) * curWeight[0];
+        value += __half2float(x1) * curWeight[1];
+        value += __half2float(x2) * curWeight[2];
+        value += __half2float(x3) * curWeight[3];
+        half conv = __float2half_rn(value);
+        half *outputToken =
+            output + ((size_t)batchIndex * numTokens + token) * channels;
+#ifdef CUDA_NO_TENSOR_CORE
+        float y = __half2float(conv);
+        outputToken[channel] = __float2half(y / (1.0f + expf(-y)));
+#else
+        outputToken[channel] =
+            __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+        if (token < numSnaps) {
+            half *snapshot =
+                pointers[batch + batchIndex * numSnaps + token];
             if (snapshot != nullptr) {
                 half *snapshotRow = snapshot + (size_t)channel * 4;
                 snapshotRow[0] = x0;
@@ -16676,11 +16915,12 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     }
     int batch = (int)caches.size();
     int channels = first.dims[1];
-    bool tokenMajorPrefill =
-        numTokenCaches == 0 &&
+    bool tokenMajorInput =
         tokenMajorInputOffset + channels <= newTokens.dims[2] &&
         newTokens.dims[1] > 1 &&
-        newTokens.dims[1] <= FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX;
+        newTokens.dims[1] <= (numTokenCaches == 0 ?
+            FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX :
+            FASTLLM_CUDA_MTP_FAST_SEQ_MAX);
     bool channelMajor =
         tokenMajorInputOffset == 0 &&
         newTokens.dims[1] == channels &&
@@ -16688,11 +16928,11 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
         newTokens.dims[2] <= (numTokenCaches == 0 ?
             FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX :
             FASTLLM_CUDA_MTP_FAST_SEQ_MAX);
-    if (!tokenMajorPrefill && !channelMajor) {
+    if (!tokenMajorInput && !channelMajor) {
         return false;
     }
     int numTokens =
-        tokenMajorPrefill ? newTokens.dims[1] : newTokens.dims[2];
+        tokenMajorInput ? newTokens.dims[1] : newTokens.dims[2];
     if (numTokenCaches > numTokens) {
         return false;
     }
@@ -16707,7 +16947,6 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
           !FastllmCudaDataHasDenseStrides(bias)))) {
         return false;
     }
-
     std::vector<void*> pointers;
     pointers.reserve(batch * (1 + numTokenCaches));
     for (fastllm::Data *cache : caches) {
@@ -16744,9 +16983,8 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
             pointers.push_back(snapshot->cudaData);
         }
     }
-
     output.dataType = first.dataType;
-    output.Resize(tokenMajorPrefill ?
+    output.Resize(tokenMajorInput ?
         std::vector<int>{batch, numTokens, channels} :
         std::vector<int>{batch, channels, numTokens});
     output.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{device});
@@ -16766,7 +17004,7 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
         int elementBlocks =
             (int)((totalElements + threads - 1) / threads);
         int cacheBlocks = (total + threads - 1) / threads;
-        if (tokenMajorPrefill) {
+        if (tokenMajorInput) {
             const char *token16Env = std::getenv(
                 "FASTLLM_CUDA_QWEN35_GDN_CONV_TOKEN16");
             bool useToken16 =
@@ -16862,13 +17100,28 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
         }
     } else {
         int blocks = (total + threads - 1) / threads;
-        FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKernel
-            <<<blocks, threads>>>(
-                (half**)devicePointers, (const half*)newTokens.cudaData,
-                (const float*)weight.cudaData,
-                bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
-                (half*)output.cudaData, batch, channels, numTokens,
-                numTokenCaches);
+        if (tokenMajorInput) {
+            FastllmShiftAppendConv1DPerChannelSiluMultiTokenMajorHalfPointerKernel
+                <<<blocks, threads>>>(
+                    (half**)devicePointers,
+                    (const half*)newTokens.cudaData,
+                    (const float*)weight.cudaData,
+                    bias.dims.empty() ?
+                        nullptr : (const float*)bias.cudaData,
+                    (half*)output.cudaData, batch, channels, numTokens,
+                    newTokens.dims[2], tokenMajorInputOffset,
+                    numTokenCaches);
+        } else {
+            FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKernel
+                <<<blocks, threads>>>(
+                    (half**)devicePointers,
+                    (const half*)newTokens.cudaData,
+                    (const float*)weight.cudaData,
+                    bias.dims.empty() ?
+                        nullptr : (const float*)bias.cudaData,
+                    (half*)output.cudaData, batch, channels, numTokens,
+                    numTokenCaches);
+        }
     }
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {

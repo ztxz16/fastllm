@@ -7978,6 +7978,131 @@ namespace {
         fastllm::ClearAllPagedCacheManagers();
     }
 
+#ifdef USE_CUDA
+    void RunCudaPagedCacheAppendPackedBatchRegression() {
+        constexpr int batch = 3;
+        constexpr int totalTokens = 10;
+        constexpr int pageLen = 4;
+        constexpr int numHeads = 2;
+        constexpr int headDim = 3;
+        constexpr int maxPages = 9;
+        const std::vector<int32_t> qSizes = {0, 2, 7, 10};
+        const std::vector<int32_t> pageSizes = {0, 2, 5, 8};
+        const std::vector<int32_t> pageIndexs = {
+            5, 2,
+            7, 1, 6,
+            4, 8, 3,
+        };
+        const std::vector<int32_t> baseTokenLens = {3, 4, 7};
+
+        std::vector<float> input(
+            (size_t)numHeads * totalTokens * headDim);
+        for (int head = 0; head < numHeads; ++head) {
+            for (int token = 0; token < totalTokens; ++token) {
+                for (int dim = 0; dim < headDim; ++dim) {
+                    input[((size_t)head * totalTokens + token) * headDim +
+                          dim] = (float)(head * 10000 + token * 100 + dim);
+                }
+            }
+        }
+
+        constexpr float sentinel = -12345.0f;
+        std::vector<float> expected(
+            (size_t)maxPages * pageLen * numHeads * headDim, sentinel);
+        for (int request = 0; request < batch; ++request) {
+            for (int token = qSizes[request];
+                 token < qSizes[request + 1]; ++token) {
+                int absoluteToken =
+                    baseTokenLens[request] + token - qSizes[request];
+                int logicalPage = absoluteToken / pageLen;
+                int pageOffset = absoluteToken % pageLen;
+                int physicalPage =
+                    pageIndexs[pageSizes[request] + logicalPage];
+                for (int head = 0; head < numHeads; ++head) {
+                    for (int dim = 0; dim < headDim; ++dim) {
+                        size_t src =
+                            ((size_t)head * totalTokens + token) * headDim +
+                            dim;
+                        size_t dst =
+                            ((size_t)physicalPage * pageLen + pageOffset) *
+                                numHeads * headDim +
+                            (size_t)head * headDim + dim;
+                        expected[dst] = input[src];
+                    }
+                }
+            }
+        }
+
+        struct CudaAllocations {
+            std::vector<void*> pointers;
+            ~CudaAllocations() {
+                for (void *pointer : pointers) {
+                    cudaFree(pointer);
+                }
+            }
+            void *Allocate(size_t bytes) {
+                void *pointer = nullptr;
+                cudaError_t status = cudaMalloc(&pointer, bytes);
+                Expect(status == cudaSuccess && pointer != nullptr,
+                       "packed paged append CUDA allocation failed.");
+                pointers.push_back(pointer);
+                return pointer;
+            }
+        } allocations;
+
+        float *devicePaged = (float*)allocations.Allocate(
+            expected.size() * sizeof(float));
+        float *deviceInput = (float*)allocations.Allocate(
+            input.size() * sizeof(float));
+        int32_t *deviceQSizes = (int32_t*)allocations.Allocate(
+            qSizes.size() * sizeof(int32_t));
+        int32_t *devicePageSizes = (int32_t*)allocations.Allocate(
+            pageSizes.size() * sizeof(int32_t));
+        int32_t *devicePageIndexs = (int32_t*)allocations.Allocate(
+            pageIndexs.size() * sizeof(int32_t));
+        int32_t *deviceBaseTokenLens = (int32_t*)allocations.Allocate(
+            baseTokenLens.size() * sizeof(int32_t));
+
+        std::vector<float> actual(expected.size(), sentinel);
+        Expect(cudaMemcpy(devicePaged, actual.data(),
+                          actual.size() * sizeof(float),
+                          cudaMemcpyHostToDevice) == cudaSuccess &&
+               cudaMemcpy(deviceInput, input.data(),
+                          input.size() * sizeof(float),
+                          cudaMemcpyHostToDevice) == cudaSuccess &&
+               cudaMemcpy(deviceQSizes, qSizes.data(),
+                          qSizes.size() * sizeof(int32_t),
+                          cudaMemcpyHostToDevice) == cudaSuccess &&
+               cudaMemcpy(devicePageSizes, pageSizes.data(),
+                          pageSizes.size() * sizeof(int32_t),
+                          cudaMemcpyHostToDevice) == cudaSuccess &&
+               cudaMemcpy(devicePageIndexs, pageIndexs.data(),
+                          pageIndexs.size() * sizeof(int32_t),
+                          cudaMemcpyHostToDevice) == cudaSuccess &&
+               cudaMemcpy(deviceBaseTokenLens, baseTokenLens.data(),
+                          baseTokenLens.size() * sizeof(int32_t),
+                          cudaMemcpyHostToDevice) == cudaSuccess,
+               "packed paged append CUDA input copy failed.");
+
+        Expect(FastllmCudaPagedCacheAppendPackedBatch(
+                   (uint8_t*)devicePaged, deviceQSizes, devicePageSizes,
+                   devicePageIndexs, deviceBaseTokenLens,
+                   batch, totalTokens, pageLen, numHeads, headDim,
+                   fastllm::DataType::FLOAT32,
+                   (const uint8_t*)deviceInput,
+                   fastllm::DataType::FLOAT32),
+               "packed paged append kernel launch failed.");
+        Expect(cudaDeviceSynchronize() == cudaSuccess,
+               "packed paged append kernel execution failed.");
+        Expect(cudaMemcpy(actual.data(), devicePaged,
+                          actual.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost) == cudaSuccess,
+               "packed paged append CUDA output copy failed.");
+        Expect(actual == expected,
+               "packed paged append produced an incorrect physical-page layout.");
+    }
+#endif
+
     float DecodeFP8E4M3(uint8_t value) {
         const float sign = (value & 0x80) ? -1.0f : 1.0f;
         const int exponent = (value >> 3) & 0x0f;
@@ -11599,6 +11724,14 @@ namespace {
 int main(int argc, char **argv) {
     try {
 #ifdef USE_CUDA
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-paged-packed-append") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "packed paged append regression requires CUDA.");
+            RunCudaPagedCacheAppendPackedBatchRegression();
+            std::cout << "CUDA packed paged-cache append regression: PASS\n";
+            return 0;
+        }
         if (argc == 2 &&
             std::string(argv[1]) == "--cuda-dsv4-compressed-kv") {
             Expect(FastllmCudaGetDeviceCount() > 0,
