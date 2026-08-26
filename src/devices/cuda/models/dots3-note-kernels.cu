@@ -854,7 +854,7 @@ __global__ void SparseAttentionKernel(
     }
 }
 
-template <typename IndexT, bool CacheIndices>
+template <typename IndexT, bool CacheIndices, int Warps>
 __global__ void SparseAttentionPrefillRowKernel(
         const __nv_bfloat16 *q, uint64_t qHeadStride,
         uint64_t qTokenStride, const __nv_bfloat16 *k,
@@ -863,7 +863,9 @@ __global__ void SparseAttentionPrefillRowKernel(
         uint64_t vTokenStride, const IndexT *indices,
         __nv_bfloat16 *output, int seqlen, int totalLen,
         int startPos, float scale) {
-    constexpr int warps = 8;
+    constexpr int warps = Warps;
+    static_assert(warps == 4 || warps == 8 || warps == 16,
+                  "unsupported sparse prefill warp count");
     int row = blockIdx.x;
     // Keep adjacent CTAs on the same attention head. Neighboring prefill
     // queries usually select many of the same KV rows, so this ordering keeps
@@ -1039,16 +1041,16 @@ __global__ void SparseAttentionPrefillRowKernel(
     }
 }
 
-template <typename IndexT, bool CacheIndices>
-void LaunchSparseAttentionPrefillRow(
+template <typename IndexT, bool CacheIndices, int Warps>
+void LaunchSparseAttentionPrefillRowWithWarps(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, const fastllm::Data &indices,
         int startPos, float scale, fastllm::Data &output) {
     int seqlen = q.dims[1];
     size_t sharedBytes = CacheIndices
         ? kIndexerTopK * sizeof(IndexT) : 0;
-    SparseAttentionPrefillRowKernel<IndexT, CacheIndices><<<
-        seqlen * kAttentionHeads, 256, sharedBytes,
+    SparseAttentionPrefillRowKernel<IndexT, CacheIndices, Warps><<<
+        seqlen * kAttentionHeads, Warps * 32, sharedBytes,
         cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)q.cudaData,
             q.strides[0], q.strides[1],
@@ -1059,6 +1061,37 @@ void LaunchSparseAttentionPrefillRow(
             (const IndexT *)indices.cudaData,
             (__nv_bfloat16 *)output.cudaData,
             seqlen, k.dims[1], startPos, scale);
+}
+
+template <typename IndexT, bool CacheIndices>
+void LaunchSparseAttentionPrefillRow(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indices,
+        int startPos, float scale, fastllm::Data &output) {
+    // Turing exposes at most 32 resident warps per SM. A 16-warp CTA reaches
+    // full occupancy with two blocks despite this kernel's shared-memory
+    // footprint; later architectures retain the lower-overhead 8-warp shape.
+    int warps = getCudaInfos()->cudaArch == 750 ? 16 : 8;
+    if (const char *configured = std::getenv(
+            "FASTLLM_DOTS3_NOTE_SPARSE_PREFILL_WARPS")) {
+        int parsed = std::atoi(configured);
+        if (parsed == 4 || parsed == 8 || parsed == 16) {
+            warps = parsed;
+        }
+    }
+    if (warps == 4) {
+        LaunchSparseAttentionPrefillRowWithWarps<
+            IndexT, CacheIndices, 4>(
+                q, k, v, indices, startPos, scale, output);
+    } else if (warps == 16) {
+        LaunchSparseAttentionPrefillRowWithWarps<
+            IndexT, CacheIndices, 16>(
+                q, k, v, indices, startPos, scale, output);
+    } else {
+        LaunchSparseAttentionPrefillRowWithWarps<
+            IndexT, CacheIndices, 8>(
+                q, k, v, indices, startPos, scale, output);
+    }
 }
 
 template <typename IndexT>
