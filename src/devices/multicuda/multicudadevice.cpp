@@ -3930,6 +3930,124 @@ namespace fastllm {
         }
     };
 
+    struct MultiCudaDoOutputGatherLinearOp : MultiThreadBaseOp {
+        Data *input, *weight, *bias, *output;
+        int n, k, len;
+        uint8_t *gatheredOutput;
+        int deviceId, rootDevice;
+        std::vector<std::pair<int, int> > outputRanges;
+
+        MultiCudaDoOutputGatherLinearOp(
+                Data *input, Data *weight, Data *bias, Data *output,
+                int n, int k, int len,
+                const std::vector<std::pair<int, int> > &outputRanges,
+                uint8_t *gatheredOutput, int deviceId, int rootDevice) :
+                input(input), weight(weight), bias(bias), output(output),
+                n(n), k(k), len(len), gatheredOutput(gatheredOutput),
+                deviceId(deviceId), rootDevice(rootDevice),
+                outputRanges(outputRanges) {}
+
+        void Run() {
+            FastllmCudaSetDevice(deviceId);
+            AssertInFastLLM(
+                input->cudaData != nullptr,
+                "MultiCudaDoOutputGatherLinearOp: local input should be prepared.\n");
+            DoCudaLinearReshape(*input, *weight, *output);
+            bool directRootOutput =
+                deviceId == rootDevice && n == 1 &&
+                outputRanges.size() == 1 &&
+                outputRanges[0].first == 0 &&
+                outputRanges[0].second - outputRanges[0].first == len;
+            if (directRootOutput) {
+                output->isFake = true;
+                output->UpdateUnitSize();
+                output->cudaData = gatheredOutput;
+                output->expansionSize = output->Count(0);
+                output->expansionBytes =
+                    (output->Count(0) * output->unitSize - 1) /
+                        output->unitSizeDiv +
+                    1;
+            }
+            DoCudaLinear(
+                *input, *weight,
+                bias == nullptr ? *GetEmptyData() : *bias, *output);
+
+            if (directRootOutput) {
+                return;
+            }
+            // DoCudaLinear runs on this worker's per-thread stream. Make the
+            // local shard visible before issuing a peer copy on the root.
+            FastllmCudaSyncCurrentThreadStream();
+            const size_t elementBytes =
+                output->unitSize / output->unitSizeDiv;
+            AssertInFastLLM(
+                elementBytes > 0,
+                "MultiCudaDoOutputGatherLinearOp: invalid output element size.\n");
+            int localStart = 0;
+            for (auto &range : outputRanges) {
+                int rangeLen = range.second - range.first;
+                if (rangeLen <= 0) {
+                    continue;
+                }
+                FastllmCudaMemcpy2DDeviceToDeviceAuto(
+                    gatheredOutput + (size_t)range.first * elementBytes,
+                    (size_t)k * elementBytes,
+                    (uint8_t*)output->cudaData +
+                        (size_t)localStart * elementBytes,
+                    (size_t)len * elementBytes,
+                    (size_t)rangeLen * elementBytes, n,
+                    rootDevice, deviceId);
+                localStart += rangeLen;
+            }
+            AssertInFastLLM(
+                localStart == len,
+                "MultiCudaDoOutputGatherLinearOp: output ranges do not match "
+                "the local shard.\n");
+        }
+    };
+
+    static bool RunMultiCudaOutputGatherLinear(
+            Data &input, Data &weight, Data &bias, Data &output) {
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1) {
+            return false;
+        }
+
+        output.Allocate();
+        const int n = input.Count(0) / input.dims.back();
+        const int k = output.dims.back();
+        DivisionScheme divisionScheme =
+            BuildMultiCudaRowSplitScheme(weight, devices, ratios);
+        if (!SplitMultiCudaWeight(
+                weight, bias, devices, divisionScheme, 0, true, true)) {
+            return false;
+        }
+
+        EnsureReplicatedMultiCudaTensor(input, devices, true);
+        Data localOutput;
+        localOutput.dataDevice = input.dataDevice;
+        CopyToMultiDevices(localOutput, devices, false);
+        std::vector<fastllm::MultiThreadBaseOp*> ops;
+        ops.reserve(devices.size());
+        for (int device : devices) {
+            int len = 0;
+            for (auto &range : divisionScheme[device]) {
+                len += range.second - range.first;
+            }
+            ops.push_back(new MultiCudaDoOutputGatherLinearOp(
+                input.multiDeviceDatas[device],
+                weight.multiDeviceDatas[device],
+                bias.multiDeviceDatas[device],
+                localOutput.multiDeviceDatas[device],
+                n, k, len, divisionScheme[device],
+                (uint8_t*)output.cudaData, device, devices.front()));
+        }
+        RunMultiCudaDeviceOpsAndDelete(devices, ops);
+        return true;
+    }
+
     struct MultiCudaDoLinearShardOp : MultiThreadBaseOp {
         Data *input, *weight, *bias, *output;
         int deviceId;
@@ -4942,6 +5060,12 @@ namespace fastllm {
         if (intParams.find("exType") != intParams.end()) {
             return false;
         }
+        bool forceOutputGather =
+            intParams.find("forceOutputGather") != intParams.end() &&
+            intParams.find("forceOutputGather")->second != 0;
+        if (forceOutputGather) {
+            return true;
+        }
         Data &input = *(datas.find("input")->second);
         Data &weight = *(datas.find("weight")->second);
         bool keepTpReplicated = intParams.find("keepTpReplicated") != intParams.end() &&
@@ -4963,6 +5087,16 @@ namespace fastllm {
         Data &bias = *(datas.find("bias")->second);
         bool keepTpReplicated = intParams.find("keepTpReplicated") != intParams.end() &&
                                 intParams.find("keepTpReplicated")->second != 0;
+        bool forceOutputGather =
+            intParams.find("forceOutputGather") != intParams.end() &&
+            intParams.find("forceOutputGather")->second != 0;
+        if (forceOutputGather) {
+            AssertInFastLLM(
+                RunMultiCudaOutputGatherLinear(
+                    input, weight, bias, output),
+                "MultiCuda output-gather linear failed.\n");
+            return;
+        }
         bool preferRowLinear = weight.tpLinearType == TP_LINEAR_ROW || IsTensorParallelRowWeight(weight);
         bool preferColumnLinear = weight.tpLinearType == TP_LINEAR_COLUMN || IsTensorParallelColumnWeight(weight);
         bool isRowLinear = preferRowLinear;

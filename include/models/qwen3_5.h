@@ -337,6 +337,10 @@ namespace fastllm {
         bool dflashEnabled = false;
         bool dflashWeightsPrepared = false;
         int dflashWeightsPreparedDevice = -1;
+        bool dflashTpBackboneDecisionMade = false;
+        bool dflashTpBackbonePrepared = false;
+        std::vector<int> dflashTpPreparedDevices;
+        std::map<int, int> dflashTpPreparedRatios;
         int dflashCheckpointBlockSize = 0;
         int dflashRuntimeBlockSize = 0;
         int dflashLayers = 0;
@@ -401,6 +405,9 @@ namespace fastllm {
         bool HasDFlashWeights() const;
         int DFlashDraftsPerStep() const;
         void PrepareDFlashWeightsForDevice(int device);
+        void PrepareDFlashBackboneTensorParallelWeights(int device);
+        void RunDFlashGateupLinear(int device, Data &input,
+                                   Data &linearWeight, Data &output);
         void EnsureDFlashRotary(int positions, int device);
         void AppendDFlashTargetHidden(int device, int tokens,
                                       DFlashContext &context);

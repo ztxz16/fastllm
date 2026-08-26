@@ -136,6 +136,164 @@ namespace fastllm {
         return value != nullptr && Qwen35MoeIsTrueString(std::string(value));
     }
 
+    static bool Qwen35DFlashBackboneTpForced() {
+        // "force" keeps an explicit escape hatch for benchmarking other
+        // GPU/interconnect topologies.
+        const char *value =
+            std::getenv("FASTLLM_CUDA_DFLASH_TP_BACKBONE");
+        if (value == nullptr) {
+            return false;
+        }
+        std::string lowered = value;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) {
+                           return (char)std::tolower(c);
+                       });
+        return lowered == "force";
+    }
+
+    static bool Qwen35DFlashBackboneTpRequested() {
+        const char *value =
+            std::getenv("FASTLLM_CUDA_DFLASH_TP_BACKBONE");
+        if (value == nullptr || value[0] == '\0') {
+            return true;
+        }
+        std::string lowered = value;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) {
+                           return (char)std::tolower(c);
+                       });
+        return lowered == "auto" || lowered == "force" ||
+               Qwen35MoeIsTrueString(lowered);
+    }
+
+#ifdef USE_CUDA
+    static bool Qwen35DFlashTpValidatedTopology(
+            const std::vector<int> &devices,
+            const std::map<int, int> &ratios) {
+        if (devices.size() != 2) {
+            return false;
+        }
+        auto ratioFor = [&](int device) {
+            auto it = ratios.find(device);
+            return it == ratios.end() ? 1 : std::max(1, it->second);
+        };
+        if (ratioFor(devices[0]) != ratioFor(devices[1])) {
+            return false;
+        }
+
+        const int previousDevice = FastllmCudaGetDevice();
+        bool supported = true;
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            const int arch = FastllmCudaRuntimeArch();
+            if (arch <= 0 || arch > 75) {
+                supported = false;
+                break;
+            }
+        }
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
+        return supported;
+    }
+
+    static bool Qwen35DFlashBackboneTpEnabledFor(
+            const std::vector<int> &devices,
+            const std::map<int, int> &ratios) {
+        return Qwen35DFlashBackboneTpRequested() && devices.size() > 1 &&
+               (Qwen35DFlashBackboneTpForced() ||
+                Qwen35DFlashTpValidatedTopology(devices, ratios));
+    }
+#endif
+
+    static uint64_t Qwen35DFlashTpMinWeightBytes() {
+        const char *value =
+            std::getenv("FASTLLM_CUDA_DFLASH_TP_MIN_WEIGHT_MB");
+        long megabytes = 32;
+        if (value != nullptr && value[0] != '\0') {
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end != value) {
+                megabytes = std::max(0L, parsed);
+            }
+        }
+        return (uint64_t)megabytes * 1024ULL * 1024ULL;
+    }
+
+    static bool Qwen35DFlashTpLinearEligible(
+            const std::string &name, const Data &data) {
+        static const std::string gateupSuffix =
+            ".mlp.gateup_proj.weight";
+        if (name.rfind("dflash.", 0) != 0 ||
+            name.size() < gateupSuffix.size() ||
+            name.compare(name.size() - gateupSuffix.size(),
+                         gateupSuffix.size(), gateupSuffix) != 0 ||
+            data.dims.size() != 2 || data.isFake ||
+            data.cudaDataBorrowed ||
+            data.GetBytes() < Qwen35DFlashTpMinWeightBytes()) {
+            return false;
+        }
+        // Roll out the output-gather path first for the five large, repeated
+        // fused gate/up projections. This is the latency-dominant subset that
+        // has a favorable compute-to-gather ratio on PCIe-connected
+        // SM <= 75 GPUs; attention, down, selector and context projections
+        // stay on the root until they have separate performance validation.
+        return true;
+    }
+
+    static std::string Qwen35DFlashTpDeviceSpec(
+            const std::vector<int> &devices,
+            const std::map<int, int> &ratios) {
+        std::ostringstream spec;
+        spec << "multicuda:";
+        for (int i = 0; i < (int)devices.size(); i++) {
+            if (i > 0) {
+                spec << ',';
+            }
+            spec << devices[i];
+            auto ratioIt = ratios.find(devices[i]);
+            if (ratioIt != ratios.end() && ratioIt->second > 0) {
+                spec << ':' << ratioIt->second;
+            }
+        }
+        return spec.str();
+    }
+
+    static Executor &Qwen35DFlashTpExecutor(
+            const std::vector<int> &devices,
+            const std::map<int, int> &ratios) {
+        struct ThreadLocalExecutor {
+            std::string spec;
+            std::unique_ptr<Executor> executor;
+        };
+        static thread_local ThreadLocalExecutor state;
+        const std::string spec =
+            Qwen35DFlashTpDeviceSpec(devices, ratios);
+        if (state.executor == nullptr || state.spec != spec) {
+            state.executor.reset(new Executor());
+            state.executor->SetFirstDevice(spec);
+            state.spec = spec;
+        }
+        return *state.executor;
+    }
+
+    static bool Qwen35DFlashHasTpShards(
+            const Data &data, const std::vector<int> &devices) {
+        if (!data.multiDeviceData || devices.size() <= 1) {
+            return false;
+        }
+        for (int device : devices) {
+            auto it = data.multiDeviceDatas.find(device);
+            if (it == data.multiDeviceDatas.end() || it->second == nullptr ||
+                it->second->dataDevice != DataDevice::CUDA ||
+                it->second->cudaData == nullptr) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     static bool Qwen35MoeDisableFusedMoe() {
         const char *env = std::getenv("FASTLLM_QWEN35_MOE_DISABLE_FUSED_MOE");
         if (env == nullptr) {
@@ -7704,11 +7862,23 @@ namespace fastllm {
         if (allocationFreeServing) {
             reserveBytes += Qwen35CudaServingPoolReserveBytes();
         }
-        if (reserveDFlashWeights && !devices.empty() &&
-            devices.front() == deviceId) {
+        if (reserveDFlashWeights && !devices.empty()) {
             // DFlash is materialized after target-model auto warmup. Account
-            // for its root-GPU weights before the remaining memory is assigned
-            // to paged target KV cache. Selector codebooks stay on the host.
+            // for its weights before the remaining memory is assigned to the
+            // paged target KV cache. The optional output-gather TP path stages
+            // each source on the root and leaves one row shard on every rank,
+            // so non-root ranks need their persistent shard budget as well.
+            const bool useDFlashTp =
+                Qwen35DFlashBackboneTpEnabledFor(devices, ratios);
+            long long largestRootShard = 0;
+            long long ratioSum = 0;
+            for (int tpDevice : devices) {
+                auto ratioIt = ratios.find(tpDevice);
+                ratioSum += ratioIt == ratios.end() ? 1 :
+                    std::max(1, ratioIt->second);
+            }
+            const int localRatio = ratios.find(deviceId) == ratios.end() ? 1 :
+                std::max(1, ratios.find(deviceId)->second);
             for (const auto &item : weight.weight) {
                 if (item.first.rfind("dflash.", 0) != 0 ||
                     item.first ==
@@ -7717,11 +7887,34 @@ namespace fastllm {
                         "dflash.candidate_selector.successor_codebook") {
                     continue;
                 }
-                reserveBytes += (long long)item.second.GetBytes();
+                const long long bytes =
+                    (long long)item.second.GetBytes();
+                const bool sharded = useDFlashTp &&
+                    Qwen35DFlashTpLinearEligible(item.first, item.second);
+                if (deviceId == devices.front()) {
+                    // Keep the original full-weight allowance because the
+                    // source exists until SplitMultiCudaWeight has copied the
+                    // local shard. Add the largest simultaneous root shard as
+                    // the peak staging margin.
+                    reserveBytes += bytes;
+                    if (sharded) {
+                        long long localBytes =
+                            (bytes * localRatio + ratioSum - 1) / ratioSum;
+                        largestRootShard = std::max(
+                            largestRootShard, localBytes + (1LL << 20));
+                    }
+                } else if (sharded) {
+                    reserveBytes +=
+                        (bytes * localRatio + ratioSum - 1) / ratioSum +
+                        (1LL << 20);
+                }
             }
-            const int rotaryPositions = std::min(max_positions, 4096);
-            reserveBytes += (long long)rotaryPositions * dflashHeadDim *
-                            2LL * (long long)sizeof(float);
+            if (deviceId == devices.front()) {
+                reserveBytes += largestRootShard;
+                const int rotaryPositions = std::min(max_positions, 4096);
+                reserveBytes += (long long)rotaryPositions * dflashHeadDim *
+                                2LL * (long long)sizeof(float);
+            }
         }
         return reserveBytes;
 #else
@@ -22460,6 +22653,7 @@ namespace fastllm {
             return;
         }
         if (dflashWeightsPrepared && dflashWeightsPreparedDevice == device) {
+            PrepareDFlashBackboneTensorParallelWeights(device);
             return;
         }
         auto move = [&](const std::string &name) {
@@ -22584,9 +22778,112 @@ namespace fastllm {
             DataDevice::CPU);
         dflashWeightsPrepared = true;
         dflashWeightsPreparedDevice = device;
+        PrepareDFlashBackboneTensorParallelWeights(device);
 #else
         (void)device;
 #endif
+    }
+
+    void Qwen3_5Model::PrepareDFlashBackboneTensorParallelWeights(
+            int device) {
+#ifdef USE_CUDA
+        if (!Qwen35DFlashBackboneTpRequested() ||
+            !dflashWeightsPrepared || dflashWeightsPreparedDevice != device ||
+            dflashTpBackboneDecisionMade) {
+            return;
+        }
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetQwen35GPUForwardDevices(
+                this->deviceMap, devices, ratios) || devices.empty() ||
+            devices.front() != device) {
+            return;
+        }
+        dflashTpBackboneDecisionMade = true;
+        if (!Qwen35DFlashBackboneTpEnabledFor(devices, ratios)) {
+            std::printf(
+                "[Qwen3.5 DFlash2] output-gather TP skipped: the safe "
+                "path is limited to two equal-ratio SM <= 75 GPUs; set "
+                "FASTLLM_CUDA_DFLASH_TP_BACKBONE=force before model load "
+                "to override.\n");
+            std::fflush(stdout);
+            return;
+        }
+
+        const int previousDevice = FastllmCudaGetDevice();
+        int shardedWeights = 0;
+        uint64_t shardedBytes = 0;
+        for (auto &item : weight.weight) {
+            Data &linearWeight = item.second;
+            if (!Qwen35DFlashTpLinearEligible(
+                    item.first, linearWeight)) {
+                continue;
+            }
+            if (linearWeight.multiDeviceData) {
+                AssertInFastLLM(
+                    Qwen35DFlashHasTpShards(linearWeight, devices),
+                    "DFlash TP found an incomplete existing shard set for " +
+                        item.first + ".\n");
+            } else {
+                std::vector<int> deviceCopy = devices;
+                DivisionScheme scheme = BuildMultiCudaRowSplitScheme(
+                    linearWeight, deviceCopy, ratios);
+                Data emptyBias;
+                AssertInFastLLM(
+                    SplitMultiCudaWeight(
+                        linearWeight, emptyBias, deviceCopy, scheme, 0,
+                        true, true),
+                    "DFlash TP failed to split " + item.first + ".\n");
+            }
+            shardedWeights++;
+            shardedBytes += linearWeight.GetBytes();
+        }
+
+        dflashTpPreparedDevices = devices;
+        dflashTpPreparedRatios = ratios;
+        dflashTpBackbonePrepared = true;
+        FastllmCudaSetDevice(device);
+        std::printf(
+            "[Qwen3.5 DFlash2] output-gather TP prepared: %d weights, "
+            "%.2f GiB logical, %zu CUDA ranks, min_weight=%llu MiB.\n",
+            shardedWeights,
+            (double)shardedBytes / 1073741824.0,
+            devices.size(),
+            (unsigned long long)(
+                Qwen35DFlashTpMinWeightBytes() / 1048576ULL));
+        std::fflush(stdout);
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
+#else
+        (void)device;
+#endif
+    }
+
+    void Qwen3_5Model::RunDFlashGateupLinear(
+            int device, Data &input, Data &linearWeight, Data &output) {
+#ifdef USE_CUDA
+        if (dflashTpBackbonePrepared &&
+            dflashTpPreparedDevices.size() > 1 &&
+            dflashTpPreparedDevices.front() == device &&
+            Qwen35DFlashHasTpShards(
+                linearWeight, dflashTpPreparedDevices)) {
+            Executor &tpExecutor = Qwen35DFlashTpExecutor(
+                dflashTpPreparedDevices, dflashTpPreparedRatios);
+            tpExecutor.Run(
+                "Linear",
+                {{"input", &input},
+                 {"weight", &linearWeight},
+                 {"bias", GetEmptyData()},
+                 {"output", &output}},
+                {}, {{"forceOutputGather", 1}});
+            FastllmCudaSetDevice(device);
+            return;
+        }
+#else
+        (void)device;
+#endif
+        Linear(input, linearWeight, *GetEmptyData(), output);
     }
 
     void Qwen3_5Model::EnsureDFlashRotary(int positions, int device) {
@@ -23266,8 +23563,8 @@ namespace fastllm {
             auto gateupIt = weight.weight.find(
                 prefix + "mlp.gateup_proj.weight");
             if (gateupIt != weight.weight.end()) {
-                Linear(mlpInput, gateupIt->second,
-                       *GetEmptyData(), gateup);
+                RunDFlashGateupLinear(device, mlpInput,
+                                      gateupIt->second, gateup);
                 if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
                         "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
                     ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
