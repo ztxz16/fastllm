@@ -22,8 +22,9 @@ namespace {
 
 using KernelFn = void (*)(MARLIN_KERNEL_PARAMS);
 
-static bool DeviceOk() {
+static bool DeviceOk(int *deviceArch = nullptr) {
 #ifdef CUDA_NO_TENSOR_CORE
+    if (deviceArch != nullptr) *deviceArch = 0;
     return false;
 #else
     int dev = 0, major = 0, minor = 0;
@@ -32,7 +33,9 @@ static bool DeviceOk() {
         return false;
     if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess)
         return false;
-    return major * 10 + minor >= 75;
+    const int arch = major * 10 + minor;
+    if (deviceArch != nullptr) *deviceArch = arch;
+    return arch >= 75;
 #endif
 }
 
@@ -201,10 +204,16 @@ static KernelFn PickFp4Kernel(int sizeM, int threadK, int threadN,
 #undef RET_FP4_FOR_ARCH
 #undef RET_FP4
 
-static bool SelectTile(int sizeM, int sizeN, int sizeK, int &threadK, int &threadN) {
+static bool SelectTile(int sizeM, int sizeN, int sizeK, int deviceArch,
+                       int &threadK, int &threadN) {
     static const int smallM[][2] = {{64, 128}, {128, 64}, {128, 128}};
+    // On Turing, the 256-thread tile amortizes the fixed M8 reduction cost
+    // better than either 128-thread tile. Keep the established priority on
+    // newer architectures until it is benchmarked there.
+    static const int smallMTuring[][2] = {{128, 128}, {64, 128}, {128, 64}};
     static const int largeM[][2] = {{64, 128}, {128, 64}, {64, 256}, {128, 128}};
-    const int (*cfgs)[2] = sizeM <= 8 ? smallM : largeM;
+    const int (*cfgs)[2] = sizeM <= 8
+        ? (deviceArch == 75 ? smallMTuring : smallM) : largeM;
     int n = sizeM <= 8 ? 3 : 4;
     for (int i = 0; i < n; i++) {
         if (sizeK % cfgs[i][0] == 0 && sizeN % cfgs[i][1] == 0) {
@@ -377,7 +386,10 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
         const void *a, const uint32_t *b_q_weight, const void *b_scales,
         void *c, int size_m, int size_n, int size_k, int group_size,
         int *workspace) {
-    if (!DeviceOk() || size_m <= 0 || size_n <= 0 || size_k <= 0) return false;
+    int deviceArch = 0;
+    if (!DeviceOk(&deviceArch) || size_m <= 0 || size_n <= 0 || size_k <= 0) {
+        return false;
+    }
     if (group_size != 128 && group_size != -1) return false;
     if (size_n % 64 != 0 || size_k % 64 != 0) return false;
     if (group_size == 128 && size_k % 128 != 0) return false;
@@ -411,7 +423,10 @@ extern "C" bool FastllmCudaMarlinHalfFP8Gemm(
         }
 
         int threadK = 0, threadN = 0;
-        if (!SelectTile(chunkM, size_n, size_k, threadK, threadN)) return false;
+        if (!SelectTile(chunkM, size_n, size_k, deviceArch,
+                        threadK, threadN)) {
+            return false;
+        }
 
         int threads = 0;
         bool m8 = chunkM <= 8;
