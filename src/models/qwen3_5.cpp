@@ -221,6 +221,20 @@ namespace fastllm {
         return (uint64_t)megabytes * 1024ULL * 1024ULL;
     }
 
+    static bool Qwen35DFlashTpPairedMlpRequested() {
+        const char *value =
+            std::getenv("FASTLLM_CUDA_DFLASH_TP_MLP");
+        if (value == nullptr || value[0] == '\0') {
+            return true;
+        }
+        std::string lowered = value;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) {
+                           return (char)std::tolower(c);
+                       });
+        return lowered == "auto" || Qwen35MoeIsTrueString(lowered);
+    }
+
     static bool Qwen35DFlashTpLinearEligible(
             const std::string &name, const Data &data) {
         static const std::string gateupSuffix =
@@ -234,12 +248,39 @@ namespace fastllm {
             data.GetBytes() < Qwen35DFlashTpMinWeightBytes()) {
             return false;
         }
-        // Roll out the output-gather path first for the five large, repeated
-        // fused gate/up projections. This is the latency-dominant subset that
-        // has a favorable compute-to-gather ratio on PCIe-connected
-        // SM <= 75 GPUs; attention, down, selector and context projections
-        // stay on the root until they have separate performance validation.
+        // Restrict backbone TP to the five large, repeated fused gate/up
+        // projections. They either use output-gather directly or pair with
+        // the matching down projection; attention, selector and context
+        // projections stay on the root until separately validated.
         return true;
+    }
+
+    static std::string Qwen35DFlashTpDownWeightName(
+            const std::string &gateupName) {
+        static const std::string gateupSuffix =
+            "gateup_proj.weight";
+        static const std::string downSuffix =
+            "down_proj.weight";
+        AssertInFastLLM(
+            gateupName.size() >= gateupSuffix.size() &&
+                gateupName.compare(
+                    gateupName.size() - gateupSuffix.size(),
+                    gateupSuffix.size(), gateupSuffix) == 0,
+            "DFlash TP got an invalid gate/up weight name.\n");
+        return gateupName.substr(
+                   0, gateupName.size() - gateupSuffix.size()) +
+               downSuffix;
+    }
+
+    static bool Qwen35DFlashTpPairedMlpEligible(
+            const Data &gateup, const Data &down) {
+        return gateup.dims.size() == 2 && down.dims.size() == 2 &&
+               gateup.dims[0] > 0 && gateup.dims[0] % 2 == 0 &&
+               gateup.dims[1] == down.dims[0] &&
+               gateup.dims[0] / 2 == down.dims[1] &&
+               gateup.dataType == down.dataType &&
+               !down.isFake && !down.cudaDataBorrowed &&
+               down.GetBytes() >= Qwen35DFlashTpMinWeightBytes();
     }
 
     static std::string Qwen35DFlashTpDeviceSpec(
@@ -7865,11 +7906,28 @@ namespace fastllm {
         if (reserveDFlashWeights && !devices.empty()) {
             // DFlash is materialized after target-model auto warmup. Account
             // for its weights before the remaining memory is assigned to the
-            // paged target KV cache. The optional output-gather TP path stages
-            // each source on the root and leaves one row shard on every rank,
-            // so non-root ranks need their persistent shard budget as well.
+            // paged target KV cache. Backbone TP stages each source on the root
+            // and leaves one shard on every rank, so non-root ranks need the
+            // persistent gate/up and paired down-projection budgets as well.
             const bool useDFlashTp =
                 Qwen35DFlashBackboneTpEnabledFor(devices, ratios);
+            std::set<std::string> pairedDownWeightNames;
+            if (useDFlashTp && Qwen35DFlashTpPairedMlpRequested()) {
+                for (const auto &item : weight.weight) {
+                    if (!Qwen35DFlashTpLinearEligible(
+                            item.first, item.second)) {
+                        continue;
+                    }
+                    const std::string downName =
+                        Qwen35DFlashTpDownWeightName(item.first);
+                    auto downIt = weight.weight.find(downName);
+                    if (downIt != weight.weight.end() &&
+                        Qwen35DFlashTpPairedMlpEligible(
+                            item.second, downIt->second)) {
+                        pairedDownWeightNames.insert(downName);
+                    }
+                }
+            }
             long long largestRootShard = 0;
             long long ratioSum = 0;
             for (int tpDevice : devices) {
@@ -7890,7 +7948,8 @@ namespace fastllm {
                 const long long bytes =
                     (long long)item.second.GetBytes();
                 const bool sharded = useDFlashTp &&
-                    Qwen35DFlashTpLinearEligible(item.first, item.second);
+                    (Qwen35DFlashTpLinearEligible(item.first, item.second) ||
+                     pairedDownWeightNames.count(item.first) != 0);
                 if (deviceId == devices.front()) {
                     // Keep the original full-weight allowance because the
                     // source exists until SplitMultiCudaWeight has copied the
@@ -22802,7 +22861,7 @@ namespace fastllm {
         dflashTpBackboneDecisionMade = true;
         if (!Qwen35DFlashBackboneTpEnabledFor(devices, ratios)) {
             std::printf(
-                "[Qwen3.5 DFlash2] output-gather TP skipped: the safe "
+                "[Qwen3.5 DFlash2] backbone TP skipped: the safe "
                 "path is limited to two equal-ratio SM <= 75 GPUs; set "
                 "FASTLLM_CUDA_DFLASH_TP_BACKBONE=force before model load "
                 "to override.\n");
@@ -22812,11 +22871,73 @@ namespace fastllm {
 
         const int previousDevice = FastllmCudaGetDevice();
         int shardedWeights = 0;
+        int pairedMlps = 0;
+        int outputGatherWeights = 0;
         uint64_t shardedBytes = 0;
+        std::set<std::string> pairedGateupNames;
+
+        if (Qwen35DFlashTpPairedMlpRequested()) {
+            for (auto &item : weight.weight) {
+                Data &gateup = item.second;
+                if (!Qwen35DFlashTpLinearEligible(item.first, gateup)) {
+                    continue;
+                }
+                const std::string downName =
+                    Qwen35DFlashTpDownWeightName(item.first);
+                auto downIt = weight.weight.find(downName);
+                if (downIt == weight.weight.end() ||
+                    !Qwen35DFlashTpPairedMlpEligible(
+                        gateup, downIt->second)) {
+                    continue;
+                }
+                Data &down = downIt->second;
+                gateup.tpLinearType = TP_LINEAR_ROW;
+                gateup.tpPackType = TP_PACK_GATEUP;
+                down.tpLinearType = TP_LINEAR_COLUMN;
+
+                if (gateup.multiDeviceData || down.multiDeviceData) {
+                    AssertInFastLLM(
+                        Qwen35DFlashHasTpShards(gateup, devices) &&
+                            Qwen35DFlashHasTpShards(down, devices),
+                        "DFlash paired MLP TP found an incomplete existing "
+                        "shard set for " + item.first + ".\n");
+                } else {
+                    std::vector<int> deviceCopy = devices;
+                    DivisionScheme gateupScheme =
+                        BuildMultiCudaRowSplitScheme(
+                            gateup, deviceCopy, ratios);
+                    BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(
+                        item.first, devices, gateupScheme,
+                        gateup.dims[0] / 2, true);
+                    DivisionScheme downScheme =
+                        ExtractQwen35FirstRangeScheme(gateupScheme);
+                    Data emptyBias;
+                    AssertInFastLLM(
+                        SplitMultiCudaWeight(
+                            gateup, emptyBias, deviceCopy, gateupScheme, 0,
+                            true, true),
+                        "DFlash paired MLP TP failed to split " +
+                            item.first + ".\n");
+                    deviceCopy = devices;
+                    AssertInFastLLM(
+                        SplitMultiCudaWeight(
+                            down, emptyBias, deviceCopy, downScheme, 1,
+                            true, true),
+                        "DFlash paired MLP TP failed to split " +
+                            downName + ".\n");
+                }
+                pairedGateupNames.insert(item.first);
+                pairedMlps++;
+                shardedWeights += 2;
+                shardedBytes += gateup.GetBytes() + down.GetBytes();
+            }
+        }
+
         for (auto &item : weight.weight) {
             Data &linearWeight = item.second;
             if (!Qwen35DFlashTpLinearEligible(
-                    item.first, linearWeight)) {
+                    item.first, linearWeight) ||
+                pairedGateupNames.count(item.first) != 0) {
                 continue;
             }
             if (linearWeight.multiDeviceData) {
@@ -22836,16 +22957,21 @@ namespace fastllm {
                     "DFlash TP failed to split " + item.first + ".\n");
             }
             shardedWeights++;
+            outputGatherWeights++;
             shardedBytes += linearWeight.GetBytes();
         }
 
         dflashTpPreparedDevices = devices;
         dflashTpPreparedRatios = ratios;
         dflashTpBackbonePrepared = true;
+        dflashTpPairedMlpPrepared = pairedMlps > 0;
         FastllmCudaSetDevice(device);
         std::printf(
-            "[Qwen3.5 DFlash2] output-gather TP prepared: %d weights, "
+            "[Qwen3.5 DFlash2] TP prepared: %d paired MLPs, "
+            "%d output-gather weights, %d weights total, "
             "%.2f GiB logical, %zu CUDA ranks, min_weight=%llu MiB.\n",
+            pairedMlps,
+            outputGatherWeights,
             shardedWeights,
             (double)shardedBytes / 1073741824.0,
             devices.size(),
@@ -22884,6 +23010,51 @@ namespace fastllm {
         (void)device;
 #endif
         Linear(input, linearWeight, *GetEmptyData(), output);
+    }
+
+    bool Qwen3_5Model::RunDFlashTensorParallelMlp(
+            int device, Data &input, Data &gateupWeight,
+            Data &downWeight, Data &output) {
+#ifdef USE_CUDA
+        if (!dflashTpBackbonePrepared ||
+            !dflashTpPairedMlpPrepared ||
+            dflashTpPreparedDevices.size() <= 1 ||
+            dflashTpPreparedDevices.front() != device ||
+            gateupWeight.tpPackType != TP_PACK_GATEUP ||
+            gateupWeight.tpLinearType != TP_LINEAR_ROW ||
+            downWeight.tpLinearType != TP_LINEAR_COLUMN ||
+            !Qwen35DFlashHasTpShards(
+                gateupWeight, dflashTpPreparedDevices) ||
+            !Qwen35DFlashHasTpShards(
+                downWeight, dflashTpPreparedDevices)) {
+            return false;
+        }
+
+        Executor &tpExecutor = Qwen35DFlashTpExecutor(
+            dflashTpPreparedDevices, dflashTpPreparedRatios);
+        Data swigluOutput, unusedScratch, gateupOutput;
+        tpExecutor.Run(
+            "MLP",
+            {{"input", &input},
+             {"output", &output},
+             {"weight0", &gateupWeight},
+             {"bias0", GetEmptyData()},
+             {"weight1", &downWeight},
+             {"bias1", GetEmptyData()},
+             {"w1", &swigluOutput},
+             {"w2", &unusedScratch},
+             {"w3", &gateupOutput}},
+            {}, {});
+        FastllmCudaSetDevice(device);
+        return true;
+#else
+        (void)device;
+        (void)input;
+        (void)gateupWeight;
+        (void)downWeight;
+        (void)output;
+        return false;
+#endif
     }
 
     void Qwen3_5Model::EnsureDFlashRotary(int positions, int device) {
@@ -23558,53 +23729,67 @@ namespace fastllm {
             dynamicConvolve(
                 normalized, mlpDynamic,
                 weight[prefix + "mlp_conv.base_kernel"], 0, mlpInput);
-            Data gate, up, gateup;
-            bool fusedGateupPrepared = false;
+            Data mlpOutput, convolvedMlp;
             auto gateupIt = weight.weight.find(
                 prefix + "mlp.gateup_proj.weight");
-            if (gateupIt != weight.weight.end()) {
-                RunDFlashGateupLinear(device, mlpInput,
-                                      gateupIt->second, gateup);
-                if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                        "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
-                    ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
-                    gate.dataType = DataType::BFLOAT16;
-                    gate.UpdateUnitSize();
-                    gate.Resize(
-                        {1, blockSize, dflashIntermediateSize});
-                    gate.Allocate(false);
-                    fusedGateupPrepared =
-                        FastllmCudaDFlashPrepareGateup(
-                            gateup, gate, blockSize,
-                            dflashIntermediateSize);
-                    if (!fusedGateupPrepared) {
-                        gate.FreeSpace();
-                        gate.dims.clear();
-                        gate.strides.clear();
-                        gate.expansionDims.clear();
+            auto downIt = weight.weight.find(
+                prefix + "mlp.down_proj.weight");
+            bool pairedTpMlp =
+                gateupIt != weight.weight.end() &&
+                downIt != weight.weight.end() &&
+                RunDFlashTensorParallelMlp(
+                    device, mlpInput, gateupIt->second,
+                    downIt->second, mlpOutput);
+            if (!pairedTpMlp) {
+                Data gate, up, gateup;
+                bool fusedGateupPrepared = false;
+                if (gateupIt != weight.weight.end()) {
+                    RunDFlashGateupLinear(device, mlpInput,
+                                          gateupIt->second, gateup);
+                    if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                            "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
+                        ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
+                        gate.dataType = DataType::BFLOAT16;
+                        gate.UpdateUnitSize();
+                        gate.Resize(
+                            {1, blockSize, dflashIntermediateSize});
+                        gate.Allocate(false);
+                        fusedGateupPrepared =
+                            FastllmCudaDFlashPrepareGateup(
+                                gateup, gate, blockSize,
+                                dflashIntermediateSize);
+                        if (!fusedGateupPrepared) {
+                            gate.FreeSpace();
+                            gate.dims.clear();
+                            gate.strides.clear();
+                            gate.expansionDims.clear();
+                        }
                     }
+                    if (!fusedGateupPrepared) {
+                        Split(gateup, -1, 0, dflashIntermediateSize, gate);
+                        Split(gateup, -1, dflashIntermediateSize,
+                              2 * dflashIntermediateSize, up);
+                    }
+                } else {
+                    Linear(
+                        mlpInput,
+                        weight[prefix + "mlp.gate_proj.weight"],
+                        *GetEmptyData(), gate);
+                    Linear(
+                        mlpInput,
+                        weight[prefix + "mlp.up_proj.weight"],
+                        *GetEmptyData(), up);
                 }
                 if (!fusedGateupPrepared) {
-                    Split(gateup, -1, 0, dflashIntermediateSize, gate);
-                    Split(gateup, -1, dflashIntermediateSize,
-                          2 * dflashIntermediateSize, up);
+                    ToDataType(gate, DataType::FLOAT16);
+                    ToDataType(up, DataType::FLOAT16);
+                    Silu(gate, gate);
+                    MulTo(gate, up);
+                    ToDataType(gate, DataType::BFLOAT16);
                 }
-            } else {
-                Linear(mlpInput, weight[prefix + "mlp.gate_proj.weight"],
-                       *GetEmptyData(), gate);
-                Linear(mlpInput, weight[prefix + "mlp.up_proj.weight"],
-                       *GetEmptyData(), up);
+                Linear(gate, weight[prefix + "mlp.down_proj.weight"],
+                       *GetEmptyData(), mlpOutput);
             }
-            if (!fusedGateupPrepared) {
-                ToDataType(gate, DataType::FLOAT16);
-                ToDataType(up, DataType::FLOAT16);
-                Silu(gate, gate);
-                MulTo(gate, up);
-                ToDataType(gate, DataType::BFLOAT16);
-            }
-            Data mlpOutput, convolvedMlp;
-            Linear(gate, weight[prefix + "mlp.down_proj.weight"],
-                   *GetEmptyData(), mlpOutput);
             dynamicConvolve(
                 mlpOutput, mlpDynamic,
                 weight[prefix + "mlp_conv.base_kernel"], 1,
