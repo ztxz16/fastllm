@@ -4056,6 +4056,15 @@ namespace fastllm {
                 {"stride", stride}, {"pad", pad}});
     }
 
+    void CausalDepthwiseConv1DDecode(const Data &input, const Data &weight,
+                                     Data &state, int kernel, bool silu,
+                                     Data &output) {
+        curExecutor->Run("CausalDepthwiseConv1DDecode", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"state", &state}, {"output", &output}
+        }, {}, {{"kernel", kernel}, {"silu", silu ? 1 : 0}});
+    }
+
     void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output) {
         curExecutor->Run("Conv2D", {
                 {"input", (Data*)&input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}

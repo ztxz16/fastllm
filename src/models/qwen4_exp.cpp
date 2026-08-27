@@ -1012,7 +1012,10 @@ namespace fastllm {
         Linear(typedInput, this->weight[linear + "in_proj_z.weight"], Data(), z);
         Linear(typedInput, this->weight[linear + "in_proj_b.weight"], Data(), beta);
         Linear(typedInput, this->weight[linear + "in_proj_a.weight"], Data(), alpha);
-        ToDataType(qkv, DataType::FLOAT32);
+        const bool fusedDecode = sequence == 1;
+        if (!fusedDecode) {
+            ToDataType(qkv, DataType::FLOAT32);
+        }
 
         qkv.Reshape({batch, sequence, -1});
         PermuteSelf(qkv, {0, 2, 1});
@@ -1035,44 +1038,53 @@ namespace fastllm {
             pastRecurrent.lockInCPU = true;
         }
 
-        Data convInput;
-        if (hadConvState) {
-            Cat(pastConv, qkv, -1, convInput);
+        Data currentConvolved;
+        if (fusedDecode) {
+            fastllm::CausalDepthwiseConv1DDecode(
+                qkv, this->weight[linear + "conv1d.weight"],
+                pastConv, this->linearConvKernel, true, currentConvolved);
+            pastConv.expansionDims = pastConv.dims;
         } else {
-            convInput.CopyFrom(qkv);
-        }
+            Data convInput;
+            if (hadConvState) {
+                Cat(pastConv, qkv, -1, convInput);
+            } else {
+                convInput.CopyFrom(qkv);
+            }
 
-        // update_conv_state(..., kernel_size=4) keeps exactly the four most
-        // recent raw Q/K/V values and left-pads an initial short prompt.
-        if (convInput.dims.back() >= this->linearConvKernel) {
-            Split(convInput, -1,
-                  convInput.dims.back() - this->linearConvKernel,
-                  convInput.dims.back(), pastConv);
-        } else {
-            Data zeros(DataType::FLOAT32,
-                       {convInput.dims[0], convInput.dims[1],
-                        this->linearConvKernel - convInput.dims.back()});
-            zeros.ToDevice(convInput.dataDevice);
-            zeros.Allocate(0.0f);
-            Cat(zeros, convInput, -1, pastConv);
-        }
-        pastConv.expansionDims = pastConv.dims;
+            // update_conv_state(..., kernel_size=4) keeps exactly the four most
+            // recent raw Q/K/V values and left-pads an initial short prompt.
+            if (convInput.dims.back() >= this->linearConvKernel) {
+                Split(convInput, -1,
+                      convInput.dims.back() - this->linearConvKernel,
+                      convInput.dims.back(), pastConv);
+            } else {
+                Data zeros(DataType::FLOAT32,
+                           {convInput.dims[0], convInput.dims[1],
+                            this->linearConvKernel - convInput.dims.back()});
+                zeros.ToDevice(convInput.dataDevice);
+                zeros.Allocate(0.0f);
+                Cat(zeros, convInput, -1, pastConv);
+            }
+            pastConv.expansionDims = pastConv.dims;
 
-        Data convolved, currentConvolved, emptyConvBias;
-        Conv1DPerChannel(convInput, this->weight[linear + "conv1d.weight"],
-                         emptyConvBias, convInput.dims[1],
-                         this->weight[linear + "conv1d.weight"].dims[0],
-                         this->linearConvKernel, 1,
-                         hadConvState ? 0 : this->linearConvKernel - 1,
-                         convolved);
-        if (hadConvState) {
-            Split(convolved, -1, convolved.dims.back() - sequence,
-                  convolved.dims.back(), currentConvolved);
-        } else {
-            Split(convolved, -1, 0, sequence, currentConvolved);
+            Data convolved, emptyConvBias;
+            Conv1DPerChannel(convInput,
+                             this->weight[linear + "conv1d.weight"],
+                             emptyConvBias, convInput.dims[1],
+                             this->weight[linear + "conv1d.weight"].dims[0],
+                             this->linearConvKernel, 1,
+                             hadConvState ? 0 : this->linearConvKernel - 1,
+                             convolved);
+            if (hadConvState) {
+                Split(convolved, -1, convolved.dims.back() - sequence,
+                      convolved.dims.back(), currentConvolved);
+            } else {
+                Split(convolved, -1, 0, sequence, currentConvolved);
+            }
+            Silu(currentConvolved, currentConvolved);
+            PermuteSelf(currentConvolved, {0, 2, 1});
         }
-        Silu(currentConvolved, currentConvolved);
-        PermuteSelf(currentConvolved, {0, 2, 1});
 
         if (pastRecurrent.dims.empty()) {
             pastRecurrent.Resize({batch, this->num_v_heads,

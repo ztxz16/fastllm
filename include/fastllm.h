@@ -936,6 +936,13 @@ namespace fastllm {
     void Conv1DPerChannel(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, 
             int kernel, int stride, int pad, Data &output);
 
+    // Single-token causal depthwise convolution. The float32 state has shape
+    // [batch, channels, kernel] and is shifted/updated in place; input is
+    // [batch, channels, 1], output is float32 [batch, 1, channels].
+    void CausalDepthwiseConv1DDecode(const Data &input, const Data &weight,
+                                     Data &state, int kernel, bool silu,
+                                     Data &output);
+
     void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output);
 
     void Embedding(const Data &input, Data &weight, Data &output);

@@ -347,6 +347,33 @@ namespace {
             Qwen4CudaToFloat(hyperInput[index]) + injected));
     }
 
+    __global__ void CausalDepthwiseConv1DDecodeKernel(
+            const void *input, int inputType, const float *weight,
+            float *state, float *output, int total, int channels,
+            int kernel, bool silu) {
+        const int item = blockIdx.x * blockDim.x + threadIdx.x;
+        if (item >= total) {
+            return;
+        }
+        const int channel = item % channels;
+        float *stateRow = state + (uint64_t)item * kernel;
+        for (int tap = 0; tap + 1 < kernel; tap++) {
+            stateRow[tap] = stateRow[tap + 1];
+        }
+        stateRow[kernel - 1] =
+            Qwen4CudaLoadActivation(input, inputType, item);
+        const float *weightRow = weight + (uint64_t)channel * kernel;
+        float value = 0.0f;
+        #pragma unroll
+        for (int tap = 0; tap < kernel; tap++) {
+            value += stateRow[tap] * weightRow[tap];
+        }
+        if (silu) {
+            value = value / (1.0 + expf(-value));
+        }
+        output[item] = value;
+    }
+
     template <typename T>
     __global__ __launch_bounds__(128) void Qwen4GatedDeltaRuleDecodeKernel(
             const float *qkv, const T *alpha, const T *beta,
@@ -646,6 +673,44 @@ bool FastllmCudaQwen4HyperCombine(
             (__nv_bfloat16*)output.cudaData, count, groups,
             blockChannels);
     }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaCausalDepthwiseConv1DDecode(
+        const fastllm::Data &input, const fastllm::Data &weight,
+        fastllm::Data &state, fastllm::Data &output,
+        int kernel, bool silu, bool initializeState) {
+    const int batch = input.dims.empty() ? 0 : input.dims[0];
+    const int channels = input.dims.size() == 3 ? input.dims[1] : 0;
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        state.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || weight.cudaData == nullptr ||
+        state.cudaData == nullptr || output.cudaData == nullptr ||
+        !Qwen4CudaActivationType(input.dataType) ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        state.dataType != fastllm::DataType::FLOAT32 ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        batch <= 0 || channels <= 0 || kernel <= 0 ||
+        input.dims.size() != 3 || input.dims[2] != 1 ||
+        weight.Count(0) != (uint64_t)channels * kernel ||
+        state.dims != std::vector<int>({batch, channels, kernel}) ||
+        output.dims != std::vector<int>({batch, 1, channels})) {
+        return false;
+    }
+    if (initializeState) {
+        FastllmCudaMemset0(state.cudaData, state.GetBytes());
+    }
+    const int total = batch * channels;
+    constexpr int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    CausalDepthwiseConv1DDecodeKernel<<<
+        blocks, threads, 0, cudaStreamPerThread>>>(
+        input.cudaData, (int)input.dataType, (const float*)weight.cudaData,
+        (float*)state.cudaData, (float*)output.cudaData,
+        total, channels, kernel, silu);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }

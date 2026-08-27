@@ -303,6 +303,110 @@ namespace fastllm {
         });
     }
 
+    bool CpuCausalDepthwiseConv1DDecodeOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        const int kernel = intParams.find("kernel")->second;
+        if (!Qwen4ActivationType(input.dataType) ||
+            weight.dataType != DataType::FLOAT32 ||
+            state.dataType != DataType::FLOAT32 || kernel <= 0 ||
+            input.dims.size() != 3 || input.dims[2] != 1) {
+            return false;
+        }
+        const int batch = input.dims[0];
+        const int channels = input.dims[1];
+        return batch > 0 && channels > 0 &&
+               weight.Count(0) == (uint64_t)channels * kernel &&
+               (state.dims.empty() ||
+                state.dims == std::vector<int>({batch, channels, kernel}));
+    }
+
+    void CpuCausalDepthwiseConv1DDecodeOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        const int kernel = intParams.find("kernel")->second;
+        AssertInFastLLM(input.dims.size() == 3 && input.dims[2] == 1 &&
+                        kernel > 0,
+                        "CausalDepthwiseConv1DDecode expects one token.\n");
+        const int batch = input.dims[0];
+        const int channels = input.dims[1];
+        AssertInFastLLM(weight.dataType == DataType::FLOAT32 &&
+                        weight.Count(0) == (uint64_t)channels * kernel,
+                        "CausalDepthwiseConv1DDecode weight shape mismatch.\n");
+        if (state.dims.empty()) {
+            state.dataType = DataType::FLOAT32;
+            state.UpdateUnitSize();
+            state.Resize({batch, channels, kernel});
+        } else {
+            AssertInFastLLM(
+                state.dataType == DataType::FLOAT32 &&
+                state.dims == std::vector<int>({batch, channels, kernel}),
+                "CausalDepthwiseConv1DDecode state shape mismatch.\n");
+        }
+        output.dataType = DataType::FLOAT32;
+        output.Resize({batch, 1, channels});
+    }
+
+    void CpuCausalDepthwiseConv1DDecodeOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        const int kernel = intParams.find("kernel")->second;
+        auto siluIt = intParams.find("silu");
+        const bool silu = siluIt != intParams.end() && siluIt->second != 0;
+        const bool initializeState = state.cpuData == nullptr;
+        state.Allocate(false);
+        output.Allocate(false);
+        Qwen4AssertCpuTensor(input, "CausalDepthwiseConv1DDecode input");
+        AssertInFastLLM(weight.cpuData != nullptr &&
+                        weight.dataType == DataType::FLOAT32 &&
+                        state.cpuData != nullptr &&
+                        state.dataType == DataType::FLOAT32,
+                        "CausalDepthwiseConv1DDecode requires float32 weight/state.\n");
+        if (initializeState) {
+            std::fill((float*)state.cpuData,
+                      (float*)state.cpuData + state.Count(0), 0.0f);
+        }
+
+        const int batch = input.dims[0];
+        const int channels = input.dims[1];
+        const int total = batch * channels;
+        const float *weightData = (const float*)weight.cpuData;
+        float *stateData = (float*)state.cpuData;
+        float *outputData = (float*)output.cpuData;
+        Qwen4ParallelFor(total, [&](int start, int end) {
+            for (int item = start; item < end; item++) {
+                const int channel = item % channels;
+                float *stateRow = stateData + (uint64_t)item * kernel;
+                for (int tap = 0; tap + 1 < kernel; tap++) {
+                    stateRow[tap] = stateRow[tap + 1];
+                }
+                stateRow[kernel - 1] = Qwen4LoadCpu(
+                    input.cpuData, input.dataType, item);
+                const float *weightRow = weightData +
+                                         (uint64_t)channel * kernel;
+                float value = 0.0f;
+                for (int tap = 0; tap < kernel; tap++) {
+                    value += stateRow[tap] * weightRow[tap];
+                }
+                if (silu) {
+                    value = value / (1.0 + expf(-value));
+                }
+                outputData[item] = value;
+            }
+        });
+    }
+
     void CpuQwen4GatedDeltaRuleDecodeOp::Reshape(
             const std::string &opType, const DataDict &datas,
             const FloatDict &floatParams, const IntDict &intParams) {
