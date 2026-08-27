@@ -37,6 +37,7 @@
 #include "deepseekv4.h"
 #include "dots3_note.h"
 #include "glm5_moe_dsa.h"
+#include "glm5_next.h"
 #include "qwen.h"
 #include "glm.h"
 #include "minicpm.h"
@@ -762,6 +763,9 @@ namespace fastllm {
         } else if (modelType == "glm_moe_dsa") {
             model = (basellm*)(new Glm5MoeDsaModel());
             model->model_type = "glm_moe_dsa";
+        } else if (modelType == "glm5_next" ||
+                   modelType == "glm5_next_text") {
+            model = (basellm*)(new Glm5NextModel());
         } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2" ||
                    modelType == "deepseek_v32") {
             model = (basellm*)(new DeepSeekV2Model());

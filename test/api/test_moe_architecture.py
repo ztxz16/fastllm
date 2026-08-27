@@ -37,6 +37,23 @@ class MoeArchitectureTest(unittest.TestCase):
             _is_moe_architecture("UnknownArchitecture", "kimi_k3")
         )
 
+    def test_glm5_next_architecture_is_moe(self):
+        self.assertTrue(
+            _is_moe_architecture("Glm5NextForConditionalGeneration")
+        )
+
+    def test_glm5_next_model_type_is_moe(self):
+        self.assertTrue(
+            _is_moe_architecture("UnknownArchitecture", "glm5_next")
+        )
+
+    def test_glm5_next_text_model_type_is_moe(self):
+        self.assertTrue(
+            _is_moe_architecture(
+                "UnknownArchitecture", "unknown", "glm5_next_text"
+            )
+        )
+
     def test_laguna_architecture_uses_hybrid_tp(self):
         self.assertTrue(
             _prefers_laguna_hybrid_tp("LagunaForCausalLM")

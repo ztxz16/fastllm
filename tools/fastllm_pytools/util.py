@@ -462,10 +462,11 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "LagunaForCausalLM",
         "KimiK3ForConditionalGeneration",
         "Dots3NoteForCausalLM",
+        "Glm5NextForConditionalGeneration",
     ] or model_type in [
         "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
-        "kimi_k3", "dots3_note",
-    ] or text_model_type == "qwen3_5_moe_text")
+        "kimi_k3", "dots3_note", "glm5_next", "glm5_next_text",
+    ] or text_model_type in ["qwen3_5_moe_text", "glm5_next_text"])
 
 def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
     return (architecture == "DeepseekV4ForCausalLM" or
