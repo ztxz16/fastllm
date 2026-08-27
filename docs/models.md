@@ -73,6 +73,7 @@
 | Qwen/Qwen2.5-14B-Instruct  | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen2.5-32B-Instruct  | √ | √ | ✔ |
 | Qwen/Qwen2.5-72B-Instruct  |  | √ | ✔ |
+| [Qwen4-Exp / Qwen3.8-Flash-Next FP8 text](qwen4_exp.md) |  |  | ✔ |
 
 > 注3： ~~需要更新，检查 `tokenizer_config.json` 是否为最新版本~~
 
