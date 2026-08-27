@@ -317,8 +317,38 @@ class FastLLmCompletion:
           or text_model_type in qwen3_5_types
       )
 
+  def _is_qwen4_exp_model(self) -> bool:
+      qwen4_exp_types = {"qwen4_exp", "qwen4_exp_text"}
+      try:
+          if self.model.get_type() in qwen4_exp_types:
+              return True
+      except Exception:
+          pass
+
+      config = getattr(self.model, "config", None)
+      if not isinstance(config, dict):
+          return False
+      architectures = config.get("architectures") or []
+      architecture = architectures[0] if architectures else ""
+      model_type = config.get("model_type", "")
+      text_config = config.get("text_config")
+      text_model_type = (
+          text_config.get("model_type", "")
+          if isinstance(text_config, dict) else "")
+      return (
+          architecture in {
+              "Qwen4ExpForConditionalGeneration",
+              "Qwen4ExpForCausalLM",
+          }
+          or model_type in qwen4_exp_types
+          or text_model_type in qwen4_exp_types
+      )
+
+  def _is_qwen_reasoning_model(self) -> bool:
+      return self._is_qwen3_5_model() or self._is_qwen4_exp_model()
+
   def _is_qwen3_5_reasoning_response(self, enable_thinking: bool) -> bool:
-      return (enable_thinking and self._is_qwen3_5_model()
+      return (enable_thinking and self._is_qwen_reasoning_model()
               and not getattr(self.model, "force_chat_template", False))
 
   def _is_dots3_note_model(self) -> bool:
@@ -370,7 +400,7 @@ class FastLLmCompletion:
   def _resolve_qwen3_5_reasoning_effort(
       self, request: ChatCompletionRequest
   ) -> Optional[str]:
-      if not self._is_qwen3_5_model():
+      if not self._is_qwen_reasoning_model():
           return None
       effort = request.reasoning_effort
       template_kwargs = request.chat_template_kwargs or {}
@@ -381,7 +411,7 @@ class FastLLmCompletion:
           effort = "xhigh"
       if effort not in {"low", "medium", "xhigh"}:
           raise ValueError(
-              "Qwen3.5 reasoning_effort must be one of: low, medium, xhigh")
+              "Qwen reasoning_effort must be one of: low, medium, xhigh")
       return effort
 
   def _resolve_glm5_next_reasoning_effort(
@@ -3129,7 +3159,8 @@ class FastLLmCompletion:
               reasoning_content = None
               if not request.tools:
                   result = self._strip_kimi_k3_response_wrapper(result)
-      elif self._is_qwen3_5_model() or self._is_dots3_note_model():
+      elif (self._is_qwen_reasoning_model()
+            or self._is_dots3_note_model()):
           result, reasoning_content = self._split_qwen3_5_reasoning(
               result, emit_reasoning_content)
       elif self._is_glm5_next_model():

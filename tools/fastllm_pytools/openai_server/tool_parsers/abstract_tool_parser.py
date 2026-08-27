@@ -263,7 +263,8 @@ class ToolParserManager:
         elif (model_type == 'qwen3' or model_type == 'qwen2' or model_type == 'qwen3_moe'
             or model_type == "qwen3_next" or model_type == "qwen3_5"
             or model_type == "qwen3_5_text" or model_type == "qwen3_5_moe"
-            or model_type == "qwen3_5_moe_text"):
+            or model_type == "qwen3_5_moe_text" or model_type == "qwen4_exp"
+            or model_type == "qwen4_exp_text"):
             # 判断是否是coder系列模型（使用xml工具调用）
             if is_qwen_xml_tool_template(chat_template):
                 target = 'qwen3_coder'

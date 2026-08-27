@@ -13,12 +13,13 @@ class FastLLmModel:
             getattr(model, "configured_context_window_limit", None)
         )
         is_kimi_k3 = self._is_kimi_k3(model)
-        is_qwen3_5 = self._is_qwen3_5(model)
         is_glm5_next = self._is_glm5_next(model)
+        is_qwen_reasoning = (
+            self._is_qwen3_5(model) or self._is_qwen4_exp(model))
         if is_kimi_k3 or is_glm5_next:
             reasoning_efforts = ["low", "high", "max"]
             default_reasoning_effort = "max"
-        elif is_qwen3_5:
+        elif is_qwen_reasoning:
             reasoning_efforts = ["low", "medium", "xhigh"]
             default_reasoning_effort = "xhigh"
         else:
@@ -253,6 +254,7 @@ class FastLLmModel:
                     return True
             except Exception:
                 pass
+
         config = getattr(model, "config", None)
         if not isinstance(config, dict):
             return False
@@ -265,4 +267,33 @@ class FastLLmModel:
             "Glm5NextForConditionalGeneration" in architectures
             or config.get("model_type") == "glm5_next"
             or text_model_type == "glm5_next_text"
+        )
+
+    @staticmethod
+    def _is_qwen4_exp(model):
+        qwen4_exp_types = {"qwen4_exp", "qwen4_exp_text"}
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                if get_type() in qwen4_exp_types:
+                    return True
+            except Exception:
+                pass
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures") or []
+        architecture = architectures[0] if architectures else ""
+        model_type = config.get("model_type", "")
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type", "")
+            if isinstance(text_config, dict) else "")
+        return (
+            architecture in {
+                "Qwen4ExpForConditionalGeneration",
+                "Qwen4ExpForCausalLM",
+            }
+            or model_type in qwen4_exp_types
+            or text_model_type in qwen4_exp_types
         )
