@@ -1100,7 +1100,7 @@ namespace fastllm {
         // established fp16 rounding semantics remain bit-identical.
         if (sequence == 1) {
             Data core;
-            fastllm::Qwen4GatedDeltaRuleDecode(
+            fastllm::GatedDeltaRuleDecode(
                 currentConvolved, alpha, beta,
                 this->weight[linear + "A_log"],
                 this->weight[linear + "dt_bias"],
@@ -1174,30 +1174,89 @@ namespace fastllm {
         PermuteSelf(value, {0, 2, 1, 3});
         PermuteSelf(beta, {0, 2, 1});
         PermuteSelf(decay, {0, 2, 1});
-        Mul(query, inverseHead, query);
 
-        // RecurrentGatedDeltaRule is the exact reference recurrence.  Applying
-        // it token-by-token also handles chunked prefills with an existing
-        // state and avoids imposing FLA's 64-token padding assumptions.
-        Data allCore;
-        for (int token = 0; token < sequence; token++) {
-            Data tokenQ, tokenK, tokenV, tokenBeta, tokenDecay, tokenCore;
-            Split(query, 2, token, token + 1, tokenQ);
-            Split(key, 2, token, token + 1, tokenK);
-            Split(value, 2, token, token + 1, tokenV);
-            Split(beta, 2, token, token + 1, tokenBeta);
-            Split(decay, 2, token, token + 1, tokenDecay);
-            RecurrentGatedDeltaRule(tokenQ, tokenK, tokenV, tokenDecay,
-                                    tokenBeta, pastRecurrent, tokenCore);
-            if (token == 0) {
-                allCore.CopyFrom(tokenCore);
-            } else {
-                Data previous;
-                previous.CopyFrom(allCore);
-                Cat(previous, tokenCore, 2, allCore);
-            }
+        // Use the same 64-token chunk GDN decomposition as Qwen3.5.  Besides
+        // matching the reference FLA algorithm, this removes the per-token
+        // Split/Recurrent/Cat launch chain and the quadratic Cat copies.
+        constexpr int chunkSize = 64;
+        const int padding = (chunkSize - sequence % chunkSize) % chunkSize;
+        Data scaledQuery, paddedKey, paddedValue, paddedBeta, paddedDecay;
+        Data *chunkKey, *chunkValue, *chunkBeta, *chunkDecay;
+        if (padding > 0) {
+            Data paddedQuery;
+            Pad(query, 2, padding, paddedQuery);
+            Pad(key, 2, padding, paddedKey);
+            Pad(value, 2, padding, paddedValue);
+            Pad(beta, 2, padding, paddedBeta);
+            Pad(decay, 2, padding, paddedDecay);
+            Mul(paddedQuery, inverseHead, scaledQuery);
+            chunkKey = &paddedKey;
+            chunkValue = &paddedValue;
+            chunkBeta = &paddedBeta;
+            chunkDecay = &paddedDecay;
+        } else {
+            Mul(query, inverseHead, scaledQuery);
+            chunkKey = &key;
+            chunkValue = &value;
+            chunkBeta = &beta;
+            chunkDecay = &decay;
         }
-        PermuteSelf(allCore, {0, 2, 1, 3});
+
+        chunkBeta->Resize({chunkBeta->dims[0], chunkBeta->dims[1],
+                           chunkBeta->dims[2], 1});
+        Data keyBeta, valueBeta;
+        Mul(*chunkKey, 1.0f, keyBeta);
+        Mul(*chunkValue, 1.0f, valueBeta);
+        MulTo(keyBeta, *chunkBeta);
+        MulTo(valueBeta, *chunkBeta);
+
+        scaledQuery.Reshape({scaledQuery.dims[0], scaledQuery.dims[1], -1,
+                             chunkSize, scaledQuery.dims.back()});
+        chunkKey->Reshape({chunkKey->dims[0], chunkKey->dims[1], -1,
+                           chunkSize, chunkKey->dims.back()});
+        keyBeta.Reshape({keyBeta.dims[0], keyBeta.dims[1], -1,
+                         chunkSize, keyBeta.dims.back()});
+        valueBeta.Reshape({valueBeta.dims[0], valueBeta.dims[1], -1,
+                           chunkSize, valueBeta.dims.back()});
+        chunkDecay->Reshape({chunkDecay->dims[0], chunkDecay->dims[1], -1,
+                             chunkSize});
+
+        CumSumLastDim(*chunkDecay);
+        Data decayMask;
+        MakeDecayMask(*chunkDecay, decayMask);
+
+        Data attention, negativeKeyAttention;
+        MatMulTransB(keyBeta, *chunkKey, negativeKeyAttention);
+        Mul(negativeKeyAttention, -1.0f, attention);
+        MulTo(attention, decayMask);
+        CausalMask(attention, 0, 0.0f);
+        TransferAttn(attention);
+
+        Data chunkValueOutput;
+        MatMul(attention, valueBeta, chunkValueOutput);
+        Data decayExp, keyCumDecay;
+        Exp(*chunkDecay, decayExp);
+        MulTo(keyBeta, decayExp);
+        MatMul(attention, keyBeta, keyCumDecay);
+
+        MatMulTransB(scaledQuery, *chunkKey, attention);
+        MulTo(attention, decayMask);
+        CausalMask(attention, 1, 0.0f);
+
+        Data allCore;
+        ChunkGatedDeltaRulePrefill(scaledQuery, *chunkKey, chunkValueOutput,
+                                   *chunkDecay, attention, keyCumDecay,
+                                   pastRecurrent, allCore);
+        allCore.Reshape({allCore.dims[0], allCore.dims[1], -1,
+                         allCore.dims.back()});
+        if (padding > 0) {
+            Data unpaddedCore;
+            Split(allCore, 2, 0, sequence, unpaddedCore);
+            PermuteSelf(unpaddedCore, {0, 2, 1, 3});
+            allCore.CopyFrom(unpaddedCore);
+        } else {
+            PermuteSelf(allCore, {0, 2, 1, 3});
+        }
 
         z.Reshape({batch, sequence, this->num_v_heads, this->head_v_dim});
         ToDataType(allCore, this->dataType);
