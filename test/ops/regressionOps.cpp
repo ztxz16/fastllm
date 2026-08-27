@@ -3464,6 +3464,136 @@ namespace {
                         ToFloatVector(cudaChunkedState), 2e-5f, 2e-5f,
                         "CUDA Kimi-K3 chunked output-only KDA state");
 
+        // GLM-5.3 uses the same recurrent delta-rule state transition, but
+        // normalizes raw BF16 Q/K in FP32 inside the recurrence and observes
+        // a BF16 boundary after sigmoid(beta).  Keep this path separate from
+        // the default Kimi-K3 contract above and verify both backends agree.
+        fastllm::Data cpuGlmState(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        fastllm::Data cpuGlmOutput;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::KimiK3RecurrentKDAOutputOnly(
+                cpuQ, cpuK, cpuV, cpuGate, cpuRawBeta, cpuALog, cpuDtBias,
+                -5.0f, cpuGlmState, cpuGlmOutput, true, true);
+        }
+
+        const std::vector<float> referenceQ = ToFloatVector(cpuQ);
+        const std::vector<float> referenceK = ToFloatVector(cpuK);
+        const std::vector<float> referenceV = ToFloatVector(cpuV);
+        const std::vector<float> referenceGate = ToFloatVector(cpuGate);
+        const std::vector<float> referenceRawBeta =
+            ToFloatVector(cpuRawBeta);
+        const std::vector<float> referenceALog = ToFloatVector(cpuALog);
+        const std::vector<float> referenceDtBias = ToFloatVector(cpuDtBias);
+        std::vector<float> referenceGlmState = initialStateValues;
+        std::vector<float> referenceGlmOutput(referenceQ.size());
+        auto sigmoid = [](float value) {
+            return 1.0f / (1.0f + std::exp(-value));
+        };
+        const float outputScale = 1.0f / std::sqrt((float)dimension);
+        for (int batchIndex = 0; batchIndex < batch; batchIndex++) {
+            for (int head = 0; head < heads; head++) {
+                const size_t stateBase =
+                    ((size_t)batchIndex * heads + head) *
+                    dimension * dimension;
+                std::vector<float> query(dimension);
+                std::vector<float> key(dimension);
+                std::vector<float> delta(dimension);
+                for (int token = 0; token < sequence; token++) {
+                    const size_t vectorBase =
+                        (((size_t)batchIndex * sequence + token) * heads +
+                         head) * dimension;
+                    const size_t betaIndex =
+                        ((size_t)batchIndex * sequence + token) * heads +
+                        head;
+                    float beta = fastllm::RoundFloat32ToBFloat16RNE(
+                        sigmoid(referenceRawBeta[betaIndex]));
+                    float querySquareSum = 0.0f;
+                    float keySquareSum = 0.0f;
+                    for (int channel = 0; channel < dimension; channel++) {
+                        query[channel] = referenceQ[vectorBase + channel];
+                        key[channel] = referenceK[vectorBase + channel];
+                        querySquareSum += query[channel] * query[channel];
+                        keySquareSum += key[channel] * key[channel];
+
+                        float gate = -5.0f * sigmoid(
+                            std::exp(referenceALog[head]) *
+                            (referenceGate[vectorBase + channel] +
+                             referenceDtBias[
+                                 (size_t)head * dimension + channel]));
+                        float retention = std::exp(gate);
+                        for (int value = 0; value < dimension; value++) {
+                            referenceGlmState[
+                                stateBase + (size_t)channel * dimension +
+                                value] *= retention;
+                        }
+                    }
+                    const float queryScale =
+                        1.0f / std::sqrt(querySquareSum + 1e-6f);
+                    const float keyScale =
+                        1.0f / std::sqrt(keySquareSum + 1e-6f);
+                    for (int channel = 0; channel < dimension; channel++) {
+                        query[channel] *= queryScale;
+                        key[channel] *= keyScale;
+                    }
+                    for (int value = 0; value < dimension; value++) {
+                        float prediction = 0.0f;
+                        for (int channel = 0; channel < dimension; channel++) {
+                            prediction += key[channel] * referenceGlmState[
+                                stateBase + (size_t)channel * dimension +
+                                value];
+                        }
+                        delta[value] =
+                            (referenceV[vectorBase + value] - prediction) *
+                            beta;
+                    }
+                    for (int channel = 0; channel < dimension; channel++) {
+                        for (int value = 0; value < dimension; value++) {
+                            referenceGlmState[
+                                stateBase + (size_t)channel * dimension +
+                                value] += key[channel] * delta[value];
+                        }
+                    }
+                    for (int value = 0; value < dimension; value++) {
+                        float result = 0.0f;
+                        for (int channel = 0; channel < dimension; channel++) {
+                            result += query[channel] * referenceGlmState[
+                                stateBase + (size_t)channel * dimension +
+                                value];
+                        }
+                        referenceGlmOutput[vectorBase + value] =
+                            fastllm::RoundFloat32ToBFloat16RNE(
+                                result * outputScale);
+                    }
+                }
+            }
+        }
+        ExpectFloatNear(referenceGlmOutput, ToFloatVector(cpuGlmOutput),
+                        0.0f, 0.0f,
+                        "CPU GLM-5.3 recurrent KDA reference output");
+        ExpectFloatNear(referenceGlmState, ToFloatVector(cpuGlmState),
+                        0.0f, 0.0f,
+                        "CPU GLM-5.3 recurrent KDA reference state");
+
+        fastllm::Data cudaGlmState = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, stateDims, initialStateValues);
+        fastllm::Data cudaGlmOutput;
+        {
+            ScopedFirstDevice device("cuda:0");
+            fastllm::KimiK3RecurrentKDAOutputOnly(
+                cudaQ, cudaK, cudaV, cudaGate, cudaRawBeta,
+                cudaALog, cudaDtBias, -5.0f,
+                cudaGlmState, cudaGlmOutput, true, true);
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(cpuGlmOutput),
+                        ToFloatVector(cudaGlmOutput), 1.0f / 128.0f, 0.0f,
+                        "CUDA GLM-5.3 recurrent KDA output");
+        ExpectFloatNear(ToFloatVector(cpuGlmState),
+                        ToFloatVector(cudaGlmState), 2e-5f, 2e-5f,
+                        "CUDA GLM-5.3 recurrent KDA state");
+
         constexpr int replayTokens = 5;
         const int replayVectorItems = replayTokens * heads * dimension;
         const int replayBetaItems = replayTokens * heads;
@@ -11724,6 +11854,13 @@ namespace {
 int main(int argc, char **argv) {
     try {
 #ifdef USE_CUDA
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-kimi-kda") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "Kimi/GLM recurrent KDA regression requires CUDA.");
+            RunCudaKimiK3RecurrentKdaRegression();
+            return 0;
+        }
         if (argc == 2 &&
             std::string(argv[1]) == "--cuda-paged-packed-append") {
             Expect(FastllmCudaGetDeviceCount() > 0,

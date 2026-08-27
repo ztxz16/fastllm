@@ -4131,7 +4131,9 @@ namespace fastllm {
             const Data &q, const Data &k, const Data &v,
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
-            Data &state, Data &output) {
+            Data &state, Data &output,
+            bool normalizeQKInFp32,
+            bool roundBetaToBfloat16) {
         Data unusedDecay, unusedBeta;
         curExecutor->Run("KimiK3RecurrentKDA", {
                 {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
@@ -4141,7 +4143,9 @@ namespace fastllm {
                 {"state", &state}, {"output", &output},
                 {"decay", &unusedDecay}, {"beta", &unusedBeta}
         }, {{"lowerBound", lowerBound}},
-        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 0}});
+        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 0},
+         {"normalizeQKInFp32", normalizeQKInFp32 ? 1 : 0},
+         {"roundBetaToBfloat16", roundBetaToBfloat16 ? 1 : 0}});
     }
 
     void KimiK3RecurrentKDAUpdateState(

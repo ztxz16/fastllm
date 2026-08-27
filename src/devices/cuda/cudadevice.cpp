@@ -4641,6 +4641,12 @@ namespace fastllm {
         const int tokenLimit =
             intParams.find("tokenLimit") == intParams.end() ? -1 :
             intParams.find("tokenLimit")->second;
+        const bool normalizeQKInFp32 =
+            intParams.find("normalizeQKInFp32") != intParams.end() &&
+            intParams.find("normalizeQKInFp32")->second != 0;
+        const bool roundBetaToBfloat16 =
+            intParams.find("roundBetaToBfloat16") != intParams.end() &&
+            intParams.find("roundBetaToBfloat16")->second != 0;
         AssertInFastLLM(
             q.dims.size() == 4 && q.dims == k.dims && q.dims == v.dims &&
             q.dims == rawGate.dims,
@@ -4658,7 +4664,8 @@ namespace fastllm {
             FastllmCudaKimiK3RecurrentKDA(
                 q, k, v, rawGate, rawBeta, aLog, dtBias, state, output,
                 decay, beta, lowerBound, initializeState,
-                tokenLimit, stateOnly, outputAux),
+                tokenLimit, stateOnly, outputAux, normalizeQKInFp32,
+                roundBetaToBfloat16),
             "CUDA KimiK3RecurrentKDA launch failed.");
     }
 

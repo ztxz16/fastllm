@@ -497,7 +497,8 @@ bool FastllmCudaKimiK3RecurrentKDA(
         fastllm::Data &output, fastllm::Data &decay,
         fastllm::Data &beta, float lowerBound, bool initializeState,
         int tokenLimit = -1, bool stateOnly = false,
-        bool outputAux = true);
+        bool outputAux = true, bool normalizeQKInFp32 = false,
+        bool roundBetaToBfloat16 = false);
 bool FastllmCudaKimiK3RMSNormSigmoidGate(
         const fastllm::Data &input, const fastllm::Data &gate,
         const fastllm::Data &weight, fastllm::Data &output, float eps);

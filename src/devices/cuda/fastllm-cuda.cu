@@ -7918,7 +7918,8 @@ namespace {
             const float *rawBeta, const float *aLog, const float *dtBias,
             float *state, __nv_bfloat16 *output, float *decay,
             float *activatedBeta, int batch, int inputSequence, int tokens,
-            int heads, int dimension, int aLogCount, float lowerBound) {
+            int heads, int dimension, int aLogCount, float lowerBound,
+            bool normalizeQKInFp32, bool roundBetaToBfloat16) {
         int item = blockIdx.x;
         int batchIndex = item / heads;
         int head = item % heads;
@@ -7932,6 +7933,7 @@ namespace {
         float *delta = query + dimension;
         float *retention = delta + dimension;
         float *sharedBeta = retention + dimension;
+        float *normalizationScales = sharedBeta + 1;
         float *headState = state +
             ((size_t)batchIndex * heads + head) * dimension * dimension;
         float outputScale = rsqrtf((float)dimension);
@@ -7944,6 +7946,10 @@ namespace {
                 ((size_t)batchIndex * inputSequence + token) * heads + head;
             if (channel == 0) {
                 sharedBeta[0] = KimiK3CudaSigmoid(rawBeta[betaIndex]);
+                if (roundBetaToBfloat16) {
+                    sharedBeta[0] = __bfloat162float(
+                        __float2bfloat16_rn(sharedBeta[0]));
+                }
                 if (activatedBeta != nullptr) {
                     activatedBeta[betaIndex] = sharedBeta[0];
                 }
@@ -7965,6 +7971,34 @@ namespace {
                 retention[channel] = expf(gate);
             }
             __syncthreads();
+
+            if (normalizeQKInFp32) {
+                if (channel == 0) {
+                    float keySquareSum = 0.0f;
+                    float querySquareSum = 0.0f;
+                    for (int sourceChannel = 0;
+                         sourceChannel < dimension; sourceChannel++) {
+                        keySquareSum +=
+                            key[sourceChannel] * key[sourceChannel];
+                        if (output != nullptr) {
+                            querySquareSum += query[sourceChannel] *
+                                              query[sourceChannel];
+                        }
+                    }
+                    normalizationScales[0] =
+                        rsqrtf(keySquareSum + 1e-6f);
+                    normalizationScales[1] = output == nullptr ? 1.0f :
+                        rsqrtf(querySquareSum + 1e-6f);
+                }
+                __syncthreads();
+                if (channel < dimension) {
+                    key[channel] *= normalizationScales[0];
+                    if (output != nullptr) {
+                        query[channel] *= normalizationScales[1];
+                    }
+                }
+                __syncthreads();
+            }
 
             // Traverse the row-major state as a flat array.  Adjacent CUDA
             // threads now touch adjacent values, instead of every thread
@@ -8270,7 +8304,8 @@ bool FastllmCudaKimiK3RecurrentKDA(
         const fastllm::Data &dtBias, fastllm::Data &state,
         fastllm::Data &output, fastllm::Data &decay,
         fastllm::Data &beta, float lowerBound, bool initializeState,
-        int tokenLimit, bool stateOnly, bool outputAux) {
+        int tokenLimit, bool stateOnly, bool outputAux,
+        bool normalizeQKInFp32, bool roundBetaToBfloat16) {
     if (!KimiK3CudaDataReady(q, fastllm::DataType::BFLOAT16) ||
         !KimiK3CudaDataReady(k, fastllm::DataType::BFLOAT16) ||
         !KimiK3CudaDataReady(v, fastllm::DataType::BFLOAT16) ||
@@ -8317,7 +8352,7 @@ bool FastllmCudaKimiK3RecurrentKDA(
     // Vector reductions retain one owner per state column, while all threads
     // cooperate on the row-major decay and rank-one update passes.
     int threads = KIMI_K3_CUDA_THREADS;
-    size_t sharedBytes = ((size_t)dimension * 4 + 1) * sizeof(float);
+    size_t sharedBytes = ((size_t)dimension * 4 + 3) * sizeof(float);
     KimiK3RecurrentKDAKernel<<<batch * heads, threads, sharedBytes>>>(
         (const __nv_bfloat16*)q.cudaData,
         (const __nv_bfloat16*)k.cudaData,
@@ -8331,7 +8366,8 @@ bool FastllmCudaKimiK3RecurrentKDA(
         stateOnly || !outputAux ? nullptr : (float*)decay.cudaData,
         stateOnly || !outputAux ? nullptr : (float*)beta.cudaData,
         batch, sequence, tokens, heads, dimension,
-        (int)aLog.Count(0), lowerBound);
+        (int)aLog.Count(0), lowerBound, normalizeQKInFp32,
+        roundBetaToBfloat16);
     return KimiK3CudaLastError("KimiK3RecurrentKDA CUDA kernel failed.");
 }
 

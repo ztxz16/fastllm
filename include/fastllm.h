@@ -978,7 +978,9 @@ namespace fastllm {
             const Data &q, const Data &k, const Data &v,
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
-            Data &state, Data &output);
+            Data &state, Data &output,
+            bool normalizeQKInFp32 = false,
+            bool roundBetaToBfloat16 = false);
 
     // Replays only the recurrent-state transition for the first `tokens`
     // rows of a captured verification batch.

@@ -492,6 +492,12 @@ namespace fastllm {
         const bool outputAux =
             intParams.find("outputAux") == intParams.end() ||
             intParams.find("outputAux")->second != 0;
+        const bool normalizeQKInFp32 =
+            intParams.find("normalizeQKInFp32") != intParams.end() &&
+            intParams.find("normalizeQKInFp32")->second != 0;
+        const bool roundBetaToBfloat16 =
+            intParams.find("roundBetaToBfloat16") != intParams.end() &&
+            intParams.find("roundBetaToBfloat16")->second != 0;
         const int requestedTokens =
             intParams.find("tokenLimit") == intParams.end() ? -1 :
             intParams.find("tokenLimit")->second;
@@ -555,6 +561,9 @@ namespace fastllm {
                     uint64_t betaIndex =
                         ((uint64_t)batchIndex * sequence + token) * heads + head;
                     float beta = KimiK3Sigmoid(betaData[betaIndex]);
+                    if (roundBetaToBfloat16) {
+                        beta = RoundFloat32ToBFloat16RNE(beta);
+                    }
                     if (activatedBetaData != nullptr) {
                         activatedBetaData[betaIndex] = beta;
                     }
@@ -577,6 +586,26 @@ namespace fastllm {
                         float *stateRow = headState + (uint64_t)channel * dimension;
                         for (int value = 0; value < dimension; value++) {
                             stateRow[value] *= retention;
+                        }
+                    }
+                    if (normalizeQKInFp32) {
+                        float keySquareSum = 0.0f;
+                        float querySquareSum = 0.0f;
+                        for (int channel = 0; channel < dimension; channel++) {
+                            keySquareSum += key[channel] * key[channel];
+                            if (!stateOnly) {
+                                querySquareSum += query[channel] * query[channel];
+                            }
+                        }
+                        const float keyScale =
+                            1.0f / std::sqrt(keySquareSum + 1e-6f);
+                        const float queryScale = stateOnly ? 1.0f :
+                            1.0f / std::sqrt(querySquareSum + 1e-6f);
+                        for (int channel = 0; channel < dimension; channel++) {
+                            key[channel] *= keyScale;
+                            if (!stateOnly) {
+                                query[channel] *= queryScale;
+                            }
                         }
                     }
                     for (int value = 0; value < dimension; value++) {
