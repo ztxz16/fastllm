@@ -88,6 +88,10 @@ namespace fastllm {
             Cat(qkCache, vCache, 0, combined);
             Copy(combined, packed);
             packed.SetKVCache();
+            // This is a fixed-size convolution history, not a token-growing
+            // attention cache.  Generic history-cache restore must copy it as
+            // a whole instead of slicing dimension 1 by the matched prefix.
+            packed.isLinearAttention = true;
         }
 
         void AppendGlm5NextSequenceCache(
@@ -278,6 +282,17 @@ namespace fastllm {
 
     Glm5NextModel::~Glm5NextModel() {
         ShutdownRuntime();
+    }
+
+    void Glm5NextModel::SetDataType(DataType dataType) {
+        if (dataType != DataType::BFLOAT16) {
+            basellm::SetDataType(dataType);
+            return;
+        }
+        this->dataType = dataType;
+        if (!this->useCustomKVCacheDataType) {
+            this->kvCacheDataType = dataType;
+        }
     }
 
     void Glm5NextModel::InitParams() {
@@ -727,6 +742,10 @@ namespace fastllm {
             qCache, kCache, vCache,
             pastKeyValues[layerIndex].first);
         state.SetKVCache();
+        // The KDA recurrent matrix is also a fixed-size state.  Keeping both
+        // members marked makes schedulers and cache accounting consistently
+        // skip token-length handling for KDA layers.
+        state.isLinearAttention = true;
     }
 
     void Glm5NextModel::RunSparseAttention(

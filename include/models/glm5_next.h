@@ -20,6 +20,14 @@ namespace fastllm {
 
         void OnModelWeightsLoaded() override;
 
+        void SetDataType(DataType dataType) override;
+
+        // The generic history cache assumes that every layer can be restored
+        // from one shared token-prefix length.  GLM-5.3 mixes fixed KDA
+        // recurrent state with token-growing DSA caches, so use a fresh
+        // prefill until an atomic model-specific snapshot is available.
+        bool UseGenericHistoryCache() const override { return false; }
+
         int Forward(
                 const Data &inputIds,
                 const Data &attentionMask,
