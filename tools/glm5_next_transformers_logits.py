@@ -45,8 +45,6 @@ def main() -> None:
     if args.threads <= 0:
         raise ValueError("--threads must be positive")
 
-    os.environ.setdefault("OMP_NUM_THREADS", str(args.threads))
-    os.environ.setdefault("MKL_NUM_THREADS", str(args.threads))
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     import torch
