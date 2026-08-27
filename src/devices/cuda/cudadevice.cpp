@@ -4621,9 +4621,9 @@ namespace fastllm {
         const int groups = CudaQwen4Groups(intParams);
         if (input.dims.empty() || groups <= 0 ||
             input.dims.back() % groups != 0 ||
-            input.dataType != blockOutput.dataType ||
-            input.dataType != injection.dataType ||
-            !CudaQwen4ActivationType(input.dataType)) {
+            !CudaQwen4ActivationType(input.dataType) ||
+            !CudaQwen4ActivationType(blockOutput.dataType) ||
+            !CudaQwen4ActivationType(injection.dataType)) {
             return false;
         }
         const int rows = (int)(input.Count(0) / input.dims.back());

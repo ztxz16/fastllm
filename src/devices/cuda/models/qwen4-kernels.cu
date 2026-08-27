@@ -311,11 +311,22 @@ namespace {
             Qwen4CudaRound<T>(gate * 2.0f));
     }
 
+    __device__ __forceinline__ float Qwen4CudaLoadActivation(
+            const void *data, int type, uint64_t index) {
+        if (type == (int)fastllm::DataType::FLOAT32) {
+            return ((const float*)data)[index];
+        }
+        if (type == (int)fastllm::DataType::FLOAT16) {
+            return __half2float(((const half*)data)[index]);
+        }
+        return __bfloat162float(((const __nv_bfloat16*)data)[index]);
+    }
+
     template <typename T>
     __global__ void Qwen4HyperCombineKernel(
-            const T *hyperInput, const T *blockOutput,
-            const T *injection, T *output, uint64_t count,
-            int groups, int blockChannels) {
+            const T *hyperInput, const void *blockOutput, int blockType,
+            const void *injection, int injectionType,
+            T *output, uint64_t count, int groups, int blockChannels) {
         const uint64_t index = (uint64_t)blockIdx.x * blockDim.x +
                                threadIdx.x;
         if (index >= count) {
@@ -326,9 +337,12 @@ namespace {
         const int withinRow = (int)(index % channels);
         const int group = withinRow / blockChannels;
         const int channel = withinRow % blockChannels;
-        const float injected = Qwen4CudaRound<T>(
-            Qwen4CudaToFloat(blockOutput[row * blockChannels + channel]) *
-            Qwen4CudaToFloat(injection[row * groups + group]));
+        const float blockValue = Qwen4CudaRound<T>(
+            Qwen4CudaLoadActivation(blockOutput, blockType,
+                                    row * blockChannels + channel));
+        const float scale = Qwen4CudaRound<T>(Qwen4CudaLoadActivation(
+            injection, injectionType, row * groups + group));
+        const float injected = Qwen4CudaRound<T>(blockValue * scale);
         output[index] = Qwen4CudaFromFloat<T>(Qwen4CudaRound<T>(
             Qwen4CudaToFloat(hyperInput[index]) + injected));
     }
@@ -597,10 +611,10 @@ bool FastllmCudaQwen4HyperCombine(
         injection.cudaData == nullptr || output.cudaData == nullptr ||
         hyperInput.dims.empty() || groups <= 0 ||
         hyperInput.dims.back() % groups != 0 ||
-        hyperInput.dataType != blockOutput.dataType ||
-        hyperInput.dataType != injection.dataType ||
         hyperInput.dataType != output.dataType ||
-        !Qwen4CudaActivationType(hyperInput.dataType)) {
+        !Qwen4CudaActivationType(hyperInput.dataType) ||
+        !Qwen4CudaActivationType(blockOutput.dataType) ||
+        !Qwen4CudaActivationType(injection.dataType)) {
         return false;
     }
     const int blockChannels = hyperInput.dims.back() / groups;
@@ -615,20 +629,20 @@ bool FastllmCudaQwen4HyperCombine(
     if (hyperInput.dataType == fastllm::DataType::FLOAT32) {
         Qwen4HyperCombineKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
             (const float*)hyperInput.cudaData,
-            (const float*)blockOutput.cudaData,
-            (const float*)injection.cudaData, (float*)output.cudaData,
-            count, groups, blockChannels);
+            blockOutput.cudaData, (int)blockOutput.dataType,
+            injection.cudaData, (int)injection.dataType,
+            (float*)output.cudaData, count, groups, blockChannels);
     } else if (hyperInput.dataType == fastllm::DataType::FLOAT16) {
         Qwen4HyperCombineKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
             (const half*)hyperInput.cudaData,
-            (const half*)blockOutput.cudaData,
-            (const half*)injection.cudaData, (half*)output.cudaData,
-            count, groups, blockChannels);
+            blockOutput.cudaData, (int)blockOutput.dataType,
+            injection.cudaData, (int)injection.dataType,
+            (half*)output.cudaData, count, groups, blockChannels);
     } else {
         Qwen4HyperCombineKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16*)hyperInput.cudaData,
-            (const __nv_bfloat16*)blockOutput.cudaData,
-            (const __nv_bfloat16*)injection.cudaData,
+            blockOutput.cudaData, (int)blockOutput.dataType,
+            injection.cudaData, (int)injection.dataType,
             (__nv_bfloat16*)output.cudaData, count, groups,
             blockChannels);
     }

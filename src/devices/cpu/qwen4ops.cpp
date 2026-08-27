@@ -262,9 +262,7 @@ namespace fastllm {
         Qwen4AssertCpuTensor(blockOutput, "Qwen4HyperCombine block output");
         Qwen4AssertCpuTensor(injection, "Qwen4HyperCombine injection");
         AssertInFastLLM(!hyperInput.dims.empty() && groups > 0 &&
-                        hyperInput.dims.back() % groups == 0 &&
-                        hyperInput.dataType == blockOutput.dataType &&
-                        hyperInput.dataType == injection.dataType,
+                        hyperInput.dims.back() % groups == 0,
                         "Qwen4HyperCombine received incompatible tensors.\n");
 
         const int channels = hyperInput.dims.back();
@@ -276,20 +274,24 @@ namespace fastllm {
                         "Qwen4HyperCombine shape mismatch.\n");
         output.Allocate(false);
         const DataType type = hyperInput.dataType;
+        const DataType blockType = blockOutput.dataType;
+        const DataType injectionType = injection.dataType;
         Qwen4ParallelFor(rows, [&](int start, int end) {
             for (int row = start; row < end; row++) {
                 const uint64_t hyperBase = (uint64_t)row * channels;
                 const uint64_t blockBase = (uint64_t)row * blockChannels;
                 const uint64_t injectionBase = (uint64_t)row * groups;
                 for (int group = 0; group < groups; group++) {
-                    const float scale = Qwen4LoadCpu(
-                        injection.cpuData, type, injectionBase + group);
+                    const float scale = Qwen4RoundCpu(Qwen4LoadCpu(
+                        injection.cpuData, injectionType,
+                        injectionBase + group), type);
                     for (int channel = 0; channel < blockChannels; channel++) {
                         const uint64_t outputIndex = hyperBase +
                             (uint64_t)group * blockChannels + channel;
                         const float injected = Qwen4RoundCpu(
-                            Qwen4LoadCpu(blockOutput.cpuData, type,
-                                         blockBase + channel) * scale, type);
+                            Qwen4RoundCpu(Qwen4LoadCpu(
+                                blockOutput.cpuData, blockType,
+                                blockBase + channel), type) * scale, type);
                         const float combined = Qwen4RoundCpu(
                             Qwen4LoadCpu(hyperInput.cpuData, type,
                                          outputIndex) + injected, type);

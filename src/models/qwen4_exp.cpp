@@ -442,21 +442,11 @@ namespace fastllm {
                                       const Data &blockOutput,
                                       const Data &injectionWeights,
                                       Data &output) {
-        const Data *typedBlock = &blockOutput;
-        const Data *typedInjection = &injectionWeights;
-        Data convertedBlock, convertedInjection;
-        if (blockOutput.dataType != hyperInput.dataType) {
-            convertedBlock.CopyFrom(blockOutput);
-            Qwen4CastLike(convertedBlock, hyperInput);
-            typedBlock = &convertedBlock;
-        }
-        if (injectionWeights.dataType != hyperInput.dataType) {
-            convertedInjection.CopyFrom(injectionWeights);
-            Qwen4CastLike(convertedInjection, hyperInput);
-            typedInjection = &convertedInjection;
-        }
-        fastllm::Qwen4HyperCombine(hyperInput, *typedBlock,
-                                  *typedInjection, this->hcCount,
+        // The operation rounds mixed-dtype block/injection values to the
+        // residual dtype internally, matching the previous explicit casts
+        // without materializing temporary tensors.
+        fastllm::Qwen4HyperCombine(hyperInput, blockOutput,
+                                  injectionWeights, this->hcCount,
                                   output);
     }
 
@@ -1218,7 +1208,8 @@ namespace fastllm {
         const int batch = input.dims[0];
         const int sequence = input.dims[1];
         Data flattened;
-        flattened.CopyFrom(input);
+        flattened.FakeFrom(input, 0);
+        flattened.Resize(input.dims);
         flattened.Reshape({batch * sequence, input.dims.back()});
 
         Data routerLogits, sharedGateUp, sharedHidden, sharedOutput, sharedGate;
@@ -1292,33 +1283,34 @@ namespace fastllm {
             requestState = &this->requestStates[&pastKeyValues];
         }
 
-        Data embedding, repeatedEmbedding, hiddenStates;
+        Data embedding, hiddenBuffers[2];
+        Data *hiddenStates = &hiddenBuffers[0];
+        Data *nextHiddenStates = &hiddenBuffers[1];
         DumpTensorIfRequested("input_ids", inputIds);
         DumpTensorIfRequested("position_ids", positionIds);
         Embedding(inputIds, this->weight[languagePrefix + "embed_tokens.weight"],
                   embedding);
         embedding.Reshape({batch, inputIds.dims[1], 1, this->embed_dim});
-        Repeat(embedding, 2, this->hcCount, repeatedEmbedding);
-        repeatedEmbedding.Reshape({batch, inputIds.dims[1],
-                                   this->hcCount * this->embed_dim});
-        hiddenStates.CopyFrom(repeatedEmbedding);
-        DumpTensorIfRequested("embedding", hiddenStates);
+        Repeat(embedding, 2, this->hcCount, *hiddenStates);
+        hiddenStates->Reshape({batch, inputIds.dims[1],
+                               this->hcCount * this->embed_dim});
+        DumpTensorIfRequested("embedding", *hiddenStates);
 
         for (int layer = 0; layer < this->block_cnt; layer++) {
             ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
 
             if (layer == this->pleLayer) {
                 Data pleOutput;
-                RunPLE(hiddenStates, inputIds, *requestState, pleOutput);
-                AddTo(hiddenStates, pleOutput);
+                RunPLE(*hiddenStates, inputIds, *requestState, pleOutput);
+                AddTo(*hiddenStates, pleOutput);
                 DumpTensorIfRequested("layer_" + std::to_string(layer) +
-                                      "_ple", hiddenStates);
+                                      "_ple", *hiddenStates);
             }
 
             const std::string layerPrefix = languagePrefix + "layers." +
                                             std::to_string(layer) + ".";
             Data attentionInput, attentionInjection, attentionOutput;
-            HyperMix(hiddenStates, layerPrefix + "attn_hyper_connection.",
+            HyperMix(*hiddenStates, layerPrefix + "attn_hyper_connection.",
                      attentionInput, &attentionInjection);
             if (this->IsLinearAttentionLayer(layer)) {
                 RunLinearAttention(layer, attentionInput,
@@ -1334,24 +1326,23 @@ namespace fastllm {
             }
             DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                   "_attention", attentionOutput);
-            Data afterAttention;
-            HyperCombine(hiddenStates, attentionOutput, attentionInjection,
-                         afterAttention);
-            hiddenStates.CopyFrom(afterAttention);
+            HyperCombine(*hiddenStates, attentionOutput, attentionInjection,
+                         *nextHiddenStates);
+            std::swap(hiddenStates, nextHiddenStates);
 
             Data mlpInput, mlpInjection, mlpOutput;
-            HyperMix(hiddenStates, layerPrefix + "mlp_hyper_connection.",
+            HyperMix(*hiddenStates, layerPrefix + "mlp_hyper_connection.",
                      mlpInput, &mlpInjection);
             RunMoE(layer, mlpInput, mlpOutput);
-            Data afterMlp;
-            HyperCombine(hiddenStates, mlpOutput, mlpInjection, afterMlp);
-            hiddenStates.CopyFrom(afterMlp);
+            HyperCombine(*hiddenStates, mlpOutput, mlpInjection,
+                         *nextHiddenStates);
+            std::swap(hiddenStates, nextHiddenStates);
             DumpTensorIfRequested("layer_" + std::to_string(layer) +
-                                  "_output", hiddenStates);
+                                  "_output", *hiddenStates);
         }
 
         Data finalHidden;
-        HyperMix(hiddenStates, languagePrefix + "hyper_connection_mixer.",
+        HyperMix(*hiddenStates, languagePrefix + "hyper_connection_mixer.",
                  finalHidden, nullptr);
         DumpTensorIfRequested("final_hidden", finalHidden);
         Data lastHidden;
@@ -1359,7 +1350,8 @@ namespace fastllm {
             Split(finalHidden, 1, finalHidden.dims[1] - 1,
                   finalHidden.dims[1], lastHidden);
         } else {
-            lastHidden.CopyFrom(finalHidden);
+            lastHidden.FakeFrom(finalHidden, 0);
+            lastHidden.Resize(finalHidden.dims);
         }
 
         Data logits;
