@@ -496,9 +496,6 @@ void Gett(
   static int constexpr kBlockM = 64;
   static int constexpr kBlockN = 64;
 
-#if defined(_OPENMP)
-  #pragma omp parallel for collapse(3)
-#endif
   for (int64_t l = 0; l < cute::size<2>(mainloop_params.A.layout()); ++l) {
     for (int64_t m = 0; m < cute::size<0>(mainloop_params.A.layout()); m += kBlockM) {
       for (int64_t n = 0; n < cute::size<0>(mainloop_params.B.layout()); n += kBlockN) {
@@ -799,9 +796,6 @@ void gett_epilogue(
     }
   }
 
-#if defined(_OPENMP)
-  #pragma omp critical(Abs_Max_Data_Update)
-#endif
   {
     if constexpr (IsScalingAndAmaxOutputNeeded) {
       if (epilogue_params.abs_max_D) {

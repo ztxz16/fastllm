@@ -209,9 +209,6 @@ private:
     int32_t S = size<1>(tensor_b_);
     int32_t C = size<0>(tensor_b_);
 
-#if defined(_OPENMP)
-  #pragma omp parallel for collapse(2)
-#endif
     for (int32_t g = 0; g < G; ++g) {
       for (int32_t n = 0; n < N; ++n) {
         for (int32_t q = 0; q < Q; ++q) {
@@ -261,9 +258,6 @@ private:
     int32_t S = size<1>(tensor_b_);
     int32_t C = size<0>(tensor_b_);
 
-#if defined(_OPENMP)
-    #pragma omp parallel for collapse(3)
-#endif
     for (int32_t g = 0; g < G; ++g) {
       for (int32_t n = 0; n < N; ++n) {
         for (int32_t p = 0; p < P; ++p) {
@@ -320,9 +314,6 @@ private:
     int32_t S = size<1>(tensor_b_);
     int32_t C = size<0>(tensor_b_);
 
-#if defined(_OPENMP)
-    #pragma omp parallel for collapse(3)
-#endif
     for (int32_t g = 0; g < G; ++g) {
       for (int32_t n = 0; n < N; ++n) {
         for (int32_t z = 0; z < Z; ++z) {
@@ -380,9 +371,6 @@ private:
     int32_t K = size<2>(tensor_b_);
     int32_t S = size<1>(tensor_b_);
 
-#if defined(_OPENMP)
-   #pragma omp parallel for collapse(2)
-#endif
     for (int32_t g = 0; g < G; ++g) {
       for (int32_t n = 0; n < N; ++n) {
         for (int32_t w = 0; w < W; ++w) {
@@ -437,9 +425,6 @@ private:
     int32_t R = size<2>(tensor_b_);
     int32_t S = size<1>(tensor_b_);
 
-#if defined(_OPENMP)
-    #pragma omp parallel for collapse(3)
-#endif
     for (int32_t g = 0; g < G; ++g) {
       for (int32_t n = 0; n < N; ++n) {
         for (int32_t h = 0; h < H; ++h) {
@@ -508,9 +493,6 @@ private:
     int32_t R = size<2>(tensor_b_);
     int32_t S = size<1>(tensor_b_);
 
-#if defined(_OPENMP)
-    #pragma omp parallel for collapse(3)
-#endif
     for (int32_t g = 0; g < G; ++g) {
       for (int32_t n = 0; n < N; ++n) {
         for (int32_t d = 0; d < D; ++d) {
@@ -588,9 +570,6 @@ private:
     int32_t S = size<1>(tensor_d_);
     int32_t C = size<0>(tensor_d_);
 
-#if defined(_OPENMP)
-    #pragma omp parallel for collapse(2)
-#endif
     for (int32_t g = 0; g < G; ++g) {
       for (int32_t k = 0; k < K; ++k) {
         for (int32_t s = 0; s < S; ++s) {
@@ -649,9 +628,6 @@ private:
     int32_t S = size<1>(tensor_d_);
     int32_t C = size<0>(tensor_d_);
 
-#if defined(_OPENMP)
-    #pragma omp parallel for collapse(3)
-#endif
     for (int32_t g = 0; g < G; ++g) {
       for (int32_t k = 0; k < K; ++k) {
         for (int32_t r = 0; r < R; ++r) {
@@ -718,9 +694,6 @@ private:
     int32_t S = size<1>(tensor_d_);
     int32_t C = size<0>(tensor_d_);
 
-#if defined(_OPENMP)
-    #pragma omp parallel for collapse(3)
-#endif
     for (int32_t g = 0 ; g < G; ++g) {
       for (int32_t k = 0; k < K; ++k) {
         for (int32_t t = 0; t < T; ++t) {
