@@ -10,6 +10,7 @@
 
 #include "qwen4_exp.h"
 
+#include "devices/cpu/alivethreadpool.h"
 #include "json11.hpp"
 #include "utils.h"
 
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <set>
 #include <sstream>
@@ -31,6 +33,62 @@ namespace fastllm {
         constexpr uint64_t kSplitMixM1 = 0xBF58476D1CE4E5B9ULL;
         constexpr uint64_t kSplitMixM2 = 0x94D049BB133111EBULL;
         constexpr uint64_t kPleLayerPrime = 10007ULL;
+
+        class Qwen4RangeTask final : public MultiThreadBaseOp {
+        public:
+            Qwen4RangeTask(int start, int end,
+                           const std::function<void(int, int)> &function)
+                : start(start), end(end), function(function) {}
+
+            void Run() override {
+                function(start, end);
+            }
+
+        private:
+            int start;
+            int end;
+            std::function<void(int, int)> function;
+        };
+
+        void Qwen4ParallelFor(int count,
+                              const std::function<void(int, int)> &function) {
+            if (count <= 0) {
+                return;
+            }
+            AliveThreadPool *pool = GetAlivePool();
+            const int firstThread = pool->curActivateThreadInterval.first;
+            const int availableThreads = std::max(
+                1, pool->curActivateThreadInterval.second - firstThread);
+            const int threadCount = std::min(count, availableThreads);
+            if (threadCount == 1) {
+                function(0, count);
+                return;
+            }
+
+            std::vector<Qwen4RangeTask*> tasks;
+            tasks.reserve(threadCount);
+            for (int thread = 0; thread < threadCount; thread++) {
+                const int start = (int)((int64_t)count * thread / threadCount);
+                const int end = (int)((int64_t)count * (thread + 1) /
+                                      threadCount);
+                tasks.push_back(new Qwen4RangeTask(start, end, function));
+                pool->PushOp(firstThread + thread, tasks.back());
+            }
+            for (int thread = 0; thread < threadCount; thread++) {
+                pool->Wait(firstThread + thread);
+                delete tasks[thread];
+            }
+        }
+
+        bool Qwen4EnvFlagEnabled(const char *name) {
+            const char *value = std::getenv(name);
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "FALSE") != 0 &&
+                   std::strcmp(value, "off") != 0 &&
+                   std::strcmp(value, "OFF") != 0;
+        }
 
         uint64_t Qwen4SplitMix64(uint64_t value) {
             value += kSplitMixGamma;
@@ -770,6 +828,147 @@ namespace fastllm {
             1.0f / std::sqrt((float)this->indexerHeadDim);
         const int rotaryHalf = this->rotary_dim / 2;
         std::vector<float> maskValues((size_t)sequence * keyLength, 1.0f);
+
+        // An ordinary single-request prefill has a contiguous causal mask.
+        // The compressed block key is independent of the query, but the
+        // original reference rebuilt it inside every query/block pair and ran
+        // the whole QSA scorer serially.  Past the 2048-token budget that made
+        // index construction quadratic on one CPU core and dominated the
+        // complete forward.  Build every block key once, then score independent
+        // query rows across FastLLM's CPU pool.  The arithmetic and TopK
+        // tie-break remain identical to the reference path below.
+        if (baseMaskValues == nullptr &&
+            !Qwen4EnvFlagEnabled("FASTLLM_QWEN4_DISABLE_FAST_QSA")) {
+            const int completeKeyBlocks = keyLength /
+                                          this->indexerCompressRatio;
+            std::vector<float> blockKeys(
+                (size_t)completeKeyBlocks * this->indexerHeadDim);
+            Qwen4ParallelFor(completeKeyBlocks, [&](int start, int end) {
+                std::vector<float> pooled(this->indexerHeadDim);
+                for (int block = start; block < end; block++) {
+                    std::fill(pooled.begin(), pooled.end(), 0.0f);
+                    const int groupStart = block * this->indexerCompressRatio;
+                    for (int member = 0;
+                         member < this->indexerCompressRatio; member++) {
+                        const float *source = rawKeyCache.data() +
+                            (size_t)(groupStart + member) *
+                                this->indexerHeadDim;
+                        for (int column = 0;
+                             column < this->indexerHeadDim; column++) {
+                            pooled[column] += source[column];
+                        }
+                    }
+
+                    float squareSum = 0.0f;
+                    for (float value : pooled) {
+                        const float averaged = value /
+                            (float)this->indexerCompressRatio;
+                        squareSum += averaged * averaged;
+                    }
+                    const float inverseRms = 1.0f / std::sqrt(
+                        squareSum / this->indexerHeadDim +
+                        this->rms_norm_eps);
+                    for (int column = 0;
+                         column < this->indexerHeadDim; column++) {
+                        pooled[column] = pooled[column] /
+                            (float)this->indexerCompressRatio * inverseRms *
+                            keyNorm[column];
+                    }
+
+                    const int position =
+                        (int)(positionCache[groupStart] + 0.01f);
+                    AssertInFastLLM(position >= 0 &&
+                                    position < this->sinData.dims[0],
+                                    "Qwen4-Exp QSA position exceeds its rotary table.");
+                    const float *sinRow = sinValues +
+                        (size_t)position * rotaryStride;
+                    const float *cosRow = cosValues +
+                        (size_t)position * rotaryStride;
+                    float *destination = blockKeys.data() +
+                        (size_t)block * this->indexerHeadDim;
+                    std::copy(pooled.begin(), pooled.end(), destination);
+                    for (int column = 0; column < rotaryHalf; column++) {
+                        destination[column] =
+                            pooled[column] * cosRow[column] -
+                            pooled[column + rotaryHalf] * sinRow[column];
+                        destination[column + rotaryHalf] =
+                            pooled[column + rotaryHalf] *
+                                cosRow[column + rotaryHalf] +
+                            pooled[column] * sinRow[column + rotaryHalf];
+                    }
+                }
+            });
+
+            Qwen4ParallelFor(sequence, [&](int start, int end) {
+                std::vector<std::pair<float, int>> blockScores;
+                blockScores.reserve(completeKeyBlocks);
+                for (int taskIndex = start; taskIndex < end; taskIndex++) {
+                    // Pair early cheap rows with late expensive rows so every
+                    // worker receives a similar number of scored blocks.
+                    const int queryIndex = (taskIndex & 1) == 0
+                        ? taskIndex / 2
+                        : sequence - 1 - taskIndex / 2;
+                    const int visibleTokens = previousLength + queryIndex + 1;
+                    const int completeBlocks = visibleTokens /
+                                               this->indexerCompressRatio;
+                    float *maskRow = maskValues.data() +
+                                     (size_t)queryIndex * keyLength;
+                    if (completeBlocks <= blockTopK) {
+                        std::fill(maskRow, maskRow + visibleTokens, 0.0f);
+                        continue;
+                    }
+
+                    blockScores.clear();
+                    for (int block = 0; block < completeBlocks; block++) {
+                        const float *blockKey = blockKeys.data() +
+                            (size_t)block * this->indexerHeadDim;
+                        float score = 0.0f;
+                        for (int head = 0; head < this->indexerHeads; head++) {
+                            const float *headQuery = queryValues +
+                                ((size_t)queryIndex * this->indexerHeads + head) *
+                                    this->indexerHeadDim;
+                            float headScore = 0.0f;
+                            for (int column = 0;
+                                 column < this->indexerHeadDim; column++) {
+                                headScore += headQuery[column] * blockKey[column];
+                            }
+                            score += std::max(headScore, 0.0f);
+                        }
+                        blockScores.push_back(
+                            {score * inverseSqrtIndex, block});
+                    }
+
+                    std::partial_sort(
+                        blockScores.begin(),
+                        blockScores.begin() + blockTopK,
+                        blockScores.end(),
+                        [](const std::pair<float, int> &left,
+                           const std::pair<float, int> &right) {
+                            if (left.first != right.first) {
+                                return left.first > right.first;
+                            }
+                            return left.second < right.second;
+                        });
+                    for (int rank = 0; rank < blockTopK; rank++) {
+                        const int tokenStart =
+                            blockScores[rank].second *
+                            this->indexerCompressRatio;
+                        std::fill(maskRow + tokenStart,
+                                  maskRow + tokenStart +
+                                      this->indexerCompressRatio,
+                                  0.0f);
+                    }
+                    std::fill(maskRow +
+                                  completeBlocks * this->indexerCompressRatio,
+                              maskRow + visibleTokens, 0.0f);
+                }
+            });
+
+            qsaMask.CopyFrom(Data(
+                DataType::FLOAT32, {batch, sequence, keyLength}, maskValues));
+            return;
+        }
+
         std::vector<int> visibleIndices;
         std::vector<float> pooled(this->indexerHeadDim);
         std::vector<float> rotated(this->indexerHeadDim);
@@ -1501,6 +1700,10 @@ namespace fastllm {
                                                const Data &data) const {
         const char *directory = std::getenv("FASTLLM_QWEN4_DUMP_DIR");
         if (directory == nullptr || directory[0] == '\0') {
+            return;
+        }
+        const char *only = std::getenv("FASTLLM_QWEN4_DUMP_ONLY");
+        if (only != nullptr && only[0] != '\0' && name != only) {
             return;
         }
         Data cpu;
