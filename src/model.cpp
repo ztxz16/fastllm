@@ -27,6 +27,7 @@
 #include "qwen3_moe.h"
 #include "hy_v3.h"
 #include "qwen3_next.h"
+#include "qwen4_exp.h"
 #include "kimi_k3.h"
 #include "qwen3_5.h"
 #include "step3p5.h"
@@ -758,6 +759,8 @@ namespace fastllm {
             model = (basellm*)(new MinimaxM2Model());
         } else if (modelType == "qwen3_next") {
             model = (basellm*)(new Qwen3NextModel());
+        } else if (modelType == "qwen4_exp" || modelType == "qwen4_exp_text") {
+            model = (basellm*)(new Qwen4ExpModel());
         } else if (modelType == "kimi_k3") {
             model = (basellm*)(new KimiK3Model());
         } else if (modelType == "glm_moe_dsa") {
@@ -1381,6 +1384,8 @@ namespace fastllm {
                 unitSize = 4;
             } else if (dstType == DataType::FLOAT16 || dstType == DataType::BFLOAT16) {
                 unitSize = 2;
+            } else if (dstType == DataType::FP8_E4M3) {
+                unitSize = 1;
             } else if (dstType == DataType::INT32 || dstType == DataType::INT32PARAM) {
                 unitSize = 4;
             } else {

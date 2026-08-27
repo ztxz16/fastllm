@@ -3569,6 +3569,7 @@ namespace fastllm {
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next" ||
+                            this->model_struct == "qwen4_exp" ||
                             this->model_struct == "gemma4",
                             this->model_struct + " doesn't support float16");
         } else if (dataType == DataType::BFLOAT16) {
@@ -3587,6 +3588,7 @@ namespace fastllm {
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next" ||
+                            this->model_struct == "qwen4_exp" ||
                             this->model_struct == "kimi_k3" ||
                             this->model_struct == "gemma4",
                             this->model_struct + " doesn't support bfloat16");

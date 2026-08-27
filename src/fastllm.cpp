@@ -1402,15 +1402,21 @@ namespace fastllm {
             } else if (dataType == DataType::FP8_E4M3 || dataType == DataType::NVFP4) {
                 this->blockK = blockK;
                 this->blockM = blockM;
-                int rows = 1;
-                for (int i = 0; i + 1 < (int)this->dims.size(); i++) {
-                    rows *= this->dims[i];
+                // Some non-linear checkpoint tensors (for example Qwen4-Exp's
+                // sharded PLE lookup table) intentionally keep raw E4M3 bytes
+                // and apply one external scalar after gathering.  They have no
+                // block-scale metadata and must remain valid Data objects.
+                if (!(dataType == DataType::FP8_E4M3 && oriScales == nullptr)) {
+                    int rows = 1;
+                    for (int i = 0; i + 1 < (int)this->dims.size(); i++) {
+                        rows *= this->dims[i];
+                    }
+                    int cols = this->dims.back();
+                    int ks = (rows - 1) / this->blockK + 1;
+                    int ms = (cols - 1) / this->blockM + 1;
+                    data.scales.resize(ks * ms);
+                    memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
                 }
-                int cols = this->dims.back();
-                int ks = (rows - 1) / this->blockK + 1;
-                int ms = (cols - 1) / this->blockM + 1;
-                data.scales.resize(ks * ms);
-                memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
             }
         } else if (oriDataType == DataType::BFLOAT16
                 && dataType == DataType::FLOAT16) {
