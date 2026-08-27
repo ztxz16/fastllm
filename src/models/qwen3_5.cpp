@@ -8057,9 +8057,9 @@ namespace fastllm {
         if (reserveDFlashWeights && !devices.empty()) {
             // DFlash is materialized after target-model auto warmup. Account
             // for its weights before the remaining memory is assigned to the
-            // paged target KV cache. Backbone TP stages each source on the root
-            // and leaves one shard on every rank, so non-root ranks need the
-            // persistent gate/up and paired down-projection budgets as well.
+            // paged target KV cache. TP weights are copied directly from their
+            // CPU/mmap source into the persistent per-rank shards, then BF16
+            // shards are converted to FP16 in place on pre-Ampere GPUs.
             const bool useDFlashTp =
                 Qwen35DFlashBackboneTpEnabledFor(devices, ratios);
             std::set<std::string> pairedDownWeightNames;
@@ -8079,7 +8079,7 @@ namespace fastllm {
                     }
                 }
             }
-            long long largestRootShard = 0;
+            long long largestFallbackSource = 0;
             long long ratioSum = 0;
             for (int tpDevice : devices) {
                 auto ratioIt = ratios.find(tpDevice);
@@ -8101,26 +8101,26 @@ namespace fastllm {
                 const bool sharded = useDFlashTp &&
                     (Qwen35DFlashTpLinearEligible(item.first, item.second) ||
                      pairedDownWeightNames.count(item.first) != 0);
-                if (deviceId == devices.front()) {
-                    // Keep the original full-weight allowance because the
-                    // source exists until SplitMultiCudaWeight has copied the
-                    // local shard. Add the largest simultaneous root shard as
-                    // the peak staging margin.
-                    reserveBytes += bytes;
-                    if (sharded) {
-                        long long localBytes =
-                            (bytes * localRatio + ratioSum - 1) / ratioSum;
-                        largestRootShard = std::max(
-                            largestRootShard, localBytes + (1LL << 20));
-                    }
-                } else if (sharded) {
+                if (sharded) {
                     reserveBytes +=
                         (bytes * localRatio + ratioSum - 1) / ratioSum +
                         (1LL << 20);
+                    if (deviceId == devices.front() &&
+                        item.second.cpuData == nullptr &&
+                        !item.second.multiDeviceData) {
+                        // Nonstandard loaders may not retain a host source. In
+                        // that case SplitMultiCudaWeight stages one full tensor
+                        // on the root, but deferred preparation still limits
+                        // the extra peak to the largest individual source.
+                        largestFallbackSource = std::max(
+                            largestFallbackSource, bytes);
+                    }
+                } else if (deviceId == devices.front()) {
+                    reserveBytes += bytes;
                 }
             }
             if (deviceId == devices.front()) {
-                reserveBytes += largestRootShard;
+                reserveBytes += largestFallbackSource;
                 const int rotaryPositions = std::min(max_positions, 4096);
                 reserveBytes += (long long)rotaryPositions * dflashHeadDim *
                                 2LL * (long long)sizeof(float);
@@ -23143,6 +23143,32 @@ namespace fastllm {
             PrepareDFlashBackboneTensorParallelWeights(device);
             return;
         }
+        std::set<std::string> deferredTpLinearWeights;
+        std::vector<int> tpDevices;
+        std::map<int, int> tpRatios;
+        if (GetQwen35GPUForwardDevices(
+                this->deviceMap, tpDevices, tpRatios) &&
+            !tpDevices.empty() && tpDevices.front() == device &&
+            Qwen35DFlashBackboneTpEnabledFor(tpDevices, tpRatios)) {
+            for (const auto &item : weight.weight) {
+                if (!Qwen35DFlashTpLinearEligible(
+                        item.first, item.second)) {
+                    continue;
+                }
+                deferredTpLinearWeights.insert(item.first);
+                if (!Qwen35DFlashTpPairedMlpRequested()) {
+                    continue;
+                }
+                const std::string downName =
+                    Qwen35DFlashTpDownWeightName(item.first);
+                auto downIt = weight.weight.find(downName);
+                if (downIt != weight.weight.end() &&
+                    Qwen35DFlashTpPairedMlpEligible(
+                        item.second, downIt->second)) {
+                    deferredTpLinearWeights.insert(downName);
+                }
+            }
+        }
         auto move = [&](const std::string &name) {
             auto it = weight.weight.find(name);
             if (it != weight.weight.end() && !it->second.dims.empty()) {
@@ -23155,6 +23181,12 @@ namespace fastllm {
         auto moveLinear = [&](const std::string &name) {
             auto it = weight.weight.find(name);
             if (it == weight.weight.end() || it->second.dims.empty()) {
+                return;
+            }
+            // TP-owned MLP weights are split directly from their CPU/mmap
+            // source. Moving all ten full tensors here makes GPU 0 retain a
+            // roughly 2.5 GiB allocator high-water mark even after splitting.
+            if (deferredTpLinearWeights.count(name) != 0) {
                 return;
             }
             it->second.ToDevice(DataDevice::CUDA, {device}, true);
@@ -23326,8 +23358,37 @@ namespace fastllm {
         int shardedWeights = 0;
         int pairedMlps = 0;
         int outputGatherWeights = 0;
+        int convertedTpWeights = 0;
         uint64_t shardedBytes = 0;
         std::set<std::string> pairedGateupNames;
+        const bool useFp16LinearWeights =
+            Qwen35DFlashFp16LinearWeightsEnabledFor(device);
+        auto convertTpShardsToFp16 = [&](Data &linearWeight) {
+            if (!useFp16LinearWeights ||
+                linearWeight.dataType != DataType::BFLOAT16) {
+                return;
+            }
+            AssertInFastLLM(
+                Qwen35DFlashHasTpShards(linearWeight, devices),
+                "DFlash FP16 TP conversion requires complete shards for " +
+                    linearWeight.name + ".\n");
+            for (int tpDevice : devices) {
+                Data *local = linearWeight.multiDeviceDatas.at(tpDevice);
+                AssertInFastLLM(
+                    local != nullptr &&
+                        local->dataType == DataType::BFLOAT16,
+                    "DFlash FP16 TP conversion found an invalid local "
+                    "shard for " + linearWeight.name + ".\n");
+                FastllmCudaSetDevice(tpDevice);
+                ToDataType(*local, DataType::FLOAT16);
+            }
+            // SplitMultiCudaWeight keeps the parent as logical metadata. Its
+            // CPU mapping may still contain BF16 bytes, but all runtime reads
+            // use the distributed local tensors after this point.
+            linearWeight.dataType = DataType::FLOAT16;
+            linearWeight.UpdateUnitSize();
+            convertedTpWeights++;
+        };
 
         if (Qwen35DFlashTpPairedMlpRequested()) {
             for (auto &item : weight.weight) {
@@ -23379,6 +23440,8 @@ namespace fastllm {
                         "DFlash paired MLP TP failed to split " +
                             downName + ".\n");
                 }
+                convertTpShardsToFp16(gateup);
+                convertTpShardsToFp16(down);
                 pairedGateupNames.insert(item.first);
                 pairedMlps++;
                 shardedWeights += 2;
@@ -23409,6 +23472,7 @@ namespace fastllm {
                         true, true),
                     "DFlash TP failed to split " + item.first + ".\n");
             }
+            convertTpShardsToFp16(linearWeight);
             shardedWeights++;
             outputGatherWeights++;
             shardedBytes += linearWeight.GetBytes();
@@ -23430,6 +23494,12 @@ namespace fastllm {
             devices.size(),
             (unsigned long long)(
                 Qwen35DFlashTpMinWeightBytes() / 1048576ULL));
+        if (convertedTpWeights > 0) {
+            std::printf(
+                "[Qwen3.5 DFlash2] converted %d sharded BF16 linear "
+                "weights to FP16 after TP split.\n",
+                convertedTpWeights);
+        }
         std::fflush(stdout);
         if (previousDevice >= 0) {
             FastllmCudaSetDevice(previousDevice);
@@ -23574,7 +23644,31 @@ namespace fastllm {
             Qwen35DFlashCacheAllocationUnit(
                 dflashSlidingWindow, dflashCheckpointBlockSize);
 
+        Data &projectionWeight = weight["dflash.fc.weight"];
+        const bool useFp16ProjectionInput =
+            projectionWeight.dataType == DataType::FLOAT16 &&
+            tokens > dflashCheckpointBlockSize;
+        const DataType projectionInputType =
+            useFp16ProjectionInput ?
+                DataType::FLOAT16 : DataType::BFLOAT16;
         Data combined;
+        ::fastllm::Qwen3CudaPrepareLocalOutput(combined, device);
+        combined.dataType = projectionInputType;
+        combined.UpdateUnitSize();
+        const int combinedWidth = embed_dim *
+            (int)speculativeDFlashHiddenStates.size();
+        combined.Resize({1, tokens, combinedWidth});
+        combined.Allocate(false);
+        // Fill one final-width allocation directly. This replaces the old Cat
+        // + Copy growth pattern, which retained two buffers at every
+        // intermediate width and inflated a 2048-token root-GPU high-water
+        // mark.
+        const size_t elementBytes =
+            combined.unitSize / combined.unitSizeDiv;
+        const size_t featureRowBytes =
+            (size_t)embed_dim * elementBytes;
+        const size_t combinedRowBytes =
+            (size_t)combinedWidth * elementBytes;
         for (int feature = 0;
              feature < (int)speculativeDFlashHiddenStates.size(); feature++) {
             Data &captured = speculativeDFlashHiddenStates[feature];
@@ -23584,36 +23678,52 @@ namespace fastllm {
                                 captured.dims[2] == embed_dim,
                             "DFlash captured target hidden shape is invalid.\n");
             Data selected;
-            if (captured.dims[1] == tokens) {
-                Copy(captured, selected);
-            } else {
+            Data *selectedInput = &captured;
+            if (captured.dims[1] != tokens) {
                 Split(captured, 1, 0, tokens, selected);
+                selectedInput = &selected;
             }
-            if (selected.dataType != DataType::BFLOAT16) {
-                ToDataType(selected, DataType::BFLOAT16);
+            if (selectedInput->dataType != projectionInputType) {
+                // Captures are dedicated DFlash buffers and are released as
+                // soon as this projection completes. Converting them in place
+                // lets SM70-SM75 feed the FP16 FC directly instead of keeping
+                // another full combined-input conversion buffer alive.
+                ToDataType(*selectedInput, projectionInputType);
             }
-            if (feature == 0) {
-                Copy(selected, combined);
-            } else {
-                Data joined;
-                Cat(combined, selected, -1, joined);
-                Copy(joined, combined);
-            }
+            AssertInFastLLM(
+                selectedInput->dataDevice == DataDevice::CUDA &&
+                    selectedInput->cudaData != nullptr &&
+                    selectedInput->strides.size() == 3 &&
+                    selectedInput->unitSizeDiv == 1 &&
+                    selectedInput->unitSize == (int)elementBytes,
+                "DFlash selected target hidden layout is invalid.\n");
+            FastllmCudaMemcpy2DDeviceToDevice(
+                (uint8_t*)combined.cudaData +
+                    (size_t)feature * featureRowBytes,
+                combinedRowBytes,
+                selectedInput->cudaData,
+                (size_t)selectedInput->strides[1] * elementBytes,
+                featureRowBytes, tokens);
         }
         const int projectionTokens = std::max(8, tokens);
         Data projectionInput;
-        if (projectionTokens == tokens) {
-            Copy(combined, projectionInput);
-        } else {
+        Data *projectionSource = &combined;
+        // The preallocated combined tensor is already contiguous at its final
+        // width. Only the short decode path needs a padded projection input.
+        if (projectionTokens != tokens) {
             Data zeroRow, padding;
             Split(combined, 1, 0, 1, zeroRow);
             Mul(zeroRow, 0.0f, zeroRow);
             Repeat(zeroRow, 1, projectionTokens - tokens, padding);
             Cat(combined, padding, 1, projectionInput);
+            projectionSource = &projectionInput;
         }
         Data projected, projectedContextHidden;
-        Linear(projectionInput, weight["dflash.fc.weight"],
+        Linear(*projectionSource, projectionWeight,
                *GetEmptyData(), projected);
+        if (projected.dataType != DataType::BFLOAT16) {
+            ToDataType(projected, DataType::BFLOAT16);
+        }
         RMSNorm(projected, weight["dflash.hidden_norm.weight"],
                 dflashRmsNormEps, projectedContextHidden);
 
