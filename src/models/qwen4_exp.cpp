@@ -1023,8 +1023,6 @@ namespace fastllm {
         Linear(typedInput, this->weight[linear + "in_proj_b.weight"], Data(), beta);
         Linear(typedInput, this->weight[linear + "in_proj_a.weight"], Data(), alpha);
         ToDataType(qkv, DataType::FLOAT32);
-        ToDataType(beta, DataType::FLOAT32);
-        ToDataType(alpha, DataType::FLOAT32);
 
         qkv.Reshape({batch, sequence, -1});
         PermuteSelf(qkv, {0, 2, 1});
@@ -1086,6 +1084,46 @@ namespace fastllm {
         Silu(currentConvolved, currentConvolved);
         PermuteSelf(currentConvolved, {0, 2, 1});
 
+        if (pastRecurrent.dims.empty()) {
+            pastRecurrent.Resize({batch, this->num_v_heads,
+                                  this->head_k_dim, this->head_v_dim});
+            pastRecurrent.ToDevice(currentConvolved.dataDevice);
+            pastRecurrent.Allocate(0.0f);
+        }
+
+        // Decode is dominated by the many small Q/K normalization, head
+        // repeat, recurrent-state and output-gate launches.  Keep the state in
+        // float32 as required by the checkpoint.  Fuse the state transition,
+        // then reuse the standard output RMSNorm/gate operations so their
+        // established fp16 rounding semantics remain bit-identical.
+        if (sequence == 1) {
+            Data core;
+            fastllm::Qwen4GatedDeltaRuleDecode(
+                currentConvolved, alpha, beta,
+                this->weight[linear + "A_log"],
+                this->weight[linear + "dt_bias"],
+                pastRecurrent, this->num_k_heads, this->num_v_heads,
+                this->head_k_dim, this->head_v_dim,
+                1e-6f, core);
+            ToDataType(core, this->dataType);
+            core.Reshape({-1, this->head_v_dim});
+            z.Reshape({-1, this->head_v_dim});
+            RMSNorm(core, this->weight[linear + "norm.weight"],
+                    this->rms_norm_eps, core);
+            Sigmoid(z, z);
+            Qwen4CastLike(z, core);
+            MulTo(core, z);
+            core.Reshape({batch, sequence,
+                          this->num_v_heads * this->head_v_dim});
+            Linear(core,
+                   this->weight[linear + "out_proj.weight"],
+                   Data(), output);
+            return;
+        }
+
+        ToDataType(beta, DataType::FLOAT32);
+        ToDataType(alpha, DataType::FLOAT32);
+
         const int keyDimension = this->num_k_heads * this->head_k_dim;
         const int valueDimension = this->num_v_heads * this->head_v_dim;
         Data query, key, value;
@@ -1135,13 +1173,6 @@ namespace fastllm {
         PermuteSelf(beta, {0, 2, 1});
         PermuteSelf(decay, {0, 2, 1});
         Mul(query, inverseHead, query);
-
-        if (pastRecurrent.dims.empty()) {
-            pastRecurrent.Resize({batch, this->num_v_heads,
-                                  this->head_k_dim, this->head_v_dim});
-            pastRecurrent.ToDevice(query.dataDevice);
-            pastRecurrent.Allocate(0.0f);
-        }
 
         // RecurrentGatedDeltaRule is the exact reference recurrence.  Applying
         // it token-by-token also handles chunked prefills with an existing
