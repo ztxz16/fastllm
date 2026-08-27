@@ -4127,12 +4127,12 @@ namespace fastllm {
         }, {}, {{"groups", groups}});
     }
 
-    void Qwen4GatedDeltaRuleDecode(
+    void GatedDeltaRuleDecode(
             const Data &qkv, const Data &alpha, const Data &beta,
             const Data &aLog, const Data &dtBias,
             Data &state, int keyHeads, int valueHeads,
             int keyDim, int valueDim, float recurrentEps, Data &output) {
-        curExecutor->Run("Qwen4GatedDeltaRuleDecode", {
+        curExecutor->Run("GatedDeltaRuleDecode", {
                 {"input", (Data*)&qkv},
                 {"alpha", (Data*)&alpha}, {"beta", (Data*)&beta},
                 {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
@@ -4140,6 +4140,16 @@ namespace fastllm {
         }, {{"recurrentEps", recurrentEps}},
         {{"keyHeads", keyHeads}, {"valueHeads", valueHeads},
          {"keyDim", keyDim}, {"valueDim", valueDim}});
+    }
+
+    void Qwen4GatedDeltaRuleDecode(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output) {
+        GatedDeltaRuleDecode(qkv, alpha, beta, aLog, dtBias, state,
+                             keyHeads, valueHeads, keyDim, valueDim,
+                             recurrentEps, output);
     }
 
     void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,

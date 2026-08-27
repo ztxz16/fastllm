@@ -953,6 +953,15 @@ namespace fastllm {
 
     void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output);
 
+    // Fused one-token GDN recurrence from packed, convolved Q/K/V and raw
+    // alpha/beta gates.  The state remains float32; CPU and CUDA share this
+    // executor contract, while backends may specialize common head sizes.
+    void GatedDeltaRuleDecode(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output);
+
     // Qwen4-Exp hyper-connection primitives.  Keeping these behind the regular
     // executor lets CPU and CUDA share one model path while avoiding the many
     // Split/Cat/elementwise launches in the operator-composed reference.
@@ -963,6 +972,8 @@ namespace fastllm {
     void Qwen4HyperInject(const Data &logits, int groups, Data &output);
     void Qwen4HyperCombine(const Data &hyperInput, const Data &blockOutput,
                            const Data &injection, int groups, Data &output);
+    // Compatibility alias for callers that used the original model-specific
+    // name before GatedDeltaRuleDecode became a standard operation.
     void Qwen4GatedDeltaRuleDecode(
             const Data &qkv, const Data &alpha, const Data &beta,
             const Data &aLog, const Data &dtBias,
