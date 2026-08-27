@@ -168,6 +168,39 @@ namespace fastllm {
     }
 
 #ifdef USE_CUDA
+    static bool Qwen35DFlashFp16LinearWeightsEnabledFor(int device) {
+        const char *value =
+            std::getenv("FASTLLM_CUDA_DFLASH_FP16_LINEAR_WEIGHTS");
+        if (value != nullptr && value[0] != '\0') {
+            std::string lowered = value;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                           [](unsigned char c) {
+                               return (char)std::tolower(c);
+                           });
+            if (lowered == "force") {
+                return true;
+            }
+            if (lowered == "0" || lowered == "false" ||
+                lowered == "off" || lowered == "no") {
+                return false;
+            }
+        }
+
+        const int previousDevice = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(device);
+        const int arch = FastllmCudaRuntimeArch();
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
+        // Native BF16 starts at SM80. On valid pre-Ampere devices, storing the
+        // linear weights as FP16 selects the existing mixed GEMM path instead
+        // of the slow BF16 fallback. SM70-SM75 can use FP16 Tensor Cores for
+        // the eight-token DFlash GEMM; older devices use the non-Tensor FP16
+        // path, whose throughput remains device-dependent. Keep Ampere+
+        // weights in BF16 by default.
+        return arch > 0 && arch <= 75;
+    }
+
     static bool Qwen35DFlashTpValidatedTopology(
             const std::vector<int> &devices,
             const std::map<int, int> &ratios) {
@@ -22721,14 +22754,29 @@ namespace fastllm {
                 it->second.ToDevice(DataDevice::CUDA, {device}, true);
             }
         };
-        move("dflash.fc.weight");
+        const bool useFp16LinearWeights =
+            Qwen35DFlashFp16LinearWeightsEnabledFor(device);
+        int convertedLinearWeights = 0;
+        auto moveLinear = [&](const std::string &name) {
+            auto it = weight.weight.find(name);
+            if (it == weight.weight.end() || it->second.dims.empty()) {
+                return;
+            }
+            it->second.ToDevice(DataDevice::CUDA, {device}, true);
+            if (useFp16LinearWeights &&
+                it->second.dataType == DataType::BFLOAT16) {
+                ToDataType(it->second, DataType::FLOAT16);
+                convertedLinearWeights++;
+            }
+        };
+        moveLinear("dflash.fc.weight");
         move("dflash.hidden_norm.weight");
         move("dflash.norm.weight");
-        move("dflash.candidate_selector.hidden_projection.weight");
+        moveLinear("dflash.candidate_selector.hidden_projection.weight");
         auto fusedKvQkvIt = weight.weight.find(
             "dflash.fused_kv_qkv.weight");
         if (fusedKvQkvIt != weight.weight.end()) {
-            move("dflash.fused_kv_qkv.weight");
+            moveLinear("dflash.fused_kv_qkv.weight");
             Data &fusedWeight = fusedKvQkvIt->second;
             const int qRows = dflashHeads * dflashHeadDim;
             const int kvRows = dflashKvHeads * dflashHeadDim;
@@ -22770,31 +22818,41 @@ namespace fastllm {
             for (const std::string &suffix : {
                      "input_layernorm.weight",
                      "post_attention_layernorm.weight",
-                     "self_attn.o_proj.weight",
                      "self_attn.q_norm.weight",
                      "self_attn.k_norm.weight",
-                     "mlp.down_proj.weight",
                      "attention_conv.base_kernel",
-                     "attention_conv.kernel_projection.weight",
-                     "mlp_conv.base_kernel",
-                     "mlp_conv.kernel_projection.weight"}) {
+                     "mlp_conv.base_kernel"}) {
                 move(prefix + suffix);
+            }
+            for (const std::string &suffix : {
+                     "self_attn.o_proj.weight",
+                     "mlp.down_proj.weight",
+                     "attention_conv.kernel_projection.weight",
+                     "mlp_conv.kernel_projection.weight"}) {
+                moveLinear(prefix + suffix);
             }
             if (weight.weight.find(prefix + "self_attn.mergeqkv.weight") !=
                 weight.weight.end()) {
-                move(prefix + "self_attn.mergeqkv.weight");
+                moveLinear(prefix + "self_attn.mergeqkv.weight");
             } else {
-                move(prefix + "self_attn.q_proj.weight");
-                move(prefix + "self_attn.k_proj.weight");
-                move(prefix + "self_attn.v_proj.weight");
+                moveLinear(prefix + "self_attn.q_proj.weight");
+                moveLinear(prefix + "self_attn.k_proj.weight");
+                moveLinear(prefix + "self_attn.v_proj.weight");
             }
             if (weight.weight.find(prefix + "mlp.gateup_proj.weight") !=
                 weight.weight.end()) {
-                move(prefix + "mlp.gateup_proj.weight");
+                moveLinear(prefix + "mlp.gateup_proj.weight");
             } else {
-                move(prefix + "mlp.gate_proj.weight");
-                move(prefix + "mlp.up_proj.weight");
+                moveLinear(prefix + "mlp.gate_proj.weight");
+                moveLinear(prefix + "mlp.up_proj.weight");
             }
+        }
+        if (convertedLinearWeights > 0) {
+            std::printf(
+                "[Qwen3.5 DFlash2] converted %d BF16 linear weights to "
+                "FP16 for the pre-Ampere mixed GEMM path.\n",
+                convertedLinearWeights);
+            std::fflush(stdout);
         }
         if (fusedKvQkvIt != weight.weight.end() &&
             Qwen35EnvDefaultEnabled(
