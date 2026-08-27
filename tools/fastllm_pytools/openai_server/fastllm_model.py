@@ -14,7 +14,8 @@ class FastLLmModel:
         )
         is_kimi_k3 = self._is_kimi_k3(model)
         is_qwen3_5 = self._is_qwen3_5(model)
-        if is_kimi_k3:
+        is_glm5_next = self._is_glm5_next(model)
+        if is_kimi_k3 or is_glm5_next:
             reasoning_efforts = ["low", "high", "max"]
             default_reasoning_effort = "max"
         elif is_qwen3_5:
@@ -235,4 +236,33 @@ class FastLLmModel:
             }
             or model_type in qwen3_5_types
             or text_model_type in qwen3_5_types
+        )
+
+    @staticmethod
+    def _is_glm5_next(model):
+        detector = getattr(model, "_is_glm5_next", None)
+        if callable(detector):
+            try:
+                return bool(detector())
+            except Exception:
+                pass
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                if get_type() in {"glm5_next", "glm5_next_text"}:
+                    return True
+            except Exception:
+                pass
+        config = getattr(model, "config", None)
+        if not isinstance(config, dict):
+            return False
+        architectures = config.get("architectures") or []
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type", "")
+            if isinstance(text_config, dict) else "")
+        return (
+            "Glm5NextForConditionalGeneration" in architectures
+            or config.get("model_type") == "glm5_next"
+            or text_model_type == "glm5_next_text"
         )

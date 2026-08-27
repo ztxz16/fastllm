@@ -270,6 +270,24 @@ class FastLLmCompletion:
   def _is_kimi_k3_reasoning_response(self, enable_thinking: bool) -> bool:
       return enable_thinking and self._is_kimi_k3_model()
 
+  def _is_glm5_next_model(self) -> bool:
+      detector = getattr(self.model, "_is_glm5_next", None)
+      if callable(detector):
+          try:
+              return bool(detector())
+          except Exception:
+              pass
+      try:
+          return self.model.get_type() in {"glm5_next", "glm5_next_text"}
+      except Exception:
+          return False
+
+  def _is_glm5_next_reasoning_response(self) -> bool:
+      # The official GLM-5.3 template always ends the generation prompt inside
+      # <think>; enable_thinking is not a template switch for this model.
+      return (self._is_glm5_next_model()
+              and not getattr(self.model, "force_chat_template", False))
+
   def _is_qwen3_5_model(self) -> bool:
       qwen3_5_types = {
           "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
@@ -307,6 +325,7 @@ class FastLLmCompletion:
       return (self._is_deepseek_v4_reasoning_response(enable_thinking)
               or self._is_poolside_reasoning_response(enable_thinking)
               or self._is_kimi_k3_reasoning_response(enable_thinking)
+              or self._is_glm5_next_reasoning_response()
               or self._is_qwen3_5_reasoning_response(enable_thinking))
 
   def _resolve_kimi_k3_reasoning_effort(
@@ -343,19 +362,40 @@ class FastLLmCompletion:
               "Qwen3.5 reasoning_effort must be one of: low, medium, xhigh")
       return effort
 
+  def _resolve_glm5_next_reasoning_effort(
+      self, request: ChatCompletionRequest
+  ) -> Optional[str]:
+      if not self._is_glm5_next_model():
+          return None
+      effort = request.reasoning_effort
+      template_kwargs = request.chat_template_kwargs or {}
+      if effort is None:
+          effort = template_kwargs.get(
+              "reasoning_effort", template_kwargs.get("thinking_effort"))
+      if effort is None:
+          effort = "max"
+      if effort not in {"low", "high", "max"}:
+          raise ValueError(
+              "GLM-5.3 reasoning_effort must be one of: low, high, max")
+      return effort
+
   def _resolve_chat_template_kwargs(
       self,
       request: ChatCompletionRequest,
       qwen3_5_reasoning_effort: Optional[str],
+      glm5_next_reasoning_effort: Optional[str] = None,
   ) -> Optional[Dict[str, Any]]:
       if (request.chat_template_kwargs is None
-              and qwen3_5_reasoning_effort is None):
+              and qwen3_5_reasoning_effort is None
+              and glm5_next_reasoning_effort is None):
           return None
       template_kwargs = dict(request.chat_template_kwargs or {})
       if qwen3_5_reasoning_effort is not None:
           # Qwen3.5's native template names this variable reasoning_effort;
           # thinking_effort is retained as a request-side compatibility alias.
           template_kwargs["reasoning_effort"] = qwen3_5_reasoning_effort
+      if glm5_next_reasoning_effort is not None:
+          template_kwargs["reasoning_effort"] = glm5_next_reasoning_effort
       return template_kwargs
 
   def _serialize_tool_choice(self, tool_choice: Any) -> Any:
@@ -588,6 +628,22 @@ class FastLLmCompletion:
       if think_end_idx < 0:
           # The Qwen3.5 generation prompt ends inside <think>. A truncated
           # generation without </think> therefore contains reasoning only.
+          return "", result or None
+      reasoning_content = result[:think_end_idx]
+      content = result[think_end_idx + len(think_end):]
+      return content, reasoning_content or None
+
+  def _split_glm5_next_reasoning(
+      self,
+      result: str,
+      emit_reasoning_content: bool,
+  ) -> Tuple[str, Optional[str]]:
+      if not emit_reasoning_content:
+          return result, None
+      result = self._strip_optional_think_start(result)
+      think_end = "</think>"
+      think_end_idx = result.find(think_end)
+      if think_end_idx < 0:
           return "", result or None
       reasoning_content = result[:think_end_idx]
       content = result[think_end_idx + len(think_end):]
@@ -1311,6 +1367,9 @@ class FastLLmCompletion:
       force_type = getattr(self.model, "tool_call_parser", "auto")
       model_type = self.model.get_type()
       tool_parser_name = force_type if force_type != "auto" else model_type
+      if (force_type == "auto"
+              and model_type in {"glm5_next", "glm5_next_text"}):
+          tool_parser_name = "glm47"
       return FunctionCallParser.build_constraint_descriptor_from_request(
           request,
           tool_parser_name = tool_parser_name,
@@ -2740,11 +2799,14 @@ class FastLLmCompletion:
           thinking_effort = self._resolve_kimi_k3_reasoning_effort(request)
           qwen3_5_reasoning_effort = (
               self._resolve_qwen3_5_reasoning_effort(request))
+          glm5_next_reasoning_effort = (
+              self._resolve_glm5_next_reasoning_effort(request))
       except ValueError as error:
           self._cleanup_temp_paths(media.temp_paths)
           return self.create_error_response(str(error))
       chat_template_kwargs = self._resolve_chat_template_kwargs(
-          request, qwen3_5_reasoning_effort)
+          request, qwen3_5_reasoning_effort,
+          glm5_next_reasoning_effort)
       tool_choice = self._serialize_tool_choice(request.tool_choice)
 
       #logging.info(request)
@@ -2910,6 +2972,9 @@ class FastLLmCompletion:
                   result = self._strip_kimi_k3_response_wrapper(result)
       elif self._is_qwen3_5_model():
           result, reasoning_content = self._split_qwen3_5_reasoning(
+              result, emit_reasoning_content)
+      elif self._is_glm5_next_model():
+          result, reasoning_content = self._split_glm5_next_reasoning(
               result, emit_reasoning_content)
       else:
           result, reasoning_content = self._split_deepseek_v4_reasoning(

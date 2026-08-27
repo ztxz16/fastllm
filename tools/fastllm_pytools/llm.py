@@ -1423,6 +1423,24 @@ class model:
         except Exception:
             return False
 
+    def _is_glm5_next(self) -> bool:
+        if self._get_architecture() == "Glm5NextForConditionalGeneration":
+            return True
+        try:
+            config = (
+                self.config
+                if isinstance(getattr(self, "config", None), dict) else {})
+            text_config = config.get("text_config")
+            text_model_type = (
+                text_config.get("model_type", "")
+                if isinstance(text_config, dict) else "")
+            return (
+                str(config.get("model_type", "")) == "glm5_next"
+                or str(text_model_type) == "glm5_next_text"
+            )
+        except Exception:
+            return False
+
     def _has_hf_chat_template(self) -> bool:
         if self.hf_tokenizer is None:
             return False
@@ -1617,8 +1635,8 @@ class model:
             for i in range(len(conversation)):
                 if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
-        elif (model_struct == "dots3_note"):
-            # The Dots chat template iterates over argument objects, while the
+        elif model_struct in ("dots3_note", "glm5_next"):
+            # These chat templates iterate over argument objects, while the
             # OpenAI wire protocol stores function.arguments as a JSON string.
             # Normalize assistant tool-call history before rendering so a
             # tool-result round trip can be fed back into the model.
@@ -1640,13 +1658,13 @@ class model:
                                          if arguments.strip() else {})
                         except json.JSONDecodeError as error:
                             raise ValueError(
-                                "Dots3-Note tool-call history contains "
+                                f"{model_struct} tool-call history contains "
                                 "invalid JSON arguments") from error
                     elif arguments is None:
                         arguments = {}
                     if not isinstance(arguments, dict):
                         raise ValueError(
-                            "Dots3-Note tool-call arguments must decode to "
+                            f"{model_struct} tool-call arguments must decode to "
                             "a JSON object")
                     function["arguments"] = arguments
         return conversation

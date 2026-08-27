@@ -108,6 +108,20 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         self.assertEqual(model["default_reasoning_effort"], "xhigh")
         self.assertEqual(model["defaultReasoningEffort"], "xhigh")
 
+    def test_glm5_next_reasoning_efforts_are_discoverable(self):
+        metadata = FastLLmModel(
+            "glm-5.3-flash",
+            _FakeModel(2048, 2048, model_type = "glm5_next"),
+        )
+
+        model = metadata.response["data"][0]
+        self.assertEqual(
+            model["supported_reasoning_efforts"], ["low", "high", "max"])
+        self.assertEqual(model["supportedReasoningEfforts"],
+                         ["low", "high", "max"])
+        self.assertEqual(model["default_reasoning_effort"], "max")
+        self.assertEqual(model["defaultReasoningEffort"], "max")
+
 
 class ServerContextArgumentTest(unittest.TestCase):
     def test_hyphenated_alias_is_parsed(self):

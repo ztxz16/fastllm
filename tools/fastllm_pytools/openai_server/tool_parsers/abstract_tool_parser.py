@@ -269,7 +269,7 @@ class ToolParserManager:
                 target = 'qwen3_coder'
             else:
                 target = 'hermes'
-        elif model_type == 'glm_moe_dsa':
+        elif model_type in ('glm_moe_dsa', 'glm5_next', 'glm5_next_text'):
             target = 'glm47'
         elif model_type == 'glm4_moe':
             target = 'glm45'
