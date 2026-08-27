@@ -981,9 +981,17 @@ namespace fastllm {
         this->forceGGUFFp32Dequant = ori.forceGGUFFp32Dequant;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
+        bool hasStorage = false;
+        if (this->dataDevice == DataDevice::CPU) {
+            hasStorage = this->cpuData != nullptr;
+        } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            hasStorage = this->cudaData != nullptr;
+#endif
+        }
         if (needRebuildGGUFTensor ||
             ori.expansionDims != this->expansionDims || ori.dims != this->dims ||
-            this->cpuData == nullptr || ori.dataType != this->dataType) {
+            !hasStorage || ori.dataType != this->dataType) {
             if (ori.dims.size() == 0) {
                 this->dataType = ori.dataType;
                 this->UpdateUnitSize();
@@ -1008,12 +1016,12 @@ namespace fastllm {
             if (ori.expansionDims.size() > 0 && ori.expansionDims != ori.dims) {
                 this->Expansion(ori.expansionDims);
                 this->Resize(ori.dims);
-                this->Allocate();
+                this->Allocate(false);
             } else {
                 this->expansionDims.clear();
                 this->Resize(ori.dims);
                 this->FreeSpace();
-                this->MallocSpace(Count(0));
+                this->MallocSpace(Count(0), false);
             }
         }
 

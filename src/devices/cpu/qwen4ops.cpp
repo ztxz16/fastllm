@@ -133,7 +133,7 @@ namespace fastllm {
         Qwen4AssertCpuTensor(weight, "Qwen4GroupedRMSNorm weight");
         AssertInFastLLM(weight.Count(0) == (uint64_t)input.dims.back(),
                         "Qwen4GroupedRMSNorm weight shape mismatch.\n");
-        output.Allocate();
+        output.Allocate(false);
 
         const int channels = input.dims.back();
         const int groupChannels = channels / groups;
@@ -191,7 +191,7 @@ namespace fastllm {
         const int groups = Qwen4Groups(intParams);
         Qwen4AssertCpuTensor(normalized, "Qwen4HyperMix input");
         Qwen4AssertCpuTensor(mixLogits, "Qwen4HyperMix logits");
-        output.Allocate();
+        output.Allocate(false);
 
         const int channels = normalized.dims.back();
         const int outputChannels = channels / groups;
@@ -235,7 +235,7 @@ namespace fastllm {
         AssertInFastLLM(groups > 0 && !input.dims.empty() &&
                         input.dims.back() == groups,
                         "Qwen4HyperInject received an invalid shape.\n");
-        output.Allocate();
+        output.Allocate(false);
         const DataType type = input.dataType;
         const int count = (int)input.Count(0);
         Qwen4ParallelFor(count, [&](int start, int end) {
@@ -274,7 +274,7 @@ namespace fastllm {
                             (uint64_t)rows * blockChannels &&
                         injection.Count(0) == (uint64_t)rows * groups,
                         "Qwen4HyperCombine shape mismatch.\n");
-        output.Allocate();
+        output.Allocate(false);
         const DataType type = hyperInput.dataType;
         Qwen4ParallelFor(rows, [&](int start, int end) {
             for (int row = start; row < end; row++) {
@@ -359,7 +359,7 @@ namespace fastllm {
                         state.dims == std::vector<int>({batch, valueHeads,
                                                        keyDim, valueDim}),
                         "Qwen4GatedDeltaRuleDecode shape mismatch.\n");
-        output.Allocate();
+        output.Allocate(false);
 
         const float *qkvData = (const float*)qkv.cpuData;
         const float *aLogData = (const float*)aLog.cpuData;

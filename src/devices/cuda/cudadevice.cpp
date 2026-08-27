@@ -4410,7 +4410,7 @@ namespace fastllm {
     }
 
     void DoCudaAttention(Data &q, Data &k, Data &v, Data &mask, Data &output, int group, float scale, int maskType) {
-        output.Allocate();
+        output.Allocate(false);
         if (q.dataType == DataType::FLOAT32) {
             FastllmCudaAttention(q, k, v, mask, output, group, scale, maskType);
         } else if (q.dataType == DataType::FLOAT16) {
@@ -4419,7 +4419,10 @@ namespace fastllm {
             ToDataType(q, q32, DataType::FLOAT32);
             ToDataType(k, k32, DataType::FLOAT32);
             ToDataType(v, v32, DataType::FLOAT32);
-            ToDataType(output, output32, DataType::FLOAT32);
+            output32.dataType = DataType::FLOAT32;
+            output32.Resize(output.dims);
+            output32.ToDevice(output.dataDevice);
+            output32.Allocate(false);
             if (mask.dims.size() > 0)
                 ToDataType(mask, mask32, DataType::FLOAT32);
             FastllmCudaAttention(q32, k32, v32, mask32, output32, group, scale, maskType);
@@ -5077,7 +5080,7 @@ namespace fastllm {
         int stride = intParams.find("stride")->second;
         int groups = inputChannels;  // 组数等于通道数，实现逐通道卷积
 
-        output.Allocate();
+        output.Allocate(false);
         FastllmCudaConv1DPerChannelFloat32(input, weight, bias, inputChannels, outputChannels, kernelSize, stride, padding, output);
     }
 
@@ -5590,7 +5593,7 @@ namespace fastllm {
     }
 
     void DoCudaSplit(Data &input, int axis, int start, int end, Data &output) {
-        output.Allocate();
+        output.Allocate(false);
 
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
@@ -5628,7 +5631,7 @@ namespace fastllm {
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
 
-        output.Allocate();
+        output.Allocate(false);
 
         int outer = output.Count(0) / output.Count(axis);
         int inputStride = input.Count(axis);
@@ -6061,7 +6064,7 @@ namespace fastllm {
         Data &input1 = *(datas.find("input1")->second);
         Data &output = *(datas.find("output")->second);
 
-        output.Allocate();
+        output.Allocate(false);
 
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         if (input0.dims.size() == 0 && input1.dims.size() > 0) {
@@ -6403,7 +6406,7 @@ namespace fastllm {
     }
 
     void DoCudaSwiglu(Data &input, Data &output) {
-        output.Allocate();
+        output.Allocate(false);
         FastllmCudaSwiglu(input, output);
     }
 
@@ -6647,7 +6650,7 @@ namespace fastllm {
                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        output.Allocate();
+        output.Allocate(false);
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : -1;
         FastllmCudaTopK(input, output, topk);
     }

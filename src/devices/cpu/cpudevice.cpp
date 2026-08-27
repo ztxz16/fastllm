@@ -1189,7 +1189,7 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
-        output.Allocate();
+        output.Allocate(false);
         int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
 
         if (q.dataType == DataType::FLOAT32) {
@@ -5752,7 +5752,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
-        output.Allocate(0.0f);
+        output.Allocate(false);
         int inputChannels = intParams.find("inputChannels")->second;    
         int outputChannels = intParams.find("outputChannels")->second; 
         int kernelSize = intParams.find("kernel")->second;
@@ -6907,7 +6907,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
 
-        output.Allocate();
+        output.Allocate(false);
 
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
@@ -6955,7 +6955,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
 
-        output.Allocate();
+        output.Allocate(false);
 
         int outer = output.Count(0) / output.Count(axis);
         int inputStride = input.Count(axis);
@@ -7073,7 +7073,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input1 = *(datas.find("input1")->second);
         Data &output = *(datas.find("output")->second);
 
-        output.Allocate();
+        output.Allocate(false);
 
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         if (input0.dims.size() == 0 && input1.dims.size() > 0) {
@@ -8272,7 +8272,7 @@ ops += (long long)lines * inputDim * interDim * 2;
     }
 
     void DoCpuSwiglu(Data &input, Data &output) {
-        output.Allocate();
+        output.Allocate(false);
         AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
                         input.dataType == DataType::BFLOAT16,
                         "Swiglu error: Data's type should be float32, float16 or bfloat16.\n");
@@ -8299,7 +8299,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         
-        output.Allocate();
+        output.Allocate(false);
         AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
                         input.dataType == DataType::BFLOAT16,
                         "Swiglu error: Data's type should be float32, float16 or bfloat16.\n");
@@ -9087,7 +9087,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        output.Allocate();
+        output.Allocate(false);
 
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : -1;
         int dimsLen = input.dims.size();
