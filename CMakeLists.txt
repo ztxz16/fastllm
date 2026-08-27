@@ -350,7 +350,8 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/dots3-note-kernels.cu
-        src/devices/cuda/models/deepseekv4-kernels.cu)
+        src/devices/cuda/models/deepseekv4-kernels.cu
+        src/devices/cuda/models/qwen4-kernels.cu)
 
     # FlashInfer's DeepSeek-V4 sparse MLA decode kernel uses SM120-only
     # block-scaled FP8 MMA instructions.  Compile it as a separate fatbin so a

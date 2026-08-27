@@ -344,6 +344,11 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
         this->ops["RMSNormPart"] = (BaseOperator*)(new CpuRMSNormPartOp());
+        this->ops["Qwen4GroupedRMSNorm"] = (BaseOperator*)(new CpuQwen4GroupedRMSNormOp());
+        this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CpuQwen4HyperMixOp());
+        this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CpuQwen4HyperInjectOp());
+        this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CpuQwen4HyperCombineOp());
+        this->ops["Qwen4GatedDeltaRuleDecode"] = (BaseOperator*)(new CpuQwen4GatedDeltaRuleDecodeOp());
         this->ops["KimiK3RMSNorm"] = (BaseOperator*)(new CpuKimiK3RMSNormOp());
         this->ops["KimiK3CausalConv1D"] = (BaseOperator*)(new CpuKimiK3CausalConv1DOp());
         this->ops["KimiK3UpdatePackedConvCache"] =

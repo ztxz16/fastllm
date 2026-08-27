@@ -409,29 +409,16 @@ namespace fastllm {
         AssertInFastLLM(!input.dims.empty() &&
                         input.dims.back() == this->hcCount * this->embed_dim,
                         "Qwen4-Exp grouped RMSNorm received an invalid hidden size.");
-        Data inputPart, weightPart, outputPart, accumulated;
-        for (int stream = 0; stream < this->hcCount; stream++) {
-            Split(input, -1, stream * this->embed_dim,
-                  (stream + 1) * this->embed_dim, inputPart);
-            Split(normWeight, 0, stream * this->embed_dim,
-                  (stream + 1) * this->embed_dim, weightPart);
-            RMSNorm(inputPart, weightPart, this->rms_norm_eps, outputPart);
-            if (stream == 0) {
-                accumulated.CopyFrom(outputPart);
-            } else {
-                Data previous;
-                previous.CopyFrom(accumulated);
-                Cat(previous, outputPart, -1, accumulated);
-            }
-        }
-        output.CopyFrom(accumulated);
+        fastllm::Qwen4GroupedRMSNorm(input, normWeight,
+                                    this->rms_norm_eps,
+                                    this->hcCount, output);
     }
 
     void Qwen4ExpModel::HyperMix(const Data &hyperInput,
                                   const std::string &prefix,
                                   Data &mixedInput,
                                   Data *injectionWeights) {
-        Data normalized, lowRank, inputMix, weighted, streamPart;
+        Data normalized, lowRank, inputMix;
         GroupedRMSNorm(hyperInput, this->weight[prefix + "hc_norm.weight"], normalized);
         Linear(normalized, this->weight[prefix + "input_mix_weight_down.weight"],
                Data(), lowRank);
@@ -439,28 +426,15 @@ namespace fastllm {
         Silu(lowRank, lowRank);
         Linear(lowRank, this->weight[prefix + "input_mix_weight_up.weight"],
                Data(), inputMix);
-        Sigmoid(inputMix, inputMix);
-        Qwen4CastLike(inputMix, normalized);
-        MulTo(inputMix, normalized);
-
-        for (int stream = 0; stream < this->hcCount; stream++) {
-            Split(inputMix, -1, stream * this->embed_dim,
-                  (stream + 1) * this->embed_dim, streamPart);
-            if (stream == 0) {
-                weighted.CopyFrom(streamPart);
-            } else {
-                AddTo(weighted, streamPart);
-            }
-        }
-        Mul(weighted, 1.0f / (float)this->hcCount, mixedInput);
+        fastllm::Qwen4HyperMix(normalized, inputMix,
+                              this->hcCount, mixedInput);
 
         if (injectionWeights != nullptr) {
             Linear(normalized, this->weight[prefix + "block_inject_weight.weight"],
                    Data(), *injectionWeights);
-            Mul(*injectionWeights, 1.0f / (float)this->hcCount,
-                *injectionWeights);
-            Sigmoid(*injectionWeights, *injectionWeights);
-            Mul(*injectionWeights, 2.0f, *injectionWeights);
+            fastllm::Qwen4HyperInject(*injectionWeights,
+                                     this->hcCount,
+                                     *injectionWeights);
         }
     }
 
@@ -468,26 +442,22 @@ namespace fastllm {
                                       const Data &blockOutput,
                                       const Data &injectionWeights,
                                       Data &output) {
-        Data stream, scale, injected, combined, accumulated;
-        for (int index = 0; index < this->hcCount; index++) {
-            Split(hyperInput, -1, index * this->embed_dim,
-                  (index + 1) * this->embed_dim, stream);
-            Split(injectionWeights, -1, index, index + 1, scale);
-            injected.CopyFrom(blockOutput);
-            Qwen4CastLike(injected, stream);
-            Qwen4CastLike(scale, stream);
-            MulTo(injected, scale);
-            combined.CopyFrom(stream);
-            AddTo(combined, injected);
-            if (index == 0) {
-                accumulated.CopyFrom(combined);
-            } else {
-                Data previous;
-                previous.CopyFrom(accumulated);
-                Cat(previous, combined, -1, accumulated);
-            }
+        const Data *typedBlock = &blockOutput;
+        const Data *typedInjection = &injectionWeights;
+        Data convertedBlock, convertedInjection;
+        if (blockOutput.dataType != hyperInput.dataType) {
+            convertedBlock.CopyFrom(blockOutput);
+            Qwen4CastLike(convertedBlock, hyperInput);
+            typedBlock = &convertedBlock;
         }
-        output.CopyFrom(accumulated);
+        if (injectionWeights.dataType != hyperInput.dataType) {
+            convertedInjection.CopyFrom(injectionWeights);
+            Qwen4CastLike(convertedInjection, hyperInput);
+            typedInjection = &convertedInjection;
+        }
+        fastllm::Qwen4HyperCombine(hyperInput, *typedBlock,
+                                  *typedInjection, this->hcCount,
+                                  output);
     }
 
     void Qwen4ExpModel::RunPLE(const Data &hyperInput,

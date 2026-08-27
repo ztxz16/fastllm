@@ -946,6 +946,22 @@ namespace fastllm {
 
     void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output);
 
+    // Qwen4-Exp hyper-connection primitives.  Keeping these behind the regular
+    // executor lets CPU and CUDA share one model path while avoiding the many
+    // Split/Cat/elementwise launches in the operator-composed reference.
+    void Qwen4GroupedRMSNorm(const Data &input, const Data &weight,
+                             float eps, int groups, Data &output);
+    void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
+                       int groups, Data &output);
+    void Qwen4HyperInject(const Data &logits, int groups, Data &output);
+    void Qwen4HyperCombine(const Data &hyperInput, const Data &blockOutput,
+                           const Data &injection, int groups, Data &output);
+    void Qwen4GatedDeltaRuleDecode(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output);
+
     // Kimi-K3 operators.  These are dispatched through the regular FastLLM
     // executor; the CPU backend is the first implementation.
     void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,

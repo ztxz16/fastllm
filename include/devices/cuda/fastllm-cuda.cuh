@@ -543,6 +543,26 @@ bool FastllmCudaRMSNormFloat16WithThreadCount(const fastllm::Data &input, fastll
 bool FastllmCudaRMSNormBFloat16WithThreadCount(const fastllm::Data &input, fastllm::Data &weight,
                                                fastllm::Data &output, float eps, int threadCount);
 bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end);
+bool FastllmCudaQwen4GroupedRMSNorm(const fastllm::Data &input,
+                                    const fastllm::Data &weight,
+                                    fastllm::Data &output, float eps,
+                                    int groups);
+bool FastllmCudaQwen4HyperMix(const fastllm::Data &normalized,
+                              const fastllm::Data &mixLogits,
+                              fastllm::Data &output, int groups);
+bool FastllmCudaQwen4HyperInject(const fastllm::Data &logits,
+                                 fastllm::Data &output, int groups);
+bool FastllmCudaQwen4HyperCombine(const fastllm::Data &hyperInput,
+                                  const fastllm::Data &blockOutput,
+                                  const fastllm::Data &injection,
+                                  fastllm::Data &output, int groups);
+bool FastllmCudaQwen4GatedDeltaRuleDecode(
+        const fastllm::Data &qkv, const fastllm::Data &alpha,
+        const fastllm::Data &beta,
+        const fastllm::Data &aLog, const fastllm::Data &dtBias,
+        fastllm::Data &state, fastllm::Data &output,
+        int keyHeads, int valueHeads, int keyDim, int valueDim,
+        float recurrentEps);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
                                        int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                        float eps);

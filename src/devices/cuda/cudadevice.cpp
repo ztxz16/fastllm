@@ -4047,6 +4047,11 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["RMSNormPart"] = (BaseOperator*)(new CudaRMSNormPartOp());
+        this->ops["Qwen4GroupedRMSNorm"] = (BaseOperator*)(new CudaQwen4GroupedRMSNormOp());
+        this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CudaQwen4HyperMixOp());
+        this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CudaQwen4HyperInjectOp());
+        this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CudaQwen4HyperCombineOp());
+        this->ops["Qwen4GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
         this->ops["KimiK3RMSNorm"] =
             (BaseOperator*)(new CudaKimiK3RMSNormOp());
         this->ops["KimiK3CausalConv1D"] =
@@ -4509,6 +4514,195 @@ namespace fastllm {
         int start = intParams.find("start")->second;
         int end = intParams.find("end")->second;
         FastllmCudaRMSNormPart(input, weight, output, eps, start, end);
+    }
+
+    namespace {
+        bool CudaQwen4ActivationType(DataType type) {
+            return type == DataType::FLOAT32 ||
+                   type == DataType::FLOAT16 ||
+                   type == DataType::BFLOAT16;
+        }
+
+        int CudaQwen4Groups(const IntDict &intParams) {
+            auto it = intParams.find("groups");
+            return it == intParams.end() ? 1 : it->second;
+        }
+    }
+
+    bool CudaQwen4GroupedRMSNormOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        return !input.dims.empty() && groups > 0 &&
+               input.dims.back() % groups == 0 &&
+               CudaQwen4ActivationType(input.dataType) &&
+               weight.dataType == DataType::FLOAT32 &&
+               weight.Count(0) == (uint64_t)input.dims.back();
+    }
+
+    void CudaQwen4GroupedRMSNormOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        const float eps = floatParams.find("eps") == floatParams.end()
+            ? 1e-6f : floatParams.find("eps")->second;
+        output.Allocate(false);
+        if (!FastllmCudaQwen4GroupedRMSNorm(
+                input, weight, output, eps, groups)) {
+            ErrorInFastLLM(
+                "Qwen4GroupedRMSNorm CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperMixOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &mixLogits = *datas.find("mixLogits")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        return !input.dims.empty() && groups > 0 &&
+               input.dims.back() % groups == 0 &&
+               input.dims == mixLogits.dims &&
+               CudaQwen4ActivationType(input.dataType) &&
+               CudaQwen4ActivationType(mixLogits.dataType);
+    }
+
+    void CudaQwen4HyperMixOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &mixLogits = *datas.find("mixLogits")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        output.Allocate(false);
+        if (!FastllmCudaQwen4HyperMix(input, mixLogits, output, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperMix CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperInjectOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        return !input.dims.empty() && groups > 0 &&
+               input.dims.back() == groups &&
+               CudaQwen4ActivationType(input.dataType);
+    }
+
+    void CudaQwen4HyperInjectOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        output.Allocate(false);
+        if (!FastllmCudaQwen4HyperInject(input, output, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperInject CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperCombineOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        if (input.dims.empty() || groups <= 0 ||
+            input.dims.back() % groups != 0 ||
+            input.dataType != blockOutput.dataType ||
+            input.dataType != injection.dataType ||
+            !CudaQwen4ActivationType(input.dataType)) {
+            return false;
+        }
+        const int rows = (int)(input.Count(0) / input.dims.back());
+        return blockOutput.Count(0) ==
+                   (uint64_t)rows * input.dims.back() / groups &&
+               injection.Count(0) == (uint64_t)rows * groups;
+    }
+
+    void CudaQwen4HyperCombineOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        output.Allocate(false);
+        if (!FastllmCudaQwen4HyperCombine(
+                input, blockOutput, injection, output, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperCombine CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4GatedDeltaRuleDecodeOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &qkv = *datas.find("input")->second;
+        Data &alpha = *datas.find("alpha")->second;
+        Data &beta = *datas.find("beta")->second;
+        Data &aLog = *datas.find("aLog")->second;
+        Data &dtBias = *datas.find("dtBias")->second;
+        Data &state = *datas.find("state")->second;
+        const int keyHeads = intParams.find("keyHeads")->second;
+        const int valueHeads = intParams.find("valueHeads")->second;
+        const int keyDim = intParams.find("keyDim")->second;
+        const int valueDim = intParams.find("valueDim")->second;
+        const int batch = qkv.dims.empty() ? 0 : qkv.dims[0];
+        const int qkvChannels = 2 * keyHeads * keyDim +
+                                valueHeads * valueDim;
+        return qkv.dataType == DataType::FLOAT32 &&
+               state.dataType == DataType::FLOAT32 &&
+               aLog.dataType == DataType::FLOAT32 &&
+               dtBias.dataType == DataType::FLOAT32 &&
+               CudaQwen4ActivationType(alpha.dataType) &&
+               beta.dataType == alpha.dataType &&
+               keyHeads > 0 && valueHeads > 0 &&
+               valueHeads % keyHeads == 0 &&
+               keyDim == 128 && valueDim == 128 &&
+               qkv.dims.size() == 3 && qkv.dims[1] == 1 &&
+               qkv.dims[2] == qkvChannels &&
+               alpha.Count(0) == (uint64_t)batch * valueHeads &&
+               beta.Count(0) == (uint64_t)batch * valueHeads &&
+               aLog.Count(0) == (uint64_t)valueHeads &&
+               dtBias.Count(0) == (uint64_t)valueHeads &&
+               state.dims == std::vector<int>({batch, valueHeads,
+                                               keyDim, valueDim});
+    }
+
+    void CudaQwen4GatedDeltaRuleDecodeOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &qkv = *datas.find("input")->second;
+        Data &alpha = *datas.find("alpha")->second;
+        Data &beta = *datas.find("beta")->second;
+        Data &aLog = *datas.find("aLog")->second;
+        Data &dtBias = *datas.find("dtBias")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        const int keyHeads = intParams.find("keyHeads")->second;
+        const int valueHeads = intParams.find("valueHeads")->second;
+        const int keyDim = intParams.find("keyDim")->second;
+        const int valueDim = intParams.find("valueDim")->second;
+        const float recurrentEps =
+            floatParams.find("recurrentEps")->second;
+        output.Allocate(false);
+        if (!FastllmCudaQwen4GatedDeltaRuleDecode(
+                qkv, alpha, beta, aLog, dtBias, state, output,
+                keyHeads, valueHeads, keyDim, valueDim, recurrentEps)) {
+            ErrorInFastLLM(
+                "Qwen4GatedDeltaRuleDecode CUDA error: kernel rejected input.\n");
+        }
     }
 
     namespace {

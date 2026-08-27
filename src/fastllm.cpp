@@ -4079,6 +4079,52 @@ namespace fastllm {
         }, {{"eps", eps}}, {{"start", start}, {"end", end}});
     }
 
+    void Qwen4GroupedRMSNorm(const Data &input, const Data &weight,
+                             float eps, int groups, Data &output) {
+        curExecutor->Run("Qwen4GroupedRMSNorm", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"output", &output}
+        }, {{"eps", eps}}, {{"groups", groups}});
+    }
+
+    void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
+                       int groups, Data &output) {
+        curExecutor->Run("Qwen4HyperMix", {
+                {"input", (Data*)&normalized},
+                {"mixLogits", (Data*)&mixLogits}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4HyperInject(const Data &logits, int groups, Data &output) {
+        curExecutor->Run("Qwen4HyperInject", {
+                {"input", (Data*)&logits}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4HyperCombine(const Data &hyperInput, const Data &blockOutput,
+                           const Data &injection, int groups, Data &output) {
+        curExecutor->Run("Qwen4HyperCombine", {
+                {"input", (Data*)&hyperInput},
+                {"blockOutput", (Data*)&blockOutput},
+                {"injection", (Data*)&injection}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4GatedDeltaRuleDecode(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output) {
+        curExecutor->Run("Qwen4GatedDeltaRuleDecode", {
+                {"input", (Data*)&qkv},
+                {"alpha", (Data*)&alpha}, {"beta", (Data*)&beta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output}
+        }, {{"recurrentEps", recurrentEps}},
+        {{"keyHeads", keyHeads}, {"valueHeads", valueHeads},
+         {"keyDim", keyDim}, {"valueDim", valueDim}});
+    }
+
     void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,
                        Data &output) {
         curExecutor->Run("KimiK3RMSNorm", {
