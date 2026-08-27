@@ -4271,6 +4271,9 @@ namespace fastllm {
             int mtpTokens = 0;
             Data mtpKey;
             Data mtpValue;
+            bool dflashValid = false;
+            int dflashTokens = 0;
+            std::vector<std::pair<Data, Data> > dflashKeyValues;
         };
 
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
@@ -4406,6 +4409,67 @@ namespace fastllm {
             dst.multiDeviceDatas.clear();
             dst.ClearTensorParallelLayout();
             dst.ToDevice(DataDevice::CPU, true);
+            return dst.cpuData != nullptr;
+        }
+
+        static bool Qwen35SnapshotCopyCompactTensor(
+                const Data &src, Data &dst) {
+            if (src.dims.size() != 3 || src.multiDeviceData ||
+                src.dataType != DataType::FLOAT16 ||
+                src.strides.size() != 3 || src.strides[2] != 1 ||
+                src.strides[1] != src.dims[2]) {
+                return false;
+            }
+            if (src.dataDevice == DataDevice::CUDA && src.cudaData == nullptr) {
+                return false;
+            }
+            if (src.dataDevice == DataDevice::CPU && src.cpuData == nullptr) {
+                return false;
+            }
+            dst.FreeSpace();
+            dst.dataType = src.dataType;
+            dst.UpdateUnitSize();
+            dst.dataDevice = DataDevice::CPU;
+            dst.dataDeviceIds.clear();
+            dst.expansionDims.clear();
+            dst.Resize(src.dims);
+            dst.Allocate();
+            const size_t rowBytes =
+                (size_t)src.dims[1] * src.dims[2] * sizeof(uint16_t);
+            if (src.dataDevice == DataDevice::CUDA) {
+                int oldDevice = FastllmCudaGetDevice();
+                if (!src.dataDeviceIds.empty()) {
+                    FastllmCudaSetDevice(src.dataDeviceIds[0]);
+                }
+                for (int head = 0; head < src.dims[0]; head++) {
+                    FastllmCudaCopyFromDeviceToHost(
+                        dst.cpuData + (size_t)head * rowBytes,
+                        (uint8_t*)src.cudaData +
+                            (size_t)head * src.strides[0] *
+                                sizeof(uint16_t),
+                        rowBytes);
+                }
+                FastllmCudaSetDevice(oldDevice);
+            } else {
+                for (int head = 0; head < src.dims[0]; head++) {
+                    std::memcpy(
+                        dst.cpuData + (size_t)head * rowBytes,
+                        src.cpuData +
+                            (size_t)head * src.strides[0] *
+                                sizeof(uint16_t),
+                        rowBytes);
+                }
+            }
+            dst.isKVCache = true;
+            dst.isLinearAttention = false;
+            dst.isLinearAttentionTransposed = false;
+            dst.isPagedKVCache = false;
+            dst.pagedKVCacheData = nullptr;
+            dst.pageIndex.clear();
+            dst.lastPageLen = 0;
+            dst.multiDeviceData = false;
+            dst.multiDeviceDatas.clear();
+            dst.ClearTensorParallelLayout();
             return dst.cpuData != nullptr;
         }
 
@@ -4549,7 +4613,7 @@ namespace fastllm {
             return !dst.multiDeviceDatas.empty();
         }
 
-        static bool Qwen35RestoreMtpSnapshotTensor(
+        static bool Qwen35RestoreDraftSnapshotTensor(
                 const Data &snapshot,
                 Data &dst,
                 int device) {
@@ -4570,12 +4634,47 @@ namespace fastllm {
                    dst.cudaData != nullptr && dst.dims.size() >= 2;
         }
 
+        static bool Qwen35DFlashSnapshotMatches(
+                const Qwen35LinearPrefixSnapshot &snapshot,
+                int cachedLen,
+                int dflashLayers,
+                int dflashKvHeads,
+                int dflashHeadDim) {
+            if (!snapshot.dflashValid ||
+                snapshot.dflashTokens != cachedLen ||
+                (int)snapshot.dflashKeyValues.size() !=
+                    dflashLayers) {
+                return false;
+            }
+            for (const auto &layerCache : snapshot.dflashKeyValues) {
+                const Data &key = layerCache.first;
+                const Data &value = layerCache.second;
+                if (key.dims.size() != 3 || value.dims.size() != 3 ||
+                    key.dims[0] != dflashKvHeads ||
+                    value.dims[0] != dflashKvHeads ||
+                    key.dims[1] <= 0 || key.dims[1] > cachedLen ||
+                    key.dims[1] != value.dims[1] ||
+                    key.dims[2] != dflashHeadDim ||
+                    value.dims[2] != dflashHeadDim ||
+                    key.dataDevice != DataDevice::CPU ||
+                    value.dataDevice != DataDevice::CPU ||
+                    key.cpuData == nullptr || value.cpuData == nullptr) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         static const Qwen35LinearPrefixSnapshot *Qwen35FindLinearPrefixSnapshotLocked(
                 const Qwen3_5Model *model,
                 const std::vector<int> &tokens,
                 int maxCachedLen,
                 int exactLen = -1,
-                bool requireMtp = false) {
+                bool requireMtp = false,
+                bool requireDFlash = false,
+                int dflashLayers = 0,
+                int dflashKvHeads = 0,
+                int dflashHeadDim = 0) {
             auto &all = Qwen35LinearPrefixSnapshots();
             auto it = all.find(model);
             if (it == all.end()) {
@@ -4602,6 +4701,13 @@ namespace fastllm {
                      snapshot->mtpValue.dims.size() < 2 ||
                      snapshot->mtpKey.dims[1] != snapshot->cachedLen ||
                      snapshot->mtpValue.dims[1] != snapshot->cachedLen)) {
+                    continue;
+                }
+                if (requireDFlash &&
+                    !Qwen35DFlashSnapshotMatches(
+                        *snapshot, snapshot->cachedLen,
+                        dflashLayers, dflashKvHeads,
+                        dflashHeadDim)) {
                     continue;
                 }
                 if (best == nullptr ||
@@ -6775,6 +6881,9 @@ namespace fastllm {
             int mtpTokens = 0;
             Data mtpKey;
             Data mtpValue;
+            bool dflashValid = false;
+            int dflashTokens = 0;
+            std::vector<std::pair<Data, Data> > dflashKeyValues;
         };
 
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
@@ -6860,12 +6969,20 @@ namespace fastllm {
                 const std::vector<int> &tokens,
                 int maxCachedLen,
                 int exactLen = -1,
-                bool requireMtp = false) {
+                bool requireMtp = false,
+                bool requireDFlash = false,
+                int dflashLayers = 0,
+                int dflashKvHeads = 0,
+                int dflashHeadDim = 0) {
             (void)model;
             (void)tokens;
             (void)maxCachedLen;
             (void)exactLen;
             (void)requireMtp;
+            (void)requireDFlash;
+            (void)dflashLayers;
+            (void)dflashKvHeads;
+            (void)dflashHeadDim;
             return nullptr;
         }
 
@@ -8219,13 +8336,23 @@ namespace fastllm {
         if (context == nullptr) {
             return false;
         }
-        return !Qwen35MtpDisabledByEnv() &&
+        return !HasDFlashWeights() &&
+               !Qwen35MtpDisabledByEnv() &&
                HasMtpWeights() &&
                Qwen35MtpSupportsGenerationConfig(context->generationConfig);
     }
 
+    bool Qwen3_5Model::RequiresDFlashPrefixSnapshot(
+            const ResponseContext *context) const {
+        if (context == nullptr) {
+            return false;
+        }
+        return dflashEnabled && HasDFlashWeights() &&
+               Qwen35MtpSupportsGenerationConfig(context->generationConfig);
+    }
+
     bool Qwen3_5Model::TryRecordPagedPrefixCacheExtra(ResponseContext *context) {
-        if (dflashEnabled || context == nullptr ||
+        if (context == nullptr ||
             !Qwen35LinearPrefixCacheEnabled() ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
             return false;
@@ -8273,22 +8400,59 @@ namespace fastllm {
         }
 
         bool requireMtp = RequiresMtpPrefixSnapshot(context);
-        if (requireMtp) {
+        bool requireDFlash = RequiresDFlashPrefixSnapshot(context);
+        if (requireMtp || requireDFlash) {
 #ifdef USE_CUDA
             std::lock_guard<std::mutex> guard(mtpCacheMutex);
-            auto mtpIt = mtpCaches.find(context);
-            if (mtpIt == mtpCaches.end() ||
-                mtpIt->second.tokens != currentLen ||
-                mtpIt->second.key.dims.size() < 2 ||
-                mtpIt->second.value.dims.size() < 2 ||
-                mtpIt->second.key.dims[1] != currentLen ||
-                mtpIt->second.value.dims[1] != currentLen ||
-                !Qwen35SnapshotCopyTensor(mtpIt->second.key, snapshot->mtpKey) ||
-                !Qwen35SnapshotCopyTensor(mtpIt->second.value, snapshot->mtpValue)) {
-                return false;
+            if (requireDFlash) {
+                auto dflashIt = dflashContexts.find(context);
+                if (dflashIt == dflashContexts.end() ||
+                    dflashIt->second.committedTokens != currentLen ||
+                    (int)dflashIt->second.draftKeyValues.size() !=
+                        dflashLayers) {
+                    return false;
+                }
+                snapshot->dflashKeyValues.resize(dflashLayers);
+                for (int layer = 0; layer < dflashLayers; layer++) {
+                    const Data &key =
+                        dflashIt->second.draftKeyValues[layer].first;
+                    const Data &value =
+                        dflashIt->second.draftKeyValues[layer].second;
+                    if (key.dims.size() != 3 || value.dims.size() != 3 ||
+                        key.dims[0] != dflashKvHeads ||
+                        value.dims[0] != dflashKvHeads ||
+                        key.dims[1] <= 0 || key.dims[1] > currentLen ||
+                        key.dims[1] != value.dims[1] ||
+                        key.dims[2] != dflashHeadDim ||
+                        value.dims[2] != dflashHeadDim ||
+                        !Qwen35SnapshotCopyCompactTensor(
+                            key,
+                            snapshot->dflashKeyValues[layer].first) ||
+                        !Qwen35SnapshotCopyCompactTensor(
+                            value,
+                            snapshot->dflashKeyValues[layer].second)) {
+                        return false;
+                    }
+                }
+                snapshot->dflashValid = true;
+                snapshot->dflashTokens = currentLen;
+            } else {
+                auto mtpIt = mtpCaches.find(context);
+                if (mtpIt == mtpCaches.end() ||
+                    mtpIt->second.tokens != currentLen ||
+                    mtpIt->second.key.dims.size() < 2 ||
+                    mtpIt->second.value.dims.size() < 2 ||
+                    mtpIt->second.key.dims[1] != currentLen ||
+                    mtpIt->second.value.dims[1] != currentLen ||
+                    !Qwen35SnapshotCopyTensor(
+                        mtpIt->second.key, snapshot->mtpKey) ||
+                    !Qwen35SnapshotCopyTensor(
+                        mtpIt->second.value, snapshot->mtpValue)) {
+                    return false;
+                }
+                snapshot->mtpValid = true;
+                snapshot->mtpTokens = currentLen;
             }
-            snapshot->mtpValid = true;
-            snapshot->mtpTokens = currentLen;
 #else
             return false;
 #endif
@@ -8301,8 +8465,10 @@ namespace fastllm {
                 Qwen35LinearPrefixSnapshot *old = it->get();
                 if (old != nullptr && old->cachedLen == snapshot->cachedLen &&
                     old->tokens == snapshot->tokens) {
-                    // MTP snapshots also contain everything needed by non-MTP requests.
-                    if (old->mtpValid && !snapshot->mtpValid) {
+                    // A draft-aware snapshot also contains everything needed
+                    // by requests that do not use speculative decoding.
+                    if ((old->mtpValid && !snapshot->mtpValid) ||
+                        (old->dflashValid && !snapshot->dflashValid)) {
                         snapshot = std::move(*it);
                     }
                     it = items.erase(it);
@@ -8349,9 +8515,6 @@ namespace fastllm {
     }
 
     int Qwen3_5Model::QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const {
-        if (dflashEnabled) {
-            return 0;
-        }
         if (context == nullptr || maxCachedLen <= 0 ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
             return maxCachedLen;
@@ -8360,10 +8523,13 @@ namespace fastllm {
             return 0;
         }
         bool requireMtp = RequiresMtpPrefixSnapshot(context);
+        bool requireDFlash = RequiresDFlashPrefixSnapshot(context);
         std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
         const Qwen35LinearPrefixSnapshot *snapshot =
             Qwen35FindLinearPrefixSnapshotLocked(
-                this, context->currentTokens, maxCachedLen, -1, requireMtp);
+                this, context->currentTokens, maxCachedLen, -1,
+                requireMtp, requireDFlash, dflashLayers,
+                dflashKvHeads, dflashHeadDim);
         return snapshot == nullptr ? 0 : snapshot->cachedLen;
     }
 
@@ -8373,11 +8539,15 @@ namespace fastllm {
             return true;
         }
         bool requireMtp = RequiresMtpPrefixSnapshot(context);
+        bool requireDFlash = RequiresDFlashPrefixSnapshot(context);
         const Qwen35LinearPrefixSnapshot *snapshot = nullptr;
+        int restoredDFlashCacheTokens = 0;
         {
             std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
             snapshot = Qwen35FindLinearPrefixSnapshotLocked(
-                this, context->currentTokens, cachedLen, cachedLen, requireMtp);
+                this, context->currentTokens, cachedLen, cachedLen,
+                requireMtp, requireDFlash, dflashLayers,
+                dflashKvHeads, dflashHeadDim);
             if (snapshot == nullptr || (int)snapshot->layers.size() < this->block_cnt) {
                 return false;
             }
@@ -8403,30 +8573,69 @@ namespace fastllm {
                     return false;
                 }
             }
-            if (requireMtp) {
+            if (requireMtp || requireDFlash) {
 #ifdef USE_CUDA
                 std::vector<int> devices;
                 std::map<int, int> ratios;
-                if (!snapshot->mtpValid || snapshot->mtpTokens != cachedLen ||
-                    !GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
+                if (!GetQwen35GPUForwardDevices(
+                        this->deviceMap, devices, ratios) ||
                     devices.empty()) {
                     return false;
                 }
                 std::lock_guard<std::mutex> mtpGuard(mtpCacheMutex);
                 mtpCaches.erase(context);
-                MtpKvCache &mtpCache = mtpCaches[context];
-                if (!Qwen35RestoreMtpSnapshotTensor(
-                        snapshot->mtpKey, mtpCache.key, devices[0]) ||
-                    !Qwen35RestoreMtpSnapshotTensor(
-                        snapshot->mtpValue, mtpCache.value, devices[0])) {
-                    mtpCaches.erase(context);
-                    return false;
+                dflashContexts.erase(context);
+                if (requireDFlash) {
+                    if (!Qwen35DFlashSnapshotMatches(
+                            *snapshot, cachedLen, dflashLayers,
+                            dflashKvHeads, dflashHeadDim)) {
+                        return false;
+                    }
+                    DFlashContext &dflashCache =
+                        dflashContexts[context];
+                    dflashCache.draftKeyValues.resize(dflashLayers);
+                    for (int layer = 0; layer < dflashLayers; layer++) {
+                        if (!Qwen35RestoreDraftSnapshotTensor(
+                                snapshot->dflashKeyValues[layer].first,
+                                dflashCache.draftKeyValues[layer].first,
+                                devices[0]) ||
+                            !Qwen35RestoreDraftSnapshotTensor(
+                                snapshot->dflashKeyValues[layer].second,
+                                dflashCache.draftKeyValues[layer].second,
+                                devices[0])) {
+                            dflashContexts.erase(context);
+                            return false;
+                        }
+                    }
+                    dflashCache.committedTokens = cachedLen;
+                    restoredDFlashCacheTokens =
+                        dflashCache.draftKeyValues.empty() ? 0 :
+                        dflashCache.draftKeyValues[0].first.dims[1];
+                } else {
+                    if (!snapshot->mtpValid ||
+                        snapshot->mtpTokens != cachedLen) {
+                        return false;
+                    }
+                    MtpKvCache &mtpCache = mtpCaches[context];
+                    if (!Qwen35RestoreDraftSnapshotTensor(
+                            snapshot->mtpKey, mtpCache.key, devices[0]) ||
+                        !Qwen35RestoreDraftSnapshotTensor(
+                            snapshot->mtpValue, mtpCache.value,
+                            devices[0])) {
+                        mtpCaches.erase(context);
+                        return false;
+                    }
+                    mtpCache.tokens = cachedLen;
                 }
-                mtpCache.tokens = cachedLen;
 #else
                 return false;
 #endif
             }
+        }
+        if (requireDFlash) {
+            printf("[Qwen3.5 DFlash2] prefix cache restored: tokens=%d, draft_kv_tokens=%d.\n",
+                   cachedLen, restoredDFlashCacheTokens);
+            fflush(stdout);
         }
         return true;
     }

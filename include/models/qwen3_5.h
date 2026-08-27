@@ -424,6 +424,7 @@ namespace fastllm {
         bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
         bool CanUseQwen35DFlashBatchForward(int draftsPerStep) const;
         bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
+        bool RequiresDFlashPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
         void RunMtpFeedForward(int device, Data &hiddenStates);
