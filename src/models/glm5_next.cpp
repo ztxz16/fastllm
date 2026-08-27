@@ -66,27 +66,36 @@ namespace fastllm {
             return values;
         }
 
-        void UnpackGlm5NextConvCache(
-                Data &packed, int history, int channels,
+        void BindGlm5NextConvCacheViews(
+                Data &packed, const Data &reference,
+                int history, int channels,
                 Data &qCache, Data &kCache, Data &vCache) {
             if (packed.dims.empty()) {
-                return;
+                packed.dataType = DataType::BFLOAT16;
+                packed.UpdateUnitSize();
+                packed.dataDevice = reference.dataDevice;
+                packed.dataDeviceIds = reference.dataDeviceIds;
+                packed.Resize({3, history, channels});
+                packed.Allocate();
             }
             AssertInFastLLM(
                 packed.dataType == DataType::BFLOAT16 &&
                 packed.dims == std::vector<int>({3, history, channels}),
                 "GLM-5.3 packed KDA convolution cache has an invalid shape.");
-            Split(packed, 0, 0, 1, qCache);
-            Split(packed, 0, 1, 2, kCache);
-            Split(packed, 0, 2, 3, vCache);
-        }
-
-        void PackGlm5NextConvCache(
-                Data &qCache, Data &kCache, Data &vCache, Data &packed) {
-            Data qkCache, combined;
-            Cat(qCache, kCache, 0, qkCache);
-            Cat(qkCache, vCache, 0, combined);
-            Copy(combined, packed);
+            if (!packed.lockInCPU) {
+                packed.ToDevice(
+                    reference.dataDevice, reference.dataDeviceIds);
+            }
+            const size_t sliceBytes = packed.GetBytes() / 3;
+            auto bind = [&](Data &view, int index) {
+                view.FakeFrom(packed, (size_t)index * sliceBytes);
+                view.dataDeviceIds = packed.dataDeviceIds;
+                view.lockInCPU = packed.lockInCPU;
+                view.Resize({1, history, channels});
+            };
+            bind(qCache, 0);
+            bind(kCache, 1);
+            bind(vCache, 2);
             packed.SetKVCache();
             // This is a fixed-size convolution history, not a token-growing
             // attention cache.  Generic history-cache restore must copy it as
@@ -653,8 +662,9 @@ namespace fastllm {
         const std::string prefix = languagePrefix + "layers." +
             std::to_string(layerIndex) + ".self_attn.";
         Data qCache, kCache, vCache;
-        UnpackGlm5NextConvCache(
+        BindGlm5NextConvCacheViews(
             pastKeyValues[layerIndex].first,
+            input,
             shortConvKernel - 1, kdaHeads * kdaHeadDim,
             qCache, kCache, vCache);
         Data &state = pastKeyValues[layerIndex].second;
@@ -738,9 +748,6 @@ namespace fastllm {
             }
             output.expansionDims.clear();
         }
-        PackGlm5NextConvCache(
-            qCache, kCache, vCache,
-            pastKeyValues[layerIndex].first);
         state.SetKVCache();
         // The KDA recurrent matrix is also a fixed-size state.  Keeping both
         // members marked makes schedulers and cache accounting consistently
@@ -834,13 +841,11 @@ namespace fastllm {
         const std::string mlp = languagePrefix + "layers." +
             std::to_string(layerIndex) + ".mlp.";
         const std::vector<int> outputDims = input.dims;
-        Data flatInput;
-        Copy(input, flatInput);
-        flatInput.Reshape({sequence, embed_dim});
+        input.Reshape({sequence, embed_dim});
 
         ApplyDeviceMap(deviceMap, layerIndex + 1, block_cnt);
         Data routerInput, routerScores;
-        ToDataType(flatInput, routerInput, DataType::FLOAT32);
+        ToDataType(input, routerInput, DataType::FLOAT32);
         Linear(routerInput, weight[mlp + "gate.weight"],
                Data(), routerScores);
         Sigmoid(routerScores, routerScores);
@@ -851,33 +856,32 @@ namespace fastllm {
             routed_scaling_factor,
             &weight[mlp + "gate.e_score_correction_bias"]);
 
-        Data sharedOutput;
         if (GetCudaSharedExpert()) {
             ApplyDeviceMap(deviceMap, layerIndex + 1, block_cnt);
         } else {
             ApplyMoeDeviceMapForLayer(layerIndex);
         }
         RunClampedMlp(
-            flatInput,
+            input,
             weight[mlp + "shared_experts.gateup_proj.weight"],
             weight[mlp + "shared_experts.down_proj.weight"],
-            sharedOutput);
+            output);
 
         Data w1, w2, w3, tempInput, tempOutput;
         Data moeInputTemp, moeOutputTemp, routedOutput;
         ApplyMoeDeviceMapForLayer(layerIndex);
         MergeMOEBlock(
-            &flatInput, &expertIndex, &expertScore,
+            &input, &expertIndex, &expertScore,
             &expertWeights[layerIndex], &expertBiases[layerIndex],
             &w1, &w2, &w3, &tempInput, &tempOutput,
             0.0f, &routedOutput, layerIndex,
-            flatInput.dataType, moeAtype,
+            input.dataType, moeAtype,
             &moeInputTemp, &moeOutputTemp,
             MoeGateSwiglu, false, swigluLimit, true);
 
         ApplyDeviceMap(deviceMap, layerIndex + 1, block_cnt);
-        Copy(routedOutput, output);
-        AddTo(output, sharedOutput);
+        AddTo(output, routedOutput);
+        input.Reshape(outputDims);
         output.Reshape(outputDims);
     }
 
@@ -890,15 +894,17 @@ namespace fastllm {
             hiddenStates.dims.size() == 3 &&
             hiddenStates.dims[0] == 1,
             "GLM-5.3 final hidden state has an invalid shape.");
-        Data lastHidden;
+        Data lastHiddenView;
+        Data *lastHidden = &hiddenStates;
         const int sequence = hiddenStates.dims[1];
         if (sequence > 1) {
-            Split(hiddenStates, 1, sequence - 1, sequence, lastHidden);
-        } else {
-            Copy(hiddenStates, lastHidden);
+            Split(
+                hiddenStates, 1, sequence - 1, sequence,
+                lastHiddenView);
+            lastHidden = &lastHiddenView;
         }
         Data outputLogits;
-        Linear(lastHidden, weight["lm_head.weight"],
+        Linear(*lastHidden, weight["lm_head.weight"],
                Data(), outputLogits);
         ToDataType(outputLogits, DataType::FLOAT32);
         outputLogits.ToDevice(DataDevice::CPU);
