@@ -386,6 +386,7 @@ namespace fastllm {
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
     static constexpr int QWEN35_MTP_BATCH_ATTENTION_CACHE_MAX = 4096;
     static constexpr int QWEN35_BATCH_PREFILL_SEQ_MAX = 4096;
+    static constexpr int QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE = 2048;
 
     static int Qwen35DFlashCacheTrimThreshold(int slidingWindow) {
         const int keepTokens = std::max(1, slidingWindow - 1);
@@ -20133,6 +20134,11 @@ namespace fastllm {
                 bool consumeGpuTokenHandoff = gpuTokenHandoffPending &&
                     !handles.empty() && seqLens.size() == handles.size() &&
                     tokenContexts.size() == handles.size();
+                const int longPrefillChunkSize = schedulerUsesDFlash ?
+                    std::max(1, std::min(
+                        prefillChunkSize,
+                        QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE)) :
+                    prefillChunkSize;
                 if (consumeGpuTokenHandoff) {
                     for (int i = 0; i < (int)handles.size(); i++) {
                         consumeGpuTokenHandoff &= seqLens[i] == 1 &&
@@ -20223,8 +20229,8 @@ namespace fastllm {
                         tokensManager,
                         &logits);
                 } else if (seqLens.size() == 1 && selectedIsPrompt &&
-                           seqLens[0] > prefillChunkSize &&
-                           singleContext != nullptr && !schedulerUsesDFlash) {
+                           seqLens[0] > longPrefillChunkSize &&
+                           singleContext != nullptr) {
                     int len = seqLens[0];
                     std::vector<std::pair<Data, Data> > *pastKeyValue1 = nullptr;
                     dictLocker.lock();
@@ -20236,40 +20242,86 @@ namespace fastllm {
                     if (pastKeyValue1 == nullptr) {
                         ret.push_back(model->eos_token_id);
                     } else {
-                        std::vector<int> longPrefillMtpDevices;
-                        std::map<int, int> longPrefillMtpRatios;
-                        int longPrefillMtpDrafts = Qwen35MtpDraftsPerStep();
-                        bool seedLongPrefillMtp =
-                            !Qwen35MtpDisabledByEnv() &&
-                            longPrefillMtpDrafts > 0 &&
-                            model->HasMtpWeights() &&
+                        std::vector<int> longPrefillDraftDevices;
+                        std::map<int, int> longPrefillDraftRatios;
+                        const int longPrefillMtpDrafts = schedulerUsesDFlash ?
+                            0 : Qwen35MtpDraftsPerStep();
+                        const int longPrefillDFlashDrafts = schedulerUsesDFlash ?
+                            model->DFlashDraftsPerStep() : 0;
+                        const bool canSeedLongPrefillDraft =
                             generationConfigs.size() == 1 &&
                             Qwen35MtpSupportsGenerationConfig(
                                 generationConfigs[0]) &&
                             positionIds[0] != nullptr &&
                             GetQwen35GPUForwardDevices(
-                                model->deviceMap, longPrefillMtpDevices,
-                                longPrefillMtpRatios) &&
-                            !longPrefillMtpDevices.empty();
-                        int longPrefillMtpBaseTokens = singleContext->cacheLen;
-                        if (seedLongPrefillMtp) {
+                                model->deviceMap, longPrefillDraftDevices,
+                                longPrefillDraftRatios) &&
+                            !longPrefillDraftDevices.empty();
+                        bool seedLongPrefillMtp =
+                            !schedulerUsesDFlash && canSeedLongPrefillDraft &&
+                            !Qwen35MtpDisabledByEnv() &&
+                            longPrefillMtpDrafts > 0 &&
+                            model->HasMtpWeights();
+                        bool seedLongPrefillDFlash =
+                            schedulerUsesDFlash && canSeedLongPrefillDraft &&
+                            longPrefillDFlashDrafts > 0 &&
+                            model->HasDFlashWeights();
+                        const int longPrefillBaseTokens =
+                            singleContext->cacheLen;
+                        auto validLongPrefillDFlashCache =
+                            [&](const DFlashContext &cache, int tokens) {
+                                if (cache.committedTokens != tokens ||
+                                    (int)cache.draftKeyValues.size() !=
+                                        model->dflashLayers) {
+                                    return false;
+                                }
+                                for (const auto &layerCache :
+                                     cache.draftKeyValues) {
+                                    if (layerCache.first.dims.size() != 3 ||
+                                        layerCache.second.dims.size() != 3 ||
+                                        layerCache.first.dims[1] !=
+                                            layerCache.second.dims[1] ||
+                                        layerCache.first.dims[1] > tokens) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            };
+                        if (seedLongPrefillMtp ||
+                            seedLongPrefillDFlash) {
                             std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
-                            if (longPrefillMtpBaseTokens == 0) {
-                                model->mtpCaches.erase(singleContext);
+                            if (longPrefillBaseTokens == 0) {
+                                if (seedLongPrefillDFlash) {
+                                    model->dflashContexts.erase(singleContext);
+                                } else {
+                                    model->mtpCaches.erase(singleContext);
+                                }
+                            } else if (seedLongPrefillDFlash) {
+                                auto dflashIt =
+                                    model->dflashContexts.find(singleContext);
+                                seedLongPrefillDFlash =
+                                    dflashIt != model->dflashContexts.end() &&
+                                    validLongPrefillDFlashCache(
+                                        dflashIt->second,
+                                        longPrefillBaseTokens);
                             } else {
                                 auto mtpIt = model->mtpCaches.find(singleContext);
                                 seedLongPrefillMtp =
                                     mtpIt != model->mtpCaches.end() &&
-                                    mtpIt->second.tokens == longPrefillMtpBaseTokens &&
+                                    mtpIt->second.tokens == longPrefillBaseTokens &&
                                     mtpIt->second.key.dims.size() >= 2 &&
                                     mtpIt->second.value.dims.size() >= 2 &&
-                                    mtpIt->second.key.dims[1] == longPrefillMtpBaseTokens &&
-                                    mtpIt->second.value.dims[1] == longPrefillMtpBaseTokens;
+                                    mtpIt->second.key.dims[1] == longPrefillBaseTokens &&
+                                    mtpIt->second.value.dims[1] == longPrefillBaseTokens;
                             }
                         }
-                        auto eraseLongPrefillMtpCache = [&]() {
+                        auto eraseLongPrefillDraftCache = [&]() {
                             std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
-                            model->mtpCaches.erase(singleContext);
+                            if (schedulerUsesDFlash) {
+                                model->dflashContexts.erase(singleContext);
+                            } else {
+                                model->mtpCaches.erase(singleContext);
+                            }
                         };
                         auto appendLongPrefillMtpCache =
                             [&](const Data &targetHiddenStates,
@@ -20293,8 +20345,8 @@ namespace fastllm {
                                 }
                                 try {
                                     draftToken = model->RunMtpGreedyDraft(
-                                        longPrefillMtpDevices[0],
-                                        longPrefillMtpDevices, cache,
+                                        longPrefillDraftDevices[0],
+                                        longPrefillDraftDevices, cache,
                                         targetHiddenStates, mtpInputTokens,
                                         mtpPositionIds,
                                         (int)mtpInputTokens.size() - 1,
@@ -20315,12 +20367,75 @@ namespace fastllm {
                                 }
                                 return valid;
                             };
+                        auto appendLongPrefillDFlashCache =
+                            [&](int expectedTokens, int chunkTokens,
+                                bool generateDrafts, int anchorToken,
+                                std::vector<int> &drafts) {
+                                std::lock_guard<std::mutex> guard(
+                                    model->mtpCacheMutex);
+                                auto cacheIt =
+                                    model->dflashContexts.find(singleContext);
+                                if (cacheIt == model->dflashContexts.end()) {
+                                    if (expectedTokens != 0) {
+                                        return false;
+                                    }
+                                    cacheIt = model->dflashContexts.emplace(
+                                        singleContext, DFlashContext()).first;
+                                }
+                                DFlashContext &cache = cacheIt->second;
+                                if (cache.committedTokens != expectedTokens) {
+                                    model->dflashContexts.erase(cacheIt);
+                                    return false;
+                                }
+                                try {
+                                    // This projects the captured target features
+                                    // and compacts draft KV back to its sliding
+                                    // window before the next target chunk.
+                                    model->AppendDFlashTargetHidden(
+                                        longPrefillDraftDevices[0],
+                                        chunkTokens, cache);
+                                    if (generateDrafts) {
+                                        drafts = model->RunDFlashDraft(
+                                            longPrefillDraftDevices[0],
+                                            longPrefillDraftDevices,
+                                            anchorToken,
+                                            generationConfigs[0], cache);
+                                    }
+                                } catch (...) {
+                                    model->dflashContexts.erase(singleContext);
+                                    throw;
+                                }
+                                const int newTokens =
+                                    expectedTokens + chunkTokens;
+                                const bool valid =
+                                    validLongPrefillDFlashCache(cache, newTokens) &&
+                                    (!generateDrafts ||
+                                     (int)drafts.size() ==
+                                         longPrefillDFlashDrafts);
+                                if (!valid) {
+                                    model->dflashContexts.erase(singleContext);
+                                }
+                                return valid;
+                            };
 
+                        auto releaseLongPrefillDFlashHidden = [&]() {
+                            for (Data &hidden :
+                                 model->speculativeDFlashHiddenStates) {
+                                hidden.FreeSpace();
+                                hidden.dims.clear();
+                                hidden.strides.clear();
+                                hidden.expansionDims.clear();
+                            }
+                            model->speculativeDFlashHiddenStates.clear();
+                        };
                         int longPrefillFirstDraft = -1;
+                        std::vector<int> longPrefillDFlashDraftTokens;
                         bool longPrefillMtpSeeded = false;
+                        bool longPrefillDFlashSeeded = false;
                         auto prefillStartTime = std::chrono::system_clock::now();
                         for (int st = 0; st < len; ) {
-                            int curLen = std::min(prefillChunkSize, len - st);
+                            int curLen = std::min(
+                                longPrefillChunkSize, len - st);
                             bool isLastChunk = st + curLen == len;
                             auto chunkStartTime = std::chrono::system_clock::now();
                             Data curInput, curPositionIds;
@@ -20348,14 +20463,21 @@ namespace fastllm {
                             }
                             bool oldCaptureAllHiddenStates =
                                 model->speculativeCaptureAllHiddenStates;
+                            bool oldCaptureDFlashHiddenStates =
+                                model->speculativeCaptureDFlashHiddenStates;
                             bool oldCacheOnlyForward =
                                 model->speculativeCacheOnlyForward;
                             bool skipIntermediateHead =
-                                !isLastChunk && !seedLongPrefillMtp &&
-                                generationConfigs.size() == 1 &&
-                                generationConfigs[0].IsSimpleGreedy() &&
-                                Qwen35SkipIntermediateChunkHeadEnabled();
-                            model->speculativeCaptureAllHiddenStates = seedLongPrefillMtp;
+                                !isLastChunk &&
+                                (seedLongPrefillDFlash ||
+                                 (!seedLongPrefillMtp &&
+                                  generationConfigs.size() == 1 &&
+                                  generationConfigs[0].IsSimpleGreedy() &&
+                                  Qwen35SkipIntermediateChunkHeadEnabled()));
+                            model->speculativeCaptureAllHiddenStates =
+                                seedLongPrefillMtp;
+                            model->speculativeCaptureDFlashHiddenStates =
+                                seedLongPrefillDFlash;
                             model->speculativeCacheOnlyForward =
                                 oldCacheOnlyForward || skipIntermediateHead;
                             if (seedLongPrefillMtp) {
@@ -20363,6 +20485,11 @@ namespace fastllm {
                                 model->speculativeHiddenStates.dims.clear();
                                 model->speculativeHiddenStates.strides.clear();
                                 model->speculativeHiddenStates.expansionDims.clear();
+                            }
+                            if (seedLongPrefillDFlash) {
+                                releaseLongPrefillDFlashHidden();
+                                model->speculativeDFlashHiddenStates.resize(
+                                    model->dflashTargetLayerIds.size());
                             }
                             try {
                                 ret = model->ForwardGPU(1, curInput, curAttentionMasks,
@@ -20372,15 +20499,23 @@ namespace fastllm {
                             } catch (...) {
                                 model->speculativeCaptureAllHiddenStates =
                                     oldCaptureAllHiddenStates;
+                                model->speculativeCaptureDFlashHiddenStates =
+                                    oldCaptureDFlashHiddenStates;
                                 model->speculativeCacheOnlyForward =
                                     oldCacheOnlyForward;
-                                if (seedLongPrefillMtp) {
-                                    eraseLongPrefillMtpCache();
+                                if (seedLongPrefillDFlash) {
+                                    releaseLongPrefillDFlashHidden();
+                                }
+                                if (seedLongPrefillMtp ||
+                                    seedLongPrefillDFlash) {
+                                    eraseLongPrefillDraftCache();
                                 }
                                 throw;
                             }
                             model->speculativeCaptureAllHiddenStates =
                                 oldCaptureAllHiddenStates;
+                            model->speculativeCaptureDFlashHiddenStates =
+                                oldCaptureDFlashHiddenStates;
                             model->speculativeCacheOnlyForward =
                                 oldCacheOnlyForward;
 
@@ -20397,7 +20532,7 @@ namespace fastllm {
                                 bool appended = appendLongPrefillMtpCache(
                                     model->speculativeHiddenStates,
                                     mtpInputTokens, curPositionIds,
-                                    longPrefillMtpBaseTokens + st,
+                                    longPrefillBaseTokens + st,
                                     !isLastChunk, draftToken);
                                 if (!appended) {
                                     seedLongPrefillMtp = false;
@@ -20406,8 +20541,37 @@ namespace fastllm {
                                     longPrefillMtpSeeded = draftToken >= 0;
                                 }
                             }
+                            if (seedLongPrefillDFlash) {
+                                if (isLastChunk) {
+                                    AssertInFastLLM(
+                                        !ret.empty(),
+                                        "Qwen3.5 DFlash long prefill returned no token.\n");
+                                }
+                                bool appended = false;
+                                try {
+                                    appended =
+                                        appendLongPrefillDFlashCache(
+                                            longPrefillBaseTokens + st,
+                                            curLen, isLastChunk,
+                                            isLastChunk ? ret.back() : -1,
+                                            longPrefillDFlashDraftTokens);
+                                } catch (...) {
+                                    releaseLongPrefillDFlashHidden();
+                                    throw;
+                                }
+                                // The projection and draft-KV materialization
+                                // have consumed this chunk. Releasing the
+                                // captured target features here keeps peak
+                                // memory proportional to 2048 tokens.
+                                releaseLongPrefillDFlashHidden();
+                                if (!appended) {
+                                    seedLongPrefillDFlash = false;
+                                } else if (isLastChunk) {
+                                    longPrefillDFlashSeeded = true;
+                                }
+                            }
                             st += curLen;
-                            int cachedTokens = longPrefillMtpBaseTokens + st;
+                            int cachedTokens = longPrefillBaseTokens + st;
                             if (cachedTokens % pageLen == 0) {
                                 singleContext->TryRecordPagedCache(model);
                             }
@@ -20421,7 +20585,29 @@ namespace fastllm {
                                        st, len, st * 100 / len, chunkSpeed);
                             }
                         }
-                        if (longPrefillMtpSeeded) {
+                        if (longPrefillDFlashSeeded) {
+                            int nextToken = ret.back();
+                            usedMtpForward = true;
+                            acceptedTokenLists = {{nextToken}};
+                            nextInputTokenLists = {{nextToken}};
+                            nextInputTokenLists[0].insert(
+                                nextInputTokenLists[0].end(),
+                                longPrefillDFlashDraftTokens.begin(),
+                                longPrefillDFlashDraftTokens.end());
+                            keptInputLens = {len};
+                            if (!model->mtpLogPrinted.exchange(true)) {
+                                printf("[Qwen3.5 DFlash2] enabled: layers=%d, drafts_per_step=%d, root_device=cuda:%d, tp_devices=%zu, log_interval=%d validations.\n",
+                                       model->dflashLayers,
+                                       longPrefillDFlashDrafts,
+                                       longPrefillDraftDevices[0],
+                                       longPrefillDraftDevices.size(),
+                                       QWEN35_MTP_LOG_INTERVAL);
+                            }
+                            printf("[Qwen3.5 DFlash2] long prefill cache seeded: tokens=%d, chunk=%d.\n",
+                                   longPrefillBaseTokens + len,
+                                   longPrefillChunkSize);
+                            fflush(stdout);
+                        } else if (longPrefillMtpSeeded) {
                             int nextToken = ret.back();
                             usedMtpForward = true;
                             acceptedTokenLists = {{nextToken}};
@@ -20433,12 +20619,12 @@ namespace fastllm {
                                 printf("[Qwen3.5 MTP] enabled: layers=%d, drafts_per_step=%d, root_device=cuda:%d, tp_devices=%zu, log_interval=%d validations.\n",
                                        model->mtp_num_hidden_layers,
                                        longPrefillMtpDrafts,
-                                       longPrefillMtpDevices[0],
-                                       longPrefillMtpDevices.size(),
+                                       longPrefillDraftDevices[0],
+                                       longPrefillDraftDevices.size(),
                                        QWEN35_MTP_LOG_INTERVAL);
                             }
                             printf("[Qwen3.5 MTP] long prefill cache seeded: tokens=%d.\n",
-                                   longPrefillMtpBaseTokens + len);
+                                   longPrefillBaseTokens + len);
                             fflush(stdout);
                         }
                     }
