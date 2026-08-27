@@ -90,6 +90,26 @@ namespace fastllm {
                    std::strcmp(value, "OFF") != 0;
         }
 
+        int Qwen4EnvInt(const char *name, int fallback) {
+            const char *value = std::getenv(name);
+            if (value == nullptr || value[0] == '\0') {
+                return fallback;
+            }
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            return end == value ? fallback : (int)parsed;
+        }
+
+        bool Qwen4PrefixCacheEnabled() {
+            const char *value = std::getenv("FASTLLM_PREFIX_CACHE");
+            return value == nullptr || value[0] == '\0' ||
+                   Qwen4EnvFlagEnabled("FASTLLM_PREFIX_CACHE");
+        }
+
+        bool Qwen4PrefixCacheDebugEnabled() {
+            return Qwen4EnvFlagEnabled("FASTLLM_QWEN4_PREFIX_CACHE_DEBUG");
+        }
+
         uint64_t Qwen4SplitMix64(uint64_t value) {
             value += kSplitMixGamma;
             value = ((value ^ (value >> 30)) * kSplitMixM1);
@@ -161,6 +181,23 @@ namespace fastllm {
                 ToDataType(value, reference.dataType);
             }
         }
+
+        void Qwen4ResetCacheTensor(Data &cache, bool linear) {
+            const DataType dataType = cache.dataType;
+            const long long cacheUid = cache.cacheUid;
+            if (cache.multiDeviceData) {
+                for (auto &item : cache.multiDeviceDatas) {
+                    delete item.second;
+                }
+                cache.multiDeviceDatas.clear();
+                cache.multiDeviceData = false;
+            }
+            cache.FreeSpace();
+            cache = Data(dataType);
+            cache.cacheUid = cacheUid;
+            cache.isKVCache = true;
+            cache.isLinearAttention = linear;
+        }
     }
 
     Qwen4ExpModel::Qwen4ExpModel() : Qwen3NextModel() {
@@ -207,6 +244,19 @@ namespace fastllm {
             languagePrefix + "layers.*.ple.key_proj.weight",
             languagePrefix + "layers.*.ple.value_proj.weight"
         };
+    }
+
+    Qwen4ExpModel::~Qwen4ExpModel() {
+        ShutdownRuntime();
+        {
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            this->pendingPrefixRestores.clear();
+            this->prefixSnapshots.clear();
+        }
+        {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            this->requestStates.clear();
+        }
     }
 
     void Qwen4ExpModel::InitParams() {
@@ -520,6 +570,10 @@ namespace fastllm {
         const float *ids = reinterpret_cast<const float *>(idsCpu.cpuData);
         const int batch = inputIds.dims[0];
         const int sequence = inputIds.dims[1];
+        state.processedTokens.reserve(state.processedTokens.size() + sequence);
+        for (int token = 0; token < sequence; token++) {
+            state.processedTokens.push_back((int)(ids[token] + 0.01f));
+        }
 
         const std::string ple = languagePrefix + "layers." +
             std::to_string(this->pleLayer) + ".ple.";
@@ -1518,13 +1572,414 @@ namespace fastllm {
         AddTo(output, sharedOutput);
     }
 
-    int Qwen4ExpModel::Forward(const Data &inputIds,
-                               const Data &attentionMask,
-                               const Data &positionIds,
-                               std::vector<std::pair<Data, Data>> &pastKeyValues,
-                               const GenerationConfig &generationConfig,
-                               const LastTokensManager &lastTokens,
-                               std::vector<float> *retLogits) {
+    std::shared_ptr<Qwen4ExpModel::PrefixSnapshot>
+    Qwen4ExpModel::FindPrefixSnapshotLocked(
+            const std::vector<int> &tokens,
+            int maxCachedLen,
+            int exactLen) const {
+        std::shared_ptr<PrefixSnapshot> best;
+        for (const auto &snapshot : this->prefixSnapshots) {
+            if (snapshot == nullptr || snapshot->cachedLen <= 0 ||
+                snapshot->cachedLen > maxCachedLen ||
+                snapshot->cachedLen > (int)tokens.size()) {
+                continue;
+            }
+            if (exactLen >= 0 && snapshot->cachedLen != exactLen) {
+                continue;
+            }
+            if ((int)snapshot->tokens.size() != snapshot->cachedLen ||
+                !std::equal(snapshot->tokens.begin(), snapshot->tokens.end(),
+                            tokens.begin())) {
+                continue;
+            }
+            if (best == nullptr || snapshot->cachedLen > best->cachedLen ||
+                (snapshot->cachedLen == best->cachedLen &&
+                 snapshot->timestamp > best->timestamp)) {
+                best = snapshot;
+            }
+        }
+        return best;
+    }
+
+    void Qwen4ExpModel::MaybeRecordPrefixSnapshot(
+            const std::vector<std::pair<Data, Data>> &pastKeyValues,
+            RequestState &state) {
+        if (!Qwen4PrefixCacheEnabled() ||
+            (int)pastKeyValues.size() < this->block_cnt) {
+            return;
+        }
+
+        int cachedLen = 0;
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            if (this->IsLinearAttentionLayer(layer)) {
+                continue;
+            }
+            const Data &key = pastKeyValues[layer].first;
+            const Data &value = pastKeyValues[layer].second;
+            if (key.dims.size() < 2 || value.dims.size() < 2 ||
+                key.dims[1] <= 0 || key.dims[1] != value.dims[1] ||
+                (cachedLen > 0 && cachedLen != key.dims[1])) {
+                return;
+            }
+            cachedLen = key.dims[1];
+        }
+        if (cachedLen <= 0 ||
+            cachedLen != (int)state.processedTokens.size()) {
+            return;
+        }
+
+        const int pageLen = std::max(1, fastllm::GetPageLen());
+        const int intervalPages = std::max(
+            1, Qwen4EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16));
+        const int interval = pageLen * intervalPages;
+        if (cachedLen - state.lastPrefixSnapshotLen < interval) {
+            return;
+        }
+
+        uint64_t tensorBytes = 0;
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            const Data &first = pastKeyValues[layer].first;
+            const Data &second = pastKeyValues[layer].second;
+            if (first.dims.empty() || second.dims.empty() ||
+                first.multiDeviceData || second.multiDeviceData) {
+                return;
+            }
+            tensorBytes += first.GetBytes() + second.GetBytes();
+            if (this->IsLinearAttentionLayer(layer)) {
+                continue;
+            }
+            const auto raw = state.indexerRawKeys.find(layer);
+            const auto positions = state.indexerPositions.find(layer);
+            const size_t expectedRaw = (size_t)cachedLen *
+                this->indexerKvHeads * this->indexerHeadDim;
+            if (raw == state.indexerRawKeys.end() ||
+                raw->second.size() != expectedRaw ||
+                positions == state.indexerPositions.end() ||
+                positions->second.size() != (size_t)cachedLen) {
+                return;
+            }
+        }
+
+        uint64_t stateBytes =
+            ((uint64_t)state.processedTokens.size() + cachedLen) * sizeof(int) +
+            (uint64_t)state.convHistory.size() * sizeof(float);
+        for (const auto &item : state.indexerRawKeys) {
+            stateBytes += (uint64_t)item.second.size() * sizeof(float);
+        }
+        for (const auto &item : state.indexerPositions) {
+            stateBytes += (uint64_t)item.second.size() * sizeof(float);
+        }
+        const uint64_t snapshotBytes = tensorBytes + stateBytes;
+        const uint64_t maxSnapshotBytes =
+            (uint64_t)std::max(
+                1, Qwen4EnvInt(
+                    "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_MB", 4096)) *
+            1024ULL * 1024ULL;
+        if (snapshotBytes > maxSnapshotBytes) {
+            state.lastPrefixSnapshotLen = cachedLen;
+            if (Qwen4PrefixCacheDebugEnabled()) {
+                std::printf(
+                    "[qwen4-prefix-cache] skip tokens=%d bytes=%.3f GiB "
+                    "limit=%.3f GiB\n",
+                    cachedLen, snapshotBytes / 1073741824.0,
+                    maxSnapshotBytes / 1073741824.0);
+                std::fflush(stdout);
+            }
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            if (state.prefixRequestId <= 0) {
+                state.prefixRequestId = ++this->prefixRequestCounter;
+                if (state.prefixRequestId <= 0) {
+                    state.prefixRequestId = 1;
+                    this->prefixRequestCounter = 1;
+                }
+            }
+            auto existing = FindPrefixSnapshotLocked(
+                state.processedTokens, cachedLen, cachedLen);
+            if (existing != nullptr) {
+                existing->timestamp = ++this->prefixSnapshotTimestamp;
+                state.lastPrefixSnapshotLen = cachedLen;
+                return;
+            }
+        }
+
+        std::shared_ptr<PrefixSnapshot> snapshot(new PrefixSnapshot());
+        snapshot->cachedLen = cachedLen;
+        snapshot->requestId = state.prefixRequestId;
+        snapshot->tensorBytes = tensorBytes;
+        snapshot->stateBytes = stateBytes;
+        snapshot->tokens = state.processedTokens;
+        snapshot->state = state;
+        snapshot->state.lastPrefixSnapshotLen = cachedLen;
+        snapshot->layers.resize(this->block_cnt);
+
+        auto copyTensorToCpu = [](const Data &source, Data &destination,
+                                  DataDevice &sourceDevice,
+                                  std::vector<int> &sourceDeviceIds) -> bool {
+            if (source.dims.empty() ||
+                (source.dataDevice == DataDevice::CUDA &&
+                 source.cudaData == nullptr) ||
+                (source.dataDevice == DataDevice::CPU &&
+                 source.cpuData == nullptr)) {
+                return false;
+            }
+            sourceDevice = source.dataDevice;
+            sourceDeviceIds = source.dataDeviceIds;
+            destination.CopyFrom(source);
+            destination.isKVCache = true;
+            destination.isLinearAttention = source.isLinearAttention;
+            destination.isLinearAttentionTransposed =
+                source.isLinearAttentionTransposed;
+            destination.isPagedKVCache = false;
+            destination.pagedKVCacheData = nullptr;
+            destination.pageIndex.clear();
+            destination.lastPageLen = 0;
+            destination.multiDeviceData = false;
+            destination.multiDeviceDatas.clear();
+            destination.ClearTensorParallelLayout();
+            destination.ToDevice(DataDevice::CPU, true);
+            return destination.cpuData != nullptr;
+        };
+
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            PrefixLayerSnapshot &layerSnapshot = snapshot->layers[layer];
+            layerSnapshot.linear = this->IsLinearAttentionLayer(layer);
+            if (!copyTensorToCpu(
+                    pastKeyValues[layer].first,
+                    layerSnapshot.first,
+                    layerSnapshot.firstDevice,
+                    layerSnapshot.firstDeviceIds) ||
+                !copyTensorToCpu(
+                    pastKeyValues[layer].second,
+                    layerSnapshot.second,
+                    layerSnapshot.secondDevice,
+                    layerSnapshot.secondDeviceIds)) {
+                return;
+            }
+        }
+
+        size_t recordCount = 0;
+        uint64_t recordBytes = 0;
+        {
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            auto existing = FindPrefixSnapshotLocked(
+                snapshot->tokens, cachedLen, cachedLen);
+            if (existing != nullptr) {
+                existing->timestamp = ++this->prefixSnapshotTimestamp;
+            } else {
+                snapshot->timestamp = ++this->prefixSnapshotTimestamp;
+                this->prefixSnapshots.push_back(snapshot);
+            }
+
+            const int maxPerRequest = std::max(
+                1, Qwen4EnvInt(
+                    "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 4));
+            while (std::count_if(
+                       this->prefixSnapshots.begin(),
+                       this->prefixSnapshots.end(),
+                       [&](const std::shared_ptr<PrefixSnapshot> &item) {
+                           return item != nullptr &&
+                                  item->requestId == state.prefixRequestId;
+                       }) > maxPerRequest) {
+                auto oldest = this->prefixSnapshots.end();
+                for (auto it = this->prefixSnapshots.begin();
+                     it != this->prefixSnapshots.end(); ++it) {
+                    if (*it == nullptr ||
+                        (*it)->requestId != state.prefixRequestId) {
+                        continue;
+                    }
+                    if (oldest == this->prefixSnapshots.end() ||
+                        (*it)->timestamp < (*oldest)->timestamp) {
+                        oldest = it;
+                    }
+                }
+                if (oldest == this->prefixSnapshots.end()) {
+                    break;
+                }
+                this->prefixSnapshots.erase(oldest);
+            }
+
+            const int maxRecords = std::max(
+                1, Qwen4EnvInt(
+                    "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 8));
+            for (const auto &item : this->prefixSnapshots) {
+                if (item != nullptr) {
+                    recordBytes += item->tensorBytes + item->stateBytes;
+                }
+            }
+            while ((int)this->prefixSnapshots.size() > maxRecords ||
+                   recordBytes > maxSnapshotBytes) {
+                auto oldest = std::min_element(
+                    this->prefixSnapshots.begin(),
+                    this->prefixSnapshots.end(),
+                    [](const std::shared_ptr<PrefixSnapshot> &left,
+                       const std::shared_ptr<PrefixSnapshot> &right) {
+                        if (left == nullptr) {
+                            return right != nullptr;
+                        }
+                        if (right == nullptr) {
+                            return false;
+                        }
+                        return left->timestamp < right->timestamp;
+                    });
+                if (*oldest != nullptr) {
+                    const uint64_t oldestBytes =
+                        (*oldest)->tensorBytes + (*oldest)->stateBytes;
+                    recordBytes -= std::min(recordBytes, oldestBytes);
+                }
+                this->prefixSnapshots.erase(oldest);
+            }
+            recordCount = this->prefixSnapshots.size();
+        }
+
+        state.lastPrefixSnapshotLen = cachedLen;
+        if (Qwen4PrefixCacheDebugEnabled()) {
+            std::printf(
+                "[qwen4-prefix-cache] record tokens=%d tensors=%.3f GiB "
+                "state=%.3f GiB records=%zu resident=%.3f GiB\n",
+                cachedLen, tensorBytes / 1073741824.0,
+                stateBytes / 1073741824.0, recordCount,
+                recordBytes / 1073741824.0);
+            std::fflush(stdout);
+        }
+    }
+
+    bool Qwen4ExpModel::TryRestoreHistoryCache(
+            std::vector<int> &inputTokens, int &cacheLen) {
+        cacheLen = 0;
+        if (!Qwen4PrefixCacheEnabled() || inputTokens.size() <= 1) {
+            return false;
+        }
+
+        const std::vector<int> originalTokens = inputTokens;
+        std::shared_ptr<PrefixSnapshot> snapshot;
+        {
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            snapshot = FindPrefixSnapshotLocked(
+                originalTokens, (int)originalTokens.size() - 1);
+            if (snapshot == nullptr) {
+                return false;
+            }
+            snapshot->timestamp = ++this->prefixSnapshotTimestamp;
+            PendingPrefixRestore pending;
+            pending.cachedLen = snapshot->cachedLen;
+            pending.tokens = originalTokens;
+            pending.snapshot = snapshot;
+            this->pendingPrefixRestores.push_back(std::move(pending));
+            while (this->pendingPrefixRestores.size() > 64) {
+                this->pendingPrefixRestores.pop_front();
+            }
+        }
+
+        cacheLen = snapshot->cachedLen;
+        inputTokens.erase(inputTokens.begin(), inputTokens.begin() + cacheLen);
+        if (Qwen4PrefixCacheDebugEnabled()) {
+            std::printf("[qwen4-prefix-cache] hit cached=%d remaining=%zu\n",
+                        cacheLen, inputTokens.size());
+            std::fflush(stdout);
+        }
+        return true;
+    }
+
+    bool Qwen4ExpModel::RestorePrefixSnapshot(
+            ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot) {
+        if (context == nullptr || snapshot == nullptr ||
+            snapshot->cachedLen <= 0 ||
+            snapshot->cachedLen != context->cacheLen ||
+            (int)snapshot->layers.size() < this->block_cnt ||
+            (int)context->pastKeyValues.size() < this->block_cnt ||
+            (int)snapshot->state.processedTokens.size() !=
+                snapshot->cachedLen) {
+            return false;
+        }
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            const PrefixLayerSnapshot &layerSnapshot = snapshot->layers[layer];
+            if (layerSnapshot.first.dims.empty() ||
+                layerSnapshot.second.dims.empty() ||
+                layerSnapshot.linear !=
+                    this->IsLinearAttentionLayer(layer)) {
+                return false;
+            }
+        }
+
+        auto restoreTensor = [](const Data &source, Data &destination,
+                                bool linear, DataDevice targetDevice,
+                                const std::vector<int> &targetDeviceIds)
+                                -> bool {
+            const long long cacheUid = destination.cacheUid;
+            destination.FreeSpace();
+            destination.CopyFrom(source);
+            destination.cacheUid = cacheUid;
+            destination.isKVCache = true;
+            destination.isLinearAttention = linear;
+            destination.isLinearAttentionTransposed =
+                source.isLinearAttentionTransposed;
+            destination.isPagedKVCache = false;
+            destination.pagedKVCacheData = nullptr;
+            destination.pageIndex.clear();
+            destination.lastPageLen = 0;
+            destination.multiDeviceData = false;
+            destination.multiDeviceDatas.clear();
+            destination.ClearTensorParallelLayout();
+            if (destination.expansionDims.size() != destination.dims.size()) {
+                destination.expansionDims = destination.dims;
+            }
+            if (targetDevice == DataDevice::CUDA) {
+                destination.ToDevice(
+                    DataDevice::CUDA, targetDeviceIds, true);
+                return destination.cudaData != nullptr;
+            }
+            destination.ToDevice(DataDevice::CPU, true);
+            return destination.cpuData != nullptr;
+        };
+
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            const PrefixLayerSnapshot &layerSnapshot = snapshot->layers[layer];
+            if (!restoreTensor(
+                    layerSnapshot.first,
+                    context->pastKeyValues[layer].first,
+                    layerSnapshot.linear,
+                    layerSnapshot.firstDevice,
+                    layerSnapshot.firstDeviceIds) ||
+                !restoreTensor(
+                    layerSnapshot.second,
+                    context->pastKeyValues[layer].second,
+                    layerSnapshot.linear,
+                    layerSnapshot.secondDevice,
+                    layerSnapshot.secondDeviceIds)) {
+                return false;
+            }
+        }
+
+        RequestState restored = snapshot->state;
+        {
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            restored.prefixRequestId = ++this->prefixRequestCounter;
+            if (restored.prefixRequestId <= 0) {
+                restored.prefixRequestId = 1;
+                this->prefixRequestCounter = 1;
+            }
+        }
+        restored.lastPrefixSnapshotLen = snapshot->cachedLen;
+        {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            this->requestStates[&context->pastKeyValues[0].first] =
+                std::move(restored);
+        }
+        return true;
+    }
+    int Qwen4ExpModel::Forward(
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *retLogits) {
         std::vector<std::vector<float> *> batchLogits = {retLogits};
         return ForwardBatch(1, inputIds, attentionMask, positionIds,
                             pastKeyValues, generationConfig, lastTokens,
@@ -1550,7 +2005,7 @@ namespace fastllm {
         RequestState *requestState;
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
-            requestState = &this->requestStates[&pastKeyValues];
+            requestState = &this->requestStates[&pastKeyValues[0].first];
         }
 
         Data embedding, hiddenBuffers[2];
@@ -1611,6 +2066,8 @@ namespace fastllm {
                                   "_output", *hiddenStates);
         }
 
+        MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
+
         Data finalHidden;
         HyperMix(*hiddenStates, languagePrefix + "hyper_connection_mixer.",
                  finalHidden, nullptr);
@@ -1655,8 +2112,91 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
-        std::lock_guard<std::mutex> guard(this->stateMutex);
-        this->requestStates.erase(&context->pastKeyValues);
+        std::shared_ptr<PrefixSnapshot> snapshot;
+        if (context->cacheLen > 0) {
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            for (auto it = this->pendingPrefixRestores.begin();
+                 it != this->pendingPrefixRestores.end(); ++it) {
+                if (it->cachedLen == context->cacheLen &&
+                    it->tokens == context->allTokens) {
+                    snapshot = it->snapshot;
+                    this->pendingPrefixRestores.erase(it);
+                    break;
+                }
+            }
+        }
+
+        bool restored = false;
+        if (snapshot != nullptr) {
+            // Cache materialization allocates and copies CUDA tensors.  Use
+            // the same exclusion as the generic history-cache restore so a
+            // newly launched request cannot interleave those copies with an
+            // already running Forward call.
+            std::lock_guard<std::mutex> guard(this->forwardLocker);
+            restored = RestorePrefixSnapshot(context, snapshot);
+        }
+        if (restored) {
+            // The legacy scheduler classifies preTokens == 0 as a new
+            // prefill.  A restored request already owns cache storage, so
+            // classifying it as a new prefill makes it count itself against a
+            // max-batch=1 admission check and it can never run.  Mark the
+            // aligned prefix as processed; the mandatory uncached suffix is
+            // then evaluated by the ordinary decode path.
+            context->preTokens = context->cacheLen;
+            context->intParams["add_special_tokens"] = 0;
+            if (context->currentTokens.size() == 1) {
+                context->intParams["promptLen"] = context->cacheLen;
+                context->intParams["index"] = 0;
+            } else {
+                context->intParams["promptLen"] =
+                    context->cacheLen + context->currentTokens.size();
+                context->intParams["index"] = -1;
+            }
+            if (Qwen4PrefixCacheDebugEnabled()) {
+                std::printf("[qwen4-prefix-cache] restore tokens=%d\n",
+                            context->cacheLen);
+                std::fflush(stdout);
+            }
+            return;
+        }
+
+        if (context->cacheLen > 0) {
+            for (int layer = 0;
+                 layer < (int)context->pastKeyValues.size(); layer++) {
+                const bool linear = layer < this->block_cnt &&
+                    this->IsLinearAttentionLayer(layer);
+                Qwen4ResetCacheTensor(
+                    context->pastKeyValues[layer].first, linear);
+                Qwen4ResetCacheTensor(
+                    context->pastKeyValues[layer].second, linear);
+            }
+            context->cacheLen = 0;
+            context->currentTokens = context->allTokens;
+            context->preTokens = 0;
+            context->intParams.clear();
+            if (Qwen4PrefixCacheDebugEnabled()) {
+                std::printf(
+                    "[qwen4-prefix-cache] restore failed; recompute\n");
+                std::fflush(stdout);
+            }
+        }
+
+        const int layerCount = std::min(
+            this->block_cnt, (int)context->pastKeyValues.size());
+        for (int layer = 0; layer < layerCount; layer++) {
+            if (!this->IsLinearAttentionLayer(layer)) {
+                continue;
+            }
+            context->pastKeyValues[layer].first.isLinearAttention = true;
+            context->pastKeyValues[layer].second.isLinearAttention = true;
+        }
+        {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            if (!context->pastKeyValues.empty()) {
+                this->requestStates[&context->pastKeyValues[0].first] =
+                    RequestState();
+            }
+        }
     }
 
     void Qwen4ExpModel::OnResponseContextRemoved(ResponseContext *context) {
@@ -1664,7 +2204,9 @@ namespace fastllm {
             return;
         }
         std::lock_guard<std::mutex> guard(this->stateMutex);
-        this->requestStates.erase(&context->pastKeyValues);
+        if (!context->pastKeyValues.empty()) {
+            this->requestStates.erase(&context->pastKeyValues[0].first);
+        }
     }
 
     void Qwen4ExpModel::WarmUp() {
@@ -1681,7 +2223,9 @@ namespace fastllm {
         Forward(inputIds, attentionMask, positionIds, cache);
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
-            this->requestStates.erase(&cache);
+            if (!cache.empty()) {
+                this->requestStates.erase(&cache[0].first);
+            }
         }
 
         this->elementsInKVCachePerToken = 0;

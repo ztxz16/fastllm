@@ -7,7 +7,10 @@
 
 #include "qwen3_next.h"
 
+#include <cstdint>
+#include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -16,6 +19,7 @@ namespace fastllm {
     class Qwen4ExpModel : public Qwen3NextModel {
     public:
         Qwen4ExpModel();
+        ~Qwen4ExpModel() override;
 
         void InitParams() override;
 
@@ -43,6 +47,8 @@ namespace fastllm {
 
         void WarmUp() override;
 
+        bool TryRestoreHistoryCache(std::vector<int> &inputTokens,
+                                    int &cacheLen) override;
         void OnResponseContextCreated(ResponseContext *context) override;
         void OnResponseContextRemoved(ResponseContext *context) override;
         bool UseGenericHistoryCache() const override { return false; }
@@ -54,6 +60,36 @@ namespace fastllm {
             std::vector<float> convHistory;
             std::map<int, std::vector<float>> indexerRawKeys;
             std::map<int, std::vector<float>> indexerPositions;
+            std::vector<int> processedTokens;
+            int prefixRequestId = 0;
+            int lastPrefixSnapshotLen = 0;
+        };
+
+        struct PrefixLayerSnapshot {
+            bool linear = false;
+            Data first;
+            Data second;
+            DataDevice firstDevice = DataDevice::CPU;
+            DataDevice secondDevice = DataDevice::CPU;
+            std::vector<int> firstDeviceIds;
+            std::vector<int> secondDeviceIds;
+        };
+
+        struct PrefixSnapshot {
+            int cachedLen = 0;
+            int requestId = 0;
+            long long timestamp = 0;
+            uint64_t tensorBytes = 0;
+            uint64_t stateBytes = 0;
+            std::vector<int> tokens;
+            std::vector<PrefixLayerSnapshot> layers;
+            RequestState state;
+        };
+
+        struct PendingPrefixRestore {
+            int cachedLen = 0;
+            std::vector<int> tokens;
+            std::shared_ptr<PrefixSnapshot> snapshot;
         };
 
         static const std::string languagePrefix;
@@ -80,8 +116,13 @@ namespace fastllm {
 
         bool preparedWeights = false;
         std::mutex prepareMutex;
-        std::mutex stateMutex;
-        std::map<const std::vector<std::pair<Data, Data>> *, RequestState> requestStates;
+        mutable std::mutex stateMutex;
+        mutable std::map<const Data *, RequestState> requestStates;
+        mutable std::mutex prefixCacheMutex;
+        std::vector<std::shared_ptr<PrefixSnapshot>> prefixSnapshots;
+        std::deque<PendingPrefixRestore> pendingPrefixRestores;
+        long long prefixSnapshotTimestamp = 0;
+        int prefixRequestCounter = 0;
 
         std::vector<uint64_t> pleMultipliers;
         std::vector<int64_t> pleHeadVocabSizes;
@@ -112,6 +153,16 @@ namespace fastllm {
                                 Data &pastConv, Data &pastRecurrent,
                                 Data &output);
         void RunMoE(int layer, const Data &input, Data &output);
+
+        std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
+            const std::vector<int> &tokens, int maxCachedLen,
+            int exactLen = -1) const;
+        void MaybeRecordPrefixSnapshot(
+            const std::vector<std::pair<Data, Data>> &pastKeyValues,
+            RequestState &state);
+        bool RestorePrefixSnapshot(
+            ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot);
 
         void DumpTensorIfRequested(const std::string &name, const Data &data) const;
     };
