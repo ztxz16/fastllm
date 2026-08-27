@@ -792,7 +792,7 @@ namespace {
                     "FastLLM FP16 cuBLAS GEMM failed: status=%d, "
                     "shape=(n=%d,m=%d,k=%d), addTo=%d, graphCapture=%d.\n",
                     (int)status, n, m, k, addTo ? 1 : 0,
-                    FastllmCudaGraphIsCapturing() ? 1 : 0);
+                    FastllmCudaGraphIsCapturingFast() ? 1 : 0);
             fflush(stderr);
 #ifdef CUDA_NO_TENSOR_CORE
             FastllmCudaFree(cudaFp32Output);
@@ -844,7 +844,7 @@ namespace {
                     "shape=(n=%d,m=%d,k=%d), addTo=%d, graphCapture=%d.\n",
                     (int)state, cudaGetErrorString(state), n, m, k,
                     addTo ? 1 : 0,
-                    FastllmCudaGraphIsCapturing() ? 1 : 0);
+                    FastllmCudaGraphIsCapturingFast() ? 1 : 0);
             fflush(stderr);
             cudaGetLastError();
             return false;

@@ -2537,7 +2537,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (alreadyOnTarget && this->dataDevice == DataDevice::CUDA &&
             this->cudaData != nullptr && deviceIds.size() > 0 &&
-            !FastllmCudaGraphIsCapturing()) {
+            !FastllmCudaGraphIsCapturingFast()) {
             // Pointer-attribute queries are useful for detecting stale view
             // metadata in eager execution, but CUDA forbids them during stream
             // capture. A graph path must eagerly warm the identical topology

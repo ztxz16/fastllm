@@ -155,6 +155,10 @@ void FastllmCudaGraphDestroy(void *graph);
 void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
 bool FastllmCudaGraphIsCapturing();
+// Hot-path query for FastLLM-managed captures. When CUDA Graph is disabled
+// and no capture has been observed on this thread, this avoids a CUDA runtime
+// call. External capturers should call the exact query above once first.
+bool FastllmCudaGraphIsCapturingFast();
 bool FastllmCudaGraphCaptureInvalidated();
 // Give pointer-batched kernels a stable, bounded set of device pointer tables
 // while warming/capturing one whole-step graph. Scopes may be nested and must

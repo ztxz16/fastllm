@@ -2430,7 +2430,7 @@ namespace fastllm {
         // Synchronizing an event during stream capture is illegal. The graph
         // warmup normally fills this cache; if it did not, retain native until
         // an eager execution can make an evidence-based decision.
-        if (FastllmCudaGraphIsCapturing()) {
+        if (FastllmCudaGraphIsCapturingFast()) {
             bool ok = RunCudaNativeLinearFp8Block128(
                 input, weight, bias, output, n, m, k);
             if (ok) {
@@ -2641,7 +2641,7 @@ namespace fastllm {
         // Event synchronization is illegal during graph capture. Qwen3.5 and
         // the other graph users execute an eager warmup before capture, so the
         // normal path reaches this point and populates the cache first.
-        if (FastllmCudaGraphIsCapturing()) {
+        if (FastllmCudaGraphIsCapturingFast()) {
             if (!PreferCudaTritonLinearFp8Sm89Fallback(
                     input.dataType, n, m, k)) {
                 return false;

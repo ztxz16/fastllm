@@ -190,7 +190,7 @@ static bool PrepareWorkspace(DeviceWorkspace &workspace, int device) {
     if (workspace.ready) {
         return workspace.device == device;
     }
-    if (FastllmCudaGraphIsCapturing()) {
+    if (FastllmCudaGraphIsCapturingFast()) {
         return false;
     }
 
@@ -270,7 +270,7 @@ static bool PrepareWeightCache(WeightCache &cache,
         return cache.device == device &&
                cache.weightPointer == weight.cudaData;
     }
-    if (FastllmCudaGraphIsCapturing()) {
+    if (FastllmCudaGraphIsCapturingFast()) {
         return false;
     }
 

@@ -415,7 +415,7 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                                device) != cudaSuccess ||
         major != 12 || minor != 0 || sms != kNumSms ||
-        FastllmCudaGraphIsCapturing() ||
+        FastllmCudaGraphIsCapturingFast() ||
         !PrepareKernelFunctions()) {
         cudaGetLastError();
         return false;
@@ -1154,7 +1154,7 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
                                device) != cudaSuccess ||
         major != 12 || minor != 0 || sms != kNumSms ||
-        FastllmCudaGraphIsCapturing() ||
+        FastllmCudaGraphIsCapturingFast() ||
         !PrepareKernelFunctions()) {
         cudaGetLastError();
         return false;

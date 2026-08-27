@@ -701,6 +701,18 @@ void FastllmCudaCurrentThreadStreamWaitEvent(void *event) {
 }
 
 static thread_local std::string fastllmCudaGraphLastError;
+// FastLLM-owned captures enter and leave through the wrappers below. Remember
+// that state on the calling thread so eager execution can avoid thousands of
+// cudaStreamIsCapturing runtime queries when CUDA Graph is disabled. The exact
+// public query also latches captures started externally. Do not clear the latch
+// on a negative query: tensor-parallel code can temporarily inspect a different
+// device's per-thread stream while the original stream is active.
+static thread_local bool fastllmCudaGraphCaptureMayBeActive = false;
+
+static bool FastllmCudaGraphCaptureQueryRequired() {
+    return fastllmCudaGraphCaptureMayBeActive ||
+           fastllm::GetFastllmEnv().cudaGraph;
+}
 
 static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
     if (err == cudaSuccess) {
@@ -725,6 +737,9 @@ bool FastllmCudaGraphBeginCapture() {
     }
     state = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
     bool ok = FastllmCudaGraphSetError("cudaStreamBeginCapture", state);
+    if (ok) {
+        fastllmCudaGraphCaptureMayBeActive = true;
+    }
     if (ok && fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
                   FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
         FastllmCudaGraphRegisterCurrentCapture();
@@ -742,6 +757,9 @@ bool FastllmCudaGraphPrepareCaptureDevice() {
 // 不通过 showError 上报的错误路径（如 FlashInfer、独立 kernel 封装内的 printf）
 // 也会 invalidate 捕获，因此该检查是错误标志之外的兜底。
 bool FastllmCudaGraphCaptureInvalidated() {
+    if (!FastllmCudaGraphCaptureQueryRequired()) {
+        return false;
+    }
     cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
     cudaError_t state = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
     if (state != cudaSuccess) {
@@ -758,7 +776,16 @@ bool FastllmCudaGraphIsCapturing() {
         cudaGetLastError();
         return false;
     }
-    return captureStatus != cudaStreamCaptureStatusNone;
+    const bool capturing = captureStatus != cudaStreamCaptureStatusNone;
+    fastllmCudaGraphCaptureMayBeActive |= capturing;
+    return capturing;
+}
+
+bool FastllmCudaGraphIsCapturingFast() {
+    if (!FastllmCudaGraphCaptureQueryRequired()) {
+        return false;
+    }
+    return FastllmCudaGraphIsCapturing();
 }
 
 bool FastllmCudaGraphGetAllocationFailurePlaceholder(void **ptr) {
@@ -768,7 +795,7 @@ bool FastllmCudaGraphGetAllocationFailurePlaceholder(void **ptr) {
     *ptr = nullptr;
     if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) !=
             FASTLLM_CUDA_GRAPH_POOL_CAPTURING ||
-        !FastllmCudaGetThreadError() || !FastllmCudaGraphIsCapturing()) {
+        !FastllmCudaGetThreadError() || !FastllmCudaGraphIsCapturingFast()) {
         return false;
     }
     int device = -1;
@@ -806,6 +833,9 @@ namespace {
     }
 
     static bool FastllmCudaGraphIsCapturingCurrentThread() {
+        if (!FastllmCudaGraphCaptureQueryRequired()) {
+            return false;
+        }
         cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
         return cudaStreamIsCapturing(cudaStreamPerThread, &status) == cudaSuccess &&
                status == cudaStreamCaptureStatusActive;
@@ -1283,6 +1313,7 @@ bool FastllmCudaGraphQwen35MoeSelfTest() {
 bool FastllmCudaGraphEndCapture(void **graph) {
     cudaGraph_t cudaGraph = nullptr;
     cudaError_t state = cudaStreamEndCapture(cudaStreamPerThread, &cudaGraph);
+    fastllmCudaGraphCaptureMayBeActive = false;
     if (graph != nullptr) {
         *graph = (void*)cudaGraph;
     }
@@ -4504,7 +4535,7 @@ static void CudaMemDebugRemove(void *ptr) {
 #endif // CUDA_MEM_DEBUG
 
 void * FastllmCudaDirectMalloc(size_t size) {
-    if (FastllmCudaGraphIsCapturing()) {
+    if (FastllmCudaGraphIsCapturingFast()) {
         FastllmCudaSetThreadError();
         return nullptr;
     }
@@ -4536,7 +4567,7 @@ void FastllmCudaDirectFree(void *ret) {
 
 void FastllmCudaMemset0(void *ret, size_t size) {
     cudaError_t state = cudaSuccess;
-    if (FastllmCudaGraphIsCapturing()) {
+    if (FastllmCudaGraphIsCapturingFast()) {
         // cudaMemset is a synchronous runtime API and invalidates stream
         // capture. Keep zero-initialization ordered with the captured kernels
         // on the same per-thread stream without changing eager semantics.
@@ -4692,7 +4723,7 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(size_t size, void **ret, in
     // cudaFree is forbidden while a stream is being captured. A capture-time
     // pool miss must be reported to the graph path instead of trying the
     // ordinary OOM recovery, which would invalidate every participating rank.
-    if (FastllmCudaGraphIsCapturing()) {
+    if (FastllmCudaGraphIsCapturingFast()) {
         FastllmCudaSetThreadError();
         return false;
     }
@@ -4853,7 +4884,7 @@ void * FastllmCudaMalloc(size_t size) {
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
     const bool capturePoolOnly = captureIdentity.valid ||
-        FastllmCudaGraphIsCapturing();
+        FastllmCudaGraphIsCapturingFast();
     const bool useAnyFittingPooledBuffer = capturePoolOnly ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(*view.lock);
@@ -5106,7 +5137,7 @@ bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
     }
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
-    if (captureIdentity.valid || FastllmCudaGraphIsCapturing()) {
+    if (captureIdentity.valid || FastllmCudaGraphIsCapturingFast()) {
         return false;
     }
 
@@ -5611,11 +5642,10 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
         return;
     }
 
-    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
-    cudaError_t state = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
-    checkCudaErrors("Error: CUDA error when checking CUDA graph capture status!", state);
-    if (captureStatus != cudaStreamCaptureStatusNone) {
-        state = cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    cudaError_t state = cudaSuccess;
+    if (FastllmCudaGraphIsCapturingFast()) {
+        state = cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice,
+                                cudaStreamPerThread);
         checkCudaErrors("Error: CUDA error when async copy on GPU!", state);
         return;
     }
@@ -5688,18 +5718,14 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
     if (forceStagedCopy) {
         canPeerAccess = 0;
     }
-    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
     cudaError_t switchState = cudaSetDevice(dstId);
+    bool destinationCapturing = false;
     if (switchState == cudaSuccess) {
-        cudaError_t captureState = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
-        if (captureState != cudaSuccess) {
-            cudaGetLastError();
-            captureStatus = cudaStreamCaptureStatusNone;
-        }
+        destinationCapturing = FastllmCudaGraphIsCapturingFast();
     }
     cudaSetDevice(oriId);
 
-    if (captureStatus != cudaStreamCaptureStatusNone) {
+    if (destinationCapturing) {
         // Record a send node on the source graph and a matching receive node on
         // the destination graph.  Unlike a destination-side peer-read kernel,
         // this dependency is generation-safe across repeated graph replays.
@@ -5789,10 +5815,8 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
         return;
     }
 
-    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
-    cudaError_t state = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
-    checkCudaErrors("Error: CUDA error when checking CUDA graph capture status!", state);
-    if (captureStatus != cudaStreamCaptureStatusNone) {
+    cudaError_t state = cudaSuccess;
+    if (FastllmCudaGraphIsCapturingFast()) {
         state = cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height,
                                   cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         checkCudaErrors("Error: CUDA error when async 2D copy on GPU!", state);
@@ -15803,7 +15827,7 @@ static bool FastllmCudaResolveDataDeviceId(const fastllm::Data &data,
     // checked. During capture allocations and device placement are frozen, so
     // the single-device metadata is the graph-safe source of truth. Ambiguous
     // views (no device id) still fail closed and use the eager fallback.
-    if (FastllmCudaGraphIsCapturing()) {
+    if (FastllmCudaGraphIsCapturingFast()) {
         if (data.dataDeviceIds.size() != 1 || data.dataDeviceIds[0] < 0) {
             return false;
         }
@@ -15903,7 +15927,7 @@ static void **FastllmCudaStagePointers(const std::vector<void*> &pointers) {
         PointerTableKey key(scope.owner, device, scope.nextSlot++);
         auto &entry = graphTables[key];
         if (entry == nullptr) {
-            if (FastllmCudaGraphIsCapturing()) {
+            if (FastllmCudaGraphIsCapturingFast()) {
                 FastllmCudaSetThreadError();
                 return nullptr;
             }
@@ -15917,7 +15941,7 @@ static void **FastllmCudaStagePointers(const std::vector<void*> &pointers) {
     bool needAllocate = table->device != device ||
                         table->capacity < bytes;
     bool needUpdate = needAllocate || table->pointers != pointers;
-    if ((needAllocate || needUpdate) && FastllmCudaGraphIsCapturing()) {
+    if ((needAllocate || needUpdate) && FastllmCudaGraphIsCapturingFast()) {
         // The warmup for this exact graph topology must create and populate
         // every slot. A miss here means host control flow changed; finish the
         // common TP capture protocol and discard the graph.

@@ -12,6 +12,68 @@
 
 namespace {
 
+bool RunExternalCaptureQueryRegression() {
+    bool passed = false;
+    std::string error;
+    std::thread worker([&]() {
+        FastllmCudaSetDevice(0);
+        void *pointer = nullptr;
+        cudaGraph_t graph = nullptr;
+        bool captureStarted = false;
+        if (FastllmCudaGraphIsCapturing()) {
+            error = "exact capture query reported an idle stream as active";
+            return;
+        }
+        if (cudaMalloc(&pointer, 1) != cudaSuccess) {
+            error = "failed to allocate external-capture probe storage";
+            return;
+        }
+        if (cudaStreamBeginCapture(
+                cudaStreamPerThread,
+                cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            error = "failed to start external CUDA stream capture";
+        } else {
+            captureStarted = true;
+        }
+        if (error.empty() && !FastllmCudaGraphIsCapturing()) {
+            error = "exact query missed an externally started capture";
+        }
+        if (error.empty() && !FastllmCudaGraphIsCapturingFast()) {
+            error = "external capture was not latched for hot-path queries";
+        }
+        if (error.empty() &&
+            cudaMemsetAsync(pointer, 0, 1, cudaStreamPerThread) !=
+                cudaSuccess) {
+            error = "failed to record work in external CUDA capture";
+        }
+        if (captureStarted) {
+            cudaError_t endState =
+                cudaStreamEndCapture(cudaStreamPerThread, &graph);
+            if (error.empty() && endState != cudaSuccess) {
+                error = "failed to finish external CUDA stream capture";
+            }
+        }
+        if (graph != nullptr) {
+            cudaGraphDestroy(graph);
+        }
+        if (pointer != nullptr) {
+            cudaFree(pointer);
+        }
+        if (error.empty() && FastllmCudaGraphIsCapturing()) {
+            error = "exact capture query remained active after capture end";
+        }
+        if (error.empty() && FastllmCudaGraphIsCapturingFast()) {
+            error = "hot-path capture query remained active after capture end";
+        }
+        passed = error.empty();
+    });
+    worker.join();
+    if (!passed) {
+        std::cerr << error << "\n";
+    }
+    return passed;
+}
+
 bool RunDeferredBigBufferClearRegression() {
     FastllmCudaSetDevice(0);
     constexpr size_t kDeferredBytes = 304ULL * 1024ULL * 1024ULL;
@@ -76,6 +138,9 @@ int main() {
     if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount <= 0) {
         std::cerr << "no CUDA device available for graph pool-miss regression\n";
         return 2;
+    }
+    if (!RunExternalCaptureQueryRegression()) {
+        return 17;
     }
     const int participants = std::min(deviceCount, 4);
     FastllmCudaSetDevice(0);

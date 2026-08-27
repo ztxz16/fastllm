@@ -1072,7 +1072,7 @@ bool FastllmCudaDots3NoteIndexerTopK(
     // per-head matrices, then exactly rescore a bounded candidate set before
     // the final selection. Short rows keep the lower-overhead scalar kernel.
     bool useTensorCore = getCudaInfos()->cudaArch >= 890 &&
-                         !FastllmCudaGraphIsCapturing();
+                         !FastllmCudaGraphIsCapturingFast();
     if (const char *env = std::getenv(
             "FASTLLM_DOTS3_NOTE_INDEXER_TENSOR_CORE")) {
         useTensorCore = useTensorCore && env[0] != '\0' &&
