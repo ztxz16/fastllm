@@ -25,6 +25,7 @@ def _args(**overrides):
         "tp": "cuda:0,1",
         "device": "cuda:0",
         "low": False,
+        "speculative_algorithm": "",
         "cuda_embedding": False,
         "max_batch": 64,
     }
@@ -75,6 +76,21 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
             self.assertNotIn("FASTLLM_CUDA_GRAPH", os.environ)
             self.assertNotIn(
                 "FASTLLM_GPU_TOKEN_HANDOFF", os.environ)
+            self.assertFalse(args.cuda_embedding)
+
+    def test_does_not_enable_fast_paths_for_dflash(self):
+        with patch.dict(os.environ, {}, clear=True):
+            args = _configure_qwen35_auto_fast_paths(
+                _args(speculative_algorithm="dflash"),
+                is_qwen35_model=True,
+                mtp=0,
+            )
+
+            self.assertNotIn("FASTLLM_CUDA_GRAPH", os.environ)
+            self.assertNotIn(
+                "FASTLLM_GPU_TOKEN_HANDOFF", os.environ)
+            self.assertNotIn(
+                "FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH", os.environ)
             self.assertFalse(args.cuda_embedding)
 
     def test_does_not_change_other_models(self):

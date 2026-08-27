@@ -23892,8 +23892,19 @@ namespace fastllm {
             inputIds.ToDevice(DataDevice::CUDA, {device}, true);
             Embedding(inputIds, *draftEmbedWeight, hiddenStates);
         } else {
-            Qwen35CpuEmbeddingDirect(inputIds, embedWeight, hiddenStates,
-                                     DataType::BFLOAT16);
+            // Keep the host table in the target path's established type.
+            // Alternating the full 248k x hidden table between FP16 and BF16
+            // once per proposal is far more expensive than converting the
+            // eight selected rows after the lookup.
+            DataType hostEmbeddingType = embedWeight.dataType;
+            if (hostEmbeddingType != DataType::FLOAT16 &&
+                hostEmbeddingType != DataType::BFLOAT16 &&
+                hostEmbeddingType != DataType::FLOAT32) {
+                hostEmbeddingType = DataType::BFLOAT16;
+            }
+            Qwen35CpuEmbeddingDirect(
+                inputIds, embedWeight, hiddenStates,
+                hostEmbeddingType);
             hiddenStates.ToDevice(DataDevice::CUDA, {device}, true);
         }
         if (hiddenStates.dataType != DataType::BFLOAT16) {

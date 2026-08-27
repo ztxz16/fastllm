@@ -349,12 +349,17 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
 
     Environment variables remain authoritative debugging overrides.  The
     automatic path is deliberately limited to the configuration for which the
-    scheduler can safely fall back row-by-row: CUDA thread TP, no MTP, and no
-    low-memory mode.
+    scheduler can safely fall back row-by-row: CUDA thread TP, no MTP or
+    external DFlash, and no low-memory mode. DFlash keeps the embedding table
+    on the host by default; its target and draft paths share one table dtype
+    and only transfer the selected hidden rows.
     """
     tp_arg = getattr(args, "tp", "")
     device = getattr(args, "device", "")
+    speculative_algorithm = str(
+        getattr(args, "speculative_algorithm", "") or "").strip().lower()
     eligible = (is_qwen35_model and mtp == 0 and
+                speculative_algorithm != "dflash" and
                 not bool(getattr(args, "low", False)) and
                 _uses_thread_tp(tp_arg) and _uses_cuda_device(device))
 
