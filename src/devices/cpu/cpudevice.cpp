@@ -408,6 +408,7 @@ namespace fastllm {
         this->ops["TransferAttn"] = (BaseOperator*)(new CpuTransferAttnOp());
         this->ops["ApplyChunkDecayByLastLogG"] = (BaseOperator*)(new CpuApplyChunkDecayByLastLogGOp());
         this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CpuRecurrentGatedDeltaRuleOp());
+        this->ops["ChunkGatedDeltaRulePrefill"] = (BaseOperator*)(new CpuChunkGatedDeltaRulePrefillOp());
         this->ops["CausalMask"] = (BaseOperator*)(new CpuCausalMaskOp());
         this->ops["TopK"] = (BaseOperator*)(new CpuTopKOp());
         this->ops["SelectExpert"] = (BaseOperator*)(new CpuSelectExpertOp());
@@ -8819,6 +8820,144 @@ ops += (long long)lines * inputDim * interDim * 2;
 
         if (q.dataType == DataType::FLOAT16) {
             Float32ToFloat16(fatv, (uint16_t*)core_attn_out.cpuData, (int)atvVector.size());
+        }
+    }
+
+    void CpuChunkGatedDeltaRulePrefillOp::Reshape(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &coreAttnOut = *(datas.find("core_attn_out")->second);
+        AssertInFastLLM(q.dims.size() == 5 && v.dims.size() == 5,
+                        "CPU chunk GDN prefill expects 5-D q and v.\n");
+        coreAttnOut.dataType = v.dataType;
+        coreAttnOut.Resize({q.dims[0], q.dims[1], q.dims[2],
+                            q.dims[3], v.dims[4]});
+    }
+
+    void CpuChunkGatedDeltaRulePrefillOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &g = *(datas.find("g")->second);
+        Data &attn = *(datas.find("attn")->second);
+        Data &kCumDecay = *(datas.find("k_cumdecay")->second);
+        Data &state = *(datas.find("last_recurrent_state")->second);
+        Data &coreAttnOut = *(datas.find("core_attn_out")->second);
+
+        AssertInFastLLM(
+            (q.dataType == DataType::FLOAT32 ||
+             q.dataType == DataType::FLOAT16) &&
+            k.dataType == q.dataType && v.dataType == q.dataType &&
+            g.dataType == q.dataType && attn.dataType == q.dataType &&
+            kCumDecay.dataType == q.dataType && state.dataType == q.dataType,
+            "CPU chunk GDN prefill expects matching float32 or float16 inputs.\n");
+        AssertInFastLLM(
+            q.dims.size() == 5 && k.dims.size() == 5 &&
+            v.dims.size() == 5 && g.dims.size() == 4 &&
+            attn.dims.size() == 5 && kCumDecay.dims.size() == 5 &&
+            state.dims.size() == 4,
+            "CPU chunk GDN prefill received invalid tensor ranks.\n");
+
+        const int batch = q.dims[0];
+        const int heads = q.dims[1];
+        const int chunks = q.dims[2];
+        const int chunkSize = q.dims[3];
+        const int keyDim = q.dims[4];
+        const int valueDim = v.dims[4];
+        AssertInFastLLM(
+            state.dims == std::vector<int>({batch, heads, keyDim, valueDim}),
+            "CPU chunk GDN prefill state shape mismatch.\n");
+
+        // The chunk formula is composed from standard CPU matmul/elementwise
+        // operators.  Reorder only private copies so the public operation does
+        // not mutate q/k/v/g/attn/kCumDecay.
+        Data qByChunk, kByChunk, vByChunk, gByChunk;
+        Data attnByChunk, kCumByChunk;
+        Mul(q, 1.0f, qByChunk);
+        Mul(k, 1.0f, kByChunk);
+        Mul(v, 1.0f, vByChunk);
+        Mul(g, 1.0f, gByChunk);
+        Mul(attn, 1.0f, attnByChunk);
+        Mul(kCumDecay, 1.0f, kCumByChunk);
+        PermuteSelf(qByChunk, {2, 0, 1, 3, 4});
+        PermuteSelf(kByChunk, {2, 0, 1, 3, 4});
+        PermuteSelf(vByChunk, {2, 0, 1, 3, 4});
+        PermuteSelf(gByChunk, {2, 0, 1, 3});
+        PermuteSelf(attnByChunk, {2, 0, 1, 3, 4});
+        PermuteSelf(kCumByChunk, {2, 0, 1, 3, 4});
+
+        auto makeChunk4D = [](Data &src, int index, Data &dst) {
+            dst.dims = {src.dims[1], src.dims[2], src.dims[3], src.dims[4]};
+            dst.strides = {src.strides[1], src.strides[2],
+                           src.strides[3], src.strides[4]};
+            dst.FakeFrom(src, (size_t)index * src.strides[0] * src.unitSize);
+        };
+        auto makeChunk3D = [](Data &src, int index, Data &dst) {
+            dst.dims = {src.dims[1], src.dims[2], src.dims[3]};
+            dst.strides = {src.strides[1], src.strides[2], src.strides[3]};
+            dst.FakeFrom(src, (size_t)index * src.strides[0] * src.unitSize);
+        };
+
+        coreAttnOut.Allocate();
+        const size_t unitBytes = coreAttnOut.unitSize;
+        const size_t chunkBytes =
+            (size_t)chunkSize * valueDim * unitBytes;
+        for (int chunk = 0; chunk < chunks; chunk++) {
+            Data qChunk, kChunk, vChunk, gChunk, attnChunk, kCumChunk;
+            makeChunk4D(qByChunk, chunk, qChunk);
+            makeChunk4D(kByChunk, chunk, kChunk);
+            makeChunk4D(vByChunk, chunk, vChunk);
+            makeChunk3D(gByChunk, chunk, gChunk);
+            makeChunk4D(attnByChunk, chunk, attnChunk);
+            makeChunk4D(kCumByChunk, chunk, kCumChunk);
+
+            Data stateCorrection, valueNew;
+            MatMul(kCumChunk, state, stateCorrection);
+            Mul(stateCorrection, -1.0f, valueNew);
+            AddTo(valueNew, vChunk);
+
+            Data gExp, qScaled, stateOutput, localOutput;
+            Exp(gChunk, gExp);
+            gExp.Resize({batch, heads, chunkSize, 1});
+            Mul(qChunk, 1.0f, qScaled);
+            MulTo(qScaled, gExp);
+            MatMul(qScaled, state, stateOutput);
+            MatMul(attnChunk, valueNew, localOutput);
+            AddTo(localOutput, stateOutput);
+
+            const char *src = (const char *)localOutput.cpuData;
+            char *dst = (char *)coreAttnOut.cpuData;
+            for (int batchHead = 0; batchHead < batch * heads; batchHead++) {
+                const size_t srcOffset = (size_t)batchHead * chunkBytes;
+                const size_t dstOffset =
+                    ((size_t)batchHead * chunks + chunk) * chunkBytes;
+                std::memcpy(dst + dstOffset, src + srcOffset, chunkBytes);
+            }
+
+            Data gLast, gLastRepeated, negativeG, stateScale, keyScale;
+            Split(gChunk, 2, chunkSize - 1, chunkSize, gLast);
+            Repeat(gLast, 2, chunkSize, gLastRepeated);
+            Mul(gChunk, -1.0f, negativeG);
+            AddTo(gLastRepeated, negativeG);
+            Exp(gLastRepeated, keyScale);
+            keyScale.Resize({batch, heads, chunkSize, 1});
+
+            Data keyScaled, stateDelta;
+            Mul(kChunk, 1.0f, keyScaled);
+            MulTo(keyScaled, keyScale);
+            PermuteSelf(keyScaled, {0, 1, 3, 2});
+            MatMul(keyScaled, valueNew, stateDelta);
+
+            Exp(gLast, stateScale);
+            stateScale.Resize({batch, heads, 1, 1});
+            MulTo(state, stateScale);
+            AddTo(state, stateDelta);
         }
     }
 
