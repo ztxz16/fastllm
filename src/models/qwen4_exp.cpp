@@ -167,7 +167,7 @@ namespace fastllm {
         this->canDoBatchForward = false;
         this->model_type = "qwen4_exp";
         this->model_struct = "qwen4_exp";
-        this->defaultChunkedPrefillSize = 2048;
+        this->defaultChunkedPrefillSize = 4096;
         this->block_cnt = 48;
         this->rotary_dim = 64;
 
