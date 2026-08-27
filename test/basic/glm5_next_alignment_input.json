@@ -1,0 +1,27 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "1+1="
+    }
+  ],
+  "rendered_prompt": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>1+1=<|assistant|><think>",
+  "input_ids": [
+    154822,
+    154824,
+    154826,
+    25062,
+    287,
+    29905,
+    371,
+    25,
+    7487,
+    154827,
+    16,
+    10,
+    16,
+    28,
+    154828,
+    154841
+  ]
+}
