@@ -92,11 +92,52 @@ the PLE rows selected by the test tokens.  For validation tokens `[31114,
 same top-10 token set (10/10 overlap).  Logit cosine similarity was
 `0.999888539`; relative L2 error was `0.0150250`.
 
+## Official Transformers CPU check
+
+`qwen4_exp_transformers_check.py` constructs the upstream
+`Qwen4ExpForCausalLM` on a meta device, loads all regular parameters on CPU,
+and keeps only the 512-expert and sharded PLE storage lazy.  The upstream
+Transformers implementations of hyper-connections, attention, Gated DeltaNet,
+PLE, routing, norms, and the language-model head execute unchanged.
+
+```bash
+PYTHONPATH=/path/to/transformers/src \
+  python tools/qwen4_exp_transformers_check.py \
+    "$MODEL" /tmp/qwen4_dump --threads 64 \
+    --json /tmp/qwen4_transformers_cpu.json
+```
+
+The command exits non-zero unless argmax matches, logit cosine is at least
+`0.999`, and relative L2 error is at most `0.02`.  Against Transformers
+`5.16.0.dev0` at `36deb0b53ed0863f4b4dfdea23dcaec7f3df3701`, the validation
+run passed all three checks.  It compared all 48 decoder outputs and all
+248,320 final logits; argmax was `44` in both implementations, top-10 set
+overlap was 10/10, logit cosine was `0.999888480`, and relative L2 error was
+`0.015025171`.  The official CPU forward took 9.244 seconds after lazy model
+storage was ready.
+
+## Thinking and tool calling
+
+Qwen4-Exp is registered with the existing Qwen tagged-reasoning and XML tool
+protocols.  The OpenAI server advertises `low`, `medium`, and `xhigh`
+reasoning efforts, with `xhigh` as the default.  Per-request thinking can be
+disabled with:
+
+```json
+{"chat_template_kwargs":{"enable_thinking":false}}
+```
+
+The validation run covered both modes and a required tool call through
+`/v1/chat/completions`.  Thinking mode returned separate `reasoning_content`
+and final `content`; disabled thinking returned only `391`.  A weather request
+returned a structured `get_weather` tool call with `{"city":"北京"}` and
+`finish_reason: "tool_calls"`.
+
 The architecture audit used these source snapshots:
 
 | project | snapshot | use in the audit |
 | --- | --- | --- |
-| Transformers | `dabae5f` | eager QSA, GDN, PLE, hyper-connection, MoE, and logits equations |
+| Transformers | `36deb0b53` | official CPU model graph and eager QSA, GDN, PLE, hyper-connection, MoE, and logits equations |
 | SGLang | `73a255206` | exact Qwen4-Exp inference path, pinned-host PLE layout, and weight-loader semantics |
 | vLLM | `17da485` | Qwen3-Next/Qwen3.5 FP8 and GDN baseline |
 
