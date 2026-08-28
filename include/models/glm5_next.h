@@ -107,6 +107,16 @@ namespace fastllm {
                 std::vector<std::pair<Data, Data>> &pastKeyValues,
                 Data &output);
 
+        void RunCompressedMlaAttention(
+                int layerIndex, Data &input, int sequence,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                Data &output);
+
+        void RunExpandedSparseAttention(
+                int layerIndex, Data &input, int sequence,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                Data &output);
+
         void RunClampedMlp(
                 Data &input, Data &gateUpWeight, Data &downWeight,
                 Data &output);
@@ -131,6 +141,12 @@ namespace fastllm {
         int qkRopeHeadDim = 0;
         int qkHeadDim = 0;
         int valueHeadDim = 0;
+        // FlashInfer's paged MLA kernel currently has a (512, 64)
+        // specialization. GLM-5.3 has no positional K/Q component, so a
+        // shared all-zero 64-wide component lets it use that specialization
+        // without changing attention scores.
+        int mlaPaddedPeHeadDim = 64;
+        bool useCompressedMla = true;
 
         int denseIntermediateSize = 0;
         int moeIntermediateSize = 0;

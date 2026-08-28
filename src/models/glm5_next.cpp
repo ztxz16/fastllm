@@ -214,6 +214,14 @@ namespace fastllm {
             return enabled;
         }
 
+        bool Glm5NextEnvEnabled(const char *name) {
+            const char *value = std::getenv(name);
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "off") != 0;
+        }
+
         int Glm5NextPagedCacheLength(const Data &cache) {
             if (!cache.isPagedKVCache ||
                 cache.pagedKVCacheData == nullptr ||
@@ -415,6 +423,8 @@ namespace fastllm {
 
         indexTopK = requiredInt("index_topk");
         max_positions = requiredInt("max_position_embeddings");
+        useCompressedMla = !Glm5NextEnvEnabled(
+            "FASTLLM_GLM5_NEXT_EXPANDED_DSA");
         AssertInFastLLM(
             max_positions >= indexTopK,
             "GLM-5.3 max_position_embeddings is smaller than index_topk.");
@@ -488,9 +498,14 @@ namespace fastllm {
         elementsInKVCachePerToken = 0;
         for (int layer = 0; layer < block_cnt; layer++) {
             if (!kdaLayers[layer]) {
-                elementsInKVCachePerToken +=
-                    (long long)num_attention_heads *
-                    (qkHeadDim + valueHeadDim);
+                if (useCompressedMla) {
+                    elementsInKVCachePerToken +=
+                        kvLoraRank + mlaPaddedPeHeadDim;
+                } else {
+                    elementsInKVCachePerToken +=
+                        (long long)num_attention_heads *
+                        (qkHeadDim + valueHeadDim);
+                }
             }
         }
 
@@ -544,7 +559,9 @@ namespace fastllm {
             << "42 MoE layers, BF16 activations.\n"
             << "[GLM-5.3] Context window restored to " << max_positions
             << " tokens. DSA above Top-" << indexTopK
-            << " currently uses exact paged attention with "
+            << (useCompressedMla ?
+                " uses exact compressed paged MLA with " :
+                " uses legacy expanded paged attention with ")
             << fastllm::GetPageLen() << "-token cache pages.\n";
     }
 
@@ -821,10 +838,11 @@ namespace fastllm {
                 }
                 continue;
             }
-            auto validPaged = [&](const Data &cache, int headDim) {
+            auto validPaged = [&](const Data &cache, int cacheHeads,
+                                  int headDim) {
                 if (cache.dataType != DataType::BFLOAT16 ||
                     cache.dims != std::vector<int>({
-                        num_attention_heads, memory.sequenceLength,
+                        cacheHeads, memory.sequenceLength,
                         headDim}) ||
                     cache.isLinearAttention ||
                     Glm5NextPagedCacheLength(cache) !=
@@ -836,7 +854,7 @@ namespace fastllm {
                     cache.pagedKVCacheData->dims.size() != 4 ||
                     cache.pagedKVCacheData->dims[1] != cache.pageLen ||
                     cache.pagedKVCacheData->dims[2] !=
-                        num_attention_heads ||
+                        cacheHeads ||
                     cache.pagedKVCacheData->dims[3] != headDim) {
                     return false;
                 }
@@ -848,10 +866,20 @@ namespace fastllm {
                 }
                 return true;
             };
-            if (!validPaged(first, qkHeadDim) ||
-                !validPaged(second, valueHeadDim) ||
+            const int firstHeads = useCompressedMla ? 1 :
+                num_attention_heads;
+            const int secondHeads = useCompressedMla ? 1 :
+                num_attention_heads;
+            const int firstDim = useCompressedMla ?
+                mlaPaddedPeHeadDim : qkHeadDim;
+            const int secondDim = useCompressedMla ?
+                kvLoraRank : valueHeadDim;
+            if (!validPaged(first, firstHeads, firstDim) ||
+                !validPaged(second, secondHeads, secondDim) ||
                 first.pageLen != second.pageLen ||
-                first.pageIndex.size() != second.pageIndex.size()) {
+                first.pageIndex.size() != second.pageIndex.size() ||
+                (useCompressedMla &&
+                 first.pageIndex != second.pageIndex)) {
                 return false;
             }
         }
@@ -1436,6 +1464,191 @@ namespace fastllm {
     }
 
     void Glm5NextModel::RunSparseAttention(
+            int layerIndex, Data &input, int sequence,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            Data &output) {
+        if (useCompressedMla) {
+            RunCompressedMlaAttention(
+                layerIndex, input, sequence, pastKeyValues, output);
+        } else {
+            RunExpandedSparseAttention(
+                layerIndex, input, sequence, pastKeyValues, output);
+        }
+    }
+
+    void Glm5NextModel::RunCompressedMlaAttention(
+            int layerIndex, Data &input, int sequence,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            Data &output) {
+        AssertInFastLLM(
+            qkRopeHeadDim == 0 && qkHeadDim == qkNopeHeadDim &&
+            kvLoraRank == 512 && mlaPaddedPeHeadDim == 64,
+            "GLM-5.3 compressed MLA received an unsupported shape.");
+        const std::string prefix = languagePrefix + "layers." +
+            std::to_string(layerIndex) + ".self_attn.";
+
+        Data qResidual, qNormalized, query;
+        Linear(input, weight[prefix + "q_a_proj.weight"],
+               Data(), qResidual);
+        KimiK3RMSNorm(
+            qResidual, weight[prefix + "q_a_layernorm.weight"],
+            rms_norm_eps, qNormalized);
+        Linear(qNormalized, weight[prefix + "q_b_proj.weight"],
+               Data(), query);
+        qResidual.FreeSpace();
+        qNormalized.FreeSpace();
+        ToDataType(query, DataType::BFLOAT16);
+        query.Reshape(
+            {1, sequence, num_attention_heads, qkNopeHeadDim});
+        PermuteSelf(query, {0, 2, 1, 3});
+
+        Data compressedKv, latentKv;
+        Linear(input, weight[prefix + "kv_a_proj_with_mqa.weight"],
+               Data(), compressedKv);
+        KimiK3RMSNorm(
+            compressedKv, weight[prefix + "kv_a_layernorm.weight"],
+            rms_norm_eps, latentKv);
+        compressedKv.FreeSpace();
+        ToDataType(latentKv, DataType::BFLOAT16);
+        latentKv.Reshape({1, sequence, kvLoraRank});
+
+        // GLM-5.3 has qk_rope_head_dim=0. A zero positional component is
+        // mathematically neutral and lets the existing (512, 64) paged MLA
+        // specialization serve this rope-free model on Ada GPUs.
+        Data keyPe(DataType::BFLOAT16);
+        keyPe.dataDevice = latentKv.dataDevice;
+        keyPe.dataDeviceIds = latentKv.dataDeviceIds;
+        keyPe.Resize({1, sequence, mlaPaddedPeHeadDim});
+        keyPe.Allocate(0.0f);
+
+        Data &keyPeCache = pastKeyValues[layerIndex].first;
+        Data &latentKvCache = pastKeyValues[layerIndex].second;
+        auto initializePagedDescriptor = [](Data &cache,
+                                             const Data &current) {
+            if (cache.dims.empty() && cache.pageIndex.empty() &&
+                cache.pagedKVCacheData == nullptr) {
+                cache.dataType = current.dataType;
+                cache.UpdateUnitSize();
+                cache.dataDevice = current.dataDevice;
+                cache.dataDeviceIds = current.dataDeviceIds;
+                cache.SetKVCache();
+            }
+            AssertInFastLLM(
+                cache.dataType == current.dataType,
+                "GLM-5.3 MLA paged-cache descriptor dtype mismatch.");
+        };
+        initializePagedDescriptor(keyPeCache, keyPe);
+        initializePagedDescriptor(latentKvCache, latentKv);
+        PagedCacheManager *keyPeManager = AllocatePagedCacheManager(
+            layerIndex * 2,
+            PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+            keyPe);
+        PagedCacheManager *latentKvManager = AllocatePagedCacheManager(
+            layerIndex * 2 + 1,
+            PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+            latentKv);
+        AssertInFastLLM(
+            keyPeManager != nullptr && latentKvManager != nullptr,
+            "GLM-5.3 failed to allocate compressed MLA cache managers.");
+        AppendPagedCache(*keyPeManager, keyPeCache, keyPe);
+        AppendPagedCache(*latentKvManager, latentKvCache, latentKv);
+        keyPe.FreeSpace();
+        latentKv.FreeSpace();
+        AssertInFastLLM(
+            Glm5NextPagedCacheLength(keyPeCache) == keyPeCache.dims[1] &&
+            Glm5NextPagedCacheLength(latentKvCache) ==
+                latentKvCache.dims[1] &&
+            keyPeCache.dims[1] == latentKvCache.dims[1] &&
+            keyPeCache.pageLen == latentKvCache.pageLen &&
+            keyPeCache.lastPageLen == latentKvCache.lastPageLen &&
+            keyPeCache.pageIndex == latentKvCache.pageIndex,
+            "GLM-5.3 compressed MLA caches are out of sync.");
+
+        const std::string kvWeightName = prefix + "kv_b_proj.weight";
+        const std::string keyWeightName = kvWeightName + "__mla_key";
+        const std::string valueWeightName = kvWeightName + "__mla_value";
+        auto combined = weight.weight.find(kvWeightName);
+        if (combined != weight.weight.end()) {
+            weight.weight.try_emplace(keyWeightName);
+            weight.weight.try_emplace(valueWeightName);
+            combined = weight.weight.find(kvWeightName);
+            auto keyWeight = weight.weight.find(keyWeightName);
+            auto valueWeight = weight.weight.find(valueWeightName);
+            AssertInFastLLM(
+                combined->second.Count(0) ==
+                    (uint64_t)num_attention_heads *
+                    (qkNopeHeadDim + valueHeadDim) * kvLoraRank,
+                "GLM-5.3 KV-B projection weight has an invalid size.");
+            combined->second.Reshape({
+                num_attention_heads,
+                qkNopeHeadDim + valueHeadDim,
+                kvLoraRank});
+            Split(combined->second, 1, 0, qkNopeHeadDim,
+                  keyWeight->second);
+            Split(combined->second, 1, qkNopeHeadDim,
+                  qkNopeHeadDim + valueHeadDim,
+                  valueWeight->second);
+            weight.weight.erase(combined);
+        }
+        auto keyWeightIt = weight.weight.find(keyWeightName);
+        auto valueWeightIt = weight.weight.find(valueWeightName);
+        AssertInFastLLM(
+            keyWeightIt != weight.weight.end() &&
+            valueWeightIt != weight.weight.end(),
+            "GLM-5.3 compressed MLA split weights are missing.");
+        Data &keyWeight = keyWeightIt->second;
+        Data &valueWeight = valueWeightIt->second;
+        if (keyWeight.dims == std::vector<int>({
+                num_attention_heads, kvLoraRank, qkNopeHeadDim})) {
+            PermuteSelf(keyWeight, {0, 2, 1});
+        }
+        if (valueWeight.dims == std::vector<int>({
+                num_attention_heads, kvLoraRank, valueHeadDim})) {
+            PermuteSelf(valueWeight, {0, 2, 1});
+        }
+        AssertInFastLLM(
+            keyWeight.dims == std::vector<int>({
+                num_attention_heads, qkNopeHeadDim, kvLoraRank}) &&
+            valueWeight.dims == std::vector<int>({
+                num_attention_heads, valueHeadDim, kvLoraRank}),
+            "GLM-5.3 compressed MLA split weights have invalid shapes.");
+
+        PermuteSelf(query, {0, 2, 1, 3});
+        Data queryPe(DataType::BFLOAT16);
+        queryPe.dataDevice = query.dataDevice;
+        queryPe.dataDeviceIds = query.dataDeviceIds;
+        queryPe.Resize({
+            1, sequence, num_attention_heads, mlaPaddedPeHeadDim});
+        queryPe.Allocate(0.0f);
+        PermuteSelf(query, {2, 0, 1, 3});
+        query.Reshape({
+            num_attention_heads, sequence, qkNopeHeadDim});
+
+        Data absorbedQuery;
+        MatMul(query, keyWeight, absorbedQuery);
+        query.FreeSpace();
+        ToDataType(absorbedQuery, DataType::BFLOAT16);
+        Data latentAttention;
+        MergeMLAPaged(
+            absorbedQuery, queryPe, keyPeCache, latentKvCache,
+            latentAttention,
+            1.0f / std::sqrt((float)qkHeadDim));
+        absorbedQuery.FreeSpace();
+        queryPe.FreeSpace();
+
+        Data attentionHeads;
+        MatMulTransB(latentAttention, valueWeight, attentionHeads);
+        latentAttention.FreeSpace();
+        attentionHeads.Reshape({
+            num_attention_heads, 1, sequence, valueHeadDim});
+        PermuteSelf(attentionHeads, {1, 2, 0, 3});
+        attentionHeads.Reshape(
+            {1, sequence, num_attention_heads * valueHeadDim});
+        Linear(attentionHeads, weight[prefix + "o_proj.weight"],
+               Data(), output);
+    }
+
+    void Glm5NextModel::RunExpandedSparseAttention(
             int layerIndex, Data &input, int sequence,
             std::vector<std::pair<Data, Data>> &pastKeyValues,
             Data &output) {
