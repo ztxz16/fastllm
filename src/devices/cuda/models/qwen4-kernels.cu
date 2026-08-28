@@ -672,6 +672,85 @@ namespace {
         }
     }
 
+    template <typename T>
+    __global__ void Qwen4QSAScoreSerialKernel(
+            const T *query, const float *compressedKeys, float *scores,
+            int rows, int blocks, int heads, int headDim,
+            float inverseSqrt, int queryStart, int compressRatio) {
+        const uint64_t total = (uint64_t)rows * blocks;
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int row = item / blocks;
+            const int block = item - (uint64_t)row * blocks;
+            const int rowBlocks = queryStart >= 0
+                ? (queryStart + row + 1) / compressRatio : blocks;
+            if (block >= rowBlocks) {
+                continue;
+            }
+            const float *blockKey = compressedKeys +
+                                    (uint64_t)block * headDim;
+            float score = 0.0f;
+            for (int head = 0; head < heads; head++) {
+                const T *headQuery = query +
+                    ((uint64_t)row * heads + head) * headDim;
+                float dot = 0.0f;
+                // Match the reference and warp kernel's per-head serial
+                // accumulation order exactly. A thread owns the independent
+                // score item, avoiding a mostly idle warp when heads is four.
+                for (int column = 0; column < headDim; column++) {
+                    dot += Qwen4CudaToFloat(headQuery[column]) *
+                           blockKey[column];
+                }
+                score += fmaxf(dot, 0.0f);
+            }
+            scores[item] = score * inverseSqrt;
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4QSAScoreFourHeadKernel(
+            const T *query, const float *compressedKeys, float *scores,
+            int rows, int blocks, int heads, int headDim,
+            float inverseSqrt, int queryStart, int compressRatio) {
+        constexpr int lanesPerItem = 4;
+        const int lane = threadIdx.x & (lanesPerItem - 1);
+        const int itemInBlock = threadIdx.x / lanesPerItem;
+        const int itemsPerBlock = blockDim.x / lanesPerItem;
+        const uint64_t total = (uint64_t)rows * blocks;
+        for (uint64_t item =
+                 (uint64_t)blockIdx.x * itemsPerBlock + itemInBlock;
+             item < total;
+             item += (uint64_t)itemsPerBlock * gridDim.x) {
+            const int row = item / blocks;
+            const int block = item - (uint64_t)row * blocks;
+            const int rowBlocks = queryStart >= 0
+                ? (queryStart + row + 1) / compressRatio : blocks;
+            if (block >= rowBlocks) {
+                continue;
+            }
+            const float *blockKey = compressedKeys +
+                                    (uint64_t)block * headDim;
+            float dot = 0.0f;
+            if (lane < heads) {
+                const T *headQuery = query +
+                    ((uint64_t)row * heads + lane) * headDim;
+                for (int column = 0; column < headDim; column++) {
+                    dot += Qwen4CudaToFloat(headQuery[column]) *
+                           blockKey[column];
+                }
+            }
+            float score = 0.0f;
+            for (int head = 0; head < heads; head++) {
+                score += fmaxf(__shfl_sync(
+                    0xffffffffu, dot, head, lanesPerItem), 0.0f);
+            }
+            if (lane == 0) {
+                scores[item] = score * inverseSqrt;
+            }
+        }
+    }
+
     __device__ __forceinline__ uint32_t Qwen4QSAOrderedFloatBits(
             float value) {
         uint32_t bits = __float_as_uint(value);
@@ -1320,25 +1399,40 @@ bool FastllmCudaQwen4QSASelect(
     }
     constexpr int threads = 256;
     constexpr int warpsPerBlock = threads / 32;
+    const int scoreItemsPerBlock = heads == 4
+        ? threads / 4 : (heads < 4 ? threads : warpsPerBlock);
     const int scoreBlocks = std::min<uint64_t>(
         1024,
-        ((uint64_t)rows * completeBlocks + warpsPerBlock - 1) /
-            warpsPerBlock);
+        ((uint64_t)rows * completeBlocks + scoreItemsPerBlock - 1) /
+            scoreItemsPerBlock);
     const float inverseSqrt = 1.0f / std::sqrt((float)headDim);
     if (query.dataType == fastllm::DataType::FLOAT32) {
-        Qwen4QSAScoreKernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
+        auto kernel = heads == 4
+            ? Qwen4QSAScoreFourHeadKernel<float>
+            : (heads < 4 ? Qwen4QSAScoreSerialKernel<float>
+                         : Qwen4QSAScoreKernel<float>);
+        kernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
             (const float*)query.cudaData,
             (const float*)compressedKeys.cudaData, scores,
             rows, completeBlocks, heads, headDim, inverseSqrt,
             queryStart, compressRatio);
     } else if (query.dataType == fastllm::DataType::FLOAT16) {
-        Qwen4QSAScoreKernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
+        auto kernel = heads == 4
+            ? Qwen4QSAScoreFourHeadKernel<half>
+            : (heads < 4 ? Qwen4QSAScoreSerialKernel<half>
+                         : Qwen4QSAScoreKernel<half>);
+        kernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
             (const half*)query.cudaData,
             (const float*)compressedKeys.cudaData, scores,
             rows, completeBlocks, heads, headDim, inverseSqrt,
             queryStart, compressRatio);
     } else {
-        Qwen4QSAScoreKernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
+        auto kernel = heads == 4
+            ? Qwen4QSAScoreFourHeadKernel<__nv_bfloat16>
+            : (heads < 4
+                   ? Qwen4QSAScoreSerialKernel<__nv_bfloat16>
+                   : Qwen4QSAScoreKernel<__nv_bfloat16>);
+        kernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16*)query.cudaData,
             (const float*)compressedKeys.cudaData, scores,
             rows, completeBlocks, heads, headDim, inverseSqrt,

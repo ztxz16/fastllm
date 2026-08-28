@@ -1057,16 +1057,15 @@ namespace fastllm {
 
         // Keep QSA selection on CUDA. The host vector above remains
         // snapshot-safe, while this lazily materialized tensor uploads only
-        // newly completed rows. Decode always benefits from compact KV gather;
-        // causal prefill switches after one normal 4096-token chunk, where it
-        // overtakes the contiguous dense-attention path.
+        // newly completed rows. Decode and long prefill consume the selected
+        // indices directly. Shorter prefill builds the ordinary dense mask on
+        // CUDA, preserving the faster contiguous attention path without doing
+        // the QSA scorer and TopK on the host.
         const int sparsePrefillMinContext = std::max(
             this->indexerBudget, kQwen4SparsePrefillMinContext);
         const bool useDeviceQsa =
             baseMask.dims.empty() &&
-            query.dataDevice == DataDevice::CUDA &&
-            (sequence == 1 ||
-             (sequence > 1 && keyLength > sparsePrefillMinContext));
+            query.dataDevice == DataDevice::CUDA;
         if (useDeviceQsa) {
             std::shared_ptr<Data> &cacheTensor =
                 state.indexerBlockKeyTensors[layer];
@@ -1115,15 +1114,22 @@ namespace fastllm {
                 }
                 CatDirect(*cacheTensor, delta, 0);
             }
+            const bool useSparseAttention = sequence == 1 ||
+                (sequence > 1 && keyLength > sparsePrefillMinContext);
             Qwen4QSASelect(query, *cacheTensor, keyLength,
                            this->indexerHeads, this->indexerHeadDim,
                            this->indexerBudget,
                            this->indexerCompressRatio, qsaIndices,
                            sequence > 1 ? previousLength : -1);
-            // SparseAttention gathers selected K/V rows and reuses FastLLM's
-            // established Attention op, preserving QK/softmax/V arithmetic
-            // without scanning the full cache.
-            qsaMask = Data();
+            if (useSparseAttention) {
+                // SparseAttention gathers selected K/V rows and reuses
+                // FastLLM's established Attention op, preserving
+                // QK/softmax/V arithmetic without scanning the full cache.
+                qsaMask = Data();
+            } else {
+                Qwen4QSABuildMask(qsaIndices, input, keyLength, qsaMask);
+                qsaIndices = Data();
+            }
             return;
         }
 
