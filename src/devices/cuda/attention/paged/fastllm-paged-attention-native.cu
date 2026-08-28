@@ -899,6 +899,16 @@ static bool FastllmPagedUseGqaDecodeFor(int group, int headDim, int H, int numKv
            group <= 4 && H == group * numKvHeads;
 }
 
+// Qwen3.5 在 TP=2 时使用 group=6、headDim=256。原来的共享 GQA kernel 只覆盖
+// headDim<=128，因此会回退到 per-Q-head 路径，把同一个 KV head 从 HBM 重读 6 次。
+// 这条路径的 kernel 配置专门按 V100 的寄存器、共享内存和 SM 数量调优；严格限制为
+// SM70，避免改变其它架构已有的 FlashInfer/native 路径。设为 0 可随时回退做对照。
+static bool FastllmPagedUseSm70GqaD256DecodeFor(int group, int headDim, int H, int numKvHeads) {
+    const char *env = std::getenv("FASTLLM_PAGED_SM70_GQA_D256_DECODE");
+    return FastllmCudaRuntimeArch() == 70 && (env == nullptr || env[0] != '0') &&
+           group == 6 && headDim == 256 && H == group * numKvHeads;
+}
+
 template <typename KVType>
 __device__ __forceinline__ KVType FastllmKvLoad(const KVType *base, int d) {
     return __ldg(base + d);
@@ -1605,6 +1615,195 @@ FastllmPagedAttentionSplitGQAKernel(
     }
 }
 
+// SM70 headDim=256、group=6 的共享 GQA decode kernel。
+//
+// 一个 block 用 4 个 warp 处理一个 (kv head, 3 个 Q head, split)。同组 3 个 Q head
+// 复用寄存器中的 K/V，因此完整 group=6 只需读取两遍 KV，而 per-Q-head 路径需要读取
+// 六遍。拆成 2 个三头子组可把静态共享内存控制在约 15KB，并在 V100 上维持足够占用率。
+// partial softmax 仍写入通用 scratch，后续沿用已有的 GQA combine kernel。
+static const int FASTLLM_PAGED_SM70_GQA_D256_SUBGROUP = 3;
+static const int FASTLLM_PAGED_SM70_GQA_D256_WARPS = 4;
+
+template <typename QType, typename KVType>
+__global__ void __launch_bounds__(128, 4)
+FastllmPagedAttentionSplitSm70GqaD256Kernel(
+    const QType *qd,
+    const KVType *pagedK,
+    const KVType *pagedV,
+    float *scratch,
+    const int32_t *qSizes,
+    const int32_t *pageSizes,
+    const int32_t *pageIndexs,
+    const int32_t *lastPageLens,
+    int H, int group, int numKvHeads, int pageLen,
+    int q_stride_h, int q_stride_n, float scale, int S) {
+    constexpr int kHeadDim = 256;
+    constexpr int kSubgroup = FASTLLM_PAGED_SM70_GQA_D256_SUBGROUP;
+    constexpr int kWarps = FASTLLM_PAGED_SM70_GQA_D256_WARPS;
+    constexpr int kDimsPerLane = kHeadDim / 32;
+
+    int b = blockIdx.x;
+    int packedGroup = blockIdx.y;
+    int split = blockIdx.z;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    int subgroupCount = group / kSubgroup; // 该路径固定为 group=6，因此为 2。
+    int kvh = packedGroup / subgroupCount;
+    int subgroup = packedGroup - kvh * subgroupCount;
+    int firstQHead = kvh * group + subgroup * kSubgroup;
+    int headDimPlus = kHeadDim + 2;
+
+    int tokenStart = qSizes[b];
+    int qoLen = qSizes[b + 1] - tokenStart;
+    int pageStart = pageSizes[b];
+    int numPages = pageSizes[b + 1] - pageStart;
+    int kvLen = (numPages > 0) ? ((numPages - 1) * pageLen + lastPageLens[b]) : 0;
+
+    __shared__ float sQ[kSubgroup * kHeadDim];
+    __shared__ float sM[kSubgroup * kWarps];
+    __shared__ float sL[kSubgroup * kWarps];
+    __shared__ float sAcc[kSubgroup * kWarps * kHeadDim];
+
+    int chunk = (kvLen > 0) ? ((kvLen + S - 1) / S) : 0;
+    int kvStart = split * chunk;
+    int kvEnd = min(kvStart + chunk, kvLen);
+
+    if (qoLen <= 0 || numPages <= 0 || kvLen <= 0 || kvStart >= kvEnd) {
+        for (int g = 0; g < kSubgroup; g++) {
+            int h = firstQHead + g;
+            float *slot = scratch + ((size_t)(b * H + h) * S + split) * headDimPlus;
+            for (int d = tid; d < kHeadDim; d += blockDim.x) {
+                slot[d] = 0.0f;
+            }
+            if (tid == 0) {
+                slot[kHeadDim] = -1e30f;
+                slot[kHeadDim + 1] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    int token = tokenStart; // 仅用于 qoLen==1 的 decode。
+    for (int idx = tid; idx < kSubgroup * kHeadDim; idx += blockDim.x) {
+        int g = idx / kHeadDim;
+        int d = idx - g * kHeadDim;
+        int h = firstQHead + g;
+        sQ[idx] = FastllmAttentionValueToFloat<QType>(
+            qd[(size_t)h * q_stride_h + (size_t)token * q_stride_n + d]);
+    }
+    __syncthreads();
+
+    size_t pageStride = (size_t)pageLen * numKvHeads * kHeadDim;
+    size_t tokenStride = (size_t)numKvHeads * kHeadDim;
+    size_t kvHeadOffset = (size_t)kvh * kHeadDim;
+    int d0 = lane * kDimsPerLane;
+    const float scaleLog2 = scale * 1.4426950408889634f;
+
+    float m[kSubgroup], l[kSubgroup];
+    float acc[kSubgroup * kDimsPerLane];
+    #pragma unroll
+    for (int g = 0; g < kSubgroup; g++) {
+        m[g] = -1e30f;
+        l[g] = 0.0f;
+    }
+    #pragma unroll
+    for (int i = 0; i < kSubgroup * kDimsPerLane; i++) {
+        acc[i] = 0.0f;
+    }
+
+    for (int j = kvStart + warpId; j < kvEnd; j += kWarps) {
+        size_t base = FastllmPagedKvTokenBase(j, pageStart, pageLen, numPages, pageIndexs,
+                                              pageStride, tokenStride, kvHeadOffset);
+        float kreg[kDimsPerLane], vreg[kDimsPerLane];
+        FastllmKvLoad4Contig<KVType>(pagedK + base, d0, kHeadDim, kreg);
+        FastllmKvLoad4Contig<KVType>(pagedK + base, d0 + 4, kHeadDim, kreg + 4);
+        FastllmKvLoad4Contig<KVType>(pagedV + base, d0, kHeadDim, vreg);
+        FastllmKvLoad4Contig<KVType>(pagedV + base, d0 + 4, kHeadDim, vreg + 4);
+
+        float partial[kSubgroup];
+        #pragma unroll
+        for (int g = 0; g < kSubgroup; g++) {
+            float value = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < kDimsPerLane; i++) {
+                value += sQ[g * kHeadDim + d0 + i] * kreg[i];
+            }
+            partial[g] = value;
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            #pragma unroll
+            for (int g = 0; g < kSubgroup; g++) {
+                partial[g] += __shfl_xor_sync(0xffffffffu, partial[g], offset);
+            }
+        }
+
+        #pragma unroll
+        for (int g = 0; g < kSubgroup; g++) {
+            float score = partial[g] * scaleLog2;
+            if (score > m[g]) {
+                float corr = exp2f(m[g] - score);
+                #pragma unroll
+                for (int i = 0; i < kDimsPerLane; i++) {
+                    acc[g * kDimsPerLane + i] *= corr;
+                }
+                l[g] *= corr;
+                m[g] = score;
+            }
+            float p = exp2f(score - m[g]);
+            #pragma unroll
+            for (int i = 0; i < kDimsPerLane; i++) {
+                acc[g * kDimsPerLane + i] += p * vreg[i];
+            }
+            l[g] += p;
+        }
+    }
+
+    #pragma unroll
+    for (int g = 0; g < kSubgroup; g++) {
+        if (lane == 0) {
+            sM[g * kWarps + warpId] = m[g];
+            sL[g * kWarps + warpId] = l[g];
+        }
+        #pragma unroll
+        for (int i = 0; i < kDimsPerLane; i++) {
+            sAcc[(g * kWarps + warpId) * kHeadDim + d0 + i] =
+                acc[g * kDimsPerLane + i];
+        }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int g = 0; g < kSubgroup; g++) {
+        int h = firstQHead + g;
+        float *slot = scratch + ((size_t)(b * H + h) * S + split) * headDimPlus;
+        float M = -1e30f;
+        #pragma unroll
+        for (int w = 0; w < kWarps; w++) {
+            M = fmaxf(M, sM[g * kWarps + w]);
+        }
+        float L = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < kWarps; w++) {
+            L += sL[g * kWarps + w] * exp2f(sM[g * kWarps + w] - M);
+        }
+        for (int d = tid; d < kHeadDim; d += blockDim.x) {
+            float value = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < kWarps; w++) {
+                value += sAcc[(g * kWarps + w) * kHeadDim + d] *
+                         exp2f(sM[g * kWarps + w] - M);
+            }
+            slot[d] = value;
+        }
+        if (tid == 0) {
+            slot[kHeadDim] = M;
+            slot[kHeadDim + 1] = L;
+        }
+    }
+}
+
 // 解码 GQA 非 split：grid = (batch, numKvHeads)，一次扫完整 KV，无 scratch/combine。
 // 同样用 __launch_bounds__ 提高 V100 占用率（短上下文 decode 走此路径）。
 template <typename QType, typename KVType, int GROUP_MAX>
@@ -1866,6 +2065,22 @@ static void FastllmCudaPagedAttentionBatchGqaLaunch(
 }
 
 template <typename QType, typename KVType>
+static void FastllmCudaPagedAttentionSplitLaunchSm70GqaD256(
+    QType *qd, KVType *pagedK, KVType *pagedV, float *scratch,
+    int32_t *qSizesData, int32_t *pageSizesData, int32_t *pageIndexsData, int32_t *lastPageLensData,
+    uint32_t batch_size, int H, int group, int numKvHeads, int pageLen,
+    int q_stride_h, int q_stride_n, float scale, int S) {
+    constexpr int kSubgroupsPerKvHead = 6 / FASTLLM_PAGED_SM70_GQA_D256_SUBGROUP;
+    constexpr int kBlockThreads = FASTLLM_PAGED_SM70_GQA_D256_WARPS * 32;
+    dim3 grid(batch_size, (unsigned int)(numKvHeads * kSubgroupsPerKvHead), (unsigned int)S);
+    dim3 block(kBlockThreads, 1, 1);
+    FastllmPagedAttentionSplitSm70GqaD256Kernel<QType, KVType><<<grid, block>>>(
+        qd, pagedK, pagedV, scratch,
+        qSizesData, pageSizesData, pageIndexsData, lastPageLensData,
+        H, group, numKvHeads, pageLen, q_stride_h, q_stride_n, scale, S);
+}
+
+template <typename QType, typename KVType>
 static void FastllmCudaPagedAttentionSplitLaunchGqa(
     QType *qd, KVType *pagedK, KVType *pagedV, float *scratch, QType *od,
     int32_t *qSizesData, int32_t *pageSizesData, int32_t *pageIndexsData, int32_t *lastPageLensData,
@@ -1924,8 +2139,32 @@ static void FastllmCudaPagedAttentionSplitLaunch(
     QType *qd = (QType*)q.cudaData;
     QType *od = (QType*)output.cudaData;
     const bool useGqa = FastllmPagedUseGqaDecodeFor(group, headDim, H, numKvHeads);
+    const bool useSm70GqaD256 =
+        FastllmPagedUseSm70GqaD256DecodeFor(group, headDim, H, numKvHeads);
 
-    if (useGqa) {
+    if (useSm70GqaD256) {
+        if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
+            FastllmCudaPagedAttentionSplitLaunchSm70GqaD256<QType, __nv_fp8_e4m3>(
+                qd, (__nv_fp8_e4m3*)pagedKVCacheK->cudaData,
+                (__nv_fp8_e4m3*)pagedKVCacheV->cudaData, scratch,
+                qSizesData, pageSizesData, pageIndexsData, lastPageLensData,
+                batch_size, H, group, numKvHeads, pageLen,
+                q_stride_h, q_stride_n, scale, S);
+        } else if (pagedKVCacheK->dataType == fastllm::DataType::BFLOAT16) {
+            FastllmCudaPagedAttentionSplitLaunchSm70GqaD256<QType, __nv_bfloat16>(
+                qd, (__nv_bfloat16*)pagedKVCacheK->cudaData,
+                (__nv_bfloat16*)pagedKVCacheV->cudaData, scratch,
+                qSizesData, pageSizesData, pageIndexsData, lastPageLensData,
+                batch_size, H, group, numKvHeads, pageLen,
+                q_stride_h, q_stride_n, scale, S);
+        } else {
+            FastllmCudaPagedAttentionSplitLaunchSm70GqaD256<QType, half>(
+                qd, (half*)pagedKVCacheK->cudaData, (half*)pagedKVCacheV->cudaData, scratch,
+                qSizesData, pageSizesData, pageIndexsData, lastPageLensData,
+                batch_size, H, group, numKvHeads, pageLen,
+                q_stride_h, q_stride_n, scale, S);
+        }
+    } else if (useGqa) {
         if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
             FastllmCudaPagedAttentionSplitLaunchGqa<QType, __nv_fp8_e4m3>(
                 qd, (__nv_fp8_e4m3*)pagedKVCacheK->cudaData, (__nv_fp8_e4m3*)pagedKVCacheV->cudaData,
@@ -1958,7 +2197,11 @@ static void FastllmCudaPagedAttentionSplitLaunch(
     }
     dim3 grid2(batch_size, (unsigned int)H, 1);
     dim3 block2((unsigned int)headDim, 1, 1);
-    if (useGqa) {
+    if (useSm70GqaD256) {
+        grid2.y = (unsigned int)numKvHeads;
+        FastllmPagedAttentionCombineGQAKernel<QType, 6><<<grid2, block2>>>(
+            scratch, od, qSizesData, H, group, headDim, S);
+    } else if (useGqa) {
         grid2.y = (unsigned int)numKvHeads;
         if (group == 2) {
             FastllmPagedAttentionCombineGQAKernel<QType, 2><<<grid2, block2>>>(
@@ -2025,8 +2268,14 @@ static bool FastllmCudaHalfPagedAttentionBatchCapturable(
         float *scratch = FastllmGetPagedSplitScratch(device, H, kMaxDecodeBatch, headDim,
                                                      capacitySlots, capturing);
         const bool useGqa = FastllmPagedUseGqaDecodeFor(group, headDim, H, numKvHeads);
-        int S = useGqa ? FastllmChoosePagedSplits(batch_size, numKvHeads, true)
-                       : FastllmChoosePagedSplits(batch_size, H, false);
+        const bool useSm70GqaD256 =
+            FastllmPagedUseSm70GqaD256DecodeFor(group, headDim, H, numKvHeads);
+        int sharedGqaHeads = useSm70GqaD256
+            ? numKvHeads * (group / FASTLLM_PAGED_SM70_GQA_D256_SUBGROUP)
+            : numKvHeads;
+        int S = (useGqa || useSm70GqaD256)
+            ? FastllmChoosePagedSplits(batch_size, sharedGqaHeads, true)
+            : FastllmChoosePagedSplits(batch_size, H, false);
         if (useGqa && S == 1) {
             if (q.dataType == fastllm::DataType::BFLOAT16) {
                 FastllmCudaPagedAttentionBatchGqaLaunch<__nv_bfloat16>(
