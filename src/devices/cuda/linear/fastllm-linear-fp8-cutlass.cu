@@ -1431,6 +1431,21 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGateAdd(
         weight, bias, output, n, m, k, true);
 }
 
+// Check only backend-wide prerequisites here. Input-specific validation stays
+// in the implementation so this remains a reusable, side-effect-free probe.
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAvailable() {
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && \
+    (defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120) || defined(FASTLLM_CUTLASS_FP8_ENABLE_SM121))
+    using namespace fastllm_cuda_cutlass_fp8;
+    return FastllmCutlassUseFusedSwigluQuant() &&
+           FastllmCutlassUseWarpQuant() &&
+           FastllmCutlassFp8CompiledForRuntimeArch(
+               FastllmCudaRuntimeArch());
+#else
+    return false;
+#endif
+}
+
 static bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluImpl(
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
     fastllm::Data &output, int n, int m, int k, bool exactResidual) {

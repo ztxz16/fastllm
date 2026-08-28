@@ -1477,6 +1477,7 @@ bool FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGateAdd(
         int batch, int seqLen, int gateOffset, int gateHeads, float eps,
         fastllm::Data &weight, const fastllm::Data &bias,
         fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAvailable();
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAdd(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

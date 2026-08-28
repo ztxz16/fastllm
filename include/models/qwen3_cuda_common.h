@@ -497,7 +497,8 @@ namespace fastllm {
                 "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT_TP") ||
             !Qwen3CudaCanUseSwigluLinearAdd(
                 input, gateUp, down, downBias,
-                hiddenStates, false)) {
+                hiddenStates, false) ||
+            !FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAvailable()) {
             return false;
         }
         int tokens = input.Count(0) / input.dims.back();
