@@ -4282,6 +4282,456 @@ namespace {
         };
     }
 
+    static OpCase MakeQwen4PLEGateCase() {
+        return {
+            "qwen4_ple_gate",
+            "Qwen4 PLE gate CPU/CUDA agreement",
+            []() {
+                OpTestParams params;
+                params.Add("sequence", "17", "number of input tokens");
+                params.Add("groups", "4", "hyper-connection streams");
+                params.Add("hidden", "160", "channels per stream");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int groups = params.GetInt("groups");
+                const int hidden = params.GetInt("hidden");
+                fastllm::Data key = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.11f, 0.2f);
+                fastllm::Data query = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.37f, 0.2f);
+                fastllm::Data value = MakeTensor(
+                    {1, sequence, hidden}, 0.73f, 0.2f);
+                fastllm::Data output;
+                return CanRunOnDevice(
+                    device, "Qwen4PLEGate",
+                    {{"key", &key}, {"query", &query},
+                     {"value", &value}, {"output", &output}},
+                    {}, {{"groups", groups}});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int groups = params.GetInt("groups");
+                const int hidden = params.GetInt("hidden");
+                fastllm::Data key = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.11f, 0.2f);
+                fastllm::Data query = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.37f, 0.2f);
+                fastllm::Data value = MakeTensor(
+                    {1, sequence, hidden}, 0.73f, 0.2f);
+                fastllm::Data output;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4PLEGate(
+                    key, query, value, groups, output);
+                output.ToDevice(fastllm::DataDevice::CPU);
+                return output;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double groups = params.GetInt("groups");
+                const double hidden = params.GetInt("hidden");
+                return sequence * hidden * (3.0 * groups + 1.0) *
+                       sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double groups = params.GetInt("groups");
+                const double hidden = params.GetInt("hidden");
+                return sequence * groups * hidden * 3.0;
+            }
+        };
+    }
+
+    static OpCase MakeQwen4PLECausalConvCase() {
+        return {
+            "qwen4_ple_conv",
+            "Qwen4 PLE dilated convolution output/history agreement",
+            []() {
+                OpTestParams params;
+                params.Add("sequence", "8", "number of input tokens");
+                params.Add("channels", "64", "depthwise channels");
+                params.Add("kernel", "4", "convolution taps");
+                params.Add("dilation", "3", "causal dilation");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                const int dilation = params.GetInt("dilation");
+                const int historyLength = (kernel - 1) * dilation;
+                fastllm::Data input = MakeTensor(
+                    {1, sequence, channels}, 0.19f, 0.2f);
+                fastllm::Data gated = MakeTensor(
+                    {1, sequence, channels}, 0.43f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.67f, 0.1f);
+                fastllm::Data history = MakeTensor(
+                    {historyLength, channels}, 0.89f, 0.2f);
+                fastllm::Data output, newHistory;
+                return CanRunOnDevice(
+                    device, "Qwen4PLECausalConv",
+                    {{"input", &input}, {"gated", &gated},
+                     {"weight", &weight}, {"history", &history},
+                     {"output", &output}, {"newHistory", &newHistory}},
+                    {}, {{"kernel", kernel}, {"dilation", dilation}});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                const int dilation = params.GetInt("dilation");
+                const int historyLength = (kernel - 1) * dilation;
+                fastllm::Data input = MakeTensor(
+                    {1, sequence, channels}, 0.19f, 0.2f);
+                fastllm::Data gated = MakeTensor(
+                    {1, sequence, channels}, 0.43f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.67f, 0.1f);
+                fastllm::Data history = MakeTensor(
+                    {historyLength, channels}, 0.89f, 0.2f);
+                fastllm::Data output, newHistory;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4PLECausalConv(
+                    input, gated, weight, history, kernel, dilation,
+                    output, newHistory);
+                output.Reshape({(int)output.Count(0)});
+                newHistory.Reshape({(int)newHistory.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(output, newHistory, 0, combined);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double channels = params.GetInt("channels");
+                const double history =
+                    (params.GetInt("kernel") - 1) *
+                    params.GetInt("dilation");
+                return (3.0 * sequence * channels +
+                        2.0 * history * channels +
+                        channels * params.GetInt("kernel")) *
+                       sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("sequence") *
+                       params.GetInt("channels") *
+                       (3.0 * params.GetInt("kernel") + 4.0);
+            }
+        };
+    }
+
+    static OpCase MakeCausalDepthwiseConv1DPrefillCase() {
+        return {
+            "causal_depthwise_conv1d_prefill",
+            "token-major causal depthwise convolution output/state agreement",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "batch size");
+                params.Add("sequence", "3", "number of new tokens");
+                params.Add("channels", "64", "depthwise channels");
+                params.Add("kernel", "4", "convolution taps");
+                params.Add("with_history", "1", "seed a nonzero prior state");
+                params.Add("silu", "1", "apply SiLU to convolution output");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int batch = params.GetInt("batch");
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                fastllm::Data input = MakeTensor(
+                    {batch, sequence, channels}, 0.23f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.61f, 0.1f);
+                fastllm::Data state = params.GetInt("with_history")
+                    ? MakeTensor({batch, channels, kernel}, 0.97f, 0.2f)
+                    : fastllm::Data(fastllm::DataType::FLOAT32);
+                fastllm::Data output;
+                return CanRunOnDevice(
+                    device, "CausalDepthwiseConv1DPrefill",
+                    {{"input", &input}, {"weight", &weight},
+                     {"state", &state}, {"output", &output}},
+                    {}, {{"kernel", kernel},
+                         {"silu", params.GetInt("silu")}});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int batch = params.GetInt("batch");
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                fastllm::Data input = MakeTensor(
+                    {batch, sequence, channels}, 0.23f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.61f, 0.1f);
+                fastllm::Data state = params.GetInt("with_history")
+                    ? MakeTensor({batch, channels, kernel}, 0.97f, 0.2f)
+                    : fastllm::Data(fastllm::DataType::FLOAT32);
+                fastllm::Data output;
+                ScopedFirstDevice guard(device);
+                fastllm::CausalDepthwiseConv1DPrefill(
+                    input, weight, state, kernel,
+                    params.GetInt("silu") != 0, output);
+                output.Reshape({(int)output.Count(0)});
+                state.Reshape({(int)state.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(output, state, 0, combined);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params, const std::string &device)
+                    -> std::function<void()> {
+#ifdef USE_CUDA
+                if (device.rfind("cuda", 0) != 0) {
+                    return nullptr;
+                }
+                const int batch = params.GetInt("batch");
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                const bool silu = params.GetInt("silu") != 0;
+                auto input = std::make_shared<fastllm::Data>(MakeTensor(
+                    {batch, sequence, channels}, 0.23f, 0.2f));
+                auto weight = std::make_shared<fastllm::Data>(MakeTensor(
+                    {channels, 1, kernel}, 0.61f, 0.1f));
+                auto state = std::make_shared<fastllm::Data>(MakeTensor(
+                    {batch, channels, kernel}, 0.97f, 0.2f));
+                auto output = std::make_shared<fastllm::Data>(
+                    fastllm::DataType::FLOAT32,
+                    std::vector<int>({batch, sequence, channels}));
+                input->ToDevice(fastllm::DataDevice::CUDA);
+                weight->ToDevice(fastllm::DataDevice::CUDA);
+                state->ToDevice(fastllm::DataDevice::CUDA);
+                output->ToDevice(fastllm::DataDevice::CUDA);
+                output->Allocate(false);
+                return [input, weight, state, output, kernel, silu]() {
+                    if (!FastllmCudaCausalDepthwiseConv1DPrefill(
+                            *input, *weight, *state, *output,
+                            kernel, silu, false)) {
+                        throw std::runtime_error(
+                            "causal depthwise prefill CUDA replay failed");
+                    }
+                };
+#else
+                (void)params;
+                (void)device;
+                return nullptr;
+#endif
+            },
+            [](const OpTestParams &params) {
+                const double batch = params.GetInt("batch");
+                const double sequence = params.GetInt("sequence");
+                const double channels = params.GetInt("channels");
+                const double kernel = params.GetInt("kernel");
+                return batch * channels *
+                       (2.0 * sequence + 2.0 * kernel) * sizeof(float) +
+                       channels * kernel * sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("batch") *
+                       params.GetInt("sequence") *
+                       params.GetInt("channels") *
+                       (2.0 * params.GetInt("kernel") + 4.0);
+            }
+        };
+    }
+
+    static OpCase MakeQwen4QSADenseMaskCase() {
+        return {
+            "qwen4_qsa_dense_mask",
+            "Qwen4 causal QSA selection and dense-mask CPU/CUDA agreement",
+            []() {
+                OpTestParams params;
+                params.Add("rows", "521", "number of causal query rows");
+                params.Add("heads", "4", "indexer query heads");
+                params.Add("head_dim", "128", "indexer head dimension");
+                params.Add("token_budget", "256", "selected token budget");
+                params.Add("compress_ratio", "4", "tokens per index block");
+                params.Add("query_start", "0", "first visible query position");
+                params.Add("key_length", "0", "explicit key length, or zero for causal rows");
+                params.Add("dtype", "float16", "query activation type");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device == "cpu" || device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int rows = params.GetInt("rows");
+                const int heads = params.GetInt("heads");
+                const int headDim = params.GetInt("head_dim");
+                const int tokenBudget = params.GetInt("token_budget");
+                const int compressRatio = params.GetInt("compress_ratio");
+                const int queryStart = params.GetInt("query_start");
+                const int keyLength = params.GetInt("key_length") > 0
+                    ? params.GetInt("key_length") : queryStart + rows;
+                const int blocks = keyLength / compressRatio;
+                fastllm::Data query = MakeTensor(
+                    {rows, heads, headDim}, 0.37f, 0.2f);
+                if (params.GetString("dtype") == "float16") {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(query, fastllm::DataType::FLOAT16);
+                } else if (params.GetString("dtype") != "float32") {
+                    throw std::runtime_error(
+                        "qwen4_qsa_dense_mask dtype must be float16 or float32");
+                }
+                fastllm::Data compressedKeys = MakeTensor(
+                    {blocks, headDim}, 0.83f, 0.2f);
+                fastllm::Data indices, mask;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4QSASelect(
+                    query, compressedKeys, keyLength, heads, headDim,
+                    tokenBudget, compressRatio, indices, queryStart);
+                fastllm::Qwen4QSABuildMask(
+                    indices, query, keyLength, mask);
+                fastllm::Data result;
+                fastllm::ToDataType(
+                    mask, result, fastllm::DataType::FLOAT32);
+                result.ToDevice(fastllm::DataDevice::CPU);
+                return result;
+            },
+            [](const OpTestParams &params) {
+                const double rows = params.GetInt("rows");
+                const double heads = params.GetInt("heads");
+                const double headDim = params.GetInt("head_dim");
+                const double keyLength = params.GetInt("key_length") > 0
+                    ? params.GetInt("key_length")
+                    : params.GetInt("query_start") + rows;
+                return (rows * heads * headDim +
+                        keyLength / params.GetInt("compress_ratio") * headDim +
+                        rows * keyLength) * sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                const double rows = params.GetInt("rows");
+                const double heads = params.GetInt("heads");
+                const double headDim = params.GetInt("head_dim");
+                const double keyLength = params.GetInt("key_length") > 0
+                    ? params.GetInt("key_length")
+                    : params.GetInt("query_start") + rows;
+                const double blocks = keyLength /
+                    params.GetInt("compress_ratio");
+                return rows * blocks * heads * headDim * 2.0;
+            }
+        };
+    }
+
+    static OpCase MakeCausalDepthwiseConv1DPrefillReferenceCase() {
+        return {
+            "causal_depthwise_conv1d_prefill_reference",
+            "fused prefill convolution versus the former standard op chain",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "batch size");
+                params.Add("sequence", "64", "number of new tokens");
+                params.Add("channels", "257", "depthwise channels");
+                params.Add("kernel", "4", "convolution taps");
+                params.Add("with_history", "1", "seed a nonzero prior state");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device == "cpu" || device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int batch = params.GetInt("batch");
+                const int sequence = params.GetInt("sequence");
+                const int channels = params.GetInt("channels");
+                const int kernel = params.GetInt("kernel");
+                const int combinedCount =
+                    batch * sequence * channels +
+                    batch * channels * kernel;
+                if (device == "cpu") {
+                    fastllm::Data zeros(
+                        fastllm::DataType::FLOAT32, {combinedCount});
+                    zeros.Allocate(0.0f);
+                    return zeros;
+                }
+
+                fastllm::Data input = MakeTensor(
+                    {batch, sequence, channels}, 0.23f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {channels, 1, kernel}, 0.61f, 0.1f);
+                fastllm::Data initialState;
+                if (params.GetInt("with_history")) {
+                    initialState.CopyFrom(MakeTensor(
+                        {batch, channels, kernel}, 0.97f, 0.2f));
+                }
+
+                ScopedFirstDevice guard(device);
+                fastllm::Data oldInput;
+                oldInput.CopyFrom(input);
+                fastllm::PermuteSelf(oldInput, {0, 2, 1});
+                const bool hadState = !initialState.dims.empty();
+                fastllm::Data oldState;
+                if (hadState) {
+                    oldState.CopyFrom(initialState);
+                }
+                fastllm::Data convInput;
+                if (hadState) {
+                    fastllm::Cat(oldState, oldInput, -1, convInput);
+                } else {
+                    convInput.CopyFrom(oldInput);
+                }
+                if (convInput.dims.back() >= kernel) {
+                    fastllm::Split(
+                        convInput, -1, convInput.dims.back() - kernel,
+                        convInput.dims.back(), oldState);
+                } else {
+                    fastllm::Data padding(
+                        fastllm::DataType::FLOAT32,
+                        {batch, channels, kernel - convInput.dims.back()});
+                    padding.ToDevice(convInput.dataDevice);
+                    padding.Allocate(0.0f);
+                    fastllm::Cat(padding, convInput, -1, oldState);
+                }
+
+                fastllm::Data oldConvolved, emptyBias;
+                fastllm::Conv1DPerChannel(
+                    convInput, weight, emptyBias, channels, channels,
+                    kernel, 1, hadState ? 0 : kernel - 1, oldConvolved);
+                fastllm::Data oldOutput;
+                if (hadState) {
+                    fastllm::Split(
+                        oldConvolved, -1,
+                        oldConvolved.dims.back() - sequence,
+                        oldConvolved.dims.back(), oldOutput);
+                } else {
+                    fastllm::Split(
+                        oldConvolved, -1, 0, sequence, oldOutput);
+                }
+                fastllm::Silu(oldOutput, oldOutput);
+                fastllm::PermuteSelf(oldOutput, {0, 2, 1});
+
+                fastllm::Data fusedState;
+                if (hadState) {
+                    fusedState.CopyFrom(initialState);
+                }
+                fastllm::Data fusedOutput;
+                fastllm::CausalDepthwiseConv1DPrefill(
+                    input, weight, fusedState, kernel, true, fusedOutput);
+                fastllm::AddTo(fusedOutput, oldOutput, -1.0f);
+                fastllm::AddTo(fusedState, oldState, -1.0f);
+                fusedOutput.Reshape({(int)fusedOutput.Count(0)});
+                fusedState.Reshape({(int)fusedState.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(fusedOutput, fusedState, 0, combined);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("batch") *
+                       params.GetInt("channels") *
+                       (4.0 * params.GetInt("sequence") +
+                        4.0 * params.GetInt("kernel")) * sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                return (double)params.GetInt("batch") *
+                       params.GetInt("sequence") *
+                       params.GetInt("channels") *
+                       (4.0 * params.GetInt("kernel") + 8.0);
+            }
+        };
+    }
+
     static std::vector<OpCase> BuildRegistry() {
         return {
             MakeAddToCase(),
@@ -4305,6 +4755,11 @@ namespace {
             MakeFusedMoeFp8Case(),
             MakeRouterLinearFp16Case(),
             MakeFusedRouterTopKCase(),
+            MakeQwen4PLEGateCase(),
+            MakeQwen4PLECausalConvCase(),
+            MakeCausalDepthwiseConv1DPrefillCase(),
+            MakeQwen4QSADenseMaskCase(),
+            MakeCausalDepthwiseConv1DPrefillReferenceCase(),
             MakeDots3NoteIndexerCase()
         };
     }
