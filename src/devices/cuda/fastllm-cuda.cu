@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -5667,6 +5668,26 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         cudaGetLastError();
         canPeerAccess = 0;
     }
+    // Keep the no-P2P path testable on development systems whose GPUs normally
+    // have peer access. Cache the process-wide setting so normal copies do not
+    // pay for getenv/string parsing on every decode step.
+    static const bool forceStagedCopy = []() {
+        const char *value =
+            std::getenv("FASTLLM_CUDA_FORCE_STAGED_COPY");
+        if (value == nullptr || value[0] == '\0') {
+            return false;
+        }
+        std::string lowered(value);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) {
+                           return (char)std::tolower(c);
+                       });
+        return lowered != "0" && lowered != "false" &&
+               lowered != "off" && lowered != "no";
+    }();
+    if (forceStagedCopy) {
+        canPeerAccess = 0;
+    }
     cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
     cudaError_t switchState = cudaSetDevice(dstId);
     if (switchState == cudaSuccess) {
@@ -5704,16 +5725,31 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
     state = cudaSetDevice(srcId);
     failedStage = "cudaSetDevice(src)";
     if (state == cudaSuccess) {
-        state = cudaMemcpy(cpuData, src, size, cudaMemcpyDeviceToHost);
-        failedStage = "cudaMemcpyDeviceToHost";
+        state = cudaMemcpyAsync(cpuData, src, size, cudaMemcpyDeviceToHost,
+                                cudaStreamPerThread);
+        failedStage = "cudaMemcpyAsyncDeviceToHost";
+    }
+    if (state == cudaSuccess) {
+        state = cudaStreamSynchronize(cudaStreamPerThread);
+        failedStage = "cudaStreamSynchronize(src)";
     }
     if (state == cudaSuccess) {
         state = cudaSetDevice(dstId);
         failedStage = "cudaSetDevice(dst)";
     }
     if (state == cudaSuccess) {
-        state = cudaMemcpy(dst, cpuData, size, cudaMemcpyHostToDevice);
-        failedStage = "cudaMemcpyHostToDevice";
+        state = cudaMemcpyAsync(dst, cpuData, size, cudaMemcpyHostToDevice,
+                                cudaStreamPerThread);
+        failedStage = "cudaMemcpyAsyncHostToDevice";
+    }
+    if (state == cudaSuccess) {
+        // The destination is consumed by a persistent TP worker whose
+        // per-thread default stream differs from this caller's stream.  A
+        // pageable H2D cudaMemcpy may return after host staging but before the
+        // DMA reaches device memory, so complete it before handing the tensor
+        // to that worker.
+        state = cudaStreamSynchronize(cudaStreamPerThread);
+        failedStage = "cudaStreamSynchronize(dst)";
     }
     delete[] cpuData;
     if (state != cudaSuccess) {
@@ -5723,10 +5759,6 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         fflush(stdout);
     }
     checkCudaErrors("Error: CUDA error when copy Between GPUs!", state);
-    if (state == cudaSuccess) {
-        FastllmCudaSetDevice(dstId);
-        DeviceSync();
-    }
     FastllmCudaSetDevice(oriId);
 }
 
