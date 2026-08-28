@@ -196,6 +196,30 @@ __global__ void FastllmPagedGatherQHeadToHalfKernel(
         qData[(size_t)token * tokenStride + dim]));
 }
 
+template <typename SrcT>
+__global__ void FastllmPagedGatherQHeadGroupToHalfKernel(
+    const SrcT *qData,
+    int firstHead,
+    int group,
+    int qoLen,
+    int headDim,
+    int headStride,
+    int tokenStride,
+    half *outData) {
+    int totalElements = group * qoLen * headDim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalElements) {
+        return;
+    }
+    int row = idx / headDim;
+    int dim = idx - row * headDim;
+    int g = row / qoLen;
+    int token = row - g * qoLen;
+    outData[idx] = __float2half(FastllmAttentionValueToFloat<SrcT>(
+        qData[(size_t)(firstHead + g) * headStride +
+              (size_t)token * tokenStride + dim]));
+}
+
 template <typename DstT>
 __global__ void FastllmPagedStoreHeadFromFloatKernel(
     const float *srcData,
@@ -211,6 +235,30 @@ __global__ void FastllmPagedStoreHeadFromFloatKernel(
     int token = idx / headDim;
     int dim = idx - token * headDim;
     outData[(size_t)token * tokenStride + dim] =
+        FastllmAttentionFloatToValue<DstT>(srcData[idx]);
+}
+
+template <typename DstT>
+__global__ void FastllmPagedStoreHeadGroupFromFloatKernel(
+    const float *srcData,
+    DstT *outData,
+    int firstHead,
+    int group,
+    int qoLen,
+    int headDim,
+    int headStride,
+    int tokenStride) {
+    int totalElements = group * qoLen * headDim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalElements) {
+        return;
+    }
+    int row = idx / headDim;
+    int dim = idx - row * headDim;
+    int g = row / qoLen;
+    int token = row - g * qoLen;
+    outData[(size_t)(firstHead + g) * headStride +
+            (size_t)token * tokenStride + dim] =
         FastllmAttentionFloatToValue<DstT>(srcData[idx]);
 }
 
@@ -323,6 +371,31 @@ __global__ void FastllmPagedCublasSoftmaxWithCausalMask(half *input, half *outpu
         maxp + o, sump + o);
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmPagedCublasSoftmaxWithGroupedCausalMask(
+    half *input,
+    half *output,
+    int outer,
+    int qoLen,
+    int channels,
+    int base,
+    float *maxp,
+    float *sump) {
+    int o = blockIdx.x;
+    int queryToken = o % qoLen;
+    int visible = queryToken + base + 1;
+    if (visible < 0) {
+        visible = 0;
+    }
+    if (visible > channels) {
+        visible = channels;
+    }
+    FastllmPagedCublasSoftmaxCausalFunc<THREAD_PER_BLOCK>(
+        input + (size_t)o * channels,
+        output + (size_t)o * channels,
+        visible, channels, maxp + o, sump + o);
+}
+
 static size_t FastllmPagedAlignWorkspaceOffset(size_t offset) {
     const size_t align = 256;
     return ((offset + align - 1) / align) * align;
@@ -338,6 +411,11 @@ static int FastllmPagedCublasChunkSizeFromEnv(int fallback) {
         return fallback;
     }
     return value;
+}
+
+static bool FastllmPagedCublasGroupedGqaEnabled() {
+    const char *env = std::getenv("FASTLLM_PAGED_CUBLAS_GROUPED_GQA");
+    return env == nullptr || env[0] != '0';
 }
 
 static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
@@ -393,19 +471,26 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         ownPageIndices = true;
     }
 
+    // MTP verifies only a handful of tokens.  Treat all query heads sharing a
+    // KV head as the N dimension of one GEMM so cuBLAS can reuse the same K/V
+    // tiles instead of launching and rereading them once per GQA head.
+    const bool useGroupedGqa = FastllmPagedCublasGroupedGqaEnabled() &&
+        group > 1 && group <= 8 && qoLen <= 8 && group * qoLen <= 64;
+    const int groupedRows = useGroupedGqa ? group * qoLen : qoLen;
+
     const int targetChunk = FastllmPagedCublasChunkSizeFromEnv(8192);
     size_t wsBytes = 0;
     bool wsOwn = false;
     size_t stateBytes = FastllmPagedAlignWorkspaceOffset((size_t)group * qoLen * sizeof(float));
-    size_t qScratchBytes = qIsBf16 ?
-        FastllmPagedAlignWorkspaceOffset((size_t)qoLen * headDim * sizeof(half)) : 0;
+    size_t qScratchBytes = (qIsBf16 || useGroupedGqa) ?
+        FastllmPagedAlignWorkspaceOffset((size_t)groupedRows * headDim * sizeof(half)) : 0;
     size_t outFloatScratchBytes =
         FastllmPagedAlignWorkspaceOffset((size_t)group * qoLen * headDim * sizeof(float));
     auto chunkWorkspaceBytes = [&](int chunk) -> size_t {
         size_t bytes = 0;
         bytes += FastllmPagedAlignWorkspaceOffset((size_t)chunk * headDim * sizeof(half));
         bytes += FastllmPagedAlignWorkspaceOffset((size_t)chunk * headDim * sizeof(half));
-        bytes += FastllmPagedAlignWorkspaceOffset((size_t)qoLen * chunk * sizeof(half));
+        bytes += FastllmPagedAlignWorkspaceOffset((size_t)groupedRows * chunk * sizeof(half));
         return bytes;
     };
     size_t fixedBytes = stateBytes * 4 + qScratchBytes + outFloatScratchBytes;
@@ -443,7 +528,7 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     half *vChunk = (half*)(workspace + offset);
     offset += FastllmPagedAlignWorkspaceOffset((size_t)maxChunk * headDim * sizeof(half));
     half *qk = (half*)(workspace + offset);
-    offset += FastllmPagedAlignWorkspaceOffset((size_t)qoLen * maxChunk * sizeof(half));
+    offset += FastllmPagedAlignWorkspaceOffset((size_t)groupedRows * maxChunk * sizeof(half));
     float *lastSum = (float*)(workspace + offset);
     offset += stateBytes;
     float *lastMax = (float*)(workspace + offset);
@@ -452,7 +537,8 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     offset += stateBytes;
     float *currentMax = (float*)(workspace + offset);
     offset += stateBytes;
-    half *qHalfScratch = qIsBf16 ? (half*)(workspace + offset) : nullptr;
+    half *qHalfScratch = (qIsBf16 || useGroupedGqa) ?
+        (half*)(workspace + offset) : nullptr;
     offset += qScratchBytes;
     float *outFloatScratch = (float*)(workspace + offset);
 
@@ -468,6 +554,30 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         FastllmPagedCublasInitBlockAtten<<<(stateLen + initThreads - 1) / initThreads, initThreads>>>(
             lastSum, lastMax, currentSum, currentMax, stateLen);
 
+        half *groupedQ = nullptr;
+        if (useGroupedGqa) {
+            int firstHead = kvh * group;
+            bool directHalf = qIsHalf && qTokenStride == headDim &&
+                qHeadStride == qoLen * headDim;
+            if (directHalf) {
+                groupedQ = (half*)qData + (size_t)firstHead * qHeadStride;
+            } else {
+                const int THREAD_PER_BLOCK = 256;
+                int qElements = groupedRows * headDim;
+                int qBlocks = (qElements + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
+                if (qIsHalf) {
+                    FastllmPagedGatherQHeadGroupToHalfKernel<half><<<qBlocks, THREAD_PER_BLOCK>>>(
+                        (half*)qData, firstHead, group, qoLen, headDim,
+                        qHeadStride, qTokenStride, qHalfScratch);
+                } else {
+                    FastllmPagedGatherQHeadGroupToHalfKernel<__nv_bfloat16><<<qBlocks, THREAD_PER_BLOCK>>>(
+                        (__nv_bfloat16*)qData, firstHead, group, qoLen, headDim,
+                        qHeadStride, qTokenStride, qHalfScratch);
+                }
+                groupedQ = qHalfScratch;
+            }
+        }
+
         for (int kvStart = 0; kvStart < kvLen && ok; kvStart += maxChunk) {
             int chunkLen = std::min(maxChunk, kvLen - kvStart);
             ok = FastllmCudaPagedCacheGatherHeadRangeToHalf(
@@ -476,6 +586,60 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 pagedKVCacheV, pageIndicesGpu, kvStart, chunkLen, pageLen, numKvHeads, headDim, kvh, vChunk);
             if (!ok) {
                 break;
+            }
+
+            if (useGroupedGqa) {
+                cublasStatus_t status = cublasHgemm(
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    chunkLen, groupedRows, headDim, &hscale,
+                    kChunk, headDim,
+                    groupedQ, headDim,
+                    &beta,
+                    qk, chunkLen);
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("FastllmCudaPagedAttentionNativeChunkedCublas: grouped cublas qk failed, status=%d\n",
+                           (int)status);
+                    ok = false;
+                    break;
+                }
+
+                const bool singleChunk = kvStart == 0 && chunkLen == kvLen;
+                float *softmaxMax = singleChunk ? lastMax : currentMax;
+                float *softmaxSum = singleChunk ? lastSum : currentSum;
+                FastllmPagedCublasSoftmaxWithGroupedCausalMask<256><<<groupedRows, 256>>>(
+                    qk, qk, groupedRows, qoLen, chunkLen,
+                    kvLen - qoLen - kvStart, softmaxMax, softmaxSum);
+
+                if (kvStart > 0) {
+                    FastllmPagedCublasAttnBlockUpdateFloat<<<groupedRows, 128>>>(
+                        outFloatScratch, headDim, headDim,
+                        lastMax, lastSum, currentMax, currentSum);
+                } else if (!singleChunk) {
+                    cudaMemcpyAsync(lastMax, currentMax,
+                                    (size_t)groupedRows * sizeof(float),
+                                    cudaMemcpyDeviceToDevice,
+                                    cudaStreamPerThread);
+                    cudaMemcpyAsync(lastSum, currentSum,
+                                    (size_t)groupedRows * sizeof(float),
+                                    cudaMemcpyDeviceToDevice,
+                                    cudaStreamPerThread);
+                }
+
+                float currentScale = kvStart > 0 ? 1.0f : 0.0f;
+                status = cublasGemmEx(
+                    handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                    headDim, groupedRows, chunkLen, &oneFloat,
+                    vChunk, CUDA_R_16F, headDim,
+                    qk, CUDA_R_16F, chunkLen,
+                    &currentScale,
+                    outFloatScratch, CUDA_R_32F, headDim,
+                    CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("FastllmCudaPagedAttentionNativeChunkedCublas: grouped cublas pv failed, status=%d\n",
+                           (int)status);
+                    ok = false;
+                }
+                continue;
             }
 
             for (int g = 0; g < group; g++) {
@@ -515,15 +679,32 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                     break;
                 }
 
+                // A single KV chunk has no later online-softmax merge. Write
+                // its state directly to the final buffers and avoid two tiny
+                // D2D handoff operations per query head.
+                const bool singleChunk = kvStart == 0 && chunkLen == kvLen;
+                float *softmaxMaxH = singleChunk ? lastMaxH : currentMaxH;
+                float *softmaxSumH = singleChunk ? lastSumH : currentSumH;
                 FastllmPagedCublasSoftmaxWithCausalMask<256><<<qoLen, 256>>>(
-                    qk, qk, qoLen, chunkLen, kvLen - qoLen - kvStart, currentMaxH, currentSumH);
+                    qk, qk, qoLen, chunkLen, kvLen - qoLen - kvStart,
+                    softmaxMaxH, softmaxSumH);
 
                 if (kvStart > 0) {
                     FastllmPagedCublasAttnBlockUpdateFloat<<<qoLen, 128>>>(
                         outH, headDim, outStrideForCublas, lastMaxH, lastSumH, currentMaxH, currentSumH);
-                } else {
-                    cudaMemcpy(lastMaxH, currentMaxH, (size_t)qoLen * sizeof(float), cudaMemcpyDeviceToDevice);
-                    cudaMemcpy(lastSumH, currentSumH, (size_t)qoLen * sizeof(float), cudaMemcpyDeviceToDevice);
+                } else if (!singleChunk) {
+                    // Keep the first-chunk state handoff on the PTDS.  The
+                    // synchronous D2D copies used to drain all preceding QK
+                    // and softmax work once per query head, leaving large GPU
+                    // bubbles in small speculative-verify prefills.
+                    cudaMemcpyAsync(lastMaxH, currentMaxH,
+                                    (size_t)qoLen * sizeof(float),
+                                    cudaMemcpyDeviceToDevice,
+                                    cudaStreamPerThread);
+                    cudaMemcpyAsync(lastSumH, currentSumH,
+                                    (size_t)qoLen * sizeof(float),
+                                    cudaMemcpyDeviceToDevice,
+                                    cudaStreamPerThread);
                 }
 
                 float currentScale = kvStart > 0 ? 1.0f : 0.0f;
@@ -545,6 +726,21 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         }
         if (ok) {
             const int THREAD_PER_BLOCK = 256;
+            if (useGroupedGqa) {
+                int storeElements = groupedRows * headDim;
+                int storeBlocks = (storeElements + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
+                int firstHead = kvh * group;
+                if (outIsHalf) {
+                    FastllmPagedStoreHeadGroupFromFloatKernel<half><<<storeBlocks, THREAD_PER_BLOCK>>>(
+                        outFloatScratch, (half*)outData, firstHead, group, qoLen,
+                        headDim, outHeadStride, outTokenStride);
+                } else {
+                    FastllmPagedStoreHeadGroupFromFloatKernel<__nv_bfloat16><<<storeBlocks, THREAD_PER_BLOCK>>>(
+                        outFloatScratch, (__nv_bfloat16*)outData, firstHead, group, qoLen,
+                        headDim, outHeadStride, outTokenStride);
+                }
+                continue;
+            }
             int storeBlocks = (qoLen * headDim + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
             for (int g = 0; g < group; g++) {
                 int h = kvh * group + g;
@@ -1957,12 +2153,24 @@ bool FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         return false;
     }
 
-    // 分页元数据（qSizes/pageSizes/pageIndexs/lastPageLens）在 decode 阶段可能只在 GPU 上更新
-    // （见 fillLastPageLensOnDevice 等机制），host 端的 cpuIntDatas 可能是过期值。
-    // 这里统一从 GPU 拷贝最新值，与 FlashInfer 路径读取的缓冲保持一致。
-    auto loadHostInts = [](fastllm::Data &data, int count, const std::vector<int> &fallbackHost) -> std::vector<int32_t> {
+    // GeneratePagedBatchParams refreshes cpuIntDatas for prefill (including
+    // speculative multi-token verify) immediately before uploading the same
+    // metadata. Reuse that authoritative host copy here: reading four tiny
+    // arrays back from the GPU at every attention layer serializes the PTDS
+    // and costs much more than the payload. Decode can update metadata only
+    // on-device, so its legacy fallback must still read the CUDA buffers.
+    auto loadHostInts = [useChunkedCublasPrefill](
+            fastllm::Data &data, int count,
+            const std::vector<int> &fallbackHost) -> std::vector<int32_t> {
         std::vector<int32_t> host((size_t)std::max(count, 0));
         if (count <= 0) {
+            return host;
+        }
+        if (useChunkedCublasPrefill &&
+            (int)fallbackHost.size() >= count) {
+            for (int i = 0; i < count; ++i) {
+                host[i] = fallbackHost[i];
+            }
             return host;
         }
         if (data.dataDevice == fastllm::DataDevice::CUDA && data.cudaData != nullptr) {
