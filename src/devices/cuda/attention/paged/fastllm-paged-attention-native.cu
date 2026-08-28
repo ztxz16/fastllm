@@ -7,6 +7,7 @@
 #include "attention/fastllm-attention-dtype.cuh"
 #include "attention/fastllm-paged-attention-native.cuh"
 
+#include <algorithm>
 #include <cuda_fp8.h>
 #include <cstdlib>
 #include <map>
@@ -413,9 +414,98 @@ static int FastllmPagedCublasChunkSizeFromEnv(int fallback) {
     return value;
 }
 
+static int FastllmPagedCublasLinearKvChunkSizeFromEnv(int fallback) {
+    const char *env = std::getenv("FASTLLM_PAGED_CUBLAS_LINEAR_KV_CHUNK");
+    if (env != nullptr && env[0] != '\0') {
+        int value = atoi(env);
+        return value > 0 ? value : fallback;
+    }
+    // Keep the existing global knob as an override for users that already
+    // tune all paged cuBLAS paths together.  The dedicated knob lets the
+    // contiguous short-query path use a larger chunk without inflating the
+    // O(qoLen * chunk) prefill workspace.
+    return FastllmPagedCublasChunkSizeFromEnv(fallback);
+}
+
 static bool FastllmPagedCublasGroupedGqaEnabled() {
     const char *env = std::getenv("FASTLLM_PAGED_CUBLAS_GROUPED_GQA");
     return env == nullptr || env[0] != '0';
+}
+
+static bool FastllmPagedCublasLinearKvEnabled() {
+    const char *env = std::getenv("FASTLLM_PAGED_CUBLAS_LINEAR_KV");
+    if (env != nullptr && env[0] != '\0') {
+        return env[0] != '0';
+    }
+    // This predicate is evaluated once per attention layer in the MTP hot
+    // path. Device properties are invariant for a worker thread, so avoid a
+    // CUDA runtime query on every layer while retaining the environment
+    // override above for A/B and emergency fallback.
+    static thread_local int defaultEnabled = -1;
+    if (defaultEnabled < 0) {
+        defaultEnabled = FastllmCudaRuntimeArch() == 70 ? 1 : 0;
+    }
+    return defaultEnabled != 0;
+}
+
+static bool FastllmPagedCublasFragmentedLinearKvEnabled() {
+    const char *env = std::getenv("FASTLLM_PAGED_CUBLAS_FRAGMENTED_LINEAR_KV");
+    if (env != nullptr && env[0] != '\0') {
+        return env[0] != '0';
+    }
+    static thread_local int defaultEnabled = -1;
+    if (defaultEnabled < 0) {
+        defaultEnabled = FastllmCudaRuntimeArch() == 70 ? 1 : 0;
+    }
+    return defaultEnabled != 0;
+}
+
+static int FastllmPagedLinearPageDirection(const std::vector<int32_t> &pageIndices) {
+    if (pageIndices.empty()) {
+        return 0;
+    }
+    if (pageIndices.size() == 1) {
+        return 1;
+    }
+    int direction = pageIndices[1] == pageIndices[0] + 1 ? 1 :
+                    pageIndices[1] == pageIndices[0] - 1 ? -1 : 0;
+    if (direction == 0) {
+        return 0;
+    }
+    for (size_t i = 1; i < pageIndices.size(); i++) {
+        if (pageIndices[i] != pageIndices[0] + direction * (int32_t)i) {
+            return 0;
+        }
+    }
+    return direction;
+}
+
+static int FastllmPagedLinearPrefixRunCount(
+    const std::vector<int32_t> &pageIndices,
+    int pageCount,
+    int stopAfter) {
+    int runCount = 0;
+    for (int first = 0; first < pageCount;) {
+        int end = first + 1;
+        int direction = 0;
+        if (end < pageCount) {
+            int delta = pageIndices[end] - pageIndices[first];
+            if (delta == 1 || delta == -1) {
+                direction = delta;
+            }
+        }
+        if (direction != 0) {
+            while (end < pageCount &&
+                   pageIndices[end] == pageIndices[end - 1] + direction) {
+                end++;
+            }
+        }
+        first = end;
+        if (++runCount > stopAfter) {
+            break;
+        }
+    }
+    return runCount;
 }
 
 static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
@@ -478,7 +568,44 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         group > 1 && group <= 8 && qoLen <= 8 && group * qoLen <= 64;
     const int groupedRows = useGroupedGqa ? group * qoLen : qoLen;
 
-    const int targetChunk = FastllmPagedCublasChunkSizeFromEnv(8192);
+    // Paged KV is laid out as [page, token, kv_head, dim].  For the tested
+    // SM70 Qwen3.5 MTP shape, consecutive FP16 pages can be exposed directly
+    // to cuBLAS with tokenStride as the leading dimension.  The page allocator
+    // alternates between ascending and descending runs after a request is
+    // released; both directions are handled below. On SM70, fragmented,
+    // fully-visible prefix pages are also coalesced into physical runs.
+    // Cache dtypes needing conversion retain the gather path.
+    const bool linearKvShape = useGroupedGqa &&
+        group == 6 && numKvHeads == 2 && headDim == 256 &&
+        qoLen <= pageLen &&
+        pagedKVCacheK->dataType == fastllm::DataType::FLOAT16 &&
+        pagedKVCacheV->dataType == fastllm::DataType::FLOAT16;
+    const bool linearKvCandidate = linearKvShape && FastllmPagedCublasLinearKvEnabled();
+    const int linearPageDirection = linearKvCandidate ?
+        FastllmPagedLinearPageDirection(pageIndices) : 0;
+    const int fullyVisiblePages = pageLen > 0 ? std::max(0, std::min(
+        numPages, (kvLen - qoLen) / pageLen)) : 0;
+    // Direct cuBLAS calls save the gather traffic only while the physical
+    // prefix consists of a small number of runs. Bound the unmerged logical
+    // run count so adversarial fragmentation cannot turn one gather chunk
+    // into hundreds of tiny GEMMs. Physical sorting may merge this upper
+    // bound further below.
+    const int maxFragmentedRuns = 8;
+    const int fragmentedPrefixRuns = linearKvCandidate && linearPageDirection == 0 ?
+        FastllmPagedLinearPrefixRunCount(
+            pageIndices, fullyVisiblePages, maxFragmentedRuns) : 0;
+    const bool useLinearKv = linearKvCandidate &&
+        (linearPageDirection != 0 ||
+         (FastllmPagedCublasFragmentedLinearKvEnabled() &&
+          fragmentedPrefixRuns <= maxFragmentedRuns));
+
+    const int configuredChunk = useLinearKv ?
+        FastllmPagedCublasLinearKvChunkSizeFromEnv(32768) :
+        FastllmPagedCublasChunkSizeFromEnv(8192);
+    // There is no benefit in reserving workspace beyond the current KV
+    // length, especially for short requests using the larger linear-KV
+    // decode default.
+    const int targetChunk = std::min(configuredChunk, kvLen);
     size_t wsBytes = 0;
     bool wsOwn = false;
     size_t stateBytes = FastllmPagedAlignWorkspaceOffset((size_t)group * qoLen * sizeof(float));
@@ -488,8 +615,10 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         FastllmPagedAlignWorkspaceOffset((size_t)group * qoLen * headDim * sizeof(float));
     auto chunkWorkspaceBytes = [&](int chunk) -> size_t {
         size_t bytes = 0;
-        bytes += FastllmPagedAlignWorkspaceOffset((size_t)chunk * headDim * sizeof(half));
-        bytes += FastllmPagedAlignWorkspaceOffset((size_t)chunk * headDim * sizeof(half));
+        if (!useLinearKv) {
+            bytes += FastllmPagedAlignWorkspaceOffset((size_t)chunk * headDim * sizeof(half));
+            bytes += FastllmPagedAlignWorkspaceOffset((size_t)chunk * headDim * sizeof(half));
+        }
         bytes += FastllmPagedAlignWorkspaceOffset((size_t)groupedRows * chunk * sizeof(half));
         return bytes;
     };
@@ -523,10 +652,14 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     }
 
     size_t offset = 0;
-    half *kChunk = (half*)(workspace + offset);
-    offset += FastllmPagedAlignWorkspaceOffset((size_t)maxChunk * headDim * sizeof(half));
-    half *vChunk = (half*)(workspace + offset);
-    offset += FastllmPagedAlignWorkspaceOffset((size_t)maxChunk * headDim * sizeof(half));
+    half *kChunk = nullptr;
+    half *vChunk = nullptr;
+    if (!useLinearKv) {
+        kChunk = (half*)(workspace + offset);
+        offset += FastllmPagedAlignWorkspaceOffset((size_t)maxChunk * headDim * sizeof(half));
+        vChunk = (half*)(workspace + offset);
+        offset += FastllmPagedAlignWorkspaceOffset((size_t)maxChunk * headDim * sizeof(half));
+    }
     half *qk = (half*)(workspace + offset);
     offset += FastllmPagedAlignWorkspaceOffset((size_t)groupedRows * maxChunk * sizeof(half));
     float *lastSum = (float*)(workspace + offset);
@@ -547,6 +680,142 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     float oneFloat = 1.0f;
     auto handle = getFastllmCublasHandle();
     bool ok = true;
+
+    const size_t linearPageStride = (size_t)pageLen * numKvHeads * headDim;
+    const size_t linearTokenStride = (size_t)numKvHeads * headDim;
+    const half *linearK = useLinearKv ? (const half*)pagedKVCacheK->cudaData : nullptr;
+    const half *linearV = useLinearKv ? (const half*)pagedKVCacheV->cudaData : nullptr;
+    struct LinearKvChunk {
+        int logicalStart;
+        int length;
+        size_t physicalOffset;
+    };
+    std::vector<LinearKvChunk> linearKvChunks;
+    if (useLinearKv) {
+        linearKvChunks.reserve((kvLen + maxChunk - 1) / maxChunk + 2);
+        if (linearPageDirection > 0) {
+            for (int start = 0; start < kvLen; start += maxChunk) {
+                int length = std::min(maxChunk, kvLen - start);
+                linearKvChunks.push_back({
+                    start,
+                    length,
+                    (size_t)pageIndices[0] * linearPageStride +
+                        (size_t)start * linearTokenStride
+                });
+            }
+        } else if (linearPageDirection < 0) {
+            // Attention reduction is invariant to the order of pages before
+            // the first query token. Scan that prefix in ascending physical
+            // order, then process the one or two causal-tail pages in logical
+            // order. This also covers a verify step crossing a page.
+            int prefixLen = fullyVisiblePages * pageLen;
+            if (prefixLen > 0) {
+                size_t prefixBase =
+                    (size_t)pageIndices[fullyVisiblePages - 1] * linearPageStride;
+                for (int start = 0; start < prefixLen; start += maxChunk) {
+                    int length = std::min(maxChunk, prefixLen - start);
+                    linearKvChunks.push_back({
+                        start,
+                        length,
+                        prefixBase + (size_t)start * linearTokenStride
+                    });
+                }
+            }
+            for (int page = fullyVisiblePages; page < numPages; page++) {
+                int pageTokens = page == numPages - 1 ? lastPageLen : pageLen;
+                for (int start = 0; start < pageTokens; start += maxChunk) {
+                    int length = std::min(maxChunk, pageTokens - start);
+                    linearKvChunks.push_back({
+                        page * pageLen + start,
+                        length,
+                        (size_t)pageIndices[page] * linearPageStride +
+                            (size_t)start * linearTokenStride
+                    });
+                }
+            }
+        } else {
+            // A released short request can split the next request's page list
+            // into several physically contiguous runs. All pages before the
+            // causal tail are visible to every query token, so their reduction
+            // order is immaterial. Reorder only that prefix into ascending
+            // physical runs and expose each run directly to cuBLAS.
+            struct PhysicalPageRun {
+                int firstPage;
+                int pageCount;
+            };
+            std::vector<PhysicalPageRun> prefixRuns;
+            prefixRuns.reserve(std::min(fullyVisiblePages, 16));
+            for (int first = 0; first < fullyVisiblePages;) {
+                int end = first + 1;
+                int direction = 0;
+                if (end < fullyVisiblePages) {
+                    int delta = pageIndices[end] - pageIndices[first];
+                    if (delta == 1 || delta == -1) {
+                        direction = delta;
+                    }
+                }
+                if (direction != 0) {
+                    while (end < fullyVisiblePages &&
+                           pageIndices[end] == pageIndices[end - 1] + direction) {
+                        end++;
+                    }
+                }
+                prefixRuns.push_back({
+                    std::min(pageIndices[first], pageIndices[end - 1]),
+                    end - first
+                });
+                first = end;
+            }
+            std::sort(prefixRuns.begin(), prefixRuns.end(),
+                      [](const PhysicalPageRun &a, const PhysicalPageRun &b) {
+                          return a.firstPage < b.firstPage;
+                      });
+            size_t mergedRunCount = 0;
+            for (const auto &run : prefixRuns) {
+                if (mergedRunCount > 0) {
+                    PhysicalPageRun &last = prefixRuns[mergedRunCount - 1];
+                    if (last.firstPage + last.pageCount == run.firstPage) {
+                        last.pageCount += run.pageCount;
+                        continue;
+                    }
+                }
+                prefixRuns[mergedRunCount++] = run;
+            }
+            prefixRuns.resize(mergedRunCount);
+
+            int logicalStart = 0;
+            for (const auto &run : prefixRuns) {
+                int runTokens = run.pageCount * pageLen;
+                for (int start = 0; start < runTokens; start += maxChunk) {
+                    int length = std::min(maxChunk, runTokens - start);
+                    linearKvChunks.push_back({
+                        logicalStart,
+                        length,
+                        (size_t)run.firstPage * linearPageStride +
+                            (size_t)start * linearTokenStride
+                    });
+                    logicalStart += length;
+                }
+            }
+
+            // qoLen <= pageLen leaves at most two causal-tail pages. Preserve
+            // their logical order so each query token sees exactly its causal
+            // prefix even when those pages are physically unrelated.
+            for (int page = fullyVisiblePages; page < numPages; page++) {
+                int pageTokens = page == numPages - 1 ? lastPageLen : pageLen;
+                for (int start = 0; start < pageTokens; start += maxChunk) {
+                    int length = std::min(maxChunk, pageTokens - start);
+                    linearKvChunks.push_back({
+                        logicalStart,
+                        length,
+                        (size_t)pageIndices[page] * linearPageStride +
+                            (size_t)start * linearTokenStride
+                    });
+                    logicalStart += length;
+                }
+            }
+        }
+    }
 
     for (int kvh = 0; kvh < numKvHeads && ok; kvh++) {
         int stateLen = group * qoLen;
@@ -578,21 +847,39 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
             }
         }
 
-        for (int kvStart = 0; kvStart < kvLen && ok; kvStart += maxChunk) {
-            int chunkLen = std::min(maxChunk, kvLen - kvStart);
-            ok = FastllmCudaPagedCacheGatherHeadRangeToHalf(
-                pagedKVCacheK, pageIndicesGpu, kvStart, chunkLen, pageLen, numKvHeads, headDim, kvh, kChunk);
-            ok = ok && FastllmCudaPagedCacheGatherHeadRangeToHalf(
-                pagedKVCacheV, pageIndicesGpu, kvStart, chunkLen, pageLen, numKvHeads, headDim, kvh, vChunk);
-            if (!ok) {
-                break;
+        int chunkCount = useLinearKv ? (int)linearKvChunks.size() :
+            (kvLen + maxChunk - 1) / maxChunk;
+        for (int chunkIndex = 0; chunkIndex < chunkCount && ok; chunkIndex++) {
+            int kvStart = useLinearKv ? linearKvChunks[chunkIndex].logicalStart :
+                chunkIndex * maxChunk;
+            int chunkLen = useLinearKv ? linearKvChunks[chunkIndex].length :
+                std::min(maxChunk, kvLen - kvStart);
+            const half *kInput = kChunk;
+            const half *vInput = vChunk;
+            int kvLeadingDim = headDim;
+            if (useLinearKv) {
+                size_t base = linearKvChunks[chunkIndex].physicalOffset +
+                              (size_t)kvh * headDim;
+                kInput = linearK + base;
+                vInput = linearV + base;
+                kvLeadingDim = (int)linearTokenStride;
+            } else {
+                ok = FastllmCudaPagedCacheGatherHeadRangeToHalf(
+                    pagedKVCacheK, pageIndicesGpu, kvStart, chunkLen, pageLen,
+                    numKvHeads, headDim, kvh, kChunk);
+                ok = ok && FastllmCudaPagedCacheGatherHeadRangeToHalf(
+                    pagedKVCacheV, pageIndicesGpu, kvStart, chunkLen, pageLen,
+                    numKvHeads, headDim, kvh, vChunk);
+                if (!ok) {
+                    break;
+                }
             }
 
             if (useGroupedGqa) {
                 cublasStatus_t status = cublasHgemm(
                     handle, CUBLAS_OP_T, CUBLAS_OP_N,
                     chunkLen, groupedRows, headDim, &hscale,
-                    kChunk, headDim,
+                    kInput, kvLeadingDim,
                     groupedQ, headDim,
                     &beta,
                     qk, chunkLen);
@@ -629,7 +916,7 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 status = cublasGemmEx(
                     handle, CUBLAS_OP_N, CUBLAS_OP_N,
                     headDim, groupedRows, chunkLen, &oneFloat,
-                    vChunk, CUDA_R_16F, headDim,
+                    vInput, CUDA_R_16F, kvLeadingDim,
                     qk, CUDA_R_16F, chunkLen,
                     &currentScale,
                     outFloatScratch, CUDA_R_32F, headDim,
@@ -668,7 +955,7 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 cublasStatus_t status = cublasHgemm(
                     handle, CUBLAS_OP_T, CUBLAS_OP_N,
                     chunkLen, qoLen, headDim, &hscale,
-                    kChunk, headDim,
+                    kInput, kvLeadingDim,
                     qHead, qLdb,
                     &beta,
                     qk, chunkLen);
@@ -711,7 +998,7 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                 status = cublasGemmEx(
                     handle, CUBLAS_OP_N, CUBLAS_OP_N,
                     headDim, qoLen, chunkLen, &oneFloat,
-                    vChunk, CUDA_R_16F, headDim,
+                    vInput, CUDA_R_16F, kvLeadingDim,
                     qk, CUDA_R_16F, chunkLen,
                     &currentScale,
                     outH, CUDA_R_32F, outStrideForCublas,
