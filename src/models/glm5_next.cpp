@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -101,51 +102,6 @@ namespace fastllm {
             // attention cache.  Generic history-cache restore must copy it as
             // a whole instead of slicing dimension 1 by the matched prefix.
             packed.isLinearAttention = true;
-        }
-
-        void AppendGlm5NextSequenceCache(
-                Data &cache, const Data &current, int allocationUnit = 64) {
-            AssertInFastLLM(
-                current.dims.size() == 3,
-                "GLM-5.3 attention cache input must be [heads,tokens,dim].");
-            if (cache.dims.empty() && cache.expansionDims.empty() &&
-                cache.expansionSize == 0) {
-                cache.dataType = current.dataType;
-                cache.UpdateUnitSize();
-                cache.dataDevice = current.dataDevice;
-                cache.dataDeviceIds = current.dataDeviceIds;
-            }
-            cache.SetKVCache();
-            AssertInFastLLM(
-                cache.dataType == current.dataType,
-                "GLM-5.3 attention cache dtype mismatch.");
-            const int appendTokens = current.dims[1];
-            while ((cache.dims.empty() &&
-                    (cache.expansionDims.size() < 2 ||
-                     appendTokens > cache.expansionDims[1])) ||
-                   (!cache.dims.empty() &&
-                    (cache.expansionDims.size() < 2 ||
-                     cache.dims[1] + appendTokens >
-                         cache.expansionDims[1]))) {
-                std::vector<int> expanded;
-                if (cache.dims.empty()) {
-                    expanded = {
-                        current.dims[0],
-                        ((appendTokens - 1) / allocationUnit + 1) *
-                            allocationUnit,
-                        current.dims[2],
-                    };
-                } else {
-                    expanded = cache.expansionDims.size() ==
-                                       cache.dims.size() ?
-                        cache.expansionDims : cache.dims;
-                    expanded[1] +=
-                        ((appendTokens - 1) / allocationUnit + 1) *
-                            allocationUnit;
-                }
-                cache.Expansion(expanded);
-            }
-            CatDirect(cache, current, 1);
         }
 
         float Glm5NextReadFloat(const Data &data, uint64_t index) {
@@ -245,6 +201,105 @@ namespace fastllm {
                    text.compare(text.size() - suffix.size(),
                                 suffix.size(), suffix) == 0;
         }
+
+        bool Glm5NextHistoryCacheDebugEnabled() {
+            static const bool enabled = []() {
+                const char *value = std::getenv(
+                    "FASTLLM_GLM5_NEXT_HISTORY_CACHE_DEBUG");
+                return value != nullptr && value[0] != '\0' &&
+                       std::strcmp(value, "0") != 0 &&
+                       std::strcmp(value, "false") != 0 &&
+                       std::strcmp(value, "off") != 0;
+            }();
+            return enabled;
+        }
+
+        int Glm5NextPagedCacheLength(const Data &cache) {
+            if (!cache.isPagedKVCache ||
+                cache.pagedKVCacheData == nullptr ||
+                cache.pageLen <= 0 || cache.pageIndex.empty() ||
+                cache.lastPageLen <= 0 ||
+                cache.lastPageLen > cache.pageLen) {
+                return -1;
+            }
+            return ((int)cache.pageIndex.size() - 1) * cache.pageLen +
+                   cache.lastPageLen;
+        }
+
+        uint64_t Glm5NextPagedCacheBytes(const Data &cache) {
+            if (Glm5NextPagedCacheLength(cache) <= 0) {
+                return 0;
+            }
+            const PagedCacheManager *manager = cache.pagedKVCacheData;
+            if (manager->maxPages <= 0 || manager->dims.size() != 4) {
+                return 0;
+            }
+            return manager->GetBytes() / (uint64_t)manager->maxPages *
+                   (uint64_t)cache.pageIndex.size();
+        }
+
+        std::string Glm5NextDimsText(const std::vector<int> &dims) {
+            std::string text = "[";
+            for (size_t i = 0; i < dims.size(); i++) {
+                if (i > 0) {
+                    text += ",";
+                }
+                text += std::to_string(dims[i]);
+            }
+            return text + "]";
+        }
+
+        void DebugGlm5NextCacheDescriptor(
+                int layer, const char *slot, const Data &cache) {
+            if (!Glm5NextHistoryCacheDebugEnabled()) {
+                return;
+            }
+            const std::string dims = Glm5NextDimsText(cache.dims);
+            const std::string managerDims =
+                cache.pagedKVCacheData == nullptr ? "[]" :
+                Glm5NextDimsText(cache.pagedKVCacheData->dims);
+            fprintf(stderr,
+                    "[glm5-next-history] descriptor layer=%d slot=%s "
+                    "dtype=%d dims=%s kv=%d linear=%d transposed=%d "
+                    "paged=%d pages=%zu page_len=%d last_page_len=%d "
+                    "manager_dims=%s manager_max_pages=%d\n",
+                    layer, slot, (int)cache.dataType, dims.c_str(),
+                    cache.isKVCache ? 1 : 0,
+                    cache.isLinearAttention ? 1 : 0,
+                    cache.isLinearAttentionTransposed ? 1 : 0,
+                    cache.isPagedKVCache ? 1 : 0,
+                    cache.pageIndex.size(), cache.pageLen,
+                    cache.lastPageLen, managerDims.c_str(),
+                    cache.pagedKVCacheData == nullptr ? -1 :
+                        cache.pagedKVCacheData->maxPages);
+        }
+
+        void ShareGlm5NextPagedCache(
+                const Data &source, Data &target) {
+            AssertInFastLLM(
+                Glm5NextPagedCacheLength(source) > 0 &&
+                source.pagedKVCacheData->dims.size() == 4 &&
+                target.pageIndex.empty() &&
+                target.pagedKVCacheData == nullptr &&
+                target.cpuData == nullptr && target.cudaData == nullptr,
+                "GLM-5.3 cannot share an invalid or non-empty paged cache.");
+            target.name = source.name;
+            target.cacheUid = source.cacheUid;
+            target.isKVCache = true;
+            target.isPagedKVCache = true;
+            target.isLinearAttention = false;
+            target.isLinearAttentionTransposed = false;
+            target.dataType = source.dataType;
+            target.UpdateUnitSize();
+            target.dataDevice = source.dataDevice;
+            target.dataDeviceIds = source.dataDeviceIds;
+            target.Resize(source.dims);
+            target.pageLen = source.pageLen;
+            target.pagedKVCacheData = source.pagedKVCacheData;
+            target.pageIndex = source.pageIndex;
+            target.lastPageLen = source.lastPageLen;
+            target.pagedKVCacheData->Pick(target.pageIndex);
+        }
     }
 
     Glm5NextModel::Glm5NextModel() {
@@ -291,6 +346,17 @@ namespace fastllm {
 
     Glm5NextModel::~Glm5NextModel() {
         ShutdownRuntime();
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            pendingHistoryCache.reset();
+            historyCache.clear();
+            historyCacheBytes = 0;
+        }
+        {
+            std::lock_guard<std::mutex> guard(responseContextsMutex);
+            responseContexts.clear();
+        }
+        ClearAllPagedCacheManagers();
     }
 
     void Glm5NextModel::SetDataType(DataType dataType) {
@@ -348,10 +414,35 @@ namespace fastllm {
         rms_norm_eps = requiredFloat("rms_norm_eps");
 
         indexTopK = requiredInt("index_topk");
-        exactSparseAttentionLimit = indexTopK;
-        max_positions = std::min(
-            requiredInt("max_position_embeddings"),
-            exactSparseAttentionLimit);
+        max_positions = requiredInt("max_position_embeddings");
+        AssertInFastLLM(
+            max_positions >= indexTopK,
+            "GLM-5.3 max_position_embeddings is smaller than index_topk.");
+        if (const char *gpuCacheMb = std::getenv(
+                "FASTLLM_GLM5_NEXT_HISTORY_CACHE_GPU_MB")) {
+            char *end = nullptr;
+            unsigned long long value = std::strtoull(
+                gpuCacheMb, &end, 10);
+            AssertInFastLLM(
+                end != gpuCacheMb && *end == '\0' && value <= 65536,
+                "FASTLLM_GLM5_NEXT_HISTORY_CACHE_GPU_MB must be an "
+                "integer in [0, 65536].");
+            historyCacheGpuStateLimitBytes =
+                (uint64_t)value * 1024ULL * 1024ULL;
+        }
+        if (const char *cacheBudgetGb = std::getenv(
+                "FASTLLM_GLM5_NEXT_HISTORY_CACHE_MAX_GB")) {
+            char *end = nullptr;
+            unsigned long long value = std::strtoull(
+                cacheBudgetGb, &end, 10);
+            AssertInFastLLM(
+                end != cacheBudgetGb && *end == '\0' &&
+                value >= 1 && value <= 1024,
+                "FASTLLM_GLM5_NEXT_HISTORY_CACHE_MAX_GB must be an "
+                "integer in [1, 1024].");
+            historyCacheMaxBytes =
+                (uint64_t)value * 1024ULL * 1024ULL * 1024ULL;
+        }
 
         num_experts = requiredInt("n_routed_experts");
         num_experts_per_tok = requiredInt("num_experts_per_tok");
@@ -451,9 +542,10 @@ namespace fastllm {
         std::cout
             << "[GLM-5.3] Hybrid text model: 34 KDA + 11 DSA layers, "
             << "42 MoE layers, BF16 activations.\n"
-            << "[GLM-5.3] DSA currently uses the exact all-visible path "
-            << "through " << exactSparseAttentionLimit
-            << " cached tokens.\n";
+            << "[GLM-5.3] Context window restored to " << max_positions
+            << " tokens. DSA above Top-" << indexTopK
+            << " currently uses exact paged attention with "
+            << fastllm::GetPageLen() << "-token cache pages.\n";
     }
 
     std::map<std::string,
@@ -655,6 +747,594 @@ namespace fastllm {
         }
     }
 
+    int Glm5NextModel::GetHistoryCacheSequenceLength(
+            const std::vector<std::pair<Data, Data>>
+                &pastKeyValues) const {
+        if ((int)pastKeyValues.size() < block_cnt ||
+            (int)kdaLayers.size() < block_cnt) {
+            return -1;
+        }
+        int sequenceLength = -1;
+        int sparseLayers = 0;
+        int populatedSparseLayers = 0;
+        for (int layer = 0; layer < block_cnt; layer++) {
+            if (kdaLayers[layer]) {
+                continue;
+            }
+            sparseLayers++;
+            const Data &key = pastKeyValues[layer].first;
+            const Data &value = pastKeyValues[layer].second;
+            if (key.dims.empty() && value.dims.empty() &&
+                !key.isPagedKVCache && !value.isPagedKVCache) {
+                continue;
+            }
+            populatedSparseLayers++;
+            const int keyLength = Glm5NextPagedCacheLength(key);
+            const int valueLength = Glm5NextPagedCacheLength(value);
+            if (key.dims.size() != 3 || value.dims.size() != 3 ||
+                keyLength <= 0 || keyLength != valueLength ||
+                key.dims[1] != keyLength ||
+                value.dims[1] != valueLength) {
+                return -1;
+            }
+            if (sequenceLength < 0) {
+                sequenceLength = keyLength;
+            } else if (sequenceLength != keyLength) {
+                return -1;
+            }
+        }
+        if (populatedSparseLayers > 0 &&
+            populatedSparseLayers != sparseLayers) {
+            return -1;
+        }
+        return std::max(0, sequenceLength);
+    }
+
+    bool Glm5NextModel::CanRestoreHistoryCache(
+            const HistoryCacheMemory &memory) const {
+        if (memory.sequenceLength <= 0 ||
+            memory.sequenceLength != (int)memory.tokens.size() ||
+            (int)memory.pastKeyValues.size() < block_cnt ||
+            (int)kdaLayers.size() < block_cnt) {
+            return false;
+        }
+        for (int layer = 0; layer < block_cnt; layer++) {
+            const Data &first = memory.pastKeyValues[layer].first;
+            const Data &second = memory.pastKeyValues[layer].second;
+            if (first.multiDeviceData || second.multiDeviceData ||
+                !first.multiDeviceDatas.empty() ||
+                !second.multiDeviceDatas.empty()) {
+                return false;
+            }
+            if (kdaLayers[layer]) {
+                if (first.dataType != DataType::BFLOAT16 ||
+                    first.dims != std::vector<int>({
+                        3, shortConvKernel - 1,
+                        kdaHeads * kdaHeadDim}) ||
+                    second.dataType != DataType::FLOAT32 ||
+                    second.dims != std::vector<int>({
+                        1, kdaHeads, kdaHeadDim, kdaHeadDim}) ||
+                    !first.isLinearAttention ||
+                    !second.isLinearAttention ||
+                    first.isPagedKVCache || second.isPagedKVCache) {
+                    return false;
+                }
+                continue;
+            }
+            auto validPaged = [&](const Data &cache, int headDim) {
+                if (cache.dataType != DataType::BFLOAT16 ||
+                    cache.dims != std::vector<int>({
+                        num_attention_heads, memory.sequenceLength,
+                        headDim}) ||
+                    cache.isLinearAttention ||
+                    Glm5NextPagedCacheLength(cache) !=
+                        memory.sequenceLength ||
+                    cache.lastPageLen != cache.pageLen ||
+                    cache.pagedKVCacheData == nullptr ||
+                    cache.pagedKVCacheData->dataType !=
+                        DataType::BFLOAT16 ||
+                    cache.pagedKVCacheData->dims.size() != 4 ||
+                    cache.pagedKVCacheData->dims[1] != cache.pageLen ||
+                    cache.pagedKVCacheData->dims[2] !=
+                        num_attention_heads ||
+                    cache.pagedKVCacheData->dims[3] != headDim) {
+                    return false;
+                }
+                for (int page : cache.pageIndex) {
+                    if (page < 0 ||
+                        page >= cache.pagedKVCacheData->maxPages) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (!validPaged(first, qkHeadDim) ||
+                !validPaged(second, valueHeadDim) ||
+                first.pageLen != second.pageLen ||
+                first.pageIndex.size() != second.pageIndex.size()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void Glm5NextModel::OnResponseContextCreated(
+            ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        std::shared_ptr<HistoryCacheMemory> pending;
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            pending.swap(pendingHistoryCache);
+        }
+        if (pending != nullptr) {
+            std::lock_guard<std::mutex> forwardGuard(forwardLocker);
+            RestoreHistoryCache(*pending, context);
+            context->preTokens = context->cacheLen;
+            context->intParams["add_special_tokens"] = 0;
+            context->intParams["promptLen"] =
+                context->cacheLen + (int)context->currentTokens.size();
+            context->intParams["index"] = -1;
+        }
+        std::lock_guard<std::mutex> guard(responseContextsMutex);
+        responseContexts[&context->pastKeyValues] = context;
+    }
+
+    void Glm5NextModel::OnResponseContextRemoved(
+            ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(responseContextsMutex);
+        responseContexts.erase(&context->pastKeyValues);
+    }
+
+    bool Glm5NextModel::TryRestoreHistoryCache(
+            std::vector<int> &inputTokens, int &cacheLen) {
+        if (!saveHistoryChat || inputTokens.size() <= 1) {
+            return false;
+        }
+        std::shared_ptr<HistoryCacheMemory> best;
+        size_t bestLength = 0;
+        size_t recordCount = 0;
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            pendingHistoryCache.reset();
+            for (auto it = historyCache.begin();
+                 it != historyCache.end();) {
+                auto current = it++;
+                if (!CanRestoreHistoryCache(*current->second)) {
+                    historyCacheBytes -= std::min(
+                        historyCacheBytes, current->second->bytes);
+                    historyCache.erase(current);
+                    continue;
+                }
+                const std::vector<int> &cachedTokens = current->first;
+                if (cachedTokens.size() <= bestLength ||
+                    cachedTokens.size() >= inputTokens.size() ||
+                    !std::equal(cachedTokens.begin(), cachedTokens.end(),
+                                inputTokens.begin())) {
+                    continue;
+                }
+                best = current->second;
+                bestLength = cachedTokens.size();
+            }
+
+            // Custom snapshots retain pages outside the generic paged trie.
+            // Reclaim unrelated LRU snapshots before scheduler admission so
+            // their references cannot leave a prefill waiting forever for a
+            // fixed-size page pool. Keep a small decode reserve and never
+            // evict the snapshot selected for this request.
+            std::set<PagedCacheManager*> managers;
+            for (const auto &item : historyCache) {
+                const auto &values = item.second->pastKeyValues;
+                for (int layer = 0;
+                     layer < block_cnt && layer < (int)values.size();
+                     layer++) {
+                    if (kdaLayers[layer]) {
+                        continue;
+                    }
+                    if (values[layer].first.pagedKVCacheData != nullptr) {
+                        managers.insert(
+                            values[layer].first.pagedKVCacheData);
+                    }
+                    if (values[layer].second.pagedKVCacheData != nullptr) {
+                        managers.insert(
+                            values[layer].second.pagedKVCacheData);
+                    }
+                }
+            }
+            const int remainingTokens =
+                (int)inputTokens.size() - (int)bestLength;
+            auto hasPageReserve = [&]() {
+                for (PagedCacheManager *manager : managers) {
+                    if (manager == nullptr || manager->pageLen <= 0 ||
+                        manager->maxPages <= 0) {
+                        continue;
+                    }
+                    const int requiredPages =
+                        (remainingTokens + manager->pageLen - 1) /
+                        manager->pageLen;
+                    const int reservePages =
+                        std::max(1, manager->maxPages / 8);
+                    const int desiredFreePages = std::min(
+                        manager->maxPages,
+                        requiredPages + reservePages);
+                    std::lock_guard<std::mutex> pageGuard(
+                        manager->pageIndexLocker);
+                    if (manager->FreePageCount() < desiredFreePages) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            while (!historyCache.empty() && !hasPageReserve()) {
+                auto oldest = historyCache.end();
+                for (auto it = historyCache.begin();
+                     it != historyCache.end(); ++it) {
+                    if (it->second == best) {
+                        continue;
+                    }
+                    if (oldest == historyCache.end() ||
+                        it->second->flushTime <
+                            oldest->second->flushTime) {
+                        oldest = it;
+                    }
+                }
+                if (oldest == historyCache.end()) {
+                    break;
+                }
+                historyCacheBytes -= std::min(
+                    historyCacheBytes, oldest->second->bytes);
+                historyCache.erase(oldest);
+            }
+            recordCount = historyCache.size();
+            if (best != nullptr) {
+                best->flushTime = ++historyCacheFlushTime;
+                pendingHistoryCache = best;
+            }
+        }
+        if (best == nullptr) {
+            if (Glm5NextHistoryCacheDebugEnabled()) {
+                fprintf(stderr,
+                        "[glm5-next-history] miss input=%zu records=%zu\n",
+                        inputTokens.size(), recordCount);
+            }
+            return false;
+        }
+        inputTokens.erase(
+            inputTokens.begin(), inputTokens.begin() + bestLength);
+        cacheLen = (int)bestLength;
+        if (Glm5NextHistoryCacheDebugEnabled()) {
+            fprintf(stderr,
+                    "[glm5-next-history] hit input=%zu restore=%zu "
+                    "state=%s dsa=shared-pages\n",
+                    inputTokens.size() + bestLength, bestLength,
+                    best->recurrentStateOnCpu ? "cpu" : "gpu");
+        }
+        return true;
+    }
+
+    void Glm5NextModel::RecordHistoryCache(
+            const std::vector<int> &tokens,
+            const std::vector<std::pair<Data, Data>> &pastKeyValues,
+            int sequenceLength) {
+        if (!saveHistoryChat || sequenceLength <= 0 ||
+            sequenceLength != (int)tokens.size() ||
+            GetHistoryCacheSequenceLength(pastKeyValues) !=
+                sequenceLength) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            auto existing = historyCache.find(tokens);
+            if (existing != historyCache.end()) {
+                existing->second->flushTime = ++historyCacheFlushTime;
+                return;
+            }
+        }
+
+        uint64_t estimatedBytes = 0;
+        uint64_t recurrentBytes = 0;
+        bool recurrentSourcesOnCuda = true;
+        for (int layer = 0; layer < block_cnt; layer++) {
+            for (const Data *source : {
+                    &pastKeyValues[layer].first,
+                    &pastKeyValues[layer].second}) {
+                if (source->dims.empty() || source->multiDeviceData ||
+                    !source->multiDeviceDatas.empty()) {
+                    return;
+                }
+                if (kdaLayers[layer]) {
+                    if (source->isPagedKVCache) {
+                        return;
+                    }
+                    const uint64_t bytes =
+                        source->expansionBytes > 0 ?
+                        source->expansionBytes : source->GetBytes();
+                    recurrentBytes += bytes;
+                    estimatedBytes += bytes;
+                    recurrentSourcesOnCuda &=
+                        source->dataDevice == DataDevice::CUDA;
+                } else {
+                    if (Glm5NextPagedCacheLength(*source) !=
+                            sequenceLength ||
+                        source->lastPageLen != source->pageLen) {
+                        return;
+                    }
+                    const uint64_t bytes =
+                        Glm5NextPagedCacheBytes(*source);
+                    if (bytes == 0) {
+                        return;
+                    }
+                    estimatedBytes += bytes;
+                }
+            }
+        }
+
+        // DSA pages remain in their runtime pools and are retained by reference;
+        // only the fixed-size KDA recurrent state needs a physical snapshot.
+        bool storeOnCpu = GetHistoryCacheInCPU() ||
+            !recurrentSourcesOnCuda ||
+            recurrentBytes > historyCacheGpuStateLimitBytes;
+#ifdef USE_CUDA
+        if (!storeOnCpu) {
+            const uint64_t reserveBytes =
+                512ULL * 1024ULL * 1024ULL;
+            const long long freeBytes = FastllmCudaGetFreeSize();
+            storeOnCpu = freeBytes <= 0 ||
+                recurrentBytes + reserveBytes > (uint64_t)freeBytes;
+        }
+#else
+        storeOnCpu = true;
+#endif
+
+        auto evictOldestLocked = [&]() -> bool {
+            auto oldest = historyCache.end();
+            for (auto it = historyCache.begin();
+                 it != historyCache.end(); ++it) {
+                if (oldest == historyCache.end() ||
+                    it->second->flushTime < oldest->second->flushTime) {
+                    oldest = it;
+                }
+            }
+            if (oldest == historyCache.end()) {
+                return false;
+            }
+            historyCacheBytes -= std::min(
+                historyCacheBytes, oldest->second->bytes);
+            historyCache.erase(oldest);
+            return true;
+        };
+        auto overBudget = [&](uint64_t incoming) {
+            return incoming > historyCacheMaxBytes ||
+                historyCacheBytes > historyCacheMaxBytes - incoming;
+        };
+        {
+            std::lock_guard<std::mutex> guard(historyCacheMutex);
+            while (!historyCache.empty() &&
+                   ((int)historyCache.size() >= historyCacheMaxRecords ||
+                    overBudget(estimatedBytes))) {
+                if (!evictOldestLocked()) {
+                    break;
+                }
+            }
+        }
+
+        auto memory = std::make_shared<HistoryCacheMemory>();
+        memory->tokens = tokens;
+        memory->sequenceLength = sequenceLength;
+        memory->recurrentStateOnCpu = storeOnCpu;
+        memory->pastKeyValues.resize(block_cnt);
+        const bool lockCpuCache = GetHistoryCacheInCPU();
+        auto copyTensor = [&](const Data &source, Data &target) {
+            if (!storeOnCpu) {
+#ifdef USE_CUDA
+                const int originalDevice = FastllmCudaGetDevice();
+                int sourceDevice = GetPointerDeviceId(source.cudaData);
+                if (sourceDevice < 0 && !source.dataDeviceIds.empty()) {
+                    sourceDevice = source.dataDeviceIds[0];
+                }
+                AssertInFastLLM(
+                    sourceDevice >= 0,
+                    "GLM-5.3 history cache source GPU is unknown.");
+                FastllmCudaSetDevice(sourceDevice);
+                target.CopyFrom(source);
+                target.dataDeviceIds = source.dataDeviceIds;
+                FastllmCudaSetDevice(originalDevice);
+#else
+                ErrorInFastLLM(
+                    "GLM-5.3 CUDA history cache requires a CUDA build.");
+#endif
+                return;
+            }
+
+            target.name = source.name;
+            target.isKVCache = source.isKVCache;
+            target.isLinearAttention = source.isLinearAttention;
+            target.isLinearAttentionTransposed =
+                source.isLinearAttentionTransposed;
+            target.cacheUid = source.cacheUid;
+            target.dataType = source.dataType;
+            target.UpdateUnitSize();
+            target.dataDevice = DataDevice::CPU;
+            target.dataDeviceIds = source.dataDeviceIds;
+            target.Resize(source.dims);
+            if (!source.expansionDims.empty() &&
+                source.expansionDims != source.dims) {
+                target.Expansion(source.expansionDims);
+                target.Resize(source.dims);
+            } else {
+                target.Allocate(false);
+            }
+            const size_t bytes = source.expansionBytes > 0 ?
+                source.expansionBytes : source.GetBytes();
+            AssertInFastLLM(
+                target.cpuData != nullptr &&
+                bytes <= target.expansionBytes,
+                "GLM-5.3 CPU history cache allocation failed.");
+            if (source.dataDevice == DataDevice::CPU) {
+                AssertInFastLLM(
+                    source.cpuData != nullptr,
+                    "GLM-5.3 history cache source has no CPU data.");
+                std::memcpy(target.cpuData, source.cpuData, bytes);
+            } else {
+#ifdef USE_CUDA
+                AssertInFastLLM(
+                    source.cudaData != nullptr,
+                    "GLM-5.3 history cache source has no CUDA data.");
+                const int originalDevice = FastllmCudaGetDevice();
+                int sourceDevice = GetPointerDeviceId(source.cudaData);
+                if (sourceDevice < 0 && !source.dataDeviceIds.empty()) {
+                    sourceDevice = source.dataDeviceIds[0];
+                }
+                AssertInFastLLM(
+                    sourceDevice >= 0,
+                    "GLM-5.3 history cache source GPU is unknown.");
+                FastllmCudaSetDevice(sourceDevice);
+                FastllmCudaCopyFromDeviceToHost(
+                    target.cpuData, source.cudaData, bytes);
+                FastllmCudaSetDevice(originalDevice);
+#else
+                ErrorInFastLLM(
+                    "GLM-5.3 CUDA history cache requires a CUDA build.");
+#endif
+            }
+            target.lockInCPU = lockCpuCache;
+        };
+
+        for (int layer = 0; layer < block_cnt; layer++) {
+            if (kdaLayers[layer]) {
+                copyTensor(pastKeyValues[layer].first,
+                           memory->pastKeyValues[layer].first);
+                copyTensor(pastKeyValues[layer].second,
+                           memory->pastKeyValues[layer].second);
+                memory->bytes +=
+                    memory->pastKeyValues[layer].first.expansionBytes;
+                memory->bytes +=
+                    memory->pastKeyValues[layer].second.expansionBytes;
+            } else {
+                ShareGlm5NextPagedCache(
+                    pastKeyValues[layer].first,
+                    memory->pastKeyValues[layer].first);
+                ShareGlm5NextPagedCache(
+                    pastKeyValues[layer].second,
+                    memory->pastKeyValues[layer].second);
+                memory->bytes += Glm5NextPagedCacheBytes(
+                    memory->pastKeyValues[layer].first);
+                memory->bytes += Glm5NextPagedCacheBytes(
+                    memory->pastKeyValues[layer].second);
+            }
+        }
+        if (!CanRestoreHistoryCache(*memory)) {
+            for (int layer = 0; layer < block_cnt; layer++) {
+                DebugGlm5NextCacheDescriptor(
+                    layer, "first",
+                    memory->pastKeyValues[layer].first);
+                DebugGlm5NextCacheDescriptor(
+                    layer, "second",
+                    memory->pastKeyValues[layer].second);
+            }
+            fprintf(stderr,
+                    "[glm5-next-history] skipped incomplete snapshot\n");
+            return;
+        }
+
+        std::lock_guard<std::mutex> guard(historyCacheMutex);
+        auto existing = historyCache.find(tokens);
+        if (existing != historyCache.end()) {
+            existing->second->flushTime = ++historyCacheFlushTime;
+            return;
+        }
+        while (!historyCache.empty() &&
+               ((int)historyCache.size() >= historyCacheMaxRecords ||
+                overBudget(memory->bytes))) {
+            if (!evictOldestLocked()) {
+                break;
+            }
+        }
+        memory->flushTime = ++historyCacheFlushTime;
+        historyCacheBytes += memory->bytes;
+        historyCache[tokens] = std::move(memory);
+        if (Glm5NextHistoryCacheDebugEnabled()) {
+            const auto &stored = historyCache[tokens];
+            fprintf(stderr,
+                    "[glm5-next-history] record tokens=%zu bytes=%.2fGiB "
+                    "state=%s dsa=shared-pages records=%zu total=%.2fGiB\n",
+                    tokens.size(),
+                    stored->bytes / (1024.0 * 1024.0 * 1024.0),
+                    stored->recurrentStateOnCpu ? "cpu" : "gpu",
+                    historyCache.size(),
+                    historyCacheBytes /
+                        (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+
+    void Glm5NextModel::RestoreHistoryCache(
+            const HistoryCacheMemory &memory,
+            ResponseContext *context) {
+        AssertInFastLLM(
+            context != nullptr &&
+            context->cacheLen == memory.sequenceLength &&
+            CanRestoreHistoryCache(memory),
+            "GLM-5.3 history cache snapshot is incomplete.");
+        context->pastKeyValues.resize(block_cnt);
+        auto restoreTensor = [](const Data &source, Data &target) {
+#ifdef USE_CUDA
+            const int originalDevice = FastllmCudaGetDevice();
+            if (source.dataDevice == DataDevice::CUDA &&
+                source.cudaData != nullptr) {
+                int sourceDevice = GetPointerDeviceId(source.cudaData);
+                if (sourceDevice < 0 && !source.dataDeviceIds.empty()) {
+                    sourceDevice = source.dataDeviceIds[0];
+                }
+                AssertInFastLLM(
+                    sourceDevice >= 0,
+                    "GLM-5.3 history cache source GPU is unknown.");
+                FastllmCudaSetDevice(sourceDevice);
+            }
+#endif
+            target.CopyFrom(source);
+            target.lockInCPU = source.lockInCPU;
+            target.dataDeviceIds = source.dataDeviceIds;
+#ifdef USE_CUDA
+            if (source.dataDevice == DataDevice::CPU &&
+                !source.lockInCPU && !source.dataDeviceIds.empty()) {
+                target.ToDevice(
+                    DataDevice::CUDA, source.dataDeviceIds);
+            }
+            FastllmCudaSetDevice(originalDevice);
+#endif
+        };
+        for (int layer = 0; layer < block_cnt; layer++) {
+            if (kdaLayers[layer]) {
+                restoreTensor(memory.pastKeyValues[layer].first,
+                              context->pastKeyValues[layer].first);
+                restoreTensor(memory.pastKeyValues[layer].second,
+                              context->pastKeyValues[layer].second);
+            } else {
+                ShareGlm5NextPagedCache(
+                    memory.pastKeyValues[layer].first,
+                    context->pastKeyValues[layer].first);
+                ShareGlm5NextPagedCache(
+                    memory.pastKeyValues[layer].second,
+                    context->pastKeyValues[layer].second);
+            }
+        }
+        AssertInFastLLM(
+            GetHistoryCacheSequenceLength(context->pastKeyValues) ==
+                memory.sequenceLength,
+            "GLM-5.3 restored DSA caches are out of sync.");
+        if (Glm5NextHistoryCacheDebugEnabled()) {
+            fprintf(stderr,
+                    "[glm5-next-history] restored=%d state=%s "
+                    "dsa=shared-pages\n",
+                    memory.sequenceLength,
+                    memory.recurrentStateOnCpu ? "cpu" : "gpu");
+        }
+    }
+
     void Glm5NextModel::RunKdaAttention(
             int layerIndex, Data &input, int sequence,
             std::vector<std::pair<Data, Data>> &pastKeyValues,
@@ -770,6 +1450,12 @@ namespace fastllm {
             rms_norm_eps, qNormalized);
         Linear(qNormalized, weight[prefix + "q_b_proj.weight"],
                Data(), query);
+        qResidual.FreeSpace();
+        qNormalized.FreeSpace();
+        // The generic Linear path can materialize these projections as FP32.
+        // Paged CUDA attention supports half/bfloat16 queries and cache pages;
+        // keep GLM-5.3's advertised BF16 activation/cache contract explicit.
+        ToDataType(query, DataType::BFLOAT16);
         query.Reshape(
             {1, sequence, num_attention_heads, qkHeadDim});
         PermuteSelf(query, {0, 2, 1, 3});
@@ -782,6 +1468,9 @@ namespace fastllm {
             rms_norm_eps, kvNormalized);
         Linear(kvNormalized, weight[prefix + "kv_b_proj.weight"],
                Data(), expandedKv);
+        compressedKv.FreeSpace();
+        kvNormalized.FreeSpace();
+        ToDataType(expandedKv, DataType::BFLOAT16);
         expandedKv.Reshape(
             {1, sequence, num_attention_heads,
              qkNopeHeadDim + valueHeadDim});
@@ -798,20 +1487,57 @@ namespace fastllm {
 
         Data &keyCache = pastKeyValues[layerIndex].first;
         Data &valueCache = pastKeyValues[layerIndex].second;
-        AppendGlm5NextSequenceCache(keyCache, key);
-        AppendGlm5NextSequenceCache(valueCache, value);
+        auto initializePagedDescriptor = [](Data &cache,
+                                             const Data &current) {
+            if (cache.dims.empty() && cache.pageIndex.empty() &&
+                cache.pagedKVCacheData == nullptr) {
+                cache.dataType = current.dataType;
+                cache.UpdateUnitSize();
+                cache.dataDevice = current.dataDevice;
+                cache.dataDeviceIds = current.dataDeviceIds;
+                cache.SetKVCache();
+            }
+            AssertInFastLLM(
+                cache.dataType == current.dataType,
+                "GLM-5.3 DSA paged-cache descriptor dtype mismatch.");
+        };
+        initializePagedDescriptor(keyCache, key);
+        initializePagedDescriptor(valueCache, value);
+        PagedCacheManager *keyManager = AllocatePagedCacheManager(
+            layerIndex * 2,
+            PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            key);
+        PagedCacheManager *valueManager = AllocatePagedCacheManager(
+            layerIndex * 2 + 1,
+            PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            value);
         AssertInFastLLM(
-            keyCache.dims[1] == valueCache.dims[1] &&
-            keyCache.dims[1] <= exactSparseAttentionLimit,
-            "GLM-5.3 DSA exact all-visible path supports at most " +
-            std::to_string(exactSparseAttentionLimit) +
-            " cached tokens.");
+            keyManager != nullptr && valueManager != nullptr,
+            "GLM-5.3 failed to allocate DSA paged-cache managers.");
+        AppendPagedCache(*keyManager, keyCache, key);
+        AppendPagedCache(*valueManager, valueCache, value);
+        key.FreeSpace();
+        value.FreeSpace();
+        AssertInFastLLM(
+            Glm5NextPagedCacheLength(keyCache) == keyCache.dims[1] &&
+            Glm5NextPagedCacheLength(valueCache) == valueCache.dims[1] &&
+            keyCache.dims[1] == valueCache.dims[1],
+            "GLM-5.3 DSA key/value caches are out of sync.");
 
+        // Paged attention reads the shared page pool directly. expandedKv is
+        // twice as wide as the result, so reuse its now-dead K/V projection
+        // storage for the attention output.
+        query.Reshape(
+            {num_attention_heads, sequence, qkHeadDim});
         Data attentionHeads;
-        KimiK3CausalAttention(
-            query, keyCache, valueCache,
-            1.0f / std::sqrt((float)qkHeadDim), attentionHeads);
-        PermuteSelf(attentionHeads, {0, 2, 1, 3});
+        attentionHeads.FakeFrom(expandedKv, 0);
+        attentionHeads.dataDeviceIds = expandedKv.dataDeviceIds;
+        AttentionPaged(
+            query, keyCache, valueCache, attentionHeads, 1,
+            1.0f / std::sqrt((float)qkHeadDim), 1,
+            layerIndex > kvCacheId);
+        query.FreeSpace();
+        PermuteSelf(attentionHeads, {1, 0, 2});
         attentionHeads.Reshape(
             {1, sequence, num_attention_heads * valueHeadDim});
         Linear(attentionHeads, weight[prefix + "o_proj.weight"],
@@ -937,6 +1663,94 @@ namespace fastllm {
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens,
             std::vector<float> *logits) {
+        AssertInFastLLM(
+            inputIds.dims.size() == 2 && inputIds.dims[0] == 1 &&
+            inputIds.dims[1] > 0,
+            "GLM-5.3 Forward currently supports one non-empty request.");
+        const int sequence = inputIds.dims[1];
+        ResponseContext *context = nullptr;
+        if (saveHistoryChat) {
+            std::lock_guard<std::mutex> guard(responseContextsMutex);
+            auto it = responseContexts.find(&pastKeyValues);
+            if (it != responseContexts.end()) {
+                context = it->second;
+            }
+        }
+        const int cachedLength =
+            GetHistoryCacheSequenceLength(pastKeyValues);
+        const bool isFinalPromptChunk =
+            context != nullptr && cachedLength >= 0 &&
+            cachedLength + sequence == context->inputTokens &&
+            (int)context->allTokens.size() >= context->inputTokens;
+        if (!isFinalPromptChunk) {
+            return ForwardImpl(
+                inputIds, attentionMask, positionIds, pastKeyValues,
+                generationConfig, lastTokens, logits, true);
+        }
+
+        // KDA stores a recurrent state after every consumed token and cannot
+        // be sliced back like DSA K/V. Keep the atomic checkpoint strictly
+        // before prompt N and align it to a complete DSA page. Restored
+        // requests therefore append into a new page instead of modifying a
+        // page that is still shared with history.
+        const int pageLen = fastllm::GetPageLen();
+        AssertInFastLLM(
+            pageLen > 0,
+            "GLM-5.3 history cache requires a positive page length.");
+        const int checkpointLength =
+            (context->inputTokens - 1) / pageLen * pageLen;
+        const int prefixLength = checkpointLength - cachedLength;
+        AssertInFastLLM(
+            prefixLength >= 0 && prefixLength < sequence,
+            "GLM-5.3 prompt checkpoint is outside the current chunk.");
+
+        Data suffixInput, suffixPositionIds;
+        if (prefixLength > 0) {
+            Data prefixInput, prefixPositionIds;
+            Split(inputIds, 1, 0, prefixLength, prefixInput);
+            Split(inputIds, 1, prefixLength, sequence, suffixInput);
+            if (positionIds.dims.size() == 2 &&
+                positionIds.dims[0] == 1 &&
+                positionIds.dims[1] == sequence) {
+                Split(positionIds, 1, 0, prefixLength,
+                      prefixPositionIds);
+                Split(positionIds, 1, prefixLength, sequence,
+                      suffixPositionIds);
+            }
+            ForwardImpl(
+                prefixInput, Data(), prefixPositionIds, pastKeyValues,
+                generationConfig, lastTokens, nullptr, false);
+        }
+        AssertInFastLLM(
+            GetHistoryCacheSequenceLength(pastKeyValues) ==
+                checkpointLength,
+            "GLM-5.3 prompt checkpoint is not page-aligned.");
+        if (checkpointLength > 0) {
+            std::vector<int> checkpointTokens(
+                context->allTokens.begin(),
+                context->allTokens.begin() + checkpointLength);
+            RecordHistoryCache(
+                checkpointTokens, pastKeyValues, checkpointLength);
+        }
+        if (prefixLength > 0) {
+            return ForwardImpl(
+                suffixInput, Data(), suffixPositionIds, pastKeyValues,
+                generationConfig, lastTokens, logits, true);
+        }
+        return ForwardImpl(
+            inputIds, attentionMask, positionIds, pastKeyValues,
+            generationConfig, lastTokens, logits, true);
+    }
+
+    int Glm5NextModel::ForwardImpl(
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits,
+            bool sampleOutput) {
         (void)attentionMask;
         (void)positionIds;
         AssertInFastLLM(
@@ -1016,6 +1830,10 @@ namespace fastllm {
             DeepSeekV4HcPost(
                 ffnOutput, *current, ffnPost, ffnComb, *next);
             std::swap(current, next);
+        }
+
+        if (!sampleOutput) {
+            return 0;
         }
 
         ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
