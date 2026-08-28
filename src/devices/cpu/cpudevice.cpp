@@ -348,6 +348,9 @@ namespace fastllm {
         this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CpuQwen4HyperMixOp());
         this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CpuQwen4HyperInjectOp());
         this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CpuQwen4HyperCombineOp());
+        this->ops["Qwen4QSASelect"] = (BaseOperator*)(new CpuQwen4QSASelectOp());
+        this->ops["Qwen4QSABuildMask"] = (BaseOperator*)(new CpuQwen4QSABuildMaskOp());
+        this->ops["Qwen4SparseAttention"] = (BaseOperator*)(new CpuQwen4SparseAttentionOp());
         this->ops["CausalDepthwiseConv1DDecode"] = (BaseOperator*)(new CpuCausalDepthwiseConv1DDecodeOp());
         this->ops["GatedDeltaRuleDecode"] = (BaseOperator*)(new CpuQwen4GatedDeltaRuleDecodeOp());
         this->ops["Qwen4GatedDeltaRuleDecode"] = (BaseOperator*)(new CpuQwen4GatedDeltaRuleDecodeOp());

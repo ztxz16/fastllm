@@ -981,6 +981,22 @@ namespace fastllm {
     void Qwen4HyperInject(const Data &logits, int groups, Data &output);
     void Qwen4HyperCombine(const Data &hyperInput, const Data &blockOutput,
                            const Data &injection, int groups, Data &output);
+    // Qwen4 QSA primitives. QSASelect scores compressed block keys, selects
+    // the highest-scoring blocks, and expands them to sorted token indices.
+    // queryStart >= 0 enables row-wise causal selection for prefill: row r can
+    // only select keys [0, queryStart + r]. QSABuildMask converts the indices
+    // to the standard attention-mask contract; SparseAttention consumes them
+    // directly without materializing a sequence-by-context mask. All
+    // operations are available through the normal CPU/CUDA executor.
+    void Qwen4QSASelect(const Data &query, const Data &compressedKeys,
+                        int keyLength, int heads, int headDim,
+                        int tokenBudget, int compressRatio, Data &indices,
+                        int queryStart = -1);
+    void Qwen4QSABuildMask(const Data &indices, const Data &reference,
+                           int keyLength, Data &mask);
+    void Qwen4SparseAttention(const Data &query, const Data &key,
+                              const Data &value, const Data &indices,
+                              int group, float scale, Data &output);
     // Compatibility alias for callers that used the original model-specific
     // name before GatedDeltaRuleDecode became a standard operation.
     void Qwen4GatedDeltaRuleDecode(

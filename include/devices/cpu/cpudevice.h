@@ -362,6 +362,21 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class CpuQwen4QSASelectOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuQwen4QSABuildMaskOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuQwen4SparseAttentionOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CpuCausalDepthwiseConv1DDecodeOp : BaseOperator {
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);

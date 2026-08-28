@@ -60,6 +60,11 @@ namespace fastllm {
             std::vector<float> convHistory;
             std::map<int, std::vector<float>> indexerRawKeys;
             std::map<int, std::vector<float>> indexerPositions;
+            // Host compressed keys are the snapshot-safe source of truth.
+            // The tensor view is rebuilt lazily on the request's execution
+            // device and is deliberately excluded from prefix snapshots.
+            std::map<int, std::vector<float>> indexerBlockKeys;
+            std::map<int, std::shared_ptr<Data>> indexerBlockKeyTensors;
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
@@ -128,6 +133,13 @@ namespace fastllm {
         std::vector<int64_t> pleHeadVocabSizes;
         std::vector<int64_t> pleHeadOffsets;
         std::vector<bool> linearLayers;
+        // QSA cache compression applies RoPE on the host while regular
+        // attention applies it on its execution device. Keep an immutable
+        // host view so cache updates never migrate the shared sinData/cosData
+        // tensors away from CUDA during decode.
+        std::vector<float> qsaSinValues;
+        std::vector<float> qsaCosValues;
+        std::map<int, std::vector<float>> qsaKeyNormValues;
 
         void PrepareWeights();
         bool IsLinearAttentionLayer(int layer) const;
@@ -143,7 +155,7 @@ namespace fastllm {
         void BuildQSAMask(int layer, const Data &input,
                           const Data &baseMask, const Data &positionIds,
                           int previousLength, RequestState &state,
-                          Data &qsaMask);
+                          Data &qsaMask, Data &qsaIndices);
         void RunFullAttention(int layer, const Data &input,
                               const Data &attentionMask,
                               const Data &positionIds,

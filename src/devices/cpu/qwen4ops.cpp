@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
+#include <numeric>
+#include <utility>
 #include <vector>
 
 namespace fastllm {
@@ -322,6 +325,308 @@ namespace fastllm {
                weight.Count(0) == (uint64_t)channels * kernel &&
                (state.dims.empty() ||
                 state.dims == std::vector<int>({batch, channels, kernel}));
+    }
+
+    void CpuQwen4QSASelectOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &output = *datas.find("output")->second;
+        const int keyLength = intParams.find("keyLength")->second;
+        const int heads = intParams.find("heads")->second;
+        const int headDim = intParams.find("headDim")->second;
+        const int tokenBudget = intParams.find("tokenBudget")->second;
+        const int compressRatio = intParams.find("compressRatio")->second;
+        const auto queryStartIt = intParams.find("queryStart");
+        const int queryStart = queryStartIt == intParams.end()
+            ? -1 : queryStartIt->second;
+        AssertInFastLLM(keyLength > 0 && heads > 0 && headDim > 0 &&
+                        tokenBudget > 0 &&
+                        compressRatio > 0 &&
+                        query.Count(0) % ((uint64_t)heads * headDim) == 0,
+                        "Qwen4QSASelect received invalid dimensions.\n");
+        const int rows = (int)(query.Count(0) /
+                               ((uint64_t)heads * headDim));
+        AssertInFastLLM(queryStart == -1 ||
+                        (queryStart >= 0 && queryStart + rows <= keyLength),
+                        "Qwen4QSASelect received an invalid causal range.\n");
+        const int outputWidth = queryStart >= 0
+            ? tokenBudget + compressRatio - 1
+            : tokenBudget + keyLength % compressRatio;
+        output.dataType = DataType::INT32;
+        output.UpdateUnitSize();
+        output.Resize({rows, outputWidth});
+    }
+
+    void CpuQwen4QSASelectOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &compressedKeys = *datas.find("compressedKeys")->second;
+        Data &output = *datas.find("output")->second;
+        const int keyLength = intParams.find("keyLength")->second;
+        const int heads = intParams.find("heads")->second;
+        const int headDim = intParams.find("headDim")->second;
+        const int tokenBudget = intParams.find("tokenBudget")->second;
+        const int compressRatio = intParams.find("compressRatio")->second;
+        const auto queryStartIt = intParams.find("queryStart");
+        const int queryStart = queryStartIt == intParams.end()
+            ? -1 : queryStartIt->second;
+        const int blockTopK = tokenBudget / compressRatio;
+        const int completeBlocks = keyLength / compressRatio;
+        const int rows = (int)(query.Count(0) /
+                               ((uint64_t)heads * headDim));
+        const int outputWidth = queryStart >= 0
+            ? tokenBudget + compressRatio - 1
+            : tokenBudget + keyLength % compressRatio;
+
+        Qwen4AssertCpuTensor(query, "Qwen4QSASelect query");
+        Qwen4AssertCpuTensor(compressedKeys,
+                             "Qwen4QSASelect compressed keys");
+        AssertInFastLLM(compressedKeys.dataType == DataType::FLOAT32 &&
+                        compressedKeys.dims.size() == 2 &&
+                        compressedKeys.dims[0] >= completeBlocks &&
+                        compressedKeys.dims[1] == headDim &&
+                        tokenBudget > 0 && compressRatio > 0 &&
+                        tokenBudget % compressRatio == 0 &&
+                        blockTopK > 0 && rows > 0 &&
+                        (queryStart == -1 ||
+                         (queryStart >= 0 &&
+                          queryStart + rows <= keyLength)) &&
+                        output.dims ==
+                            std::vector<int>({rows, outputWidth}),
+                        "Qwen4QSASelect received invalid cache or parameters.\n");
+        output.Allocate(false);
+        int32_t *outputData = (int32_t*)output.cpuData;
+        std::fill(outputData, outputData + output.Count(0), -1);
+
+        const float *keyData = (const float*)compressedKeys.cpuData;
+        const float inverseSqrt = 1.0f / std::sqrt((float)headDim);
+        Qwen4ParallelFor(rows, [&](int start, int end) {
+            for (int row = start; row < end; row++) {
+                const int visibleLength = queryStart >= 0
+                    ? queryStart + row + 1 : keyLength;
+                const int rowBlocks = visibleLength / compressRatio;
+                const int selectedCount = std::min(blockTopK, rowBlocks);
+                std::vector<int> selected(selectedCount);
+                if (rowBlocks <= blockTopK) {
+                    std::iota(selected.begin(), selected.end(), 0);
+                } else {
+                    std::vector<std::pair<float, int>> ranked(rowBlocks);
+                    for (int block = 0; block < rowBlocks; block++) {
+                        const float *blockKey = keyData +
+                                                (size_t)block * headDim;
+                        float score = 0.0f;
+                        for (int head = 0; head < heads; head++) {
+                            const uint64_t queryBase =
+                                ((uint64_t)row * heads + head) * headDim;
+                            float dot = 0.0f;
+                            for (int column = 0; column < headDim; column++) {
+                                dot += Qwen4LoadCpu(
+                                           query.cpuData, query.dataType,
+                                           queryBase + column) *
+                                       blockKey[column];
+                            }
+                            score += std::max(dot, 0.0f);
+                        }
+                        const float value = score * inverseSqrt;
+                        ranked[block] = {
+                            std::isfinite(value)
+                                ? value
+                                : -std::numeric_limits<float>::infinity(),
+                            block};
+                    }
+                    std::partial_sort(
+                        ranked.begin(), ranked.begin() + selectedCount,
+                        ranked.end(),
+                        [](const std::pair<float, int> &left,
+                           const std::pair<float, int> &right) {
+                            return left.first != right.first
+                                ? left.first > right.first
+                                : left.second < right.second;
+                        });
+                    for (int rank = 0; rank < selectedCount; rank++) {
+                        selected[rank] = ranked[rank].second;
+                    }
+                    std::sort(selected.begin(), selected.end());
+                }
+                int32_t *rowOutput = outputData + (size_t)row * outputWidth;
+                int cursor = 0;
+                for (int block : selected) {
+                    for (int member = 0; member < compressRatio; member++) {
+                        rowOutput[cursor++] = block * compressRatio + member;
+                    }
+                }
+                for (int token = rowBlocks * compressRatio;
+                     token < visibleLength; token++) {
+                    rowOutput[cursor++] = token;
+                }
+                AssertInFastLLM(cursor <= outputWidth,
+                                "Qwen4QSASelect output width overflow.\n");
+            }
+        });
+    }
+
+    void CpuQwen4QSABuildMaskOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &indices = *datas.find("indices")->second;
+        Data &reference = *datas.find("reference")->second;
+        Data &output = *datas.find("output")->second;
+        const int keyLength = intParams.find("keyLength")->second;
+        AssertInFastLLM(indices.dims.size() == 2 && keyLength > 0 &&
+                        Qwen4ActivationType(reference.dataType),
+                        "Qwen4QSABuildMask received invalid dimensions.\n");
+        output.dataType = reference.dataType;
+        output.UpdateUnitSize();
+        output.Resize({1, indices.dims[0], keyLength});
+    }
+
+    void CpuQwen4QSABuildMaskOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &indices = *datas.find("indices")->second;
+        Data &reference = *datas.find("reference")->second;
+        Data &output = *datas.find("output")->second;
+        const int keyLength = intParams.find("keyLength")->second;
+        AssertInFastLLM(indices.dataDevice == DataDevice::CPU &&
+                        indices.dataType == DataType::INT32 &&
+                        indices.cpuData != nullptr &&
+                        reference.dataDevice == DataDevice::CPU &&
+                        Qwen4ActivationType(reference.dataType) &&
+                        indices.dims.size() == 2 && keyLength > 0,
+                        "Qwen4QSABuildMask received incompatible tensors.\n");
+        output.Allocate(false);
+        const int rows = indices.dims[0];
+        const int width = indices.dims[1];
+        const int32_t *indexData =
+            reinterpret_cast<const int32_t *>(indices.cpuData);
+        Qwen4ParallelFor(rows, [&](int start, int end) {
+            for (int row = start; row < end; row++) {
+                const uint64_t maskBase = (uint64_t)row * keyLength;
+                for (int token = 0; token < keyLength; token++) {
+                    Qwen4StoreCpu(output.cpuData, output.dataType,
+                                  maskBase + token, 1.0f);
+                }
+                const int32_t *rowIndices = indexData +
+                                            (size_t)row * width;
+                for (int index = 0; index < width; index++) {
+                    const int token = rowIndices[index];
+                    if (token >= 0 && token < keyLength) {
+                        Qwen4StoreCpu(output.cpuData, output.dataType,
+                                      maskBase + token, 0.0f);
+                    }
+                }
+            }
+        });
+    }
+
+    void CpuQwen4SparseAttentionOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &output = *datas.find("output")->second;
+        output.dataType = query.dataType;
+        output.UpdateUnitSize();
+        output.Resize(query.dims);
+    }
+
+    void CpuQwen4SparseAttentionOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &key = *datas.find("key")->second;
+        Data &value = *datas.find("value")->second;
+        Data &indices = *datas.find("indices")->second;
+        Data &output = *datas.find("output")->second;
+        const int group = intParams.find("group")->second;
+        const float scale = floatParams.find("scale")->second;
+        Qwen4AssertCpuTensor(query, "Qwen4SparseAttention query");
+        Qwen4AssertCpuTensor(key, "Qwen4SparseAttention key");
+        Qwen4AssertCpuTensor(value, "Qwen4SparseAttention value");
+        AssertInFastLLM(indices.dataDevice == DataDevice::CPU &&
+                        indices.dataType == DataType::INT32 &&
+                        indices.cpuData != nullptr &&
+                        query.dims.size() == 3 && key.dims.size() == 3 &&
+                        value.dims == key.dims && indices.dims.size() == 2 &&
+                        query.dataType == key.dataType &&
+                        query.dataType == value.dataType && group > 0 &&
+                        query.dims[0] == key.dims[0] * group &&
+                        query.dims[1] == indices.dims[0] &&
+                        query.dims[2] == key.dims[2],
+                        "Qwen4SparseAttention received incompatible tensors.\n");
+        output.Allocate(false);
+        const int queryHeads = query.dims[0];
+        const int sequence = query.dims[1];
+        const int keyLength = key.dims[1];
+        const int headDim = query.dims[2];
+        const int indexWidth = indices.dims[1];
+        const int32_t *indexData = (const int32_t*)indices.cpuData;
+        const DataType type = query.dataType;
+        const float nativeScale = Qwen4RoundCpu(scale, type);
+
+        Qwen4ParallelFor(queryHeads * sequence, [&](int start, int end) {
+            std::vector<float> logits(indexWidth);
+            std::vector<float> probabilities(indexWidth);
+            for (int row = start; row < end; row++) {
+                const int head = row / sequence;
+                const int token = row % sequence;
+                const int keyHead = head / group;
+                const int32_t *rowIndices = indexData +
+                    (size_t)token * indexWidth;
+                const uint64_t queryBase =
+                    ((uint64_t)head * sequence + token) * headDim;
+                float maximum = -std::numeric_limits<float>::infinity();
+                int valid = 0;
+                for (int selected = 0; selected < indexWidth; selected++) {
+                    const int keyIndex = rowIndices[selected];
+                    if (keyIndex < 0) {
+                        break;
+                    }
+                    AssertInFastLLM(keyIndex < keyLength,
+                                    "Qwen4SparseAttention index is out of range.\n");
+                    const uint64_t keyBase =
+                        ((uint64_t)keyHead * keyLength + keyIndex) * headDim;
+                    float dot = 0.0f;
+                    for (int column = 0; column < headDim; column++) {
+                        dot += Qwen4LoadCpu(query.cpuData, type,
+                                            queryBase + column) *
+                               Qwen4LoadCpu(key.cpuData, type,
+                                            keyBase + column);
+                    }
+                    logits[selected] = Qwen4RoundCpu(
+                        dot * nativeScale, type);
+                    maximum = std::max(maximum, logits[selected]);
+                    valid++;
+                }
+                AssertInFastLLM(valid > 0,
+                                "Qwen4SparseAttention selected no keys.\n");
+                float sum = 0.0f;
+                for (int selected = 0; selected < valid; selected++) {
+                    probabilities[selected] =
+                        std::exp(logits[selected] - maximum);
+                    sum += probabilities[selected];
+                }
+                for (int selected = 0; selected < valid; selected++) {
+                    probabilities[selected] = Qwen4RoundCpu(
+                        probabilities[selected] / sum, type);
+                }
+                for (int column = 0; column < headDim; column++) {
+                    float result = 0.0f;
+                    for (int selected = 0; selected < valid; selected++) {
+                        const int keyIndex = rowIndices[selected];
+                        const uint64_t valueIndex =
+                            ((uint64_t)keyHead * keyLength + keyIndex) *
+                                headDim + column;
+                        result += probabilities[selected] *
+                                  Qwen4LoadCpu(value.cpuData, type,
+                                               valueIndex);
+                    }
+                    Qwen4StoreCpu(output.cpuData, type,
+                                  queryBase + column, result);
+                }
+            }
+        });
     }
 
     void CpuCausalDepthwiseConv1DDecodeOp::Reshape(

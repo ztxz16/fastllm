@@ -4145,6 +4145,38 @@ namespace fastllm {
         }, {}, {{"groups", groups}});
     }
 
+    void Qwen4QSASelect(const Data &query, const Data &compressedKeys,
+                        int keyLength, int heads, int headDim,
+                        int tokenBudget, int compressRatio, Data &indices,
+                        int queryStart) {
+        curExecutor->Run("Qwen4QSASelect", {
+                {"query", (Data*)&query},
+                {"compressedKeys", (Data*)&compressedKeys},
+                {"output", &indices}
+        }, {}, {{"keyLength", keyLength}, {"heads", heads},
+                {"headDim", headDim}, {"tokenBudget", tokenBudget},
+                {"compressRatio", compressRatio},
+                {"queryStart", queryStart}});
+    }
+
+    void Qwen4QSABuildMask(const Data &indices, const Data &reference,
+                           int keyLength, Data &mask) {
+        curExecutor->Run("Qwen4QSABuildMask", {
+                {"indices", (Data*)&indices},
+                {"reference", (Data*)&reference}, {"output", &mask}
+        }, {}, {{"keyLength", keyLength}});
+    }
+
+    void Qwen4SparseAttention(const Data &query, const Data &key,
+                              const Data &value, const Data &indices,
+                              int group, float scale, Data &output) {
+        curExecutor->Run("Qwen4SparseAttention", {
+                {"query", (Data*)&query}, {"key", (Data*)&key},
+                {"value", (Data*)&value}, {"indices", (Data*)&indices},
+                {"output", &output}
+        }, {{"scale", scale}}, {{"group", group}});
+    }
+
     void GatedDeltaRuleDecode(
             const Data &qkv, const Data &alpha, const Data &beta,
             const Data &aLog, const Data &dtBias,

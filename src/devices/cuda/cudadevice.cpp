@@ -48,6 +48,8 @@ namespace fastllm {
         cudaLinearExactBatchThreshold = std::max(0, threshold);
     }
 
+    static constexpr int kQwen4SparsePrefillTileRows = 128;
+
     void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag() {
         cudaMergeMOEUsedGraphUnsafeFallback = false;
     }
@@ -4051,6 +4053,9 @@ namespace fastllm {
         this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CudaQwen4HyperMixOp());
         this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CudaQwen4HyperInjectOp());
         this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CudaQwen4HyperCombineOp());
+        this->ops["Qwen4QSASelect"] = (BaseOperator*)(new CudaQwen4QSASelectOp());
+        this->ops["Qwen4QSABuildMask"] = (BaseOperator*)(new CudaQwen4QSABuildMaskOp());
+        this->ops["Qwen4SparseAttention"] = (BaseOperator*)(new CudaQwen4SparseAttentionOp());
         this->ops["CausalDepthwiseConv1DDecode"] = (BaseOperator*)(new CudaCausalDepthwiseConv1DDecodeOp());
         this->ops["GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
         this->ops["Qwen4GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
@@ -4648,6 +4653,184 @@ namespace fastllm {
             ErrorInFastLLM(
                 "Qwen4HyperCombine CUDA error: kernel rejected input.\n");
         }
+    }
+
+    bool CudaQwen4QSASelectOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &compressedKeys = *datas.find("compressedKeys")->second;
+        const int keyLength = intParams.find("keyLength")->second;
+        const int heads = intParams.find("heads")->second;
+        const int headDim = intParams.find("headDim")->second;
+        const int tokenBudget = intParams.find("tokenBudget")->second;
+        const int compressRatio = intParams.find("compressRatio")->second;
+        const auto queryStartIt = intParams.find("queryStart");
+        const int queryStart = queryStartIt == intParams.end()
+            ? -1 : queryStartIt->second;
+        const int completeBlocks = compressRatio > 0
+            ? keyLength / compressRatio : 0;
+        const int rows = heads > 0 && headDim > 0
+            ? (int)(query.Count(0) / ((uint64_t)heads * headDim)) : 0;
+        return CudaQwen4ActivationType(query.dataType) &&
+               compressedKeys.dataType == DataType::FLOAT32 &&
+               compressedKeys.dims.size() == 2 &&
+               compressedKeys.dims[0] >= completeBlocks &&
+               compressedKeys.dims[1] == headDim && heads > 0 && heads <= 32 &&
+               headDim > 0 && tokenBudget > 0 && compressRatio > 0 &&
+               tokenBudget % compressRatio == 0 &&
+               completeBlocks >= tokenBudget / compressRatio &&
+               query.Count(0) % ((uint64_t)heads * headDim) == 0 &&
+               (queryStart == -1 ||
+                (queryStart >= 0 && queryStart + rows <= keyLength));
+    }
+
+    void CudaQwen4QSASelectOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &compressedKeys = *datas.find("compressedKeys")->second;
+        Data &output = *datas.find("output")->second;
+        output.Allocate(false);
+        if (!FastllmCudaQwen4QSASelect(
+                query, compressedKeys, output,
+                intParams.find("keyLength")->second,
+                intParams.find("heads")->second,
+                intParams.find("headDim")->second,
+                intParams.find("tokenBudget")->second,
+                intParams.find("compressRatio")->second,
+                intParams.find("queryStart") == intParams.end()
+                    ? -1 : intParams.find("queryStart")->second)) {
+            ErrorInFastLLM(
+                "Qwen4QSASelect CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4QSABuildMaskOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &indices = *datas.find("indices")->second;
+        Data &reference = *datas.find("reference")->second;
+        const int keyLength = intParams.find("keyLength")->second;
+        return indices.dataType == DataType::INT32 &&
+               indices.dims.size() == 2 && indices.dims[0] > 0 &&
+               indices.dims[1] > 0 &&
+               CudaQwen4ActivationType(reference.dataType) &&
+               keyLength > 0;
+    }
+
+    void CudaQwen4QSABuildMaskOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &indices = *datas.find("indices")->second;
+        Data &reference = *datas.find("reference")->second;
+        Data &output = *datas.find("output")->second;
+        output.Allocate(false);
+        if (!FastllmCudaQwen4QSABuildMask(
+                indices, reference, output,
+                intParams.find("keyLength")->second)) {
+            ErrorInFastLLM(
+                "Qwen4QSABuildMask CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4SparseAttentionOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &key = *datas.find("key")->second;
+        Data &value = *datas.find("value")->second;
+        Data &indices = *datas.find("indices")->second;
+        const int group = intParams.find("group")->second;
+        return (query.dataType == DataType::FLOAT32 ||
+                query.dataType == DataType::FLOAT16) &&
+               key.dataType == query.dataType &&
+               value.dataType == query.dataType &&
+               indices.dataType == DataType::INT32 &&
+               query.dims.size() == 3 && key.dims.size() == 3 &&
+               value.dims == key.dims && indices.dims.size() == 2 &&
+               group > 0 && query.dims[0] == key.dims[0] * group &&
+               query.dims[1] == indices.dims[0] &&
+               query.dims[2] == key.dims[2] &&
+               query.dims[2] <= 256 && indices.dims[1] <= 3072;
+    }
+
+    void CudaQwen4SparseAttentionOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &key = *datas.find("key")->second;
+        Data &value = *datas.find("value")->second;
+        Data &indices = *datas.find("indices")->second;
+        Data &output = *datas.find("output")->second;
+        const int width = indices.dims[1];
+        const int sequence = query.dims[1];
+        if (sequence > 1) {
+            output.Allocate(false);
+            const int tileRows = std::min(
+                sequence, kQwen4SparsePrefillTileRows);
+            for (int rowStart = 0; rowStart < sequence;
+                 rowStart += tileRows) {
+                const int rows = std::min(tileRows, sequence - rowStart);
+                Data packedQuery(query.dataType,
+                                 {rows * query.dims[0], 1, query.dims[2]});
+                Data compactKey(key.dataType,
+                                {rows * key.dims[0], width, key.dims[2]});
+                Data compactValue(value.dataType,
+                                  {rows * value.dims[0], width,
+                                   value.dims[2]});
+                Data paddingMask(query.dataType, {rows, 1, width});
+                packedQuery.ToDevice(DataDevice::CUDA, false);
+                compactKey.ToDevice(DataDevice::CUDA, false);
+                compactValue.ToDevice(DataDevice::CUDA, false);
+                paddingMask.ToDevice(DataDevice::CUDA, false);
+                packedQuery.Allocate(false);
+                compactKey.Allocate(false);
+                compactValue.Allocate(false);
+                paddingMask.Allocate(false);
+                if (!FastllmCudaQwen4PrepareSparseBatch(
+                        query, key, value, indices, packedQuery,
+                        compactKey, compactValue, paddingMask,
+                        rowStart, rows)) {
+                    ErrorInFastLLM(
+                        "Qwen4SparseAttention CUDA error: batched gather "
+                        "rejected input.\n");
+                }
+                Data packedOutput(
+                    query.dataType,
+                    {rows * query.dims[0], 1, value.dims[2]});
+                packedOutput.ToDevice(DataDevice::CUDA, false);
+                DoCudaAttention(
+                    packedQuery, compactKey, compactValue, paddingMask,
+                    packedOutput, intParams.find("group")->second,
+                    floatParams.find("scale")->second, 1);
+                if (!FastllmCudaQwen4UnpackSparseBatch(
+                        packedOutput, output, rowStart, rows)) {
+                    ErrorInFastLLM(
+                        "Qwen4SparseAttention CUDA error: output unpack "
+                        "rejected input.\n");
+                }
+            }
+            return;
+        }
+        Data compactKey(key.dataType,
+                        {key.dims[0], width, key.dims[2]});
+        Data compactValue(value.dataType,
+                          {value.dims[0], width, value.dims[2]});
+        compactKey.ToDevice(DataDevice::CUDA, false);
+        compactValue.ToDevice(DataDevice::CUDA, false);
+        compactKey.Allocate(false);
+        compactValue.Allocate(false);
+        if (!FastllmCudaQwen4GatherKV(
+                key, value, indices, compactKey, compactValue)) {
+            ErrorInFastLLM(
+                "Qwen4SparseAttention CUDA error: KV gather rejected input.\n");
+        }
+        Data emptyMask;
+        DoCudaAttention(
+            query, compactKey, compactValue, emptyMask, output,
+            intParams.find("group")->second,
+            floatParams.find("scale")->second, 1);
     }
 
     bool CudaCausalDepthwiseConv1DDecodeOp::CanRun(

@@ -556,6 +556,28 @@ bool FastllmCudaQwen4HyperCombine(const fastllm::Data &hyperInput,
                                   const fastllm::Data &blockOutput,
                                   const fastllm::Data &injection,
                                   fastllm::Data &output, int groups);
+bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
+                               const fastllm::Data &compressedKeys,
+                               fastllm::Data &indices, int keyLength,
+                               int heads, int headDim, int tokenBudget,
+                               int compressRatio, int queryStart);
+bool FastllmCudaQwen4QSABuildMask(const fastllm::Data &indices,
+                                  const fastllm::Data &reference,
+                                  fastllm::Data &mask, int keyLength);
+bool FastllmCudaQwen4GatherKV(const fastllm::Data &key,
+                             const fastllm::Data &value,
+                             const fastllm::Data &indices,
+                             fastllm::Data &compactKey,
+                             fastllm::Data &compactValue);
+bool FastllmCudaQwen4PrepareSparseBatch(
+        const fastllm::Data &query, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &indices,
+        fastllm::Data &packedQuery, fastllm::Data &compactKey,
+        fastllm::Data &compactValue, fastllm::Data &paddingMask,
+        int rowStart, int rows);
+bool FastllmCudaQwen4UnpackSparseBatch(
+        const fastllm::Data &packedOutput, fastllm::Data &output,
+        int rowStart, int rows);
 bool FastllmCudaCausalDepthwiseConv1DDecode(
         const fastllm::Data &input, const fastllm::Data &weight,
         fastllm::Data &state, fastllm::Data &output,

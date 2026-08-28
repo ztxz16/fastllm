@@ -4,6 +4,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cfloat>
+#include <cstdint>
 #include <cmath>
 #include <type_traits>
 #include <vector>
@@ -476,6 +479,342 @@ namespace {
         output[(uint64_t)item * VALUE_DIM + tid] = core;
     }
 
+    template <typename T>
+    __global__ void Qwen4QSAScoreKernel(
+            const T *query, const float *compressedKeys, float *scores,
+            int rows, int blocks, int heads, int headDim,
+            float inverseSqrt, int queryStart, int compressRatio) {
+        const int lane = threadIdx.x & 31;
+        const int warpInBlock = threadIdx.x >> 5;
+        const int warpsPerBlock = blockDim.x >> 5;
+        const uint64_t total = (uint64_t)rows * blocks;
+        for (uint64_t item =
+                 (uint64_t)blockIdx.x * warpsPerBlock + warpInBlock;
+             item < total;
+             item += (uint64_t)warpsPerBlock * gridDim.x) {
+            const int row = item / blocks;
+            const int block = item - (uint64_t)row * blocks;
+            const int rowBlocks = queryStart >= 0
+                ? (queryStart + row + 1) / compressRatio : blocks;
+            if (block >= rowBlocks) {
+                continue;
+            }
+            const float *blockKey = compressedKeys +
+                                    (uint64_t)block * headDim;
+            float dot = 0.0f;
+            if (lane < heads) {
+                const T *headQuery = query +
+                    ((uint64_t)row * heads + lane) * headDim;
+                // One lane owns one indexer head and retains the reference's
+                // serial column accumulation order. The warp only parallelizes
+                // independent heads, so score values and TopK ties stay stable.
+                for (int column = 0; column < headDim; column++) {
+                    dot += Qwen4CudaToFloat(headQuery[column]) *
+                           blockKey[column];
+                }
+            }
+            float score = 0.0f;
+            for (int head = 0; head < heads; head++) {
+                score += fmaxf(__shfl_sync(0xffffffffu, dot, head), 0.0f);
+            }
+            if (lane == 0) {
+                scores[item] = score * inverseSqrt;
+            }
+        }
+    }
+
+    __device__ __forceinline__ uint32_t Qwen4QSAOrderedFloatBits(
+            float value) {
+        uint32_t bits = __float_as_uint(value);
+        return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    }
+
+    // Four radix histogram passes identify the exact K-th score without
+    // sorting every compressed block. Equal scores are resolved by the lower
+    // block id, and the emitted block ids are already in ascending order.
+    __global__ void Qwen4QSARadixSelectKernel(
+            const float *scores, int32_t *selectedBlocks,
+            int rows, int blocks, int selectedK,
+            int queryStart, int compressRatio) {
+        const int rowIndex = blockIdx.x;
+        if (rowIndex >= rows) {
+            return;
+        }
+        const float *row = scores + (uint64_t)rowIndex * blocks;
+        int32_t *output = selectedBlocks +
+                          (uint64_t)rowIndex * selectedK;
+        const int rowBlocks = queryStart >= 0
+            ? (queryStart + rowIndex + 1) / compressRatio : blocks;
+        if (rowBlocks <= selectedK) {
+            for (int block = threadIdx.x; block < selectedK;
+                 block += blockDim.x) {
+                output[block] = block < rowBlocks ? block : -1;
+            }
+            return;
+        }
+
+        __shared__ uint32_t histogram[256];
+        __shared__ uint32_t prefix;
+        __shared__ uint32_t remaining;
+        __shared__ uint32_t threadHigher[256];
+        __shared__ uint32_t threadPivot[256];
+        __shared__ uint32_t threadPivotChosen[256];
+        __shared__ uint32_t threadOutputOffset[256];
+        if (threadIdx.x == 0) {
+            prefix = 0;
+            remaining = selectedK;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int round = 0; round < 4; round++) {
+            if (threadIdx.x < 256) {
+                histogram[threadIdx.x] = 0;
+            }
+            __syncthreads();
+            const int shift = 24 - round * 8;
+            const uint32_t mask = round == 0
+                ? 0u : (~0u << (32 - round * 8));
+            const uint32_t currentPrefix = prefix;
+            for (int block = threadIdx.x; block < rowBlocks;
+                 block += blockDim.x) {
+                const uint32_t ordered =
+                    Qwen4QSAOrderedFloatBits(row[block]);
+                if ((ordered & mask) == currentPrefix) {
+                    atomicAdd(&histogram[(ordered >> shift) & 0xffu], 1u);
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                uint32_t higher = 0;
+                for (int bucket = 255; bucket >= 0; bucket--) {
+                    const uint32_t count = histogram[bucket];
+                    if (higher + count >= remaining) {
+                        prefix = currentPrefix |
+                                 ((uint32_t)bucket << shift);
+                        remaining -= higher;
+                        break;
+                    }
+                    higher += count;
+                }
+            }
+            __syncthreads();
+        }
+        // Emit the chosen set in physical cache order without a single CUDA
+        // thread rescanning the entire context. Give every thread a contiguous
+        // block-id range, prefix-sum its counts, then compact in parallel. The
+        // first pivot-valued block ids still win ties exactly as before.
+        const uint32_t pivot = prefix;
+        const int chunk = (rowBlocks + blockDim.x - 1) / blockDim.x;
+        const int begin = min(rowBlocks, (int)threadIdx.x * chunk);
+        const int end = min(rowBlocks, begin + chunk);
+        uint32_t higher = 0;
+        uint32_t equal = 0;
+        for (int block = begin; block < end; block++) {
+            const uint32_t ordered = Qwen4QSAOrderedFloatBits(row[block]);
+            higher += ordered > pivot;
+            equal += ordered == pivot;
+        }
+        threadHigher[threadIdx.x] = higher;
+        threadPivot[threadIdx.x] = equal;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            uint32_t higherTotal = 0;
+            for (int thread = 0; thread < blockDim.x; thread++) {
+                higherTotal += threadHigher[thread];
+            }
+            uint32_t pivotRemaining = selectedK - higherTotal;
+            uint32_t outputOffset = 0;
+            for (int thread = 0; thread < blockDim.x; thread++) {
+                const uint32_t chosen = min(
+                    threadPivot[thread], pivotRemaining);
+                threadPivotChosen[thread] = chosen;
+                threadOutputOffset[thread] = outputOffset;
+                outputOffset += threadHigher[thread] + chosen;
+                pivotRemaining -= chosen;
+            }
+        }
+        __syncthreads();
+        uint32_t outputIndex = threadOutputOffset[threadIdx.x];
+        uint32_t pivotSeen = 0;
+        const uint32_t pivotChosen = threadPivotChosen[threadIdx.x];
+        for (int block = begin; block < end; block++) {
+            const uint32_t ordered = Qwen4QSAOrderedFloatBits(row[block]);
+            if (ordered > pivot ||
+                (ordered == pivot && pivotSeen++ < pivotChosen)) {
+                output[outputIndex++] = block;
+            }
+        }
+    }
+
+    __global__ void Qwen4QSAExpandIndicesKernel(
+            const int32_t *selectedBlocks, int32_t *indices,
+            int rows, int selectedK, int compressRatio,
+            int completeBlocks, int keyLength, int outputWidth,
+            int queryStart) {
+        const uint64_t total = (uint64_t)rows * outputWidth;
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int row = item / outputWidth;
+            const int column = item - (uint64_t)row * outputWidth;
+            const int visibleLength = queryStart >= 0
+                ? queryStart + row + 1 : keyLength;
+            const int rowBlocks = queryStart >= 0
+                ? visibleLength / compressRatio : completeBlocks;
+            const int selectedTokens = min(selectedK, rowBlocks) *
+                                       compressRatio;
+            if (column < selectedTokens) {
+                const int block = selectedBlocks[
+                    (uint64_t)row * selectedK + column / compressRatio];
+                indices[item] = block * compressRatio +
+                                column % compressRatio;
+            } else {
+                const int tail = column - selectedTokens;
+                const int remainder = visibleLength -
+                                      rowBlocks * compressRatio;
+                indices[item] = tail < remainder
+                    ? rowBlocks * compressRatio + tail : -1;
+            }
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4QSAFillMaskKernel(T *mask, uint64_t count) {
+        for (uint64_t index = (uint64_t)blockIdx.x * blockDim.x +
+                              threadIdx.x;
+             index < count; index += (uint64_t)blockDim.x * gridDim.x) {
+            mask[index] = Qwen4CudaFromFloat<T>(1.0f);
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4QSAScatterMaskKernel(
+            const int32_t *indices, T *mask, int rows,
+            int width, int keyLength) {
+        const int count = rows * width;
+        for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+             index < count; index += blockDim.x * gridDim.x) {
+            const int row = index / width;
+            const int token = indices[index];
+            if (token >= 0 && token < keyLength) {
+                mask[(uint64_t)row * keyLength + token] =
+                    Qwen4CudaFromFloat<T>(0.0f);
+            }
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4GatherKVKernel(
+            const T *key, const T *value, const int32_t *indices,
+            T *compactKey, T *compactValue, int keyHeads,
+            int keyLength, int headDim, int width) {
+        const uint64_t total =
+            (uint64_t)keyHeads * width * headDim;
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int column = item % headDim;
+            const int selected = (item / headDim) % width;
+            const int head = item / ((uint64_t)width * headDim);
+            const int sourceToken = indices[selected];
+            if (sourceToken >= 0 && sourceToken < keyLength) {
+                const uint64_t source =
+                    ((uint64_t)head * keyLength + sourceToken) * headDim +
+                    column;
+                compactKey[item] = key[source];
+                compactValue[item] = value[source];
+            } else {
+                compactKey[item] = Qwen4CudaFromFloat<T>(0.0f);
+                compactValue[item] = Qwen4CudaFromFloat<T>(0.0f);
+            }
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4PackSparseQueryKernel(
+            const T *query, T *packedQuery, int queryHeads,
+            int sequence, int headDim, int rowStart, int rows) {
+        const uint64_t total = (uint64_t)rows * queryHeads * headDim;
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int column = item % headDim;
+            const uint64_t rowHead = item / headDim;
+            const int head = rowHead % queryHeads;
+            const int row = rowHead / queryHeads;
+            const uint64_t source =
+                ((uint64_t)head * sequence + rowStart + row) * headDim +
+                column;
+            packedQuery[item] = query[source];
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4GatherSparseBatchKVKernel(
+            const T *key, const T *value, const int32_t *indices,
+            T *compactKey, T *compactValue, int keyHeads,
+            int keyLength, int headDim, int width,
+            int rowStart, int rows) {
+        const uint64_t total =
+            (uint64_t)rows * keyHeads * width * headDim;
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int column = item % headDim;
+            const uint64_t vector = item / headDim;
+            const int selected = vector % width;
+            const int head = (vector / width) % keyHeads;
+            const int row = vector / ((uint64_t)width * keyHeads);
+            const int sourceToken = indices[
+                (uint64_t)(rowStart + row) * width + selected];
+            if (sourceToken >= 0 && sourceToken < keyLength) {
+                const uint64_t source =
+                    ((uint64_t)head * keyLength + sourceToken) * headDim +
+                    column;
+                compactKey[item] = key[source];
+                compactValue[item] = value[source];
+            } else {
+                compactKey[item] = Qwen4CudaFromFloat<T>(0.0f);
+                compactValue[item] = Qwen4CudaFromFloat<T>(0.0f);
+            }
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4SparsePaddingMaskKernel(
+            const int32_t *indices, T *mask, int keyLength,
+            int width, int rowStart, int rows) {
+        const int total = rows * width;
+        for (int item = blockIdx.x * blockDim.x + threadIdx.x;
+             item < total; item += blockDim.x * gridDim.x) {
+            const int row = item / width;
+            const int selected = item - row * width;
+            const int sourceToken = indices[
+                (uint64_t)(rowStart + row) * width + selected];
+            mask[item] = Qwen4CudaFromFloat<T>(
+                sourceToken >= 0 && sourceToken < keyLength ? 0.0f : 1.0f);
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4UnpackSparseOutputKernel(
+            const T *packedOutput, T *output, int queryHeads,
+            int sequence, int headDim, int rowStart, int rows) {
+        const uint64_t total = (uint64_t)rows * queryHeads * headDim;
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int column = item % headDim;
+            const uint64_t rowHead = item / headDim;
+            const int head = rowHead % queryHeads;
+            const int row = rowHead / queryHeads;
+            const uint64_t destination =
+                ((uint64_t)head * sequence + rowStart + row) * headDim +
+                column;
+            output[destination] = packedOutput[item];
+        }
+    }
+
     bool Qwen4CudaActivationType(fastllm::DataType type) {
         return type == fastllm::DataType::FLOAT32 ||
                type == fastllm::DataType::FLOAT16 ||
@@ -672,6 +1011,364 @@ bool FastllmCudaQwen4HyperCombine(
             injection.cudaData, (int)injection.dataType,
             (__nv_bfloat16*)output.cudaData, count, groups,
             blockChannels);
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4QSASelect(
+        const fastllm::Data &query,
+        const fastllm::Data &compressedKeys,
+        fastllm::Data &indices, int keyLength,
+        int heads, int headDim, int tokenBudget,
+        int compressRatio, int queryStart) {
+    const int completeBlocks = compressRatio > 0
+        ? keyLength / compressRatio : 0;
+    const int selectedK = compressRatio > 0
+        ? tokenBudget / compressRatio : 0;
+    const int rows = heads > 0 && headDim > 0
+        ? (int)(query.Count(0) / ((uint64_t)heads * headDim)) : 0;
+    const int outputWidth = compressRatio > 0
+        ? (queryStart >= 0
+            ? tokenBudget + compressRatio - 1
+            : tokenBudget + keyLength % compressRatio)
+        : 0;
+    if (query.dataDevice != fastllm::DataDevice::CUDA ||
+        compressedKeys.dataDevice != fastllm::DataDevice::CUDA ||
+        indices.dataDevice != fastllm::DataDevice::CUDA ||
+        query.cudaData == nullptr || compressedKeys.cudaData == nullptr ||
+        indices.cudaData == nullptr || !Qwen4CudaActivationType(query.dataType) ||
+        compressedKeys.dataType != fastllm::DataType::FLOAT32 ||
+        indices.dataType != fastllm::DataType::INT32 ||
+        compressedKeys.dims.size() != 2 ||
+        compressedKeys.dims[0] < completeBlocks ||
+        compressedKeys.dims[1] != headDim || rows <= 0 || heads <= 0 ||
+        heads > 32 ||
+        headDim <= 0 || tokenBudget <= 0 || compressRatio <= 0 ||
+        tokenBudget % compressRatio != 0 || completeBlocks < selectedK ||
+        (queryStart != -1 &&
+         (queryStart < 0 || queryStart + rows > keyLength)) ||
+        indices.dims != std::vector<int>({rows, outputWidth})) {
+        return false;
+    }
+
+    float *scores = (float*)FastllmCudaMalloc(
+        (size_t)rows * completeBlocks * sizeof(float));
+    int32_t *selectedBlocks = (int32_t*)FastllmCudaMalloc(
+        (size_t)rows * selectedK * sizeof(int32_t));
+    if (scores == nullptr || selectedBlocks == nullptr) {
+        FastllmCudaFree(scores);
+        FastllmCudaFree(selectedBlocks);
+        return false;
+    }
+    constexpr int threads = 256;
+    constexpr int warpsPerBlock = threads / 32;
+    const int scoreBlocks = std::min<uint64_t>(
+        1024,
+        ((uint64_t)rows * completeBlocks + warpsPerBlock - 1) /
+            warpsPerBlock);
+    const float inverseSqrt = 1.0f / std::sqrt((float)headDim);
+    if (query.dataType == fastllm::DataType::FLOAT32) {
+        Qwen4QSAScoreKernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)query.cudaData,
+            (const float*)compressedKeys.cudaData, scores,
+            rows, completeBlocks, heads, headDim, inverseSqrt,
+            queryStart, compressRatio);
+    } else if (query.dataType == fastllm::DataType::FLOAT16) {
+        Qwen4QSAScoreKernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)query.cudaData,
+            (const float*)compressedKeys.cudaData, scores,
+            rows, completeBlocks, heads, headDim, inverseSqrt,
+            queryStart, compressRatio);
+    } else {
+        Qwen4QSAScoreKernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)query.cudaData,
+            (const float*)compressedKeys.cudaData, scores,
+            rows, completeBlocks, heads, headDim, inverseSqrt,
+            queryStart, compressRatio);
+    }
+    Qwen4QSARadixSelectKernel<<<
+        rows, threads, 0, cudaStreamPerThread>>>(
+        scores, selectedBlocks, rows, completeBlocks, selectedK,
+        queryStart, compressRatio);
+    const int expandBlocks = std::min<uint64_t>(
+        1024,
+        ((uint64_t)rows * outputWidth + threads - 1) / threads);
+    Qwen4QSAExpandIndicesKernel<<<
+        expandBlocks, threads, 0, cudaStreamPerThread>>>(
+        selectedBlocks, (int32_t*)indices.cudaData,
+        rows, selectedK, compressRatio, completeBlocks,
+        keyLength, outputWidth, queryStart);
+    DeviceSync();
+    const cudaError_t status = cudaGetLastError();
+    FastllmCudaFree(scores);
+    FastllmCudaFree(selectedBlocks);
+    return status == cudaSuccess;
+}
+
+bool FastllmCudaQwen4QSABuildMask(
+        const fastllm::Data &indices,
+        const fastllm::Data &reference,
+        fastllm::Data &mask, int keyLength) {
+    const int rows = indices.dims.size() == 2 ? indices.dims[0] : 0;
+    const int width = indices.dims.size() == 2 ? indices.dims[1] : 0;
+    if (indices.dataDevice != fastllm::DataDevice::CUDA ||
+        reference.dataDevice != fastllm::DataDevice::CUDA ||
+        mask.dataDevice != fastllm::DataDevice::CUDA ||
+        indices.cudaData == nullptr || reference.cudaData == nullptr ||
+        mask.cudaData == nullptr ||
+        indices.dataType != fastllm::DataType::INT32 ||
+        !Qwen4CudaActivationType(reference.dataType) ||
+        mask.dataType != reference.dataType ||
+        indices.dims.size() != 2 || rows <= 0 || width <= 0 ||
+        keyLength <= 0 ||
+        mask.dims != std::vector<int>({1, rows, keyLength})) {
+        return false;
+    }
+    constexpr int threads = 256;
+    const uint64_t maskCount = (uint64_t)rows * keyLength;
+    const int fillBlocks = std::min<uint64_t>(
+        1024, (maskCount + threads - 1) / threads);
+    const int scatterBlocks = std::min(
+        1024, (rows * width + threads - 1) / threads);
+    if (reference.dataType == fastllm::DataType::FLOAT32) {
+        Qwen4QSAFillMaskKernel<<<
+            fillBlocks, threads, 0, cudaStreamPerThread>>>(
+            (float*)mask.cudaData, maskCount);
+        Qwen4QSAScatterMaskKernel<<<
+            scatterBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const int32_t*)indices.cudaData, (float*)mask.cudaData,
+            rows, width, keyLength);
+    } else if (reference.dataType == fastllm::DataType::FLOAT16) {
+        Qwen4QSAFillMaskKernel<<<
+            fillBlocks, threads, 0, cudaStreamPerThread>>>(
+            (half*)mask.cudaData, maskCount);
+        Qwen4QSAScatterMaskKernel<<<
+            scatterBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const int32_t*)indices.cudaData, (half*)mask.cudaData,
+            rows, width, keyLength);
+    } else {
+        Qwen4QSAFillMaskKernel<<<
+            fillBlocks, threads, 0, cudaStreamPerThread>>>(
+            (__nv_bfloat16*)mask.cudaData, maskCount);
+        Qwen4QSAScatterMaskKernel<<<
+            scatterBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const int32_t*)indices.cudaData,
+            (__nv_bfloat16*)mask.cudaData,
+            rows, width, keyLength);
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4GatherKV(
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, fastllm::Data &compactKey,
+        fastllm::Data &compactValue) {
+    const int keyHeads = key.dims.size() == 3 ? key.dims[0] : 0;
+    const int keyLength = key.dims.size() == 3 ? key.dims[1] : 0;
+    const int headDim = key.dims.size() == 3 ? key.dims[2] : 0;
+    const int width = indices.dims.size() == 2 ? indices.dims[1] : 0;
+    const std::vector<int> compactDims = {keyHeads, width, headDim};
+    if (key.dataDevice != fastllm::DataDevice::CUDA ||
+        value.dataDevice != fastllm::DataDevice::CUDA ||
+        indices.dataDevice != fastllm::DataDevice::CUDA ||
+        compactKey.dataDevice != fastllm::DataDevice::CUDA ||
+        compactValue.dataDevice != fastllm::DataDevice::CUDA ||
+        key.cudaData == nullptr || value.cudaData == nullptr ||
+        indices.cudaData == nullptr || compactKey.cudaData == nullptr ||
+        compactValue.cudaData == nullptr ||
+        !Qwen4CudaActivationType(key.dataType) ||
+        value.dataType != key.dataType ||
+        compactKey.dataType != key.dataType ||
+        compactValue.dataType != key.dataType ||
+        indices.dataType != fastllm::DataType::INT32 ||
+        key.dims.size() != 3 || value.dims != key.dims ||
+        indices.dims.size() != 2 || indices.dims[0] != 1 ||
+        keyHeads <= 0 || keyLength <= 0 || headDim <= 0 || width <= 0 ||
+        compactKey.dims != compactDims || compactValue.dims != compactDims) {
+        return false;
+    }
+    constexpr int threads = 256;
+    const uint64_t count = (uint64_t)keyHeads * width * headDim;
+    const int blocks = std::min<uint64_t>(
+        1024, (count + threads - 1) / threads);
+    if (key.dataType == fastllm::DataType::FLOAT32) {
+        Qwen4GatherKVKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)key.cudaData, (const float*)value.cudaData,
+            (const int32_t*)indices.cudaData, (float*)compactKey.cudaData,
+            (float*)compactValue.cudaData, keyHeads, keyLength,
+            headDim, width);
+    } else if (key.dataType == fastllm::DataType::FLOAT16) {
+        Qwen4GatherKVKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)key.cudaData, (const half*)value.cudaData,
+            (const int32_t*)indices.cudaData, (half*)compactKey.cudaData,
+            (half*)compactValue.cudaData, keyHeads, keyLength,
+            headDim, width);
+    } else {
+        Qwen4GatherKVKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)key.cudaData,
+            (const __nv_bfloat16*)value.cudaData,
+            (const int32_t*)indices.cudaData,
+            (__nv_bfloat16*)compactKey.cudaData,
+            (__nv_bfloat16*)compactValue.cudaData,
+            keyHeads, keyLength, headDim, width);
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4PrepareSparseBatch(
+        const fastllm::Data &query, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &indices,
+        fastllm::Data &packedQuery, fastllm::Data &compactKey,
+        fastllm::Data &compactValue, fastllm::Data &paddingMask,
+        int rowStart, int rows) {
+    const int queryHeads = query.dims.size() == 3 ? query.dims[0] : 0;
+    const int sequence = query.dims.size() == 3 ? query.dims[1] : 0;
+    const int headDim = query.dims.size() == 3 ? query.dims[2] : 0;
+    const int keyHeads = key.dims.size() == 3 ? key.dims[0] : 0;
+    const int keyLength = key.dims.size() == 3 ? key.dims[1] : 0;
+    const int width = indices.dims.size() == 2 ? indices.dims[1] : 0;
+    const std::vector<int> packedQueryDims = {
+        rows * queryHeads, 1, headDim};
+    const std::vector<int> compactDims = {
+        rows * keyHeads, width, headDim};
+    const std::vector<int> maskDims = {rows, 1, width};
+    if (query.dataDevice != fastllm::DataDevice::CUDA ||
+        key.dataDevice != fastllm::DataDevice::CUDA ||
+        value.dataDevice != fastllm::DataDevice::CUDA ||
+        indices.dataDevice != fastllm::DataDevice::CUDA ||
+        packedQuery.dataDevice != fastllm::DataDevice::CUDA ||
+        compactKey.dataDevice != fastllm::DataDevice::CUDA ||
+        compactValue.dataDevice != fastllm::DataDevice::CUDA ||
+        paddingMask.dataDevice != fastllm::DataDevice::CUDA ||
+        query.cudaData == nullptr || key.cudaData == nullptr ||
+        value.cudaData == nullptr || indices.cudaData == nullptr ||
+        packedQuery.cudaData == nullptr || compactKey.cudaData == nullptr ||
+        compactValue.cudaData == nullptr || paddingMask.cudaData == nullptr ||
+        !Qwen4CudaActivationType(query.dataType) ||
+        key.dataType != query.dataType || value.dataType != query.dataType ||
+        packedQuery.dataType != query.dataType ||
+        compactKey.dataType != query.dataType ||
+        compactValue.dataType != query.dataType ||
+        paddingMask.dataType != query.dataType ||
+        indices.dataType != fastllm::DataType::INT32 ||
+        query.dims.size() != 3 || key.dims.size() != 3 ||
+        value.dims != key.dims || indices.dims.size() != 2 ||
+        indices.dims[0] != sequence || queryHeads <= 0 || keyHeads <= 0 ||
+        keyLength <= 0 || headDim <= 0 || key.dims[2] != headDim ||
+        width <= 0 || rowStart < 0 || rows <= 0 ||
+        rowStart + rows > sequence ||
+        packedQuery.dims != packedQueryDims ||
+        compactKey.dims != compactDims || compactValue.dims != compactDims ||
+        paddingMask.dims != maskDims) {
+        return false;
+    }
+
+    constexpr int threads = 256;
+    const uint64_t queryCount =
+        (uint64_t)rows * queryHeads * headDim;
+    const uint64_t kvCount =
+        (uint64_t)rows * keyHeads * width * headDim;
+    const int maskCount = rows * width;
+    const int queryBlocks = std::min<uint64_t>(
+        1024, (queryCount + threads - 1) / threads);
+    const int kvBlocks = std::min<uint64_t>(
+        1024, (kvCount + threads - 1) / threads);
+    const int maskBlocks = std::min(
+        1024, (maskCount + threads - 1) / threads);
+    const int32_t *indexData = (const int32_t*)indices.cudaData;
+    if (query.dataType == fastllm::DataType::FLOAT32) {
+        Qwen4PackSparseQueryKernel<<<
+            queryBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)query.cudaData, (float*)packedQuery.cudaData,
+            queryHeads, sequence, headDim, rowStart, rows);
+        Qwen4GatherSparseBatchKVKernel<<<
+            kvBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)key.cudaData, (const float*)value.cudaData,
+            indexData, (float*)compactKey.cudaData,
+            (float*)compactValue.cudaData, keyHeads, keyLength, headDim,
+            width, rowStart, rows);
+        Qwen4SparsePaddingMaskKernel<<<
+            maskBlocks, threads, 0, cudaStreamPerThread>>>(
+            indexData, (float*)paddingMask.cudaData, keyLength,
+            width, rowStart, rows);
+    } else if (query.dataType == fastllm::DataType::FLOAT16) {
+        Qwen4PackSparseQueryKernel<<<
+            queryBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)query.cudaData, (half*)packedQuery.cudaData,
+            queryHeads, sequence, headDim, rowStart, rows);
+        Qwen4GatherSparseBatchKVKernel<<<
+            kvBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)key.cudaData, (const half*)value.cudaData,
+            indexData, (half*)compactKey.cudaData,
+            (half*)compactValue.cudaData, keyHeads, keyLength, headDim,
+            width, rowStart, rows);
+        Qwen4SparsePaddingMaskKernel<<<
+            maskBlocks, threads, 0, cudaStreamPerThread>>>(
+            indexData, (half*)paddingMask.cudaData, keyLength,
+            width, rowStart, rows);
+    } else {
+        Qwen4PackSparseQueryKernel<<<
+            queryBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)query.cudaData,
+            (__nv_bfloat16*)packedQuery.cudaData,
+            queryHeads, sequence, headDim, rowStart, rows);
+        Qwen4GatherSparseBatchKVKernel<<<
+            kvBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)key.cudaData,
+            (const __nv_bfloat16*)value.cudaData, indexData,
+            (__nv_bfloat16*)compactKey.cudaData,
+            (__nv_bfloat16*)compactValue.cudaData,
+            keyHeads, keyLength, headDim, width, rowStart, rows);
+        Qwen4SparsePaddingMaskKernel<<<
+            maskBlocks, threads, 0, cudaStreamPerThread>>>(
+            indexData, (__nv_bfloat16*)paddingMask.cudaData,
+            keyLength, width, rowStart, rows);
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4UnpackSparseBatch(
+        const fastllm::Data &packedOutput, fastllm::Data &output,
+        int rowStart, int rows) {
+    const int queryHeads = output.dims.size() == 3 ? output.dims[0] : 0;
+    const int sequence = output.dims.size() == 3 ? output.dims[1] : 0;
+    const int headDim = output.dims.size() == 3 ? output.dims[2] : 0;
+    const std::vector<int> packedDims = {
+        rows * queryHeads, 1, headDim};
+    if (packedOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        packedOutput.cudaData == nullptr || output.cudaData == nullptr ||
+        !Qwen4CudaActivationType(output.dataType) ||
+        packedOutput.dataType != output.dataType ||
+        output.dims.size() != 3 || packedOutput.dims != packedDims ||
+        queryHeads <= 0 || sequence <= 0 || headDim <= 0 ||
+        rowStart < 0 || rows <= 0 || rowStart + rows > sequence) {
+        return false;
+    }
+    constexpr int threads = 256;
+    const uint64_t count = (uint64_t)rows * queryHeads * headDim;
+    const int blocks = std::min<uint64_t>(
+        1024, (count + threads - 1) / threads);
+    if (output.dataType == fastllm::DataType::FLOAT32) {
+        Qwen4UnpackSparseOutputKernel<<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)packedOutput.cudaData, (float*)output.cudaData,
+            queryHeads, sequence, headDim, rowStart, rows);
+    } else if (output.dataType == fastllm::DataType::FLOAT16) {
+        Qwen4UnpackSparseOutputKernel<<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)packedOutput.cudaData, (half*)output.cudaData,
+            queryHeads, sequence, headDim, rowStart, rows);
+    } else {
+        Qwen4UnpackSparseOutputKernel<<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)packedOutput.cudaData,
+            (__nv_bfloat16*)output.cudaData,
+            queryHeads, sequence, headDim, rowStart, rows);
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
