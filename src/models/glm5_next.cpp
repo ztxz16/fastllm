@@ -7,6 +7,9 @@
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -1794,6 +1797,21 @@ namespace fastllm {
             num_experts_per_tok, norm_topk_prob,
             routed_scaling_factor,
             &weight[mlp + "gate.e_score_correction_bias"]);
+
+#if defined(USE_CUDA) && defined(USE_NUMAS)
+        const std::string routedDevice =
+            SelectMoeDeviceForLayer(layerIndex);
+        const bool prefetchNumasDecode =
+            sequence == 1 && GetCudaSharedExpert() &&
+            (routedDevice == "numa" ||
+             routedDevice.rfind("numa:", 0) == 0) &&
+            std::getenv(
+                "FASTLLM_GLM5_DISABLE_NUMAS_MOE_OVERLAP") == nullptr;
+        if (prefetchNumasDecode) {
+            PrefetchNumasMoeDecodeInput(
+                input, expertIndex, expertScore, layerIndex);
+        }
+#endif
 
         if (GetCudaSharedExpert()) {
             ApplyDeviceMap(deviceMap, layerIndex + 1, block_cnt);

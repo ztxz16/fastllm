@@ -1243,6 +1243,24 @@ namespace fastllm {
             }
         }
     };
+
+    struct FastllmCudaEventDestroyDeleter {
+        int device = -1;
+
+        void operator()(void *event) const {
+            if (event == nullptr) {
+                return;
+            }
+            int oriDevice = FastllmCudaGetDevice();
+            if (device >= 0 && oriDevice != device) {
+                FastllmCudaSetDevice(device);
+            }
+            FastllmCudaEventDestroy(event);
+            if (device >= 0 && oriDevice != device) {
+                FastllmCudaSetDevice(oriDevice);
+            }
+        }
+    };
     #endif
 
     struct FastllmMoeDataManagerNumas {
@@ -1277,6 +1295,90 @@ namespace fastllm {
             std::unique_ptr<void, FastllmCudaStreamDestroyDeleter> routeCopyStream {
                 nullptr, FastllmCudaStreamDestroyDeleter {}
             };
+            std::unique_ptr<void, FastllmCudaEventDestroyDeleter>
+                decodeOutputCopyEvent {
+                    nullptr, FastllmCudaEventDestroyDeleter {}
+                };
+            bool decodeOutputCopyPending = false;
+            struct DecodeInputPrefetch {
+                bool active = false;
+                int device = -1;
+                const void *inputCuda = nullptr;
+                const void *indexCuda = nullptr;
+                const void *scoreCuda = nullptr;
+                size_t inputBytes = 0;
+                size_t indexBytes = 0;
+                size_t scoreBytes = 0;
+                uint8_t *inputHost = nullptr;
+                uint8_t *indexHost = nullptr;
+                uint8_t *scoreHost = nullptr;
+            } decodeInputPrefetch;
+
+            void SynchronizeDecodeInputPrefetch() {
+                if (!decodeInputPrefetch.active) {
+                    return;
+                }
+                const int pendingDevice = decodeInputPrefetch.device;
+                const int originalDevice = FastllmCudaGetDevice();
+                if (originalDevice != pendingDevice) {
+                    FastllmCudaSetDevice(pendingDevice);
+                }
+                FastllmCudaStreamSynchronize(
+                    EnsureRouteCopyStream(pendingDevice));
+                FastllmCudaStreamSynchronize(
+                    EnsureInputCopyStream(pendingDevice));
+                decodeInputPrefetch.active = false;
+                if (originalDevice != pendingDevice) {
+                    FastllmCudaSetDevice(originalDevice);
+                }
+            }
+
+            void SynchronizeDecodeOutputCopy() {
+                if (!decodeOutputCopyPending) {
+                    return;
+                }
+                const int eventDevice =
+                    decodeOutputCopyEvent.get_deleter().device;
+                const int originalDevice = FastllmCudaGetDevice();
+                if (originalDevice != eventDevice) {
+                    FastllmCudaSetDevice(eventDevice);
+                }
+                FastllmCudaEventSynchronize(
+                    decodeOutputCopyEvent.get());
+                decodeOutputCopyPending = false;
+                if (originalDevice != eventDevice) {
+                    FastllmCudaSetDevice(originalDevice);
+                }
+            }
+
+            void RecordDecodeOutputCopy(int gpuId) {
+                SynchronizeDecodeOutputCopy();
+                if (decodeOutputCopyEvent.get() == nullptr ||
+                    decodeOutputCopyEvent.get_deleter().device != gpuId) {
+                    decodeOutputCopyEvent.reset(nullptr);
+                    const int originalDevice = FastllmCudaGetDevice();
+                    if (originalDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    decodeOutputCopyEvent = std::unique_ptr<
+                        void, FastllmCudaEventDestroyDeleter>(
+                            FastllmCudaEventCreate(),
+                            FastllmCudaEventDestroyDeleter {gpuId});
+                    if (originalDevice != gpuId) {
+                        FastllmCudaSetDevice(originalDevice);
+                    }
+                }
+                const int originalDevice = FastllmCudaGetDevice();
+                if (originalDevice != gpuId) {
+                    FastllmCudaSetDevice(gpuId);
+                }
+                FastllmCudaEventRecordCurrentThread(
+                    decodeOutputCopyEvent.get());
+                decodeOutputCopyPending = true;
+                if (originalDevice != gpuId) {
+                    FastllmCudaSetDevice(originalDevice);
+                }
+            }
 
             uint8_t *EnsurePinnedInput(size_t bytes) {
                 if (pinnedInputBytes < bytes || pinnedInput.get() == nullptr) {
@@ -1287,6 +1389,10 @@ namespace fastllm {
             }
 
             uint8_t *EnsurePinnedOutput(size_t bytes) {
+                // A decode H2D copy reads this reusable host buffer after
+                // MergeMOE returns.  Do not let a later device/thread write or
+                // reallocate it until that copy has actually completed.
+                SynchronizeDecodeOutputCopy();
                 if (pinnedOutputBytes < bytes || pinnedOutput.get() == nullptr) {
                     pinnedOutput.reset(FastllmCudaHostMalloc(bytes));
                     pinnedOutputBytes = bytes;
@@ -1417,7 +1523,98 @@ namespace fastllm {
     }
 
     void ClearNumasMoeRuntimeCache() {
+#ifdef USE_CUDA
+        for (auto &item : GetNumasMoeRuntimeCache()) {
+            item.second.SynchronizeDecodeInputPrefetch();
+            item.second.SynchronizeDecodeOutputCopy();
+        }
+#endif
         GetNumasMoeRuntimeCache().clear();
+    }
+
+    bool PrefetchNumasMoeDecodeInput(
+            const Data &input, const Data &index, const Data &score,
+            int layer) {
+#ifndef USE_CUDA
+        (void)input;
+        (void)index;
+        (void)score;
+        (void)layer;
+        return false;
+#else
+        if (input.dataDevice != DataDevice::CUDA ||
+            index.dataDevice != DataDevice::CUDA ||
+            score.dataDevice != DataDevice::CUDA ||
+            input.cudaData == nullptr || index.cudaData == nullptr ||
+            score.cudaData == nullptr || input.multiDeviceData ||
+            index.multiDeviceData || score.multiDeviceData ||
+            input.dims.empty() || input.Count(0) != input.dims.back()) {
+            return false;
+        }
+        auto pointerDevice = [](const Data &data) {
+            int device = GetPointerDeviceId(data.cudaData);
+            return device >= 0 ? device :
+                (data.dataDeviceIds.empty() ? FastllmCudaGetDevice() :
+                 data.dataDeviceIds[0]);
+        };
+        const int device = pointerDevice(input);
+        if (pointerDevice(index) != device || pointerDevice(score) != device) {
+            return false;
+        }
+
+        FastllmMoeDataManagerNumas &workspace =
+            GetNumasMoeRuntimeCache()[layer % 2];
+        auto &pending = workspace.decodeInputPrefetch;
+        if (pending.active) {
+            // A pending copy should normally be consumed by the immediately
+            // following MergeMOE.  Drain it before reusing the same parity
+            // workspace so a fallback path cannot overwrite pinned memory.
+            workspace.SynchronizeDecodeInputPrefetch();
+        }
+
+        FastllmCudaSetDevice(device);
+        const size_t inputBytes = input.GetBytes();
+        const size_t indexBytes = index.GetBytes();
+        const size_t scoreBytes = score.GetBytes();
+        uint8_t *staging = workspace.EnsurePinnedInput(
+            inputBytes + indexBytes + scoreBytes);
+        void *inputCopyStream = workspace.EnsureInputCopyStream(device);
+        void *routeCopyStream = workspace.EnsureRouteCopyStream(device);
+        void *sourceReadyEvent = FastllmCudaEventCreate();
+        FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
+        FastllmCudaStreamWaitEvent(inputCopyStream, sourceReadyEvent);
+        FastllmCudaStreamWaitEvent(routeCopyStream, sourceReadyEvent);
+
+        uint8_t *inputHost = staging;
+        uint8_t *indexHost = inputHost + inputBytes;
+        uint8_t *scoreHost = indexHost + indexBytes;
+        bool copied =
+            FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                inputHost, input.cudaData, inputBytes, inputCopyStream) &&
+            FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                indexHost, index.cudaData, indexBytes, routeCopyStream) &&
+            FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                scoreHost, score.cudaData, scoreBytes, routeCopyStream);
+        FastllmCudaEventDestroy(sourceReadyEvent);
+        if (!copied) {
+            FastllmCudaStreamSynchronize(routeCopyStream);
+            FastllmCudaStreamSynchronize(inputCopyStream);
+            return false;
+        }
+
+        pending.active = true;
+        pending.device = device;
+        pending.inputCuda = input.cudaData;
+        pending.indexCuda = index.cudaData;
+        pending.scoreCuda = score.cudaData;
+        pending.inputBytes = inputBytes;
+        pending.indexBytes = indexBytes;
+        pending.scoreBytes = scoreBytes;
+        pending.inputHost = inputHost;
+        pending.indexHost = indexHost;
+        pending.scoreHost = scoreHost;
+        return true;
+#endif
     }
 
     // CrossSwiglu 重排：将 a[n, m] 重排为 b[n, m]
@@ -5708,7 +5905,10 @@ namespace fastllm {
         std::unique_ptr<Data> pinnedIndexAlias;
         std::unique_ptr<Data> pinnedScoreAlias;
         void *inputCopyStream = nullptr;
+        void *routeCopyStream = nullptr;
         bool inputCopyPending = false;
+        int cudaDeviceId = -1;
+        bool returnDecodeOutputToCuda = false;
         const bool inputOnCuda = rawInput.dataDevice == DataDevice::CUDA &&
             rawInput.cudaData != nullptr && !rawInput.multiDeviceData;
         const bool indexOnCuda = rawIndex.dataDevice == DataDevice::CUDA &&
@@ -5722,7 +5922,7 @@ namespace fastllm {
                     (data.dataDeviceIds.empty() ? FastllmCudaGetDevice() :
                      data.dataDeviceIds[0]);
             };
-            int cudaDeviceId = inputOnCuda ? cudaId(rawInput) :
+            cudaDeviceId = inputOnCuda ? cudaId(rawInput) :
                 (indexOnCuda ? cudaId(rawIndex) : cudaId(rawScore));
             AssertInFastLLM(
                 (!inputOnCuda || cudaId(rawInput) == cudaDeviceId) &&
@@ -5734,25 +5934,73 @@ namespace fastllm {
             const size_t inputBytes = rawInput.GetBytes();
             const size_t indexBytes = rawIndex.GetBytes();
             const size_t scoreBytes = rawScore.GetBytes();
-            uint8_t *staging = fastllmMoeDataManagerNumas.
-                EnsurePinnedInput(inputBytes + indexBytes + scoreBytes);
-            uint8_t *inputHost = staging;
-            uint8_t *indexHost = inputHost + inputBytes;
-            uint8_t *scoreHost = indexHost + indexBytes;
+            auto &pending =
+                fastllmMoeDataManagerNumas.decodeInputPrefetch;
+            const bool usePending =
+                pending.active && inputOnCuda && indexOnCuda && scoreOnCuda &&
+                pending.device == cudaDeviceId &&
+                pending.inputCuda == rawInput.cudaData &&
+                pending.indexCuda == rawIndex.cudaData &&
+                pending.scoreCuda == rawScore.cudaData &&
+                pending.inputBytes == inputBytes &&
+                pending.indexBytes == indexBytes &&
+                pending.scoreBytes == scoreBytes;
+            if (pending.active && !usePending) {
+                // Drain the streams on the device that owns the pending copy
+                // before Ensure*CopyStream is allowed to replace them for a
+                // different device.  cudaStreamDestroy does not wait for
+                // queued work, so replacing first could race pinned reuse.
+                fastllmMoeDataManagerNumas.
+                    SynchronizeDecodeInputPrefetch();
+                FastllmCudaSetDevice(cudaDeviceId);
+            }
             inputCopyStream = fastllmMoeDataManagerNumas.
                 EnsureInputCopyStream(cudaDeviceId);
-            void *routeCopyStream = fastllmMoeDataManagerNumas.
+            routeCopyStream = fastllmMoeDataManagerNumas.
                 EnsureRouteCopyStream(cudaDeviceId);
-            void *sourceReadyEvent = FastllmCudaEventCreate();
-            FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
-            FastllmCudaStreamWaitEvent(inputCopyStream, sourceReadyEvent);
-            FastllmCudaStreamWaitEvent(routeCopyStream, sourceReadyEvent);
+
+            uint8_t *inputHost = nullptr;
+            uint8_t *indexHost = nullptr;
+            uint8_t *scoreHost = nullptr;
+            if (usePending) {
+                inputHost = pending.inputHost;
+                indexHost = pending.indexHost;
+                scoreHost = pending.scoreHost;
+                pending.active = false;
+            } else {
+                uint8_t *staging = fastllmMoeDataManagerNumas.
+                    EnsurePinnedInput(inputBytes + indexBytes + scoreBytes);
+                inputHost = staging;
+                indexHost = inputHost + inputBytes;
+                scoreHost = indexHost + indexBytes;
+                void *sourceReadyEvent = FastllmCudaEventCreate();
+                FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
+                FastllmCudaStreamWaitEvent(inputCopyStream, sourceReadyEvent);
+                FastllmCudaStreamWaitEvent(routeCopyStream, sourceReadyEvent);
+                if (inputOnCuda) {
+                    AssertInFastLLM(
+                        FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                            inputHost, rawInput.cudaData, inputBytes,
+                            inputCopyStream),
+                        "NUMA MergeMOE failed to enqueue the input D2H copy.");
+                }
+                if (indexOnCuda) {
+                    AssertInFastLLM(
+                        FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                            indexHost, rawIndex.cudaData, indexBytes,
+                            routeCopyStream),
+                        "NUMA MergeMOE failed to enqueue the index D2H copy.");
+                }
+                if (scoreOnCuda) {
+                    AssertInFastLLM(
+                        FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                            scoreHost, rawScore.cudaData, scoreBytes,
+                            routeCopyStream),
+                        "NUMA MergeMOE failed to enqueue the score D2H copy.");
+                }
+                FastllmCudaEventDestroy(sourceReadyEvent);
+            }
             if (inputOnCuda) {
-                AssertInFastLLM(
-                    FastllmCudaCopyFromDeviceToPinnedHostAsync(
-                        inputHost, rawInput.cudaData, inputBytes,
-                        inputCopyStream),
-                    "NUMA MergeMOE failed to enqueue the input D2H copy.");
                 pinnedInputAlias.reset(new Data(
                     rawInput.dataType, rawInput.dims,
                     DataDevice::CPU, inputHost));
@@ -5761,11 +6009,6 @@ namespace fastllm {
                 inputCopyPending = true;
             }
             if (indexOnCuda) {
-                AssertInFastLLM(
-                    FastllmCudaCopyFromDeviceToPinnedHostAsync(
-                        indexHost, rawIndex.cudaData, indexBytes,
-                        routeCopyStream),
-                    "NUMA MergeMOE failed to enqueue the index D2H copy.");
                 pinnedIndexAlias.reset(new Data(
                     rawIndex.dataType, rawIndex.dims,
                     DataDevice::CPU, indexHost));
@@ -5773,22 +6016,23 @@ namespace fastllm {
                 indexPtr = pinnedIndexAlias.get();
             }
             if (scoreOnCuda) {
-                AssertInFastLLM(
-                    FastllmCudaCopyFromDeviceToPinnedHostAsync(
-                        scoreHost, rawScore.cudaData, scoreBytes,
-                        routeCopyStream),
-                    "NUMA MergeMOE failed to enqueue the score D2H copy.");
                 pinnedScoreAlias.reset(new Data(
                     rawScore.dataType, rawScore.dims,
                     DataDevice::CPU, scoreHost));
                 pinnedScoreAlias->strides = rawScore.strides;
                 scorePtr = pinnedScoreAlias.get();
             }
-            FastllmCudaEventDestroy(sourceReadyEvent);
             // Routing is needed to partition experts.  Waiting on its small
             // transfer also establishes producer completion before GPU expert
             // workers consume the source activation on their own streams.
             FastllmCudaStreamSynchronize(routeCopyStream);
+            returnDecodeOutputToCuda =
+                usePending && inputOnCuda &&
+                rawInput.dims.size() == 2 &&
+                rawInput.dims[0] < 32 &&
+                std::getenv(
+                    "FASTLLM_NUMAS_MOE_DISABLE_ASYNC_DECODE_OUTPUT") ==
+                    nullptr;
         }
 #endif
         if (inputPtr == nullptr) {
@@ -5959,7 +6203,23 @@ namespace fastllm {
 
         if (input.dims[0] < 32) {
             waitForCpuInput();
-            ensureCpuOutput();
+            Data *cpuOutput = &output;
+#ifdef USE_CUDA
+            std::unique_ptr<Data> pinnedDecodeOutputAlias;
+            if (returnDecodeOutputToCuda) {
+                uint8_t *pinnedOutput =
+                    fastllmMoeDataManagerNumas.EnsurePinnedOutput(
+                        output.GetBytes());
+                pinnedDecodeOutputAlias.reset(new Data(
+                    output.dataType, output.dims,
+                    DataDevice::CPU, pinnedOutput));
+                pinnedDecodeOutputAlias->strides = output.strides;
+                cpuOutput = pinnedDecodeOutputAlias.get();
+            } else
+#endif
+            {
+                ensureCpuOutput();
+            }
 // auto st = std::chrono::system_clock::now();
             int32_t *indexData = (int32_t*)index.cpuData;
             float *scoreData = (float*)score.cpuData;
@@ -5970,7 +6230,7 @@ namespace fastllm {
                 int bs = input.dims[0];
                 int inputDim = input.dims[1];
                 int interDim = weights[2]->dims[0] / 2;
-                int outputDim = output.dims[1];
+                int outputDim = cpuOutput->dims[1];
 
                 for (int o = 0; o < bs; o++) {
                     if (profileDetail) {
@@ -6779,8 +7039,9 @@ namespace fastllm {
 
 // printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     float *fLastOutput = reduceOutput.data();
-                    if (output.dataType == DataType::FLOAT32) {
-                        fLastOutput = ((float*)output.cpuData) + o * outputDim;
+                    if (cpuOutput->dataType == DataType::FLOAT32) {
+                        fLastOutput =
+                            ((float*)cpuOutput->cpuData) + o * outputDim;
                     }
 
                     // 6. reduce
@@ -6840,11 +7101,19 @@ namespace fastllm {
 
 // printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 7. reduceOutput -> last Output
-                    if (output.dataType != DataType::FLOAT32) {
-                        if (output.dataType == DataType::FLOAT16) {
-                            Float32ToFloat16(reduceOutput.data(), ((uint16_t*)output.cpuData) + o * outputDim, outputDim);
-                        } else if (output.dataType == DataType::BFLOAT16) {
-                            uint16_t *dst = (uint16_t*)output.cpuData + o * outputDim;
+                    if (cpuOutput->dataType != DataType::FLOAT32) {
+                        if (cpuOutput->dataType == DataType::FLOAT16) {
+                            Float32ToFloat16(
+                                reduceOutput.data(),
+                                ((uint16_t*)cpuOutput->cpuData) +
+                                    o * outputDim,
+                                outputDim);
+                        } else if (
+                                cpuOutput->dataType ==
+                                DataType::BFLOAT16) {
+                            uint16_t *dst =
+                                (uint16_t*)cpuOutput->cpuData +
+                                o * outputDim;
                             if (deepSeekV4Mode) {
                                 for (int d = 0; d < outputDim; d++) {
                                     dst[d] = Float32ToBFloat16RNEBits(reduceOutput[d]);
@@ -6868,6 +7137,23 @@ namespace fastllm {
                     fflush(stdout);
                 }
             }
+#ifdef USE_CUDA
+            if (returnDecodeOutputToCuda) {
+                output.ToDevice(
+                    DataDevice::CUDA,
+                    std::vector<int>{cudaDeviceId}, false);
+                output.Allocate(false);
+                AssertInFastLLM(
+                    output.cudaData != nullptr &&
+                    FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+                        output.cudaData, cpuOutput->cpuData,
+                        output.GetBytes()),
+                    "NUMA MergeMOE failed to enqueue the decode output "
+                    "H2D copy.");
+                fastllmMoeDataManagerNumas.RecordDecodeOutputCopy(
+                    cudaDeviceId);
+            }
+#endif
         } else {
             Data gate, attenPart, moePart;
             int bs = input.dims[0];

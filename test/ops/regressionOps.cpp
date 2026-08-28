@@ -11265,13 +11265,22 @@ namespace {
     std::vector<uint16_t> RunNumasDeepSeekV4LargeMoeCase(
             MoeWeights &weights, int batch,
             fastllm::DataDevice *mergeOutputDevice = nullptr,
-            bool keepCudaInputMirror = false) {
+            bool keepCudaInputMirror = false,
+            int cudaInputDevice = -1,
+            bool prefetchCudaDecode = false) {
         const int inputDim = weights.routedGate.dims[1];
         const int outputDim = weights.routedDown.dims[0];
         fastllm::Data input = MakeTensor(
             fastllm::DataType::BFLOAT16, {batch, inputDim}, 0.73f);
 #ifdef USE_CUDA
-        if (keepCudaInputMirror) {
+        if (cudaInputDevice >= 0) {
+            Expect(!keepCudaInputMirror && batch == 1,
+                   "NUMA MoE CUDA decode regression requires one input row "
+                   "without a CPU-primary mirror.");
+            input.ToDevice(
+                fastllm::DataDevice::CUDA,
+                std::vector<int>{cudaInputDevice}, true);
+        } else if (keepCudaInputMirror) {
             input.ToDevice(
                 fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
             input.ToDevice(
@@ -11281,7 +11290,8 @@ namespace {
                    "failed to retain the DeepSeek-V4 mixed-inference CUDA mirror.");
         }
 #else
-        Expect(!keepCudaInputMirror,
+        Expect(!keepCudaInputMirror && cudaInputDevice < 0 &&
+                   !prefetchCudaDecode,
                "CUDA input mirror requested in a non-CUDA build.");
 #endif
         fastllm::Data index = MakeIntTensor(
@@ -11292,6 +11302,16 @@ namespace {
         }
         fastllm::Data score(
             fastllm::DataType::FLOAT32, {batch, 1}, routeScores);
+#ifdef USE_CUDA
+        if (cudaInputDevice >= 0) {
+            index.ToDevice(
+                fastllm::DataDevice::CUDA,
+                std::vector<int>{cudaInputDevice}, true);
+            score.ToDevice(
+                fastllm::DataDevice::CUDA,
+                std::vector<int>{cudaInputDevice}, true);
+        }
+#endif
         fastllm::Data output(
             fastllm::DataType::BFLOAT16, {batch, outputDim});
         fastllm::Data w1, w2, w3, curInput, curOutput;
@@ -11301,6 +11321,15 @@ namespace {
         std::vector<fastllm::Data*> biasPtrs(4, nullptr);
         {
             ScopedFirstDevice guard("numa");
+#ifdef USE_CUDA
+            if (prefetchCudaDecode) {
+                Expect(cudaInputDevice >= 0,
+                       "NUMA MoE decode prefetch requires CUDA inputs.");
+                Expect(fastllm::PrefetchNumasMoeDecodeInput(
+                           input, index, score, 0),
+                       "NUMA MoE decode input prefetch was not accepted.");
+            }
+#endif
             fastllm::MergeMOE(
                 input, index, score, weightPtrs, biasPtrs,
                 w1, w2, w3, curInput, curOutput,
@@ -11326,6 +11355,90 @@ namespace {
         return std::vector<uint16_t>(
             data, data + (size_t)batch * outputDim);
     }
+
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+    void CUDART_CB DelayCudaStreamForNumasOutputReuseRegression(
+            void *userData) {
+        std::unique_ptr<int> delayMilliseconds(
+            static_cast<int*>(userData));
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(*delayMilliseconds));
+    }
+
+    void RunNumasPrefetchedDecodeWithoutOutputSync(
+            MoeWeights &weights, int cudaDevice, float inputSeed,
+            float routeScore, fastllm::Data &output,
+            int outputCopyDelayMilliseconds = 0,
+            cudaEvent_t outputCopyDelayComplete = nullptr) {
+        const int inputDim = weights.routedGate.dims[1];
+        fastllm::Data input = MakeTensor(
+            fastllm::DataType::BFLOAT16, {1, inputDim}, inputSeed);
+        fastllm::Data index = MakeIntTensor({1, 1}, {0});
+        fastllm::Data score(
+            fastllm::DataType::FLOAT32, {1, 1}, {routeScore});
+        input.ToDevice(
+            fastllm::DataDevice::CUDA,
+            std::vector<int>{cudaDevice}, true);
+        index.ToDevice(
+            fastllm::DataDevice::CUDA,
+            std::vector<int>{cudaDevice}, true);
+        score.ToDevice(
+            fastllm::DataDevice::CUDA,
+            std::vector<int>{cudaDevice}, true);
+
+        fastllm::Data w1, w2, w3, curInput, curOutput;
+        std::vector<fastllm::Data*> weightPtrs = {
+            nullptr, nullptr, &weights.routedGate, &weights.routedDown
+        };
+        std::vector<fastllm::Data*> biasPtrs(4, nullptr);
+        {
+            ScopedFirstDevice guard("numa");
+            Expect(fastllm::PrefetchNumasMoeDecodeInput(
+                       input, index, score, 0),
+                   "NUMA MoE output-reuse prefetch was not accepted.");
+            if (outputCopyDelayMilliseconds > 0) {
+                int *delay = new int(outputCopyDelayMilliseconds);
+                const cudaError_t state = cudaLaunchHostFunc(
+                    cudaStreamPerThread,
+                    DelayCudaStreamForNumasOutputReuseRegression,
+                    delay);
+                if (state != cudaSuccess) {
+                    delete delay;
+                }
+                Expect(state == cudaSuccess,
+                       "failed to delay the NUMA MoE decode output copy.");
+                if (outputCopyDelayComplete != nullptr) {
+                    Expect(cudaEventRecord(
+                               outputCopyDelayComplete,
+                               cudaStreamPerThread) == cudaSuccess,
+                           "failed to record the NUMA MoE decode output "
+                           "delay event.");
+                }
+            }
+            fastllm::MergeMOE(
+                input, index, score, weightPtrs, biasPtrs,
+                w1, w2, w3, curInput, curOutput,
+                0.0f, output, 0, fastllm::MoeGateSwiglu,
+                false, 7.0f, true);
+        }
+        Expect(output.dataDevice == fastllm::DataDevice::CUDA &&
+                   output.cudaData != nullptr &&
+                   GetPointerDeviceId(output.cudaData) == cudaDevice,
+               "NUMA MoE output-reuse decode did not stay on its CUDA "
+               "device.");
+    }
+
+    std::vector<uint16_t> CopyNumasCudaDecodeOutputToHost(
+            fastllm::Data &output, int cudaDevice) {
+        FastllmCudaSetDevice(cudaDevice);
+        output.ToDevice(
+            fastllm::DataDevice::CPU,
+            std::vector<int>{cudaDevice}, true);
+        const uint16_t *data = (const uint16_t*)output.cpuData;
+        return std::vector<uint16_t>(
+            data, data + output.Count(0));
+    }
+#endif
 
     void RunNumasDeepSeekV4LargeMoeRegression() {
         constexpr int batch = 32;
@@ -11434,6 +11547,152 @@ namespace {
             ExpectFloatNear(
                 cpuOnlyFloat, mixedFloat, 2.0f, 0.05f,
                 "DeepSeek-V4 NUMA mixed CPU/GPU MergeMOE output");
+
+            const char *savedAsyncOutputDisable = std::getenv(
+                "FASTLLM_NUMAS_MOE_DISABLE_ASYNC_DECODE_OUTPUT");
+            const bool hadAsyncOutputDisable =
+                savedAsyncOutputDisable != nullptr;
+            const std::string savedAsyncOutputDisableValue =
+                hadAsyncOutputDisable ? savedAsyncOutputDisable : "";
+            unsetenv("FASTLLM_NUMAS_MOE_DISABLE_ASYNC_DECODE_OUTPUT");
+
+            MoeWeights decodeReferenceWeights = makeWeights();
+            fastllm::DataDevice decodeReferenceDevice =
+                fastllm::DataDevice::CUDA;
+            std::vector<uint16_t> decodeReference =
+                RunNumasDeepSeekV4LargeMoeCase(
+                    decodeReferenceWeights, 1, &decodeReferenceDevice);
+            Expect(decodeReferenceDevice == fastllm::DataDevice::CPU,
+                   "ordinary NUMA MoE decode unexpectedly returned CUDA "
+                   "output.");
+
+            MoeWeights prefetchedDecodeWeights = makeWeights();
+            fastllm::DataDevice prefetchedDecodeDevice =
+                fastllm::DataDevice::CPU;
+            std::vector<uint16_t> prefetchedDecode =
+                RunNumasDeepSeekV4LargeMoeCase(
+                    prefetchedDecodeWeights, 1, &prefetchedDecodeDevice,
+                    false, 0, true);
+            Expect(prefetchedDecodeDevice == fastllm::DataDevice::CUDA,
+                   "prefetched NUMA MoE decode did not return CUDA output.");
+            Expect(decodeReference == prefetchedDecode,
+                   "prefetched NUMA MoE decode changed BF16 output bits.");
+
+            if (FastllmCudaGetDeviceCount() >= 2) {
+                fastllm::Data staleInput = MakeTensor(
+                    fastllm::DataType::BFLOAT16,
+                    {1, 4 * 1024 * 1024}, 0.41f);
+                fastllm::Data staleIndex = MakeIntTensor({1, 1}, {0});
+                fastllm::Data staleScore(
+                    fastllm::DataType::FLOAT32, {1, 1}, {0.25f});
+                staleInput.ToDevice(
+                    fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+                staleIndex.ToDevice(
+                    fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+                staleScore.ToDevice(
+                    fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+                Expect(fastllm::PrefetchNumasMoeDecodeInput(
+                           staleInput, staleIndex, staleScore, 0),
+                       "NUMA MoE stale decode prefetch was not accepted.");
+
+                MoeWeights switchedDeviceWeights = makeWeights();
+                fastllm::DataDevice switchedDeviceOutputDevice =
+                    fastllm::DataDevice::CUDA;
+                std::vector<uint16_t> switchedDeviceOutput =
+                    RunNumasDeepSeekV4LargeMoeCase(
+                        switchedDeviceWeights, 1,
+                        &switchedDeviceOutputDevice, false, 1);
+                Expect(
+                    switchedDeviceOutputDevice == fastllm::DataDevice::CPU,
+                    "mismatched NUMA MoE prefetch unexpectedly returned a "
+                    "CUDA output.");
+                Expect(decodeReference == switchedDeviceOutput,
+                       "draining a NUMA MoE prefetch from another device "
+                       "changed BF16 output bits.");
+
+#if !defined(USE_ROCM)
+                // Keep GPU0's async decode H2D pending while GPU1 reaches the
+                // same parity workspace.  The reusable pinned output must not
+                // be overwritten until GPU0 has consumed the first result.
+                MoeWeights outputReuseWeights = makeWeights();
+                fastllm::DataDevice outputReuseWarmupDevice =
+                    fastllm::DataDevice::CPU;
+                std::vector<uint16_t> outputReuseReference =
+                    RunNumasDeepSeekV4LargeMoeCase(
+                        outputReuseWeights, 1,
+                        &outputReuseWarmupDevice, false, 0, true);
+                Expect(
+                    outputReuseWarmupDevice == fastllm::DataDevice::CUDA,
+                    "NUMA MoE output-reuse warmup did not return CUDA "
+                    "output.");
+
+                fastllm::Data firstOutput(
+                    fastllm::DataType::BFLOAT16, {1, outputDim});
+                firstOutput.ToDevice(
+                    fastllm::DataDevice::CUDA,
+                    std::vector<int>{0}, false);
+                firstOutput.Allocate(false);
+                fastllm::Data secondOutput(
+                    fastllm::DataType::BFLOAT16, {1, outputDim});
+                secondOutput.ToDevice(
+                    fastllm::DataDevice::CUDA,
+                    std::vector<int>{1}, false);
+                secondOutput.Allocate(false);
+
+                FastllmCudaSetDevice(0);
+                FastllmCudaSyncCurrentThreadStream();
+                cudaEvent_t firstOutputDelayComplete = nullptr;
+                Expect(cudaEventCreateWithFlags(
+                           &firstOutputDelayComplete,
+                           cudaEventDisableTiming) == cudaSuccess,
+                       "failed to create the NUMA MoE output-reuse event.");
+                RunNumasPrefetchedDecodeWithoutOutputSync(
+                    outputReuseWeights, 0, 0.73f, 0.25f,
+                    firstOutput, 2000, firstOutputDelayComplete);
+                const bool firstCopyWasPending =
+                    cudaEventQuery(firstOutputDelayComplete) ==
+                    cudaErrorNotReady;
+
+                RunNumasPrefetchedDecodeWithoutOutputSync(
+                    outputReuseWeights, 1, -0.37f, 0.50f,
+                    secondOutput);
+                FastllmCudaSetDevice(0);
+                const bool firstCopyCompletedBeforeReuse =
+                    cudaEventQuery(firstOutputDelayComplete) == cudaSuccess;
+                Expect(cudaEventSynchronize(firstOutputDelayComplete) ==
+                           cudaSuccess,
+                       "failed to synchronize the NUMA MoE output-reuse "
+                       "event.");
+                FastllmCudaSyncCurrentThreadStream();
+                Expect(cudaEventDestroy(firstOutputDelayComplete) ==
+                           cudaSuccess,
+                       "failed to destroy the NUMA MoE output-reuse event.");
+
+                std::vector<uint16_t> firstOutputHost =
+                    CopyNumasCudaDecodeOutputToHost(firstOutput, 0);
+                std::vector<uint16_t> secondOutputHost =
+                    CopyNumasCudaDecodeOutputToHost(secondOutput, 1);
+                Expect(firstCopyWasPending,
+                       "NUMA MoE output-reuse regression did not establish "
+                       "a pending first H2D copy.");
+                Expect(firstCopyCompletedBeforeReuse,
+                       "NUMA MoE reused pinned output before the previous "
+                       "device finished reading it.");
+                Expect(firstOutputHost == outputReuseReference,
+                       "NUMA MoE cross-device output reuse corrupted the "
+                       "first BF16 result.");
+                Expect(secondOutputHost != outputReuseReference,
+                       "NUMA MoE output-reuse regression inputs produced "
+                       "indistinguishable results.");
+#endif
+            }
+
+            if (hadAsyncOutputDisable) {
+                setenv("FASTLLM_NUMAS_MOE_DISABLE_ASYNC_DECODE_OUTPUT",
+                       savedAsyncOutputDisableValue.c_str(), 1);
+            } else {
+                unsetenv("FASTLLM_NUMAS_MOE_DISABLE_ASYNC_DECODE_OUTPUT");
+            }
 
             FastllmMultiCudaSetDevice(savedDevices);
         }

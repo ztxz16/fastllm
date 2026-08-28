@@ -58,6 +58,14 @@ namespace fastllm {
     // Release them explicitly while the CUDA allocator is still alive.
     void ClearNumasMoeRuntimeCache();
 
+    // Begin copying one-token CUDA MoE inputs to the reusable pinned NUMA
+    // staging buffers.  The eventual MergeMOE call consumes the pending copy.
+    // This lets an independent CUDA shared-expert branch run while the routed
+    // inputs are transferred, instead of recording the copy dependency after
+    // that branch has already completed.
+    bool PrefetchNumasMoeDecodeInput(
+        const Data &input, const Data &index, const Data &score, int layer);
+
     class NumasKimiK3RoutedExpertsOp : BaseOperator {
         bool CanRun(const std::string &opType, const DataDict &datas,
                     const FloatDict &floatParams, const IntDict &intParams);
