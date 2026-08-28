@@ -314,6 +314,92 @@ namespace {
             Qwen4CudaRound<T>(gate * 2.0f));
     }
 
+    template <typename T, int THREADS>
+    __global__ void Qwen4PLEGateKernel(
+            const T *key, const T *query, const T *value,
+            float *output, int rows, int groups, int groupChannels) {
+        const int item = blockIdx.x;
+        if (item >= rows * groups) {
+            return;
+        }
+        const int row = item / groups;
+        const int group = item % groups;
+        const int channels = groups * groupChannels;
+        const uint64_t base = (uint64_t)row * channels +
+                              (uint64_t)group * groupChannels;
+
+        __shared__ float probability;
+        if (threadIdx.x == 0) {
+            // This score feeds MoE routing after PLE. Even a few ULPs from a
+            // parallel reduction can change an expert tie and amplify across
+            // later layers, so preserve the reference's left-to-right sum.
+            float dot = 0.0f;
+            for (int channel = 0; channel < groupChannels; channel++) {
+                dot += Qwen4CudaToFloat(key[base + channel]) *
+                       Qwen4CudaToFloat(query[base + channel]);
+            }
+            // Match RunPLE's host expression exactly.  rsqrtf differs by one
+            // ULP on this model and that is enough to perturb a later MoE tie.
+            const float inverseSqrt = 1.0f / sqrtf((float)groupChannels);
+            float gate = dot * inverseSqrt;
+            if (gate != 0.0f) {
+                gate = copysignf(
+                    sqrtf(fmaxf(fabsf(gate), 1e-6f)), gate);
+            }
+            probability = Qwen4CudaSigmoid(gate);
+        }
+        __syncthreads();
+
+        const uint64_t valueBase = (uint64_t)row * groupChannels;
+        for (int channel = threadIdx.x; channel < groupChannels;
+             channel += THREADS) {
+            output[base + channel] = probability *
+                Qwen4CudaToFloat(value[valueBase + channel]);
+        }
+    }
+
+    __global__ void Qwen4PLECausalConvKernel(
+            const float *input, const float *gated, const float *weight,
+            const float *history, float *output, uint64_t total,
+            int sequence, int channels, int kernel, int dilation,
+            int historyLength) {
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int token = (int)(item / channels);
+            const int channel = (int)(item % channels);
+            float sum = 0.0f;
+            for (int tap = 0; tap < kernel; tap++) {
+                const int relative =
+                    token - historyLength + tap * dilation;
+                const float sample = relative >= 0
+                    ? input[(uint64_t)relative * channels + channel]
+                    : history[(uint64_t)(historyLength + relative) *
+                                  channels + channel];
+                sum += sample * weight[(uint64_t)channel * kernel + tap];
+            }
+            output[item] = gated[item] + sum / (1.0f + expf(-sum));
+        }
+    }
+
+    __global__ void Qwen4PLEUpdateHistoryKernel(
+            const float *input, const float *history, float *newHistory,
+            uint64_t total, int sequence, int channels,
+            int historyLength) {
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int historyIndex = (int)(item / channels);
+            const int channel = (int)(item % channels);
+            const int sourceToken =
+                sequence - historyLength + historyIndex;
+            newHistory[item] = sourceToken >= 0
+                ? input[(uint64_t)sourceToken * channels + channel]
+                : history[(uint64_t)(historyLength + sourceToken) *
+                              channels + channel];
+        }
+    }
+
     __device__ __forceinline__ float Qwen4CudaLoadActivation(
             const void *data, int type, uint64_t index) {
         if (type == (int)fastllm::DataType::FLOAT32) {
@@ -863,6 +949,114 @@ bool FastllmCudaQwen4GroupedRMSNorm(
             (__nv_bfloat16*)output.cudaData, rows, groups,
             groupChannels, eps);
     }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4PLEGate(
+        const fastllm::Data &key, const fastllm::Data &query,
+        const fastllm::Data &value, fastllm::Data &output, int groups) {
+    const int channels = key.dims.empty() ? 0 : key.dims.back();
+    const int groupChannels = groups > 0 ? channels / groups : 0;
+    const int rows = channels > 0
+        ? (int)(key.Count(0) / channels) : 0;
+    if (key.dataDevice != fastllm::DataDevice::CUDA ||
+        query.dataDevice != fastllm::DataDevice::CUDA ||
+        value.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        key.cudaData == nullptr || query.cudaData == nullptr ||
+        value.cudaData == nullptr || output.cudaData == nullptr ||
+        key.dims.empty() || key.dims != query.dims || groups <= 0 ||
+        channels % groups != 0 || rows <= 0 ||
+        key.dataType != query.dataType || key.dataType != value.dataType ||
+        !Qwen4CudaActivationType(key.dataType) ||
+        value.Count(0) != (uint64_t)rows * groupChannels ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        output.dims != key.dims) {
+        return false;
+    }
+    constexpr int threads = 512;
+    const int blocks = rows * groups;
+    if (key.dataType == fastllm::DataType::FLOAT32) {
+        Qwen4PLEGateKernel<float, threads><<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)key.cudaData, (const float*)query.cudaData,
+            (const float*)value.cudaData, (float*)output.cudaData,
+            rows, groups, groupChannels);
+    } else if (key.dataType == fastllm::DataType::FLOAT16) {
+        Qwen4PLEGateKernel<half, threads><<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)key.cudaData, (const half*)query.cudaData,
+            (const half*)value.cudaData, (float*)output.cudaData,
+            rows, groups, groupChannels);
+    } else {
+        Qwen4PLEGateKernel<__nv_bfloat16, threads><<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)key.cudaData,
+            (const __nv_bfloat16*)query.cudaData,
+            (const __nv_bfloat16*)value.cudaData,
+            (float*)output.cudaData, rows, groups, groupChannels);
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4PLECausalConv(
+        const fastllm::Data &normalized, const fastllm::Data &gated,
+        const fastllm::Data &weight, const fastllm::Data &history,
+        fastllm::Data &output, fastllm::Data &newHistory,
+        int kernel, int dilation) {
+    const int channels = normalized.dims.size() == 3
+        ? normalized.dims[2] : 0;
+    const int sequence = normalized.dims.size() == 3
+        ? normalized.dims[1] : 0;
+    const int historyLength = (kernel - 1) * dilation;
+    if (normalized.dataDevice != fastllm::DataDevice::CUDA ||
+        gated.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        history.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        newHistory.dataDevice != fastllm::DataDevice::CUDA ||
+        normalized.cudaData == nullptr || gated.cudaData == nullptr ||
+        weight.cudaData == nullptr || history.cudaData == nullptr ||
+        output.cudaData == nullptr || newHistory.cudaData == nullptr ||
+        normalized.dims.size() != 3 || normalized.dims[0] != 1 ||
+        normalized.dims != gated.dims || sequence <= 0 || channels <= 0 ||
+        kernel <= 1 || dilation <= 0 ||
+        normalized.dataType != fastllm::DataType::FLOAT32 ||
+        gated.dataType != fastllm::DataType::FLOAT32 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        history.dataType != fastllm::DataType::FLOAT32 ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        newHistory.dataType != fastllm::DataType::FLOAT32 ||
+        weight.Count(0) != (uint64_t)channels * kernel ||
+        history.dims != std::vector<int>({historyLength, channels}) ||
+        output.dims != normalized.dims ||
+        newHistory.dims != history.dims) {
+        return false;
+    }
+
+    constexpr int threads = 256;
+    const uint64_t outputCount = (uint64_t)sequence * channels;
+    const uint64_t historyCount = (uint64_t)historyLength * channels;
+    const int outputBlocks = std::min<uint64_t>(
+        65535, (outputCount + threads - 1) / threads);
+    const int historyBlocks = std::min<uint64_t>(
+        65535, (historyCount + threads - 1) / threads);
+    Qwen4PLECausalConvKernel<<<
+        outputBlocks, threads, 0, cudaStreamPerThread>>>(
+        (const float*)normalized.cudaData,
+        (const float*)gated.cudaData,
+        (const float*)weight.cudaData,
+        (const float*)history.cudaData,
+        (float*)output.cudaData, outputCount, sequence, channels,
+        kernel, dilation, historyLength);
+    Qwen4PLEUpdateHistoryKernel<<<
+        historyBlocks, threads, 0, cudaStreamPerThread>>>(
+        (const float*)normalized.cudaData,
+        (const float*)history.cudaData,
+        (float*)newHistory.cudaData, historyCount, sequence, channels,
+        historyLength);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }

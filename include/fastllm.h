@@ -976,6 +976,17 @@ namespace fastllm {
     // Split/Cat/elementwise launches in the operator-composed reference.
     void Qwen4GroupedRMSNorm(const Data &input, const Data &weight,
                              float eps, int groups, Data &output);
+    // PLE keeps the ngram table lookup on the host, but the projection tail
+    // uses regular executor operations so CUDA does not round-trip the full
+    // sequence through host memory. PLEGate produces float32 gated values;
+    // PLECausalConv consumes the normalized values and returns both the
+    // residual result and the next float32 convolution history.
+    void Qwen4PLEGate(const Data &key, const Data &query,
+                      const Data &value, int groups, Data &output);
+    void Qwen4PLECausalConv(const Data &normalized, const Data &gated,
+                            const Data &weight, const Data &history,
+                            int kernel, int dilation, Data &output,
+                            Data &newHistory);
     void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
                        int groups, Data &output);
     void Qwen4HyperInject(const Data &logits, int groups, Data &output);

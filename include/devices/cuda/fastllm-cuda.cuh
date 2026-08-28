@@ -547,6 +547,15 @@ bool FastllmCudaQwen4GroupedRMSNorm(const fastllm::Data &input,
                                     const fastllm::Data &weight,
                                     fastllm::Data &output, float eps,
                                     int groups);
+bool FastllmCudaQwen4PLEGate(const fastllm::Data &key,
+                             const fastllm::Data &query,
+                             const fastllm::Data &value,
+                             fastllm::Data &output, int groups);
+bool FastllmCudaQwen4PLECausalConv(
+        const fastllm::Data &normalized, const fastllm::Data &gated,
+        const fastllm::Data &weight, const fastllm::Data &history,
+        fastllm::Data &output, fastllm::Data &newHistory,
+        int kernel, int dilation);
 bool FastllmCudaQwen4HyperMix(const fastllm::Data &normalized,
                               const fastllm::Data &mixLogits,
                               fastllm::Data &output, int groups);

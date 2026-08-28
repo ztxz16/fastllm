@@ -4050,6 +4050,8 @@ namespace fastllm {
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["RMSNormPart"] = (BaseOperator*)(new CudaRMSNormPartOp());
         this->ops["Qwen4GroupedRMSNorm"] = (BaseOperator*)(new CudaQwen4GroupedRMSNormOp());
+        this->ops["Qwen4PLEGate"] = (BaseOperator*)(new CudaQwen4PLEGateOp());
+        this->ops["Qwen4PLECausalConv"] = (BaseOperator*)(new CudaQwen4PLECausalConvOp());
         this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CudaQwen4HyperMixOp());
         this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CudaQwen4HyperInjectOp());
         this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CudaQwen4HyperCombineOp());
@@ -4566,6 +4568,84 @@ namespace fastllm {
                 input, weight, output, eps, groups)) {
             ErrorInFastLLM(
                 "Qwen4GroupedRMSNorm CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4PLEGateOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &key = *datas.find("key")->second;
+        Data &query = *datas.find("query")->second;
+        Data &value = *datas.find("value")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        if (key.dims.empty() || key.dims != query.dims || groups <= 0 ||
+            key.dims.back() % groups != 0 ||
+            key.dataType != query.dataType ||
+            key.dataType != value.dataType ||
+            !CudaQwen4ActivationType(key.dataType)) {
+            return false;
+        }
+        const int channels = key.dims.back();
+        const int rows = (int)(key.Count(0) / channels);
+        return value.Count(0) ==
+            (uint64_t)rows * channels / groups;
+    }
+
+    void CudaQwen4PLEGateOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &key = *datas.find("key")->second;
+        Data &query = *datas.find("query")->second;
+        Data &value = *datas.find("value")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        output.Allocate(false);
+        if (!FastllmCudaQwen4PLEGate(
+                key, query, value, output, groups)) {
+            ErrorInFastLLM(
+                "Qwen4PLEGate CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4PLECausalConvOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &gated = *datas.find("gated")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &history = *datas.find("history")->second;
+        const int kernel = intParams.find("kernel")->second;
+        const int dilation = intParams.find("dilation")->second;
+        const int historyLength = (kernel - 1) * dilation;
+        return input.dims.size() == 3 && input.dims[0] == 1 &&
+               input.dims == gated.dims && input.dataType == DataType::FLOAT32 &&
+               gated.dataType == DataType::FLOAT32 &&
+               weight.dataType == DataType::FLOAT32 &&
+               history.dataType == DataType::FLOAT32 && kernel > 1 &&
+               dilation > 0 && weight.Count(0) ==
+                   (uint64_t)input.dims.back() * kernel &&
+               history.dims == std::vector<int>({historyLength,
+                                                   input.dims.back()});
+    }
+
+    void CudaQwen4PLECausalConvOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &gated = *datas.find("gated")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &history = *datas.find("history")->second;
+        Data &output = *datas.find("output")->second;
+        Data &newHistory = *datas.find("newHistory")->second;
+        const int kernel = intParams.find("kernel")->second;
+        const int dilation = intParams.find("dilation")->second;
+        output.Allocate(false);
+        newHistory.Allocate(false);
+        if (!FastllmCudaQwen4PLECausalConv(
+                input, gated, weight, history, output, newHistory,
+                kernel, dilation)) {
+            ErrorInFastLLM(
+                "Qwen4PLECausalConv CUDA error: kernel rejected input.\n");
         }
     }
 

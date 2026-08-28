@@ -4122,6 +4122,25 @@ namespace fastllm {
         }, {{"eps", eps}}, {{"groups", groups}});
     }
 
+    void Qwen4PLEGate(const Data &key, const Data &query,
+                      const Data &value, int groups, Data &output) {
+        curExecutor->Run("Qwen4PLEGate", {
+                {"key", (Data*)&key}, {"query", (Data*)&query},
+                {"value", (Data*)&value}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
+    void Qwen4PLECausalConv(const Data &normalized, const Data &gated,
+                            const Data &weight, const Data &history,
+                            int kernel, int dilation, Data &output,
+                            Data &newHistory) {
+        curExecutor->Run("Qwen4PLECausalConv", {
+                {"input", (Data*)&normalized}, {"gated", (Data*)&gated},
+                {"weight", (Data*)&weight}, {"history", (Data*)&history},
+                {"output", &output}, {"newHistory", &newHistory}
+        }, {}, {{"kernel", kernel}, {"dilation", dilation}});
+    }
+
     void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
                        int groups, Data &output) {
         curExecutor->Run("Qwen4HyperMix", {

@@ -169,6 +169,172 @@ namespace fastllm {
         });
     }
 
+    void CpuQwen4PLEGateOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &key = *datas.find("key")->second;
+        Data &query = *datas.find("query")->second;
+        Data &value = *datas.find("value")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = Qwen4Groups(intParams);
+        AssertInFastLLM(!key.dims.empty() && key.dims == query.dims &&
+                        groups > 0 && key.dims.back() % groups == 0,
+                        "Qwen4PLEGate received incompatible key/query shapes.\n");
+        const int channels = key.dims.back();
+        const int rows = (int)(key.Count(0) / channels);
+        AssertInFastLLM(value.Count(0) ==
+                            (uint64_t)rows * channels / groups,
+                        "Qwen4PLEGate received an incompatible value shape.\n");
+        output.dataType = DataType::FLOAT32;
+        output.Resize(key.dims);
+    }
+
+    void CpuQwen4PLEGateOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &key = *datas.find("key")->second;
+        Data &query = *datas.find("query")->second;
+        Data &value = *datas.find("value")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = Qwen4Groups(intParams);
+        Qwen4AssertCpuTensor(key, "Qwen4PLEGate key");
+        Qwen4AssertCpuTensor(query, "Qwen4PLEGate query");
+        Qwen4AssertCpuTensor(value, "Qwen4PLEGate value");
+        output.Allocate(false);
+
+        const int channels = key.dims.back();
+        const int groupChannels = channels / groups;
+        const int rows = (int)(key.Count(0) / channels);
+        const float inverseSqrtHidden =
+            1.0f / std::sqrt((float)groupChannels);
+        float *outputValues = reinterpret_cast<float *>(output.cpuData);
+        Qwen4ParallelFor(rows * groups, [&](int start, int end) {
+            for (int item = start; item < end; item++) {
+                const int row = item / groups;
+                const int group = item % groups;
+                const uint64_t base = (uint64_t)row * channels +
+                                      (uint64_t)group * groupChannels;
+                float dot = 0.0f;
+                for (int channel = 0; channel < groupChannels; channel++) {
+                    dot += Qwen4LoadCpu(key.cpuData, key.dataType,
+                                       base + channel) *
+                           Qwen4LoadCpu(query.cpuData, query.dataType,
+                                       base + channel);
+                }
+                float gate = dot * inverseSqrtHidden;
+                if (gate != 0.0f) {
+                    gate = std::copysign(
+                        std::sqrt(std::max(std::fabs(gate), 1e-6f)), gate);
+                }
+                const float probability = Qwen4SigmoidCpu(gate);
+                const uint64_t valueBase =
+                    (uint64_t)row * groupChannels;
+                for (int channel = 0; channel < groupChannels; channel++) {
+                    outputValues[base + channel] = probability *
+                        Qwen4LoadCpu(value.cpuData, value.dataType,
+                                     valueBase + channel);
+                }
+            }
+        });
+    }
+
+    void CpuQwen4PLECausalConvOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &gated = *datas.find("gated")->second;
+        Data &history = *datas.find("history")->second;
+        Data &output = *datas.find("output")->second;
+        Data &newHistory = *datas.find("newHistory")->second;
+        const int kernel = intParams.find("kernel")->second;
+        const int dilation = intParams.find("dilation")->second;
+        const int historyLength = (kernel - 1) * dilation;
+        AssertInFastLLM(input.dims.size() == 3 && input.dims[0] == 1 &&
+                        input.dims == gated.dims && kernel > 1 &&
+                        dilation > 0 && history.dims ==
+                            std::vector<int>({historyLength,
+                                              input.dims.back()}),
+                        "Qwen4PLECausalConv received incompatible shapes.\n");
+        output.dataType = DataType::FLOAT32;
+        output.Resize(input.dims);
+        newHistory.dataType = DataType::FLOAT32;
+        newHistory.Resize(history.dims);
+    }
+
+    void CpuQwen4PLECausalConvOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &gated = *datas.find("gated")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &history = *datas.find("history")->second;
+        Data &output = *datas.find("output")->second;
+        Data &newHistory = *datas.find("newHistory")->second;
+        const int kernel = intParams.find("kernel")->second;
+        const int dilation = intParams.find("dilation")->second;
+        const int historyLength = (kernel - 1) * dilation;
+        const int sequence = input.dims[1];
+        const int channels = input.dims[2];
+        Qwen4AssertCpuTensor(input, "Qwen4PLECausalConv input");
+        Qwen4AssertCpuTensor(gated, "Qwen4PLECausalConv gated input");
+        Qwen4AssertCpuTensor(weight, "Qwen4PLECausalConv weight");
+        Qwen4AssertCpuTensor(history, "Qwen4PLECausalConv history");
+        AssertInFastLLM(weight.dataType == DataType::FLOAT32 &&
+                        history.dataType == DataType::FLOAT32 &&
+                        weight.Count(0) == (uint64_t)channels * kernel,
+                        "Qwen4PLECausalConv requires float32 weight/history.\n");
+        output.Allocate(false);
+        newHistory.Allocate(false);
+        const float *weightValues =
+            reinterpret_cast<const float *>(weight.cpuData);
+        const float *historyValues =
+            reinterpret_cast<const float *>(history.cpuData);
+        float *outputValues = reinterpret_cast<float *>(output.cpuData);
+        float *nextHistory =
+            reinterpret_cast<float *>(newHistory.cpuData);
+
+        Qwen4ParallelFor(sequence * channels, [&](int start, int end) {
+            for (int item = start; item < end; item++) {
+                const int token = item / channels;
+                const int channel = item % channels;
+                float sum = 0.0f;
+                for (int tap = 0; tap < kernel; tap++) {
+                    const int relative =
+                        token - historyLength + tap * dilation;
+                    const float sample = relative >= 0
+                        ? Qwen4LoadCpu(
+                              input.cpuData, input.dataType,
+                              (uint64_t)relative * channels + channel)
+                        : historyValues[
+                              (uint64_t)(historyLength + relative) *
+                                  channels + channel];
+                    sum += sample *
+                           weightValues[(uint64_t)channel * kernel + tap];
+                }
+                const float conv = sum / (1.0f + std::exp(-sum));
+                outputValues[item] = Qwen4LoadCpu(
+                    gated.cpuData, gated.dataType, item) + conv;
+            }
+        });
+
+        Qwen4ParallelFor(historyLength * channels,
+                         [&](int start, int end) {
+            for (int item = start; item < end; item++) {
+                const int historyIndex = item / channels;
+                const int channel = item % channels;
+                const int sourceToken =
+                    sequence - historyLength + historyIndex;
+                nextHistory[item] = sourceToken >= 0
+                    ? Qwen4LoadCpu(
+                          input.cpuData, input.dataType,
+                          (uint64_t)sourceToken * channels + channel)
+                    : historyValues[
+                          (uint64_t)(historyLength + sourceToken) *
+                              channels + channel];
+            }
+        });
+    }
+
     void CpuQwen4HyperMixOp::Reshape(
             const std::string &opType, const DataDict &datas,
             const FloatDict &floatParams, const IntDict &intParams) {

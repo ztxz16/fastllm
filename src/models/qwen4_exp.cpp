@@ -737,6 +737,61 @@ namespace fastllm {
         GroupedRMSNorm(hyperInput, this->weight[ple + "norm_query.weight"],
                        queryNormed);
 
+        // The ngram lookup above intentionally remains on the host. For a
+        // multi-token CUDA prefill, keep the much larger projection tail on
+        // the device: the legacy path copied key/query/value/normalized to
+        // CPU and the final result back to CUDA (about 880 MiB at 4K).
+        // Single-token decode still uses the legacy implementation until its
+        // convolution history becomes a persistent device cache.
+        if (sequence > 1 &&
+            keyNormed.dataDevice == DataDevice::CUDA &&
+            queryNormed.dataDevice == DataDevice::CUDA &&
+            value.dataDevice == DataDevice::CUDA) {
+            const int channels = this->hcCount * this->embed_dim;
+            const int dilation = this->ngramSize;
+            const int historyLength =
+                (this->pleConvKernel - 1) * dilation;
+            if ((int)state.convHistory.size() != historyLength * channels) {
+                state.convHistory.assign(
+                    (size_t)historyLength * channels, 0.0f);
+            }
+
+            Data gatedData, normalized;
+            fastllm::Qwen4PLEGate(
+                keyNormed, queryNormed, value,
+                this->hcCount, gatedData);
+            GroupedRMSNorm(
+                gatedData, this->weight[ple + "norm_conv.weight"],
+                normalized);
+
+            Data &convWeight = this->weight[ple + "conv1d.weight"];
+            if (convWeight.dataType != DataType::FLOAT32) {
+                convWeight.ToDevice(DataDevice::CPU);
+                ToDataType(convWeight, DataType::FLOAT32);
+            }
+            convWeight.ToDevice(normalized.dataDevice);
+            AssertInFastLLM(
+                convWeight.dims.size() == 3 &&
+                convWeight.dims[0] == channels &&
+                convWeight.dims.back() == this->pleConvKernel,
+                "Qwen4-Exp PLE convolution weight has an invalid shape.");
+
+            Data historyData(
+                DataType::FLOAT32, {historyLength, channels},
+                state.convHistory);
+            historyData.ToDevice(normalized.dataDevice);
+            Data nextHistory;
+            fastllm::Qwen4PLECausalConv(
+                normalized, gatedData, convWeight, historyData,
+                this->pleConvKernel, dilation, output, nextHistory);
+            nextHistory.ToDevice(DataDevice::CPU);
+            std::memcpy(state.convHistory.data(), nextHistory.cpuData,
+                        state.convHistory.size() * sizeof(float));
+            ToDataType(output, hyperInput.dataType);
+            output.ToDevice(hyperInput.dataDevice);
+            return;
+        }
+
         Data keyCpu, queryCpu, valueCpu;
         ToDataType(keyNormed, keyCpu, DataType::FLOAT32);
         ToDataType(queryNormed, queryCpu, DataType::FLOAT32);
