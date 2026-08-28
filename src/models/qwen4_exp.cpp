@@ -345,6 +345,12 @@ namespace fastllm {
                 }
             }
         }
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            if (!this->IsLinearAttentionLayer(layer)) {
+                this->kvCacheId = layer;
+                break;
+            }
+        }
 
         // ple_layer_ids are one-indexed.  The released checkpoint has one PLE
         // at decoder layer 2, i.e. C++ layer index 1.
@@ -2269,6 +2275,7 @@ namespace fastllm {
         Data logits;
         Linear(lastHidden, this->weight["lm_head.weight"], Data(), logits);
         ToDataType(logits, DataType::FLOAT32);
+        ResetLogitsOfEOS(1, &logits, pastKeyValues, generationConfig);
         DumpTensorIfRequested("logits", logits);
 
         if (generationConfig.output_logits && retLogits != nullptr &&
