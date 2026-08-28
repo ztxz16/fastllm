@@ -6129,6 +6129,22 @@ namespace fastllm {
                     int totalExperts = v.size();
                     int k = interDim * 2;
                     int kPer = k / numaConfig->numaCnt;
+                    // GLM-5.3 decode selects eight routed experts.  With one
+                    // NUMA node and 24 workers, 172 gate rows create exactly
+                    // 192 tasks (eight waves), while 152 down rows create 216
+                    // tasks (nine waves).  The defaults leave only 16 workers
+                    // active in their final wave.
+                    if (numaConfig->numaCnt == 1 &&
+                        numaConfig->threads == 24 &&
+                        totalExperts == 8 && inputDim == 4096 &&
+                        interDim == 2048 && outputDim == 4096 &&
+                        kPer == 4096 &&
+                        std::getenv(
+                            "FASTLLM_DSV4_DISABLE_NUMAS_MOE_T24_BALANCED_ROWS") ==
+                            nullptr) {
+                        gateRowsPerTask = 172;
+                        downRowsPerTask = 152;
+                    }
                     // With one NUMA node and 30 workers, six routed experts
                     // use 210 down tasks.  These are exactly seven full worker
                     // waves, avoiding the decode tail left by the two-NUMA

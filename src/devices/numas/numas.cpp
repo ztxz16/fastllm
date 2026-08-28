@@ -1,9 +1,92 @@
 #include "numas.h"
+#include <fstream>
+#include <map>
+#include <string>
+#include <vector>
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
+    static bool ReadSysfsInt(const std::string &path, int &value) {
+        std::ifstream input(path);
+        input >> value;
+        return !input.fail();
+    }
+
+    static std::vector<int> SpreadCpusAcrossLastLevelCaches(
+            const std::vector<int> &cpuIds) {
+        struct CoreGroup {
+            std::vector<int> cpuIds;
+        };
+        struct CacheGroup {
+            std::vector<CoreGroup> cores;
+            std::map<int, int> coreToIndex;
+        };
+
+        std::vector<CacheGroup> caches;
+        std::map<int, int> cacheToIndex;
+        for (int cpuId : cpuIds) {
+            const std::string cpuPath =
+                "/sys/devices/system/cpu/cpu" + std::to_string(cpuId);
+            int cacheId = -1;
+            int coreId = -1;
+            if (!ReadSysfsInt(cpuPath + "/cache/index3/id", cacheId) ||
+                !ReadSysfsInt(cpuPath + "/topology/core_id", coreId)) {
+                return cpuIds;
+            }
+
+            auto cacheIt = cacheToIndex.find(cacheId);
+            if (cacheIt == cacheToIndex.end()) {
+                int cacheIndex = (int)caches.size();
+                cacheToIndex[cacheId] = cacheIndex;
+                caches.emplace_back();
+                cacheIt = cacheToIndex.find(cacheId);
+            }
+            CacheGroup &cache = caches[cacheIt->second];
+            auto coreIt = cache.coreToIndex.find(coreId);
+            if (coreIt == cache.coreToIndex.end()) {
+                int coreIndex = (int)cache.cores.size();
+                cache.coreToIndex[coreId] = coreIndex;
+                cache.cores.emplace_back();
+                coreIt = cache.coreToIndex.find(coreId);
+            }
+            cache.cores[coreIt->second].cpuIds.push_back(cpuId);
+        }
+
+        if (caches.size() <= 1) {
+            return cpuIds;
+        }
+
+        size_t maxCores = 0;
+        size_t maxThreadsPerCore = 0;
+        for (const CacheGroup &cache : caches) {
+            maxCores = std::max(maxCores, cache.cores.size());
+            for (const CoreGroup &core : cache.cores) {
+                maxThreadsPerCore =
+                    std::max(maxThreadsPerCore, core.cpuIds.size());
+            }
+        }
+
+        std::vector<int> spreadCpuIds;
+        spreadCpuIds.reserve(cpuIds.size());
+        // Select one physical core from every LLC before taking the next core
+        // from an already-used LLC.  SMT siblings are considered only after
+        // every physical core has been selected.
+        for (size_t sibling = 0; sibling < maxThreadsPerCore; sibling++) {
+            for (size_t core = 0; core < maxCores; core++) {
+                for (const CacheGroup &cache : caches) {
+                    if (core < cache.cores.size() &&
+                        sibling < cache.cores[core].cpuIds.size()) {
+                        spreadCpuIds.push_back(
+                            cache.cores[core].cpuIds[sibling]);
+                    }
+                }
+            }
+        }
+        return spreadCpuIds.size() == cpuIds.size() ? spreadCpuIds : cpuIds;
+    }
+
     struct NumaDetector {
         bool canUseNuma = true;
 
@@ -302,11 +385,17 @@ namespace fastllm {
         int threadIdx = 0;
 
         for (int i = 0; i < this->numaCnt; i++) {
-            for (int j = 0; j < per && j < machineNumaInfo->cpuIds[i].size(); j++) {
+            std::vector<int> workerCpuIds = machineNumaInfo->cpuIds[i];
+            if (std::getenv("FASTLLM_NUMAS_DISABLE_LLC_SPREAD") == nullptr) {
+                workerCpuIds = SpreadCpusAcrossLastLevelCaches(workerCpuIds);
+            }
+            for (int j = 0; j < per && j < workerCpuIds.size(); j++) {
                 this->threadIdToNumaDict[threadIdx] = i;
-                this->numaToCpuDict[i].push_back(std::make_pair(threadIdx++, machineNumaInfo->cpuIds[i][j]));
+                this->numaToCpuDict[i].push_back(
+                    std::make_pair(threadIdx++, workerCpuIds[j]));
                 
-                printf("threadIdx: %d, use cpu %d, bind to numa %d\n", threadIdx - 1, machineNumaInfo->cpuIds[i][j], i);
+                printf("threadIdx: %d, use cpu %d, bind to numa %d\n",
+                       threadIdx - 1, workerCpuIds[j], i);
             }
         }
 
