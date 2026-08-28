@@ -20477,6 +20477,39 @@ __global__ void FastllmChunkGatedDeltaRuleBuildQScaledChunkKernel(
     }
 }
 
+// Qwen4's float32 prefill needs both scaled Q and transposed/scaled K before
+// the recurrent GEMMs.  They read the same cumulative-decay row, so produce
+// them together without changing any GEMM or state-update arithmetic.
+template <typename T>
+__global__ void FastllmChunkGatedDeltaRuleBuildQKScaledChunkKernel(
+    const T *q, const T *k, const T *g,
+    T *qScaled, T *kScaledTrans, float *gLastExp,
+    int chunks, int ci, int chunkSize, int kdim, size_t total) {
+    const size_t index =
+        (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= total) {
+        return;
+    }
+    const size_t inner = (size_t)chunkSize * kdim;
+    const size_t bh = index / inner;
+    const size_t remainder = index % inner;
+    const int token = (int)(remainder / kdim);
+    const int kd = (int)(remainder % kdim);
+    const size_t gBase = (bh * chunks + ci) * chunkSize;
+    const float decay = FastllmCudaValueToFloat(g[gBase + token]);
+    const float last =
+        FastllmCudaValueToFloat(g[gBase + chunkSize - 1]);
+    const size_t source = gBase * kdim + (size_t)token * kdim + kd;
+    qScaled[index] = FastllmCudaFloatToValue<T>(
+        FastllmCudaValueToFloat(q[source]) * expf(decay));
+    kScaledTrans[bh * inner + (size_t)kd * chunkSize + token] =
+        FastllmCudaFloatToValue<T>(
+            FastllmCudaValueToFloat(k[source]) * expf(last - decay));
+    if (remainder == 0) {
+        gLastExp[bh] = expf(last);
+    }
+}
+
 template <typename T>
 __global__ void FastllmChunkGatedDeltaRuleBuildChunkScaleKernel(
     const T *g, float *gScale, float *gLastExp,
@@ -21289,6 +21322,11 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     long long attnChunkStride = (long long)chunk_size * chunk_size;
     bool useBatchedGemm = q.dataType == fastllm::DataType::FLOAT32 ||
                           q.dataType == fastllm::DataType::FLOAT16;
+    const bool combineQKScale =
+        q.dataType == fastllm::DataType::FLOAT32 &&
+        k.dataType == fastllm::DataType::FLOAT32 &&
+        g.dataType == fastllm::DataType::FLOAT32 &&
+        chunk_size == 64 && kdim == 128 && vdim == 128;
 
     size_t hElems = (size_t)batch * heads * chunks * kdim * vdim;
     size_t vNewElems = useBatchedGemm ? (size_t)bhCount * vChunkStride
@@ -21315,7 +21353,10 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         size_t kScaledTransElems = (size_t)bhCount * kdim * chunk_size;
         qScaledData = FastllmCudaMalloc(qScaledElems * unitBytes);
         kScaledTransData = FastllmCudaMalloc(kScaledTransElems * unitBytes);
-        gScaleData = (float*)FastllmCudaMalloc((size_t)bhCount * chunk_size * sizeof(float));
+        if (!combineQKScale) {
+            gScaleData = (float*)FastllmCudaMalloc(
+                (size_t)bhCount * chunk_size * sizeof(float));
+        }
         gLastExpData = (float*)FastllmCudaMalloc((size_t)bhCount * sizeof(float));
 
         const int threads = 256;
@@ -21330,7 +21371,14 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
             uint8_t *attnSlice = (uint8_t*)attnData + (size_t)ci * attnChunkStride * unitBytes;
             uint8_t *outSlice = (uint8_t*)outData + (size_t)ci * vChunkStride * unitBytes;
 
-            if (q.dataType == fastllm::DataType::FLOAT32) {
+            if (combineQKScale) {
+                FastllmChunkGatedDeltaRuleBuildQKScaledChunkKernel<float>
+                    <<<qScaleBlocks, threads>>>(
+                        (const float*)qData, (const float*)kData,
+                        (const float*)gData, (float*)qScaledData,
+                        (float*)kScaledTransData, gLastExpData,
+                        chunks, ci, chunk_size, kdim, qScaledElems);
+            } else if (q.dataType == fastllm::DataType::FLOAT32) {
                 FastllmChunkGatedDeltaRuleBuildQScaledChunkKernel<float><<<qScaleBlocks, threads>>>(
                     (float*)qData, (float*)gData, (float*)qScaledData,
                     chunks, ci, chunk_size, kdim, qScaledElems);
@@ -21364,7 +21412,12 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
                 (long long)chunks * attnChunkStride, vChunkStride, outStride,
                 1.0f, 1.0f);
 
-            if (q.dataType == fastllm::DataType::FLOAT32) {
+            if (combineQKScale) {
+                FastllmChunkGatedDeltaRuleScaleStateKernel<float>
+                    <<<stateScaleBlocks, threads>>>(
+                        (float*)stateData, gLastExpData,
+                        (int)stateStride, stateElems);
+            } else if (q.dataType == fastllm::DataType::FLOAT32) {
                 FastllmChunkGatedDeltaRuleBuildChunkScaleKernel<float><<<chunkScaleBlocks, threads>>>(
                     (float*)gData, gScaleData, gLastExpData, (int)bhCount, chunks, chunk_size, ci);
                 FastllmChunkGatedDeltaRuleScaleStateKernel<float><<<stateScaleBlocks, threads>>>(

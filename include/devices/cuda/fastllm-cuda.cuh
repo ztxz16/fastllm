@@ -591,6 +591,10 @@ bool FastllmCudaCausalDepthwiseConv1DDecode(
         const fastllm::Data &input, const fastllm::Data &weight,
         fastllm::Data &state, fastllm::Data &output,
         int kernel, bool silu, bool initializeState);
+bool FastllmCudaCausalDepthwiseConv1DPrefill(
+        const fastllm::Data &input, const fastllm::Data &weight,
+        fastllm::Data &state, fastllm::Data &output,
+        int kernel, bool silu, bool initializeState);
 bool FastllmCudaQwen4GatedDeltaRuleDecode(
         const fastllm::Data &qkv, const fastllm::Data &alpha,
         const fastllm::Data &beta,

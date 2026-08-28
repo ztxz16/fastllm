@@ -952,6 +952,14 @@ namespace fastllm {
                                      Data &state, int kernel, bool silu,
                                      Data &output);
 
+    // Multi-token causal depthwise convolution in token-major layout.
+    // input is [batch, sequence, channels], the float32 state is
+    // [batch, channels, kernel] and is updated in place, and output is
+    // float32 with the same shape as input.
+    void CausalDepthwiseConv1DPrefill(const Data &input, const Data &weight,
+                                      Data &state, int kernel, bool silu,
+                                      Data &output);
+
     void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output);
 
     void Embedding(const Data &input, Data &weight, Data &output);

@@ -464,6 +464,69 @@ namespace {
     }
 
     template <typename T>
+    __global__ void CausalDepthwiseConv1DPrefillKernel(
+            const T *input, const float *weight, const float *state,
+            float *output, uint64_t total, int sequence, int channels,
+            int kernel, bool silu) {
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int channel = (int)(item % channels);
+            const uint64_t row = item / channels;
+            const int token = (int)(row % sequence);
+            const int batch = (int)(row / sequence);
+            const float *weightRow = weight + (uint64_t)channel * kernel;
+            const float *stateRow = state +
+                ((uint64_t)batch * channels + channel) * kernel;
+            float value = 0.0f;
+            for (int tap = 0; tap < kernel; tap++) {
+                const int sourceToken = token - kernel + 1 + tap;
+                const float sample = sourceToken >= 0
+                    ? Qwen4CudaToFloat(input[
+                          ((uint64_t)batch * sequence + sourceToken) *
+                              channels + channel])
+                    : stateRow[kernel + sourceToken];
+                value += sample * weightRow[tap];
+            }
+            if (silu) {
+                // Keep bitwise parity with FastllmSiluKernel(float).
+                value = value / (1.0 + expf(-value));
+            }
+            output[item] = value;
+        }
+    }
+
+    template <typename T>
+    __global__ void CausalDepthwiseConv1DPrefillStateKernel(
+            const T *input, float *state,
+            int total, int sequence, int channels, int kernel) {
+        const int item = blockIdx.x * blockDim.x + threadIdx.x;
+        if (item >= total) {
+            return;
+        }
+        const int batch = item / channels;
+        const int channel = item % channels;
+        float *stateRow = state + (uint64_t)item * kernel;
+        if (sequence >= kernel) {
+            for (int slot = 0; slot < kernel; slot++) {
+                stateRow[slot] = Qwen4CudaToFloat(input[
+                    ((uint64_t)batch * sequence + sequence - kernel + slot) *
+                        channels + channel]);
+            }
+        } else {
+            for (int slot = 0; slot < kernel - sequence; slot++) {
+                stateRow[slot] = stateRow[slot + sequence];
+            }
+            for (int token = 0; token < sequence; token++) {
+                stateRow[kernel - sequence + token] =
+                    Qwen4CudaToFloat(input[
+                        ((uint64_t)batch * sequence + token) * channels +
+                            channel]);
+            }
+        }
+    }
+
+    template <typename T>
     __global__ __launch_bounds__(128) void Qwen4GatedDeltaRuleDecodeKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
@@ -1602,6 +1665,78 @@ bool FastllmCudaCausalDepthwiseConv1DDecode(
         input.cudaData, (int)input.dataType, (const float*)weight.cudaData,
         (float*)state.cudaData, (float*)output.cudaData,
         total, channels, kernel, silu);
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaCausalDepthwiseConv1DPrefill(
+        const fastllm::Data &input, const fastllm::Data &weight,
+        fastllm::Data &state, fastllm::Data &output,
+        int kernel, bool silu, bool initializeState) {
+    const int batch = input.dims.empty() ? 0 : input.dims[0];
+    const int sequence = input.dims.size() == 3 ? input.dims[1] : 0;
+    const int channels = input.dims.size() == 3 ? input.dims[2] : 0;
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        state.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || weight.cudaData == nullptr ||
+        state.cudaData == nullptr || output.cudaData == nullptr ||
+        !Qwen4CudaActivationType(input.dataType) ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        state.dataType != fastllm::DataType::FLOAT32 ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        batch <= 0 || sequence <= 0 || channels <= 0 || kernel <= 0 ||
+        input.dims.size() != 3 ||
+        weight.Count(0) != (uint64_t)channels * kernel ||
+        state.dims != std::vector<int>({batch, channels, kernel}) ||
+        output.dims != input.dims) {
+        return false;
+    }
+    if (initializeState) {
+        FastllmCudaMemset0(state.cudaData, state.GetBytes());
+    }
+    constexpr int threads = 256;
+    const uint64_t outputCount = (uint64_t)batch * sequence * channels;
+    const int outputBlocks = std::min<uint64_t>(
+        65535, (outputCount + threads - 1) / threads);
+    const int stateItems = batch * channels;
+    const int stateBlocks = (stateItems + threads - 1) / threads;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        CausalDepthwiseConv1DPrefillKernel<<<
+            outputBlocks, threads, 0, cudaStreamPerThread>>>(
+                (const float*)input.cudaData,
+                (const float*)weight.cudaData,
+                (const float*)state.cudaData, (float*)output.cudaData,
+                outputCount, sequence, channels, kernel, silu);
+        CausalDepthwiseConv1DPrefillStateKernel<<<
+            stateBlocks, threads, 0, cudaStreamPerThread>>>(
+                (const float*)input.cudaData, (float*)state.cudaData,
+                stateItems, sequence, channels, kernel);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        CausalDepthwiseConv1DPrefillKernel<<<
+            outputBlocks, threads, 0, cudaStreamPerThread>>>(
+                (const half*)input.cudaData,
+                (const float*)weight.cudaData,
+                (const float*)state.cudaData, (float*)output.cudaData,
+                outputCount, sequence, channels, kernel, silu);
+        CausalDepthwiseConv1DPrefillStateKernel<<<
+            stateBlocks, threads, 0, cudaStreamPerThread>>>(
+                (const half*)input.cudaData, (float*)state.cudaData,
+                stateItems, sequence, channels, kernel);
+    } else {
+        CausalDepthwiseConv1DPrefillKernel<<<
+            outputBlocks, threads, 0, cudaStreamPerThread>>>(
+                (const __nv_bfloat16*)input.cudaData,
+                (const float*)weight.cudaData,
+                (const float*)state.cudaData, (float*)output.cudaData,
+                outputCount, sequence, channels, kernel, silu);
+        CausalDepthwiseConv1DPrefillStateKernel<<<
+            stateBlocks, threads, 0, cudaStreamPerThread>>>(
+                (const __nv_bfloat16*)input.cudaData,
+                (float*)state.cudaData,
+                stateItems, sequence, channels, kernel);
+    }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }

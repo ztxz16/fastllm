@@ -1506,8 +1506,6 @@ namespace fastllm {
         }
 
         qkv.Reshape({batch, sequence, -1});
-        PermuteSelf(qkv, {0, 2, 1});
-        const bool hadConvState = !pastConv.dims.empty();
         pastConv.isKVCache = true;
         pastConv.isLinearAttention = true;
         pastRecurrent.isKVCache = true;
@@ -1528,50 +1526,19 @@ namespace fastllm {
 
         Data currentConvolved;
         if (fusedDecode) {
+            PermuteSelf(qkv, {0, 2, 1});
             fastllm::CausalDepthwiseConv1DDecode(
                 qkv, this->weight[linear + "conv1d.weight"],
                 pastConv, this->linearConvKernel, true, currentConvolved);
             pastConv.expansionDims = pastConv.dims;
         } else {
-            Data convInput;
-            if (hadConvState) {
-                Cat(pastConv, qkv, -1, convInput);
-            } else {
-                convInput.CopyFrom(qkv);
-            }
-
-            // update_conv_state(..., kernel_size=4) keeps exactly the four most
-            // recent raw Q/K/V values and left-pads an initial short prompt.
-            if (convInput.dims.back() >= this->linearConvKernel) {
-                Split(convInput, -1,
-                      convInput.dims.back() - this->linearConvKernel,
-                      convInput.dims.back(), pastConv);
-            } else {
-                Data zeros(DataType::FLOAT32,
-                           {convInput.dims[0], convInput.dims[1],
-                            this->linearConvKernel - convInput.dims.back()});
-                zeros.ToDevice(convInput.dataDevice);
-                zeros.Allocate(0.0f);
-                Cat(zeros, convInput, -1, pastConv);
-            }
+            // Keep Q/K/V token-major during prefill.  The standard fused op is
+            // mathematically identical to the old permute + Cat + Conv1D +
+            // Split + SiLU chain and updates the four-value history in place.
+            fastllm::CausalDepthwiseConv1DPrefill(
+                qkv, this->weight[linear + "conv1d.weight"],
+                pastConv, this->linearConvKernel, true, currentConvolved);
             pastConv.expansionDims = pastConv.dims;
-
-            Data convolved, emptyConvBias;
-            Conv1DPerChannel(convInput,
-                             this->weight[linear + "conv1d.weight"],
-                             emptyConvBias, convInput.dims[1],
-                             this->weight[linear + "conv1d.weight"].dims[0],
-                             this->linearConvKernel, 1,
-                             hadConvState ? 0 : this->linearConvKernel - 1,
-                             convolved);
-            if (hadConvState) {
-                Split(convolved, -1, convolved.dims.back() - sequence,
-                      convolved.dims.back(), currentConvolved);
-            } else {
-                Split(convolved, -1, 0, sequence, currentConvolved);
-            }
-            Silu(currentConvolved, currentConvolved);
-            PermuteSelf(currentConvolved, {0, 2, 1});
         }
 
         if (pastRecurrent.dims.empty()) {

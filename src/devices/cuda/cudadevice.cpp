@@ -4059,6 +4059,7 @@ namespace fastllm {
         this->ops["Qwen4QSABuildMask"] = (BaseOperator*)(new CudaQwen4QSABuildMaskOp());
         this->ops["Qwen4SparseAttention"] = (BaseOperator*)(new CudaQwen4SparseAttentionOp());
         this->ops["CausalDepthwiseConv1DDecode"] = (BaseOperator*)(new CudaCausalDepthwiseConv1DDecodeOp());
+        this->ops["CausalDepthwiseConv1DPrefill"] = (BaseOperator*)(new CudaCausalDepthwiseConv1DPrefillOp());
         this->ops["GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
         this->ops["Qwen4GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
         this->ops["KimiK3RMSNorm"] =
@@ -4952,6 +4953,48 @@ namespace fastllm {
                 kernel, silu, initializeState)) {
             ErrorInFastLLM(
                 "CausalDepthwiseConv1DDecode CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaCausalDepthwiseConv1DPrefillOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        const int kernel = intParams.find("kernel")->second;
+        if (!CudaQwen4ActivationType(input.dataType) ||
+            weight.dataType != DataType::FLOAT32 ||
+            state.dataType != DataType::FLOAT32 || kernel <= 0 ||
+            input.dims.size() != 3 || input.dims[1] <= 0) {
+            return false;
+        }
+        const int batch = input.dims[0];
+        const int channels = input.dims[2];
+        return batch > 0 && channels > 0 &&
+               weight.Count(0) == (uint64_t)channels * kernel &&
+               (state.dims.empty() ||
+                state.dims == std::vector<int>({batch, channels, kernel}));
+    }
+
+    void CudaCausalDepthwiseConv1DPrefillOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        const int kernel = intParams.find("kernel")->second;
+        auto siluIt = intParams.find("silu");
+        const bool silu = siluIt != intParams.end() && siluIt->second != 0;
+        const bool initializeState = state.cudaData == nullptr;
+        state.Allocate(false);
+        output.Allocate(false);
+        if (!FastllmCudaCausalDepthwiseConv1DPrefill(
+                input, weight, state, output,
+                kernel, silu, initializeState)) {
+            ErrorInFastLLM(
+                "CausalDepthwiseConv1DPrefill CUDA error: kernel rejected input.\n");
         }
     }
 
