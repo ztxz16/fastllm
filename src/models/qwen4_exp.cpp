@@ -429,6 +429,23 @@ namespace fastllm {
     Qwen4ExpModel::GetTensorMap(const std::vector<std::string> &tensorNames) {
         std::map<std::string, std::vector<std::pair<std::string, DataType>>> result;
         std::vector<std::string> ordinary;
+        const bool compactNvfp4Experts = std::any_of(
+            tensorNames.begin(), tensorNames.end(), [](const std::string &name) {
+                if (name.find(".mlp.experts.") == std::string::npos) {
+                    return false;
+                }
+                // Scalar safetensors (including weight_scale_2) are omitted
+                // from GetSortedItemNames().  The planar block-scale tensor is
+                // non-scalar and therefore is the reliable model-map marker.
+                return Qwen4EndsWith(name, ".weight_scale") ||
+                       Qwen4EndsWith(name, ".weight_scale_2");
+            });
+        const bool scaledFp8Ple = std::any_of(
+            tensorNames.begin(), tensorNames.end(), [](const std::string &name) {
+                return name.find(
+                    "ple_embedding.ngram_embedding.weight_scale") !=
+                    std::string::npos;
+            });
         for (const std::string &name : tensorNames) {
             if (name != "lm_head.weight" && !Qwen4StartsWith(name, languagePrefix)) {
                 // The model directory also contains vision and MTP tensors.
@@ -442,9 +459,15 @@ namespace fastllm {
             }
             if (name.find("ple_embedding.ngram_embedding.shard_") != std::string::npos &&
                 Qwen4EndsWith(name, ".weight")) {
-                // Preserve the unscaled E4M3 payload; RunPLE applies the common
-                // checkpoint scalar after gathering only the selected rows.
-                result[name].push_back({name, DataType::FP8_E4M3});
+                // Older Qwen4-Exp checkpoints store an unscaled E4M3 payload
+                // plus one common scalar.  Official Qwen3.8-Flash-Next NVFP4
+                // checkpoints instead keep the large CPU-offloaded PLE table
+                // in BF16 and omit that scalar.  Preserve either source
+                // representation so the table is neither expanded nor
+                // requantized while loading.
+                result[name].push_back({
+                    name,
+                    scaledFp8Ple ? DataType::FP8_E4M3 : DataType::BFLOAT16});
                 continue;
             }
             if (name.find("ple_embedding.ngram_embedding.weight_scale") != std::string::npos) {
@@ -454,6 +477,17 @@ namespace fastllm {
             ordinary.push_back(name);
         }
         auto mapped = basellm::GetTensorMap(ordinary);
+        if (compactNvfp4Experts) {
+            for (auto &source : mapped) {
+                for (auto &target : source.second) {
+                    if (this->moeLinears.find(target.first) !=
+                        this->moeLinears.end()) {
+                        target.second =
+                            DataType::NVFP4_BLOCK_16_E4M3;
+                    }
+                }
+            }
+        }
         result.insert(mapped.begin(), mapped.end());
         return result;
     }
@@ -580,17 +614,26 @@ namespace fastllm {
         const std::string embeddingPrefix = ple +
             "ple_embedding.ngram_embedding.";
         Data &firstShard = this->weight[embeddingPrefix + "shard_0.weight"];
-        AssertInFastLLM(firstShard.dataType == DataType::FP8_E4M3 &&
+        const bool fp8Embedding = firstShard.dataType == DataType::FP8_E4M3;
+        const bool bf16Embedding = firstShard.dataType == DataType::BFLOAT16;
+        AssertInFastLLM((fp8Embedding || bf16Embedding) &&
                         firstShard.dims.size() == 2 &&
                         firstShard.dims[1] == this->ngramHeadDim,
                         "Qwen4-Exp PLE shard has an unexpected dtype or shape.");
         const int64_t rowsPerShard = firstShard.dims[0];
 
-        Data &scaleWeight = this->weight[embeddingPrefix + "weight_scale"];
-        scaleWeight.ToDevice(DataDevice::CPU);
-        ToDataType(scaleWeight, DataType::FLOAT32);
-        const float embeddingScale =
-            reinterpret_cast<const float *>(scaleWeight.cpuData)[0];
+        float embeddingScale = 1.0f;
+        if (fp8Embedding) {
+            const std::string scaleName = embeddingPrefix + "weight_scale";
+            auto scaleIt = this->weight.weight.find(scaleName);
+            AssertInFastLLM(scaleIt != this->weight.weight.end(),
+                            "Qwen4-Exp FP8 PLE shard is missing weight_scale.");
+            Data &scaleWeight = scaleIt->second;
+            scaleWeight.ToDevice(DataDevice::CPU);
+            ToDataType(scaleWeight, DataType::FLOAT32);
+            embeddingScale =
+                reinterpret_cast<const float *>(scaleWeight.cpuData)[0];
+        }
         static const FP8E4M3ToFP32Manager fp8Decoder;
 
         std::vector<float> embeddings((size_t)batch * sequence * this->pleEmbedDim);
@@ -628,14 +671,24 @@ namespace fastllm {
                                                std::to_string(shardIndex) +
                                                ".weight"];
                     shard.ToDevice(DataDevice::CPU);
-                    const uint8_t *source = shard.cpuData +
-                        (size_t)shardRow * this->ngramHeadDim;
                     float *destination = embeddings.data() +
                         ((size_t)tokenIndex * this->ngramHeads + head) *
                         this->ngramHeadDim;
-                    for (int column = 0; column < this->ngramHeadDim; column++) {
-                        destination[column] =
-                            fp8Decoder.dict[source[column]] * embeddingScale;
+                    if (fp8Embedding) {
+                        const uint8_t *source = shard.cpuData +
+                            (size_t)shardRow * this->ngramHeadDim;
+                        for (int column = 0; column < this->ngramHeadDim; column++) {
+                            destination[column] =
+                                fp8Decoder.dict[source[column]] * embeddingScale;
+                        }
+                    } else {
+                        const uint16_t *source =
+                            reinterpret_cast<const uint16_t *>(shard.cpuData) +
+                            (size_t)shardRow * this->ngramHeadDim;
+                        for (int column = 0; column < this->ngramHeadDim; column++) {
+                            destination[column] =
+                                BFloat16BitsToFloat32(source[column]);
+                        }
                     }
                 }
             }

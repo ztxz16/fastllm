@@ -458,6 +458,7 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "GlmMoeDsaForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen4ExpForConditionalGeneration",
+        "Qwen3_8FlashNextForConditionalGeneration",
         "MiniMaxM2ForCausalLM",
         "HYV3ForCausalLM",
         "LagunaForCausalLM",
@@ -467,8 +468,10 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
     ] or model_type in [
         "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
         "kimi_k3", "dots3_note", "glm5_next", "glm5_next_text", "qwen4_exp",
+        "qwen3_8_flash_next",
     ] or text_model_type in [
         "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
+        "qwen3_8_flash_next_text",
     ])
 
 def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
@@ -757,6 +760,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
     is_qwen35_model = False
+    is_qwen38_flash_next_model = False
     is_dots3_note_model = False
     if (os.path.exists(config_path)):
         try:
@@ -779,6 +783,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 ) or
                 model_type in ("qwen3_5", "qwen3_5_moe") or
                 text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
+            )
+            is_qwen38_flash_next_model = (
+                architecture == "Qwen3_8FlashNextForConditionalGeneration" or
+                model_type == "qwen3_8_flash_next" or
+                text_model_type == "qwen3_8_flash_next_text"
             )
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
@@ -850,7 +859,9 @@ def make_normal_llm_model(args, startup_progress = None):
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
                 architecture == 'Qwen4ExpForConditionalGeneration' or
-                model_type == 'qwen4_exp' or text_model_type == 'qwen4_exp_text' or
+                architecture == 'Qwen3_8FlashNextForConditionalGeneration' or
+                model_type in ('qwen4_exp', 'qwen3_8_flash_next') or
+                text_model_type in ('qwen4_exp_text', 'qwen3_8_flash_next_text') or
                 architecture == 'Glm4MoeForCausalLM' or architecture == 'GlmMoeDsaForCausalLM' or
                 architecture == 'Glm5NextForConditionalGeneration' or
                 architecture == 'HYV3ForCausalLM' or model_type == 'glm_moe_dsa' or
@@ -953,6 +964,16 @@ def make_normal_llm_model(args, startup_progress = None):
             args.cuda_slab = (96 if is_laguna_hybrid_tp_model and
                               _thread_tp_cuda_device_count(args.tp) == 4
                               else 256)
+    if (is_qwen38_flash_next_model and args.cuda_slab <= 0 and
+            _uses_cuda_device(args.device) and
+            (args.moe_device_layers >= 0 or
+             _uses_cuda_device(args.moe_device))):
+        # ModelOpt NVFP4 expands each 16-value expert block to twelve bytes.
+        # One Qwen3.8 expert therefore uses 2.34375 MiB for merged gate-up and
+        # 1.171875 MiB for down.  A 225 MiB slab packs 64 experts exactly and
+        # avoids CUDA page/allocation overhead from tens of thousands of tiny
+        # expert tensors.
+        args.cuda_slab = 225
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"

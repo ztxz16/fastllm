@@ -8168,6 +8168,73 @@ namespace fastllm {
         return success;
     }
 
+    static bool CudaNvfp4E4M3MoeCompactFallbackUnavailable(
+            Data **weights, int weightsBatch) {
+        if (weights == nullptr || weightsBatch < 4) {
+            return false;
+        }
+        for (int slot = 2; slot < weightsBatch; ++slot) {
+            Data *weight = weights[slot];
+            if (weight != nullptr &&
+                weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 &&
+                weight->cudaData == nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[noreturn]] static void FailCudaNvfp4E4M3MoeAfterRepack(
+            const char *stage) {
+        std::string message =
+            "NVFP4 E4M3 grouped-Marlin " + std::string(stage) +
+            " failed after the compact expert weights were released; "
+            "the source-layout fallback is unavailable.";
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(message);
+    }
+
+    static bool TryCudaMergeMOENVFP4E4M3MarlinIndexed(
+            const Data &input, Data &output, const Data &index,
+            const Data &score, int batch, int topk, Data &gateOutput,
+            Data &activation, Data **weights, int weightsBatch,
+            MoeGateType gateType) {
+        bool hasCandidate =
+            weights != nullptr && weightsBatch >= 4 &&
+            weights[2] != nullptr &&
+            weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3;
+        if (gateType != MoeGateSwiglu ||
+            (input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::FLOAT32) ||
+            input.dataDevice != DataDevice::CUDA ||
+            input.dims.size() != 2 || input.dims[0] != batch ||
+            batch <= 0 || topk <= 0 || topk > 16 ||
+            index.dataDevice != DataDevice::CUDA ||
+            index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA ||
+            score.dataType != DataType::FLOAT32 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            !hasCandidate) {
+            if (hasCandidate &&
+                CudaNvfp4E4M3MoeCompactFallbackUnavailable(
+                    weights, weightsBatch)) {
+                FailCudaNvfp4E4M3MoeAfterRepack(
+                    "received an incompatible invocation");
+            }
+            return false;
+        }
+        bool success = FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
+            input, gateOutput, activation, output, weights, weightsBatch,
+            (const int32_t *)index.cudaData, (const float *)score.cudaData,
+            batch, topk);
+        if (!success &&
+            CudaNvfp4E4M3MoeCompactFallbackUnavailable(
+                weights, weightsBatch)) {
+            FailCudaNvfp4E4M3MoeAfterRepack("execution");
+        }
+        return success;
+    }
+
     static bool TryCudaMergeMOEBatch1Fp8(
         Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
         Data &w1, Data **weights, float sharedScale, MoeGateType gateType) {
@@ -8627,6 +8694,11 @@ namespace fastllm {
             int batch = input.dims[0];
 
             int marlinTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
+            if (TryCudaMergeMOENVFP4E4M3MarlinIndexed(
+                    input, output, index, score, batch, marlinTopk,
+                    w1, w2, weights, weightsBatch, gateType)) {
+                return;
+            }
             if (TryCudaMergeMOEInt4GroupMarlinIndexed(
                     input, output, index, score, batch, marlinTopk, w1, w2,
                     weights, weightsBatch, gateType)) {

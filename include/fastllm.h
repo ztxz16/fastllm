@@ -330,6 +330,10 @@ namespace fastllm {
         // Internal NUMA layout for NVFP4 blockM=32 weights:
         // [16 packed fp4 bytes] [one inline E8M0 scale byte].
         NVFP4_BLOCK_32_E8M0 = 1009,
+        // Compact, lossless safetensors NVFP4 layout. Packed E2M1 weights are
+        // followed by planar raw E4M3 block-16 scales. Tensor-level dequant
+        // multipliers are retained in Data::scales.
+        NVFP4_BLOCK_16_E4M3 = 1010,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -507,6 +511,11 @@ namespace fastllm {
         std::vector <float> scales, mins;
         std::vector <int> zeros;
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
+        // Lazily materialized effective FP32 block scales for the compact
+        // E4M3 NVFP4 CPU path. CUDA keeps using the raw one-byte scales. The
+        // vector belongs to the weight so queued worker tasks retain a stable
+        // data pointer until they finish.
+        std::vector <float> cpuNVFP4Scales;
 
         std::vector <uint16_t> halfScales; // 某些量化方式使用float16的scales
 

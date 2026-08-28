@@ -10,6 +10,7 @@
 #include <cfloat>
 #include <cmath>
 #include <algorithm>
+#include <mutex>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -1003,6 +1004,51 @@ namespace fastllm {
         return scales != nullptr ? scales[idx] : NVFP4E8M0ScaleToFloat(scaleBytes[idx]);
     }
 
+    static void PrepareNVFP4LinearScales(
+            Data &weight, int outputRows, int inputColumns,
+            float *&scaleFloats, uint8_t *&scaleBytes) {
+        scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
+        scaleBytes = GetNVFP4ScaleData(weight);
+        if (weight.dataType != DataType::NVFP4_BLOCK_16_E4M3) {
+            return;
+        }
+        AssertInFastLLM(weight.blockK > 0 && weight.blockM > 0 &&
+                        scaleBytes != nullptr && !weight.scales.empty(),
+                        "Compact E4M3 NVFP4 CPU linear has invalid scale metadata.");
+        const int scaleRows =
+            (outputRows + weight.blockK - 1) / weight.blockK;
+        const int scaleColumns =
+            (inputColumns + weight.blockM - 1) / weight.blockM;
+        const size_t scaleCount = (size_t)scaleRows * scaleColumns;
+
+        // Expert linears may be enqueued concurrently. Serialize only the
+        // first lazy expansion; later calls observe an immutable vector.
+        static std::mutex compactScaleMutex;
+        {
+            std::lock_guard<std::mutex> lock(compactScaleMutex);
+            if (weight.cpuNVFP4Scales.size() != scaleCount) {
+                weight.cpuNVFP4Scales.resize(scaleCount);
+                const int globalCount = (int)weight.scales.size();
+                for (int scaleRow = 0; scaleRow < scaleRows; ++scaleRow) {
+                    const int globalIndex = std::min(
+                        globalCount - 1,
+                        (int)((long long)scaleRow * globalCount / scaleRows));
+                    const float globalScale = weight.scales[globalIndex];
+                    const size_t rowOffset =
+                        (size_t)scaleRow * scaleColumns;
+                    for (int scaleColumn = 0;
+                         scaleColumn < scaleColumns; ++scaleColumn) {
+                        const size_t index = rowOffset + scaleColumn;
+                        weight.cpuNVFP4Scales[index] =
+                            fp8e4m3tofp32.dict[scaleBytes[index]] * globalScale;
+                    }
+                }
+            }
+        }
+        scaleFloats = weight.cpuNVFP4Scales.data();
+        scaleBytes = nullptr;
+    }
+
     static inline uint16_t FloatToBFloat16Trunc(float v) {
         uint32_t bits;
         memcpy(&bits, &v, sizeof(bits));
@@ -1832,8 +1878,10 @@ namespace fastllm {
     void RunLinearBFloat16NVFP4(uint16_t *inputData, Data &weight, float *outputData, float *biasData,
                                 int n, int m, int k,
                                 AliveThreadPool *pool, int startTid, int threadNum) {
-        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
-        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
+        float *scaleFloats = nullptr;
+        uint8_t *scaleBytes = nullptr;
+        PrepareNVFP4LinearScales(
+            weight, k, m, scaleFloats, scaleBytes);
         int ms = (m - 1) / weight.blockM + 1;
         int packedM = (m + 1) / 2;
         if (n > 31) {
@@ -2065,8 +2113,10 @@ namespace fastllm {
     void RunLinearFloat32NVFP4(float *inputData, Data &weight, float *outputData, float *biasData,
                     int n, int m, int k,
                     AliveThreadPool *pool, int startTid, int threadNum) {
-        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
-        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
+        float *scaleFloats = nullptr;
+        uint8_t *scaleBytes = nullptr;
+        PrepareNVFP4LinearScales(
+            weight, k, m, scaleFloats, scaleBytes);
         if (cpuInstructInfo.hasAVX512BF16 || n > 4) {
             std::vector <uint16_t> &bf16Input = fastllmBf16Manager.bf16Input;
             if (bf16Input.size() < n * m) {
@@ -2126,8 +2176,10 @@ namespace fastllm {
     void LaunchLinearFloat32NVFP4(float *inputData, Data &weight, float *outputData, float *biasData,
         int n, int m, int k,
         std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
-        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
-        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
+        float *scaleFloats = nullptr;
+        uint8_t *scaleBytes = nullptr;
+        PrepareNVFP4LinearScales(
+            weight, k, m, scaleFloats, scaleBytes);
         int per = k / threadNum;
         int cur = 0;
         for (int i = 0; i < threadNum; i++) {
@@ -2147,8 +2199,10 @@ namespace fastllm {
     void LaunchLinearBFloat16NVFP4(uint16_t *inputData, Data &weight, float *outputData, float *biasData,
         int n, int m, int k,
         std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
-        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
-        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
+        float *scaleFloats = nullptr;
+        uint8_t *scaleBytes = nullptr;
+        PrepareNVFP4LinearScales(
+            weight, k, m, scaleFloats, scaleBytes);
         int per = k / threadNum;
         int cur = 0;
         for (int i = 0; i < threadNum; i++) {
@@ -2439,8 +2493,10 @@ namespace fastllm {
     void RunLinearFloat16NVFP4(uint16_t *inputData, Data &weight, uint16_t *outputData, float *biasData,
         int n, int m, int k,
         AliveThreadPool *pool, int startTid, int threadNum) {
-        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
-        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
+        float *scaleFloats = nullptr;
+        uint8_t *scaleBytes = nullptr;
+        PrepareNVFP4LinearScales(
+            weight, k, m, scaleFloats, scaleBytes);
         std::vector <float> floatOutput;
         floatOutput.resize(n * k);
 

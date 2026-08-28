@@ -19,11 +19,13 @@
 #include "fastllm-cuda.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -96,6 +98,34 @@ static MarlinMoeKernelFn GetAwqMarlinMoeKernel(bool gate, bool smallBatch,
         marlin_types::kFloat16.id(), marlin_types::kU4.id(),
         marlin_types::kFloat16.id(), marlin_types::kFloat16.id(),
         128, 2, 8, 4, false, 4, 2, false>;
+}
+
+static MarlinMoeKernelFn GetNvfp4E4M3MarlinMoeKernel(
+        bool gate, bool smallBatch, int &threads) {
+    if (smallBatch) {
+        threads = 256;
+        return marlin_kernel::Marlin<
+            marlin_types::kFloat16.id(), marlin_types::kFE2M1f.id(),
+            marlin_types::kFloat16.id(), marlin_types::kFE4M3fn.id(),
+            256, 1, 8, 8, true, 4, 1, false>;
+    }
+    if (gate) {
+        threads = 256;
+        return marlin_kernel::Marlin<
+            marlin_types::kFloat16.id(), marlin_types::kFE2M1f.id(),
+            marlin_types::kFloat16.id(), marlin_types::kFE4M3fn.id(),
+            256, 4, 16, 4, false, 4, 1, false>;
+    }
+    threads = 128;
+    return marlin_kernel::Marlin<
+        marlin_types::kFloat16.id(), marlin_types::kFE2M1f.id(),
+        marlin_types::kFloat16.id(), marlin_types::kFE4M3fn.id(),
+        128, 2, 8, 4, false, 4, 1, false>;
+}
+
+static int GetNvfp4E4M3MarlinMoeSharedMemorySize(
+        bool gate, bool smallBatch) {
+    return smallBatch ? 45184 : (gate ? 71680 : 35328);
 }
 
 static int GetAwqMarlinMoeSharedMemorySize(bool gate, bool smallBatch) {
@@ -192,6 +222,35 @@ static bool PrepareAwqMarlinMoeKernels(int device) {
     return true;
 }
 
+static bool PrepareNvfp4E4M3MarlinMoeKernels(int device) {
+    if (!MarlinMoeDeviceSupported(device)) {
+        return false;
+    }
+    int maxSharedMemory = 0;
+    if (cudaDeviceGetAttribute(&maxSharedMemory,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               device) != cudaSuccess ||
+        maxSharedMemory <= 0) {
+        return false;
+    }
+    for (bool smallBatch : {false, true}) {
+        for (bool gate : {true, false}) {
+            int threads = 0;
+            MarlinMoeKernelFn kernel =
+                GetNvfp4E4M3MarlinMoeKernel(gate, smallBatch, threads);
+            int sharedMemory =
+                GetNvfp4E4M3MarlinMoeSharedMemorySize(gate, smallBatch);
+            if (kernel == nullptr || sharedMemory > maxSharedMemory ||
+                cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    sharedMemory) != cudaSuccess) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool LaunchMarlinMoe(
         const void *activation, const void *weight, void *output,
         float *temporaryOutput, const void *scales,
@@ -262,6 +321,43 @@ static bool LaunchAwqMarlinMoe(
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+static bool LaunchNvfp4E4M3MarlinMoe(
+        bool gate, bool smallBatch, const void *activation,
+        const void *weight, void *output, float *temporaryOutput,
+        const void *scales, const float *globalScale,
+        const int32_t *sortedTokenIds, const int32_t *expertIds,
+        const int32_t *numTokensPadded, const float *topkWeights,
+        int topk, bool multiplyTopkWeights, int rows, int outputColumns,
+        int inputColumns, int *workspace, cudaStream_t stream, int sms) {
+    int threads = 0;
+    MarlinMoeKernelFn kernel =
+        GetNvfp4E4M3MarlinMoeKernel(gate, smallBatch, threads);
+    if (kernel == nullptr || activation == nullptr || weight == nullptr ||
+        output == nullptr || temporaryOutput == nullptr || scales == nullptr ||
+        globalScale == nullptr || sortedTokenIds == nullptr ||
+        expertIds == nullptr || numTokensPadded == nullptr ||
+        topkWeights == nullptr || workspace == nullptr || rows <= 0 ||
+        outputColumns <= 0 || inputColumns <= 0 ||
+        inputColumns % 16 != 0 || sms <= 0) {
+        return false;
+    }
+
+    const int blocksPerSm = gate ? 1 : 2;
+    kernel<<<sms * blocksPerSm, threads,
+             GetNvfp4E4M3MarlinMoeSharedMemorySize(gate, smallBatch),
+             stream>>>(
+        reinterpret_cast<const int4 *>(activation),
+        reinterpret_cast<const int4 *>(weight),
+        reinterpret_cast<int4 *>(output),
+        reinterpret_cast<int4 *>(temporaryOutput),
+        nullptr, nullptr, reinterpret_cast<const int4 *>(scales),
+        globalScale, nullptr, nullptr, sortedTokenIds, expertIds,
+        numTokensPadded, topkWeights, topk, multiplyTopkWeights,
+        inputColumns / 16, rows, outputColumns, inputColumns, workspace,
+        false, false, true);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 template <typename T>
 __device__ __forceinline__ float ToFloat(T value);
 
@@ -328,6 +424,43 @@ __global__ void PermuteMxfp4ScalesKernel(const uint8_t *__restrict__ source,
     int group = transposedFlat / outputRows;
     int row = transposedFlat - group * outputRows;
     destination[id] = source[(size_t)row * groups + group];
+}
+
+// Convert planar raw E4M3 block-16 scales into Marlin's special S0E5M3
+// layout. This is the same scale permutation and normalization used by the
+// existing dense NVFP4 Marlin path, but keeps the checkpoint bytes compact
+// until the one-time GPU repack.
+__global__ void BuildNvfp4E4M3MarlinScalesKernel(
+        const uint8_t *__restrict__ source,
+        uint8_t *__restrict__ destination,
+        int outputRows, int groups, int globalCount,
+        float global0, float global1, float commonGlobal) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = outputRows * groups;
+    if (id >= count) {
+        return;
+    }
+
+    constexpr int processPerm[4] = {0, 2, 1, 3};
+    int block = id & ~63;
+    int position = id & 63;
+    int afterProcess = (position & ~3) + processPerm[position & 3];
+    int scaleSource = (afterProcess >> 3) + 8 * (afterProcess & 7);
+    int transposedFlat = block + scaleSource;
+    int group = transposedFlat / outputRows;
+    int row = transposedFlat - group * outputRows;
+
+    __nv_fp8_e4m3 rawScale;
+    rawScale.__x = source[(size_t)row * groups + group];
+    float tensorGlobal =
+        globalCount == 2 && row >= outputRows / 2 ? global1 : global0;
+    float effectiveScale = static_cast<float>(rawScale) * tensorGlobal;
+    half normalized = __float2half_rn(effectiveScale / commonGlobal);
+    half shifted = __hmul(normalized, __float2half_rn(128.0f));
+    uint16_t bits = __half_as_ushort(shifted);
+    destination[id] = __half2float(shifted) < 2.0f
+                          ? 0
+                          : static_cast<uint8_t>(bits >> 7);
 }
 
 __global__ void BuildEpMetadataKernel(const int32_t *__restrict__ globalIndices,
@@ -547,6 +680,24 @@ __global__ void SumAwqMoeRowsKernel(const half *__restrict__ rows,
     reinterpret_cast<half2 *>(output)[
         (size_t)token * pairsPerRow + columnPair] = __floats2half2_rn(
             sum.x, sum.y);
+}
+
+__global__ void SumAwqMoeRowsFloatKernel(const half *__restrict__ rows,
+                                         float *__restrict__ output,
+                                         int batch, int topk, int hidden) {
+    int column = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = batch * hidden;
+    if (column >= count) {
+        return;
+    }
+    int token = column / hidden;
+    int hiddenColumn = column - token * hidden;
+    float sum = 0.0f;
+    for (int slot = 0; slot < topk; ++slot) {
+        sum += __half2float(rows[
+            ((size_t)token * topk + slot) * hidden + hiddenColumn]);
+    }
+    output[column] = sum;
 }
 
 __device__ __forceinline__ int AwqDecodeLoadZero(
@@ -2400,6 +2551,684 @@ static bool RunAwqMarlinMoe(
     return true;
 }
 
+struct Nvfp4E4M3MarlinLayerCache {
+    bool ready = false;
+    bool failed = false;
+    std::atomic<bool> retired {false};
+    int device = -1;
+    int experts = 0;
+    int hidden = 0;
+    int intermediate = 0;
+    int sms = 0;
+    int sourceDirectWeights = 0;
+    size_t sourceWeightBytes = 0;
+
+    uint32_t *gateWeight = nullptr;
+    uint32_t *downWeight = nullptr;
+    uint8_t *gateScale = nullptr;
+    uint8_t *downScale = nullptr;
+    float *gateGlobalScale = nullptr;
+    float *downGlobalScale = nullptr;
+
+    int32_t *expertCounts = nullptr;
+    int32_t *expertStarts = nullptr;
+    int32_t *expertCursors = nullptr;
+    AwqMarlinRouteStorage smallRoutes;
+    AwqMarlinRouteStorage largeRoutes;
+
+    int *workspace = nullptr;
+    float *temporaryOutput = nullptr;
+    std::mutex buildMutex;
+    std::mutex runtimeMutex;
+
+    ~Nvfp4E4M3MarlinLayerCache();
+};
+
+static bool Nvfp4E4M3CompactFallbackUnavailable(
+        fastllm::Data **weights, int weightsBatch) {
+    if (weights == nullptr || weightsBatch < 4) {
+        return false;
+    }
+    for (int slot = 2; slot < weightsBatch; ++slot) {
+        const fastllm::Data *weight = weights[slot];
+        if (weight != nullptr &&
+            weight->dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3 &&
+            weight->cudaData == nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[noreturn]] static void FailNvfp4E4M3MarlinAfterRepack(
+        const char *stage,
+        const Nvfp4E4M3MarlinLayerCache *cache = nullptr) {
+    cudaError_t state = cudaPeekAtLastError();
+    std::string message =
+        "NVFP4 E4M3 grouped-Marlin " + std::string(stage) +
+        " failed after the compact expert weights were released; "
+        "the source-layout fallback is unavailable";
+    if (cache != nullptr) {
+        message += " (cuda:" + std::to_string(cache->device) +
+                   ", H=" + std::to_string(cache->hidden) +
+                   ", N=" + std::to_string(cache->intermediate) + ")";
+    }
+    if (state != cudaSuccess) {
+        message += ": ";
+        message += cudaGetErrorString(state);
+    }
+    message += ".";
+    std::fprintf(stderr, "[FastLLM] %s\n", message.c_str());
+    std::fflush(stderr);
+    FastllmCudaSetThreadError();
+    throw std::runtime_error(message);
+}
+
+static std::mutex &Nvfp4E4M3LayerCacheRegistryMutex() {
+    static auto *mutex = new std::mutex();
+    return *mutex;
+}
+
+static std::map<
+    const fastllm::Data *, std::shared_ptr<Nvfp4E4M3MarlinLayerCache>> &
+Nvfp4E4M3LayerCacheRegistry() {
+    static auto *registry = new std::map<
+        const fastllm::Data *,
+        std::shared_ptr<Nvfp4E4M3MarlinLayerCache>>();
+    return *registry;
+}
+
+static thread_local std::map<
+    const fastllm::Data *, std::weak_ptr<Nvfp4E4M3MarlinLayerCache>>
+    nvfp4E4M3LayerCacheFront;
+
+static void ReleaseNvfp4E4M3CacheStorage(
+        Nvfp4E4M3MarlinLayerCache &cache) {
+    int originalDevice = -1;
+    bool restoreDevice = false;
+    if (cache.device >= 0 && cudaGetDevice(&originalDevice) == cudaSuccess &&
+        originalDevice != cache.device) {
+        restoreDevice = cudaSetDevice(cache.device) == cudaSuccess;
+    }
+    ReleaseDirect(cache.gateWeight);
+    ReleaseDirect(cache.downWeight);
+    ReleaseDirect(cache.gateScale);
+    ReleaseDirect(cache.downScale);
+    ReleaseDirect(cache.gateGlobalScale);
+    ReleaseDirect(cache.downGlobalScale);
+    ReleaseDirect(cache.expertCounts);
+    ReleaseDirect(cache.expertStarts);
+    ReleaseDirect(cache.expertCursors);
+    ReleaseAwqRouteStorage(cache.smallRoutes);
+    ReleaseAwqRouteStorage(cache.largeRoutes);
+    ReleaseDirect(cache.workspace);
+    ReleaseDirect(cache.temporaryOutput);
+    cache.gateWeight = nullptr;
+    cache.downWeight = nullptr;
+    cache.gateScale = nullptr;
+    cache.downScale = nullptr;
+    cache.gateGlobalScale = nullptr;
+    cache.downGlobalScale = nullptr;
+    cache.expertCounts = nullptr;
+    cache.expertStarts = nullptr;
+    cache.expertCursors = nullptr;
+    cache.workspace = nullptr;
+    cache.temporaryOutput = nullptr;
+    cache.ready = false;
+    if (restoreDevice) {
+        cudaSetDevice(originalDevice);
+    }
+}
+
+Nvfp4E4M3MarlinLayerCache::~Nvfp4E4M3MarlinLayerCache() {
+    ReleaseNvfp4E4M3CacheStorage(*this);
+}
+
+static bool ValidateNvfp4E4M3Weight(
+        const fastllm::Data *weight, int outputColumns, int inputColumns,
+        int globalScales) {
+    const size_t packedBytes = (size_t)outputColumns * inputColumns / 2;
+    const size_t scaleBytes =
+        (size_t)outputColumns * (inputColumns / 16);
+    return weight != nullptr &&
+           weight->dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3 &&
+           weight->dims.size() == 2 &&
+           weight->dims[0] == outputColumns &&
+           weight->dims[1] == inputColumns &&
+           weight->blockK == 1 && weight->blockM == 16 &&
+           weight->scales.size() == (size_t)globalScales &&
+           weight->GetBytes() >= packedBytes + scaleBytes &&
+           weight->cudaData != nullptr && weight->directMemory &&
+           !weight->cudaDataBorrowed;
+}
+
+static bool GetNvfp4E4M3CommonGlobal(
+        const fastllm::Data &weight, float &commonGlobal) {
+    commonGlobal = INFINITY;
+    for (float scale : weight.scales) {
+        if (std::isfinite(scale) && scale > 0.0f) {
+            commonGlobal = std::min(commonGlobal, scale);
+        }
+    }
+    return std::isfinite(commonGlobal) && commonGlobal > 0.0f;
+}
+
+static bool BuildNvfp4E4M3LayerCache(
+        fastllm::Data **weights, int weightsBatch,
+        Nvfp4E4M3MarlinLayerCache &cache) {
+    if (weights == nullptr || weightsBatch < 4 ||
+        (weightsBatch & 1) != 0 || weights[0] != nullptr ||
+        weights[1] != nullptr || weights[2] == nullptr ||
+        weights[3] == nullptr || weights[2]->dims.size() != 2 ||
+        weights[3]->dims.size() != 2) {
+        return false;
+    }
+
+    const int experts = weightsBatch / 2 - 1;
+    const int gateRows = weights[2]->dims[0];
+    const int hidden = weights[2]->dims[1];
+    const int intermediate = gateRows / 2;
+    if (experts <= 0 || gateRows <= 0 || hidden <= 0 ||
+        (gateRows & 1) != 0 || gateRows % 256 != 0 ||
+        hidden % 128 != 0 || intermediate % 64 != 0 ||
+        weights[3]->dims[0] != hidden ||
+        weights[3]->dims[1] != intermediate ||
+        ((size_t)gateRows * (hidden / 16)) % 64 != 0 ||
+        ((size_t)hidden * (intermediate / 16)) % 64 != 0) {
+        return false;
+    }
+    for (int expert = 0; expert < experts; ++expert) {
+        int slot = 2 + expert * 2;
+        if (!ValidateNvfp4E4M3Weight(
+                weights[slot], gateRows, hidden, 2) ||
+            !ValidateNvfp4E4M3Weight(
+                weights[slot + 1], hidden, intermediate, 1)) {
+            return false;
+        }
+    }
+
+    int device = 0;
+    int sms = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
+                               device) != cudaSuccess ||
+        sms <= 0 || !PrepareNvfp4E4M3MarlinMoeKernels(device)) {
+        return false;
+    }
+
+    const size_t gateWeightBytes = (size_t)gateRows * hidden / 2;
+    const size_t downWeightBytes = (size_t)hidden * intermediate / 2;
+    const size_t gateScaleValues =
+        (size_t)gateRows * (hidden / 16);
+    const size_t downScaleValues =
+        (size_t)hidden * (intermediate / 16);
+    const size_t temporaryFloats = (size_t)sms * 4 * 8 * 256 * 2;
+    const size_t persistentBytes =
+        (gateWeightBytes + downWeightBytes) * experts +
+        (gateScaleValues + downScaleValues) * experts +
+        (size_t)experts * 2 * sizeof(float) +
+        temporaryFloats * sizeof(float) +
+        (size_t)sms * 4 * sizeof(int) +
+        (size_t)experts * 3 * sizeof(int32_t);
+    size_t freeMemory = 0;
+    size_t totalMemory = 0;
+    constexpr size_t reserveBytes = (size_t)1024 << 20;
+    if (cudaMemGetInfo(&freeMemory, &totalMemory) != cudaSuccess ||
+        freeMemory < persistentBytes + reserveBytes) {
+        static std::atomic<unsigned long long> warnedDevices {0};
+        unsigned long long bit = device < 64 ? (1ull << device) : 0;
+        if (bit == 0 ||
+            (warnedDevices.fetch_or(bit, std::memory_order_relaxed) & bit) ==
+                0) {
+            std::fprintf(
+                stderr,
+                "[FastLLM] NVFP4 E4M3 grouped-Marlin needs %.1f MiB for "
+                "this layer but only %.1f MiB is free on GPU %d.\n",
+                persistentBytes / 1048576.0, freeMemory / 1048576.0,
+                device);
+            std::fflush(stderr);
+        }
+        return false;
+    }
+
+    cache.device = device;
+    cache.experts = experts;
+    cache.hidden = hidden;
+    cache.intermediate = intermediate;
+    cache.sms = sms;
+    cache.gateWeight = (uint32_t *)AllocateDirect(
+        gateWeightBytes * experts);
+    cache.downWeight = (uint32_t *)AllocateDirect(
+        downWeightBytes * experts);
+    cache.gateScale = (uint8_t *)AllocateDirect(
+        gateScaleValues * experts);
+    cache.downScale = (uint8_t *)AllocateDirect(
+        downScaleValues * experts);
+    cache.gateGlobalScale = (float *)AllocateDirect(
+        (size_t)experts * sizeof(float));
+    cache.downGlobalScale = (float *)AllocateDirect(
+        (size_t)experts * sizeof(float));
+    cache.expertCounts = (int32_t *)AllocateDirect(
+        (size_t)experts * sizeof(int32_t));
+    cache.expertStarts = (int32_t *)AllocateDirect(
+        (size_t)experts * sizeof(int32_t));
+    cache.expertCursors = (int32_t *)AllocateDirect(
+        (size_t)experts * sizeof(int32_t));
+    cache.workspace = (int *)AllocateDirect(
+        (size_t)sms * 4 * sizeof(int));
+    cache.temporaryOutput = (float *)AllocateDirect(
+        temporaryFloats * sizeof(float));
+    if (cache.gateWeight == nullptr || cache.downWeight == nullptr ||
+        cache.gateScale == nullptr || cache.downScale == nullptr ||
+        cache.gateGlobalScale == nullptr ||
+        cache.downGlobalScale == nullptr ||
+        cache.expertCounts == nullptr || cache.expertStarts == nullptr ||
+        cache.expertCursors == nullptr || cache.workspace == nullptr ||
+        cache.temporaryOutput == nullptr) {
+        ReleaseNvfp4E4M3CacheStorage(cache);
+        return false;
+    }
+
+    const size_t gateQWeightCount =
+        (size_t)(hidden / 8) * gateRows;
+    const size_t downQWeightCount =
+        (size_t)(intermediate / 8) * hidden;
+    uint32_t *standardQWeight = (uint32_t *)AllocateDirect(
+        std::max(gateQWeightCount, downQWeightCount) * sizeof(uint32_t));
+    if (standardQWeight == nullptr) {
+        ReleaseNvfp4E4M3CacheStorage(cache);
+        return false;
+    }
+
+    std::vector<float> gateGlobals(experts);
+    std::vector<float> downGlobals(experts);
+    cudaStream_t stream = cudaStreamPerThread;
+    constexpr int threads = 256;
+    bool success =
+        cudaMemsetAsync(cache.workspace, 0,
+                        (size_t)sms * 4 * sizeof(int), stream) ==
+        cudaSuccess;
+    for (int expert = 0; expert < experts && success; ++expert) {
+        fastllm::Data &gate = *weights[2 + expert * 2];
+        fastllm::Data &down = *weights[3 + expert * 2];
+        float gateCommon = 0.0f;
+        float downCommon = 0.0f;
+        if (!GetNvfp4E4M3CommonGlobal(gate, gateCommon) ||
+            !GetNvfp4E4M3CommonGlobal(down, downCommon)) {
+            success = false;
+            break;
+        }
+        gateGlobals[expert] = gateCommon * 128.0f;
+        downGlobals[expert] = downCommon * 128.0f;
+
+        TransposePackedFp4Kernel<<<
+            (gateQWeightCount + threads - 1) / threads,
+            threads, 0, stream>>>(
+            (const uint32_t *)gate.cudaData, standardQWeight,
+            gateRows, hidden / 8);
+        success = cudaGetLastError() == cudaSuccess &&
+                  FastllmCudaGptqMarlinRepackStream(
+                      standardQWeight,
+                      cache.gateWeight + gateQWeightCount * expert,
+                      hidden, gateRows, (void *)stream);
+        if (!success) {
+            break;
+        }
+        BuildNvfp4E4M3MarlinScalesKernel<<<
+            (gateScaleValues + threads - 1) / threads,
+            threads, 0, stream>>>(
+            (const uint8_t *)gate.cudaData + gateWeightBytes,
+            cache.gateScale + gateScaleValues * expert,
+            gateRows, hidden / 16, 2,
+            gate.scales[0], gate.scales[1], gateCommon);
+        success = cudaGetLastError() == cudaSuccess;
+        if (!success) {
+            break;
+        }
+
+        TransposePackedFp4Kernel<<<
+            (downQWeightCount + threads - 1) / threads,
+            threads, 0, stream>>>(
+            (const uint32_t *)down.cudaData, standardQWeight,
+            hidden, intermediate / 8);
+        success = cudaGetLastError() == cudaSuccess &&
+                  FastllmCudaGptqMarlinRepackStream(
+                      standardQWeight,
+                      cache.downWeight + downQWeightCount * expert,
+                      intermediate, hidden, (void *)stream);
+        if (!success) {
+            break;
+        }
+        BuildNvfp4E4M3MarlinScalesKernel<<<
+            (downScaleValues + threads - 1) / threads,
+            threads, 0, stream>>>(
+            (const uint8_t *)down.cudaData + downWeightBytes,
+            cache.downScale + downScaleValues * expert,
+            hidden, intermediate / 16, 1,
+            down.scales[0], down.scales[0], downCommon);
+        success = cudaGetLastError() == cudaSuccess;
+    }
+    if (success) {
+        success =
+            cudaMemcpyAsync(cache.gateGlobalScale, gateGlobals.data(),
+                            gateGlobals.size() * sizeof(float),
+                            cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+            cudaMemcpyAsync(cache.downGlobalScale, downGlobals.data(),
+                            downGlobals.size() * sizeof(float),
+                            cudaMemcpyHostToDevice, stream) == cudaSuccess;
+    }
+    cudaError_t syncState = cudaStreamSynchronize(stream);
+    success = success && syncState == cudaSuccess;
+    ReleaseDirect(standardQWeight);
+    if (!success) {
+        ReleaseNvfp4E4M3CacheStorage(cache);
+        return false;
+    }
+
+    for (int expert = 0; expert < experts; ++expert) {
+        fastllm::Data *gate = weights[2 + expert * 2];
+        fastllm::Data *down = weights[3 + expert * 2];
+        cache.sourceDirectWeights += gate->directMemory ? 1 : 0;
+        cache.sourceDirectWeights += down->directMemory ? 1 : 0;
+        cache.sourceWeightBytes += gate->GetBytes() + down->GetBytes();
+        ReleaseAwqOriginalWeight(*gate);
+        ReleaseAwqOriginalWeight(*down);
+    }
+
+    cache.ready = true;
+    static std::atomic<unsigned long long> announcedDevices {0};
+    unsigned long long bit = device < 64 ? (1ull << device) : 0;
+    if (bit == 0 ||
+        (announcedDevices.fetch_or(bit, std::memory_order_relaxed) & bit) ==
+            0) {
+        std::fprintf(
+            stderr,
+            "[FastLLM] replaced compact E4M3 NVFP4-MoE weights with "
+            "grouped Marlin on GPU %d (%d experts, H=%d, N=%d; "
+            "prefill and decode; released %.1f MiB, direct %d/%d).\n",
+            device, experts, hidden, intermediate,
+            cache.sourceWeightBytes / 1048576.0,
+            cache.sourceDirectWeights, experts * 2);
+        std::fflush(stderr);
+    }
+    return true;
+}
+
+static AwqMarlinRouteStorage *EnsureNvfp4E4M3RuntimeCapacity(
+        Nvfp4E4M3MarlinLayerCache &cache, size_t routes,
+        bool smallBatch, int gateBlock, int downBlock) {
+    AwqMarlinRouteStorage &storage =
+        smallBatch ? cache.smallRoutes : cache.largeRoutes;
+    if (routes <= storage.routeCapacity &&
+        storage.gateBlock == gateBlock &&
+        storage.downBlock == downBlock) {
+        return &storage;
+    }
+    std::lock_guard<std::mutex> lock(cache.runtimeMutex);
+    if (routes <= storage.routeCapacity &&
+        storage.gateBlock == gateBlock &&
+        storage.downBlock == downBlock) {
+        return &storage;
+    }
+    if (cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        return nullptr;
+    }
+    ReleaseAwqRouteStorage(storage);
+    size_t routeCapacity = smallBatch
+        ? std::max<size_t>(routes, 64 * 16) : routes;
+    size_t paddedCapacity =
+        routeCapacity + (size_t)cache.experts * (gateBlock - 1);
+    size_t gateBlocks =
+        (paddedCapacity + gateBlock - 1) / gateBlock;
+    size_t downBlocks =
+        (paddedCapacity + downBlock - 1) / downBlock;
+    storage.sortedTokenIds = (int32_t *)AllocateDirect(
+        paddedCapacity * sizeof(int32_t));
+    storage.gateExpertIds = (int32_t *)AllocateDirect(
+        gateBlocks * sizeof(int32_t));
+    storage.downExpertIds = (int32_t *)AllocateDirect(
+        downBlocks * sizeof(int32_t));
+    storage.numTokensPadded =
+        (int32_t *)AllocateDirect(sizeof(int32_t));
+    if (storage.sortedTokenIds == nullptr ||
+        storage.gateExpertIds == nullptr ||
+        storage.downExpertIds == nullptr ||
+        storage.numTokensPadded == nullptr) {
+        ReleaseAwqRouteStorage(storage);
+        return nullptr;
+    }
+    storage.routeCapacity = routeCapacity;
+    storage.gateBlock = gateBlock;
+    storage.downBlock = downBlock;
+    return &storage;
+}
+
+static std::shared_ptr<Nvfp4E4M3MarlinLayerCache>
+GetOrBuildNvfp4E4M3LayerCache(
+        fastllm::Data **weights, int weightsBatch) {
+    if (weights == nullptr || weightsBatch < 4 || weights[2] == nullptr) {
+        return {};
+    }
+    const fastllm::Data *key = weights[2];
+    auto local = nvfp4E4M3LayerCacheFront.find(key);
+    if (local != nvfp4E4M3LayerCacheFront.end()) {
+        std::shared_ptr<Nvfp4E4M3MarlinLayerCache> cached =
+            local->second.lock();
+        if (cached != nullptr &&
+            !cached->retired.load(std::memory_order_acquire) &&
+            cached->ready && !cached->failed) {
+            return cached;
+        }
+        nvfp4E4M3LayerCacheFront.erase(local);
+    }
+
+    std::shared_ptr<Nvfp4E4M3MarlinLayerCache> cache;
+    {
+        std::lock_guard<std::mutex> lock(
+            Nvfp4E4M3LayerCacheRegistryMutex());
+        auto &registry = Nvfp4E4M3LayerCacheRegistry();
+        auto it = registry.find(key);
+        if (it == registry.end()) {
+            cache = std::make_shared<Nvfp4E4M3MarlinLayerCache>();
+            registry.emplace(key, cache);
+        } else {
+            cache = it->second;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(cache->buildMutex);
+        if (cache->retired.load(std::memory_order_acquire) ||
+            cache->failed) {
+            return {};
+        }
+        if (!cache->ready &&
+            !BuildNvfp4E4M3LayerCache(weights, weightsBatch, *cache)) {
+            cache->failed = true;
+            return {};
+        }
+    }
+    nvfp4E4M3LayerCacheFront[key] = cache;
+    return cache;
+}
+
+static void ReleaseNvfp4E4M3LayerCache(const fastllm::Data *key) {
+    if (key == nullptr) {
+        return;
+    }
+    std::shared_ptr<Nvfp4E4M3MarlinLayerCache> retired;
+    {
+        std::lock_guard<std::mutex> lock(
+            Nvfp4E4M3LayerCacheRegistryMutex());
+        auto &registry = Nvfp4E4M3LayerCacheRegistry();
+        auto it = registry.find(key);
+        if (it == registry.end()) {
+            return;
+        }
+        it->second->retired.store(true, std::memory_order_release);
+        retired = std::move(it->second);
+        registry.erase(it);
+    }
+}
+
+static bool RunNvfp4E4M3MarlinMoe(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &activation, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int batch, int topk) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        (input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::FLOAT32) ||
+        input.dims.size() != 2 || input.dims[0] != batch ||
+        input.cudaData == nullptr || indices == nullptr || scores == nullptr ||
+        batch <= 0 || topk <= 0 || topk > 16) {
+        if (Nvfp4E4M3CompactFallbackUnavailable(weights, weightsBatch)) {
+            FailNvfp4E4M3MarlinAfterRepack(
+                "received an incompatible invocation");
+        }
+        return false;
+    }
+    std::shared_ptr<Nvfp4E4M3MarlinLayerCache> cache =
+        GetOrBuildNvfp4E4M3LayerCache(weights, weightsBatch);
+    if (cache == nullptr || !cache->ready) {
+        if (Nvfp4E4M3CompactFallbackUnavailable(weights, weightsBatch)) {
+            FailNvfp4E4M3MarlinAfterRepack(
+                "could not recover its canonical cache");
+        }
+        return false;
+    }
+    if (input.dims[1] != cache->hidden) {
+        FailNvfp4E4M3MarlinAfterRepack(
+            "received an incompatible hidden size", cache.get());
+    }
+
+    const int routes = batch * topk;
+    const bool smallBatch = routes <= cache->experts * 16;
+    const int gateBlock = smallBatch ? 8 : 64;
+    const int downBlock = smallBatch ? 8 : 32;
+    AwqMarlinRouteStorage *routeStorage =
+        EnsureNvfp4E4M3RuntimeCapacity(
+            *cache, routes, smallBatch, gateBlock, downBlock);
+    if (routeStorage == nullptr) {
+        FailNvfp4E4M3MarlinAfterRepack(
+            "route-buffer allocation", cache.get());
+    }
+
+    gateOutput.dataType = fastllm::DataType::FLOAT16;
+    gateOutput.dataDevice = fastllm::DataDevice::CUDA;
+    gateOutput.dataDeviceIds = input.dataDeviceIds;
+    gateOutput.Resize(
+        {routes, std::max(cache->hidden, cache->intermediate * 2)});
+    gateOutput.Allocate(false);
+    activation.dataType = fastllm::DataType::FLOAT16;
+    activation.dataDevice = fastllm::DataDevice::CUDA;
+    activation.dataDeviceIds = input.dataDeviceIds;
+    const int inputElements = batch * cache->hidden;
+    const int activationElements = routes * cache->intermediate;
+    activation.Resize({std::max(inputElements, activationElements)});
+    activation.Allocate(false);
+    output.dataType = input.dataType;
+    output.dataDevice = fastllm::DataDevice::CUDA;
+    output.dataDeviceIds = input.dataDeviceIds;
+    output.Resize(input.dims);
+    output.Allocate(false);
+    if (gateOutput.cudaData == nullptr || activation.cudaData == nullptr ||
+        output.cudaData == nullptr) {
+        FailNvfp4E4M3MarlinAfterRepack(
+            "runtime buffer allocation", cache.get());
+    }
+
+    cudaStream_t stream = cudaStreamPerThread;
+    constexpr int threads = 256;
+    const void *marlinInput = input.cudaData;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmCudaFloat2HalfKernel<<<
+            (inputElements + threads - 1) / threads,
+            threads, 0, stream>>>(
+            (float *)input.cudaData, (half *)activation.cudaData,
+            inputElements);
+        if (cudaPeekAtLastError() != cudaSuccess) {
+            FailNvfp4E4M3MarlinAfterRepack(
+                "input FP16 conversion launch", cache.get());
+        }
+        marlinInput = activation.cudaData;
+    }
+    InitAwqMoeRouteCountersKernel<<<
+        (cache->experts + threads - 1) / threads,
+        threads, 0, stream>>>(
+        cache->expertCounts, cache->expertCursors, cache->experts);
+    CountAwqMoeRoutesKernel<<<
+        (routes + threads - 1) / threads,
+        threads, 0, stream>>>(
+        indices, cache->expertCounts, routes, cache->experts);
+    BuildAwqMoeRouteOffsetsKernel<<<1, threads, 0, stream>>>(
+        cache->expertCounts, cache->expertStarts,
+        routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
+        routeStorage->downExpertIds, routeStorage->numTokensPadded,
+        routes, cache->experts, gateBlock, downBlock);
+    ScatterAwqMoeRoutesKernel<<<
+        (routes + threads - 1) / threads,
+        threads, 0, stream>>>(
+        indices, cache->expertStarts, cache->expertCursors,
+        routeStorage->sortedTokenIds, routes, cache->experts);
+    if (cudaPeekAtLastError() != cudaSuccess) {
+        FailNvfp4E4M3MarlinAfterRepack(
+            "route-metadata launch", cache.get());
+    }
+
+    if (!LaunchNvfp4E4M3MarlinMoe(
+            true, smallBatch, marlinInput, cache->gateWeight,
+            gateOutput.cudaData, cache->temporaryOutput,
+            cache->gateScale, cache->gateGlobalScale,
+            routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
+            routeStorage->numTokensPadded, scores, topk, false,
+            batch, cache->intermediate * 2, cache->hidden,
+            cache->workspace, stream, cache->sms)) {
+        FailNvfp4E4M3MarlinAfterRepack(
+            "gate/up Marlin launch", cache.get());
+    }
+    SwigluRowsKernel<<<
+        (activationElements + threads - 1) / threads,
+        threads, 0, stream>>>(
+        (const half *)gateOutput.cudaData,
+        (half *)activation.cudaData, routes, cache->intermediate);
+    if (cudaPeekAtLastError() != cudaSuccess) {
+        FailNvfp4E4M3MarlinAfterRepack("SwiGLU launch", cache.get());
+    }
+
+    if (!LaunchNvfp4E4M3MarlinMoe(
+            false, smallBatch, activation.cudaData, cache->downWeight,
+            gateOutput.cudaData, cache->temporaryOutput,
+            cache->downScale, cache->downGlobalScale,
+            routeStorage->sortedTokenIds, routeStorage->downExpertIds,
+            routeStorage->numTokensPadded, scores, 1, true,
+            routes, cache->hidden, cache->intermediate,
+            cache->workspace, stream, cache->sms)) {
+        FailNvfp4E4M3MarlinAfterRepack(
+            "down Marlin launch", cache.get());
+    }
+    if (output.dataType == fastllm::DataType::FLOAT32) {
+        const int outputElements = batch * cache->hidden;
+        SumAwqMoeRowsFloatKernel<<<
+            (outputElements + threads - 1) / threads,
+            threads, 0, stream>>>(
+            (const half *)gateOutput.cudaData,
+            (float *)output.cudaData, batch, topk, cache->hidden);
+    } else {
+        const int outputPairs = batch * (cache->hidden / 2);
+        SumAwqMoeRowsKernel<<<
+            (outputPairs + threads - 1) / threads,
+            threads, 0, stream>>>(
+            (const half *)gateOutput.cudaData,
+            (half *)output.cudaData, batch, topk, cache->hidden);
+    }
+    if (cudaPeekAtLastError() != cudaSuccess) {
+        FailNvfp4E4M3MarlinAfterRepack(
+            "output-reduction launch", cache.get());
+    }
+    return true;
+}
+
 template <typename T>
 static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                              fastllm::Data &output, fastllm::Data **weights,
@@ -2610,6 +3439,7 @@ void FastllmCudaReleaseMergeMOEVllmMarlinCache(
         const fastllm::Data *layerKey) {
     fastllm_marlin_moe::ReleaseLayerCache(layerKey);
     fastllm_marlin_moe::ReleaseAwqLayerCache(layerKey);
+    fastllm_marlin_moe::ReleaseNvfp4E4M3LayerCache(layerKey);
 }
 
 bool FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
@@ -2619,6 +3449,29 @@ bool FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
         const int32_t *indices, const float *scores,
         int batch, int topk) {
     return fastllm_marlin_moe::RunAwqMarlinMoe(
+        input, gateOutput, activation, output, weights, weightsBatch,
+        indices, scores, batch, topk);
+}
+
+bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &activation, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int batch, int topk) {
+    return fastllm_marlin_moe::RunNvfp4E4M3MarlinMoe(
+        input, gateOutput, activation, output, weights, weightsBatch,
+        indices, scores, batch, topk);
+}
+
+// Keep the pre-generic internal symbol available for already-built tools.
+extern "C" bool FastllmCudaHalfMergeMOENVFP4E4M3MarlinIndexed(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &activation, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int batch, int topk) {
+    return FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
         input, gateOutput, activation, output, weights, weightsBatch,
         indices, scores, batch, topk);
 }

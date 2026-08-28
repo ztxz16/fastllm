@@ -539,6 +539,7 @@ namespace fastllm {
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
+        {DataType::NVFP4_BLOCK_16_E4M3, {"nvfp4_block_16_e4m3"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
         {DataType::NVFP4_BLOCK_32_E8M0, {"nvfp4_block_32_e8m0"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
@@ -581,8 +582,12 @@ namespace fastllm {
     }
 
     uint8_t *GetNVFP4ScaleData(Data &data) {
-        if (data.dataType != DataType::NVFP4 || data.dims.size() != 2 ||
-            data.blockK <= 0 || data.blockM <= 0 || !data.scales.empty()) {
+        const bool compactE8M0 = data.dataType == DataType::NVFP4 &&
+                                 data.scales.empty();
+        const bool compactE4M3 =
+            data.dataType == DataType::NVFP4_BLOCK_16_E4M3;
+        if ((!compactE8M0 && !compactE4M3) || data.dims.size() != 2 ||
+            data.blockK <= 0 || data.blockM <= 0) {
             return nullptr;
         }
         uint64_t weightBytes = GetNVFP4WeightBytes(data.dims[0], data.dims[1]);
@@ -593,8 +598,12 @@ namespace fastllm {
     }
 
     const uint8_t *GetNVFP4ScaleData(const Data &data) {
-        if (data.dataType != DataType::NVFP4 || data.dims.size() != 2 ||
-            data.blockK <= 0 || data.blockM <= 0 || !data.scales.empty()) {
+        const bool compactE8M0 = data.dataType == DataType::NVFP4 &&
+                                 data.scales.empty();
+        const bool compactE4M3 =
+            data.dataType == DataType::NVFP4_BLOCK_16_E4M3;
+        if ((!compactE8M0 && !compactE4M3) || data.dims.size() != 2 ||
+            data.blockK <= 0 || data.blockM <= 0) {
             return nullptr;
         }
         uint64_t weightBytes = GetNVFP4WeightBytes(data.dims[0], data.dims[1]);
@@ -628,6 +637,8 @@ namespace fastllm {
         } else if (type == DataType::NVFP4_BLOCK_16_E8M0) {
             int blocks = (columns - 1) / 16 + 1;
             return rows * blocks * (8 + sizeof(uint8_t));
+        } else if (type == DataType::NVFP4_BLOCK_16_E4M3) {
+            return GetNVFP4StorageBytes(rows, columns, 1, 16);
         } else if (type == DataType::NVFP4_BLOCK_32_E8M0) {
             int blocks = (columns - 1) / 32 + 1;
             return rows * blocks * (16 + sizeof(uint8_t));
@@ -1323,13 +1334,15 @@ namespace fastllm {
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
              dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              dataType == DataType::INT4_GROUP32)) {
             this->blockK = blockK;
             this->blockM = blockM;
             if (dataType == DataType::NVFP4) {
                 this->scales.clear();
-            } else if (dataType == DataType::NVFP4_BLOCK_16) {
+            } else if (dataType == DataType::NVFP4_BLOCK_16 ||
+                       dataType == DataType::NVFP4_BLOCK_16_E4M3) {
                 // NVFP4_BLOCK_16 keeps its block scales inline.  oriScales, when
                 // present, contains only the tensor-level dequant multiplier
                 // retained by the safetensors loader for Marlin preparation.
@@ -1692,6 +1705,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                    this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    this->dataType == DataType::INT4_GROUP32) {
             this->unitSize = 1;
@@ -1721,6 +1735,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1946,6 +1961,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1965,6 +1981,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
              this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -3043,6 +3060,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::NVFP4 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                    this->dataType == DataType::NVFP4_BLOCK_32_E8M0) {
             return batchSize > 31 ? DataType::BFLOAT16 : DataType::FLOAT32;
         } else if (this->dataType == DataType::INT4_PERCHANNEL ||
