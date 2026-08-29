@@ -4357,6 +4357,7 @@ namespace fastllm {
         this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CudaQwen4HyperMixOp());
         this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CudaQwen4HyperInjectOp());
         this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CudaQwen4HyperCombineOp());
+        this->ops["Qwen4HyperCombineRMSNorm"] = (BaseOperator*)(new CudaQwen4HyperCombineRMSNormOp());
         this->ops["Qwen4QSASelect"] = (BaseOperator*)(new CudaQwen4QSASelectOp());
         this->ops["Qwen4QSABuildMask"] = (BaseOperator*)(new CudaQwen4QSABuildMaskOp());
         this->ops["Qwen4SparseAttention"] = (BaseOperator*)(new CudaQwen4SparseAttentionOp());
@@ -5035,6 +5036,51 @@ namespace fastllm {
                 input, blockOutput, injection, output, groups)) {
             ErrorInFastLLM(
                 "Qwen4HyperCombine CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperCombineRMSNormOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        Data &weight = *datas.find("weight")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        if (input.dims.empty() || groups <= 0 ||
+            input.dims.back() % groups != 0 ||
+            !CudaQwen4ActivationType(input.dataType) ||
+            !CudaQwen4ActivationType(blockOutput.dataType) ||
+            !CudaQwen4ActivationType(injection.dataType) ||
+            weight.dataType != DataType::FLOAT32 ||
+            weight.Count(0) != (uint64_t)input.dims.back()) {
+            return false;
+        }
+        const int rows = (int)(input.Count(0) / input.dims.back());
+        return blockOutput.Count(0) ==
+                   (uint64_t)rows * input.dims.back() / groups &&
+               injection.Count(0) == (uint64_t)rows * groups;
+    }
+
+    void CudaQwen4HyperCombineRMSNormOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        Data &normalized = *datas.find("normalized")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        const float eps = floatParams.find("eps") == floatParams.end()
+            ? 1e-6f : floatParams.find("eps")->second;
+        output.Allocate(false);
+        normalized.Allocate(false);
+        if (!FastllmCudaQwen4HyperCombineRMSNorm(
+                input, blockOutput, injection, weight,
+                output, normalized, eps, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperCombineRMSNorm CUDA error: kernel rejected input.\n");
         }
     }
 

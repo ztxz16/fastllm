@@ -1000,6 +1000,14 @@ namespace fastllm {
     void Qwen4HyperInject(const Data &logits, int groups, Data &output);
     void Qwen4HyperCombine(const Data &hyperInput, const Data &blockOutput,
                            const Data &injection, int groups, Data &output);
+    // Hyper-connection residual update followed by grouped RMSNorm.  The
+    // residual is rounded to hyperInput's dtype before normalization, exactly
+    // matching Qwen4HyperCombine + Qwen4GroupedRMSNorm while avoiding the
+    // intermediate launch and reload.
+    void Qwen4HyperCombineRMSNorm(
+        const Data &hyperInput, const Data &blockOutput,
+        const Data &injection, const Data &normWeight,
+        float eps, int groups, Data &residual, Data &normalized);
     // Qwen4 QSA primitives. QSASelect scores compressed block keys, selects
     // the highest-scoring blocks, and expands them to sorted token indices.
     // queryStart >= 0 enables row-wise causal selection for prefill: row r can

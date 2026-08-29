@@ -565,6 +565,14 @@ bool FastllmCudaQwen4HyperCombine(const fastllm::Data &hyperInput,
                                   const fastllm::Data &blockOutput,
                                   const fastllm::Data &injection,
                                   fastllm::Data &output, int groups);
+bool FastllmCudaQwen4HyperCombineRMSNorm(
+    const fastllm::Data &hyperInput,
+    const fastllm::Data &blockOutput,
+    const fastllm::Data &injection,
+    const fastllm::Data &normWeight,
+    fastllm::Data &residual,
+    fastllm::Data &normalized,
+    float eps, int groups);
 bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                const fastllm::Data &compressedKeys,
                                fastllm::Data &indices, int keyLength,

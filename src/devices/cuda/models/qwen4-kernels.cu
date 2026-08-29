@@ -412,6 +412,23 @@ namespace {
     }
 
     template <typename T>
+    __device__ __forceinline__ T Qwen4HyperCombinedValue(
+            const T *hyperInput, const void *blockOutput, int blockType,
+            const void *injection, int injectionType,
+            uint64_t hyperIndex, uint64_t blockIndex,
+            uint64_t injectionIndex) {
+        const float blockValue = Qwen4CudaRound<T>(
+            Qwen4CudaLoadActivation(blockOutput, blockType, blockIndex));
+        const float injectionScale = Qwen4CudaRound<T>(
+            Qwen4CudaLoadActivation(
+                injection, injectionType, injectionIndex));
+        const float injected = Qwen4CudaRound<T>(
+            blockValue * injectionScale);
+        return Qwen4CudaFromFloat<T>(Qwen4CudaRound<T>(
+            Qwen4CudaToFloat(hyperInput[hyperIndex]) + injected));
+    }
+
+    template <typename T>
     __global__ void Qwen4HyperCombineKernel(
             const T *hyperInput, const void *blockOutput, int blockType,
             const void *injection, int injectionType,
@@ -426,14 +443,241 @@ namespace {
         const int withinRow = (int)(index % channels);
         const int group = withinRow / blockChannels;
         const int channel = withinRow % blockChannels;
-        const float blockValue = Qwen4CudaRound<T>(
-            Qwen4CudaLoadActivation(blockOutput, blockType,
-                                    row * blockChannels + channel));
-        const float scale = Qwen4CudaRound<T>(Qwen4CudaLoadActivation(
-            injection, injectionType, row * groups + group));
-        const float injected = Qwen4CudaRound<T>(blockValue * scale);
-        output[index] = Qwen4CudaFromFloat<T>(Qwen4CudaRound<T>(
-            Qwen4CudaToFloat(hyperInput[index]) + injected));
+        output[index] = Qwen4HyperCombinedValue(
+            hyperInput, blockOutput, blockType, injection, injectionType,
+            index, row * blockChannels + channel, row * groups + group);
+    }
+
+    template <typename T, int THREADS>
+    __global__ void Qwen4HyperCombineRMSNormKernel(
+            const T *hyperInput, const void *blockOutput, int blockType,
+            const void *injection, int injectionType,
+            const float *weight, T *residual, T *normalized,
+            int rows, int groups, int groupChannels, float eps) {
+        const int item = blockIdx.x;
+        if (item >= rows * groups) {
+            return;
+        }
+        const int group = item % groups;
+        const int row = item / groups;
+        const int channels = groups * groupChannels;
+        const uint64_t hyperBase = (uint64_t)row * channels +
+                                   (uint64_t)group * groupChannels;
+        const uint64_t blockBase = (uint64_t)row * groupChannels;
+        const uint64_t injectionIndex = (uint64_t)row * groups + group;
+        T *groupResidual = residual + hyperBase;
+        T *groupNormalized = normalized + hyperBase;
+        const float *groupWeight = weight +
+                                   (uint64_t)group * groupChannels;
+
+        // Keep the same packed channel-to-thread mapping and reduction tree
+        // as Qwen4GroupedRMSNormKernel.  The residual is rounded before it
+        // contributes to the square sum, matching the unfused operation pair.
+        float sum = 0.0f;
+        if constexpr (std::is_same_v<T, float>) {
+            if ((groupChannels & 3) == 0) {
+                const int packedChannels = groupChannels / 4;
+                for (int index = threadIdx.x; index < packedChannels;
+                     index += THREADS) {
+                    const int channel = index * 4;
+                    float4 value;
+                    value.x = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel,
+                        blockBase + channel, injectionIndex);
+                    value.y = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel + 1,
+                        blockBase + channel + 1, injectionIndex);
+                    value.z = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel + 2,
+                        blockBase + channel + 2, injectionIndex);
+                    value.w = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel + 3,
+                        blockBase + channel + 3, injectionIndex);
+                    reinterpret_cast<float4*>(groupResidual)[index] = value;
+                    sum += value.x * value.x + value.y * value.y +
+                           value.z * value.z + value.w * value.w;
+                }
+            } else {
+                for (int channel = threadIdx.x; channel < groupChannels;
+                     channel += THREADS) {
+                    const float value = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel,
+                        blockBase + channel, injectionIndex);
+                    groupResidual[channel] = value;
+                    sum += value * value;
+                }
+            }
+        } else if constexpr (std::is_same_v<T, half>) {
+            if ((groupChannels & 1) == 0) {
+                const int packedChannels = groupChannels / 2;
+                for (int index = threadIdx.x; index < packedChannels;
+                     index += THREADS) {
+                    const int channel = index * 2;
+                    const half low = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel,
+                        blockBase + channel, injectionIndex);
+                    const half high = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel + 1,
+                        blockBase + channel + 1, injectionIndex);
+                    reinterpret_cast<half2*>(groupResidual)[index] =
+                        __halves2half2(low, high);
+                    const float lowValue = __half2float(low);
+                    const float highValue = __half2float(high);
+                    sum += lowValue * lowValue + highValue * highValue;
+                }
+            } else {
+                for (int channel = threadIdx.x; channel < groupChannels;
+                     channel += THREADS) {
+                    const half value = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel,
+                        blockBase + channel, injectionIndex);
+                    groupResidual[channel] = value;
+                    const float floatValue = __half2float(value);
+                    sum += floatValue * floatValue;
+                }
+            }
+        } else {
+            if ((groupChannels & 1) == 0) {
+                const int packedChannels = groupChannels / 2;
+                for (int index = threadIdx.x; index < packedChannels;
+                     index += THREADS) {
+                    const int channel = index * 2;
+                    __nv_bfloat162 value;
+                    value.x = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel,
+                        blockBase + channel, injectionIndex);
+                    value.y = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel + 1,
+                        blockBase + channel + 1, injectionIndex);
+                    reinterpret_cast<__nv_bfloat162*>(
+                        groupResidual)[index] = value;
+                    const float lowValue = __bfloat162float(value.x);
+                    const float highValue = __bfloat162float(value.y);
+                    sum += lowValue * lowValue + highValue * highValue;
+                }
+            } else {
+                for (int channel = threadIdx.x; channel < groupChannels;
+                     channel += THREADS) {
+                    const __nv_bfloat16 value = Qwen4HyperCombinedValue(
+                        hyperInput, blockOutput, blockType, injection,
+                        injectionType, hyperBase + channel,
+                        blockBase + channel, injectionIndex);
+                    groupResidual[channel] = value;
+                    const float floatValue = __bfloat162float(value);
+                    sum += floatValue * floatValue;
+                }
+            }
+        }
+
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+        __shared__ float warpSums[THREADS / 32];
+        __shared__ float normScale;
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        if (lane == 0) {
+            warpSums[warp] = sum;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            float total = lane < THREADS / 32 ? warpSums[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(0xffffffff, total, offset);
+            }
+            if (lane == 0) {
+                normScale = rsqrtf(total / groupChannels + eps);
+            }
+        }
+        __syncthreads();
+
+        if constexpr (std::is_same_v<T, float>) {
+            if ((groupChannels & 3) == 0) {
+                const int packedChannels = groupChannels / 4;
+                const float4 *packedResidual =
+                    reinterpret_cast<const float4*>(groupResidual);
+                float4 *packedNormalized =
+                    reinterpret_cast<float4*>(groupNormalized);
+                const float4 *packedWeight =
+                    reinterpret_cast<const float4*>(groupWeight);
+                for (int index = threadIdx.x; index < packedChannels;
+                     index += THREADS) {
+                    const float4 value = packedResidual[index];
+                    const float4 currentWeight = packedWeight[index];
+                    packedNormalized[index] = {
+                        value.x * normScale * currentWeight.x,
+                        value.y * normScale * currentWeight.y,
+                        value.z * normScale * currentWeight.z,
+                        value.w * normScale * currentWeight.w};
+                }
+            } else {
+                for (int channel = threadIdx.x; channel < groupChannels;
+                     channel += THREADS) {
+                    groupNormalized[channel] = groupResidual[channel] *
+                        normScale * groupWeight[channel];
+                }
+            }
+        } else if constexpr (std::is_same_v<T, half>) {
+            if ((groupChannels & 1) == 0) {
+                const int packedChannels = groupChannels / 2;
+                const half2 *packedResidual =
+                    reinterpret_cast<const half2*>(groupResidual);
+                half2 *packedNormalized =
+                    reinterpret_cast<half2*>(groupNormalized);
+                for (int index = threadIdx.x; index < packedChannels;
+                     index += THREADS) {
+                    const float2 value =
+                        __half22float2(packedResidual[index]);
+                    packedNormalized[index] = __floats2half2_rn(
+                        value.x * normScale * groupWeight[index * 2],
+                        value.y * normScale * groupWeight[index * 2 + 1]);
+                }
+            } else {
+                for (int channel = threadIdx.x; channel < groupChannels;
+                     channel += THREADS) {
+                    groupNormalized[channel] = __float2half_rn(
+                        __half2float(groupResidual[channel]) * normScale *
+                        groupWeight[channel]);
+                }
+            }
+        } else {
+            if ((groupChannels & 1) == 0) {
+                const int packedChannels = groupChannels / 2;
+                const __nv_bfloat162 *packedResidual =
+                    reinterpret_cast<const __nv_bfloat162*>(groupResidual);
+                __nv_bfloat162 *packedNormalized =
+                    reinterpret_cast<__nv_bfloat162*>(groupNormalized);
+                for (int index = threadIdx.x; index < packedChannels;
+                     index += THREADS) {
+                    const __nv_bfloat162 value = packedResidual[index];
+                    __nv_bfloat162 result;
+                    result.x = __float2bfloat16_rn(
+                        __bfloat162float(value.x) * normScale *
+                        groupWeight[index * 2]);
+                    result.y = __float2bfloat16_rn(
+                        __bfloat162float(value.y) * normScale *
+                        groupWeight[index * 2 + 1]);
+                    packedNormalized[index] = result;
+                }
+            } else {
+                for (int channel = threadIdx.x; channel < groupChannels;
+                     channel += THREADS) {
+                    groupNormalized[channel] = __float2bfloat16_rn(
+                        __bfloat162float(groupResidual[channel]) *
+                        normScale * groupWeight[channel]);
+                }
+            }
+        }
     }
 
     __global__ void CausalDepthwiseConv1DDecodeKernel(
@@ -1347,6 +1591,78 @@ bool FastllmCudaQwen4HyperCombine(
             injection.cudaData, (int)injection.dataType,
             (__nv_bfloat16*)output.cudaData, count, groups,
             blockChannels);
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4HyperCombineRMSNorm(
+        const fastllm::Data &hyperInput,
+        const fastllm::Data &blockOutput,
+        const fastllm::Data &injection,
+        const fastllm::Data &normWeight,
+        fastllm::Data &residual,
+        fastllm::Data &normalized,
+        float eps, int groups) {
+    if (hyperInput.dataDevice != fastllm::DataDevice::CUDA ||
+        blockOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        injection.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        residual.dataDevice != fastllm::DataDevice::CUDA ||
+        normalized.dataDevice != fastllm::DataDevice::CUDA ||
+        hyperInput.cudaData == nullptr || blockOutput.cudaData == nullptr ||
+        injection.cudaData == nullptr || normWeight.cudaData == nullptr ||
+        residual.cudaData == nullptr || normalized.cudaData == nullptr ||
+        hyperInput.dims.empty() || groups <= 0 ||
+        hyperInput.dims.back() % groups != 0 ||
+        hyperInput.dataType != residual.dataType ||
+        hyperInput.dataType != normalized.dataType ||
+        residual.dims != hyperInput.dims ||
+        normalized.dims != hyperInput.dims ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        !Qwen4CudaActivationType(hyperInput.dataType) ||
+        !Qwen4CudaActivationType(blockOutput.dataType) ||
+        !Qwen4CudaActivationType(injection.dataType)) {
+        return false;
+    }
+    const int groupChannels = hyperInput.dims.back() / groups;
+    const int rows = (int)(hyperInput.Count(0) / hyperInput.dims.back());
+    if (blockOutput.Count(0) != (uint64_t)rows * groupChannels ||
+        injection.Count(0) != (uint64_t)rows * groups ||
+        normWeight.Count(0) != (uint64_t)hyperInput.dims.back()) {
+        return false;
+    }
+
+    constexpr int threads = 512;
+    const int blocks = rows * groups;
+    if (hyperInput.dataType == fastllm::DataType::FLOAT32) {
+        Qwen4HyperCombineRMSNormKernel<float, threads><<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)hyperInput.cudaData,
+            blockOutput.cudaData, (int)blockOutput.dataType,
+            injection.cudaData, (int)injection.dataType,
+            (const float*)normWeight.cudaData,
+            (float*)residual.cudaData, (float*)normalized.cudaData,
+            rows, groups, groupChannels, eps);
+    } else if (hyperInput.dataType == fastllm::DataType::FLOAT16) {
+        Qwen4HyperCombineRMSNormKernel<half, threads><<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)hyperInput.cudaData,
+            blockOutput.cudaData, (int)blockOutput.dataType,
+            injection.cudaData, (int)injection.dataType,
+            (const float*)normWeight.cudaData,
+            (half*)residual.cudaData, (half*)normalized.cudaData,
+            rows, groups, groupChannels, eps);
+    } else {
+        Qwen4HyperCombineRMSNormKernel<__nv_bfloat16, threads><<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)hyperInput.cudaData,
+            blockOutput.cudaData, (int)blockOutput.dataType,
+            injection.cudaData, (int)injection.dataType,
+            (const float*)normWeight.cudaData,
+            (__nv_bfloat16*)residual.cudaData,
+            (__nv_bfloat16*)normalized.cudaData,
+            rows, groups, groupChannels, eps);
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;

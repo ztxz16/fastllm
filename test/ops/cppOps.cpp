@@ -4343,6 +4343,120 @@ namespace {
         };
     }
 
+    static OpCase MakeQwen4HyperCombineNormCase() {
+        return {
+            "qwen4_hyper_combine_norm",
+            "fused hyper residual update and grouped RMSNorm versus unfused reference",
+            []() {
+                OpTestParams params;
+                params.Add("sequence", "17", "number of input tokens");
+                params.Add("groups", "4", "hyper-connection streams");
+                params.Add("hidden", "160", "channels per stream");
+                params.Add("dtype", "float16",
+                           "float32, float16 or bfloat16 activation type");
+                params.Add("compare_unfused", "1",
+                           "return fused-minus-unfused outputs when set");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int groups = params.GetInt("groups");
+                const int hidden = params.GetInt("hidden");
+                fastllm::Data input = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.11f, 0.2f);
+                fastllm::Data block = MakeTensor(
+                    {1, sequence, hidden}, 0.37f, 0.2f);
+                fastllm::Data injection = MakeTensor(
+                    {1, sequence, groups}, 0.73f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {groups * hidden}, 0.91f, 0.1f, 1.0f);
+                fastllm::DataType type = fastllm::DataType::FLOAT32;
+                if (params.GetString("dtype") == "float16") {
+                    type = fastllm::DataType::FLOAT16;
+                } else if (params.GetString("dtype") == "bfloat16") {
+                    type = fastllm::DataType::BFLOAT16;
+                } else if (params.GetString("dtype") != "float32") {
+                    throw std::runtime_error(
+                        "qwen4_hyper_combine_norm dtype must be float32, float16 or bfloat16");
+                }
+                if (type != fastllm::DataType::FLOAT32) {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(input, type);
+                    fastllm::ToDataType(block, type);
+                    fastllm::ToDataType(injection, type);
+                }
+                fastllm::Data output, normalized;
+                return CanRunOnDevice(
+                    device, "Qwen4HyperCombineRMSNorm",
+                    {{"input", &input}, {"blockOutput", &block},
+                     {"injection", &injection}, {"weight", &weight},
+                     {"output", &output}, {"normalized", &normalized}},
+                    {{"eps", 1e-6f}}, {{"groups", groups}});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int groups = params.GetInt("groups");
+                const int hidden = params.GetInt("hidden");
+                fastllm::Data input = MakeTensor(
+                    {1, sequence, groups * hidden}, 0.11f, 0.2f);
+                fastllm::Data block = MakeTensor(
+                    {1, sequence, hidden}, 0.37f, 0.2f);
+                fastllm::Data injection = MakeTensor(
+                    {1, sequence, groups}, 0.73f, 0.2f);
+                fastllm::Data weight = MakeTensor(
+                    {groups * hidden}, 0.91f, 0.1f, 1.0f);
+                fastllm::DataType type = fastllm::DataType::FLOAT32;
+                if (params.GetString("dtype") == "float16") {
+                    type = fastllm::DataType::FLOAT16;
+                } else if (params.GetString("dtype") == "bfloat16") {
+                    type = fastllm::DataType::BFLOAT16;
+                }
+                if (type != fastllm::DataType::FLOAT32) {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(input, type);
+                    fastllm::ToDataType(block, type);
+                    fastllm::ToDataType(injection, type);
+                }
+                fastllm::Data output, normalized;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4HyperCombineRMSNorm(
+                    input, block, injection, weight, 1e-6f, groups,
+                    output, normalized);
+                if (params.GetInt("compare_unfused") != 0) {
+                    fastllm::Data referenceOutput, referenceNormalized;
+                    fastllm::Qwen4HyperCombine(
+                        input, block, injection, groups, referenceOutput);
+                    fastllm::Qwen4GroupedRMSNorm(
+                        referenceOutput, weight, 1e-6f, groups,
+                        referenceNormalized);
+                    fastllm::AddTo(output, referenceOutput, -1.0f);
+                    fastllm::AddTo(
+                        normalized, referenceNormalized, -1.0f);
+                }
+                output.Reshape({(int)output.Count(0)});
+                normalized.Reshape({(int)normalized.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(output, normalized, 0, combined);
+                fastllm::ToDataType(
+                    combined, fastllm::DataType::FLOAT32);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double groups = params.GetInt("groups");
+                const double hidden = params.GetInt("hidden");
+                return sequence * groups * hidden * 5.0 * sizeof(float);
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double groups = params.GetInt("groups");
+                const double hidden = params.GetInt("hidden");
+                return sequence * groups * hidden * 10.0;
+            }
+        };
+    }
+
     static OpCase MakeQwen4PLECausalConvCase() {
         return {
             "qwen4_ple_conv",
@@ -4948,6 +5062,7 @@ namespace {
             MakeFusedMoeFp8Case(),
             MakeRouterLinearFp16Case(),
             MakeFusedRouterTopKCase(),
+            MakeQwen4HyperCombineNormCase(),
             MakeQwen4PLEGateCase(),
             MakeQwen4PLECausalConvCase(),
             MakeCausalDepthwiseConv1DPrefillCase(),

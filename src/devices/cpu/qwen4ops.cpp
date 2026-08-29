@@ -472,6 +472,100 @@ namespace fastllm {
         });
     }
 
+    void CpuQwen4HyperCombineRMSNormOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &output = *datas.find("output")->second;
+        Data &normalized = *datas.find("normalized")->second;
+        output.dataType = input.dataType;
+        output.UpdateUnitSize();
+        output.Resize(input.dims);
+        normalized.dataType = input.dataType;
+        normalized.UpdateUnitSize();
+        normalized.Resize(input.dims);
+    }
+
+    void CpuQwen4HyperCombineRMSNormOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &hyperInput = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        Data &normalized = *datas.find("normalized")->second;
+        const int groups = Qwen4Groups(intParams);
+        const float eps = floatParams.find("eps") == floatParams.end()
+            ? 1e-6f : floatParams.find("eps")->second;
+        Qwen4AssertCpuTensor(hyperInput,
+                             "Qwen4HyperCombineRMSNorm hyper input");
+        Qwen4AssertCpuTensor(blockOutput,
+                             "Qwen4HyperCombineRMSNorm block output");
+        Qwen4AssertCpuTensor(injection,
+                             "Qwen4HyperCombineRMSNorm injection");
+        Qwen4AssertCpuTensor(weight,
+                             "Qwen4HyperCombineRMSNorm weight");
+        AssertInFastLLM(!hyperInput.dims.empty() && groups > 0 &&
+                        hyperInput.dims.back() % groups == 0,
+                        "Qwen4HyperCombineRMSNorm received incompatible tensors.\n");
+
+        const int channels = hyperInput.dims.back();
+        const int groupChannels = channels / groups;
+        const int rows = (int)(hyperInput.Count(0) / channels);
+        AssertInFastLLM(
+            blockOutput.Count(0) == (uint64_t)rows * groupChannels &&
+            injection.Count(0) == (uint64_t)rows * groups &&
+            weight.Count(0) == (uint64_t)channels,
+            "Qwen4HyperCombineRMSNorm shape mismatch.\n");
+        output.Allocate(false);
+        normalized.Allocate(false);
+
+        const DataType type = hyperInput.dataType;
+        const DataType blockType = blockOutput.dataType;
+        const DataType injectionType = injection.dataType;
+        Qwen4ParallelFor(rows * groups, [&](int start, int end) {
+            for (int item = start; item < end; item++) {
+                const int row = item / groups;
+                const int group = item % groups;
+                const uint64_t hyperBase = (uint64_t)row * channels +
+                    (uint64_t)group * groupChannels;
+                const uint64_t blockBase =
+                    (uint64_t)row * groupChannels;
+                const float scale = Qwen4RoundCpu(Qwen4LoadCpu(
+                    injection.cpuData, injectionType,
+                    (uint64_t)row * groups + group), type);
+                float squareSum = 0.0f;
+                for (int channel = 0; channel < groupChannels; channel++) {
+                    const float blockValue = Qwen4RoundCpu(Qwen4LoadCpu(
+                        blockOutput.cpuData, blockType,
+                        blockBase + channel), type);
+                    const float injected = Qwen4RoundCpu(
+                        blockValue * scale, type);
+                    const float combined = Qwen4RoundCpu(
+                        Qwen4LoadCpu(hyperInput.cpuData, type,
+                                     hyperBase + channel) + injected,
+                        type);
+                    Qwen4StoreCpu(output.cpuData, type,
+                                  hyperBase + channel, combined);
+                    squareSum += combined * combined;
+                }
+                const float normScale = 1.0f /
+                    std::sqrt(squareSum / groupChannels + eps);
+                for (int channel = 0; channel < groupChannels; channel++) {
+                    const uint64_t index = hyperBase + channel;
+                    const float value = Qwen4LoadCpu(
+                        output.cpuData, type, index);
+                    const float normWeight = Qwen4LoadCpu(
+                        weight.cpuData, weight.dataType,
+                        (uint64_t)group * groupChannels + channel);
+                    Qwen4StoreCpu(normalized.cpuData, type, index,
+                                  value * normScale * normWeight);
+                }
+            }
+        });
+    }
+
     bool CpuCausalDepthwiseConv1DDecodeOp::CanRun(
             const std::string &opType, const DataDict &datas,
             const FloatDict &floatParams, const IntDict &intParams) {

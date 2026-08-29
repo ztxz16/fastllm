@@ -149,10 +149,18 @@ namespace fastllm {
         bool IsLinearAttentionLayer(int layer) const;
 
         void GroupedRMSNorm(const Data &input, Data &normWeight, Data &output);
-        void HyperMix(const Data &hyperInput, const std::string &prefix,
-                      Data &mixedInput, Data *injectionWeights);
+        void HyperMixNormalized(Data &normalized,
+                                const std::string &prefix,
+                                Data &mixedInput,
+                                Data *injectionWeights);
         void HyperCombine(const Data &hyperInput, const Data &blockOutput,
                           const Data &injectionWeights, Data &output);
+        void HyperCombineRMSNorm(const Data &hyperInput,
+                                 const Data &blockOutput,
+                                 const Data &injectionWeights,
+                                 Data &normWeight,
+                                 Data &output,
+                                 Data &normalized);
 
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output);

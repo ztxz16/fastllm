@@ -591,13 +591,12 @@ namespace fastllm {
                                     this->hcCount, output);
     }
 
-    void Qwen4ExpModel::HyperMix(const Data &hyperInput,
-                                  const std::string &prefix,
-                                  Data &mixedInput,
-                                  Data *injectionWeights) {
-        Data normalized, lowRank, inputMix;
-        GroupedRMSNorm(hyperInput, this->weight[prefix + "hc_norm.weight"], normalized);
-        Linear(normalized, this->weight[prefix + "input_mix_weight_down.weight"],
+    void Qwen4ExpModel::HyperMixNormalized(
+            Data &normalized, const std::string &prefix,
+            Data &mixedInput, Data *injectionWeights) {
+        Data lowRank, inputMix;
+        Linear(normalized,
+               this->weight[prefix + "input_mix_weight_down.weight"],
                Data(), lowRank);
         Mul(lowRank, 1.0f / (float)this->hcCount, lowRank);
         Silu(lowRank, lowRank);
@@ -607,7 +606,8 @@ namespace fastllm {
                               this->hcCount, mixedInput);
 
         if (injectionWeights != nullptr) {
-            Linear(normalized, this->weight[prefix + "block_inject_weight.weight"],
+            Linear(normalized,
+                   this->weight[prefix + "block_inject_weight.weight"],
                    Data(), *injectionWeights);
             fastllm::Qwen4HyperInject(*injectionWeights,
                                      this->hcCount,
@@ -625,6 +625,15 @@ namespace fastllm {
         fastllm::Qwen4HyperCombine(hyperInput, blockOutput,
                                   injectionWeights, this->hcCount,
                                   output);
+    }
+
+    void Qwen4ExpModel::HyperCombineRMSNorm(
+            const Data &hyperInput, const Data &blockOutput,
+            const Data &injectionWeights, Data &normWeight,
+            Data &output, Data &normalized) {
+        fastllm::Qwen4HyperCombineRMSNorm(
+            hyperInput, blockOutput, injectionWeights, normWeight,
+            this->rms_norm_eps, this->hcCount, output, normalized);
     }
 
     void Qwen4ExpModel::RunPLE(const Data &hyperInput,
@@ -2305,6 +2314,9 @@ namespace fastllm {
                                this->hcCount * this->embed_dim});
         DumpTensorIfRequested("embedding", *hiddenStates);
 
+        Data carriedAttentionNorm, finalHyperNorm;
+        bool hasCarriedAttentionNorm = false;
+        bool hasFinalHyperNorm = false;
         for (int layer = 0; layer < this->block_cnt; layer++) {
             ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
 
@@ -2314,13 +2326,29 @@ namespace fastllm {
                 AddTo(*hiddenStates, pleOutput);
                 DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                       "_ple", *hiddenStates);
+                carriedAttentionNorm.FreeSpace();
+                hasCarriedAttentionNorm = false;
             }
 
             const std::string layerPrefix = languagePrefix + "layers." +
                                             std::to_string(layer) + ".";
-            Data attentionInput, attentionInjection, attentionOutput;
-            HyperMix(*hiddenStates, layerPrefix + "attn_hyper_connection.",
-                     attentionInput, &attentionInjection);
+            const std::string attentionHyperPrefix =
+                layerPrefix + "attn_hyper_connection.";
+            Data attentionNorm, attentionInput, attentionInjection;
+            Data attentionOutput;
+            Data *normalizedAttention = &attentionNorm;
+            if (hasCarriedAttentionNorm) {
+                normalizedAttention = &carriedAttentionNorm;
+            } else {
+                GroupedRMSNorm(
+                    *hiddenStates,
+                    this->weight[attentionHyperPrefix + "hc_norm.weight"],
+                    attentionNorm);
+            }
+            HyperMixNormalized(*normalizedAttention, attentionHyperPrefix,
+                               attentionInput, &attentionInjection);
+            normalizedAttention->FreeSpace();
+            hasCarriedAttentionNorm = false;
             if (this->IsLinearAttentionLayer(layer)) {
                 RunLinearAttention(layer, attentionInput,
                                    pastKeyValues[layer].first,
@@ -2335,16 +2363,47 @@ namespace fastllm {
             }
             DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                   "_attention", attentionOutput);
-            HyperCombine(*hiddenStates, attentionOutput, attentionInjection,
-                         *nextHiddenStates);
+            const std::string mlpHyperPrefix =
+                layerPrefix + "mlp_hyper_connection.";
+            Data mlpNorm;
+            HyperCombineRMSNorm(
+                *hiddenStates, attentionOutput, attentionInjection,
+                this->weight[mlpHyperPrefix + "hc_norm.weight"],
+                *nextHiddenStates, mlpNorm);
             std::swap(hiddenStates, nextHiddenStates);
 
             Data mlpInput, mlpInjection, mlpOutput;
-            HyperMix(*hiddenStates, layerPrefix + "mlp_hyper_connection.",
-                     mlpInput, &mlpInjection);
+            HyperMixNormalized(mlpNorm, mlpHyperPrefix,
+                               mlpInput, &mlpInjection);
+            mlpNorm.FreeSpace();
             RunMoE(layer, mlpInput, mlpOutput);
-            HyperCombine(*hiddenStates, mlpOutput, mlpInjection,
-                         *nextHiddenStates);
+            if (layer + 1 == this->block_cnt) {
+                const std::string finalHyperPrefix =
+                    languagePrefix + "hyper_connection_mixer.";
+                HyperCombineRMSNorm(
+                    *hiddenStates, mlpOutput, mlpInjection,
+                    this->weight[finalHyperPrefix + "hc_norm.weight"],
+                    *nextHiddenStates, finalHyperNorm);
+                hasFinalHyperNorm = true;
+                hasCarriedAttentionNorm = false;
+            } else if (layer + 1 != this->pleLayer) {
+                const std::string nextAttentionHyperPrefix =
+                    languagePrefix + "layers." +
+                    std::to_string(layer + 1) +
+                    ".attn_hyper_connection.";
+                HyperCombineRMSNorm(
+                    *hiddenStates, mlpOutput, mlpInjection,
+                    this->weight[nextAttentionHyperPrefix +
+                                 "hc_norm.weight"],
+                    *nextHiddenStates, carriedAttentionNorm);
+                hasCarriedAttentionNorm = true;
+            } else {
+                // PLE changes the residual before the next attention norm, so
+                // this single boundary cannot be normalized ahead of time.
+                HyperCombine(*hiddenStates, mlpOutput, mlpInjection,
+                             *nextHiddenStates);
+                hasCarriedAttentionNorm = false;
+            }
             std::swap(hiddenStates, nextHiddenStates);
             DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                   "_output", *hiddenStates);
@@ -2353,8 +2412,12 @@ namespace fastllm {
         MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
 
         Data finalHidden;
-        HyperMix(*hiddenStates, languagePrefix + "hyper_connection_mixer.",
-                 finalHidden, nullptr);
+        AssertInFastLLM(hasFinalHyperNorm,
+                        "Qwen4-Exp final hyper norm was not produced.");
+        HyperMixNormalized(
+            finalHyperNorm, languagePrefix + "hyper_connection_mixer.",
+            finalHidden, nullptr);
+        finalHyperNorm.FreeSpace();
         DumpTensorIfRequested("final_hidden", finalHidden);
         Data lastHidden;
         if (finalHidden.dims[1] > 1) {

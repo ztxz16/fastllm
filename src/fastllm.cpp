@@ -4173,6 +4173,19 @@ namespace fastllm {
         }, {}, {{"groups", groups}});
     }
 
+    void Qwen4HyperCombineRMSNorm(
+            const Data &hyperInput, const Data &blockOutput,
+            const Data &injection, const Data &normWeight,
+            float eps, int groups, Data &residual, Data &normalized) {
+        curExecutor->Run("Qwen4HyperCombineRMSNorm", {
+                {"input", (Data*)&hyperInput},
+                {"blockOutput", (Data*)&blockOutput},
+                {"injection", (Data*)&injection},
+                {"weight", (Data*)&normWeight},
+                {"output", &residual}, {"normalized", &normalized}
+        }, {{"eps", eps}}, {{"groups", groups}});
+    }
+
     void Qwen4QSASelect(const Data &query, const Data &compressedKeys,
                         int keyLength, int heads, int headDim,
                         int tokenBudget, int compressRatio, Data &indices,
