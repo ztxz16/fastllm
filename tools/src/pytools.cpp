@@ -257,6 +257,28 @@ extern "C" {
         return ret;
     }
 
+    static bool is_supported_tool_call_constraint_format(
+            const std::string &format) {
+        return format == "deepseek_v4_dsml" || format == "dots_xml";
+    }
+
+    static std::vector<std::string> default_tool_call_name_prefixes(
+            const std::string &format, bool parameter) {
+        if (format == "dots_xml") {
+            return {parameter ? "<parameter name=\"" : "<invoke name=\""};
+        }
+        if (parameter) {
+            return {
+                "<｜DSML｜parameter name=\"",
+                "<\\DSML\\parameter name=\"",
+            };
+        }
+        return {
+            "<｜DSML｜invoke name=\"",
+            "<\\DSML\\invoke name=\"",
+        };
+    }
+
     static bool apply_tool_call_constraint_json(
             fastllm::GenerationConfig &config,
             const std::string &payload) {
@@ -290,9 +312,11 @@ extern "C" {
         if (!nameConstraint.is_object()) {
             nameConstraint = root;
         }
+        std::string constraintFormat =
+            nameConstraint["format"].string_value();
         if (!nameConstraint.is_object() ||
             nameConstraint["type"].string_value() != "tool_name_enum" ||
-            nameConstraint["format"].string_value() != "deepseek_v4_dsml") {
+            !is_supported_tool_call_constraint_format(constraintFormat)) {
             return false;
         }
 
@@ -302,8 +326,8 @@ extern "C" {
         }
         auto prefixes = read_string_array(nameConstraint["invoke_name_prefixes"]);
         if (prefixes.empty()) {
-            prefixes.push_back("<｜DSML｜invoke name=\"");
-            prefixes.push_back("<\\DSML\\invoke name=\"");
+            prefixes = default_tool_call_name_prefixes(
+                constraintFormat, false);
         }
         std::string terminator = nameConstraint["name_terminator"].string_value();
         if (terminator.empty()) {
@@ -321,15 +345,15 @@ extern "C" {
         json11::Json parameterNameConstraint = root["parameter_name_constraint"];
         if (parameterNameConstraint.is_object() &&
             parameterNameConstraint["type"].string_value() == "tool_parameter_name_enum" &&
-            parameterNameConstraint["format"].string_value() == "deepseek_v4_dsml") {
+            parameterNameConstraint["format"].string_value() == constraintFormat) {
             auto parameterNames = read_string_array_map(
                     parameterNameConstraint["parameter_names_by_tool"]);
             if (!parameterNames.empty()) {
                 auto parameterPrefixes = read_string_array(
                         parameterNameConstraint["parameter_name_prefixes"]);
                 if (parameterPrefixes.empty()) {
-                    parameterPrefixes.push_back("<｜DSML｜parameter name=\"");
-                    parameterPrefixes.push_back("<\\DSML\\parameter name=\"");
+                    parameterPrefixes = default_tool_call_name_prefixes(
+                        constraintFormat, true);
                 }
                 config.tool_call_parameter_name_constraint_enabled = true;
                 config.tool_call_allowed_parameter_names = std::move(parameterNames);

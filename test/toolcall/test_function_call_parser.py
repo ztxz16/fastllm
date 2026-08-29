@@ -227,6 +227,37 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertEqual(result.diagnostics[0].code, "tool_choice_violation")
         self.assertEqual(result.diagnostics[0].tool_name, "get_weather")
 
+    def test_named_tool_choice_without_call_is_invalid(self):
+        parser = FunctionCallParser.from_request(
+            _request(
+                tools=[_weather_tool(), _time_tool()],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "get_time"},
+                },
+            ))
+
+        result = parser.parse_non_stream("普通回复")
+
+        self.assertFalse(result.tools_called)
+        self.assertTrue(result.has_invalid_tool_block)
+        self.assertEqual(len(result.diagnostics), 1)
+        self.assertEqual(result.diagnostics[0].code, "tool_choice_violation")
+        self.assertIn("get_time", result.diagnostics[0].message)
+
+    def test_none_tool_choice_disables_parsing_and_constraints(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_weather_tool()], tool_choice="none"))
+        wire = _dsml_call("get_weather")
+
+        result = parser.parse_non_stream(wire)
+
+        self.assertFalse(result.tools_called)
+        self.assertEqual(result.content, wire)
+        self.assertEqual(result.diagnostics, [])
+        self.assertFalse(parser.has_tool_call(wire))
+        self.assertIsNone(parser.build_constraint_descriptor())
+
     def test_required_tool_choice_without_call_is_invalid(self):
         parser = FunctionCallParser.from_request(
             _request(tools=[_weather_tool()], tool_choice="required"))

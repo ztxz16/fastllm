@@ -197,6 +197,54 @@ class ToolCallConstraintCompilerTest(unittest.TestCase):
         self.assertIn('"get_time"', spec.name_grammar)
         self.assertNotIn('"get_weather"', spec.name_grammar)
 
+    def test_dots_xml_emits_native_name_and_parameter_constraints(self):
+        descriptor = FunctionCallParser.build_constraint_descriptor_from_request(
+            _request(tools=[_weather_tool(), _time_tool()]),
+            tool_parser_name="dots3_note",
+        )
+
+        spec = compile_tool_call_constraint(descriptor)
+
+        self.assertEqual(spec.structural_tag["format"], "dots_xml")
+        self.assertEqual(spec.structural_tag["tool_call_start"],
+                         "<dots_function_call>")
+        self.assertEqual(spec.name_constraint["format"], "dots_xml")
+        self.assertEqual(spec.name_constraint["allowed_names"],
+                         ["get_weather", "get_time"])
+        self.assertEqual(spec.name_constraint["invoke_name_prefixes"],
+                         ['<invoke name="'])
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_names_by_tool"],
+            {
+                "get_weather": ["city", "days"],
+                "get_time": ["timezone"],
+            },
+        )
+        self.assertEqual(
+            spec.parameter_name_constraint["parameter_name_prefixes"],
+            ['<parameter name="'],
+        )
+        self.assertIn("<dots_function_call>", spec.name_grammar)
+
+    def test_named_dots_choice_restricts_native_name_constraint(self):
+        descriptor = FunctionCallParser.build_constraint_descriptor_from_request(
+            _request(
+                tools=[_weather_tool(), _time_tool()],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "get_time"},
+                },
+            ),
+            tool_parser_name="dots3_note",
+        )
+
+        spec = compile_tool_call_constraint(descriptor)
+
+        self.assertEqual(spec.name_constraint["allowed_names"], ["get_time"])
+        self.assertTrue(spec.structural_tag["requires_tool_call"])
+        self.assertIn('"get_time"', spec.name_grammar)
+        self.assertNotIn('"get_weather"', spec.name_grammar)
+
     def test_software_dev_tools_emit_request_driven_name_enum(self):
         spec = compile_tool_call_constraint(
             _descriptor(tools=software_dev_tools()))

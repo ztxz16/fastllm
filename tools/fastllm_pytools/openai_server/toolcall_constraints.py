@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 @dataclass(frozen=True)
 class ToolCallConstraintSpec:
-    """Backend-neutral prototype for future toolcall constrained decoding."""
+    """Backend-neutral tool-call constraint description."""
 
     version: int
     backend: str
@@ -55,7 +55,8 @@ def compile_tool_call_constraint(
     parameter_name_constraint = None
     name_grammar = None
     notes = [
-        "prototype only: native FastLLM decoding does not consume this yet",
+        "native FastLLM consumes supported tool and parameter name enums",
+        "full structure and argument schemas remain parser-validated",
         "no xgrammar dependency is required to build this spec",
     ]
     if constraint_type == "deepseek_v4_dsml":
@@ -64,6 +65,12 @@ def compile_tool_call_constraint(
         parameter_name_constraint = (
             _build_deepseek_v4_parameter_name_constraint(descriptor_dict))
         name_grammar = _build_deepseek_v4_name_grammar(descriptor_dict)
+    elif constraint_type == "dots_xml":
+        structural_tag = _build_dots_structural_tag(descriptor_dict)
+        name_constraint = _build_dots_name_constraint(descriptor_dict)
+        parameter_name_constraint = (
+            _build_dots_parameter_name_constraint(descriptor_dict))
+        name_grammar = _build_dots_name_grammar(descriptor_dict)
     else:
         notes.append(
             f"no structural_tag prototype for constraint_type={constraint_type!r}")
@@ -262,6 +269,90 @@ def _build_deepseek_v4_name_grammar(descriptor: Dict[str, Any]) -> str:
         'parameter ::= "<｜DSML｜parameter" parameter_attrs ">" '
         'parameter_value "</｜DSML｜parameter>"',
         'parameter_attrs ::= /[^>]*/',
+        'parameter_value ::= /[^<]*/',
+    ])
+
+
+def _build_dots_structural_tag(
+    descriptor: Dict[str, Any],
+) -> Dict[str, Any]:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    return {
+        "type": "structural_tag",
+        "format": "dots_xml",
+        "tool_call_start": "<dots_function_call>",
+        "tool_call_end": "</dots_function_call>",
+        "invoke": {
+            "tag": "invoke",
+            "name_attribute": "name",
+            "allowed_names": allowed_tool_names,
+        },
+        "parameter": {
+            "tag": "parameter",
+            "required_attributes": ["name"],
+        },
+        "requires_tool_call": bool(descriptor.get("requires_tool_call")),
+        "max_tool_calls": (
+            1 if descriptor.get("parallel_tool_calls") is False else None
+        ),
+        "schemas": copy.deepcopy(descriptor.get("schemas") or {}),
+    }
+
+
+def _build_dots_name_constraint(
+    descriptor: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "type": "tool_name_enum",
+        "format": "dots_xml",
+        "matching": "tokenizer_agnostic_string_prefix",
+        "allowed_names": list(descriptor.get("allowed_tool_names") or []),
+        "invoke_name_prefixes": ['<invoke name="'],
+        "name_terminator": '"',
+        "notes": [
+            "constrains Dots invoke name values only",
+            "arguments and full XML structure remain parser-validated",
+        ],
+    }
+
+
+def _build_dots_parameter_name_constraint(
+    descriptor: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    parameter_names = _normalize_parameter_names(
+        descriptor.get("parameter_names") or {})
+    if not parameter_names:
+        return None
+    return {
+        "type": "tool_parameter_name_enum",
+        "format": "dots_xml",
+        "matching": "tokenizer_agnostic_string_prefix",
+        "parameter_names_by_tool": parameter_names,
+        "parameter_name_prefixes": ['<parameter name="'],
+        "name_terminator": '"',
+        "notes": [
+            "constrains top-level Dots parameter name values only",
+            "argument values and nested JSON schema remain parser-validated",
+        ],
+    }
+
+
+def _build_dots_name_grammar(descriptor: Dict[str, Any]) -> str:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    tool_name_rule = " | ".join(
+        _quote_ebnf_literal(name) for name in allowed_tool_names)
+    if not tool_name_rule:
+        tool_name_rule = '""'
+    return "\n".join([
+        "root ::= tool_calls",
+        'tool_calls ::= "<dots_function_call>" invoke+ '
+        '"</dots_function_call>"',
+        'invoke ::= "<invoke name=\\\"" tool_name "\\\">" '
+        'parameter* "</invoke>"',
+        f"tool_name ::= {tool_name_rule}",
+        'parameter ::= "<parameter name=\\\"" parameter_name "\\\">" '
+        'parameter_value "</parameter>"',
+        'parameter_name ::= /[^"<>]+/',
         'parameter_value ::= /[^<]*/',
     ])
 

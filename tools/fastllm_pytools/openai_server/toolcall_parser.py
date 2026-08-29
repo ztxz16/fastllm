@@ -164,7 +164,7 @@ class FunctionCallParser:
         return bool(self.tools)
 
     def has_tool_call(self, text: str) -> bool:
-        if not self.has_tools:
+        if not self.has_tools or self.tool_choice == "none":
             return False
         detector = getattr(self.parser, "has_tool_call", None)
         if callable(detector):
@@ -188,7 +188,7 @@ class FunctionCallParser:
     def build_constraint_descriptor(
         self,
     ) -> Optional[ToolCallConstraintDescriptor]:
-        if not self.has_tools:
+        if not self.has_tools or self.tool_choice == "none":
             return None
 
         named_tool_choice = self._named_tool_choice()
@@ -219,8 +219,7 @@ class FunctionCallParser:
             allowed_tool_names=allowed_tool_names,
             tool_choice=_normalize_tool_choice_for_descriptor(
                 self.tool_choice),
-            requires_tool_call=self._requires_tool_call()
-            or named_tool_choice is not None,
+            requires_tool_call=self._requires_tool_call(),
             named_tool_choice=named_tool_choice,
             parallel_tool_calls=self.parallel_tool_calls,
             schemas=schemas,
@@ -229,7 +228,7 @@ class FunctionCallParser:
         )
 
     def parse_non_stream(self, text: str) -> ToolCallParseResult:
-        if not self.has_tools:
+        if not self.has_tools or self.tool_choice == "none":
             return ToolCallParseResult(content=text)
 
         extracted = self.parser.extract_tool_calls(text, self._request)
@@ -260,7 +259,7 @@ class FunctionCallParser:
         current_token_ids: Iterable[int],
         delta_token_ids: Iterable[int],
     ) -> ToolCallParseResult:
-        if not self.has_tools:
+        if not self.has_tools or self.tool_choice == "none":
             return ToolCallParseResult(content=delta_text)
 
         self.stream_text = current_text
@@ -429,10 +428,17 @@ class FunctionCallParser:
         valid_tool_calls = list(validation.valid_tool_calls)
         invalid_tool_calls = list(validation.invalid_tool_calls)
         if self._requires_tool_call() and not validation.valid_tool_calls:
+            required_name = self._named_tool_choice()
+            message = (
+                f"tool_choice requires function {required_name!r} but no "
+                "valid tool call was produced"
+                if required_name is not None else
+                "tool_choice='required' was set but no valid tool call was produced"
+            )
             diagnostics.append(
                 ToolCallDiagnostic(
                     code="tool_choice_violation",
-                    message="tool_choice='required' was set but no valid tool call was produced",
+                    message=message,
                 ))
             has_invalid_tool_block = True
         if (self.parallel_tool_calls is False
@@ -493,10 +499,17 @@ class FunctionCallParser:
                         ),
                     ))
         if self._requires_tool_call() and not self.has_valid_streamed_tool_calls:
+            required_name = self._named_tool_choice()
+            message = (
+                f"tool_choice requires function {required_name!r} but no "
+                "valid stream tool call was produced"
+                if required_name is not None else
+                "tool_choice='required' was set but no valid stream tool call was produced"
+            )
             diagnostics.append(
                 ToolCallDiagnostic(
                     code="tool_choice_violation",
-                    message="tool_choice='required' was set but no valid stream tool call was produced",
+                    message=message,
                 ))
         for raw_index in sorted(self.valid_stream_tool_indices):
             state = self.stream_tool_call_fragments.get(raw_index, {})
@@ -556,7 +569,8 @@ class FunctionCallParser:
         )
 
     def _requires_tool_call(self) -> bool:
-        return self.tool_choice == "required"
+        return (self.tool_choice == "required"
+                or self._named_tool_choice() is not None)
 
     def _named_tool_choice(self) -> Optional[str]:
         if isinstance(self.tool_choice, str) or self.tool_choice is None:
@@ -708,6 +722,8 @@ class FunctionCallParser:
     def _constraint_type(self) -> str:
         if self.tool_parser_name == "deepseek_v4":
             return "deepseek_v4_dsml"
+        if self.tool_parser_name in {"dots", "dots3_note"}:
+            return "dots_xml"
         return f"{self.tool_parser_name}_tool_call"
 
 

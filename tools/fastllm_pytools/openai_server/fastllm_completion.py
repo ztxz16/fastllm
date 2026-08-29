@@ -321,12 +321,34 @@ class FastLLmCompletion:
       return (enable_thinking and self._is_qwen3_5_model()
               and not getattr(self.model, "force_chat_template", False))
 
+  def _is_dots3_note_model(self) -> bool:
+      try:
+          if self.model.get_type() == "dots3_note":
+              return True
+      except Exception:
+          pass
+
+      config = getattr(self.model, "config", None)
+      if not isinstance(config, dict):
+          return False
+      architectures = config.get("architectures") or []
+      architecture = architectures[0] if architectures else ""
+      return (architecture == "Dots3NoteForCausalLM"
+              or config.get("model_type") == "dots3_note")
+
+  def _is_dots3_note_reasoning_response(
+      self, enable_thinking: bool
+  ) -> bool:
+      return (enable_thinking and self._is_dots3_note_model()
+              and not getattr(self.model, "force_chat_template", False))
+
   def _uses_tagged_reasoning_response(self, enable_thinking: bool) -> bool:
       return (self._is_deepseek_v4_reasoning_response(enable_thinking)
               or self._is_poolside_reasoning_response(enable_thinking)
               or self._is_kimi_k3_reasoning_response(enable_thinking)
               or self._is_glm5_next_reasoning_response()
-              or self._is_qwen3_5_reasoning_response(enable_thinking))
+              or self._is_qwen3_5_reasoning_response(enable_thinking)
+              or self._is_dots3_note_reasoning_response(enable_thinking))
 
   def _resolve_kimi_k3_reasoning_effort(
       self, request: ChatCompletionRequest
@@ -405,6 +427,18 @@ class FastLLmCompletion:
           return tool_choice.dict(exclude_none=True)
       return tool_choice
 
+  def _named_tool_choice(self, tool_choice: Any) -> Optional[str]:
+      tool_choice = self._serialize_tool_choice(tool_choice)
+      if not isinstance(tool_choice, dict):
+          return None
+      if tool_choice.get("type") != "function":
+          return None
+      function = tool_choice.get("function")
+      if not isinstance(function, dict):
+          return None
+      name = function.get("name")
+      return name if isinstance(name, str) and name else None
+
   def _with_effective_tool_choice(
       self,
       request: ChatCompletionRequest,
@@ -417,6 +451,115 @@ class FastLLmCompletion:
       if callable(model_copy):
           return model_copy(update={"tool_choice": tool_choice})
       return request.copy(update={"tool_choice": tool_choice})
+
+  def _append_text_to_message(
+      self,
+      message: Dict[str, Any],
+      text: str,
+      separator: str = "\n\n",
+  ) -> Dict[str, Any]:
+      """Copy a message and append text without mutating request content."""
+      updated = dict(message)
+      content = message.get("content")
+      if isinstance(content, str):
+          if text not in content:
+              updated["content"] = content.rstrip() + separator + text
+          return updated
+
+      if isinstance(content, list):
+          content_parts = [
+              dict(part) if isinstance(part, dict) else part
+              for part in content
+          ]
+          has_text = any(
+              isinstance(part, dict)
+              and text in str(part.get("text", ""))
+              for part in content_parts
+          )
+          if not has_text:
+              content_parts.append({
+                  "type": "text",
+                  "text": separator + text,
+              })
+          updated["content"] = content_parts
+          return updated
+
+      updated["content"] = text
+      return updated
+
+  def _apply_dots_tool_choice(
+      self,
+      messages: List[Dict[str, Any]],
+      tools: Optional[List[Dict[str, Any]]],
+      tool_choice: Any,
+  ) -> Tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+      if not self._is_dots3_note_model():
+          return messages, tools
+      if tool_choice == "none":
+          return messages, None
+
+      named_tool = self._named_tool_choice(tool_choice)
+      if tool_choice != "required" and named_tool is None:
+          return messages, tools
+      if not tools:
+          raise ValueError(
+              "Dots3-Note tool_choice requires at least one request tool")
+
+      selected_tools = tools
+      if named_tool is not None:
+          selected_tools = [
+              tool for tool in tools
+              if isinstance(tool, dict)
+              and isinstance(tool.get("function"), dict)
+              and tool["function"].get("name") == named_tool
+          ]
+          if not selected_tools:
+              raise ValueError(
+                  f"tool_choice requests unknown function {named_tool!r}")
+          guidance = (
+              "Tool choice requirement: you must call the function "
+              f"{named_tool!r} in your next response. Do not call another "
+              "function and do not answer with plain text instead. Use the "
+              "exact Dots XML tool-call format described below. Call it "
+              "immediately without explaining or discussing this requirement."
+          )
+          user_guidance = (
+              "【系统工具选择约束】本轮 tool_choice 指定函数 "
+              f"{named_tool!r}。此约束优先于上述用户要求：你必须且只能"
+              "调用该函数，禁止只输出普通文本；无需解释或展开思考，请立即"
+              "按系统消息规定的 Dots XML 格式调用。"
+          )
+      else:
+          guidance = (
+              "Tool choice requirement: you must call at least one of the "
+              "available functions in your next response. A plain-text "
+              "answer without a tool call is invalid. Use the exact Dots "
+              "XML tool-call format described below. Call a function "
+              "immediately without explaining or discussing this requirement."
+          )
+          user_guidance = (
+              "【系统工具选择约束】本轮 tool_choice=required。"
+              "此约束优先于上述用户要求：你必须在本次回复中调用至少一个"
+              "可用工具，禁止只输出普通文本；无需解释或展开思考，请立即"
+              "按系统消息规定的 Dots XML 格式调用。"
+          )
+
+      guided = [dict(message) for message in messages]
+      if guided and guided[0].get("role") == "system":
+          guided[0] = self._append_text_to_message(guided[0], guidance)
+      else:
+          guided.insert(0, {
+              "role": "system",
+              "content": "You are a helpful assistant.\n\n" + guidance,
+          })
+      for index in range(len(guided) - 1, -1, -1):
+          message = guided[index]
+          if message.get("role") != "user":
+              continue
+          guided[index] = self._append_text_to_message(
+              message, user_guidance)
+          break
+      return guided, selected_tools
 
   def _resolve_kimi_k3_auto_tool_choice(
       self,
@@ -545,10 +688,8 @@ class FastLLmCompletion:
           "context, respond without a tool.")
       guided = [dict(message) for message in messages]
       for index, message in enumerate(guided):
-          content = message.get("content")
-          if message.get("role") == "system" and isinstance(content, str):
-              if guidance not in content:
-                  guided[index]["content"] = content.rstrip() + "\n\n" + guidance
+          if message.get("role") == "system":
+              guided[index] = self._append_text_to_message(message, guidance)
               return guided
       guided.insert(0, {"role": "system", "content": guidance})
       return guided
@@ -563,7 +704,7 @@ class FastLLmCompletion:
               or tool_choice != "required"):
           return messages
       guidance = (
-          "\n\n系统动作要求：必须立即调用合适的工具完成上述操作；不要只说明"
+          "系统动作要求：必须立即调用合适的工具完成上述操作；不要只说明"
           "将要执行，也不要在信息足够时追问。纯文本回复无效。如果请求是"
           "创建或写入文件，直接调用 write 工具，不要先用 bash 检查目录；"
           "调用 write 时必须同时提供 filePath 和完整 content。")
@@ -572,9 +713,7 @@ class FastLLmCompletion:
           message = guided[index]
           if message.get("role") != "user":
               continue
-          content = message.get("content")
-          if isinstance(content, str) and guidance not in content:
-              guided[index]["content"] = content.rstrip() + guidance
+          guided[index] = self._append_text_to_message(message, guidance)
           break
       return guided
 
@@ -660,8 +799,22 @@ class FastLLmCompletion:
       think_end = "</think>"
       state["buffer"] = state.get("buffer", "") + delta_text
       if not state.get("started"):
-          state["buffer"] = self._strip_optional_think_start(state["buffer"])
-          state["started"] = True
+          think_start = "<think>"
+          if state["buffer"].startswith(think_start):
+              state["buffer"] = state["buffer"][len(think_start):]
+              state["started"] = True
+              state["strip_leading_newline"] = True
+          elif think_start.startswith(state["buffer"]):
+              return [], ""
+          else:
+              state["started"] = True
+
+      if state.get("strip_leading_newline"):
+          if not state["buffer"]:
+              return [], ""
+          if state["buffer"].startswith("\n"):
+              state["buffer"] = state["buffer"][1:]
+          state["strip_leading_newline"] = False
 
       think_end_idx = state["buffer"].find(think_end)
       if think_end_idx >= 0:
@@ -2824,6 +2977,12 @@ class FastLLmCompletion:
           messages, tools, tool_choice)
       messages = self._apply_kimi_k3_required_tool_guidance(
           messages, tools, tool_choice)
+      try:
+          messages, tools = self._apply_dots_tool_choice(
+              messages, tools, tool_choice)
+      except ValueError as error:
+          self._cleanup_temp_paths(media.temp_paths)
+          return self.create_error_response(str(error))
       effective_request = self._with_effective_tool_choice(
           request, tool_choice)
 
@@ -2970,7 +3129,7 @@ class FastLLmCompletion:
               reasoning_content = None
               if not request.tools:
                   result = self._strip_kimi_k3_response_wrapper(result)
-      elif self._is_qwen3_5_model():
+      elif self._is_qwen3_5_model() or self._is_dots3_note_model():
           result, reasoning_content = self._split_qwen3_5_reasoning(
               result, emit_reasoning_content)
       elif self._is_glm5_next_model():

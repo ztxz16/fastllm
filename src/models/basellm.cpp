@@ -87,6 +87,21 @@ namespace fastllm {
                    memcmp(text.data(), prefix.data(), prefix.size()) == 0;
         }
 
+        static bool ContainsToolCallPrefix(
+                const std::vector<std::string> &prefixes,
+                const std::string &target) {
+            return std::find(prefixes.begin(), prefixes.end(), target) !=
+                   prefixes.end();
+        }
+
+        static void KeepLaterPosition(std::string::size_type candidate,
+                                      std::string::size_type &position) {
+            if (position == std::string::npos ||
+                (candidate != std::string::npos && candidate > position)) {
+                position = candidate;
+            }
+        }
+
         static bool FindLastPrefix(const std::string &text,
                                    const std::vector<std::string> &prefixes,
                                    std::string::size_type &bestPos,
@@ -167,11 +182,23 @@ namespace fastllm {
                 return false;
             }
 
-            const std::vector<std::string> parameterCloseTags = {
+            static const std::vector<std::string> dsmlParameterCloseTags = {
                     "</｜DSML｜parameter>",
                     "</\\DSML\\parameter>",
             };
-            auto closePos = FindLastNeedleBefore(text, parameterCloseTags, parameterPos);
+            auto closePos = FindLastNeedleBefore(
+                text, dsmlParameterCloseTags, parameterPos);
+            if (ContainsToolCallPrefix(
+                    config.tool_call_parameter_name_prefixes,
+                    "<parameter name=\"")) {
+                static const std::vector<std::string> dotsParameterCloseTags = {
+                    "</parameter>",
+                };
+                KeepLaterPosition(
+                    FindLastNeedleBefore(
+                        text, dotsParameterCloseTags, parameterPos),
+                    closePos);
+            }
             if (closePos != std::string::npos && closePos > previousParameterPos) {
                 return false;
             }
@@ -211,8 +238,6 @@ namespace fastllm {
             }
             const std::string terminator =
                     config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
-            const std::string standardClose = "</｜DSML｜invoke>";
-            const std::string alternateClose = "</\\DSML\\invoke>";
             std::string::size_type bestPos = std::string::npos;
             const std::string *bestPrefix = nullptr;
             if (!FindLastPrefix(text, config.tool_call_invoke_name_prefixes,
@@ -224,13 +249,22 @@ namespace fastllm {
             if (terminatorPos == std::string::npos) {
                 return false;
             }
-            auto standardClosePos = text.rfind(standardClose);
-            auto alternateClosePos = text.rfind(alternateClose);
-            auto closePos = standardClosePos;
-            if (closePos == std::string::npos ||
-                (alternateClosePos != std::string::npos &&
-                 alternateClosePos > closePos)) {
-                closePos = alternateClosePos;
+            static const std::vector<std::string> dsmlInvokeCloseTags = {
+                "</｜DSML｜invoke>",
+                "</\\DSML\\invoke>",
+            };
+            auto closePos = FindLastNeedleBefore(
+                text, dsmlInvokeCloseTags, text.size());
+            if (ContainsToolCallPrefix(
+                    config.tool_call_invoke_name_prefixes,
+                    "<invoke name=\"")) {
+                static const std::vector<std::string> dotsInvokeCloseTags = {
+                    "</invoke>",
+                };
+                KeepLaterPosition(
+                    FindLastNeedleBefore(
+                        text, dotsInvokeCloseTags, text.size()),
+                    closePos);
             }
             if (closePos != std::string::npos && closePos > bestPos) {
                 return false;

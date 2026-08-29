@@ -372,7 +372,7 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_calls[0]["name"], "git_status")
         self.assertEqual(json.loads(tool_calls[0]["arguments"]), {})
 
-    async def test_named_tool_choice_mismatch_is_suppressed(self):
+    async def test_named_tool_choice_mismatch_returns_error(self):
         with self.assertLogs(level="WARNING") as logs:
             chunks, saw_done = await self._collect_stream(
                 _weather_call("get_weather"),
@@ -386,7 +386,9 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(saw_done)
-        self.assertEqual(self._finish_reason(chunks), "stop")
+        errors = self._errors(chunks)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("tool_choice_violation", errors[0]["message"])
         self.assertEqual(self._reconstruct_tool_calls(chunks), {})
         self.assertIn("tool_choice_violation", "\n".join(logs.output))
 
