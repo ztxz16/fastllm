@@ -2856,6 +2856,41 @@ namespace fastllm {
                 printf("Load chatTemplate = %s\n", model->weight.tokenizer.chatTemplate.c_str());
             }
 
+            // Canonical BPE is defined by the rank of each rule in "tokenizer.ggml.merges"
+            // (rank 0 is applied first). Tokenizer::TryMergePairs however orders candidate
+            // merges by token score, and SymbolPairs::operator< falls back to comparing
+            // positions when the scores are equal, so giving every token the same score
+            // turns the merge order into a plain left-to-right greedy scan. That yields a
+            // valid but non-canonical split, e.g. "brutalist" -> "bru" + "talist" instead
+            // of "br" + "ut" + "alist". GPT-2 style vocabularies (tokenizer.ggml.model ==
+            // "gpt2") carry no "tokenizer.ggml.scores" field at all, so merges are the only
+            // ordering information available for them.
+            //
+            // Scoring the token produced by rule i with -i makes the existing max-heap pop
+            // the lowest rank first, which is exactly canonical BPE, without changing the
+            // tokenizer. Tokens that no merge rule can produce get a very low score, so
+            // they can still be merged as a last resort but never outrank a real merge.
+            // Files without merges (SentencePiece style vocabularies) keep the previous
+            // score of 1.0f and therefore behave exactly as before.
+            std::unordered_map <std::string, int> mergeRanks;
+            {
+                const auto &mergeItems = params["tokenizer.ggml.merges"].array_items();
+                mergeRanks.reserve(mergeItems.size() * 2);
+                for (int i = 0; i < (int)mergeItems.size(); i++) {
+                    // every rule looks like "<left> <right>" and produces "<left><right>"
+                    const std::string &rule = mergeItems[i].string_value();
+                    size_t sep = rule.find(' ');
+                    if (sep == std::string::npos || sep == 0 || sep + 1 >= rule.size()) {
+                        continue;
+                    }
+                    // keep the best (smallest) rank if a string is produced more than once
+                    mergeRanks.insert({rule.substr(0, sep) + rule.substr(sep + 1), i});
+                }
+                if (!mergeRanks.empty()) {
+                    printf("Load tokenizer merges = %d\n", (int)mergeRanks.size());
+                }
+            }
+
             const auto &tokenItems = params["tokenizer.ggml.tokens"].array_items();
             int tokenTotal = (int)tokenItems.size();
             ReportModelLoadProgress("tokenizer", 0, std::max(1, tokenTotal));
@@ -2864,7 +2899,12 @@ namespace fastllm {
                 if (idx < 10) {
                     // printf("%s: %d\n", it.string_value().c_str(), idx);
                 }
-                model->weight.AddTokenizerWord(it.string_value(), idx, 1.0f);
+                float score = 1.0f;
+                if (!mergeRanks.empty()) {
+                    auto rankIt = mergeRanks.find(it.string_value());
+                    score = (rankIt == mergeRanks.end()) ? -1e9f : -(float)rankIt->second;
+                }
+                model->weight.AddTokenizerWord(it.string_value(), idx, score);
                 idx++;
                 if (idx == tokenTotal ||
                     idx * 100 / std::max(1, tokenTotal) != (idx - 1) * 100 / std::max(1, tokenTotal)) {
