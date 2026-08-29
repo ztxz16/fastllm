@@ -85,6 +85,122 @@ namespace fastllm {
             }
         }
 
+        uint64_t Qwen4DenseLogicalBytes(const Data &data) {
+            uint64_t elements = 1;
+            for (int dim : data.dims) {
+                elements *= (uint64_t)dim;
+            }
+            return (elements * data.unitSize + data.unitSizeDiv - 1) /
+                   data.unitSizeDiv;
+        }
+
+#ifdef USE_CUDA
+        class Qwen4CudaDeviceGuard {
+        public:
+            explicit Qwen4CudaDeviceGuard(
+                    const std::vector<int> &deviceIds)
+                : previousDevice(FastllmCudaGetDevice()), changed(false) {
+                if (!deviceIds.empty() &&
+                    deviceIds[0] != this->previousDevice) {
+                    FastllmCudaSetDevice(deviceIds[0]);
+                    this->changed = true;
+                }
+            }
+
+            ~Qwen4CudaDeviceGuard() {
+                if (this->changed) {
+                    FastllmCudaSetDevice(this->previousDevice);
+                }
+            }
+
+        private:
+            int previousDevice;
+            bool changed;
+        };
+
+        bool Qwen4BorrowCudaTensor(const Data &source, Data &destination,
+                                   bool linear) {
+            if (source.dataDevice != DataDevice::CUDA ||
+                source.cudaData == nullptr || source.multiDeviceData) {
+                return false;
+            }
+            const long long cacheUid = destination.cacheUid;
+            destination.FreeSpace();
+            destination.isFake = false;
+            destination.dataType = source.dataType;
+            destination.UpdateUnitSize();
+            destination.dims = source.dims;
+            destination.strides = source.strides;
+            destination.expansionSize = source.expansionSize;
+            destination.expansionBytes = source.expansionBytes;
+            destination.expansionDims = source.expansionDims;
+            // Data::CopyFrom intentionally drops expansionDims when capacity
+            // exactly equals the logical shape.  The legacy scheduler still
+            // uses expansionDims[1] as its cache-capacity marker, so restore
+            // the canonical exact-capacity metadata for a borrowed view.
+            if (destination.expansionDims.size() !=
+                destination.dims.size()) {
+                destination.expansionDims = destination.dims;
+            }
+            destination.dataDevice = DataDevice::CUDA;
+            destination.dataDeviceIds = source.dataDeviceIds;
+            destination.cudaData = source.cudaData;
+            destination.cudaDataBorrowed = true;
+            destination.cacheUid = cacheUid;
+            destination.isKVCache = true;
+            destination.isLinearAttention = linear;
+            destination.isLinearAttentionTransposed =
+                source.isLinearAttentionTransposed;
+            destination.isPagedKVCache = false;
+            destination.pagedKVCacheData = nullptr;
+            destination.pageIndex.clear();
+            destination.lastPageLen = 0;
+            destination.multiDeviceData = false;
+            destination.multiDeviceDatas.clear();
+            destination.ClearTensorParallelLayout();
+            return true;
+        }
+
+        void Qwen4DetachBorrowedCudaTensor(Data &data) {
+            if (data.dataDevice != DataDevice::CUDA ||
+                !data.cudaDataBorrowed || data.cudaData == nullptr) {
+                return;
+            }
+            Qwen4CudaDeviceGuard deviceGuard(data.dataDeviceIds);
+            if (!data.isLinearAttention && data.dims.size() >= 2) {
+                // Full-attention K/V grows along the token axis immediately
+                // after restore.  Let Expansion perform COW and reserve the
+                // same CUDA growth quantum used by RunFullAttention, avoiding
+                // a second full-cache copy on the first appended token.
+                std::vector<int> capacity = data.expansionDims;
+                if (capacity.size() != data.dims.size()) {
+                    capacity = data.dims;
+                }
+                capacity[1] = std::max(capacity[1], data.dims[1] + 128);
+                data.Expansion(capacity);
+                return;
+            }
+            void *borrowed = data.cudaData;
+            const uint64_t copyBytes = data.expansionBytes != 0
+                ? data.expansionBytes : data.GetBytes();
+            uint64_t allocationSize = data.expansionSize;
+            if (allocationSize == 0 && !data.dims.empty()) {
+                allocationSize = data.strides.empty()
+                    ? data.Count(0)
+                    : data.strides[0] * data.dims[0];
+            }
+            data.cudaData = nullptr;
+            data.cudaDataBorrowed = false;
+            data.expansionSize = 0;
+            data.expansionBytes = 0;
+            data.MallocSpace(allocationSize, false);
+            AssertInFastLLM(data.cudaData != nullptr,
+                            "Qwen4-Exp prefix cache COW allocation failed.\n");
+            FastllmCudaCopyFromDeviceToDevice(
+                data.cudaData, borrowed, copyBytes);
+        }
+#endif
+
         bool Qwen4EnvFlagEnabled(const char *name) {
             const char *value = std::getenv(name);
             return value != nullptr && value[0] != '\0' &&
@@ -1926,8 +2042,12 @@ namespace fastllm {
                 first.multiDeviceData || second.multiDeviceData) {
                 return;
             }
-            tensorBytes += first.GetBytes() + second.GetBytes();
-            if (this->IsLinearAttentionLayer(layer)) {
+            const bool linear = this->IsLinearAttentionLayer(layer);
+            tensorBytes += linear
+                ? first.GetBytes() + second.GetBytes()
+                : Qwen4DenseLogicalBytes(first) +
+                  Qwen4DenseLogicalBytes(second);
+            if (linear) {
                 continue;
             }
             const auto raw = state.indexerRawKeys.find(layer);
@@ -2004,13 +2124,16 @@ namespace fastllm {
         snapshot->stateBytes = stateBytes;
         snapshot->tokens = state.processedTokens;
         snapshot->state = state;
+        snapshot->state.borrowedPrefixSnapshot.reset();
         snapshot->state.indexerBlockKeyTensors.clear();
         snapshot->state.lastPrefixSnapshotLen = cachedLen;
         snapshot->layers.resize(this->block_cnt);
 
-        auto copyTensorToCpu = [](const Data &source, Data &destination,
-                                  DataDevice &sourceDevice,
-                                  std::vector<int> &sourceDeviceIds) -> bool {
+        auto copyTensorToResident = [](const Data &source,
+                                       Data &destination,
+                                       DataDevice &sourceDevice,
+                                       std::vector<int> &sourceDeviceIds)
+                                       -> bool {
             if (source.dims.empty() ||
                 (source.dataDevice == DataDevice::CUDA &&
                  source.cudaData == nullptr) ||
@@ -2020,7 +2143,20 @@ namespace fastllm {
             }
             sourceDevice = source.dataDevice;
             sourceDeviceIds = source.dataDeviceIds;
-            destination.CopyFrom(source);
+#ifdef USE_CUDA
+            Qwen4CudaDeviceGuard deviceGuard(
+                source.dataDevice == DataDevice::CUDA
+                    ? source.dataDeviceIds : std::vector<int>());
+#endif
+            if (!source.isLinearAttention && source.dims.size() >= 2) {
+                // Growing K/V caches retain spare token-axis capacity.  A
+                // full-range Split copies only the logical tokens into tight
+                // snapshot storage instead of duplicating that unused space.
+                fastllm::Split(source, 1, 0, source.dims[1], destination);
+            } else {
+                destination.CopyFrom(source);
+            }
+            destination.dataDeviceIds = source.dataDeviceIds;
             destination.isKVCache = true;
             destination.isLinearAttention = source.isLinearAttention;
             destination.isLinearAttentionTransposed =
@@ -2032,19 +2168,23 @@ namespace fastllm {
             destination.multiDeviceData = false;
             destination.multiDeviceDatas.clear();
             destination.ClearTensorParallelLayout();
-            destination.ToDevice(DataDevice::CPU, true);
-            return destination.cpuData != nullptr;
+            // Keep CUDA caches on their execution device. CopyFrom performs a
+            // D2D snapshot; CPU caches retain the established host fallback.
+            return (destination.dataDevice == DataDevice::CUDA &&
+                    destination.cudaData != nullptr) ||
+                   (destination.dataDevice == DataDevice::CPU &&
+                    destination.cpuData != nullptr);
         };
 
         for (int layer = 0; layer < this->block_cnt; layer++) {
             PrefixLayerSnapshot &layerSnapshot = snapshot->layers[layer];
             layerSnapshot.linear = this->IsLinearAttentionLayer(layer);
-            if (!copyTensorToCpu(
+            if (!copyTensorToResident(
                     pastKeyValues[layer].first,
                     layerSnapshot.first,
                     layerSnapshot.firstDevice,
                     layerSnapshot.firstDeviceIds) ||
-                !copyTensorToCpu(
+                !copyTensorToResident(
                     pastKeyValues[layer].second,
                     layerSnapshot.second,
                     layerSnapshot.secondDevice,
@@ -2202,6 +2342,15 @@ namespace fastllm {
                                 bool linear, DataDevice targetDevice,
                                 const std::vector<int> &targetDeviceIds)
                                 -> bool {
+#ifdef USE_CUDA
+            if (targetDevice == DataDevice::CUDA &&
+                source.dataDevice == DataDevice::CUDA &&
+                (targetDeviceIds.empty() ||
+                 targetDeviceIds == source.dataDeviceIds)) {
+                return Qwen4BorrowCudaTensor(
+                    source, destination, linear);
+            }
+#endif
             const long long cacheUid = destination.cacheUid;
             destination.FreeSpace();
             destination.CopyFrom(source);
@@ -2248,6 +2397,7 @@ namespace fastllm {
         }
 
         RequestState restored = snapshot->state;
+        restored.borrowedPrefixSnapshot = snapshot;
         restored.indexerBlockKeyTensors.clear();
         {
             std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
@@ -2299,6 +2449,21 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
             requestState = &this->requestStates[&pastKeyValues[0].first];
+        }
+
+        if (requestState->borrowedPrefixSnapshot != nullptr) {
+#ifdef USE_CUDA
+            // Restored CUDA caches initially alias immutable snapshot storage.
+            // Detach all mutable layer states before any attention/GDN update;
+            // other requests keep sharing the original snapshot safely.
+            for (int layer = 0; layer < this->block_cnt; layer++) {
+                Qwen4DetachBorrowedCudaTensor(
+                    pastKeyValues[layer].first);
+                Qwen4DetachBorrowedCudaTensor(
+                    pastKeyValues[layer].second);
+            }
+#endif
+            requestState->borrowedPrefixSnapshot.reset();
         }
 
         Data embedding, hiddenBuffers[2];

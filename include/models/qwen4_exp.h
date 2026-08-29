@@ -54,6 +54,8 @@ namespace fastllm {
         bool UseGenericHistoryCache() const override { return false; }
 
     private:
+        struct PrefixSnapshot;
+
         struct RequestState {
             int previousToken1 = -1;
             int previousToken2 = -1;
@@ -68,6 +70,10 @@ namespace fastllm {
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
+            // Keeps GPU-resident snapshot storage alive while restored cache
+            // tensors borrow it. The next Forward detaches mutable tensors
+            // with a device-to-device copy and releases this reference.
+            std::shared_ptr<PrefixSnapshot> borrowedPrefixSnapshot;
         };
 
         struct PrefixLayerSnapshot {
