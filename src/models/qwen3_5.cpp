@@ -1185,6 +1185,48 @@ namespace fastllm {
         return diff > 1e-6f || diff < -1e-6f;
     }
 
+    static bool Qwen35DFlashCommitEndsRequest(
+            const Qwen3_5Model &model, const ResponseContext *context,
+            const std::vector<int> &committedTokens) {
+        if (context == nullptr) {
+            return true;
+        }
+        if (committedTokens.empty()) {
+            return false;
+        }
+        for (int token : committedTokens) {
+            if (token == model.eos_token_id ||
+                model.eos_token_ids.find(token) !=
+                    model.eos_token_ids.end() ||
+                context->generationConfig.stop_token_ids.find(token) !=
+                    context->generationConfig.stop_token_ids.end()) {
+                return true;
+            }
+        }
+        const int outputLimit =
+            context->generationConfig.output_token_limit;
+        if (outputLimit > 0 &&
+            (long long)context->curTokens +
+                    (long long)committedTokens.size() >= outputLimit) {
+            return true;
+        }
+        return model.max_positions > 0 &&
+            context->allTokens.size() + committedTokens.size() >=
+                (size_t)model.max_positions;
+    }
+
+    static bool Qwen35DFlashDraftFitsContext(
+            int maxPositions, int checkpointBlockSize,
+            int committedTokens) {
+        // The checkpoint always evaluates its full trained block, even when
+        // the runtime exposes fewer draft slots. Rotary therefore needs room
+        // for checkpointBlockSize positions, not only the visible drafts.
+        return committedTokens >= 0 &&
+            checkpointBlockSize > 0 &&
+            maxPositions >= committedTokens &&
+            checkpointBlockSize <= maxPositions - committedTokens;
+    }
+
     static bool Qwen35MtpSupportsGenerationConfig(
             const GenerationConfig &config) {
         if (config.output_logits ||
@@ -5519,6 +5561,24 @@ namespace fastllm {
             baseTokens = key.pageIndex.empty() ? 0 :
                 ((int)key.pageIndex.size() - 1) * key.pageLen +
                     key.lastPageLen;
+            const size_t originalKeyPages = key.pageIndex.size();
+            const size_t originalValuePages = value.pageIndex.size();
+            const int originalKeyLastPageLen = key.lastPageLen;
+            const int originalValueLastPageLen = value.lastPageLen;
+            auto rollbackNewPages = [&]() {
+                while (value.pageIndex.size() > originalValuePages) {
+                    value.pagedKVCacheData->ReleasePageIndex(
+                        value.pageIndex.back());
+                    value.pageIndex.pop_back();
+                }
+                while (key.pageIndex.size() > originalKeyPages) {
+                    key.pagedKVCacheData->ReleasePageIndex(
+                        key.pageIndex.back());
+                    key.pageIndex.pop_back();
+                }
+                key.lastPageLen = originalKeyLastPageLen;
+                value.lastPageLen = originalValueLastPageLen;
+            };
             for (int token = 0; token < appendTokens; ++token) {
                 if (key.pageIndex.empty() ||
                     key.lastPageLen >= key.pageLen) {
@@ -5527,6 +5587,15 @@ namespace fastllm {
                     int valuePage =
                         value.pagedKVCacheData->GetUnusedPageIndex(true);
                     if (keyPage < 0 || valuePage != keyPage) {
+                        if (valuePage >= 0) {
+                            value.pagedKVCacheData->ReleasePageIndex(
+                                valuePage);
+                        }
+                        if (keyPage >= 0) {
+                            key.pagedKVCacheData->ReleasePageIndex(
+                                keyPage);
+                        }
+                        rollbackNewPages();
                         return false;
                     }
                     key.pageIndex.push_back(keyPage);
@@ -16147,7 +16216,8 @@ namespace fastllm {
                                        const std::vector<int> &draftInputTokens,
                                        const Data &,
                                        int,
-                                       int) {
+                                       int,
+                                       const std::vector<int> &committedTokens) {
             AssertInFastLLM(!draftInputTokens.empty(),
                             "DFlash draft input is empty.\n");
             auto draftStart = mtpProfileEnabled ?
@@ -16155,6 +16225,14 @@ namespace fastllm {
                 std::chrono::steady_clock::time_point();
             AppendDFlashTargetHidden(
                 device, (int)draftInputTokens.size(), dflashContext);
+            if (Qwen35DFlashCommitEndsRequest(
+                    *this, context, committedTokens) ||
+                !Qwen35DFlashDraftFitsContext(
+                    max_positions, dflashCheckpointBlockSize,
+                    dflashContext.committedTokens)) {
+                mtpProfileAddSpan(mtpProfileDraftFirstUs, draftStart);
+                return std::vector<int>();
+            }
             std::vector<int> drafts = RunDFlashDraft(
                 device, devices, draftInputTokens.back(),
                 generationConfigs[0], dflashContext);
@@ -16165,11 +16243,12 @@ namespace fastllm {
                                             const std::vector<int> &draftInputTokens,
                                             const Data &draftPositionIds,
                                             int sampleRow,
-                                            int lastPositionRow) {
+                                            int lastPositionRow,
+                                            const std::vector<int> &committedTokens) {
             if (useDFlash) {
                 return runDFlashDraftChain(
                     targetHiddenStates, draftInputTokens, draftPositionIds,
-                    sampleRow, lastPositionRow);
+                    sampleRow, lastPositionRow, committedTokens);
             }
             return runMtpDraftChain(
                 targetHiddenStates, draftInputTokens, draftPositionIds,
@@ -16196,7 +16275,7 @@ namespace fastllm {
             Data mtpPositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, seqLen, 0);
             std::vector<int> drafts = runSpeculativeDraftChain(
                 speculativeHiddenStates, mtpInputTokens, mtpPositionIds,
-                seqLen - 1, seqLen - 1);
+                seqLen - 1, seqLen - 1, std::vector<int>{nextToken});
             mtpProfileMark(mtpProfileDraftUs);
             acceptedTokens[0].push_back(nextToken);
             setNextInputWithDrafts(nextToken, drafts);
@@ -16875,7 +16954,7 @@ namespace fastllm {
             mtpInputTokens.push_back(committedRet[commitLen - 1]);
             std::vector<int> drafts = runSpeculativeDraftChain(
                 hiddenForMtp, mtpInputTokens, mtpPositionIds,
-                commitLen - 1, commitLen - 1);
+                commitLen - 1, commitLen - 1, committedRet);
             mtpProfileMark(mtpProfileDraftUs);
             acceptedTokens[0].assign(committedRet.begin(),
                                      committedRet.begin() + commitLen);
@@ -17217,7 +17296,7 @@ namespace fastllm {
             mtpInputTokens.push_back(committedRet[commitLen - 1]);
             std::vector<int> drafts = runSpeculativeDraftChain(
                 hiddenForMtp, mtpInputTokens, mtpPositionIds,
-                commitLen - 1, commitLen - 1);
+                commitLen - 1, commitLen - 1, committedRet);
             mtpProfileMark(mtpProfileDraftUs);
             acceptedTokens[0].assign(committedRet.begin(),
                                      committedRet.begin() + commitLen);
@@ -17466,7 +17545,7 @@ namespace fastllm {
             Data mtpPositionIds = BuildMtpPositionIdsSlice(allPositionIds, 0, seqLen, 0);
             std::vector<int> drafts = runSpeculativeDraftChain(
                 speculativeHiddenStates, mtpInputTokens, mtpPositionIds,
-                seqLen - 1, seqLen - 1);
+                seqLen - 1, seqLen - 1, committedRet);
             mtpProfileMark(mtpProfileDraftUs);
             mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
             acceptedTokens[0] = committedRet;
@@ -17526,7 +17605,7 @@ namespace fastllm {
         mtpInputTokens.push_back(committedRet[commitLen - 1]);
         std::vector<int> drafts = runSpeculativeDraftChain(
             hiddenForMtp, mtpInputTokens, mtpPositionIds,
-            commitLen - 1, commitLen - 1);
+            commitLen - 1, commitLen - 1, committedRet);
         mtpProfileMark(mtpProfileDraftUs);
         acceptedTokens[0].assign(committedRet.begin(), committedRet.begin() + commitLen);
         setNextInputWithDrafts(committedRet[commitLen - 1], drafts);
@@ -18812,18 +18891,26 @@ namespace fastllm {
                 const int tokenOffset = tokenOffsets[b];
                 const int lastTargetToken =
                     targetRet[tokenOffset + commitLen - 1];
+                commitAcceptedTokens(b);
                 speculativeDFlashHiddenStates =
                     std::move(committedDFlashHidden[b]);
                 AppendDFlashTargetHidden(
                     rootDevice, commitLen, *requestDFlashContexts[b]);
-                std::vector<int> drafts = RunDFlashDraft(
-                    rootDevice, devices, lastTargetToken,
-                    generationConfigs[b], *requestDFlashContexts[b]);
-                AssertInFastLLM(
-                    (int)drafts.size() == draftsPerStep,
-                    "Qwen3.5 batched DFlash draft returned invalid output.\n");
+                std::vector<int> drafts;
+                if (!Qwen35DFlashCommitEndsRequest(
+                        *this, contexts[b], acceptedTokens[b]) &&
+                    Qwen35DFlashDraftFitsContext(
+                        max_positions, dflashCheckpointBlockSize,
+                        requestDFlashContexts[b]->committedTokens)) {
+                    drafts = RunDFlashDraft(
+                        rootDevice, devices, lastTargetToken,
+                        generationConfigs[b],
+                        *requestDFlashContexts[b]);
+                    AssertInFastLLM(
+                        (int)drafts.size() == draftsPerStep,
+                        "Qwen3.5 batched DFlash draft returned invalid output.\n");
+                }
 
-                commitAcceptedTokens(b);
                 nextInputTokens[b].reserve(1 + drafts.size());
                 nextInputTokens[b].push_back(lastTargetToken);
                 nextInputTokens[b].insert(nextInputTokens[b].end(),
@@ -20756,12 +20843,23 @@ namespace fastllm {
                                         !ret.empty(),
                                         "Qwen3.5 DFlash long prefill returned no token.\n");
                                 }
+                                const bool generateDFlashDrafts =
+                                    isLastChunk &&
+                                    !Qwen35DFlashCommitEndsRequest(
+                                        *model, singleContext,
+                                        std::vector<int>{ret.back()}) &&
+                                    Qwen35DFlashDraftFitsContext(
+                                        model->max_positions,
+                                        model->dflashCheckpointBlockSize,
+                                        longPrefillBaseTokens + st +
+                                            curLen);
                                 bool appended = false;
                                 try {
                                     appended =
                                         appendLongPrefillDFlashCache(
                                             longPrefillBaseTokens + st,
-                                            curLen, isLastChunk,
+                                            curLen,
+                                            generateDFlashDrafts,
                                             isLastChunk ? ret.back() : -1,
                                             longPrefillDFlashDraftTokens);
                                 } catch (...) {
@@ -23962,6 +24060,14 @@ namespace fastllm {
         AssertInFastLLM(HasDFlashWeights() &&
                             (int)context.draftKeyValues.size() == dflashLayers,
                         "DFlash draft weights or KV context are incomplete.\n");
+        if (!Qwen35DFlashDraftFitsContext(
+                max_positions, dflashCheckpointBlockSize,
+                context.committedTokens)) {
+            context.proposalTokens.clear();
+            context.proposalCandidateIds.clear();
+            context.proposalCandidateProbs.clear();
+            return {};
+        }
         Qwen35ScopedGenericExecutor executor(
             "cuda:" + std::to_string(device));
         FastllmCudaSetDevice(device);
