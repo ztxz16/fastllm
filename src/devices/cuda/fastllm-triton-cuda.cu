@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -2169,6 +2170,103 @@ extern "C" bool FastllmCudaTritonChunkGdnPostConv(
         (unsigned int)(numWarps * 32), (unsigned int)shared, args, stream);
     finishPrepared();
     return CheckCu(result, "cuLaunchKernel chunk_gdn_postconv");
+}
+
+extern "C" bool FastllmCudaTritonQwen4SparseAttention(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared,
+    const fastllm::Data &query, const fastllm::Data &key,
+    const fastllm::Data &value, const fastllm::Data &indices,
+    int group, float scale, fastllm::Data &output) {
+    const int queryHeads = query.dims.size() == 3 ? query.dims[0] : 0;
+    const int sequence = query.dims.size() == 3 ? query.dims[1] : 0;
+    const int headDim = query.dims.size() == 3 ? query.dims[2] : 0;
+    const int kvHeads = key.dims.size() == 3 ? key.dims[0] : 0;
+    const int keyLength = key.dims.size() == 3 ? key.dims[1] : 0;
+    const int topk = indices.dims.size() == 2 ? indices.dims[1] : 0;
+    if (cubinPath == nullptr || kernelName == nullptr ||
+        numWarps <= 0 || shared < 0 ||
+        query.dataType != fastllm::DataType::FLOAT16 ||
+        key.dataType != query.dataType ||
+        value.dataType != query.dataType ||
+        indices.dataType != fastllm::DataType::INT32 ||
+        query.dataDevice != fastllm::DataDevice::CUDA ||
+        key.dataDevice != fastllm::DataDevice::CUDA ||
+        value.dataDevice != fastllm::DataDevice::CUDA ||
+        indices.dataDevice != fastllm::DataDevice::CUDA ||
+        query.cudaData == nullptr || key.cudaData == nullptr ||
+        value.cudaData == nullptr || indices.cudaData == nullptr ||
+        query.dims.size() != 3 || key.dims.size() != 3 ||
+        value.dims != key.dims || indices.dims.size() != 2 ||
+        queryHeads <= 0 || kvHeads <= 0 || group <= 0 ||
+        queryHeads != kvHeads * group || sequence <= 1 ||
+        keyLength <= 0 || headDim < 16 || headDim > 256 ||
+        (headDim & (headDim - 1)) != 0 ||
+        key.dims[2] != headDim || indices.dims[0] != sequence ||
+        topk <= 0 || topk > 3072 || !std::isfinite(scale) ||
+        query.Count(0) !=
+            (uint64_t)queryHeads * sequence * headDim ||
+        key.Count(0) !=
+            (uint64_t)kvHeads * keyLength * headDim ||
+        indices.Count(0) != (uint64_t)sequence * topk) {
+        return false;
+    }
+
+    LoadedTritonKernel *kernel =
+        LoadTritonKernel(cubinPath, kernelName, shared);
+    if (kernel == nullptr) {
+        return false;
+    }
+
+    output.dataType = query.dataType;
+    output.UpdateUnitSize();
+    output.dataDevice = query.dataDevice;
+    output.dataDeviceIds = query.dataDeviceIds;
+    output.Resize(query.dims);
+    output.Allocate(false);
+    if (output.cudaData == nullptr) {
+        return false;
+    }
+
+    void *queryData = FastllmCudaPrepareInput(query);
+    void *keyData = FastllmCudaPrepareInput(key);
+    void *valueData = FastllmCudaPrepareInput(value);
+    void *indicesData = FastllmCudaPrepareInput(indices);
+    void *outputData = FastllmCudaPrepareOutput(output);
+    auto finishPrepared = [&]() {
+        FastllmCudaFinishInput(query, queryData);
+        FastllmCudaFinishInput(key, keyData);
+        FastllmCudaFinishInput(value, valueData);
+        FastllmCudaFinishInput(indices, indicesData);
+        FastllmCudaFinishOutput(output, outputData);
+    };
+    if (queryData == nullptr || keyData == nullptr ||
+        valueData == nullptr || indicesData == nullptr ||
+        outputData == nullptr) {
+        finishPrepared();
+        return false;
+    }
+
+    CUdeviceptr queryPtr = (CUdeviceptr)queryData;
+    CUdeviceptr keyPtr = (CUdeviceptr)keyData;
+    CUdeviceptr valuePtr = (CUdeviceptr)valueData;
+    CUdeviceptr indicesPtr = (CUdeviceptr)indicesData;
+    CUdeviceptr outputPtr = (CUdeviceptr)outputData;
+    int32_t sequenceArg = sequence;
+    int32_t keyLengthArg = keyLength;
+    CUdeviceptr globalScratch = 0;
+    CUdeviceptr profileScratch = 0;
+    void *args[] = {
+        &queryPtr, &keyPtr, &valuePtr, &indicesPtr, &outputPtr,
+        &sequenceArg, &keyLengthArg, &scale,
+        &globalScratch, &profileScratch,
+    };
+    CUstream stream = reinterpret_cast<CUstream>(cudaStreamPerThread);
+    CUresult result = LaunchTritonKernel(
+        kernel, (unsigned int)sequence, (unsigned int)kvHeads, 1,
+        (unsigned int)(numWarps * 32), (unsigned int)shared, args, stream);
+    finishPrepared();
+    return CheckCu(result, "cuLaunchKernel qwen4_sparse_attention");
 }
 
 namespace {

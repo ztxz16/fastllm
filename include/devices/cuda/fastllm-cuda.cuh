@@ -979,6 +979,9 @@ bool FastllmCudaTryTritonChunkGdnPostConv(
         Data &normalizedQ, Data &normalizedK,
         Data &q, Data &k, Data &v, Data &g, Data &beta,
         Data &kBeta, Data &vBeta);
+bool FastllmCudaTryTritonQwen4SparseAttention(
+        const Data &query, const Data &key, const Data &value,
+        const Data &indices, int group, float scale, Data &output);
 bool FastllmCudaTryChunkGdnRaggedPostConv(
         const Data &qkvInput, const Data &normWeight,
         const Data &combinedBaInput, const Data &aLog,
@@ -1685,6 +1688,13 @@ bool FastllmCudaTritonChunkGdnPostConv(
     fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &beta,
     fastllm::Data &kBeta, fastllm::Data &vBeta);
+
+bool FastllmCudaTritonQwen4SparseAttention(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared,
+    const fastllm::Data &query, const fastllm::Data &key,
+    const fastllm::Data &value, const fastllm::Data &indices,
+    int group, float scale, fastllm::Data &output);
 
 bool FastllmCudaTritonChunkGdnRecompute(
     const char *cubinPath, const char *kernelName,

@@ -239,6 +239,17 @@ namespace fastllm {
         int numStages = 2;
     };
 
+    struct CudaTritonQwen4SparseAttentionMeta {
+        CudaTritonKernelMeta kernel;
+        std::string dtype;
+        int groupSize = 1;
+        int headDim = 128;
+        int topk = 1;
+        int blockM = 1;
+        int blockN = 64;
+        int numStages = 2;
+    };
+
     struct CudaTritonChunkGdnRecomputeMeta {
         CudaTritonKernelMeta kernels[kCudaTritonChunkGdnRecomputeKernelCount];
         int chunkSize = 64;
@@ -439,6 +450,22 @@ namespace fastllm {
            << "_hk" << keyHeads << "_hv" << valueHeads
            << "_k" << kDim << "_v" << vDim
            << "_bt" << blockT
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonQwen4SparseAttentionBaseName(
+        const std::string &dtype, int arch, int groupSize, int headDim,
+        int topk, int blockN, int numWarps, int numStages) {
+        int blockM = 1;
+        while (blockM < groupSize) {
+            blockM <<= 1;
+        }
+        std::ostringstream os;
+        os << "qwen4_sparse_attention_v1_" << dtype << "_sm" << arch
+           << "_g" << groupSize
+           << "_d" << headDim << "_w" << topk
+           << "_bm" << blockM << "_bn" << blockN
            << "_nw" << numWarps << "_ns" << numStages;
         return os.str();
     }
@@ -706,6 +733,46 @@ namespace fastllm {
                meta.valueHeads % meta.keyHeads == 0 &&
                meta.kDim == 128 && meta.vDim == 128 &&
                meta.blockT == 16 && meta.numStages > 0;
+    }
+
+    static bool CudaTritonReadQwen4SparseAttentionMeta(
+        const std::string &path,
+        CudaTritonQwen4SparseAttentionMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "qwen4_sparse_attention") {
+            return false;
+        }
+        meta.kernel.cubinPath = json["cubin"].string_value();
+        meta.kernel.kernelName = json["kernel"].string_value();
+        meta.kernel.shared = json["shared"].int_value();
+        meta.kernel.numWarps = json["num_warps"].int_value();
+        meta.dtype = json["dtype"].string_value();
+        meta.groupSize = json["group_size"].int_value();
+        meta.headDim = json["head_dim"].int_value();
+        meta.topk = json["topk"].int_value();
+        meta.blockM = json["block_m"].int_value();
+        meta.blockN = json["block_n"].int_value();
+        meta.numStages = json["num_stages"].int_value();
+        return !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 &&
+               CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.dtype == "fp16" &&
+               meta.groupSize > 0 && meta.groupSize <= 16 &&
+               meta.headDim >= 16 && meta.headDim <= 256 &&
+               (meta.headDim & (meta.headDim - 1)) == 0 &&
+               meta.topk > 0 && meta.topk <= 3072 &&
+               meta.blockM >= meta.groupSize && meta.blockM <= 16 &&
+               (meta.blockM & (meta.blockM - 1)) == 0 &&
+               (meta.blockN == 16 || meta.blockN == 32 ||
+                meta.blockN == 64 || meta.blockN == 128) &&
+               meta.numStages > 0;
     }
 
     static bool CudaTritonReadChunkGdnRecomputeMeta(
@@ -1568,6 +1635,116 @@ namespace fastllm {
             loaded.valueHeads != valueHeads ||
             loaded.kDim != kDim || loaded.vDim != vDim ||
             loaded.blockT != blockT || loaded.numStages != numStages) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestQwen4SparseAttentionKernel(
+        const std::string &cacheDir, int arch, const std::string &dtype,
+        int groupSize, int headDim, int topk,
+        int blockN, int numWarps, int numStages,
+        CudaTritonQwen4SparseAttentionMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "qwen4_sparse_attention"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"dtype", dtype},
+            {"group_size", groupSize},
+            {"head_dim", headDim},
+            {"topk", topk},
+            {"block_n", blockN},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: Qwen4 sparse attention compile "
+                       "failed; falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.kernel.cubinPath = response["cubin"].string_value();
+        meta.kernel.kernelName = response["kernel"].string_value();
+        meta.kernel.shared = response["shared"].int_value();
+        meta.kernel.numWarps = response["num_warps"].int_value();
+        meta.dtype = response["dtype"].string_value();
+        meta.groupSize = response["group_size"].int_value();
+        meta.headDim = response["head_dim"].int_value();
+        meta.topk = response["topk"].int_value();
+        meta.blockM = response["block_m"].int_value();
+        meta.blockN = response["block_n"].int_value();
+        meta.numStages = response["num_stages"].int_value();
+        return !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 &&
+               CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.dtype == dtype && meta.groupSize == groupSize &&
+               meta.headDim == headDim && meta.topk == topk &&
+               meta.blockN == blockN &&
+               meta.kernel.numWarps == numWarps &&
+               meta.numStages == numStages;
+    }
+
+    static bool CudaTritonGetQwen4SparseAttentionMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, const std::string &dtype,
+        int groupSize, int headDim, int topk,
+        int blockN, int numWarps, int numStages,
+        const CudaTritonQwen4SparseAttentionMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string,
+                        CudaTritonQwen4SparseAttentionMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonQwen4SparseAttentionMeta loaded;
+        if (!CudaTritonReadQwen4SparseAttentionMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestQwen4SparseAttentionKernel(
+                    cacheDir, arch, dtype, groupSize,
+                    headDim, topk, blockN, numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        int expectedBlockM = 1;
+        while (expectedBlockM < groupSize) {
+            expectedBlockM <<= 1;
+        }
+        if (loaded.dtype != dtype || loaded.groupSize != groupSize ||
+            loaded.headDim != headDim || loaded.topk != topk ||
+            loaded.blockM != expectedBlockM || loaded.blockN != blockN ||
+            loaded.kernel.numWarps != numWarps ||
+            loaded.numStages != numStages) {
             return false;
         }
 
@@ -3244,6 +3421,93 @@ namespace fastllm {
             q, k, v, g, beta, kBeta, vBeta);
     }
 
+    bool FastllmCudaTryTritonQwen4SparseAttention(
+        const Data &query, const Data &key, const Data &value,
+        const Data &indices, int group, float scale, Data &output) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION", true)) {
+            return false;
+        }
+        auto isDense = [](const Data &data) {
+            if (data.dims.empty() ||
+                data.strides.size() != data.dims.size()) {
+                return false;
+            }
+            uint64_t expected = 1;
+            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+                if (data.strides[i] != expected) {
+                    return false;
+                }
+                expected *= (uint64_t)data.dims[i];
+            }
+            return true;
+        };
+        auto isCudaDense = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA &&
+                   data.cudaData != nullptr && isDense(data);
+        };
+        if (query.dims.size() != 3 || key.dims.size() != 3 ||
+            value.dims != key.dims || indices.dims.size() != 2 ||
+            query.dataType != key.dataType ||
+            query.dataType != value.dataType ||
+            query.dataType != DataType::FLOAT16 ||
+            indices.dataType != DataType::INT32 ||
+            !isCudaDense(query) || !isCudaDense(key) ||
+            !isCudaDense(value) || !isCudaDense(indices) ||
+            group <= 0 || group > 16 ||
+            query.dims[0] != key.dims[0] * group ||
+            query.dims[1] != indices.dims[0] ||
+            query.dims[2] != key.dims[2] ||
+            query.dims[1] <= 1 || key.dims[1] <= 0 ||
+            query.dims[2] < 16 || query.dims[2] > 256 ||
+            (query.dims[2] & (query.dims[2] - 1)) != 0 ||
+            indices.dims[1] <= 0 || indices.dims[1] > 3072 ||
+            !std::isfinite(scale)) {
+            return false;
+        }
+
+        std::string dtype;
+        if (!CudaTritonDataTypeName(query.dataType, dtype)) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 80) {
+            return false;
+        }
+        int blockN = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION_BLOCK_N",
+            64, 16, 128);
+        if (blockN != 16 && blockN != 32 &&
+            blockN != 64 && blockN != 128) {
+            return false;
+        }
+        int numWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION_NUM_WARPS",
+            2, 1, 32);
+        int numStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION_NUM_STAGES",
+            2, 1, 8);
+        int headDim = query.dims[2];
+        int topk = indices.dims[1];
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonQwen4SparseAttentionBaseName(
+            dtype, arch, group, headDim, topk,
+            blockN, numWarps, numStages);
+        const CudaTritonQwen4SparseAttentionMeta *meta = nullptr;
+        if (!CudaTritonGetQwen4SparseAttentionMeta(
+                cacheDir, base, arch, dtype, group,
+                headDim, topk, blockN,
+                numWarps, numStages, meta) || meta == nullptr) {
+            return false;
+        }
+        return FastllmCudaTritonQwen4SparseAttention(
+            meta->kernel.cubinPath.c_str(),
+            meta->kernel.kernelName.c_str(),
+            meta->kernel.numWarps, meta->kernel.shared,
+            query, key, value, indices, group, scale, output);
+    }
+
     bool FastllmCudaTryChunkGdnRaggedPostConv(
         const Data &qkvInput, const Data &normWeight,
         const Data &combinedBaInput, const Data &aLog,
@@ -3963,6 +4227,12 @@ namespace fastllm {
         Data &, Data &,
         Data &, Data &, Data &, Data &, Data &,
         Data &, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonQwen4SparseAttention(
+        const Data &, const Data &, const Data &, const Data &,
+        int, float, Data &) {
         return false;
     }
 
@@ -4879,6 +5149,12 @@ namespace fastllm {
         const int width = indices.dims[1];
         const int sequence = query.dims[1];
         if (sequence > 1) {
+            if (FastllmCudaTryTritonQwen4SparseAttention(
+                    query, key, value, indices,
+                    intParams.find("group")->second,
+                    floatParams.find("scale")->second, output)) {
+                return;
+            }
             output.Allocate(false);
             const int tileRows = std::min(
                 sequence, kQwen4SparsePrefillTileRows);

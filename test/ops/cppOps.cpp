@@ -4632,6 +4632,104 @@ namespace {
         };
     }
 
+    static OpCase MakeQwen4SparseAttentionCase() {
+        return {
+            "qwen4_sparse_attention",
+            "Qwen4 direct-index sparse attention CPU/CUDA agreement",
+            []() {
+                OpTestParams params;
+                params.Add("sequence", "17", "number of query rows");
+                params.Add("query_heads", "24", "number of query heads");
+                params.Add("kv_heads", "2", "number of KV heads");
+                params.Add("key_length", "137", "cached KV length");
+                params.Add("head_dim", "64", "attention head dimension");
+                params.Add("topk", "67", "sparse index width");
+                params.Add("valid", "53", "valid indices per row");
+                params.Add("scale", "0.125", "attention score scale");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device == "cpu" || device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int sequence = params.GetInt("sequence");
+                const int queryHeads = params.GetInt("query_heads");
+                const int kvHeads = params.GetInt("kv_heads");
+                const int keyLength = params.GetInt("key_length");
+                const int headDim = params.GetInt("head_dim");
+                const int topk = params.GetInt("topk");
+                const int valid = std::min(params.GetInt("valid"), topk);
+                if (sequence <= 0 || queryHeads <= 0 || kvHeads <= 0 ||
+                    queryHeads % kvHeads != 0 || keyLength <= 0 ||
+                    headDim <= 0 || topk <= 0 || valid <= 0 ||
+                    valid > keyLength) {
+                    throw std::runtime_error(
+                        "invalid qwen4_sparse_attention parameters");
+                }
+                fastllm::Data query = MakeTensor(
+                    {queryHeads, sequence, headDim}, 0.31f, 0.08f);
+                fastllm::Data key = MakeTensor(
+                    {kvHeads, keyLength, headDim}, 0.73f, 0.08f);
+                fastllm::Data value = MakeTensor(
+                    {kvHeads, keyLength, headDim}, 1.17f, 0.08f);
+                {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(query, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(key, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(value, fastllm::DataType::FLOAT16);
+                }
+                fastllm::Data indices;
+                indices.dataType = fastllm::DataType::INT32;
+                indices.UpdateUnitSize();
+                indices.Resize({sequence, topk});
+                indices.Allocate(false);
+                int32_t *indexData =
+                    reinterpret_cast<int32_t*>(indices.cpuData);
+                for (int row = 0; row < sequence; row++) {
+                    for (int selected = 0; selected < topk; selected++) {
+                        indexData[(size_t)row * topk + selected] =
+                            selected < valid
+                            ? (row * 29 + selected * 17) % keyLength
+                            : -1;
+                    }
+                }
+                fastllm::Data output;
+                ScopedFirstDevice guard(device);
+                fastllm::Qwen4SparseAttention(
+                    query, key, value, indices, queryHeads / kvHeads,
+                    params.GetFloat("scale"), output);
+                fastllm::Data result;
+                fastllm::ToDataType(
+                    output, result, fastllm::DataType::FLOAT32);
+                result.ToDevice(fastllm::DataDevice::CPU);
+                return result;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double queryHeads = params.GetInt("query_heads");
+                const double kvHeads = params.GetInt("kv_heads");
+                const double headDim = params.GetInt("head_dim");
+                const double topk = params.GetInt("topk");
+                const double valid = params.GetInt("valid");
+                const double queryAndOutput =
+                    2.0 * queryHeads * sequence * headDim;
+                const double sparseKeyAndValue =
+                    2.0 * kvHeads * sequence * valid * headDim;
+                const double indexReads =
+                    kvHeads * sequence * topk;
+                return 2.0 * (queryAndOutput + sparseKeyAndValue) +
+                       4.0 * indexReads;
+            },
+            [](const OpTestParams &params) {
+                const double sequence = params.GetInt("sequence");
+                const double queryHeads = params.GetInt("query_heads");
+                const double headDim = params.GetInt("head_dim");
+                const double valid = params.GetInt("valid");
+                return 4.0 * sequence * queryHeads * valid * headDim;
+            }
+        };
+    }
+
     static OpCase MakeQwen4QSADenseMaskCase() {
         return {
             "qwen4_qsa_dense_mask",
@@ -4854,6 +4952,7 @@ namespace {
             MakeQwen4PLECausalConvCase(),
             MakeCausalDepthwiseConv1DPrefillCase(),
             MakeChunkGdnMixedStateCase(),
+            MakeQwen4SparseAttentionCase(),
             MakeQwen4QSADenseMaskCase(),
             MakeCausalDepthwiseConv1DPrefillReferenceCase(),
             MakeDots3NoteIndexerCase()

@@ -77,6 +77,101 @@ if triton is not None:
 
 
     @triton.jit
+    def fastllm_qwen4_sparse_attention_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        indices_ptr,
+        output_ptr,
+        sequence,
+        key_length,
+        scale,
+        GROUP_SIZE: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        TOPK: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Qwen4 sparse GQA over FastLLM's contiguous head-major KV cache.
+
+        One program owns one query row and one KV head.  It follows vLLM's
+        direct-indexed QSA prefill design: selected logical token indices load
+        K/V in place, while FP32 online softmax avoids materializing gathered
+        caches, logits, probabilities, or padding masks.
+        """
+        row = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        head_offsets = tl.arange(0, BLOCK_M)
+        dim_offsets = tl.arange(0, HEAD_DIM)
+        column_offsets = tl.arange(0, BLOCK_N)
+        first_head = kv_head * GROUP_SIZE
+
+        query = tl.load(
+            q_ptr
+            + ((first_head + head_offsets[:, None]) * sequence + row)
+            * HEAD_DIM
+            + dim_offsets[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0.0,
+        )
+        max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
+        normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+        scale_log2 = scale * 1.4426950408889634
+
+        for tile in range(0, (TOPK + BLOCK_N - 1) // BLOCK_N):
+            columns = tile * BLOCK_N + column_offsets
+            logical_token = tl.load(
+                indices_ptr + row * TOPK + columns,
+                mask=columns < TOPK,
+                other=-1,
+            )
+            valid = (logical_token >= 0) & (logical_token < key_length)
+            safe_token = tl.maximum(logical_token, 0).to(tl.int64)
+            keys = tl.load(
+                k_ptr
+                + (kv_head * key_length + safe_token[None, :]) * HEAD_DIM
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_ptr
+                + (kv_head * key_length + safe_token[:, None]) * HEAD_DIM
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            scores = tl.dot(query, keys)
+            scores *= scale_log2
+            scores = tl.where(valid[None, :], scores, -1.0e20)
+            next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+            alpha = tl.math.exp2(max_value - next_max)
+            probabilities = tl.where(
+                valid[None, :],
+                tl.math.exp2(scores - next_max[:, None]),
+                0.0,
+            )
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
+            normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+            max_value = next_max
+
+        output = accumulator / tl.maximum(normalizer[:, None], 1.0e-20)
+        tl.store(
+            output_ptr
+            + ((first_head + head_offsets[:, None]) * sequence + row)
+            * HEAD_DIM
+            + dim_offsets[None, :],
+            output,
+            mask=head_offsets[:, None] < GROUP_SIZE,
+        )
+
+
+    @triton.jit
     def fastllm_chunk_gdn_prefill_h_kernel(
         k_ptr,
         v_ptr,
@@ -2483,6 +2578,37 @@ def chunk_gdn_postconv_cache_paths(payload):
     return cache_dir / f"{name}.cubin", cache_dir / f"{name}.json"
 
 
+def qwen4_sparse_attention_cache_paths(payload):
+    arch = require_int(payload, "arch")
+    dtype = require_dtype(payload, "dtype")
+    if dtype != "fp16":
+        raise ValueError("qwen4_sparse_attention requires fp16")
+    group_size = require_int(payload, "group_size")
+    head_dim = require_int(payload, "head_dim")
+    topk = require_int(payload, "topk")
+    block_n = require_int(payload, "block_n", 64)
+    num_warps = require_int(payload, "num_warps", 2)
+    num_stages = require_int(payload, "num_stages", 2)
+    if group_size <= 0 or group_size > 16:
+        raise ValueError("qwen4_sparse_attention requires group_size in [1, 16]")
+    block_m = 1 << (group_size - 1).bit_length()
+    if head_dim < 16 or head_dim > 256 or head_dim & (head_dim - 1):
+        raise ValueError(
+            "qwen4_sparse_attention requires a power-of-two head_dim in [16, 256]"
+        )
+    if topk <= 0 or topk > 3072:
+        raise ValueError("qwen4_sparse_attention requires topk in [1, 3072]")
+    if block_n not in {16, 32, 64, 128}:
+        raise ValueError("qwen4_sparse_attention block_n must be 16, 32, 64, or 128")
+    cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
+    name = (
+        f"qwen4_sparse_attention_v1_{dtype}_sm{arch}"
+        f"_g{group_size}_d{head_dim}_w{topk}"
+        f"_bm{block_m}_bn{block_n}_nw{num_warps}_ns{num_stages}"
+    )
+    return cache_dir / f"{name}.cubin", cache_dir / f"{name}.json"
+
+
 def chunk_gdn_recompute_cache_paths(payload):
     arch = require_int(payload, "arch")
     dtype = require_dtype(payload, "dtype")
@@ -3123,6 +3249,75 @@ def compile_chunk_gdn_postconv(payload):
         "k_dim": k_dim,
         "v_dim": v_dim,
         "block_t": block_t,
+    }
+    meta_path.write_text(json.dumps(meta, sort_keys=True))
+    return meta
+
+
+def compile_qwen4_sparse_attention(payload):
+    if triton is None:
+        raise RuntimeError(f"failed to import triton: {_triton_error}")
+
+    arch = require_int(payload, "arch")
+    dtype = require_dtype(payload, "dtype")
+    group_size = require_int(payload, "group_size")
+    head_dim = require_int(payload, "head_dim")
+    topk = require_int(payload, "topk")
+    block_n = require_int(payload, "block_n", 64)
+    num_warps = require_int(payload, "num_warps", 2)
+    num_stages = require_int(payload, "num_stages", 2)
+    cubin_path, meta_path = qwen4_sparse_attention_cache_paths(payload)
+    if cubin_path.exists() and meta_path.exists():
+        return json.loads(meta_path.read_text())
+
+    block_m = 1 << (group_size - 1).bit_length()
+    cubin_path.parent.mkdir(parents=True, exist_ok=True)
+    signature = {
+        "q_ptr": f"*{dtype}",
+        "k_ptr": f"*{dtype}",
+        "v_ptr": f"*{dtype}",
+        "indices_ptr": "*i32",
+        "output_ptr": f"*{dtype}",
+        "sequence": "i32",
+        "key_length": "i32",
+        "scale": "fp32",
+        "GROUP_SIZE": "constexpr",
+        "HEAD_DIM": "constexpr",
+        "TOPK": "constexpr",
+        "BLOCK_M": "constexpr",
+        "BLOCK_N": "constexpr",
+    }
+    constexprs = {
+        "GROUP_SIZE": group_size,
+        "HEAD_DIM": head_dim,
+        "TOPK": topk,
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+    }
+    ccinfo = _compile_cubin(
+        fastllm_qwen4_sparse_attention_kernel,
+        signature,
+        constexprs,
+        arch,
+        num_warps,
+        num_stages,
+        cubin_path,
+    )
+    meta = {
+        "ok": True,
+        "op": "qwen4_sparse_attention",
+        "cubin": str(cubin_path),
+        "kernel": ccinfo.metadata.name,
+        "shared": int(ccinfo.metadata.shared),
+        "num_warps": int(ccinfo.metadata.num_warps),
+        "num_stages": int(ccinfo.metadata.num_stages),
+        "arch": arch,
+        "dtype": dtype,
+        "group_size": group_size,
+        "head_dim": head_dim,
+        "topk": topk,
+        "block_m": block_m,
+        "block_n": block_n,
     }
     meta_path.write_text(json.dumps(meta, sort_keys=True))
     return meta
@@ -4342,6 +4537,8 @@ def handle_compile(payload):
             return compile_chunk_gdn_varlen_prefill(payload)
         if op == "chunk_gdn_postconv":
             return compile_chunk_gdn_postconv(payload)
+        if op == "qwen4_sparse_attention":
+            return compile_qwen4_sparse_attention(payload)
         if op in (
             "chunk_gdn_recompute",
             "chunk_gdn_recompute_v5",
